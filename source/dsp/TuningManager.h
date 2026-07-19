@@ -11,6 +11,13 @@
 //                    falls back to 12-TET, so it is always safe to select.
 //   * Scala (.scl) - a user-loaded Scala scale file, any number of notes per
 //                    period, ratios or cents. 1/1 is anchored to middle C.
+//                    Ableton .ascl files are a superset of .scl (extra data lives
+//                    in "! @ABL ..." comment lines); we honour @ABL REFERENCE_PITCH
+//                    so the file's own anchor octave/degree/frequency wins.
+//
+// Note that Ableton Live 12's tuning systems / Microtuner do NOT hand the plugin
+// a file: they retune via per-note MPE pitch bend (range +-48 st), which the
+// synth follows in any mode. Loading the same .ascl here is for standalone use.
 //
 // Real-time contract: frequencyForNote() is called from the audio thread once
 // per block per voice. It only reads atomics / the MTS shared-memory table, so
@@ -154,14 +161,39 @@ public:
         for (int j = 0; j < count - 1; ++j)
             perDegree.push_back (intervals[(size_t) j]);
 
+        // Build anchored at middle C first (degree 0 on key 60), into a local
+        // buffer so an @ABL reference can rescale before publishing.
+        std::array<double, 128> freqs {};
         for (int n = 0; n < 128; ++n)
         {
             const int d   = n - kRefKey;
             const int oct = (int) std::floor ((double) d / (double) count);
             const int step = d - oct * count; // 0..count-1
-            const double f = kRefFreq * std::pow (period, (double) oct) * perDegree[(size_t) step];
-            table[(size_t) n].store (f, std::memory_order_relaxed);
+            freqs[(size_t) n] = kRefFreq * std::pow (period, (double) oct) * perDegree[(size_t) step];
         }
+
+        // Ableton .ascl: "! @ABL REFERENCE_PITCH <octave> <degree> <freq>" pins
+        // scale degree <degree> of octave <octave> (middle C octave = 3) to <freq>.
+        // The reference frequency is computed in CLOSED FORM (same math as the
+        // table build), so an anchor outside the 0..127 key range - possible for
+        // large-count EDOs - still rescales exactly instead of clamping onto the
+        // wrong key and silently shifting the whole tuning.
+        {
+            AblReference ref;
+            if (parseAblReference (text, ref))
+            {
+                const int d    = (ref.octave - 3) * count + ref.degree; // offset from kRefKey (may exceed MIDI range)
+                const int oct  = (int) std::floor ((double) d / (double) count);
+                const int step = d - oct * count; // 0..count-1
+                const double fAtRef = kRefFreq * std::pow (period, (double) oct) * perDegree[(size_t) step];
+                const double scale  = ref.freq / fAtRef;
+                if (std::isfinite (fAtRef) && fAtRef > 0.0 && std::isfinite (scale) && scale > 0.0)
+                    for (auto& f : freqs) f *= scale;
+            }
+        }
+
+        for (int n = 0; n < 128; ++n)
+            table[(size_t) n].store (freqs[(size_t) n], std::memory_order_relaxed);
 
         scalaName   = name.isNotEmpty() ? name : desc;
         scalaSource = text;
@@ -240,6 +272,52 @@ private:
     static double equalFreq (int n) noexcept
     {
         return 440.0 * std::pow (2.0, (n - 69) / 12.0);
+    }
+
+    // Ableton .ascl "@ABL REFERENCE_PITCH <octave> <degree> <freq>" (inside a
+    // '!' comment line). Returns false if the file has none (plain .scl).
+    struct AblReference { int octave = 3; int degree = 0; double freq = 0.0; };
+
+    static bool parseAblReference (const juce::String& text, AblReference& out)
+    {
+        juce::StringArray raw;
+        raw.addLines (text);
+        for (const auto& l : raw)
+        {
+            const auto t = l.trim();
+            if (! t.startsWith ("!"))
+                continue;
+            const auto body = t.substring (1).trim();
+            if (! body.startsWith ("@ABL"))
+                continue;
+            auto rest = body.substring (4).trim();
+            if (! rest.startsWith ("REFERENCE_PITCH"))
+                continue;
+            rest = rest.substring (15).trim();
+
+            juce::StringArray tok;
+            tok.addTokens (rest, " \t", "\"");
+            tok.removeEmptyStrings();
+            if (tok.size() < 3)
+                return false;
+
+            // getIntValue() would turn a non-numeric token into 0 and silently
+            // mis-anchor the whole tuning - validate before parsing (a bad @ABL
+            // line degrades to plain-.scl middle-C anchoring instead).
+            const auto isIntToken = [] (const juce::String& s)
+            {
+                const auto body = s.startsWith ("-") ? s.substring (1) : s;
+                return body.isNotEmpty() && body.containsOnly ("0123456789");
+            };
+            if (! isIntToken (tok[0]) || ! isIntToken (tok[1]))
+                return false;
+
+            out.octave = tok[0].getIntValue();
+            out.degree = tok[1].getIntValue();
+            out.freq   = tok[2].getDoubleValue();
+            return std::isfinite (out.freq) && out.freq > 0.0 && out.degree >= 0;
+        }
+        return false;
     }
 
     // Parse a Scala .scl into the list of interval ratios (degrees 1..N).

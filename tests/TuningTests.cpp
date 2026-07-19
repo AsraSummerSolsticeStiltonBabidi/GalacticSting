@@ -114,6 +114,77 @@ int main()
     }
 
     //--------------------------------------------------------------------------
+    std::printf ("Ableton .ascl: @ABL REFERENCE_PITCH re-anchors the scale:\n");
+    {
+        // 12-TET in cents, but the file pins degree 9 of octave 3 (= A4) to 432 Hz.
+        const juce::String ascl =
+            "! test.ascl\n"
+            "12-TET at A=432\n"
+            " 12\n"
+            "!\n"
+            " 100.0\n 200.0\n 300.0\n 400.0\n 500.0\n 600.0\n"
+            " 700.0\n 800.0\n 900.0\n 1000.0\n 1100.0\n 1200.0\n"
+            "!\n"
+            "! @ABL REFERENCE_PITCH 3 9 432.0\n"
+            "! @ABL SOURCE unit test\n";
+        TuningManager t; juce::String err;
+        const bool ok = t.loadScalaString (ascl, "a432", err);
+        t.setMode (TuningManager::Mode::Scala);
+        check (ok, "parsed .ascl with @ABL lines");
+        check (approxHz (t.frequencyForNote (69), 432.0, 0.05), "A4 = 432 (file reference wins)");
+        check (approxHz (t.frequencyForNote (57), 216.0, 0.05), "A3 = 216 (octave preserved)");
+        check (approxHz (t.frequencyForNote (60), 432.0 * std::pow (2.0, -9.0 / 12.0), 0.05),
+               "C4 shifted consistently with the new anchor");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf (".ascl hardening: out-of-range and malformed references:\n");
+    {
+        const juce::String twelve =
+            "12-TET\n 12\n"
+            " 100.0\n 200.0\n 300.0\n 400.0\n 500.0\n 600.0\n"
+            " 700.0\n 800.0\n 900.0\n 1000.0\n 1100.0\n 1200.0\n";
+
+        // Reference far above the MIDI range (A9 = 14080 Hz) must still resolve
+        // exactly (closed form), keeping A4 = 440 - no clamped mis-anchor.
+        {
+            TuningManager t; juce::String err;
+            t.loadScalaString (twelve + "! @ABL REFERENCE_PITCH 8 9 14080.0\n", "hi", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (approxHz (t.frequencyForNote (69), 440.0, 0.05), "out-of-range reference: A4 stays 440");
+        }
+        // Non-numeric octave token: the @ABL line is IGNORED (plain .scl anchor).
+        {
+            TuningManager t; juce::String err;
+            t.loadScalaString (twelve + "! @ABL REFERENCE_PITCH three 9 440.0\n", "bad-oct", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (approxHz (t.frequencyForNote (60), TuningManager::kRefFreq, 0.05),
+                   "non-numeric octave ignored -> middle-C anchor kept");
+        }
+        // Infinite frequency: rejected (no inf table / silent blast).
+        {
+            TuningManager t; juce::String err;
+            t.loadScalaString (twelve + "! @ABL REFERENCE_PITCH 3 9 1e999\n", "inf", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (approxHz (t.frequencyForNote (69), 440.0, 0.05), "infinite reference freq ignored");
+        }
+        // 53-EDO with a reference 2 periods up: key 60 must stay ~kRefFreq * (1046.502/expected)
+        // - here we just require the anchor to resolve finitely and periodically.
+        {
+            juce::String edo53 = "53-EDO\n 53\n";
+            for (int i = 1; i <= 53; ++i)
+                edo53 += " " + juce::String (1200.0 * i / 53.0, 6) + "\n";
+            edo53 += "! @ABL REFERENCE_PITCH 5 0 1046.502\n"; // virtual key 60 + 2*53 = 166
+            TuningManager t; juce::String err;
+            const bool ok = t.loadScalaString (edo53, "53edo", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (ok, "53-EDO .ascl parsed");
+            check (approxHz (t.frequencyForNote (60), 1046.502 / 4.0, 0.05),
+                   "53-EDO reference 2 periods up -> key 60 = freq/4");
+        }
+    }
+
+    //--------------------------------------------------------------------------
     std::printf ("clearScala reverts to 12-TET:\n");
     {
         TuningManager t; juce::String err;

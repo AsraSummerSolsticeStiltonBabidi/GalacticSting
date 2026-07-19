@@ -14,9 +14,12 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
       apvts (*this, nullptr, "PARAMS", createParameterLayout())
 {
     // Legacy mode lets the MPE engine also respond to ordinary MIDI, so the
-    // computer keyboard and plain Ableton MIDI clips produce sound. Real MPE
-    // controllers still work; we will add a proper MPE/legacy switch later.
-    synth.enableLegacyMode();
+    // computer keyboard and plain Ableton MIDI clips produce sound. Each MIDI
+    // channel is independent with its own pitch bend, which is exactly how
+    // Ableton Live 12 delivers its tuning systems / Microtuner: per-note MPE
+    // pitch bend with an assumed range of +-48 semitones (the MPE default).
+    // The range is a parameter ("bendRange"); 48 is required for Live tuning.
+    synth.enableLegacyMode (48);
     synth.setVoiceStealingEnabled (true);
 
     for (int i = 0; i < 32; ++i)
@@ -138,6 +141,11 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "tuningMode", 1 }, "Tuning",
         StringArray { "12-TET", "MTS-ESP", "Scala (.scl)" }, 0));
+    // Per-note pitch-bend range. +-48 st is the MPE default and what Ableton
+    // Live 12's tuning systems / Microtuner assume; +-2 suits classic keyboards.
+    params.push_back (std::make_unique<AudioParameterChoice>(
+        ParameterID { "bendRange", 1 }, "Pitch Bend Range",
+        StringArray { "+-2 st", "+-12 st", "+-48 st (MPE)" }, 2));
 
     //-- Scala-as-timbre --------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterInt>(
@@ -195,6 +203,16 @@ void FractalAdditiveAudioProcessor::timerCallback()
     }
 
     tuning.setMode ((TuningManager::Mode) (int) apvts.getRawParameterValue ("tuningMode")->load());
+
+    // Apply the bend-range choice only when it changes: setLegacyModePitchbendRange
+    // releases all held notes, so it must never be called redundantly.
+    static constexpr int bendValues[] = { 2, 12, 48 };
+    const int bendIdx = juce::jlimit (0, 2, (int) apvts.getRawParameterValue ("bendRange")->load());
+    if (bendValues[bendIdx] != lastBendApplied)
+    {
+        lastBendApplied = bendValues[bendIdx];
+        synth.setLegacyModePitchbendRange (lastBendApplied);
+    }
 }
 
 //==============================================================================
@@ -306,12 +324,12 @@ juce::AudioProcessorEditor* FractalAdditiveAudioProcessor::createEditor()
 }
 
 //==============================================================================
-void FractalAdditiveAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+// The full patch as a ValueTree: the parameters plus the loaded Scala scale and
+// Scala-timbre (as child trees). Shared by host state save/load AND file presets.
+juce::ValueTree FractalAdditiveAudioProcessor::captureState()
 {
     auto state = apvts.copyState();
 
-    // Persist a loaded Scala scale as a child of the parameter tree so reopening
-    // a project restores the exact tuning (APVTS ignores non-parameter children).
     state.removeChild (state.getChildWithName ("SCALA"), nullptr);
     if (tuning.getScalaSource().isNotEmpty())
     {
@@ -329,46 +347,118 @@ void FractalAdditiveAudioProcessor::getStateInformation (juce::MemoryBlock& dest
         tim.setProperty ("source", timbreSource, nullptr);
         state.appendChild (tim, nullptr);
     }
+    return state;
+}
 
-    if (auto xml = state.createXml())
+void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
+{
+    if (! tree.isValid() || ! tree.hasType (apvts.state.getType()))
+        return;
+
+    apvts.replaceState (tree);
+
+    if (auto scl = tree.getChildWithName ("SCALA"); scl.isValid())
+    {
+        juce::String err;
+        tuning.loadScalaString (scl.getProperty ("source").toString(),
+                                scl.getProperty ("name").toString(), err);
+    }
+    else
+    {
+        tuning.clearScala();
+    }
+
+    tuning.setMode ((TuningManager::Mode) (int) apvts.getRawParameterValue ("tuningMode")->load());
+
+    clearTimbre();
+    if (auto tim = tree.getChildWithName ("TIMBRE"); tim.isValid())
+    {
+        const auto src = tim.getProperty ("source").toString();
+        std::vector<double> perDeg; double period = 2.0; juce::String err;
+        if (src.isNotEmpty() && TuningManager::parseScalaScale (src, perDeg, period, err))
+        {
+            timbreDegrees.assign (perDeg.begin(), perDeg.end());
+            timbrePeriod = (float) period;
+            timbreName   = tim.getProperty ("name").toString();
+            timbreSource = src;
+            timbreActive = true;
+        }
+    }
+}
+
+void FractalAdditiveAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    if (auto xml = captureState().createXml())
         copyXmlToBinary (*xml, destData);
 }
 
 void FractalAdditiveAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
+        restoreState (juce::ValueTree::fromXml (*xml));
+}
+
+//==============================================================================
+// File presets (.gsting XML). User presets live in Documents/Galactic Sting/Presets;
+// factory presets shipped in a "Presets" folder next to the binary are copied in on
+// first run so they "come with the download".
+juce::File FractalAdditiveAudioProcessor::getPresetFolder()
+{
+    auto dir = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                   .getChildFile ("Galactic Sting").getChildFile ("Presets");
+    if (! dir.exists())
     {
-        auto tree = juce::ValueTree::fromXml (*xml);
-        apvts.replaceState (tree);
-
-        if (auto scl = tree.getChildWithName ("SCALA"); scl.isValid())
-        {
-            juce::String err;
-            tuning.loadScalaString (scl.getProperty ("source").toString(),
-                                    scl.getProperty ("name").toString(), err);
-        }
-        else
-        {
-            tuning.clearScala();
-        }
-
-        tuning.setMode ((TuningManager::Mode) (int) apvts.getRawParameterValue ("tuningMode")->load());
-
-        clearTimbre();
-        if (auto tim = tree.getChildWithName ("TIMBRE"); tim.isValid())
-        {
-            const auto src = tim.getProperty ("source").toString();
-            std::vector<double> perDeg; double period = 2.0; juce::String err;
-            if (src.isNotEmpty() && TuningManager::parseScalaScale (src, perDeg, period, err))
-            {
-                timbreDegrees.assign (perDeg.begin(), perDeg.end());
-                timbrePeriod = (float) period;
-                timbreName   = tim.getProperty ("name").toString();
-                timbreSource = src;
-                timbreActive = true;
-            }
-        }
+        dir.createDirectory();
+        // Seed with any factory presets shipped alongside the executable/plugin.
+        auto factory = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
+                           .getParentDirectory().getChildFile ("Presets");
+        if (factory.isDirectory())
+            for (const auto& f : factory.findChildFiles (juce::File::findFiles, false, "*.gsting"))
+                f.copyFileTo (dir.getChildFile (f.getFileName()));
     }
+    return dir;
+}
+
+juce::StringArray FractalAdditiveAudioProcessor::getPresetNames()
+{
+    juce::StringArray names;
+    for (const auto& f : getPresetFolder().findChildFiles (juce::File::findFiles, false, "*.gsting"))
+        names.add (f.getFileNameWithoutExtension());
+    names.sortNatural();
+    return names;
+}
+
+juce::String FractalAdditiveAudioProcessor::savePreset (const juce::String& name)
+{
+    // Returns the name actually stored (filename characters are sanitised, so it
+    // can differ from what was typed), or empty on failure - the editor shows it.
+    const auto safe = juce::File::createLegalFileName (name).trim();
+    if (safe.isEmpty())
+        return {};
+    auto file = getPresetFolder().getChildFile (safe + ".gsting");
+    if (auto xml = captureState().createXml())
+        if (xml->writeTo (file))
+            return safe;
+    return {};
+}
+
+bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
+{
+    auto file = getPresetFolder().getChildFile (name + ".gsting");
+    if (! file.existsAsFile())
+        return false;
+    if (auto xml = juce::XmlDocument::parse (file))
+    {
+        // .gsting files are user-editable: only apply a tree of OUR type, or a
+        // foreign XML would reset every parameter and wipe the tuning/timbre
+        // while reporting success.
+        auto tree = juce::ValueTree::fromXml (*xml);
+        if (! tree.hasType (apvts.state.getType()))
+            return false;
+        restoreState (tree);
+        return true;
+    }
+    return false;
 }
 
 //==============================================================================

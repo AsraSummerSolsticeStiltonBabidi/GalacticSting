@@ -38,20 +38,25 @@ namespace
 
         juce::Font getLabelFont (juce::Label& l) override
         {
-            return juce::Font (juce::FontOptions (l.getFont().getHeight()).withStyle ("Bold"));
+            return juce::Font (juce::FontOptions (juce::jmax (12.5f, l.getFont().getHeight())).withStyle ("Bold"));
         }
 
         void drawGroupComponentOutline (juce::Graphics& g, int w, int h, const juce::String& text,
                                         const juce::Justification&, juce::GroupComponent& group) override
         {
             const auto col = group.findColour (juce::GroupComponent::outlineColourId);
-            constexpr float titleH = 17.0f;
-            auto frame = juce::Rectangle<float> (1.0f, titleH * 0.5f,
-                                                 (float) w - 2.0f, (float) h - titleH * 0.5f - 1.0f);
-            g.setColour (col.withAlpha (0.9f));
-            g.drawRoundedRectangle (frame, 6.0f, 1.8f);
+            constexpr float titleH = 18.0f;
+            auto frame = juce::Rectangle<float> (1.3f, titleH * 0.5f,
+                                                 (float) w - 2.6f, (float) h - titleH * 0.5f - 1.3f);
 
-            g.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
+            // Interior panel: lighter than the page (0xff0c0c12) and subtly tinted by the
+            // section colour, so each box reads as a raised, distinct panel.
+            g.setColour (juce::Colour (0xff17171f).interpolatedWith (col, 0.05f));
+            g.fillRoundedRectangle (frame, 7.0f);
+            g.setColour (col.withAlpha (0.95f));
+            g.drawRoundedRectangle (frame, 7.0f, 2.6f); // thicker outline
+
+            g.setFont (juce::Font (juce::FontOptions (14.0f).withStyle ("Bold")));
             const int tw = juce::GlyphArrangement::getStringWidthInt (g.getCurrentFont(), text) + 14;
             auto chip = juce::Rectangle<float> (11.0f, 0.0f, (float) tw, titleH);
             g.setColour (juce::Colour (0xff0c0c12));
@@ -183,9 +188,47 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     langButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff33334a));
     langButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
     langButton.setMouseClickGrabsKeyboardFocus (false);
-    langButton.setTooltip ("Switch language: English / Català");
     langButton.onClick = [this] { catalan = ! catalan; applyLanguage(); refocus(); };
     addAndMakeVisible (langButton);
+
+    // Preset browser (top-left): a combo that lists Documents/Galactic Sting/Presets
+    // and a Save button. The list refreshes every time the popup opens.
+    presetBox.setColour (juce::ComboBox::outlineColourId, juce::Colour (0xff55557a));
+    presetBox.setMouseClickGrabsKeyboardFocus (false);
+    presetBox.onBeforePopup = [this] { refreshPresetList(); };
+    presetBox.onChange = [this]
+    {
+        const auto name = presetBox.getText();
+        if (name.isNotEmpty() && processorRef.loadPreset (name))
+            applyTimbreEnablement (processorRef.isTimbreActive());
+        refocus();
+    };
+    addAndMakeVisible (presetBox);
+    refreshPresetList();
+
+    savePresetButton.setColour (juce::TextButton::buttonColourId, cLoad);
+    savePresetButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    savePresetButton.setMouseClickGrabsKeyboardFocus (false);
+    savePresetButton.onClick = [this] { savePresetFlow(); };
+    addAndMakeVisible (savePresetButton);
+
+    // Pitch-bend range (inside the Tuning box).
+    configCombo (bendBox, "bendRange", bendAtt, cTuning, {});
+    makeLabel (lblBend, cTuning);
+
+    // Floating "why is this silent?" explainer (shown by the timer when the
+    // template is empty).
+    addChildComponent (warningOverlay);
+
+    // Integer faders: relative drag (no snap-to-click) so the drag distance,
+    // not the track length, sets the resolution; Ctrl stretches it x4 (see
+    // SteppedSlider). Base N (1..64) gets the longest travel = least sensitive.
+    for (auto* s : { &baseNFader, &spectrumRangeFader, &fractalFader, &timbreRepeatsFader })
+        s->setSliderSnapsToMousePosition (false);
+    baseNFader.normalSensitivity         = 520;
+    spectrumRangeFader.normalSensitivity = 300;
+    fractalFader.normalSensitivity       = 260;
+    timbreRepeatsFader.normalSensitivity = 280;
 
     meterLabel.setJustificationType (juce::Justification::centred);
     meterLabel.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
@@ -202,7 +245,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     lastTimbreActive = processorRef.isTimbreActive();
 
     setWantsKeyboardFocus (true);
-    setSize (1280, 648);
+    setSize (1280, 566); // stay well within a 720p screen so the standalone's Options/preset bar stays visible
     startTimerHz (15);
     juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<juce::Component> (this)]
     { if (safe != nullptr) safe->grabKeyboardFocus(); });
@@ -211,6 +254,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 FractalAdditiveAudioProcessorEditor::~FractalAdditiveAudioProcessorEditor()
 {
     stopTimer();
+    // Dismiss a still-open save-preset dialog so no orphaned modal window
+    // survives the editor (its callback is already SafePointer-guarded).
+    if (activePrompt != nullptr)
+        activePrompt->exitModalState (0);
     setLookAndFeel (nullptr);
 }
 
@@ -239,6 +286,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
 {
     using juce::dontSendNotification;
     langButton.setButtonText (catalan ? "ENG" : "CAT");
+    langButton.setTooltip (tr ("Switch the interface language to Catal\xc3\xa0.",
+                               "Torna la interf\xc3\xad" "cie a l'angl\xc3\xa8s."));
 
     gBase.setText          (tr ("Base", "Base"));
     gWhitelist.setText     (tr ("Harmonics", "Harm\xc3\xb2nics"));
@@ -261,16 +310,92 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblRes.setText       (tr ("Res", "Res"), dontSendNotification);
     lblEnvAmt.setText    (tr ("Env", "Env"), dontSendNotification);
     lblTimbreRepeats.setText (tr ("Reps", "Reps"), dontSendNotification);
+    lblBend.setText      (tr ("Bend", "Bend"), dontSendNotification);
     recentLabel.setText  (tr ("Recent", "Recents"), dontSendNotification);
 
     loadSclButton.setButtonText    (tr ("Load .scl", "Obrir .scl"));
     clearSclButton.setButtonText   (tr ("Reset", "Reinicia"));
     loadTimbreButton.setButtonText (tr ("Load .scl", "Obrir .scl"));
     clearTimbreButton.setButtonText(tr ("Off", "Apaga"));
+    savePresetButton.setButtonText (tr ("Save", "Desa"));
+    presetBox.setTextWhenNothingSelected (tr ("Presets...", "Presets..."));
 
     helpLabel.setText (tr ("Click the colour bar or type A S D F...  W E T Y U...   Z / X = down / up one scale period.   Chords of 3+ PC keys need an n-key-rollover keyboard (or use MIDI).",
                            "Clica la barra de colors o escriu A S D F...  W E T Y U...   Z / X = avall / amunt un per\xc3\xadode.   Els acords de 3+ tecles al PC depenen del teclat (o fes servir MIDI)."),
                        dontSendNotification);
+
+    //-- Tooltips: one idea per sentence, no loose ends. ------------------------
+    baseNFader.setTooltip (tr (
+        "Which harmonic of a virtual fundamental the played key becomes. The spectrum is the harmonic series from N upward (N, N+1, N+2...), so raising N packs in more, closer partials. 1 = normal harmonic series. Hold Ctrl while dragging for fine control.",
+        "Quin harm\xc3\xb2nic d'una fonamental virtual passa a ser la tecla tocada. L'espectre \xc3\xa9s la s\xc3\xa8rie harm\xc3\xb2nica des de N cap amunt (N, N+1, N+2...), aix\xc3\xad que pujar N afegeix parcials m\xc3\xa9s densos. 1 = s\xc3\xa8rie harm\xc3\xb2nica normal. Mant\xc3\xa9n Ctrl mentre arrossegues per a ajust fi."));
+    basePitchBox.setTooltip (tr (
+        "Where that series sits. 'Transposed down': the lowest surviving partial is moved onto the played pitch; with high N and Aligned phase this creates an audible slow pulse (the difference tone) - that is the intended effect, not extra notes. 'Original': harmonics stay at their natural frequencies, so raising N just makes the sound brighter and thinner.",
+        "On queda la s\xc3\xa8rie. 'Transposada avall': el parcial m\xc3\xa9s greu es mou al to tocat; amb N alta i fase Alineada apareix un pols greu audible (el to diferencial) - \xc3\xa9s l'efecte buscat, no notes extra. 'Original': els harm\xc3\xb2nics queden a la seva freq\xc3\xbc\xc3\xa8ncia natural, i pujar N nom\xc3\xa9s fa el so m\xc3\xa9s brillant i prim."));
+    whitelistBox.setTooltip (tr (
+        "Keeps only these harmonic numbers: All, Even (2,4,6...), Odd (1,3,5...) or Prime (2,3,5,7...). A harmonic must ALSO pass Prime Control - both filters apply at once, and if together they exclude everything the sound is silent.",
+        "Nom\xc3\xa9s deixa aquests n\xc3\xbameros d'harm\xc3\xb2nic: Tots, Parells (2,4,6...), Senars (1,3,5...) o Primers (2,3,5,7...). L'harm\xc3\xb2nic TAMB\xc3\x89 ha de passar el Control de primers - els dos filtres s'apliquen alhora, i si entre tots dos ho exclouen tot, no sona res."));
+    slopeFader.setTooltip (tr (
+        "How fast higher partials lose volume: 0 = all equal (brightest), 1 = like a saw (1/n), 2 = like a triangle, higher = darker. Also shapes the stacked scale in Timbre mode.",
+        "Com de r\xc3\xa0pid perden volum els parcials aguts: 0 = tots iguals (m\xc3\xa9s brillant), 1 = com una serra (1/n), 2 = com un triangle, m\xc3\xa9s = m\xc3\xa9s fosc. Tamb\xc3\xa9 d\xc3\xb3na forma a l'escala apilada en mode Timbre."));
+    spectrumRangeFader.setTooltip (tr (
+        "Hard cut: removes every partial more than this many octaves above the played note. 10 = no cut (full range).",
+        "Tall dur: elimina tot parcial m\xc3\xa9s agut que aquest nombre d'octaves per sobre de la nota tocada. 10 = sense tall (rang complet)."));
+    fractalFader.setTooltip (tr (
+        "Replaces each partial with a scaled copy of the whole spectrum, this many levels deep. 1 = off. Each level multiplies density and adds self-similar, inharmonic detail.",
+        "Substitueix cada parcial per una c\xc3\xb2pia escalada de tot l'espectre, tants nivells com indiquis. 1 = apagat. Cada nivell multiplica la densitat i afegeix detall autosemblant i inharm\xc3\xb2nic."));
+    phaseBox.setTooltip (tr (
+        "Starting phase of the partials. 'Aligned': all peak together, forming a periodic pulse - tonal, never clips, and with dense spectra the pulse itself is heard as a low difference tone. 'Scattered': random phases - smoother, louder, no pulse.",
+        "Fase inicial dels parcials. 'Alineat': tots fan el pic alhora i formen un pols peri\xc3\xb2""dic - tonal, mai clipa, i amb espectres densos el pols s'escolta com un to diferencial greu. 'Dispers': fases aleat\xc3\xb2ries - m\xc3\xa9s suau, m\xc3\xa9s fort, sense pols."));
+    gainFader.setTooltip (tr ("Final output volume, in dB.", "Volum final de sortida, en dB."));
+    primeModeBox.setTooltip (tr (
+        "How prime numbers filter the harmonics. 'Limit': a harmonic passes only if its largest prime factor is at most the chosen limit. 'Whitelist': it passes only if EVERY prime factor is ticked below.",
+        "Com filtren els primers els harm\xc3\xb2nics. 'L\xc3\xadmit': un harm\xc3\xb2nic passa nom\xc3\xa9s si el seu factor primer m\xc3\xa9s gran \xc3\xa9s com a molt el l\xc3\xadmit triat. 'Llista': passa nom\xc3\xa9s si TOTS els seus factors primers estan marcats a sota."));
+    primeLimitBox.setTooltip (tr (
+        "Largest prime factor a harmonic may contain. Example: limit 7 keeps 14 (2*7) and 25 (5*5) but drops 11 and 22 (2*11). Off = no prime filtering.",
+        "Factor primer m\xc3\xa9s gran que pot tenir un harm\xc3\xb2nic. Exemple: l\xc3\xadmit 7 mant\xc3\xa9 14 (2*7) i 25 (5*5) per\xc3\xb2 elimina 11 i 22 (2*11). No = sense filtre de primers."));
+    const char* pn2[] = { "2","3","5","7","11","13","17","19","23" };
+    for (int i = 0; i < 9; ++i)
+        primeToggle[i].setTooltip (tr ("Allow harmonics whose prime factors include ",
+                                       "Permet harm\xc3\xb2nics amb el factor primer ") + juce::String (pn2[i]));
+    cutoffFader.setTooltip (tr ("Low-pass filter cutoff, in Hz. Partials above it are attenuated.",
+                                "Freq\xc3\xbc\xc3\xa8ncia de tall del filtre passa-baixos, en Hz. Els parcials per sobre s'atenuen."));
+    resFader.setTooltip (tr ("Resonance: a volume peak right at the cutoff frequency.",
+                             "Res(son\xc3\xa0ncia): un pic de volum just a la freq\xc3\xbc\xc3\xa8ncia de tall."));
+    fEnvAmtFader.setTooltip (tr (
+        "How many octaves the filter envelope moves the cutoff. Positive opens it, negative closes it, 0 = envelope off.",
+        "Quantes octaves mou el tall l'envolupant de filtre. Positiu l'obre, negatiu el tanca, 0 = envolupant sense efecte."));
+    for (int i = 0; i < 4; ++i)
+    {
+        ampAdsr[i].setTooltip (tr ("Volume envelope: Attack, Decay, Sustain (level), Release. Times in seconds.",
+                                   "Envolupant de volum: Atac, Decay, Sustain (nivell), Release. Temps en segons."));
+        filtAdsr[i].setTooltip (tr ("Filter envelope: Attack, Decay, Sustain (level), Release. Times in seconds.",
+                                    "Envolupant de filtre: Atac, Decay, Sustain (nivell), Release. Temps en segons."));
+    }
+    tuningBox.setTooltip (tr (
+        "Which tuning the keys follow. 12-TET: standard. MTS-ESP: follow an ODDSound MTS-ESP master running in the session. Scala: the .scl/.ascl file loaded below. Note: Ableton Live's own tuning arrives as MPE pitch bend and works in ANY of these modes (set Bend to +-48).",
+        "Quina afinaci\xc3\xb3 segueixen les tecles. 12-TET: est\xc3\xa0ndard. MTS-ESP: segueix un mestre MTS-ESP d'ODDSound actiu a la sessi\xc3\xb3. Scala: el fitxer .scl/.ascl carregat a sota. Nota: l'afinaci\xc3\xb3 pr\xc3\xb2pia d'Ableton Live arriba com a pitch bend MPE i funciona en QUALSEVOL d'aquests modes (posa Bend a +-48)."));
+    loadSclButton.setTooltip (tr (
+        "Load a Scala .scl or Ableton .ascl file to retune the keys. The 1/1 sits on middle C unless the file sets its own reference (@ABL REFERENCE_PITCH).",
+        "Carrega un fitxer Scala .scl o Ableton .ascl per reafinar les tecles. L'1/1 queda al Do central tret que el fitxer porti la seva refer\xc3\xa8ncia (@ABL REFERENCE_PITCH)."));
+    clearSclButton.setTooltip (tr ("Unload the scale and return to standard 12-TET.",
+                                   "Descarrega l'escala i torna al 12-TET est\xc3\xa0ndard."));
+    for (int i = 0; i < 3; ++i)
+        recentBtn[i].setTooltip (tr ("Reload this recently used file as the scale.",
+                                     "Torna a carregar aquest fitxer recent com a escala."));
+    bendBox.setTooltip (tr (
+        "Per-note pitch-bend range. +-48 st is the MPE standard and is REQUIRED for Ableton Live 12's tuning systems and the Microtuner device (enable MPE on this plugin in Live). Use +-2 for a classic keyboard pitch wheel.",
+        "Rang del pitch bend per nota. +-48 st \xc3\xa9s l'est\xc3\xa0ndard MPE i \xc3\x89S NECESSARI per als sistemes d'afinaci\xc3\xb3 d'Ableton Live 12 i el Microtuner (activa MPE al plugin dins de Live). Fes servir +-2 per a la roda d'un teclat cl\xc3\xa0ssic."));
+    loadTimbreButton.setTooltip (tr (
+        "Load a .scl/.ascl whose intervals become the PARTIALS of the sound, replacing the harmonic engine. Slope, Fractal, Range and Reps still shape it; the greyed-out controls do not apply.",
+        "Carrega un .scl/.ascl els intervals del qual passen a ser els PARCIALS del so, substituint el motor harm\xc3\xb2nic. Pendent, Fractal, Rang i Reps encara hi actuen; els controls en gris no apliquen."));
+    clearTimbreButton.setTooltip (tr ("Turn Timbre mode off and return to the harmonic engine.",
+                                      "Apaga el mode Timbre i torna al motor harm\xc3\xb2nic."));
+    timbreRepeatsFader.setTooltip (tr (
+        "How many periods of the scale are stacked as partials. More repeats = the timbre reaches higher in the spectrum.",
+        "Quants per\xc3\xado""des de l'escala s'apilen com a parcials. M\xc3\xa9s repeticions = el timbre arriba m\xc3\xa9s amunt de l'espectre."));
+    presetBox.setTooltip (tr ("Load a saved preset.", "Carrega un preset desat."));
+    savePresetButton.setTooltip (tr ("Save the current sound as a preset (stored in Documents/Galactic Sting/Presets).",
+                                     "Desa el so actual com a preset (a Documents/Galactic Sting/Presets)."));
 
     auto localise = [] (juce::ComboBox& b, const juce::StringArray& items)
     {
@@ -282,13 +407,115 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (phaseBox,     { tr ("Aligned", "Alineat"), tr ("Scattered", "Dispers") });
     localise (primeModeBox, { tr ("Limit", "L\xc3\xadmit"), tr ("Whitelist", "Llista") });
     localise (primeLimitBox,{ tr ("Off", "No"), "2","3","5","7","11","13","17","19","23" });
+    localise (bendBox,      { "\xc2\xb1""2 st", "\xc2\xb1""12 st", "\xc2\xb1""48 st (MPE)" });
 
     repaint(); // title uses the language
 }
 
+//==============================================================================
+void FractalAdditiveAudioProcessorEditor::refreshPresetList()
+{
+    const auto names = processorRef.getPresetNames();
+    const auto current = presetBox.getText();
+    presetBox.clear (juce::dontSendNotification);
+    int id = 1;
+    for (const auto& n : names)
+        presetBox.addItem (n, id++);
+    // keep showing the loaded preset's name without re-triggering a load
+    if (current.isNotEmpty() && names.contains (current))
+        presetBox.setText (current, juce::dontSendNotification);
+}
+
+void FractalAdditiveAudioProcessorEditor::savePresetFlow()
+{
+    auto* aw = new juce::AlertWindow (tr ("Save preset", "Desar preset"),
+                                      tr ("Name for this preset:", "Nom per a aquest preset:"),
+                                      juce::MessageBoxIconType::NoIcon, this);
+    aw->addTextEditor ("name", presetBox.getText(), {});
+    aw->addButton (tr ("Save", "Desa"), 1, juce::KeyPress (juce::KeyPress::returnKey));
+    aw->addButton (tr ("Cancel", "Cancel\xc2\xb7la"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    activePrompt = aw; // so the destructor can dismiss an orphaned dialog
+
+    // The AlertWindow is a top-level window that OUTLIVES this editor if the host
+    // closes the plugin UI while the dialog is up -> capture a SafePointer, never
+    // raw `this`, and bail out if the editor is gone.
+    aw->enterModalState (true, juce::ModalCallbackFunction::create (
+        [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this), aw] (int result)
+        {
+            if (safe == nullptr)
+                return;
+
+            const auto name = aw->getTextEditorContents ("name").trim();
+            if (result == 1 && name.isNotEmpty())
+            {
+                const auto stored = safe->processorRef.savePreset (name); // sanitised name, or empty
+                if (stored.isNotEmpty())
+                {
+                    safe->refreshPresetList();
+                    safe->presetBox.setText (stored, juce::dontSendNotification);
+                }
+                else
+                {
+                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                        safe->tr ("Save preset", "Desar preset"),
+                        safe->tr ("Could not save the preset. Try a different name.",
+                                  "No s'ha pogut desar el preset. Prova un altre nom."),
+                        safe.getComponent());
+                }
+            }
+            safe->refocus();
+        }), true);
+}
+
+void FractalAdditiveAudioProcessorEditor::updateWarning (int templatePartials)
+{
+    const bool silent = (templatePartials == 0) && ! processorRef.isTimbreActive();
+    if (! silent)
+    {
+        warningOverlay.setVisible (false);
+        return;
+    }
+
+    const auto& ap = processorRef.apvts;
+    const int  sel       = (int) ap.getRawParameterValue ("selection")->load();
+    const bool wl        = ap.getRawParameterValue ("primeMode")->load() > 0.5f;
+    const int  limitIdx  = (int) ap.getRawParameterValue ("primeLimit")->load();
+    const int  baseN     = (int) ap.getRawParameterValue ("baseN")->load();
+    unsigned mask = 0;
+    for (int i = 0; i < 9; ++i)
+        if (ap.getRawParameterValue ("primeWL" + juce::String (i))->load() > 0.5f)
+            mask |= (1u << i);
+
+    const auto nStr = juce::String (baseN);
+    juce::String why;
+    if (sel == 3 && wl)
+        why = tr ("'Harmonics = Prime' combined with the prime Whitelist: a prime harmonic can only pass if it IS one of the ticked primes (max 23), and the series starts at N = ",
+                  "'Harm\xc3\xb2nics = Primers' amb la Llista de primers: un harm\xc3\xb2nic primer nom\xc3\xa9s passa si \xc3\x89S un dels primers marcats (m\xc3\xa0xim 23), i la s\xc3\xa8rie comen\xc3\xa7""a a N = ")
+            + nStr
+            + tr (". Set Prime Control to Limit/Off, or Harmonics to All.",
+                  ". Posa el Control de primers en L\xc3\xadmit/No, o Harm\xc3\xb2nics en Tots.");
+    else if (wl && mask == 0)
+        why = tr ("The prime Whitelist has no primes ticked, so no harmonic can pass. Tick some primes or switch to Limit mode.",
+                  "La Llista de primers no t\xc3\xa9 cap primer marcat, aix\xc3\xad que cap harm\xc3\xb2nic pot passar. Marca'n alguns o canvia al mode L\xc3\xadmit.");
+    else if (sel == 3 && ! wl && limitIdx > 0)
+        why = tr ("'Harmonics = Prime' with a low Prime Limit: every prime harmonic above the limit is removed, and the series starts at N = ",
+                  "'Harm\xc3\xb2nics = Primers' amb un L\xc3\xadmit de primers baix: tot harm\xc3\xb2nic primer per sobre del l\xc3\xadmit s'elimina, i la s\xc3\xa8rie comen\xc3\xa7""a a N = ")
+            + nStr
+            + tr (". Raise the limit, set it to Off, or lower N.",
+                  ". Puja el l\xc3\xadmit, posa'l en No, o abaixa N.");
+    else
+        why = tr ("The Harmonics selection and the Prime filter together exclude every harmonic of the current Base N. Relax one of the two filters or change N.",
+                  "La selecci\xc3\xb3 d'Harm\xc3\xb2nics i el filtre de Primers junts exclouen tots els harm\xc3\xb2nics de la Base N actual. Relaxa un dels dos filtres o canvia N.");
+
+    warningOverlay.title = tr ("Why is there no sound?", "Per qu\xc3\xa8 no sona res?");
+    warningOverlay.body  = why;
+    warningOverlay.setVisible (true);
+    warningOverlay.repaint();
+}
+
 void FractalAdditiveAudioProcessorEditor::openScalaChooser()
 {
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a Scala scale (.scl)", juce::File(), "*.scl");
+    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale (.scl / .ascl)", juce::File(), "*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
         {
@@ -304,7 +531,7 @@ void FractalAdditiveAudioProcessorEditor::openScalaChooser()
 
 void FractalAdditiveAudioProcessorEditor::openTimbreChooser()
 {
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a Scala file as timbre (.scl)", juce::File(), "*.scl");
+    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale file as timbre (.scl / .ascl)", juce::File(), "*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
         {
@@ -362,6 +589,9 @@ void FractalAdditiveAudioProcessorEditor::configFader (juce::Slider& s, const ju
     s.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
     s.setMouseClickGrabsKeyboardFocus (false);
     s.setTooltip (tooltip);
+    // Uniform fine-adjust: hold Ctrl while dragging ANY fader to switch to slow
+    // velocity mode (some sliders had it by default, others not).
+    s.setVelocityModeParameters (0.6, 1, 0.06, true, juce::ModifierKeys::ctrlModifier);
     s.onDragEnd = [this] { refocus(); };
     addAndMakeVisible (s);
     att = std::make_unique<SliderAttachment> (processorRef.apvts, paramID, s);
@@ -404,29 +634,35 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colour (0xff0c0c12));
 
-    auto titleArea = getLocalBounds().removeFromTop (52);
+    auto titleArea = getLocalBounds().removeFromTop (42);
     g.setColour (juce::Colour (0xff2a2a3c));
     g.fillRect (0, titleArea.getBottom() - 1, getWidth(), 1);
 
-    auto t = titleArea.reduced (16, 8);
-    juce::ColourGradient grad (juce::Colour (0xff7dd3fc), (float) t.getX(), 0.0f,
-                               juce::Colour (0xfff58bff), (float) juce::jmin (t.getRight(), t.getX() + 430), 0.0f, false);
+    // Title centred in the window; the gradient spans the text width around the centre.
+    auto t = titleArea.reduced (16, 6);
+    const float cx = (float) getWidth() * 0.5f;
+    juce::ColourGradient grad (juce::Colour (0xff7dd3fc), cx - 215.0f, 0.0f,
+                               juce::Colour (0xfff58bff), cx + 215.0f, 0.0f, false);
     g.setGradientFill (grad);
-    g.setFont (juce::Font (juce::FontOptions (32.0f).withStyle ("Bold")));
+    g.setFont (juce::Font (juce::FontOptions (28.0f).withStyle ("Bold")));
     g.drawText (catalan ? juce::String::fromUTF8 ("FIBL\xc3\x93 GAL\xc3\x80" "CTIC") : juce::String ("GALACTIC STING"),
-                t, juce::Justification::centredLeft, false);
+                t, juce::Justification::centred, false);
 }
 
 void FractalAdditiveAudioProcessorEditor::resized()
 {
     auto full = getLocalBounds();
-    auto titleBar = full.removeFromTop (52);
-    langButton.setBounds (titleBar.removeFromRight (86).withSizeKeepingCentre (66, 26));
+    auto titleBar = full.removeFromTop (42);
+    langButton.setBounds (titleBar.removeFromRight (86).withSizeKeepingCentre (66, 24));
+    auto presetArea = titleBar.removeFromLeft (272).reduced (10, 0);
+    presetBox.setBounds (presetArea.removeFromLeft (190).withSizeKeepingCentre (190, 24));
+    presetArea.removeFromLeft (6);
+    savePresetButton.setBounds (presetArea.withSizeKeepingCentre (juce::jmin (56, presetArea.getWidth()), 24));
 
     auto area = full.reduced (6, 4);
 
     {
-        auto kb = area.removeFromBottom (96).reduced (2, 6);
+        auto kb = area.removeFromBottom (78).reduced (2, 5);
         keyboard.setRange (36);
         keyboard.setBounds (kb);
     }
@@ -451,10 +687,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
     const int rowH = (area.getHeight() - 4) / 2;
 
-    //== Row 1 ==================================================================
+    //== Row 1: Base | (Harmonics over Prime Control) | Slope | Range | Fractal | Phase | Gain
     {
         auto row = area.removeFromTop (rowH).reduced (0, 2);
-        const int u = row.getWidth() / 10;
+        const int u = row.getWidth() / 9;
 
         {
             auto bb = row.removeFromLeft (u * 2);
@@ -464,39 +700,43 @@ void FractalAdditiveAudioProcessorEditor::resized()
             lblBaseN.setBounds (left.removeFromTop (13)); baseNFader.setBounds (left);
             lblBasePitch.setBounds (bi.removeFromTop (13)); compact (basePitchBox, bi);
         }
-        oneCombo (row.removeFromLeft (u), gWhitelist, whitelistBox);
-        oneFader (row.removeFromLeft (u), gSlope,         slopeFader,         nullptr);
-        oneFader (row.removeFromLeft (u), gSpectrumRange, spectrumRangeFader, &lblRange);
-        oneFader (row.removeFromLeft (u), gFractal,       fractalFader,       nullptr);
-        oneCombo (row.removeFromLeft (u), gPhase,         phaseBox);
-        oneFader (row.removeFromLeft (u), gGain,          gainFader,          nullptr);
 
+        // Harmonics stacked on top of Prime Control, sharing one 2u-wide column.
         {
-            auto pbox = row;
+            auto colBox = row.removeFromLeft (u * 2);
+            auto hb = colBox.removeFromTop (colBox.getHeight() * 2 / 5);
+            oneCombo (hb, gWhitelist, whitelistBox);
+
             const bool wl = processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f;
             primeLimitBox.setVisible (! wl); lblPrimeLimit.setVisible (! wl);
             for (int i = 0; i < 9; ++i) { primeToggle[i].setVisible (wl); primeLbl[i].setVisible (wl); }
 
-            gPrime.setBounds (pbox.reduced (3));
-            auto pi = pbox.reduced (3).reduced (6, 4); pi.removeFromTop (16);
-            compact (primeModeBox, pi.removeFromTop (24));
-            pi.removeFromTop (4);
+            gPrime.setBounds (colBox.reduced (3));
+            auto pi = colBox.reduced (3).reduced (6, 4); pi.removeFromTop (16);
+            compact (primeModeBox, pi.removeFromTop (22));
+            pi.removeFromTop (2);
             if (wl)
             {
                 const int tw = pi.getWidth() / 9;
                 for (int i = 0; i < 9; ++i)
                 {
                     auto cell = pi.removeFromLeft (tw);
-                    primeLbl[i].setBounds (cell.removeFromBottom (14));
-                    primeToggle[i].setBounds (cell.withSizeKeepingCentre (juce::jmin (24, tw), juce::jmin (24, cell.getHeight())));
+                    primeLbl[i].setBounds (cell.removeFromBottom (13));
+                    primeToggle[i].setBounds (cell.withSizeKeepingCentre (juce::jmin (22, tw), juce::jmin (22, cell.getHeight())));
                 }
             }
             else
             {
                 lblPrimeLimit.setBounds (pi.removeFromLeft (42).withSizeKeepingCentre (42, 22));
-                compact (primeLimitBox, pi.removeFromLeft (110));
+                compact (primeLimitBox, pi.removeFromLeft (juce::jmin (110, pi.getWidth())));
             }
         }
+
+        oneFader (row.removeFromLeft (u), gSlope,         slopeFader,         nullptr);
+        oneFader (row.removeFromLeft (u), gSpectrumRange, spectrumRangeFader, &lblRange);
+        oneFader (row.removeFromLeft (u), gFractal,       fractalFader,       nullptr);
+        oneCombo (row.removeFromLeft (u), gPhase,         phaseBox);
+        oneFader (row,                    gGain,          gainFader,          nullptr);
     }
 
     //== Row 2: Filter | Volume Env | Tuning(+Recent) | Timbre ==================
@@ -527,6 +767,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
             for (int i = 0; i < 3; ++i) recentBtn[i].setBounds (rrow.removeFromLeft (rw).reduced (2, 0));
             ti.removeFromTop (3);
             tuningStatusLabel.setBounds (ti.removeFromTop (18));
+            ti.removeFromTop (2);
+            auto bendRow = ti.removeFromTop (22);
+            lblBend.setBounds (bendRow.removeFromLeft (44));
+            compact (bendBox, bendRow.removeFromLeft (juce::jmin (130, bendRow.getWidth())));
         }
 
         {
@@ -544,6 +788,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
             timbreStatusLabel.setBounds (ti.removeFromTop (40));
         }
     }
+
+    // Floating "silent settings" explainer, centred over everything.
+    warningOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (540, 160));
+    warningOverlay.toFront (false);
 }
 
 void FractalAdditiveAudioProcessorEditor::mouseDown (const juce::MouseEvent&) { grabKeyboardFocus(); }
@@ -584,11 +832,24 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     const int  rendered  = processorRef.getPartialCount();
     const int  templ     = processorRef.getTemplatePartialCount();
     const bool truncated = processorRef.isSpectrumTruncated();
-    juce::String meter = juce::String (rendered) + tr (" partials audible", " parcials audibles")
-                       + "   \xe2\x80\x94   " + juce::String (templ) + tr (" in the full timbre", " al timbre complet");
-    if (truncated) meter += tr ("   (safety cap)", "   (l\xc3\xadmit de seguretat)");
-    meterLabel.setColour (juce::Label::textColourId, truncated ? juce::Colours::orange : juce::Colour (0xff7ff59a));
+    juce::String meter;
+    if (templ == 0)
+    {
+        // Empty template = the selection + prime rules (intersected) left nothing.
+        meter = tr ("0 partials \xe2\x80\x94 the selection / prime filters leave nothing to sound",
+                    "0 parcials \xe2\x80\x94 la selecci\xc3\xb3 / els filtres de primers no deixen sonar res");
+        meterLabel.setColour (juce::Label::textColourId, juce::Colours::orange);
+    }
+    else
+    {
+        meter = juce::String (rendered) + tr (" partials audible", " parcials audibles")
+              + "   \xe2\x80\x94   " + juce::String (templ) + tr (" in the full timbre", " al timbre complet");
+        if (truncated) meter += tr ("   (safety cap)", "   (l\xc3\xadmit de seguretat)");
+        meterLabel.setColour (juce::Label::textColourId, truncated ? juce::Colours::orange : juce::Colour (0xff7ff59a));
+    }
     meterLabel.setText (meter, juce::dontSendNotification);
+
+    updateWarning (templ);
 
     // Localised tuning status.
     juce::String ts;

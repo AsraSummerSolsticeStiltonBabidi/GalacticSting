@@ -80,6 +80,13 @@ public:
     juce::StringArray getRecentSclPaths() const { return recentSclPaths; }
 
     //==========================================================================
+    // File presets (.gsting). Called from the editor.
+    static juce::File getPresetFolder();
+    juce::StringArray getPresetNames();
+    juce::String savePreset (const juce::String& name); // returns the stored name, or empty on failure
+    bool loadPreset (const juce::String& name);
+
+    //==========================================================================
     // Shared with the editor:
     juce::MidiKeyboardState keyboardState;
     juce::AudioProcessorValueTreeState apvts;
@@ -90,6 +97,9 @@ private:
     spectrum::SpectrumSettings currentSettings() const;
     void timerCallback() override;
     void addRecentScl (const juce::File&);
+
+    juce::ValueTree captureState();
+    void restoreState (const juce::ValueTree&);
 
     // Declared before `synth`: the AdditiveVoices owned by `synth` hold references
     // to spectrumEngine and tuning, so the voices must be destroyed before them.
@@ -109,6 +119,7 @@ private:
     juce::StringArray                     recentSclPaths;
 
     float lastGain = 0.0f;
+    int   lastBendApplied = 48; // matches enableLegacyMode(48) in the constructor
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FractalAdditiveAudioProcessor)
 };
