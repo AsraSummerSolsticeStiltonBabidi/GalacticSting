@@ -1,0 +1,5 @@
+# Normalise line endings in the repo (LF); check out native on each OS.
+* text=auto
+
+# Scala scale files are plain text.
+*.scl text

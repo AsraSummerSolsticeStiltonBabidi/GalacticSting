@@ -1,0 +1,20 @@
+# CMake build trees (JUCE is downloaded here on first configure)
+build/
+build-*/
+
+# IDE / editor
+.vs/
+.idea/
+*.user
+CMakeUserPresets.json
+
+# Local Claude Code tooling / settings
+.claude/
+
+# A SEPARATE project (real-time microtonal autotune) that happens to live in this
+# folder. It is not part of Fractal Additive — give it its own repo if you share it.
+MicrotuneRT/
+
+# OS cruft
+.DS_Store
+Thumbs.db
