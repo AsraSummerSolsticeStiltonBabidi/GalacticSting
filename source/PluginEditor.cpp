@@ -292,15 +292,15 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     gBase.setText          (tr ("Base", "Base"));
     gWhitelist.setText     (tr ("Harmonics", "Harm\xc3\xb2nics"));
     gSlope.setText         (tr ("Decay Slope", "Pendent"));
-    gSpectrumRange.setText (tr ("Spectrum Range", "Rang espectral"));
+    gSpectrumRange.setText (tr ("Range", "Rang"));
     gFractal.setText       (tr ("Fractal", "Fractal"));
     gPhase.setText         (tr ("Phase", "Fase"));
     gGain.setText          (tr ("Gain", "Guany"));
     gPrime.setText         (tr ("Prime Control", "Control primers"));
     gFilter.setText        (tr ("Filter", "Filtre"));
     gAmpEnv.setText        (tr ("Volume Envelope", "Envolupant volum"));
-    gTuning.setText        (tr ("Tuning (scale)", "Afinaci\xc3\xb3 (escala)"));
-    gTimbre.setText        (tr ("Timbre (.scl)", "Timbre (.scl)"));
+    gTuning.setText        (tr ("Tuning", "Afinaci\xc3\xb3"));
+    gTimbre.setText        (tr (".scl as Timbre", ".scl com a Timbre"));
 
     lblBaseN.setText     ("N", dontSendNotification);
     lblBasePitch.setText (tr ("Pitch", "To"), dontSendNotification);
