@@ -87,6 +87,15 @@ public:
     bool loadPreset (const juce::String& name);
 
     //==========================================================================
+    // "Tune by dissonance curve" (Sethares): analyses the CURRENT spectrum,
+    // builds a .scl from the curve's minima (or maxima in reverse mode), loads
+    // it as the active scale and keeps the text for saving to disk.
+    bool generateDissonanceScale (int count, bool useMaxima, juce::String& errorOut);
+    bool saveGeneratedScl (const juce::File& f, juce::String& errorOut);
+    bool hasGeneratedScl() const noexcept { return lastDissScl.isNotEmpty(); }
+    juce::String getGeneratedSclName() const { return lastDissName; }
+
+    //==========================================================================
     // Shared with the editor:
     juce::MidiKeyboardState keyboardState;
     juce::AudioProcessorValueTreeState apvts;
@@ -117,6 +126,9 @@ private:
     // Persistent recent-.scl list (global app settings, shared across instances).
     std::unique_ptr<juce::PropertiesFile> appProps;
     juce::StringArray                     recentSclPaths;
+
+    // Last dissonance-generated .scl (text + display name), for saving to disk.
+    juce::String lastDissScl, lastDissName;
 
     float lastGain = 0.0f;
     int   lastBendApplied = 48; // matches enableLegacyMode(48) in the constructor

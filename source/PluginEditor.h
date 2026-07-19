@@ -41,6 +41,8 @@ private:
     void refreshPresetList();
     void savePresetFlow();
     void updateWarning (int templatePartials);
+    void runDissonanceTune();
+    void saveDissonanceScl();
     juce::String tr (const char* en, const char* ca) const { return catalan ? juce::String::fromUTF8 (ca) : juce::String (en); }
     void timerCallback() override;
 
@@ -97,11 +99,12 @@ private:
     SteppedSlider baseNFader, spectrumRangeFader, fractalFader, timbreRepeatsFader;
     juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader;
     juce::Slider  ampAdsr[4], filtAdsr[4];
-    juce::ComboBox basePitchBox, whitelistBox, phaseBox, primeModeBox, primeLimitBox, tuningBox, bendBox;
+    juce::ComboBox basePitchBox, whitelistBox, phaseBox, primeModeBox, primeLimitBox, tuningBox, bendBox,
+                   dissCountBox;
     RefreshingComboBox presetBox;
-    juce::ToggleButton primeToggle[9];
+    juce::ToggleButton primeToggle[9], dissMaxToggle;
     juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
-                     langButton, savePresetButton, recentBtn[3];
+                     langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3];
     WarningOverlay warningOverlay;
 
     juce::GroupComponent gBase, gWhitelist, gSlope, gSpectrumRange, gFractal, gPhase, gGain,

@@ -7,6 +7,7 @@
 // high (reach to Nyquist); the tests set it small to check exact partial sets.
 
 #include "dsp/Spectrum.h"
+#include "dsp/Dissonance.h"
 
 #include <cstdio>
 #include <cmath>
@@ -238,6 +239,40 @@ int main()
         auto tb = compileSpectrum (b);
         check (tb.partials.size() > ta.partials.size(), "4 repeats has more partials than 2");
         check ((double) tb.partials.back().ratio > (double) ta.partials.back().ratio, "and reaches a higher top ratio");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("Sethares dissonance curve (harmonic timbre -> minima at simple ratios):\n");
+    {
+        // Classic reference case: 6 harmonic partials, amplitudes 0.88^k.
+        std::vector<dissonance::Partial> spec;
+        for (int k = 0; k < 6; ++k)
+            spec.push_back ({ 261.63 * (k + 1), std::pow (0.88, (double) k) });
+
+        auto curve = dissonance::dissonanceCurve (spec, 2.0, 1.0);
+        check ((int) curve.size() == 1200, "1-cent curve over an octave has 1200 points");
+
+        // Unison-adjacent dissonance must RISE from near-zero, and the curve must
+        // come back down near the octave (2/1 is consonant for harmonic timbres).
+        check (curve.front().second < curve[80].second, "dissonance rises away from unison");
+        check (curve.back().second < curve[1000].second, "dissonance falls again toward the octave");
+
+        auto minima = dissonance::pickExtremes (curve, 6, false, 2.0);
+        check ((int) minima.size() == 6, "6 minima found");
+        auto hasNear = [&] (double cents, double tol)
+        {
+            for (double r : minima)
+                if (std::abs (1200.0 * std::log2 (r) - cents) < tol) return true;
+            return false;
+        };
+        check (hasNear (702.0, 15.0), "minimum near the just fifth (3/2, ~702c)");
+        check (hasNear (498.0, 15.0) || hasNear (386.0, 15.0) || hasNear (884.0, 15.0),
+               "minimum near 4/3, 5/4 or 5/3");
+
+        auto maxima = dissonance::pickExtremes (curve, 4, true, 2.0);
+        check ((int) maxima.size() >= 1, "reverse mode finds maxima");
+        for (double r : maxima)
+            check (r > 1.0 && r < 2.0, "maxima strictly inside the period");
     }
 
     //--------------------------------------------------------------------------

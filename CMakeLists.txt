@@ -42,6 +42,9 @@ juce_add_plugin(FractalAdditive
     FORMATS                     Standalone VST3
     PRODUCT_NAME                "Galactic Sting")
 
+# Embedded assets (title font).
+juce_add_binary_data(GalacticAssets SOURCES assets/fonts/Jokerman.otf)
+
 target_sources(FractalAdditive PRIVATE
     source/PluginProcessor.cpp
     source/PluginEditor.cpp
@@ -58,6 +61,7 @@ target_compile_definitions(FractalAdditive PUBLIC
 
 target_link_libraries(FractalAdditive
     PRIVATE
+        GalacticAssets
         juce::juce_audio_utils
         juce::juce_dsp
     PUBLIC
@@ -107,6 +111,7 @@ target_compile_definitions(FftVerify PRIVATE
     JUCE_USE_CURL=0
     JUCE_STRICT_REFCOUNTEDPOINTER=1)
 target_link_libraries(FftVerify PRIVATE
+    GalacticAssets
     juce::juce_audio_utils
     juce::juce_dsp
     juce::juce_audio_processors

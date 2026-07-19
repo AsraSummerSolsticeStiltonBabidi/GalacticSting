@@ -1,7 +1,16 @@
 #include "PluginEditor.h"
+#include "BinaryData.h"
 
 namespace
 {
+    // Embedded Jokerman title typeface (loaded once).
+    const juce::Typeface::Ptr& titleTypeface()
+    {
+        static juce::Typeface::Ptr tf = juce::Typeface::createSystemTypefaceFor (
+            BinaryData::Jokerman_otf, (size_t) BinaryData::Jokerman_otfSize);
+        return tf;
+    }
+
     // Brighter, higher-contrast section colours.
     const juce::Colour cBase      { 0xff5cb8ff };
     const juce::Colour cWhitelist { 0xff5ff2b0 };
@@ -216,6 +225,30 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     configCombo (bendBox, "bendRange", bendAtt, cTuning, {});
     makeLabel (lblBend, cTuning);
 
+    // Tune by dissonance curve (Sethares): generate + count + reverse + save.
+    dissBtn.setColour (juce::TextButton::buttonColourId, cTuning.withAlpha (0.35f));
+    dissBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    dissBtn.setMouseClickGrabsKeyboardFocus (false);
+    dissBtn.onClick = [this] { runDissonanceTune(); };
+    addAndMakeVisible (dissBtn);
+    for (int i = 1; i <= 24; ++i)
+        dissCountBox.addItem (juce::String (i), i);
+    dissCountBox.setSelectedId (7, juce::dontSendNotification);
+    dissCountBox.setColour (juce::ComboBox::outlineColourId, cTuning.withAlpha (0.7f));
+    dissCountBox.setMouseClickGrabsKeyboardFocus (false);
+    dissCountBox.onChange = [this] { refocus(); };
+    addAndMakeVisible (dissCountBox);
+    dissMaxToggle.setColour (juce::ToggleButton::textColourId, cTuning);
+    dissMaxToggle.setColour (juce::ToggleButton::tickColourId, cTuning);
+    dissMaxToggle.setMouseClickGrabsKeyboardFocus (false);
+    dissMaxToggle.onClick = [this] { refocus(); };
+    addAndMakeVisible (dissMaxToggle);
+    dissSaveBtn.setColour (juce::TextButton::buttonColourId, cLoad);
+    dissSaveBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    dissSaveBtn.setMouseClickGrabsKeyboardFocus (false);
+    dissSaveBtn.onClick = [this] { saveDissonanceScl(); };
+    addAndMakeVisible (dissSaveBtn);
+
     // Floating "why is this silent?" explainer (shown by the timer when the
     // template is empty).
     addChildComponent (warningOverlay);
@@ -245,7 +278,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     lastTimbreActive = processorRef.isTimbreActive();
 
     setWantsKeyboardFocus (true);
-    setSize (1280, 566); // stay well within a 720p screen so the standalone's Options/preset bar stays visible
+    setSize (1280, 600); // still fits a 720p work area incl. the standalone's Options bar
     startTimerHz (15);
     juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<juce::Component> (this)]
     { if (safe != nullptr) safe->grabKeyboardFocus(); });
@@ -319,6 +352,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     clearTimbreButton.setButtonText(tr ("Off", "Apaga"));
     savePresetButton.setButtonText (tr ("Save", "Desa"));
     presetBox.setTextWhenNothingSelected (tr ("Presets...", "Presets..."));
+    dissBtn.setButtonText          (tr ("Diss. tune", "Afina diss."));
+    dissMaxToggle.setButtonText    ("Max");
+    dissSaveBtn.setButtonText      (tr ("Save", "Desa"));
 
     helpLabel.setText (tr ("Click the colour bar or type A S D F...  W E T Y U...   Z / X = down / up one scale period.   Chords of 3+ PC keys need an n-key-rollover keyboard (or use MIDI).",
                            "Clica la barra de colors o escriu A S D F...  W E T Y U...   Z / X = avall / amunt un per\xc3\xadode.   Els acords de 3+ tecles al PC depenen del teclat (o fes servir MIDI)."),
@@ -396,6 +432,18 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     presetBox.setTooltip (tr ("Load a saved preset.", "Carrega un preset desat."));
     savePresetButton.setTooltip (tr ("Save the current sound as a preset (stored in Documents/Galactic Sting/Presets).",
                                      "Desa el so actual com a preset (a Documents/Galactic Sting/Presets)."));
+    dissBtn.setTooltip (tr (
+        "Computes the Sethares sensory-dissonance curve of the CURRENT timbre and builds a scale from its most consonant points (the curve's minima), then loads it as the active tuning. With Max ticked it uses the roughest points (maxima) instead.",
+        "Calcula la corba de dissonancia sensorial de Sethares del timbre ACTUAL i construeix una escala amb els seus punts m\xc3\xa9s consonants (els m\xc3\xadnims de la corba), i la carrega com a afinaci\xc3\xb3 activa. Amb Max marcat fa servir els punts m\xc3\xa9s aspres (m\xc3\xa0xims)."));
+    dissCountBox.setTooltip (tr (
+        "How many notes the generated scale gets (curve minima - or maxima in Max mode), plus the period as the final note.",
+        "Quantes notes tindra l'escala generada (m\xc3\xadnims de la corba - o m\xc3\xa0xims en mode Max), m\xc3\xa9s el per\xc3\xado" "de com a nota final."));
+    dissMaxToggle.setTooltip (tr (
+        "Reverse mode: pick the curve's MAXIMA (the most dissonant intervals) instead of the minima.",
+        "Mode invers: tria els MAXIMS de la corba (els intervals m\xc3\xa9s dissonants) en lloc dels m\xc3\xadnims."));
+    dissSaveBtn.setTooltip (tr (
+        "Save the generated scale as a .scl file (it also joins the Recent list).",
+        "Desa l'escala generada com a fitxer .scl (tamb\xc3\xa9 s'afegeix a Recents)."));
 
     auto localise = [] (juce::ComboBox& b, const juce::StringArray& items)
     {
@@ -465,6 +513,47 @@ void FractalAdditiveAudioProcessorEditor::savePresetFlow()
             }
             safe->refocus();
         }), true);
+}
+
+void FractalAdditiveAudioProcessorEditor::runDissonanceTune()
+{
+    const int  n      = juce::jmax (1, dissCountBox.getSelectedId());
+    const bool maxima = dissMaxToggle.getToggleState();
+    juce::String err;
+    if (! processorRef.generateDissonanceScale (n, maxima, err))
+        juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+            tr ("Dissonance tuning", "Afinaci\xc3\xb3 per dissonancia"), err, this);
+    refocus();
+}
+
+void FractalAdditiveAudioProcessorEditor::saveDissonanceScl()
+{
+    if (! processorRef.hasGeneratedScl())
+    {
+        juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon,
+            tr ("Save scale", "Desar escala"),
+            tr ("Generate a dissonance scale first (the 'Diss. tune' button).",
+                "Primer genera una escala de dissonancia (bot\xc3\xb3 'Afina diss.')."), this);
+        return;
+    }
+
+    fileChooser = std::make_unique<juce::FileChooser> (
+        tr ("Save the generated scale (.scl)", "Desa l'escala generada (.scl)"),
+        juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+            .getChildFile (processorRef.getGeneratedSclName() + ".scl"),
+        "*.scl");
+    fileChooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
+        [this] (const juce::FileChooser& fc)
+        {
+            if (fc.getResult() != juce::File())
+            {
+                juce::String err;
+                if (! processorRef.saveGeneratedScl (fc.getResult(), err))
+                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                        "Save scale", err, this);
+            }
+            refocus();
+        });
 }
 
 void FractalAdditiveAudioProcessorEditor::updateWarning (int templatePartials)
@@ -634,25 +723,45 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colour (0xff0c0c12));
 
-    auto titleArea = getLocalBounds().removeFromTop (42);
+    auto titleArea = getLocalBounds().removeFromTop (50);
     g.setColour (juce::Colour (0xff2a2a3c));
     g.fillRect (0, titleArea.getBottom() - 1, getWidth(), 1);
 
-    // Title centred in the window; the gradient spans the text width around the centre.
-    auto t = titleArea.reduced (16, 6);
-    const float cx = (float) getWidth() * 0.5f;
-    juce::ColourGradient grad (juce::Colour (0xff7dd3fc), cx - 215.0f, 0.0f,
-                               juce::Colour (0xfff58bff), cx + 215.0f, 0.0f, false);
-    g.setGradientFill (grad);
-    g.setFont (juce::Font (juce::FontOptions (28.0f).withStyle ("Bold")));
-    g.drawText (catalan ? juce::String::fromUTF8 ("FIBL\xc3\x93 GAL\xc3\x80" "CTIC") : juce::String ("GALACTIC STING"),
-                t, juce::Justification::centred, false);
+    // Title in Jokerman, centred, one colour per letter following the colour
+    // keyboard's logic: a red->violet sweep that wraps so the FIRST and LAST
+    // letters are both red (one full "period" across the title).
+    const auto title = catalan ? juce::String::fromUTF8 ("FIBL\xc3\x93 GAL\xc3\x80" "CTIC")
+                               : juce::String ("GALACTIC STING");
+    const juce::Font titleFont = titleTypeface() != nullptr
+        ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (40.0f))
+        : juce::Font (juce::FontOptions (34.0f).withStyle ("Bold"));
+    g.setFont (titleFont);
+
+    const int L = title.length();
+    std::vector<int> widths ((size_t) L);
+    int total = 0;
+    for (int i = 0; i < L; ++i)
+    {
+        widths[(size_t) i] = juce::GlyphArrangement::getStringWidthInt (titleFont, title.substring (i, i + 1));
+        total += widths[(size_t) i];
+    }
+
+    int x = (getWidth() - total) / 2;
+    const int period = juce::jmax (1, L - 1); // last letter wraps back to degree 0 = red
+    for (int i = 0; i < L; ++i)
+    {
+        const float hue = 0.82f * (float) (i % period) / (float) period;
+        g.setColour (juce::Colour::fromHSV (hue, 0.72f, 1.0f, 1.0f));
+        g.drawText (title.substring (i, i + 1), x, titleArea.getY() + 4,
+                    widths[(size_t) i], titleArea.getHeight() - 8, juce::Justification::centred, false);
+        x += widths[(size_t) i];
+    }
 }
 
 void FractalAdditiveAudioProcessorEditor::resized()
 {
     auto full = getLocalBounds();
-    auto titleBar = full.removeFromTop (42);
+    auto titleBar = full.removeFromTop (50);
     langButton.setBounds (titleBar.removeFromRight (86).withSizeKeepingCentre (66, 24));
     auto presetArea = titleBar.removeFromLeft (272).reduced (10, 0);
     presetBox.setBounds (presetArea.removeFromLeft (190).withSizeKeepingCentre (190, 24));
@@ -771,6 +880,15 @@ void FractalAdditiveAudioProcessorEditor::resized()
             auto bendRow = ti.removeFromTop (22);
             lblBend.setBounds (bendRow.removeFromLeft (44));
             compact (bendBox, bendRow.removeFromLeft (juce::jmin (130, bendRow.getWidth())));
+            ti.removeFromTop (2);
+            auto dRow = ti.removeFromTop (22);
+            dissBtn.setBounds (dRow.removeFromLeft (88).reduced (1, 0));
+            dRow.removeFromLeft (3);
+            compact (dissCountBox, dRow.removeFromLeft (52));
+            dRow.removeFromLeft (3);
+            dissMaxToggle.setBounds (dRow.removeFromLeft (52));
+            dRow.removeFromLeft (3);
+            dissSaveBtn.setBounds (dRow.reduced (1, 0));
         }
 
         {
