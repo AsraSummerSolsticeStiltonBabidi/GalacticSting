@@ -40,7 +40,7 @@ juce_add_plugin(FractalAdditive
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE          # required for computer-keyboard play
     VST3_CATEGORIES             "Instrument" "Synth"
     FORMATS                     Standalone VST3
-    PRODUCT_NAME                "Fractal Additive")
+    PRODUCT_NAME                "Galactic Sting")
 
 target_sources(FractalAdditive PRIVATE
     source/PluginProcessor.cpp

@@ -27,7 +27,7 @@ public:
     bool hasEditor() const override { return true; }
 
     //==========================================================================
-    const juce::String getName() const override { return "Fractal Additive"; }
+    const juce::String getName() const override { return "Galactic Sting"; }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
@@ -57,6 +57,14 @@ public:
     void clearScala();
     juce::String getTuningStatus() const { return tuning.getStatusText(); }
 
+    // Raw tuning/timbre state so the editor can format localised status strings.
+    int  getTuningMode()    const noexcept { return (int) apvts.getRawParameterValue ("tuningMode")->load(); }
+    bool tuningHasMaster()  const noexcept { return tuning.hasMtsMaster(); }
+    bool tuningHasScala()   const noexcept { return tuning.hasScala(); }
+    juce::String tuningScaleName() const { return tuning.currentScaleName(); }
+    juce::String getTimbreName()   const { return timbreName; }
+    int  getTimbreNoteCount() const noexcept { return (int) timbreDegrees.size(); }
+
     // Degrees per period of the active tuning (for the colour keyboard).
     int getScaleDegrees() const noexcept { return tuning.degreesPerPeriod(); }
 
@@ -68,6 +76,9 @@ public:
     bool isTimbreActive() const noexcept { return timbreActive; }
     juce::String getTimbreStatus() const;
 
+    // Recently-used .scl files (persisted across sessions, newest first, max 3).
+    juce::StringArray getRecentSclPaths() const { return recentSclPaths; }
+
     //==========================================================================
     // Shared with the editor:
     juce::MidiKeyboardState keyboardState;
@@ -78,6 +89,7 @@ private:
 
     spectrum::SpectrumSettings currentSettings() const;
     void timerCallback() override;
+    void addRecentScl (const juce::File&);
 
     // Declared before `synth`: the AdditiveVoices owned by `synth` hold references
     // to spectrumEngine and tuning, so the voices must be destroyed before them.
@@ -91,6 +103,10 @@ private:
     float              timbrePeriod = 2.0f;
     bool               timbreActive = false;
     juce::String       timbreName, timbreSource;
+
+    // Persistent recent-.scl list (global app settings, shared across instances).
+    std::unique_ptr<juce::PropertiesFile> appProps;
+    juce::StringArray                     recentSclPaths;
 
     float lastGain = 0.0f;
 

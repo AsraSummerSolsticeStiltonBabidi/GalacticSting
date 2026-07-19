@@ -191,6 +191,22 @@ int main()
     }
 
     //--------------------------------------------------------------------------
+    std::printf ("Spectrum range: hard-cut N octaves above the fundamental:\n");
+    {
+        SpectrumSettings s; s.baseN = 1; s.reach = 64; s.selection = Selection::All; s.curveSlope = 0.0f;
+        s.spectrumRangeOct = 3; // keep ratio <= 2^3 = 8
+        auto t = compileSpectrum (s);
+        double maxR = 0.0; for (const auto& p : t.partials) maxR = std::max (maxR, (double) p.ratio);
+        check (maxR <= 8.0 + 1e-3, "no partial above 2^3 = 8");
+        check (hasRatio (t, 8.0), "ratio 8 kept (exactly at the edge)");
+        check (! hasRatio (t, 9.0) && ! hasRatio (t, 16.0), "ratios 9 and 16 cut");
+
+        SpectrumSettings full = s; full.spectrumRangeOct = 10; // full = no cut
+        auto tf = compileSpectrum (full);
+        check (hasRatio (tf, 16.0) && hasRatio (tf, 32.0), "range=10 (full) keeps 16 and 32");
+    }
+
+    //--------------------------------------------------------------------------
     std::printf ("Scala-as-timbre: degrees stacked over periods become the partials:\n");
     {
         // A 12-TET scale (12 degrees), 2 periods, flat slope, no fractal.

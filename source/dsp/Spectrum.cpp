@@ -17,11 +17,24 @@ namespace spectrum
         return true;
     }
 
+    // Spectrum range: hard-cut every partial more than 2^N octaves above the played
+    // pitch (ratio 1). N == 10 (or more) reaches the full template, so it is a no-op.
+    static void applyRangeCut (std::vector<Partial>& parts, const SpectrumSettings& s)
+    {
+        if (s.spectrumRangeOct >= 10)
+            return;
+        const double maxR = std::pow (2.0, (double) s.spectrumRangeOct);
+        parts.erase (std::remove_if (parts.begin(), parts.end(),
+                                     [maxR] (const Partial& p) { return (double) p.ratio > maxR; }),
+                     parts.end());
+    }
+
     // Shared tail: keep-loudest cap (always keeping the lowest-ratio partial so the
     // played pitch survives), ascending sort, RMS normalisation. Used by both engines.
     static void finalisePartials (std::vector<Partial>& parts, const SpectrumSettings& s,
                                   SpectrumTemplate& out)
     {
+        applyRangeCut (parts, s);
         out.rawCount = (int) parts.size();
 
         const int cap = std::min (s.maxPartials, kMaxPartials);
@@ -317,6 +330,8 @@ namespace spectrum
             if (minRatio > 0.0)
                 for (auto& p : parts) p.ratio = (float) ((double) p.ratio / minRatio);
         }
+
+        applyRangeCut (parts, s); // hard spectrum-range cut, relative to the played pitch
 
         out.rawCount = (int) parts.size();
 

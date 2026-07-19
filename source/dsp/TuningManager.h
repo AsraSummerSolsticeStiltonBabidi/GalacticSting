@@ -203,6 +203,18 @@ public:
     juce::String getScalaName()   const { return scalaName; }
     juce::String getScalaSource() const { return scalaSource; }
 
+    // Name of the scale actually in effect (MTS master's, or the loaded .scl), for the UI.
+    juce::String currentScaleName() const
+    {
+        switch (mode.load (std::memory_order_relaxed))
+        {
+            case Mode::MtsEsp: if (hasMtsMaster())                            return juce::String (MTS_GetScaleName (client)); break;
+            case Mode::Scala:  if (scalaValid.load (std::memory_order_relaxed)) return scalaName; break;
+            case Mode::Equal:  default: break;
+        }
+        return {};
+    }
+
     // Human-readable description of what is actually sounding right now (for the UI).
     juce::String getStatusText() const
     {

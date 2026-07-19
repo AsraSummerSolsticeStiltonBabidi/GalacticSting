@@ -69,6 +69,7 @@ namespace spectrum
         int       fractalLevel  = 1;                 // 1 = normal, 2, 3, ...
         float     ampFloorDb    = -120.0f;           // partials below this (rel. to max) are dropped
         int       maxPartials   = kMaxPartials;      // safety cap (keep loudest)
+        int       spectrumRangeOct = 10;             // hard-cut partials above 2^this x the played pitch (10 = full)
 
         // Scala-as-timbre source (used only when source == ScalaTimbre).
         Source             source = Source::Harmonic;
@@ -89,6 +90,7 @@ namespace spectrum
                 && fractalLevel == o.fractalLevel
                 && ampFloorDb == o.ampFloorDb
                 && maxPartials == o.maxPartials
+                && spectrumRangeOct == o.spectrumRangeOct
                 && source == o.source
                 && timbrePeriod == o.timbrePeriod
                 && timbrePeriodRepeats == o.timbrePeriodRepeats

@@ -21,6 +21,30 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
 
     for (int i = 0; i < 32; ++i)
         synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning));
+
+    // Global app settings (recent .scl files), shared across all instances.
+    juce::PropertiesFile::Options o;
+    o.applicationName     = "GalacticSting";
+    o.filenameSuffix      = "settings";
+    o.folderName          = "GalacticSting";
+    o.osxLibrarySubFolder = "Application Support";
+    appProps = std::make_unique<juce::PropertiesFile> (o);
+    recentSclPaths.addLines (appProps->getValue ("recentScl"));
+    recentSclPaths.removeEmptyStrings();
+}
+
+void FractalAdditiveAudioProcessor::addRecentScl (const juce::File& f)
+{
+    const auto path = f.getFullPathName();
+    recentSclPaths.removeString (path);
+    recentSclPaths.insert (0, path);
+    while (recentSclPaths.size() > 3)
+        recentSclPaths.remove (recentSclPaths.size() - 1);
+    if (appProps != nullptr)
+    {
+        appProps->setValue ("recentScl", recentSclPaths.joinIntoString ("\n"));
+        appProps->saveIfNeeded();
+    }
 }
 
 FractalAdditiveAudioProcessor::~FractalAdditiveAudioProcessor()
@@ -62,6 +86,8 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     }
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "fractalLevel", 1 }, "Fractal Level", 1, 4, 1));
+    params.push_back (std::make_unique<AudioParameterInt>(
+        ParameterID { "spectrumRange", 1 }, "Spectrum Range (oct)", 1, 10, 10));
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "phaseMode", 1 }, "Phase",
         StringArray { "Aligned", "Scattered" }, 0));
@@ -140,6 +166,7 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
     s.primeWhitelistMask = mask;
 
     s.fractalLevel   = (int) apvts.getRawParameterValue ("fractalLevel")->load();
+    s.spectrumRangeOct = (int) apvts.getRawParameterValue ("spectrumRange")->load();
     s.ampFloorDb     = -120.0f;
     s.maxPartials    = spectrum::kMaxPartials;
 
@@ -180,6 +207,7 @@ bool FractalAdditiveAudioProcessor::loadScalaFile (const juce::File& f, juce::St
     if (auto* p = apvts.getParameter ("tuningMode"))
         p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
     tuning.setMode (TuningManager::Mode::Scala);
+    addRecentScl (f);
     return true;
 }
 
@@ -211,6 +239,7 @@ bool FractalAdditiveAudioProcessor::loadTimbreFile (const juce::File& f, juce::S
     timbreName   = f.getFileNameWithoutExtension();
     timbreSource = text;
     timbreActive = true;
+    addRecentScl (f);
     return true;
 }
 
