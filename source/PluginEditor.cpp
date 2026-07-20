@@ -69,7 +69,7 @@ namespace
                                         const juce::Justification&, juce::GroupComponent& group) override
         {
             const auto col = group.findColour (juce::GroupComponent::outlineColourId);
-            constexpr float titleH = 18.0f;
+            constexpr float titleH = 19.0f;
             auto frame = juce::Rectangle<float> (1.3f, titleH * 0.5f,
                                                  (float) w - 2.6f, (float) h - titleH * 0.5f - 1.3f);
 
@@ -78,15 +78,19 @@ namespace
             g.setColour (juce::Colour (0xff17171f).interpolatedWith (col, 0.05f));
             g.fillRoundedRectangle (frame, 7.0f);
             g.setColour (col.withAlpha (0.95f));
-            g.drawRoundedRectangle (frame, 7.0f, 2.6f); // thicker outline
+            g.drawRoundedRectangle (frame, 7.0f, 2.6f); // thick outline
 
-            g.setFont (juce::Font (juce::FontOptions (14.0f).withStyle ("Bold")));
-            const int tw = juce::GlyphArrangement::getStringWidthInt (g.getCurrentFont(), text) + 14;
-            auto chip = juce::Rectangle<float> (11.0f, 0.0f, (float) tw, titleH);
-            g.setColour (juce::Colour (0xff0c0c12));
-            g.fillRoundedRectangle (chip, 3.0f);
+            // Title: no background chip - BLACK glyphs with a thick coloured stroke
+            // (the frame's colour), so the title reads as outlined black text.
+            const juce::Font tf (juce::FontOptions (14.5f).withStyle ("Bold"));
+            juce::GlyphArrangement ga;
+            ga.addLineOfText (tf, text, 12.0f, titleH - 4.0f);
+            juce::Path p;
+            ga.createPath (p);
             g.setColour (col);
-            g.drawText (text, chip, juce::Justification::centred, false);
+            g.strokePath (p, juce::PathStrokeType (3.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            g.setColour (juce::Colours::black);
+            g.fillPath (p);
         }
     };
 }
@@ -182,9 +186,13 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         addChildComponent (recentBtn[i]);
     }
     tuningStatusLabel.setJustificationType (juce::Justification::centredLeft);
-    tuningStatusLabel.setColour (juce::Label::textColourId, cTuning.brighter (0.2f));
-    tuningStatusLabel.setFont (juce::Font (juce::FontOptions (14.0f).withStyle ("Bold")));
+    tuningStatusLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8)); // dim prefix
+    tuningStatusLabel.setFont (juce::Font (juce::FontOptions (13.5f).withStyle ("Bold")));
     addAndMakeVisible (tuningStatusLabel);
+    tuningNameLabel.setJustificationType (juce::Justification::centredLeft);
+    tuningNameLabel.setColour (juce::Label::textColourId, juce::Colours::white); // the loaded scale, highlighted
+    tuningNameLabel.setFont (juce::Font (juce::FontOptions (14.0f).withStyle ("Bold")));
+    addAndMakeVisible (tuningNameLabel);
 
     // Timbre (.scl as spectrum).
     configGroup (gTimbre, cTimbre);
@@ -425,6 +433,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblBend.setText      (tr ("Pitch bend", "Pitch bend"), dontSendNotification);
     lblPeriod.setText    (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
     lblRefA.setText      ("A =", dontSendNotification);
+    degreeList.tip = tr (
+        "Each row is a degree of the generated scale: colour chip = its keyboard colour, then its interval, then its DISSONANCE HEIGHT on Sethares' curve (how rough that interval sounds with this exact timbre). Lower = more consonant. Sorted most-consonant first; the height colour runs green (period, most consonant) -> yellow -> red (roughest).",
+        "Cada fila \xc3\xa9s un grau de l'escala generada: xip de color = el seu color al teclat, despr\xc3\xa9s l'interval, i l'AL\xc3\x87""ADA DE DISSONANCIA a la corba de Sethares (com de aspre sona amb aquest timbre). M\xc3\xa9s baix = m\xc3\xa9s consonant. Ordenats de m\xc3\xa9s consonant primer; el color va de verd (per\xc3\xado""de, m\xc3\xa9s consonant) -> groc -> vermell (m\xc3\xa9s aspre).");
     recentLabel.setText  (tr ("Recent", "Recents"), dontSendNotification);
 
     loadSclButton.setButtonText    (tr ("Load .scl", "Obrir .scl"));
@@ -872,56 +883,43 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     g.setColour (juce::Colour (0xff2a2a3c));
     g.fillRect (0, titleArea.getBottom() - 1, getWidth(), 1);
 
-    // Title: Title Case, every letter inside a coloured square (keyboard hue
-    // logic, first and last letter red), letter drawn black or white by the
-    // square's brightness - exactly like the keys. Letter sizes vary notably
-    // (deterministic pattern) but stay legible.
+    // Title: Title Case, each letter in an EQUAL-SIZED SQUARE (sharp corners),
+    // keyboard hue logic (first and last letter red), letter black or white by
+    // the square's brightness - like the keys. All squares the same (big) size;
+    // it's the LETTER size that varies notably (deterministic cycle), staying
+    // legible.
     const auto title = catalan ? juce::String::fromUTF8 ("Fibl\xc3\xb3 Gal\xc3\xa0" "ctic")
                                : juce::String ("Galactic Sting");
     const int L = title.length();
     const int period = juce::jmax (1, L - 1); // last letter wraps to degree 0 = red
 
-    const float baseH = 44.0f;
-    const auto sizeOf = [baseH] (int i)      // scrambled 5-step size cycle, 58%..100%
-    { return baseH * (0.58f + 0.42f * (float) ((i * 7) % 5) / 4.0f); };
+    const float side = 52.0f;   // all squares identical, big
+    const float gap  = 4.0f;
+    const auto letterH = [] (int i)  // scrambled cycle: 66%..104% of the square
+    { return 34.0f + 20.0f * (float) ((i * 7) % 5) / 4.0f; };
 
-    // First pass: measure.
-    std::vector<float> sides ((size_t) L);
-    std::vector<juce::Font> fonts;
-    fonts.reserve ((size_t) L);
-    float total = 0.0f;
-    for (int i = 0; i < L; ++i)
-    {
-        const float h = sizeOf (i);
-        juce::Font f = titleTypeface() != nullptr
-            ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (h))
-            : juce::Font (juce::FontOptions (h * 0.85f).withStyle ("Bold"));
-        fonts.push_back (f);
-        if (title[i] == ' ')
-            sides[(size_t) i] = 14.0f; // word gap, no square
-        else
-            sides[(size_t) i] = (float) juce::jmax (
-                juce::GlyphArrangement::getStringWidthInt (f, title.substring (i, i + 1)) + 8, (int) (h * 0.9f));
-        total += sides[(size_t) i] + 3.0f;
-    }
+    int squares = 0, spaces = 0;
+    for (int i = 0; i < L; ++i) (title[i] == ' ' ? spaces : squares)++;
+    const float total = (float) squares * (side + gap) + (float) spaces * (side * 0.5f);
 
     float x = ((float) getWidth() - total) * 0.5f;
     const float cy = (float) titleArea.getCentreY();
     for (int i = 0; i < L; ++i)
     {
-        const float side = sides[(size_t) i];
-        if (title[i] != ' ')
-        {
-            const float hue = 0.82f * (float) (i % period) / (float) period;
-            const auto sq = juce::Rectangle<float> (x, cy - side * 0.5f, side, side);
-            const auto col = juce::Colour::fromHSV (hue, 0.62f, 0.9f, 1.0f); // same S/V as the keys
-            g.setColour (col);
-            g.fillRoundedRectangle (sq, 5.0f);
-            g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-            g.setFont (fonts[(size_t) i]);
-            g.drawText (title.substring (i, i + 1), sq, juce::Justification::centred, false);
-        }
-        x += side + 3.0f;
+        if (title[i] == ' ') { x += side * 0.5f; continue; }
+
+        const float hue = 0.82f * (float) (i % period) / (float) period;
+        const auto sq  = juce::Rectangle<float> (x, cy - side * 0.5f, side, side);
+        const auto col = juce::Colour::fromHSV (hue, 0.62f, 0.9f, 1.0f); // same S/V as the keys
+        g.setColour (col);
+        g.fillRect (sq); // sharp corners
+        g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
+        const float h = letterH (i);
+        g.setFont (titleTypeface() != nullptr
+                       ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (h))
+                       : juce::Font (juce::FontOptions (h * 0.85f).withStyle ("Bold")));
+        g.drawText (title.substring (i, i + 1), sq, juce::Justification::centred, false);
+        x += side + gap;
     }
 }
 
@@ -1085,7 +1083,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
             const int rw = rrow.getWidth() / 3;
             for (int i = 0; i < 3; ++i) recentBtn[i].setBounds (rrow.removeFromLeft (rw).reduced (2, 1));
             ti.removeFromTop (3);
-            tuningStatusLabel.setBounds (ti.removeFromTop (18));
+            {
+                auto srow = ti.removeFromTop (18);
+                tuningStatusLabel.setBounds (srow.removeFromLeft (juce::jmin (62, srow.getWidth())));
+                tuningNameLabel.setBounds (srow);
+            }
             ti.removeFromTop (2);
             auto bendRow = ti.removeFromTop (22);
             lblBend.setJustificationType (juce::Justification::centredLeft);
@@ -1215,17 +1217,19 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
 
     updateWarning (templ);
 
-    // Localised tuning status.
-    juce::String ts;
+    // Localised tuning status - a dim prefix + a highlighted scale name. The
+    // A=440 reference now has its own control, so 12-TET shows just "12-TET".
+    juce::String prefix, sname;
     switch (processorRef.getTuningMode())
     {
-        case 1:  ts = processorRef.tuningHasMaster() ? "MTS-ESP: " + processorRef.tuningScaleName()
-                                                     : tr ("MTS-ESP (no master)", "MTS-ESP (sense mestre)"); break;
-        case 2:  ts = processorRef.tuningHasScala()  ? tr ("Loaded: ", "Carregat: ") + processorRef.tuningScaleName()
-                                                     : tr ("Scala (no file)", "Scala (sense fitxer)"); break;
-        default: ts = tr ("12-TET (A=440)", "12-TET (La=440)"); break;
+        case 1:  if (processorRef.tuningHasMaster()) { prefix = "MTS-ESP:"; sname = processorRef.tuningScaleName(); }
+                 else prefix = tr ("MTS-ESP (no master)", "MTS-ESP (sense mestre)"); break;
+        case 2:  if (processorRef.tuningHasScala())  { prefix = tr ("Loaded:", "Carregat:"); sname = processorRef.tuningScaleName(); }
+                 else prefix = tr ("Scala (no file)", "Scala (sense fitxer)"); break;
+        default: prefix = "12-TET"; break;
     }
-    tuningStatusLabel.setText (ts, juce::dontSendNotification);
+    tuningStatusLabel.setText (prefix, juce::dontSendNotification);
+    tuningNameLabel.setText (sname, juce::dontSendNotification);
 
     juce::String tms = processorRef.isTimbreActive()
         ? "Timbre: " + processorRef.getTimbreName() + "  (" + juce::String (processorRef.getTimbreNoteCount())

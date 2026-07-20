@@ -147,7 +147,15 @@ public:
         const double baseFreq = tuning.frequencyForNote ((int) currentlyPlayingNote.initialNote);
         const double f0 = baseFreq * std::pow (2.0, (double) currentlyPlayingNote.totalPitchbendInSemitones / 12.0);
 
-        if (tmpl != nullptr && currentSampleRate > 0.0 && f0 > 0.0)
+        // Infrasound guard: wide-period tunings (e.g. a period-5 scale) map keys
+        // well below the tonic to sub-audio pitches - a key can land at ~7 Hz.
+        // Below ~18 Hz there is no pitch, only inaudible speaker-thumping rumble,
+        // so we render nothing there (higher partials of such a low note are still
+        // fine, but its fundamental region is pure rumble). 20-40 Hz real bass is
+        // untouched.
+        const bool audibleFundamental = f0 >= 18.0;
+
+        if (tmpl != nullptr && currentSampleRate > 0.0 && f0 > 0.0 && audibleFundamental)
         {
             const double maxRatio = (0.5 * currentSampleRate) / f0; // Nyquist / f0
             const auto&  ps       = tmpl->partials;

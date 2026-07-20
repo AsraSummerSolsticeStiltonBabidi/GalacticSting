@@ -195,10 +195,10 @@ private:
 
     void timerCallback() override
     {
-        // Arm the hover tooltip only after 1.25 s resting on the same key with no
-        // button held (the global TooltipWindow then displays getTooltip()).
+        // Arm the hover tooltip only after resting on the same key with no button
+        // held (the global TooltipWindow then displays getTooltip()).
         if (! hoverArmed && hoverCell >= 0 && ! isMouseButtonDown()
-            && juce::Time::getMillisecondCounter() - hoverStartMs >= 1250)
+            && juce::Time::getMillisecondCounter() - hoverStartMs >= 700)
             hoverArmed = true;
         repaint();
     }

@@ -73,10 +73,12 @@ private:
     // Sorted list of the generated scale's degrees: colour chip + interval label
     // + dissonance height on a green->yellow->red gradient. Data set by the timer
     // whenever a new scale is generated.
-    struct DissDegreeList : juce::Component
+    struct DissDegreeList : juce::Component, juce::TooltipClient
     {
         struct Row { juce::String num, label, value; juce::Colour chip, valueCol; };
         std::vector<Row> rows;
+        juce::String tip;
+        juce::String getTooltip() override { return tip; }
         void paint (juce::Graphics& g) override
         {
             if (rows.empty())
@@ -184,7 +186,7 @@ private:
                          gPrime, gFilter, gAmpEnv, gTuning, gTimbre, gSpecScale, gReference;
     juce::Label lblBaseN, lblBasePitch, lblRange, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
                 lblTimbreRepeats, lblBend, lblPeriod, lblRefA,
-                tuningStatusLabel, timbreStatusLabel, recentLabel;
+                tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel;
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], primeLbl[9];
 
     std::unique_ptr<SliderAttachment>   baseNAtt, slopeAtt, spectrumRangeAtt, fractalAtt, gainAtt,
