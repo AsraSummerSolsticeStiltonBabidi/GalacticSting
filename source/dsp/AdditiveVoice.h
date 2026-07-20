@@ -92,6 +92,7 @@ public:
         fastKillGain = 1.0f;
         snapAmps     = true;
         snapNorm     = true;
+        releasing    = false; // fresh note: parameter re-apply is allowed again
 
         const double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
         updateAdsrParameters();
@@ -109,7 +110,7 @@ public:
 
     void noteStopped (bool allowTailOff) override
     {
-        if (allowTailOff) { adsr.noteOff(); filterAdsr.noteOff(); }
+        if (allowTailOff) { adsr.noteOff(); filterAdsr.noteOff(); releasing = true; }
         else              beginFastKill();
     }
 
@@ -127,6 +128,10 @@ public:
             adsr.setSampleRate (sr);
             filterAdsr.setSampleRate (sr);
             filter.prepare ({ sr, 8192, 1 });
+            // The ADSR rates are sample-rate dependent, so force a re-apply on the
+            // next block instead of skipping it as an unchanged parameter set.
+            ampParamsApplied  = { -1.0f, -1.0f, -1.0f, -1.0f };
+            filtParamsApplied = { -1.0f, -1.0f, -1.0f, -1.0f };
         }
     }
 
@@ -147,15 +152,14 @@ public:
         const double baseFreq = tuning.frequencyForNote ((int) currentlyPlayingNote.initialNote);
         const double f0 = baseFreq * std::pow (2.0, (double) currentlyPlayingNote.totalPitchbendInSemitones / 12.0);
 
-        // Infrasound guard: wide-period tunings (e.g. a period-5 scale) map keys
-        // well below the tonic to sub-audio pitches - a key can land at ~7 Hz.
-        // Below ~18 Hz there is no pitch, only inaudible speaker-thumping rumble,
-        // so we render nothing there (higher partials of such a low note are still
-        // fine, but its fundamental region is pure rumble). 20-40 Hz real bass is
-        // untouched.
-        const bool audibleFundamental = f0 >= 18.0;
-
-        if (tmpl != nullptr && currentSampleRate > 0.0 && f0 > 0.0 && audibleFundamental)
+        // No infrasound gate: a very low fundamental (wide-period tunings can map a
+        // key to a few Hz) is not silenced, because its HARMONICS - at 2x, 3x, ...
+        // the fundamental - are audible even when the fundamental itself is not, so
+        // muting the whole note would wrongly kill an audible tone. A sub-audio
+        // fundamental just adds inaudible rumble; the note still sounds through its
+        // partials. (The colour keyboard's range adapts to the period so such deep
+        // keys are not normally offered in the first place.)
+        if (tmpl != nullptr && currentSampleRate > 0.0 && f0 > 0.0)
         {
             const double maxRatio = (0.5 * currentSampleRate) / f0; // Nyquist / f0
             const auto&  ps       = tmpl->partials;
@@ -263,24 +267,51 @@ public:
 
 private:
     //==========================================================================
+    // Push ADSR parameters to the envelope, but AVOID JUCE's release-rate bug:
+    // JUCE's ADSR recomputes its release RATE from `sustain` inside every
+    // setParameters() call (recalculateRates: sustain / (release * sr)), whereas
+    // noteOff() derives the correct rate from the LIVE envelope value. So ANY
+    // setParameters() during the release tail overwrites the honest rate and the
+    // tail length jumps ("suddenly longer, more release"). Two guards close this:
+    //   1. `releasing` - once the tail has begun, freeze the envelope entirely;
+    //      parameter edits/automation take effect on the NEXT note, not this tail.
+    //   2. change detection - even before release, only re-apply when a value
+    //      actually changed, so we never touch the envelope needlessly.
+    // (JUCE's own docs: "Do not change the parameters during playback.")
+    static bool paramsEqual (const juce::ADSR::Parameters& a, const juce::ADSR::Parameters& b) noexcept
+    {
+        return a.attack == b.attack && a.decay == b.decay
+            && a.sustain == b.sustain && a.release == b.release;
+    }
+
     void updateAdsrParameters()
     {
+        if (releasing) return; // never disturb a release tail's rate
         juce::ADSR::Parameters p;
         p.attack  = attackParam->load();
         p.decay   = decayParam->load();
         p.sustain = sustainParam->load();
         p.release = releaseParam->load();
-        adsr.setParameters (p);
+        if (! paramsEqual (p, ampParamsApplied))
+        {
+            ampParamsApplied = p;
+            adsr.setParameters (p);
+        }
     }
 
     void updateFilterAdsrParameters()
     {
+        if (releasing) return; // never disturb a release tail's rate
         juce::ADSR::Parameters p;
         p.attack  = fAttackParam->load();
         p.decay   = fDecayParam->load();
         p.sustain = fSustainParam->load();
         p.release = fReleaseParam->load();
-        filterAdsr.setParameters (p);
+        if (! paramsEqual (p, filtParamsApplied))
+        {
+            filtParamsApplied = p;
+            filterAdsr.setParameters (p);
+        }
     }
 
     void beginFastKill()
@@ -297,6 +328,7 @@ private:
         filterAdsr.reset();
         fastKill     = false;
         fastKillGain = 1.0f;
+        releasing    = false;
         clearCurrentNote();
     }
 
@@ -319,6 +351,10 @@ private:
     std::atomic<float>* fReleaseParam  = nullptr;
 
     juce::ADSR adsr, filterAdsr;
+    // Last parameters actually pushed to each ADSR (sentinel = force first apply).
+    // See updateAdsrParameters() for why we gate on change.
+    juce::ADSR::Parameters ampParamsApplied  { -1.0f, -1.0f, -1.0f, -1.0f };
+    juce::ADSR::Parameters filtParamsApplied { -1.0f, -1.0f, -1.0f, -1.0f };
     juce::dsp::StateVariableTPTFilter<float> filter;
     float filterEnvValue = 0.0f;
 
@@ -338,4 +374,5 @@ private:
     bool  fastKill = false;
     float fastKillGain = 1.0f;
     float fastKillDelta = 0.0f;
+    bool  releasing = false; // in the note-off release tail: freeze ADSR params (see updateAdsrParameters)
 };

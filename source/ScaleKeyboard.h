@@ -29,9 +29,17 @@ public:
 
     ~ScaleKeyboard() override { stopTimer(); }
 
-    // Lowest MIDI note shown at the left edge; the reference key that defines
-    // degree 0 (matches TuningManager::kRefKey = 60 so every tonic reads "0").
-    void setRange (int lowestKey) { baseKey = juce::jlimit (0, 120, lowestKey); repaint(); }
+    // The visible key window: lowest MIDI note at the left edge (the reference key
+    // that defines degree 0 - matches TuningManager::kRefKey = 60 so every tonic
+    // reads "0") and how many keys to show. `numKeys <= 0` restores the automatic
+    // ~26 px-per-cell count. Adapting the window to the tuning's period keeps wide
+    // scales from exposing sub-audio / ultrasonic keys.
+    void setRange (int lowestKey, int numKeys = 0)
+    {
+        baseKey   = juce::jlimit (0, 127, lowestKey);
+        shownKeys = numKeys;
+        repaint();
+    }
     int  getBaseKey() const noexcept { return baseKey; }
 
     // Optional: a short just-intonation label per degree (e.g. "3/2"), drawn
@@ -39,7 +47,7 @@ public:
     void setDegreeLabeller (std::function<juce::String(int)> fn) { getLabel = std::move (fn); }
 
     // Optional hover text per degree (ratio -> cents, or cents -> nearest just
-    // interval). Shown ONLY after the mouse rests 1.25 s on a key, never while
+    // interval). Shown ONLY after the mouse rests ~0.5 s on a key, never while
     // that key is being clicked/dragged.
     void setHoverTextProvider (std::function<juce::String(int)> fn) { getHoverText = std::move (fn); }
 
@@ -159,7 +167,8 @@ private:
 
     int numCells() const
     {
-        const int target = juce::jmax (1, getWidth() / 26); // ~26 px per cell
+        const int target = shownKeys > 0 ? shownKeys
+                                          : juce::jmax (1, getWidth() / 26); // ~26 px per cell
         return juce::jlimit (1, 128 - baseKey, target);
     }
 
@@ -198,7 +207,7 @@ private:
         // Arm the hover tooltip only after resting on the same key with no button
         // held (the global TooltipWindow then displays getTooltip()).
         if (! hoverArmed && hoverCell >= 0 && ! isMouseButtonDown()
-            && juce::Time::getMillisecondCounter() - hoverStartMs >= 700)
+            && juce::Time::getMillisecondCounter() - hoverStartMs >= 500)
             hoverArmed = true;
         repaint();
     }
@@ -208,6 +217,7 @@ private:
     std::function<juce::String(int)> getLabel;
     std::function<juce::String(int)> getHoverText;
     int baseKey  = 48; // C3
+    int shownKeys = 0; // >0 = fixed visible-key count; 0 = auto (~26 px/cell)
     int mouseNote = -1;
     int hoverCell = -1;
     bool hoverArmed = false;

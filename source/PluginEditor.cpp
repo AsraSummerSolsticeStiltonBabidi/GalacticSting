@@ -69,22 +69,23 @@ namespace
                                         const juce::Justification&, juce::GroupComponent& group) override
         {
             const auto col = group.findColour (juce::GroupComponent::outlineColourId);
-            constexpr float titleH = 19.0f;
+            constexpr float titleH = 21.0f;
             auto frame = juce::Rectangle<float> (1.3f, titleH * 0.5f,
                                                  (float) w - 2.6f, (float) h - titleH * 0.5f - 1.3f);
 
             // Interior panel: lighter than the page (0xff0c0c12) and subtly tinted by the
-            // section colour, so each box reads as a raised, distinct panel.
+            // section colour, so each box reads as a raised, distinct panel. Sharp
+            // (square) corners, not rounded.
             g.setColour (juce::Colour (0xff17171f).interpolatedWith (col, 0.05f));
-            g.fillRoundedRectangle (frame, 7.0f);
+            g.fillRect (frame);
             g.setColour (col.withAlpha (0.95f));
-            g.drawRoundedRectangle (frame, 7.0f, 2.6f); // thick outline
+            g.drawRect (frame, 2.6f); // thick square outline
 
             // Title: no background chip - BLACK glyphs with a thick coloured stroke
             // (the frame's colour), so the title reads as outlined black text.
-            const juce::Font tf (juce::FontOptions (14.5f).withStyle ("Bold"));
+            const juce::Font tf (juce::FontOptions (16.0f).withStyle ("Bold"));
             juce::GlyphArrangement ga;
-            ga.addLineOfText (tf, text, 12.0f, titleH - 4.0f);
+            ga.addLineOfText (tf, text, 12.0f, titleH - 5.5f);
             juce::Path p;
             ga.createPath (p);
             g.setColour (col);
@@ -653,7 +654,7 @@ void FractalAdditiveAudioProcessorEditor::refreshDegreeList (bool showNotice)
         row.value = juce::String (d.height, 2);
         row.chip  = juce::Colour::fromHSV (0.82f * (float) d.degree / (float) juce::jmax (1, D), 0.62f, 0.9f, 1.0f);
 
-        // green (period height) -> yellow -> red (curve max).
+        // green (most-consonant degree) -> yellow -> red (curve max).
         const double t = juce::jlimit (0.0, 1.0, (d.height - g0) / juce::jmax (1.0e-12, r0 - g0));
         const juce::Colour green (0xff3ec659), yellow (0xffe8d44d), red (0xffe0453f);
         row.valueCol = t < 0.5 ? green.interpolatedWith (yellow, (float) (t * 2.0))
@@ -885,22 +886,26 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 
     // Title: Title Case, each letter in an EQUAL-SIZED SQUARE (sharp corners),
     // keyboard hue logic (first and last letter red), letter black or white by
-    // the square's brightness - like the keys. All squares the same (big) size;
-    // it's the LETTER size that varies notably (deterministic cycle), staying
-    // legible.
+    // the square's brightness - like the keys. Every letter is stretched to FILL
+    // its square (see the loop) - it grows and deforms to almost touch the edges.
     const auto title = catalan ? juce::String::fromUTF8 ("Fibl\xc3\xb3 Gal\xc3\xa0" "ctic")
                                : juce::String ("Galactic Sting");
     const int L = title.length();
     const int period = juce::jmax (1, L - 1); // last letter wraps to degree 0 = red
 
-    const float side = 52.0f;   // all squares identical, big
-    const float gap  = 4.0f;
-    const auto letterH = [] (int i)  // scrambled cycle: 66%..104% of the square
-    { return 34.0f + 20.0f * (float) ((i * 7) % 5) / 4.0f; };
+    const float side   = 52.0f;         // all squares identical, big
+    const float gap    = 4.0f;
+    const float margin = side * 0.10f;  // small breathing room to the square's edge
 
     int squares = 0, spaces = 0;
     for (int i = 0; i < L; ++i) (title[i] == ' ' ? spaces : squares)++;
     const float total = (float) squares * (side + gap) + (float) spaces * (side * 0.5f);
+
+    // Nominal-size font; each glyph's path is rescaled per-square below, so the
+    // exact height here only needs enough resolution for a clean outline.
+    const juce::Font glyphFont = titleTypeface() != nullptr
+        ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (64.0f))
+        : juce::Font (juce::FontOptions (64.0f).withStyle ("Bold"));
 
     float x = ((float) getWidth() - total) * 0.5f;
     const float cy = (float) titleArea.getCentreY();
@@ -913,12 +918,27 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         const auto col = juce::Colour::fromHSV (hue, 0.62f, 0.9f, 1.0f); // same S/V as the keys
         g.setColour (col);
         g.fillRect (sq); // sharp corners
-        g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-        const float h = letterH (i);
-        g.setFont (titleTypeface() != nullptr
-                       ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (h))
-                       : juce::Font (juce::FontOptions (h * 0.85f).withStyle ("Bold")));
-        g.drawText (title.substring (i, i + 1), sq, juce::Justification::centred, false);
+
+        // Draw the letter as a glyph PATH stretched non-uniformly (X and Y scaled
+        // independently) to fill the square minus the margin: it grows AND deforms
+        // to almost touch the edges, so a narrow letter (I) widens and a wide one
+        // (M) squashes - every square ends up equally, boldly filled.
+        juce::GlyphArrangement ga;
+        ga.addLineOfText (glyphFont, title.substring (i, i + 1), 0.0f, 0.0f);
+        juce::Path gp;
+        ga.createPath (gp);
+        const auto gb = gp.getBounds();
+        if (! gb.isEmpty() && gb.getWidth() > 0.0f && gb.getHeight() > 0.0f)
+        {
+            const auto target = sq.reduced (margin);
+            const auto t = juce::AffineTransform::translation (-gb.getCentreX(), -gb.getCentreY())
+                               .scaled (target.getWidth()  / gb.getWidth(),
+                                        target.getHeight() / gb.getHeight())
+                               .translated (target.getCentreX(), target.getCentreY());
+            gp.applyTransform (t);
+            g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
+            g.fillPath (gp);
+        }
         x += side + gap;
     }
 }
@@ -937,7 +957,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
     {
         auto kb = area.removeFromBottom (88).reduced (2, 5);
-        keyboard.setRange (36);
+        int kbLo = 36, kbNum = 0;
+        processorRef.getKeyboardKeyRange (kbLo, kbNum);
+        lastKbLo = kbLo; lastKbNum = kbNum;
+        keyboard.setRange (kbLo, kbNum);
         keyboard.setBounds (kb);
     }
     helpLabel.setBounds (area.removeFromBottom (16));
@@ -1194,6 +1217,19 @@ void FractalAdditiveAudioProcessorEditor::pollComputerKeyboard()
 void FractalAdditiveAudioProcessorEditor::timerCallback()
 {
     pollComputerKeyboard(); // safety net for missed KEYUPs / ghost keys / focus loss
+
+    // Re-adapt the colour keyboard's visible window whenever the active tuning
+    // changes (a scale loaded/generated, or the A reference moved), so a wide
+    // period never leaves sub-audio/ultrasonic keys on screen.
+    {
+        int kbLo = 36, kbNum = 0;
+        processorRef.getKeyboardKeyRange (kbLo, kbNum);
+        if (kbLo != lastKbLo || kbNum != lastKbNum)
+        {
+            lastKbLo = kbLo; lastKbNum = kbNum;
+            keyboard.setRange (kbLo, kbNum);
+        }
+    }
 
     const int  rendered  = processorRef.getPartialCount();
     const int  templ     = processorRef.getTemplatePartialCount();

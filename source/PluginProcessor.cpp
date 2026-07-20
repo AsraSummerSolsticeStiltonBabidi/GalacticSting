@@ -368,8 +368,16 @@ bool FractalAdditiveAudioProcessor::generateDissonanceScale (int count, bool use
     dissDegrees.push_back ({ 0, periodRatio, periodH });
     std::sort (dissDegrees.begin(), dissDegrees.end(),
                [] (const DissDegreeInfo& a, const DissDegreeInfo& b) { return a.height < b.height; });
-    dissGreenH    = periodH;
-    dissRedH      = std::max (maxCurve, periodH + 1.0e-9);
+    // Green anchors at the ACTUALLY most-consonant degree, NOT unconditionally at
+    // the period. The period is a structural degree (the scale's repeat interval)
+    // but is only consonant if the curve says so - for a non-harmonic timbre a
+    // wide period (3, 5, ...) can be quite rough, and several interior minima can
+    // be far more consonant than it. Forcing green = periodH used to paint the
+    // period as "maximum consonance" even then, which is why the same ratio looked
+    // consonant as a period yet unremarkable as an interior interval. Now every
+    // degree - the period included - is coloured by its true curve height.
+    dissGreenH    = dissDegrees.empty() ? 0.0 : dissDegrees.front().height; // sorted asc -> most consonant
+    dissRedH      = std::max (maxCurve, dissGreenH + 1.0e-9);
     dissRequested = count;
     dissFound     = (int) found.size();
     ++dissGeneration;

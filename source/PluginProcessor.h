@@ -68,6 +68,32 @@ public:
     // Degrees per period of the active tuning (for the colour keyboard).
     int getScaleDegrees() const noexcept { return tuning.degreesPerPeriod(); }
 
+    // MIDI range the colour keyboard should display, adapted to the active tuning
+    // so wide-period scales (e.g. a period-5 scale, whose keys span sub-audio to
+    // ultrasonic over a fixed 44-key window) only ever offer keys in a musical
+    // band. Expands out from the tonic (key 60) while the fundamental stays in
+    // [loHz, hiHz], then caps the span for playable cell widths.
+    void getKeyboardKeyRange (int& lowKey, int& numKeys) const noexcept
+    {
+        constexpr double loHz = 40.0, hiHz = 4186.0; // ~E1 .. ~C8
+        constexpr int tonic = 60, maxKeys = 52, minKeys = 8;
+        int lo = tonic, hi = tonic;
+        while (lo > 0   && tuning.frequencyForNote (lo - 1) >= loHz) --lo;
+        while (hi < 127 && tuning.frequencyForNote (hi + 1) <= hiHz) ++hi;
+        if (hi - lo + 1 > maxKeys) // 12-TET etc.: comfortable window centred on the tonic
+        {
+            lo = juce::jmax (lo, tonic - maxKeys / 2);
+            hi = juce::jmin (hi, lo + maxKeys - 1);
+        }
+        if (hi - lo + 1 < minKeys) // ultra-wide period: still show a few keys
+        {
+            lo = juce::jlimit (0, 127 - minKeys + 1, tonic - minKeys / 2);
+            hi = lo + minKeys - 1;
+        }
+        lowKey  = lo;
+        numKeys = hi - lo + 1;
+    }
+
     // Frequency ratio of scale degree `d` relative to degree 0 (the tonic on
     // key 60), for the keyboard's just-interval labels. Degree d is mapped to an
     // IN-RANGE key of the same degree class (walking down whole periods) rather
