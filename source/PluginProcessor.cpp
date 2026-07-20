@@ -326,7 +326,9 @@ bool FractalAdditiveAudioProcessor::generateDissonanceScale (int count, bool use
         scl << " " << juce::String (1200.0 * std::log2 (r), 5) << "\n";
     scl << " 1200.00000\n"; // octave, exact
 
-    const auto name = "diss-" + kind + "-" + juce::String ((int) ratios.size() + 1);
+    // Name by the number of extremes the user asked for (the .scl note-count is
+    // one higher because it also lists the period as the last interval).
+    const auto name = "diss-" + kind + "-" + juce::String ((int) ratios.size());
     if (! tuning.loadScalaString (scl, name, errorOut))
         return false;
 

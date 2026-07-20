@@ -70,20 +70,47 @@ public:
             g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
             if (label.isNotEmpty())
             {
-                auto top = cell.removeFromTop (cell.getHeight() * 0.56f);
-                g.setFont (juce::Font (juce::FontOptions (juce::jmin (17.0f, w * 0.52f)).withStyle ("Bold")));
+                auto top = cell.removeFromTop (cell.getHeight() * 0.52f);
+                g.setFont (juce::Font (juce::FontOptions (juce::jmin (18.0f, w * 0.5f)).withStyle ("Bold")));
                 g.drawText (juce::String (degree), top, juce::Justification::centred, false);
-                // drawFittedText shrinks the font so "~13/8" / "~317c" never spills
-                // past the cell edges, however narrow the keys are.
-                g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
-                g.drawFittedText (label, cell.reduced (1, 0).toNearestInt(),
-                                  juce::Justification::centredTop, 1, 0.7f);
+                drawIntervalLabel (g, label, cell, w);
             }
             else
             {
                 g.setFont (juce::Font (juce::FontOptions (juce::jmin (18.0f, w * 0.55f)).withStyle ("Bold")));
                 g.drawText (juce::String (degree), cell, juce::Justification::centred, false);
             }
+        }
+    }
+
+    // Draw a just-interval label inside `area`. A fraction "p/q" is drawn STACKED
+    // (numerator over a bar over denominator) so it fits even very narrow keys and
+    // never gets truncated to "..."; anything else (a cents value "317c") is drawn
+    // on one line, auto-shrunk to fit.
+    void drawIntervalLabel (juce::Graphics& g, const juce::String& label,
+                            juce::Rectangle<float> area, float w)
+    {
+        const int slash = label.indexOfChar ('/');
+        if (slash > 0 && label.indexOfChar ('c') < 0)
+        {
+            const auto num = label.substring (0, slash);
+            const auto den = label.substring (slash + 1);
+            auto numArea = area.removeFromTop (area.getHeight() * 0.5f);
+            auto denArea = area;
+            const float fs = juce::jmin (13.0f, numArea.getHeight() * 0.95f, w * 0.42f);
+            g.setFont (juce::Font (juce::FontOptions (fs).withStyle ("Bold")));
+            g.drawFittedText (num, numArea.toNearestInt(), juce::Justification::centredBottom, 1, 0.5f);
+            g.drawFittedText (den, denArea.toNearestInt(), juce::Justification::centredTop,    1, 0.5f);
+            // fraction bar
+            const float bw = juce::jmin (numArea.getWidth() * 0.6f, fs * 1.4f);
+            g.fillRect (juce::Rectangle<float> (numArea.getCentreX() - bw * 0.5f,
+                                                numArea.getBottom() - 0.5f, bw, 1.2f));
+        }
+        else
+        {
+            g.setFont (juce::Font (juce::FontOptions (juce::jmin (12.0f, w * 0.4f)).withStyle ("Bold")));
+            g.drawFittedText (label, area.reduced (1.0f, 0.0f).toNearestInt(),
+                              juce::Justification::centred, 1, 0.4f);
         }
     }
 

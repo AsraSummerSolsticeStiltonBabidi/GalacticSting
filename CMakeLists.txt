@@ -43,7 +43,7 @@ juce_add_plugin(FractalAdditive
     PRODUCT_NAME                "Galactic Sting")
 
 # Embedded assets (title font).
-juce_add_binary_data(GalacticAssets SOURCES assets/fonts/LiquidAlien.ttf)
+juce_add_binary_data(GalacticAssets SOURCES assets/fonts/Jokerman.otf)
 
 target_sources(FractalAdditive PRIVATE
     source/PluginProcessor.cpp

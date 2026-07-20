@@ -284,17 +284,19 @@ int main()
         check (justIntervalName (1.5) == "3/2", "1.5 -> exact 3/2");
         check (justIntervalName (5.0/4.0) == "5/4", "1.25 -> exact 5/4");
         check (justIntervalName (2.0) == "1/1", "octave reduces to 1/1");
-        check (justIntervalName (std::pow (2.0, 7.0/12.0)) == "3/2", "12-TET fifth ~ 3/2 (within 5c -> exact label)");
-        // 12-TET major third is 14c from 5/4 -> approximate label with the ~ prefix.
-        {
-            const auto s = justIntervalName (std::pow (2.0, 4.0/12.0));
-            check (s.rfind ("\xe2\x89\x88", 0) == 0 && s.find ("5/4") != std::string::npos,
-                   "12-TET third -> ~5/4 (approx prefix)");
-        }
-        // A weird inharmonic interval still gets a fraction, never blank.
+        check (justIntervalName (std::pow (2.0, 7.0/12.0)) == "3/2", "12-TET fifth -> 3/2 (within tol)");
+        check (justIntervalName (std::pow (2.0, 4.0/12.0)) == "5/4", "12-TET third -> 5/4 (14c, no ~ symbol)");
+        // No approximation symbol anywhere.
         {
             const auto s = justIntervalName (1.37);
+            check (s.find ("\xe2\x89\x88") == std::string::npos, "no ~ symbol in the label");
             check (! s.empty() && s.find ('/') != std::string::npos, "1.37 -> a fraction (weird timbre, not blank)");
+        }
+        // A ratio far from any low-denominator ratio -> cents, ending in 'c'.
+        {
+            const auto s = justIntervalName (std::pow (2.0, 550.0/1200.0)); // 550c, between 4/3 and 7/5-ish
+            check (! s.empty(), "far interval -> non-blank");
+            check (s.back() == 'c' || s.find ('/') != std::string::npos, "far interval -> cents or a fraction");
         }
         check (justIntervalName (0.0).empty() && justIntervalName (-1.0).empty(), "non-positive ratio -> blank");
     }

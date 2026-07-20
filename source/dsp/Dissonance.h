@@ -28,12 +28,11 @@ namespace dissonance
     struct Partial { double freq; double amp; };
 
     // Short label for a scale-degree ratio (reduced into one octave): the simplest
-    // fraction that approximates it, via continued-fraction convergents with
-    // denominator <= 16. Exact -> "3/2"; close -> "~3/2"; otherwise the cents
-    // value "~317c". So an inharmonic (weird-timbre) interval that lands on no
-    // simple just ratio still gets an approximate fraction, never a blank. The
-    // "~" is UTF-8 U+2248. Pure C++ so it is unit-tested in SpectrumTests.
-    inline std::string justIntervalName (double ratio)
+    // fraction that approximates it (continued-fraction convergents, denominator
+    // <= 16) when one is within `fracTolCents`; otherwise the interval in cents
+    // ("317c"), which is itself the honest "no simple ratio" indicator. Never
+    // blank for a valid ratio. Pure C++ so it is unit-tested in SpectrumTests.
+    inline std::string justIntervalName (double ratio, double fracTolCents = 16.0)
     {
         if (! std::isfinite (ratio) || ratio <= 0.0)
             return {};
@@ -56,13 +55,9 @@ namespace dissonance
 
         const double centsR  = 1200.0 * std::log2 (ratio);
         const double centsPQ = 1200.0 * std::log2 ((double) p / (double) q);
-        const double err     = std::abs (centsR - centsPQ);
-        const std::string f  = std::to_string (p) + "/" + std::to_string (q);
-        const char* approx   = "\xe2\x89\x88"; // U+2248
-
-        if (err < 5.0)  return f;
-        if (err < 28.0) return approx + f;
-        return approx + std::to_string ((long long) std::llround (centsR)) + "c";
+        if (std::abs (centsR - centsPQ) < fracTolCents)
+            return std::to_string (p) + "/" + std::to_string (q); // plain fraction
+        return std::to_string ((long long) std::llround (centsR)) + "c"; // cents
     }
 
     // Sethares' pairwise sensory-dissonance measure (verbatim constants).

@@ -8,7 +8,7 @@ namespace
     const juce::Typeface::Ptr& titleTypeface()
     {
         static juce::Typeface::Ptr tf = juce::Typeface::createSystemTypefaceFor (
-            BinaryData::LiquidAlien_ttf, (size_t) BinaryData::LiquidAlien_ttfSize);
+            BinaryData::Jokerman_otf, (size_t) BinaryData::Jokerman_otfSize);
         return tf;
     }
 
@@ -294,7 +294,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     lastTimbreActive = processorRef.isTimbreActive();
 
     setWantsKeyboardFocus (true);
-    setSize (1280, 616); // still fits a 720p work area incl. the standalone's Options bar
+    setSize (1280, 636); // still fits a 720p work area incl. the standalone's Options bar
     startTimerHz (30); // also the reconcile rate for stuck/ghost computer-keyboard notes
     juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<juce::Component> (this)]
     { if (safe != nullptr) safe->grabKeyboardFocus(); });
@@ -363,7 +363,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblRes.setText       (tr ("Res", "Res"), dontSendNotification);
     lblEnvAmt.setText    (tr ("Env", "Env"), dontSendNotification);
     lblTimbreRepeats.setText (tr ("Reps", "Reps"), dontSendNotification);
-    lblBend.setText      (tr ("Bend", "Bend"), dontSendNotification);
+    lblBend.setText      (tr ("Pitch bend", "Pitch bend"), dontSendNotification);
     recentLabel.setText  (tr ("Recent", "Recents"), dontSendNotification);
 
     loadSclButton.setButtonText    (tr ("Load .scl", "Obrir .scl"));
@@ -741,7 +741,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colour (0xff0c0c12));
 
-    auto titleArea = getLocalBounds().removeFromTop (60);
+    auto titleArea = getLocalBounds().removeFromTop (68);
     g.setColour (juce::Colour (0xff2a2a3c));
     g.fillRect (0, titleArea.getBottom() - 1, getWidth(), 1);
 
@@ -751,8 +751,8 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     const auto title = catalan ? juce::String::fromUTF8 ("FIBL\xc3\x93 GAL\xc3\x80" "CTIC")
                                : juce::String ("GALACTIC STING");
     const juce::Font titleFont = titleTypeface() != nullptr
-        ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (50.0f))
-        : juce::Font (juce::FontOptions (40.0f).withStyle ("Bold"));
+        ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (58.0f))
+        : juce::Font (juce::FontOptions (44.0f).withStyle ("Bold"));
     g.setFont (titleFont);
 
     const int L = title.length();
@@ -779,7 +779,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 void FractalAdditiveAudioProcessorEditor::resized()
 {
     auto full = getLocalBounds();
-    auto titleBar = full.removeFromTop (60);
+    auto titleBar = full.removeFromTop (68);
     langButton.setBounds (titleBar.removeFromRight (86).withSizeKeepingCentre (66, 24));
     auto presetArea = titleBar.removeFromLeft (272).reduced (10, 0);
     presetBox.setBounds (presetArea.removeFromLeft (190).withSizeKeepingCentre (190, 24));
@@ -789,7 +789,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
     auto area = full.reduced (6, 4);
 
     {
-        auto kb = area.removeFromBottom (78).reduced (2, 5);
+        auto kb = area.removeFromBottom (88).reduced (2, 5);
         keyboard.setRange (36);
         keyboard.setBounds (kb);
     }
@@ -905,8 +905,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
             tuningStatusLabel.setBounds (ti.removeFromTop (18));
             ti.removeFromTop (2);
             auto bendRow = ti.removeFromTop (22);
-            lblBend.setBounds (bendRow.removeFromLeft (44));
-            compact (bendBox, bendRow.removeFromLeft (juce::jmin (130, bendRow.getWidth())));
+            lblBend.setJustificationType (juce::Justification::centredLeft);
+            lblBend.setBounds (bendRow.removeFromLeft (74));
+            compact (bendBox, bendRow.removeFromLeft (juce::jmin (120, bendRow.getWidth())));
             ti.removeFromTop (2);
             auto dRow = ti.removeFromTop (22);
             dissBtn.setBounds (dRow.removeFromLeft (88).reduced (1, 0));
@@ -1032,7 +1033,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     {
         case 1:  ts = processorRef.tuningHasMaster() ? "MTS-ESP: " + processorRef.tuningScaleName()
                                                      : tr ("MTS-ESP (no master)", "MTS-ESP (sense mestre)"); break;
-        case 2:  ts = processorRef.tuningHasScala()  ? "Scala: " + processorRef.tuningScaleName()
+        case 2:  ts = processorRef.tuningHasScala()  ? tr ("Loaded: ", "Carregat: ") + processorRef.tuningScaleName()
                                                      : tr ("Scala (no file)", "Scala (sense fitxer)"); break;
         default: ts = tr ("12-TET (A=440)", "12-TET (La=440)"); break;
     }
