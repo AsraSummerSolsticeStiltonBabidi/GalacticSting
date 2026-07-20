@@ -70,11 +70,14 @@ public:
             g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
             if (label.isNotEmpty())
             {
-                auto top = cell.removeFromTop (cell.getHeight() * 0.58f);
+                auto top = cell.removeFromTop (cell.getHeight() * 0.56f);
                 g.setFont (juce::Font (juce::FontOptions (juce::jmin (17.0f, w * 0.52f)).withStyle ("Bold")));
                 g.drawText (juce::String (degree), top, juce::Justification::centred, false);
-                g.setFont (juce::Font (juce::FontOptions (juce::jmin (12.0f, w * 0.42f)).withStyle ("Bold")));
-                g.drawText (label, cell, juce::Justification::centredTop, false);
+                // drawFittedText shrinks the font so "~13/8" / "~317c" never spills
+                // past the cell edges, however narrow the keys are.
+                g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+                g.drawFittedText (label, cell.reduced (1, 0).toNearestInt(),
+                                  juce::Justification::centredTop, 1, 0.7f);
             }
             else
             {

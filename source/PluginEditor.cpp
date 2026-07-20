@@ -1,5 +1,6 @@
 #include "PluginEditor.h"
 #include "BinaryData.h"
+#include "dsp/Dissonance.h"
 
 namespace
 {
@@ -27,27 +28,10 @@ namespace
     const juce::Colour cLoad      { 0xff2fb155 }; // green = Load buttons
     const juce::Colour cReset     { 0xffe0453f }; // red   = Reset / Off buttons
 
-    // Nearest just-intonation interval name for a ratio, reduced into one octave.
-    // Empty if nothing common is within ~14 cents (so arbitrary scales stay blank).
+    // UI wrapper over the (unit-tested, pure-C++) label logic in Dissonance.h.
     juce::String justName (double ratio)
     {
-        if (! std::isfinite (ratio) || ratio <= 0.0) // guard NaN/inf/<=0 (inf would loop below)
-            return {};
-        while (ratio >= 2.0 - 1.0e-9) ratio *= 0.5;
-        while (ratio < 1.0)           ratio *= 2.0;
-        struct J { const char* name; double r; };
-        static const J tbl[] = {
-            { "1/1", 1.0 }, { "16/15", 16.0/15 }, { "9/8", 9.0/8 }, { "7/6", 7.0/6 },
-            { "6/5", 6.0/5 }, { "5/4", 5.0/4 }, { "4/3", 4.0/3 }, { "7/5", 7.0/5 },
-            { "3/2", 3.0/2 }, { "8/5", 8.0/5 }, { "5/3", 5.0/3 }, { "7/4", 7.0/4 },
-            { "9/5", 9.0/5 }, { "15/8", 15.0/8 } };
-        double best = 1.0e9; const char* bn = nullptr;
-        for (const auto& j : tbl)
-        {
-            const double c = std::abs (1200.0 * std::log2 (ratio / j.r));
-            if (c < best) { best = c; bn = j.name; }
-        }
-        return (best < 14.0 && bn != nullptr) ? juce::String (bn) : juce::String();
+        return juce::String::fromUTF8 (dissonance::justIntervalName (ratio).c_str());
     }
 
     // Contiguous scale-degree layout (not a piano): the home row A..L is degrees

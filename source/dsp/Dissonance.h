@@ -21,10 +21,49 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <string>
 
 namespace dissonance
 {
     struct Partial { double freq; double amp; };
+
+    // Short label for a scale-degree ratio (reduced into one octave): the simplest
+    // fraction that approximates it, via continued-fraction convergents with
+    // denominator <= 16. Exact -> "3/2"; close -> "~3/2"; otherwise the cents
+    // value "~317c". So an inharmonic (weird-timbre) interval that lands on no
+    // simple just ratio still gets an approximate fraction, never a blank. The
+    // "~" is UTF-8 U+2248. Pure C++ so it is unit-tested in SpectrumTests.
+    inline std::string justIntervalName (double ratio)
+    {
+        if (! std::isfinite (ratio) || ratio <= 0.0)
+            return {};
+        while (ratio >= 2.0 - 1.0e-9) ratio *= 0.5;
+        while (ratio < 1.0)           ratio *= 2.0;
+
+        constexpr long long maxDen = 16;
+        long long pPrev = 1, p = (long long) std::floor (ratio);
+        long long qPrev = 0, q = 1;
+        double frac = ratio - std::floor (ratio);
+        while (frac > 1.0e-9)
+        {
+            const double y = 1.0 / frac;
+            const long long a = (long long) std::floor (y);
+            const long long pN = a * p + pPrev, qN = a * q + qPrev;
+            if (qN > maxDen) break;
+            pPrev = p; p = pN; qPrev = q; q = qN;
+            frac = y - std::floor (y);
+        }
+
+        const double centsR  = 1200.0 * std::log2 (ratio);
+        const double centsPQ = 1200.0 * std::log2 ((double) p / (double) q);
+        const double err     = std::abs (centsR - centsPQ);
+        const std::string f  = std::to_string (p) + "/" + std::to_string (q);
+        const char* approx   = "\xe2\x89\x88"; // U+2248
+
+        if (err < 5.0)  return f;
+        if (err < 28.0) return approx + f;
+        return approx + std::to_string ((long long) std::llround (centsR)) + "c";
+    }
 
     // Sethares' pairwise sensory-dissonance measure (verbatim constants).
     inline double dissmeasure (std::vector<Partial> p)
