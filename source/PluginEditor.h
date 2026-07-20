@@ -70,6 +70,73 @@ private:
         }
     };
 
+    // Sorted list of the generated scale's degrees: colour chip + interval label
+    // + dissonance height on a green->yellow->red gradient. Data set by the timer
+    // whenever a new scale is generated.
+    struct DissDegreeList : juce::Component
+    {
+        struct Row { juce::String num, label, value; juce::Colour chip, valueCol; };
+        std::vector<Row> rows;
+        void paint (juce::Graphics& g) override
+        {
+            if (rows.empty())
+                return;
+            // floor 13 px: even 25 rows (24 degrees + period) fit the panel height
+            const int rowH = juce::jlimit (13, 22, getHeight() / juce::jmax (1, (int) rows.size()));
+            int y = 0;
+            for (const auto& r : rows)
+            {
+                if (y + rowH > getHeight()) break;
+                auto chipR = juce::Rectangle<int> (0, y + 1, rowH - 2, rowH - 2);
+                g.setColour (r.chip);
+                g.fillRoundedRectangle (chipR.toFloat(), 3.0f);
+                g.setColour (r.chip.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
+                g.setFont (juce::Font (juce::FontOptions ((float) rowH * 0.62f).withStyle ("Bold")));
+                g.drawText (r.num, chipR, juce::Justification::centred, false);
+
+                g.setColour (juce::Colour (0xffb9c0d0));
+                g.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
+                g.drawText (r.label, rowH + 4, y, 70, rowH, juce::Justification::centredLeft, false);
+
+                g.setColour (r.valueCol);
+                g.drawText (r.value, rowH + 78, y, getWidth() - rowH - 78, rowH,
+                            juce::Justification::centredLeft, false);
+                y += rowH;
+            }
+        }
+    };
+
+    // Closable floating notice (e.g. "only N minima exist"). Click X to dismiss.
+    struct NoticeOverlay : juce::Component
+    {
+        juce::String title, body;
+        juce::TextButton closeBtn { "X" };
+        NoticeOverlay()
+        {
+            closeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
+            closeBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+            closeBtn.onClick = [this] { setVisible (false); };
+            addAndMakeVisible (closeBtn);
+        }
+        void resized() override { closeBtn.setBounds (getWidth() - 28, 6, 22, 22); }
+        void paint (juce::Graphics& g) override
+        {
+            auto r = getLocalBounds().toFloat();
+            g.setColour (juce::Colour (0xf2141a24));
+            g.fillRoundedRectangle (r, 10.0f);
+            g.setColour (juce::Colour (0xff5cb8ff));
+            g.drawRoundedRectangle (r.reduced (1.5f), 10.0f, 3.0f);
+            auto in = getLocalBounds().reduced (22, 14);
+            g.setColour (juce::Colour (0xff5cb8ff));
+            g.setFont (juce::Font (juce::FontOptions (17.0f).withStyle ("Bold")));
+            g.drawText (title, in.removeFromTop (24), juce::Justification::centredLeft);
+            in.removeFromTop (6);
+            g.setColour (juce::Colours::white);
+            g.setFont (juce::Font (juce::FontOptions (13.5f)));
+            g.drawFittedText (body, in, juce::Justification::topLeft, 8, 1.0f);
+        }
+    };
+
     // Floating centre panel that explains WHY the current settings are silent.
     struct WarningOverlay : juce::Component
     {
@@ -100,7 +167,7 @@ private:
     ScaleKeyboard keyboard;
 
     SteppedSlider baseNFader, spectrumRangeFader, fractalFader, timbreRepeatsFader;
-    juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader;
+    juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, refAFader;
     juce::Slider  ampAdsr[4], filtAdsr[4];
     juce::ComboBox basePitchBox, whitelistBox, phaseBox, primeModeBox, primeLimitBox, tuningBox, bendBox,
                    dissCountBox;
@@ -108,16 +175,20 @@ private:
     juce::ToggleButton primeToggle[9], dissMaxToggle;
     juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
                      langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3];
+    juce::TextEditor periodEdit;
     WarningOverlay warningOverlay;
+    NoticeOverlay  noticeOverlay;
+    DissDegreeList degreeList;
 
     juce::GroupComponent gBase, gWhitelist, gSlope, gSpectrumRange, gFractal, gPhase, gGain,
-                         gPrime, gFilter, gAmpEnv, gTuning, gTimbre;
+                         gPrime, gFilter, gAmpEnv, gTuning, gTimbre, gSpecScale, gReference;
     juce::Label lblBaseN, lblBasePitch, lblRange, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
-                lblTimbreRepeats, lblBend, tuningStatusLabel, timbreStatusLabel, recentLabel;
+                lblTimbreRepeats, lblBend, lblPeriod, lblRefA,
+                tuningStatusLabel, timbreStatusLabel, recentLabel;
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], primeLbl[9];
 
     std::unique_ptr<SliderAttachment>   baseNAtt, slopeAtt, spectrumRangeAtt, fractalAtt, gainAtt,
-                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt;
+                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, refAAtt;
     std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4];
     std::unique_ptr<ComboBoxAttachment> basePitchAtt, whitelistAtt, phaseAtt,
                                         primeModeAtt, primeLimitAtt, tuningAtt, bendAtt;
@@ -133,6 +204,8 @@ private:
     int  lastPrimeMode = -1;
     bool lastTimbreActive = false;
     int  lastResetOffState = -1; // packs Reset/Off visibility to detect changes for relayout
+    int  lastDissGeneration = 0; // refresh the degree list / shortfall notice once per generation
+    void refreshDegreeList (bool showNotice = true);
     std::map<int, int> heldKeys;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FractalAdditiveAudioProcessorEditor)

@@ -103,13 +103,23 @@ public:
     bool loadPreset (const juce::String& name);
 
     //==========================================================================
-    // "Tune by dissonance curve" (Sethares): analyses the CURRENT spectrum,
-    // builds a .scl from the curve's minima (or maxima in reverse mode), loads
-    // it as the active scale and keeps the text for saving to disk.
-    bool generateDissonanceScale (int count, bool useMaxima, juce::String& errorOut);
+    // "Spectrum to Scale" (Sethares): analyses the CURRENT spectrum, builds a
+    // .scl from the curve's minima (or maxima in reverse mode) over the chosen
+    // period, loads it as the active scale and keeps the text for saving.
+    bool generateDissonanceScale (int count, bool useMaxima, double periodRatio,
+                                  const juce::String& periodSclLine, juce::String& errorOut);
     bool saveGeneratedScl (const juce::File& f, juce::String& errorOut);
     bool hasGeneratedScl() const noexcept { return lastDissScl.isNotEmpty(); }
     juce::String getGeneratedSclName() const { return lastDissName; }
+
+    // Generated-scale degree list for the UI (sorted ascending by curve height).
+    struct DissDegreeInfo { int degree; double ratio; double height; };
+    const std::vector<DissDegreeInfo>& getDissDegrees() const noexcept { return dissDegrees; }
+    double getDissGreenHeight() const noexcept { return dissGreenH; }
+    double getDissRedHeight()   const noexcept { return dissRedH; }
+    int    getDissRequested()   const noexcept { return dissRequested; }
+    int    getDissFound()       const noexcept { return dissFound; }
+    int    getDissGeneration()  const noexcept { return dissGeneration; }
 
     //==========================================================================
     // Shared with the editor:
@@ -143,8 +153,12 @@ private:
     std::unique_ptr<juce::PropertiesFile> appProps;
     juce::StringArray                     recentSclPaths;
 
-    // Last dissonance-generated .scl (text + display name), for saving to disk.
+    // Last dissonance-generated .scl (text + display name), for saving to disk,
+    // plus the degree/height data shown in the Spectrum-to-Scale panel.
     juce::String lastDissScl, lastDissName;
+    std::vector<DissDegreeInfo> dissDegrees;
+    double dissGreenH = 0.0, dissRedH = 1.0;
+    int    dissRequested = 0, dissFound = 0, dissGeneration = 0;
 
     float lastGain = 0.0f;
     int   lastBendApplied = 48; // matches enableLegacyMode(48) in the constructor

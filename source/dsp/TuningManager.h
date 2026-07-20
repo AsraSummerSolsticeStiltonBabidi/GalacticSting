@@ -63,6 +63,15 @@ public:
     void setMode (Mode m) noexcept { mode.store (m, std::memory_order_relaxed); }
     Mode getMode() const noexcept  { return mode.load (std::memory_order_relaxed); }
 
+    // Master reference: A = <hz>. Every mode is transposed by hz/440, so setting
+    // A=432 moves the WHOLE instrument down by ~32 cents without changing ratios.
+    void setReferenceA (double hz) noexcept
+    {
+        if (hz > 0.0 && std::isfinite (hz))
+            refScale.store (hz / 440.0, std::memory_order_relaxed);
+    }
+    double referenceScale() const noexcept { return refScale.load (std::memory_order_relaxed); }
+
     bool hasMtsMaster() const noexcept
     {
         return client != nullptr && MTS_HasMaster (client);
@@ -106,9 +115,11 @@ public:
     }
 
     // Base pitch of a MIDI note under the active tuning (before any pitch bend).
+    // The A=440 reference multiplier applies to every mode ("transpose all").
     double frequencyForNote (int midiNote) const noexcept
     {
         const int n = juce::jlimit (0, 127, midiNote);
+        const double ref = refScale.load (std::memory_order_relaxed);
 
         switch (mode.load (std::memory_order_relaxed))
         {
@@ -116,21 +127,21 @@ public:
                 // -1 channel = "don't care" (recommended for MPE). Falls back to
                 // 12-TET internally when no master is connected.
                 if (client != nullptr)
-                    return MTS_NoteToFrequency (client, (char) n, -1);
+                    return MTS_NoteToFrequency (client, (char) n, -1) * ref;
                 break;
 
             case Mode::Scala:
                 // acquire pairs with the release in loadScalaString so the 128
                 // table writes are guaranteed visible once we observe the flag.
                 if (scalaValid.load (std::memory_order_acquire))
-                    return table[(size_t) n].load (std::memory_order_relaxed);
+                    return table[(size_t) n].load (std::memory_order_relaxed) * ref;
                 break;
 
             case Mode::Equal:
             default:
                 break;
         }
-        return equalFreq (n);
+        return equalFreq (n) * ref;
     }
 
     //== Message thread =======================================================
@@ -220,6 +231,61 @@ public:
         perDegreeOut.push_back (1.0);
         for (int j = 0; j < count - 1; ++j)
             perDegreeOut.push_back (intervals[(size_t) j]);
+        return true;
+    }
+
+    // Parse a scale-period spec typed by the user: an integer ("3"), a fraction
+    // ("3/2"), or cents with a trailing 'c' ("701.955c"). On success returns the
+    // ratio and the exact line to write as the .scl period (ratio kept as a
+    // fraction so it stays exact; cents kept as cents).
+    static bool parsePeriodSpec (const juce::String& textIn, double& ratioOut, juce::String& sclLineOut)
+    {
+        const auto t = textIn.trim().removeCharacters (" \t");
+        if (t.isEmpty())
+            return false;
+
+        const auto validRatio = [&] (double r) { return std::isfinite (r) && r > 1.02 && r <= 16.0; };
+
+        if (t.endsWithIgnoreCase ("c"))
+        {
+            const auto num = t.dropLastCharacters (1);
+            if (! num.containsOnly ("0123456789.")
+                || num.indexOfChar ('.') != num.lastIndexOfChar ('.') || num.isEmpty())
+                return false;
+            const double cents = num.getDoubleValue();
+            const double r = std::pow (2.0, cents / 1200.0);
+            if (! validRatio (r))
+                return false;
+            ratioOut   = r;
+            sclLineOut = juce::String (cents, 5);
+            return true;
+        }
+
+        if (t.containsChar ('/'))
+        {
+            const auto a = t.upToFirstOccurrenceOf ("/", false, false);
+            const auto b = t.fromFirstOccurrenceOf ("/", false, false);
+            if (! a.containsOnly ("0123456789") || ! b.containsOnly ("0123456789")
+                || a.isEmpty() || b.isEmpty())
+                return false;
+            const double num = a.getDoubleValue(), den = b.getDoubleValue();
+            if (den <= 0.0)
+                return false;
+            const double r = num / den;
+            if (! validRatio (r))
+                return false;
+            ratioOut   = r;
+            sclLineOut = a + "/" + b;
+            return true;
+        }
+
+        if (! t.containsOnly ("0123456789"))
+            return false;
+        const double r = t.getDoubleValue();
+        if (! validRatio (r))
+            return false;
+        ratioOut   = r;
+        sclLineOut = t + "/1";
         return true;
     }
 
@@ -425,6 +491,7 @@ private:
 
     MTSClient* client = nullptr;
     std::atomic<Mode> mode { Mode::Equal };
+    std::atomic<double> refScale { 1.0 }; // A-reference / 440
     std::array<std::atomic<double>, 128> table {};
     std::atomic<bool> scalaValid { false };
     std::atomic<int>  scalaDegreeCount { 12 };

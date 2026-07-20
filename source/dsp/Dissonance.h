@@ -27,19 +27,20 @@ namespace dissonance
 {
     struct Partial { double freq; double amp; };
 
-    // Short label for a scale-degree ratio (reduced into one octave): the simplest
-    // fraction that approximates it (continued-fraction convergents, denominator
-    // <= 16) when one is within `fracTolCents`; otherwise the interval in cents
-    // ("317c"), which is itself the honest "no simple ratio" indicator. Never
-    // blank for a valid ratio. Pure C++ so it is unit-tested in SpectrumTests.
-    inline std::string justIntervalName (double ratio, double fracTolCents = 16.0)
+    // Reduce a ratio into [1, 2). Returns 0 for invalid input.
+    inline double octaveReduce (double ratio)
     {
         if (! std::isfinite (ratio) || ratio <= 0.0)
-            return {};
+            return 0.0;
         while (ratio >= 2.0 - 1.0e-9) ratio *= 0.5;
         while (ratio < 1.0)           ratio *= 2.0;
+        return ratio;
+    }
 
-        constexpr long long maxDen = 16;
+    // Simplest integer fraction approximating `ratio` (continued-fraction
+    // convergents, denominator <= maxDen). Returns p/q.
+    inline void bestFraction (double ratio, long long& pOut, long long& qOut, long long maxDen = 16)
+    {
         long long pPrev = 1, p = (long long) std::floor (ratio);
         long long qPrev = 0, q = 1;
         double frac = ratio - std::floor (ratio);
@@ -52,12 +53,28 @@ namespace dissonance
             pPrev = p; p = pN; qPrev = q; q = qN;
             frac = y - std::floor (y);
         }
+        pOut = p; qOut = q;
+    }
+
+    // STRICT, LITERAL label for a scale-degree ratio: an integer fraction ONLY
+    // when the ratio matches it EXACTLY (within `exactTolCents`, a hair's width
+    // that only absorbs floating-point/file rounding); anything else shows its
+    // interval in cents ("317c"). The ratio is NOT folded into an octave - a
+    // degree of 5/2 in a tritave scale labels "5/2" (or its true cents), never
+    // "5/4" - so every label can be trusted literally. Unit-tested.
+    inline std::string justIntervalName (double ratio, double exactTolCents = 0.5)
+    {
+        if (! std::isfinite (ratio) || ratio <= 0.0)
+            return {};
+
+        long long p = 1, q = 1;
+        bestFraction (ratio, p, q);
 
         const double centsR  = 1200.0 * std::log2 (ratio);
-        const double centsPQ = 1200.0 * std::log2 ((double) p / (double) q);
-        if (std::abs (centsR - centsPQ) < fracTolCents)
-            return std::to_string (p) + "/" + std::to_string (q); // plain fraction
-        return std::to_string ((long long) std::llround (centsR)) + "c"; // cents
+        const double centsPQ = (p > 0 && q > 0) ? 1200.0 * std::log2 ((double) p / (double) q) : 1.0e9;
+        if (std::abs (centsR - centsPQ) < exactTolCents)
+            return std::to_string (p) + "/" + std::to_string (q); // exact match only
+        return std::to_string ((long long) std::llround (centsR)) + "c";
     }
 
     // Sethares' pairwise sensory-dissonance measure (verbatim constants).
@@ -140,18 +157,22 @@ namespace dissonance
         return std::pow (2.0, 0.5 * (a + b));
     }
 
+    struct ExtremeInfo { double ratio; double value; };
+
     // The `count` most PROMINENT local minima (or, reversed, maxima) of the curve,
-    // each refined to sub-cent precision, as interval ratios sorted ascending.
+    // each refined to sub-cent precision, with its dissonance height, sorted
+    // ascending by ratio.
     //
     // Ranking is by PROMINENCE (how deep the notch is relative to the flanking
     // opposite extremes), NOT by absolute dissonance: the curve slopes down toward
-    // the octave, so ranking by raw value would crowd the picks near the period
-    // and skip clear notches like 5/4. Unison and the period edge are excluded
-    // (1/1 is implicit in the .scl and the period is appended by the caller).
-    inline std::vector<double> pickExtremes (const std::vector<Partial>& spectrum,
-                                             const std::vector<std::pair<double, double>>& curve,
-                                             int count, bool maxima, double period,
-                                             double edgeCents = 6.0)
+    // the period, so ranking by raw value would crowd the picks near it and skip
+    // clear notches like 5/4. Only a sliver around unison and the period itself is
+    // excluded (1/1 is implicit in the .scl and the period is appended by the
+    // caller) - every other strict local extreme is usable, however wild.
+    inline std::vector<ExtremeInfo> pickExtremes (const std::vector<Partial>& spectrum,
+                                                  const std::vector<std::pair<double, double>>& curve,
+                                                  int count, bool maxima, double period,
+                                                  double edgeCents = 1.5)
     {
         const size_t n = curve.size();
         if (n < 3)
@@ -195,11 +216,15 @@ namespace dissonance
         if ((int) cands.size() > count)
             cands.resize ((size_t) count);
 
-        std::vector<double> ratios;
-        ratios.reserve (cands.size());
+        std::vector<ExtremeInfo> out;
+        out.reserve (cands.size());
         for (const auto& cnd : cands)
-            ratios.push_back (refineExtreme (spectrum, curve[cnd.idx - 1].first, curve[cnd.idx + 1].first, maxima));
-        std::sort (ratios.begin(), ratios.end());
-        return ratios;
+        {
+            const double r = refineExtreme (spectrum, curve[cnd.idx - 1].first, curve[cnd.idx + 1].first, maxima);
+            out.push_back ({ r, dissonanceAt (spectrum, r) });
+        }
+        std::sort (out.begin(), out.end(),
+                   [] (const ExtremeInfo& a, const ExtremeInfo& b) { return a.ratio < b.ratio; });
+        return out;
     }
 }

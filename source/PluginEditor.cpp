@@ -202,6 +202,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addAndMakeVisible (clearTimbreButton);
     configFader (timbreRepeatsFader, "timbreRepeats", timbreRepeatsAtt, cTimbre,
                  "How many times the scale's period stacks into the timbre. More = reaches higher.");
+    timbreRepeatsFader.setSliderStyle (juce::Slider::LinearHorizontal); // compact box
+    timbreRepeatsFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 34, 16);
     makeLabel (lblTimbreRepeats, cTimbre);
     timbreStatusLabel.setJustificationType (juce::Justification::centredLeft);
     timbreStatusLabel.setColour (juce::Label::textColourId, cTimbre);
@@ -240,7 +242,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     configCombo (bendBox, "bendRange", bendAtt, cTuning, {});
     makeLabel (lblBend, cTuning);
 
-    // Tune by dissonance curve (Sethares): generate + count + reverse + save.
+    // "Spectrum to Scale" (Sethares): generate + count + reverse + period + save,
+    // plus the sorted degree/height list.
+    configGroup (gSpecScale, cRange);
+    configGroup (gReference, cGain);
     dissBtn.setColour (juce::TextButton::buttonColourId, cTuning.withAlpha (0.35f));
     dissBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
     dissBtn.setMouseClickGrabsKeyboardFocus (false);
@@ -263,6 +268,37 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     dissSaveBtn.setMouseClickGrabsKeyboardFocus (false);
     dissSaveBtn.onClick = [this] { saveDissonanceScl(); };
     addAndMakeVisible (dissSaveBtn);
+    periodEdit.setText ("2", juce::dontSendNotification);
+    periodEdit.setJustification (juce::Justification::centred);
+    periodEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
+    periodEdit.setColour (juce::TextEditor::outlineColourId, cRange.withAlpha (0.7f));
+    periodEdit.setSelectAllWhenFocused (true);
+    periodEdit.onReturnKey = [this] { refocus(); }; // give the keys back to note-playing
+    periodEdit.onEscapeKey = [this] { refocus(); };
+    addAndMakeVisible (periodEdit);
+    makeLabel (lblPeriod, cRange);
+    addAndMakeVisible (degreeList);
+
+    // Master reference A = <hz> (transposes everything, all tuning modes).
+    refAFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    refAFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 62, 18);
+    refAFader.setColour (juce::Slider::thumbColourId, cGain);
+    refAFader.setColour (juce::Slider::trackColourId, cGain.withAlpha (0.55f));
+    refAFader.setColour (juce::Slider::textBoxTextColourId, juce::Colours::white);
+    refAFader.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+    refAFader.setMouseClickGrabsKeyboardFocus (false);
+    refAFader.setVelocityModeParameters (0.6, 1, 0.06, true, juce::ModifierKeys::ctrlModifier);
+    refAFader.onDragEnd = [this] { refocus(); };
+    addAndMakeVisible (refAFader);
+    refAAtt = std::make_unique<SliderAttachment> (processorRef.apvts, "refA", refAFader);
+    makeLabel (lblRefA, cGain);
+
+    addChildComponent (noticeOverlay);
+
+    // A generation may already exist (editor reopened): repopulate the degree
+    // list WITHOUT resurrecting an already-dismissed shortfall notice.
+    lastDissGeneration = processorRef.getDissGeneration();
+    refreshDegreeList (false);
 
     // Floating "why is this silent?" explainer (shown by the timer when the
     // template is empty).
@@ -287,6 +323,27 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addAndMakeVisible (helpLabel);
 
     keyboard.setDegreeLabeller ([this] (int d) { return justName (processorRef.getDegreeRatio (d)); });
+    keyboard.setHoverTextProvider ([this] (int d) -> juce::String
+    {
+        // LITERAL interval of this key vs the tonic - no octave folding, so a
+        // 5/2 degree in a tritave scale reads as 5/2 / 1586 c, never "5/4".
+        const double ratio = processorRef.getDegreeRatio (d);
+        if (! (ratio > 0.0) || ! std::isfinite (ratio))
+            return {};
+        const double cents = 1200.0 * std::log2 (ratio);
+        long long p = 1, q = 1;
+        dissonance::bestFraction (ratio, p, q);
+        const double fracCents = 1200.0 * std::log2 ((double) p / (double) q);
+        const auto frac = juce::String (p) + "/" + juce::String (q);
+
+        if (std::abs (cents - fracCents) < 0.5) // the key IS this ratio -> show it in cents
+            return frac + " = " + juce::String (cents, 2) + " c";
+
+        // Cents key -> nearest simple just interval + signed error.
+        const int err = juce::roundToInt (cents - fracCents);
+        return juce::String (cents, 2) + " c   (" + frac + (err >= 0 ? " +" : " -")
+             + juce::String (std::abs (err)) + "c)";
+    });
     addAndMakeVisible (keyboard);
 
     applyLanguage();
@@ -353,7 +410,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     gFilter.setText        (tr ("Filter", "Filtre"));
     gAmpEnv.setText        (tr ("Volume Envelope", "Envolupant volum"));
     gTuning.setText        (tr ("Tuning", "Afinaci\xc3\xb3"));
-    gTimbre.setText        (tr (".scl as Timbre", ".scl com a Timbre"));
+    gTimbre.setText        (tr (".scl as Spectrum", ".scl com a Espectre"));
+    gSpecScale.setText     (tr ("Spectrum to Scale", "Espectre a escala"));
+    gReference.setText     (tr ("Reference", "Refer\xc3\xa8ncia"));
 
     lblBaseN.setText     ("N", dontSendNotification);
     lblBasePitch.setText (tr ("Pitch", "To"), dontSendNotification);
@@ -364,6 +423,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblEnvAmt.setText    (tr ("Env", "Env"), dontSendNotification);
     lblTimbreRepeats.setText (tr ("Reps", "Reps"), dontSendNotification);
     lblBend.setText      (tr ("Pitch bend", "Pitch bend"), dontSendNotification);
+    lblPeriod.setText    (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
+    lblRefA.setText      ("A =", dontSendNotification);
     recentLabel.setText  (tr ("Recent", "Recents"), dontSendNotification);
 
     loadSclButton.setButtonText    (tr ("Load .scl", "Obrir .scl"));
@@ -376,8 +437,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     dissMaxToggle.setButtonText    ("Max");
     dissSaveBtn.setButtonText      (tr ("Save", "Desa"));
 
-    helpLabel.setText (tr ("Play: A S D F G H J K L = the scale in order, then Q W E R T Y U I O P continue higher.   Z / X = down / up one scale period.   3+ key chords need an n-key-rollover keyboard (or use MIDI).",
-                           "Toca: A S D F G H J K L = l'escala en ordre, i Q W E R T Y U I O P segueixen m\xc3\xa9s agudes.   Z / X = avall / amunt un per\xc3\xado" "de.   Acords de 3+ tecles: cal un teclat amb n-key rollover (o MIDI)."),
+    helpLabel.setText (tr ("Play: A S D F G H J K L = the scale in order, then Q W E R T Y U I O P continue higher.   Z / X = down / up one scale period.",
+                           "Toca: A S D F G H J K L = l'escala en ordre, i Q W E R T Y U I O P segueixen m\xc3\xa9s agudes.   Z / X = avall / amunt un per\xc3\xado" "de."),
                        dontSendNotification);
 
     //-- Tooltips: one idea per sentence, no loose ends. ------------------------
@@ -464,6 +525,12 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     dissSaveBtn.setTooltip (tr (
         "Save the generated scale as a .scl file (it also joins the Recent list).",
         "Desa l'escala generada com a fitxer .scl (tamb\xc3\xa9 s'afegeix a Recents)."));
+    periodEdit.setTooltip (tr (
+        "Period of the generated scale: an integer (\"3\"), a fraction (\"3/2\"), or cents with a trailing c (\"701.955c\"). Default 2 = octave. Wider periods find new extremes inside them; narrower ones omit those outside.",
+        "Per\xc3\xado" "de de l'escala generada: un enter (\"3\"), una fracci\xc3\xb3 (\"3/2\") o cents amb una c final (\"701.955c\"). Per defecte 2 = octava. Un per\xc3\xado" "de m\xc3\xa9s ample troba nous extrems a dins; un de m\xc3\xa9s estret omet els de fora."));
+    refAFader.setTooltip (tr (
+        "Reference pitch: A = this many Hz (default 440). Transposes the WHOLE instrument in every tuning mode. Hold Ctrl for fine control.",
+        "To de refer\xc3\xa8ncia: La = aquests Hz (per defecte 440). Transposa TOT l'instrument en qualsevol mode d'afinaci\xc3\xb3. Mant\xc3\xa9n Ctrl per a ajust fi."));
 
     auto localise = [] (juce::ComboBox& b, const juce::StringArray& items)
     {
@@ -537,13 +604,73 @@ void FractalAdditiveAudioProcessorEditor::savePresetFlow()
 
 void FractalAdditiveAudioProcessorEditor::runDissonanceTune()
 {
+    double periodRatio = 2.0;
+    juce::String periodLine = "2/1";
+    if (! TuningManager::parsePeriodSpec (periodEdit.getText(), periodRatio, periodLine))
+    {
+        juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+            tr ("Spectrum to Scale", "Espectre a escala"),
+            tr ("Invalid period. Use an integer (\"3\"), a fraction (\"3/2\"), or cents with a trailing c (\"701.955c\").",
+                "Per\xc3\xado" "de no v\xc3\xa0lid. Fes servir un enter (\"3\"), una fracci\xc3\xb3 (\"3/2\") o cents amb una c final (\"701.955c\")."),
+            this);
+        refocus();
+        return;
+    }
+
     const int  n      = juce::jmax (1, dissCountBox.getSelectedId());
     const bool maxima = dissMaxToggle.getToggleState();
     juce::String err;
-    if (! processorRef.generateDissonanceScale (n, maxima, err))
+    if (! processorRef.generateDissonanceScale (n, maxima, periodRatio, periodLine, err))
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-            tr ("Dissonance tuning", "Afinaci\xc3\xb3 per dissonancia"), err, this);
+            tr ("Spectrum to Scale", "Espectre a escala"), err, this);
     refocus();
+}
+
+void FractalAdditiveAudioProcessorEditor::refreshDegreeList (bool showNotice)
+{
+    const auto& degs = processorRef.getDissDegrees();
+    const double g0 = processorRef.getDissGreenHeight();
+    const double r0 = processorRef.getDissRedHeight();
+    const int    D  = processorRef.getDissFound() + 1; // degrees per period incl. the tonic
+
+    degreeList.rows.clear();
+    for (const auto& d : degs)
+    {
+        DissDegreeList::Row row;
+        row.num   = juce::String (d.degree);
+        row.label = juce::String::fromUTF8 (dissonance::justIntervalName (d.ratio).c_str());
+        row.value = juce::String (d.height, 2);
+        row.chip  = juce::Colour::fromHSV (0.82f * (float) d.degree / (float) juce::jmax (1, D), 0.62f, 0.9f, 1.0f);
+
+        // green (period height) -> yellow -> red (curve max).
+        const double t = juce::jlimit (0.0, 1.0, (d.height - g0) / juce::jmax (1.0e-12, r0 - g0));
+        const juce::Colour green (0xff3ec659), yellow (0xffe8d44d), red (0xffe0453f);
+        row.valueCol = t < 0.5 ? green.interpolatedWith (yellow, (float) (t * 2.0))
+                               : yellow.interpolatedWith (red, (float) ((t - 0.5) * 2.0));
+        degreeList.rows.push_back (std::move (row));
+    }
+    degreeList.repaint();
+
+    // Fewer extremes than requested -> closable notice explaining why. A
+    // generation that satisfies the request dismisses any stale notice.
+    if (processorRef.getDissFound() >= processorRef.getDissRequested() || ! showNotice)
+    {
+        if (processorRef.getDissFound() >= processorRef.getDissRequested())
+            noticeOverlay.setVisible (false);
+    }
+    else
+    {
+        noticeOverlay.title = tr ("Fewer degrees than requested", "Menys graus dels demanats");
+        noticeOverlay.body  = tr ("You asked for ", "N'has demanat ")
+            + juce::String (processorRef.getDissRequested())
+            + tr (" but this timbre's dissonance curve only has ", " per\xc3\xb2 la corba de dissonancia d'aquest timbre nom\xc3\xa9s t\xc3\xa9 ")
+            + juce::String (processorRef.getDissFound())
+            + tr (" usable extremes in the chosen period. A curve only forms a notch where partials interact; sparse spectra (few partials, e.g. a near-sine) form few notches - a pure sine forms none. The scale was generated with all the extremes that exist. Add partials (higher N, Fractal, flatter Slope) or widen the period for more.",
+                  " extrems usables dins del per\xc3\xado" "de triat. La corba nom\xc3\xa9s fa un clot on els parcials interactuen; els espectres escassos (pocs parcials) en fan pocs - un sinus pur no en fa cap. L'escala s'ha generat amb tots els extrems existents. Afegeix parcials (N m\xc3\xa9s alta, Fractal, Pendent m\xc3\xa9s pla) o eixampla el per\xc3\xado" "de per obtenir-ne m\xc3\xa9s.");
+        noticeOverlay.setVisible (true);
+        noticeOverlay.toFront (false);
+        noticeOverlay.repaint();
+    }
 }
 
 void FractalAdditiveAudioProcessorEditor::saveDissonanceScl()
@@ -745,34 +872,56 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     g.setColour (juce::Colour (0xff2a2a3c));
     g.fillRect (0, titleArea.getBottom() - 1, getWidth(), 1);
 
-    // Title in Jokerman, centred, one colour per letter following the colour
-    // keyboard's logic: a red->violet sweep that wraps so the FIRST and LAST
-    // letters are both red (one full "period" across the title).
-    const auto title = catalan ? juce::String::fromUTF8 ("FIBL\xc3\x93 GAL\xc3\x80" "CTIC")
-                               : juce::String ("GALACTIC STING");
-    const juce::Font titleFont = titleTypeface() != nullptr
-        ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (58.0f))
-        : juce::Font (juce::FontOptions (44.0f).withStyle ("Bold"));
-    g.setFont (titleFont);
-
+    // Title: Title Case, every letter inside a coloured square (keyboard hue
+    // logic, first and last letter red), letter drawn black or white by the
+    // square's brightness - exactly like the keys. Letter sizes vary notably
+    // (deterministic pattern) but stay legible.
+    const auto title = catalan ? juce::String::fromUTF8 ("Fibl\xc3\xb3 Gal\xc3\xa0" "ctic")
+                               : juce::String ("Galactic Sting");
     const int L = title.length();
-    std::vector<int> widths ((size_t) L);
-    int total = 0;
+    const int period = juce::jmax (1, L - 1); // last letter wraps to degree 0 = red
+
+    const float baseH = 44.0f;
+    const auto sizeOf = [baseH] (int i)      // scrambled 5-step size cycle, 58%..100%
+    { return baseH * (0.58f + 0.42f * (float) ((i * 7) % 5) / 4.0f); };
+
+    // First pass: measure.
+    std::vector<float> sides ((size_t) L);
+    std::vector<juce::Font> fonts;
+    fonts.reserve ((size_t) L);
+    float total = 0.0f;
     for (int i = 0; i < L; ++i)
     {
-        widths[(size_t) i] = juce::GlyphArrangement::getStringWidthInt (titleFont, title.substring (i, i + 1));
-        total += widths[(size_t) i];
+        const float h = sizeOf (i);
+        juce::Font f = titleTypeface() != nullptr
+            ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (h))
+            : juce::Font (juce::FontOptions (h * 0.85f).withStyle ("Bold"));
+        fonts.push_back (f);
+        if (title[i] == ' ')
+            sides[(size_t) i] = 14.0f; // word gap, no square
+        else
+            sides[(size_t) i] = (float) juce::jmax (
+                juce::GlyphArrangement::getStringWidthInt (f, title.substring (i, i + 1)) + 8, (int) (h * 0.9f));
+        total += sides[(size_t) i] + 3.0f;
     }
 
-    int x = (getWidth() - total) / 2;
-    const int period = juce::jmax (1, L - 1); // last letter wraps back to degree 0 = red
+    float x = ((float) getWidth() - total) * 0.5f;
+    const float cy = (float) titleArea.getCentreY();
     for (int i = 0; i < L; ++i)
     {
-        const float hue = 0.82f * (float) (i % period) / (float) period;
-        g.setColour (juce::Colour::fromHSV (hue, 0.72f, 1.0f, 1.0f));
-        g.drawText (title.substring (i, i + 1), x, titleArea.getY() + 4,
-                    widths[(size_t) i], titleArea.getHeight() - 8, juce::Justification::centred, false);
-        x += widths[(size_t) i];
+        const float side = sides[(size_t) i];
+        if (title[i] != ' ')
+        {
+            const float hue = 0.82f * (float) (i % period) / (float) period;
+            const auto sq = juce::Rectangle<float> (x, cy - side * 0.5f, side, side);
+            const auto col = juce::Colour::fromHSV (hue, 0.62f, 0.9f, 1.0f); // same S/V as the keys
+            g.setColour (col);
+            g.fillRoundedRectangle (sq, 5.0f);
+            g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
+            g.setFont (fonts[(size_t) i]);
+            g.drawText (title.substring (i, i + 1), sq, juce::Justification::centred, false);
+        }
+        x += side + 3.0f;
     }
 }
 
@@ -812,15 +961,36 @@ void FractalAdditiveAudioProcessorEditor::resized()
         compact (c, r);
     };
 
+    //== Right panel: Spectrum to Scale (full height) ===========================
+    {
+        auto sp = area.removeFromRight (254);
+        gSpecScale.setBounds (sp.reduced (3));
+        auto si = sp.reduced (3).reduced (8, 5); si.removeFromTop (16);
+        auto r1 = si.removeFromTop (24);
+        dissBtn.setBounds (r1.removeFromLeft (r1.getWidth() - 56).reduced (1, 0));
+        r1.removeFromLeft (4);
+        compact (dissCountBox, r1);
+        si.removeFromTop (4);
+        auto r2 = si.removeFromTop (24);
+        lblPeriod.setBounds (r2.removeFromLeft (50));
+        periodEdit.setBounds (r2.removeFromLeft (62).reduced (0, 1));
+        r2.removeFromLeft (4);
+        dissMaxToggle.setBounds (r2.removeFromLeft (52));
+        dissSaveBtn.setBounds (r2.reduced (1, 0));
+        si.removeFromTop (6);
+        degreeList.setBounds (si);
+    }
+    area.removeFromRight (2);
+
     const int rowH = (area.getHeight() - 4) / 2;
 
-    //== Row 1: Base | (Harmonics over Prime Control) | Slope | Range | Fractal | Phase | Gain
+    //== Row 1: Base | (Harmonics over Prime) | Slope | Range | Fractal | (Phase over Gain)
     {
         auto row = area.removeFromTop (rowH).reduced (0, 2);
-        const int u = row.getWidth() / 9;
+        const int W = row.getWidth();
 
         {
-            auto bb = row.removeFromLeft (u * 2);
+            auto bb = row.removeFromLeft (W * 19 / 100);
             gBase.setBounds (bb.reduced (3));
             auto bi = bb.reduced (3).reduced (6, 4); bi.removeFromTop (16);
             auto left = bi.removeFromLeft (bi.getWidth() / 2);
@@ -828,11 +998,15 @@ void FractalAdditiveAudioProcessorEditor::resized()
             lblBasePitch.setBounds (bi.removeFromTop (13)); compact (basePitchBox, bi);
         }
 
-        // Harmonics stacked on top of Prime Control, sharing one 2u-wide column.
+        // Harmonics stacked on top of Prime Control.
         {
-            auto colBox = row.removeFromLeft (u * 2);
+            auto colBox = row.removeFromLeft (W * 28 / 100);
             auto hb = colBox.removeFromTop (colBox.getHeight() * 2 / 5);
-            oneCombo (hb, gWhitelist, whitelistBox);
+            {
+                gWhitelist.setBounds (hb.reduced (3));
+                auto r = hb.reduced (3).reduced (6, 4); r.removeFromTop (14);
+                compact (whitelistBox, r);
+            }
 
             const bool wl = processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f;
             primeLimitBox.setVisible (! wl); lblPrimeLimit.setVisible (! wl);
@@ -859,11 +1033,20 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
         }
 
-        oneFader (row.removeFromLeft (u), gSlope,         slopeFader,         nullptr);
-        oneFader (row.removeFromLeft (u), gSpectrumRange, spectrumRangeFader, &lblRange);
-        oneFader (row.removeFromLeft (u), gFractal,       fractalFader,       nullptr);
-        oneCombo (row.removeFromLeft (u), gPhase,         phaseBox);
-        oneFader (row,                    gGain,          gainFader,          nullptr);
+        // Narrow single-fader boxes.
+        oneFader (row.removeFromLeft (W * 12 / 100), gSlope,         slopeFader,         nullptr);
+        oneFader (row.removeFromLeft (W * 12 / 100), gSpectrumRange, spectrumRangeFader, &lblRange);
+        oneFader (row.removeFromLeft (W * 12 / 100), gFractal,       fractalFader,       nullptr);
+
+        // Phase (combo only, short box) stacked over Gain.
+        {
+            auto colBox = row;
+            auto ph = colBox.removeFromTop (juce::jmin (76, colBox.getHeight() * 2 / 5));
+            gPhase.setBounds (ph.reduced (3));
+            auto pr = ph.reduced (3).reduced (6, 4); pr.removeFromTop (14);
+            compact (phaseBox, pr);
+            oneFader (colBox, gGain, gainFader, nullptr);
+        }
     }
 
     //== Row 2: Filter | Volume Env | Tuning(+Recent) | Timbre ==================
@@ -871,16 +1054,16 @@ void FractalAdditiveAudioProcessorEditor::resized()
         auto row = area.removeFromTop (rowH).reduced (0, 2);
         const int W = row.getWidth();
 
-        layoutFaders (gFilter, row.removeFromLeft (W * 4 / 10), cFilter,
+        layoutFaders (gFilter, row.removeFromLeft (W * 34 / 100), cFilter,
             { &cutoffFader, &resFader, &fEnvAmtFader, &filtAdsr[0], &filtAdsr[1], &filtAdsr[2], &filtAdsr[3] },
             { &lblCutoff, &lblRes, &lblEnvAmt, &filtAdsrLbl[0], &filtAdsrLbl[1], &filtAdsrLbl[2], &filtAdsrLbl[3] });
 
-        layoutFaders (gAmpEnv, row.removeFromLeft (W * 2 / 10), cEnv,
+        layoutFaders (gAmpEnv, row.removeFromLeft (W * 20 / 100), cEnv,
             { &ampAdsr[0], &ampAdsr[1], &ampAdsr[2], &ampAdsr[3] },
             { &ampAdsrLbl[0], &ampAdsrLbl[1], &ampAdsrLbl[2], &ampAdsrLbl[3] });
 
         {
-            auto tb = row.removeFromLeft (W * 25 / 100);
+            auto tb = row.removeFromLeft (W * 27 / 100);
             gTuning.setBounds (tb.reduced (3));
             auto ti = tb.reduced (3).reduced (8, 5); ti.removeFromTop (15);
             compact (tuningBox, ti.removeFromTop (24)); ti.removeFromTop (4);
@@ -908,22 +1091,15 @@ void FractalAdditiveAudioProcessorEditor::resized()
             lblBend.setJustificationType (juce::Justification::centredLeft);
             lblBend.setBounds (bendRow.removeFromLeft (74));
             compact (bendBox, bendRow.removeFromLeft (juce::jmin (120, bendRow.getWidth())));
-            ti.removeFromTop (2);
-            auto dRow = ti.removeFromTop (22);
-            dissBtn.setBounds (dRow.removeFromLeft (88).reduced (1, 0));
-            dRow.removeFromLeft (3);
-            compact (dissCountBox, dRow.removeFromLeft (52));
-            dRow.removeFromLeft (3);
-            dissMaxToggle.setBounds (dRow.removeFromLeft (52));
-            dRow.removeFromLeft (3);
-            dissSaveBtn.setBounds (dRow.reduced (1, 0));
         }
 
+        // Right column: ".scl as Spectrum" (compact, horizontal fader) over "Reference".
         {
-            auto tb = row;
-            gTimbre.setBounds (tb.reduced (3));
-            auto ti = tb.reduced (3).reduced (8, 5); ti.removeFromTop (15);
-            auto brow = ti.removeFromTop (23);
+            auto colBox = row;
+            auto sb = colBox.removeFromTop (colBox.getHeight() * 55 / 100);
+            gTimbre.setBounds (sb.reduced (3));
+            auto ti = sb.reduced (3).reduced (8, 4); ti.removeFromTop (15);
+            auto brow = ti.removeFromTop (22);
             const bool offVis = processorRef.isTimbreActive();
             clearTimbreButton.setVisible (offVis);
             if (offVis)
@@ -935,18 +1111,27 @@ void FractalAdditiveAudioProcessorEditor::resized()
             {
                 loadTimbreButton.setBounds (brow.reduced (2, 0));
             }
-            ti.removeFromTop (4);
-            auto fr = ti.removeFromRight (54);
-            lblTimbreRepeats.setBounds (fr.removeFromTop (13));
+            ti.removeFromTop (2);
+            timbreStatusLabel.setBounds (ti.removeFromTop (16));
+            ti.removeFromTop (2);
+            auto fr = ti.removeFromTop (20);
+            lblTimbreRepeats.setJustificationType (juce::Justification::centredLeft);
+            lblTimbreRepeats.setBounds (fr.removeFromLeft (38));
             timbreRepeatsFader.setBounds (fr);
-            ti.removeFromRight (6);
-            timbreStatusLabel.setBounds (ti.removeFromTop (40));
+
+            gReference.setBounds (colBox.reduced (3));
+            auto ri = colBox.reduced (3).reduced (8, 4); ri.removeFromTop (15);
+            auto rrow2 = ri.removeFromTop (24);
+            lblRefA.setJustificationType (juce::Justification::centredLeft);
+            lblRefA.setBounds (rrow2.removeFromLeft (32));
+            refAFader.setBounds (rrow2);
         }
     }
 
     // Floating "silent settings" explainer, centred over everything.
     warningOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (580, 200));
     warningOverlay.toFront (false);
+    noticeOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (560, 220));
 }
 
 void FractalAdditiveAudioProcessorEditor::mouseDown (const juce::MouseEvent&) { grabKeyboardFocus(); }
@@ -975,7 +1160,10 @@ bool FractalAdditiveAudioProcessorEditor::keyStateChanged (bool)
 // so global key presses in other apps never play notes.
 void FractalAdditiveAudioProcessorEditor::pollComputerKeyboard()
 {
-    if (! hasKeyboardFocus (true))
+    // No note-playing while unfocused OR while typing in a text field (the
+    // Period box, a preset name...): letters there must never trigger notes.
+    const bool typing = dynamic_cast<juce::TextEditor*> (juce::Component::getCurrentlyFocusedComponent()) != nullptr;
+    if (! hasKeyboardFocus (true) || typing)
     {
         for (const auto& kv : heldKeys)
             processorRef.keyboardState.noteOff (1, kv.second, 0.0f);
@@ -1064,6 +1252,12 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
 
     const int mode = (int) (processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f);
     if (mode != lastPrimeMode) { lastPrimeMode = mode; resized(); }
+
+    if (processorRef.getDissGeneration() != lastDissGeneration)
+    {
+        lastDissGeneration = processorRef.getDissGeneration();
+        refreshDegreeList();
+    }
 
     const bool timbre = processorRef.isTimbreActive();
     if (timbre != lastTimbreActive)

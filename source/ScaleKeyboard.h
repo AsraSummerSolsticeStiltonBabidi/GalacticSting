@@ -15,6 +15,7 @@
 // the loaded scale's count for Scala, the master's map size for MTS-ESP).
 //==============================================================================
 class ScaleKeyboard : public juce::Component,
+                      public juce::TooltipClient,
                       private juce::Timer
 {
 public:
@@ -36,6 +37,25 @@ public:
     // Optional: a short just-intonation label per degree (e.g. "3/2"), drawn
     // under the degree number - the interval each Sethares minimum lands on.
     void setDegreeLabeller (std::function<juce::String(int)> fn) { getLabel = std::move (fn); }
+
+    // Optional hover text per degree (ratio -> cents, or cents -> nearest just
+    // interval). Shown ONLY after the mouse rests 1.25 s on a key, never while
+    // that key is being clicked/dragged.
+    void setHoverTextProvider (std::function<juce::String(int)> fn) { getHoverText = std::move (fn); }
+
+    juce::String getTooltip() override
+    {
+        if (hoverArmed && hoverCell >= 0 && getHoverText != nullptr)
+        {
+            const int note = baseKey + hoverCell;
+            if (note <= 127)
+            {
+                const int D = juce::jmax (1, getDegrees ? getDegrees() : 12);
+                return getHoverText (((note - kRefKey) % D + D) % D);
+            }
+        }
+        return {};
+    }
 
     void paint (juce::Graphics& g) override
     {
@@ -114,9 +134,25 @@ public:
         }
     }
 
-    void mouseDown (const juce::MouseEvent& e) override { playAt (e.x); }
-    void mouseDrag (const juce::MouseEvent& e) override { playAt (e.x); }
-    void mouseUp   (const juce::MouseEvent&)   override { releaseHeld(); }
+    void mouseDown (const juce::MouseEvent& e) override { hoverArmed = false; playAt (e.x); }
+    void mouseDrag (const juce::MouseEvent& e) override { hoverArmed = false; playAt (e.x); }
+    void mouseUp   (const juce::MouseEvent&)   override
+    {
+        releaseHeld();
+        hoverArmed = false;
+        hoverStartMs = juce::Time::getMillisecondCounter(); // re-arm from scratch
+    }
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        const int cell = noteAt (e.x) >= 0 ? juce::jlimit (0, numCells() - 1, e.x * numCells() / juce::jmax (1, getWidth())) : -1;
+        if (cell != hoverCell)
+        {
+            hoverCell    = cell;
+            hoverArmed   = false;
+            hoverStartMs = juce::Time::getMillisecondCounter();
+        }
+    }
+    void mouseExit (const juce::MouseEvent&) override { hoverCell = -1; hoverArmed = false; }
 
 private:
     static constexpr int kRefKey = 60;
@@ -157,13 +193,25 @@ private:
         }
     }
 
-    void timerCallback() override { repaint(); }
+    void timerCallback() override
+    {
+        // Arm the hover tooltip only after 1.25 s resting on the same key with no
+        // button held (the global TooltipWindow then displays getTooltip()).
+        if (! hoverArmed && hoverCell >= 0 && ! isMouseButtonDown()
+            && juce::Time::getMillisecondCounter() - hoverStartMs >= 1250)
+            hoverArmed = true;
+        repaint();
+    }
 
     juce::MidiKeyboardState&        state;
     std::function<int()>            getDegrees;
     std::function<juce::String(int)> getLabel;
+    std::function<juce::String(int)> getHoverText;
     int baseKey  = 48; // C3
     int mouseNote = -1;
+    int hoverCell = -1;
+    bool hoverArmed = false;
+    juce::uint32 hoverStartMs = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ScaleKeyboard)
 };

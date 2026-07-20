@@ -261,8 +261,8 @@ int main()
         check ((int) minima.size() == 6, "6 minima found");
         auto hasNear = [&] (double cents, double tol)
         {
-            for (double r : minima)
-                if (std::abs (1200.0 * std::log2 (r) - cents) < tol) return true;
+            for (const auto& e : minima)
+                if (std::abs (1200.0 * std::log2 (e.ratio) - cents) < tol) return true;
             return false;
         };
         // Sub-cent refinement: the fifth must land on the JUST 3/2 (701.955c), not
@@ -270,35 +270,44 @@ int main()
         check (hasNear (701.955, 0.2), "minimum on the JUST fifth 3/2 (701.955c, sub-cent precision)");
         check (hasNear (498.04, 2.0), "minimum on the just fourth 4/3 (498c)");
         check (hasNear (386.31, 3.0), "minimum on the just major third 5/4 (386c)");
+        // Heights: every minimum's dissonance must be below the curve's maximum.
+        {
+            double maxC = 0.0; for (const auto& c : curve) maxC = std::max (maxC, c.second);
+            for (const auto& e : minima)
+                check (e.value < maxC, "minimum height below the curve maximum");
+        }
 
         auto maxima = dissonance::pickExtremes (spec, curve, 4, true, 2.0);
         check ((int) maxima.size() >= 1, "reverse mode finds maxima");
-        for (double r : maxima)
-            check (r > 1.0 && r < 2.0, "maxima strictly inside the period");
+        for (const auto& e : maxima)
+            check (e.ratio > 1.0 && e.ratio < 2.0, "maxima strictly inside the period");
     }
 
     //--------------------------------------------------------------------------
-    std::printf ("Just-interval labels (exact / approx / cents fallback):\n");
+    std::printf ("Just-interval labels (STRICT: fraction only on exact match, else cents):\n");
     {
         using dissonance::justIntervalName;
         check (justIntervalName (1.5) == "3/2", "1.5 -> exact 3/2");
         check (justIntervalName (5.0/4.0) == "5/4", "1.25 -> exact 5/4");
-        check (justIntervalName (2.0) == "1/1", "octave reduces to 1/1");
-        check (justIntervalName (std::pow (2.0, 7.0/12.0)) == "3/2", "12-TET fifth -> 3/2 (within tol)");
-        check (justIntervalName (std::pow (2.0, 4.0/12.0)) == "5/4", "12-TET third -> 5/4 (14c, no ~ symbol)");
-        // No approximation symbol anywhere.
+        // Labels are LITERAL: no octave folding (a tritave-scale degree of 5/2
+        // must never be shown as 5/4).
+        check (justIntervalName (2.0) == "2/1", "2.0 -> 2/1 (literal, not folded to 1/1)");
+        check (justIntervalName (2.5) == "5/2", "2.5 -> 5/2 (non-octave degree, literal)");
+        check (justIntervalName (3.0) == "3/1", "3.0 -> 3/1 (tritave period, literal)");
+        // 12-TET intervals are NOT exact just ratios -> cents, never a fraction.
+        check (justIntervalName (std::pow (2.0, 7.0/12.0)) == "700c", "12-TET fifth -> 700c (not 3/2)");
+        check (justIntervalName (std::pow (2.0, 4.0/12.0)) == "400c", "12-TET third -> 400c (not 5/4)");
         {
-            const auto s = justIntervalName (1.37);
-            check (s.find ("\xe2\x89\x88") == std::string::npos, "no ~ symbol in the label");
-            check (! s.empty() && s.find ('/') != std::string::npos, "1.37 -> a fraction (weird timbre, not blank)");
-        }
-        // A ratio far from any low-denominator ratio -> cents, ending in 'c'.
-        {
-            const auto s = justIntervalName (std::pow (2.0, 550.0/1200.0)); // 550c, between 4/3 and 7/5-ish
-            check (! s.empty(), "far interval -> non-blank");
-            check (s.back() == 'c' || s.find ('/') != std::string::npos, "far interval -> cents or a fraction");
+            const auto s = justIntervalName (1.37); // ~545c, no exact simple ratio
+            check (! s.empty() && s.back() == 'c', "inexact interval -> cents label");
         }
         check (justIntervalName (0.0).empty() && justIntervalName (-1.0).empty(), "non-positive ratio -> blank");
+
+        long long p = 0, q = 0;
+        dissonance::bestFraction (1.5, p, q);
+        check (p == 3 && q == 2, "bestFraction(1.5) = 3/2");
+        dissonance::bestFraction (std::pow (2.0, 4.0/12.0), p, q);
+        check (p == 5 && q == 4, "bestFraction(12-TET third) = 5/4 (for the hover hint)");
     }
 
     //--------------------------------------------------------------------------

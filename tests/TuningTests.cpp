@@ -196,6 +196,36 @@ int main()
     }
 
     //--------------------------------------------------------------------------
+    std::printf ("parsePeriodSpec (integer / fraction / cents):\n");
+    {
+        double r = 0.0; juce::String line;
+        check (TuningManager::parsePeriodSpec ("2", r, line) && approxHz (r, 2.0, 1e-9) && line == "2/1",
+               "\"2\" -> ratio 2, scl line 2/1");
+        check (TuningManager::parsePeriodSpec ("3", r, line) && approxHz (r, 3.0, 1e-9) && line == "3/1",
+               "\"3\" -> ratio 3 (tritave)");
+        check (TuningManager::parsePeriodSpec ("3/2", r, line) && approxHz (r, 1.5, 1e-9) && line == "3/2",
+               "\"3/2\" -> ratio 1.5, exact line");
+        check (TuningManager::parsePeriodSpec ("701.955c", r, line) && approxHz (r, 1.5, 1e-4),
+               "\"701.955c\" -> ~1.5");
+        check (! TuningManager::parsePeriodSpec ("1", r, line),   "\"1\" rejected (no period)");
+        check (! TuningManager::parsePeriodSpec ("abc", r, line), "garbage rejected");
+        check (! TuningManager::parsePeriodSpec ("0/3", r, line), "zero numerator rejected");
+        check (! TuningManager::parsePeriodSpec ("-700c", r, line), "negative cents rejected");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("reference A transposes everything:\n");
+    {
+        TuningManager t;
+        t.setMode (TuningManager::Mode::Equal);
+        t.setReferenceA (432.0);
+        check (approxHz (t.frequencyForNote (69), 432.0, 0.01), "A4 = 432 after setReferenceA(432)");
+        check (approxHz (t.frequencyForNote (57), 216.0, 0.01), "A3 = 216 (everything scaled)");
+        t.setReferenceA (440.0);
+        check (approxHz (t.frequencyForNote (69), 440.0, 0.01), "back to 440");
+    }
+
+    //--------------------------------------------------------------------------
     std::printf ("malformed files are rejected (no silent wrong tuning):\n");
     {
         TuningManager t; juce::String err;
