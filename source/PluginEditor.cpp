@@ -8,7 +8,7 @@ namespace
     const juce::Typeface::Ptr& titleTypeface()
     {
         static juce::Typeface::Ptr tf = juce::Typeface::createSystemTypefaceFor (
-            BinaryData::Jokerman_otf, (size_t) BinaryData::Jokerman_otfSize);
+            BinaryData::Kablammo_ttf, (size_t) BinaryData::Kablammo_ttfSize);
         return tf;
     }
 
@@ -225,6 +225,23 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     langButton.setMouseClickGrabsKeyboardFocus (false);
     langButton.onClick = [this] { catalan = ! catalan; applyLanguage(); refocus(); };
     addAndMakeVisible (langButton);
+
+    // Credit: "Vibe coded by Asra3" (Asra3 is a link to Instagram), left of the language button.
+    vibeLabel.setText ("Vibe coded by", juce::dontSendNotification);
+    vibeLabel.setJustificationType (juce::Justification::centredRight);
+    vibeLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
+    vibeLabel.setFont (juce::Font (juce::FontOptions (12.5f)));
+    vibeLabel.setInterceptsMouseClicks (false, false);
+    addAndMakeVisible (vibeLabel);
+
+    vibeLink.setButtonText ("Asra3");
+    vibeLink.setURL (juce::URL ("https://www.instagram.com/asra3333333/"));
+    vibeLink.setColour (juce::HyperlinkButton::textColourId, juce::Colour (0xff5cb8ff));
+    vibeLink.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")),
+                      false, juce::Justification::centredLeft);
+    vibeLink.setMouseClickGrabsKeyboardFocus (false);
+    vibeLink.setTooltip ("https://www.instagram.com/asra3333333/");
+    addAndMakeVisible (vibeLink);
 
     // Preset browser (top-left): a combo that lists Documents/Galactic Sting/Presets
     // and a Save button. The list refreshes every time the popup opens.
@@ -948,6 +965,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
     auto full = getLocalBounds();
     auto titleBar = full.removeFromTop (68);
     langButton.setBounds (titleBar.removeFromRight (86).withSizeKeepingCentre (66, 24));
+    titleBar.removeFromRight (4);
+    {
+        auto credit = titleBar.removeFromRight (156).withSizeKeepingCentre (156, 20);
+        vibeLink.setBounds (credit.removeFromRight (46));
+        credit.removeFromRight (3); // small gap between "by" and the link
+        vibeLabel.setBounds (credit);
+    }
     auto presetArea = titleBar.removeFromLeft (272).reduced (10, 0);
     presetBox.setBounds (presetArea.removeFromLeft (190).withSizeKeepingCentre (190, 24));
     presetArea.removeFromLeft (6);

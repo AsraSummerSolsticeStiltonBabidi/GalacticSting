@@ -29,7 +29,7 @@ FetchContent_MakeAvailable(JUCE)
 # The plugin target (Standalone app + VST3).
 #-------------------------------------------------------------------------------
 juce_add_plugin(FractalAdditive
-    COMPANY_NAME                "ASRA Beats"
+    COMPANY_NAME                "Asra3"
     BUNDLE_ID                   com.asrabeats.fractaladditive
     PLUGIN_MANUFACTURER_CODE    Asrb
     PLUGIN_CODE                 Frac
@@ -43,7 +43,7 @@ juce_add_plugin(FractalAdditive
     PRODUCT_NAME                "Galactic Sting")
 
 # Embedded assets (title font).
-juce_add_binary_data(GalacticAssets SOURCES assets/fonts/Jokerman.otf)
+juce_add_binary_data(GalacticAssets SOURCES assets/fonts/Kablammo.ttf)
 
 target_sources(FractalAdditive PRIVATE
     source/PluginProcessor.cpp

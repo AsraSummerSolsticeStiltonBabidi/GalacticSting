@@ -1,4 +1,7 @@
-# Fractal Additive
+# Galactic Sting
+
+*(internal CMake target / build folders are still named `FractalAdditive` — that is just the
+code name and does not affect the product.)*
 
 An MPE-compatible **additive / fractal spectral synthesizer** (VST3 + Standalone), built
 with JUCE. It builds a tone from a bank of sine partials whose ratios and amplitudes are
@@ -77,8 +80,8 @@ macOS additionally needs code-signing / notarisation.
 
 ### Outputs
 
-- **Standalone:** `build/FractalAdditive_artefacts/Release/Standalone/Fractal Additive.exe`
-- **VST3:** `build/FractalAdditive_artefacts/Release/VST3/Fractal Additive.vst3`
+- **Standalone:** `build/FractalAdditive_artefacts/Release/Standalone/Galactic Sting.exe`
+- **VST3:** `build/FractalAdditive_artefacts/Release/VST3/Galactic Sting.vst3`
 
 To use in Ableton: copy the `.vst3` to `C:\Program Files\Common Files\VST3\` (Windows) or
 `~/Library/Audio/Plug-Ins/VST3/` (macOS), then rescan plug-ins.
@@ -147,3 +150,26 @@ spectral math.
 Built with JUCE under the **Personal** licence (the JUCE splash screen stays enabled). Keep
 `PLUGIN_CODE`, `PLUGIN_MANUFACTURER_CODE`, and parameter IDs stable once shipped so saved
 projects keep loading correctly.
+
+**Embedded font — `assets/fonts/Kablammo.ttf`** (Kablammo, by The Kablammo Project) is bundled
+into the binary for the title graphic. It is licensed under the **SIL Open Font License 1.1**
+(`assets/fonts/OFL.txt`), which **allows embedding and commercial use**, so it is fine to ship
+and to keep in a public repo. The title-drawing code loads it via `BinaryData::Kablammo_ttf`; to
+change the title font, drop another `.ttf`/`.otf` in `assets/fonts/`, update the
+`juce_add_binary_data(...)` line in `CMakeLists.txt`, and point `titleTypeface()` at the new symbol.
+
+---
+
+## Collaborating on this repo (GitHub)
+
+New to Git? The everyday loop is: **Pull → change → Commit → Push.**
+
+- **Pull** (GitHub Desktop: *Fetch origin* then *Pull*) before you start, to get others' latest work.
+- **Commit** your change with a short message describing *what* and *why*.
+- **Push** (*Push origin*) to share it.
+- If two people changed the **same lines**, Git flags a *merge conflict*; GitHub Desktop walks you
+  through picking which version wins. Committing often + pulling before you start keeps these rare.
+- Prefer small, focused commits over one giant one — they are far easier to review and to undo.
+
+For bigger or riskier changes, work on a **branch** (GitHub Desktop: *Current branch → New branch*),
+push it, and open a **Pull Request** on github.com so a friend can review before it merges into `main`.

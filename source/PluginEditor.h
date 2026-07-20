@@ -177,6 +177,8 @@ private:
     juce::ToggleButton primeToggle[9], dissMaxToggle;
     juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
                      langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3];
+    juce::Label          vibeLabel;   // "Vibe coded by" credit, left of the language button
+    juce::HyperlinkButton vibeLink;   // "Asra3" -> Instagram
     juce::TextEditor periodEdit;
     WarningOverlay warningOverlay;
     NoticeOverlay  noticeOverlay;
