@@ -77,16 +77,18 @@ private:
         void paint (juce::Graphics& g) override
         {
             auto r = getLocalBounds().toFloat();
-            g.setColour (juce::Colour (0xee1a1420));
+            g.setColour (juce::Colour (0xf21a1420));
             g.fillRoundedRectangle (r, 10.0f);
             g.setColour (juce::Colour (0xffffb020));
             g.drawRoundedRectangle (r.reduced (1.5f), 10.0f, 3.0f);
-            auto in = getLocalBounds().reduced (18, 12);
-            g.setFont (juce::Font (juce::FontOptions (17.0f).withStyle ("Bold")));
+            auto in = getLocalBounds().reduced (22, 14);
+            g.setColour (juce::Colour (0xffffb020));
+            g.setFont (juce::Font (juce::FontOptions (18.0f).withStyle ("Bold")));
             g.drawText (title, in.removeFromTop (26), juce::Justification::centred);
+            in.removeFromTop (6);
             g.setColour (juce::Colours::white);
-            g.setFont (juce::Font (juce::FontOptions (13.5f)));
-            g.drawFittedText (body, in, juce::Justification::centred, 6);
+            g.setFont (juce::Font (juce::FontOptions (14.0f)));
+            g.drawFittedText (body, in, juce::Justification::topLeft, 8, 1.0f);
         }
     };
 
@@ -129,6 +131,7 @@ private:
     int  baseKey = 60; // MIDI note of the leftmost computer key; Z/X shift it by one period
     int  lastPrimeMode = -1;
     bool lastTimbreActive = false;
+    int  lastResetOffState = -1; // packs Reset/Off visibility to detect changes for relayout
     std::map<int, int> heldKeys;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FractalAdditiveAudioProcessorEditor)

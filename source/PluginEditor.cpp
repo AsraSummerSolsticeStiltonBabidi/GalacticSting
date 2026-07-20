@@ -27,10 +27,13 @@ namespace
     const juce::Colour cLoad      { 0xff2fb155 }; // green = Load buttons
     const juce::Colour cReset     { 0xffe0453f }; // red   = Reset / Off buttons
 
+    // Contiguous scale-degree layout (not a piano): the home row A..L is degrees
+    // 0..8, then the top row Q..P continues higher, 9..18 - one unbroken run that
+    // matches the colour keyboard. Z / X shift the whole thing by one period.
     struct KeyNote { int ch; int off; };
     const KeyNote kKeyMap[] = {
-        {'a',0},{'w',1},{'s',2},{'e',3},{'d',4},{'f',5},{'t',6},{'g',7},
-        {'y',8},{'h',9},{'u',10},{'j',11},{'k',12},{'o',13},{'l',14},{'p',15}
+        {'a',0},{'s',1},{'d',2},{'f',3},{'g',4},{'h',5},{'j',6},{'k',7},{'l',8},
+        {'q',9},{'w',10},{'e',11},{'r',12},{'t',13},{'y',14},{'u',15},{'i',16},{'o',17},{'p',18}
     };
 
     // Bold group titles in a filled chip (so nothing overlaps the title), a thicker
@@ -48,6 +51,11 @@ namespace
         juce::Font getLabelFont (juce::Label& l) override
         {
             return juce::Font (juce::FontOptions (juce::jmax (12.5f, l.getFont().getHeight())).withStyle ("Bold"));
+        }
+
+        juce::Font getTextButtonFont (juce::TextButton&, int buttonHeight) override
+        {
+            return juce::Font (juce::FontOptions (juce::jmin (16.0f, (float) buttonHeight * 0.62f)).withStyle ("Bold"));
         }
 
         void drawGroupComponentOutline (juce::Graphics& g, int w, int h, const juce::String& text,
@@ -356,8 +364,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     dissMaxToggle.setButtonText    ("Max");
     dissSaveBtn.setButtonText      (tr ("Save", "Desa"));
 
-    helpLabel.setText (tr ("Click the colour bar or type A S D F...  W E T Y U...   Z / X = down / up one scale period.   Chords of 3+ PC keys need an n-key-rollover keyboard (or use MIDI).",
-                           "Clica la barra de colors o escriu A S D F...  W E T Y U...   Z / X = avall / amunt un per\xc3\xadode.   Els acords de 3+ tecles al PC depenen del teclat (o fes servir MIDI)."),
+    helpLabel.setText (tr ("Play: A S D F G H J K L = the scale in order, then Q W E R T Y U I O P continue higher.   Z / X = down / up one scale period.   3+ key chords need an n-key-rollover keyboard (or use MIDI).",
+                           "Toca: A S D F G H J K L = l'escala en ordre, i Q W E R T Y U I O P segueixen m\xc3\xa9s agudes.   Z / X = avall / amunt un per\xc3\xado" "de.   Acords de 3+ tecles: cal un teclat amb n-key rollover (o MIDI)."),
                        dontSendNotification);
 
     //-- Tooltips: one idea per sentence, no loose ends. ------------------------
@@ -575,28 +583,26 @@ void FractalAdditiveAudioProcessorEditor::updateWarning (int templatePartials)
         if (ap.getRawParameterValue ("primeWL" + juce::String (i))->load() > 0.5f)
             mask |= (1u << i);
 
-    const auto nStr = juce::String (baseN);
+    // Plain-language cause + the single most direct fix. The synth has two
+    // harmonic filters (Harmonics and Prime Control) that BOTH must let a
+    // harmonic through; when they overlap to nothing, every partial is removed.
     juce::String why;
     if (sel == 3 && wl)
-        why = tr ("'Harmonics = Prime' combined with the prime Whitelist: a prime harmonic can only pass if it IS one of the ticked primes (max 23), and the series starts at N = ",
-                  "'Harm\xc3\xb2nics = Primers' amb la Llista de primers: un harm\xc3\xb2nic primer nom\xc3\xa9s passa si \xc3\x89S un dels primers marcats (m\xc3\xa0xim 23), i la s\xc3\xa8rie comen\xc3\xa7""a a N = ")
-            + nStr
-            + tr (". Set Prime Control to Limit/Off, or Harmonics to All.",
-                  ". Posa el Control de primers en L\xc3\xadmit/No, o Harm\xc3\xb2nics en Tots.");
+        why = tr ("Two filters are cancelling out.  'Harmonics = Prime' keeps only prime-numbered harmonics, and the Prime whitelist then keeps only harmonics built from the ticked primes.  A prime is only itself, so together they can keep nothing above 23.\n\nFix: set Harmonics to 'All', or set Prime Control to 'Limit / Off'.",
+                  "Dos filtres s'anul\xc2\xb7len.  'Harm\xc3\xb2nics = Primers' nom\xc3\xa9s deixa els harm\xc3\xb2nics de n\xc3\xbamero primer, i la Llista de primers nom\xc3\xa9s deixa els fets amb els primers marcats.  Un primer nom\xc3\xa9s \xc3\xa9s ell mateix, aix\xc3\xad que junts no poden deixar res per sobre de 23.\n\nSoluci\xc3\xb3: posa Harm\xc3\xb2nics en 'Tots', o el Control de primers en 'L\xc3\xadmit / No'.");
     else if (wl && mask == 0)
-        why = tr ("The prime Whitelist has no primes ticked, so no harmonic can pass. Tick some primes or switch to Limit mode.",
-                  "La Llista de primers no t\xc3\xa9 cap primer marcat, aix\xc3\xad que cap harm\xc3\xb2nic pot passar. Marca'n alguns o canvia al mode L\xc3\xadmit.");
+        why = tr ("The Prime whitelist has no primes ticked, so no harmonic is allowed through.\n\nFix: tick at least one prime, or switch Prime Control to 'Limit'.",
+                  "La Llista de primers no t\xc3\xa9 cap primer marcat, aix\xc3\xad que no passa cap harm\xc3\xb2nic.\n\nSoluci\xc3\xb3: marca almenys un primer, o posa el Control de primers en 'L\xc3\xadmit'.");
     else if (sel == 3 && ! wl && limitIdx > 0)
-        why = tr ("'Harmonics = Prime' with a low Prime Limit: every prime harmonic above the limit is removed, and the series starts at N = ",
-                  "'Harm\xc3\xb2nics = Primers' amb un L\xc3\xadmit de primers baix: tot harm\xc3\xb2nic primer per sobre del l\xc3\xadmit s'elimina, i la s\xc3\xa8rie comen\xc3\xa7""a a N = ")
-            + nStr
-            + tr (". Raise the limit, set it to Off, or lower N.",
-                  ". Puja el l\xc3\xadmit, posa'l en No, o abaixa N.");
+        why = tr ("'Harmonics = Prime' keeps only prime harmonics, but the Prime Limit then removes every prime bigger than the limit - and your Base N starts the series above it.\n\nFix: raise the Prime Limit (or set it to Off), or lower Base N.",
+                  "'Harm\xc3\xb2nics = Primers' nom\xc3\xa9s deixa harm\xc3\xb2nics primers, per\xc3\xb2 el L\xc3\xadmit de primers treu tot primer m\xc3\xa9s gran que el l\xc3\xadmit - i la teva Base N comen\xc3\xa7""a la s\xc3\xa8rie per sobre.\n\nSoluci\xc3\xb3: puja el L\xc3\xadmit de primers (o posa'l en No), o abaixa la Base N.");
     else
-        why = tr ("The Harmonics selection and the Prime filter together exclude every harmonic of the current Base N. Relax one of the two filters or change N.",
-                  "La selecci\xc3\xb3 d'Harm\xc3\xb2nics i el filtre de Primers junts exclouen tots els harm\xc3\xb2nics de la Base N actual. Relaxa un dels dos filtres o canvia N.");
+        why = tr ("The Harmonics filter and the Prime Control filter, applied together, remove every harmonic of the current Base N.\n\nFix: relax either filter (Harmonics = All, or Prime Control = Off), or change Base N.",
+                  "El filtre d'Harm\xc3\xb2nics i el de Control de primers, aplicats alhora, treuen tots els harm\xc3\xb2nics de la Base N actual.\n\nSoluci\xc3\xb3: relaxa qualsevol dels dos (Harm\xc3\xb2nics = Tots, o Control de primers = No), o canvia la Base N.");
 
-    warningOverlay.title = tr ("Why is there no sound?", "Per qu\xc3\xa8 no sona res?");
+    juce::ignoreUnused (baseN);
+    warningOverlay.title = tr ("No sound: every partial is filtered out",
+                               "Sense so: s'han filtrat tots els parcials");
     warningOverlay.body  = why;
     warningOverlay.setVisible (true);
     warningOverlay.repaint();
@@ -867,13 +873,22 @@ void FractalAdditiveAudioProcessorEditor::resized()
             auto ti = tb.reduced (3).reduced (8, 5); ti.removeFromTop (15);
             compact (tuningBox, ti.removeFromTop (24)); ti.removeFromTop (4);
             auto brow = ti.removeFromTop (23);
-            loadSclButton.setBounds (brow.removeFromLeft (brow.getWidth() / 2).reduced (2, 0));
-            clearSclButton.setBounds (brow.reduced (2, 0));
+            const bool resetVis = processorRef.getTuningMode() != 0 || processorRef.tuningHasScala();
+            clearSclButton.setVisible (resetVis);
+            if (resetVis)
+            {
+                loadSclButton.setBounds (brow.removeFromLeft (brow.getWidth() / 2).reduced (2, 0));
+                clearSclButton.setBounds (brow.reduced (2, 0));
+            }
+            else
+            {
+                loadSclButton.setBounds (brow.reduced (2, 0));
+            }
             ti.removeFromTop (4);
             recentLabel.setBounds (ti.removeFromTop (14));
-            auto rrow = ti.removeFromTop (22);
+            auto rrow = ti.removeFromTop (26); // taller -> bigger recent-button text
             const int rw = rrow.getWidth() / 3;
-            for (int i = 0; i < 3; ++i) recentBtn[i].setBounds (rrow.removeFromLeft (rw).reduced (2, 0));
+            for (int i = 0; i < 3; ++i) recentBtn[i].setBounds (rrow.removeFromLeft (rw).reduced (2, 1));
             ti.removeFromTop (3);
             tuningStatusLabel.setBounds (ti.removeFromTop (18));
             ti.removeFromTop (2);
@@ -896,8 +911,17 @@ void FractalAdditiveAudioProcessorEditor::resized()
             gTimbre.setBounds (tb.reduced (3));
             auto ti = tb.reduced (3).reduced (8, 5); ti.removeFromTop (15);
             auto brow = ti.removeFromTop (23);
-            loadTimbreButton.setBounds (brow.removeFromLeft (brow.getWidth() * 6 / 10).reduced (2, 0));
-            clearTimbreButton.setBounds (brow.reduced (2, 0));
+            const bool offVis = processorRef.isTimbreActive();
+            clearTimbreButton.setVisible (offVis);
+            if (offVis)
+            {
+                loadTimbreButton.setBounds (brow.removeFromLeft (brow.getWidth() * 6 / 10).reduced (2, 0));
+                clearTimbreButton.setBounds (brow.reduced (2, 0));
+            }
+            else
+            {
+                loadTimbreButton.setBounds (brow.reduced (2, 0));
+            }
             ti.removeFromTop (4);
             auto fr = ti.removeFromRight (54);
             lblTimbreRepeats.setBounds (fr.removeFromTop (13));
@@ -908,7 +932,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
     }
 
     // Floating "silent settings" explainer, centred over everything.
-    warningOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (540, 160));
+    warningOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (580, 200));
     warningOverlay.toFront (false);
 }
 
@@ -995,6 +1019,14 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         recentBtn[i].setVisible (has);
         if (has) recentBtn[i].setButtonText (juce::File (recents[i]).getFileNameWithoutExtension());
     }
+
+    // Hide the "undo" buttons when there is nothing to undo: Reset only matters
+    // away from plain 12-TET, Off only when Timbre mode is actually on. Relayout
+    // so the Load button expands to fill the freed space.
+    const bool resetVis = processorRef.getTuningMode() != 0 || processorRef.tuningHasScala();
+    const bool offVis   = processorRef.isTimbreActive();
+    const int  packed   = (resetVis ? 1 : 0) | (offVis ? 2 : 0);
+    if (packed != lastResetOffState) { lastResetOffState = packed; resized(); }
 
     const int mode = (int) (processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f);
     if (mode != lastPrimeMode) { lastPrimeMode = mode; resized(); }

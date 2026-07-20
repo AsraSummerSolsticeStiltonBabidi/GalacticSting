@@ -257,7 +257,7 @@ int main()
         check (curve.front().second < curve[80].second, "dissonance rises away from unison");
         check (curve.back().second < curve[1000].second, "dissonance falls again toward the octave");
 
-        auto minima = dissonance::pickExtremes (curve, 6, false, 2.0);
+        auto minima = dissonance::pickExtremes (spec, curve, 6, false, 2.0);
         check ((int) minima.size() == 6, "6 minima found");
         auto hasNear = [&] (double cents, double tol)
         {
@@ -265,11 +265,13 @@ int main()
                 if (std::abs (1200.0 * std::log2 (r) - cents) < tol) return true;
             return false;
         };
-        check (hasNear (702.0, 15.0), "minimum near the just fifth (3/2, ~702c)");
-        check (hasNear (498.0, 15.0) || hasNear (386.0, 15.0) || hasNear (884.0, 15.0),
-               "minimum near 4/3, 5/4 or 5/3");
+        // Sub-cent refinement: the fifth must land on the JUST 3/2 (701.955c), not
+        // a rounded 702; likewise 4/3 (498.04c) and 5/4 (386.31c) must appear.
+        check (hasNear (701.955, 0.2), "minimum on the JUST fifth 3/2 (701.955c, sub-cent precision)");
+        check (hasNear (498.04, 2.0), "minimum on the just fourth 4/3 (498c)");
+        check (hasNear (386.31, 3.0), "minimum on the just major third 5/4 (386c)");
 
-        auto maxima = dissonance::pickExtremes (curve, 4, true, 2.0);
+        auto maxima = dissonance::pickExtremes (spec, curve, 4, true, 2.0);
         check ((int) maxima.size() >= 1, "reverse mode finds maxima");
         for (double r : maxima)
             check (r > 1.0 && r < 2.0, "maxima strictly inside the period");

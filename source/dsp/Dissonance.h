@@ -81,39 +81,90 @@ namespace dissonance
         return curve;
     }
 
-    // The `count` most consonant local minima (or, reversed, the most dissonant
-    // local maxima) of the curve, as interval ratios sorted ascending. Unison and
-    // anything within `edgeCents` of it or of the period are excluded (the .scl
-    // gets 1/1 implicitly and the period explicitly).
-    inline std::vector<double> pickExtremes (const std::vector<std::pair<double, double>>& curve,
-                                             int count, bool maxima, double period,
-                                             double edgeCents = 5.0)
+    // Refine one located extreme to sub-cent precision by golden-section search
+    // on the bracketing curve segment (locally unimodal). The 1-cent sampling
+    // only LOCATES an extreme; this pins it exactly, so a harmonic timbre's fifth
+    // comes out at 701.955 c (ratio 1.49994...) - just-intonation precision - not
+    // a rounded "702".
+    inline double refineExtreme (const std::vector<Partial>& spectrum,
+                                 double alphaLo, double alphaHi, bool maxima)
     {
-        std::vector<std::pair<double, double>> found; // (alpha, value)
-        for (size_t i = 1; i + 1 < curve.size(); ++i)
+        constexpr double invPhi = 0.6180339887498949;
+        double a = std::log2 (alphaLo), b = std::log2 (alphaHi);
+        const auto eval = [&] (double x)
+        {
+            const double v = dissonanceAt (spectrum, std::pow (2.0, x));
+            return maxima ? -v : v; // always minimise
+        };
+        double c = b - (b - a) * invPhi, d = a + (b - a) * invPhi;
+        double fc = eval (c), fd = eval (d);
+        for (int it = 0; it < 80 && (b - a) > 5.0e-9; ++it)
+        {
+            if (fc < fd) { b = d; d = c; fd = fc; c = b - (b - a) * invPhi; fc = eval (c); }
+            else         { a = c; c = d; fc = fd; d = a + (b - a) * invPhi; fd = eval (d); }
+        }
+        return std::pow (2.0, 0.5 * (a + b));
+    }
+
+    // The `count` most PROMINENT local minima (or, reversed, maxima) of the curve,
+    // each refined to sub-cent precision, as interval ratios sorted ascending.
+    //
+    // Ranking is by PROMINENCE (how deep the notch is relative to the flanking
+    // opposite extremes), NOT by absolute dissonance: the curve slopes down toward
+    // the octave, so ranking by raw value would crowd the picks near the period
+    // and skip clear notches like 5/4. Unison and the period edge are excluded
+    // (1/1 is implicit in the .scl and the period is appended by the caller).
+    inline std::vector<double> pickExtremes (const std::vector<Partial>& spectrum,
+                                             const std::vector<std::pair<double, double>>& curve,
+                                             int count, bool maxima, double period,
+                                             double edgeCents = 6.0)
+    {
+        const size_t n = curve.size();
+        if (n < 3)
+            return {};
+
+        std::vector<size_t> minIdx, maxIdx;
+        for (size_t i = 1; i + 1 < n; ++i)
         {
             const double prev = curve[i - 1].second, cur = curve[i].second, next = curve[i + 1].second;
-            const bool isExtreme = maxima ? (cur > prev && cur >= next)
-                                          : (cur < prev && cur <= next);
-            if (! isExtreme)
-                continue;
-            const double cents = 1200.0 * std::log2 (curve[i].first);
-            const double periodCents = 1200.0 * std::log2 (period);
-            if (cents < edgeCents || cents > periodCents - edgeCents)
-                continue;
-            found.emplace_back (curve[i].first, cur);
+            if (cur < prev && cur <= next) minIdx.push_back (i);
+            if (cur > prev && cur >= next) maxIdx.push_back (i);
         }
 
-        // Most consonant first (lowest dissonance) - or roughest first in reverse.
-        std::sort (found.begin(), found.end(),
-                   [maxima] (const auto& a, const auto& b)
-                   { return maxima ? (a.second > b.second) : (a.second < b.second); });
-        if ((int) found.size() > count)
-            found.resize ((size_t) count);
+        const auto& own      = maxima ? maxIdx : minIdx;
+        const auto& opposite = maxima ? minIdx : maxIdx;
+        const double periodCents = 1200.0 * std::log2 (period);
+
+        struct Cand { size_t idx; double prominence; };
+        std::vector<Cand> cands;
+        for (const size_t i : own)
+        {
+            const double cents = 1200.0 * std::log2 (curve[i].first);
+            if (cents < edgeCents || cents > periodCents - edgeCents)
+                continue;
+
+            // Nearest opposite extreme on each side (curve endpoints as fallback).
+            double left = curve.front().second, right = curve.back().second;
+            for (auto it = opposite.rbegin(); it != opposite.rend(); ++it)
+                if (*it < i) { left = curve[*it].second; break; }
+            for (const size_t j : opposite)
+                if (j > i) { right = curve[j].second; break; }
+
+            const double cur = curve[i].second;
+            const double prom = maxima ? cur - std::max (left, right)
+                                       : std::min (left, right) - cur;
+            cands.push_back ({ i, prom });
+        }
+
+        std::sort (cands.begin(), cands.end(),
+                   [] (const Cand& a, const Cand& b) { return a.prominence > b.prominence; });
+        if ((int) cands.size() > count)
+            cands.resize ((size_t) count);
 
         std::vector<double> ratios;
-        ratios.reserve (found.size());
-        for (const auto& f : found) ratios.push_back (f.first);
+        ratios.reserve (cands.size());
+        for (const auto& cnd : cands)
+            ratios.push_back (refineExtreme (spectrum, curve[cnd.idx - 1].first, curve[cnd.idx + 1].first, maxima));
         std::sort (ratios.begin(), ratios.end());
         return ratios;
     }
