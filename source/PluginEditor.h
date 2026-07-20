@@ -32,6 +32,7 @@ private:
     void layoutFaders (juce::GroupComponent&, juce::Rectangle<int>, juce::Colour,
                        std::initializer_list<juce::Slider*>, std::initializer_list<juce::Label*>);
     void refocus();
+    void pollComputerKeyboard(); // reconcile held keys against the real key state
     void openScalaChooser();
     void openTimbreChooser();
     void loadRecent (int index);

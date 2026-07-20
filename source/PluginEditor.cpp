@@ -3,11 +3,11 @@
 
 namespace
 {
-    // Embedded Jokerman title typeface (loaded once).
+    // Embedded title typeface (loaded once).
     const juce::Typeface::Ptr& titleTypeface()
     {
         static juce::Typeface::Ptr tf = juce::Typeface::createSystemTypefaceFor (
-            BinaryData::Jokerman_otf, (size_t) BinaryData::Jokerman_otfSize);
+            BinaryData::LiquidAlien_ttf, (size_t) BinaryData::LiquidAlien_ttfSize);
         return tf;
     }
 
@@ -26,6 +26,29 @@ namespace
     const juce::Colour cGain      { 0xffef7dff };
     const juce::Colour cLoad      { 0xff2fb155 }; // green = Load buttons
     const juce::Colour cReset     { 0xffe0453f }; // red   = Reset / Off buttons
+
+    // Nearest just-intonation interval name for a ratio, reduced into one octave.
+    // Empty if nothing common is within ~14 cents (so arbitrary scales stay blank).
+    juce::String justName (double ratio)
+    {
+        if (! std::isfinite (ratio) || ratio <= 0.0) // guard NaN/inf/<=0 (inf would loop below)
+            return {};
+        while (ratio >= 2.0 - 1.0e-9) ratio *= 0.5;
+        while (ratio < 1.0)           ratio *= 2.0;
+        struct J { const char* name; double r; };
+        static const J tbl[] = {
+            { "1/1", 1.0 }, { "16/15", 16.0/15 }, { "9/8", 9.0/8 }, { "7/6", 7.0/6 },
+            { "6/5", 6.0/5 }, { "5/4", 5.0/4 }, { "4/3", 4.0/3 }, { "7/5", 7.0/5 },
+            { "3/2", 3.0/2 }, { "8/5", 8.0/5 }, { "5/3", 5.0/3 }, { "7/4", 7.0/4 },
+            { "9/5", 9.0/5 }, { "15/8", 15.0/8 } };
+        double best = 1.0e9; const char* bn = nullptr;
+        for (const auto& j : tbl)
+        {
+            const double c = std::abs (1200.0 * std::log2 (ratio / j.r));
+            if (c < best) { best = c; bn = j.name; }
+        }
+        return (best < 14.0 && bn != nullptr) ? juce::String (bn) : juce::String();
+    }
 
     // Contiguous scale-degree layout (not a piano): the home row A..L is degrees
     // 0..8, then the top row Q..P continues higher, 9..18 - one unbroken run that
@@ -175,8 +198,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         addChildComponent (recentBtn[i]);
     }
     tuningStatusLabel.setJustificationType (juce::Justification::centredLeft);
-    tuningStatusLabel.setColour (juce::Label::textColourId, cTuning);
-    tuningStatusLabel.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+    tuningStatusLabel.setColour (juce::Label::textColourId, cTuning.brighter (0.2f));
+    tuningStatusLabel.setFont (juce::Font (juce::FontOptions (14.0f).withStyle ("Bold")));
     addAndMakeVisible (tuningStatusLabel);
 
     // Timbre (.scl as spectrum).
@@ -279,6 +302,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     helpLabel.setFont (juce::Font (juce::FontOptions (12.0f)));
     addAndMakeVisible (helpLabel);
 
+    keyboard.setDegreeLabeller ([this] (int d) { return justName (processorRef.getDegreeRatio (d)); });
     addAndMakeVisible (keyboard);
 
     applyLanguage();
@@ -286,8 +310,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     lastTimbreActive = processorRef.isTimbreActive();
 
     setWantsKeyboardFocus (true);
-    setSize (1280, 600); // still fits a 720p work area incl. the standalone's Options bar
-    startTimerHz (15);
+    setSize (1280, 616); // still fits a 720p work area incl. the standalone's Options bar
+    startTimerHz (30); // also the reconcile rate for stuck/ghost computer-keyboard notes
     juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<juce::Component> (this)]
     { if (safe != nullptr) safe->grabKeyboardFocus(); });
 }
@@ -295,6 +319,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 FractalAdditiveAudioProcessorEditor::~FractalAdditiveAudioProcessorEditor()
 {
     stopTimer();
+    // Release any computer-keyboard notes still held when the UI closes.
+    for (const auto& kv : heldKeys)
+        processorRef.keyboardState.noteOff (1, kv.second, 0.0f);
+    heldKeys.clear();
     // Dismiss a still-open save-preset dialog so no orphaned modal window
     // survives the editor (its callback is already SafePointer-guarded).
     if (activePrompt != nullptr)
@@ -729,7 +757,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colour (0xff0c0c12));
 
-    auto titleArea = getLocalBounds().removeFromTop (50);
+    auto titleArea = getLocalBounds().removeFromTop (60);
     g.setColour (juce::Colour (0xff2a2a3c));
     g.fillRect (0, titleArea.getBottom() - 1, getWidth(), 1);
 
@@ -739,8 +767,8 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     const auto title = catalan ? juce::String::fromUTF8 ("FIBL\xc3\x93 GAL\xc3\x80" "CTIC")
                                : juce::String ("GALACTIC STING");
     const juce::Font titleFont = titleTypeface() != nullptr
-        ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (40.0f))
-        : juce::Font (juce::FontOptions (34.0f).withStyle ("Bold"));
+        ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (50.0f))
+        : juce::Font (juce::FontOptions (40.0f).withStyle ("Bold"));
     g.setFont (titleFont);
 
     const int L = title.length();
@@ -767,7 +795,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 void FractalAdditiveAudioProcessorEditor::resized()
 {
     auto full = getLocalBounds();
-    auto titleBar = full.removeFromTop (50);
+    auto titleBar = full.removeFromTop (60);
     langButton.setBounds (titleBar.removeFromRight (86).withSizeKeepingCentre (66, 24));
     auto presetArea = titleBar.removeFromLeft (272).reduced (10, 0);
     presetBox.setBounds (presetArea.removeFromLeft (190).withSizeKeepingCentre (190, 24));
@@ -949,7 +977,27 @@ bool FractalAdditiveAudioProcessorEditor::keyPressed (const juce::KeyPress& key)
 
 bool FractalAdditiveAudioProcessorEditor::keyStateChanged (bool)
 {
-    bool consumed = false;
+    pollComputerKeyboard();
+    return false; // never swallow keys - let shortcuts etc. through
+}
+
+// Reconcile the sounding computer-keyboard notes with the ACTUAL physical key
+// state (isKeyCurrentlyDown -> GetAsyncKeyState on Windows). Called both on key
+// events (low latency) and on the 30 Hz timer (safety net): a KEYUP missed while
+// the editor was unfocused, or a phantom key from keyboard ghosting, otherwise
+// leaves a stuck note - and since the top row is an octave up, that stuck note
+// appears "in another octave". If we do not have focus, everything is released
+// so global key presses in other apps never play notes.
+void FractalAdditiveAudioProcessorEditor::pollComputerKeyboard()
+{
+    if (! hasKeyboardFocus (true))
+    {
+        for (const auto& kv : heldKeys)
+            processorRef.keyboardState.noteOff (1, kv.second, 0.0f);
+        heldKeys.clear();
+        return;
+    }
+
     for (const auto& m : kKeyMap)
     {
         const bool down = juce::KeyPress::isKeyCurrentlyDown (m.ch);
@@ -958,19 +1006,20 @@ bool FractalAdditiveAudioProcessorEditor::keyStateChanged (bool)
         {
             const int note = juce::jlimit (0, 127, baseKey + m.off);
             processorRef.keyboardState.noteOn (1, note, 0.8f);
-            heldKeys[m.ch] = note; consumed = true;
+            heldKeys[m.ch] = note;
         }
         else if (! down && it != heldKeys.end())
         {
             processorRef.keyboardState.noteOff (1, it->second, 0.0f);
-            heldKeys.erase (it); consumed = true;
+            heldKeys.erase (it);
         }
     }
-    return consumed;
 }
 
 void FractalAdditiveAudioProcessorEditor::timerCallback()
 {
+    pollComputerKeyboard(); // safety net for missed KEYUPs / ghost keys / focus loss
+
     const int  rendered  = processorRef.getPartialCount();
     const int  templ     = processorRef.getTemplatePartialCount();
     const bool truncated = processorRef.isSpectrumTruncated();

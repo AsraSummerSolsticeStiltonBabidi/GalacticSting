@@ -68,6 +68,22 @@ public:
     // Degrees per period of the active tuning (for the colour keyboard).
     int getScaleDegrees() const noexcept { return tuning.degreesPerPeriod(); }
 
+    // Frequency ratio of scale degree `d` relative to degree 0 (the tonic on
+    // key 60), for the keyboard's just-interval labels. Degree d is mapped to an
+    // IN-RANGE key of the same degree class (walking down whole periods) rather
+    // than clamping the MIDI note, so dense scales (72-EDO etc.) label correctly.
+    double getDegreeRatio (int d) const
+    {
+        const int D = juce::jmax (1, tuning.degreesPerPeriod());
+        int key = 60 + d;
+        while (key > 127 && key - D >= 0) key -= D;
+        while (key < 0   && key + D <= 127) key += D;
+        key = juce::jlimit (0, 127, key);
+        const double f0 = tuning.frequencyForNote (60);
+        const double f  = tuning.frequencyForNote (key);
+        return f0 > 0.0 ? f / f0 : 1.0;
+    }
+
     //==========================================================================
     // Scala-as-timbre: a loaded .scl becomes the partial set instead of the
     // harmonic engine. Called from the editor.

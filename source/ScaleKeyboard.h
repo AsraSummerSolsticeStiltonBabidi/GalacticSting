@@ -33,6 +33,10 @@ public:
     void setRange (int lowestKey) { baseKey = juce::jlimit (0, 120, lowestKey); repaint(); }
     int  getBaseKey() const noexcept { return baseKey; }
 
+    // Optional: a short just-intonation label per degree (e.g. "3/2"), drawn
+    // under the degree number - the interval each Sethares minimum lands on.
+    void setDegreeLabeller (std::function<juce::String(int)> fn) { getLabel = std::move (fn); }
+
     void paint (juce::Graphics& g) override
     {
         const int D = juce::jmax (1, getDegrees ? getDegrees() : 12);
@@ -61,10 +65,22 @@ public:
                 g.drawRect (cell, 2.0f);
             }
 
-            // Degree number, high-contrast, centred.
+            // Degree number + (optional) just-interval label below it.
+            const juce::String label = getLabel ? getLabel (degree) : juce::String();
             g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-            g.setFont (juce::Font (juce::FontOptions (juce::jmin (18.0f, w * 0.55f)).withStyle ("Bold")));
-            g.drawText (juce::String (degree), cell, juce::Justification::centred, false);
+            if (label.isNotEmpty())
+            {
+                auto top = cell.removeFromTop (cell.getHeight() * 0.58f);
+                g.setFont (juce::Font (juce::FontOptions (juce::jmin (17.0f, w * 0.52f)).withStyle ("Bold")));
+                g.drawText (juce::String (degree), top, juce::Justification::centred, false);
+                g.setFont (juce::Font (juce::FontOptions (juce::jmin (12.0f, w * 0.42f)).withStyle ("Bold")));
+                g.drawText (label, cell, juce::Justification::centredTop, false);
+            }
+            else
+            {
+                g.setFont (juce::Font (juce::FontOptions (juce::jmin (18.0f, w * 0.55f)).withStyle ("Bold")));
+                g.drawText (juce::String (degree), cell, juce::Justification::centred, false);
+            }
         }
     }
 
@@ -113,8 +129,9 @@ private:
 
     void timerCallback() override { repaint(); }
 
-    juce::MidiKeyboardState& state;
-    std::function<int()>     getDegrees;
+    juce::MidiKeyboardState&        state;
+    std::function<int()>            getDegrees;
+    std::function<juce::String(int)> getLabel;
     int baseKey  = 48; // C3
     int mouseNote = -1;
 
