@@ -12,21 +12,29 @@ namespace
         return tf;
     }
 
-    // Brighter, higher-contrast section colours.
-    const juce::Colour cBase      { 0xff5cb8ff };
-    const juce::Colour cHarmonic  { 0xff5cb8ff }; // one colour for the whole Harmonic Engine macro-group
+    // Section colours, deliberately spread around the hue wheel so that NO two
+    // neighbouring panels (horizontally OR vertically) share a similar hue - in
+    // particular no two near-identical blues sit side by side. Reading the two
+    // rows left-to-right the hue hops far each step:
+    //   Row 1: Harmonic(blue) | Range(yellow) | Fractal(vermilion) | Phase(green)
+    //   Row 2: Filter(orange) | Volume(purple) | Pitch(teal) | Tuning(gold) | Custom(pink)
+    // and every vertical pair contrasts too (blue over orange, yellow over purple,
+    // vermilion over teal, green over gold...).
+    const juce::Colour cBase      { 0xff5cb8ff }; // Harmonic Engine is one blue
+    const juce::Colour cHarmonic  { 0xff5cb8ff };
     const juce::Colour cWhitelist { 0xff5ff2b0 };
     const juce::Colour cSlope     { 0xff8ef0c4 };
-    const juce::Colour cRange     { 0xffffc95c };
-    const juce::Colour cFractal   { 0xffff9a3c };
-    const juce::Colour cPhase     { 0xff8ec5ff };
+    const juce::Colour cRange     { 0xffffce4a }; // yellow
+    const juce::Colour cFractal   { 0xffff6a3a }; // vermilion (was orange - now clears yellow)
+    const juce::Colour cPhase     { 0xff58e08a }; // green (was a second blue)
     const juce::Colour cPrime     { 0xffffd84d };
-    const juce::Colour cFilter    { 0xff4fe6ff };
-    const juce::Colour cEnv       { 0xffff8f8f };
-    const juce::Colour cPitch     { 0xff40d8c8 }; // pitch envelope (teal)
-    const juce::Colour cTuning    { 0xffb9a4ff };
-    const juce::Colour cTimbre    { 0xfff58bff };
-    const juce::Colour cGain      { 0xffef7dff };
+    const juce::Colour cFilter    { 0xffff9a3c }; // orange (was cyan - sat under the blue engine)
+    const juce::Colour cEnv       { 0xffb488ff }; // purple (was red - sat next to orange)
+    const juce::Colour cPitch     { 0xff40d8c8 }; // teal
+    const juce::Colour cTuning    { 0xffe9c15a }; // gold (was purple - clashed with the pink beside it)
+    const juce::Colour cTimbre    { 0xfff58bff }; // pink
+    const juce::Colour cGain      { 0xffef7dff }; // magenta
+    const juce::Colour cReference { 0xff4fd8e6 }; // cyan (its own colour, no longer a magenta twin of Gain)
     const juce::Colour cLoad      { 0xff2fb155 }; // green = Load buttons
     const juce::Colour cReset     { 0xffe0453f }; // red   = Reset / Off buttons
 
@@ -169,6 +177,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     makeLabel (lblRange, cRange);
     configGroup (gFractal, cFractal);
     configFader (fractalFader, "fractalLevel", fractalAtt, cFractal, "Fractal self-similarity level (1 = off)");
+    makeLabel (lblFractal, cFractal);
     configGroup (gPhase, cPhase);
     configCombo (phaseBox, "phaseMode", phaseAtt, cPhase, "Aligned: tonal pulse, never clips.  Scattered: louder, noisier.");
     configGroup (gGain, cGain);
@@ -357,7 +366,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // "Spectrum to Scale" (Sethares): generate + count + reverse + period + save,
     // plus the sorted degree/height list.
     configGroup (gSpecScale, cRange);
-    configGroup (gReference, cGain);
+    configGroup (gReference, cReference);
     dissBtn.setColour (juce::TextButton::buttonColourId, cTuning.withAlpha (0.35f));
     dissBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
     dissBtn.setMouseClickGrabsKeyboardFocus (false);
@@ -420,8 +429,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // Master reference A = <hz> (transposes everything, all tuning modes).
     refAFader.setSliderStyle (juce::Slider::LinearHorizontal);
     refAFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 62, 18);
-    refAFader.setColour (juce::Slider::thumbColourId, cGain);
-    refAFader.setColour (juce::Slider::trackColourId, cGain.withAlpha (0.55f));
+    refAFader.setColour (juce::Slider::thumbColourId, cReference);
+    refAFader.setColour (juce::Slider::trackColourId, cReference.withAlpha (0.55f));
     refAFader.setColour (juce::Slider::textBoxTextColourId, juce::Colours::white);
     refAFader.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
     refAFader.setMouseClickGrabsKeyboardFocus (false);
@@ -429,7 +438,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     refAFader.onDragEnd = [this] { refocus(); };
     addAndMakeVisible (refAFader);
     refAAtt = std::make_unique<SliderAttachment> (processorRef.apvts, "refA", refAFader);
-    makeLabel (lblRefA, cGain);
+    makeLabel (lblRefA, cReference);
 
     addChildComponent (noticeOverlay);
 
@@ -556,6 +565,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblBaseN.setText     ("N", dontSendNotification);
     lblBasePitch.setText (tr ("Pitch", "To"), dontSendNotification);
     lblRange.setText     (tr ("Oct", "Oct"), dontSendNotification);
+    lblFractal.setText   (tr ("Level", "Nivell"), dontSendNotification);
     lblPrimeLimit.setText(tr ("Limit", "L\xc3\xadmit"), dontSendNotification);
     lblCutoff.setText    (tr ("Cut", "Tall"), dontSendNotification);
     lblRes.setText       (tr ("Res", "Res"), dontSendNotification);
@@ -1022,6 +1032,110 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 
     auto titleArea = getLocalBounds().removeFromTop (68);
 
+    // Title layout is computed FIRST (positions + colours + glyph paths) but the
+    // squares are DRAWN LAST, so the connector lines can tuck their ends under the
+    // letters. Each letter is an equal square, keyboard-hue coloured (first/last
+    // red), the glyph stretched to fill it.
+    const auto title  = juce::String::fromUTF8 ("Fibl\xc3\xb3 Gal\xc3\xa0" "ctic");
+    const int  L      = title.length();
+    const int  period = juce::jmax (1, L - 1);
+    float       side  = 52.0f;
+    const float gap   = 4.0f;
+    int squaresN = 0, spaces = 0;
+    for (int i = 0; i < L; ++i) (title[i] == ' ' ? spaces : squaresN)++;
+    float total = (float) squaresN * (side + gap) + (float) spaces * (side * 0.5f);
+    const float freeLeft  = 268.0f;
+    const float freeRight = (float) getWidth() - 312.0f;
+    const float freeW     = juce::jmax (120.0f, freeRight - freeLeft);
+    if (total > freeW) { side *= freeW / total; total = freeW; }
+    const float margin = side * 0.10f;
+    const juce::Font glyphFont = titleTypeface() != nullptr
+        ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (64.0f))
+        : juce::Font (juce::FontOptions (64.0f).withStyle ("Bold"));
+
+    struct Sq { juce::Rectangle<float> rect; juce::Colour col; juce::Path glyph; juce::Colour glyphCol; };
+    std::vector<Sq> squares;
+    {
+        float x = freeLeft + (freeW - total) * 0.5f;
+        const float cy = (float) titleArea.getCentreY();
+        for (int i = 0; i < L; ++i)
+        {
+            if (title[i] == ' ') { x += side * 0.5f; continue; }
+            const float hue = 0.82f * (float) (i % period) / (float) period;
+            Sq s;
+            s.rect = juce::Rectangle<float> (x, cy - side * 0.5f, side, side);
+            s.col  = juce::Colour::fromHSV (hue, 0.62f, 0.9f, 1.0f);
+            juce::GlyphArrangement ga;
+            ga.addLineOfText (glyphFont, title.substring (i, i + 1), 0.0f, 0.0f);
+            juce::Path gp; ga.createPath (gp);
+            const auto gb = gp.getBounds();
+            if (! gb.isEmpty() && gb.getWidth() > 0.0f && gb.getHeight() > 0.0f)
+            {
+                const auto target = s.rect.reduced (margin);
+                gp.applyTransform (juce::AffineTransform::translation (-gb.getCentreX(), -gb.getCentreY())
+                                       .scaled (target.getWidth() / gb.getWidth(),
+                                                target.getHeight() / gb.getHeight())
+                                       .translated (target.getCentreX(), target.getCentreY()));
+                s.glyph    = gp;
+                s.glyphCol = s.col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white;
+            }
+            squares.push_back (std::move (s));
+            x += side + gap;
+        }
+    }
+
+    // Connector lines: each panel is tied to the title letter closest to it in HUE
+    // (so a line ends at the letter that shares the menu's colour) with a thin,
+    // strictly orthogonal path (only N/S/E/W runs + right-angle turns). Drawn now -
+    // BEFORE the panels and the Harmonic-Engine box - so wherever a run would cross
+    // a box it is hidden behind it, and the line reads as threading up through the
+    // gaps to its matching letter.
+    if (! squares.empty() && ! harmonicEngineBounds.isEmpty())
+    {
+        struct Conn { juce::Rectangle<int> box; juce::Colour col; };
+        const Conn conns[] = {
+            { harmonicEngineBounds,       cHarmonic  },
+            { gSpectrumRange.getBounds(), cRange     },
+            { gFractal.getBounds(),       cFractal   },
+            { gPhase.getBounds(),         cPhase     },
+            { gGain.getBounds(),          cGain      },
+            { gReference.getBounds(),     cReference },
+            { gSpecScale.getBounds(),     cRange     },
+            { gFilter.getBounds(),        cFilter    },
+            { gAmpEnv.getBounds(),        cEnv       },
+            { gPitchEnv.getBounds(),      cPitch     },
+            { gTuning.getBounds(),        cTuning    },
+            { gTimbre.getBounds(),        cTimbre    },
+        };
+        auto hueDist = [] (float a, float b) { const float d = std::abs (a - b); return juce::jmin (d, 1.0f - d); };
+        int k = 0;
+        for (const auto& c : conns)
+        {
+            if (c.box.isEmpty()) { ++k; continue; }
+            int best = 0; float bestD = 2.0f;
+            const float ch = c.col.getHue();
+            for (int s = 0; s < (int) squares.size(); ++s)
+            {
+                const float d = hueDist (ch, squares[(size_t) s].col.getHue());
+                if (d < bestD) { bestD = d; best = s; }
+            }
+            const auto& sq = squares[(size_t) best].rect;
+            const float sx  = (float) c.box.getCentreX();
+            const float sy  = (float) c.box.getY();
+            const float lx  = sq.getCentreX();
+            const float lb  = sq.getBottom();
+            const float chY = 58.0f + (float) (k % 6) * 2.3f; // stagger channels across the gap
+            juce::Path pth;
+            pth.startNewSubPath (sx, sy);
+            pth.lineTo (sx, chY);
+            pth.lineTo (lx, chY);
+            pth.lineTo (lx, lb);
+            g.setColour (c.col.withAlpha (0.72f));
+            g.strokePath (pth, juce::PathStrokeType (1.0f, juce::PathStrokeType::mitered, juce::PathStrokeType::butt));
+            ++k;
+        }
+    }
+
     // Harmonic Engine macro-group: the WHOLE box is drawn here - frame + fill + title
     // (like the other boxes but in ONE colour) + the SHARED internal dividers between
     // its sub-cells + each cell's small inline uppercase label. Drawn in the editor
@@ -1063,68 +1177,17 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         sub (hcSlope, tr ("SLOPE", "PENDENT"));
     }
 
-    // Title: Title Case, each letter in an EQUAL-SIZED SQUARE (sharp corners),
-    // keyboard hue logic (first and last letter red), letter black or white by
-    // the square's brightness - like the keys. Every letter is stretched to FILL
-    // its square (see the loop) - it grows and deforms to almost touch the edges.
-    const auto title = juce::String::fromUTF8 ("Fibl\xc3\xb3 Gal\xc3\xa0" "ctic"); // always, both languages
-    const int L = title.length();
-    const int period = juce::jmax (1, L - 1); // last letter wraps to degree 0 = red
-
-    float side      = 52.0f;            // all squares identical, big (shrinks to fit below)
-    const float gap = 4.0f;
-
-    int squares = 0, spaces = 0;
-    for (int i = 0; i < L; ++i) (title[i] == ' ' ? spaces : squares)++;
-    float total = (float) squares * (side + gap) + (float) spaces * (side * 0.5f);
-
-    // Keep the title inside the FREE ZONE between the Save button (left) and the
-    // menu / credit / language controls (right), so it never overlaps them.
-    const float freeLeft  = 268.0f;
-    const float freeRight = (float) getWidth() - 312.0f;
-    const float freeW     = juce::jmax (120.0f, freeRight - freeLeft);
-    if (total > freeW) { side *= freeW / total; total = freeW; }
-    const float margin = side * 0.10f;  // small breathing room to the square's edge
-
-    // Nominal-size font; each glyph's path is rescaled per-square below, so the
-    // exact height here only needs enough resolution for a clean outline.
-    const juce::Font glyphFont = titleTypeface() != nullptr
-        ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (64.0f))
-        : juce::Font (juce::FontOptions (64.0f).withStyle ("Bold"));
-
-    float x = freeLeft + (freeW - total) * 0.5f;
-    const float cy = (float) titleArea.getCentreY();
-    for (int i = 0; i < L; ++i)
+    // Title squares + glyphs, drawn LAST so each connector line disappears under
+    // the letter it points to (its end tucks beneath the square).
+    for (const auto& s : squares)
     {
-        if (title[i] == ' ') { x += side * 0.5f; continue; }
-
-        const float hue = 0.82f * (float) (i % period) / (float) period;
-        const auto sq  = juce::Rectangle<float> (x, cy - side * 0.5f, side, side);
-        const auto col = juce::Colour::fromHSV (hue, 0.62f, 0.9f, 1.0f); // same S/V as the keys
-        g.setColour (col);
-        g.fillRect (sq); // sharp corners
-
-        // Draw the letter as a glyph PATH stretched non-uniformly (X and Y scaled
-        // independently) to fill the square minus the margin: it grows AND deforms
-        // to almost touch the edges, so a narrow letter (I) widens and a wide one
-        // (M) squashes - every square ends up equally, boldly filled.
-        juce::GlyphArrangement ga;
-        ga.addLineOfText (glyphFont, title.substring (i, i + 1), 0.0f, 0.0f);
-        juce::Path gp;
-        ga.createPath (gp);
-        const auto gb = gp.getBounds();
-        if (! gb.isEmpty() && gb.getWidth() > 0.0f && gb.getHeight() > 0.0f)
+        g.setColour (s.col);
+        g.fillRect (s.rect); // sharp corners
+        if (! s.glyph.isEmpty())
         {
-            const auto target = sq.reduced (margin);
-            const auto t = juce::AffineTransform::translation (-gb.getCentreX(), -gb.getCentreY())
-                               .scaled (target.getWidth()  / gb.getWidth(),
-                                        target.getHeight() / gb.getHeight())
-                               .translated (target.getCentreX(), target.getCentreY());
-            gp.applyTransform (t);
-            g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-            g.fillPath (gp);
+            g.setColour (s.glyphCol);
+            g.fillPath (s.glyph);
         }
-        x += side + gap;
     }
 }
 
@@ -1213,8 +1276,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
         macro.removeFromTop (14); // clear the "HARMONIC ENGINE" title
         const int mW = macro.getWidth();
 
-        hcBase      = macro.removeFromLeft (mW * 22 / 62);
-        auto midCol = macro.removeFromLeft (mW * 28 / 62);
+        // Base is a touch wider (and Harmonics/Prime a touch narrower) so the Base
+        // pitch combo can show "Transposed down" in full without clipping.
+        hcBase      = macro.removeFromLeft (mW * 24 / 62);
+        auto midCol = macro.removeFromLeft (mW * 26 / 62);
         hcSlope     = macro;
         hcHarm      = midCol.withHeight (midCol.getHeight() * 2 / 5);
         hcPrime     = midCol.withTrimmedTop (midCol.getHeight() * 2 / 5);
@@ -1222,7 +1287,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         const int lblH = 15; // inline sub-label band (BASE / HARMONICS / PRIME / SLOPE)
         {
             auto bi = hcBase.reduced (5, 3); bi.removeFromTop (lblH);
-            auto left = bi.removeFromLeft (bi.getWidth() * 40 / 100);
+            auto left = bi.removeFromLeft (bi.getWidth() * 36 / 100);
             lblBaseN.setBounds (left.removeFromTop (13)); baseNFader.setBounds (left);
             bi.removeFromLeft (5);
             lblBasePitch.setBounds (bi.removeFromTop (13));
@@ -1267,7 +1332,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         }
 
         oneFader (row.removeFromLeft (W * 12 / 100), gSpectrumRange, spectrumRangeFader, &lblRange);
-        oneFader (row.removeFromLeft (W * 12 / 100), gFractal,       fractalFader,       nullptr);
+        oneFader (row.removeFromLeft (W * 12 / 100), gFractal,       fractalFader,       &lblFractal);
 
         // Phase (combo) | Gain (horizontal) | Reference, stacked top-to-bottom.
         {
@@ -1411,7 +1476,22 @@ void FractalAdditiveAudioProcessorEditor::pollComputerKeyboard()
     // always mirrors exactly what we triggered - a stale entry from a mass-clear
     // was one way a key could later re-fire and leave a note stuck in memory.
     const bool typing = dynamic_cast<juce::TextEditor*> (juce::Component::getCurrentlyFocusedComponent()) != nullptr;
-    const bool active = hasKeyboardFocus (true) && ! typing;
+
+    // Focus is fragile: clicking a slider (grabs-focus off keeps focus, but a
+    // combo popup, a colour picker, a preset dialog... all momentarily steal it),
+    // and every such flicker used to release+retrigger the held notes - that is
+    // the "the note suddenly sounds different" bug, AND it made it impossible to
+    // grab a control while sustaining a note. So we debounce: a real note only
+    // releases once focus has been gone for >250 ms (you actually left the
+    // plugin). Brief losses keep the notes sounding, so you can freely tweak any
+    // parameter with a note held down.
+    const bool focusedNow = hasKeyboardFocus (true) && ! typing;
+    const juce::uint32 now = juce::Time::getMillisecondCounter();
+    if (focusedNow)
+        lastFocusedMs = now;
+    // Typing must silence immediately (letters belong to the text field, not the
+    // keyboard); otherwise honour the debounce window.
+    const bool active = ! typing && (focusedNow || (now - lastFocusedMs) < 250);
 
     for (const auto& m : kKeyMap)
     {

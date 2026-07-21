@@ -189,7 +189,7 @@ private:
 
     juce::GroupComponent gHarmonic, gBase, gWhitelist, gSlope, gSpectrumRange, gFractal, gPhase, gGain,
                          gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale, gReference;
-    juce::Label lblBaseN, lblBasePitch, lblRange, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
+    juce::Label lblBaseN, lblBasePitch, lblRange, lblFractal, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
                 lblTimbreRepeats, lblBend, lblPeriod, lblRefA, lblPitchAmt, lblMorphTime,
                 tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel;
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], pitchAdsrLbl[4], primeLbl[9];
@@ -218,6 +218,7 @@ private:
     juce::Rectangle<int> hcBase, hcHarm, hcPrime, hcSlope; // its 4 sub-cells (dividers/labels in paint)
     void refreshDegreeList (bool showNotice = true);
     std::map<int, int> heldKeys;
+    juce::uint32 lastFocusedMs = 0; // debounce: keep playing through brief focus flickers
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FractalAdditiveAudioProcessorEditor)
 };
