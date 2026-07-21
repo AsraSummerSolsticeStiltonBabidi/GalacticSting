@@ -69,10 +69,10 @@ namespace
     // so long Catalan titles still fit inside the box.
     void drawTitleChip (juce::Graphics& g, juce::Rectangle<float> box, juce::Colour col, const juce::String& text)
     {
-        constexpr float titleH  = 21.0f;
-        constexpr float stretch = 1.26f; // text stretched a little taller (upward)
+        constexpr float stretch = 1.34f; // letters stretched taller (upward)
+        constexpr float chipH   = 16.0f; // stays INSIDE the box (never clipped at the top)
         const juce::String upper = text.toUpperCase();
-        const float maxW = box.getWidth() - 6.0f;
+        const float maxW = box.getWidth() - 4.0f;
 
         // Measure + auto-shrink the font so even a long Catalan title fits the box.
         auto measure = [&] (const juce::Font& f, juce::GlyphArrangement& ga)
@@ -81,26 +81,34 @@ namespace
             ga.addLineOfText (f, upper, 0.0f, 0.0f);
             return ga.getBoundingBox (0, -1, true);
         };
-        float fontH = 14.5f;
+        float fontH = 13.0f;
         juce::Font tf (juce::FontOptions (fontH).withStyle ("Bold"));
         juce::GlyphArrangement ga;
         auto bb = measure (tf, ga);
-        if (bb.getWidth() + 12.0f > maxW && bb.getWidth() > 1.0f)
+        if (bb.getWidth() + 11.0f > maxW && bb.getWidth() > 1.0f)
         {
-            fontH = juce::jmax (8.0f, fontH * (maxW - 12.0f) / bb.getWidth());
+            fontH = juce::jmax (8.0f, fontH * (maxW - 11.0f) / bb.getWidth());
             tf = juce::Font (juce::FontOptions (fontH).withStyle ("Bold"));
             bb = measure (tf, ga);
         }
 
-        // The chip is FLUSH LEFT (on the box's left border) and its bottom sits on the
-        // frame's top line, so it never covers any control below it - it only reaches
-        // UP into the empty gap above the box.
-        const float chipW = juce::jmin (maxW, bb.getWidth() + 12.0f);
-        const float chipH = bb.getHeight() * stretch + 4.0f;
-        const float chipBottom = box.getY() + titleH * 0.5f + 3.5f; // above the content, only a small tab above the box
-        auto chip = juce::Rectangle<float> (box.getX() + 2.0f, chipBottom - chipH, chipW, chipH);
+        // FLUSH with the box's left border, sitting at the very top INSIDE the box, so
+        // its top is never clipped and it stays clear of the controls below.
+        const float chipW = juce::jmin (maxW, bb.getWidth() + 11.0f);
+        auto chip = juce::Rectangle<float> (box.getX() + 1.3f, box.getY() + 1.0f, chipW, chipH);
+
+        // Rounded TOP corners, sharp (angular) BOTTOM corners.
+        const float rad = juce::jmin (6.0f, chipW * 0.5f);
+        juce::Path shape;
+        shape.startNewSubPath (chip.getX(), chip.getBottom());
+        shape.lineTo (chip.getX(), chip.getY() + rad);
+        shape.quadraticTo (chip.getX(), chip.getY(), chip.getX() + rad, chip.getY());
+        shape.lineTo (chip.getRight() - rad, chip.getY());
+        shape.quadraticTo (chip.getRight(), chip.getY(), chip.getRight(), chip.getY() + rad);
+        shape.lineTo (chip.getRight(), chip.getBottom());
+        shape.closeSubPath();
         g.setColour (col);
-        g.fillRect (chip); // sharp corners = "angular", like the main-title squares
+        g.fillPath (shape);
 
         // Letters, stretched vertically (upward) and centred in the chip; black/white
         // by the chip's brightness (as the title letters and the keys do).
@@ -145,8 +153,8 @@ namespace
         juce::Label* createSliderTextBox (juce::Slider& s) override
         {
             auto* l = juce::LookAndFeel_V4::createSliderTextBox (s);
-            l->setFont (juce::Font (juce::FontOptions (11.5f)));
-            l->setMinimumHorizontalScale (0.4f); // shrink-to-fit rather than ellipsize
+            l->setFont (juce::Font (juce::FontOptions (10.0f))); // small: fits the squeezed fader value boxes
+            l->setMinimumHorizontalScale (0.35f); // shrink-to-fit rather than ellipsize
             l->setJustificationType (juce::Justification::centred);
             return l;
         }
@@ -286,9 +294,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 
     configCombo (whitelistBox, "selection", whitelistAtt, cHarmonic, "Which harmonics may sound: All / Even / Odd / Prime");
     configFader (slopeFader, "curveSlope", slopeAtt, cHarmonic, "Amplitude roll-off. 0 = flat/bright, 1 = saw, 2 = triangle.  (Also thins the highs in Timbre mode.)");
-    configGroup (gSpectrumRange, cRange);
-    configFader (spectrumRangeFader, "spectrumRange", spectrumRangeAtt, cRange, "Hard-cut the spectrum this many octaves above the played note (10 = full range, no cut).");
-    makeLabel (lblRange, cRange);
+    // "Range" (spectrum hard-cut) removed from the UI - redundant with the Filter.
+    // The parameter defaults to 10 (= no cut), so it has no effect.
     configGroup (gFractal, cFractal);
     configFader (fractalFader, "fractalLevel", fractalAtt, cFractal, "Fractal self-similarity level (1 = off)");
     makeLabel (lblFractal, cFractal);
@@ -600,10 +607,9 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // Integer faders: relative drag (no snap-to-click) so the drag distance,
     // not the track length, sets the resolution; Ctrl stretches it x4 (see
     // SteppedSlider). Base N (1..64) gets the longest travel = least sensitive.
-    for (auto* s : { &baseNFader, &spectrumRangeFader, &fractalFader, &timbreRepeatsFader })
+    for (auto* s : { &baseNFader, &fractalFader, &timbreRepeatsFader })
         s->setSliderSnapsToMousePosition (false);
     baseNFader.normalSensitivity         = 520;
-    spectrumRangeFader.normalSensitivity = 300;
     fractalFader.normalSensitivity       = 260;
     timbreRepeatsFader.normalSensitivity = 280;
 
@@ -644,7 +650,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     lastTimbreActive = processorRef.isTimbreActive();
 
     setWantsKeyboardFocus (true);
-    setSize (1280, 604); // slightly flatter (shorter fader rows; text sizes unchanged)
+    setSize (1200, 604); // narrower (Range removed; faders squeezed closer)
     startTimerHz (30); // also the reconcile rate for stuck/ghost computer-keyboard notes
     juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<juce::Component> (this)]
     { if (safe != nullptr) safe->grabKeyboardFocus(); });
@@ -693,7 +699,6 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     langButton.setTooltip (tr ("Switch the interface language to Catal\xc3\xa0.",
                                "Torna la interf\xc3\xad" "cie a l'angl\xc3\xa8s."));
 
-    gSpectrumRange.setText (tr ("Range", "Rang"));
     gFractal.setText       (tr ("Fractal", "Fractal"));
     gPrime.setText         (tr ("Prime Control", "Control primers"));
     gFilter.setText        (tr ("Filter", "Filtre"));
@@ -707,7 +712,6 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
 
     lblBaseN.setText     ("N", dontSendNotification);
     lblBasePitch.setText (tr ("Pitch", "To"), dontSendNotification);
-    lblRange.setText     (tr ("Oct", "Oct"), dontSendNotification);
     lblFractal.setText   (tr ("Level", "Nivell"), dontSendNotification);
     lblPrimeLimit.setText(tr ("Limit", "L\xc3\xadmit"), dontSendNotification);
     lblCutoff.setText    (tr ("Cut", "Tall"), dontSendNotification);
@@ -753,9 +757,6 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     slopeFader.setTooltip (tr (
         "How fast higher partials lose volume: 0 = all equal (brightest), 1 = like a saw (1/n), 2 = like a triangle, higher = darker. Also shapes the stacked scale in Timbre mode.",
         "Com de r\xc3\xa0pid perden volum els parcials aguts: 0 = tots iguals (m\xc3\xa9s brillant), 1 = com una serra (1/n), 2 = com un triangle, m\xc3\xa9s = m\xc3\xa9s fosc. Tamb\xc3\xa9 d\xc3\xb3na forma a l'escala apilada en mode Timbre."));
-    spectrumRangeFader.setTooltip (tr (
-        "Hard cut: removes every partial more than this many octaves above the played note. 10 = no cut (full range).",
-        "Tall dur: elimina tot parcial m\xc3\xa9s agut que aquest nombre d'octaves per sobre de la nota tocada. 10 = sense tall (rang complet)."));
     fractalFader.setTooltip (tr (
         "Replaces each partial with a scaled copy of the whole spectrum, this many levels deep. 1 = off. Each level multiplies density and adds self-similar, inharmonic detail.",
         "Substitueix cada parcial per una c\xc3\xb2pia escalada de tot l'espectre, tants nivells com indiquis. 1 = apagat. Cada nivell multiplica la densitat i afegeix detall autosemblant i inharm\xc3\xb2nic."));
@@ -1218,7 +1219,7 @@ void FractalAdditiveAudioProcessorEditor::layoutFaders (juce::GroupComponent& g,
                                                         std::initializer_list<juce::Label*> labels)
 {
     g.setBounds (area.reduced (3));
-    auto in = area.reduced (3).reduced (5, 4); in.removeFromTop (14); // clear the title chip
+    auto in = area.reduced (3).reduced (5, 4); in.removeFromTop (17); // clear the title chip
     const int n = (int) faders.size();
     const int cw = in.getWidth() / juce::jmax (1, n);
     auto fit = faders.begin(); auto lit = labels.begin();
@@ -1418,7 +1419,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
     //== Right panel: Spectrum to Scale (full height) ===========================
     {
-        auto sp = area.removeFromRight (224);
+        auto sp = area.removeFromRight (208);
         gSpecScale.setBounds (sp.reduced (3));
         auto si = sp.reduced (3).reduced (8, 5); si.removeFromTop (16);
         auto r1 = si.removeFromTop (24);
@@ -1451,7 +1452,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         const int macroW = W * 60 / 100;
         harmonicEngineBounds = row.removeFromLeft (macroW);
         auto macro = harmonicEngineBounds.reduced (5, 4);
-        macro.removeFromTop (14); // clear the "HARMONIC ENGINE" title
+        macro.removeFromTop (17); // clear the "HARMONIC ENGINE" title
         const int mW = macro.getWidth();
 
         // Base is a touch wider (and Harmonics/Prime a touch narrower) so the Base
@@ -1509,8 +1510,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             slopeFader.setBounds (si);
         }
 
-        oneFader (row.removeFromLeft (W * 11 / 100), gSpectrumRange, spectrumRangeFader, &lblRange);
-        oneFader (row.removeFromLeft (W * 11 / 100), gFractal,       fractalFader,       &lblFractal);
+        oneFader (row.removeFromLeft (W * 12 / 100), gFractal,       fractalFader,       &lblFractal);
 
         // Essentials macro (Phase / Gain / Reference / Octave) - one framed box like
         // the Harmonic Engine: 4 stacked cells, shared horizontal dividers + inline
@@ -1518,7 +1518,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         {
             essentialsBounds = row;
             auto e = essentialsBounds.reduced (5, 4);
-            e.removeFromTop (14); // clear the "ESSENTIALS" title
+            e.removeFromTop (17); // clear the "ESSENTIALS" title
             const int ch = e.getHeight() / 4;
             ecPhase = e.removeFromTop (ch);
             ecGain  = e.removeFromTop (ch);
@@ -1546,7 +1546,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
         // Custom Engine (leftmost now): load .scl OR type intervals + Reps.
         {
-            auto sb = row.removeFromLeft (W * 16 / 100);
+            auto sb = row.removeFromLeft (W * 14 / 100);
             gTimbre.setBounds (sb.reduced (3));
             auto ti = sb.reduced (3).reduced (8, 5); ti.removeFromTop (16);
             auto brow = ti.removeFromTop (24);
@@ -1572,12 +1572,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
             timbreRepeatsFader.setBounds (fr);
         }
 
-        layoutFaders (gAmpEnv, row.removeFromLeft (W * 15 / 100), cEnv,
+        layoutFaders (gAmpEnv, row.removeFromLeft (W * 16 / 100), cEnv,
             { &ampAdsr[0], &ampAdsr[1], &ampAdsr[2], &ampAdsr[3] },
             { &ampAdsrLbl[0], &ampAdsrLbl[1], &ampAdsrLbl[2], &ampAdsrLbl[3] });
 
         // Pitch envelope: Amount (semitones) + A D S R, like the filter envelope.
-        layoutFaders (gPitchEnv, row.removeFromLeft (W * 18 / 100), cPitch,
+        layoutFaders (gPitchEnv, row.removeFromLeft (W * 19 / 100), cPitch,
             { &pEnvAmtFader, &pitchAdsr[0], &pitchAdsr[1], &pitchAdsr[2], &pitchAdsr[3] },
             { &lblPitchAmt, &pitchAdsrLbl[0], &pitchAdsrLbl[1], &pitchAdsrLbl[2], &pitchAdsrLbl[3] });
 
