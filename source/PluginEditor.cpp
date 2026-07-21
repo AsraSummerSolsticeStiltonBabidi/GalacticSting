@@ -12,45 +12,6 @@ namespace
         return tf;
     }
 
-    // Comic Sans, loaded ONCE from the user's own Windows font file (not embedded /
-    // redistributed - it renders with the copy already on their machine). JUCE 8 does
-    // not resolve "Comic Sans MS" by name, so we hand it a concrete Typeface instead.
-    // Returns nullptr if the file is absent (then the UI keeps the default face).
-    const juce::Typeface::Ptr& comicTypeface()
-    {
-        static juce::Typeface::Ptr tf = []() -> juce::Typeface::Ptr
-        {
-            for (const char* p : { "C:\\Windows\\Fonts\\comic.ttf",
-                                   "C:\\Windows\\Fonts\\comicbd.ttf" })
-            {
-                juce::File f (p);
-                if (f.existsAsFile())
-                {
-                    juce::MemoryBlock mb;
-                    if (f.loadFileAsData (mb) && mb.getSize() > 0)
-                        return juce::Typeface::createSystemTypefaceFor (mb.getData(), mb.getSize());
-                }
-            }
-            return nullptr;
-        }();
-        return tf;
-    }
-
-}
-
-// A UI font in the comic face at the given height (falls back to the default sans
-// if Comic Sans could not be loaded). Declared in GalacticFont.h so the editor, the
-// keyboard and the nested paint helpers can all reach it.
-juce::Font galactic::comicFont (float height)
-{
-    if (comicTypeface() != nullptr)
-        return juce::Font (juce::FontOptions (comicTypeface()).withHeight (height));
-    return juce::Font (juce::FontOptions (height));
-}
-
-namespace
-{
-
     // Section colours, deliberately spread around the hue wheel so that NO two
     // neighbouring panels (horizontally OR vertically) share a similar hue - in
     // particular no two near-identical blues sit side by side. Reading the two
@@ -101,41 +62,51 @@ namespace
         {'q',9},{'w',10},{'e',11},{'r',12},{'t',13},{'y',14},{'u',15},{'i',16},{'o',17},{'p',18}
     };
 
+    // Draws a menu title inside an ANGULAR (sharp-cornered) chip filled with the
+    // section colour, bounded to the text, at the top-left of `box` - just like the
+    // coloured squares of the main title. The letter colour flips black/white with
+    // the chip's brightness (as the title letters and the keys do). The font shrinks
+    // so long Catalan titles still fit inside the box.
+    void drawTitleChip (juce::Graphics& g, juce::Rectangle<float> box, juce::Colour col, const juce::String& text)
+    {
+        constexpr float titleH = 21.0f;
+        const juce::String upper = text.toUpperCase();
+        const float maxW = box.getWidth() - 10.0f;
+        auto measure = [&] (const juce::Font& f)
+        {
+            juce::GlyphArrangement ga; ga.addLineOfText (f, upper, 0.0f, 0.0f);
+            return ga.getBoundingBox (0, -1, true).getWidth();
+        };
+        float fontH = 15.0f;
+        juce::Font tf (juce::FontOptions (fontH).withStyle ("Bold"));
+        float tw = measure (tf);
+        if (tw + 14.0f > maxW && tw > 1.0f)
+        {
+            fontH = juce::jmax (8.0f, fontH * (maxW - 14.0f) / tw);
+            tf = juce::Font (juce::FontOptions (fontH).withStyle ("Bold"));
+            tw = measure (tf);
+        }
+        const float chipH = juce::jmin (titleH, fontH + 6.0f);
+        const float chipW = juce::jmin (maxW, tw + 14.0f);
+        auto chip = juce::Rectangle<float> (box.getX() + 8.0f,
+                                            box.getY() + (titleH - chipH) * 0.5f, chipW, chipH);
+        g.setColour (col);
+        g.fillRect (chip); // sharp corners = "angular", like the main-title squares
+        g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
+        g.setFont (tf);
+        g.drawText (upper, chip, juce::Justification::centred, false);
+    }
+
     // Bold group titles in a filled chip (so nothing overlaps the title), a thicker
     // rounded frame, and bold labels -> more contrast + clarity.
     struct GalacticLnF : juce::LookAndFeel_V4
     {
         GalacticLnF()
         {
-            // Everything (except the Kablammo main title, which sets its typeface
-            // explicitly) renders in a rounded, curvy comic face. Comic Sans MS ships
-            // with every Windows install, so referencing it by name just renders with
-            // the user's own system font - no font file is redistributed, so there is
-            // no licensing issue for a commercial Windows plugin. If it is ever missing
-            // JUCE falls back to a rounded sans automatically.
-            setDefaultSansSerifTypefaceName ("Comic Sans MS");
-
             setColour (juce::ComboBox::backgroundColourId, juce::Colour (0xff20202b));
             setColour (juce::ComboBox::textColourId, juce::Colours::white);
             setColour (juce::PopupMenu::backgroundColourId, juce::Colour (0xff20202b));
             setColour (juce::PopupMenu::highlightedBackgroundColourId, juce::Colour (0xff3a3a52));
-        }
-
-        // Force the comic face for every font that does not name its own typeface
-        // (JUCE 8's FontOptions do not always honour setDefaultSansSerifTypefaceName).
-        // The main title names the embedded Kablammo typeface, so it is untouched.
-        juce::Typeface::Ptr getTypefaceForFont (const juce::Font& f) override
-        {
-            const auto name = f.getTypefaceName();
-            if (name == juce::Font::getDefaultSansSerifFontName()
-                || name == juce::Font::getDefaultSerifFontName()
-                || name.isEmpty())
-            {
-                juce::Font g (f);
-                g.setTypefaceName ("Comic Sans MS");
-                return juce::Typeface::createSystemTypefaceFor (g);
-            }
-            return juce::LookAndFeel_V4::getTypefaceForFont (f);
         }
 
         juce::Font getLabelFont (juce::Label& l) override
@@ -143,30 +114,21 @@ namespace
             // A slider's value read-out is a child Label: keep it SMALL (and not bold)
             // so two decimals fit in the narrow box instead of clipping to "...".
             if (dynamic_cast<juce::Slider*> (l.getParentComponent()) != nullptr)
-                return galactic::comicFont (10.0f);
-            return galactic::comicFont (juce::jmax (12.5f, l.getFont().getHeight()));
+                return juce::Font (juce::FontOptions (10.0f));
+            return juce::Font (juce::FontOptions (juce::jmax (12.5f, l.getFont().getHeight())).withStyle ("Bold"));
         }
 
         juce::Font getTextButtonFont (juce::TextButton&, int buttonHeight) override
         {
-            return galactic::comicFont (juce::jmin (16.0f, (float) buttonHeight * 0.62f));
+            return juce::Font (juce::FontOptions (juce::jmin (16.0f, (float) buttonHeight * 0.62f)).withStyle ("Bold"));
         }
-
-        juce::Font getComboBoxFont (juce::ComboBox& b) override
-        {
-            return galactic::comicFont (juce::jmin (15.0f, (float) b.getHeight() * 0.62f));
-        }
-        juce::Font getPopupMenuFont() override            { return galactic::comicFont (15.0f); }
-        juce::Font getAlertWindowMessageFont() override   { return galactic::comicFont (15.0f); }
-        juce::Font getAlertWindowTitleFont() override     { return galactic::comicFont (18.0f); }
-        juce::Font getAlertWindowFont() override          { return galactic::comicFont (14.0f); }
 
         // Slider value read-outs: a small font + generous horizontal squish so the
         // value ALWAYS fits (e.g. two decimals) instead of being clipped to "...".
         juce::Label* createSliderTextBox (juce::Slider& s) override
         {
             auto* l = juce::LookAndFeel_V4::createSliderTextBox (s);
-            l->setFont (galactic::comicFont (11.5f));
+            l->setFont (juce::Font (juce::FontOptions (11.5f)));
             l->setMinimumHorizontalScale (0.4f); // shrink-to-fit rather than ellipsize
             l->setJustificationType (juce::Justification::centred);
             return l;
@@ -188,35 +150,8 @@ namespace
             g.setColour (col.withAlpha (0.95f));
             g.drawRect (frame, 2.6f); // thick square outline
 
-            // Title: UPPERCASE, no background chip - BLACK glyphs with a thick stroke in
-            // the section colour (outlined text). The font auto-shrinks to fit the box
-            // width (long Catalan titles would otherwise overrun).
-            const juce::String upper = text.toUpperCase();
-            float fontH = 16.0f;
-            const float avail = (float) w - 12.0f - 5.0f;
-            juce::Font tf = galactic::comicFont (fontH);
-            juce::GlyphArrangement ga;
-            ga.addLineOfText (tf, upper, 12.0f, titleH - 5.5f);
-            const float tw = ga.getBoundingBox (0, -1, true).getWidth();
-            if (tw > avail && tw > 1.0f)
-            {
-                fontH = juce::jmax (8.5f, fontH * avail / tw);
-                ga.clear();
-                tf = galactic::comicFont (fontH);
-                ga.addLineOfText (tf, upper, 12.0f, titleH - 5.5f);
-            }
-            juce::Path p;
-            ga.createPath (p);
-            // Stretch the glyphs a little taller, UPWARD only (anchored on the
-            // baseline), so the title reads bigger without moving its baseline or
-            // touching anything below it.
-            const float baseY = titleH - 5.5f;
-            p.applyTransform (juce::AffineTransform::translation (0.0f, -baseY)
-                                  .scaled (1.0f, 1.28f).translated (0.0f, baseY));
-            g.setColour (col);
-            g.strokePath (p, juce::PathStrokeType (3.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-            g.setColour (juce::Colours::black);
-            g.fillPath (p);
+            // Title: an angular colour chip bounded to the text (see drawTitleChip).
+            drawTitleChip (g, juce::Rectangle<float> (0.0f, 0.0f, (float) w, (float) h), col, text);
         }
 
         // Square buttons (sharp corners), filled with the button's colour.
@@ -246,6 +181,51 @@ namespace
             g.setFont (getTextButtonFont (b, b.getHeight()));
             g.drawFittedText (b.getButtonText(), b.getLocalBounds().reduced (4, 0),
                               juce::Justification::centred, 2);
+        }
+
+        // Text FIELDS (combo boxes + text editors) are as rounded as possible - a
+        // full pill (corner radius = half the height).
+        void drawComboBox (juce::Graphics& g, int width, int height, bool,
+                           int, int, int, int, juce::ComboBox& box) override
+        {
+            auto r = juce::Rectangle<float> (0.0f, 0.0f, (float) width, (float) height);
+            const float rad = (float) height * 0.5f;
+            g.setColour (box.findColour (juce::ComboBox::backgroundColourId));
+            g.fillRoundedRectangle (r.reduced (0.5f), rad);
+            g.setColour (box.findColour (juce::ComboBox::outlineColourId));
+            g.drawRoundedRectangle (r.reduced (0.75f), rad, 1.4f);
+
+            // Chevron on the right.
+            const float cx = (float) width - (float) height * 0.55f;
+            const float cy = (float) height * 0.5f;
+            const float s  = (float) height * 0.15f;
+            juce::Path p;
+            p.startNewSubPath (cx - s, cy - s * 0.5f);
+            p.lineTo (cx,     cy + s * 0.6f);
+            p.lineTo (cx + s, cy - s * 0.5f);
+            g.setColour (box.findColour (juce::ComboBox::textColourId).withAlpha (box.isEnabled() ? 0.9f : 0.35f));
+            g.strokePath (p, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        }
+
+        // Keep the selected-item text clear of the rounded left end.
+        void positionComboBoxText (juce::ComboBox& box, juce::Label& label) override
+        {
+            const int inset = box.getHeight() / 3;
+            label.setBounds (inset, 1, box.getWidth() - inset - box.getHeight() / 2, box.getHeight() - 2);
+            label.setFont (getComboBoxFont (box));
+        }
+
+        void fillTextEditorBackground (juce::Graphics& g, int width, int height, juce::TextEditor& te) override
+        {
+            g.setColour (te.findColour (juce::TextEditor::backgroundColourId));
+            g.fillRoundedRectangle (juce::Rectangle<float> (0.0f, 0.0f, (float) width, (float) height).reduced (0.5f),
+                                    (float) height * 0.5f);
+        }
+        void drawTextEditorOutline (juce::Graphics& g, int width, int height, juce::TextEditor& te) override
+        {
+            g.setColour (te.findColour (juce::TextEditor::outlineColourId));
+            g.drawRoundedRectangle (juce::Rectangle<float> (0.0f, 0.0f, (float) width, (float) height).reduced (0.9f),
+                                    (float) height * 0.5f, 1.4f);
         }
     };
 }
@@ -376,7 +356,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuningStatusLabel.setVisible (false); // "loaded:" prefix removed - name shows by the mode combo
     tuningNameLabel.setJustificationType (juce::Justification::centredLeft);
     tuningNameLabel.setColour (juce::Label::textColourId, cTuning); // the loaded scale's file name
-    tuningNameLabel.setFont (galactic::comicFont (13.0f));
+    tuningNameLabel.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
     addAndMakeVisible (tuningNameLabel);
 
     // Tuning bank: a slot selector (automatable) + a button to load a .scl into it.
@@ -419,7 +399,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     makeLabel (lblTimbreRepeats, cTimbre);
     timbreStatusLabel.setJustificationType (juce::Justification::centredLeft);
     timbreStatusLabel.setColour (juce::Label::textColourId, cTimbre);
-    timbreStatusLabel.setFont (galactic::comicFont (12.0f));
+    timbreStatusLabel.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
     addAndMakeVisible (timbreStatusLabel);
 
     // Language toggle (top-right).
@@ -463,14 +443,14 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     vibeLabel.setText ("Vibe coded by", juce::dontSendNotification);
     vibeLabel.setJustificationType (juce::Justification::centredRight);
     vibeLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
-    vibeLabel.setFont (galactic::comicFont (12.5f));
+    vibeLabel.setFont (juce::Font (juce::FontOptions (12.5f)));
     vibeLabel.setInterceptsMouseClicks (false, false);
     addAndMakeVisible (vibeLabel);
 
     vibeLink.setButtonText ("Asra3");
     vibeLink.setURL (juce::URL ("https://www.instagram.com/asra3333333/"));
     vibeLink.setColour (juce::HyperlinkButton::textColourId, juce::Colour (0xff5cb8ff));
-    vibeLink.setFont (galactic::comicFont (12.5f),
+    vibeLink.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")),
                       false, juce::Justification::centredLeft);
     vibeLink.setMouseClickGrabsKeyboardFocus (false);
     vibeLink.setTooltip ("https://www.instagram.com/asra3333333/");
@@ -533,6 +513,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     periodEdit.setJustification (juce::Justification::centred);
     periodEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
     periodEdit.setColour (juce::TextEditor::outlineColourId, cSpecScale.withAlpha (0.7f));
+    periodEdit.setIndents (10, 2); // clear the rounded (pill) ends
     periodEdit.setSelectAllWhenFocused (true);
     periodEdit.onReturnKey = [this] { refocus(); }; // give the keys back to note-playing
     periodEdit.onEscapeKey = [this] { refocus(); };
@@ -544,7 +525,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     intervalEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
     intervalEdit.setColour (juce::TextEditor::outlineColourId, cTimbre.withAlpha (0.7f));
     intervalEdit.setColour (juce::TextEditor::textColourId, juce::Colours::white);
-    intervalEdit.setFont (galactic::comicFont (13.0f));
+    intervalEdit.setIndents (12, 2); // clear the rounded (pill) ends
+    intervalEdit.setFont (juce::Font (juce::FontOptions (13.0f)));
     intervalEdit.onReturnKey = [this]
     {
         juce::String err;
@@ -573,6 +555,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     refAEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
     refAEdit.setColour (juce::TextEditor::outlineColourId, cEssentials.withAlpha (0.7f));
     refAEdit.setColour (juce::TextEditor::textColourId, juce::Colours::white);
+    refAEdit.setIndents (8, 2); // clear the rounded (pill) ends
     refAEdit.setSelectAllWhenFocused (true);
     refAEdit.setText (juce::String (processorRef.apvts.getRawParameterValue ("refA")->load(), 2), juce::dontSendNotification);
     refAEdit.onReturnKey  = [this] { commitRefA(); refocus(); };
@@ -583,7 +566,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     lblRefHz.setText ("hz", juce::dontSendNotification);
     lblRefHz.setJustificationType (juce::Justification::centredLeft);
     lblRefHz.setColour (juce::Label::textColourId, cEssentials.brighter (0.15f));
-    lblRefHz.setFont (galactic::comicFont (11.5f));
+    lblRefHz.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
     addAndMakeVisible (lblRefHz);
 
     addChildComponent (noticeOverlay);
@@ -608,11 +591,11 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     timbreRepeatsFader.normalSensitivity = 280;
 
     meterLabel.setJustificationType (juce::Justification::centred);
-    meterLabel.setFont (galactic::comicFont (13.0f));
+    meterLabel.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
     addAndMakeVisible (meterLabel);
     helpLabel.setJustificationType (juce::Justification::centred);
     helpLabel.setColour (juce::Label::textColourId, juce::Colour (0xff9aa0b0));
-    helpLabel.setFont (galactic::comicFont (10.0f));
+    helpLabel.setFont (juce::Font (juce::FontOptions (9.5f)));
     addAndMakeVisible (helpLabel);
 
     keyboard.setDegreeLabeller ([this] (int d) { return justName (processorRef.getDegreeRatio (d)); });
@@ -1167,7 +1150,7 @@ void FractalAdditiveAudioProcessorEditor::makeLabel (juce::Label& l, juce::Colou
 {
     l.setJustificationType (juce::Justification::centred);
     l.setColour (juce::Label::textColourId, c.brighter (0.15f));
-    l.setFont (galactic::comicFont (12.0f));
+    l.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
     addAndMakeVisible (l);
 }
 
@@ -1307,21 +1290,12 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         g.fillRect (frame);
         g.setColour (col.withAlpha (0.95f));
         g.drawRect (frame, 2.6f);
-        juce::GlyphArrangement ga;
-        const float baseY = box.getY() + titleH - 5.5f;
-        ga.addLineOfText (galactic::comicFont (16.0f),
-                          ttl, box.getX() + 12.0f, baseY);
-        juce::Path p; ga.createPath (p);
-        p.applyTransform (juce::AffineTransform::translation (0.0f, -baseY)  // taller, upward only
-                              .scaled (1.0f, 1.28f).translated (0.0f, baseY));
-        g.setColour (col);
-        g.strokePath (p, juce::PathStrokeType (3.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-        g.setColour (juce::Colours::black); g.fillPath (p);
+        drawTitleChip (g, box, col, ttl); // angular colour chip, bounded to the text
     };
     auto subLabel = [&] (const juce::Rectangle<int>& c, juce::Colour col, const juce::String& s, float al)
     {
         g.setColour (col.withMultipliedAlpha (al));
-        g.setFont (galactic::comicFont (11.5f));
+        g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
         g.drawText (s, c.withHeight (13).reduced (5, 0), juce::Justification::centredLeft, false);
     };
 
@@ -1411,9 +1385,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
     { c.setBounds (r.withSizeKeepingCentre (r.getWidth(), juce::jmin (24, r.getHeight()))); };
     auto oneFader = [&] (juce::Rectangle<int> b, juce::GroupComponent& grp, juce::Slider& s, juce::Label* lbl)
     {
-        // Full row height (only the horizontal gap is trimmed), so these boxes are the
-        // exact same height as the Harmonic-Engine / Essentials macro boxes beside
-        // them - top AND bottom line up. The CONTENT is unchanged.
+        // Box top aligned to the row top (like the Harmonic-Engine / Essentials macro
+        // boxes) so all Row-1 titles sit on the same line; the CONTENT is unchanged.
         grp.setBounds (b.reduced (3, 0));
         auto r = b.reduced (3).reduced (5, 4); r.removeFromTop (14);
         if (lbl) lbl->setBounds (r.removeFromTop (13));

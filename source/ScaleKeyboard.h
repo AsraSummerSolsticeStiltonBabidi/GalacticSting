@@ -1,7 +1,6 @@
 #pragma once
 
 #include <juce_audio_utils/juce_audio_utils.h>
-#include "GalacticFont.h"
 #include <functional>
 
 //==============================================================================
@@ -100,13 +99,13 @@ public:
             if (label.isNotEmpty())
             {
                 auto top = cell.removeFromTop (cell.getHeight() * 0.52f);
-                g.setFont (galactic::comicFont (juce::jmin (18.0f, w * 0.5f)));
+                g.setFont (juce::Font (juce::FontOptions (juce::jmin (18.0f, w * 0.5f)).withStyle ("Bold")));
                 g.drawText (juce::String (degree), top, juce::Justification::centred, false);
                 drawIntervalLabel (g, label, cell, w);
             }
             else
             {
-                g.setFont (galactic::comicFont (juce::jmin (18.0f, w * 0.55f)));
+                g.setFont (juce::Font (juce::FontOptions (juce::jmin (18.0f, w * 0.55f)).withStyle ("Bold")));
                 g.drawText (juce::String (degree), cell, juce::Justification::centred, false);
             }
         }
@@ -127,7 +126,7 @@ public:
             auto numArea = area.removeFromTop (area.getHeight() * 0.5f);
             auto denArea = area;
             const float fs = juce::jmin (13.0f, numArea.getHeight() * 0.95f, w * 0.42f);
-            g.setFont (galactic::comicFont (fs));
+            g.setFont (juce::Font (juce::FontOptions (fs).withStyle ("Bold")));
             g.drawFittedText (num, numArea.toNearestInt(), juce::Justification::centredBottom, 1, 0.5f);
             g.drawFittedText (den, denArea.toNearestInt(), juce::Justification::centredTop,    1, 0.5f);
             // fraction bar
@@ -137,7 +136,7 @@ public:
         }
         else
         {
-            g.setFont (galactic::comicFont (juce::jmin (12.0f, w * 0.4f)));
+            g.setFont (juce::Font (juce::FontOptions (juce::jmin (12.0f, w * 0.4f)).withStyle ("Bold")));
             g.drawFittedText (label, area.reduced (1.0f, 0.0f).toNearestInt(),
                               juce::Justification::centred, 1, 0.4f);
         }

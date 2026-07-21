@@ -1,7 +1,6 @@
 #pragma once
 
 #include "PluginProcessor.h"
-#include "GalacticFont.h"
 #include "ScaleKeyboard.h"
 #include <map>
 
@@ -96,11 +95,11 @@ private:
                 g.setColour (r.chip);
                 g.fillRoundedRectangle (chipR.toFloat(), 3.0f);
                 g.setColour (r.chip.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-                g.setFont (galactic::comicFont ((float) rowH * 0.62f));
+                g.setFont (juce::Font (juce::FontOptions ((float) rowH * 0.62f).withStyle ("Bold")));
                 g.drawText (r.num, chipR, juce::Justification::centred, false);
 
                 g.setColour (juce::Colour (0xffb9c0d0));
-                g.setFont (galactic::comicFont (12.5f));
+                g.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
                 g.drawText (r.label, rowH + 4, y, 70, rowH, juce::Justification::centredLeft, false);
 
                 g.setColour (r.valueCol);
@@ -133,11 +132,11 @@ private:
             g.drawRoundedRectangle (r.reduced (1.5f), 10.0f, 3.0f);
             auto in = getLocalBounds().reduced (22, 14);
             g.setColour (juce::Colour (0xff5cb8ff));
-            g.setFont (galactic::comicFont (17.0f));
+            g.setFont (juce::Font (juce::FontOptions (17.0f).withStyle ("Bold")));
             g.drawText (title, in.removeFromTop (24), juce::Justification::centredLeft);
             in.removeFromTop (6);
             g.setColour (juce::Colours::white);
-            g.setFont (galactic::comicFont (13.5f));
+            g.setFont (juce::Font (juce::FontOptions (13.5f)));
             g.drawFittedText (body, in, juce::Justification::topLeft, 8, 1.0f);
         }
     };
@@ -156,11 +155,11 @@ private:
             g.drawRoundedRectangle (r.reduced (1.5f), 10.0f, 3.0f);
             auto in = getLocalBounds().reduced (22, 14);
             g.setColour (juce::Colour (0xffffb020));
-            g.setFont (galactic::comicFont (18.0f));
+            g.setFont (juce::Font (juce::FontOptions (18.0f).withStyle ("Bold")));
             g.drawText (title, in.removeFromTop (26), juce::Justification::centred);
             in.removeFromTop (6);
             g.setColour (juce::Colours::white);
-            g.setFont (galactic::comicFont (14.0f));
+            g.setFont (juce::Font (juce::FontOptions (14.0f)));
             g.drawFittedText (body, in, juce::Justification::topLeft, 8, 1.0f);
         }
     };
