@@ -22,6 +22,7 @@ namespace
     const juce::Colour cPrime     { 0xffffd84d };
     const juce::Colour cFilter    { 0xff4fe6ff };
     const juce::Colour cEnv       { 0xffff8f8f };
+    const juce::Colour cPitch     { 0xff40d8c8 }; // pitch envelope (teal)
     const juce::Colour cTuning    { 0xffb9a4ff };
     const juce::Colour cTimbre    { 0xfff58bff };
     const juce::Colour cGain      { 0xffef7dff };
@@ -150,15 +151,21 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     makeLabel (lblCutoff, cFilter); makeLabel (lblRes, cFilter); makeLabel (lblEnvAmt, cFilter);
 
     configGroup (gAmpEnv, cEnv);
-    const char* ampIds[]  = { "ampAttack","ampDecay","ampSustain","ampRelease" };
-    const char* fltIds[]  = { "filterAttack","filterDecay","filterSustain","filterRelease" };
-    const char* adsrTxt[] = { "A","D","S","R" };
+    configGroup (gPitchEnv, cPitch);
+    configFader (pEnvAmtFader, "pitchEnvAmount", pEnvAmtAtt, cPitch, "How far the pitch envelope bends the pitch (semitones, +/-).");
+    makeLabel (lblPitchAmt, cPitch);
+    const char* ampIds[]   = { "ampAttack","ampDecay","ampSustain","ampRelease" };
+    const char* fltIds[]   = { "filterAttack","filterDecay","filterSustain","filterRelease" };
+    const char* pitchIds[] = { "pitchAttack","pitchDecay","pitchSustain","pitchRelease" };
+    const char* adsrTxt[]  = { "A","D","S","R" };
     for (int i = 0; i < 4; ++i)
     {
-        configFader (ampAdsr[i],  ampIds[i], ampAdsrAtt[i],  cEnv,    "Amplitude envelope");
-        configFader (filtAdsr[i], fltIds[i], filtAdsrAtt[i], cFilter, "Filter envelope");
-        makeLabel (ampAdsrLbl[i],  cEnv);    ampAdsrLbl[i].setText  (adsrTxt[i], juce::dontSendNotification);
-        makeLabel (filtAdsrLbl[i], cFilter); filtAdsrLbl[i].setText (adsrTxt[i], juce::dontSendNotification);
+        configFader (ampAdsr[i],   ampIds[i],   ampAdsrAtt[i],   cEnv,    "Amplitude envelope");
+        configFader (filtAdsr[i],  fltIds[i],   filtAdsrAtt[i],  cFilter, "Filter envelope");
+        configFader (pitchAdsr[i], pitchIds[i], pitchAdsrAtt[i], cPitch,  "Pitch envelope");
+        makeLabel (ampAdsrLbl[i],   cEnv);    ampAdsrLbl[i].setText   (adsrTxt[i], juce::dontSendNotification);
+        makeLabel (filtAdsrLbl[i],  cFilter); filtAdsrLbl[i].setText  (adsrTxt[i], juce::dontSendNotification);
+        makeLabel (pitchAdsrLbl[i], cPitch);  pitchAdsrLbl[i].setText (adsrTxt[i], juce::dontSendNotification);
     }
 
     // Tuning (scale) + Recent .scl.
@@ -435,6 +442,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     gPrime.setText         (tr ("Prime Control", "Control primers"));
     gFilter.setText        (tr ("Filter", "Filtre"));
     gAmpEnv.setText        (tr ("Volume Envelope", "Envolupant volum"));
+    gPitchEnv.setText      (tr ("Pitch Envelope", "Envolupant to"));
     gTuning.setText        (tr ("Tuning", "Afinaci\xc3\xb3"));
     gTimbre.setText        (tr (".scl as Spectrum", ".scl com a Espectre"));
     gSpecScale.setText     (tr ("Spectrum to Scale", "Espectre a escala"));
@@ -447,6 +455,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblCutoff.setText    (tr ("Cut", "Tall"), dontSendNotification);
     lblRes.setText       (tr ("Res", "Res"), dontSendNotification);
     lblEnvAmt.setText    (tr ("Env", "Env"), dontSendNotification);
+    lblPitchAmt.setText  (tr ("St", "St"), dontSendNotification);
     lblTimbreRepeats.setText (tr ("Reps", "Reps"), dontSendNotification);
     lblBend.setText      (tr ("Pitch bend", "Pitch bend"), dontSendNotification);
     lblPeriod.setText    (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
@@ -516,6 +525,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
                                    "Envolupant de volum: Atac, Decay, Sustain (nivell), Release. Temps en segons."));
         filtAdsr[i].setTooltip (tr ("Filter envelope: Attack, Decay, Sustain (level), Release. Times in seconds.",
                                     "Envolupant de filtre: Atac, Decay, Sustain (nivell), Release. Temps en segons."));
+        pitchAdsr[i].setTooltip (tr ("Pitch envelope: Attack, Decay, Sustain (level), Release. Bends pitch by the Amount (semitones). Sustain 0 = a pitch blip that settles back to the played note.",
+                                     "Envolupant de to: Atac, Decay, Sustain (nivell), Release. Desafina el to segons la Quantitat (semitons). Sustain 0 = un cop de to que torna a la nota tocada."));
     }
     tuningBox.setTooltip (tr (
         "Which tuning the keys follow. 12-TET: standard. MTS-ESP: follow an ODDSound MTS-ESP master running in the session. Scala: the .scl/.ascl file loaded below. Note: Ableton Live's own tuning arrives as MPE pitch bend and works in ANY of these modes (set Bend to +-48).",
@@ -1008,19 +1019,19 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
     //== Right panel: Spectrum to Scale (full height) ===========================
     {
-        auto sp = area.removeFromRight (254);
+        auto sp = area.removeFromRight (224);
         gSpecScale.setBounds (sp.reduced (3));
         auto si = sp.reduced (3).reduced (8, 5); si.removeFromTop (16);
         auto r1 = si.removeFromTop (24);
-        dissBtn.setBounds (r1.removeFromLeft (r1.getWidth() - 56).reduced (1, 0));
+        dissBtn.setBounds (r1.removeFromLeft (r1.getWidth() - 52).reduced (1, 0));
         r1.removeFromLeft (4);
         compact (dissCountBox, r1);
         si.removeFromTop (4);
         auto r2 = si.removeFromTop (24);
-        lblPeriod.setBounds (r2.removeFromLeft (50));
-        periodEdit.setBounds (r2.removeFromLeft (62).reduced (0, 1));
+        lblPeriod.setBounds (r2.removeFromLeft (42));
+        periodEdit.setBounds (r2.removeFromLeft (58).reduced (0, 1));
         r2.removeFromLeft (4);
-        dissMaxToggle.setBounds (r2.removeFromLeft (52));
+        dissMaxToggle.setBounds (r2.removeFromLeft (50));
         dissSaveBtn.setBounds (r2.reduced (1, 0));
         si.removeFromTop (6);
         degreeList.setBounds (si);
@@ -1099,16 +1110,21 @@ void FractalAdditiveAudioProcessorEditor::resized()
         auto row = area.removeFromTop (rowH).reduced (0, 2);
         const int W = row.getWidth();
 
-        layoutFaders (gFilter, row.removeFromLeft (W * 34 / 100), cFilter,
+        layoutFaders (gFilter, row.removeFromLeft (W * 27 / 100), cFilter,
             { &cutoffFader, &resFader, &fEnvAmtFader, &filtAdsr[0], &filtAdsr[1], &filtAdsr[2], &filtAdsr[3] },
             { &lblCutoff, &lblRes, &lblEnvAmt, &filtAdsrLbl[0], &filtAdsrLbl[1], &filtAdsrLbl[2], &filtAdsrLbl[3] });
 
-        layoutFaders (gAmpEnv, row.removeFromLeft (W * 20 / 100), cEnv,
+        layoutFaders (gAmpEnv, row.removeFromLeft (W * 15 / 100), cEnv,
             { &ampAdsr[0], &ampAdsr[1], &ampAdsr[2], &ampAdsr[3] },
             { &ampAdsrLbl[0], &ampAdsrLbl[1], &ampAdsrLbl[2], &ampAdsrLbl[3] });
 
+        // Pitch envelope: Amount (semitones) + A D S R, like the filter envelope.
+        layoutFaders (gPitchEnv, row.removeFromLeft (W * 18 / 100), cPitch,
+            { &pEnvAmtFader, &pitchAdsr[0], &pitchAdsr[1], &pitchAdsr[2], &pitchAdsr[3] },
+            { &lblPitchAmt, &pitchAdsrLbl[0], &pitchAdsrLbl[1], &pitchAdsrLbl[2], &pitchAdsrLbl[3] });
+
         {
-            auto tb = row.removeFromLeft (W * 27 / 100);
+            auto tb = row.removeFromLeft (W * 24 / 100);
             gTuning.setBounds (tb.reduced (3));
             auto ti = tb.reduced (3).reduced (8, 5); ti.removeFromTop (15);
             compact (tuningBox, ti.removeFromTop (24)); ti.removeFromTop (4);
@@ -1209,28 +1225,30 @@ bool FractalAdditiveAudioProcessorEditor::keyStateChanged (bool)
 // so global key presses in other apps never play notes.
 void FractalAdditiveAudioProcessorEditor::pollComputerKeyboard()
 {
-    // No note-playing while unfocused OR while typing in a text field (the
-    // Period box, a preset name...): letters there must never trigger notes.
+    // No note-playing while unfocused OR while typing in a text field (the Period
+    // box, a preset name...): letters there must never trigger notes. This is
+    // folded PER KEY into `active` rather than a mass clear+return, so heldKeys
+    // always mirrors exactly what we triggered - a stale entry from a mass-clear
+    // was one way a key could later re-fire and leave a note stuck in memory.
     const bool typing = dynamic_cast<juce::TextEditor*> (juce::Component::getCurrentlyFocusedComponent()) != nullptr;
-    if (! hasKeyboardFocus (true) || typing)
-    {
-        for (const auto& kv : heldKeys)
-            processorRef.keyboardState.noteOff (1, kv.second, 0.0f);
-        heldKeys.clear();
-        return;
-    }
+    const bool active = hasKeyboardFocus (true) && ! typing;
 
     for (const auto& m : kKeyMap)
     {
-        const bool down = juce::KeyPress::isKeyCurrentlyDown (m.ch);
+        const bool wantOn = active && juce::KeyPress::isKeyCurrentlyDown (m.ch);
         const auto it = heldKeys.find (m.ch);
-        if (down && it == heldKeys.end())
+        if (wantOn && it == heldKeys.end())
         {
             const int note = juce::jlimit (0, 127, baseKey + m.off);
-            processorRef.keyboardState.noteOn (1, note, 0.8f);
             heldKeys[m.ch] = note;
+            // Guard against a SECOND note-on for a note that is already sounding
+            // (from an overlapping key/source or a reconcile race): a duplicate
+            // note-on starts a second voice, which is exactly the "press one key
+            // and two sound at once" bug. Only ring it if it is not already on.
+            if (! processorRef.keyboardState.isNoteOn (1, note))
+                processorRef.keyboardState.noteOn (1, note, 0.8f);
         }
-        else if (! down && it != heldKeys.end())
+        else if (! wantOn && it != heldKeys.end())
         {
             processorRef.keyboardState.noteOff (1, it->second, 0.0f);
             heldKeys.erase (it);

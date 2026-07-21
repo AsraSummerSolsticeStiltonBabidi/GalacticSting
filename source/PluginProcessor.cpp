@@ -138,6 +138,20 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "filterRelease", 1 }, "Filter Release", timeRange (8.0f), 0.300f));
 
+    //-- Pitch envelope (bends the played pitch, in semitones) ------------------
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "pitchEnvAmount", 1 }, "Pitch Env Amount (st)",
+        NormalisableRange<float> (-24.0f, 24.0f, 0.01f), 0.0f));
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "pitchAttack", 1 }, "Pitch Attack", timeRange (5.0f), 0.005f));
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "pitchDecay", 1 }, "Pitch Decay", timeRange (5.0f), 0.150f));
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "pitchSustain", 1 }, "Pitch Sustain",
+        NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.0f));
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "pitchRelease", 1 }, "Pitch Release", timeRange (8.0f), 0.150f));
+
     //-- Tuning ----------------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "tuningMode", 1 }, "Tuning",
