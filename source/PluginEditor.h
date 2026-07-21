@@ -35,6 +35,8 @@ private:
     void pollComputerKeyboard(); // reconcile held keys against the real key state
     void openScalaChooser();
     void openTimbreChooser();
+    void openTuningBankChooser();
+    void refreshTuningBank(); // sync the bank combo items + selection with the processor
     void loadRecent (int index);
     void forceDefault (const juce::String& paramID);
     void applyTimbreEnablement (bool active);
@@ -169,36 +171,37 @@ private:
     ScaleKeyboard keyboard;
 
     SteppedSlider baseNFader, spectrumRangeFader, fractalFader, timbreRepeatsFader;
-    juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, refAFader, pEnvAmtFader;
+    juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, octaveFader, pEnvAmtFader;
     juce::Slider  ampAdsr[4], filtAdsr[4], pitchAdsr[4];
     juce::ComboBox basePitchBox, whitelistBox, phaseBox, primeModeBox, primeLimitBox, tuningBox, bendBox,
-                   dissCountBox;
+                   dissCountBox, dissModeBox, tuningBankBox;
     RefreshingComboBox presetBox;
-    juce::ToggleButton primeToggle[9], dissMaxToggle, morphToggle;
+    juce::ToggleButton primeToggle[9], morphToggle;
     juce::Slider       morphTimeFader;
     juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
     juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
-                     langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3];
+                     langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3], tuningBankLoadBtn;
     juce::Label          vibeLabel;   // "Vibe coded by" credit, left of the language button
     juce::HyperlinkButton vibeLink;   // "Asra3" -> Instagram
     juce::TextEditor periodEdit;
     juce::TextEditor intervalEdit; // Spectrum Builder: typed intervals -> partials
+    juce::TextEditor refAEdit;     // Reference A: type the Hz directly ("hz" shown to its right)
     WarningOverlay warningOverlay;
     NoticeOverlay  noticeOverlay;
     DissDegreeList degreeList;
 
-    juce::GroupComponent gHarmonic, gBase, gWhitelist, gSlope, gSpectrumRange, gFractal, gPhase, gGain,
-                         gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale, gReference;
+    juce::GroupComponent gHarmonic, gBase, gWhitelist, gSlope, gSpectrumRange, gFractal,
+                         gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale;
     juce::Label lblBaseN, lblBasePitch, lblRange, lblFractal, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
-                lblTimbreRepeats, lblBend, lblPeriod, lblRefA, lblPitchAmt, lblMorphTime,
-                tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel;
+                lblTimbreRepeats, lblBend, lblPeriod, lblRefA, lblRefHz, lblOctave, lblPitchAmt, lblMorphTime,
+                lblTuningBank, tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel;
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], pitchAdsrLbl[4], primeLbl[9];
 
     std::unique_ptr<SliderAttachment>   baseNAtt, slopeAtt, spectrumRangeAtt, fractalAtt, gainAtt,
-                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, refAAtt, pEnvAmtAtt;
+                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, octaveAtt, pEnvAmtAtt;
     std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4], pitchAdsrAtt[4];
     std::unique_ptr<ComboBoxAttachment> basePitchAtt, whitelistAtt, phaseAtt,
-                                        primeModeAtt, primeLimitAtt, tuningAtt, bendAtt;
+                                        primeModeAtt, primeLimitAtt, tuningAtt, bendAtt, tuningBankAtt;
     std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], morphAtt;
     std::unique_ptr<SliderAttachment>   morphTimeAtt;
 
@@ -216,7 +219,11 @@ private:
     int  lastKbLo = -1, lastKbNum = -1; // last keyboard window applied (re-adapt on tuning change)
     juce::Rectangle<int> harmonicEngineBounds; // macro-group frame
     juce::Rectangle<int> hcBase, hcHarm, hcPrime, hcSlope; // its 4 sub-cells (dividers/labels in paint)
+    juce::Rectangle<int> essentialsBounds;     // Essentials macro-group frame
+    juce::Rectangle<int> ecPhase, ecGain, ecRef, ecOct; // its 4 sub-cells (dividers/labels in paint)
     void refreshDegreeList (bool showNotice = true);
+    void commitRefA();       // parse the Reference-A text box -> set the refA parameter
+    void refreshRefAText();  // set the Reference-A text box from the current parameter
     std::map<int, int> heldKeys;
     juce::uint32 lastFocusedMs = 0; // debounce: keep playing through brief focus flickers
 

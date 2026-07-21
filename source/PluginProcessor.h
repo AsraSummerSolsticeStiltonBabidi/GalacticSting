@@ -126,6 +126,17 @@ public:
     juce::StringArray getRecentSclPaths() const { return recentSclPaths; }
 
     //==========================================================================
+    // Tuning bank: up to kBankSlots .scl slots. The "tuningBankSlot" parameter
+    // (0 = none, 1..N = slot) is automatable, so a host can switch scales; the
+    // switch is picked up on the message thread (timerCallback) and loaded there.
+    static constexpr int kBankSlots = 8;
+    void setTuningBankFile (int slot0, const juce::File& f);       // load a .scl into a slot + activate it
+    juce::String getTuningBankName (int slot0) const { return juce::isPositiveAndBelow (slot0, kBankSlots) ? bankName[(size_t) slot0] : juce::String(); }
+    int  getTuningBankSlotParam() const noexcept { return (int) apvts.getRawParameterValue ("tuningBankSlot")->load(); }
+    void setTuningBankSlotParam (int slot);                        // 0 = none, 1..N = slot (drives automation + load)
+    int  firstEmptyBankSlot() const noexcept;
+
+    //==========================================================================
     // File presets (.gsting). Called from the editor.
     static juce::File getPresetFolder();
     juce::StringArray getPresetNames();
@@ -182,6 +193,10 @@ private:
     // Persistent recent-.scl list (global app settings, shared across instances).
     std::unique_ptr<juce::PropertiesFile> appProps;
     juce::StringArray                     recentSclPaths;
+
+    // Tuning bank: per-instance .scl slots (name + raw source), persisted in state.
+    std::array<juce::String, kBankSlots> bankName, bankSource;
+    int lastBankSlot = 0; // last applied "tuningBankSlot" value (message thread)
 
     // Last dissonance-generated .scl (text + display name), for saving to disk,
     // plus the degree/height data shown in the Spectrum-to-Scale panel.

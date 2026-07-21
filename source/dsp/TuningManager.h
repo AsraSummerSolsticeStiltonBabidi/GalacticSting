@@ -72,6 +72,13 @@ public:
     }
     double referenceScale() const noexcept { return refScale.load (std::memory_order_relaxed); }
 
+    // Whole-instrument octave transpose: multiplies every note by 2^octaves, on top
+    // of the A-reference. Pure frequency scale, so it works in every tuning mode.
+    void setOctaveShift (int octaves) noexcept
+    {
+        octScale.store (std::pow (2.0, (double) juce::jlimit (-5, 5, octaves)), std::memory_order_relaxed);
+    }
+
     bool hasMtsMaster() const noexcept
     {
         return client != nullptr && MTS_HasMaster (client);
@@ -119,7 +126,8 @@ public:
     double frequencyForNote (int midiNote) const noexcept
     {
         const int n = juce::jlimit (0, 127, midiNote);
-        const double ref = refScale.load (std::memory_order_relaxed);
+        const double ref = refScale.load (std::memory_order_relaxed)
+                         * octScale.load (std::memory_order_relaxed);
 
         switch (mode.load (std::memory_order_relaxed))
         {
@@ -492,6 +500,7 @@ private:
     MTSClient* client = nullptr;
     std::atomic<Mode> mode { Mode::Equal };
     std::atomic<double> refScale { 1.0 }; // A-reference / 440
+    std::atomic<double> octScale { 1.0 }; // whole-instrument octave transpose (2^oct)
     std::array<std::atomic<double>, 128> table {};
     std::atomic<bool> scalaValid { false };
     std::atomic<int>  scalaDegreeCount { 12 };
