@@ -14,6 +14,7 @@ namespace
 
     // Brighter, higher-contrast section colours.
     const juce::Colour cBase      { 0xff5cb8ff };
+    const juce::Colour cHarmonic  { 0xff5cb8ff }; // one colour for the whole Harmonic Engine macro-group
     const juce::Colour cWhitelist { 0xff5ff2b0 };
     const juce::Colour cSlope     { 0xff8ef0c4 };
     const juce::Colour cRange     { 0xffffc95c };
@@ -97,25 +98,26 @@ namespace
             g.setColour (col.withAlpha (0.95f));
             g.drawRect (frame, 2.6f); // thick square outline
 
-            // Title: no background chip - BLACK glyphs with a thick WHITE stroke, so
-            // the title reads as clean white outlined text. The font auto-shrinks to
-            // fit the box width (long Catalan titles would otherwise overrun).
+            // Title: UPPERCASE, no background chip - BLACK glyphs with a thick stroke in
+            // the section colour (outlined text). The font auto-shrinks to fit the box
+            // width (long Catalan titles would otherwise overrun).
+            const juce::String upper = text.toUpperCase();
             float fontH = 16.0f;
             const float avail = (float) w - 12.0f - 5.0f;
             juce::Font tf (juce::FontOptions (fontH).withStyle ("Bold"));
             juce::GlyphArrangement ga;
-            ga.addLineOfText (tf, text, 12.0f, titleH - 5.5f);
+            ga.addLineOfText (tf, upper, 12.0f, titleH - 5.5f);
             const float tw = ga.getBoundingBox (0, -1, true).getWidth();
             if (tw > avail && tw > 1.0f)
             {
                 fontH = juce::jmax (8.5f, fontH * avail / tw);
                 ga.clear();
                 tf = juce::Font (juce::FontOptions (fontH).withStyle ("Bold"));
-                ga.addLineOfText (tf, text, 12.0f, titleH - 5.5f);
+                ga.addLineOfText (tf, upper, 12.0f, titleH - 5.5f);
             }
             juce::Path p;
             ga.createPath (p);
-            g.setColour (juce::Colours::white);
+            g.setColour (col);
             g.strokePath (p, juce::PathStrokeType (3.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
             g.setColour (juce::Colours::black);
             g.fillPath (p);
@@ -139,29 +141,29 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         catalan = (lang == "ca" || lang.startsWith ("ca-") || lang.startsWith ("ca_"));
     }
 
-    configGroup (gBase, cBase);
-    configFader (baseNFader,   "baseN",    baseNAtt,     cBase, "Base harmonic N");
-    configCombo (basePitchBox, "baseMode", basePitchAtt, cBase, "Original = harmonics at natural positions.  Transposed down = lowest partial at the played pitch.");
-    makeLabel (lblBaseN, cBase); makeLabel (lblBasePitch, cBase);
+    // Harmonic Engine macro-group: one framed box, one colour, with the sub-sections
+    // (Base / Harmonics / Prime / Slope) separated by shared divider lines - the whole
+    // box (frame/title/dividers/labels) is drawn in paint(), not as a GroupComponent.
+    configFader (baseNFader,   "baseN",    baseNAtt,     cHarmonic, "Base harmonic N");
+    configCombo (basePitchBox, "baseMode", basePitchAtt, cHarmonic, "Original = harmonics at natural positions.  Transposed down = lowest partial at the played pitch.");
+    makeLabel (lblBaseN, cHarmonic); makeLabel (lblBasePitch, cHarmonic);
 
     // Morphing: when ON, a spectrum change glides each partial to its new position
     // (a per-partial pitch bend) over the Morph time, instead of snapping.
-    morphToggle.setColour (juce::ToggleButton::textColourId, cBase);
-    morphToggle.setColour (juce::ToggleButton::tickColourId, cBase);
-    morphToggle.setColour (juce::ToggleButton::tickDisabledColourId, cBase.withAlpha (0.4f));
+    morphToggle.setColour (juce::ToggleButton::textColourId, cHarmonic);
+    morphToggle.setColour (juce::ToggleButton::tickColourId, cHarmonic);
+    morphToggle.setColour (juce::ToggleButton::tickDisabledColourId, cHarmonic.withAlpha (0.4f));
     morphToggle.setMouseClickGrabsKeyboardFocus (false);
     morphToggle.onClick = [this] { refocus(); };
     addAndMakeVisible (morphToggle);
     morphAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "morph", morphToggle);
-    configFader (morphTimeFader, "morphTime", morphTimeAtt, cBase, "Morph transition time in seconds: how long partials take to glide to the new spectrum.");
+    configFader (morphTimeFader, "morphTime", morphTimeAtt, cHarmonic, "Morph transition time in seconds: how long partials take to glide to the new spectrum.");
     morphTimeFader.setSliderStyle (juce::Slider::LinearHorizontal);
     morphTimeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 14);
-    makeLabel (lblMorphTime, cBase);
+    makeLabel (lblMorphTime, cHarmonic);
 
-    configGroup (gWhitelist, cWhitelist);
-    configCombo (whitelistBox, "selection", whitelistAtt, cWhitelist, "Which harmonics may sound: All / Even / Odd / Prime");
-    configGroup (gSlope, cSlope);
-    configFader (slopeFader, "curveSlope", slopeAtt, cSlope, "Amplitude roll-off. 0 = flat/bright, 1 = saw, 2 = triangle.  (Also thins the highs in Timbre mode.)");
+    configCombo (whitelistBox, "selection", whitelistAtt, cHarmonic, "Which harmonics may sound: All / Even / Odd / Prime");
+    configFader (slopeFader, "curveSlope", slopeAtt, cHarmonic, "Amplitude roll-off. 0 = flat/bright, 1 = saw, 2 = triangle.  (Also thins the highs in Timbre mode.)");
     configGroup (gSpectrumRange, cRange);
     configFader (spectrumRangeFader, "spectrumRange", spectrumRangeAtt, cRange, "Hard-cut the spectrum this many octaves above the played note (10 = full range, no cut).");
     makeLabel (lblRange, cRange);
@@ -171,23 +173,24 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     configCombo (phaseBox, "phaseMode", phaseAtt, cPhase, "Aligned: tonal pulse, never clips.  Scattered: louder, noisier.");
     configGroup (gGain, cGain);
     configFader (gainFader, "masterGain", gainAtt, cGain, "Master output gain");
+    gainFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    gainFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 46, 14);
 
-    configGroup (gPrime, cPrime);
-    configCombo (primeModeBox,  "primeMode",  primeModeAtt,  cPrime, "Limit = drop harmonics with a prime factor above the value.  Whitelist = only the ticked primes.");
-    configCombo (primeLimitBox, "primeLimit", primeLimitAtt, cPrime, "Largest prime factor allowed (Limit mode).");
-    makeLabel (lblPrimeLimit, cPrime);
+    configCombo (primeModeBox,  "primeMode",  primeModeAtt,  cHarmonic, "Limit = drop harmonics with a prime factor above the value.  Whitelist = only the ticked primes.");
+    configCombo (primeLimitBox, "primeLimit", primeLimitAtt, cHarmonic, "Largest prime factor allowed (Limit mode).");
+    makeLabel (lblPrimeLimit, cHarmonic);
     const char* pn[] = { "2","3","5","7","11","13","17","19","23" };
     for (int i = 0; i < 9; ++i)
     {
         primeToggle[i].setButtonText ({});
-        primeToggle[i].setColour (juce::ToggleButton::tickColourId, cPrime);
-        primeToggle[i].setColour (juce::ToggleButton::tickDisabledColourId, cPrime.withAlpha (0.4f));
+        primeToggle[i].setColour (juce::ToggleButton::tickColourId, cHarmonic);
+        primeToggle[i].setColour (juce::ToggleButton::tickDisabledColourId, cHarmonic.withAlpha (0.4f));
         primeToggle[i].setMouseClickGrabsKeyboardFocus (false);
         primeToggle[i].setTooltip ("Allow prime " + juce::String (pn[i]));
         primeToggle[i].onClick = [this] { refocus(); };
         addAndMakeVisible (primeToggle[i]);
         primeToggleAtt[i] = std::make_unique<ButtonAttachment> (processorRef.apvts, "primeWL" + juce::String (i), primeToggle[i]);
-        makeLabel (primeLbl[i], cPrime); primeLbl[i].setText (pn[i], juce::dontSendNotification);
+        makeLabel (primeLbl[i], cHarmonic); primeLbl[i].setText (pn[i], juce::dontSendNotification);
     }
 
     configGroup (gFilter, cFilter);
@@ -486,7 +489,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     lastTimbreActive = processorRef.isTimbreActive();
 
     setWantsKeyboardFocus (true);
-    setSize (1280, 636); // still fits a 720p work area incl. the standalone's Options bar
+    setSize (1280, 604); // slightly flatter (shorter fader rows; text sizes unchanged)
     startTimerHz (30); // also the reconcile rate for stuck/ghost computer-keyboard notes
     juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<juce::Component> (this)]
     { if (safe != nullptr) safe->grabKeyboardFocus(); });
@@ -535,9 +538,6 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     langButton.setTooltip (tr ("Switch the interface language to Catal\xc3\xa0.",
                                "Torna la interf\xc3\xad" "cie a l'angl\xc3\xa8s."));
 
-    gBase.setText          (tr ("Base", "Base"));
-    gWhitelist.setText     (tr ("Harmonics", "Harm\xc3\xb2nics"));
-    gSlope.setText         (tr ("Decay Slope", "Pendent"));
     gSpectrumRange.setText (tr ("Range", "Rang"));
     gFractal.setText       (tr ("Fractal", "Fractal"));
     gPhase.setText         (tr ("Phase", "Fase"));
@@ -935,12 +935,17 @@ void FractalAdditiveAudioProcessorEditor::applyTimbreEnablement (bool active)
     for (auto& t : primeToggle) t.setEnabled (en);
 
     const float a = active ? 0.4f : 1.0f;
-    for (auto* g : { &gBase, &gWhitelist, &gPhase, &gPrime }) g->setAlpha (a);
+    gPhase.setAlpha (a);
     baseNFader.setAlpha (a); basePitchBox.setAlpha (a); whitelistBox.setAlpha (a);
     phaseBox.setAlpha (a); primeModeBox.setAlpha (a); primeLimitBox.setAlpha (a);
     for (auto& t : primeToggle) t.setAlpha (a);
     for (auto& l : primeLbl)    l.setAlpha (a);
     lblBaseN.setAlpha (a); lblBasePitch.setAlpha (a); lblPrimeLimit.setAlpha (a);
+
+    // Reps only does anything once a custom spectrum is loaded/typed -> grey it off.
+    timbreRepeatsFader.setEnabled (active);
+    timbreRepeatsFader.setAlpha (active ? 1.0f : 0.4f);
+    lblTimbreRepeats.setAlpha (active ? 1.0f : 0.4f);
 }
 
 void FractalAdditiveAudioProcessorEditor::makeLabel (juce::Label& l, juce::Colour c)
@@ -1016,20 +1021,46 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     g.fillAll (juce::Colour (0xff0c0c12));
 
     auto titleArea = getLocalBounds().removeFromTop (68);
-    g.setColour (juce::Colour (0xff2a2a3c));
-    g.fillRect (0, titleArea.getBottom() - 1, getWidth(), 1);
 
-    // "Harmonic Engine" macro-group: a frame + label around Base / Harmonics /
-    // Prime / Slope, drawn behind those child panels.
+    // Harmonic Engine macro-group: the WHOLE box is drawn here - frame + fill + title
+    // (like the other boxes but in ONE colour) + the SHARED internal dividers between
+    // its sub-cells + each cell's small inline uppercase label. Drawn in the editor
+    // paint so it sits UNDER the child controls but is never covered by a child fill.
     if (! harmonicEngineBounds.isEmpty())
     {
-        g.setColour (juce::Colour (0xff4a4668));
-        g.drawRect (harmonicEngineBounds.toFloat(), 1.3f);
-        g.setColour (juce::Colours::white.withAlpha (0.9f));
-        g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
-        g.drawText (tr ("HARMONIC ENGINE", "MOTOR HARM\xc3\x92NIC"),
-                    harmonicEngineBounds.withHeight (16).reduced (10, 1),
-                    juce::Justification::centredLeft, false);
+        constexpr float titleH = 21.0f;
+        auto box = harmonicEngineBounds.toFloat();
+        auto frame = juce::Rectangle<float> (box.getX() + 1.3f, box.getY() + titleH * 0.5f,
+                                             box.getWidth() - 2.6f, box.getHeight() - titleH * 0.5f - 1.3f);
+        g.setColour (juce::Colour (0xff17171f).interpolatedWith (cHarmonic, 0.05f));
+        g.fillRect (frame);
+        g.setColour (cHarmonic.withAlpha (0.95f));
+        g.drawRect (frame, 2.6f);
+        {
+            juce::GlyphArrangement ga;
+            ga.addLineOfText (juce::Font (juce::FontOptions (16.0f).withStyle ("Bold")),
+                              tr ("HARMONIC ENGINE", "MOTOR HARM\xc3\x92NIC"),
+                              box.getX() + 12.0f, box.getY() + titleH - 5.5f);
+            juce::Path p; ga.createPath (p);
+            g.setColour (cHarmonic);
+            g.strokePath (p, juce::PathStrokeType (3.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            g.setColour (juce::Colours::black); g.fillPath (p);
+        }
+        g.setColour (cHarmonic.withAlpha (0.5f)); // shared internal dividers
+        const float top = (float) hcBase.getY();
+        const float bot = box.getBottom() - 3.0f;
+        g.drawLine ((float) hcHarm.getX(),  top, (float) hcHarm.getX(),  bot, 1.0f);
+        g.drawLine ((float) hcSlope.getX(), top, (float) hcSlope.getX(), bot, 1.0f);
+        g.drawLine ((float) hcHarm.getX(), (float) hcPrime.getY(),
+                    (float) hcHarm.getRight(), (float) hcPrime.getY(), 1.0f);
+        g.setColour (cHarmonic); // small inline uppercase cell labels (like A/D/S/R)
+        g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+        auto sub = [&] (const juce::Rectangle<int>& c, const juce::String& s)
+        { g.drawText (s, c.withHeight (13).reduced (5, 0), juce::Justification::centredLeft, false); };
+        sub (hcBase,  tr ("BASE", "BASE"));
+        sub (hcHarm,  tr ("HARMONICS", "HARM\xc3\x92NICS"));
+        sub (hcPrime, tr ("PRIME", "PRIMERS"));
+        sub (hcSlope, tr ("SLOPE", "PENDENT"));
     }
 
     // Title: Title Case, each letter in an EQUAL-SIZED SQUARE (sharp corners),
@@ -1173,49 +1204,45 @@ void FractalAdditiveAudioProcessorEditor::resized()
         auto row = area.removeFromTop (rowH).reduced (0, 2);
         const int W = row.getWidth();
 
-        // "Harmonic Engine" macro-group wraps Base + Harmonics/Prime + Slope. Reserve
-        // a title band at the top of those columns; paint() draws the frame + label.
+        // "Harmonic Engine" = ONE framed box (gHarmonic) holding Base | Harmonics /
+        // Prime | Slope, separated by SHARED divider lines + small inline uppercase
+        // labels drawn in paint() (from the hc* cell rects stored here).
         const int macroW = W * 62 / 100;
         harmonicEngineBounds = row.removeFromLeft (macroW);
-        auto macro = harmonicEngineBounds.reduced (2);
-        macro.removeFromTop (15); // macro-title band
+        auto macro = harmonicEngineBounds.reduced (5, 4);
+        macro.removeFromTop (14); // clear the "HARMONIC ENGINE" title
         const int mW = macro.getWidth();
 
+        hcBase      = macro.removeFromLeft (mW * 22 / 62);
+        auto midCol = macro.removeFromLeft (mW * 28 / 62);
+        hcSlope     = macro;
+        hcHarm      = midCol.withHeight (midCol.getHeight() * 2 / 5);
+        hcPrime     = midCol.withTrimmedTop (midCol.getHeight() * 2 / 5);
+
+        const int lblH = 15; // inline sub-label band (BASE / HARMONICS / PRIME / SLOPE)
         {
-            auto bb = macro.removeFromLeft (mW * 22 / 62);
-            gBase.setBounds (bb.reduced (3));
-            auto bi = bb.reduced (3).reduced (6, 4); bi.removeFromTop (16);
-            auto left = bi.removeFromLeft (bi.getWidth() * 40 / 100); // N fader column
+            auto bi = hcBase.reduced (5, 3); bi.removeFromTop (lblH);
+            auto left = bi.removeFromLeft (bi.getWidth() * 40 / 100);
             lblBaseN.setBounds (left.removeFromTop (13)); baseNFader.setBounds (left);
             bi.removeFromLeft (5);
-            // Right column: Pitch, then the Morphing toggle + its Time control.
             lblBasePitch.setBounds (bi.removeFromTop (13));
             compact (basePitchBox, bi.removeFromTop (24));
-            bi.removeFromTop (8);
-            morphToggle.setBounds (bi.removeFromTop (22));
-            bi.removeFromTop (2);
+            bi.removeFromTop (6);
+            morphToggle.setBounds (bi.removeFromTop (20));
             lblMorphTime.setJustificationType (juce::Justification::centredLeft);
-            auto mr = bi.removeFromTop (20);
-            lblMorphTime.setBounds (mr.removeFromLeft (36));
+            auto mr = bi.removeFromTop (19);
+            lblMorphTime.setBounds (mr.removeFromLeft (34));
             morphTimeFader.setBounds (mr);
         }
-
-        // Harmonics stacked on top of Prime Control.
         {
-            auto colBox = macro.removeFromLeft (mW * 28 / 62);
-            auto hb = colBox.removeFromTop (colBox.getHeight() * 2 / 5);
-            {
-                gWhitelist.setBounds (hb.reduced (3));
-                auto r = hb.reduced (3).reduced (6, 4); r.removeFromTop (14);
-                compact (whitelistBox, r);
-            }
+            auto hi = hcHarm.reduced (5, 3); hi.removeFromTop (lblH);
+            compact (whitelistBox, hi);
 
             const bool wl = processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f;
             primeLimitBox.setVisible (! wl); lblPrimeLimit.setVisible (! wl);
             for (int i = 0; i < 9; ++i) { primeToggle[i].setVisible (wl); primeLbl[i].setVisible (wl); }
 
-            gPrime.setBounds (colBox.reduced (3));
-            auto pi = colBox.reduced (3).reduced (6, 4); pi.removeFromTop (16);
+            auto pi = hcPrime.reduced (5, 3); pi.removeFromTop (lblH);
             compact (primeModeBox, pi.removeFromTop (22));
             pi.removeFromTop (2);
             if (wl)
@@ -1234,20 +1261,33 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 compact (primeLimitBox, pi.removeFromLeft (juce::jmin (110, pi.getWidth())));
             }
         }
+        {
+            auto si = hcSlope.reduced (6, 3); si.removeFromTop (lblH);
+            slopeFader.setBounds (si);
+        }
 
-        // Narrow single-fader boxes. Slope closes the Harmonic-Engine macro-group.
-        oneFader (macro,                             gSlope,         slopeFader,         nullptr);
         oneFader (row.removeFromLeft (W * 12 / 100), gSpectrumRange, spectrumRangeFader, &lblRange);
         oneFader (row.removeFromLeft (W * 12 / 100), gFractal,       fractalFader,       nullptr);
 
-        // Phase (combo only, short box) stacked over Gain.
+        // Phase (combo) | Gain (horizontal) | Reference, stacked top-to-bottom.
         {
             auto colBox = row;
-            auto ph = colBox.removeFromTop (juce::jmin (76, colBox.getHeight() * 2 / 5));
+            auto ph = colBox.removeFromTop (juce::jmin (64, colBox.getHeight() / 3));
             gPhase.setBounds (ph.reduced (3));
             auto pr = ph.reduced (3).reduced (6, 4); pr.removeFromTop (14);
             compact (phaseBox, pr);
-            oneFader (colBox, gGain, gainFader, nullptr);
+
+            auto gn = colBox.removeFromTop (colBox.getHeight() / 2);
+            gGain.setBounds (gn.reduced (3));
+            auto gi = gn.reduced (3).reduced (8, 4); gi.removeFromTop (15);
+            gainFader.setBounds (gi.withSizeKeepingCentre (gi.getWidth(), juce::jmin (24, gi.getHeight())));
+
+            gReference.setBounds (colBox.reduced (3));
+            auto ri = colBox.reduced (3).reduced (8, 4); ri.removeFromTop (15);
+            auto rr = ri.removeFromTop (24);
+            lblRefA.setJustificationType (juce::Justification::centredLeft);
+            lblRefA.setBounds (rr.removeFromLeft (32));
+            refAFader.setBounds (rr);
         }
     }
 
@@ -1304,13 +1344,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
             compact (bendBox, bendRow.removeFromLeft (juce::jmin (120, bendRow.getWidth())));
         }
 
-        // Right column: "Spectrum Builder" (load .scl OR type intervals + Reps) over "Reference".
+        // Right column: "Custom Engine" (load .scl OR type intervals + Reps), full height.
         {
-            auto colBox = row;
-            auto sb = colBox.removeFromTop (colBox.getHeight() * 64 / 100);
+            auto sb = row; // Reference now lives up in the Phase/Gain column instead
             gTimbre.setBounds (sb.reduced (3));
-            auto ti = sb.reduced (3).reduced (8, 4); ti.removeFromTop (15);
-            auto brow = ti.removeFromTop (22);
+            auto ti = sb.reduced (3).reduced (8, 5); ti.removeFromTop (16);
+            auto brow = ti.removeFromTop (24);
             const bool offVis = processorRef.isTimbreActive();
             clearTimbreButton.setVisible (offVis);
             if (offVis)
@@ -1322,22 +1361,15 @@ void FractalAdditiveAudioProcessorEditor::resized()
             {
                 loadTimbreButton.setBounds (brow.reduced (2, 0));
             }
-            ti.removeFromTop (3);
-            intervalEdit.setBounds (ti.removeFromTop (22).reduced (1, 0)); // type intervals, Enter builds
-            ti.removeFromTop (3);
-            timbreStatusLabel.setBounds (ti.removeFromTop (14));
-            ti.removeFromTop (2);
-            auto fr = ti.removeFromTop (20);
+            ti.removeFromTop (5);
+            intervalEdit.setBounds (ti.removeFromTop (24).reduced (1, 0)); // type intervals, Enter builds
+            ti.removeFromTop (5);
+            timbreStatusLabel.setBounds (ti.removeFromTop (16));
+            ti.removeFromTop (5);
+            auto fr = ti.removeFromTop (22);
             lblTimbreRepeats.setJustificationType (juce::Justification::centredLeft);
             lblTimbreRepeats.setBounds (fr.removeFromLeft (38));
             timbreRepeatsFader.setBounds (fr);
-
-            gReference.setBounds (colBox.reduced (3));
-            auto ri = colBox.reduced (3).reduced (8, 4); ri.removeFromTop (15);
-            auto rrow2 = ri.removeFromTop (24);
-            lblRefA.setJustificationType (juce::Justification::centredLeft);
-            lblRefA.setBounds (rrow2.removeFromLeft (32));
-            refAFader.setBounds (rrow2);
         }
     }
 

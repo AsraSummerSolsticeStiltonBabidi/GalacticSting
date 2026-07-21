@@ -187,7 +187,7 @@ private:
     NoticeOverlay  noticeOverlay;
     DissDegreeList degreeList;
 
-    juce::GroupComponent gBase, gWhitelist, gSlope, gSpectrumRange, gFractal, gPhase, gGain,
+    juce::GroupComponent gHarmonic, gBase, gWhitelist, gSlope, gSpectrumRange, gFractal, gPhase, gGain,
                          gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale, gReference;
     juce::Label lblBaseN, lblBasePitch, lblRange, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
                 lblTimbreRepeats, lblBend, lblPeriod, lblRefA, lblPitchAmt, lblMorphTime,
@@ -214,7 +214,8 @@ private:
     int  lastResetOffState = -1; // packs Reset/Off visibility to detect changes for relayout
     int  lastDissGeneration = 0; // refresh the degree list / shortfall notice once per generation
     int  lastKbLo = -1, lastKbNum = -1; // last keyboard window applied (re-adapt on tuning change)
-    juce::Rectangle<int> harmonicEngineBounds; // macro-group frame drawn in paint()
+    juce::Rectangle<int> harmonicEngineBounds; // macro-group frame
+    juce::Rectangle<int> hcBase, hcHarm, hcPrime, hcSlope; // its 4 sub-cells (dividers/labels in paint)
     void refreshDegreeList (bool showNotice = true);
     std::map<int, int> heldKeys;
 
