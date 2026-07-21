@@ -141,16 +141,22 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     //-- Pitch envelope (bends the played pitch, in semitones) ------------------
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "pitchEnvAmount", 1 }, "Pitch Env Amount (st)",
-        NormalisableRange<float> (-24.0f, 24.0f, 0.01f), 0.0f));
+        NormalisableRange<float> (-48.0f, 48.0f, 0.01f), 0.0f));
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "pitchAttack", 1 }, "Pitch Attack", timeRange (5.0f), 0.005f));
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "pitchDecay", 1 }, "Pitch Decay", timeRange (5.0f), 0.150f));
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "pitchSustain", 1 }, "Pitch Sustain",
-        NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.0f));
+        NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.0f));   // min by default
     params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "pitchRelease", 1 }, "Pitch Release", timeRange (8.0f), 0.150f));
+        ParameterID { "pitchRelease", 1 }, "Pitch Release", timeRange (8.0f), 0.001f)); // min by default
+
+    //-- Spectral morphing (glide partials to their new positions on a spectrum change)
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "morph", 1 }, "Morphing", false));
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "morphTime", 1 }, "Morph Time", timeRange (5.0f), 0.300f));
 
     //-- Tuning ----------------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterChoice>(
@@ -281,6 +287,73 @@ bool FractalAdditiveAudioProcessor::loadTimbreFile (const juce::File& f, juce::S
     timbreSource = text;
     timbreActive = true;
     addRecentScl (f);
+    return true;
+}
+
+bool FractalAdditiveAudioProcessor::loadTimbreText (const juce::String& text, juce::String& errorOut)
+{
+    // Parse each token into a ratio. 'c' suffix or a decimal point = cents;
+    // "a/b" = fraction; a bare integer = a/1.
+    juce::StringArray tokens;
+    tokens.addTokens (text, " \t\r\n,;", "");
+    tokens.removeEmptyStrings();
+
+    std::vector<double> ratios;
+    for (auto tk : tokens)
+    {
+        tk = tk.trim();
+        double r = 0.0;
+        if (tk.endsWithIgnoreCase ("c") || tk.containsChar ('.'))
+        {
+            auto num = tk.endsWithIgnoreCase ("c") ? tk.dropLastCharacters (1) : tk;
+            if (! num.containsOnly ("0123456789.+-") || num.isEmpty()
+                || num.indexOfChar ('.') != num.lastIndexOfChar ('.'))
+            { errorOut = "Bad cents value: \"" + tk + "\""; return false; }
+            r = std::pow (2.0, num.getDoubleValue() / 1200.0);
+        }
+        else if (tk.containsChar ('/'))
+        {
+            const auto a = tk.upToFirstOccurrenceOf ("/", false, false);
+            const auto b = tk.fromFirstOccurrenceOf ("/", false, false);
+            if (! a.containsOnly ("0123456789") || ! b.containsOnly ("0123456789") || a.isEmpty() || b.isEmpty())
+            { errorOut = "Bad ratio: \"" + tk + "\""; return false; }
+            const double den = b.getDoubleValue();
+            if (den <= 0.0) { errorOut = "Bad ratio: \"" + tk + "\""; return false; }
+            r = a.getDoubleValue() / den;
+        }
+        else if (tk.containsOnly ("0123456789"))
+        {
+            r = tk.getDoubleValue();
+        }
+        else { errorOut = "Not an interval: \"" + tk + "\""; return false; }
+
+        if (std::isfinite (r) && r > 1.0000001) // above the (implicit) 1/1 fundamental
+            ratios.push_back (r);
+    }
+
+    std::sort (ratios.begin(), ratios.end());
+    ratios.erase (std::unique (ratios.begin(), ratios.end(),
+                               [] (double a, double b) { return std::abs (a - b) < 1.0e-6; }),
+                  ratios.end());
+    if (ratios.empty())
+    {
+        errorOut = "Type at least one interval above 1/1 (e.g. \"3/2 2\" or \"700c 1200c\").";
+        return false;
+    }
+
+    // Highest interval = the period; the rest (plus the implicit 1/1) are the partials.
+    const double period = ratios.back();
+    std::vector<float> deg;
+    deg.reserve (ratios.size());
+    deg.push_back (1.0f);
+    for (size_t i = 0; i + 1 < ratios.size(); ++i)
+        deg.push_back ((float) ratios[i]);
+
+    timbreDegrees = deg;
+    timbrePeriod  = (float) period;
+    timbreName    = "typed";
+    timbreSource  = text;
+    timbreActive  = true;
     return true;
 }
 
@@ -511,15 +584,21 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     clearTimbre();
     if (auto tim = tree.getChildWithName ("TIMBRE"); tim.isValid())
     {
-        const auto src = tim.getProperty ("source").toString();
+        const auto src  = tim.getProperty ("source").toString();
+        const auto name = tim.getProperty ("name").toString();
         std::vector<double> perDeg; double period = 2.0; juce::String err;
-        if (src.isNotEmpty() && TuningManager::parseScalaScale (src, perDeg, period, err))
+        if (src.isNotEmpty() && name != "typed"
+            && TuningManager::parseScalaScale (src, perDeg, period, err))
         {
             timbreDegrees.assign (perDeg.begin(), perDeg.end());
             timbrePeriod = (float) period;
-            timbreName   = tim.getProperty ("name").toString();
+            timbreName   = name;
             timbreSource = src;
             timbreActive = true;
+        }
+        else if (src.isNotEmpty()) // typed intervals (Spectrum Builder)
+        {
+            loadTimbreText (src, err);
         }
     }
 }

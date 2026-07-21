@@ -174,12 +174,14 @@ private:
     juce::ComboBox basePitchBox, whitelistBox, phaseBox, primeModeBox, primeLimitBox, tuningBox, bendBox,
                    dissCountBox;
     RefreshingComboBox presetBox;
-    juce::ToggleButton primeToggle[9], dissMaxToggle;
+    juce::ToggleButton primeToggle[9], dissMaxToggle, morphToggle;
+    juce::Slider       morphTimeFader;
     juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
                      langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3];
     juce::Label          vibeLabel;   // "Vibe coded by" credit, left of the language button
     juce::HyperlinkButton vibeLink;   // "Asra3" -> Instagram
     juce::TextEditor periodEdit;
+    juce::TextEditor intervalEdit; // Spectrum Builder: typed intervals -> partials
     WarningOverlay warningOverlay;
     NoticeOverlay  noticeOverlay;
     DissDegreeList degreeList;
@@ -187,7 +189,7 @@ private:
     juce::GroupComponent gBase, gWhitelist, gSlope, gSpectrumRange, gFractal, gPhase, gGain,
                          gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale, gReference;
     juce::Label lblBaseN, lblBasePitch, lblRange, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
-                lblTimbreRepeats, lblBend, lblPeriod, lblRefA, lblPitchAmt,
+                lblTimbreRepeats, lblBend, lblPeriod, lblRefA, lblPitchAmt, lblMorphTime,
                 tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel;
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], pitchAdsrLbl[4], primeLbl[9];
 
@@ -196,7 +198,8 @@ private:
     std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4], pitchAdsrAtt[4];
     std::unique_ptr<ComboBoxAttachment> basePitchAtt, whitelistAtt, phaseAtt,
                                         primeModeAtt, primeLimitAtt, tuningAtt, bendAtt;
-    std::unique_ptr<ButtonAttachment>   primeToggleAtt[9];
+    std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], morphAtt;
+    std::unique_ptr<SliderAttachment>   morphTimeAtt;
 
     std::unique_ptr<juce::FileChooser>  fileChooser;
     juce::Component::SafePointer<juce::AlertWindow> activePrompt; // open save-preset dialog, if any

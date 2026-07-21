@@ -68,6 +68,10 @@ namespace spectrum
         int  getRawCount()     const noexcept { return rawCount.load(); }
         bool isTruncated()     const noexcept { return truncated.load(); }
 
+        // Bumped on every publish, so a voice can tell the template CHANGED (and
+        // start a morph) rather than just re-reading it. Read on the audio thread.
+        juce::uint32 getGeneration() const noexcept { return generation.load (std::memory_order_acquire); }
+
         // Audio thread: a voice reports how many partials it actually renders (after the
         // per-pitch Nyquist cull) so the meter can show the audible count, not the
         // (much larger, pitch-independent) template size.
@@ -107,6 +111,7 @@ namespace spectrum
             liveCount.store ((int) pool[(size_t) w].partials.size());
             rawCount .store (pool[(size_t) w].rawCount);
             truncated.store (pool[(size_t) w].truncated);
+            generation.fetch_add (1, std::memory_order_acq_rel);
             live.store (w, std::memory_order_release);
         }
 
@@ -114,6 +119,7 @@ namespace spectrum
         std::array<SpectrumTemplate, kSlots> pool;
 
         std::atomic<int>  live       { -1 };
+        std::atomic<juce::uint32> generation { 0 };
         std::atomic<int>  liveCount  { 0 };
         std::atomic<int>  rawCount   { 0 };
         std::atomic<bool> truncated  { false };

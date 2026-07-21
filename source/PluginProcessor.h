@@ -114,6 +114,10 @@ public:
     // Scala-as-timbre: a loaded .scl becomes the partial set instead of the
     // harmonic engine. Called from the editor.
     bool loadTimbreFile (const juce::File& f, juce::String& errorOut);
+    // Build the timbre spectrum from typed intervals (cents "701.955c" / "700.0",
+    // ratios "3/2", or integers "3"), space/comma/newline separated. The highest
+    // interval becomes the period (the Reps repeat point).
+    bool loadTimbreText (const juce::String& text, juce::String& errorOut);
     void clearTimbre();
     bool isTimbreActive() const noexcept { return timbreActive; }
     juce::String getTimbreStatus() const;
