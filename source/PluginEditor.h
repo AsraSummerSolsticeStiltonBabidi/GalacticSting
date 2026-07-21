@@ -176,6 +176,7 @@ private:
     RefreshingComboBox presetBox;
     juce::ToggleButton primeToggle[9], dissMaxToggle, morphToggle;
     juce::Slider       morphTimeFader;
+    juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
     juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
                      langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3];
     juce::Label          vibeLabel;   // "Vibe coded by" credit, left of the language button
@@ -213,6 +214,7 @@ private:
     int  lastResetOffState = -1; // packs Reset/Off visibility to detect changes for relayout
     int  lastDissGeneration = 0; // refresh the degree list / shortfall notice once per generation
     int  lastKbLo = -1, lastKbNum = -1; // last keyboard window applied (re-adapt on tuning change)
+    juce::Rectangle<int> harmonicEngineBounds; // macro-group frame drawn in paint()
     void refreshDegreeList (bool showNotice = true);
     std::map<int, int> heldKeys;
 

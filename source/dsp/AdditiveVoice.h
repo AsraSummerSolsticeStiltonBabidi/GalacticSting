@@ -281,12 +281,12 @@ public:
                 const double mt = std::max (0.001, (double) morphTimeParam->load());
                 morphPos += (double) numSamples / (mt * currentSampleRate);
                 const double t = std::min (1.0, morphPos);
-                // Clean pitch-bend glide for almost all of the morph; only the last
-                // ~40 ms crossfade to the coherent destination phase (the partial is
-                // by then right at its target, so there is no audible beating), so the
-                // note ENDS as a proper pulse instead of a phase-drifted smear.
-                const double xf = std::min (0.5, 0.04 / mt);
-                morphW = (t <= 1.0 - xf) ? 0.0 : std::min (1.0, (t - (1.0 - xf)) / xf);
+                // Phase-lock PROGRESSIVELY (over the second half of the morph, with an
+                // ease-in), reaching perfect coherence exactly at the end - the Morph
+                // Time - instead of a brusque sync in the last few ms. The clean glide
+                // dominates early; the coherent pulse eases in toward the end.
+                const double x = std::min (1.0, std::max (0.0, (t - 0.5) * 2.0));
+                morphW = x * x;
                 for (int j = 0; j < morphN; ++j)
                     curRatio[(size_t) j] = std::exp2 (morphStartLog[(size_t) j]
                                             + (morphTgtLog[(size_t) j] - morphStartLog[(size_t) j]) * t);

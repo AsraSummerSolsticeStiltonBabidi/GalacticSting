@@ -27,7 +27,7 @@ public:
     bool hasEditor() const override { return true; }
 
     //==========================================================================
-    const juce::String getName() const override { return "Galactic Sting"; }
+    const juce::String getName() const override { return juce::String::fromUTF8 ("Fibl\xc3\xb3 Gal\xc3\xa0" "ctic"); }
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
