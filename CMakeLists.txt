@@ -5,6 +5,12 @@ project(FractalAdditive VERSION 0.1.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Compile with UTF-8 so a non-ASCII product name (Fibló Galàctic) survives into the
+# binary correctly instead of being re-encoded to the system codepage (mojibake).
+if(MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 # JUCE does not use C++20 modules; disabling the scanner avoids a Ninja/MSVC
 # rule-generation bug and speeds configuration up.
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
@@ -40,7 +46,7 @@ juce_add_plugin(FractalAdditive
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE          # required for computer-keyboard play
     VST3_CATEGORIES             "Instrument" "Synth"
     FORMATS                     Standalone VST3
-    PRODUCT_NAME                "Galactic Sting")
+    PRODUCT_NAME                "Fibló Galàctic")
 
 # Embedded assets (title font).
 juce_add_binary_data(GalacticAssets SOURCES assets/fonts/Kablammo.ttf)

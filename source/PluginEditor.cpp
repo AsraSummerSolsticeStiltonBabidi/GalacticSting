@@ -97,15 +97,26 @@ namespace
             g.setColour (col.withAlpha (0.95f));
             g.drawRect (frame, 2.6f); // thick square outline
 
-            // Title: no background chip - BLACK glyphs with a thick coloured stroke
-            // (the frame's colour), so the title reads as outlined black text.
-            const juce::Font tf (juce::FontOptions (16.0f).withStyle ("Bold"));
+            // Title: no background chip - BLACK glyphs with a thick WHITE stroke, so
+            // the title reads as clean white outlined text. The font auto-shrinks to
+            // fit the box width (long Catalan titles would otherwise overrun).
+            float fontH = 16.0f;
+            const float avail = (float) w - 12.0f - 5.0f;
+            juce::Font tf (juce::FontOptions (fontH).withStyle ("Bold"));
             juce::GlyphArrangement ga;
             ga.addLineOfText (tf, text, 12.0f, titleH - 5.5f);
+            const float tw = ga.getBoundingBox (0, -1, true).getWidth();
+            if (tw > avail && tw > 1.0f)
+            {
+                fontH = juce::jmax (8.5f, fontH * avail / tw);
+                ga.clear();
+                tf = juce::Font (juce::FontOptions (fontH).withStyle ("Bold"));
+                ga.addLineOfText (tf, text, 12.0f, titleH - 5.5f);
+            }
             juce::Path p;
             ga.createPath (p);
-            g.setColour (col);
-            g.strokePath (p, juce::PathStrokeType (3.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            g.setColour (juce::Colours::white);
+            g.strokePath (p, juce::PathStrokeType (3.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
             g.setColour (juce::Colours::black);
             g.fillPath (p);
         }
@@ -268,6 +279,36 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     langButton.onClick = [this] { catalan = ! catalan; applyLanguage(); refocus(); };
     addAndMakeVisible (langButton);
 
+    // Top-bar menu (works in the VST too, where the standalone's Options bar is absent):
+    // Init = reset every parameter to default; Panic = all notes off.
+    menuButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff33334a));
+    menuButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    menuButton.setMouseClickGrabsKeyboardFocus (false);
+    menuButton.onClick = [this]
+    {
+        juce::PopupMenu m;
+        m.addItem (1, tr ("Init - reset all parameters", "Init - reinicia tots els par\xc3\xa0metres"));
+        m.addItem (2, tr ("Panic - all notes off", "P\xc3\xa0nic - atura totes les notes"));
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (menuButton),
+            [this] (int r)
+            {
+                if (r == 1)
+                {
+                    for (auto* p : processorRef.getParameters())
+                        p->setValueNotifyingHost (p->getDefaultValue());
+                    processorRef.clearScala();
+                    processorRef.clearTimbre();
+                    intervalEdit.clear();
+                }
+                else if (r == 2)
+                {
+                    for (int ch = 1; ch <= 16; ++ch) processorRef.keyboardState.allNotesOff (ch);
+                }
+                refocus();
+            });
+    };
+    addAndMakeVisible (menuButton);
+
     // Credit: "Vibe coded by Asra3" (Asra3 is a link to Instagram), left of the language button.
     vibeLabel.setText ("Vibe coded by", juce::dontSendNotification);
     vibeLabel.setJustificationType (juce::Justification::centredRight);
@@ -413,7 +454,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addAndMakeVisible (meterLabel);
     helpLabel.setJustificationType (juce::Justification::centred);
     helpLabel.setColour (juce::Label::textColourId, juce::Colour (0xff9aa0b0));
-    helpLabel.setFont (juce::Font (juce::FontOptions (12.0f)));
+    helpLabel.setFont (juce::Font (juce::FontOptions (9.5f)));
     addAndMakeVisible (helpLabel);
 
     keyboard.setDegreeLabeller ([this] (int d) { return justName (processorRef.getDegreeRatio (d)); });
@@ -490,6 +531,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
 {
     using juce::dontSendNotification;
     langButton.setButtonText (catalan ? "ENG" : "CAT");
+    menuButton.setButtonText (tr ("Menu", "Men\xc3\xba"));
     langButton.setTooltip (tr ("Switch the interface language to Catal\xc3\xa0.",
                                "Torna la interf\xc3\xad" "cie a l'angl\xc3\xa8s."));
 
@@ -505,7 +547,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     gAmpEnv.setText        (tr ("Volume Envelope", "Envolupant volum"));
     gPitchEnv.setText      (tr ("Pitch Envelope", "Envolupant to"));
     gTuning.setText        (tr ("Tuning", "Afinaci\xc3\xb3"));
-    gTimbre.setText        (tr ("Spectrum Builder", "Constructor d'espectre"));
+    gTimbre.setText        (tr ("Custom Engine", "Motor propi"));
     intervalEdit.setTextToShowWhenEmpty (tr ("intervals: 3/2 2 700c ...", "intervals: 3/2 2 700c ..."),
                                          juce::Colour (0xff8f96a8));
     gSpecScale.setText     (tr ("Spectrum to Scale", "Espectre a escala"));
@@ -977,22 +1019,41 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     g.setColour (juce::Colour (0xff2a2a3c));
     g.fillRect (0, titleArea.getBottom() - 1, getWidth(), 1);
 
+    // "Harmonic Engine" macro-group: a frame + label around Base / Harmonics /
+    // Prime / Slope, drawn behind those child panels.
+    if (! harmonicEngineBounds.isEmpty())
+    {
+        g.setColour (juce::Colour (0xff4a4668));
+        g.drawRect (harmonicEngineBounds.toFloat(), 1.3f);
+        g.setColour (juce::Colours::white.withAlpha (0.9f));
+        g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+        g.drawText (tr ("HARMONIC ENGINE", "MOTOR HARM\xc3\x92NIC"),
+                    harmonicEngineBounds.withHeight (16).reduced (10, 1),
+                    juce::Justification::centredLeft, false);
+    }
+
     // Title: Title Case, each letter in an EQUAL-SIZED SQUARE (sharp corners),
     // keyboard hue logic (first and last letter red), letter black or white by
     // the square's brightness - like the keys. Every letter is stretched to FILL
     // its square (see the loop) - it grows and deforms to almost touch the edges.
-    const auto title = catalan ? juce::String::fromUTF8 ("Fibl\xc3\xb3 Gal\xc3\xa0" "ctic")
-                               : juce::String ("Galactic Sting");
+    const auto title = juce::String::fromUTF8 ("Fibl\xc3\xb3 Gal\xc3\xa0" "ctic"); // always, both languages
     const int L = title.length();
     const int period = juce::jmax (1, L - 1); // last letter wraps to degree 0 = red
 
-    const float side   = 52.0f;         // all squares identical, big
-    const float gap    = 4.0f;
-    const float margin = side * 0.10f;  // small breathing room to the square's edge
+    float side      = 52.0f;            // all squares identical, big (shrinks to fit below)
+    const float gap = 4.0f;
 
     int squares = 0, spaces = 0;
     for (int i = 0; i < L; ++i) (title[i] == ' ' ? spaces : squares)++;
-    const float total = (float) squares * (side + gap) + (float) spaces * (side * 0.5f);
+    float total = (float) squares * (side + gap) + (float) spaces * (side * 0.5f);
+
+    // Keep the title inside the FREE ZONE between the Save button (left) and the
+    // menu / credit / language controls (right), so it never overlaps them.
+    const float freeLeft  = 268.0f;
+    const float freeRight = (float) getWidth() - 312.0f;
+    const float freeW     = juce::jmax (120.0f, freeRight - freeLeft);
+    if (total > freeW) { side *= freeW / total; total = freeW; }
+    const float margin = side * 0.10f;  // small breathing room to the square's edge
 
     // Nominal-size font; each glyph's path is rescaled per-square below, so the
     // exact height here only needs enough resolution for a clean outline.
@@ -1000,7 +1061,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (64.0f))
         : juce::Font (juce::FontOptions (64.0f).withStyle ("Bold"));
 
-    float x = ((float) getWidth() - total) * 0.5f;
+    float x = freeLeft + (freeW - total) * 0.5f;
     const float cy = (float) titleArea.getCentreY();
     for (int i = 0; i < L; ++i)
     {
@@ -1048,6 +1109,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
         credit.removeFromRight (3); // small gap between "by" and the link
         vibeLabel.setBounds (credit);
     }
+    titleBar.removeFromRight (6);
+    menuButton.setBounds (titleBar.removeFromRight (52).withSizeKeepingCentre (48, 24));
     auto presetArea = titleBar.removeFromLeft (272).reduced (10, 0);
     presetBox.setBounds (presetArea.removeFromLeft (190).withSizeKeepingCentre (190, 24));
     presetArea.removeFromLeft (6);
@@ -1110,8 +1173,16 @@ void FractalAdditiveAudioProcessorEditor::resized()
         auto row = area.removeFromTop (rowH).reduced (0, 2);
         const int W = row.getWidth();
 
+        // "Harmonic Engine" macro-group wraps Base + Harmonics/Prime + Slope. Reserve
+        // a title band at the top of those columns; paint() draws the frame + label.
+        const int macroW = W * 62 / 100;
+        harmonicEngineBounds = row.removeFromLeft (macroW);
+        auto macro = harmonicEngineBounds.reduced (2);
+        macro.removeFromTop (15); // macro-title band
+        const int mW = macro.getWidth();
+
         {
-            auto bb = row.removeFromLeft (W * 22 / 100);
+            auto bb = macro.removeFromLeft (mW * 22 / 62);
             gBase.setBounds (bb.reduced (3));
             auto bi = bb.reduced (3).reduced (6, 4); bi.removeFromTop (16);
             auto left = bi.removeFromLeft (bi.getWidth() * 40 / 100); // N fader column
@@ -1131,7 +1202,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
         // Harmonics stacked on top of Prime Control.
         {
-            auto colBox = row.removeFromLeft (W * 28 / 100);
+            auto colBox = macro.removeFromLeft (mW * 28 / 62);
             auto hb = colBox.removeFromTop (colBox.getHeight() * 2 / 5);
             {
                 gWhitelist.setBounds (hb.reduced (3));
@@ -1164,8 +1235,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
         }
 
-        // Narrow single-fader boxes.
-        oneFader (row.removeFromLeft (W * 12 / 100), gSlope,         slopeFader,         nullptr);
+        // Narrow single-fader boxes. Slope closes the Harmonic-Engine macro-group.
+        oneFader (macro,                             gSlope,         slopeFader,         nullptr);
         oneFader (row.removeFromLeft (W * 12 / 100), gSpectrumRange, spectrumRangeFader, &lblRange);
         oneFader (row.removeFromLeft (W * 12 / 100), gFractal,       fractalFader,       nullptr);
 
@@ -1387,9 +1458,9 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     tuningNameLabel.setText (sname, juce::dontSendNotification);
 
     juce::String tms = processorRef.isTimbreActive()
-        ? "Timbre: " + processorRef.getTimbreName() + "  (" + juce::String (processorRef.getTimbreNoteCount())
+        ? "Custom: " + processorRef.getTimbreName() + "  (" + juce::String (processorRef.getTimbreNoteCount())
           + tr (" notes/period)", " notes/per\xc3\xadode)")
-        : tr ("Timbre off (harmonic engine)", "Timbre apagat (motor harm\xc3\xb2nic)");
+        : tr ("Custom engine off", "Motor propi apagat");
     timbreStatusLabel.setText (tms, juce::dontSendNotification);
 
     // Recent .scl buttons.
