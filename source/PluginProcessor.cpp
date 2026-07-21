@@ -174,6 +174,12 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         params.push_back (std::make_unique<AudioParameterFloat>(
             ParameterID { "refA", 1 }, "Reference A (Hz)", r, 440.0f));
     }
+    // Whole-instrument octave transpose (+-5 octaves), on top of the A reference.
+    params.push_back (std::make_unique<AudioParameterInt>(
+        ParameterID { "octaveShift", 1 }, "Octave Transpose", -5, 5, 0));
+    // Tuning bank slot (0 = none, 1..N = load that bank .scl). Automatable.
+    params.push_back (std::make_unique<AudioParameterInt>(
+        ParameterID { "tuningBankSlot", 1 }, "Tuning Bank Slot", 0, kBankSlots, 0));
 
     //-- Scala-as-timbre --------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterInt>(
@@ -230,8 +236,28 @@ void FractalAdditiveAudioProcessor::timerCallback()
         lastPushed = s;
     }
 
+    // Tuning-bank slot switched (UI or host automation): load that slot's .scl.
+    // Runs on the message thread (timerCallback), so the parse/load is safe here.
+    {
+        const int slot = getTuningBankSlotParam();
+        if (slot != lastBankSlot)
+        {
+            lastBankSlot = slot;
+            if (slot >= 1 && slot <= kBankSlots && bankSource[(size_t) (slot - 1)].isNotEmpty())
+            {
+                juce::String err;
+                if (tuning.loadScalaString (bankSource[(size_t) (slot - 1)], bankName[(size_t) (slot - 1)], err))
+                {
+                    if (auto* pm = apvts.getParameter ("tuningMode"))
+                        pm->setValueNotifyingHost (pm->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
+                }
+            }
+        }
+    }
+
     tuning.setMode ((TuningManager::Mode) (int) apvts.getRawParameterValue ("tuningMode")->load());
     tuning.setReferenceA ((double) apvts.getRawParameterValue ("refA")->load());
+    tuning.setOctaveShift ((int) apvts.getRawParameterValue ("octaveShift")->load());
 
     // Apply the bend-range choice only when it changes: setLegacyModePitchbendRange
     // releases all held notes, so it must never be called redundantly.
@@ -264,6 +290,37 @@ void FractalAdditiveAudioProcessor::clearScala()
     if (auto* p = apvts.getParameter ("tuningMode"))
         p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Equal));
     tuning.setMode (TuningManager::Mode::Equal);
+}
+
+//==============================================================================
+int FractalAdditiveAudioProcessor::firstEmptyBankSlot() const noexcept
+{
+    for (int i = 0; i < kBankSlots; ++i)
+        if (bankSource[(size_t) i].isEmpty())
+            return i;
+    return 0; // all full -> reuse the first
+}
+
+void FractalAdditiveAudioProcessor::setTuningBankFile (int slot0, const juce::File& f)
+{
+    if (! juce::isPositiveAndBelow (slot0, kBankSlots) || ! f.existsAsFile())
+        return;
+
+    const auto text = f.loadFileAsString();
+    std::vector<double> tmp; double per = 2.0; juce::String err;
+    if (! TuningManager::parseScalaScale (text, tmp, per, err)) // validate before storing
+        return;
+
+    bankSource[(size_t) slot0] = text;
+    bankName[(size_t) slot0]   = f.getFileNameWithoutExtension();
+    addRecentScl (f);
+    setTuningBankSlotParam (slot0 + 1); // select + load it now
+}
+
+void FractalAdditiveAudioProcessor::setTuningBankSlotParam (int slot)
+{
+    if (auto* p = apvts.getParameter ("tuningBankSlot"))
+        p->setValueNotifyingHost (p->convertTo0to1 ((float) juce::jlimit (0, kBankSlots, slot)));
 }
 
 //==============================================================================
@@ -558,6 +615,22 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         tim.setProperty ("source", timbreSource, nullptr);
         state.appendChild (tim, nullptr);
     }
+
+    state.removeChild (state.getChildWithName ("BANK"), nullptr);
+    {
+        juce::ValueTree bank ("BANK");
+        for (int i = 0; i < kBankSlots; ++i)
+            if (bankSource[(size_t) i].isNotEmpty())
+            {
+                juce::ValueTree slot ("SLOT");
+                slot.setProperty ("i",      i,                      nullptr);
+                slot.setProperty ("name",   bankName[(size_t) i],   nullptr);
+                slot.setProperty ("source", bankSource[(size_t) i], nullptr);
+                bank.appendChild (slot, nullptr);
+            }
+        if (bank.getNumChildren() > 0)
+            state.appendChild (bank, nullptr);
+    }
     return state;
 }
 
@@ -567,6 +640,21 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
         return;
 
     apvts.replaceState (tree);
+
+    // Tuning bank slots.
+    for (auto& s : bankName)   s.clear();
+    for (auto& s : bankSource) s.clear();
+    if (auto bank = tree.getChildWithName ("BANK"); bank.isValid())
+        for (auto slot : bank)
+        {
+            const int i = (int) slot.getProperty ("i", -1);
+            if (juce::isPositiveAndBelow (i, kBankSlots))
+            {
+                bankName[(size_t) i]   = slot.getProperty ("name").toString();
+                bankSource[(size_t) i] = slot.getProperty ("source").toString();
+            }
+        }
+    lastBankSlot = getTuningBankSlotParam(); // don't re-load on restore; state's SCALA already has it
 
     if (auto scl = tree.getChildWithName ("SCALA"); scl.isValid())
     {
