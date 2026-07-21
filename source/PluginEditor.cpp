@@ -122,6 +122,12 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     lnf = std::make_unique<GalacticLnF>();
     setLookAndFeel (lnf.get());
 
+    // Open in Catalan if the computer's language is Catalan (else English).
+    {
+        const auto lang = juce::SystemStats::getUserLanguage().toLowerCase();
+        catalan = (lang == "ca" || lang.startsWith ("ca-") || lang.startsWith ("ca_"));
+    }
+
     configGroup (gBase, cBase);
     configFader (baseNFader,   "baseN",    baseNAtt,     cBase, "Base harmonic N");
     configCombo (basePitchBox, "baseMode", basePitchAtt, cBase, "Original = harmonics at natural positions.  Transposed down = lowest partial at the played pitch.");
@@ -243,7 +249,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     clearTimbreButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
     clearTimbreButton.setMouseClickGrabsKeyboardFocus (false);
     clearTimbreButton.setTooltip ("Back to the harmonic engine.");
-    clearTimbreButton.onClick = [this] { processorRef.clearTimbre(); refocus(); };
+    clearTimbreButton.onClick = [this] { processorRef.clearTimbre(); intervalEdit.clear(); refocus(); };
     addAndMakeVisible (clearTimbreButton);
     configFader (timbreRepeatsFader, "timbreRepeats", timbreRepeatsAtt, cTimbre,
                  "How many times the scale's period stacks into the timbre. More = reaches higher.");
@@ -349,10 +355,19 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     intervalEdit.onReturnKey = [this]
     {
         juce::String err;
-        if (intervalEdit.getText().trim().isNotEmpty()
-            && ! processorRef.loadTimbreText (intervalEdit.getText(), err))
-            juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                tr ("Spectrum Builder", "Constructor d'espectre"), err, this);
+        if (intervalEdit.getText().trim().isNotEmpty())
+        {
+            if (processorRef.loadTimbreText (intervalEdit.getText(), err))
+            {
+                // Same as loading a .scl: switch the engine off, grey the harmonic
+                // controls and show the Off button - immediately, not on the next tick.
+                applyTimbreEnablement (true);
+                resized();
+            }
+            else
+                juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                    tr ("Spectrum Builder", "Constructor d'espectre"), err, this);
+        }
         refocus();
     };
     intervalEdit.onEscapeKey = [this] { refocus(); };
