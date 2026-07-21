@@ -134,6 +134,12 @@ namespace
             }
             juce::Path p;
             ga.createPath (p);
+            // Stretch the glyphs a little taller, UPWARD only (anchored on the
+            // baseline), so the title reads bigger without moving its baseline or
+            // touching anything below it.
+            const float baseY = titleH - 5.5f;
+            p.applyTransform (juce::AffineTransform::translation (0.0f, -baseY)
+                                  .scaled (1.0f, 1.28f).translated (0.0f, baseY));
             g.setColour (col);
             g.strokePath (p, juce::PathStrokeType (3.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
             g.setColour (juce::Colours::black);
@@ -1210,90 +1216,6 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         }
     }
 
-    // Connector lines: each panel is tied to the title letter closest to it in HUE
-    // (so a line ends at the letter that shares the menu's colour) with a thin,
-    // strictly orthogonal path. The lines travel ONLY through the black-background
-    // channels - never over a panel or its text: a top corridor just under the
-    // title, the gap between the two panel rows, and the vertical gaps between the
-    // Row-1 panels. So a Row-2 line rises through a Row-1 gap, not behind a panel.
-    if (! squares.empty() && ! harmonicEngineBounds.isEmpty() && ! essentialsBounds.isEmpty())
-    {
-        struct Conn { juce::Rectangle<int> box; juce::Colour col; };
-        const auto rangeB = gSpectrumRange.getBounds();
-        const auto fracB  = gFractal.getBounds();
-        const auto specB  = gSpecScale.getBounds();
-        const auto timbB  = gTimbre.getBounds();
-        const Conn conns[] = {
-            { harmonicEngineBounds, cHarmonic   },
-            { rangeB,               cRange      },
-            { fracB,                cFractal    },
-            { essentialsBounds,     cEssentials },
-            { specB,                cSpecScale  },
-            { gFilter.getBounds(),  cFilter     },
-            { gAmpEnv.getBounds(),  cEnv        },
-            { gPitchEnv.getBounds(),cPitch      },
-            { gTuning.getBounds(),  cTuning     },
-            { timbB,                cTimbre     },
-        };
-
-        // The channels (all on black background, between panels):
-        const float corridorTop = (float) harmonicEngineBounds.getY() - 4.0f;      // under the title, above Row 1
-        const float rowGapY     = 0.5f * (float) (harmonicEngineBounds.getBottom() + timbB.getY()); // between the rows
-        const float rowSplit    = (float) timbB.getY() - 2.0f;                      // panels below this are Row 2
-        auto midX = [] (juce::Rectangle<int> a, juce::Rectangle<int> b)
-        { return 0.5f * (float) (a.getRight() + b.getX()); };
-        const float vgaps[] = {                                   // vertical black gaps between Row-1 panels
-            (float) harmonicEngineBounds.getX() - 3.0f,           // left margin
-            midX (harmonicEngineBounds, rangeB),
-            midX (rangeB, fracB),
-            midX (fracB, essentialsBounds),
-            midX (essentialsBounds, specB)
-        };
-
-        auto hueDist = [] (float a, float b) { const float d = std::abs (a - b); return juce::jmin (d, 1.0f - d); };
-        int k = 0;
-        for (const auto& c : conns)
-        {
-            if (c.box.isEmpty()) { ++k; continue; }
-            int best = 0; float bestD = 2.0f;
-            const float ch = c.col.getHue();
-            for (int s = 0; s < (int) squares.size(); ++s)
-            {
-                const float d = hueDist (ch, squares[(size_t) s].col.getHue());
-                if (d < bestD) { bestD = d; best = s; }
-            }
-            const auto& sq = squares[(size_t) best].rect;
-            const float lx  = sq.getCentreX();
-            const float lb  = sq.getBottom();
-            const float cx  = (float) c.box.getCentreX();
-            const float corrY = corridorTop - (float) (k % 5) * 1.8f; // slight stagger so parallel runs don't merge
-
-            juce::Path pth;
-            pth.startNewSubPath (cx, (float) c.box.getY());
-            if ((float) c.box.getY() > rowSplit)
-            {
-                // Row 2: up into the row gap, across to the Row-1 vertical gap that
-                // gives the shortest total path, up that gap to the top corridor.
-                float vg = vgaps[0], bd = 1.0e9f;
-                for (float v : vgaps) { const float d = std::abs (cx - v) + std::abs (v - lx); if (d < bd) { bd = d; vg = v; } }
-                pth.lineTo (cx, rowGapY);
-                pth.lineTo (vg, rowGapY);
-                pth.lineTo (vg, corrY);
-                pth.lineTo (lx, corrY);
-            }
-            else
-            {
-                // Row 1 (and the full-height right panel): straight up into the corridor.
-                pth.lineTo (cx, corrY);
-                pth.lineTo (lx, corrY);
-            }
-            pth.lineTo (lx, lb);
-            g.setColour (c.col.withAlpha (0.82f));
-            g.strokePath (pth, juce::PathStrokeType (1.0f, juce::PathStrokeType::mitered, juce::PathStrokeType::butt));
-            ++k;
-        }
-    }
-
     // Harmonic Engine macro-group: the WHOLE box is drawn here - frame + fill + title
     // (like the other boxes but in ONE colour) + the SHARED internal dividers between
     // its sub-cells + each cell's small inline uppercase label. Drawn in the editor
@@ -1313,9 +1235,12 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         g.setColour (col.withAlpha (0.95f));
         g.drawRect (frame, 2.6f);
         juce::GlyphArrangement ga;
+        const float baseY = box.getY() + titleH - 5.5f;
         ga.addLineOfText (juce::Font (juce::FontOptions (16.0f).withStyle ("Bold")),
-                          ttl, box.getX() + 12.0f, box.getY() + titleH - 5.5f);
+                          ttl, box.getX() + 12.0f, baseY);
         juce::Path p; ga.createPath (p);
+        p.applyTransform (juce::AffineTransform::translation (0.0f, -baseY)  // taller, upward only
+                              .scaled (1.0f, 1.28f).translated (0.0f, baseY));
         g.setColour (col);
         g.strokePath (p, juce::PathStrokeType (3.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         g.setColour (juce::Colours::black); g.fillPath (p);
@@ -1413,7 +1338,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
     { c.setBounds (r.withSizeKeepingCentre (r.getWidth(), juce::jmin (24, r.getHeight()))); };
     auto oneFader = [&] (juce::Rectangle<int> b, juce::GroupComponent& grp, juce::Slider& s, juce::Label* lbl)
     {
-        grp.setBounds (b.reduced (3));
+        // Box top aligned to the row top (like the Harmonic-Engine / Essentials macro
+        // boxes) so all Row-1 titles sit on the same line; the CONTENT is unchanged.
+        grp.setBounds (b.reduced (3).withTop (b.getY()));
         auto r = b.reduced (3).reduced (5, 4); r.removeFromTop (14);
         if (lbl) lbl->setBounds (r.removeFromTop (13));
         s.setBounds (r);
