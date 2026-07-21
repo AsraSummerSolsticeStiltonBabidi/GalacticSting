@@ -281,12 +281,10 @@ public:
                 const double mt = std::max (0.001, (double) morphTimeParam->load());
                 morphPos += (double) numSamples / (mt * currentSampleRate);
                 const double t = std::min (1.0, morphPos);
-                // Phase-lock PROGRESSIVELY (over the second half of the morph, with an
-                // ease-in), reaching perfect coherence exactly at the end - the Morph
-                // Time - instead of a brusque sync in the last few ms. The clean glide
-                // dominates early; the coherent pulse eases in toward the end.
-                const double x = std::min (1.0, std::max (0.0, (t - 0.5) * 2.0));
-                morphW = x * x;
+                // Phase-lock PROGRESSIVELY across the WHOLE morph (gentle ease-in that
+                // reaches perfect coherence exactly at the end - the Morph Time), so the
+                // pulse comes into phase very gradually rather than snapping near the end.
+                morphW = t * t; // quadratic ease-in across the whole morph (very gradual)
                 for (int j = 0; j < morphN; ++j)
                     curRatio[(size_t) j] = std::exp2 (morphStartLog[(size_t) j]
                                             + (morphTgtLog[(size_t) j] - morphStartLog[(size_t) j]) * t);
