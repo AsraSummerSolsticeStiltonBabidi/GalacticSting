@@ -181,6 +181,7 @@ public:
         // Pitch env: amount (semitones) * the envelope value [0..1], evaluated once
         // per block (like the filter cutoff) - the env itself advances per sample.
         int n = 0;
+        double morphW = 0.0; // 0..1 crossfade weight from running phases -> coherent alignPhase
         const auto* tmpl = engine.getLive();
         const double baseFreq = tuning.frequencyForNote ((int) currentlyPlayingNote.initialNote);
         const double pitchEnvSemis = (double) pEnvAmtParam->load() * (double) pitchEnvValue;
@@ -200,38 +201,75 @@ public:
             const auto&  ps       = tmpl->partials;
             const int    count    = std::min ((int) ps.size(), spectrum::kMaxPartials);
 
-            // Target amplitudes + the sub-Nyquist partial count (freqs handled below).
+            // Sub-Nyquist partial count of the CURRENT template.
+            int newN = 0;
             for (int i = 0; i < count; ++i)
             {
                 if ((double) ps[(size_t) i].ratio > maxRatio) break; // sorted asc -> rest are higher
-                tgtAmp[(size_t) i] = ps[(size_t) i].amp;
-                n = i + 1;
+                newN = i + 1;
             }
 
-            // Spectral MORPHING: when the template CHANGES, glide each partial's
-            // frequency from its nearest previous partial to its new position over
-            // Morph Time (a per-partial pitch bend), instead of snapping. If the new
-            // spectrum has more partials, several new ones share a nearest old start
-            // and spread out from it; if fewer, several old ones map to one target.
-            // Morphing off -> frequencies snap instantly, exactly as before.
+            // Spectral MORPHING: when the template CHANGES, each partial glides from
+            // where it is NOW to its new position over Morph Time (a per-partial pitch
+            // bend) instead of snapping. Mapping is rank-wise (old rank j -> new rank j),
+            // which always produces a real glide when the spectra differ; if the count
+            // grew, the extra new partials appear from their nearest old one (split);
+            // if it shrank, the extra old partials converge to their nearest new one and
+            // fade (merge). A change mid-morph just restarts the glide FROM the current
+            // (already-gliding) state - it never snaps. Morphing off -> instant snap.
             const juce::uint32 gen = engine.getGeneration();
             const bool morphOn = morphParam != nullptr && morphParam->load() > 0.5f;
             if (gen != lastGen)
             {
-                if (morphOn && ! snapAmps && prevN > 0 && n > 0)
+                if (morphOn && ! snapAmps && prevN > 0 && newN > 0)
                 {
-                    int k = 0; // nearest previous partial for each new one (both sorted asc)
-                    for (int j = 0; j < n; ++j)
+                    const int lo = std::min (prevN, newN);
+                    const int hi = std::max (prevN, newN);
+                    for (int j = 0; j < lo; ++j) // shared ranks: straight old[j] -> new[j]
                     {
-                        const double tr = (double) ps[(size_t) j].ratio;
-                        while (k + 1 < prevN
-                               && std::abs (curRatio[(size_t) (k + 1)] - tr) <= std::abs (curRatio[(size_t) k] - tr))
-                            ++k;
-                        morphStartLog[(size_t) j] = std::log2 (std::max (1.0e-12, curRatio[(size_t) k]));
+                        morphStartLog[(size_t) j] = std::log2 (std::max (1.0e-12, curRatio[(size_t) j]));
+                        morphTgtLog  [(size_t) j] = std::log2 (std::max (1.0e-12, (double) ps[(size_t) j].ratio));
                     }
-                    for (int j = 0; j < n; ++j)
+                    if (newN > prevN) // grew: extra new partials start from their nearest old
+                    {
+                        int k = 0;
+                        for (int j = prevN; j < newN; ++j)
+                        {
+                            const double tr = (double) ps[(size_t) j].ratio;
+                            while (k + 1 < prevN
+                                   && std::abs (curRatio[(size_t)(k+1)] - tr) <= std::abs (curRatio[(size_t) k] - tr)) ++k;
+                            morphStartLog[(size_t) j] = std::log2 (std::max (1.0e-12, curRatio[(size_t) k]));
+                            morphTgtLog  [(size_t) j] = std::log2 (std::max (1.0e-12, tr));
+                        }
+                    }
+                    else if (prevN > newN) // shrank: extra old partials converge to nearest new, then fade
+                    {
+                        int k = 0;
+                        for (int j = newN; j < prevN; ++j)
+                        {
+                            const double srr = curRatio[(size_t) j];
+                            while (k + 1 < newN
+                                   && std::abs ((double) ps[(size_t)(k+1)].ratio - srr) <= std::abs ((double) ps[(size_t) k].ratio - srr)) ++k;
+                            morphStartLog[(size_t) j] = std::log2 (std::max (1.0e-12, srr));
+                            morphTgtLog  [(size_t) j] = std::log2 (std::max (1.0e-12, (double) ps[(size_t) k].ratio));
+                        }
+                    }
+                    for (int j = 0; j < hi; ++j)
                         curRatio[(size_t) j] = std::exp2 (morphStartLog[(size_t) j]);
-                    morphN = n; morphPos = 0.0; morphActive = true;
+                    morphN = hi; morphPos = 0.0; morphActive = true;
+
+                    // Coherent phase reference for the DESTINATION (as if the new
+                    // spectrum were freshly played now); the audio crossfades from the
+                    // current running phases to this over the morph, so the note ends
+                    // phase-coherent (a real pulse in Aligned mode) instead of a drifted
+                    // smear. Without this the sustain after a morph sounds "wrong".
+                    const bool alg = phaseModeParam->load() < 0.5f;
+                    for (int j = 0; j < hi; ++j)
+                    {
+                        if (alg) alignPhase[(size_t) j] = 0.25;
+                        else { const double h = std::sin ((double) j * 12.9898) * 43758.5453;
+                               alignPhase[(size_t) j] = h - std::floor (h); }
+                    }
                 }
                 else
                     morphActive = false; // snap
@@ -243,26 +281,45 @@ public:
                 const double mt = std::max (0.001, (double) morphTimeParam->load());
                 morphPos += (double) numSamples / (mt * currentSampleRate);
                 const double t = std::min (1.0, morphPos);
-                for (int j = 0; j < n; ++j)
-                {
-                    const double tgtLog = std::log2 (std::max (1.0e-12, (double) ps[(size_t) j].ratio));
-                    curRatio[(size_t) j] = (j < morphN)
-                        ? std::exp2 (morphStartLog[(size_t) j] + (tgtLog - morphStartLog[(size_t) j]) * t)
-                        : (double) ps[(size_t) j].ratio;
-                }
-                if (morphPos >= 1.0) morphActive = false;
+                // Clean pitch-bend glide for almost all of the morph; only the last
+                // ~40 ms crossfade to the coherent destination phase (the partial is
+                // by then right at its target, so there is no audible beating), so the
+                // note ENDS as a proper pulse instead of a phase-drifted smear.
+                const double xf = std::min (0.5, 0.04 / mt);
+                morphW = (t <= 1.0 - xf) ? 0.0 : std::min (1.0, (t - (1.0 - xf)) / xf);
+                for (int j = 0; j < morphN; ++j)
+                    curRatio[(size_t) j] = std::exp2 (morphStartLog[(size_t) j]
+                                            + (morphTgtLog[(size_t) j] - morphStartLog[(size_t) j]) * t);
+                for (int j = morphN; j < newN; ++j)         // partials that appeared mid-glide
+                    curRatio[(size_t) j] = (double) ps[(size_t) j].ratio;
             }
             else
             {
-                for (int j = 0; j < n; ++j)
+                for (int j = 0; j < newN; ++j)
                     curRatio[(size_t) j] = (double) ps[(size_t) j].ratio; // snapped
             }
+
+            // Render up to morphN during a morph (old extras keep sounding as they
+            // converge, then fade); the target amps come from the current template,
+            // with any partial past its end fading to 0.
+            n = morphActive ? std::max (morphN, newN) : newN;
+            for (int j = 0; j < n; ++j)
+                tgtAmp[(size_t) j] = (j < newN) ? ps[(size_t) j].amp : 0.0;
 
             for (int j = 0; j < n; ++j) // clamp guards a partial pushed past Nyquist by pitch bend
                 inc[(size_t) j] = std::min (curRatio[(size_t) j] * f0 / currentSampleRate, 0.4999);
 
+            // Increment for the coherent reference: the DESTINATION frequency (not the
+            // gliding one), so alignPhase converges to a proper pulse for the new spectrum.
+            if (morphActive)
+                for (int j = 0; j < n; ++j)
+                {
+                    const double dr = (j < newN) ? (double) ps[(size_t) j].ratio : curRatio[(size_t) j];
+                    alignInc[(size_t) j] = std::min (dr * f0 / currentSampleRate, 0.4999);
+                }
+
             prevN = n;
-            engine.reportRendered (n); // audible partial count for the meter
+            engine.reportRendered (newN); // meter: the true (target) partial count
         }
 
         if (snapAmps)
@@ -320,7 +377,15 @@ public:
                 if (p >= 1.0) p -= 1.0;
                 phase[(size_t) i] = p;
 
-                acc += curAmp[(size_t) i] * (double) sine.lookup (p);
+                double s = (double) sine.lookup (p);
+                if (morphActive) // crossfade the running phase -> the coherent destination phase
+                {
+                    double pa = alignPhase[(size_t) i] + alignInc[(size_t) i]; // advances at the DEST freq
+                    if (pa >= 1.0) pa -= 1.0;
+                    alignPhase[(size_t) i] = pa;
+                    s += morphW * ((double) sine.lookup (pa) - s);
+                }
+                acc += curAmp[(size_t) i] * s;
             }
 
             const float env    = adsr.getNextSample();
@@ -345,6 +410,15 @@ public:
                 finishNote();
                 break;
             }
+        }
+
+        // Morph finished this block: adopt the coherent destination phases (the
+        // crossfade already reached them) so the sustained note carries on exactly
+        // like a freshly-played new spectrum, not a phase-drifted version.
+        if (morphActive && morphPos >= 1.0)
+        {
+            for (int i = 0; i < morphN; ++i) phase[(size_t) i] = alignPhase[(size_t) i];
+            morphActive = false;
         }
 
         // Keep fading-out tails alive until they are inaudible.
@@ -479,6 +553,9 @@ private:
     std::array<double, spectrum::kMaxPartials> curAmp {}; // slewed amplitude actually rendered
     std::array<double, spectrum::kMaxPartials> curRatio      {}; // current (gliding) ratio per partial
     std::array<double, spectrum::kMaxPartials> morphStartLog {}; // log2 start ratio during a morph
+    std::array<double, spectrum::kMaxPartials> morphTgtLog   {}; // log2 target ratio during a morph
+    std::array<double, spectrum::kMaxPartials> alignPhase    {}; // coherent destination phase (morph crossfade)
+    std::array<double, spectrum::kMaxPartials> alignInc      {}; // destination-frequency increment for alignPhase
 
     double        morphPos    = 1.0;   // 0..1 glide progress (>= 1 -> done)
     bool          morphActive = false;
