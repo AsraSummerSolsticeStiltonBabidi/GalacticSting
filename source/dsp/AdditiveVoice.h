@@ -52,6 +52,12 @@ public:
         fSustainParam= apvts.getRawParameterValue ("filterSustain");
         fReleaseParam= apvts.getRawParameterValue ("filterRelease");
 
+        pEnvAmtParam = apvts.getRawParameterValue ("pitchEnvAmount");
+        pAttackParam = apvts.getRawParameterValue ("pitchAttack");
+        pDecayParam  = apvts.getRawParameterValue ("pitchDecay");
+        pSustainParam= apvts.getRawParameterValue ("pitchSustain");
+        pReleaseParam= apvts.getRawParameterValue ("pitchRelease");
+
         filter.setType (juce::dsp::StateVariableTPTFilterType::lowpass);
     }
 
@@ -65,23 +71,33 @@ public:
             return;
         }
 
+        // Is this note-on REUSING a still-sounding voice (voice steal)? JUCE's
+        // MPESynthesiser starts a stolen voice by calling noteStarted() directly
+        // on the active voice - with no noteStopped() first. Hard-resetting here
+        // (envelope to 0, phases scrambled) would step the output discontinuously
+        // = an audible click/glitch at the tail of the stolen note, most likely
+        // when the 32-voice pool runs dry during fast playing. So on reuse we keep
+        // the envelope, phases and filter CONTINUOUS and just re-attack + slew the
+        // amplitudes toward the new note: a click-free hand-off.
+        const bool reuse = adsr.isActive() || fastKill;
+
         // Deterministic note-on (same note twice = identical). Two phase modes:
         //   Aligned  - every partial starts at its peak (cosine), so they form a coherent
-        //              pulse at the difference-tone rate -> a defined tone, not noise. The
-        //              summed peak is then exactly sum|amp|, which the render normalises
-        //              against so it never clips (dense patches just get quieter).
+        //              pulse at the difference-tone rate -> a defined tone, not noise.
         //   Scattered- pseudo-random phases decorrelate the partials into a soft/noisy bed.
-        const bool aligned = phaseModeParam->load() < 0.5f;
-        for (int i = 0; i < spectrum::kMaxPartials; ++i)
+        // Skipped on reuse (keeping the running phases avoids a discontinuity).
+        if (! reuse)
         {
-            if (aligned)
+            const bool aligned = phaseModeParam->load() < 0.5f;
+            for (int i = 0; i < spectrum::kMaxPartials; ++i)
             {
-                phase[(size_t) i] = 0.25; // sin(2*pi*0.25) = 1 -> all partials at their peak
-            }
-            else
-            {
-                const double h = std::sin ((double) i * 12.9898) * 43758.5453;
-                phase[(size_t) i] = h - std::floor (h);
+                if (aligned)
+                    phase[(size_t) i] = 0.25; // sin(2*pi*0.25) = 1 -> all partials at their peak
+                else
+                {
+                    const double h = std::sin ((double) i * 12.9898) * 43758.5453;
+                    phase[(size_t) i] = h - std::floor (h);
+                }
             }
         }
 
@@ -90,27 +106,30 @@ public:
 
         fastKill     = false;
         fastKillGain = 1.0f;
-        snapAmps     = true;
-        snapNorm     = true;
-        releasing    = false; // fresh note: parameter re-apply is allowed again
+        snapAmps     = ! reuse; // cold: snap amps to the template; reuse: slew them (no jump)
+        snapNorm     = ! reuse;
+        releasing    = false;   // fresh note: parameter re-apply is allowed again
 
         const double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
         updateAdsrParameters();
         adsr.setSampleRate (sr);
-        adsr.reset();     // start from silence -> click-free onset, deterministic
-        adsr.noteOn();
+        if (! reuse) adsr.reset(); // cold: start from silence; reuse: keep the envelope continuous
+        adsr.noteOn();             // reuse: re-attacks from the CURRENT level -> no step
 
         updateFilterAdsrParameters();
         filterAdsr.setSampleRate (sr);
-        filterAdsr.reset();
+        if (! reuse) { filterAdsr.reset(); filter.reset(); filterEnvValue = 0.0f; }
         filterAdsr.noteOn();
-        filter.reset();
-        filterEnvValue = 0.0f;
+
+        updatePitchAdsrParameters();
+        pitchAdsr.setSampleRate (sr);
+        if (! reuse) { pitchAdsr.reset(); pitchEnvValue = 0.0f; }
+        pitchAdsr.noteOn();
     }
 
     void noteStopped (bool allowTailOff) override
     {
-        if (allowTailOff) { adsr.noteOff(); filterAdsr.noteOff(); releasing = true; }
+        if (allowTailOff) { adsr.noteOff(); filterAdsr.noteOff(); pitchAdsr.noteOff(); releasing = true; }
         else              beginFastKill();
     }
 
@@ -127,11 +146,13 @@ public:
             const double sr = newRate > 0.0 ? newRate : 44100.0;
             adsr.setSampleRate (sr);
             filterAdsr.setSampleRate (sr);
+            pitchAdsr.setSampleRate (sr);
             filter.prepare ({ sr, 8192, 1 });
             // The ADSR rates are sample-rate dependent, so force a re-apply on the
             // next block instead of skipping it as an unchanged parameter set.
             ampParamsApplied  = { -1.0f, -1.0f, -1.0f, -1.0f };
             filtParamsApplied = { -1.0f, -1.0f, -1.0f, -1.0f };
+            pitchParamsApplied= { -1.0f, -1.0f, -1.0f, -1.0f };
         }
     }
 
@@ -143,14 +164,19 @@ public:
 
         updateAdsrParameters();
         updateFilterAdsrParameters();
+        updatePitchAdsrParameters();
 
         // Snapshot the live template: FREQUENCIES snap, AMPLITUDES are the slew target.
         // Pitch comes from the active tuning (12-TET / MTS-ESP / Scala) for the base
-        // note, with any MPE per-note pitch bend riding on top.
+        // note, with any MPE per-note pitch bend AND the pitch envelope riding on top.
+        // Pitch env: amount (semitones) * the envelope value [0..1], evaluated once
+        // per block (like the filter cutoff) - the env itself advances per sample.
         int n = 0;
         const auto* tmpl = engine.getLive();
         const double baseFreq = tuning.frequencyForNote ((int) currentlyPlayingNote.initialNote);
-        const double f0 = baseFreq * std::pow (2.0, (double) currentlyPlayingNote.totalPitchbendInSemitones / 12.0);
+        const double pitchEnvSemis = (double) pEnvAmtParam->load() * (double) pitchEnvValue;
+        const double f0 = baseFreq * std::pow (2.0,
+            ((double) currentlyPlayingNote.totalPitchbendInSemitones + pitchEnvSemis) / 12.0);
 
         // No infrasound gate: a very low fundamental (wide-period tunings can map a
         // key to a few Hz) is not silenced, because its HARMONICS - at 2x, 3x, ...
@@ -239,6 +265,7 @@ public:
             const float gain   = env * killG * velocityLevel * (0.35f + 0.65f * pressure) * normGain;
             const float s      = filter.processSample (0, (float) acc * gain);
             filterEnvValue     = filterAdsr.getNextSample();
+            pitchEnvValue      = pitchAdsr.getNextSample();
 
             for (int ch = 0; ch < numChannels; ++ch)
                 output.addSample (ch, startSample, s);
@@ -314,6 +341,21 @@ private:
         }
     }
 
+    void updatePitchAdsrParameters()
+    {
+        if (releasing) return; // never disturb a release tail's rate
+        juce::ADSR::Parameters p;
+        p.attack  = pAttackParam->load();
+        p.decay   = pDecayParam->load();
+        p.sustain = pSustainParam->load();
+        p.release = pReleaseParam->load();
+        if (! paramsEqual (p, pitchParamsApplied))
+        {
+            pitchParamsApplied = p;
+            pitchAdsr.setParameters (p);
+        }
+    }
+
     void beginFastKill()
     {
         constexpr double fadeSeconds = 0.005; // 5 ms
@@ -326,6 +368,7 @@ private:
     {
         adsr.reset();
         filterAdsr.reset();
+        pitchAdsr.reset();
         fastKill     = false;
         fastKillGain = 1.0f;
         releasing    = false;
@@ -349,14 +392,21 @@ private:
     std::atomic<float>* fDecayParam    = nullptr;
     std::atomic<float>* fSustainParam  = nullptr;
     std::atomic<float>* fReleaseParam  = nullptr;
+    std::atomic<float>* pEnvAmtParam   = nullptr;
+    std::atomic<float>* pAttackParam   = nullptr;
+    std::atomic<float>* pDecayParam    = nullptr;
+    std::atomic<float>* pSustainParam  = nullptr;
+    std::atomic<float>* pReleaseParam  = nullptr;
 
-    juce::ADSR adsr, filterAdsr;
+    juce::ADSR adsr, filterAdsr, pitchAdsr;
     // Last parameters actually pushed to each ADSR (sentinel = force first apply).
     // See updateAdsrParameters() for why we gate on change.
-    juce::ADSR::Parameters ampParamsApplied  { -1.0f, -1.0f, -1.0f, -1.0f };
-    juce::ADSR::Parameters filtParamsApplied { -1.0f, -1.0f, -1.0f, -1.0f };
+    juce::ADSR::Parameters ampParamsApplied   { -1.0f, -1.0f, -1.0f, -1.0f };
+    juce::ADSR::Parameters filtParamsApplied  { -1.0f, -1.0f, -1.0f, -1.0f };
+    juce::ADSR::Parameters pitchParamsApplied { -1.0f, -1.0f, -1.0f, -1.0f };
     juce::dsp::StateVariableTPTFilter<float> filter;
     float filterEnvValue = 0.0f;
+    float pitchEnvValue   = 0.0f;
 
     std::array<double, spectrum::kMaxPartials> phase  {};
     std::array<double, spectrum::kMaxPartials> inc    {}; // snapped frequency (cycles/sample)

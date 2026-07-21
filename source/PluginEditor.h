@@ -169,8 +169,8 @@ private:
     ScaleKeyboard keyboard;
 
     SteppedSlider baseNFader, spectrumRangeFader, fractalFader, timbreRepeatsFader;
-    juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, refAFader;
-    juce::Slider  ampAdsr[4], filtAdsr[4];
+    juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, refAFader, pEnvAmtFader;
+    juce::Slider  ampAdsr[4], filtAdsr[4], pitchAdsr[4];
     juce::ComboBox basePitchBox, whitelistBox, phaseBox, primeModeBox, primeLimitBox, tuningBox, bendBox,
                    dissCountBox;
     RefreshingComboBox presetBox;
@@ -185,15 +185,15 @@ private:
     DissDegreeList degreeList;
 
     juce::GroupComponent gBase, gWhitelist, gSlope, gSpectrumRange, gFractal, gPhase, gGain,
-                         gPrime, gFilter, gAmpEnv, gTuning, gTimbre, gSpecScale, gReference;
+                         gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale, gReference;
     juce::Label lblBaseN, lblBasePitch, lblRange, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
-                lblTimbreRepeats, lblBend, lblPeriod, lblRefA,
+                lblTimbreRepeats, lblBend, lblPeriod, lblRefA, lblPitchAmt,
                 tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel;
-    juce::Label ampAdsrLbl[4], filtAdsrLbl[4], primeLbl[9];
+    juce::Label ampAdsrLbl[4], filtAdsrLbl[4], pitchAdsrLbl[4], primeLbl[9];
 
     std::unique_ptr<SliderAttachment>   baseNAtt, slopeAtt, spectrumRangeAtt, fractalAtt, gainAtt,
-                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, refAAtt;
-    std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4];
+                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, refAAtt, pEnvAmtAtt;
+    std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4], pitchAdsrAtt[4];
     std::unique_ptr<ComboBoxAttachment> basePitchAtt, whitelistAtt, phaseAtt,
                                         primeModeAtt, primeLimitAtt, tuningAtt, bendAtt;
     std::unique_ptr<ButtonAttachment>   primeToggleAtt[9];
