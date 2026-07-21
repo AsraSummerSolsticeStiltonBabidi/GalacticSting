@@ -58,6 +58,9 @@ public:
         pSustainParam= apvts.getRawParameterValue ("pitchSustain");
         pReleaseParam= apvts.getRawParameterValue ("pitchRelease");
 
+        morphParam     = apvts.getRawParameterValue ("morph");
+        morphTimeParam = apvts.getRawParameterValue ("morphTime");
+
         filter.setType (juce::dsp::StateVariableTPTFilterType::lowpass);
     }
 
@@ -109,6 +112,12 @@ public:
         snapAmps     = ! reuse; // cold: snap amps to the template; reuse: slew them (no jump)
         snapNorm     = ! reuse;
         releasing    = false;   // fresh note: parameter re-apply is allowed again
+
+        // Morphing state: on a cold start snap to the current template (no glide);
+        // on reuse keep the running frequencies continuous. Sync lastGen either way
+        // so a steal is never mistaken for a spectrum change.
+        lastGen = engine.getGeneration();
+        if (! reuse) { morphActive = false; morphPos = 1.0; prevN = 0; }
 
         const double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
         updateAdsrParameters();
@@ -191,14 +200,68 @@ public:
             const auto&  ps       = tmpl->partials;
             const int    count    = std::min ((int) ps.size(), spectrum::kMaxPartials);
 
+            // Target amplitudes + the sub-Nyquist partial count (freqs handled below).
             for (int i = 0; i < count; ++i)
             {
-                if (ps[(size_t) i].ratio > maxRatio) break; // sorted ascending -> rest are higher
-                inc[(size_t) i]    = (double) ps[(size_t) i].ratio * f0 / currentSampleRate;
+                if ((double) ps[(size_t) i].ratio > maxRatio) break; // sorted asc -> rest are higher
                 tgtAmp[(size_t) i] = ps[(size_t) i].amp;
                 n = i + 1;
             }
 
+            // Spectral MORPHING: when the template CHANGES, glide each partial's
+            // frequency from its nearest previous partial to its new position over
+            // Morph Time (a per-partial pitch bend), instead of snapping. If the new
+            // spectrum has more partials, several new ones share a nearest old start
+            // and spread out from it; if fewer, several old ones map to one target.
+            // Morphing off -> frequencies snap instantly, exactly as before.
+            const juce::uint32 gen = engine.getGeneration();
+            const bool morphOn = morphParam != nullptr && morphParam->load() > 0.5f;
+            if (gen != lastGen)
+            {
+                if (morphOn && ! snapAmps && prevN > 0 && n > 0)
+                {
+                    int k = 0; // nearest previous partial for each new one (both sorted asc)
+                    for (int j = 0; j < n; ++j)
+                    {
+                        const double tr = (double) ps[(size_t) j].ratio;
+                        while (k + 1 < prevN
+                               && std::abs (curRatio[(size_t) (k + 1)] - tr) <= std::abs (curRatio[(size_t) k] - tr))
+                            ++k;
+                        morphStartLog[(size_t) j] = std::log2 (std::max (1.0e-12, curRatio[(size_t) k]));
+                    }
+                    for (int j = 0; j < n; ++j)
+                        curRatio[(size_t) j] = std::exp2 (morphStartLog[(size_t) j]);
+                    morphN = n; morphPos = 0.0; morphActive = true;
+                }
+                else
+                    morphActive = false; // snap
+                lastGen = gen;
+            }
+
+            if (morphActive)
+            {
+                const double mt = std::max (0.001, (double) morphTimeParam->load());
+                morphPos += (double) numSamples / (mt * currentSampleRate);
+                const double t = std::min (1.0, morphPos);
+                for (int j = 0; j < n; ++j)
+                {
+                    const double tgtLog = std::log2 (std::max (1.0e-12, (double) ps[(size_t) j].ratio));
+                    curRatio[(size_t) j] = (j < morphN)
+                        ? std::exp2 (morphStartLog[(size_t) j] + (tgtLog - morphStartLog[(size_t) j]) * t)
+                        : (double) ps[(size_t) j].ratio;
+                }
+                if (morphPos >= 1.0) morphActive = false;
+            }
+            else
+            {
+                for (int j = 0; j < n; ++j)
+                    curRatio[(size_t) j] = (double) ps[(size_t) j].ratio; // snapped
+            }
+
+            for (int j = 0; j < n; ++j) // clamp guards a partial pushed past Nyquist by pitch bend
+                inc[(size_t) j] = std::min (curRatio[(size_t) j] * f0 / currentSampleRate, 0.4999);
+
+            prevN = n;
             engine.reportRendered (n); // audible partial count for the meter
         }
 
@@ -397,6 +460,8 @@ private:
     std::atomic<float>* pDecayParam    = nullptr;
     std::atomic<float>* pSustainParam  = nullptr;
     std::atomic<float>* pReleaseParam  = nullptr;
+    std::atomic<float>* morphParam     = nullptr;
+    std::atomic<float>* morphTimeParam = nullptr;
 
     juce::ADSR adsr, filterAdsr, pitchAdsr;
     // Last parameters actually pushed to each ADSR (sentinel = force first apply).
@@ -409,9 +474,17 @@ private:
     float pitchEnvValue   = 0.0f;
 
     std::array<double, spectrum::kMaxPartials> phase  {};
-    std::array<double, spectrum::kMaxPartials> inc    {}; // snapped frequency (cycles/sample)
+    std::array<double, spectrum::kMaxPartials> inc    {}; // frequency (cycles/sample), from curRatio
     std::array<double, spectrum::kMaxPartials> tgtAmp {}; // target amplitude (from template)
     std::array<double, spectrum::kMaxPartials> curAmp {}; // slewed amplitude actually rendered
+    std::array<double, spectrum::kMaxPartials> curRatio      {}; // current (gliding) ratio per partial
+    std::array<double, spectrum::kMaxPartials> morphStartLog {}; // log2 start ratio during a morph
+
+    double        morphPos    = 1.0;   // 0..1 glide progress (>= 1 -> done)
+    bool          morphActive = false;
+    int           morphN      = 0;     // partial count captured when the morph started
+    int           prevN       = 0;     // partials rendered last block (nearest-neighbour source)
+    juce::uint32  lastGen     = 0;     // last template generation seen (detects a spectrum change)
 
     int   activeCount = 0;     // slots to process (includes fading-out tails)
     bool  snapAmps    = true;  // snap amps to target this block (cold note start)

@@ -58,12 +58,27 @@ namespace
 
         juce::Font getLabelFont (juce::Label& l) override
         {
+            // A slider's value read-out is a child Label: keep it SMALL (and not bold)
+            // so two decimals fit in the narrow box instead of clipping to "...".
+            if (dynamic_cast<juce::Slider*> (l.getParentComponent()) != nullptr)
+                return juce::Font (juce::FontOptions (10.0f));
             return juce::Font (juce::FontOptions (juce::jmax (12.5f, l.getFont().getHeight())).withStyle ("Bold"));
         }
 
         juce::Font getTextButtonFont (juce::TextButton&, int buttonHeight) override
         {
             return juce::Font (juce::FontOptions (juce::jmin (16.0f, (float) buttonHeight * 0.62f)).withStyle ("Bold"));
+        }
+
+        // Slider value read-outs: a small font + generous horizontal squish so the
+        // value ALWAYS fits (e.g. two decimals) instead of being clipped to "...".
+        juce::Label* createSliderTextBox (juce::Slider& s) override
+        {
+            auto* l = juce::LookAndFeel_V4::createSliderTextBox (s);
+            l->setFont (juce::Font (juce::FontOptions (11.5f)));
+            l->setMinimumHorizontalScale (0.4f); // shrink-to-fit rather than ellipsize
+            l->setJustificationType (juce::Justification::centred);
+            return l;
         }
 
         void drawGroupComponentOutline (juce::Graphics& g, int w, int h, const juce::String& text,
@@ -111,6 +126,20 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     configFader (baseNFader,   "baseN",    baseNAtt,     cBase, "Base harmonic N");
     configCombo (basePitchBox, "baseMode", basePitchAtt, cBase, "Original = harmonics at natural positions.  Transposed down = lowest partial at the played pitch.");
     makeLabel (lblBaseN, cBase); makeLabel (lblBasePitch, cBase);
+
+    // Morphing: when ON, a spectrum change glides each partial to its new position
+    // (a per-partial pitch bend) over the Morph time, instead of snapping.
+    morphToggle.setColour (juce::ToggleButton::textColourId, cBase);
+    morphToggle.setColour (juce::ToggleButton::tickColourId, cBase);
+    morphToggle.setColour (juce::ToggleButton::tickDisabledColourId, cBase.withAlpha (0.4f));
+    morphToggle.setMouseClickGrabsKeyboardFocus (false);
+    morphToggle.onClick = [this] { refocus(); };
+    addAndMakeVisible (morphToggle);
+    morphAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "morph", morphToggle);
+    configFader (morphTimeFader, "morphTime", morphTimeAtt, cBase, "Morph transition time in seconds: how long partials take to glide to the new spectrum.");
+    morphTimeFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    morphTimeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 14);
+    makeLabel (lblMorphTime, cBase);
 
     configGroup (gWhitelist, cWhitelist);
     configCombo (whitelistBox, "selection", whitelistAtt, cWhitelist, "Which harmonics may sound: All / Even / Odd / Prime");
@@ -312,6 +341,23 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     makeLabel (lblPeriod, cRange);
     addAndMakeVisible (degreeList);
 
+    // Spectrum Builder: typed intervals -> partials (Enter applies them).
+    intervalEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
+    intervalEdit.setColour (juce::TextEditor::outlineColourId, cTimbre.withAlpha (0.7f));
+    intervalEdit.setColour (juce::TextEditor::textColourId, juce::Colours::white);
+    intervalEdit.setFont (juce::Font (juce::FontOptions (13.0f)));
+    intervalEdit.onReturnKey = [this]
+    {
+        juce::String err;
+        if (intervalEdit.getText().trim().isNotEmpty()
+            && ! processorRef.loadTimbreText (intervalEdit.getText(), err))
+            juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                tr ("Spectrum Builder", "Constructor d'espectre"), err, this);
+        refocus();
+    };
+    intervalEdit.onEscapeKey = [this] { refocus(); };
+    addAndMakeVisible (intervalEdit);
+
     // Master reference A = <hz> (transposes everything, all tuning modes).
     refAFader.setSliderStyle (juce::Slider::LinearHorizontal);
     refAFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 62, 18);
@@ -444,7 +490,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     gAmpEnv.setText        (tr ("Volume Envelope", "Envolupant volum"));
     gPitchEnv.setText      (tr ("Pitch Envelope", "Envolupant to"));
     gTuning.setText        (tr ("Tuning", "Afinaci\xc3\xb3"));
-    gTimbre.setText        (tr (".scl as Spectrum", ".scl com a Espectre"));
+    gTimbre.setText        (tr ("Spectrum Builder", "Constructor d'espectre"));
+    intervalEdit.setTextToShowWhenEmpty (tr ("intervals: 3/2 2 700c ...", "intervals: 3/2 2 700c ..."),
+                                         juce::Colour (0xff8f96a8));
     gSpecScale.setText     (tr ("Spectrum to Scale", "Espectre a escala"));
     gReference.setText     (tr ("Reference", "Refer\xc3\xa8ncia"));
 
@@ -456,6 +504,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblRes.setText       (tr ("Res", "Res"), dontSendNotification);
     lblEnvAmt.setText    (tr ("Env", "Env"), dontSendNotification);
     lblPitchAmt.setText  (tr ("St", "St"), dontSendNotification);
+    lblMorphTime.setText (tr ("Time", "Temps"), dontSendNotification);
+    morphToggle.setButtonText (tr ("Morph", "Morph"));
     lblTimbreRepeats.setText (tr ("Reps", "Reps"), dontSendNotification);
     lblBend.setText      (tr ("Pitch bend", "Pitch bend"), dontSendNotification);
     lblPeriod.setText    (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
@@ -1046,12 +1096,22 @@ void FractalAdditiveAudioProcessorEditor::resized()
         const int W = row.getWidth();
 
         {
-            auto bb = row.removeFromLeft (W * 19 / 100);
+            auto bb = row.removeFromLeft (W * 22 / 100);
             gBase.setBounds (bb.reduced (3));
             auto bi = bb.reduced (3).reduced (6, 4); bi.removeFromTop (16);
-            auto left = bi.removeFromLeft (bi.getWidth() / 2);
+            auto left = bi.removeFromLeft (bi.getWidth() * 40 / 100); // N fader column
             lblBaseN.setBounds (left.removeFromTop (13)); baseNFader.setBounds (left);
-            lblBasePitch.setBounds (bi.removeFromTop (13)); compact (basePitchBox, bi);
+            bi.removeFromLeft (5);
+            // Right column: Pitch, then the Morphing toggle + its Time control.
+            lblBasePitch.setBounds (bi.removeFromTop (13));
+            compact (basePitchBox, bi.removeFromTop (24));
+            bi.removeFromTop (8);
+            morphToggle.setBounds (bi.removeFromTop (22));
+            bi.removeFromTop (2);
+            lblMorphTime.setJustificationType (juce::Justification::centredLeft);
+            auto mr = bi.removeFromTop (20);
+            lblMorphTime.setBounds (mr.removeFromLeft (36));
+            morphTimeFader.setBounds (mr);
         }
 
         // Harmonics stacked on top of Prime Control.
@@ -1158,10 +1218,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
             compact (bendBox, bendRow.removeFromLeft (juce::jmin (120, bendRow.getWidth())));
         }
 
-        // Right column: ".scl as Spectrum" (compact, horizontal fader) over "Reference".
+        // Right column: "Spectrum Builder" (load .scl OR type intervals + Reps) over "Reference".
         {
             auto colBox = row;
-            auto sb = colBox.removeFromTop (colBox.getHeight() * 55 / 100);
+            auto sb = colBox.removeFromTop (colBox.getHeight() * 64 / 100);
             gTimbre.setBounds (sb.reduced (3));
             auto ti = sb.reduced (3).reduced (8, 4); ti.removeFromTop (15);
             auto brow = ti.removeFromTop (22);
@@ -1176,8 +1236,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
             {
                 loadTimbreButton.setBounds (brow.reduced (2, 0));
             }
-            ti.removeFromTop (2);
-            timbreStatusLabel.setBounds (ti.removeFromTop (16));
+            ti.removeFromTop (3);
+            intervalEdit.setBounds (ti.removeFromTop (22).reduced (1, 0)); // type intervals, Enter builds
+            ti.removeFromTop (3);
+            timbreStatusLabel.setBounds (ti.removeFromTop (14));
             ti.removeFromTop (2);
             auto fr = ti.removeFromTop (20);
             lblTimbreRepeats.setJustificationType (juce::Justification::centredLeft);
