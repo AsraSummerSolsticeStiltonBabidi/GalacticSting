@@ -69,32 +69,49 @@ namespace
     // so long Catalan titles still fit inside the box.
     void drawTitleChip (juce::Graphics& g, juce::Rectangle<float> box, juce::Colour col, const juce::String& text)
     {
-        constexpr float titleH = 21.0f;
+        constexpr float titleH  = 21.0f;
+        constexpr float stretch = 1.26f; // text stretched a little taller (upward)
         const juce::String upper = text.toUpperCase();
-        const float maxW = box.getWidth() - 10.0f;
-        auto measure = [&] (const juce::Font& f)
+        const float maxW = box.getWidth() - 6.0f;
+
+        // Measure + auto-shrink the font so even a long Catalan title fits the box.
+        auto measure = [&] (const juce::Font& f, juce::GlyphArrangement& ga)
         {
-            juce::GlyphArrangement ga; ga.addLineOfText (f, upper, 0.0f, 0.0f);
-            return ga.getBoundingBox (0, -1, true).getWidth();
+            ga.clear();
+            ga.addLineOfText (f, upper, 0.0f, 0.0f);
+            return ga.getBoundingBox (0, -1, true);
         };
-        float fontH = 15.0f;
+        float fontH = 14.5f;
         juce::Font tf (juce::FontOptions (fontH).withStyle ("Bold"));
-        float tw = measure (tf);
-        if (tw + 14.0f > maxW && tw > 1.0f)
+        juce::GlyphArrangement ga;
+        auto bb = measure (tf, ga);
+        if (bb.getWidth() + 12.0f > maxW && bb.getWidth() > 1.0f)
         {
-            fontH = juce::jmax (8.0f, fontH * (maxW - 14.0f) / tw);
+            fontH = juce::jmax (8.0f, fontH * (maxW - 12.0f) / bb.getWidth());
             tf = juce::Font (juce::FontOptions (fontH).withStyle ("Bold"));
-            tw = measure (tf);
+            bb = measure (tf, ga);
         }
-        const float chipH = juce::jmin (titleH, fontH + 6.0f);
-        const float chipW = juce::jmin (maxW, tw + 14.0f);
-        auto chip = juce::Rectangle<float> (box.getX() + 8.0f,
-                                            box.getY() + (titleH - chipH) * 0.5f, chipW, chipH);
+
+        // The chip is FLUSH LEFT (on the box's left border) and its bottom sits on the
+        // frame's top line, so it never covers any control below it - it only reaches
+        // UP into the empty gap above the box.
+        const float chipW = juce::jmin (maxW, bb.getWidth() + 12.0f);
+        const float chipH = bb.getHeight() * stretch + 4.0f;
+        const float chipBottom = box.getY() + titleH * 0.5f + 3.5f; // above the content, only a small tab above the box
+        auto chip = juce::Rectangle<float> (box.getX() + 2.0f, chipBottom - chipH, chipW, chipH);
         g.setColour (col);
         g.fillRect (chip); // sharp corners = "angular", like the main-title squares
+
+        // Letters, stretched vertically (upward) and centred in the chip; black/white
+        // by the chip's brightness (as the title letters and the keys do).
+        juce::Path p;
+        ga.createPath (p);
+        p.applyTransform (juce::AffineTransform::scale (1.0f, stretch));
+        const auto gb = p.getBounds();
+        p.applyTransform (juce::AffineTransform::translation (chip.getCentreX() - gb.getCentreX(),
+                                                              chip.getCentreY() - gb.getCentreY()));
         g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-        g.setFont (tf);
-        g.drawText (upper, chip, juce::Justification::centred, false);
+        g.fillPath (p);
     }
 
     // Bold group titles in a filled chip (so nothing overlaps the title), a thicker
