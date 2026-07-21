@@ -12,6 +12,45 @@ namespace
         return tf;
     }
 
+    // Comic Sans, loaded ONCE from the user's own Windows font file (not embedded /
+    // redistributed - it renders with the copy already on their machine). JUCE 8 does
+    // not resolve "Comic Sans MS" by name, so we hand it a concrete Typeface instead.
+    // Returns nullptr if the file is absent (then the UI keeps the default face).
+    const juce::Typeface::Ptr& comicTypeface()
+    {
+        static juce::Typeface::Ptr tf = []() -> juce::Typeface::Ptr
+        {
+            for (const char* p : { "C:\\Windows\\Fonts\\comic.ttf",
+                                   "C:\\Windows\\Fonts\\comicbd.ttf" })
+            {
+                juce::File f (p);
+                if (f.existsAsFile())
+                {
+                    juce::MemoryBlock mb;
+                    if (f.loadFileAsData (mb) && mb.getSize() > 0)
+                        return juce::Typeface::createSystemTypefaceFor (mb.getData(), mb.getSize());
+                }
+            }
+            return nullptr;
+        }();
+        return tf;
+    }
+
+}
+
+// A UI font in the comic face at the given height (falls back to the default sans
+// if Comic Sans could not be loaded). Declared in GalacticFont.h so the editor, the
+// keyboard and the nested paint helpers can all reach it.
+juce::Font galactic::comicFont (float height)
+{
+    if (comicTypeface() != nullptr)
+        return juce::Font (juce::FontOptions (comicTypeface()).withHeight (height));
+    return juce::Font (juce::FontOptions (height));
+}
+
+namespace
+{
+
     // Section colours, deliberately spread around the hue wheel so that NO two
     // neighbouring panels (horizontally OR vertically) share a similar hue - in
     // particular no two near-identical blues sit side by side. Reading the two
@@ -68,10 +107,35 @@ namespace
     {
         GalacticLnF()
         {
+            // Everything (except the Kablammo main title, which sets its typeface
+            // explicitly) renders in a rounded, curvy comic face. Comic Sans MS ships
+            // with every Windows install, so referencing it by name just renders with
+            // the user's own system font - no font file is redistributed, so there is
+            // no licensing issue for a commercial Windows plugin. If it is ever missing
+            // JUCE falls back to a rounded sans automatically.
+            setDefaultSansSerifTypefaceName ("Comic Sans MS");
+
             setColour (juce::ComboBox::backgroundColourId, juce::Colour (0xff20202b));
             setColour (juce::ComboBox::textColourId, juce::Colours::white);
             setColour (juce::PopupMenu::backgroundColourId, juce::Colour (0xff20202b));
             setColour (juce::PopupMenu::highlightedBackgroundColourId, juce::Colour (0xff3a3a52));
+        }
+
+        // Force the comic face for every font that does not name its own typeface
+        // (JUCE 8's FontOptions do not always honour setDefaultSansSerifTypefaceName).
+        // The main title names the embedded Kablammo typeface, so it is untouched.
+        juce::Typeface::Ptr getTypefaceForFont (const juce::Font& f) override
+        {
+            const auto name = f.getTypefaceName();
+            if (name == juce::Font::getDefaultSansSerifFontName()
+                || name == juce::Font::getDefaultSerifFontName()
+                || name.isEmpty())
+            {
+                juce::Font g (f);
+                g.setTypefaceName ("Comic Sans MS");
+                return juce::Typeface::createSystemTypefaceFor (g);
+            }
+            return juce::LookAndFeel_V4::getTypefaceForFont (f);
         }
 
         juce::Font getLabelFont (juce::Label& l) override
@@ -79,21 +143,30 @@ namespace
             // A slider's value read-out is a child Label: keep it SMALL (and not bold)
             // so two decimals fit in the narrow box instead of clipping to "...".
             if (dynamic_cast<juce::Slider*> (l.getParentComponent()) != nullptr)
-                return juce::Font (juce::FontOptions (10.0f));
-            return juce::Font (juce::FontOptions (juce::jmax (12.5f, l.getFont().getHeight())).withStyle ("Bold"));
+                return galactic::comicFont (10.0f);
+            return galactic::comicFont (juce::jmax (12.5f, l.getFont().getHeight()));
         }
 
         juce::Font getTextButtonFont (juce::TextButton&, int buttonHeight) override
         {
-            return juce::Font (juce::FontOptions (juce::jmin (16.0f, (float) buttonHeight * 0.62f)).withStyle ("Bold"));
+            return galactic::comicFont (juce::jmin (16.0f, (float) buttonHeight * 0.62f));
         }
+
+        juce::Font getComboBoxFont (juce::ComboBox& b) override
+        {
+            return galactic::comicFont (juce::jmin (15.0f, (float) b.getHeight() * 0.62f));
+        }
+        juce::Font getPopupMenuFont() override            { return galactic::comicFont (15.0f); }
+        juce::Font getAlertWindowMessageFont() override   { return galactic::comicFont (15.0f); }
+        juce::Font getAlertWindowTitleFont() override     { return galactic::comicFont (18.0f); }
+        juce::Font getAlertWindowFont() override          { return galactic::comicFont (14.0f); }
 
         // Slider value read-outs: a small font + generous horizontal squish so the
         // value ALWAYS fits (e.g. two decimals) instead of being clipped to "...".
         juce::Label* createSliderTextBox (juce::Slider& s) override
         {
             auto* l = juce::LookAndFeel_V4::createSliderTextBox (s);
-            l->setFont (juce::Font (juce::FontOptions (11.5f)));
+            l->setFont (galactic::comicFont (11.5f));
             l->setMinimumHorizontalScale (0.4f); // shrink-to-fit rather than ellipsize
             l->setJustificationType (juce::Justification::centred);
             return l;
@@ -121,7 +194,7 @@ namespace
             const juce::String upper = text.toUpperCase();
             float fontH = 16.0f;
             const float avail = (float) w - 12.0f - 5.0f;
-            juce::Font tf (juce::FontOptions (fontH).withStyle ("Bold"));
+            juce::Font tf = galactic::comicFont (fontH);
             juce::GlyphArrangement ga;
             ga.addLineOfText (tf, upper, 12.0f, titleH - 5.5f);
             const float tw = ga.getBoundingBox (0, -1, true).getWidth();
@@ -129,7 +202,7 @@ namespace
             {
                 fontH = juce::jmax (8.5f, fontH * avail / tw);
                 ga.clear();
-                tf = juce::Font (juce::FontOptions (fontH).withStyle ("Bold"));
+                tf = galactic::comicFont (fontH);
                 ga.addLineOfText (tf, upper, 12.0f, titleH - 5.5f);
             }
             juce::Path p;
@@ -303,7 +376,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuningStatusLabel.setVisible (false); // "loaded:" prefix removed - name shows by the mode combo
     tuningNameLabel.setJustificationType (juce::Justification::centredLeft);
     tuningNameLabel.setColour (juce::Label::textColourId, cTuning); // the loaded scale's file name
-    tuningNameLabel.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
+    tuningNameLabel.setFont (galactic::comicFont (13.0f));
     addAndMakeVisible (tuningNameLabel);
 
     // Tuning bank: a slot selector (automatable) + a button to load a .scl into it.
@@ -346,7 +419,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     makeLabel (lblTimbreRepeats, cTimbre);
     timbreStatusLabel.setJustificationType (juce::Justification::centredLeft);
     timbreStatusLabel.setColour (juce::Label::textColourId, cTimbre);
-    timbreStatusLabel.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+    timbreStatusLabel.setFont (galactic::comicFont (12.0f));
     addAndMakeVisible (timbreStatusLabel);
 
     // Language toggle (top-right).
@@ -390,14 +463,14 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     vibeLabel.setText ("Vibe coded by", juce::dontSendNotification);
     vibeLabel.setJustificationType (juce::Justification::centredRight);
     vibeLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
-    vibeLabel.setFont (juce::Font (juce::FontOptions (12.5f)));
+    vibeLabel.setFont (galactic::comicFont (12.5f));
     vibeLabel.setInterceptsMouseClicks (false, false);
     addAndMakeVisible (vibeLabel);
 
     vibeLink.setButtonText ("Asra3");
     vibeLink.setURL (juce::URL ("https://www.instagram.com/asra3333333/"));
     vibeLink.setColour (juce::HyperlinkButton::textColourId, juce::Colour (0xff5cb8ff));
-    vibeLink.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")),
+    vibeLink.setFont (galactic::comicFont (12.5f),
                       false, juce::Justification::centredLeft);
     vibeLink.setMouseClickGrabsKeyboardFocus (false);
     vibeLink.setTooltip ("https://www.instagram.com/asra3333333/");
@@ -471,7 +544,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     intervalEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
     intervalEdit.setColour (juce::TextEditor::outlineColourId, cTimbre.withAlpha (0.7f));
     intervalEdit.setColour (juce::TextEditor::textColourId, juce::Colours::white);
-    intervalEdit.setFont (juce::Font (juce::FontOptions (13.0f)));
+    intervalEdit.setFont (galactic::comicFont (13.0f));
     intervalEdit.onReturnKey = [this]
     {
         juce::String err;
@@ -510,7 +583,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     lblRefHz.setText ("hz", juce::dontSendNotification);
     lblRefHz.setJustificationType (juce::Justification::centredLeft);
     lblRefHz.setColour (juce::Label::textColourId, cEssentials.brighter (0.15f));
-    lblRefHz.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+    lblRefHz.setFont (galactic::comicFont (11.5f));
     addAndMakeVisible (lblRefHz);
 
     addChildComponent (noticeOverlay);
@@ -535,11 +608,11 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     timbreRepeatsFader.normalSensitivity = 280;
 
     meterLabel.setJustificationType (juce::Justification::centred);
-    meterLabel.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
+    meterLabel.setFont (galactic::comicFont (13.0f));
     addAndMakeVisible (meterLabel);
     helpLabel.setJustificationType (juce::Justification::centred);
     helpLabel.setColour (juce::Label::textColourId, juce::Colour (0xff9aa0b0));
-    helpLabel.setFont (juce::Font (juce::FontOptions (9.5f)));
+    helpLabel.setFont (galactic::comicFont (10.0f));
     addAndMakeVisible (helpLabel);
 
     keyboard.setDegreeLabeller ([this] (int d) { return justName (processorRef.getDegreeRatio (d)); });
@@ -1094,7 +1167,7 @@ void FractalAdditiveAudioProcessorEditor::makeLabel (juce::Label& l, juce::Colou
 {
     l.setJustificationType (juce::Justification::centred);
     l.setColour (juce::Label::textColourId, c.brighter (0.15f));
-    l.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+    l.setFont (galactic::comicFont (12.0f));
     addAndMakeVisible (l);
 }
 
@@ -1236,7 +1309,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         g.drawRect (frame, 2.6f);
         juce::GlyphArrangement ga;
         const float baseY = box.getY() + titleH - 5.5f;
-        ga.addLineOfText (juce::Font (juce::FontOptions (16.0f).withStyle ("Bold")),
+        ga.addLineOfText (galactic::comicFont (16.0f),
                           ttl, box.getX() + 12.0f, baseY);
         juce::Path p; ga.createPath (p);
         p.applyTransform (juce::AffineTransform::translation (0.0f, -baseY)  // taller, upward only
@@ -1248,7 +1321,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     auto subLabel = [&] (const juce::Rectangle<int>& c, juce::Colour col, const juce::String& s, float al)
     {
         g.setColour (col.withMultipliedAlpha (al));
-        g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+        g.setFont (galactic::comicFont (11.5f));
         g.drawText (s, c.withHeight (13).reduced (5, 0), juce::Justification::centredLeft, false);
     };
 
@@ -1338,9 +1411,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
     { c.setBounds (r.withSizeKeepingCentre (r.getWidth(), juce::jmin (24, r.getHeight()))); };
     auto oneFader = [&] (juce::Rectangle<int> b, juce::GroupComponent& grp, juce::Slider& s, juce::Label* lbl)
     {
-        // Box top aligned to the row top (like the Harmonic-Engine / Essentials macro
-        // boxes) so all Row-1 titles sit on the same line; the CONTENT is unchanged.
-        grp.setBounds (b.reduced (3).withTop (b.getY()));
+        // Full row height (only the horizontal gap is trimmed), so these boxes are the
+        // exact same height as the Harmonic-Engine / Essentials macro boxes beside
+        // them - top AND bottom line up. The CONTENT is unchanged.
+        grp.setBounds (b.reduced (3, 0));
         auto r = b.reduced (3).reduced (5, 4); r.removeFromTop (14);
         if (lbl) lbl->setBounds (r.removeFromTop (13));
         s.setBounds (r);
