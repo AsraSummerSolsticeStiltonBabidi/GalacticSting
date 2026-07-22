@@ -119,7 +119,7 @@ namespace spectrum
             live.store (w, std::memory_order_release);
         }
 
-        static constexpr int kSlots = 4;
+        static constexpr int kSlots = 8; // margin so a burst of publishes can't wrap onto a slot a voice is mid-read
         std::array<SpectrumTemplate, kSlots> pool;
 
         std::atomic<int>  live       { -1 };
