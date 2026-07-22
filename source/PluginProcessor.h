@@ -126,10 +126,11 @@ public:
     juce::StringArray getRecentSclPaths() const { return recentSclPaths; }
 
     //==========================================================================
-    // Tuning bank: up to kBankSlots .scl slots. The "tuningBankSlot" parameter
-    // (0 = none, 1..N = slot) is automatable, so a host can switch scales; the
-    // switch is picked up on the message thread (timerCallback) and loaded there.
-    static constexpr int kBankSlots = 8;
+    // Tuning bank: load as many .scl files as you like (effectively unlimited - the
+    // automatable "tuningBankSlot" parameter just needs a bounded range, so the ceiling
+    // is a generous 128). 0 = none, 1..N = slot; the switch is picked up on the message
+    // thread (timerCallback) and loaded there. The UI only ever shows the loaded slots.
+    static constexpr int kBankSlots = 128;
     void setTuningBankFile (int slot0, const juce::File& f);       // load a .scl into a slot + activate it
     juce::String getTuningBankName (int slot0) const { return juce::isPositiveAndBelow (slot0, kBankSlots) ? bankName[(size_t) slot0] : juce::String(); }
     int  getTuningBankSlotParam() const noexcept { return (int) apvts.getRawParameterValue ("tuningBankSlot")->load(); }
