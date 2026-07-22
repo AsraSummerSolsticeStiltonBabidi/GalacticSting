@@ -104,6 +104,11 @@ namespace spectrum
         std::vector<Partial> partials; // sorted ascending by ratio
         bool truncated = false;        // hit the maxPartials cap (audible partials dropped)
         int  rawCount  = 0;            // audible partial count before the cap
+        // Publish generation this template belongs to. Stamped by SpectrumEngine::publish
+        // BEFORE the live-slot release-store, so a voice that acquire-loads the live slot
+        // reads a template and its generation as ONE consistent pair (no gen/template
+        // tearing that would leave a morph gliding to a stale spectrum).
+        unsigned int generation = 0;
     };
 
     //==========================================================================

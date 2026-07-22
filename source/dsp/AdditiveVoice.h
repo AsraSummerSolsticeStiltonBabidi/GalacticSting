@@ -114,9 +114,11 @@ public:
         releasing    = false;   // fresh note: parameter re-apply is allowed again
 
         // Morphing state: on a cold start snap to the current template (no glide);
-        // on reuse keep the running frequencies continuous. Sync lastGen either way
-        // so a steal is never mistaken for a spectrum change.
-        lastGen = engine.getGeneration();
+        // on reuse keep the running frequencies continuous. Sync lastGen to the LIVE
+        // template's own stamp (what the first renderNextBlock will read) so a steal is
+        // never mistaken for a spectrum change and no spurious morph fires.
+        if (const auto* t = engine.getLive()) lastGen = t->generation;
+        else                                  lastGen = engine.getGeneration();
         if (! reuse) { morphActive = false; morphPos = 1.0; prevN = 0; }
 
         const double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
@@ -217,7 +219,12 @@ public:
             // if it shrank, the extra old partials converge to their nearest new one and
             // fade (merge). A change mid-morph just restarts the glide FROM the current
             // (already-gliding) state - it never snaps. Morphing off -> instant snap.
-            const juce::uint32 gen = engine.getGeneration();
+            // Use the LIVE TEMPLATE'S OWN generation stamp (read via the same acquire
+            // that got `tmpl`), NOT engine.getGeneration(): the latter is a separate
+            // atomic that can read one publish ahead of `live`, which made a voice
+            // morph toward the OLD template yet mark lastGen as the NEW one - so it
+            // stuck on the wrong spectrum until re-triggered.
+            const juce::uint32 gen = tmpl->generation;
             const bool morphOn = morphParam != nullptr && morphParam->load() > 0.5f;
             if (gen != lastGen)
             {
