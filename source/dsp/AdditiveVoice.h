@@ -105,7 +105,12 @@ public:
         }
 
         velocityLevel = 0.10f + 0.90f * currentlyPlayingNote.noteOnVelocity.asUnsignedFloat();
-        pressure      = currentlyPlayingNote.pressure.asUnsignedFloat();
+        // Do NOT seed from currentlyPlayingNote.pressure: under enableLegacyMode() JUCE
+        // returns the CHANNEL'S sticky last-received aftertouch, which legacy mode never
+        // resets on note-off - so a note on an aftertouch-touched channel would start up
+        // to ~9 dB louder than one on a fresh channel. Start at rest; genuine aftertouch
+        // still swells in through notePressureChanged().
+        pressure      = 0.0f;
 
         fastKill     = false;
         fastKillGain = 1.0f;
@@ -113,13 +118,18 @@ public:
         snapNorm     = ! reuse;
         releasing    = false;   // fresh note: parameter re-apply is allowed again
 
-        // Morphing state: on a cold start snap to the current template (no glide);
-        // on reuse keep the running frequencies continuous. Sync lastGen to the LIVE
-        // template's own stamp (what the first renderNextBlock will read) so a steal is
-        // never mistaken for a spectrum change and no spurious morph fires.
+        // Sync lastGen to the LIVE template's own stamp (what the first renderNextBlock
+        // will read) so a steal is never mistaken for a spectrum change and no spurious
+        // morph fires.
         if (const auto* t = engine.getLive()) lastGen = t->generation;
         else                                  lastGen = engine.getGeneration();
-        if (! reuse) { morphActive = false; morphPos = 1.0; prevN = 0; }
+        // Reset the morph state on EVERY note-on, INCLUDING a steal. A stolen voice must
+        // not inherit the previous note's in-flight morph (morphActive / morphN /
+        // morphTgtLog / morphPos) - that would keep it gliding to the OLD note's target
+        // spectrum, then snap abruptly when the stale morph finishes. prevN=0 also makes
+        // the first block cleanly SNAP curRatio onto the current template (a frequency
+        // snap with continuous phase = click-free) instead of gliding from a stale ratio.
+        morphActive = false; morphPos = 1.0; prevN = 0;
 
         const double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
         updateAdsrParameters();
@@ -335,25 +345,32 @@ public:
             snapAmps = false;
         }
 
-        // Per-voice normalisation over the ACTUALLY-RENDERED (sub-Nyquist) partials, so
-        // every note/patch has a consistent level no matter how many partials survive the
-        // Nyquist cull, AND so the summed peak never clips.
+        // Per-voice normalisation. Derive the level from the amplitudes ACTUALLY being
+        // rendered (curAmp over `span`), NOT the jumped target (tgtAmp): during a steal
+        // or a morph, curAmp lags tgtAmp, and driving normGain from that same lagging
+        // sum keeps normGain * sum(curAmp) ~ constant every block -> no attack blast/dip
+        // on a stolen voice (that was some notes suddenly much louder). On a cold start
+        // curAmp was just snapped to tgtAmp above (activeCount=n -> span=n) = exact.
+        const int span = std::max (n, activeCount);
         double sumAmp = 0.0, sumSq = 0.0;
-        for (int i = 0; i < n; ++i)
+        for (int i = 0; i < span; ++i)
         {
-            const double a = tgtAmp[(size_t) i]; // amps are non-negative
+            const double a = curAmp[(size_t) i]; // amps are non-negative
             sumAmp += a;
             sumSq  += a * a;
         }
         const bool aligned = phaseModeParam->load() < 0.5f;
-        // Aligned: the pulse peak is sum|amp|, so normalise against it -> guaranteed no clip
-        // (dense patches simply get quieter). Scattered: RMS-normalise for even loudness.
-        const float tgtNorm = aligned ? (sumAmp > 1.0e-9  ? (float) (0.5  / sumAmp)            : 0.0f)
-                                      : (sumSq  > 1.0e-12 ? (float) (0.25 / std::sqrt (sumSq)) : 0.0f);
+        // Equal-loudness per voice = normalise to a fixed RMS. In Aligned mode a plain
+        // peak-normalise (0.5/sumAmp) equalised the PEAK, not the loudness, so sparse
+        // (high-pitch, few-partial) notes sat ~11 dB above dense ones. Use the RMS target
+        // but CAP it so the coherent pulse peak never exceeds 0.5 (no clip): the Aligned
+        // gain = min(RMS, peak cap), always <= the old peak-normalised value.
+        const float rmsNorm = sumSq  > 1.0e-12 ? (float) (0.25 / std::sqrt (sumSq)) : 0.0f;
+        const float peakCap = sumAmp > 1.0e-9  ? (float) (0.5  / sumAmp)            : 0.0f;
+        const float tgtNorm = aligned ? std::min (rmsNorm, peakCap) : rmsNorm;
         if (snapNorm) { normGain = tgtNorm; snapNorm = false; }
 
         const double sr   = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
-        const int    span = std::max (n, activeCount);
         const double slew     = 1.0 - std::exp (-1.0 / (0.007 * sr));
         const double normSlew = 1.0 - std::exp (-1.0 / (0.020 * sr));
 
