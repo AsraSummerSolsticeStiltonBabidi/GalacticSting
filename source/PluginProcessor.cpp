@@ -161,7 +161,7 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     //-- Tuning ----------------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "tuningMode", 1 }, "Tuning",
-        StringArray { "12-TET", "MTS-ESP", "Scala (.scl)" }, 0));
+        StringArray { "12ED2", "MTS-ESP", "Scala (.scl)" }, 0));
     // Per-note pitch-bend range. +-48 st is the MPE default and what Ableton
     // Live 12's tuning systems / Microtuner assume; +-2 suits classic keyboards.
     params.push_back (std::make_unique<AudioParameterChoice>(

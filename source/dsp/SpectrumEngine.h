@@ -107,11 +107,15 @@ namespace spectrum
         {
             const std::lock_guard<std::mutex> lk (buildMutex);
             const int w = (live.load() + 1) % (int) pool.size();
+            const juce::uint32 g = generation.load (std::memory_order_relaxed) + 1;
+            t.generation = g;                    // stamp BEFORE the slot is written + released
             pool[(size_t) w] = std::move (t);
             liveCount.store ((int) pool[(size_t) w].partials.size());
             rawCount .store (pool[(size_t) w].rawCount);
             truncated.store (pool[(size_t) w].truncated);
-            generation.fetch_add (1, std::memory_order_acq_rel);
+            // Keep the standalone counter in sync (used by getGeneration()); the voices
+            // read the template's own stamp so the pair is always consistent.
+            generation.store (g, std::memory_order_release);
             live.store (w, std::memory_order_release);
         }
 
