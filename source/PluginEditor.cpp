@@ -1076,9 +1076,9 @@ void FractalAdditiveAudioProcessorEditor::openTuningBankChooser()
         {
             if (fc.getResult() != juce::File())
             {
-                const int sel = tuningBankBox.getSelectedId() - 1;   // 0 = none, 1..N = slot
-                const int slot0 = sel >= 1 ? sel - 1 : processorRef.firstEmptyBankSlot();
-                processorRef.setTuningBankFile (slot0, fc.getResult());
+                // Always ADD a new scale to the bank (first free slot) - there is no
+                // practical limit; the bank just keeps growing.
+                processorRef.setTuningBankFile (processorRef.firstEmptyBankSlot(), fc.getResult());
                 refreshTuningBank();
             }
             refocus();
@@ -1087,15 +1087,17 @@ void FractalAdditiveAudioProcessorEditor::openTuningBankChooser()
 
 void FractalAdditiveAudioProcessorEditor::refreshTuningBank()
 {
-    // Rebuild the item list (slot names) and reflect the current parameter value.
+    // List ONLY the loaded slots (the bank is effectively unlimited, so we never show
+    // the empty ones), plus "- none -". Item id = slot value + 1, so id-1 is always the
+    // automatable parameter value regardless of which slots are filled.
     const int cur = processorRef.getTuningBankSlotParam(); // 0 = none
     tuningBankBox.clear (juce::dontSendNotification);
     tuningBankBox.addItem (tr ("- none -", "- cap -"), 1); // id 1 -> slot value 0
     for (int i = 0; i < FractalAdditiveAudioProcessor::kBankSlots; ++i)
     {
         const auto nm = processorRef.getTuningBankName (i);
-        tuningBankBox.addItem (juce::String (i + 1) + ": " + (nm.isNotEmpty() ? nm : juce::String (tr ("empty", "buida"))),
-                               i + 2); // id i+2 -> slot value i+1
+        if (nm.isNotEmpty())
+            tuningBankBox.addItem (juce::String (i + 1) + ": " + nm, i + 2); // id i+2 -> slot value i+1
     }
     tuningBankBox.setSelectedId (cur + 1, juce::dontSendNotification);
 }
