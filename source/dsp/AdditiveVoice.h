@@ -115,7 +115,6 @@ public:
         fastKill     = false;
         fastKillGain = 1.0f;
         snapAmps     = ! reuse; // cold: snap amps to the template; reuse: slew them (no jump)
-        snapNorm     = ! reuse;
         releasing    = false;   // fresh note: parameter re-apply is allowed again
 
         // Sync lastGen to the LIVE template's own stamp (what the first renderNextBlock
@@ -345,34 +344,37 @@ public:
             snapAmps = false;
         }
 
-        // Per-voice normalisation. Derive the level from the amplitudes ACTUALLY being
-        // rendered (curAmp over `span`), NOT the jumped target (tgtAmp): during a steal
-        // or a morph, curAmp lags tgtAmp, and driving normGain from that same lagging
-        // sum keeps normGain * sum(curAmp) ~ constant every block -> no attack blast/dip
-        // on a stolen voice (that was some notes suddenly much louder). On a cold start
-        // curAmp was just snapped to tgtAmp above (activeCount=n -> span=n) = exact.
-        const int span = std::max (n, activeCount);
-        double sumAmp = 0.0, sumSq = 0.0;
+        // Per-voice normalisation, recomputed PER SAMPLE from the amplitudes that are
+        // ACTUALLY sounding. normGain must equal target/sum(curAmp) at EVERY sample: a
+        // SLEWED normGain lags the amp slew, so on a steal/morph the product
+        // sum(curAmp)*normGain overshoots many-fold -> "some notes suddenly much louder".
+        // Since every partial slews with the SAME rate `slew`, sum(curAmp) and
+        // sum(curAmp^2) have an exact closed form in rk = (1-slew)^k:
+        //     sumCur(k) = sumTarget   + (sumCur0 - sumTarget) * rk
+        //     sumSq (k) = sumTargetSq + (2*coefA + coefB*rk)  * rk
+        // tracked with two scalar multiplies per sample - no O(n) re-sum, no lag, no clip.
+        const int    span = std::max (n, activeCount);
+        const double sr   = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
+        const double slew         = 1.0 - std::exp (-1.0 / (0.007 * sr));
+        const double oneMinusSlew = 1.0 - slew;
+        double sumCur0 = 0.0, sumTarget = 0.0, sumTargetSq = 0.0, coefA = 0.0, coefB = 0.0;
         for (int i = 0; i < span; ++i)
         {
-            const double a = curAmp[(size_t) i]; // amps are non-negative
-            sumAmp += a;
-            sumSq  += a * a;
+            const double c0 = curAmp[(size_t) i];           // amps are non-negative
+            const double tg = (i < n) ? tgtAmp[(size_t) i] : 0.0;
+            const double d  = c0 - tg;
+            sumCur0     += c0;
+            sumTarget   += tg;
+            sumTargetSq += tg * tg;
+            coefA       += tg * d;
+            coefB       += d  * d;
         }
-        const bool aligned = phaseModeParam->load() < 0.5f;
         // Equal-loudness per voice = normalise to a fixed RMS. In Aligned mode a plain
-        // peak-normalise (0.5/sumAmp) equalised the PEAK, not the loudness, so sparse
-        // (high-pitch, few-partial) notes sat ~11 dB above dense ones. Use the RMS target
-        // but CAP it so the coherent pulse peak never exceeds 0.5 (no clip): the Aligned
-        // gain = min(RMS, peak cap), always <= the old peak-normalised value.
-        const float rmsNorm = sumSq  > 1.0e-12 ? (float) (0.25 / std::sqrt (sumSq)) : 0.0f;
-        const float peakCap = sumAmp > 1.0e-9  ? (float) (0.5  / sumAmp)            : 0.0f;
-        const float tgtNorm = aligned ? std::min (rmsNorm, peakCap) : rmsNorm;
-        if (snapNorm) { normGain = tgtNorm; snapNorm = false; }
-
-        const double sr   = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
-        const double slew     = 1.0 - std::exp (-1.0 / (0.007 * sr));
-        const double normSlew = 1.0 - std::exp (-1.0 / (0.020 * sr));
+        // peak-normalise (0.5/sum) equalises the PEAK, not the loudness, so sparse
+        // (high-pitch, few-partial) notes sit ~11 dB above dense ones; use the RMS target
+        // but CAP it so the coherent pulse peak never exceeds 0.5 (no clip) = min(RMS,peak).
+        const bool   aligned = phaseModeParam->load() < 0.5f;
+        double rk = 1.0; // (1-slew)^k, advanced every sample in the loop below
 
         // Filter cutoff = base * 2^(envAmount * filterEnv). Updated per block; the filter
         // envelope itself advances every sample below.
@@ -387,7 +389,13 @@ public:
 
         while (--numSamples >= 0)
         {
-            normGain += (float) ((tgtNorm - normGain) * normSlew);
+            // Exact per-sample normalisation from the closed-form running sums (no lag).
+            rk *= oneMinusSlew;
+            const double sumCur = sumTarget   + (sumCur0 - sumTarget) * rk;
+            const double sumSq  = sumTargetSq + (2.0 * coefA + coefB * rk) * rk;
+            const double rmsN   = sumSq  > 1.0e-12 ? 0.25 / std::sqrt (sumSq) : 0.0;
+            const double peakN  = sumCur > 1.0e-9  ? 0.5  / sumCur            : 0.0;
+            normGain = (float) (aligned ? std::min (rmsN, peakN) : rmsN);
 
             double acc = 0.0;
             for (int i = 0; i < span; ++i)
@@ -587,8 +595,7 @@ private:
 
     int   activeCount = 0;     // slots to process (includes fading-out tails)
     bool  snapAmps    = true;  // snap amps to target this block (cold note start)
-    float normGain    = 1.0f;  // per-voice RMS-normalisation gain (smoothed)
-    bool  snapNorm    = true;  // snap the normalisation gain on note start
+    float normGain    = 1.0f;  // per-voice normalisation gain (recomputed per sample)
 
     float velocityLevel = 0.0f;
     float pressure = 0.0f;
