@@ -260,6 +260,13 @@ void FractalAdditiveAudioProcessor::timerCallback()
         lastPushed = s;
     }
 
+    // Segment scale tracks the timbre live: whenever the spectrum template changes
+    // (Base N, fractal, a completing morph...) OR after a project reload, rebuild it
+    // from the current partials so the scale + "from n/1" mapping stay correct.
+    if (segmentModeActive && ! segSel.empty())
+        if (const auto* lt = spectrumEngine.getLive(); lt != nullptr && lt->generation != segRebuiltGen)
+            rebuildSegmentScale();
+
     // Tuning-bank slot switched (UI or host automation): load that slot's .scl.
     // Runs on the message thread (timerCallback), so the parse/load is safe here.
     {
@@ -681,28 +688,43 @@ void FractalAdditiveAudioProcessor::rebuildSegmentScale()
         }
     }
 
-    // Fold each selected partial's ratio-to-tonic into [1, period); drop the tonic
-    // (1/1 is implicit in a .scl) and any duplicate within ~0.5 cent.
-    std::vector<double> degs;
+    // Fold each selected partial's ratio-to-tonic into [1, period); keep, per
+    // resulting degree, the SOURCE partial's raw ratio (n/1 before folding) for the
+    // keyboard's "from n/1" hover + the .scl comments. Drop the tonic (1/1 is
+    // implicit) and any duplicate within ~0.5 cent.
+    struct Deg { double folded, source; };
+    std::vector<Deg> degs;
     for (int idx : segSel)
     {
         if (idx >= (int) t->partials.size()) continue;
-        double r = (double) t->partials[(size_t) idx].ratio / r0;
+        const double src = (double) t->partials[(size_t) idx].ratio; // raw n/1
+        double r = src / r0;
         if (! (r > 0.0) || ! std::isfinite (r)) continue;
         while (r >= period - 1.0e-9) r /= period;
         while (r < 1.0 - 1.0e-9)     r *= period;
         if (r <= 1.0 + 1.0e-6) continue; // the tonic itself
         bool dup = false;
-        for (double d : degs) if (std::abs (1200.0 * std::log2 (r / d)) < 0.5) { dup = true; break; }
-        if (! dup) degs.push_back (r);
+        for (const auto& d : degs) if (std::abs (1200.0 * std::log2 (r / d.folded)) < 0.5) { dup = true; break; }
+        if (! dup) degs.push_back ({ r, src });
     }
-    std::sort (degs.begin(), degs.end());
+    std::sort (degs.begin(), degs.end(), [] (const Deg& a, const Deg& b) { return a.folded < b.folded; });
+
+    // Source partial per keyboard degree: degree 0 = tonic, i = interior, last = period.
+    segSourceByDegree.clear();
+    segSourceByDegree.push_back (r0); // tonic
+    for (const auto& d : degs) segSourceByDegree.push_back (d.source);
+
+    auto ratioName = [] (double r) { return juce::String::fromUTF8 (dissonance::justIntervalName (r).c_str()); };
 
     juce::String scl;
-    scl << "! Fibl\xc3\xb3 - scale from spectrum segment\nSpectrum segment\n "
-        << juce::String ((int) degs.size() + 1) << "\n!\n";
-    for (double d : degs) scl << " " << juce::String (1200.0 * std::log2 (d), 5) << "\n";
-    scl << " " << juce::String (1200.0 * std::log2 (period), 5) << "\n";
+    scl << "! Fibl\xc3\xb3 - scale from spectrum segment\n"
+        << "! Each degree comes from a spectrum partial (n/1 = the raw harmonic, before octave folding).\n"
+        << "! tonic 1/1  <- partial " << ratioName (r0) << "\n"
+        << "Spectrum segment\n " << juce::String ((int) degs.size() + 1) << "\n!\n";
+    for (const auto& d : degs)
+        scl << "! from partial " << ratioName (d.source) << "\n"
+            << " " << juce::String (1200.0 * std::log2 (d.folded), 5) << "\n";
+    scl << "! period\n " << juce::String (1200.0 * std::log2 (period), 5) << "\n";
 
     juce::String err;
     if (tuning.loadScalaString (scl, "segment", err))
@@ -711,8 +733,11 @@ void FractalAdditiveAudioProcessor::rebuildSegmentScale()
             p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
         tuning.setMode (TuningManager::Mode::Scala);
         lastDissScl = scl; lastDissName = "spectrum-segment";
+        segRebuiltGen = t->generation;
         ++dissGeneration; // nudge the UI (keyboard/dissonance list) to refresh
     }
+    else
+        segSourceByDegree.clear();
 }
 
 bool FractalAdditiveAudioProcessor::saveGeneratedScl (const juce::File& f, juce::String& errorOut)

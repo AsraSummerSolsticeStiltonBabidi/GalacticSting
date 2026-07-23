@@ -896,25 +896,54 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     keyboard.setDegreeLabeller ([this] (int d) { return justName (processorRef.getDegreeRatio (d)); });
     keyboard.setHoverTextProvider ([this] (int d) -> juce::String
     {
-        // LITERAL interval of this key vs the tonic - no octave folding, so a
-        // 5/2 degree in a tritave scale reads as 5/2 / 1586 c, never "5/4".
+        // Floating window: this key's interval ABOVE the tonic (the "0" key), stated
+        // literally (no octave folding), in a plain-language line for non-experts.
         const double ratio = processorRef.getDegreeRatio (d);
         if (! (ratio > 0.0) || ! std::isfinite (ratio))
             return {};
         const double cents = 1200.0 * std::log2 (ratio);
         long long p = 1, q = 1;
-        dissonance::bestFraction (ratio, p, q);
+        dissonance::bestFraction (ratio, p, q, 4096);
         const double fracCents = 1200.0 * std::log2 ((double) p / (double) q);
         const auto frac = juce::String (p) + "/" + juce::String (q);
+        const auto lead = tr ("Interval above the tonic: ", "Interval sobre la t\xc3\xb2nica: ");
 
-        if (std::abs (cents - fracCents) < 0.5) // the key IS this ratio -> show it in cents
-            return frac + " = " + juce::String (cents, 2) + " c";
+        if (std::abs (cents - fracCents) < 0.5) // the key IS this exact ratio
+            return lead + frac + " = " + juce::String (cents, 1) + " cents"
+                 + tr ("  (a pure/just interval).", "  (interval pur/just).");
 
-        // Cents key -> nearest simple just interval + signed error.
         const int err = juce::roundToInt (cents - fracCents);
-        return juce::String (cents, 2) + " c   (" + frac + (err >= 0 ? " +" : " -")
-             + juce::String (std::abs (err)) + "c)";
+        return lead + juce::String (cents, 1) + " cents"
+             + tr ("  (nearest pure interval ", "  (interval pur m\xc3\xa9s proper ") + frac
+             + (err >= 0 ? ", +" : ", -") + juce::String (std::abs (err)) + "c).";
     });
+    // Below-keyboard hover strip: each other key's distance to the hovered one, and
+    // (segment scales) the hovered key's source partial "from n/1".
+    keyboard.setDeltaProviders (
+        [this] (int fromNote, int toNote) -> juce::String
+        {
+            const double f0 = processorRef.getNoteFrequency (fromNote);
+            const double f1 = processorRef.getNoteFrequency (toNote);
+            if (! (f0 > 0.0) || ! (f1 > 0.0)) return {};
+            const int    steps = toNote - fromNote;
+            const double cents = 1200.0 * std::log2 (f1 / f0);
+            juce::String s;
+            s << (steps > 0 ? "+" : "") << steps << "st\n"
+              << (cents >= 0 ? "+" : "-") << juce::String ((int) std::llround (std::abs (cents))) << "c";
+            long long p = 1, q = 1; // exact just ratio between the two keys (tight tolerance)
+            dissonance::bestFraction (f1 / f0, p, q, 4096);
+            if (p > 0 && q > 0 && std::abs (cents - 1200.0 * std::log2 ((double) p / (double) q)) < 0.5)
+                s << "\n" << p << "/" << q;
+            return s;
+        },
+        [this] (int note) -> juce::String
+        {
+            if (! processorRef.activeScaleIsSegment()) return {};
+            const int D = juce::jmax (1, processorRef.getScaleDegrees());
+            const double src = processorRef.getSegmentDegreeSource (((note - 60) % D + D) % D);
+            return (src > 0.0) ? tr ("from\n", "de\n") + justName (src) : juce::String();
+        },
+        cSpecScale);
     addAndMakeVisible (keyboard);
 
     applyLanguage();
@@ -922,7 +951,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     lastTimbreActive = processorRef.isTimbreActive();
 
     setWantsKeyboardFocus (true);
-    setSize (1200, 620); // a touch taller so the Essentials cells breathe
+    setSize (1200, 650); // +30 vs before for the keyboard's below-key hover-delta strip
     startTimerHz (30); // also the reconcile rate for stuck/ghost computer-keyboard notes
     juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<juce::Component> (this)]
     { if (safe != nullptr) safe->grabKeyboardFocus(); });
@@ -1819,7 +1848,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
     auto area = full.reduced (6, 4);
 
     {
-        auto kb = area.removeFromBottom (88).reduced (2, 5);
+        auto kb = area.removeFromBottom (118).reduced (2, 5); // keys (~78) + hover-delta strip (30)
         int kbLo = 36, kbNum = 0;
         processorRef.getKeyboardKeyRange (kbLo, kbNum);
         lastKbLo = kbLo; lastKbNum = kbNum;
