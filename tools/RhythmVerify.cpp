@@ -14,6 +14,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <vector>
 
 static int failures = 0;
@@ -178,6 +179,36 @@ int main()
         std::printf ("  slot enabled mid-hold at %d; first pulse at %d\n", enableSample, first);
         check (first >= 0 && first - enableSample <= blk,
                "train routed MID-HOLD starts with a fresh downbeat (no stale phase)");
+    }
+
+    // --- run 6: a RE-PREPARE mid-pulse must not leave notes hanging -------------
+    // (this is the "suspended notes without rhythm" failure: a reset/re-init while a
+    // pulse gate is open used to abandon the note-off.)
+    {
+        std::map<int, int> onCount; // (ch<<8|note) -> net on-count
+        auto tally = [&] (juce::MidiBuffer& midi)
+        {
+            for (const auto meta : midi)
+            {
+                const auto m = meta.getMessage();
+                if (m.isNoteOn())  onCount[(m.getChannel() << 8) | m.getNoteNumber()]++;
+                if (m.isNoteOff()) onCount[(m.getChannel() << 8) | m.getNoteNumber()]--;
+            }
+        };
+        // Hold C3 a while so gates are open, then RE-PREPARE mid-hold, then run on.
+        for (int b = 0; b < 12; ++b)
+        {
+            juce::MidiBuffer midi;
+            if (b == 0) midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+            proc.processBlock (audio, midi);
+            tally (midi);
+        }
+        proc.prepareToPlay (sr, blk); // <-- the abandoning event
+        for (int b = 0; b < 6; ++b) { juce::MidiBuffer midi; proc.processBlock (audio, midi); tally (midi); }
+        int hanging = 0;
+        for (const auto& kv : onCount) if (kv.second != 0) hanging += kv.second;
+        std::printf ("  net hanging notes after a mid-pulse re-prepare: %d\n", hanging);
+        check (hanging == 0, "re-prepare mid-pulse leaves NO hanging notes (flush works)");
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);

@@ -79,6 +79,29 @@ namespace
         return p;
     }
 
+    // Inverted-L frame: a tall vertical BAR (right) plus a horizontal FOOT extending
+    // left at the bottom (they share the bottom edge and the bar's left edge over the
+    // foot's height). Rounded top-outer corners; angular bottom + inner notch.
+    juce::Path lShapedFrame (juce::Rectangle<float> bar, juce::Rectangle<float> foot, float rad)
+    {
+        const float bx = bar.getX(), by = bar.getY(), br = bar.getRight(), bb = bar.getBottom();
+        const float fx = foot.getX(), fy = foot.getY();
+        rad = juce::jmin (rad, bar.getWidth() * 0.5f);
+        juce::Path p;
+        p.startNewSubPath (bx + rad, by);
+        p.lineTo (br - rad, by);
+        p.quadraticTo (br, by, br, by + rad);   // bar top-right round
+        p.lineTo (br, bb);                       // right edge down
+        p.lineTo (fx, bb);                       // bottom edge to foot bottom-left
+        p.lineTo (fx, fy + rad);                 // foot left edge up
+        p.quadraticTo (fx, fy, fx + rad, fy);    // foot top-left round
+        p.lineTo (bx, fy);                       // foot top edge to inner notch
+        p.lineTo (bx, by + rad);                 // bar left edge up from notch
+        p.quadraticTo (bx, by, bx + rad, by);    // bar top-left round
+        p.closeSubPath();
+        return p;
+    }
+
     // Draws a menu title inside an ANGULAR (sharp-cornered) chip filled with the
     // section colour, bounded to the text, at the top-left of `box` - just like the
     // coloured squares of the main title. The letter colour flips black/white with
@@ -241,10 +264,11 @@ namespace
         // ADSR-style faders carry their letter INSIDE the drag thumb (the slider's
         // name, e.g. "A"): bigger thumb, letter black/white by the thumb's colour -
         // the same rule as the keyboard keys and the title letters.
+        static constexpr float kAdsrThumbR = 18.0f; // ADSR thumb circle radius
         int getSliderThumbRadius (juce::Slider& s) override
         {
             if (s.getName().isNotEmpty() && s.isVertical())
-                return 17; // bigger ADSR thumb circle
+                return (int) kAdsrThumbR;
             return juce::LookAndFeel_V4::getSliderThumbRadius (s);
         }
         void drawLinearSlider (juce::Graphics& g, int x, int y, int w, int h,
@@ -256,9 +280,12 @@ namespace
             {
                 const auto col = s.findColour (juce::Slider::thumbColourId);
                 g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-                g.setFont (juce::Font (juce::FontOptions (19.0f).withStyle ("Bold"))); // bigger letter
+                // Letter sized to sit INSIDE the circle (~0.8 of the diameter) so it
+                // never spills over the edges.
+                g.setFont (juce::Font (juce::FontOptions (kAdsrThumbR * 0.85f).withStyle ("Bold")));
+                const float d = kAdsrThumbR * 2.0f;
                 g.drawText (s.getName(),
-                            juce::Rectangle<float> ((float) x + (float) w * 0.5f - 17.0f, sliderPos - 17.0f, 34.0f, 34.0f),
+                            juce::Rectangle<float> ((float) x + (float) w * 0.5f - kAdsrThumbR, sliderPos - kAdsrThumbR, d, d),
                             juce::Justification::centred, false);
             }
         }
