@@ -2,8 +2,10 @@
 
 #include "PluginProcessor.h"
 #include "ScaleKeyboard.h"
+#include <algorithm>
 #include <limits>
 #include <map>
+#include <vector>
 
 //==============================================================================
 class FractalAdditiveAudioProcessorEditor : public juce::AudioProcessorEditor,
@@ -142,6 +144,15 @@ private:
         }
     };
 
+    // Darkens everything behind the Spectrum-to-Rhythm panel so it does not
+    // distract; clicking it (= clicking outside the panel) closes the panel.
+    struct Scrim : juce::Component
+    {
+        std::function<void()> onClick;
+        void mouseDown (const juce::MouseEvent&) override { if (onClick) onClick(); }
+        void paint (juce::Graphics& g) override { g.fillAll (juce::Colour (0xa8000008)); }
+    };
+
     // Timbre -> rhythm (MIDI out) panel: pick partials of the CURRENT patch (shown
     // with their just-intonation ratio to the fundamental, or cents when inexact /
     // .scl-derived), route each to a MIDI note + gate length, and set the global
@@ -153,6 +164,7 @@ private:
         std::function<juce::String (double)> ratioName;                       // 3/2 or 702c
         std::function<juce::String (const char*, const char*)> trF;           // EN/CA
         std::function<void()> onEdited;                                       // refocus etc.
+        std::function<void()> onClose;                                        // hide panel + scrim
 
         juce::ListBox      list { "partials", this };
         juce::ToggleButton onT, mpeT;
@@ -270,7 +282,7 @@ private:
             routeHelp.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
             addAndMakeVisible (routeHelp);
             closeB.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
-            closeB.onClick = [this] { setVisible (false); if (onEdited) onEdited(); };
+            closeB.onClick = [this] { if (onClose) onClose(); };
             addAndMakeVisible (closeB);
 
             for (int i = 0; i < RhythmEngine::kSlots; ++i)
@@ -311,11 +323,9 @@ private:
                 delB[i].setColour (juce::TextButton::buttonColourId, juce::Colour (0xffe0453f));
                 delB[i].onClick = [this, i]
                 {
-                    if (proc)
-                    {
-                        proc->getRhythm().slots[i].enabled = false;
-                        proc->getRhythm().slots[i].partial = -1;
-                    }
+                    auto v = readSlots();
+                    if (i < (int) v.size()) v.erase (v.begin() + i);
+                    writeSlots (std::move (v)); // stays compact, no gaps
                     refreshSlots();
                     list.repaint();
                 };
@@ -339,30 +349,60 @@ private:
             g.drawText (ratioName ? ratioName ((double) t->partials[(size_t) row].ratio) : juce::String(),
                         50, 0, w - 56, h, juce::Justification::centredLeft);
         }
+        // The routed trains are kept COMPACT and in LIST ORDER (sorted by partial
+        // index): no empty rows between them, no reordering surprises when a
+        // partial is added or removed.
+        struct SlotData { int partial, steps; bool useRatio; double ratio; float durMs; };
+        std::vector<SlotData> readSlots() const
+        {
+            std::vector<SlotData> v;
+            if (proc == nullptr) return v;
+            for (int i = 0; i < RhythmEngine::kSlots; ++i)
+            {
+                const auto& s = proc->getRhythm().slots[i];
+                if (s.partial.load() >= 0)
+                    v.push_back ({ s.partial.load(), s.steps.load(), s.useRatio.load(),
+                                   s.ratio.load(), s.durMs.load() });
+            }
+            return v;
+        }
+        void writeSlots (std::vector<SlotData> v)
+        {
+            if (proc == nullptr) return;
+            std::sort (v.begin(), v.end(), [] (const SlotData& a, const SlotData& b) { return a.partial < b.partial; });
+            for (int i = 0; i < RhythmEngine::kSlots; ++i)
+            {
+                auto& s = proc->getRhythm().slots[i];
+                if (i < (int) v.size())
+                {
+                    s.steps = v[(size_t) i].steps;  s.useRatio = v[(size_t) i].useRatio;
+                    s.ratio = v[(size_t) i].ratio;  s.durMs    = v[(size_t) i].durMs;
+                    s.partial = v[(size_t) i].partial;
+                    s.enabled = true;
+                }
+                else
+                {
+                    s.enabled = false; s.partial = -1;
+                    s.steps = 0; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f;
+                }
+            }
+        }
         void listBoxItemClicked (int row, const juce::MouseEvent&) override
         {
             if (proc == nullptr) return;
-            const int existing = slotOfPartial (row);
-            if (existing >= 0) // click an assigned partial -> unassign it
+            auto v = readSlots();
+            const auto it = std::find_if (v.begin(), v.end(), [row] (const SlotData& d) { return d.partial == row; });
+            if (it != v.end())
+                v.erase (it);                            // click an assigned partial -> unassign
+            else if ((int) v.size() < RhythmEngine::kSlots)
             {
-                proc->getRhythm().slots[existing].enabled = false;
-                proc->getRhythm().slots[existing].partial = -1;
+                v.push_back ({ row, 0, false, 1.0, 60.0f }); // assign (writeSlots sorts + compacts)
+                // Routing a partial means the user WANTS pulses -> flip the master On.
+                if (auto* p = proc->apvts.getParameter ("rhythmOn"))
+                    if (p->getValue() < 0.5f)
+                        p->setValueNotifyingHost (1.0f);
             }
-            else               // assign to the first free slot
-            {
-                for (int i = 0; i < RhythmEngine::kSlots; ++i)
-                    if (proc->getRhythm().slots[i].partial.load() < 0)
-                    {
-                        proc->getRhythm().slots[i].partial = row;
-                        proc->getRhythm().slots[i].enabled = true;
-                        // Routing a partial means the user WANTS pulses -> flip the
-                        // master On switch for them (no silent "why is nothing sent").
-                        if (auto* p = proc->apvts.getParameter ("rhythmOn"))
-                            if (p->getValue() < 0.5f)
-                                p->setValueNotifyingHost (1.0f);
-                        break;
-                    }
-            }
+            writeSlots (std::move (v));
             refreshSlots();
             list.repaint();
         }
@@ -604,6 +644,7 @@ private:
     WarningOverlay warningOverlay;
     NoticeOverlay  noticeOverlay;
     DissDegreeList degreeList;
+    Scrim          rhythmScrim;
     RhythmPanel    rhythmPanel;
     std::unique_ptr<ButtonAttachment>   rhythmOnAtt, rhythmMpeAtt;
     std::unique_ptr<ComboBoxAttachment> rhythmXAtt, rhythmModeAtt;
@@ -613,8 +654,8 @@ private:
     juce::GroupComponent gHarmonic, gBase, gWhitelist, gSlope, gSpectrumRange, gFractal,
                          gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale;
     juce::Label lblBaseN, lblBasePitch, lblRange, lblFractal, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
-                lblTimbreRepeats, lblBend, lblPeriod, lblRefA, lblRefHz, lblOctave, lblPitchAmt, lblMorphTime,
-                lblTuningBank, tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel;
+                lblTimbreRepeats, lblBend, lblPeriod, lblSteps, lblRefA, lblRefHz, lblOctave, lblPitchAmt,
+                lblMorphTime, lblTuningBank, tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel;
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], pitchAdsrLbl[4], primeLbl[9];
 
     std::unique_ptr<SliderAttachment>   baseNAtt, slopeAtt, spectrumRangeAtt, fractalAtt, gainAtt,
