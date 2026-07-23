@@ -198,7 +198,8 @@ namespace
             drawTitleChip (g, juce::Rectangle<float> (0.0f, 0.0f, (float) w, (float) h), col, text);
         }
 
-        // Square buttons (sharp corners), filled with the button's colour.
+        // Square buttons (sharp corners) filled with the button's colour; buttons
+        // named "round" (the OCTAVE +/- steppers) get a circular body instead.
         void drawButtonBackground (juce::Graphics& g, juce::Button& b, const juce::Colour& bg,
                                    bool over, bool down) override
         {
@@ -207,6 +208,15 @@ namespace
             if (down)      c = c.darker (0.28f);
             else if (over) c = c.brighter (0.10f);
             g.setColour (c);
+            if (b.getName() == "round")
+            {
+                const float d = juce::jmin (r.getWidth(), r.getHeight());
+                auto circle = r.withSizeKeepingCentre (d, d);
+                g.fillEllipse (circle);
+                g.setColour (juce::Colours::black.withAlpha (0.35f));
+                g.drawEllipse (circle.reduced (0.5f), 1.0f);
+                return;
+            }
             g.fillRect (r);                                    // square, not rounded
             g.setColour (juce::Colours::black.withAlpha (0.35f));
             g.drawRect (r, 1.0f);
@@ -233,7 +243,7 @@ namespace
         int getSliderThumbRadius (juce::Slider& s) override
         {
             if (s.getName().isNotEmpty() && s.isVertical())
-                return 11;
+                return 13;
             return juce::LookAndFeel_V4::getSliderThumbRadius (s);
         }
         void drawLinearSlider (juce::Graphics& g, int x, int y, int w, int h,
@@ -245,9 +255,9 @@ namespace
             {
                 const auto col = s.findColour (juce::Slider::thumbColourId);
                 g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-                g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+                g.setFont (juce::Font (juce::FontOptions (14.5f).withStyle ("Bold")));
                 g.drawText (s.getName(),
-                            juce::Rectangle<float> ((float) x + (float) w * 0.5f - 11.0f, sliderPos - 11.0f, 22.0f, 22.0f),
+                            juce::Rectangle<float> ((float) x + (float) w * 0.5f - 13.0f, sliderPos - 13.0f, 26.0f, 26.0f),
                             juce::Justification::centred, false);
             }
         }
@@ -367,6 +377,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     auto configStep = [&] (juce::TextButton& b, const char* txt, const char* id, int delta, const juce::String& tip)
     {
         b.setButtonText (txt);
+        b.setName ("round"); // circular body (see GalacticLnF::drawButtonBackground)
         b.setColour (juce::TextButton::buttonColourId, cEssentials.withAlpha (0.30f));
         b.setMouseClickGrabsKeyboardFocus (false);
         b.setTooltip (tip);
@@ -702,6 +713,22 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         refocus();
     };
     intervalEdit.onEscapeKey = [this] { refocus(); };
+    // While typing, the box grows to the window's right edge so long interval
+    // lists stay readable; on blur it collapses back and shows the text's start.
+    intervalEdit.onFocusChanged = [this] (bool focused)
+    {
+        if (intervalEditHome.isEmpty()) return;
+        if (focused)
+        {
+            intervalEdit.setBounds (intervalEditHome.withRight (getWidth() - 10));
+            intervalEdit.toFront (false);
+        }
+        else
+        {
+            intervalEdit.setBounds (intervalEditHome);
+            intervalEdit.setCaretPosition (0); // show the beginning when collapsed
+        }
+    };
     addAndMakeVisible (intervalEdit);
 
     // Master reference A = <hz> (transposes everything, all tuning modes). A text
@@ -784,7 +811,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     lastTimbreActive = processorRef.isTimbreActive();
 
     setWantsKeyboardFocus (true);
-    setSize (1200, 604); // narrower (Range removed; faders squeezed closer)
+    setSize (1200, 620); // a touch taller so the Essentials cells breathe
     startTimerHz (30); // also the reconcile rate for stuck/ghost computer-keyboard notes
     juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<juce::Component> (this)]
     { if (safe != nullptr) safe->grabKeyboardFocus(); });
@@ -858,15 +885,15 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.modeBox.setTooltip (tr (
         "Lowest note: only the lowest held note drives the pulses. All notes: every held note drives its own copy of the trains, transposed by its interval from the lowest.",
         "Nota m\xc3\xa9s greu: nom\xc3\xa9s la nota m\xc3\xa9s greu mant\xc3\xa9 els polsos. Totes les notes: cada nota mantinguda porta la seva c\xc3\xb2pia dels trens, transposada pel seu interval respecte a la m\xc3\xa9s greu."));
-    rhythmPanel.tempoSend.setButtonText (tr ("Send tempo (CC20)", "Envia tempo (CC20)"));
-    rhythmPanel.tempoSend.setTooltip (tr (
-        "Sets your DAW tempo to pulse 1 (x2 / /2 to scale). One-time setup: MIDI-map the DAW's tempo to this plugin's CC20 and set the mapping range to 20-147 BPM - then the sent value is EXACTLY the shown BPM. Works in DAWs whose tempo is MIDI-mappable (Ableton, Reaper, FL...).",
-        "Posa el tempo del DAW al pols 1 (x2 / /2 per escalar). Configuraci\xc3\xb3 \xc3\xbanica: mapeja per MIDI el tempo del DAW al CC20 d'aquest plugin amb rang 20-147 BPM - llavors el valor enviat \xc3\x89S exactament el BPM mostrat. Funciona als DAWs amb tempo mapejable per MIDI (Ableton, Reaper, FL...)."));
+    rhythmPanel.tempoT.setButtonText (tr ("Tempo sync (CC20)", "Sync de tempo (CC20)"));
+    rhythmPanel.tempoT.setTooltip (tr (
+        "While ON, the DAW tempo FOLLOWS pulse 1 (x2 / /2 to scale): CC20 is re-sent whenever the BPM changes. One-time setup: MIDI-map the DAW's tempo to this plugin's CC20 with a 20-147 BPM range - the sent value is then EXACTLY the shown BPM. Works in DAWs whose tempo is MIDI-mappable (Ableton, Reaper, FL...).",
+        "Mentre \xc3\xa9s actiu, el tempo del DAW SEGUEIX el pols 1 (x2 / /2 per escalar): el CC20 es reenvia quan canvia el BPM. Configuraci\xc3\xb3 \xc3\xbanica: mapeja el tempo del DAW al CC20 d'aquest plugin amb rang 20-147 BPM - el valor enviat \xc3\x89S exactament el BPM mostrat. Funciona als DAWs amb tempo mapejable per MIDI (Ableton, Reaper, FL...)."));
     for (int i = 0; i < RhythmEngine::kSlots; ++i)
     {
         rhythmPanel.pitchE[i].setTooltip (tr (
-            "Scale steps FROM the played note: \"7st\" = 7 up, \"7st-\" = 7 down (always relative, never a fixed note). With MPE out on, also cents (\"1987.4c\") or a ratio (\"3\", \"3/2\") above the played note, sent retuned via per-note bend. Buttons: +-1 step, +-12 steps.",
-            "Passos d'escala DES DE la nota tocada: \"7st\" = 7 amunt, \"7st-\" = 7 avall (sempre relatiu, mai una nota fixa). Amb MPE out actiu, tamb\xc3\xa9 cents (\"1987.4c\") o un ratio (\"3\", \"3/2\") sobre la nota tocada, enviat reafinat amb bend per nota. Botons: +-1 pas, +-12 passos."));
+            "Scale steps FROM the played note: \"7st\" = 7 up, \"7st-\" = 7 down (always relative, never a fixed note). With MPE out on, also cents (\"1987.4c\") or a ratio (\"3\", \"3/2\") above the played note, sent retuned via per-note bend.",
+            "Passos d'escala DES DE la nota tocada: \"7st\" = 7 amunt, \"7st-\" = 7 avall (sempre relatiu, mai una nota fixa). Amb MPE out actiu, tamb\xc3\xa9 cents (\"1987.4c\") o un ratio (\"3\", \"3/2\") sobre la nota tocada, enviat reafinat amb bend per nota."));
         rhythmPanel.durS[i].setTooltip (tr (
             "GATE: how long each pulse's MIDI note lasts (5-500 ms). It is NOT latency - pulse timing stays sample-locked; this only sets where the note-off lands.",
             "GATE: quant dura la nota MIDI de cada pols (5-500 ms). NO \xc3\xa9s lat\xc3\xa8ncia - els polsos queden clavats a la mostra; nom\xc3\xa9s fixa on cau el note-off."));
@@ -890,7 +917,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     gTimbre.setText        (tr ("Custom Engine", "Motor propi"));
     intervalEdit.setTextToShowWhenEmpty (tr ("intervals: 3/2 2 700c ...", "intervals: 3/2 2 700c ..."),
                                          juce::Colour (0xff8f96a8));
-    gSpecScale.setText     (tr ("Spectrum to Scale", "Espectre a escala"));
+    gSpecScale.setText     (tr ("Spectrum to Tuning", "Espectre a afinaci\xc3\xb3"));
 
     lblBaseN.setText     ("N", dontSendNotification);
     lblBasePitch.setText (tr ("Pitch", "To"), dontSendNotification);
@@ -1528,7 +1555,8 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
                     (float) hcHarm.getRight(), (float) hcPrime.getY(), 1.0f);
         subLabel (hcBase,  cHarmonic, tr ("BASE", "BASE"),           dimF);
         subLabel (hcHarm,  cHarmonic, tr ("HARMONICS", "HARM\xc3\x92NICS"), dimF);
-        subLabel (hcPrime, cHarmonic, tr ("PRIME", "PRIMERS"),       dimF);
+        // PRIME sits right under the shared divider -> nudge it down for breathing room.
+        subLabel (hcPrime.translated (0, 5), cHarmonic, tr ("PRIME", "PRIMERS"), dimF);
         subLabel (hcSlope, cHarmonic, tr ("SLOPE", "PENDENT"),       dimF);
     }
 
@@ -1738,7 +1766,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // Tighter label band + slimmer padding = the controls breathe (the
             // Reference value used to clip its descenders).
             const int lblH = 13; // inline PHASE / GAIN / REFERENCE / OCTAVE band
-            { auto c = ecPhase.reduced (6, 1); c.removeFromTop (lblH); compact (phaseBox, c); }
+            { auto c = ecPhase.reduced (6, 1); c.removeFromTop (lblH);
+              compact (phaseBox, c.removeFromLeft (juce::jmin (116, c.getWidth()))); } // fits "Scattered", not the whole row
             { auto c = ecGain.reduced (6, 1);  c.removeFromTop (lblH);
               gainFader.setBounds (c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))); }
             { auto c = ecRef.reduced (6, 1);   c.removeFromTop (lblH);
@@ -1749,16 +1778,16 @@ void FractalAdditiveAudioProcessorEditor::resized()
               refAEdit.setBounds (rr); }
             { auto c = ecOct.reduced (6, 1);   c.removeFromTop (13); c.removeFromBottom (4);
               const int rh = juce::jmax (14, c.getHeight() / 2);
-              // [label][white value][- red][+ green]: value first, steppers to its right.
+              // [label][white value][+ green][- red]: value first, then + before -.
               auto stepRow = [] (juce::Rectangle<int> row, juce::Label& lbl,
                                  juce::TextButton& dn, juce::Label& val, juce::TextButton& up)
               {
                   lbl.setJustificationType (juce::Justification::centredLeft);
                   lbl.setBounds (row.removeFromLeft (66));
                   val.setBounds (row.removeFromLeft (40));
-                  dn.setBounds  (row.removeFromLeft (26).reduced (0, 1));
-                  row.removeFromLeft (3);
-                  up.setBounds  (row.removeFromLeft (26).reduced (0, 1));
+                  up.setBounds  (row.removeFromLeft (24).reduced (0, 1));
+                  row.removeFromLeft (4);
+                  dn.setBounds  (row.removeFromLeft (24).reduced (0, 1));
               };
               stepRow (c.removeFromTop (rh), lblOctave, octDn, octVal, octUp);
               stepRow (c,                    lblRange,  sprDn, sprVal, sprUp); }
@@ -1788,7 +1817,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 loadTimbreButton.setBounds (brow.reduced (2, 0));
             }
             ti.removeFromTop (5);
-            intervalEdit.setBounds (ti.removeFromTop (24).reduced (1, 0)); // type intervals, Enter builds
+            intervalEditHome = ti.removeFromTop (24).reduced (1, 0); // type intervals, Enter builds
+            intervalEdit.setBounds (intervalEdit.hasKeyboardFocus (false)
+                                        ? intervalEditHome.withRight (getWidth() - 10)
+                                        : intervalEditHome);
             ti.removeFromTop (5);
             timbreStatusLabel.setBounds (ti.removeFromTop (16));
             ti.removeFromTop (5);
@@ -1821,24 +1853,29 @@ void FractalAdditiveAudioProcessorEditor::resized()
             compact (tuningBox, mrow.removeFromLeft (mrow.getWidth() * 50 / 100));
             mrow.removeFromLeft (5);
             tuningNameLabel.setBounds (mrow); // shows the loaded scale's file name
-            ti.removeFromTop (4);
-            auto brow = ti.removeFromTop (23);
-            const bool resetVis = processorRef.getTuningMode() != 0 || processorRef.tuningHasScala();
+            // Load .scl only exists in Scala mode; Reset appears whenever there is
+            // something to reset (any non-12ED2 mode or a loaded scale).
+            const int  tmode    = processorRef.getTuningMode();
+            const bool loadVis  = tmode == 2;
+            const bool resetVis = tmode != 0 || processorRef.tuningHasScala();
+            loadSclButton.setVisible (loadVis);
             clearSclButton.setVisible (resetVis);
-            if (resetVis)
+            if (loadVis || resetVis)
             {
-                loadSclButton.setBounds (brow.removeFromLeft (brow.getWidth() / 2).reduced (2, 0));
-                clearSclButton.setBounds (brow.reduced (2, 0));
-            }
-            else
-            {
-                loadSclButton.setBounds (brow.reduced (2, 0));
+                ti.removeFromTop (4);
+                auto brow = ti.removeFromTop (23);
+                if (loadVis && resetVis)
+                {
+                    loadSclButton.setBounds (brow.removeFromLeft (brow.getWidth() / 2).reduced (2, 0));
+                    clearSclButton.setBounds (brow.reduced (2, 0));
+                }
+                else if (loadVis)  loadSclButton.setBounds (brow.reduced (2, 0));
+                else               clearSclButton.setBounds (brow.reduced (2, 0));
             }
             // Pitch bend ABOVE Recent; hidden in MPE-input mode (the MPE zone fixes
             // the per-note range at +-48, so the choice is irrelevant there).
-            const int  mode    = processorRef.getTuningMode();
-            const bool sclMode = mode == 2;
-            const bool bendVis = mode != 3;
+            const bool sclMode = tmode == 2;
+            const bool bendVis = tmode != 3;
             lblBend.setVisible (bendVis); bendBox.setVisible (bendVis);
             if (bendVis)
             {
@@ -1993,6 +2030,19 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         }
         rhythmPanel.refreshLive();
     }
+    // Continuous DAW-tempo sync: while the toggle is on, re-send CC20 whenever the
+    // rounded target BPM changes (a new note re-speeds pulse 1 -> the tempo follows).
+    if (rhythmPanel.tempoT.getToggleState())
+    {
+        const double bpm = rhythmPanel.tempoBpm();
+        const int b = bpm > 0.0 ? (int) std::lround (bpm) : -1;
+        if (b > 0 && b != lastTempoSent)
+        {
+            lastTempoSent = b;
+            processorRef.getRhythm().sendController (20, juce::jlimit (0, 127, b - 20));
+        }
+    }
+    else lastTempoSent = -1;
     // Keep the tuning-bank combo's selection in sync with the parameter (host
     // automation can move it) without rebuilding the list every tick.
     if (tuningBankBox.getSelectedId() - 1 != processorRef.getTuningBankSlotParam())

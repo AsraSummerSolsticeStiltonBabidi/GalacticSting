@@ -188,10 +188,13 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     // Each selected partial pulses at f0 * ratio / x^n; all of these are automatable.
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "rhythmOn", 1 }, "Rhythm MIDI On", false));
+    // Default x^n = 2^7 = 128: playing C3 (MIDI 60 = 261.63 Hz here, the tuning
+    // anchor) pulses harmonic 1 at 261.63/128 = 2.044 Hz = 122.66 BPM - the closest
+    // power-of-two division of its frequency to ~130 BPM.
     params.push_back (std::make_unique<AudioParameterInt>(
-        ParameterID { "rhythmDivX", 1 }, "Rhythm Divide Base (x)", 1, 12, 1));
+        ParameterID { "rhythmDivX", 1 }, "Rhythm Divide Base (x)", 1, 12, 2));
     params.push_back (std::make_unique<AudioParameterInt>(
-        ParameterID { "rhythmDivN", 1 }, "Rhythm Divide Times (n)", 1, 16, 8));
+        ParameterID { "rhythmDivN", 1 }, "Rhythm Divide Times (n)", 1, 16, 7));
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "rhythmMode", 1 }, "Rhythm Mode",
         StringArray { "Lowest note", "All notes" }, 0));
