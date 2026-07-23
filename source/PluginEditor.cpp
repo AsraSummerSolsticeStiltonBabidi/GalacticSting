@@ -263,6 +263,28 @@ namespace
             }
         }
 
+        // Toggle buttons named "onled" render as a big filled ON/OFF pill: green
+        // when on, red when off (used for the Spectrum-to-Rhythm master switch).
+        void drawToggleButton (juce::Graphics& g, juce::ToggleButton& b,
+                               bool over, bool down) override
+        {
+            if (b.getName() == "onled")
+            {
+                const bool on = b.getToggleState();
+                auto r  = b.getLocalBounds().toFloat().reduced (1.0f);
+                auto col = on ? juce::Colour (0xff2fb155) : juce::Colour (0xffe0453f);
+                if (down)      col = col.darker (0.20f);
+                else if (over) col = col.brighter (0.10f);
+                g.setColour (col);
+                g.fillRoundedRectangle (r, 5.0f);
+                g.setColour (juce::Colours::white);
+                g.setFont (juce::Font (juce::FontOptions ((float) b.getHeight() * 0.62f).withStyle ("Bold")));
+                g.drawText (on ? "ON" : "OFF", b.getLocalBounds(), juce::Justification::centred, false);
+                return;
+            }
+            juce::LookAndFeel_V4::drawToggleButton (g, b, over, down);
+        }
+
         // Text FIELDS (combo boxes + text editors) are as rounded as possible - a
         // full pill (corner radius = half the height).
         void drawComboBox (juce::Graphics& g, int width, int height, bool,
@@ -602,6 +624,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addChildComponent (rhythmPanel);
     rhythmOnAtt   = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmOn",   rhythmPanel.onT);
     rhythmMpeAtt  = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmMpe",  rhythmPanel.mpeT);
+    rhythmTempoAtt = std::make_unique<ButtonAttachment>  (processorRef.apvts, "rhythmTempoSync", rhythmPanel.tempoT);
     rhythmModeAtt = std::make_unique<ComboBoxAttachment> (processorRef.apvts, "rhythmMode", rhythmPanel.modeBox);
 
     // Credit: "Vibe coded by Asra3" (Asra3 is a link to Instagram), left of the language button.
@@ -689,8 +712,6 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // Scale-dissonance box (its own group, right of Tuning): the live per-degree
     // Sethares dissonance of the ACTIVE scale, in a scrollable, header-sortable list.
     configGroup (gScaleDiss, cScaleDiss);
-    dissHeader.byStep = dissSortByStep;
-    dissHeader.onSort = [this] (bool byStep) { dissSortByStep = byStep; rebuildScaleDissList(); refocus(); };
     addAndMakeVisible (dissHeader);
     dissView.setViewedComponent (&degreeList, false); // Viewport owns display, not deletion
     dissView.setScrollBarsShown (true, false);
@@ -957,8 +978,11 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblRefA.setText      ("A =", dontSendNotification);
     lblTuningBank.setText (tr ("Tuning bank", "Banc d'afinacions"), dontSendNotification);
     degreeList.tip = tr (
-        "Each row is a degree of the ACTIVE scale (any tuning): colour chip = its keyboard colour, then its interval, then its Sethares DISSONANCE against the current timbre (how rough it sounds) - lower = more consonant, and it updates live as you change the timbre. Click 'Step' to order ascending from 1/1, or 'Sethares dissonance' from most consonant to most dissonant. The period is the red row.",
-        "Cada fila \xc3\xa9s un grau de l'escala ACTIVA (qualsevol afinaci\xc3\xb3): xip de color = el seu color al teclat, despr\xc3\xa9s l'interval, i la DISSONANCIA de Sethares contra el timbre actual (com d'aspre sona) - m\xc3\xa9s baix = m\xc3\xa9s consonant, i s'actualitza en viu en canviar el timbre. Clica 'Step' per ordenar des de 1/1, o 'Sethares dissonance' de m\xc3\xa9s consonant a m\xc3\xa9s dissonant. El per\xc3\xado""de \xc3\xa9s la fila vermella.");
+        "Each row is a degree of the ACTIVE scale (any tuning): colour chip = its keyboard colour, then its interval, then its Sethares DISSONANCE against the current timbre (how rough it sounds) - lower = more consonant. Ordered most consonant first. The period is the red row.",
+        "Cada fila \xc3\xa9s un grau de l'escala ACTIVA (qualsevol afinaci\xc3\xb3): xip de color = el seu color al teclat, despr\xc3\xa9s l'interval, i la DISSONANCIA de Sethares contra el timbre actual (com d'aspre sona) - m\xc3\xa9s baix = m\xc3\xa9s consonant. Ordenats de m\xc3\xa9s consonant primer. El per\xc3\xado""de \xc3\xa9s la fila vermella.");
+    dissHeader.tip = tr (
+        "Sethares dissonance: how ROUGH each scale step sounds with the CURRENT timbre. It is not fixed - it recomputes live from the synth's actual partials, so editing the timbre (N, fractal, slope, primes, .scl...) changes these values in real time. Lower = more consonant; the rows are ordered most consonant first.",
+        "Dissonancia de Sethares: com d'ASPRE sona cada pas de l'escala amb el timbre ACTUAL. No \xc3\xa9s fixa - es recalcula en viu a partir dels parcials reals del sinte, aix\xc3\xad que editar el timbre (N, fractal, pendent, primers, .scl...) canvia aquests valors en temps real. M\xc3\xa9s baix = m\xc3\xa9s consonant; les files van de m\xc3\xa9s consonant primer.");
     recentLabel.setText  (tr ("Recent", "Recents"), dontSendNotification);
 
     loadSclButton.setButtonText    (tr ("Load .scl", "Obrir .scl"));
@@ -1193,15 +1217,10 @@ void FractalAdditiveAudioProcessorEditor::rebuildScaleDissList()
     double lo = 1.0e30, hi = -1.0e30;
     for (const auto& d : activeDiss) { lo = juce::jmin (lo, d.height); hi = juce::jmax (hi, d.height); }
 
-    // Sort key: ascending step (== ascending ratio, so the period lands last), or
-    // ascending dissonance (most consonant first).
+    // Always ordered by dissonance (most consonant first).
     auto sorted = activeDiss;
-    if (dissSortByStep)
-        std::sort (sorted.begin(), sorted.end(),
-                   [] (const auto& a, const auto& b) { return a.ratio < b.ratio; });
-    else
-        std::sort (sorted.begin(), sorted.end(),
-                   [] (const auto& a, const auto& b) { return a.height < b.height; });
+    std::sort (sorted.begin(), sorted.end(),
+               [] (const auto& a, const auto& b) { return a.height < b.height; });
 
     degreeList.rows.clear();
     for (const auto& d : sorted)
@@ -1612,7 +1631,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         const float dimF = processorRef.isTimbreActive() ? 0.4f : 1.0f;
         macroFrameTitle (harmonicEngineBounds, cHarmonic, tr ("HARMONIC ENGINE", "MOTOR HARM\xc3\x92NIC"), dimF);
         g.setColour (cHarmonic.withAlpha (0.5f * dimF)); // shared internal dividers
-        const float top = (float) hcBase.getY();
+        const float top = (float) harmonicEngineBounds.getY() + 11.5f; // frame's inner top edge (was hcBase.getY(), ~10px low)
         const float bot = (float) harmonicEngineBounds.getBottom() - 3.0f;
         g.drawLine ((float) hcHarm.getX(),  top, (float) hcHarm.getX(),  bot, 1.0f);
         g.drawLine ((float) hcSlope.getX(), top, (float) hcSlope.getX(), bot, 1.0f);

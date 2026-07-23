@@ -199,6 +199,11 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         StringArray { "Lowest note", "All notes" }, 0));
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "rhythmMpe", 1 }, "Rhythm MPE Out", false));
+    // DAW-tempo sync toggle: a persisted parameter (not editor-only state) so it
+    // survives the editor being closed/reopened and project reloads - it was
+    // resetting itself when Ableton re-created the plugin editor on record/play.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "rhythmTempoSync", 1 }, "Rhythm Tempo Sync", false));
 
     //-- Scala-as-timbre --------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterInt>(

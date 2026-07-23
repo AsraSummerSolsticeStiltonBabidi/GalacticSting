@@ -138,33 +138,25 @@ private:
         }
     };
 
-    // Clickable two-column header over the dissonance list: "Step" (sort ascending
-    // from 1/1) on the left, "Sethares dissonance" (two lines) on the right. The
-    // arrow marks the active sort column.
-    struct DissHeader : juce::Component
+    // Two-column header over the dissonance list: "Step" and "Sethares dissonance"
+    // (two lines). The list is always ordered by dissonance (most consonant first);
+    // hovering explains that the dissonance tracks the synth's timbre live.
+    struct DissHeader : juce::Component, juce::TooltipClient
     {
-        std::function<void (bool)> onSort; // true = by step, false = by dissonance
-        bool byStep = true;
-        int  splitX = 96;
+        juce::String tip;
+        int  splitX = 92;
+        juce::String getTooltip() override { return tip; }
         void paint (juce::Graphics& g) override
         {
             const juce::Colour c (0xff8f96a8);
-            const auto up = juce::String (juce::CharPointer_UTF8 (" \xe2\x96\xb2"));
             g.setColour (c);
             g.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
-            g.drawText (juce::String ("Step") + (byStep ? up : juce::String()),
-                        juce::Rectangle<int> (0, 0, splitX, getHeight()), juce::Justification::centredLeft, false);
+            g.drawText ("Step", juce::Rectangle<int> (0, 0, splitX, getHeight()),
+                        juce::Justification::centredLeft, false);
             auto rr = juce::Rectangle<int> (splitX, 0, getWidth() - splitX, getHeight());
             g.setFont (juce::Font (juce::FontOptions (10.0f).withStyle ("Bold")));
             g.drawText ("Sethares", rr.removeFromTop (rr.getHeight() / 2), juce::Justification::bottomLeft, false);
-            g.drawText (juce::String ("dissonance") + (byStep ? juce::String() : up),
-                        rr, juce::Justification::topLeft, false);
-        }
-        void mouseDown (const juce::MouseEvent& e) override
-        {
-            byStep = e.x < splitX;
-            if (onSort) onSort (byStep);
-            repaint();
+            g.drawText ("dissonance", rr, juce::Justification::topLeft, false);
         }
     };
 
@@ -304,6 +296,7 @@ private:
             list.setRowHeight (20);
             list.setColour (juce::ListBox::backgroundColourId, juce::Colour (0xff141420));
             addAndMakeVisible (list);
+            onT.setName ("onled"); // big green(on)/red(off) pill, drawn by GalacticLnF
             addAndMakeVisible (onT);
             addAndMakeVisible (mpeT);
             modeBox.addItem ("Lowest note", 1); // idx-mapped to the rhythmMode parameter
@@ -325,11 +318,12 @@ private:
             // "divide [n] times by [x]": two tiny +/- steppers driving the params.
             for (auto* l : { &divLbl, &timesLbl })
             {
-                l->setJustificationType (juce::Justification::centredRight);
                 l->setColour (juce::Label::textColourId, juce::Colour (0xffb9c0d0));
                 l->setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
                 addAndMakeVisible (*l);
             }
+            divLbl.setJustificationType (juce::Justification::centredLeft);  // flush to the left border
+            timesLbl.setJustificationType (juce::Justification::centredRight);
             for (auto* v : { &nVal, &xVal })
             {
                 v->setJustificationType (juce::Justification::centred);
@@ -705,15 +699,17 @@ private:
             closeB.setBounds (top.removeFromRight (24).withSizeKeepingCentre (22, 22));
             top.removeFromRight (4);
             helpB.setBounds (top.removeFromRight (24).withSizeKeepingCentre (22, 22));
-            heading.setBounds (top);
+            // Master ON/OFF pill: right of the title, green (on) / red (off).
+            auto titleZone = top;
+            heading.setBounds (titleZone.removeFromLeft (juce::jmin (270, titleZone.getWidth() - 76)));
+            titleZone.removeFromLeft (8);
+            onT.setBounds (titleZone.removeFromLeft (64).withSizeKeepingCentre (64, 24));
             r.removeFromTop (6);
 
             // Three labelled control groups: PULSE RATE / OUTPUT / DAW TEMPO.
             auto grpRow = [&r] (juce::Label& sec) { sec.setBounds (r.removeFromTop (13)); return r.removeFromTop (24); };
             {
                 auto g1 = grpRow (secRate);
-                onT.setBounds (g1.removeFromLeft (58));
-                g1.removeFromLeft (6);
                 divLbl.setBounds (g1.removeFromLeft (50));
                 g1.removeFromLeft (4);
                 nDn.setBounds (g1.removeFromLeft (20).reduced (0, 2));
@@ -847,10 +843,9 @@ private:
     // the sort mode toggled by the header.
     std::vector<FractalAdditiveAudioProcessor::DissDegreeInfo> activeDiss;
     double lastScaleSig   = -1.0e30; // change signature (timbre gen + tuning shape)
-    bool   dissSortByStep = true;    // true = ascending from 1/1, false = by dissonance
     Scrim          rhythmScrim;
     RhythmPanel    rhythmPanel;
-    std::unique_ptr<ButtonAttachment>   rhythmOnAtt, rhythmMpeAtt;
+    std::unique_ptr<ButtonAttachment>   rhythmOnAtt, rhythmMpeAtt, rhythmTempoAtt;
     std::unique_ptr<ComboBoxAttachment> rhythmModeAtt;
     juce::uint32 lastRhythmGen = 0; // refresh the partial list when the template changes
     int lastTempoSent = -1;         // last CC20 BPM sent by the tempo-sync toggle
