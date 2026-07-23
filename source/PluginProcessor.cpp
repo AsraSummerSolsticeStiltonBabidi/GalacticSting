@@ -612,6 +612,109 @@ FractalAdditiveAudioProcessor::computeActiveScaleDissonance() const
     return out;
 }
 
+//==============================================================================
+// "From spectrum's segment" scale building.
+namespace
+{
+    // "2" / "3/2" / "500c" -> linear period ratio (>1). Falls back to 2.
+    double parsePeriodSpec (juce::String t)
+    {
+        t = t.trim();
+        double v = 2.0;
+        if (t.endsWithIgnoreCase ("c"))
+            v = std::exp2 (t.dropLastCharacters (1).getDoubleValue() / 1200.0);
+        else if (t.containsChar ('/'))
+        {
+            const double p = t.upToFirstOccurrenceOf ("/", false, false).getDoubleValue();
+            const double q = t.fromFirstOccurrenceOf ("/", false, false).getDoubleValue();
+            v = (p > 0.0 && q > 0.0) ? p / q : 2.0;
+        }
+        else if (t.getDoubleValue() > 0.0)
+            v = t.getDoubleValue();
+        return (v > 1.0001 && std::isfinite (v)) ? v : 2.0;
+    }
+}
+
+void FractalAdditiveAudioProcessor::segmentToggle (int partialIndex, bool rangeToAnchor)
+{
+    if (partialIndex < 0) return;
+    if (rangeToAnchor && segAnchor >= 0)
+    {
+        const int lo = juce::jmin (segAnchor, partialIndex);
+        const int hi = juce::jmax (segAnchor, partialIndex);
+        for (int i = lo; i <= hi; ++i) segSel.insert (i); // shift-click ADDS the span
+    }
+    else if (segSel.count (partialIndex))
+        segSel.erase (partialIndex);       // plain click on a selected one -> deselect
+    else
+        segSel.insert (partialIndex);      // plain click -> select
+    segAnchor = partialIndex;
+    rebuildSegmentScale();
+}
+
+void FractalAdditiveAudioProcessor::segmentClear() { segSel.clear(); segAnchor = -1; }
+bool FractalAdditiveAudioProcessor::segmentSelected (int i) const { return segSel.count (i) > 0; }
+int  FractalAdditiveAudioProcessor::segmentTonicIndex() const { return segSel.empty() ? -1 : *segSel.begin(); }
+int  FractalAdditiveAudioProcessor::segmentCount() const { return (int) segSel.size(); }
+void FractalAdditiveAudioProcessor::setSegmentPeriodText (const juce::String& s) { segPeriodText = s; rebuildSegmentScale(); }
+void FractalAdditiveAudioProcessor::setSegmentUseTopPeriod (bool b) { segUseTopPeriod = b; rebuildSegmentScale(); }
+
+void FractalAdditiveAudioProcessor::rebuildSegmentScale()
+{
+    const auto* t = spectrumEngine.getLive();
+    if (t == nullptr || segSel.empty()) return;
+
+    const int tonic = *segSel.begin();
+    if (tonic >= (int) t->partials.size()) return;
+    const double r0 = (double) t->partials[(size_t) tonic].ratio;
+    if (! (r0 > 0.0)) return;
+
+    // Period: the highest selected partial (relative to the tonic), or the typed spec.
+    double period = parsePeriodSpec (segPeriodText);
+    if (segUseTopPeriod)
+    {
+        const int top = *segSel.rbegin();
+        if (top < (int) t->partials.size())
+        {
+            const double pr = (double) t->partials[(size_t) top].ratio / r0;
+            if (pr > 1.0001 && std::isfinite (pr)) period = pr;
+        }
+    }
+
+    // Fold each selected partial's ratio-to-tonic into [1, period); drop the tonic
+    // (1/1 is implicit in a .scl) and any duplicate within ~0.5 cent.
+    std::vector<double> degs;
+    for (int idx : segSel)
+    {
+        if (idx >= (int) t->partials.size()) continue;
+        double r = (double) t->partials[(size_t) idx].ratio / r0;
+        if (! (r > 0.0) || ! std::isfinite (r)) continue;
+        while (r >= period - 1.0e-9) r /= period;
+        while (r < 1.0 - 1.0e-9)     r *= period;
+        if (r <= 1.0 + 1.0e-6) continue; // the tonic itself
+        bool dup = false;
+        for (double d : degs) if (std::abs (1200.0 * std::log2 (r / d)) < 0.5) { dup = true; break; }
+        if (! dup) degs.push_back (r);
+    }
+    std::sort (degs.begin(), degs.end());
+
+    juce::String scl;
+    scl << "! Fibl\xc3\xb3 - scale from spectrum segment\nSpectrum segment\n "
+        << juce::String ((int) degs.size() + 1) << "\n!\n";
+    for (double d : degs) scl << " " << juce::String (1200.0 * std::log2 (d), 5) << "\n";
+    scl << " " << juce::String (1200.0 * std::log2 (period), 5) << "\n";
+
+    juce::String err;
+    if (tuning.loadScalaString (scl, "segment", err))
+    {
+        if (auto* p = apvts.getParameter ("tuningMode"))
+            p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
+        tuning.setMode (TuningManager::Mode::Scala);
+        lastDissScl = scl; lastDissName = "spectrum-segment";
+        ++dissGeneration; // nudge the UI (keyboard/dissonance list) to refresh
+    }
+}
+
 bool FractalAdditiveAudioProcessor::saveGeneratedScl (const juce::File& f, juce::String& errorOut)
 {
     if (lastDissScl.isEmpty())
