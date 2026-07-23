@@ -376,11 +376,14 @@ public:
         const bool   aligned = phaseModeParam->load() < 0.5f;
         double rk = 1.0; // (1-slew)^k, advanced every sample in the loop below
 
-        // Filter cutoff = base * 2^(envAmount * filterEnv). Updated per block; the filter
-        // envelope itself advances every sample below.
+        // Filter cutoff TRACKS the played note: cutoff = f0 * 2^(cents/1200 + envOct).
+        // Cents (not Hz) means the same INTERVAL above every note -> the same
+        // partials are cut regardless of pitch (a partial at ratio r sits at
+        // 1200*log2(r) cents). Updated per block; the env advances every sample.
         {
-            const double octs = (double) fEnvAmtParam->load() * (double) filterEnvValue;
-            const double co = (double) fCutoffParam->load() * std::pow (2.0, octs);
+            const double octs = (double) fCutoffParam->load() / 1200.0
+                              + (double) fEnvAmtParam->load() * (double) filterEnvValue;
+            const double co = f0 * std::exp2 (octs);
             filter.setCutoffFrequency ((float) juce::jlimit (20.0, 0.49 * sr, co));
             filter.setResonance (juce::jlimit (0.1f, 40.0f, fResParam->load()));
         }

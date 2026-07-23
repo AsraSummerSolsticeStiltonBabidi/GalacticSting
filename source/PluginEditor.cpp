@@ -305,11 +305,18 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     configFader (gainFader, "masterGain", gainAtt, cEssentials, "Master output gain");
     gainFader.setSliderStyle (juce::Slider::LinearHorizontal);
     gainFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 46, 14);
-    // Whole-instrument octave transpose (+-5), a horizontal fader.
+    // OCTAVE cell, two rows: whole-instrument octave transpose (+-5) and the
+    // spectrum's octave span (hard-cut partials above 2^N x the note; 10 = full).
     configFader (octaveFader, "octaveShift", octaveAtt, cEssentials,
-                 "Transpose the WHOLE synth by whole octaves (+-5).");
+                 "Octave transpose: shift the WHOLE synth by whole octaves (+-5).");
     octaveFader.setSliderStyle (juce::Slider::LinearHorizontal);
     octaveFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 40, 14);
+    makeLabel (lblOctave, cEssentials);
+    configFader (spectrumRangeFader, "spectrumRange", spectrumRangeAtt, cEssentials,
+                 "Spectrum's octaves: remove every partial more than this many octaves above the played note. 10 = no cut (full spectrum).");
+    spectrumRangeFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    spectrumRangeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 40, 14);
+    makeLabel (lblRange, cEssentials);
 
     configCombo (primeModeBox,  "primeMode",  primeModeAtt,  cHarmonic, "Limit = drop harmonics with a prime factor above the value.  Whitelist = only the ticked primes.");
     configCombo (primeLimitBox, "primeLimit", primeLimitAtt, cHarmonic, "Largest prime factor allowed (Limit mode).");
@@ -330,6 +337,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 
     configGroup (gFilter, cFilter);
     configFader (cutoffFader,  "filterCutoff",    cutoffAtt,  cFilter, "Low-pass cutoff");
+    cutoffFader.setTextValueSuffix (" c"); // cents above the played note (note-tracking)
     configFader (resFader,     "filterResonance", resAtt,     cFilter, "Resonance");
     configFader (fEnvAmtFader, "filterEnvAmount", fEnvAmtAtt, cFilter, "How far the filter envelope moves the cutoff (octaves)");
     makeLabel (lblCutoff, cFilter); makeLabel (lblRes, cFilter); makeLabel (lblEnvAmt, cFilter);
@@ -639,9 +647,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // Integer faders: relative drag (no snap-to-click) so the drag distance,
     // not the track length, sets the resolution; Ctrl stretches it x4 (see
     // SteppedSlider). Base N (1..64) gets the longest travel = least sensitive.
-    for (auto* s : { &baseNFader, &fractalFader, &timbreRepeatsFader })
+    for (auto* s : { &baseNFader, &spectrumRangeFader, &fractalFader, &timbreRepeatsFader })
         s->setSliderSnapsToMousePosition (false);
     baseNFader.normalSensitivity         = 520;
+    spectrumRangeFader.normalSensitivity = 300;
     fractalFader.normalSensitivity       = 260;
     timbreRepeatsFader.normalSensitivity = 280;
 
@@ -736,7 +745,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.xLbl.setText (tr ("Divide by", "Divideix per"), dontSendNotification);
     rhythmPanel.nLbl.setText (tr ("n times", "n vegades"), dontSendNotification);
     rhythmPanel.noteHead.setText (tr ("MIDI note it sends", "Nota MIDI que envia"), dontSendNotification);
-    rhythmPanel.durHead.setText  (tr ("Note length (gate)", "Durada de la nota (gate)"), dontSendNotification);
+    rhythmPanel.durHead.setText  (tr ("GATE = how long each note lasts", "GATE = quant dura cada nota"), dontSendNotification);
     // (fromUTF8 directly: tr()'s English branch does not decode UTF-8 accents.)
     rhythmPanel.routeHelp.setText (juce::String::fromUTF8 (catalan
         ? "Ableton: a la pista receptora posa MIDI From -> (la pista del Fibl\xc3\xb3) i al SEGON selector tria \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" (la sortida MIDI del plugin), no l'entrada de la pista - i Monitor: In."
@@ -775,6 +784,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblBaseN.setText     ("N", dontSendNotification);
     lblBasePitch.setText (tr ("Pitch", "To"), dontSendNotification);
     lblFractal.setText   (tr ("Level", "Nivell"), dontSendNotification);
+    lblOctave.setText    (tr ("Transpose", "Transposa"), dontSendNotification);
+    lblRange.setText     (tr ("Spectrum", "Espectre"), dontSendNotification);
     lblPrimeLimit.setText(tr ("Limit", "L\xc3\xadmit"), dontSendNotification);
     lblCutoff.setText    (tr ("Cut", "Tall"), dontSendNotification);
     lblRes.setText       (tr ("Res", "Res"), dontSendNotification);
@@ -836,8 +847,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     for (int i = 0; i < 9; ++i)
         primeToggle[i].setTooltip (tr ("Allow harmonics whose prime factors include ",
                                        "Permet harm\xc3\xb2nics amb el factor primer ") + juce::String (pn2[i]));
-    cutoffFader.setTooltip (tr ("Low-pass filter cutoff, in Hz. Partials above it are attenuated.",
-                                "Freq\xc3\xbc\xc3\xa8ncia de tall del filtre passa-baixos, en Hz. Els parcials per sobre s'atenuen."));
+    cutoffFader.setTooltip (tr (
+        "Low-pass cutoff as an INTERVAL above the played note, in cents (1200 = one octave, 12000 = fully open). It TRACKS the note, so the same partials are cut at every pitch - a partial at ratio r sits at 1200*log2(r) cents (e.g. harmonic 2 = 1200c, harmonic 3 = 1902c). An absolute-Hz cutoff would eat different partials depending on the note.",
+        "Tall del passa-baixos com a INTERVAL per sobre de la nota tocada, en cents (1200 = una octava, 12000 = tot obert). SEGUEIX la nota, aix\xc3\xad que talla els mateixos parcials a qualsevol al\xc3\xa7""ada - un parcial de ratio r \xc3\xa9s a 1200*log2(r) cents (p. ex. harm\xc3\xb2nic 2 = 1200c, harm\xc3\xb2nic 3 = 1902c). Un tall en Hz absoluts es menjaria parcials diferents segons la nota."));
     resFader.setTooltip (tr ("Resonance: a volume peak right at the cutoff frequency.",
                              "Res(son\xc3\xa0ncia): un pic de volum just a la freq\xc3\xbc\xc3\xa8ncia de tall."));
     fEnvAmtFader.setTooltip (tr (
@@ -1601,7 +1613,15 @@ void FractalAdditiveAudioProcessorEditor::resized()
               lblRefHz.setBounds (rr.removeFromRight (22));
               refAEdit.setBounds (rr.reduced (2, 1)); }
             { auto c = ecOct.reduced (6, 3);   c.removeFromTop (lblH);
-              octaveFader.setBounds (c.withSizeKeepingCentre (c.getWidth(), juce::jmin (24, c.getHeight()))); }
+              const int rh = juce::jmax (14, c.getHeight() / 2);
+              auto r1 = c.removeFromTop (rh);
+              lblOctave.setJustificationType (juce::Justification::centredLeft);
+              lblOctave.setBounds (r1.removeFromLeft (66));
+              octaveFader.setBounds (r1);
+              auto r2 = c;
+              lblRange.setJustificationType (juce::Justification::centredLeft);
+              lblRange.setBounds (r2.removeFromLeft (66));
+              spectrumRangeFader.setBounds (r2); }
         }
     }
 

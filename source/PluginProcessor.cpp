@@ -119,9 +119,12 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         NormalisableRange<float> (-60.0f, 6.0f, 0.01f), 0.0f));
 
     //-- Filter + filter envelope ----------------------------------------------
+    // Cutoff is an INTERVAL above the played note (cents, 1200 = one octave), not
+    // absolute Hz: the filter tracks the note, so it always cuts the SAME partials
+    // (a partial at ratio r sits at 1200*log2(r) cents) regardless of pitch.
     params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "filterCutoff", 1 }, "Filter Cutoff",
-        NormalisableRange<float> (20.0f, 20000.0f, 1.0f, 0.25f), 20000.0f));
+        ParameterID { "filterCutoff", 1 }, "Filter Cutoff (cents above note)",
+        NormalisableRange<float> (0.0f, 12000.0f, 1.0f), 12000.0f));
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "filterResonance", 1 }, "Filter Resonance",
         NormalisableRange<float> (0.5f, 20.0f, 0.01f, 0.5f), 0.7f));
