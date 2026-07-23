@@ -108,10 +108,11 @@ namespace
             bb = measure (tf, ga);
         }
 
-        // FLUSH with the box's left border, sitting at the very top INSIDE the box, so
-        // its top is never clipped and it stays clear of the controls below.
+        // The chip's LEFT edge sits exactly on the frame's left border line (outer
+        // edge of the 2.6px stroke), so the box border reads as a continuation of
+        // the chip's own left edge. Top stays inside the box (never clipped).
         const float chipW = juce::jmin (maxW, bb.getWidth() + 11.0f);
-        auto chip = juce::Rectangle<float> (box.getX() + 1.3f, box.getY() + 1.0f, chipW, chipH);
+        auto chip = juce::Rectangle<float> (box.getX(), box.getY() + 1.0f, chipW, chipH);
 
         // Rounded TOP corners, sharp (angular) BOTTOM corners.
         const float rad = juce::jmin (6.0f, chipW * 0.5f);
@@ -156,6 +157,8 @@ namespace
             // so two decimals fit in the narrow box instead of clipping to "...".
             if (dynamic_cast<juce::Slider*> (l.getParentComponent()) != nullptr)
                 return juce::Font (juce::FontOptions (10.0f));
+            if (l.getName() == "small") // opt-out of the 12.5px floor (e.g. the play-keys hint)
+                return l.getFont();
             return juce::Font (juce::FontOptions (juce::jmax (12.5f, l.getFont().getHeight())).withStyle ("Bold"));
         }
 
@@ -222,6 +225,31 @@ namespace
             g.setFont (getTextButtonFont (b, b.getHeight()));
             g.drawFittedText (b.getButtonText(), b.getLocalBounds().reduced (4, 0),
                               juce::Justification::centred, 2);
+        }
+
+        // ADSR-style faders carry their letter INSIDE the drag thumb (the slider's
+        // name, e.g. "A"): bigger thumb, letter black/white by the thumb's colour -
+        // the same rule as the keyboard keys and the title letters.
+        int getSliderThumbRadius (juce::Slider& s) override
+        {
+            if (s.getName().isNotEmpty() && s.isVertical())
+                return 11;
+            return juce::LookAndFeel_V4::getSliderThumbRadius (s);
+        }
+        void drawLinearSlider (juce::Graphics& g, int x, int y, int w, int h,
+                               float sliderPos, float minPos, float maxPos,
+                               juce::Slider::SliderStyle style, juce::Slider& s) override
+        {
+            juce::LookAndFeel_V4::drawLinearSlider (g, x, y, w, h, sliderPos, minPos, maxPos, style, s);
+            if (s.getName().isNotEmpty() && s.isVertical())
+            {
+                const auto col = s.findColour (juce::Slider::thumbColourId);
+                g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
+                g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+                g.drawText (s.getName(),
+                            juce::Rectangle<float> ((float) x + (float) w * 0.5f - 11.0f, sliderPos - 11.0f, 22.0f, 22.0f),
+                            juce::Justification::centred, false);
+            }
         }
 
         // Text FIELDS (combo boxes + text editors) are as rounded as possible - a
@@ -293,6 +321,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     configFader (baseNFader,   "baseN",    baseNAtt,     cHarmonic, "Base harmonic N");
     configCombo (basePitchBox, "baseMode", basePitchAtt, cHarmonic, "Original = harmonics at natural positions.  Transposed down = lowest partial at the played pitch.");
     makeLabel (lblBaseN, cHarmonic); makeLabel (lblBasePitch, cHarmonic);
+    lblBasePitch.setJustificationType (juce::Justification::centredLeft); // top-LEFT of its combo, like the others
 
     // Morphing: when ON, a spectrum change glides each partial to its new position
     // (a per-partial pitch bend) over the Morph time, instead of snapping.
@@ -346,10 +375,14 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     };
     const auto octTip = juce::String ("Octave transpose: shift the WHOLE synth by whole octaves (+-5).");
     const auto sprTip = juce::String ("Spectrum's octaves: keep only partials within this many octaves above the played note. 10 = no cut (full spectrum).");
-    configStep (octDn, "-1", "octaveShift", -1, octTip);
-    configStep (octUp, "+1", "octaveShift",  1, octTip);
-    configStep (sprDn, "-1", "spectrumRange", -1, sprTip);
-    configStep (sprUp, "+1", "spectrumRange",  1, sprTip);
+    configStep (octDn, "-", "octaveShift", -1, octTip);
+    configStep (octUp, "+", "octaveShift",  1, octTip);
+    configStep (sprDn, "-", "spectrumRange", -1, sprTip);
+    configStep (sprUp, "+", "spectrumRange",  1, sprTip);
+    octDn.setColour (juce::TextButton::buttonColourId, cReset.withAlpha (0.85f)); // "-" red
+    sprDn.setColour (juce::TextButton::buttonColourId, cReset.withAlpha (0.85f));
+    octUp.setColour (juce::TextButton::buttonColourId, cLoad.withAlpha (0.95f));  // "+" green
+    sprUp.setColour (juce::TextButton::buttonColourId, cLoad.withAlpha (0.95f));
     for (auto* v : { &octVal, &sprVal })
     {
         v->setJustificationType (juce::Justification::centred);
@@ -397,6 +430,11 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         configFader (ampAdsr[i],   ampIds[i],   ampAdsrAtt[i],   cEnv,    "Amplitude envelope");
         configFader (filtAdsr[i],  fltIds[i],   filtAdsrAtt[i],  cFilter, "Filter envelope");
         configFader (pitchAdsr[i], pitchIds[i], pitchAdsrAtt[i], cPitch,  "Pitch envelope");
+        // The letter rides INSIDE the drag thumb (see GalacticLnF::drawLinearSlider);
+        // the old labels above the faders stay hidden (layoutFaders skips them).
+        ampAdsr[i]  .setName (adsrTxt[i]);
+        filtAdsr[i] .setName (adsrTxt[i]);
+        pitchAdsr[i].setName (adsrTxt[i]);
         makeLabel (ampAdsrLbl[i],   cEnv);    ampAdsrLbl[i].setText   (adsrTxt[i], juce::dontSendNotification);
         makeLabel (filtAdsrLbl[i],  cFilter); filtAdsrLbl[i].setText  (adsrTxt[i], juce::dontSendNotification);
         makeLabel (pitchAdsrLbl[i], cPitch);  pitchAdsrLbl[i].setText (adsrTxt[i], juce::dontSendNotification);
@@ -533,8 +571,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             rhythmPanel.refreshSlots();
             rhythmPanel.refreshLive();
         }
+        rhythmScrim.setVisible (show); // dims + click-blocks everything behind the panel
         rhythmPanel.setVisible (show);
-        if (! show) refocus();
+        if (show) { rhythmScrim.toFront (false); rhythmPanel.toFront (false); }
+        else refocus();
     };
     addAndMakeVisible (rhythmBtn);
 
@@ -542,6 +582,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     rhythmPanel.ratioName = [] (double r) { return justName (r); };
     rhythmPanel.trF       = [this] (const char* en, const char* ca) { return tr (en, ca); };
     rhythmPanel.onEdited  = [this] { refocus(); };
+    rhythmPanel.onClose   = [this]
+    { rhythmPanel.setVisible (false); rhythmScrim.setVisible (false); refocus(); };
+    rhythmScrim.onClick   = rhythmPanel.onClose; // click OUTSIDE the panel = close
+    addChildComponent (rhythmScrim);
     rhythmPanel.init();
     addChildComponent (rhythmPanel);
     rhythmOnAtt   = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmOn",   rhythmPanel.onT);
@@ -602,7 +646,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addAndMakeVisible (dissBtn);
     for (int i = 1; i <= 24; ++i)
         dissCountBox.addItem (juce::String (i), i);
-    dissCountBox.setSelectedId (7, juce::dontSendNotification);
+    dissCountBox.setSelectedId (5, juce::dontSendNotification);
+    makeLabel (lblSteps, cSpecScale);
     dissCountBox.setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
     dissCountBox.setMouseClickGrabsKeyboardFocus (false);
     dissCountBox.onChange = [this] { refocus(); };
@@ -662,6 +707,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // Master reference A = <hz> (transposes everything, all tuning modes). A text
     // box you type the Hz into (with "hz" shown to its right), not a fader.
     refAEdit.setJustification (juce::Justification::centred);
+    refAEdit.setFont (juce::Font (juce::FontOptions (13.0f))); // fits the slim cell, no clipped descenders
     refAEdit.setInputRestrictions (7, "0123456789.");
     refAEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
     refAEdit.setColour (juce::TextEditor::outlineColourId, cEssentials.withAlpha (0.7f));
@@ -705,7 +751,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addAndMakeVisible (meterLabel);
     helpLabel.setJustificationType (juce::Justification::centred);
     helpLabel.setColour (juce::Label::textColourId, juce::Colour (0xff9aa0b0));
-    helpLabel.setFont (juce::Font (juce::FontOptions (9.5f)));
+    helpLabel.setName ("small"); // opt-out of the LnF's 12.5px label floor
+    helpLabel.setFont (juce::Font (juce::FontOptions (8.5f))); // smaller: it is a hint, not a control
     addAndMakeVisible (helpLabel);
 
     keyboard.setDegreeLabeller ([this] (int d) { return justName (processorRef.getDegreeRatio (d)); });
@@ -860,6 +907,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblTimbreRepeats.setText (tr ("Reps", "Reps"), dontSendNotification);
     lblBend.setText      (tr ("Pitch bend", "Pitch bend"), dontSendNotification);
     lblPeriod.setText    (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
+    lblSteps.setText     (tr ("Steps", "Passos"), dontSendNotification);
     lblRefA.setText      ("A =", dontSendNotification);
     lblTuningBank.setText (tr ("Tuning bank", "Banc d'afinacions"), dontSendNotification);
     degreeList.tip = tr (
@@ -1366,7 +1414,10 @@ void FractalAdditiveAudioProcessorEditor::layoutFaders (juce::GroupComponent& g,
     for (int i = 0; i < n; ++i, ++fit, ++lit)
     {
         auto c = in.removeFromLeft (cw);
-        (*lit)->setBounds (c.removeFromTop (13));
+        // Named faders (A/D/S/R) carry the letter inside the thumb -> no label above.
+        const bool inThumb = (*fit)->getName().isNotEmpty();
+        (*lit)->setVisible (! inThumb);
+        if (! inThumb) (*lit)->setBounds (c.removeFromTop (13));
         (*fit)->setBounds (c);
     }
 }
@@ -1390,7 +1441,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     int squaresN = 0, spaces = 0;
     for (int i = 0; i < L; ++i) (title[i] == ' ' ? spaces : squaresN)++;
     float total = (float) squaresN * (side + gap) + (float) spaces * (side * 0.5f);
-    const float freeLeft  = 372.0f;                      // clears Menu/Presets/Save + the credit
+    const float freeLeft  = 214.0f;                      // clears credit/Menu/Presets/Save
     const float freeRight = (float) getWidth() - 186.0f; // clears the Spectrum-to-Rhythm button
     const float freeW     = juce::jmax (120.0f, freeRight - freeLeft);
     if (total > freeW) { side *= freeW / total; total = freeW; }
@@ -1402,7 +1453,11 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     struct Sq { juce::Rectangle<float> rect; juce::Colour col; juce::Path glyph; juce::Colour glyphCol; };
     std::vector<Sq> squares;
     {
-        float x = freeLeft + (freeW - total) * 0.5f;
+        // Centre the title on the FULL window width (clamped to the free zone), so
+        // "Fibló Galàctic" sits truly centred rather than centred-between-buttons.
+        float x = ((float) getWidth() - total) * 0.5f;
+        x = juce::jmax (x, freeLeft);
+        if (x + total > freeRight) x = freeRight - total;
         const float cy = (float) titleArea.getCentreY();
         for (int i = 0; i < L; ++i)
         {
@@ -1514,11 +1569,19 @@ void FractalAdditiveAudioProcessorEditor::resized()
     auto titleBar = full.removeFromTop (68);
     langButton.setVisible (false); // language now lives inside the Menu popup
     {
-        // Left cluster, two rows: Menu on top, [Presets][Save] under it - Save sits
-        // directly BELOW Menu, the preset selector directly LEFT of Save.
+        // Left cluster, two rows: the credit at the very top-left (just above the
+        // preset selector) with Menu after it, then [Presets][Save] - Save directly
+        // BELOW Menu, the preset selector directly LEFT of Save.
         auto lc = titleBar.removeFromLeft (208).withTrimmedLeft (8);
-        auto r1 = lc.removeFromTop (32).withTrimmedTop (8);
-        r1.removeFromLeft (150 + 4); // Menu column starts above Save
+        auto r1 = lc.removeFromTop (30).withTrimmedTop (8);
+        {
+            auto credit = r1.removeFromLeft (150).withHeight (18);
+            vibeLabel.setJustificationType (juce::Justification::centredLeft);
+            vibeLabel.setBounds (credit.removeFromLeft (92));
+            credit.removeFromLeft (2);
+            vibeLink.setBounds (credit);
+        }
+        r1.removeFromLeft (4);
         menuButton.setBounds (r1.removeFromLeft (46).withHeight (22));
         auto r2 = lc.withTrimmedTop (2).withHeight (22);
         presetBox.setBounds (r2.removeFromLeft (150));
@@ -1527,14 +1590,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
     }
     // Spectrum-to-Rhythm: top right, high-contrast.
     rhythmBtn.setBounds (titleBar.removeFromRight (178).withSizeKeepingCentre (168, 26));
-    {
-        // Credit just LEFT of the title zone (the title starts at x = 372, see paint()).
-        auto credit = juce::Rectangle<int> (212, titleBar.getY(), 154, titleBar.getHeight())
-                          .withSizeKeepingCentre (154, 20);
-        vibeLink.setBounds (credit.removeFromRight (46));
-        credit.removeFromRight (3);
-        vibeLabel.setBounds (credit);
-    }
 
     auto area = full.reduced (6, 4);
 
@@ -1573,17 +1628,20 @@ void FractalAdditiveAudioProcessorEditor::resized()
         gSpecScale.setBounds (sp.reduced (3));
         auto si = sp.reduced (3).reduced (8, 5); si.removeFromTop (16);
         auto r1 = si.removeFromTop (24);
-        dissBtn.setBounds (r1.removeFromLeft (r1.getWidth() - 52).reduced (1, 0));
-        r1.removeFromLeft (4);
+        dissBtn.setBounds (r1.removeFromLeft (r1.getWidth() - 92).reduced (1, 0));
+        r1.removeFromLeft (3);
+        lblSteps.setJustificationType (juce::Justification::centredLeft);
+        lblSteps.setBounds (r1.removeFromLeft (38));
         compact (dissCountBox, r1);
         si.removeFromTop (4);
         auto r2 = si.removeFromTop (24);
-        lblPeriod.setBounds (r2.removeFromLeft (38));
-        periodEdit.setBounds (r2.removeFromLeft (44).reduced (0, 1));
-        r2.removeFromLeft (4);
-        compact (dissModeBox, r2.removeFromLeft (68));
-        r2.removeFromLeft (4);
-        dissSaveBtn.setBounds (r2.reduced (1, 0));
+        lblPeriod.setJustificationType (juce::Justification::centredLeft);
+        lblPeriod.setBounds (r2.removeFromLeft (44));
+        periodEdit.setBounds (r2.removeFromLeft (36).reduced (0, 1));
+        r2.removeFromLeft (3);
+        compact (dissModeBox, r2.removeFromLeft (54));
+        r2.removeFromLeft (3);
+        dissSaveBtn.setBounds (r2.reduced (0, 1)); // full remaining width - never clipped
         si.removeFromTop (6);
         degreeList.setBounds (si);
     }
@@ -1671,34 +1729,36 @@ void FractalAdditiveAudioProcessorEditor::resized()
             e.removeFromTop (17); // clear the "ESSENTIALS" title
             // OCTAVE hosts TWO stepper rows -> it gets a fixed, taller share and the
             // other three cells split the rest evenly.
-            const int octH = juce::jmin (64, e.getHeight() / 2);
+            const int octH = juce::jmin (58, e.getHeight() / 2);
             const int ch   = (e.getHeight() - octH) / 3;
             ecPhase = e.removeFromTop (ch);
             ecGain  = e.removeFromTop (ch);
             ecRef   = e.removeFromTop (ch);
             ecOct   = e;
-            const int lblH = 15; // inline PHASE / GAIN / REFERENCE / OCTAVE band
-            { auto c = ecPhase.reduced (6, 3); c.removeFromTop (lblH); compact (phaseBox, c); }
-            { auto c = ecGain.reduced (6, 3);  c.removeFromTop (lblH);
-              gainFader.setBounds (c.withSizeKeepingCentre (c.getWidth(), juce::jmin (24, c.getHeight()))); }
-            { auto c = ecRef.reduced (6, 3);   c.removeFromTop (lblH);
-              auto rr = c.withSizeKeepingCentre (c.getWidth(), juce::jmin (24, c.getHeight()));
+            // Tighter label band + slimmer padding = the controls breathe (the
+            // Reference value used to clip its descenders).
+            const int lblH = 13; // inline PHASE / GAIN / REFERENCE / OCTAVE band
+            { auto c = ecPhase.reduced (6, 1); c.removeFromTop (lblH); compact (phaseBox, c); }
+            { auto c = ecGain.reduced (6, 1);  c.removeFromTop (lblH);
+              gainFader.setBounds (c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))); }
+            { auto c = ecRef.reduced (6, 1);   c.removeFromTop (lblH);
+              auto rr = c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()));
               lblRefA.setJustificationType (juce::Justification::centredLeft);
               lblRefA.setBounds (rr.removeFromLeft (26));
               lblRefHz.setBounds (rr.removeFromRight (22));
-              refAEdit.setBounds (rr.reduced (2, 1)); }
+              refAEdit.setBounds (rr); }
             { auto c = ecOct.reduced (6, 1);   c.removeFromTop (13); c.removeFromBottom (4);
               const int rh = juce::jmax (14, c.getHeight() / 2);
+              // [label][white value][- red][+ green]: value first, steppers to its right.
               auto stepRow = [] (juce::Rectangle<int> row, juce::Label& lbl,
                                  juce::TextButton& dn, juce::Label& val, juce::TextButton& up)
               {
                   lbl.setJustificationType (juce::Justification::centredLeft);
                   lbl.setBounds (row.removeFromLeft (66));
+                  val.setBounds (row.removeFromLeft (40));
                   dn.setBounds  (row.removeFromLeft (26).reduced (0, 1));
-                  row.removeFromLeft (2);
-                  up.setBounds  (row.removeFromRight (26).reduced (0, 1));
-                  row.removeFromRight (2);
-                  val.setBounds (row);
+                  row.removeFromLeft (3);
+                  up.setBounds  (row.removeFromLeft (26).reduced (0, 1));
               };
               stepRow (c.removeFromTop (rh), lblOctave, octDn, octVal, octUp);
               stepRow (c,                    lblRange,  sprDn, sprVal, sprUp); }
@@ -1774,22 +1834,39 @@ void FractalAdditiveAudioProcessorEditor::resized()
             {
                 loadSclButton.setBounds (brow.reduced (2, 0));
             }
-            ti.removeFromTop (4);
-            recentLabel.setBounds (ti.removeFromTop (14));
-            auto rrow = ti.removeFromTop (24);
-            const int rw = rrow.getWidth() / 3;
-            for (int i = 0; i < 3; ++i) recentBtn[i].setBounds (rrow.removeFromLeft (rw).reduced (2, 1));
-            ti.removeFromTop (3);
-            auto bendRow = ti.removeFromTop (22);
-            lblBend.setJustificationType (juce::Justification::centredLeft);
-            lblBend.setBounds (bendRow.removeFromLeft (74));
-            compact (bendBox, bendRow.removeFromLeft (juce::jmin (120, bendRow.getWidth())));
-            ti.removeFromTop (5);
-            lblTuningBank.setBounds (ti.removeFromTop (14));
-            auto bkrow = ti.removeFromTop (24);
-            tuningBankLoadBtn.setBounds (bkrow.removeFromRight (36).reduced (1, 0));
-            bkrow.removeFromRight (3);
-            compact (tuningBankBox, bkrow);
+            // Pitch bend ABOVE Recent; hidden in MPE-input mode (the MPE zone fixes
+            // the per-note range at +-48, so the choice is irrelevant there).
+            const int  mode    = processorRef.getTuningMode();
+            const bool sclMode = mode == 2;
+            const bool bendVis = mode != 3;
+            lblBend.setVisible (bendVis); bendBox.setVisible (bendVis);
+            if (bendVis)
+            {
+                ti.removeFromTop (3);
+                auto bendRow = ti.removeFromTop (22);
+                lblBend.setJustificationType (juce::Justification::centredLeft);
+                lblBend.setBounds (bendRow.removeFromLeft (74));
+                compact (bendBox, bendRow.removeFromLeft (juce::jmin (120, bendRow.getWidth())));
+            }
+            // Recent + Tuning bank only make sense in Scala (.scl) mode.
+            recentLabel.setVisible (sclMode);
+            for (int i = 0; i < 3; ++i) recentBtn[i].setVisible (sclMode && recentBtn[i].getButtonText().isNotEmpty());
+            lblTuningBank.setVisible (sclMode); tuningBankBox.setVisible (sclMode);
+            tuningBankLoadBtn.setVisible (sclMode);
+            if (sclMode)
+            {
+                ti.removeFromTop (4);
+                recentLabel.setBounds (ti.removeFromTop (14));
+                auto rrow = ti.removeFromTop (24);
+                const int rw = rrow.getWidth() / 3;
+                for (int i = 0; i < 3; ++i) recentBtn[i].setBounds (rrow.removeFromLeft (rw).reduced (2, 1));
+                ti.removeFromTop (5);
+                lblTuningBank.setBounds (ti.removeFromTop (14));
+                auto bkrow = ti.removeFromTop (24);
+                tuningBankLoadBtn.setBounds (bkrow.removeFromRight (36).reduced (1, 0));
+                bkrow.removeFromRight (3);
+                compact (tuningBankBox, bkrow);
+            }
         }
     }
 
@@ -1797,7 +1874,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
     warningOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (580, 200));
     warningOverlay.toFront (false);
     noticeOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (560, 220));
+    rhythmScrim.setBounds (getLocalBounds());
     rhythmPanel.setBounds (getLocalBounds().withSizeKeepingCentre (780, 540));
+    rhythmScrim.toFront (false);
     rhythmPanel.toFront (false);
 }
 
@@ -1973,21 +2052,23 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         : tr ("Custom engine off", "Motor propi apagat");
     timbreStatusLabel.setText (tms, juce::dontSendNotification);
 
-    // Recent .scl buttons.
+    // Recent .scl buttons (only in Scala mode - resized() also gates them).
     const auto recents = processorRef.getRecentSclPaths();
+    const bool sclMode = processorRef.getTuningMode() == 2;
     for (int i = 0; i < 3; ++i)
     {
-        const bool has = i < recents.size();
+        const bool has = sclMode && i < recents.size();
         recentBtn[i].setVisible (has);
-        if (has) recentBtn[i].setButtonText (juce::File (recents[i]).getFileNameWithoutExtension());
+        if (i < recents.size()) recentBtn[i].setButtonText (juce::File (recents[i]).getFileNameWithoutExtension());
     }
 
     // Hide the "undo" buttons when there is nothing to undo: Reset only matters
     // away from plain 12-TET, Off only when Timbre mode is actually on. Relayout
-    // so the Load button expands to fill the freed space.
+    // so the Load button expands to fill the freed space. The tuning MODE is packed
+    // in too: Recent/Tuning-bank/Pitch-bend visibility depends on it.
     const bool resetVis = processorRef.getTuningMode() != 0 || processorRef.tuningHasScala();
     const bool offVis   = processorRef.isTimbreActive();
-    const int  packed   = (resetVis ? 1 : 0) | (offVis ? 2 : 0);
+    const int  packed   = (resetVis ? 1 : 0) | (offVis ? 2 : 0) | (processorRef.getTuningMode() << 2);
     if (packed != lastResetOffState) { lastResetOffState = packed; resized(); }
 
     const int mode = (int) (processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f);
