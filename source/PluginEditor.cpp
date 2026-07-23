@@ -530,6 +530,11 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuningNameLabel.setJustificationType (juce::Justification::centredLeft);
     tuningNameLabel.setColour (juce::Label::textColourId, cTuning); // the loaded scale's file name
     tuningNameLabel.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
+    // Period of the active scale, in RED, clearly labelled.
+    tuningPeriodLbl.setJustificationType (juce::Justification::centredLeft);
+    tuningPeriodLbl.setColour (juce::Label::textColourId, juce::Colour (0xffe0453f));
+    tuningPeriodLbl.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
+    addAndMakeVisible (tuningPeriodLbl);
     addAndMakeVisible (tuningNameLabel);
 
     // Tuning bank: a slot selector (automatable) + a button to load a .scl into it.
@@ -739,10 +744,53 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // Scale-dissonance box (its own group, right of Tuning): the live per-degree
     // Sethares dissonance of the ACTIVE scale, in a scrollable, header-sortable list.
     configGroup (gScaleDiss, cScaleDiss);
+    gTuning.setVisible (false);   // the Tuning + dissonance L-frame is painted in paint()
+    gScaleDiss.setVisible (false);
     addAndMakeVisible (dissHeader);
     dissView.setViewedComponent (&degreeList, false); // Viewport owns display, not deletion
     dissView.setScrollBarsShown (true, false);
     addAndMakeVisible (dissView); // tooltip set in applyLanguage()
+
+    // Spectrum-to-Tuning MODE selector: Sethares dissonance (Transmute) vs the new
+    // "from spectrum's segment" partial picker. Relayout + reflect the tuning on change.
+    specModeBox.addItem ("Based on Sethares dissonance", 1);
+    specModeBox.addItem ("From spectrum's segment",       2);
+    specModeBox.setSelectedId (1, juce::dontSendNotification);
+    specModeBox.setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
+    specModeBox.setMouseClickGrabsKeyboardFocus (false);
+    specModeBox.onChange = [this]
+    {
+        if (specModeBox.getSelectedId() == 2) processorRef.rebuildSegmentScale();
+        resized(); refocus();
+    };
+    addAndMakeVisible (specModeBox);
+
+    segList.proc      = &processorRef;
+    segList.ratioName = [] (double r) { return justName (r); };
+    segList.onChange  = [this] { segList.repaint(); updateScaleDissonance(); refocus(); };
+    segView.setViewedComponent (&segList, false);
+    segView.setScrollBarsShown (true, false);
+    addAndMakeVisible (segView);
+    makeLabel (segPeriodLbl, cSpecScale);
+    segPeriodEdit.setText ("2", juce::dontSendNotification);
+    segPeriodEdit.setJustification (juce::Justification::centred);
+    segPeriodEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
+    segPeriodEdit.setColour (juce::TextEditor::outlineColourId, cSpecScale.withAlpha (0.7f));
+    segPeriodEdit.setSelectAllWhenFocused (true);
+    segPeriodEdit.onReturnKey = [this] { processorRef.setSegmentPeriodText (segPeriodEdit.getText()); refocus(); };
+    segPeriodEdit.onFocusLost = [this] { processorRef.setSegmentPeriodText (segPeriodEdit.getText()); };
+    addAndMakeVisible (segPeriodEdit);
+    segTopToggle.onClick = [this]
+    {
+        processorRef.setSegmentUseTopPeriod (segTopToggle.getToggleState());
+        segPeriodEdit.setEnabled (! segTopToggle.getToggleState());
+        refocus();
+    };
+    addAndMakeVisible (segTopToggle);
+    segHelpLbl.setJustificationType (juce::Justification::topLeft);
+    segHelpLbl.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
+    segHelpLbl.setFont (juce::Font (juce::FontOptions (10.5f)));
+    addAndMakeVisible (segHelpLbl);
 
     // Spectrum Builder: typed intervals -> partials (Enter applies them).
     intervalEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
@@ -985,6 +1033,15 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
                                          juce::Colour (0xff8f96a8));
     gSpecScale.setText     (tr ("Spectrum to Tuning", "Espectre a afinaci\xc3\xb3"));
     gScaleDiss.setText     (tr ("Scale Dissonance", "Dissonancia de l'escala"));
+    segPeriodLbl.setText   (tr ("Period", "Per\xc3\xado" "de"), juce::dontSendNotification);
+    segTopToggle.setButtonText (tr ("= top", "= sup"));
+    segTopToggle.setTooltip (tr ("Use the highest selected partial as the period (instead of the typed value).",
+                                 "Fes servir el parcial seleccionat m\xc3\xa9s agut com a per\xc3\xado" "de (en lloc del valor escrit)."));
+    segHelpLbl.setText (tr ("Click partials to add them to the scale; Shift-click for a range. Lowest selected = tonic (C3).",
+                            "Clica parcials per afegir-los a l'escala; Shift-clic per un rang. El m\xc3\xa9s greu seleccionat = t\xc3\xb2nica (C3)."),
+                        juce::dontSendNotification);
+    segList.tip = tr ("Each partial of the current spectrum. Click to add/remove it as a scale degree (live). Shift-click selects the span to the last click. The lowest selected is the tonic (C3); all selected share one colour.",
+                      "Cada parcial de l'espectre actual. Clica per afegir/treure'l com a grau de l'escala (en viu). Shift-clic selecciona el tram fins a l'\xc3\xbaltim clic. El m\xc3\xa9s greu seleccionat \xc3\xa9s la t\xc3\xb2nica (C3); tots els seleccionats comparteixen color.");
 
     lblBaseN.setText     ("N", dontSendNotification);
     lblBasePitch.setText (tr ("Pitch", "To"), dontSendNotification);
@@ -1688,6 +1745,28 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         subLabel (ecOct,   cEssentials, tr ("OCTAVE", "OCTAVA"),     1.0f);
     }
 
+    // Inverted-L TUNING box: the dissonance BAR (right, tall) + the controls FOOT
+    // (bottom-left), one frame, one colour, with an internal divider between them.
+    if (! lFootBounds.isEmpty() && ! lBarBounds.isEmpty())
+    {
+        constexpr float titleH = 21.0f;
+        auto barF = juce::Rectangle<float> ((float) lBarBounds.getX() + 1.3f, (float) lBarBounds.getY() + 1.3f,
+                                            (float) lBarBounds.getWidth() - 2.6f, (float) lBarBounds.getHeight() - 2.6f);
+        auto footF = juce::Rectangle<float> ((float) lFootBounds.getX() + 1.3f, (float) lFootBounds.getY() + titleH * 0.5f,
+                                             barF.getX() - ((float) lFootBounds.getX() + 1.3f), 0.0f);
+        footF.setBottom (barF.getBottom());
+        const auto shape = lShapedFrame (barF, footF, 9.0f);
+        g.setColour (juce::Colour (0xff17171f).interpolatedWith (cTuning, 0.05f));
+        g.fillPath (shape);
+        g.setColour (cTuning.withAlpha (0.95f));
+        g.strokePath (shape, juce::PathStrokeType (2.6f));
+        g.setColour (cTuning.withAlpha (0.5f)); // divider between FOOT (controls) and BAR (dissonance)
+        g.drawLine (barF.getX(), footF.getY(), barF.getX(), barF.getBottom(), 1.0f);
+        drawTitleChip (g, juce::Rectangle<float> ((float) lFootBounds.getX(), (float) lFootBounds.getY(),
+                                                  (float) lFootBounds.getWidth(), (float) lFootBounds.getHeight()),
+                       cTuning, tr ("TUNING", "AFINACI\xc3\x93"));
+    }
+
     // Title squares + glyphs, drawn LAST so each connector line disappears under
     // the letter it points to (its end tucks beneath the square).
     for (const auto& s : squares)
@@ -1761,38 +1840,64 @@ void FractalAdditiveAudioProcessorEditor::resized()
         compact (c, r);
     };
 
-    //== Right column, split in two: Spectrum to Tuning (top) over the live Scale
-    //   Dissonance list (bottom, sitting to the right of the Tuning box) ==========
+    //== Right column: Spectrum to Tuning (top) over the dissonance BAR of the L
+    //   Tuning box (its FOOT is the Tuning-controls cell of row 2, to the left) =====
     {
         auto sp = area.removeFromRight (208);
-        // Spectrum-to-Tuning keeps only what its controls need (title + 2 rows); the
-        // freed space goes to the taller Scale Dissonance list below it.
-        auto spTop = sp.removeFromTop (96);
+        const bool seg = specModeBox.getSelectedId() == 2; // "from spectrum's segment"
+        auto spTop = sp.removeFromTop (seg ? 226 : 124);   // taller for the partial list
         sp.removeFromTop (4);
-        auto spBot = sp;                            // the rest, to the right of Tuning
+        lBarBounds = sp;                                   // dissonance BAR of the L
 
-        // --- Spectrum to Tuning: just the Transmute controls (no more list) ---
         gSpecScale.setBounds (spTop.reduced (3));
         auto si = spTop.reduced (3).reduced (8, 5); si.removeFromTop (16);
-        auto r1 = si.removeFromTop (24);
-        dissBtn.setBounds (r1.removeFromLeft (r1.getWidth() - 92).reduced (1, 0));
-        r1.removeFromLeft (3);
-        lblSteps.setJustificationType (juce::Justification::centredLeft);
-        lblSteps.setBounds (r1.removeFromLeft (38));
-        compact (dissCountBox, r1);
+        compact (specModeBox, si.removeFromTop (22));
         si.removeFromTop (4);
-        auto r2 = si.removeFromTop (24);
-        lblPeriod.setJustificationType (juce::Justification::centredLeft);
-        lblPeriod.setBounds (r2.removeFromLeft (44));
-        periodEdit.setBounds (r2.removeFromLeft (36).reduced (0, 1));
-        r2.removeFromLeft (3);
-        compact (dissModeBox, r2.removeFromLeft (54));
-        r2.removeFromLeft (3);
-        dissSaveBtn.setBounds (r2.reduced (0, 1)); // full remaining width - never clipped
 
-        // --- Scale Dissonance: sortable header + scrollable list ---
-        gScaleDiss.setBounds (spBot.reduced (3));
-        auto di = spBot.reduced (3).reduced (8, 5); di.removeFromTop (16);
+        // Mode-gated visibility.
+        juce::Component* sethC[] = { &dissBtn, &dissCountBox, &lblSteps, &periodEdit, &dissModeBox, &dissSaveBtn, &lblPeriod };
+        juce::Component* segC[]  = { &segView, &segPeriodEdit, &segTopToggle, &segPeriodLbl, &segHelpLbl };
+        for (auto* c : sethC) c->setVisible (! seg);
+        for (auto* c : segC)  c->setVisible (seg);
+
+        if (! seg)
+        {
+            auto r1 = si.removeFromTop (24);
+            dissBtn.setBounds (r1.removeFromLeft (r1.getWidth() - 92).reduced (1, 0));
+            r1.removeFromLeft (3);
+            lblSteps.setJustificationType (juce::Justification::centredLeft);
+            lblSteps.setBounds (r1.removeFromLeft (38));
+            compact (dissCountBox, r1);
+            si.removeFromTop (4);
+            auto r2 = si.removeFromTop (24);
+            lblPeriod.setJustificationType (juce::Justification::centredLeft);
+            lblPeriod.setBounds (r2.removeFromLeft (44));
+            periodEdit.setBounds (r2.removeFromLeft (36).reduced (0, 1));
+            r2.removeFromLeft (3);
+            compact (dissModeBox, r2.removeFromLeft (54));
+            r2.removeFromLeft (3);
+            dissSaveBtn.setBounds (r2.reduced (0, 1));
+        }
+        else
+        {
+            auto pr = si.removeFromTop (22);
+            segPeriodLbl.setJustificationType (juce::Justification::centredLeft);
+            segPeriodLbl.setBounds (pr.removeFromLeft (48));
+            segPeriodEdit.setBounds (pr.removeFromLeft (40).reduced (0, 1));
+            pr.removeFromLeft (5);
+            segTopToggle.setBounds (pr);          // "= top partial"
+            si.removeFromTop (2);
+            segHelpLbl.setBounds (si.removeFromTop (26));
+            si.removeFromTop (2);
+            segView.setBounds (si);
+            segList.numRows = processorRef.getTemplatePartialCount();
+            const int sh  = segList.contentHeight();
+            const bool ss = sh > si.getHeight();
+            segList.setSize (ss ? si.getWidth() - 10 : si.getWidth(), juce::jmax (si.getHeight(), sh));
+        }
+
+        // --- dissonance BAR (upper part of the L Tuning box) ---
+        auto di = lBarBounds.reduced (3).reduced (8, 4); di.removeFromTop (3);
         dissHeader.splitX = 92;
         dissHeader.setBounds (di.removeFromTop (24));
         dissView.setBounds (di);
@@ -1801,7 +1906,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         degreeList.setSize (scroll ? di.getWidth() - 10 : di.getWidth(),
                             juce::jmax (di.getHeight(), ch));
     }
-    area.removeFromRight (2);
+    // no gap here: the Tuning FOOT (row-2 cell) touches the BAR to form one L box
 
     const int rowH = (area.getHeight() - 4) / 2;
 
@@ -1971,16 +2076,18 @@ void FractalAdditiveAudioProcessorEditor::resized()
             { &cutoffFader, &resFader, &fEnvAmtFader, &filtAdsr[0], &filtAdsr[1], &filtAdsr[2], &filtAdsr[3] },
             { &lblCutoff, &lblRes, &lblEnvAmt, &filtAdsrLbl[0], &filtAdsrLbl[1], &filtAdsrLbl[2], &filtAdsrLbl[3] });
 
-        // Tuning (rightmost): mode + the loaded .scl name to its right, load/reset,
-        // recent, bend range, and the Tuning Bank (automatable .scl slots).
+        // Tuning = the FOOT of the inverted-L box (the dissonance BAR is above-right);
+        // mode + the loaded .scl name, the PERIOD (red), load/reset, recent, bend, bank.
         {
-            auto tb = row; // rest
-            gTuning.setBounds (tb.reduced (3));
-            auto ti = tb.reduced (3).reduced (8, 5); ti.removeFromTop (15);
+            lFootBounds = row; // frame painted in paint() as one L with the bar
+            auto ti = row.reduced (3).reduced (8, 4); ti.removeFromTop (17); // clear the TUNING title chip
             auto mrow = ti.removeFromTop (24);
             compact (tuningBox, mrow.removeFromLeft (mrow.getWidth() * 50 / 100));
             mrow.removeFromLeft (5);
             tuningNameLabel.setBounds (mrow); // shows the loaded scale's file name
+            // Period of the active scale, in red, always visible.
+            ti.removeFromTop (3);
+            tuningPeriodLbl.setBounds (ti.removeFromTop (18));
             // Load .scl only exists in Scala mode; Reset appears whenever there is
             // something to reset (any non-12ED2 mode or a loaded scale).
             const int  tmode    = processorRef.getTuningMode();
@@ -2260,6 +2367,13 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
 
     // Live active-scale dissonance list (recomputes only when timbre/tuning change).
     updateScaleDissonance();
+
+    // Period of the active scale (red readout in the Tuning box).
+    {
+        const int D = juce::jmax (1, processorRef.getScaleDegrees());
+        tuningPeriodLbl.setText (tr ("Period  ", "Per\xc3\xado" "de  ") + justName (processorRef.getDegreeRatio (D)),
+                                 juce::dontSendNotification);
+    }
 
     const bool timbre = processorRef.isTimbreActive();
     if (timbre != lastTimbreActive)

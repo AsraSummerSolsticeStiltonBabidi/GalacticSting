@@ -160,6 +160,55 @@ private:
         }
     };
 
+    // "From spectrum's segment" partial picker: one row per partial of the current
+    // spectrum. Click toggles selection; Shift-click selects the span to the anchor;
+    // all selected rows share one colour; the tonic (lowest selected = C3) is starred.
+    struct SegmentList : juce::Component, juce::TooltipClient
+    {
+        FractalAdditiveAudioProcessor* proc = nullptr;
+        std::function<void()> onChange;
+        std::function<juce::String (double)> ratioName;
+        juce::String tip;
+        int numRows = 0;
+        static constexpr int kRowH = 18;
+        juce::String getTooltip() override { return tip; }
+        int contentHeight() const { return numRows * kRowH; }
+        void paint (juce::Graphics& g) override
+        {
+            if (proc == nullptr) return;
+            const auto* t = proc->getLiveTemplate();
+            const int n = t != nullptr ? (int) t->partials.size() : 0;
+            const int tonic = proc->segmentTonicIndex();
+            for (int i = 0; i < n; ++i)
+            {
+                const int y = i * kRowH;
+                const bool sel = proc->segmentSelected (i);
+                if (sel)
+                {
+                    g.setColour (juce::Colour (0xff2fb0c8)); // one shared colour for all selected
+                    g.fillRoundedRectangle (juce::Rectangle<int> (0, y + 1, getWidth(), kRowH - 2).toFloat(), 3.0f);
+                }
+                const bool isTonic = (i == tonic);
+                // Tonic (lowest selected = C3) stands out in gold; others white/grey.
+                g.setColour (isTonic ? juce::Colour (0xffffc95c) : (sel ? juce::Colours::white : juce::Colour (0xffb9c0d0)));
+                g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+                g.drawText ("P" + juce::String (i + 1) + (isTonic ? " C3" : juce::String()),
+                            4, y, 64, kRowH, juce::Justification::centredLeft, false);
+                if (ratioName)
+                    g.drawText (ratioName ((double) t->partials[(size_t) i].ratio),
+                                70, y, getWidth() - 72, kRowH, juce::Justification::centredLeft, false);
+            }
+        }
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            if (proc == nullptr) return;
+            const auto* t = proc->getLiveTemplate();
+            const int n = t != nullptr ? (int) t->partials.size() : 0;
+            const int i = e.y / kRowH;
+            if (i >= 0 && i < n) { proc->segmentToggle (i, e.mods.isShiftDown()); if (onChange) onChange(); }
+        }
+    };
+
     // Closable floating notice (e.g. "only N minima exist"). Click X to dismiss.
     struct NoticeOverlay : juce::Component
     {
@@ -849,8 +898,15 @@ private:
     WarningOverlay warningOverlay;
     NoticeOverlay  noticeOverlay;
     DissDegreeList degreeList;   // active-scale dissonance list (lives inside dissView)
-    DissHeader     dissHeader;   // clickable Step / Sethares-dissonance sort header
+    DissHeader     dissHeader;   // Step / Sethares-dissonance column header
     juce::Viewport dissView;     // scrolls degreeList when a scale has many steps
+    // Spectrum-to-Tuning mode + the "from spectrum's segment" partial picker.
+    juce::ComboBox   specModeBox;                 // Sethares dissonance / from spectrum's segment
+    SegmentList      segList;                     // partial picker (inside segView)
+    juce::Viewport   segView;
+    juce::TextEditor segPeriodEdit;               // "2" / "3/2" / "500c"
+    juce::ToggleButton segTopToggle;              // period = highest selected partial
+    juce::Label      segPeriodLbl, segHelpLbl;
     // Cached active-scale dissonance (recomputed only when timbre/tuning change) +
     // the sort mode toggled by the header.
     std::vector<FractalAdditiveAudioProcessor::DissDegreeInfo> activeDiss;
@@ -866,7 +922,8 @@ private:
                          gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale, gScaleDiss;
     juce::Label lblBaseN, lblBasePitch, lblRange, lblFractal, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
                 lblTimbreRepeats, lblBend, lblPeriod, lblSteps, lblRefA, lblRefHz, lblOctave, lblPitchAmt,
-                lblMorphTime, lblTuningBank, tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel;
+                lblMorphTime, lblTuningBank, tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel,
+                tuningPeriodLbl;
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], pitchAdsrLbl[4], primeLbl[9];
 
     std::unique_ptr<SliderAttachment>   baseNAtt, slopeAtt, spectrumRangeAtt, fractalAtt, gainAtt,

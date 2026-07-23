@@ -4,6 +4,8 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_dsp/juce_dsp.h>
 
+#include <set>
+
 #include "dsp/AdditiveVoice.h"
 #include "dsp/RhythmEngine.h"
 #include "dsp/SpectrumEngine.h"
@@ -183,6 +185,23 @@ public:
     int    getDissGeneration()  const noexcept { return dissGeneration; }
 
     //==========================================================================
+    // "From spectrum's segment": use SELECTED partials of the current spectrum as a
+    // scale. The LOWEST selected partial is the tonic (1/1, on C3); each selected
+    // partial's ratio to it is folded into one PERIOD (the highest selected partial,
+    // or a typed ratio/cents), duplicate pitches within the period removed, then
+    // loaded as the active .scl - rebuilt live as the selection changes. Editor calls.
+    void segmentToggle (int partialIndex, bool rangeToAnchor); // plain click / shift-click
+    void segmentClear();
+    bool segmentSelected (int partialIndex) const;
+    int  segmentTonicIndex() const;   // lowest selected partial index, -1 if none
+    int  segmentCount() const;
+    void setSegmentPeriodText (const juce::String& s); // "2" / "3/2" / "500c"
+    juce::String getSegmentPeriodText() const { return segPeriodText; }
+    void setSegmentUseTopPeriod (bool b);
+    bool getSegmentUseTopPeriod() const noexcept { return segUseTopPeriod; }
+    void rebuildSegmentScale();       // build + load the .scl from the current selection
+
+    //==========================================================================
     // Shared with the editor:
     juce::MidiKeyboardState keyboardState;
     juce::AudioProcessorValueTreeState apvts;
@@ -231,6 +250,12 @@ private:
     std::vector<DissDegreeInfo> dissDegrees;
     double dissGreenH = 0.0, dissRedH = 1.0;
     int    dissRequested = 0, dissFound = 0, dissGeneration = 0;
+
+    // "From spectrum's segment" selection state (message thread).
+    std::set<int> segSel;              // selected partial indices in the live template
+    int           segAnchor = -1;      // last clicked (shift-click range anchor)
+    juce::String  segPeriodText = "2"; // period ratio/cents when not using the top partial
+    bool          segUseTopPeriod = false;
 
     float lastGain = 0.0f;
     int   lastBendApplied = 48; // matches enableLegacyMode(48) in the constructor
