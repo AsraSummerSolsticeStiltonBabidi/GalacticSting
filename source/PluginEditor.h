@@ -141,6 +141,245 @@ private:
         }
     };
 
+    // Timbre -> rhythm (MIDI out) panel: pick partials of the CURRENT patch (shown
+    // with their just-intonation ratio to the fundamental, or cents when inexact /
+    // .scl-derived), route each to a MIDI note + gate length, and set the global
+    // divisor x^n. The pulse trains leave on the plugin's MIDI OUTPUT in exact
+    // polyrhythm with the sounding timbre (see RhythmEngine.h for the maths).
+    struct RhythmPanel : juce::Component, juce::ListBoxModel
+    {
+        FractalAdditiveAudioProcessor* proc = nullptr;
+        std::function<juce::String (double)> ratioName;                       // 3/2 or 702c
+        std::function<juce::String (const char*, const char*)> trF;           // EN/CA
+        std::function<void()> onEdited;                                       // refocus etc.
+
+        juce::ListBox      list { "partials", this };
+        juce::ToggleButton onT;
+        juce::ComboBox     xBox;
+        juce::Slider       nSlider;
+        juce::Label        heading, listHead, xLbl, nLbl, info;
+        juce::TextButton   closeB { "X" };
+        juce::Label        slotLbl[RhythmEngine::kSlots];
+        juce::Slider       noteS[RhythmEngine::kSlots], durS[RhythmEngine::kSlots];
+        juce::TextButton   delB[RhythmEngine::kSlots];
+        int numRows = 0;
+
+        void init()
+        {
+            heading.setJustificationType (juce::Justification::centredLeft);
+            heading.setColour (juce::Label::textColourId, juce::Colour (0xff5cb8ff));
+            heading.setFont (juce::Font (juce::FontOptions (16.0f).withStyle ("Bold")));
+            addAndMakeVisible (heading);
+            listHead.setJustificationType (juce::Justification::centredLeft);
+            listHead.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
+            listHead.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+            addAndMakeVisible (listHead);
+            list.setRowHeight (20);
+            list.setColour (juce::ListBox::backgroundColourId, juce::Colour (0xff141420));
+            addAndMakeVisible (list);
+            addAndMakeVisible (onT);
+            for (int v = 2; v <= 12; ++v) xBox.addItem (juce::String (v), v - 1); // idx-mapped for the attachment
+            addAndMakeVisible (xBox);
+            nSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+            nSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 34, 16);
+            addAndMakeVisible (nSlider);
+            for (auto* l : { &xLbl, &nLbl })
+            {
+                l->setJustificationType (juce::Justification::centredRight);
+                l->setColour (juce::Label::textColourId, juce::Colour (0xffb9c0d0));
+                l->setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
+                addAndMakeVisible (*l);
+            }
+            info.setJustificationType (juce::Justification::topLeft);
+            info.setColour (juce::Label::textColourId, juce::Colour (0xff7ff59a));
+            info.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+            addAndMakeVisible (info);
+            closeB.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
+            closeB.onClick = [this] { setVisible (false); if (onEdited) onEdited(); };
+            addAndMakeVisible (closeB);
+
+            for (int i = 0; i < RhythmEngine::kSlots; ++i)
+            {
+                slotLbl[i].setJustificationType (juce::Justification::centredLeft);
+                slotLbl[i].setColour (juce::Label::textColourId, juce::Colours::white);
+                slotLbl[i].setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
+                addChildComponent (slotLbl[i]);
+
+                noteS[i].setSliderStyle (juce::Slider::LinearHorizontal);
+                noteS[i].setRange (0, 127, 1);
+                noteS[i].setTextBoxStyle (juce::Slider::TextBoxRight, false, 44, 16);
+                noteS[i].textFromValueFunction = [] (double v)
+                { return juce::MidiMessage::getMidiNoteName ((int) v, true, true, 3); };
+                noteS[i].onValueChange = [this, i]
+                { if (proc) proc->getRhythm().slots[i].note = (int) noteS[i].getValue(); };
+                addChildComponent (noteS[i]);
+
+                durS[i].setSliderStyle (juce::Slider::LinearHorizontal);
+                durS[i].setRange (5.0, 500.0, 1.0);
+                durS[i].setSkewFactorFromMidPoint (80.0);
+                durS[i].setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 16);
+                durS[i].textFromValueFunction = [] (double v) { return juce::String ((int) v) + " ms"; };
+                durS[i].onValueChange = [this, i]
+                { if (proc) proc->getRhythm().slots[i].durMs = (float) durS[i].getValue(); };
+                addChildComponent (durS[i]);
+
+                delB[i].setButtonText ("X");
+                delB[i].setColour (juce::TextButton::buttonColourId, juce::Colour (0xffe0453f));
+                delB[i].onClick = [this, i]
+                {
+                    if (proc)
+                    {
+                        proc->getRhythm().slots[i].enabled = false;
+                        proc->getRhythm().slots[i].partial = -1;
+                    }
+                    refreshSlots();
+                    list.repaint();
+                };
+                addChildComponent (delB[i]);
+            }
+        }
+
+        //-- ListBoxModel: the current template's partials --------------------------
+        int getNumRows() override { return numRows; }
+        void paintListBoxItem (int row, juce::Graphics& g, int w, int h, bool) override
+        {
+            const auto* t = proc != nullptr ? proc->getLiveTemplate() : nullptr;
+            if (t == nullptr || row >= (int) t->partials.size()) return;
+            const bool assigned = slotOfPartial (row) >= 0;
+            if (assigned) { g.setColour (juce::Colour (0xff2a4a6a)); g.fillRect (0, 0, w, h); }
+            g.setColour (juce::Colour (0xff8f96a8));
+            g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+            g.drawText ("P" + juce::String (row + 1), 6, 0, 40, h, juce::Justification::centredLeft);
+            g.setColour (assigned ? juce::Colours::white : juce::Colour (0xffb9c0d0));
+            g.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
+            g.drawText (ratioName ? ratioName ((double) t->partials[(size_t) row].ratio) : juce::String(),
+                        50, 0, w - 56, h, juce::Justification::centredLeft);
+        }
+        void listBoxItemClicked (int row, const juce::MouseEvent&) override
+        {
+            if (proc == nullptr) return;
+            const int existing = slotOfPartial (row);
+            if (existing >= 0) // click an assigned partial -> unassign it
+            {
+                proc->getRhythm().slots[existing].enabled = false;
+                proc->getRhythm().slots[existing].partial = -1;
+            }
+            else               // assign to the first free slot
+            {
+                for (int i = 0; i < RhythmEngine::kSlots; ++i)
+                    if (proc->getRhythm().slots[i].partial.load() < 0)
+                    {
+                        proc->getRhythm().slots[i].partial = row;
+                        proc->getRhythm().slots[i].enabled = true;
+                        break;
+                    }
+            }
+            refreshSlots();
+            list.repaint();
+        }
+        int slotOfPartial (int p) const
+        {
+            if (proc == nullptr) return -1;
+            for (int i = 0; i < RhythmEngine::kSlots; ++i)
+                if (proc->getRhythm().slots[i].partial.load() == p) return i;
+            return -1;
+        }
+
+        //-- Refresh ----------------------------------------------------------------
+        void refreshSlots()
+        {
+            const auto* t = proc != nullptr ? proc->getLiveTemplate() : nullptr;
+            for (int i = 0; i < RhythmEngine::kSlots; ++i)
+            {
+                const int p = proc != nullptr ? proc->getRhythm().slots[i].partial.load() : -1;
+                const bool used = p >= 0;
+                slotLbl[i].setVisible (used); noteS[i].setVisible (used);
+                durS[i].setVisible (used);    delB[i].setVisible (used);
+                if (used)
+                {
+                    juce::String rl;
+                    if (t != nullptr && p < (int) t->partials.size() && ratioName)
+                        rl = juce::String::fromUTF8 (" \xc2\xb7 ") + ratioName ((double) t->partials[(size_t) p].ratio);
+                    slotLbl[i].setText ("P" + juce::String (p + 1) + rl, juce::dontSendNotification);
+                    noteS[i].setValue ((double) proc->getRhythm().slots[i].note.load(), juce::dontSendNotification);
+                    durS[i].setValue  ((double) proc->getRhythm().slots[i].durMs.load(), juce::dontSendNotification);
+                }
+            }
+        }
+
+        void refreshLive() // pulse rates + polyrhythm chain, from the audio thread's read-outs
+        {
+            if (proc == nullptr) return;
+            juce::String s;
+            const float f0 = proc->getRhythm().getDriverF0();
+            s << (f0 > 0.0f ? "f0 = " + juce::String (f0, 2) + " Hz\n"
+                            : juce::String (trF ? trF ("(hold a note to pulse)", "(mant\xc3\xa9n una nota per polsar)") : ""))
+              ;
+            float rates[RhythmEngine::kSlots]; int idx[RhythmEngine::kSlots]; int m = 0;
+            for (int i = 0; i < RhythmEngine::kSlots; ++i)
+            {
+                const float r = proc->getRhythm().getRateHz (i);
+                if (r > 0.0f) { rates[m] = r; idx[m] = i; ++m; }
+            }
+            for (int k = 0; k < m; ++k)
+                s << "P" << juce::String (proc->getRhythm().slots[idx[k]].partial.load() + 1)
+                  << ": " << juce::String (rates[k], 3) << " Hz ("
+                  << juce::String (1000.0f / rates[k], 0) << " ms)\n";
+            if (m >= 2 && ratioName)
+            {
+                s << (trF ? trF ("polyrhythm ", "poliritme ") : juce::String ("polyrhythm "));
+                for (int k = 0; k < m - 1; ++k)
+                    s << ratioName ((double) rates[k] / (double) rates[k + 1]).replaceCharacter ('/', ':')
+                      << (k + 2 < m ? ", " : "");
+            }
+            info.setText (s, juce::dontSendNotification);
+        }
+
+        void resized() override
+        {
+            auto r = getLocalBounds().reduced (14, 10);
+            auto top = r.removeFromTop (26);
+            closeB.setBounds (top.removeFromRight (24).withSizeKeepingCentre (22, 22));
+            heading.setBounds (top);
+            r.removeFromTop (4);
+            auto ctrl = r.removeFromTop (24);
+            onT.setBounds (ctrl.removeFromLeft (64));
+            xLbl.setBounds (ctrl.removeFromLeft (76));
+            ctrl.removeFromLeft (4);
+            xBox.setBounds (ctrl.removeFromLeft (56).reduced (0, 1));
+            nLbl.setBounds (ctrl.removeFromLeft (84));
+            ctrl.removeFromLeft (4);
+            nSlider.setBounds (ctrl);
+            r.removeFromTop (6);
+            auto left = r.removeFromLeft (236);
+            listHead.setBounds (left.removeFromTop (16));
+            list.setBounds (left);
+            r.removeFromLeft (10);
+            auto rows = r.removeFromTop (RhythmEngine::kSlots * 26);
+            for (int i = 0; i < RhythmEngine::kSlots; ++i)
+            {
+                auto row = rows.removeFromTop (26).reduced (0, 2);
+                slotLbl[i].setBounds (row.removeFromLeft (104));
+                delB[i].setBounds (row.removeFromRight (24));
+                row.removeFromRight (4);
+                durS[i].setBounds (row.removeFromRight (128));
+                row.removeFromRight (4);
+                noteS[i].setBounds (row);
+            }
+            r.removeFromTop (4);
+            info.setBounds (r);
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            auto r = getLocalBounds().toFloat();
+            g.setColour (juce::Colour (0xf2101018));
+            g.fillRoundedRectangle (r, 10.0f);
+            g.setColour (juce::Colour (0xff5cb8ff));
+            g.drawRoundedRectangle (r.reduced (1.5f), 10.0f, 3.0f);
+        }
+    };
+
     // Floating centre panel that explains WHY the current settings are silent.
     struct WarningOverlay : juce::Component
     {
@@ -179,6 +418,7 @@ private:
     juce::ToggleButton primeToggle[9], morphToggle;
     juce::Slider       morphTimeFader;
     juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
+    juce::TextButton   rhythmBtn;  // top-bar: opens the timbre->rhythm MIDI panel
     juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
                      langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3], tuningBankLoadBtn;
     juce::Label          vibeLabel;   // "Vibe coded by" credit, left of the language button
@@ -189,6 +429,11 @@ private:
     WarningOverlay warningOverlay;
     NoticeOverlay  noticeOverlay;
     DissDegreeList degreeList;
+    RhythmPanel    rhythmPanel;
+    std::unique_ptr<ButtonAttachment>   rhythmOnAtt;
+    std::unique_ptr<ComboBoxAttachment> rhythmXAtt;
+    std::unique_ptr<SliderAttachment>   rhythmNAtt;
+    juce::uint32 lastRhythmGen = 0; // refresh the partial list when the template changes
 
     juce::GroupComponent gHarmonic, gBase, gWhitelist, gSlope, gSpectrumRange, gFractal,
                          gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale;

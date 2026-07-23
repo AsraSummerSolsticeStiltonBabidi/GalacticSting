@@ -463,6 +463,38 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     };
     addAndMakeVisible (menuButton);
 
+    // Timbre -> rhythm MIDI panel (top-bar "MIDI" button toggles it).
+    rhythmBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff33334a));
+    rhythmBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    rhythmBtn.setMouseClickGrabsKeyboardFocus (false);
+    rhythmBtn.setTooltip (tr (
+        "Timbre to RHYTHM: send the selected partials as MIDI pulse trains (exact polyrhythms, sample-locked to the sound) to any track listening to this plugin's MIDI output.",
+        "Timbre a RITME: envia els parcials seleccionats com a trens de polsos MIDI (poliritmes exactes, clavats al so mostra a mostra) a qualsevol pista que escolti la sortida MIDI d'aquest plugin."));
+    rhythmBtn.onClick = [this]
+    {
+        const bool show = ! rhythmPanel.isVisible();
+        if (show)
+        {
+            rhythmPanel.numRows = processorRef.getTemplatePartialCount();
+            rhythmPanel.list.updateContent();
+            rhythmPanel.refreshSlots();
+            rhythmPanel.refreshLive();
+        }
+        rhythmPanel.setVisible (show);
+        if (! show) refocus();
+    };
+    addAndMakeVisible (rhythmBtn);
+
+    rhythmPanel.proc      = &processorRef;
+    rhythmPanel.ratioName = [] (double r) { return justName (r); };
+    rhythmPanel.trF       = [this] (const char* en, const char* ca) { return tr (en, ca); };
+    rhythmPanel.onEdited  = [this] { refocus(); };
+    rhythmPanel.init();
+    addChildComponent (rhythmPanel);
+    rhythmOnAtt = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmOn",   rhythmPanel.onT);
+    rhythmXAtt  = std::make_unique<ComboBoxAttachment> (processorRef.apvts, "rhythmDivX", rhythmPanel.xBox);
+    rhythmNAtt  = std::make_unique<SliderAttachment>   (processorRef.apvts, "rhythmDivN", rhythmPanel.nSlider);
+
     // Credit: "Vibe coded by Asra3" (Asra3 is a link to Instagram), left of the language button.
     vibeLabel.setText ("Vibe coded by", juce::dontSendNotification);
     vibeLabel.setJustificationType (juce::Justification::centredRight);
@@ -696,6 +728,20 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     using juce::dontSendNotification;
     langButton.setButtonText (catalan ? "ENG" : "CAT");
     menuButton.setButtonText (tr ("Menu", "Men\xc3\xba"));
+    rhythmBtn.setButtonText ("MIDI");
+    rhythmPanel.heading.setText (tr ("TIMBRE -> RHYTHM (MIDI OUT)", "TIMBRE -> RITME (SORTIDA MIDI)"), dontSendNotification);
+    rhythmPanel.listHead.setText (tr ("Partials of the current patch (click to route)",
+                                      "Parcials del patch actual (clica per encaminar)"), dontSendNotification);
+    rhythmPanel.onT.setButtonText (tr ("On", "Actiu"));
+    rhythmPanel.xLbl.setText (tr ("Divide by", "Divideix per"), dontSendNotification);
+    rhythmPanel.nLbl.setText (tr ("n times", "n vegades"), dontSendNotification);
+    rhythmPanel.onT.setTooltip (tr (
+        "Master switch for the rhythm MIDI output.",
+        "Interruptor general de la sortida MIDI de ritme."));
+    rhythmPanel.xBox.setTooltip (tr (
+        "Each partial's frequency is divided by this number, n times (f0 x ratio / x^n), to land in rhythm range. The RATIOS between pulse trains never change - only their absolute speed.",
+        "La freq\xc3\xbc\xc3\xa8ncia de cada parcial es divideix per aquest nombre, n vegades (f0 x ratio / x^n), per caure en rang r\xc3\xadtmic. Les RELACIONS entre trens de polsos no canvien mai - nom\xc3\xa9s la velocitat absoluta."));
+    rhythmPanel.nSlider.setTooltip (rhythmPanel.xBox.getTooltip());
     langButton.setTooltip (tr ("Switch the interface language to Catal\xc3\xa0.",
                                "Torna la interf\xc3\xad" "cie a l'angl\xc3\xa8s."));
 
@@ -1253,7 +1299,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     for (int i = 0; i < L; ++i) (title[i] == ' ' ? spaces : squaresN)++;
     float total = (float) squaresN * (side + gap) + (float) spaces * (side * 0.5f);
     const float freeLeft  = 268.0f;
-    const float freeRight = (float) getWidth() - 312.0f;
+    const float freeRight = (float) getWidth() - 368.0f; // clears menu + MIDI + credit + language
     const float freeW     = juce::jmax (120.0f, freeRight - freeLeft);
     if (total > freeW) { side *= freeW / total; total = freeW; }
     const float margin = side * 0.10f;
@@ -1383,6 +1429,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
     }
     titleBar.removeFromRight (6);
     menuButton.setBounds (titleBar.removeFromRight (52).withSizeKeepingCentre (48, 24));
+    titleBar.removeFromRight (4);
+    rhythmBtn.setBounds (titleBar.removeFromRight (52).withSizeKeepingCentre (48, 24));
     auto presetArea = titleBar.removeFromLeft (272).reduced (10, 0);
     presetBox.setBounds (presetArea.removeFromLeft (190).withSizeKeepingCentre (190, 24));
     presetArea.removeFromLeft (6);
@@ -1633,6 +1681,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
     warningOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (580, 200));
     warningOverlay.toFront (false);
     noticeOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (560, 220));
+    rhythmPanel.setBounds (getLocalBounds().withSizeKeepingCentre (760, 470));
+    rhythmPanel.toFront (false);
 }
 
 void FractalAdditiveAudioProcessorEditor::mouseDown (const juce::MouseEvent&) { grabKeyboardFocus(); }
@@ -1712,6 +1762,22 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     pollComputerKeyboard(); // safety net for missed KEYUPs / ghost keys / focus loss
 
     refreshRefAText();       // keep the Reference-A box in sync with the parameter (automation)
+
+    // Rhythm panel: live pulse-rate read-outs; rebuild the partial list whenever
+    // the spectrum template changes (Base N moved, .scl loaded...).
+    if (rhythmPanel.isVisible())
+    {
+        const juce::uint32 g = processorRef.getTemplateGeneration();
+        if (g != lastRhythmGen)
+        {
+            lastRhythmGen = g;
+            rhythmPanel.numRows = processorRef.getTemplatePartialCount();
+            rhythmPanel.list.updateContent();
+            rhythmPanel.list.repaint();
+            rhythmPanel.refreshSlots(); // ratio labels may have changed
+        }
+        rhythmPanel.refreshLive();
+    }
     // Keep the tuning-bank combo's selection in sync with the parameter (host
     // automation can move it) without rebuilding the list every tick.
     if (tuningBankBox.getSelectedId() - 1 != processorRef.getTuningBankSlotParam())

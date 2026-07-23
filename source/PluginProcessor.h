@@ -5,6 +5,7 @@
 #include <juce_dsp/juce_dsp.h>
 
 #include "dsp/AdditiveVoice.h"
+#include "dsp/RhythmEngine.h"
 #include "dsp/SpectrumEngine.h"
 #include "dsp/TuningManager.h"
 
@@ -29,7 +30,7 @@ public:
     //==========================================================================
     const juce::String getName() const override { return juce::String::fromUTF8 ("Fibl\xc3\xb3 Gal\xc3\xa0" "ctic"); }
     bool acceptsMidi() const override { return true; }
-    bool producesMidi() const override { return false; }
+    bool producesMidi() const override { return true; } // timbre->rhythm MIDI out (RhythmEngine)
     bool isMidiEffect() const override { return false; }
     double getTailLengthSeconds() const override { return 8.0; }
 
@@ -126,6 +127,13 @@ public:
     juce::StringArray getRecentSclPaths() const { return recentSclPaths; }
 
     //==========================================================================
+    // Timbre -> rhythm MIDI out (see RhythmEngine.h). The editor edits the slots
+    // directly (atomics) and reads the live pulse rates for its panel.
+    RhythmEngine& getRhythm() noexcept { return rhythm; }
+    const spectrum::SpectrumTemplate* getLiveTemplate() const noexcept { return spectrumEngine.getLive(); }
+    juce::uint32 getTemplateGeneration() const noexcept { return spectrumEngine.getGeneration(); }
+
+    //==========================================================================
     // Tuning bank: load as many .scl files as you like (effectively unlimited - the
     // automatable "tuningBankSlot" parameter just needs a bounded range, so the ceiling
     // is a generous 128). 0 = none, 1..N = slot; the switch is picked up on the message
@@ -184,6 +192,7 @@ private:
     TuningManager               tuning;
     juce::MPESynthesiser        synth;
     spectrum::SpectrumSettings  lastPushed;
+    RhythmEngine                rhythm { apvts, spectrumEngine, tuning };
 
     // Scala-as-timbre state (message thread; read into SpectrumSettings each poll).
     std::vector<float> timbreDegrees;
