@@ -570,8 +570,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     rhythmBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::black);
     rhythmBtn.setMouseClickGrabsKeyboardFocus (false);
     rhythmBtn.setTooltip (tr (
-        "Timbre to RHYTHM: send the selected partials as MIDI pulse trains (exact polyrhythms, sample-locked to the sound) to any track listening to this plugin's MIDI output.",
-        "Timbre a RITME: envia els parcials seleccionats com a trens de polsos MIDI (poliritmes exactes, clavats al so mostra a mostra) a qualsevol pista que escolti la sortida MIDI d'aquest plugin."));
+        "SPECTRUM TO RHYTHM: turns partials of the current patch into MIDI pulse trains - exact polyrhythms derived from the spectrum's frequency ratios, sample-locked to the sound - sent out of this plugin's MIDI OUTPUT to any other track/instrument. Click to open the panel.",
+        "ESPECTRE A RITME: converteix parcials del patch actual en trens de polsos MIDI - poliritmes exactes derivats de les relacions de freq\xc3\xbc\xc3\xa8ncia de l'espectre, clavats al so mostra a mostra - que surten per la SORTIDA MIDI del plugin cap a qualsevol altra pista/instrument. Clica per obrir el panell."));
     rhythmBtn.onClick = [this]
     {
         const bool show = ! rhythmPanel.isVisible();
@@ -601,9 +601,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addChildComponent (rhythmPanel);
     rhythmOnAtt   = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmOn",   rhythmPanel.onT);
     rhythmMpeAtt  = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmMpe",  rhythmPanel.mpeT);
-    rhythmXAtt    = std::make_unique<ComboBoxAttachment> (processorRef.apvts, "rhythmDivX", rhythmPanel.xBox);
     rhythmModeAtt = std::make_unique<ComboBoxAttachment> (processorRef.apvts, "rhythmMode", rhythmPanel.modeBox);
-    rhythmNAtt    = std::make_unique<SliderAttachment>   (processorRef.apvts, "rhythmDivN", rhythmPanel.nSlider);
 
     // Credit: "Vibe coded by Asra3" (Asra3 is a link to Instagram), left of the language button.
     vibeLabel.setText ("Vibe coded by", juce::dontSendNotification);
@@ -862,9 +860,23 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.listHead.setText (tr ("Partials of the current patch (click to route)",
                                       "Parcials del patch actual (clica per encaminar)"), dontSendNotification);
     rhythmPanel.onT.setButtonText (tr ("On", "Actiu"));
-    rhythmPanel.xLbl.setText (tr ("Divide by", "Divideix per"), dontSendNotification);
-    rhythmPanel.nLbl.setText (tr ("n times", "n vegades"), dontSendNotification);
-    rhythmPanel.noteHead.setText (tr ("Scale steps from the played note", "Passos d'escala des de la nota tocada"),
+    rhythmPanel.secRate.setText  (tr ("PULSE RATE", "VELOCITAT DELS POLSOS"), dontSendNotification);
+    rhythmPanel.secOut.setText   (tr ("OUTPUT", "SORTIDA"), dontSendNotification);
+    rhythmPanel.secTempo.setText (tr ("DAW TEMPO", "TEMPO DEL DAW"), dontSendNotification);
+    rhythmPanel.divLbl.setText   (tr ("divide", "divideix"), dontSendNotification);
+    rhythmPanel.timesLbl.setText (tr ("times by", "vegades per"), dontSendNotification);
+    for (auto* b : { &rhythmPanel.nUp, &rhythmPanel.nDn })
+        b->setTooltip (tr ("How many times the frequency is divided (n in x^n). The ratios between trains never change - only the absolute speed.",
+                           "Quantes vegades es divideix la freq\xc3\xbc\xc3\xa8ncia (la n de x^n). Les relacions entre trens no canvien - nom\xc3\xa9s la velocitat absoluta."));
+    for (auto* b : { &rhythmPanel.xUp, &rhythmPanel.xDn })
+        b->setTooltip (tr ("The divisor base (x in x^n). 2 = halve per division (octaves of rhythm).",
+                           "La base del divisor (la x de x^n). 2 = meitat per divisi\xc3\xb3 (octaves de ritme)."));
+    rhythmPanel.jiB.setButtonText (tr ("JI pitches", "Tons justos"));
+    rhythmPanel.jiB.setTooltip (tr (
+        "Needs MPE out. Sets every routed pulse's pitch to the JUST ratio of ITS OWN partial (P3 -> 3/1...), so the receiving synth plays the partials' exact pitches.",
+        "Necessita MPE out. Posa el to de cada pols al ratio JUST del SEU parcial (P3 -> 3/1...), perqu\xc3\xa8 el sinte receptor toqui els tons exactes dels parcials."));
+    rhythmPanel.helpB.setTooltip (tr ("Routing & setup help", "Ajuda d'encaminament i configuraci\xc3\xb3"));
+    rhythmPanel.noteHead.setText (tr ("Steps from the played note", "Passos des de la nota tocada"),
                                   dontSendNotification);
     rhythmPanel.noteHead.setTooltip (tr (
         "Each train sends the PLAYED note shifted by this many scale steps: \"7st\" = 7 steps up, \"7st-\" = 7 steps down. Never a fixed note. With MPE out, ratios (\"3/2\") and cents (\"702c\") are also FROM the played note.",
@@ -873,11 +885,11 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.durHead.setTooltip (tr (
         "GATE: how long each pulse's MIDI note lasts (5-500 ms). It is NOT latency - pulse timing stays sample-locked; this only sets where the note-off lands.",
         "GATE: quant dura la nota MIDI de cada pols (5-500 ms). NO \xc3\xa9s lat\xc3\xa8ncia - els polsos queden clavats a la mostra; nom\xc3\xa9s fixa on cau el note-off."));
-    // (fromUTF8 directly: tr()'s English branch does not decode UTF-8 accents.)
-    rhythmPanel.routeHelp.setText (juce::String::fromUTF8 (catalan
-        ? "Encaminament (qualsevol DAW): en una altra pista d'instrument, tria com a ENTRADA MIDI la SORTIDA MIDI d'aquest plugin (no l'entrada de la pista del Fibl\xc3\xb3!) i activa el monitoratge d'entrada. A Ableton: MIDI From -> pista del Fibl\xc3\xb3 -> 2n selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In."
-        : "Routing (any DAW): on another instrument track, choose this plugin's MIDI OUTPUT as the track's MIDI INPUT (not the Fibl\xc3\xb3 track's own input!) and enable input monitoring. In Ableton: MIDI From -> the Fibl\xc3\xb3 track -> 2nd selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In."),
-        dontSendNotification);
+    // Help popup text (the "?" button). fromUTF8 directly: tr()'s English branch
+    // does not decode UTF-8 accents.
+    rhythmPanel.helpText = juce::String::fromUTF8 (catalan
+        ? "ENCAMINAMENT (qualsevol DAW):\nEn una altra pista d'instrument, tria com a ENTRADA MIDI la SORTIDA MIDI d'aquest plugin (no l'entrada de la pista del Fibl\xc3\xb3!) i activa el monitoratge d'entrada.\nA Ableton: MIDI From -> pista del Fibl\xc3\xb3 -> 2n selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In.\n\nTEMPO DEL DAW (CC20):\nAbleton NOMES aprende mapejos MIDI de dispositius d'entrada amb Remote actiu - no del MIDI d'un plugin. Soluci\xc3\xb3: instal\xc2\xb7la loopMIDI (gratu\xc3\xaft), crea un port; a la pista del Fibl\xc3\xb3 posa MIDI To -> loopMIDI; a Preferences > Link/MIDI activa Remote a l'entrada loopMIDI; llavors fes MIDI Map al tempo (rang 20-147) i activa Sync de tempo: en tocar una nota, el CC20 arriba i el tempo es mou.\n\nLAT\xc3\x88NCIA: els polsos surten clavats a la mostra; Ableton afegeix un buffer al MIDI entre pistes - fes servir un buffer petit."
+        : "ROUTING (any DAW):\nOn another instrument track, choose this plugin's MIDI OUTPUT as the track's MIDI INPUT (not the Fibl\xc3\xb3 track's own input!) and enable input monitoring.\nIn Ableton: MIDI From -> the Fibl\xc3\xb3 track -> 2nd selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In.\n\nDAW TEMPO (CC20):\nAbleton ONLY learns MIDI mappings from input devices with Remote enabled - not from a plugin's MIDI. Fix: install loopMIDI (free), create a port; on the Fibl\xc3\xb3 track set MIDI To -> loopMIDI; in Preferences > Link/MIDI enable Remote on the loopMIDI input; then MIDI-Map the tempo (range 20-147) and turn Tempo sync on: play a note and the CC20 arrives, moving the tempo.\n\nLATENCY: pulses leave sample-locked; Ableton adds one buffer to inter-track MIDI - use a small buffer size.");
     rhythmPanel.mpeT.setButtonText ("MPE out");
     rhythmPanel.mpeT.setTooltip (tr (
         "MPE output: each pulse train gets its own MIDI channel with per-note pitch bend, and the pitch boxes also accept cents (\"1987.4c\") or ratios (\"3\", \"3/2\") - sent RETUNED so an MPE-capable synth plays the exact pitch (assumes the receiver's bend range is +-48, the MPE default).",
@@ -901,10 +913,6 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.onT.setTooltip (tr (
         "Master switch for the rhythm MIDI output.",
         "Interruptor general de la sortida MIDI de ritme."));
-    rhythmPanel.xBox.setTooltip (tr (
-        "Each partial's frequency is divided by this number, n times (f0 x ratio / x^n), to land in rhythm range. The RATIOS between pulse trains never change - only their absolute speed.",
-        "La freq\xc3\xbc\xc3\xa8ncia de cada parcial es divideix per aquest nombre, n vegades (f0 x ratio / x^n), per caure en rang r\xc3\xadtmic. Les RELACIONS entre trens de polsos no canvien mai - nom\xc3\xa9s la velocitat absoluta."));
-    rhythmPanel.nSlider.setTooltip (rhythmPanel.xBox.getTooltip());
     langButton.setTooltip (tr ("Switch the interface language to Catal\xc3\xa0.",
                                "Torna la interf\xc3\xad" "cie a l'angl\xc3\xa8s."));
 

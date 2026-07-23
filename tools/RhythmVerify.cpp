@@ -69,7 +69,7 @@ int main()
         return evs;
     };
 
-    std::printf ("== Spectrum-to-Rhythm MIDI verification (C3=60, defaults x=2 n=6) ==\n");
+    std::printf ("== Spectrum-to-Rhythm MIDI verification (key 60, defaults x=2 n=8) ==\n");
 
     // --- run 1: hold C3 for 4 s ------------------------------------------------
     const int holdBlocks = (int) (4.0 * sr / blk);
@@ -88,14 +88,14 @@ int main()
     check (! onsP3.empty() && onsP3.front() == 0, "P3 downbeat lands ON the note-on sample");
     check (ons == offs, "every note-on has its note-off (no stuck notes)");
 
-    // Key 60 = the tuning anchor 261.6256 Hz; harmonic 2 = 523.2511 Hz / 2^7 =
-    // 4.0879 Hz -> period = 48000/4.0879 = 11742.0 samples. Harmonic 3 = 2/3 of it.
+    // Key 60 = the tuning anchor 261.6256 Hz; harmonic 2 = 523.2511 Hz / 2^8 =
+    // 2.0439 Hz -> period = 48000/2.0439 = 23484.1 samples. Harmonic 3 = 2/3 of it.
     if (onsP2.size() >= 3)
     {
         const double per = (double) (onsP2[2] - onsP2[0]) / 2.0;
-        const double expect = sr / (2.0 * 261.6255653 / 128.0);
+        const double expect = sr / (2.0 * 261.6255653 / 256.0);
         std::printf ("  P2 period: %.1f samples (expected %.1f)\n", per, expect);
-        check (std::abs (per - expect) <= 1.0, "P2 pulse period is sample-exact (f0*2 / 2^7)");
+        check (std::abs (per - expect) <= 1.0, "P2 pulse period is sample-exact (f0*2 / 2^8)");
     }
     if (onsP2.size() >= 3 && onsP3.size() >= 4)
     {
@@ -105,10 +105,10 @@ int main()
         std::printf ("  polyrhythm P3:P2 = %.5f (expected 1.50000)\n", ratio);
         check (std::abs (ratio - 1.5) < 0.001, "P3 vs P2 is an EXACT 3:2 polyrhythm");
     }
-    const double rateHz = 261.6255653 / 128.0; // harmonic 1 of key 60 at the default divisor
-    std::printf ("  pulse-1 rate = %.4f Hz = %.2f BPM (target ~130, power-of-2 division)\n",
+    const double rateHz = 261.6255653 / 256.0; // harmonic 1 of key 60 at the default divisor
+    std::printf ("  pulse-1 rate = %.4f Hz = %.2f BPM (defaults: divide 8 times by 2)\n",
                  rateHz, rateHz * 60.0);
-    check (rateHz * 60.0 > 100.0 && rateHz * 60.0 < 150.0, "default pulse 1 lands near 130 BPM");
+    check (rateHz * 60.0 > 30.0 && rateHz * 60.0 < 300.0, "default pulse 1 is in musical BPM range");
     check ((int) onsP2.size() < 60, "no MIDI flood while holding (4 s of pulses)");
 
     // steps: P3 train transposed +7 from the played note
@@ -130,6 +130,55 @@ int main()
     auto evs3 = runBlocks (30, -1, -1, 60);
     int strays = 0; for (const auto& e : evs3) if (e.on) ++strays;
     check (strays == 0, "no pulses when no note is held");
+
+    // --- run 4: note-on MID-BLOCK -> first pulse exactly at that sample ---------
+    {
+        std::vector<Ev> evs4;
+        for (int b = 0; b < 40; ++b)
+        {
+            juce::MidiBuffer midi;
+            if (b == 1) midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 137);
+            if (b == 38) midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+            proc.processBlock (audio, midi);
+            for (const auto meta : midi)
+            {
+                const auto m = meta.getMessage();
+                if (m.isNoteOn())
+                    evs4.push_back ({ b * blk + (int) meta.samplePosition, true, m.getNoteNumber(), m.getChannel() });
+            }
+        }
+        check (! evs4.empty() && evs4.front().sample == blk + 137,
+               "mid-block note-on: first pulse lands exactly ON the note-on sample");
+    }
+
+    // --- run 5: slot ROUTED while a note is already held -> fresh downbeat ------
+    // (this was the "first press sounds early / out of phase" bug: a train enabled
+    // mid-hold started from a stale phase)
+    {
+        proc.getRhythm().slots[0].enabled = false; // disable, hold a note, re-enable
+        std::vector<Ev> evs5; int enableSample = -1;
+        for (int b = 0; b < 60; ++b)
+        {
+            juce::MidiBuffer midi;
+            if (b == 0)  midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+            if (b == 20) { proc.getRhythm().slots[0].enabled = true; enableSample = b * blk; }
+            if (b == 58) midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+            proc.processBlock (audio, midi);
+            for (const auto meta : midi)
+            {
+                const auto m = meta.getMessage();
+                if (m.isNoteOn() && m.getNoteNumber() == 60)
+                    evs5.push_back ({ b * blk + (int) meta.samplePosition, true, 60, m.getChannel() });
+            }
+        }
+        // First P2 pulse after enabling must land AT the enable point (fresh
+        // downbeat), not at some stale mid-phase moment.
+        int first = -1;
+        for (const auto& e : evs5) if (e.sample >= enableSample) { first = e.sample; break; }
+        std::printf ("  slot enabled mid-hold at %d; first pulse at %d\n", enableSample, first);
+        check (first >= 0 && first - enableSample <= blk,
+               "train routed MID-HOLD starts with a fresh downbeat (no stale phase)");
+    }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;

@@ -77,7 +77,7 @@ public:
         sr = sampleRate > 0.0 ? sampleRate : 44100.0;
         for (int i = 0; i < kSlots; ++i)
             for (int j = 0; j < kMaxNotes; ++j)
-            { phase[i][j] = 0.0; gateLeft[i][j] = 0; }
+            { phase[i][j] = 0.0; gateLeft[i][j] = 0; wasOn[i][j] = false; }
         for (auto& h : heldCol) h.active = false;
         for (auto& b : channelBend) b = 0.0;
         driverCol = -1; lastDriver = -1;
@@ -110,7 +110,7 @@ public:
         const bool on  = onParam   != nullptr && onParam->load()   > 0.5f;
         const bool all = modeParam != nullptr && modeParam->load() > 0.5f;
         mpeOut         = mpeParam  != nullptr && mpeParam->load()  > 0.5f;
-        const int  x   = juce::jlimit (1, 12, (int) xParam->load());
+        const int  x   = juce::jlimit (2, 12, (int) xParam->load());
         const int  nD  = juce::jlimit (1, 16, (int) nParam->load());
         divisor = std::pow ((double) x, (double) nD);
 
@@ -289,6 +289,10 @@ private:
                 const double r     = juce::jlimit (0.01, 30.0, hz);
                 inc[i][j] = r / sr;
                 if (j == driverCol) uiRate = (float) r;
+                // Fresh DOWNBEAT whenever a train BECOMES active mid-hold (slot just
+                // routed, On just flipped, mode switched...): otherwise it would start
+                // from a stale mid-phase and the first cycle sounds early/shifted.
+                if (! wasOn[i][j]) phase[i][j] = 1.0;
 
                 // Sent pitch: ratio slots = the EXACT pitch f0*slotRatio (note+bend);
                 // plain slots = the typed note transposed by this held note's interval
@@ -312,6 +316,7 @@ private:
                     sendBend[i][j] = 8192; // centre
                 }
             }
+            for (int j = 0; j < kMaxNotes; ++j) wasOn[i][j] = inc[i][j] > 0.0;
             lastRateHz[(size_t) i].store (uiRate, std::memory_order_relaxed);
         }
 
@@ -364,6 +369,7 @@ private:
     double channelBend[16] = {};
 
     double phase   [kSlots][kMaxNotes] = {};
+    bool   wasOn   [kSlots][kMaxNotes] = {}; // train was active last segment (downbeat on activation)
     int    gateLeft[kSlots][kMaxNotes] = {};
     int    gateNote[kSlots][kMaxNotes] = {};
     int    gateChn [kSlots][kMaxNotes] = {};
