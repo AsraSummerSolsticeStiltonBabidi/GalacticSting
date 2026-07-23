@@ -74,23 +74,18 @@ public:
     // Degrees per period of the active tuning (for the colour keyboard).
     int getScaleDegrees() const noexcept { return tuning.degreesPerPeriod(); }
 
-    // MIDI range the colour keyboard should display, adapted to the active tuning
-    // so wide-period scales (e.g. a period-5 scale, whose keys span sub-audio to
-    // ultrasonic over a fixed 44-key window) only ever offer keys in a musical
-    // band. Expands out from the tonic (key 60) while the fundamental stays in
-    // [loHz, hiHz], then caps the span for playable cell widths.
+    // The FULL playable MIDI range the colour keyboard should offer, adapted to the
+    // active tuning so wide-period scales only expose keys in the musical band
+    // [loHz, hiHz]. The keyboard itself shows a readable-width WINDOW of this and
+    // scrolls (arrows) through the rest, so dense scales (31-EDO...) keep big keys
+    // while still reaching the whole audible span.
     void getKeyboardKeyRange (int& lowKey, int& numKeys) const noexcept
     {
         constexpr double loHz = 40.0, hiHz = 4186.0; // ~E1 .. ~C8
-        constexpr int tonic = 60, maxKeys = 52, minKeys = 8;
+        constexpr int tonic = 60, minKeys = 8;
         int lo = tonic, hi = tonic;
         while (lo > 0   && tuning.frequencyForNote (lo - 1) >= loHz) --lo;
         while (hi < 127 && tuning.frequencyForNote (hi + 1) <= hiHz) ++hi;
-        if (hi - lo + 1 > maxKeys) // 12-TET etc.: comfortable window centred on the tonic
-        {
-            lo = juce::jmax (lo, tonic - maxKeys / 2);
-            hi = juce::jmin (hi, lo + maxKeys - 1);
-        }
         if (hi - lo + 1 < minKeys) // ultra-wide period: still show a few keys
         {
             lo = juce::jlimit (0, 127 - minKeys + 1, tonic - minKeys / 2);

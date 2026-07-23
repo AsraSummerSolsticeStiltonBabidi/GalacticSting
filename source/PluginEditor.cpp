@@ -939,8 +939,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             if (! (f0 > 0.0) || ! (f1 > 0.0)) return {};
             const int    steps = toNote - fromNote;
             const double cents = 1200.0 * std::log2 (f1 / f0);
-            juce::String s;
-            s << (steps > 0 ? "+" : "") << steps << "st\n"
+            juce::String s; // steps (no "st" - that reads as semitone), then cents
+            s << (steps > 0 ? "+" : "") << steps << "\n"
               << (cents >= 0 ? "+" : "-") << juce::String ((int) std::llround (std::abs (cents))) << "c";
             // Exact ratio ONLY when BOTH keys are genuine just degrees - then the ratio
             // between them is truly rational, so a large fraction here is real, not a
@@ -1019,6 +1019,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.heading.setText (tr ("SPECTRUM TO RHYTHM (MIDI OUT)", "ESPECTRE A RITME (SORTIDA MIDI)"), dontSendNotification);
     rhythmPanel.listHead.setText (tr ("Partials of the current patch (click to route)",
                                       "Parcials del patch actual (clica per encaminar)"), dontSendNotification);
+    rhythmPanel.pickHint.setText (juce::String::fromUTF8 (catalan
+                                      ? "\xe2\x9f\xb5 Clica un parcial per encaminar-lo"
+                                      : "\xe2\x9f\xb5 Click a partial to route it"), dontSendNotification);
     rhythmPanel.onT.setButtonText (tr ("On", "Actiu"));
     rhythmPanel.secRate.setText  (tr ("PULSE RATE", "VELOCITAT DELS POLSOS"), dontSendNotification);
     rhythmPanel.secOut.setText   (tr ("OUTPUT", "SORTIDA"), dontSendNotification);
@@ -2210,6 +2213,24 @@ void FractalAdditiveAudioProcessorEditor::resized()
 }
 
 void FractalAdditiveAudioProcessorEditor::mouseDown (const juce::MouseEvent&) { grabKeyboardFocus(); }
+
+// After switching to another plugin window (or app) and back, nothing in our
+// hierarchy holds keyboard focus, so the computer keyboard can't play (and with no
+// driving note the Spectrum-to-Rhythm pulses stop too). Reclaim focus when the host
+// re-activates our window OR the mouse re-enters the plugin - unless the user is in a
+// text field, whose typing must not be hijacked.
+void FractalAdditiveAudioProcessorEditor::reclaimFocusUnlessTyping()
+{
+    if (dynamic_cast<juce::TextEditor*> (juce::Component::getCurrentlyFocusedComponent()) != nullptr) return;
+    if (! hasKeyboardFocus (true))
+        grabKeyboardFocus();
+}
+void FractalAdditiveAudioProcessorEditor::mouseEnter (const juce::MouseEvent&) { reclaimFocusUnlessTyping(); }
+void FractalAdditiveAudioProcessorEditor::broughtToFront()
+{
+    juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
+    { if (safe != nullptr) safe->reclaimFocusUnlessTyping(); });
+}
 
 bool FractalAdditiveAudioProcessorEditor::keyPressed (const juce::KeyPress& key)
 {

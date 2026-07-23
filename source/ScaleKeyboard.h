@@ -34,10 +34,15 @@ public:
     // reads "0") and how many keys to show. `numKeys <= 0` restores the automatic
     // ~26 px-per-cell count. Adapting the window to the tuning's period keeps wide
     // scales from exposing sub-audio / ultrasonic keys.
+    // The full playable range [lowestKey, lowestKey+numKeys). If more keys fit than
+    // the minimum readable width allows, only a window is shown and left/right arrows
+    // scroll through the rest (so a dense scale like 31-EDO never gets microscopic).
     void setRange (int lowestKey, int numKeys = 0)
     {
-        baseKey   = juce::jlimit (0, 127, lowestKey);
-        shownKeys = numKeys;
+        const int lo = juce::jlimit (0, 127, lowestKey);
+        const int cnt = numKeys > 0 ? juce::jmin (numKeys, 128 - lo) : juce::jmax (1, getWidth() / 30);
+        if (lo != rangeLo || cnt != rangeCount) { rangeLo = lo; rangeCount = cnt; baseKey = lo; } // new range -> reset view
+        clampView();
         repaint();
     }
     int  getBaseKey() const noexcept { return baseKey; }
@@ -77,8 +82,9 @@ public:
     {
         const int D = juce::jmax (1, getDegrees ? getDegrees() : 12);
         const int cells = numCells();
-        const float w = (float) getWidth() / (float) cells;
-        const float h = (float) getHeight() - (float) stripH; // keys use the top; strip is below
+        const float aw = (float) arrowW();                       // scroll-arrow zones (0 if all keys fit)
+        const float w = (float) keysWidth() / (float) cells;
+        const float h = (float) getHeight() - (float) stripH;    // keys use the top; strip is below
 
         // Below-keyboard delta strip: dark, empty until a key is hovered.
         {
@@ -98,7 +104,7 @@ public:
             const float hue = 0.82f * (float) degree / (float) D;
             const bool held = state.isNoteOnForChannels (0xffff, note);
 
-            auto cell = juce::Rectangle<float> (i * w, 0.0f, w, h).reduced (0.6f);
+            auto cell = juce::Rectangle<float> (aw + i * w, 0.0f, w, h).reduced (0.6f);
             auto col = juce::Colour::fromHSV (hue, 0.62f, held ? 1.0f : 0.86f, 1.0f);
             g.setColour (held ? col.brighter (0.35f) : col);
             g.fillRect (cell);
@@ -109,27 +115,28 @@ public:
                 g.drawRect (cell, 2.0f);
             }
 
-            // Degree number + (optional) just-interval label below it.
+            // Degree number (as WIDE as the key allows via drawFittedText) + (optional)
+            // just-interval label below it.
             const juce::String label = getLabel ? getLabel (degree) : juce::String();
             g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
             if (label.isNotEmpty())
             {
                 auto top = cell.removeFromTop (cell.getHeight() * 0.52f);
-                g.setFont (juce::Font (juce::FontOptions (juce::jmin (18.0f, w * 0.5f)).withStyle ("Bold")));
-                g.drawText (juce::String (degree), top, juce::Justification::centred, false);
+                g.setFont (juce::Font (juce::FontOptions (juce::jmin (top.getHeight() * 0.98f, w * 0.9f)).withStyle ("Bold")));
+                g.drawFittedText (juce::String (degree), top.toNearestInt(), juce::Justification::centred, 1, 0.5f);
                 drawIntervalLabel (g, label, cell, w);
             }
             else
             {
-                g.setFont (juce::Font (juce::FontOptions (juce::jmin (18.0f, w * 0.55f)).withStyle ("Bold")));
-                g.drawText (juce::String (degree), cell, juce::Justification::centred, false);
+                g.setFont (juce::Font (juce::FontOptions (juce::jmin (cell.getHeight() * 0.9f, w * 0.9f)).withStyle ("Bold")));
+                g.drawFittedText (juce::String (degree), cell.toNearestInt(), juce::Justification::centred, 1, 0.5f);
             }
 
             // Below-keyboard strip: on hover, this key's distance to the hovered key
             // (or, under the hovered key itself, its "from n/1" source in the spectrum colour).
             if (hoveredNote >= 0)
             {
-                auto sc = juce::Rectangle<float> (i * w, h, w, (float) stripH).reduced (1.0f, 2.0f);
+                auto sc = juce::Rectangle<float> (aw + i * w, h, w, (float) stripH).reduced (1.0f, 2.0f);
                 if (note == hoveredNote)
                 {
                     const juce::String src = getSourceLabel ? getSourceLabel (note) : juce::String();
@@ -151,6 +158,26 @@ public:
                     }
                 }
             }
+        }
+
+        // Scroll arrows for scales too wide to show at the readable min key width.
+        if (isScrollable())
+        {
+            const bool canL = baseKey > rangeLo;
+            const bool canR = baseKey + numCells() < rangeLo + rangeCount;
+            auto drawArrow = [&] (juce::Rectangle<float> zone, bool left, bool enabled)
+            {
+                g.setColour (juce::Colour (0xff1a1a24));
+                g.fillRect (zone);
+                g.setColour (enabled ? juce::Colours::white : juce::Colour (0xff44444e));
+                auto t = zone.withSizeKeepingCentre (zone.getWidth() * 0.42f, zone.getHeight() * 0.16f);
+                juce::Path p;
+                if (left) { p.addTriangle (t.getRight(), t.getY(), t.getRight(), t.getBottom(), t.getX(), t.getCentreY()); }
+                else      { p.addTriangle (t.getX(), t.getY(), t.getX(), t.getBottom(), t.getRight(), t.getCentreY()); }
+                g.fillPath (p);
+            };
+            drawArrow (juce::Rectangle<float> (0.0f, 0.0f, aw, h), true,  canL);
+            drawArrow (juce::Rectangle<float> ((float) getWidth() - aw, 0.0f, aw, h), false, canR);
         }
     }
 
@@ -185,9 +212,24 @@ public:
         }
     }
 
-    // Only the keys play; the bottom hover-delta strip is a read-out, not a key.
-    void mouseDown (const juce::MouseEvent& e) override { hoverArmed = false; if (e.y < getHeight() - stripH) playAt (e.x); }
-    void mouseDrag (const juce::MouseEvent& e) override { hoverArmed = false; if (e.y < getHeight() - stripH) playAt (e.x); else releaseHeld(); }
+    // Only the keys play; the bottom hover-delta strip is a read-out, the side arrows scroll.
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        hoverArmed = false;
+        if (e.y >= getHeight() - stripH) return; // strip
+        const int aw = arrowW();
+        if (aw > 0 && e.x < aw)                { scrollBy (-scrollStep()); return; }
+        if (aw > 0 && e.x >= getWidth() - aw)  { scrollBy ( scrollStep()); return; }
+        playAt (e.x);
+    }
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        hoverArmed = false;
+        const int aw = arrowW();
+        if (e.y < getHeight() - stripH && e.x >= aw && e.x < getWidth() - aw) playAt (e.x);
+        else releaseHeld();
+    }
+    int scrollStep() const { return juce::jmax (1, numCells() - 1); } // near-page step
     void mouseUp   (const juce::MouseEvent&)   override
     {
         releaseHeld();
@@ -209,18 +251,30 @@ public:
 private:
     static constexpr int kRefKey = 60;
 
+    static constexpr int kMinCellW = 32; // a key never gets narrower than this (readability)
+    static constexpr int kArrowW   = 22; // scroll-arrow zone width when the scale doesn't fit
+
+    // How many keys are shown at once: everything if it fits at the min width, else a
+    // window (with arrows reserved) sized to the min width.
     int numCells() const
     {
-        const int target = shownKeys > 0 ? shownKeys
-                                          : juce::jmax (1, getWidth() / 26); // ~26 px per cell
-        return juce::jlimit (1, 128 - baseKey, target);
+        const int fit = juce::jmax (1, getWidth() / kMinCellW);
+        if (rangeCount <= fit) return rangeCount;
+        return juce::jlimit (1, rangeCount, juce::jmax (1, (getWidth() - 2 * kArrowW) / kMinCellW));
     }
+    bool isScrollable() const { return numCells() < rangeCount; }
+    int  arrowW()      const { return isScrollable() ? kArrowW : 0; }
+    int  keysWidth()   const { return juce::jmax (1, getWidth() - 2 * arrowW()); }
+    void clampView() { baseKey = juce::jlimit (rangeLo, rangeLo + rangeCount - numCells(), baseKey); }
+    void scrollBy (int d) { baseKey = juce::jlimit (rangeLo, rangeLo + rangeCount - numCells(), baseKey + d); repaint(); }
 
+    // Screen x -> MIDI note (only within the keys area; the arrow zones return -1).
     int noteAt (int x) const
     {
         const int cells = numCells();
-        if (cells <= 0 || getWidth() <= 0) return -1;
-        const int i = juce::jlimit (0, cells - 1, x * cells / getWidth());
+        const int aw = arrowW();
+        if (cells <= 0 || x < aw || x >= getWidth() - aw) return -1;
+        const int i = juce::jlimit (0, cells - 1, (x - aw) * cells / keysWidth());
         const int note = baseKey + i;
         return note <= 127 ? note : -1;
     }
@@ -264,8 +318,9 @@ private:
     std::function<juce::String(int)>     getSourceLabel; // note -> "from n/1" (segment scales)
     juce::Colour sourceColour { 0xffff9a3c };            // Spectrum-to-Tuning colour for the source label
     static constexpr int stripH = 30;                    // below-keyboard hover-delta strip height
-    int baseKey  = 48; // C3
-    int shownKeys = 0; // >0 = fixed visible-key count; 0 = auto (~26 px/cell)
+    int baseKey   = 48; // leftmost VISIBLE key (the scroll position)
+    int rangeLo   = 48; // full playable range start
+    int rangeCount = 40; // full playable range length (keys); a window of it is shown
     int mouseNote = -1;
     int hoverCell = -1;
     bool hoverArmed = false;
