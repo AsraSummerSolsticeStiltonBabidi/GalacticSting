@@ -85,7 +85,10 @@ namespace
     juce::Path lShapedFrame (juce::Rectangle<float> bar, juce::Rectangle<float> foot, float rad)
     {
         const float bx = bar.getX(), by = bar.getY(), br = bar.getRight(), bb = bar.getBottom();
-        const float fx = foot.getX(), fy = foot.getY();
+        const float fx = foot.getX();
+        // Guard: the bar must start above the foot top by at least the corner radius,
+        // else the notch would self-cross - fall back to a plain top-rounded union rect.
+        const float fy = juce::jmax (foot.getY(), by + rad + 1.0f);
         rad = juce::jmin (rad, bar.getWidth() * 0.5f);
         juce::Path p;
         p.startNewSubPath (bx + rad, by);
@@ -755,12 +758,14 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // "from spectrum's segment" partial picker. Relayout + reflect the tuning on change.
     specModeBox.addItem ("Based on Sethares dissonance", 1);
     specModeBox.addItem ("From spectrum's segment",       2);
-    specModeBox.setSelectedId (1, juce::dontSendNotification);
+    specModeBox.setSelectedId (processorRef.isSegmentModeActive() ? 2 : 1, juce::dontSendNotification); // restored state
     specModeBox.setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
     specModeBox.setMouseClickGrabsKeyboardFocus (false);
     specModeBox.onChange = [this]
     {
-        if (specModeBox.getSelectedId() == 2) processorRef.rebuildSegmentScale();
+        const bool seg = specModeBox.getSelectedId() == 2;
+        processorRef.setSegmentModeActive (seg);
+        if (seg) processorRef.rebuildSegmentScale();
         resized(); refocus();
     };
     addAndMakeVisible (specModeBox);
@@ -772,7 +777,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     segView.setScrollBarsShown (true, false);
     addAndMakeVisible (segView);
     makeLabel (segPeriodLbl, cSpecScale);
-    segPeriodEdit.setText ("2", juce::dontSendNotification);
+    segPeriodEdit.setText (processorRef.getSegmentPeriodText(), juce::dontSendNotification); // restored
     segPeriodEdit.setJustification (juce::Justification::centred);
     segPeriodEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
     segPeriodEdit.setColour (juce::TextEditor::outlineColourId, cSpecScale.withAlpha (0.7f));
@@ -780,6 +785,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     segPeriodEdit.onReturnKey = [this] { processorRef.setSegmentPeriodText (segPeriodEdit.getText()); refocus(); };
     segPeriodEdit.onFocusLost = [this] { processorRef.setSegmentPeriodText (segPeriodEdit.getText()); };
     addAndMakeVisible (segPeriodEdit);
+    segTopToggle.setToggleState (processorRef.getSegmentUseTopPeriod(), juce::dontSendNotification); // restored
+    segPeriodEdit.setEnabled (! processorRef.getSegmentUseTopPeriod());
     segTopToggle.onClick = [this]
     {
         processorRef.setSegmentUseTopPeriod (segTopToggle.getToggleState());
@@ -1845,7 +1852,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
     {
         auto sp = area.removeFromRight (208);
         const bool seg = specModeBox.getSelectedId() == 2; // "from spectrum's segment"
-        auto spTop = sp.removeFromTop (seg ? 226 : 124);   // taller for the partial list
+        // Segment mode is taller (partial list) but capped so the dissonance BAR
+        // still starts ABOVE the Tuning FOOT top - otherwise the inverted-L notch
+        // would self-cross (foot taller than bar). The list scrolls for the rest.
+        auto spTop = sp.removeFromTop (seg ? 190 : 124);
         sp.removeFromTop (4);
         lBarBounds = sp;                                   // dissonance BAR of the L
 
@@ -2264,6 +2274,23 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             rhythmPanel.refreshSlots(); // ratio labels may have changed
         }
         rhythmPanel.refreshLive();
+    }
+
+    // Segment picker: refresh when the spectrum template changes (partial count/ratios
+    // move with Base N, fractal, a completing morph...) so it never shows stale rows.
+    if (segView.isVisible())
+    {
+        const juce::uint32 g = processorRef.getTemplateGeneration();
+        if (g != lastSegGen)
+        {
+            lastSegGen = g;
+            segList.numRows = processorRef.getTemplatePartialCount();
+            const int visH = segView.getHeight();
+            const int ch   = segList.contentHeight();
+            const bool ss  = ch > visH && visH > 0;
+            segList.setSize (ss ? segView.getWidth() - 10 : segView.getWidth(), juce::jmax (visH, ch));
+            segList.repaint();
+        }
     }
     // Continuous DAW-tempo sync: while the toggle is on, re-send CC20 whenever the
     // rounded target BPM changes (a new note re-speeds pulse 1 -> the tempo follows).

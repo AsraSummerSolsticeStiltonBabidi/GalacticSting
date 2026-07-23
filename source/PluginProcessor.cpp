@@ -847,6 +847,23 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         if (ry.getNumChildren() > 0)
             state.appendChild (ry, nullptr);
     }
+
+    // "From spectrum's segment": the mode, the picked partials, the period spec, and
+    // the generated .scl text (so the picker + Save survive a reopen; the tuning
+    // itself already persists via the SCALA child).
+    {
+        juce::ValueTree sg ("SEGMENT");
+        sg.setProperty ("modeActive", segmentModeActive, nullptr);
+        sg.setProperty ("anchor",     segAnchor,         nullptr);
+        sg.setProperty ("periodText", segPeriodText,     nullptr);
+        sg.setProperty ("useTop",     segUseTopPeriod,   nullptr);
+        juce::String sel;
+        for (int i : segSel) sel += (sel.isEmpty() ? "" : ",") + juce::String (i);
+        sg.setProperty ("sel", sel, nullptr);
+        sg.setProperty ("scl",  lastDissScl,  nullptr);
+        sg.setProperty ("name", lastDissName, nullptr);
+        state.appendChild (sg, nullptr);
+    }
     return state;
 }
 
@@ -874,6 +891,20 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
                 rhythm.slots[i].enabled  = (bool)   slot.getProperty ("on", false);
             }
         }
+
+    // "From spectrum's segment" state (the tuning itself comes back via SCALA).
+    segSel.clear(); segAnchor = -1; segPeriodText = "2"; segUseTopPeriod = false; segmentModeActive = false;
+    if (auto sg = tree.getChildWithName ("SEGMENT"); sg.isValid())
+    {
+        segmentModeActive = (bool) sg.getProperty ("modeActive", false);
+        segAnchor         = (int)  sg.getProperty ("anchor", -1);
+        segPeriodText     = sg.getProperty ("periodText", "2").toString();
+        segUseTopPeriod   = (bool) sg.getProperty ("useTop", false);
+        for (const auto& tok : juce::StringArray::fromTokens (sg.getProperty ("sel").toString(), ",", ""))
+            if (tok.trim().isNotEmpty()) segSel.insert (tok.getIntValue());
+        lastDissScl  = sg.getProperty ("scl").toString();   // so Save works again
+        lastDissName = sg.getProperty ("name").toString();
+    }
 
     // Tuning bank slots.
     for (auto& s : bankName)   s.clear();

@@ -916,6 +916,7 @@ private:
     std::unique_ptr<ButtonAttachment>   rhythmOnAtt, rhythmMpeAtt, rhythmTempoAtt;
     std::unique_ptr<ComboBoxAttachment> rhythmModeAtt;
     juce::uint32 lastRhythmGen = 0; // refresh the partial list when the template changes
+    juce::uint32 lastSegGen = 0;    // refresh the segment picker on template change
     int lastTempoSent = -1;         // last CC20 BPM sent by the tempo-sync toggle
 
     juce::GroupComponent gHarmonic, gBase, gWhitelist, gSlope, gSpectrumRange, gFractal,
