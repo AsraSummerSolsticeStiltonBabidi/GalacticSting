@@ -181,6 +181,15 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "tuningBankSlot", 1 }, "Tuning Bank Slot", 0, kBankSlots, 0));
 
+    //-- Timbre -> rhythm MIDI out ----------------------------------------------
+    // Each selected partial pulses at f0 * ratio / x^n; x and n are automatable.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "rhythmOn", 1 }, "Rhythm MIDI On", false));
+    params.push_back (std::make_unique<AudioParameterInt>(
+        ParameterID { "rhythmDivX", 1 }, "Rhythm Divide Base (x)", 2, 12, 2));
+    params.push_back (std::make_unique<AudioParameterInt>(
+        ParameterID { "rhythmDivN", 1 }, "Rhythm Divide Times (n)", 1, 16, 8));
+
     //-- Scala-as-timbre --------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "timbreRepeats", 1 }, "Timbre Period Repeats", 1, 8, 3));
@@ -556,6 +565,7 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     spectrumEngine.buildNow (lastPushed);
 
     tuning.setMode ((TuningManager::Mode) (int) apvts.getRawParameterValue ("tuningMode")->load());
+    rhythm.prepare (sampleRate);
 
     startTimerHz (30); // poll spectrum params and rebuild off the audio thread
 }
@@ -583,6 +593,11 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         apvts.getRawParameterValue ("masterGain")->load());
     buffer.applyGainRamp (0, buffer.getNumSamples(), lastGain, gain);
     lastGain = gain;
+
+    // Timbre -> rhythm MIDI out: generated in this very block with exact sample
+    // stamps, from the same f0/tuning maths as the voices -> sample-locked to the
+    // audio. Consumes the input events; only the pulse MIDI leaves the plugin.
+    rhythm.process (midiMessages, buffer.getNumSamples());
 }
 
 //==============================================================================
@@ -631,6 +646,27 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         if (bank.getNumChildren() > 0)
             state.appendChild (bank, nullptr);
     }
+
+    state.removeChild (state.getChildWithName ("RHYTHM"), nullptr);
+    {
+        juce::ValueTree ry ("RHYTHM");
+        for (int i = 0; i < RhythmEngine::kSlots; ++i)
+        {
+            const auto& s = rhythm.slots[i];
+            if (s.partial.load() >= 0)
+            {
+                juce::ValueTree slot ("SLOT");
+                slot.setProperty ("i",       i,                    nullptr);
+                slot.setProperty ("partial", s.partial.load(),     nullptr);
+                slot.setProperty ("note",    s.note.load(),        nullptr);
+                slot.setProperty ("durMs",   (double) s.durMs.load(), nullptr);
+                slot.setProperty ("on",      s.enabled.load(),     nullptr);
+                ry.appendChild (slot, nullptr);
+            }
+        }
+        if (ry.getNumChildren() > 0)
+            state.appendChild (ry, nullptr);
+    }
     return state;
 }
 
@@ -640,6 +676,21 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
         return;
 
     apvts.replaceState (tree);
+
+    // Rhythm (timbre->MIDI) slots.
+    for (auto& s : rhythm.slots) { s.partial = -1; s.enabled = false; s.note = 60; s.durMs = 60.0f; }
+    if (auto ry = tree.getChildWithName ("RHYTHM"); ry.isValid())
+        for (auto slot : ry)
+        {
+            const int i = (int) slot.getProperty ("i", -1);
+            if (juce::isPositiveAndBelow (i, RhythmEngine::kSlots))
+            {
+                rhythm.slots[i].partial = (int)   slot.getProperty ("partial", -1);
+                rhythm.slots[i].note    = (int)   slot.getProperty ("note", 60);
+                rhythm.slots[i].durMs   = (float) (double) slot.getProperty ("durMs", 60.0);
+                rhythm.slots[i].enabled = (bool)  slot.getProperty ("on", false);
+            }
+        }
 
     // Tuning bank slots.
     for (auto& s : bankName)   s.clear();

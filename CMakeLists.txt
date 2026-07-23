@@ -41,7 +41,7 @@ juce_add_plugin(FractalAdditive
     PLUGIN_CODE                 Frac
     IS_SYNTH                    TRUE
     NEEDS_MIDI_INPUT            TRUE
-    NEEDS_MIDI_OUTPUT           FALSE
+    NEEDS_MIDI_OUTPUT           TRUE          # timbre->rhythm MIDI out (RhythmEngine)
     IS_MIDI_EFFECT              FALSE
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE          # required for computer-keyboard play
     VST3_CATEGORIES             "Instrument" "Synth"
