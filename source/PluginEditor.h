@@ -19,6 +19,8 @@ public:
     void paint (juce::Graphics&) override;
     void resized() override;
     void mouseDown (const juce::MouseEvent&) override;
+    void mouseEnter (const juce::MouseEvent&) override; // reclaim keyboard focus so play works after a window switch
+    void broughtToFront() override;                      // ditto when the host re-activates our window
     bool keyPressed (const juce::KeyPress&) override;
     bool keyStateChanged (bool isKeyDown) override;
 
@@ -36,6 +38,7 @@ private:
     void layoutFaders (juce::GroupComponent&, juce::Rectangle<int>, juce::Colour,
                        std::initializer_list<juce::Slider*>, std::initializer_list<juce::Label*>);
     void refocus();
+    void reclaimFocusUnlessTyping(); // regrab keyboard focus after a window switch (not while typing)
     void pollComputerKeyboard(); // reconcile held keys against the real key state
     void openScalaChooser();
     void openTimbreChooser();
@@ -265,7 +268,7 @@ private:
         juce::ListBox      list { "partials", this };
         juce::ToggleButton onT, mpeT, tempoT; // tempoT = continuous DAW-tempo sync (CC20)
         juce::ComboBox     modeBox;
-        juce::Label        heading, listHead, info, noteHead, durHead, bpmLbl;
+        juce::Label        heading, listHead, info, noteHead, durHead, bpmLbl, pickHint;
         juce::Label        secRate, secOut, secTempo;         // coloured group headers
         juce::Label        divLbl, timesLbl, nVal, xVal;      // "divide [n] times by [x]"
         juce::TextButton   nUp, nDn, xUp, xDn;                // tiny round steppers
@@ -282,23 +285,25 @@ private:
         // editor (text boxes commit + collapse; the play keys work again).
         void mouseDown (const juce::MouseEvent&) override { if (onEdited) onEdited(); }
 
-        // Scale steps FROM the played note: "7st" = 7 steps up, "7st-" (or "-7st")
-        // = 7 steps down. Returns INT_MIN when the text is not a steps spec.
+        // Scale steps FROM the played note: "7step" = 7 steps up, "7step-" (or
+        // "-7step") = 7 down. Accepts "step"/"steps"/"st". INT_MIN if not a steps spec.
         static int parseSteps (juce::String t)
         {
             t = t.trim().toLowerCase().removeCharacters (" ");
             bool down = false;
             if (t.endsWith ("-"))   { down = true; t = t.dropLastCharacters (1); }
             if (t.startsWith ("-")) { down = true; t = t.substring (1); }
-            if (! t.endsWith ("st")) return std::numeric_limits<int>::min();
-            const auto num = t.dropLastCharacters (2);
-            if (num.isEmpty() || ! num.containsOnly ("0123456789")) return std::numeric_limits<int>::min();
-            const int v = juce::jlimit (0, 127, num.getIntValue());
+            if      (t.endsWith ("steps")) t = t.dropLastCharacters (5);
+            else if (t.endsWith ("step"))  t = t.dropLastCharacters (4);
+            else if (t.endsWith ("st"))    t = t.dropLastCharacters (2);
+            else return std::numeric_limits<int>::min();
+            if (t.isEmpty() || ! t.containsOnly ("0123456789")) return std::numeric_limits<int>::min();
+            const int v = juce::jlimit (0, 127, t.getIntValue());
             return down ? -v : v;
         }
         static juce::String stepsText (int steps)
         {
-            return steps < 0 ? juce::String (-steps) + "st-" : juce::String (steps) + "st";
+            return steps < 0 ? juce::String (-steps) + "step-" : juce::String (steps) + "step";
         }
 
         // Best small fraction p/q ~ v (continued fractions, den <= 16) for the
@@ -342,6 +347,11 @@ private:
             listHead.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
             listHead.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
             addAndMakeVisible (listHead);
+            // Points at the partial list when On is on but nothing is routed yet.
+            pickHint.setJustificationType (juce::Justification::centredLeft);
+            pickHint.setColour (juce::Label::textColourId, juce::Colour (0xff2fb155)); // green (matches ON)
+            pickHint.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
+            addChildComponent (pickHint);
             list.setRowHeight (20);
             list.setColour (juce::ListBox::backgroundColourId, juce::Colour (0xff141420));
             addAndMakeVisible (list);
@@ -403,7 +413,7 @@ private:
             miniStep (xUp, "+", "rhythmDivX",  1);
             miniStep (xDn, "-", "rhythmDivX", -1);
 
-            helpB.setButtonText ("?");
+            helpB.setButtonText ("How to route");
             helpB.setColour (juce::TextButton::buttonColourId, juce::Colour (0xffffc95c));
             helpB.onClick = [this]
             {
@@ -695,6 +705,10 @@ private:
                     durS[i].setValue ((double) s.durMs.load(), juce::dontSendNotification);
                 }
             }
+            // Guide the user the moment they switch On with nothing routed yet.
+            const bool on = proc != nullptr && proc->apvts.getRawParameterValue ("rhythmOn")->load() > 0.5f;
+            const bool none = readSlots().empty();
+            pickHint.setVisible (on && none);
         }
 
         void refreshLive() // pulse rates + polyrhythm chain, from the audio thread's read-outs
@@ -747,6 +761,11 @@ private:
             }
             info.setText (s, juce::dontSendNotification);
 
+            // Guide the user the moment they switch On with nothing routed yet
+            // (updated here, every tick, so it reacts to the On toggle too).
+            const bool onNow = proc->apvts.getRawParameterValue ("rhythmOn")->load() > 0.5f;
+            pickHint.setVisible (onNow && readSlots().empty());
+
             const double bpm = tempoBpm();
             bpmLbl.setText (bpm > 0.0 ? "= " + juce::String (bpm, 1) + " BPM"
                                       : juce::String ("= ... BPM"),
@@ -758,11 +777,11 @@ private:
             auto r = getLocalBounds().reduced (14, 10);
             auto top = r.removeFromTop (26);
             closeB.setBounds (top.removeFromRight (24).withSizeKeepingCentre (22, 22));
-            top.removeFromRight (4);
-            helpB.setBounds (top.removeFromRight (24).withSizeKeepingCentre (22, 22));
+            top.removeFromRight (5);
+            helpB.setBounds (top.removeFromRight (104).withSizeKeepingCentre (104, 22)); // "How to route"
             // Master ON/OFF pill: right of the title, green (on) / red (off).
             auto titleZone = top;
-            heading.setBounds (titleZone.removeFromLeft (juce::jmin (270, titleZone.getWidth() - 76)));
+            heading.setBounds (titleZone.removeFromLeft (juce::jmin (256, titleZone.getWidth() - 76)));
             titleZone.removeFromLeft (8);
             onT.setBounds (titleZone.removeFromLeft (64).withSizeKeepingCentre (64, 24));
             r.removeFromTop (6);
@@ -808,6 +827,7 @@ private:
             listHead.setBounds (left.removeFromTop (16));
             list.setBounds (left);
             r.removeFromLeft (10);
+            pickHint.setBounds (r.withTrimmedTop (16).withHeight (34)); // over the empty slot rows, points at the list
             {
                 auto head = r.removeFromTop (14);
                 head.removeFromLeft (96);
