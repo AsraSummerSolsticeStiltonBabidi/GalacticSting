@@ -80,7 +80,7 @@ public:
             { phase[i][j] = 0.0; gateLeft[i][j] = 0; }
         for (auto& h : heldCol) h.active = false;
         for (auto& b : channelBend) b = 0.0;
-        driverCol = -1;
+        driverCol = -1; lastDriver = -1;
         displayF0.store (0.0f, std::memory_order_relaxed);
     }
 
@@ -121,61 +121,77 @@ public:
             const int  pos = juce::jlimit (0, numSamples, (int) meta.samplePosition);
             render (tmpl, on, all, cursor, pos);
             cursor = juce::jmax (cursor, pos);
-
-            if (msg.isNoteOn())
-            {
-                int col = -1; // first free column
-                for (int j = 0; j < kMaxNotes; ++j)
-                    if (! heldCol[(size_t) j].active) { col = j; break; }
-                if (col >= 0)
-                {
-                    auto& h = heldCol[(size_t) col];
-                    h.active = true;
-                    h.note   = msg.getNoteNumber();
-                    h.ch     = juce::jlimit (1, 16, msg.getChannel());
-                    h.f0     = noteHz (h.note, h.ch);
-                    for (int i = 0; i < kSlots; ++i) phase[i][col] = 1.0; // downbeat at note-on
-                }
-                updateDriver();
-            }
-            else if (msg.isNoteOff())
-            {
-                for (int j = 0; j < kMaxNotes; ++j)
-                {
-                    auto& h = heldCol[(size_t) j];
-                    if (h.active && h.note == msg.getNoteNumber() && h.ch == msg.getChannel())
-                    {
-                        closeColumnGates (j, pos);
-                        h.active = false;
-                        break;
-                    }
-                }
-                updateDriver();
-            }
-            else if (msg.isAllNotesOff() || msg.isAllSoundOff())
-            {
-                for (int j = 0; j < kMaxNotes; ++j)
-                    if (heldCol[(size_t) j].active) { closeColumnGates (j, pos); heldCol[(size_t) j].active = false; }
-                updateDriver();
-            }
-            else if (msg.isPitchWheel())
-            {
-                static constexpr int bendValues[] = { 2, 12, 48 };
-                const int idx = juce::jlimit (0, 2, bendParam != nullptr ? (int) bendParam->load() : 2);
-                const double semis = ((double) msg.getPitchWheelValue() - 8192.0) / 8192.0
-                                   * (double) bendValues[idx];
-                channelBend[(size_t) juce::jlimit (0, 15, msg.getChannel() - 1)] = semis;
-                for (auto& h : heldCol)
-                    if (h.active && h.ch == msg.getChannel())
-                        h.f0 = noteHz (h.note, h.ch);
-                updateDriver();
-            }
+            handleEvent (msg, pos, all);
         }
         render (tmpl, on, all, cursor, numSamples);
 
         io.swapWith (out); // input events consumed; only our pulses leave the plugin
     }
 
+private:
+    void handleEvent (const juce::MidiMessage& msg, int pos, bool all)
+    {
+        if (msg.isNoteOn())
+        {
+            int col = -1; // first free column
+            for (int j = 0; j < kMaxNotes; ++j)
+                if (! heldCol[(size_t) j].active) { col = j; break; }
+            if (col >= 0)
+            {
+                auto& h = heldCol[(size_t) col];
+                h.active = true;
+                h.note   = msg.getNoteNumber();
+                h.ch     = juce::jlimit (1, 16, msg.getChannel());
+                h.f0     = noteHz (h.note, h.ch);
+                for (int i = 0; i < kSlots; ++i) phase[i][col] = 1.0; // downbeat at note-on
+            }
+            updateDriver();
+        }
+        else if (msg.isNoteOff())
+        {
+            for (int j = 0; j < kMaxNotes; ++j)
+            {
+                auto& h = heldCol[(size_t) j];
+                if (h.active && h.note == msg.getNoteNumber() && h.ch == msg.getChannel())
+                {
+                    closeColumnGates (j, pos);
+                    h.active = false;
+                    break;
+                }
+            }
+            updateDriver();
+        }
+        else if (msg.isAllNotesOff() || msg.isAllSoundOff())
+        {
+            for (int j = 0; j < kMaxNotes; ++j)
+                if (heldCol[(size_t) j].active) { closeColumnGates (j, pos); heldCol[(size_t) j].active = false; }
+            updateDriver();
+        }
+        else if (msg.isPitchWheel())
+        {
+            static constexpr int bendValues[] = { 2, 12, 48 };
+            const int idx = juce::jlimit (0, 2, bendParam != nullptr ? (int) bendParam->load() : 2);
+            const double semis = ((double) msg.getPitchWheelValue() - 8192.0) / 8192.0
+                               * (double) bendValues[idx];
+            channelBend[(size_t) juce::jlimit (0, 15, msg.getChannel() - 1)] = semis;
+            for (auto& h : heldCol)
+                if (h.active && h.ch == msg.getChannel())
+                    h.f0 = noteHz (h.note, h.ch);
+            updateDriver();
+        }
+
+        // DETERMINISM: whenever the DRIVING note changes in Lowest-note mode, the
+        // new driver's trains restart from a fresh downbeat instead of resuming a
+        // frozen mid-phase - the same key always yields the same rhythm.
+        if (driverCol != lastDriver)
+        {
+            if (! all && driverCol >= 0)
+                for (int i = 0; i < kSlots; ++i) phase[i][driverCol] = 1.0;
+            lastDriver = driverCol;
+        }
+    }
+
+public:
     //==========================================================================
     // UI read-outs (message thread).
     float getRateHz (int slot) const noexcept
@@ -267,7 +283,10 @@ private:
 
                 const double ratio = (double) tmpl->partials[(size_t) p].ratio;
                 const double hz    = h.f0 * ratio / divisor;
-                const double r     = juce::jlimit (0.01, 100.0, hz);
+                // Hard rhythmic ceiling: an under-divided rate must NEVER become a
+                // 100-notes-per-second MIDI flood (that reads as a broken drone and
+                // chokes the receiving synth's voice pool).
+                const double r     = juce::jlimit (0.01, 30.0, hz);
                 inc[i][j] = r / sr;
                 if (j == driverCol) uiRate = (float) r;
 
@@ -340,7 +359,8 @@ private:
     double divisor = 1.0;
     bool   mpeOut  = false;
     Held   heldCol[kMaxNotes];
-    int    driverCol = -1;
+    int    driverCol  = -1;
+    int    lastDriver = -1; // to detect driver changes (fresh downbeat in Lowest mode)
     double channelBend[16] = {};
 
     double phase   [kSlots][kMaxNotes] = {};

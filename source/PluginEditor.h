@@ -60,6 +60,15 @@ private:
         void showPopup() override { if (onBeforePopup) onBeforePopup(); juce::ComboBox::showPopup(); }
     };
 
+    // TextEditor that grows while being edited (the Custom-Engine intervals box
+    // stretches to the window edge while typing, then shrinks back on blur).
+    struct ExpandingEditor : juce::TextEditor
+    {
+        std::function<void (bool)> onFocusChanged;
+        void focusGained (FocusChangeType t) override { juce::TextEditor::focusGained (t); if (onFocusChanged) onFocusChanged (true); }
+        void focusLost   (FocusChangeType t) override { juce::TextEditor::focusLost (t);   if (onFocusChanged) onFocusChanged (false); }
+    };
+
     // Integer-stepped fader. JUCE forces absolute (snap-to-mouse) dragging when
     // one pixel covers less than one step, so Ctrl velocity mode never engages on
     // integer parameters. We disable snapping (see ctor) and stretch the drag
@@ -167,14 +176,13 @@ private:
         std::function<void()> onClose;                                        // hide panel + scrim
 
         juce::ListBox      list { "partials", this };
-        juce::ToggleButton onT, mpeT;
+        juce::ToggleButton onT, mpeT, tempoT; // tempoT = continuous DAW-tempo sync (CC20)
         juce::ComboBox     xBox, modeBox;
         juce::Slider       nSlider;
         juce::Label        heading, listHead, xLbl, nLbl, info, noteHead, durHead, routeHelp, bpmLbl;
-        juce::TextButton   closeB { "X" }, tempoSend, tempoX2, tempoD2;
+        juce::TextButton   closeB { "X" }, tempoX2, tempoD2;
         juce::Label        slotLbl[RhythmEngine::kSlots];
         juce::TextEditor   pitchE[RhythmEngine::kSlots];
-        juce::TextButton   stepB[RhythmEngine::kSlots][4]; // -12 -1 +1 +12
         juce::Slider       durS[RhythmEngine::kSlots];
         juce::TextButton   delB[RhythmEngine::kSlots];
         int numRows = 0, tempoOct = 0;
@@ -235,12 +243,15 @@ private:
             modeBox.addItem ("All notes",   2);
             addAndMakeVisible (modeBox);
 
-            // DAW-tempo helper: emits CC20 so a MIDI-mapped host tempo follows pulse 1.
+            // DAW-tempo sync: while the TOGGLE is on, the editor timer keeps sending
+            // CC20 whenever the target BPM changes (see the editor's timerCallback) -
+            // a MIDI-mapped host tempo then FOLLOWS pulse 1 continuously.
             bpmLbl.setJustificationType (juce::Justification::centredLeft);
             bpmLbl.setColour (juce::Label::textColourId, juce::Colour (0xffffc95c));
             bpmLbl.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
             addAndMakeVisible (bpmLbl);
-            for (auto* b : { &tempoSend, &tempoX2, &tempoD2 })
+            addAndMakeVisible (tempoT);
+            for (auto* b : { &tempoX2, &tempoD2 })
             {
                 b->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
                 addAndMakeVisible (*b);
@@ -249,13 +260,6 @@ private:
             tempoD2.setButtonText ("/2");
             tempoX2.onClick = [this] { tempoOct = juce::jlimit (-6, 6, tempoOct + 1); refreshLive(); };
             tempoD2.onClick = [this] { tempoOct = juce::jlimit (-6, 6, tempoOct - 1); refreshLive(); };
-            tempoSend.onClick = [this]
-            {
-                if (proc == nullptr) return;
-                const double bpm = tempoBpm();
-                if (bpm > 0.0)
-                    proc->getRhythm().sendController (20, juce::jlimit (0, 127, (int) std::lround (bpm) - 20));
-            };
             nSlider.setSliderStyle (juce::Slider::LinearHorizontal);
             nSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 34, 16);
             addAndMakeVisible (nSlider);
@@ -300,15 +304,6 @@ private:
                 pitchE[i].onReturnKey = [this, i] { commitPitch (i); if (onEdited) onEdited(); };
                 pitchE[i].onFocusLost = [this, i] { commitPitch (i); };
                 addChildComponent (pitchE[i]);
-                static const char* stepTxt[4] = { "-12", "-1", "+1", "+12" };
-                static const int   stepVal[4] = { -12, -1, 1, 12 };
-                for (int b = 0; b < 4; ++b)
-                {
-                    stepB[i][b].setButtonText (stepTxt[b]);
-                    stepB[i][b].setColour (juce::TextButton::buttonColourId, juce::Colour (0xff33334a));
-                    stepB[i][b].onClick = [this, i, v = stepVal[b]] { stepPitch (i, v); };
-                    addChildComponent (stepB[i][b]);
-                }
 
                 durS[i].setSliderStyle (juce::Slider::LinearHorizontal);
                 durS[i].setRange (5.0, 500.0, 1.0);
@@ -435,16 +430,6 @@ private:
             }
             refreshSlots();
         }
-        void stepPitch (int i, int delta)
-        {
-            if (proc == nullptr) return;
-            auto& s = proc->getRhythm().slots[i];
-            if (s.useRatio.load())
-                s.ratio = s.ratio.load() * std::exp2 ((double) delta / 12.0); // step in 12ED2 semitones
-            else
-                s.steps = juce::jlimit (-127, 127, s.steps.load() + delta);
-            refreshSlots();
-        }
         double tempoBpm() const // pulse 1 (first enabled slot) in BPM, times 2^tempoOct
         {
             if (proc == nullptr) return 0.0;
@@ -467,7 +452,6 @@ private:
                 const bool used = p >= 0;
                 slotLbl[i].setVisible (used); pitchE[i].setVisible (used);
                 durS[i].setVisible (used);    delB[i].setVisible (used);
-                for (int b = 0; b < 4; ++b) stepB[i][b].setVisible (used);
                 if (used)
                 {
                     auto& s = proc->getRhythm().slots[i];
@@ -539,7 +523,7 @@ private:
             ctrl2.removeFromLeft (8);
             mpeT.setBounds (ctrl2.removeFromLeft (86));
             ctrl2.removeFromLeft (8);
-            tempoSend.setBounds (ctrl2.removeFromLeft (128).reduced (0, 1));
+            tempoT.setBounds (ctrl2.removeFromLeft (150));
             ctrl2.removeFromLeft (4);
             tempoX2.setBounds (ctrl2.removeFromLeft (32).reduced (0, 1));
             ctrl2.removeFromLeft (4);
@@ -568,14 +552,6 @@ private:
                 row.removeFromRight (4);
                 durS[i].setBounds (row.removeFromRight (114));
                 row.removeFromRight (4);
-                stepB[i][0].setBounds (row.removeFromLeft (30));
-                row.removeFromLeft (3);
-                stepB[i][1].setBounds (row.removeFromLeft (26));
-                row.removeFromLeft (3);
-                stepB[i][3].setBounds (row.removeFromRight (30));
-                row.removeFromRight (3);
-                stepB[i][2].setBounds (row.removeFromRight (26));
-                row.removeFromRight (3);
                 pitchE[i].setBounds (row.reduced (0, 1));
             }
             r.removeFromTop (4);
@@ -639,7 +615,8 @@ private:
     juce::Label          vibeLabel;   // "Vibe coded by" credit, left of the language button
     juce::HyperlinkButton vibeLink;   // "Asra3" -> Instagram
     juce::TextEditor periodEdit;
-    juce::TextEditor intervalEdit; // Spectrum Builder: typed intervals -> partials
+    ExpandingEditor  intervalEdit; // Custom Engine: typed intervals -> partials (grows while editing)
+    juce::Rectangle<int> intervalEditHome; // its normal (collapsed) bounds
     juce::TextEditor refAEdit;     // Reference A: type the Hz directly ("hz" shown to its right)
     WarningOverlay warningOverlay;
     NoticeOverlay  noticeOverlay;
@@ -650,6 +627,7 @@ private:
     std::unique_ptr<ComboBoxAttachment> rhythmXAtt, rhythmModeAtt;
     std::unique_ptr<SliderAttachment>   rhythmNAtt;
     juce::uint32 lastRhythmGen = 0; // refresh the partial list when the template changes
+    int lastTempoSent = -1;         // last CC20 BPM sent by the tempo-sync toggle
 
     juce::GroupComponent gHarmonic, gBase, gWhitelist, gSlope, gSpectrumRange, gFractal,
                          gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale;

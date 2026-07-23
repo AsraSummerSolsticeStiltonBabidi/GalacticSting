@@ -104,6 +104,25 @@ set_target_properties(TuningTests PROPERTIES
 # Offline FFT verification of the rendered synth output (instantiates the real
 # processor, renders audio, FFTs it, checks every partial is present).
 #-------------------------------------------------------------------------------
+juce_add_console_app(RhythmVerify PRODUCT_NAME "RhythmVerify")
+target_sources(RhythmVerify PRIVATE
+    tools/RhythmVerify.cpp
+    source/PluginProcessor.cpp
+    source/PluginEditor.cpp
+    source/dsp/Spectrum.cpp
+    third_party/MTS-ESP/libMTSClient.cpp)
+target_include_directories(RhythmVerify PRIVATE source third_party/MTS-ESP)
+target_compile_definitions(RhythmVerify PRIVATE
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_STRICT_REFCOUNTEDPOINTER=1)
+target_link_libraries(RhythmVerify PRIVATE
+    GalacticAssets
+    juce::juce_audio_utils
+    juce::juce_dsp
+    juce::juce_audio_processors
+    juce::juce_recommended_config_flags)
+
 juce_add_console_app(FftVerify PRODUCT_NAME "FftVerify")
 target_sources(FftVerify PRIVATE
     tools/FftVerify.cpp
