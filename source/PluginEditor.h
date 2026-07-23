@@ -154,15 +154,51 @@ private:
         std::function<void()> onEdited;                                       // refocus etc.
 
         juce::ListBox      list { "partials", this };
-        juce::ToggleButton onT;
-        juce::ComboBox     xBox;
+        juce::ToggleButton onT, mpeT;
+        juce::ComboBox     xBox, modeBox;
         juce::Slider       nSlider;
-        juce::Label        heading, listHead, xLbl, nLbl, info, noteHead, durHead, routeHelp;
-        juce::TextButton   closeB { "X" };
+        juce::Label        heading, listHead, xLbl, nLbl, info, noteHead, durHead, routeHelp, bpmLbl;
+        juce::TextButton   closeB { "X" }, tempoSend, tempoX2, tempoD2;
         juce::Label        slotLbl[RhythmEngine::kSlots];
-        juce::Slider       noteS[RhythmEngine::kSlots], durS[RhythmEngine::kSlots];
+        juce::TextEditor   pitchE[RhythmEngine::kSlots];
+        juce::TextButton   stepB[RhythmEngine::kSlots][4]; // -12 -1 +1 +12
+        juce::Slider       durS[RhythmEngine::kSlots];
         juce::TextButton   delB[RhythmEngine::kSlots];
-        int numRows = 0;
+        int numRows = 0, tempoOct = 0;
+
+        // "A4"-style note name <-> MIDI (C4 = 60, so A4 = 69 = 440 Hz in 12ED2).
+        static int parseNoteName (juce::String t)
+        {
+            t = t.trim().toUpperCase();
+            if (t.isEmpty()) return -1;
+            static const int semis[] = { 9, 11, 0, 2, 4, 5, 7 }; // A B C D E F G
+            const auto l = t[0];
+            if (l < 'A' || l > 'G') return -1;
+            int s = semis[l - 'A']; int pos = 1;
+            if (pos < t.length() && (t[pos] == '#')) { ++s; ++pos; }
+            else if (pos < t.length() && t[pos] == 'B' && t.length() > pos + 1) { --s; ++pos; }
+            const auto oct = t.substring (pos);
+            if (oct.isEmpty() || ! oct.retainCharacters ("-0123456789").equalsIgnoreCase (oct)) return -1;
+            const int midi = (oct.getIntValue() + 1) * 12 + s;
+            return juce::isPositiveAndBelow (midi, 128) ? midi : -1;
+        }
+        static juce::String noteName (int midi) { return juce::MidiMessage::getMidiNoteName (midi, true, true, 4); }
+
+        // MPE pitch spec: "1987.4c" (cents) or a ratio "3" / "3/2" -> linear ratio.
+        static double parseRatioSpec (juce::String t)
+        {
+            t = t.trim();
+            if (t.endsWithIgnoreCase ("c"))
+                return std::exp2 (t.dropLastCharacters (1).getDoubleValue() / 1200.0);
+            if (t.containsChar ('/'))
+            {
+                const double p = t.upToFirstOccurrenceOf ("/", false, false).getDoubleValue();
+                const double q = t.fromFirstOccurrenceOf ("/", false, false).getDoubleValue();
+                return (p > 0.0 && q > 0.0) ? p / q : 0.0;
+            }
+            const double v = t.getDoubleValue();
+            return v > 0.0 ? v : 0.0;
+        }
 
         void init()
         {
@@ -178,8 +214,34 @@ private:
             list.setColour (juce::ListBox::backgroundColourId, juce::Colour (0xff141420));
             addAndMakeVisible (list);
             addAndMakeVisible (onT);
-            for (int v = 2; v <= 12; ++v) xBox.addItem (juce::String (v), v - 1); // idx-mapped for the attachment
+            addAndMakeVisible (mpeT);
+            for (int v = 1; v <= 12; ++v) xBox.addItem (juce::String (v), v); // idx-mapped for the attachment
             addAndMakeVisible (xBox);
+            modeBox.addItem ("Lowest note", 1); // idx-mapped to the rhythmMode parameter
+            modeBox.addItem ("All notes",   2);
+            addAndMakeVisible (modeBox);
+
+            // DAW-tempo helper: emits CC20 so a MIDI-mapped host tempo follows pulse 1.
+            bpmLbl.setJustificationType (juce::Justification::centredLeft);
+            bpmLbl.setColour (juce::Label::textColourId, juce::Colour (0xffffc95c));
+            bpmLbl.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
+            addAndMakeVisible (bpmLbl);
+            for (auto* b : { &tempoSend, &tempoX2, &tempoD2 })
+            {
+                b->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
+                addAndMakeVisible (*b);
+            }
+            tempoX2.setButtonText ("x2");
+            tempoD2.setButtonText ("/2");
+            tempoX2.onClick = [this] { tempoOct = juce::jlimit (-6, 6, tempoOct + 1); refreshLive(); };
+            tempoD2.onClick = [this] { tempoOct = juce::jlimit (-6, 6, tempoOct - 1); refreshLive(); };
+            tempoSend.onClick = [this]
+            {
+                if (proc == nullptr) return;
+                const double bpm = tempoBpm();
+                if (bpm > 0.0)
+                    proc->getRhythm().sendController (20, juce::jlimit (0, 127, (int) std::lround (bpm) - 20));
+            };
             nSlider.setSliderStyle (juce::Slider::LinearHorizontal);
             nSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 34, 16);
             addAndMakeVisible (nSlider);
@@ -216,14 +278,23 @@ private:
                 slotLbl[i].setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
                 addChildComponent (slotLbl[i]);
 
-                noteS[i].setSliderStyle (juce::Slider::LinearHorizontal);
-                noteS[i].setRange (0, 127, 1);
-                noteS[i].setTextBoxStyle (juce::Slider::TextBoxRight, false, 44, 16);
-                noteS[i].textFromValueFunction = [] (double v)
-                { return juce::MidiMessage::getMidiNoteName ((int) v, true, true, 3); };
-                noteS[i].onValueChange = [this, i]
-                { if (proc) proc->getRhythm().slots[i].note = (int) noteS[i].getValue(); };
-                addChildComponent (noteS[i]);
+                pitchE[i].setJustification (juce::Justification::centred);
+                pitchE[i].setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
+                pitchE[i].setColour (juce::TextEditor::outlineColourId, juce::Colour (0xff5cb8ff).withAlpha (0.6f));
+                pitchE[i].setColour (juce::TextEditor::textColourId, juce::Colours::white);
+                pitchE[i].setSelectAllWhenFocused (true);
+                pitchE[i].onReturnKey = [this, i] { commitPitch (i); if (onEdited) onEdited(); };
+                pitchE[i].onFocusLost = [this, i] { commitPitch (i); };
+                addChildComponent (pitchE[i]);
+                static const char* stepTxt[4] = { "-12", "-1", "+1", "+12" };
+                static const int   stepVal[4] = { -12, -1, 1, 12 };
+                for (int b = 0; b < 4; ++b)
+                {
+                    stepB[i][b].setButtonText (stepTxt[b]);
+                    stepB[i][b].setColour (juce::TextButton::buttonColourId, juce::Colour (0xff33334a));
+                    stepB[i][b].onClick = [this, i, v = stepVal[b]] { stepPitch (i, v); };
+                    addChildComponent (stepB[i][b]);
+                }
 
                 durS[i].setSliderStyle (juce::Slider::LinearHorizontal);
                 durS[i].setRange (5.0, 500.0, 1.0);
@@ -301,6 +372,49 @@ private:
             return -1;
         }
 
+        //-- Pitch spec of a slot ---------------------------------------------------
+        // Plain: a note name ("A4"). MPE out on: also cents ("1987.4c") or ratios
+        // ("3", "3/2") -> the exact pitch f0*ratio is sent via per-note bend.
+        bool mpeOn() const
+        {
+            return proc != nullptr && proc->apvts.getRawParameterValue ("rhythmMpe")->load() > 0.5f;
+        }
+        void commitPitch (int i)
+        {
+            if (proc == nullptr) return;
+            auto& s = proc->getRhythm().slots[i];
+            const auto t = pitchE[i].getText();
+            if (const int m = parseNoteName (t); m >= 0)
+            { s.note = m; s.useRatio = false; }
+            else if (mpeOn())
+            {
+                if (const double r = parseRatioSpec (t); r > 0.0)
+                { s.ratio = r; s.useRatio = true; }
+            }
+            refreshSlots();
+        }
+        void stepPitch (int i, int steps)
+        {
+            if (proc == nullptr) return;
+            auto& s = proc->getRhythm().slots[i];
+            if (s.useRatio.load())
+                s.ratio = s.ratio.load() * std::exp2 ((double) steps / 12.0); // step in 12ED2 semitones
+            else
+                s.note = juce::jlimit (0, 127, s.note.load() + steps);
+            refreshSlots();
+        }
+        double tempoBpm() const // pulse 1 (first enabled slot) in BPM, times 2^tempoOct
+        {
+            if (proc == nullptr) return 0.0;
+            for (int i = 0; i < RhythmEngine::kSlots; ++i)
+                if (proc->getRhythm().slots[i].enabled.load())
+                {
+                    const double r = (double) proc->getRhythm().getRateHz (i);
+                    if (r > 0.0) return r * 60.0 * std::exp2 ((double) tempoOct);
+                }
+            return 0.0;
+        }
+
         //-- Refresh ----------------------------------------------------------------
         void refreshSlots()
         {
@@ -309,16 +423,22 @@ private:
             {
                 const int p = proc != nullptr ? proc->getRhythm().slots[i].partial.load() : -1;
                 const bool used = p >= 0;
-                slotLbl[i].setVisible (used); noteS[i].setVisible (used);
+                slotLbl[i].setVisible (used); pitchE[i].setVisible (used);
                 durS[i].setVisible (used);    delB[i].setVisible (used);
+                for (int b = 0; b < 4; ++b) stepB[i][b].setVisible (used);
                 if (used)
                 {
+                    auto& s = proc->getRhythm().slots[i];
                     juce::String rl;
                     if (t != nullptr && p < (int) t->partials.size() && ratioName)
                         rl = juce::String::fromUTF8 (" \xc2\xb7 ") + ratioName ((double) t->partials[(size_t) p].ratio);
                     slotLbl[i].setText ("P" + juce::String (p + 1) + rl, juce::dontSendNotification);
-                    noteS[i].setValue ((double) proc->getRhythm().slots[i].note.load(), juce::dontSendNotification);
-                    durS[i].setValue  ((double) proc->getRhythm().slots[i].durMs.load(), juce::dontSendNotification);
+                    if (! pitchE[i].hasKeyboardFocus (false))
+                        pitchE[i].setText (s.useRatio.load() && ratioName
+                                               ? ratioName (s.ratio.load())
+                                               : noteName (s.note.load()),
+                                           juce::dontSendNotification);
+                    durS[i].setValue ((double) s.durMs.load(), juce::dontSendNotification);
                 }
             }
         }
@@ -349,6 +469,11 @@ private:
                       << (k + 2 < m ? ", " : "");
             }
             info.setText (s, juce::dontSendNotification);
+
+            const double bpm = tempoBpm();
+            bpmLbl.setText (bpm > 0.0 ? "= " + juce::String (bpm, 1) + " BPM"
+                                      : juce::String ("= ... BPM"),
+                            juce::dontSendNotification);
         }
 
         void resized() override
@@ -366,6 +491,19 @@ private:
             nLbl.setBounds (ctrl.removeFromLeft (84));
             ctrl.removeFromLeft (4);
             nSlider.setBounds (ctrl);
+            r.removeFromTop (4);
+            auto ctrl2 = r.removeFromTop (24);
+            modeBox.setBounds (ctrl2.removeFromLeft (128).reduced (0, 1));
+            ctrl2.removeFromLeft (8);
+            mpeT.setBounds (ctrl2.removeFromLeft (86));
+            ctrl2.removeFromLeft (8);
+            tempoSend.setBounds (ctrl2.removeFromLeft (128).reduced (0, 1));
+            ctrl2.removeFromLeft (4);
+            tempoX2.setBounds (ctrl2.removeFromLeft (32).reduced (0, 1));
+            ctrl2.removeFromLeft (4);
+            tempoD2.setBounds (ctrl2.removeFromLeft (32).reduced (0, 1));
+            ctrl2.removeFromLeft (6);
+            bpmLbl.setBounds (ctrl2);
             r.removeFromTop (6);
             auto left = r.removeFromLeft (236);
             listHead.setBounds (left.removeFromTop (16));
@@ -373,9 +511,9 @@ private:
             r.removeFromLeft (10);
             {
                 auto head = r.removeFromTop (14);
-                head.removeFromLeft (104);
+                head.removeFromLeft (96);
                 head.removeFromRight (28);
-                durHead.setBounds (head.removeFromRight (128));
+                durHead.setBounds (head.removeFromRight (114));
                 head.removeFromRight (4);
                 noteHead.setBounds (head);
             }
@@ -383,15 +521,23 @@ private:
             for (int i = 0; i < RhythmEngine::kSlots; ++i)
             {
                 auto row = rows.removeFromTop (26).reduced (0, 2);
-                slotLbl[i].setBounds (row.removeFromLeft (104));
+                slotLbl[i].setBounds (row.removeFromLeft (96));
                 delB[i].setBounds (row.removeFromRight (24));
                 row.removeFromRight (4);
-                durS[i].setBounds (row.removeFromRight (128));
+                durS[i].setBounds (row.removeFromRight (114));
                 row.removeFromRight (4);
-                noteS[i].setBounds (row);
+                stepB[i][0].setBounds (row.removeFromLeft (30));
+                row.removeFromLeft (3);
+                stepB[i][1].setBounds (row.removeFromLeft (26));
+                row.removeFromLeft (3);
+                stepB[i][3].setBounds (row.removeFromRight (30));
+                row.removeFromRight (3);
+                stepB[i][2].setBounds (row.removeFromRight (26));
+                row.removeFromRight (3);
+                pitchE[i].setBounds (row.reduced (0, 1));
             }
             r.removeFromTop (4);
-            routeHelp.setBounds (r.removeFromBottom (46));
+            routeHelp.setBounds (r.removeFromBottom (48));
             info.setBounds (r);
         }
 
@@ -443,7 +589,9 @@ private:
     juce::ToggleButton primeToggle[9], morphToggle;
     juce::Slider       morphTimeFader;
     juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
-    juce::TextButton   rhythmBtn;  // top-bar: opens the timbre->rhythm MIDI panel
+    juce::TextButton   rhythmBtn;  // top-bar: opens the spectrum->rhythm MIDI panel
+    juce::TextButton   octDn, octUp, sprDn, sprUp; // OCTAVE cell: -1/+1 steppers
+    juce::Label        octVal, sprVal;             // their value read-outs
     juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
                      langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3], tuningBankLoadBtn;
     juce::Label          vibeLabel;   // "Vibe coded by" credit, left of the language button
@@ -455,8 +603,8 @@ private:
     NoticeOverlay  noticeOverlay;
     DissDegreeList degreeList;
     RhythmPanel    rhythmPanel;
-    std::unique_ptr<ButtonAttachment>   rhythmOnAtt;
-    std::unique_ptr<ComboBoxAttachment> rhythmXAtt;
+    std::unique_ptr<ButtonAttachment>   rhythmOnAtt, rhythmMpeAtt;
+    std::unique_ptr<ComboBoxAttachment> rhythmXAtt, rhythmModeAtt;
     std::unique_ptr<SliderAttachment>   rhythmNAtt;
     juce::uint32 lastRhythmGen = 0; // refresh the partial list when the template changes
 

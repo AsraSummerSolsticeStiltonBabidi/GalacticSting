@@ -305,18 +305,44 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     configFader (gainFader, "masterGain", gainAtt, cEssentials, "Master output gain");
     gainFader.setSliderStyle (juce::Slider::LinearHorizontal);
     gainFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 46, 14);
-    // OCTAVE cell, two rows: whole-instrument octave transpose (+-5) and the
-    // spectrum's octave span (hard-cut partials above 2^N x the note; 10 = full).
-    configFader (octaveFader, "octaveShift", octaveAtt, cEssentials,
-                 "Octave transpose: shift the WHOLE synth by whole octaves (+-5).");
-    octaveFader.setSliderStyle (juce::Slider::LinearHorizontal);
-    octaveFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 40, 14);
+    // OCTAVE cell, two stepper rows (+1/-1 buttons, no faders): whole-synth octave
+    // transpose (+-5) and the spectrum's octave span (partials above 2^N x the note
+    // are cut; 10 = full spectrum). The value labels are refreshed by the timer.
     makeLabel (lblOctave, cEssentials);
-    configFader (spectrumRangeFader, "spectrumRange", spectrumRangeAtt, cEssentials,
-                 "Spectrum's octaves: remove every partial more than this many octaves above the played note. 10 = no cut (full spectrum).");
-    spectrumRangeFader.setSliderStyle (juce::Slider::LinearHorizontal);
-    spectrumRangeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 40, 14);
-    makeLabel (lblRange, cEssentials);
+    makeLabel (lblRange,  cEssentials);
+    auto stepParam = [this] (const char* id, int delta)
+    {
+        if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (processorRef.apvts.getParameter (id)))
+        {
+            const float cur = processorRef.apvts.getRawParameterValue (id)->load();
+            p->setValueNotifyingHost (p->convertTo0to1 (cur + (float) delta));
+        }
+        refocus();
+    };
+    auto configStep = [&] (juce::TextButton& b, const char* txt, const char* id, int delta, const juce::String& tip)
+    {
+        b.setButtonText (txt);
+        b.setColour (juce::TextButton::buttonColourId, cEssentials.withAlpha (0.30f));
+        b.setMouseClickGrabsKeyboardFocus (false);
+        b.setTooltip (tip);
+        b.onClick = [stepParam, id, delta] { stepParam (id, delta); };
+        addAndMakeVisible (b);
+    };
+    const auto octTip = juce::String ("Octave transpose: shift the WHOLE synth by whole octaves (+-5).");
+    const auto sprTip = juce::String ("Spectrum's octaves: keep only partials within this many octaves above the played note. 10 = no cut (full spectrum).");
+    configStep (octDn, "-1", "octaveShift", -1, octTip);
+    configStep (octUp, "+1", "octaveShift",  1, octTip);
+    configStep (sprDn, "-1", "spectrumRange", -1, sprTip);
+    configStep (sprUp, "+1", "spectrumRange",  1, sprTip);
+    for (auto* v : { &octVal, &sprVal })
+    {
+        v->setJustificationType (juce::Justification::centred);
+        v->setColour (juce::Label::textColourId, juce::Colours::white);
+        v->setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+        addAndMakeVisible (*v);
+    }
+    octVal.setTooltip (octTip);
+    sprVal.setTooltip (sprTip);
 
     configCombo (primeModeBox,  "primeMode",  primeModeAtt,  cHarmonic, "Limit = drop harmonics with a prime factor above the value.  Whitelist = only the ticked primes.");
     configCombo (primeLimitBox, "primeLimit", primeLimitAtt, cHarmonic, "Largest prime factor allowed (Limit mode).");
@@ -499,9 +525,11 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     rhythmPanel.onEdited  = [this] { refocus(); };
     rhythmPanel.init();
     addChildComponent (rhythmPanel);
-    rhythmOnAtt = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmOn",   rhythmPanel.onT);
-    rhythmXAtt  = std::make_unique<ComboBoxAttachment> (processorRef.apvts, "rhythmDivX", rhythmPanel.xBox);
-    rhythmNAtt  = std::make_unique<SliderAttachment>   (processorRef.apvts, "rhythmDivN", rhythmPanel.nSlider);
+    rhythmOnAtt   = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmOn",   rhythmPanel.onT);
+    rhythmMpeAtt  = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmMpe",  rhythmPanel.mpeT);
+    rhythmXAtt    = std::make_unique<ComboBoxAttachment> (processorRef.apvts, "rhythmDivX", rhythmPanel.xBox);
+    rhythmModeAtt = std::make_unique<ComboBoxAttachment> (processorRef.apvts, "rhythmMode", rhythmPanel.modeBox);
+    rhythmNAtt    = std::make_unique<SliderAttachment>   (processorRef.apvts, "rhythmDivN", rhythmPanel.nSlider);
 
     // Credit: "Vibe coded by Asra3" (Asra3 is a link to Instagram), left of the language button.
     vibeLabel.setText ("Vibe coded by", juce::dontSendNotification);
@@ -647,10 +675,9 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // Integer faders: relative drag (no snap-to-click) so the drag distance,
     // not the track length, sets the resolution; Ctrl stretches it x4 (see
     // SteppedSlider). Base N (1..64) gets the longest travel = least sensitive.
-    for (auto* s : { &baseNFader, &spectrumRangeFader, &fractalFader, &timbreRepeatsFader })
+    for (auto* s : { &baseNFader, &fractalFader, &timbreRepeatsFader })
         s->setSliderSnapsToMousePosition (false);
     baseNFader.normalSensitivity         = 520;
-    spectrumRangeFader.normalSensitivity = 300;
     fractalFader.normalSensitivity       = 260;
     timbreRepeatsFader.normalSensitivity = 280;
 
@@ -744,18 +771,30 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.onT.setButtonText (tr ("On", "Actiu"));
     rhythmPanel.xLbl.setText (tr ("Divide by", "Divideix per"), dontSendNotification);
     rhythmPanel.nLbl.setText (tr ("n times", "n vegades"), dontSendNotification);
-    rhythmPanel.noteHead.setText (tr ("MIDI note it sends", "Nota MIDI que envia"), dontSendNotification);
+    rhythmPanel.noteHead.setText (tr ("Pitch: type \"A4\" (+MPE: \"3/2\", \"702c\")",
+                                      "To: escriu \"A4\" (+MPE: \"3/2\", \"702c\")"), dontSendNotification);
     rhythmPanel.durHead.setText  (tr ("GATE = how long each note lasts", "GATE = quant dura cada nota"), dontSendNotification);
     // (fromUTF8 directly: tr()'s English branch does not decode UTF-8 accents.)
     rhythmPanel.routeHelp.setText (juce::String::fromUTF8 (catalan
-        ? "Ableton: a la pista receptora posa MIDI From -> (la pista del Fibl\xc3\xb3) i al SEGON selector tria \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" (la sortida MIDI del plugin), no l'entrada de la pista - i Monitor: In."
-        : "Ableton: on the receiving track set MIDI From -> (the Fibl\xc3\xb3 track) and in the SECOND selector pick \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" (the plugin's MIDI OUT), not the track input - then Monitor: In."),
+        ? "Encaminament (qualsevol DAW): en una altra pista d'instrument, tria com a ENTRADA MIDI la SORTIDA MIDI d'aquest plugin (no l'entrada de la pista del Fibl\xc3\xb3!) i activa el monitoratge d'entrada. A Ableton: MIDI From -> pista del Fibl\xc3\xb3 -> 2n selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In."
+        : "Routing (any DAW): on another instrument track, choose this plugin's MIDI OUTPUT as the track's MIDI INPUT (not the Fibl\xc3\xb3 track's own input!) and enable input monitoring. In Ableton: MIDI From -> the Fibl\xc3\xb3 track -> 2nd selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In."),
         dontSendNotification);
+    rhythmPanel.mpeT.setButtonText ("MPE out");
+    rhythmPanel.mpeT.setTooltip (tr (
+        "MPE output: each pulse train gets its own MIDI channel with per-note pitch bend, and the pitch boxes also accept cents (\"1987.4c\") or ratios (\"3\", \"3/2\") - sent RETUNED so an MPE-capable synth plays the exact pitch (assumes the receiver's bend range is +-48, the MPE default).",
+        "Sortida MPE: cada tren de polsos t\xc3\xa9 el seu canal MIDI amb pitch bend per nota, i les caselles de to tamb\xc3\xa9 accepten cents (\"1987.4c\") o ratios (\"3\", \"3/2\") - s'envien REAFINATS perqu\xc3\xa8 un sinte amb MPE toqui el to exacte (assumeix rang de bend +-48 al receptor, el defecte MPE)."));
+    rhythmPanel.modeBox.setTooltip (tr (
+        "Lowest note: only the lowest held note drives the pulses. All notes: every held note drives its own copy of the trains, transposed by its interval from the lowest.",
+        "Nota m\xc3\xa9s greu: nom\xc3\xa9s la nota m\xc3\xa9s greu mant\xc3\xa9 els polsos. Totes les notes: cada nota mantinguda porta la seva c\xc3\xb2pia dels trens, transposada pel seu interval respecte a la m\xc3\xa9s greu."));
+    rhythmPanel.tempoSend.setButtonText (tr ("Send tempo (CC20)", "Envia tempo (CC20)"));
+    rhythmPanel.tempoSend.setTooltip (tr (
+        "Sets your DAW tempo to pulse 1 (x2 / /2 to scale). One-time setup: MIDI-map the DAW's tempo to this plugin's CC20 and set the mapping range to 20-147 BPM - then the sent value is EXACTLY the shown BPM. Works in DAWs whose tempo is MIDI-mappable (Ableton, Reaper, FL...).",
+        "Posa el tempo del DAW al pols 1 (x2 / /2 per escalar). Configuraci\xc3\xb3 \xc3\xbanica: mapeja per MIDI el tempo del DAW al CC20 d'aquest plugin amb rang 20-147 BPM - llavors el valor enviat \xc3\x89S exactament el BPM mostrat. Funciona als DAWs amb tempo mapejable per MIDI (Ableton, Reaper, FL...)."));
     for (int i = 0; i < RhythmEngine::kSlots; ++i)
     {
-        rhythmPanel.noteS[i].setTooltip (tr (
-            "The MIDI note this partial's pulses send to the receiving track.",
-            "La nota MIDI que envien els polsos d'aquest parcial a la pista receptora."));
+        rhythmPanel.pitchE[i].setTooltip (tr (
+            "The pitch this train sends: a note name (\"A4\"). With MPE out on, also cents (\"1987.4c\") or a ratio (\"3\", \"3/2\") above the driving note, sent retuned via per-note bend. +-1 steps a semitone, +-12 an octave.",
+            "El to que envia aquest tren: nom de nota (\"A4\"). Amb MPE out actiu, tamb\xc3\xa9 cents (\"1987.4c\") o un ratio (\"3\", \"3/2\") sobre la nota conductora, enviat reafinat amb bend per nota. +-1 puja un semit\xc3\xb2, +-12 una octava."));
         rhythmPanel.durS[i].setTooltip (tr (
             "GATE: how long each pulse's MIDI note lasts (5-500 ms). It is NOT latency - pulse timing stays sample-locked; this only sets where the note-off lands.",
             "GATE: quant dura la nota MIDI de cada pols (5-500 ms). NO \xc3\xa9s lat\xc3\xa8ncia - els polsos queden clavats a la mostra; nom\xc3\xa9s fixa on cau el note-off."));
@@ -1614,14 +1653,19 @@ void FractalAdditiveAudioProcessorEditor::resized()
               refAEdit.setBounds (rr.reduced (2, 1)); }
             { auto c = ecOct.reduced (6, 3);   c.removeFromTop (lblH);
               const int rh = juce::jmax (14, c.getHeight() / 2);
-              auto r1 = c.removeFromTop (rh);
-              lblOctave.setJustificationType (juce::Justification::centredLeft);
-              lblOctave.setBounds (r1.removeFromLeft (66));
-              octaveFader.setBounds (r1);
-              auto r2 = c;
-              lblRange.setJustificationType (juce::Justification::centredLeft);
-              lblRange.setBounds (r2.removeFromLeft (66));
-              spectrumRangeFader.setBounds (r2); }
+              auto stepRow = [] (juce::Rectangle<int> row, juce::Label& lbl,
+                                 juce::TextButton& dn, juce::Label& val, juce::TextButton& up)
+              {
+                  lbl.setJustificationType (juce::Justification::centredLeft);
+                  lbl.setBounds (row.removeFromLeft (66));
+                  dn.setBounds  (row.removeFromLeft (26).reduced (0, 1));
+                  row.removeFromLeft (2);
+                  up.setBounds  (row.removeFromRight (26).reduced (0, 1));
+                  row.removeFromRight (2);
+                  val.setBounds (row);
+              };
+              stepRow (c.removeFromTop (rh), lblOctave, octDn, octVal, octUp);
+              stepRow (c,                    lblRange,  sprDn, sprVal, sprUp); }
         }
     }
 
@@ -1717,7 +1761,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
     warningOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (580, 200));
     warningOverlay.toFront (false);
     noticeOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (560, 220));
-    rhythmPanel.setBounds (getLocalBounds().withSizeKeepingCentre (760, 470));
+    rhythmPanel.setBounds (getLocalBounds().withSizeKeepingCentre (780, 540));
     rhythmPanel.toFront (false);
 }
 
@@ -1729,13 +1773,27 @@ bool FractalAdditiveAudioProcessorEditor::keyPressed (const juce::KeyPress& key)
     const int  period = juce::jmax (1, processorRef.getScaleDegrees());
     if (c == 'z' || c == 'Z') { baseKey = juce::jlimit (0, 112, baseKey - period); return true; }
     if (c == 'x' || c == 'X') { baseKey = juce::jlimit (0, 112, baseKey + period); return true; }
+    // SWALLOW every mapped play key: if it escapes to the host, the DAW's own
+    // computer-MIDI-keyboard (Live: A S D = C D E, diatonic) fires TOO and its
+    // note lands a unison / minor second from ours (our A S D = degrees 0 1 2,
+    // chromatic) - the reported "ghost second note". Never let them through.
+    const auto lc = (juce::juce_wchar) juce::CharacterFunctions::toLowerCase (c);
+    for (const auto& m : kKeyMap)
+        if (m.ch == (int) lc) return true;
     return false;
 }
 
 bool FractalAdditiveAudioProcessorEditor::keyStateChanged (bool)
 {
+    const bool hadHeld = ! heldKeys.empty();
     pollComputerKeyboard();
-    return false; // never swallow keys - let shortcuts etc. through
+    // Swallow the event whenever it involves our play keys (a mapped key is down
+    // now, or one was just released) so key-ups can't reach the DAW's computer
+    // keyboard either. Unrelated keys (space, digits...) still pass through.
+    bool mappedDown = false;
+    for (const auto& m : kKeyMap)
+        if (juce::KeyPress::isKeyCurrentlyDown (m.ch)) { mappedDown = true; break; }
+    return hadHeld || mappedDown || ! heldKeys.empty();
 }
 
 // Reconcile the sounding computer-keyboard notes with the ACTUAL physical key
@@ -1798,6 +1856,12 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     pollComputerKeyboard(); // safety net for missed KEYUPs / ghost keys / focus loss
 
     refreshRefAText();       // keep the Reference-A box in sync with the parameter (automation)
+
+    // OCTAVE stepper read-outs (params can also move via host automation).
+    octVal.setText (juce::String ((int) processorRef.apvts.getRawParameterValue ("octaveShift")->load()),
+                    juce::dontSendNotification);
+    sprVal.setText (juce::String ((int) processorRef.apvts.getRawParameterValue ("spectrumRange")->load()),
+                    juce::dontSendNotification);
 
     // Rhythm panel: live pulse-rate read-outs; rebuild the partial list whenever
     // the spectrum template changes (Base N moved, .scl loaded...).

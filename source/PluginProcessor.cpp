@@ -164,7 +164,7 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     //-- Tuning ----------------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "tuningMode", 1 }, "Tuning",
-        StringArray { "12ED2", "MTS-ESP", "Scala (.scl)" }, 0));
+        StringArray { "12ED2", "MTS-ESP", "Scala (.scl)", "MPE (bend input)" }, 0));
     // Per-note pitch-bend range. +-48 st is the MPE default and what Ableton
     // Live 12's tuning systems / Microtuner assume; +-2 suits classic keyboards.
     params.push_back (std::make_unique<AudioParameterChoice>(
@@ -184,14 +184,19 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "tuningBankSlot", 1 }, "Tuning Bank Slot", 0, kBankSlots, 0));
 
-    //-- Timbre -> rhythm MIDI out ----------------------------------------------
-    // Each selected partial pulses at f0 * ratio / x^n; x and n are automatable.
+    //-- Spectrum -> rhythm MIDI out --------------------------------------------
+    // Each selected partial pulses at f0 * ratio / x^n; all of these are automatable.
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "rhythmOn", 1 }, "Rhythm MIDI On", false));
     params.push_back (std::make_unique<AudioParameterInt>(
-        ParameterID { "rhythmDivX", 1 }, "Rhythm Divide Base (x)", 2, 12, 2));
+        ParameterID { "rhythmDivX", 1 }, "Rhythm Divide Base (x)", 1, 12, 1));
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "rhythmDivN", 1 }, "Rhythm Divide Times (n)", 1, 16, 8));
+    params.push_back (std::make_unique<AudioParameterChoice>(
+        ParameterID { "rhythmMode", 1 }, "Rhythm Mode",
+        StringArray { "Lowest note", "All notes" }, 0));
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "rhythmMpe", 1 }, "Rhythm MPE Out", false));
 
     //-- Scala-as-timbre --------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterInt>(
@@ -267,7 +272,7 @@ void FractalAdditiveAudioProcessor::timerCallback()
         }
     }
 
-    tuning.setMode ((TuningManager::Mode) (int) apvts.getRawParameterValue ("tuningMode")->load());
+    applyTuningMode ((int) apvts.getRawParameterValue ("tuningMode")->load());
     tuning.setReferenceA ((double) apvts.getRawParameterValue ("refA")->load());
     tuning.setOctaveShift ((int) apvts.getRawParameterValue ("octaveShift")->load());
 
@@ -302,6 +307,28 @@ void FractalAdditiveAudioProcessor::clearScala()
     if (auto* p = apvts.getParameter ("tuningMode"))
         p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Equal));
     tuning.setMode (TuningManager::Mode::Equal);
+}
+
+//==============================================================================
+void FractalAdditiveAudioProcessor::applyTuningMode (int paramIndex)
+{
+    const bool mpe = paramIndex == 3;
+    tuning.setMode (mpe ? TuningManager::Mode::Equal          // MPE: no internal tuning
+                        : (TuningManager::Mode) paramIndex);
+    if (mpe != lastZoneMpe)
+    {
+        lastZoneMpe = mpe;
+        if (mpe)
+        {
+            juce::MPEZoneLayout zone;
+            zone.setLowerZone (15, 48, 2); // 15 member channels, +-48 st per-note bend
+            synth.setZoneLayout (zone);
+        }
+        else
+        {
+            synth.enableLegacyMode (lastBendApplied);
+        }
+    }
 }
 
 //==============================================================================
@@ -567,7 +594,7 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     lastPushed = currentSettings();
     spectrumEngine.buildNow (lastPushed);
 
-    tuning.setMode ((TuningManager::Mode) (int) apvts.getRawParameterValue ("tuningMode")->load());
+    applyTuningMode ((int) apvts.getRawParameterValue ("tuningMode")->load());
     rhythm.prepare (sampleRate);
 
     startTimerHz (30); // poll spectrum params and rebuild off the audio thread
@@ -659,11 +686,13 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
             if (s.partial.load() >= 0)
             {
                 juce::ValueTree slot ("SLOT");
-                slot.setProperty ("i",       i,                    nullptr);
-                slot.setProperty ("partial", s.partial.load(),     nullptr);
-                slot.setProperty ("note",    s.note.load(),        nullptr);
-                slot.setProperty ("durMs",   (double) s.durMs.load(), nullptr);
-                slot.setProperty ("on",      s.enabled.load(),     nullptr);
+                slot.setProperty ("i",        i,                    nullptr);
+                slot.setProperty ("partial",  s.partial.load(),     nullptr);
+                slot.setProperty ("note",     s.note.load(),        nullptr);
+                slot.setProperty ("useRatio", s.useRatio.load(),    nullptr);
+                slot.setProperty ("ratio",    s.ratio.load(),       nullptr);
+                slot.setProperty ("durMs",    (double) s.durMs.load(), nullptr);
+                slot.setProperty ("on",       s.enabled.load(),     nullptr);
                 ry.appendChild (slot, nullptr);
             }
         }
@@ -680,18 +709,21 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
 
     apvts.replaceState (tree);
 
-    // Rhythm (timbre->MIDI) slots.
-    for (auto& s : rhythm.slots) { s.partial = -1; s.enabled = false; s.note = 60; s.durMs = 60.0f; }
+    // Rhythm (spectrum->MIDI) slots.
+    for (auto& s : rhythm.slots)
+    { s.partial = -1; s.enabled = false; s.note = 60; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f; }
     if (auto ry = tree.getChildWithName ("RHYTHM"); ry.isValid())
         for (auto slot : ry)
         {
             const int i = (int) slot.getProperty ("i", -1);
             if (juce::isPositiveAndBelow (i, RhythmEngine::kSlots))
             {
-                rhythm.slots[i].partial = (int)   slot.getProperty ("partial", -1);
-                rhythm.slots[i].note    = (int)   slot.getProperty ("note", 60);
-                rhythm.slots[i].durMs   = (float) (double) slot.getProperty ("durMs", 60.0);
-                rhythm.slots[i].enabled = (bool)  slot.getProperty ("on", false);
+                rhythm.slots[i].partial  = (int)    slot.getProperty ("partial", -1);
+                rhythm.slots[i].note     = (int)    slot.getProperty ("note", 60);
+                rhythm.slots[i].useRatio = (bool)   slot.getProperty ("useRatio", false);
+                rhythm.slots[i].ratio    = (double) slot.getProperty ("ratio", 1.0);
+                rhythm.slots[i].durMs    = (float) (double) slot.getProperty ("durMs", 60.0);
+                rhythm.slots[i].enabled  = (bool)   slot.getProperty ("on", false);
             }
         }
 
@@ -721,7 +753,7 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
         tuning.clearScala();
     }
 
-    tuning.setMode ((TuningManager::Mode) (int) apvts.getRawParameterValue ("tuningMode")->load());
+    applyTuningMode ((int) apvts.getRawParameterValue ("tuningMode")->load());
 
     clearTimbre();
     if (auto tim = tree.getChildWithName ("TIMBRE"); tim.isValid())
