@@ -200,6 +200,9 @@ public:
     void setSegmentUseTopPeriod (bool b);
     bool getSegmentUseTopPeriod() const noexcept { return segUseTopPeriod; }
     void rebuildSegmentScale();       // build + load the .scl from the current selection
+    // Which Spectrum-to-Tuning mode is active (persisted so it survives reopen).
+    void setSegmentModeActive (bool b) noexcept { segmentModeActive = b; }
+    bool isSegmentModeActive() const noexcept { return segmentModeActive; }
 
     //==========================================================================
     // Shared with the editor:
@@ -256,6 +259,7 @@ private:
     int           segAnchor = -1;      // last clicked (shift-click range anchor)
     juce::String  segPeriodText = "2"; // period ratio/cents when not using the top partial
     bool          segUseTopPeriod = false;
+    bool          segmentModeActive = false; // Spectrum-to-Tuning mode (persisted)
 
     float lastGain = 0.0f;
     int   lastBendApplied = 48; // matches enableLegacyMode(48) in the constructor
