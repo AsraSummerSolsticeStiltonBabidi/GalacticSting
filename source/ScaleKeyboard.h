@@ -51,6 +51,14 @@ public:
     // that key is being clicked/dragged.
     void setHoverTextProvider (std::function<juce::String(int)> fn) { getHoverText = std::move (fn); }
 
+    // Below-keyboard hover strip: while a key is hovered, each OTHER key shows its
+    // distance to it via getDeltaLabel(hoveredNote, otherNote) (multi-line: steps,
+    // cents, and a just ratio when exact); the hovered key shows getSourceLabel(note)
+    // (e.g. "from 5/1" for spectrum-segment scales) drawn in `sourceColour`.
+    void setDeltaProviders (std::function<juce::String(int,int)> delta,
+                            std::function<juce::String(int)> source, juce::Colour srcColour)
+    { getDeltaLabel = std::move (delta); getSourceLabel = std::move (source); sourceColour = srcColour; }
+
     juce::String getTooltip() override
     {
         if (hoverArmed && hoverCell >= 0 && getHoverText != nullptr)
@@ -70,7 +78,15 @@ public:
         const int D = juce::jmax (1, getDegrees ? getDegrees() : 12);
         const int cells = numCells();
         const float w = (float) getWidth() / (float) cells;
-        const auto h = (float) getHeight();
+        const float h = (float) getHeight() - (float) stripH; // keys use the top; strip is below
+
+        // Below-keyboard delta strip: dark, empty until a key is hovered.
+        {
+            auto strip = juce::Rectangle<float> (0.0f, h, (float) getWidth(), (float) stripH);
+            g.setColour (juce::Colour (0xff0c0c12));
+            g.fillRect (strip);
+        }
+        const int hoveredNote = (hoverArmed && hoverCell >= 0) ? baseKey + hoverCell : -1;
 
         for (int i = 0; i < cells; ++i)
         {
@@ -107,6 +123,33 @@ public:
             {
                 g.setFont (juce::Font (juce::FontOptions (juce::jmin (18.0f, w * 0.55f)).withStyle ("Bold")));
                 g.drawText (juce::String (degree), cell, juce::Justification::centred, false);
+            }
+
+            // Below-keyboard strip: on hover, this key's distance to the hovered key
+            // (or, under the hovered key itself, its "from n/1" source in the spectrum colour).
+            if (hoveredNote >= 0)
+            {
+                auto sc = juce::Rectangle<float> (i * w, h, w, (float) stripH).reduced (1.0f, 2.0f);
+                if (note == hoveredNote)
+                {
+                    const juce::String src = getSourceLabel ? getSourceLabel (note) : juce::String();
+                    if (src.isNotEmpty())
+                    {
+                        g.setColour (sourceColour);
+                        g.setFont (juce::Font (juce::FontOptions (juce::jmin (11.5f, w * 0.36f)).withStyle ("Bold")));
+                        g.drawFittedText (src, sc.toNearestInt(), juce::Justification::centred, 2, 0.5f);
+                    }
+                }
+                else
+                {
+                    const juce::String d = getDeltaLabel ? getDeltaLabel (hoveredNote, note) : juce::String();
+                    if (d.isNotEmpty())
+                    {
+                        g.setColour (juce::Colour (0xffc4ccda));
+                        g.setFont (juce::Font (juce::FontOptions (juce::jmin (10.5f, w * 0.32f))));
+                        g.drawFittedText (d, sc.toNearestInt(), juce::Justification::centred, 3, 0.4f);
+                    }
+                }
             }
         }
     }
@@ -216,6 +259,10 @@ private:
     std::function<int()>            getDegrees;
     std::function<juce::String(int)> getLabel;
     std::function<juce::String(int)> getHoverText;
+    std::function<juce::String(int,int)> getDeltaLabel;  // (hoveredNote, otherNote) -> multi-line delta
+    std::function<juce::String(int)>     getSourceLabel; // note -> "from n/1" (segment scales)
+    juce::Colour sourceColour { 0xffff9a3c };            // Spectrum-to-Tuning colour for the source label
+    static constexpr int stripH = 30;                    // below-keyboard hover-delta strip height
     int baseKey  = 48; // C3
     int shownKeys = 0; // >0 = fixed visible-key count; 0 = auto (~26 px/cell)
     int mouseNote = -1;

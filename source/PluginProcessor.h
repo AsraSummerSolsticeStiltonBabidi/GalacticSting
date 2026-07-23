@@ -201,8 +201,17 @@ public:
     bool getSegmentUseTopPeriod() const noexcept { return segUseTopPeriod; }
     void rebuildSegmentScale();       // build + load the .scl from the current selection
     // Which Spectrum-to-Tuning mode is active (persisted so it survives reopen).
-    void setSegmentModeActive (bool b) noexcept { segmentModeActive = b; }
+    void setSegmentModeActive (bool b) noexcept { segmentModeActive = b; if (! b) segSourceByDegree.clear(); }
     bool isSegmentModeActive() const noexcept { return segmentModeActive; }
+    // For the keyboard's hover strip: absolute frequency of a MIDI note under the
+    // active tuning, and (segment scales only) the source partial ratio n/1 of a
+    // scale degree - the harmonic each key represents before octave folding.
+    double getNoteFrequency (int midiNote) const { return tuning.frequencyForNote (midiNote); }
+    bool   activeScaleIsSegment() const noexcept { return ! segSourceByDegree.empty(); }
+    double getSegmentDegreeSource (int degree) const noexcept
+    {
+        return juce::isPositiveAndBelow (degree, (int) segSourceByDegree.size()) ? segSourceByDegree[(size_t) degree] : 0.0;
+    }
 
     //==========================================================================
     // Shared with the editor:
@@ -260,6 +269,8 @@ private:
     juce::String  segPeriodText = "2"; // period ratio/cents when not using the top partial
     bool          segUseTopPeriod = false;
     bool          segmentModeActive = false; // Spectrum-to-Tuning mode (persisted)
+    std::vector<double> segSourceByDegree;   // degree -> source partial ratio n/1 (segment scales)
+    juce::uint32  segRebuiltGen = 0;          // template generation the segment scale was built from
 
     float lastGain = 0.0f;
     int   lastBendApplied = 48; // matches enableLegacyMode(48) in the constructor
