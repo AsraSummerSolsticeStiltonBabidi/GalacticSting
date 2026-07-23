@@ -182,6 +182,12 @@ private:
     spectrum::SpectrumSettings currentSettings() const;
     void timerCallback() override;
     void addRecentScl (const juce::File&);
+    // tuningMode param -> TuningManager mode + synth zone layout. Index 3 = "MPE
+    // (bend input)": no internal tuning (equal base) and a REAL MPE lower zone so
+    // per-note bends from an MPE controller/host are honoured; other modes run the
+    // legacy single-channel layout. Message thread; switching releases held notes.
+    void applyTuningMode (int paramIndex);
+    bool lastZoneMpe = false;
 
     juce::ValueTree captureState();
     void restoreState (const juce::ValueTree&);
