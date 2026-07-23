@@ -85,41 +85,86 @@ private:
         }
     };
 
-    // Sorted list of the generated scale's degrees: colour chip + interval label
-    // + dissonance height on a green->yellow->red gradient. Data set by the timer
-    // whenever a new scale is generated.
+    // Live list of the ACTIVE scale's degrees: colour chip + interval label +
+    // Sethares dissonance (green->yellow->red). Fixed row height so it can live in
+    // a Viewport and scroll when a scale has more steps than fit. Rows carry their
+    // sort keys (step, ratio, height) so the header can re-order them.
     struct DissDegreeList : juce::Component, juce::TooltipClient
     {
-        struct Row { juce::String num, label, value; juce::Colour chip, valueCol; };
+        struct Row { int step; double ratio, height; juce::String num, label, value;
+                     juce::Colour chip, valueCol; bool isPeriod; };
         std::vector<Row> rows;
         juce::String tip;
+        static constexpr int kRowH = 19;
         juce::String getTooltip() override { return tip; }
+        int contentHeight() const { return (int) rows.size() * kRowH; }
         void paint (juce::Graphics& g) override
         {
-            if (rows.empty())
-                return;
-            // floor 13 px: even 25 rows (24 degrees + period) fit the panel height
-            const int rowH = juce::jlimit (13, 22, getHeight() / juce::jmax (1, (int) rows.size()));
+            const int rowH   = kRowH;
+            const int W      = getWidth();
+            const int labelX = rowH + 4, labelW = 62;
+            const int valueX = labelX + labelW + 2;
             int y = 0;
             for (const auto& r : rows)
             {
-                if (y + rowH > getHeight()) break;
                 auto chipR = juce::Rectangle<int> (0, y + 1, rowH - 2, rowH - 2);
-                g.setColour (r.chip);
-                g.fillRoundedRectangle (chipR.toFloat(), 3.0f);
-                g.setColour (r.chip.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-                g.setFont (juce::Font (juce::FontOptions ((float) rowH * 0.62f).withStyle ("Bold")));
-                g.drawText (r.num, chipR, juce::Justification::centred, false);
-
-                g.setColour (juce::Colour (0xffb9c0d0));
-                g.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
-                g.drawText (r.label, rowH + 4, y, 70, rowH, juce::Justification::centredLeft, false);
-
+                if (r.isPeriod)
+                {
+                    // The period: one red box covering the "0" AND the interval, white text.
+                    g.setColour (juce::Colour (0xffe0453f));
+                    g.fillRoundedRectangle (juce::Rectangle<int> (0, y + 1, valueX - 3, rowH - 2).toFloat(), 3.0f);
+                    g.setColour (juce::Colours::white);
+                    g.setFont (juce::Font (juce::FontOptions ((float) rowH * 0.6f).withStyle ("Bold")));
+                    g.drawText (r.num, chipR, juce::Justification::centred, false);
+                    g.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
+                    g.drawText (r.label, labelX, y, labelW, rowH, juce::Justification::centredLeft, false);
+                }
+                else
+                {
+                    g.setColour (r.chip);
+                    g.fillRoundedRectangle (chipR.toFloat(), 3.0f);
+                    g.setColour (r.chip.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
+                    g.setFont (juce::Font (juce::FontOptions ((float) rowH * 0.6f).withStyle ("Bold")));
+                    g.drawText (r.num, chipR, juce::Justification::centred, false);
+                    g.setColour (juce::Colour (0xffb9c0d0));
+                    g.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
+                    g.drawText (r.label, labelX, y, labelW, rowH, juce::Justification::centredLeft, false);
+                }
                 g.setColour (r.valueCol);
-                g.drawText (r.value, rowH + 78, y, getWidth() - rowH - 78, rowH,
-                            juce::Justification::centredLeft, false);
+                g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+                g.drawText (r.value, valueX, y, W - valueX, rowH, juce::Justification::centredLeft, false);
                 y += rowH;
             }
+        }
+    };
+
+    // Clickable two-column header over the dissonance list: "Step" (sort ascending
+    // from 1/1) on the left, "Sethares dissonance" (two lines) on the right. The
+    // arrow marks the active sort column.
+    struct DissHeader : juce::Component
+    {
+        std::function<void (bool)> onSort; // true = by step, false = by dissonance
+        bool byStep = true;
+        int  splitX = 96;
+        void paint (juce::Graphics& g) override
+        {
+            const juce::Colour c (0xff8f96a8);
+            const auto up = juce::String (juce::CharPointer_UTF8 (" \xe2\x96\xb2"));
+            g.setColour (c);
+            g.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
+            g.drawText (juce::String ("Step") + (byStep ? up : juce::String()),
+                        juce::Rectangle<int> (0, 0, splitX, getHeight()), juce::Justification::centredLeft, false);
+            auto rr = juce::Rectangle<int> (splitX, 0, getWidth() - splitX, getHeight());
+            g.setFont (juce::Font (juce::FontOptions (10.0f).withStyle ("Bold")));
+            g.drawText ("Sethares", rr.removeFromTop (rr.getHeight() / 2), juce::Justification::bottomLeft, false);
+            g.drawText (juce::String ("dissonance") + (byStep ? juce::String() : up),
+                        rr, juce::Justification::topLeft, false);
+        }
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            byStep = e.x < splitX;
+            if (onSort) onSort (byStep);
+            repaint();
         }
     };
 
@@ -795,7 +840,14 @@ private:
     juce::TextEditor refAEdit;     // Reference A: type the Hz directly ("hz" shown to its right)
     WarningOverlay warningOverlay;
     NoticeOverlay  noticeOverlay;
-    DissDegreeList degreeList;
+    DissDegreeList degreeList;   // active-scale dissonance list (lives inside dissView)
+    DissHeader     dissHeader;   // clickable Step / Sethares-dissonance sort header
+    juce::Viewport dissView;     // scrolls degreeList when a scale has many steps
+    // Cached active-scale dissonance (recomputed only when timbre/tuning change) +
+    // the sort mode toggled by the header.
+    std::vector<FractalAdditiveAudioProcessor::DissDegreeInfo> activeDiss;
+    double lastScaleSig   = -1.0e30; // change signature (timbre gen + tuning shape)
+    bool   dissSortByStep = true;    // true = ascending from 1/1, false = by dissonance
     Scrim          rhythmScrim;
     RhythmPanel    rhythmPanel;
     std::unique_ptr<ButtonAttachment>   rhythmOnAtt, rhythmMpeAtt;
@@ -804,7 +856,7 @@ private:
     int lastTempoSent = -1;         // last CC20 BPM sent by the tempo-sync toggle
 
     juce::GroupComponent gHarmonic, gBase, gWhitelist, gSlope, gSpectrumRange, gFractal,
-                         gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale;
+                         gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale, gScaleDiss;
     juce::Label lblBaseN, lblBasePitch, lblRange, lblFractal, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
                 lblTimbreRepeats, lblBend, lblPeriod, lblSteps, lblRefA, lblRefHz, lblOctave, lblPitchAmt,
                 lblMorphTime, lblTuningBank, tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel;
@@ -834,7 +886,9 @@ private:
     juce::Rectangle<int> hcBase, hcHarm, hcPrime, hcSlope; // its 4 sub-cells (dividers/labels in paint)
     juce::Rectangle<int> essentialsBounds;     // Essentials macro-group frame
     juce::Rectangle<int> ecPhase, ecGain, ecRef, ecOct; // its 4 sub-cells (dividers/labels in paint)
-    void refreshDegreeList (bool showNotice = true);
+    void refreshDegreeList (bool showNotice = true); // generated-scale shortfall notice
+    void updateScaleDissonance();  // recompute the active-scale dissonance when timbre/tuning change
+    void rebuildScaleDissList();   // (re)build + sort degreeList.rows from the cached activeDiss
     void commitRefA();       // parse the Reference-A text box -> set the refA parameter
     void refreshRefAText();  // set the Reference-A text box from the current parameter
     std::map<int, int> heldKeys;

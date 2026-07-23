@@ -569,6 +569,44 @@ bool FractalAdditiveAudioProcessor::generateDissonanceScale (int count, bool use
     return true;
 }
 
+std::vector<FractalAdditiveAudioProcessor::DissDegreeInfo>
+FractalAdditiveAudioProcessor::computeActiveScaleDissonance() const
+{
+    std::vector<DissDegreeInfo> out;
+
+    // Same analysis spectrum the generator uses: recompiled from the current
+    // settings (message thread, deterministic, no audio-thread interaction).
+    const auto tmpl = spectrum::compileSpectrum (currentSettings());
+    if (tmpl.partials.empty())
+        return out;
+
+    // Anchor the partials at the ACTUAL sounding tonic of the active tuning, so the
+    // absolute frequencies (which Sethares roughness depends on) are correct.
+    double f0 = tuning.frequencyForNote (60);
+    if (! (f0 > 0.0) || ! std::isfinite (f0))
+        f0 = TuningManager::kRefFreq * tuning.referenceScale();
+
+    std::vector<dissonance::Partial> spec;
+    spec.reserve (tmpl.partials.size());
+    for (const auto& p : tmpl.partials)
+        spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
+    if (spec.size() > 64) // analysis cap only; the SOUND is never capped
+    {
+        std::sort (spec.begin(), spec.end(),
+                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
+        spec.resize (64);
+    }
+
+    const int D = juce::jmax (1, getScaleDegrees());
+    out.reserve ((size_t) D + 1);
+    for (int s = 0; s <= D; ++s) // 0 = tonic (1/1), D = period
+    {
+        const double r = getDegreeRatio (s);
+        out.push_back ({ s, r, dissonance::dissonanceAt (spec, r) });
+    }
+    return out;
+}
+
 bool FractalAdditiveAudioProcessor::saveGeneratedScl (const juce::File& f, juce::String& errorOut)
 {
     if (lastDissScl.isEmpty())

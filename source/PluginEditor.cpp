@@ -40,6 +40,7 @@ namespace
     const juce::Colour cTuning    { 0xffb27bff }; // purple 275
     const juce::Colour cTimbre    { 0xffff77c8 }; // pink   332  (Custom Engine)
     const juce::Colour cSpecScale { 0xffff9a3c }; // orange 32   (its own colour now, not a yellow twin of Range)
+    const juce::Colour cScaleDiss { 0xff32c8be }; // teal        (live scale-dissonance list, under Tuning)
     // Phase/Gain/Reference now share the Essentials colour (one macro, one colour).
     const juce::Colour cPhase     = cEssentials;
     const juce::Colour cGain      = cEssentials;
@@ -243,7 +244,7 @@ namespace
         int getSliderThumbRadius (juce::Slider& s) override
         {
             if (s.getName().isNotEmpty() && s.isVertical())
-                return 13;
+                return 17; // bigger ADSR thumb circle
             return juce::LookAndFeel_V4::getSliderThumbRadius (s);
         }
         void drawLinearSlider (juce::Graphics& g, int x, int y, int w, int h,
@@ -255,9 +256,9 @@ namespace
             {
                 const auto col = s.findColour (juce::Slider::thumbColourId);
                 g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-                g.setFont (juce::Font (juce::FontOptions (14.5f).withStyle ("Bold")));
+                g.setFont (juce::Font (juce::FontOptions (19.0f).withStyle ("Bold"))); // bigger letter
                 g.drawText (s.getName(),
-                            juce::Rectangle<float> ((float) x + (float) w * 0.5f - 13.0f, sliderPos - 13.0f, 26.0f, 26.0f),
+                            juce::Rectangle<float> ((float) x + (float) w * 0.5f - 17.0f, sliderPos - 17.0f, 34.0f, 34.0f),
                             juce::Justification::centred, false);
             }
         }
@@ -684,7 +685,16 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     periodEdit.onEscapeKey = [this] { refocus(); };
     addAndMakeVisible (periodEdit);
     makeLabel (lblPeriod, cSpecScale);
-    addAndMakeVisible (degreeList);
+
+    // Scale-dissonance box (its own group, right of Tuning): the live per-degree
+    // Sethares dissonance of the ACTIVE scale, in a scrollable, header-sortable list.
+    configGroup (gScaleDiss, cScaleDiss);
+    dissHeader.byStep = dissSortByStep;
+    dissHeader.onSort = [this] (bool byStep) { dissSortByStep = byStep; rebuildScaleDissList(); refocus(); };
+    addAndMakeVisible (dissHeader);
+    dissView.setViewedComponent (&degreeList, false); // Viewport owns display, not deletion
+    dissView.setScrollBarsShown (true, false);
+    addAndMakeVisible (dissView); // tooltip set in applyLanguage()
 
     // Spectrum Builder: typed intervals -> partials (Enter applies them).
     intervalEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
@@ -926,6 +936,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     intervalEdit.setTextToShowWhenEmpty (tr ("intervals: 3/2 2 700c ...", "intervals: 3/2 2 700c ..."),
                                          juce::Colour (0xff8f96a8));
     gSpecScale.setText     (tr ("Spectrum to Tuning", "Espectre a afinaci\xc3\xb3"));
+    gScaleDiss.setText     (tr ("Scale Dissonance", "Dissonancia de l'escala"));
 
     lblBaseN.setText     ("N", dontSendNotification);
     lblBasePitch.setText (tr ("Pitch", "To"), dontSendNotification);
@@ -946,8 +957,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblRefA.setText      ("A =", dontSendNotification);
     lblTuningBank.setText (tr ("Tuning bank", "Banc d'afinacions"), dontSendNotification);
     degreeList.tip = tr (
-        "Each row is a degree of the generated scale: colour chip = its keyboard colour, then its interval, then its DISSONANCE HEIGHT on Sethares' curve (how rough that interval sounds with this exact timbre). Lower = more consonant. Sorted most-consonant first; the height colour runs green (period, most consonant) -> yellow -> red (roughest).",
-        "Cada fila \xc3\xa9s un grau de l'escala generada: xip de color = el seu color al teclat, despr\xc3\xa9s l'interval, i l'AL\xc3\x87""ADA DE DISSONANCIA a la corba de Sethares (com de aspre sona amb aquest timbre). M\xc3\xa9s baix = m\xc3\xa9s consonant. Ordenats de m\xc3\xa9s consonant primer; el color va de verd (per\xc3\xado""de, m\xc3\xa9s consonant) -> groc -> vermell (m\xc3\xa9s aspre).");
+        "Each row is a degree of the ACTIVE scale (any tuning): colour chip = its keyboard colour, then its interval, then its Sethares DISSONANCE against the current timbre (how rough it sounds) - lower = more consonant, and it updates live as you change the timbre. Click 'Step' to order ascending from 1/1, or 'Sethares dissonance' from most consonant to most dissonant. The period is the red row.",
+        "Cada fila \xc3\xa9s un grau de l'escala ACTIVA (qualsevol afinaci\xc3\xb3): xip de color = el seu color al teclat, despr\xc3\xa9s l'interval, i la DISSONANCIA de Sethares contra el timbre actual (com d'aspre sona) - m\xc3\xa9s baix = m\xc3\xa9s consonant, i s'actualitza en viu en canviar el timbre. Clica 'Step' per ordenar des de 1/1, o 'Sethares dissonance' de m\xc3\xa9s consonant a m\xc3\xa9s dissonant. El per\xc3\xado""de \xc3\xa9s la fila vermella.");
     recentLabel.setText  (tr ("Recent", "Recents"), dontSendNotification);
 
     loadSclButton.setButtonText    (tr ("Load .scl", "Obrir .scl"));
@@ -957,7 +968,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     clearTimbreButton.setButtonText(tr ("Off", "Apaga"));
     savePresetButton.setButtonText (tr ("Save", "Desa"));
     presetBox.setTextWhenNothingSelected (tr ("Presets...", "Presets..."));
-    dissBtn.setButtonText          (tr ("Calculate", "Calcula"));
+    dissBtn.setButtonText          (tr ("Transmute", "Transmuta"));
     dissSaveBtn.setButtonText      (tr ("Save", "Desa"));
 
     helpLabel.setText (tr ("Play: A S D F G H J K L = the scale in order, then Q W E R T Y U I O P continue higher.   Z / X = down / up one scale period.",
@@ -1152,31 +1163,77 @@ void FractalAdditiveAudioProcessorEditor::runDissonanceTune()
     refocus();
 }
 
-void FractalAdditiveAudioProcessorEditor::refreshDegreeList (bool showNotice)
+void FractalAdditiveAudioProcessorEditor::updateScaleDissonance()
 {
-    const auto& degs = processorRef.getDissDegrees();
-    const double g0 = processorRef.getDissGreenHeight();
-    const double r0 = processorRef.getDissRedHeight();
-    const int    D  = processorRef.getDissFound() + 1; // degrees per period incl. the tonic
+    // Cheap change signature: recompute the per-degree dissonance only when the
+    // timbre or the tuning actually changes. Combines the timbre template
+    // generation, the tuning mode + degree count, the absolute pitch (octave shift
+    // and reference-A both move roughness via Sethares' frequency term), and a few
+    // degree ratios (captures a loaded/generated .scl or a tuning-bank switch).
+    const int D = juce::jmax (1, processorRef.getScaleDegrees());
+    double sig = (double) processorRef.getTemplateGeneration() * 101.0
+               + (double) processorRef.getTuningMode() * 7.0
+               + (double) D * 0.5
+               + (double) processorRef.apvts.getRawParameterValue ("octaveShift")->load() * 13.0
+               + (double) processorRef.apvts.getRawParameterValue ("refA")->load() * 0.01;
+    for (int d = 1; d <= juce::jmin (D, 16); ++d) sig += processorRef.getDegreeRatio (d) * (double) (d + 3);
+    if (std::abs (sig - lastScaleSig) < 1.0e-6) return;
+    lastScaleSig = sig;
+
+    activeDiss = processorRef.computeActiveScaleDissonance();
+    rebuildScaleDissList();
+}
+
+void FractalAdditiveAudioProcessorEditor::rebuildScaleDissList()
+{
+    const int D = juce::jmax (1, processorRef.getScaleDegrees());
+
+    // Green (most-consonant) -> yellow -> red (most-dissonant) anchored at the
+    // actual min/max height of THIS scale's degrees.
+    double lo = 1.0e30, hi = -1.0e30;
+    for (const auto& d : activeDiss) { lo = juce::jmin (lo, d.height); hi = juce::jmax (hi, d.height); }
+
+    // Sort key: ascending step (== ascending ratio, so the period lands last), or
+    // ascending dissonance (most consonant first).
+    auto sorted = activeDiss;
+    if (dissSortByStep)
+        std::sort (sorted.begin(), sorted.end(),
+                   [] (const auto& a, const auto& b) { return a.ratio < b.ratio; });
+    else
+        std::sort (sorted.begin(), sorted.end(),
+                   [] (const auto& a, const auto& b) { return a.height < b.height; });
 
     degreeList.rows.clear();
-    for (const auto& d : degs)
+    for (const auto& d : sorted)
     {
         DissDegreeList::Row row;
-        row.num   = juce::String (d.degree);
-        row.label = juce::String::fromUTF8 (dissonance::justIntervalName (d.ratio).c_str());
-        row.value = juce::String (d.height, 2);
-        row.chip  = juce::Colour::fromHSV (0.82f * (float) d.degree / (float) juce::jmax (1, D), 0.62f, 0.9f, 1.0f);
-
-        // green (most-consonant degree) -> yellow -> red (curve max).
-        const double t = juce::jlimit (0.0, 1.0, (d.height - g0) / juce::jmax (1.0e-12, r0 - g0));
+        row.step     = d.degree;
+        row.ratio    = d.ratio;
+        row.height   = d.height;
+        row.isPeriod = (d.degree == D); // the octave/period row -> red box
+        row.num      = juce::String (row.isPeriod ? 0 : d.degree); // period shows "0" like the keyboard boundary
+        row.label    = juce::String::fromUTF8 (dissonance::justIntervalName (d.ratio).c_str());
+        row.value    = juce::String (d.height, 2);
+        row.chip     = juce::Colour::fromHSV (0.82f * (float) (d.degree % D) / (float) D, 0.62f, 0.9f, 1.0f);
+        const double t = juce::jlimit (0.0, 1.0, (d.height - lo) / juce::jmax (1.0e-12, hi - lo));
         const juce::Colour green (0xff3ec659), yellow (0xffe8d44d), red (0xffe0453f);
         row.valueCol = t < 0.5 ? green.interpolatedWith (yellow, (float) (t * 2.0))
                                : yellow.interpolatedWith (red, (float) ((t - 0.5) * 2.0));
         degreeList.rows.push_back (std::move (row));
     }
+    // Re-size for the Viewport (scrolls when the list is taller than the box).
+    const int visH = dissView.getHeight();
+    const int ch   = degreeList.contentHeight();
+    const bool scroll = ch > visH && visH > 0;
+    degreeList.setSize (scroll ? dissView.getWidth() - 10 : dissView.getWidth(),
+                        juce::jmax (visH, ch));
     degreeList.repaint();
+}
 
+void FractalAdditiveAudioProcessorEditor::refreshDegreeList (bool showNotice)
+{
+    // The degree LIST is now the live active-scale list (updateScaleDissonance);
+    // this only surfaces the "fewer degrees than requested" notice after a Transmute.
     // Fewer extremes than requested -> closable notice explaining why. A
     // generation that satisfies the request dismisses any stale notice.
     if (processorRef.getDissFound() >= processorRef.getDissRequested() || ! showNotice)
@@ -1658,11 +1715,19 @@ void FractalAdditiveAudioProcessorEditor::resized()
         compact (c, r);
     };
 
-    //== Right panel: Spectrum to Scale (full height) ===========================
+    //== Right column, split in two: Spectrum to Tuning (top) over the live Scale
+    //   Dissonance list (bottom, sitting to the right of the Tuning box) ==========
     {
         auto sp = area.removeFromRight (208);
-        gSpecScale.setBounds (sp.reduced (3));
-        auto si = sp.reduced (3).reduced (8, 5); si.removeFromTop (16);
+        // Spectrum-to-Tuning keeps only what its controls need (title + 2 rows); the
+        // freed space goes to the taller Scale Dissonance list below it.
+        auto spTop = sp.removeFromTop (96);
+        sp.removeFromTop (4);
+        auto spBot = sp;                            // the rest, to the right of Tuning
+
+        // --- Spectrum to Tuning: just the Transmute controls (no more list) ---
+        gSpecScale.setBounds (spTop.reduced (3));
+        auto si = spTop.reduced (3).reduced (8, 5); si.removeFromTop (16);
         auto r1 = si.removeFromTop (24);
         dissBtn.setBounds (r1.removeFromLeft (r1.getWidth() - 92).reduced (1, 0));
         r1.removeFromLeft (3);
@@ -1678,8 +1743,17 @@ void FractalAdditiveAudioProcessorEditor::resized()
         compact (dissModeBox, r2.removeFromLeft (54));
         r2.removeFromLeft (3);
         dissSaveBtn.setBounds (r2.reduced (0, 1)); // full remaining width - never clipped
-        si.removeFromTop (6);
-        degreeList.setBounds (si);
+
+        // --- Scale Dissonance: sortable header + scrollable list ---
+        gScaleDiss.setBounds (spBot.reduced (3));
+        auto di = spBot.reduced (3).reduced (8, 5); di.removeFromTop (16);
+        dissHeader.splitX = 92;
+        dissHeader.setBounds (di.removeFromTop (24));
+        dissView.setBounds (di);
+        const int ch     = degreeList.contentHeight();
+        const bool scroll = ch > di.getHeight();
+        degreeList.setSize (scroll ? di.getWidth() - 10 : di.getWidth(),
+                            juce::jmax (di.getHeight(), ch));
     }
     area.removeFromRight (2);
 
@@ -2137,6 +2211,9 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         lastDissGeneration = processorRef.getDissGeneration();
         refreshDegreeList();
     }
+
+    // Live active-scale dissonance list (recomputes only when timbre/tuning change).
+    updateScaleDissonance();
 
     const bool timbre = processorRef.isTimbreActive();
     if (timbre != lastTimbreActive)
