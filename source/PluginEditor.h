@@ -157,7 +157,7 @@ private:
         juce::ToggleButton onT;
         juce::ComboBox     xBox;
         juce::Slider       nSlider;
-        juce::Label        heading, listHead, xLbl, nLbl, info;
+        juce::Label        heading, listHead, xLbl, nLbl, info, noteHead, durHead, routeHelp;
         juce::TextButton   closeB { "X" };
         juce::Label        slotLbl[RhythmEngine::kSlots];
         juce::Slider       noteS[RhythmEngine::kSlots], durS[RhythmEngine::kSlots];
@@ -194,6 +194,17 @@ private:
             info.setColour (juce::Label::textColourId, juce::Colour (0xff7ff59a));
             info.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
             addAndMakeVisible (info);
+            for (auto* h : { &noteHead, &durHead })
+            {
+                h->setJustificationType (juce::Justification::centredLeft);
+                h->setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
+                h->setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
+                addAndMakeVisible (*h);
+            }
+            routeHelp.setJustificationType (juce::Justification::topLeft);
+            routeHelp.setColour (juce::Label::textColourId, juce::Colour (0xffffc95c));
+            routeHelp.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+            addAndMakeVisible (routeHelp);
             closeB.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
             closeB.onClick = [this] { setVisible (false); if (onEdited) onEdited(); };
             addAndMakeVisible (closeB);
@@ -271,6 +282,11 @@ private:
                     {
                         proc->getRhythm().slots[i].partial = row;
                         proc->getRhythm().slots[i].enabled = true;
+                        // Routing a partial means the user WANTS pulses -> flip the
+                        // master On switch for them (no silent "why is nothing sent").
+                        if (auto* p = proc->apvts.getParameter ("rhythmOn"))
+                            if (p->getValue() < 0.5f)
+                                p->setValueNotifyingHost (1.0f);
                         break;
                     }
             }
@@ -355,6 +371,14 @@ private:
             listHead.setBounds (left.removeFromTop (16));
             list.setBounds (left);
             r.removeFromLeft (10);
+            {
+                auto head = r.removeFromTop (14);
+                head.removeFromLeft (104);
+                head.removeFromRight (28);
+                durHead.setBounds (head.removeFromRight (128));
+                head.removeFromRight (4);
+                noteHead.setBounds (head);
+            }
             auto rows = r.removeFromTop (RhythmEngine::kSlots * 26);
             for (int i = 0; i < RhythmEngine::kSlots; ++i)
             {
@@ -367,6 +391,7 @@ private:
                 noteS[i].setBounds (row);
             }
             r.removeFromTop (4);
+            routeHelp.setBounds (r.removeFromBottom (46));
             info.setBounds (r);
         }
 

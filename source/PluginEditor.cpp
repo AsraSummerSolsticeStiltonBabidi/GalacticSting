@@ -729,12 +729,28 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     langButton.setButtonText (catalan ? "ENG" : "CAT");
     menuButton.setButtonText (tr ("Menu", "Men\xc3\xba"));
     rhythmBtn.setButtonText ("MIDI");
-    rhythmPanel.heading.setText (tr ("TIMBRE -> RHYTHM (MIDI OUT)", "TIMBRE -> RITME (SORTIDA MIDI)"), dontSendNotification);
+    rhythmPanel.heading.setText (tr ("SPECTRUM TO RHYTHM (MIDI OUT)", "ESPECTRE A RITME (SORTIDA MIDI)"), dontSendNotification);
     rhythmPanel.listHead.setText (tr ("Partials of the current patch (click to route)",
                                       "Parcials del patch actual (clica per encaminar)"), dontSendNotification);
     rhythmPanel.onT.setButtonText (tr ("On", "Actiu"));
     rhythmPanel.xLbl.setText (tr ("Divide by", "Divideix per"), dontSendNotification);
     rhythmPanel.nLbl.setText (tr ("n times", "n vegades"), dontSendNotification);
+    rhythmPanel.noteHead.setText (tr ("MIDI note it sends", "Nota MIDI que envia"), dontSendNotification);
+    rhythmPanel.durHead.setText  (tr ("Note length (gate)", "Durada de la nota (gate)"), dontSendNotification);
+    // (fromUTF8 directly: tr()'s English branch does not decode UTF-8 accents.)
+    rhythmPanel.routeHelp.setText (juce::String::fromUTF8 (catalan
+        ? "Ableton: a la pista receptora posa MIDI From -> (la pista del Fibl\xc3\xb3) i al SEGON selector tria \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" (la sortida MIDI del plugin), no l'entrada de la pista - i Monitor: In."
+        : "Ableton: on the receiving track set MIDI From -> (the Fibl\xc3\xb3 track) and in the SECOND selector pick \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" (the plugin's MIDI OUT), not the track input - then Monitor: In."),
+        dontSendNotification);
+    for (int i = 0; i < RhythmEngine::kSlots; ++i)
+    {
+        rhythmPanel.noteS[i].setTooltip (tr (
+            "The MIDI note this partial's pulses send to the receiving track.",
+            "La nota MIDI que envien els polsos d'aquest parcial a la pista receptora."));
+        rhythmPanel.durS[i].setTooltip (tr (
+            "GATE: how long each pulse's MIDI note lasts (5-500 ms). It is NOT latency - pulse timing stays sample-locked; this only sets where the note-off lands.",
+            "GATE: quant dura la nota MIDI de cada pols (5-500 ms). NO \xc3\xa9s lat\xc3\xa8ncia - els polsos queden clavats a la mostra; nom\xc3\xa9s fixa on cau el note-off."));
+    }
     rhythmPanel.onT.setTooltip (tr (
         "Master switch for the rhythm MIDI output.",
         "Interruptor general de la sortida MIDI de ritme."));
