@@ -902,7 +902,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     for (auto* b : { &rhythmPanel.xUp, &rhythmPanel.xDn })
         b->setTooltip (tr ("The divisor base (x in x^n). 2 = halve per division (octaves of rhythm).",
                            "La base del divisor (la x de x^n). 2 = meitat per divisi\xc3\xb3 (octaves de ritme)."));
-    rhythmPanel.jiB.setButtonText (tr ("JI pitches", "Tons justos"));
+    rhythmPanel.updateJiText(); // "JI: ON" / "JI: OFF" (green/red toggle)
     rhythmPanel.jiB.setTooltip (tr (
         "Needs MPE out. Sets every routed pulse's pitch to the JUST ratio of ITS OWN partial (P3 -> 3/1...), so the receiving synth plays the partials' exact pitches.",
         "Necessita MPE out. Posa el to de cada pols al ratio JUST del SEU parcial (P3 -> 3/1...), perqu\xc3\xa8 el sinte receptor toqui els tons exactes dels parcials."));

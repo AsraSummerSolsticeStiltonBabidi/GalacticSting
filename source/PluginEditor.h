@@ -363,33 +363,25 @@ private:
             };
             addAndMakeVisible (helpB);
 
-            // JI pitches: with MPE out on, set every routed pulse's pitch to the JUST
-            // ratio of ITS OWN partial (P3 -> 3/1...), so the receiver plays the
-            // partials' exact pitches. Without MPE out it errors (ratios need bend).
-            jiB.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff33334a));
+            // JI pitches TOGGLE: when ON, every routed pulse (present and future) plays
+            // the JUST ratio of ITS OWN partial (P3 -> 3/1...), sent retuned via MPE, so
+            // the receiver plays the partials' exact pitches. Green when on, red when off.
+            // Turning it on auto-enables MPE out (JI needs per-note bend); off reverts
+            // the slots to scale steps.
+            jiB.setClickingTogglesState (true);
+            jiB.setColour (juce::TextButton::buttonColourId,   juce::Colour (0xffe0453f)); // off = red
+            jiB.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xff2fb155)); // on  = green
+            jiB.setColour (juce::TextButton::textColourOffId,  juce::Colours::white);
+            jiB.setColour (juce::TextButton::textColourOnId,   juce::Colours::white);
             jiB.onClick = [this]
             {
                 if (proc == nullptr) return;
-                if (! mpeOn())
-                {
-                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        "JI pitches",
-                        trF ? trF ("Enable MPE out first: exact just-intonation pitches need per-note pitch bend.",
-                                   "Activa primer MPE out: els tons justos exactes necessiten pitch bend per nota.")
-                            : juce::String ("Enable MPE out first."), this);
-                    return;
-                }
-                const auto* t = proc->getLiveTemplate();
-                for (int i = 0; i < RhythmEngine::kSlots; ++i)
-                {
-                    auto& s = proc->getRhythm().slots[i];
-                    const int p = s.partial.load();
-                    if (p >= 0 && t != nullptr && p < (int) t->partials.size())
-                    {
-                        s.ratio    = (double) t->partials[(size_t) p].ratio;
-                        s.useRatio = true;
-                    }
-                }
+                const bool on = jiB.getToggleState();
+                if (on && ! mpeOn()) // JI needs per-note bend -> enable MPE out with it
+                    if (auto* p = proc->apvts.getParameter ("rhythmMpe"))
+                        p->setValueNotifyingHost (1.0f);
+                applyJiToSlots();
+                updateJiText();
                 refreshSlots();
             };
             addAndMakeVisible (jiB);
@@ -555,6 +547,7 @@ private:
                         p->setValueNotifyingHost (1.0f);
             }
             writeSlots (std::move (v));
+            if (jiB.getToggleState()) applyJiToSlots(); // new partial adopts JI when the toggle is on
             refreshSlots();
             list.repaint();
         }
@@ -573,6 +566,25 @@ private:
         {
             return proc != nullptr && proc->apvts.getRawParameterValue ("rhythmMpe")->load() > 0.5f;
         }
+        // JI toggle: ON -> every routed slot uses the JUST ratio of its own partial;
+        // OFF -> slots revert to scale steps. Applied to present AND future routes.
+        void applyJiToSlots()
+        {
+            if (proc == nullptr) return;
+            const bool on = jiB.getToggleState();
+            const auto* t = proc->getLiveTemplate();
+            for (int i = 0; i < RhythmEngine::kSlots; ++i)
+            {
+                auto& s = proc->getRhythm().slots[i];
+                const int p = s.partial.load();
+                if (p < 0) continue;
+                if (on && t != nullptr && p < (int) t->partials.size())
+                { s.ratio = (double) t->partials[(size_t) p].ratio; s.useRatio = true; }
+                else if (! on)
+                    s.useRatio = false;
+            }
+        }
+        void updateJiText() { jiB.setButtonText (jiB.getToggleState() ? "JI: ON" : "JI: OFF"); }
         void commitPitch (int i)
         {
             if (proc == nullptr) return;
