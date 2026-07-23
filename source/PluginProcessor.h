@@ -20,6 +20,9 @@ public:
     //==========================================================================
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override {}
+    // Host reset (transport re-arm, state clear): flush any sounding rhythm-MIDI
+    // notes so none hang in the receiving track.
+    void reset() override { rhythm.flushOpenGates(); }
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 

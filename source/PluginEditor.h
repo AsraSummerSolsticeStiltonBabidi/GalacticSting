@@ -893,6 +893,7 @@ private:
     juce::Rectangle<int> hcBase, hcHarm, hcPrime, hcSlope; // its 4 sub-cells (dividers/labels in paint)
     juce::Rectangle<int> essentialsBounds;     // Essentials macro-group frame
     juce::Rectangle<int> ecPhase, ecGain, ecRef, ecOct; // its 4 sub-cells (dividers/labels in paint)
+    juce::Rectangle<int> lBarBounds, lFootBounds; // the inverted-L Tuning box: dissonance BAR (right) + controls FOOT (bottom-left)
     void refreshDegreeList (bool showNotice = true); // generated-scale shortfall notice
     void updateScaleDissonance();  // recompute the active-scale dissonance when timbre/tuning change
     void rebuildScaleDissList();   // (re)build + sort degreeList.rows from the cached activeDiss

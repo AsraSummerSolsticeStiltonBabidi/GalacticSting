@@ -75,6 +75,11 @@ public:
     void prepare (double sampleRate)
     {
         sr = sampleRate > 0.0 ? sampleRate : 44100.0;
+        // Before wiping the gate state, remember any OUTPUT notes that are still
+        // sounding so the next block can send their note-offs. Otherwise a re-prepare
+        // (sample-rate/block-size change, plugin re-init, transport re-arm...) would
+        // abandon them, leaving stuck "suspended notes without rhythm" in the receiver.
+        flushOpenGates();
         for (int i = 0; i < kSlots; ++i)
             for (int j = 0; j < kMaxNotes; ++j)
             { phase[i][j] = 0.0; gateLeft[i][j] = 0; wasOn[i][j] = false; }
@@ -82,6 +87,16 @@ public:
         for (auto& b : channelBend) b = 0.0;
         driverCol = -1; lastDriver = -1;
         displayF0.store (0.0f, std::memory_order_relaxed);
+    }
+
+    // Queue note-offs for every currently-open gate (message thread, when audio is
+    // stopped). The next process() block emits them so nothing hangs.
+    void flushOpenGates() noexcept
+    {
+        for (int i = 0; i < kSlots; ++i)
+            for (int j = 0; j < kMaxNotes; ++j)
+                if (gateLeft[i][j] > 0 && pendingOffN < (int) (kSlots * kMaxNotes))
+                    pendingOff[pendingOffN++] = { gateChn[i][j], gateNote[i][j] };
     }
 
     // Message thread: ask the audio thread to emit a controller (e.g. the DAW-tempo
@@ -99,6 +114,11 @@ public:
     void process (juce::MidiBuffer& io, int numSamples)
     {
         out.clear();
+
+        // Flush note-offs for gates abandoned by a reset/re-prepare (no hanging notes).
+        for (int k = 0; k < pendingOffN; ++k)
+            out.addEvent (juce::MidiMessage::noteOff (pendingOff[(size_t) k].ch, pendingOff[(size_t) k].note), 0);
+        pendingOffN = 0;
 
         // Queued one-shot controller (DAW-tempo mapping) leaves at block start.
         if (const int pk = pendingCC.exchange (-1, std::memory_order_relaxed); pk >= 0)
@@ -373,6 +393,12 @@ private:
     int    gateLeft[kSlots][kMaxNotes] = {};
     int    gateNote[kSlots][kMaxNotes] = {};
     int    gateChn [kSlots][kMaxNotes] = {};
+
+    // Note-offs owed to the receiver after a reset abandoned open gates (emitted at
+    // the start of the next process block so no note hangs).
+    struct Pending { int ch, note; };
+    Pending pendingOff[kSlots * kMaxNotes] = {};
+    int     pendingOffN = 0;
 
     juce::uint32 cachedGen = 0;
     float        maxAmp    = 1.0f;
