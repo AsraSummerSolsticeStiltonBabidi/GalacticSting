@@ -688,7 +688,7 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
                 juce::ValueTree slot ("SLOT");
                 slot.setProperty ("i",        i,                    nullptr);
                 slot.setProperty ("partial",  s.partial.load(),     nullptr);
-                slot.setProperty ("note",     s.note.load(),        nullptr);
+                slot.setProperty ("steps",    s.steps.load(),       nullptr);
                 slot.setProperty ("useRatio", s.useRatio.load(),    nullptr);
                 slot.setProperty ("ratio",    s.ratio.load(),       nullptr);
                 slot.setProperty ("durMs",    (double) s.durMs.load(), nullptr);
@@ -711,7 +711,7 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
 
     // Rhythm (spectrum->MIDI) slots.
     for (auto& s : rhythm.slots)
-    { s.partial = -1; s.enabled = false; s.note = 60; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f; }
+    { s.partial = -1; s.enabled = false; s.steps = 0; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f; }
     if (auto ry = tree.getChildWithName ("RHYTHM"); ry.isValid())
         for (auto slot : ry)
         {
@@ -719,7 +719,7 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
             if (juce::isPositiveAndBelow (i, RhythmEngine::kSlots))
             {
                 rhythm.slots[i].partial  = (int)    slot.getProperty ("partial", -1);
-                rhythm.slots[i].note     = (int)    slot.getProperty ("note", 60);
+                rhythm.slots[i].steps    = (int)    slot.getProperty ("steps", 0);
                 rhythm.slots[i].useRatio = (bool)   slot.getProperty ("useRatio", false);
                 rhythm.slots[i].ratio    = (double) slot.getProperty ("ratio", 1.0);
                 rhythm.slots[i].durMs    = (float) (double) slot.getProperty ("durMs", 60.0);

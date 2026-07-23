@@ -2,6 +2,7 @@
 
 #include "PluginProcessor.h"
 #include "ScaleKeyboard.h"
+#include <limits>
 #include <map>
 
 //==============================================================================
@@ -166,23 +167,24 @@ private:
         juce::TextButton   delB[RhythmEngine::kSlots];
         int numRows = 0, tempoOct = 0;
 
-        // "A4"-style note name <-> MIDI (C4 = 60, so A4 = 69 = 440 Hz in 12ED2).
-        static int parseNoteName (juce::String t)
+        // Scale steps FROM the played note: "7st" = 7 steps up, "7st-" (or "-7st")
+        // = 7 steps down. Returns INT_MIN when the text is not a steps spec.
+        static int parseSteps (juce::String t)
         {
-            t = t.trim().toUpperCase();
-            if (t.isEmpty()) return -1;
-            static const int semis[] = { 9, 11, 0, 2, 4, 5, 7 }; // A B C D E F G
-            const auto l = t[0];
-            if (l < 'A' || l > 'G') return -1;
-            int s = semis[l - 'A']; int pos = 1;
-            if (pos < t.length() && (t[pos] == '#')) { ++s; ++pos; }
-            else if (pos < t.length() && t[pos] == 'B' && t.length() > pos + 1) { --s; ++pos; }
-            const auto oct = t.substring (pos);
-            if (oct.isEmpty() || ! oct.retainCharacters ("-0123456789").equalsIgnoreCase (oct)) return -1;
-            const int midi = (oct.getIntValue() + 1) * 12 + s;
-            return juce::isPositiveAndBelow (midi, 128) ? midi : -1;
+            t = t.trim().toLowerCase().removeCharacters (" ");
+            bool down = false;
+            if (t.endsWith ("-"))   { down = true; t = t.dropLastCharacters (1); }
+            if (t.startsWith ("-")) { down = true; t = t.substring (1); }
+            if (! t.endsWith ("st")) return std::numeric_limits<int>::min();
+            const auto num = t.dropLastCharacters (2);
+            if (num.isEmpty() || ! num.containsOnly ("0123456789")) return std::numeric_limits<int>::min();
+            const int v = juce::jlimit (0, 127, num.getIntValue());
+            return down ? -v : v;
         }
-        static juce::String noteName (int midi) { return juce::MidiMessage::getMidiNoteName (midi, true, true, 4); }
+        static juce::String stepsText (int steps)
+        {
+            return steps < 0 ? juce::String (-steps) + "st-" : juce::String (steps) + "st";
+        }
 
         // MPE pitch spec: "1987.4c" (cents) or a ratio "3" / "3/2" -> linear ratio.
         static double parseRatioSpec (juce::String t)
@@ -384,8 +386,8 @@ private:
             if (proc == nullptr) return;
             auto& s = proc->getRhythm().slots[i];
             const auto t = pitchE[i].getText();
-            if (const int m = parseNoteName (t); m >= 0)
-            { s.note = m; s.useRatio = false; }
+            if (const int st = parseSteps (t); st != std::numeric_limits<int>::min())
+            { s.steps = st; s.useRatio = false; }
             else if (mpeOn())
             {
                 if (const double r = parseRatioSpec (t); r > 0.0)
@@ -393,14 +395,14 @@ private:
             }
             refreshSlots();
         }
-        void stepPitch (int i, int steps)
+        void stepPitch (int i, int delta)
         {
             if (proc == nullptr) return;
             auto& s = proc->getRhythm().slots[i];
             if (s.useRatio.load())
-                s.ratio = s.ratio.load() * std::exp2 ((double) steps / 12.0); // step in 12ED2 semitones
+                s.ratio = s.ratio.load() * std::exp2 ((double) delta / 12.0); // step in 12ED2 semitones
             else
-                s.note = juce::jlimit (0, 127, s.note.load() + steps);
+                s.steps = juce::jlimit (-127, 127, s.steps.load() + delta);
             refreshSlots();
         }
         double tempoBpm() const // pulse 1 (first enabled slot) in BPM, times 2^tempoOct
@@ -436,7 +438,7 @@ private:
                     if (! pitchE[i].hasKeyboardFocus (false))
                         pitchE[i].setText (s.useRatio.load() && ratioName
                                                ? ratioName (s.ratio.load())
-                                               : noteName (s.note.load()),
+                                               : stepsText (s.steps.load()),
                                            juce::dontSendNotification);
                     durS[i].setValue ((double) s.durMs.load(), juce::dontSendNotification);
                 }
