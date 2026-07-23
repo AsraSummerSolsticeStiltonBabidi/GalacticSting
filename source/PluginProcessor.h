@@ -165,6 +165,14 @@ public:
     // Generated-scale degree list for the UI (sorted ascending by curve height).
     struct DissDegreeInfo { int degree; double ratio; double height; };
     const std::vector<DissDegreeInfo>& getDissDegrees() const noexcept { return dissDegrees; }
+
+    // Per-degree Sethares dissonance of the ACTIVE tuning (any mode - 12ED2, MTS,
+    // Scala, generated), against the CURRENT timbre, for the live scale-analysis
+    // list in the Tuning panel. Row for step s in [0, getScaleDegrees()] : degree
+    // index s (the tonic is 0), ratio to the tonic, and dissonance height; the last
+    // row (s == getScaleDegrees()) is the period. Message thread only (recompiles
+    // the spectrum on the calling thread); cheap enough for the editor timer.
+    std::vector<DissDegreeInfo> computeActiveScaleDissonance() const;
     double getDissGreenHeight() const noexcept { return dissGreenH; }
     double getDissRedHeight()   const noexcept { return dissRedH; }
     int    getDissRequested()   const noexcept { return dissRequested; }
