@@ -62,6 +62,22 @@ namespace
         {'q',9},{'w',10},{'e',11},{'r',12},{'t',13},{'y',14},{'u',15},{'i',16},{'o',17},{'p',18}
     };
 
+    // Panel frame outline: ROUNDED top corners, sharp (angular) bottom corners -
+    // matching the title chips. Used for both the fill and the stroke.
+    juce::Path topRoundedFrame (juce::Rectangle<float> r, float rad)
+    {
+        rad = juce::jmin (rad, r.getWidth() * 0.5f, r.getHeight() * 0.5f);
+        juce::Path p;
+        p.startNewSubPath (r.getX(), r.getBottom());
+        p.lineTo (r.getX(), r.getY() + rad);
+        p.quadraticTo (r.getX(), r.getY(), r.getX() + rad, r.getY());
+        p.lineTo (r.getRight() - rad, r.getY());
+        p.quadraticTo (r.getRight(), r.getY(), r.getRight(), r.getY() + rad);
+        p.lineTo (r.getRight(), r.getBottom());
+        p.closeSubPath();
+        return p;
+    }
+
     // Draws a menu title inside an ANGULAR (sharp-cornered) chip filled with the
     // section colour, bounded to the text, at the top-left of `box` - just like the
     // coloured squares of the main title. The letter colour flips black/white with
@@ -168,12 +184,12 @@ namespace
                                                  (float) w - 2.6f, (float) h - titleH * 0.5f - 1.3f);
 
             // Interior panel: lighter than the page (0xff0c0c12) and subtly tinted by the
-            // section colour, so each box reads as a raised, distinct panel. Sharp
-            // (square) corners, not rounded.
+            // section colour. Rounded TOP corners + angular bottom (like the chips).
+            const auto shape = topRoundedFrame (frame, 9.0f);
             g.setColour (juce::Colour (0xff17171f).interpolatedWith (col, 0.05f));
-            g.fillRect (frame);
+            g.fillPath (shape);
             g.setColour (col.withAlpha (0.95f));
-            g.drawRect (frame, 2.6f); // thick square outline
+            g.strokePath (shape, juce::PathStrokeType (2.6f));
 
             // Title: an angular colour chip bounded to the text (see drawTitleChip).
             drawTitleChip (g, juce::Rectangle<float> (0.0f, 0.0f, (float) w, (float) h), col, text);
@@ -476,7 +492,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     {
         juce::PopupMenu m;
         m.addItem (1, tr ("Init - reset all parameters", "Init - reinicia tots els par\xc3\xa0metres"));
-        m.addItem (2, tr ("Panic - all notes off", "P\xc3\xa0nic - atura totes les notes"));
+        m.addItem (2, catalan ? juce::String ("Language: English")
+                              : juce::String::fromUTF8 ("Idioma: catal\xc3\xa0"));
         m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (menuButton),
             [this] (int r)
             {
@@ -490,16 +507,18 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                 }
                 else if (r == 2)
                 {
-                    for (int ch = 1; ch <= 16; ++ch) processorRef.keyboardState.allNotesOff (ch);
+                    catalan = ! catalan;
+                    applyLanguage();
                 }
                 refocus();
             });
     };
     addAndMakeVisible (menuButton);
 
-    // Timbre -> rhythm MIDI panel (top-bar "MIDI" button toggles it).
-    rhythmBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff33334a));
-    rhythmBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    // Spectrum -> rhythm MIDI panel (top-bar button toggles it). WHITE: maximum
+    // contrast against the dark bar and the rainbow title squares beside it.
+    rhythmBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xfff2f2f2));
+    rhythmBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::black);
     rhythmBtn.setMouseClickGrabsKeyboardFocus (false);
     rhythmBtn.setTooltip (tr (
         "Timbre to RHYTHM: send the selected partials as MIDI pulse trains (exact polyrhythms, sample-locked to the sound) to any track listening to this plugin's MIDI output.",
@@ -764,16 +783,22 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     using juce::dontSendNotification;
     langButton.setButtonText (catalan ? "ENG" : "CAT");
     menuButton.setButtonText (tr ("Menu", "Men\xc3\xba"));
-    rhythmBtn.setButtonText ("MIDI");
+    rhythmBtn.setButtonText (tr ("Spectrum to Rhythm", "Espectre a ritme"));
     rhythmPanel.heading.setText (tr ("SPECTRUM TO RHYTHM (MIDI OUT)", "ESPECTRE A RITME (SORTIDA MIDI)"), dontSendNotification);
     rhythmPanel.listHead.setText (tr ("Partials of the current patch (click to route)",
                                       "Parcials del patch actual (clica per encaminar)"), dontSendNotification);
     rhythmPanel.onT.setButtonText (tr ("On", "Actiu"));
     rhythmPanel.xLbl.setText (tr ("Divide by", "Divideix per"), dontSendNotification);
     rhythmPanel.nLbl.setText (tr ("n times", "n vegades"), dontSendNotification);
-    rhythmPanel.noteHead.setText (tr ("Pitch: type \"A4\" (+MPE: \"3/2\", \"702c\")",
-                                      "To: escriu \"A4\" (+MPE: \"3/2\", \"702c\")"), dontSendNotification);
-    rhythmPanel.durHead.setText  (tr ("GATE = how long each note lasts", "GATE = quant dura cada nota"), dontSendNotification);
+    rhythmPanel.noteHead.setText (tr ("Scale steps from the played note", "Passos d'escala des de la nota tocada"),
+                                  dontSendNotification);
+    rhythmPanel.noteHead.setTooltip (tr (
+        "Each train sends the PLAYED note shifted by this many scale steps: \"7st\" = 7 steps up, \"7st-\" = 7 steps down. Never a fixed note. With MPE out, ratios (\"3/2\") and cents (\"702c\") are also FROM the played note.",
+        "Cada tren envia la nota TOCADA despla\xc3\xa7""ada aquests passos d'escala: \"7st\" = 7 amunt, \"7st-\" = 7 avall. Mai una nota fixa. Amb MPE out, els ratios (\"3/2\") i cents (\"702c\") tamb\xc3\xa9 s\xc3\xb3n DES DE la nota tocada."));
+    rhythmPanel.durHead.setText ("GATE", dontSendNotification);
+    rhythmPanel.durHead.setTooltip (tr (
+        "GATE: how long each pulse's MIDI note lasts (5-500 ms). It is NOT latency - pulse timing stays sample-locked; this only sets where the note-off lands.",
+        "GATE: quant dura la nota MIDI de cada pols (5-500 ms). NO \xc3\xa9s lat\xc3\xa8ncia - els polsos queden clavats a la mostra; nom\xc3\xa9s fixa on cau el note-off."));
     // (fromUTF8 directly: tr()'s English branch does not decode UTF-8 accents.)
     rhythmPanel.routeHelp.setText (juce::String::fromUTF8 (catalan
         ? "Encaminament (qualsevol DAW): en una altra pista d'instrument, tria com a ENTRADA MIDI la SORTIDA MIDI d'aquest plugin (no l'entrada de la pista del Fibl\xc3\xb3!) i activa el monitoratge d'entrada. A Ableton: MIDI From -> pista del Fibl\xc3\xb3 -> 2n selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In."
@@ -793,8 +818,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     for (int i = 0; i < RhythmEngine::kSlots; ++i)
     {
         rhythmPanel.pitchE[i].setTooltip (tr (
-            "The pitch this train sends: a note name (\"A4\"). With MPE out on, also cents (\"1987.4c\") or a ratio (\"3\", \"3/2\") above the driving note, sent retuned via per-note bend. +-1 steps a semitone, +-12 an octave.",
-            "El to que envia aquest tren: nom de nota (\"A4\"). Amb MPE out actiu, tamb\xc3\xa9 cents (\"1987.4c\") o un ratio (\"3\", \"3/2\") sobre la nota conductora, enviat reafinat amb bend per nota. +-1 puja un semit\xc3\xb2, +-12 una octava."));
+            "Scale steps FROM the played note: \"7st\" = 7 up, \"7st-\" = 7 down (always relative, never a fixed note). With MPE out on, also cents (\"1987.4c\") or a ratio (\"3\", \"3/2\") above the played note, sent retuned via per-note bend. Buttons: +-1 step, +-12 steps.",
+            "Passos d'escala DES DE la nota tocada: \"7st\" = 7 amunt, \"7st-\" = 7 avall (sempre relatiu, mai una nota fixa). Amb MPE out actiu, tamb\xc3\xa9 cents (\"1987.4c\") o un ratio (\"3\", \"3/2\") sobre la nota tocada, enviat reafinat amb bend per nota. Botons: +-1 pas, +-12 passos."));
         rhythmPanel.durS[i].setTooltip (tr (
             "GATE: how long each pulse's MIDI note lasts (5-500 ms). It is NOT latency - pulse timing stays sample-locked; this only sets where the note-off lands.",
             "GATE: quant dura la nota MIDI de cada pols (5-500 ms). NO \xc3\xa9s lat\xc3\xa8ncia - els polsos queden clavats a la mostra; nom\xc3\xa9s fixa on cau el note-off."));
@@ -1365,8 +1390,8 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     int squaresN = 0, spaces = 0;
     for (int i = 0; i < L; ++i) (title[i] == ' ' ? spaces : squaresN)++;
     float total = (float) squaresN * (side + gap) + (float) spaces * (side * 0.5f);
-    const float freeLeft  = 268.0f;
-    const float freeRight = (float) getWidth() - 368.0f; // clears menu + MIDI + credit + language
+    const float freeLeft  = 372.0f;                      // clears Menu/Presets/Save + the credit
+    const float freeRight = (float) getWidth() - 186.0f; // clears the Spectrum-to-Rhythm button
     const float freeW     = juce::jmax (120.0f, freeRight - freeLeft);
     if (total > freeW) { side *= freeW / total; total = freeW; }
     const float margin = side * 0.10f;
@@ -1419,11 +1444,12 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         auto box = boxI.toFloat();
         auto frame = juce::Rectangle<float> (box.getX() + 1.3f, box.getY() + titleH * 0.5f,
                                              box.getWidth() - 2.6f, box.getHeight() - titleH * 0.5f - 1.3f);
+        const auto shape = topRoundedFrame (frame, 9.0f); // rounded top, angular bottom
         g.setColour (juce::Colour (0xff17171f).interpolatedWith (col, 0.05f * interiorAlpha));
-        g.fillRect (frame);
+        g.fillPath (shape);
         g.setColour (col.withAlpha (0.95f));
-        g.drawRect (frame, 2.6f);
-        drawTitleChip (g, box, col, ttl); // angular colour chip, bounded to the text
+        g.strokePath (shape, juce::PathStrokeType (2.6f));
+        drawTitleChip (g, box, col, ttl); // colour chip, bounded to the text
     };
     auto subLabel = [&] (const juce::Rectangle<int>& c, juce::Colour col, const juce::String& s, float al)
     {
@@ -1486,22 +1512,29 @@ void FractalAdditiveAudioProcessorEditor::resized()
 {
     auto full = getLocalBounds();
     auto titleBar = full.removeFromTop (68);
-    langButton.setBounds (titleBar.removeFromRight (86).withSizeKeepingCentre (66, 24));
-    titleBar.removeFromRight (4);
+    langButton.setVisible (false); // language now lives inside the Menu popup
     {
-        auto credit = titleBar.removeFromRight (156).withSizeKeepingCentre (156, 20);
+        // Left cluster, two rows: Menu on top, [Presets][Save] under it - Save sits
+        // directly BELOW Menu, the preset selector directly LEFT of Save.
+        auto lc = titleBar.removeFromLeft (208).withTrimmedLeft (8);
+        auto r1 = lc.removeFromTop (32).withTrimmedTop (8);
+        r1.removeFromLeft (150 + 4); // Menu column starts above Save
+        menuButton.setBounds (r1.removeFromLeft (46).withHeight (22));
+        auto r2 = lc.withTrimmedTop (2).withHeight (22);
+        presetBox.setBounds (r2.removeFromLeft (150));
+        r2.removeFromLeft (4);
+        savePresetButton.setBounds (r2.removeFromLeft (46));
+    }
+    // Spectrum-to-Rhythm: top right, high-contrast.
+    rhythmBtn.setBounds (titleBar.removeFromRight (178).withSizeKeepingCentre (168, 26));
+    {
+        // Credit just LEFT of the title zone (the title starts at x = 372, see paint()).
+        auto credit = juce::Rectangle<int> (212, titleBar.getY(), 154, titleBar.getHeight())
+                          .withSizeKeepingCentre (154, 20);
         vibeLink.setBounds (credit.removeFromRight (46));
-        credit.removeFromRight (3); // small gap between "by" and the link
+        credit.removeFromRight (3);
         vibeLabel.setBounds (credit);
     }
-    titleBar.removeFromRight (6);
-    menuButton.setBounds (titleBar.removeFromRight (52).withSizeKeepingCentre (48, 24));
-    titleBar.removeFromRight (4);
-    rhythmBtn.setBounds (titleBar.removeFromRight (52).withSizeKeepingCentre (48, 24));
-    auto presetArea = titleBar.removeFromLeft (272).reduced (10, 0);
-    presetBox.setBounds (presetArea.removeFromLeft (190).withSizeKeepingCentre (190, 24));
-    presetArea.removeFromLeft (6);
-    savePresetButton.setBounds (presetArea.withSizeKeepingCentre (juce::jmin (56, presetArea.getWidth()), 24));
 
     auto area = full.reduced (6, 4);
 
@@ -1636,7 +1669,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
             essentialsBounds = row;
             auto e = essentialsBounds.reduced (5, 4);
             e.removeFromTop (17); // clear the "ESSENTIALS" title
-            const int ch = e.getHeight() / 4;
+            // OCTAVE hosts TWO stepper rows -> it gets a fixed, taller share and the
+            // other three cells split the rest evenly.
+            const int octH = juce::jmin (64, e.getHeight() / 2);
+            const int ch   = (e.getHeight() - octH) / 3;
             ecPhase = e.removeFromTop (ch);
             ecGain  = e.removeFromTop (ch);
             ecRef   = e.removeFromTop (ch);
@@ -1651,7 +1687,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
               lblRefA.setBounds (rr.removeFromLeft (26));
               lblRefHz.setBounds (rr.removeFromRight (22));
               refAEdit.setBounds (rr.reduced (2, 1)); }
-            { auto c = ecOct.reduced (6, 3);   c.removeFromTop (lblH);
+            { auto c = ecOct.reduced (6, 1);   c.removeFromTop (13); c.removeFromBottom (4);
               const int rh = juce::jmax (14, c.getHeight() / 2);
               auto stepRow = [] (juce::Rectangle<int> row, juce::Label& lbl,
                                  juce::TextButton& dn, juce::Label& val, juce::TextButton& up)

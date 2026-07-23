@@ -47,11 +47,13 @@ public:
     static constexpr int kMaxNotes = 10; // simultaneous held notes driving trains
 
     // One routable pulse train. The editor writes these atomics (message thread);
-    // the audio thread only reads them.
+    // the audio thread only reads them. The pitch is ALWAYS relative to the note
+    // being played (never fixed): plain = scale steps from it ("7st", "7st-" =
+    // down); ratio (MPE out) = f0 * ratio, also from the played note.
     struct Slot
     {
         std::atomic<int>    partial  { -1 };    // template partial index (-1 = empty)
-        std::atomic<int>    note     { 60 };    // plain pitch: MIDI note (typed "A4")
+        std::atomic<int>    steps    { 0 };     // plain pitch: +-scale steps from the played note
         std::atomic<bool>   useRatio { false }; // ratio pitch: f0 * ratio via MPE bend
         std::atomic<double> ratio    { 1.0 };   // linear ratio (from "3", "3/2" or "...c")
         std::atomic<float>  durMs    { 60.0f }; // gate = how long each sent note lasts
@@ -235,8 +237,7 @@ private:
     {
         if (to <= from) return;
 
-        const int count   = tmpl != nullptr ? (int) tmpl->partials.size() : 0;
-        const int lowNote = driverCol >= 0 ? heldCol[(size_t) driverCol].note : 60;
+        const int count = tmpl != nullptr ? (int) tmpl->partials.size() : 0;
 
         // Per-segment constants per train (f0 constant between MIDI events).
         double inc[kSlots][kMaxNotes];
@@ -285,8 +286,10 @@ private:
                 }
                 else
                 {
+                    // Scale steps FROM the played note (each MIDI note = one scale
+                    // step of the active tuning), never a fixed pitch.
                     sendNote[i][j] = juce::jlimit (0, 127,
-                        slots[i].note.load (std::memory_order_relaxed) + (h.note - lowNote));
+                        h.note + slots[i].steps.load (std::memory_order_relaxed));
                     sendBend[i][j] = 8192; // centre
                 }
             }
