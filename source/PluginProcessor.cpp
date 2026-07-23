@@ -281,6 +281,7 @@ void FractalAdditiveAudioProcessor::timerCallback()
                 {
                     if (auto* pm = apvts.getParameter ("tuningMode"))
                         pm->setValueNotifyingHost (pm->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
+                    clearSegmentSource(); // a bank .scl replaces any segment scale
                 }
             }
         }
@@ -312,6 +313,7 @@ bool FractalAdditiveAudioProcessor::loadScalaFile (const juce::File& f, juce::St
         p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
     tuning.setMode (TuningManager::Mode::Scala);
     addRecentScl (f);
+    clearSegmentSource(); // this .scl is not the spectrum segment - drop its "from n/1" mapping
     return true;
 }
 
@@ -321,6 +323,7 @@ void FractalAdditiveAudioProcessor::clearScala()
     if (auto* p = apvts.getParameter ("tuningMode"))
         p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Equal));
     tuning.setMode (TuningManager::Mode::Equal);
+    clearSegmentSource();
 }
 
 //==============================================================================
@@ -670,6 +673,7 @@ void FractalAdditiveAudioProcessor::rebuildSegmentScale()
 {
     const auto* t = spectrumEngine.getLive();
     if (t == nullptr || segSel.empty()) return;
+    segRebuiltGen = t->generation; // mark this generation handled, even if we bail below (no 30Hz thrash)
 
     const int tonic = *segSel.begin();
     if (tonic >= (int) t->partials.size()) return;
@@ -918,7 +922,8 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
         }
 
     // "From spectrum's segment" state (the tuning itself comes back via SCALA).
-    segSel.clear(); segAnchor = -1; segPeriodText = "2"; segUseTopPeriod = false; segmentModeActive = false;
+    segSel.clear(); segAnchor = -1; segPeriodText = "2"; segUseTopPeriod = false;
+    segmentModeActive = false; segSourceByDegree.clear(); segRebuiltGen = 0;
     if (auto sg = tree.getChildWithName ("SEGMENT"); sg.isValid())
     {
         segmentModeActive = (bool) sg.getProperty ("modeActive", false);

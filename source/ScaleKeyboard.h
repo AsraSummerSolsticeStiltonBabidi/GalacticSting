@@ -185,8 +185,9 @@ public:
         }
     }
 
-    void mouseDown (const juce::MouseEvent& e) override { hoverArmed = false; playAt (e.x); }
-    void mouseDrag (const juce::MouseEvent& e) override { hoverArmed = false; playAt (e.x); }
+    // Only the keys play; the bottom hover-delta strip is a read-out, not a key.
+    void mouseDown (const juce::MouseEvent& e) override { hoverArmed = false; if (e.y < getHeight() - stripH) playAt (e.x); }
+    void mouseDrag (const juce::MouseEvent& e) override { hoverArmed = false; if (e.y < getHeight() - stripH) playAt (e.x); else releaseHeld(); }
     void mouseUp   (const juce::MouseEvent&)   override
     {
         releaseHeld();

@@ -271,6 +271,10 @@ private:
     bool          segmentModeActive = false; // Spectrum-to-Tuning mode (persisted)
     std::vector<double> segSourceByDegree;   // degree -> source partial ratio n/1 (segment scales)
     juce::uint32  segRebuiltGen = 0;          // template generation the segment scale was built from
+    // Drop the segment selection + source mapping when the active tuning becomes
+    // something else (a loaded .scl, a Sethares scale, 12ED2) so the keyboard stops
+    // showing stale "from n/1" labels and the timer stops rebuilding over it.
+    void clearSegmentSource() noexcept { segSourceByDegree.clear(); segSel.clear(); segAnchor = -1; }
 
     float lastGain = 0.0f;
     int   lastBendApplied = 48; // matches enableLegacyMode(48) in the constructor

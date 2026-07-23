@@ -903,7 +903,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             return {};
         const double cents = 1200.0 * std::log2 (ratio);
         long long p = 1, q = 1;
-        dissonance::bestFraction (ratio, p, q, 4096);
+        dissonance::bestFraction (ratio, p, q, 48); // small denominator: a tight just-ness gate
         const double fracCents = 1200.0 * std::log2 ((double) p / (double) q);
         const auto frac = juce::String (p) + "/" + juce::String (q);
         const auto lead = tr ("Interval above the tonic: ", "Interval sobre la t\xc3\xb2nica: ");
@@ -917,10 +917,22 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
              + tr ("  (nearest pure interval ", "  (interval pur m\xc3\xa9s proper ") + frac
              + (err >= 0 ? ", +" : ", -") + juce::String (std::abs (err)) + "c).";
     });
+    // A degree is "just" only if its interval to the tonic is a genuine low-denominator
+    // ratio (den <= 48 within 0.1c) - this REJECTS tempered/equal-division intervals,
+    // which only match a bounded fraction with a large denominator.
+    auto degreeIsJust = [this] (int note) -> bool
+    {
+        const int D = juce::jmax (1, processorRef.getScaleDegrees());
+        const double r = processorRef.getDegreeRatio (((note - 60) % D + D) % D);
+        if (! (r > 0.0)) return false;
+        long long p = 1, q = 1;
+        dissonance::bestFraction (r, p, q, 48);
+        return p > 0 && q > 0 && std::abs (1200.0 * std::log2 (r) - 1200.0 * std::log2 ((double) p / (double) q)) < 0.1;
+    };
     // Below-keyboard hover strip: each other key's distance to the hovered one, and
     // (segment scales) the hovered key's source partial "from n/1".
     keyboard.setDeltaProviders (
-        [this] (int fromNote, int toNote) -> juce::String
+        [this, degreeIsJust] (int fromNote, int toNote) -> juce::String
         {
             const double f0 = processorRef.getNoteFrequency (fromNote);
             const double f1 = processorRef.getNoteFrequency (toNote);
@@ -930,10 +942,16 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             juce::String s;
             s << (steps > 0 ? "+" : "") << steps << "st\n"
               << (cents >= 0 ? "+" : "-") << juce::String ((int) std::llround (std::abs (cents))) << "c";
-            long long p = 1, q = 1; // exact just ratio between the two keys (tight tolerance)
-            dissonance::bestFraction (f1 / f0, p, q, 4096);
-            if (p > 0 && q > 0 && std::abs (cents - 1200.0 * std::log2 ((double) p / (double) q)) < 0.5)
-                s << "\n" << p << "/" << q;
+            // Exact ratio ONLY when BOTH keys are genuine just degrees - then the ratio
+            // between them is truly rational, so a large fraction here is real, not a
+            // spurious approximation of an equal-tempered interval.
+            if (degreeIsJust (fromNote) && degreeIsJust (toNote))
+            {
+                long long p = 1, q = 1;
+                dissonance::bestFraction (f1 / f0, p, q, 4096);
+                if (p > 0 && q > 0 && std::abs (cents - 1200.0 * std::log2 ((double) p / (double) q)) < 0.2)
+                    s << "\n" << p << "/" << q;
+            }
             return s;
         },
         [this] (int note) -> juce::String
