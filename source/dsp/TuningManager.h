@@ -40,6 +40,14 @@ class TuningManager
 public:
     enum class Mode { Equal = 0, MtsEsp = 1, Scala = 2 };
 
+    // Where a scale degree came from - a genuine RATIONAL (written as a ratio "3/2"
+    // or a bare integer "3") vs. a CENTS/tempered value ("701.955"). This is the
+    // SOURCE of just-ness: only a rational-sourced degree is a true JI interval;
+    // a cents value only ever APPROXIMATES one (the sole exception, 1200c = 2/1, is
+    // handled by the display). Kept per-degree so the UI can show an exact ratio when
+    // it is one and an "≈p/q *" approximation (never a false exact ratio) when it is not.
+    struct DegreeSrc { bool rational = false; long long p = 1, q = 1; };
+
     // Anchor: scale degree 0 (the 1/1) sits on middle C. With a 12-TET .scl this
     // reproduces standard tuning (key 69 = A = 440 Hz).
     static constexpr int    kRefKey  = 60;
@@ -166,8 +174,9 @@ public:
     bool loadScalaString (const juce::String& text, const juce::String& name, juce::String& errorOut)
     {
         std::vector<double> intervals;
+        std::vector<DegreeSrc> intervalSrc;
         juce::String desc;
-        if (! parseScala (text, intervals, desc, errorOut))
+        if (! parseScala (text, intervals, desc, errorOut, &intervalSrc))
             return false;
 
         const int count = (int) intervals.size();          // notes per period
@@ -179,6 +188,16 @@ public:
         perDegree.push_back (1.0);
         for (int j = 0; j < count - 1; ++j)
             perDegree.push_back (intervals[(size_t) j]);
+
+        // Per-degree SOURCE (ratio vs cents), degree 0..count-1 + the period. Degree 0
+        // is the exact unison 1/1; degree j = the source of listed interval j-1; the
+        // period = the source of the last listed interval.
+        std::vector<DegreeSrc> degSrc;
+        degSrc.reserve ((size_t) count);
+        degSrc.push_back ({ true, 1, 1 });
+        for (int j = 1; j < count; ++j)
+            degSrc.push_back (intervalSrc[(size_t) (j - 1)]);
+        const DegreeSrc periodSrc = intervalSrc[(size_t) count - 1];
 
         // Build anchored at middle C first (degree 0 on key 60), into a local
         // buffer so an @ABL reference can rescale before publishing.
@@ -216,9 +235,27 @@ public:
 
         scalaName   = name.isNotEmpty() ? name : desc;
         scalaSource = text;
+        scalaDegSrc    = std::move (degSrc);   // message-thread only (display/source queries)
+        scalaPeriodSrc = periodSrc;
         scalaDegreeCount.store (count, std::memory_order_relaxed);
         // release: publishes all the table writes above to the audio thread.
         scalaValid.store (true, std::memory_order_release);
+        return true;
+    }
+
+    // Did scale degree `degree` (0..count-1, or `count` for the period) come from a
+    // genuine RATIONAL source in the loaded .scl? Returns true + the exact p/q. Only
+    // valid in Scala mode; other modes have no per-degree source (query the mode).
+    bool scalaDegreeRational (int degree, long long& p, long long& q) const
+    {
+        if (! scalaValid.load (std::memory_order_acquire) || degree < 0)
+            return false;
+        const int count = scalaDegreeCount.load (std::memory_order_relaxed);
+        const DegreeSrc* s = nullptr;
+        if (degree == count)                               s = &scalaPeriodSrc;
+        else if (degree < (int) scalaDegSrc.size())        s = &scalaDegSrc[(size_t) degree];
+        if (s == nullptr || ! s->rational) return false;
+        p = s->p; q = s->q;
         return true;
     }
 
@@ -394,9 +431,12 @@ private:
         return false;
     }
 
-    // Parse a Scala .scl into the list of interval ratios (degrees 1..N).
+    // Parse a Scala .scl into the list of interval ratios (degrees 1..N). When
+    // `srcOut` is provided it receives, per interval, whether it was a genuine
+    // rational (ratio/integer) or a cents value.
     static bool parseScala (const juce::String& text, std::vector<double>& out,
-                            juce::String& descOut, juce::String& errorOut)
+                            juce::String& descOut, juce::String& errorOut,
+                            std::vector<DegreeSrc>* srcOut = nullptr)
     {
         juce::StringArray raw;
         raw.addLines (text);
@@ -433,24 +473,28 @@ private:
 
         out.clear();
         out.reserve ((size_t) count);
+        if (srcOut != nullptr) { srcOut->clear(); srcOut->reserve ((size_t) count); }
         for (int i = 0; i < count; ++i)
         {
             double ratio = 0.0;
-            if (! parsePitch (lines[2 + i], ratio))
+            DegreeSrc src;
+            if (! parsePitchSrc (lines[2 + i], ratio, src))
             {
                 errorOut = "Bad pitch on line " + juce::String (i + 1) + ": \"" + lines[2 + i] + "\"";
                 return false;
             }
             out.push_back (ratio);
+            if (srcOut != nullptr) srcOut->push_back (src);
         }
         return true;
     }
 
     // One Scala pitch line: a value with a '.' is cents, otherwise a ratio
     // ("a/b" or a bare integer "a" = a/1). Trailing text after the value is a
-    // comment and ignored.
-    static bool parsePitch (const juce::String& lineIn, double& ratioOut)
+    // comment and ignored. `srcOut` records whether it was a genuine rational.
+    static bool parsePitchSrc (const juce::String& lineIn, double& ratioOut, DegreeSrc& srcOut)
     {
+        srcOut = {};
         auto line = lineIn.trim();
         if (line.isEmpty())
             return false;
@@ -471,16 +515,22 @@ private:
                 return false;
             const double cents = token.getDoubleValue();
             ratioOut = std::pow (2.0, cents / 1200.0);
+            srcOut.rational = false; // cents -> tempered, never claimed as an exact ratio
             return std::isfinite (ratioOut) && ratioOut > 0.0;
         }
 
         if (token.containsChar ('/'))
         {
-            const double num = token.upToFirstOccurrenceOf ("/", false, false).getDoubleValue();
-            const double den = token.fromFirstOccurrenceOf ("/", false, false).getDoubleValue();
+            const auto numT = token.upToFirstOccurrenceOf ("/", false, false);
+            const auto denT = token.fromFirstOccurrenceOf ("/", false, false);
+            const double num = numT.getDoubleValue();
+            const double den = denT.getDoubleValue();
             if (den <= 0.0 || num <= 0.0)
                 return false;
             ratioOut = num / den;
+            // Genuine rational only when both parts are plain integers.
+            if (numT.containsOnly ("0123456789") && denT.containsOnly ("0123456789"))
+            { srcOut.rational = true; srcOut.p = (long long) numT.getLargeIntValue(); srcOut.q = (long long) denT.getLargeIntValue(); }
             return std::isfinite (ratioOut) && ratioOut > 0.0;
         }
 
@@ -489,8 +539,11 @@ private:
         if (! token.containsOnly ("0123456789"))
             return false;
         ratioOut = token.getDoubleValue();
+        srcOut.rational = true; srcOut.p = (long long) token.getLargeIntValue(); srcOut.q = 1;
         return ratioOut > 0.0;
     }
+    static bool parsePitch (const juce::String& lineIn, double& ratioOut)
+    { DegreeSrc s; return parsePitchSrc (lineIn, ratioOut, s); }
 
     // The audio thread reads the tuning table via these atomics, so they must be
     // lock-free or frequencyForNote() would not be real-time safe.
@@ -506,4 +559,6 @@ private:
     std::atomic<int>  scalaDegreeCount { 12 };
 
     juce::String scalaName, scalaSource; // message-thread only
+    std::vector<DegreeSrc> scalaDegSrc;  // per-degree ratio-vs-cents source (message-thread only)
+    DegreeSrc    scalaPeriodSrc;         // the period's source
 };

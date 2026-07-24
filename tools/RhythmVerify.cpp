@@ -24,7 +24,7 @@ static void check (bool ok, const char* what)
     if (! ok) ++failures;
 }
 
-struct Ev { int sample; bool on; int note, ch; };
+struct Ev { int sample; bool on; int note, ch; int vel = 0; };
 
 int main()
 {
@@ -209,6 +209,230 @@ int main()
         for (const auto& kv : onCount) if (kv.second != 0) hanging += kv.second;
         std::printf ("  net hanging notes after a mid-pulse re-prepare: %d\n", hanging);
         check (hanging == 0, "re-prepare mid-pulse leaves NO hanging notes (flush works)");
+    }
+
+    // --- run 7: internal FRACTAL feedback ---------------------------------------
+    // Every pulse spawns the routed trains one level down (velocity faded by the
+    // decay slope, strictly decreasing). It must (a) never run away, (b) actually
+    // produce decayed generations, (c) ring out and leave NO hanging notes after
+    // release, and (d) flush cleanly on a re-prepare mid-tail.
+    {
+        setParam ("rhythmSelfPlay", 1.0f);   // feedback lives inside the self-play loop
+        setParam ("rhythmFeedback", 1.0f);
+        setParam ("rhythmFeedbackDecay", 0.5f);
+        setParam ("rhythmOn", 1.0f);          // keep MIDI-out so the pulses+echoes are observable here
+        // Single slot so the pattern is easy to read.
+        proc.getRhythm().slots[0].partial = 1; proc.getRhythm().slots[0].enabled = true;
+        proc.getRhythm().slots[0].steps = 0;   proc.getRhythm().slots[0].durMs = 30.0f;
+        proc.getRhythm().slots[0].vel = 120;
+        proc.getRhythm().slots[1].enabled = false; proc.getRhythm().slots[1].partial = -1;
+
+        std::map<int,int> net; // (ch<<8|note) -> net on-count
+        std::vector<Ev> fb;
+        const int hold = (int) (2.0 * sr / blk);
+        const int tail = (int) (2.0 * sr / blk); // let the decaying tail finish after release
+        for (int b = 0; b < hold + tail; ++b)
+        {
+            juce::MidiBuffer midi;
+            if (b == 0)    midi.addEvent (juce::MidiMessage::noteOn  (1, 60, (juce::uint8) 120), 0);
+            if (b == hold) midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+            proc.processBlock (audio, midi);
+            for (const auto meta : midi)
+            {
+                const auto m = meta.getMessage();
+                if (m.isNoteOn())  { net[(m.getChannel()<<8)|m.getNoteNumber()]++; fb.push_back ({ b*blk+(int)meta.samplePosition, true,  m.getNoteNumber(), m.getChannel(), m.getVelocity() }); }
+                if (m.isNoteOff()) { net[(m.getChannel()<<8)|m.getNoteNumber()]--; fb.push_back ({ b*blk+(int)meta.samplePosition, false, m.getNoteNumber(), m.getChannel(), 0 }); }
+            }
+        }
+        int fbOns = 0, fbOffs = 0, hanging = 0;
+        for (const auto& e : fb) (e.on ? fbOns : fbOffs)++;
+        for (const auto& kv : net) if (kv.second != 0) hanging += kv.second;
+        std::printf ("== FEEDBACK loop (decay 0.5): %d note-ons, %d note-offs ==\n", fbOns, fbOffs);
+        check (fbOns > 0,        "feedback produces repeats");
+        check (fbOns == fbOffs,  "feedback: every note-on has its note-off (tail rings out cleanly)");
+        check (hanging == 0,     "feedback: NO hanging notes after release");
+        check (fbOns < 100000,   "feedback is BOUNDED - no runaway explosion");
+
+        // Decay: fractal children must be present at the faded generations. With
+        // decay 0.5 and root velocity 120 the strictly-decreasing chain is
+        // 120 -> 60 -> 30 -> 15 ...; require at least the first two child
+        // generations to have sounded.
+        bool gen1 = false, gen2 = false, onlyRootVel = true;
+        for (const auto& e : fb)
+            if (e.on)
+            {
+                if (e.vel == 60) gen1 = true;
+                if (e.vel == 30) gen2 = true;
+                if (e.vel != 120) onlyRootVel = false;
+            }
+        check (gen1 && gen2, "fractal children sound at decayed velocities (60, 30 from 120 at slope 0.5)");
+        check (! onlyRootVel, "feedback produces more than the root pulses");
+
+        // Re-prepare mid-tail must not strand the ringing echoes. Tally EVERY block
+        // (including the hold) so on/off counts match; the flush then balances them.
+        std::map<int,int> net2;
+        auto tally2 = [&] (juce::MidiBuffer& midi)
+        {
+            for (const auto meta : midi)
+            {
+                const auto m = meta.getMessage();
+                if (m.isNoteOn())  net2[(m.getChannel()<<8)|m.getNoteNumber()]++;
+                if (m.isNoteOff()) net2[(m.getChannel()<<8)|m.getNoteNumber()]--;
+            }
+        };
+        for (int b = 0; b < 8; ++b) { juce::MidiBuffer midi; if (b==0) midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8)120), 0); proc.processBlock (audio, midi); tally2 (midi); }
+        proc.prepareToPlay (sr, blk); // abandons open echo/gate notes mid-tail
+        for (int b = 0; b < 10; ++b) { juce::MidiBuffer midi; proc.processBlock (audio, midi); tally2 (midi); }
+        int hang2 = 0; for (const auto& kv : net2) if (kv.second != 0) hang2 += kv.second;
+        std::printf ("  net hanging after feedback mid-tail re-prepare: %d\n", hang2);
+        check (hang2 == 0, "feedback: re-prepare mid-tail leaves NO hanging notes (flushEchoes works)");
+
+        setParam ("rhythmFeedback", 0.0f); // leave feedback off for any later runs
+    }
+
+    // --- run 8: fractal child TIMING is sample-exact across block boundaries ----
+    // (the reviewed bug: children spawned by fired echoes were appended after the
+    // carry pass without the end-of-block rebase, landing one block late per
+    // generation). Slot on partial 1 (ratio 2), steps 0, note 60: parent pitch =
+    // 261.6255653 Hz -> child rate = 261.6255653*2/2^8 = 2.0439 Hz -> the vel-60
+    // child of the t=0 root pulse must land at round(48000/2.0439) = 23484 samples,
+    // and the vel-30 grandchild at 2x that - NOT a block (256) late.
+    {
+        setParam ("rhythmSelfPlay", 1.0f);
+        setParam ("rhythmFeedback", 1.0f);
+        setParam ("rhythmFeedbackDecay", 0.5f);
+        setParam ("rhythmOn", 1.0f);
+        proc.getRhythm().slots[0].partial = 1; proc.getRhythm().slots[0].enabled = true;
+        proc.getRhythm().slots[0].steps = 0;   proc.getRhythm().slots[0].durMs = 30.0f;
+        proc.getRhythm().slots[0].vel = 120;   proc.getRhythm().slots[0].useRatio = false;
+        proc.prepareToPlay (sr, blk); // clean state for exact timing
+
+        std::vector<Ev> fb;
+        const int blocks = (int) (4.0 * sr / blk);
+        for (int b = 0; b < blocks; ++b)
+        {
+            juce::MidiBuffer midi;
+            if (b == 0) midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 120), 0);
+            proc.processBlock (audio, midi);
+            for (const auto meta : midi)
+            {
+                const auto m = meta.getMessage();
+                if (m.isNoteOn())
+                    fb.push_back ({ b * blk + (int) meta.samplePosition, true, m.getNoteNumber(), m.getChannel(), m.getVelocity() });
+            }
+        }
+        const double childRate  = juce::jlimit (0.01, 30.0, 261.6255653 * 2.0 / 256.0);
+        const int    childDelay = (int) std::llround (sr / childRate);
+        int firstChild = -1, firstGrand = -1;
+        for (const auto& e : fb)
+        {
+            if (e.vel == 60 && firstChild  < 0) firstChild  = e.sample;
+            if (e.vel == 30 && firstGrand  < 0) firstGrand  = e.sample;
+        }
+        std::printf ("== FRACTAL timing: child at %d (expect %d), grandchild at %d (expect %d) ==\n",
+                     firstChild, childDelay, firstGrand, 2 * childDelay);
+        check (firstChild >= 0 && std::abs (firstChild - childDelay) <= 2,
+               "level-1 child lands exactly one child-period after the root pulse");
+        check (firstGrand >= 0 && std::abs (firstGrand - 2 * childDelay) <= 3,
+               "level-2 grandchild lands exactly two periods in - NOT a block late (rebase fix)");
+        setParam ("rhythmFeedback", 0.0f);
+    }
+
+    // --- run 9: note-start gate (quantize to tempo / mono / quantize to pulse) --
+    {
+        struct FakePlayHead : juce::AudioPlayHead
+        {
+            double bpm = 120.0, sr2 = 48000.0;
+            juce::int64 samplePos = 0;
+            juce::Optional<juce::AudioPlayHead::PositionInfo> getPosition() const override
+            {
+                juce::AudioPlayHead::PositionInfo p;
+                p.setBpm (bpm);
+                p.setIsPlaying (true);
+                p.setTimeInSamples (samplePos);
+                p.setPpqPosition ((double) samplePos / sr2 * bpm / 60.0);
+                return p;
+            }
+        };
+        FakePlayHead fph;
+        fph.sr2 = sr;
+        proc.setPlayHead (&fph);
+
+        auto resetState = [&]
+        {
+            setParam ("rhythmSelfPlay", 0.0f); setParam ("rhythmFeedback", 0.0f);
+            setParam ("rhythmOn", 1.0f);
+            setParam ("rhythmQTempo", 0.0f); setParam ("rhythmMono", 0.0f); setParam ("rhythmQPulse", 0.0f);
+            setParam ("rhythmMode", 0.0f); // Lowest note
+            proc.getRhythm().slots[0].partial = 1; proc.getRhythm().slots[0].enabled = true;
+            proc.getRhythm().slots[0].steps = 0;   proc.getRhythm().slots[0].durMs = 30.0f;
+            proc.getRhythm().slots[0].vel = 100;   proc.getRhythm().slots[0].useRatio = false;
+            proc.getRhythm().slots[1].enabled = false; proc.getRhythm().slots[1].partial = -1;
+            proc.prepareToPlay (sr, blk);
+            fph.samplePos = 0;
+        };
+        auto run = [&] (int blocks, std::vector<std::pair<int,juce::MidiMessage>> events) -> std::vector<Ev>
+        {
+            std::vector<Ev> evs;
+            for (int b = 0; b < blocks; ++b)
+            {
+                juce::MidiBuffer midi;
+                for (auto& [atSample, m] : events)
+                    if (atSample / blk == b) midi.addEvent (m, atSample % blk);
+                proc.processBlock (audio, midi);
+                fph.samplePos += blk;
+                for (const auto meta : midi)
+                {
+                    const auto m = meta.getMessage();
+                    if (m.isNoteOn())
+                        evs.push_back ({ b * blk + (int) meta.samplePosition, true, m.getNoteNumber(), m.getChannel(), m.getVelocity() });
+                }
+            }
+            return evs;
+        };
+
+        // (a) Quantize to tempo: note pressed at sample 868 must not pulse until the
+        //     next beat (120 BPM @ 48k = 24000 samples/beat -> beat at 24000 exactly).
+        resetState();
+        setParam ("rhythmQTempo", 1.0f);
+        auto evA = run ((int) (1.2 * sr / blk), { { 868, juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100) } });
+        int firstA = -1; for (const auto& e : evA) if (firstA < 0) firstA = e.sample;
+        std::printf ("== NOTE GATE: qTempo first pulse at %d (expect 24000) ==\n", firstA);
+        check (firstA == 24000, "quantize-to-tempo: the note enters EXACTLY on the next beat");
+
+        // (b) Mono: pressing 64 while 60 sounds -> 60 is stopped, 64 takes over as
+        //     the driver (its pulses appear; 60's stop).
+        resetState();
+        setParam ("rhythmMono", 1.0f);
+        auto evB = run ((int) (2.0 * sr / blk),
+                        { { 0,     juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100) },
+                          { 40000, juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100) } });
+        bool any64 = false, late60 = false;
+        for (const auto& e : evB)
+        {
+            if (e.note == 64) any64 = true;
+            if (e.note == 60 && e.sample > 41000) late60 = true;
+        }
+        check (any64,    "mono: the NEW note's pulses take over");
+        check (! late60, "mono: the previous note's pulses STOP when the new one starts");
+
+        // (c) Quantize to pulse: 60 held from 0 (single train, period 23484 = the
+        //     pattern cycle); 64 pressed at ~5000 in All-notes mode must join exactly
+        //     at the pattern reset (23484), where its own downbeat fires.
+        resetState();
+        setParam ("rhythmQPulse", 1.0f);
+        setParam ("rhythmMode", 1.0f); // All notes: each held note drives its own copy
+        auto evC = run ((int) (1.2 * sr / blk),
+                        { { 0,    juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100) },
+                          { 5000, juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100) } });
+        int first64 = -1;
+        for (const auto& e : evC) if (e.note == 64 && first64 < 0) first64 = e.sample;
+        std::printf ("   qPulse: note 64 first pulse at %d (expect ~23484) ==\n", first64);
+        check (first64 >= 0 && std::abs (first64 - 23484) <= 2,
+               "quantize-to-pulse: the new note joins EXACTLY when the pattern resets on the 1");
+
+        proc.setPlayHead (nullptr);
+        setParam ("rhythmQTempo", 0.0f); setParam ("rhythmMono", 0.0f); setParam ("rhythmQPulse", 0.0f);
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);

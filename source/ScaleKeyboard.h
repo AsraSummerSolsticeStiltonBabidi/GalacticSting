@@ -41,11 +41,22 @@ public:
     {
         const int lo = juce::jlimit (0, 127, lowestKey);
         const int cnt = numKeys > 0 ? juce::jmin (numKeys, 128 - lo) : juce::jmax (1, getWidth() / 30);
-        if (lo != rangeLo || cnt != rangeCount) { rangeLo = lo; rangeCount = cnt; baseKey = lo; } // new range -> reset view
+        if (lo != rangeLo || cnt != rangeCount)
+        {
+            rangeLo = lo; rangeCount = cnt;
+            // Keep the current view when it is still inside the new range (the range
+            // grows/shrinks live, e.g. to include notes being played off-view); only
+            // reset when the view no longer fits at all.
+            if (baseKey < lo || baseKey >= lo + cnt) baseKey = lo;
+        }
         clampView();
         repaint();
     }
     int  getBaseKey() const noexcept { return baseKey; }
+
+    // Scroll the visible window (arrow keys / UI). Public so the editor can bind
+    // the computer keyboard's left/right arrows to it.
+    void scrollView (int deltaKeys) { scrollBy (deltaKeys); }
 
     // Optional: a short just-intonation label per degree (e.g. "3/2"), drawn
     // under the degree number - the interval each Sethares minimum lands on.
@@ -55,6 +66,7 @@ public:
     // interval). Shown ONLY after the mouse rests ~0.5 s on a key, never while
     // that key is being clicked/dragged.
     void setHoverTextProvider (std::function<juce::String(int)> fn) { getHoverText = std::move (fn); }
+    std::function<juce::String(int)> getHoverTextProvider() const { return getHoverText; }
 
     // Below-keyboard hover strip: while a key is hovered, each OTHER key shows its
     // distance to it via getDeltaLabel(hoveredNote, otherNote) (multi-line: steps,
@@ -63,6 +75,13 @@ public:
     void setDeltaProviders (std::function<juce::String(int,int)> delta,
                             std::function<juce::String(int)> source, juce::Colour srcColour)
     { getDeltaLabel = std::move (delta); getSourceLabel = std::move (source); sourceColour = srcColour; }
+    void setNoteHzProvider (std::function<double(int)> fn) { getNoteHz = std::move (fn); }
+
+    // While hovering, every OTHER key's strip cell also shows the Sethares sensory
+    // dissonance of that key AGAINST the hovered one, coloured green (consonant) ->
+    // red (rough) like the interval list.
+    struct DissInfo { juce::String text; juce::Colour colour; };
+    void setHoverDissProvider (std::function<DissInfo(int,int)> fn) { getHoverDiss = std::move (fn); }
 
     juce::String getTooltip() override
     {
@@ -84,15 +103,14 @@ public:
         const int cells = numCells();
         const float aw = (float) arrowW();                       // scroll-arrow zones (0 if all keys fit)
         const float w = (float) keysWidth() / (float) cells;
-        const float h = (float) getHeight() - (float) stripH;    // keys use the top; strip is below
+        const float keysY = (float) stripH;                      // strip on TOP, keys BELOW it (at screen bottom)
+        const float keysH = (float) getHeight() - (float) stripH;
 
-        // Below-keyboard delta strip: dark, empty until a key is hovered.
-        {
-            auto strip = juce::Rectangle<float> (0.0f, h, (float) getWidth(), (float) stripH);
-            g.setColour (juce::Colour (0xff0c0c12));
-            g.fillRect (strip);
-        }
+        // Info strip ABOVE the keys: dark; shows period-key Hz normally, hover deltas on hover.
+        g.setColour (juce::Colour (0xff0c0c12));
+        g.fillRect (juce::Rectangle<float> (0.0f, 0.0f, (float) getWidth(), (float) stripH));
         const int hoveredNote = (hoverArmed && hoverCell >= 0) ? baseKey + hoverCell : -1;
+        bool heldOffL = false, heldOffR = false; // a sounding note is left/right of the view
 
         for (int i = 0; i < cells; ++i)
         {
@@ -100,84 +118,119 @@ public:
             if (note > 127) break;
 
             const int degree = ((note - kRefKey) % D + D) % D;
-            // Visible-light sweep: red (hue 0, low freq) -> violet (~0.82, high freq).
             const float hue = 0.82f * (float) degree / (float) D;
             const bool held = state.isNoteOnForChannels (0xffff, note);
 
-            auto cell = juce::Rectangle<float> (aw + i * w, 0.0f, w, h).reduced (0.6f);
+            auto cell = juce::Rectangle<float> (aw + i * w, keysY, w, keysH).reduced (0.6f);
             auto col = juce::Colour::fromHSV (hue, 0.62f, held ? 1.0f : 0.86f, 1.0f);
             g.setColour (held ? col.brighter (0.35f) : col);
             g.fillRect (cell);
+            if (held) { g.setColour (juce::Colours::white); g.drawRect (cell, 2.0f); }
 
-            if (held)
-            {
-                g.setColour (juce::Colours::white);
-                g.drawRect (cell, 2.0f);
-            }
-
-            // Degree number (as WIDE as the key allows via drawFittedText) + (optional)
-            // just-interval label below it.
+            // Degree number (wide, but a touch smaller so it clears the key edges in
+            // dense scales) + the just-interval label below it.
             const juce::String label = getLabel ? getLabel (degree) : juce::String();
             g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
             if (label.isNotEmpty())
             {
                 auto top = cell.removeFromTop (cell.getHeight() * 0.52f);
-                g.setFont (juce::Font (juce::FontOptions (juce::jmin (top.getHeight() * 0.98f, w * 0.9f)).withStyle ("Bold")));
-                g.drawFittedText (juce::String (degree), top.toNearestInt(), juce::Justification::centred, 1, 0.5f);
+                g.setFont (juce::Font (juce::FontOptions (juce::jmin (top.getHeight() * 0.76f, w * 0.66f)).withStyle ("Bold")));
+                g.drawFittedText (juce::String (degree), top.reduced (1, 0).toNearestInt(), juce::Justification::centred, 1, 0.5f);
                 drawIntervalLabel (g, label, cell, w);
             }
             else
             {
-                g.setFont (juce::Font (juce::FontOptions (juce::jmin (cell.getHeight() * 0.9f, w * 0.9f)).withStyle ("Bold")));
-                g.drawFittedText (juce::String (degree), cell.toNearestInt(), juce::Justification::centred, 1, 0.5f);
+                g.setFont (juce::Font (juce::FontOptions (juce::jmin (cell.getHeight() * 0.66f, w * 0.66f)).withStyle ("Bold")));
+                g.drawFittedText (juce::String (degree), cell.reduced (1, 0).toNearestInt(), juce::Justification::centred, 1, 0.5f);
             }
 
-            // Below-keyboard strip: on hover, this key's distance to the hovered key
-            // (or, under the hovered key itself, its "from n/1" source in the spectrum colour).
+            // Strip cell (above the key): hover deltas; the hovered key itself gets an
+            // EYE whose pupil takes the key's colour (a "you are looking here" marker
+            // that covers nothing - the strip is empty space). No hover: period Hz.
+            auto sc = juce::Rectangle<float> (aw + i * w, 0.0f, w, (float) stripH).reduced (1.5f, 3.0f);
             if (hoveredNote >= 0)
             {
-                auto sc = juce::Rectangle<float> (aw + i * w, h, w, (float) stripH).reduced (1.0f, 2.0f);
                 if (note == hoveredNote)
                 {
-                    const juce::String src = getSourceLabel ? getSourceLabel (note) : juce::String();
-                    if (src.isNotEmpty())
-                    {
-                        g.setColour (sourceColour);
-                        g.setFont (juce::Font (juce::FontOptions (juce::jmin (11.5f, w * 0.36f)).withStyle ("Bold")));
-                        g.drawFittedText (src, sc.toNearestInt(), juce::Justification::centred, 2, 0.5f);
-                    }
+                    auto eye = sc.withSizeKeepingCentre (juce::jmin (sc.getWidth() - 2.0f, 26.0f),
+                                                         juce::jmin (sc.getHeight(), 16.0f));
+                    g.setColour (juce::Colour (0xffe8ecf4));           // sclera outline
+                    g.drawEllipse (eye, 1.4f);
+                    auto iris = eye.withSizeKeepingCentre (eye.getHeight() * 0.78f, eye.getHeight() * 0.78f);
+                    g.setColour (col);                                  // iris = the key's colour
+                    g.fillEllipse (iris);
+                    g.setColour (juce::Colours::black);                 // pupil
+                    g.fillEllipse (iris.withSizeKeepingCentre (iris.getWidth() * 0.42f, iris.getHeight() * 0.42f));
                 }
                 else
                 {
+                    // Bottom line: this key's Sethares dissonance AGAINST the hovered
+                    // one, in the consonance colour; above it, the interval deltas.
+                    auto dc = sc;
+                    if (getHoverDiss)
+                    {
+                        const auto info = getHoverDiss (hoveredNote, note);
+                        if (info.text.isNotEmpty())
+                        {
+                            auto db = dc.removeFromBottom (12.0f);
+                            g.setColour (info.colour);
+                            g.setFont (juce::Font (juce::FontOptions (juce::jmin (10.5f, w * 0.32f)).withStyle ("Bold")));
+                            g.drawFittedText (info.text, db.toNearestInt(), juce::Justification::centred, 1, 0.4f);
+                        }
+                    }
                     const juce::String d = getDeltaLabel ? getDeltaLabel (hoveredNote, note) : juce::String();
                     if (d.isNotEmpty())
                     {
                         g.setColour (juce::Colour (0xffc4ccda));
-                        g.setFont (juce::Font (juce::FontOptions (juce::jmin (10.5f, w * 0.32f))));
-                        g.drawFittedText (d, sc.toNearestInt(), juce::Justification::centred, 3, 0.4f);
+                        g.setFont (juce::Font (juce::FontOptions (juce::jmin (10.0f, w * 0.30f))));
+                        g.drawFittedText (d, dc.toNearestInt(), juce::Justification::centred, 3, 0.4f);
                     }
+                }
+            }
+            else if (degree == 0 && getNoteHz) // period keys: their frequency (khz over 1000)
+            {
+                const double hz = getNoteHz (note);
+                if (hz > 0.0)
+                {
+                    g.setColour (juce::Colour (0xffc4ccda));
+                    g.setFont (juce::Font (juce::FontOptions (juce::jmin (11.0f, w * 0.34f)).withStyle ("Bold")));
+                    const juce::String t = hz >= 1000.0 ? juce::String (hz / 1000.0, 2) + "khz"
+                                                        : juce::String ((int) std::lround (hz)) + "hz";
+                    g.drawFittedText (t, sc.toNearestInt(), juce::Justification::centred, 1, 0.4f);
                 }
             }
         }
 
+        // Sounding notes outside the visible window: flag their direction so the
+        // scroll arrows can point you back to what you're playing.
+        for (int n = 0; n <= 127; ++n)
+            if (state.isNoteOnForChannels (0xffff, n))
+            {
+                if (n < baseKey) heldOffL = true;
+                else if (n >= baseKey + cells) heldOffR = true;
+            }
+
         // Scroll arrows for scales too wide to show at the readable min key width.
+        // They glow GREEN when a note you're playing sits off-view in that direction.
         if (isScrollable())
         {
             const bool canL = baseKey > rangeLo;
             const bool canR = baseKey + numCells() < rangeLo + rangeCount;
-            auto drawArrow = [&] (juce::Rectangle<float> zone, bool left, bool enabled)
+            auto drawArrow = [&] (juce::Rectangle<float> zone, bool left, bool enabled, bool playing)
             {
-                g.setColour (juce::Colour (0xff1a1a24));
+                g.setColour (playing ? juce::Colour (0xff1e5a2e) : juce::Colour (0xff1a1a24));
                 g.fillRect (zone);
-                g.setColour (enabled ? juce::Colours::white : juce::Colour (0xff44444e));
-                auto t = zone.withSizeKeepingCentre (zone.getWidth() * 0.42f, zone.getHeight() * 0.16f);
+                g.setColour (playing ? juce::Colour (0xff54e678)
+                                     : (enabled ? juce::Colours::white : juce::Colour (0xff44444e)));
+                const float s = playing ? 0.24f : 0.16f; // bigger when it's pointing at your notes
+                auto t = zone.withSizeKeepingCentre (zone.getWidth() * 0.5f, zone.getHeight() * s);
                 juce::Path p;
-                if (left) { p.addTriangle (t.getRight(), t.getY(), t.getRight(), t.getBottom(), t.getX(), t.getCentreY()); }
-                else      { p.addTriangle (t.getX(), t.getY(), t.getX(), t.getBottom(), t.getRight(), t.getCentreY()); }
+                if (left) p.addTriangle (t.getRight(), t.getY(), t.getRight(), t.getBottom(), t.getX(), t.getCentreY());
+                else      p.addTriangle (t.getX(), t.getY(), t.getX(), t.getBottom(), t.getRight(), t.getCentreY());
                 g.fillPath (p);
             };
-            drawArrow (juce::Rectangle<float> (0.0f, 0.0f, aw, h), true,  canL);
-            drawArrow (juce::Rectangle<float> ((float) getWidth() - aw, 0.0f, aw, h), false, canR);
+            drawArrow (juce::Rectangle<float> (0.0f, keysY, aw, keysH), true,  canL, heldOffL);
+            drawArrow (juce::Rectangle<float> ((float) getWidth() - aw, keysY, aw, keysH), false, canR, heldOffR);
         }
     }
 
@@ -212,11 +265,11 @@ public:
         }
     }
 
-    // Only the keys play; the bottom hover-delta strip is a read-out, the side arrows scroll.
+    // Only the keys (below the top info strip) play; the side arrows scroll.
     void mouseDown (const juce::MouseEvent& e) override
     {
         hoverArmed = false;
-        if (e.y >= getHeight() - stripH) return; // strip
+        if (e.y < stripH) return; // top info strip
         const int aw = arrowW();
         if (aw > 0 && e.x < aw)                { scrollBy (-scrollStep()); return; }
         if (aw > 0 && e.x >= getWidth() - aw)  { scrollBy ( scrollStep()); return; }
@@ -226,7 +279,7 @@ public:
     {
         hoverArmed = false;
         const int aw = arrowW();
-        if (e.y < getHeight() - stripH && e.x >= aw && e.x < getWidth() - aw) playAt (e.x);
+        if (e.y >= stripH && e.x >= aw && e.x < getWidth() - aw) playAt (e.x);
         else releaseHeld();
     }
     int scrollStep() const { return juce::jmax (1, numCells() - 1); } // near-page step
@@ -238,7 +291,10 @@ public:
     }
     void mouseMove (const juce::MouseEvent& e) override
     {
-        const int cell = noteAt (e.x) >= 0 ? juce::jlimit (0, numCells() - 1, e.x * numCells() / juce::jmax (1, getWidth())) : -1;
+        // Derive the hovered CELL from noteAt so the arrow zones are accounted for
+        // (the old width-proportional math drifted one key off next to the arrows).
+        const int n    = noteAt (e.x);
+        const int cell = n >= 0 ? n - baseKey : -1;
         if (cell != hoverCell)
         {
             hoverCell    = cell;
@@ -303,9 +359,10 @@ private:
     void timerCallback() override
     {
         // Arm the hover tooltip only after resting on the same key with no button
-        // held (the global TooltipWindow then displays getTooltip()).
+        // held (the global TooltipWindow then displays getTooltip()). Slightly
+        // quicker than a standard tooltip - these read-outs are core UI.
         if (! hoverArmed && hoverCell >= 0 && ! isMouseButtonDown()
-            && juce::Time::getMillisecondCounter() - hoverStartMs >= 500)
+            && juce::Time::getMillisecondCounter() - hoverStartMs >= 350)
             hoverArmed = true;
         repaint();
     }
@@ -316,8 +373,10 @@ private:
     std::function<juce::String(int)> getHoverText;
     std::function<juce::String(int,int)> getDeltaLabel;  // (hoveredNote, otherNote) -> multi-line delta
     std::function<juce::String(int)>     getSourceLabel; // note -> "from n/1" (segment scales)
+    std::function<double(int)>           getNoteHz;      // note -> frequency (period keys show it)
+    std::function<DissInfo(int,int)>     getHoverDiss;   // (hovered, other) -> dissonance line + colour
     juce::Colour sourceColour { 0xffff9a3c };            // Spectrum-to-Tuning colour for the source label
-    static constexpr int stripH = 30;                    // below-keyboard hover-delta strip height
+    static constexpr int stripH = 44;                    // top info strip (deltas + dissonance line)
     int baseKey   = 48; // leftmost VISIBLE key (the scroll position)
     int rangeLo   = 48; // full playable range start
     int rangeCount = 40; // full playable range length (keys); a window of it is shown

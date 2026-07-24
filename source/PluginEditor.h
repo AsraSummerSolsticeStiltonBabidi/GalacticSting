@@ -163,6 +163,69 @@ private:
         }
     };
 
+    // Chord-search results: "#rank  [play]  note note note..." - one colour PER NOTE
+    // INDEX; the play glyph previews (all together, then an ascending strum);
+    // double-clicking a row loads the chord as the active .scl scale.
+    struct ChordList : juce::Component, juce::TooltipClient
+    {
+        struct Row { std::vector<juce::String> notes; double value = 0.0; };
+        std::vector<Row> rows;
+        juce::String tip;
+        std::function<void (int)> onPlay, onLoad;
+        static constexpr int kRowH = 22, kRankW = 30, kPlayW = 22;
+        int contentHeight() const { return (int) rows.size() * kRowH; }
+        juce::String getTooltip() override { return tip; }
+        static juce::Colour noteColour (int k)
+        {
+            static const juce::uint32 pal[] = { 0xffe0453f, 0xffffc95c, 0xff4fe09a, 0xff4fe6ff,
+                                                0xff9a7bff, 0xffff77c8, 0xffff9a3c, 0xffc4ccda };
+            return juce::Colour (pal[(size_t) (k % 8)]);
+        }
+        void paint (juce::Graphics& g) override
+        {
+            int y = 0, row = 0;
+            for (const auto& r : rows)
+            {
+                if (row % 2 == 1) { g.setColour (juce::Colour (0x14ffffff)); g.fillRect (0, y, getWidth(), kRowH); }
+                g.setColour (juce::Colour (0xff8f96a8));  // numbered ranking
+                g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+                g.drawText ("#" + juce::String (row + 1), 2, y, kRankW - 4, kRowH, juce::Justification::centredLeft, false);
+                // play glyph
+                {
+                    auto pr = juce::Rectangle<float> ((float) kRankW, (float) y + 5.0f, (float) kPlayW - 8.0f, (float) kRowH - 10.0f);
+                    juce::Path tri;
+                    tri.addTriangle (pr.getX(), pr.getY(), pr.getX(), pr.getBottom(), pr.getRight(), pr.getCentreY());
+                    g.setColour (juce::Colour (0xff2fb155));
+                    g.fillPath (tri);
+                }
+                // the chord's notes, one colour per note index
+                const int x0 = kRankW + kPlayW;
+                const int nw = juce::jmax (28, (getWidth() - x0) / juce::jmax (1, (int) r.notes.size()));
+                for (int k = 0; k < (int) r.notes.size(); ++k)
+                {
+                    g.setColour (noteColour (k));
+                    g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+                    g.drawFittedText (r.notes[(size_t) k],
+                                      juce::Rectangle<int> (x0 + k * nw, y, nw - 2, kRowH),
+                                      juce::Justification::centred, 1, 0.5f);
+                }
+                y += kRowH; ++row;
+            }
+        }
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            const int row = e.y / kRowH;
+            if (! juce::isPositiveAndBelow (row, (int) rows.size())) return;
+            if (e.x >= kRankW - 2 && e.x < kRankW + kPlayW && onPlay) onPlay (row);
+        }
+        void mouseDoubleClick (const juce::MouseEvent& e) override
+        {
+            const int row = e.y / kRowH;
+            if (juce::isPositiveAndBelow (row, (int) rows.size()) && e.x >= kRankW + kPlayW && onLoad)
+                onLoad (row);
+        }
+    };
+
     // "From spectrum's segment" partial picker: one row per partial of the current
     // spectrum. Click toggles selection; Shift-click selects the span to the anchor;
     // all selected rows share one colour; the tonic (lowest selected = C3) is starred.
@@ -266,19 +329,34 @@ private:
         std::function<void()> onClose;                                        // hide panel + scrim
 
         juce::ListBox      list { "partials", this };
-        juce::ToggleButton onT, mpeT, tempoT; // tempoT = continuous DAW-tempo sync (CC20)
+        juce::ToggleButton onT, selfT, mpeT, tempoT; // onT = MIDI out; selfT = play in Fibló; tempoT = DAW-tempo sync (CC20)
+        juce::ToggleButton droneT;                    // also sound the held note under the pulses
+        juce::ToggleButton qTempoT, monoT, qPulseT;   // note-start gate: beat-quantize / mono / pattern-quantize
+        juce::Label        secGate;                   // "NOTE START" group header
+        juce::ToggleButton feedbackT;                 // internal recursive feedback loop
+        juce::Slider       feedbackS;                 // its volume slope (decay per loop)
+        juce::Label        feedbackLbl;               // "Feedback" caption
+        juce::Label        outLbl, selfLbl;           // captions under the two big pill toggles
         juce::ComboBox     modeBox;
-        juce::Label        heading, listHead, info, noteHead, durHead, bpmLbl, pickHint;
+        juce::Label        heading, listHead, info, noteHead, durHead, velHead, bpmLbl, pickHint;
+        juce::Rectangle<int> rateBox;                 // framed box around the PULSE RATE group
         juce::Label        secRate, secOut, secTempo;         // coloured group headers
         juce::Label        divLbl, timesLbl, nVal, xVal;      // "divide [n] times by [x]"
         juce::TextButton   nUp, nDn, xUp, xDn;                // tiny round steppers
         juce::TextButton   closeB { "X" }, helpB, jiB, tempoX2, tempoD2;
         juce::String       helpText;                          // shown by the Help button
+        // Slot rows live in a scrollable container: kSlots is large ("unlimited"
+        // pulses), so the panel shows a window onto however many are routed.
+        juce::Viewport     slotView;
+        juce::Component    slotRows;
         juce::Label        slotLbl[RhythmEngine::kSlots];
         juce::TextEditor   pitchE[RhythmEngine::kSlots];
         juce::TextButton   s12M[RhythmEngine::kSlots], s12P[RhythmEngine::kSlots]; // -12/+12 (steps only)
         juce::Slider       durS[RhythmEngine::kSlots];
+        juce::Slider       velS[RhythmEngine::kSlots]; // per-slot MIDI velocity of each pulse
         juce::TextButton   delB[RhythmEngine::kSlots];
+        juce::Label        octLbl, octAllVal;          // "Octave (all pulses)" stepper
+        juce::TextButton   octAllUp, octAllDn;
         int numRows = 0, tempoOct = 0;
 
         // Clicking any empty spot of the panel gives keyboard focus back to the
@@ -341,7 +419,7 @@ private:
         {
             heading.setJustificationType (juce::Justification::centredLeft);
             heading.setColour (juce::Label::textColourId, juce::Colour (0xff5cb8ff));
-            heading.setFont (juce::Font (juce::FontOptions (16.0f).withStyle ("Bold")));
+            heading.setFont (juce::Font (juce::FontOptions (21.0f).withStyle ("Bold")));
             addAndMakeVisible (heading);
             listHead.setJustificationType (juce::Justification::centredLeft);
             listHead.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
@@ -357,6 +435,32 @@ private:
             addAndMakeVisible (list);
             onT.setName ("onled"); // big green(on)/red(off) pill, drawn by GalacticLnF
             addAndMakeVisible (onT);
+            selfT.setName ("onled"); // second big pill: "play in Fibló" (interpret internally)
+            addAndMakeVisible (selfT);
+            // Captions under the two big pill toggles.
+            for (auto* l : { &outLbl, &selfLbl })
+            {
+                l->setJustificationType (juce::Justification::centred);
+                l->setColour (juce::Label::textColourId, juce::Colour (0xffb9c0d0));
+                l->setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+                addAndMakeVisible (*l);
+            }
+            droneT.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
+            addAndMakeVisible (droneT);
+            // Internal feedback loop + its volume slope (only meaningful with self-play).
+            feedbackT.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
+            addAndMakeVisible (feedbackT);
+            feedbackLbl.setJustificationType (juce::Justification::centredRight);
+            feedbackLbl.setColour (juce::Label::textColourId, juce::Colour (0xffb9c0d0));
+            feedbackLbl.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+            addAndMakeVisible (feedbackLbl);
+            feedbackS.setSliderStyle (juce::Slider::LinearHorizontal);
+            feedbackS.setRange (0.05, 0.95, 0.01);
+            feedbackS.setDoubleClickReturnValue (true, 0.5); // double-click = default
+            feedbackS.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 16);
+            feedbackS.textFromValueFunction = [] (double v) { return juce::String ((int) std::lround (v * 100.0)) + " %"; };
+            feedbackS.setColour (juce::Slider::trackColourId, juce::Colour (0xffff77c8));
+            addAndMakeVisible (feedbackS);
             addAndMakeVisible (mpeT);
             modeBox.addItem ("Lowest note", 1); // idx-mapped to the rhythmMode parameter
             modeBox.addItem ("All notes",   2);
@@ -373,6 +477,12 @@ private:
             sec (secRate,  juce::Colour (0xff4fe6ff)); // cyan   - PULSE RATE
             sec (secOut,   juce::Colour (0xffff77c8)); // pink   - OUTPUT
             sec (secTempo, juce::Colour (0xffffc95c)); // yellow - DAW TEMPO
+            sec (secGate,  juce::Colour (0xff7ff59a)); // green  - NOTE START (quantize/mono)
+            for (auto* t : { &qTempoT, &monoT, &qPulseT })
+            {
+                t->setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
+                addAndMakeVisible (*t);
+            }
 
             // "divide [n] times by [x]": two tiny +/- steppers driving the params.
             for (auto* l : { &divLbl, &timesLbl })
@@ -466,7 +576,7 @@ private:
             info.setColour (juce::Label::textColourId, juce::Colour (0xff7ff59a));
             info.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
             addAndMakeVisible (info);
-            for (auto* h : { &noteHead, &durHead })
+            for (auto* h : { &noteHead, &durHead, &velHead })
             {
                 h->setJustificationType (juce::Justification::centredLeft);
                 h->setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
@@ -477,12 +587,29 @@ private:
             closeB.onClick = [this] { if (onClose) onClose(); };
             addAndMakeVisible (closeB);
 
+            // Scrollable slot-rows container ("unlimited" pulses).
+            slotView.setViewedComponent (&slotRows, false);
+            slotView.setScrollBarsShown (true, false);
+            addAndMakeVisible (slotView);
+
+            // Global octave stepper: shifts ALL pulses together (+-4 octaves).
+            octLbl.setJustificationType (juce::Justification::centredRight);
+            octLbl.setColour (juce::Label::textColourId, juce::Colour (0xffb9c0d0));
+            octLbl.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+            addAndMakeVisible (octLbl);
+            octAllVal.setJustificationType (juce::Justification::centred);
+            octAllVal.setColour (juce::Label::textColourId, juce::Colours::white);
+            octAllVal.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
+            addAndMakeVisible (octAllVal);
+            miniStep (octAllUp, "+", "rhythmOctAll",  1);
+            miniStep (octAllDn, "-", "rhythmOctAll", -1);
+
             for (int i = 0; i < RhythmEngine::kSlots; ++i)
             {
                 slotLbl[i].setJustificationType (juce::Justification::centredLeft);
                 slotLbl[i].setColour (juce::Label::textColourId, juce::Colours::white);
                 slotLbl[i].setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
-                addChildComponent (slotLbl[i]);
+                slotRows.addChildComponent (slotLbl[i]);
 
                 pitchE[i].setJustification (juce::Justification::centred);
                 pitchE[i].setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
@@ -491,14 +618,14 @@ private:
                 pitchE[i].setSelectAllWhenFocused (true);
                 pitchE[i].onReturnKey = [this, i] { commitPitch (i); if (onEdited) onEdited(); };
                 pitchE[i].onFocusLost = [this, i] { commitPitch (i); };
-                addChildComponent (pitchE[i]);
+                slotRows.addChildComponent (pitchE[i]);
 
                 // -12 / +12 step an OCTAVE of scale steps; they only apply to steps
-                // values (they do nothing when the slot holds a ratio/cents pitch).
+                // values (hidden when the slot holds a ratio/cents pitch).
                 for (auto* b : { &s12M[i], &s12P[i] })
                 {
                     b->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff33334a));
-                    addChildComponent (*b);
+                    slotRows.addChildComponent (*b);
                 }
                 s12M[i].setButtonText ("-12");
                 s12P[i].setButtonText ("+12");
@@ -515,12 +642,23 @@ private:
 
                 durS[i].setSliderStyle (juce::Slider::LinearHorizontal);
                 durS[i].setRange (5.0, 500.0, 1.0);
+                durS[i].setDoubleClickReturnValue (true, 60.0); // double-click = default
                 durS[i].setSkewFactorFromMidPoint (80.0);
                 durS[i].setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 16);
                 durS[i].textFromValueFunction = [] (double v) { return juce::String ((int) v) + " ms"; };
                 durS[i].onValueChange = [this, i]
                 { if (proc) proc->getRhythm().slots[i].durMs = (float) durS[i].getValue(); };
-                addChildComponent (durS[i]);
+                slotRows.addChildComponent (durS[i]);
+
+                // Per-slot velocity: the MIDI velocity of every pulse this train sends.
+                velS[i].setSliderStyle (juce::Slider::LinearHorizontal);
+                velS[i].setRange (1.0, 127.0, 1.0);
+                velS[i].setDoubleClickReturnValue (true, 100.0); // double-click = default
+                velS[i].setTextBoxStyle (juce::Slider::TextBoxRight, false, 32, 16);
+                velS[i].setColour (juce::Slider::trackColourId, juce::Colour (0xffff77c8)); // pink = output
+                velS[i].onValueChange = [this, i]
+                { if (proc) proc->getRhythm().slots[i].vel = (int) velS[i].getValue(); };
+                slotRows.addChildComponent (velS[i]);
 
                 delB[i].setButtonText ("X");
                 delB[i].setColour (juce::TextButton::buttonColourId, juce::Colour (0xffe0453f));
@@ -532,7 +670,7 @@ private:
                     refreshSlots();
                     list.repaint();
                 };
-                addChildComponent (delB[i]);
+                slotRows.addChildComponent (delB[i]);
             }
         }
 
@@ -555,7 +693,7 @@ private:
         // The routed trains are kept COMPACT and in LIST ORDER (sorted by partial
         // index): no empty rows between them, no reordering surprises when a
         // partial is added or removed.
-        struct SlotData { int partial, steps; bool useRatio; double ratio; float durMs; };
+        struct SlotData { int partial, steps; bool useRatio; double ratio; float durMs; int vel; };
         std::vector<SlotData> readSlots() const
         {
             std::vector<SlotData> v;
@@ -565,7 +703,7 @@ private:
                 const auto& s = proc->getRhythm().slots[i];
                 if (s.partial.load() >= 0)
                     v.push_back ({ s.partial.load(), s.steps.load(), s.useRatio.load(),
-                                   s.ratio.load(), s.durMs.load() });
+                                   s.ratio.load(), s.durMs.load(), s.vel.load() });
             }
             return v;
         }
@@ -580,13 +718,14 @@ private:
                 {
                     s.steps = v[(size_t) i].steps;  s.useRatio = v[(size_t) i].useRatio;
                     s.ratio = v[(size_t) i].ratio;  s.durMs    = v[(size_t) i].durMs;
+                    s.vel   = v[(size_t) i].vel;
                     s.partial = v[(size_t) i].partial;
                     s.enabled = true;
                 }
                 else
                 {
                     s.enabled = false; s.partial = -1;
-                    s.steps = 0; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f;
+                    s.steps = 0; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f; s.vel = 100;
                 }
             }
         }
@@ -599,14 +738,19 @@ private:
                 v.erase (it);                            // click an assigned partial -> unassign
             else if ((int) v.size() < RhythmEngine::kSlots)
             {
-                v.push_back ({ row, 0, false, 1.0, 60.0f }); // assign (writeSlots sorts + compacts)
-                // Routing a partial means the user WANTS pulses -> flip the master On.
-                if (auto* p = proc->apvts.getParameter ("rhythmOn"))
-                    if (p->getValue() < 0.5f)
+                v.push_back ({ row, 0, false, 1.0, 60.0f, 100 }); // assign (writeSlots sorts + compacts)
+                // Routing a partial means the user WANTS pulses -> make sure SOME output
+                // is on. Self-play is the default sink (plays here); don't force MIDI-out.
+                const bool anyOut = proc->apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f
+                                 || proc->apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f;
+                if (! anyOut)
+                    if (auto* p = proc->apvts.getParameter ("rhythmSelfPlay"))
                         p->setValueNotifyingHost (1.0f);
             }
             writeSlots (std::move (v));
-            if (jiB.getToggleState()) applyJiToSlots(); // new partial adopts JI when the toggle is on
+            // Only the NEWLY routed partial adopts JI - existing slots keep any
+            // hand-edited ratio (routing more partials must never reset them).
+            if (jiB.getToggleState()) applyJiToSlots (row);
             refreshSlots();
             list.repaint();
         }
@@ -625,9 +769,11 @@ private:
         {
             return proc != nullptr && proc->apvts.getRawParameterValue ("rhythmMpe")->load() > 0.5f;
         }
-        // JI toggle: ON -> every routed slot uses the JUST ratio of its own partial;
-        // OFF -> slots revert to scale steps. Applied to present AND future routes.
-        void applyJiToSlots()
+        // JI toggle: ON -> routed slots use the JUST ratio of their own partial;
+        // OFF -> slots revert to scale steps. `onlyPartial >= 0` applies it to that
+        // newly-routed partial ONLY, so routing another partial never resets a ratio
+        // the user has hand-edited on an existing slot.
+        void applyJiToSlots (int onlyPartial = -1)
         {
             if (proc == nullptr) return;
             const bool on = jiB.getToggleState();
@@ -636,7 +782,7 @@ private:
             {
                 auto& s = proc->getRhythm().slots[i];
                 const int p = s.partial.load();
-                if (p < 0) continue;
+                if (p < 0 || (onlyPartial >= 0 && p != onlyPartial)) continue;
                 if (on && t != nullptr && p < (int) t->partials.size())
                 { s.ratio = (double) t->partials[(size_t) p].ratio; s.useRatio = true; }
                 else if (! on)
@@ -687,9 +833,12 @@ private:
             {
                 const int p = proc != nullptr ? proc->getRhythm().slots[i].partial.load() : -1;
                 const bool used = p >= 0;
+                const bool stepsPitch = used && ! proc->getRhythm().slots[i].useRatio.load();
                 slotLbl[i].setVisible (used); pitchE[i].setVisible (used);
                 durS[i].setVisible (used);    delB[i].setVisible (used);
-                s12M[i].setVisible (used);    s12P[i].setVisible (used);
+                // +-12 steps only make sense for steps pitches - hidden for ratio/cents.
+                s12M[i].setVisible (stepsPitch); s12P[i].setVisible (stepsPitch);
+                velS[i].setVisible (used);
                 if (used)
                 {
                     auto& s = proc->getRhythm().slots[i];
@@ -703,12 +852,16 @@ private:
                                                : stepsText (s.steps.load()),
                                            juce::dontSendNotification);
                     durS[i].setValue ((double) s.durMs.load(), juce::dontSendNotification);
+                    velS[i].setValue ((double) s.vel.load(), juce::dontSendNotification);
                 }
             }
             // Guide the user the moment they switch On with nothing routed yet.
-            const bool on = proc != nullptr && proc->apvts.getRawParameterValue ("rhythmOn")->load() > 0.5f;
+            const bool on = proc != nullptr
+                && (proc->apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f
+                 || proc->apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f);
             const bool none = readSlots().empty();
             pickHint.setVisible (on && none);
+            layoutSlotRows(); // the used-row count may have changed
         }
 
         void refreshLive() // pulse rates + polyrhythm chain, from the audio thread's read-outs
@@ -718,6 +871,8 @@ private:
                           juce::dontSendNotification);
             xVal.setText (juce::String ((int) proc->apvts.getRawParameterValue ("rhythmDivX")->load()),
                           juce::dontSendNotification);
+            octAllVal.setText (juce::String ((int) proc->apvts.getRawParameterValue ("rhythmOctAll")->load()),
+                               juce::dontSendNotification);
             juce::String s;
             const float f0 = proc->getRhythm().getDriverF0();
             s << (f0 > 0.0f ? "f0 = " + juce::String (f0, 2) + " Hz\n"
@@ -729,10 +884,12 @@ private:
                 const float r = proc->getRhythm().getRateHz (i);
                 if (r > 0.0f) { rates[m] = r; idx[m] = i; ++m; }
             }
-            for (int k = 0; k < m; ++k)
+            for (int k = 0; k < m && k < 4; ++k) // cap the listing; the polyrhythm line summarises the rest
                 s << "P" << juce::String (proc->getRhythm().slots[idx[k]].partial.load() + 1)
                   << ": " << juce::String (rates[k], 3) << " Hz ("
                   << juce::String (1000.0f / rates[k], 0) << " ms)\n";
+            if (m > 4)
+                s << "+" << juce::String (m - 4) << (trF ? trF (" more trains\n", " trens m\xc3\xa9s\n") : juce::String ("\n"));
             if (m >= 2)
             {
                 // ONE integer chain "1:2:3" over all active trains (not pairwise):
@@ -763,7 +920,8 @@ private:
 
             // Guide the user the moment they switch On with nothing routed yet
             // (updated here, every tick, so it reacts to the On toggle too).
-            const bool onNow = proc->apvts.getRawParameterValue ("rhythmOn")->load() > 0.5f;
+            const bool onNow = proc->apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f
+                            || proc->apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f;
             pickHint.setVisible (onNow && readSlots().empty());
 
             const double bpm = tempoBpm();
@@ -775,21 +933,47 @@ private:
         void resized() override
         {
             auto r = getLocalBounds().reduced (14, 10);
-            auto top = r.removeFromTop (26);
+            auto top = r.removeFromTop (30);
             closeB.setBounds (top.removeFromRight (24).withSizeKeepingCentre (22, 22));
             top.removeFromRight (5);
             helpB.setBounds (top.removeFromRight (104).withSizeKeepingCentre (104, 22)); // "How to route"
-            // Master ON/OFF pill: right of the title, green (on) / red (off).
-            auto titleZone = top;
-            heading.setBounds (titleZone.removeFromLeft (juce::jmin (256, titleZone.getWidth() - 76)));
-            titleZone.removeFromLeft (8);
-            onT.setBounds (titleZone.removeFromLeft (64).withSizeKeepingCentre (64, 24));
+            heading.setBounds (top); // big title, no toggle inside it
             r.removeFromTop (6);
 
-            // Three labelled control groups: PULSE RATE / OUTPUT / DAW TEMPO.
-            auto grpRow = [&r] (juce::Label& sec) { sec.setBounds (r.removeFromTop (13)); return r.removeFromTop (24); };
+            // Two big pill toggles, each with a caption: MIDI OUT (send to DAW) and
+            // PLAY IN FIBLÓ (interpret the rhythm here; the held note stays silent).
             {
-                auto g1 = grpRow (secRate);
+                auto tg = r.removeFromTop (46);
+                auto p1 = tg.removeFromLeft (118);
+                onT.setBounds (p1.removeFromTop (26).withSizeKeepingCentre (84, 24));
+                outLbl.setBounds (p1);
+                tg.removeFromLeft (14);
+                auto p2 = tg.removeFromLeft (140);
+                selfT.setBounds (p2.removeFromTop (26).withSizeKeepingCentre (96, 24));
+                selfLbl.setBounds (p2);
+                tg.removeFromLeft (16);
+                droneT.setBounds (tg.withSizeKeepingCentre (tg.getWidth(), 24)); // "note under pulses"
+            }
+            r.removeFromTop (6);
+            // Internal feedback loop + its volume slope.
+            {
+                auto fr = r.removeFromTop (24);
+                feedbackT.setBounds (fr.removeFromLeft (160));
+                fr.removeFromLeft (8);
+                feedbackLbl.setBounds (fr.removeFromLeft (54));
+                fr.removeFromLeft (6);
+                feedbackS.setBounds (fr.removeFromLeft (juce::jmin (240, fr.getWidth())).reduced (0, 1));
+            }
+            r.removeFromTop (8);
+
+            // PULSE RATE group, wrapped in its own framed box (header + divide row).
+            {
+                auto box = r.removeFromTop (13 + 3 + 24 + 8);
+                rateBox = box; // stored for paint()'s frame
+                auto ra = box.reduced (8, 4);
+                secRate.setBounds (ra.removeFromTop (13));
+                ra.removeFromTop (3);
+                auto g1 = ra.removeFromTop (24);
                 divLbl.setBounds (g1.removeFromLeft (50));
                 g1.removeFromLeft (4);
                 nDn.setBounds (g1.removeFromLeft (20).reduced (0, 2));
@@ -801,7 +985,10 @@ private:
                 xVal.setBounds (g1.removeFromLeft (26));
                 xUp.setBounds (g1.removeFromLeft (20).reduced (0, 2));
             }
-            r.removeFromTop (4);
+            r.removeFromTop (6);
+
+            // OUTPUT and DAW TEMPO groups.
+            auto grpRow = [&r] (juce::Label& sec) { sec.setBounds (r.removeFromTop (13)); return r.removeFromTop (24); };
             {
                 auto g2 = grpRow (secOut);
                 modeBox.setBounds (g2.removeFromLeft (128).reduced (0, 1));
@@ -809,6 +996,12 @@ private:
                 mpeT.setBounds (g2.removeFromLeft (86));
                 g2.removeFromLeft (8);
                 jiB.setBounds (g2.removeFromLeft (100).reduced (0, 1));
+                g2.removeFromLeft (10);
+                octLbl.setBounds (g2.removeFromLeft (96));       // "Octave (all)"
+                g2.removeFromLeft (4);
+                octAllDn.setBounds (g2.removeFromLeft (20).reduced (0, 2));
+                octAllVal.setBounds (g2.removeFromLeft (26));
+                octAllUp.setBounds (g2.removeFromLeft (20).reduced (0, 2));
             }
             r.removeFromTop (4);
             {
@@ -821,6 +1014,15 @@ private:
                 g3.removeFromLeft (6);
                 bpmLbl.setBounds (g3);
             }
+            r.removeFromTop (4);
+            {
+                auto g4 = grpRow (secGate); // NOTE START: quantize/mono toggles
+                qTempoT.setBounds (g4.removeFromLeft (218));
+                g4.removeFromLeft (6);
+                monoT.setBounds (g4.removeFromLeft (76));
+                g4.removeFromLeft (6);
+                qPulseT.setBounds (g4);
+            }
             r.removeFromTop (8);
 
             auto left = r.removeFromLeft (236);
@@ -831,29 +1033,50 @@ private:
             {
                 auto head = r.removeFromTop (14);
                 head.removeFromLeft (96);
-                head.removeFromRight (28);
-                durHead.setBounds (head.removeFromRight (114));
+                head.removeFromRight (28);        // over delB (24 + gap)
+                durHead.setBounds (head.removeFromRight (104));
                 head.removeFromRight (4);
-                head.removeFromRight (64); // over the -12/+12 pair
-                noteHead.setBounds (head);
+                velHead.setBounds (head.removeFromRight (76));
+                head.removeFromRight (4 + 30 + 3 + 30 + 6); // over the -12/+12 pair + gaps
+                noteHead.setBounds (head);        // over the pitch box
             }
-            auto rows = r.removeFromTop (RhythmEngine::kSlots * 26);
+            // Scrollable slot rows: the viewport takes all space above the info
+            // read-out ("unlimited" pulses - the panel shows a window onto them).
+            auto infoArea = r.removeFromBottom (76);
+            slotView.setBounds (r.reduced (0, 2));
+            layoutSlotRows();
+            infoArea.removeFromTop (4);
+            info.setBounds (infoArea);
+        }
+
+        // Lay the slot rows out inside the scrollable container (called from
+        // resized() AND refreshSlots(), since the used count changes the height).
+        void layoutSlotRows()
+        {
+            int used = 0;
+            if (proc != nullptr)
+                for (int i = 0; i < RhythmEngine::kSlots; ++i)
+                    if (proc->getRhythm().slots[i].partial.load() >= 0) ++used;
+            const int rowH = 26;
+            const bool scroll = used * rowH > slotView.getHeight();
+            slotRows.setSize (juce::jmax (60, slotView.getWidth() - (scroll ? 10 : 0)),
+                              juce::jmax (1, used * rowH));
             for (int i = 0; i < RhythmEngine::kSlots; ++i)
             {
-                auto row = rows.removeFromTop (26).reduced (0, 2);
+                auto row = juce::Rectangle<int> (0, i * rowH, slotRows.getWidth(), rowH).reduced (0, 2);
                 slotLbl[i].setBounds (row.removeFromLeft (96));
                 delB[i].setBounds (row.removeFromRight (24));
                 row.removeFromRight (4);
-                durS[i].setBounds (row.removeFromRight (114));
+                durS[i].setBounds (row.removeFromRight (104));
+                row.removeFromRight (4);
+                velS[i].setBounds (row.removeFromRight (76));
                 row.removeFromRight (4);
                 s12P[i].setBounds (row.removeFromRight (30));
                 row.removeFromRight (3);
                 s12M[i].setBounds (row.removeFromRight (30));
-                row.removeFromRight (4);
+                row.removeFromRight (6);
                 pitchE[i].setBounds (row.reduced (0, 1));
             }
-            r.removeFromTop (4);
-            info.setBounds (r);
         }
 
         void paint (juce::Graphics& g) override
@@ -863,6 +1086,15 @@ private:
             g.fillRoundedRectangle (r, 10.0f);
             g.setColour (juce::Colour (0xff5cb8ff));
             g.drawRoundedRectangle (r.reduced (1.5f), 10.0f, 3.0f);
+            // Frame around the PULSE RATE group (drawn behind its controls).
+            if (! rateBox.isEmpty())
+            {
+                auto rb = rateBox.toFloat();
+                g.setColour (juce::Colour (0x224fe6ff)); // faint cyan wash (matches secRate)
+                g.fillRoundedRectangle (rb, 7.0f);
+                g.setColour (juce::Colour (0x664fe6ff));
+                g.drawRoundedRectangle (rb.reduced (0.5f), 7.0f, 1.2f);
+            }
         }
     };
 
@@ -892,7 +1124,7 @@ private:
     FractalAdditiveAudioProcessor& processorRef;
 
     std::unique_ptr<juce::LookAndFeel_V4> lnf;
-    juce::TooltipWindow tooltipWindow { this, 500 };
+    juce::TooltipWindow tooltipWindow { this, 350 }; // subtly quicker hover read-outs
     ScaleKeyboard keyboard;
 
     SteppedSlider baseNFader, spectrumRangeFader, fractalFader, timbreRepeatsFader;
@@ -921,7 +1153,29 @@ private:
     DissHeader     dissHeader;   // Step / Sethares-dissonance column header
     juce::Viewport dissView;     // scrolls degreeList when a scale has many steps
     // Spectrum-to-Tuning mode + the "from spectrum's segment" partial picker.
-    juce::ComboBox   specModeBox;                 // Sethares dissonance / from spectrum's segment
+    juce::ComboBox   specModeBox;                 // dyads Sethares / segment / chords Sethares
+    // Chord-search mode (n-note Sethares consonance ranking).
+    juce::ComboBox   chordNotesBox, chordCountBox, chordMinMaxBox;
+    juce::Label      chordNotesLbl, chordPerLbl, chordProgLbl;
+    juce::TextEditor chordPeriodEdit;
+    juce::TextButton chordGoBtn;
+    ChordList        chordList;
+    juce::Viewport   chordView;
+    int              lastChordGen = 0;
+    // Chord preview scheduling (messages sent into the processor's collector when due).
+    struct PrevEv { juce::uint32 dueMs; juce::MidiMessage msg; };
+    std::vector<PrevEv> previewQueue;
+    std::vector<std::pair<int,int>> previewNotes; // (ch,key) of the current preview - for explicit stops
+    void stopChordPreview();                      // explicit note-offs + bend recentre (MPE-safe)
+    void playChordPreview (int row);
+    void runChordSearch();
+    // Hover-dissonance cache: Sethares dissonance of every key AGAINST the hovered
+    // one (recomputed only when the hovered note / timbre / tuning changes).
+    void updateHoverDissCache (int hoveredNote);
+    int    hoverDissNote = -1;
+    double hoverDissSig  = -1.0e30;
+    std::array<float, 128> hoverDissVal {};
+    float  hoverDissLo = 0.0f, hoverDissHi = 1.0f;
     SegmentList      segList;                     // partial picker (inside segView)
     juce::Viewport   segView;
     juce::TextEditor segPeriodEdit;               // "2" / "3/2" / "500c"
@@ -933,7 +1187,9 @@ private:
     double lastScaleSig   = -1.0e30; // change signature (timbre gen + tuning shape)
     Scrim          rhythmScrim;
     RhythmPanel    rhythmPanel;
-    std::unique_ptr<ButtonAttachment>   rhythmOnAtt, rhythmMpeAtt, rhythmTempoAtt;
+    std::unique_ptr<ButtonAttachment>   rhythmOnAtt, rhythmSelfAtt, rhythmDroneAtt, rhythmFbAtt, rhythmMpeAtt, rhythmTempoAtt,
+                                        rhythmQTempoAtt, rhythmMonoAtt, rhythmQPulseAtt;
+    std::unique_ptr<SliderAttachment>   rhythmFbDecayAtt;
     std::unique_ptr<ComboBoxAttachment> rhythmModeAtt;
     juce::uint32 lastRhythmGen = 0; // refresh the partial list when the template changes
     juce::uint32 lastSegGen = 0;    // refresh the segment picker on template change

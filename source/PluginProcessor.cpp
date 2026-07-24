@@ -54,6 +54,10 @@ void FractalAdditiveAudioProcessor::addRecentScl (const juce::File& f)
 FractalAdditiveAudioProcessor::~FractalAdditiveAudioProcessor()
 {
     stopTimer();
+    // Stop and reap the chord-search worker before members are destroyed.
+    chordCancel = true;
+    if (chordThread != nullptr && chordThread->joinable())
+        chordThread->join();
 }
 
 //==============================================================================
@@ -188,6 +192,41 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     // Each selected partial pulses at f0 * ratio / x^n; all of these are automatable.
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "rhythmOn", 1 }, "Rhythm MIDI On", false));
+    // "Play in Fibló": the rhythm MIDI is interpreted by THIS synth (the held note
+    // itself stays silent, only the rhythmic pulses sound). Independent of MIDI-out.
+    // ON by default: routing a partial then plays the rhythm right here; disable it to
+    // use MIDI-out only. It only takes effect once at least one partial is routed, so
+    // the synth still plays normally out of the box.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "rhythmSelfPlay", 1 }, "Rhythm Play In Synth", true));
+    // "Note under pulses": when self-play is on, ALSO sound the held note normally
+    // underneath the pulses (off = only the rhythm sounds).
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "rhythmDrone", 1 }, "Rhythm Note Under Pulses", false));
+    // Internal FEEDBACK loop (self-play): every pulse spawns a decaying burst of
+    // repeats ("pulses of the pulse"), each quieter by the slope. Bounded (velocity
+    // floor + loop cap) so it always converges - never a runaway.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "rhythmFeedback", 1 }, "Rhythm Feedback", false));
+    // The volume slope: fraction of velocity kept per loop. 0.5 = halve each repeat
+    // (short tail); higher = longer, louder tail.
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "rhythmFeedbackDecay", 1 }, "Rhythm Feedback Decay",
+        juce::NormalisableRange<float> (0.05f, 0.95f, 0.01f), 0.5f));
+    // Global octave shift of ALL pulses at once (+-4 octaves).
+    params.push_back (std::make_unique<AudioParameterInt>(
+        ParameterID { "rhythmOctAll", 1 }, "Rhythm Pulses Octave", -4, 4, 0));
+    // Note-gate modes (all default OFF, independent):
+    //  - Quantize to project tempo: a note may only START on a beat of the host BPM.
+    //  - Mono: a new note stops the one currently sounding.
+    //  - Quantize to pulse: a new note waits for the moment the running polyrhythm
+    //    pattern resets (all subdivisions coincide on the 1) and joins there.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "rhythmQTempo", 1 }, "Quantize To Project Tempo", false));
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "rhythmMono", 1 }, "Mono Mode", false));
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "rhythmQPulse", 1 }, "Quantize To Pulse", false));
     // Default: divide 8 times by 2 (x^n = 2^8 = 256). Base 1 is not offered - it
     // turned the pulses into an audio-rate MIDI flood.
     params.push_back (std::make_unique<AudioParameterInt>(
@@ -761,10 +800,121 @@ bool FractalAdditiveAudioProcessor::saveGeneratedScl (const juce::File& f, juce:
 }
 
 //==============================================================================
+// N-note chord search (Sethares union measure) - background worker.
+bool FractalAdditiveAudioProcessor::startChordSearch (int notes, double periodRatio,
+                                                      const juce::String& periodSclLine,
+                                                      int count, bool maxima, juce::String& errorOut)
+{
+    notes = juce::jlimit (2, 8, notes);
+    count = juce::jlimit (1, 24, count);
+    if (! (periodRatio > 1.02) || ! std::isfinite (periodRatio))
+    {
+        errorOut = "Invalid period.";
+        return false;
+    }
+
+    // Reap any previous worker (message thread; the worker only reads its own copy).
+    chordCancel = true;
+    if (chordThread != nullptr && chordThread->joinable())
+        chordThread->join();
+    chordCancel = false;
+
+    // Analyse the spectrum the synth is REALLY producing right now (same prep as the
+    // dyad Transmute: absolute frequencies anchored at middle C x the A-reference,
+    // strongest-64 analysis cap - analysis only, never the sound).
+    const auto tmpl = spectrum::compileSpectrum (currentSettings());
+    if (tmpl.partials.empty())
+    {
+        errorOut = "The current settings produce no partials - nothing to analyse.";
+        return false;
+    }
+    const double f0 = TuningManager::kRefFreq * tuning.referenceScale();
+    std::vector<dissonance::Partial> spec;
+    spec.reserve (tmpl.partials.size());
+    for (const auto& p : tmpl.partials)
+        spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
+    if (spec.size() > 64)
+    {
+        std::sort (spec.begin(), spec.end(),
+                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
+        spec.resize (64);
+    }
+
+    chordPeriodSclLine = periodSclLine;
+    chordPeriodRatio   = periodRatio;
+    chordProgress      = 0.0f;
+    chordRunning       = true;
+
+    chordThread = std::make_unique<std::thread> (
+        [this, spec = std::move (spec), periodRatio, notes, count, maxima,
+         periodLine = periodSclLine]()
+        {
+            auto res = dissonance::searchChords (spec, periodRatio, notes, count, maxima,
+                [this] (float p) { chordProgress.store (p); return ! chordCancel.load(); });
+            {
+                const juce::ScopedLock sl (chordLock);
+                chordResults.clear();
+                for (auto& r : res)
+                    chordResults.push_back ({ std::move (r.alphas), r.value });
+                chordResultsPeriodLine = periodLine; // results + their period publish TOGETHER
+            }
+            chordProgress = 1.0f;
+            chordGeneration.fetch_add (1);
+            chordRunning = false;
+        });
+    return true;
+}
+
+void FractalAdditiveAudioProcessor::cancelChordSearch()
+{
+    chordCancel = true; // the worker exits at its next progress poll; reaped on next start/destroy
+}
+
+bool FractalAdditiveAudioProcessor::loadChordAsScale (int index, juce::String& errorOut)
+{
+    ChordHit hit;
+    juce::String periodLine;
+    {
+        const juce::ScopedLock sl (chordLock);
+        if (! juce::isPositiveAndBelow (index, (int) chordResults.size()))
+        {
+            errorOut = "No such chord.";
+            return false;
+        }
+        hit        = chordResults[(size_t) index];
+        periodLine = chordResultsPeriodLine; // the period THESE results were searched in
+    }
+
+    // Degrees = the chord's notes above the root, in cents (source-honest: these are
+    // searched/refined values, not typed ratios), then the EXACT typed period.
+    juce::String scl;
+    scl << "! Generated by Fibló Galàctic - Sethares chord search (rank " << (index + 1) << ")\n"
+        << "Chord of " << (int) hit.alphas.size() << " notes by sensory consonance\n"
+        << " " << (int) hit.alphas.size() << "\n!\n";
+    for (size_t k = 1; k < hit.alphas.size(); ++k)
+        scl << " " << juce::String (1200.0 * std::log2 (hit.alphas[k]), 5) << "\n";
+    scl << " " << periodLine << "\n";
+
+    const auto name = "chord-" + juce::String ((int) hit.alphas.size()) + "n-rank" + juce::String (index + 1);
+    if (! tuning.loadScalaString (scl, name, errorOut))
+        return false;
+    if (auto* p = apvts.getParameter ("tuningMode"))
+        p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
+    tuning.setMode (TuningManager::Mode::Scala);
+    clearSegmentSource(); // a chord scale replaces any segment mapping
+    lastDissScl  = scl;
+    lastDissName = name;
+    return true;
+}
+
+//==============================================================================
 void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     juce::ignoreUnused (samplesPerBlock);
     synth.setCurrentPlaybackSampleRate (sampleRate);
+    previewCollector.reset (sampleRate);
+    noteGate.prepare (sampleRate);
+    lastSr = sampleRate;
     lastGain = juce::Decibels::decibelsToGain (apvts.getRawParameterValue ("masterGain")->load());
 
     // Build once synchronously so a template exists before the first note.
@@ -791,20 +941,87 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 
     buffer.clear();
 
-    // Merge on-screen / computer-keyboard notes into the incoming MIDI stream.
-    keyboardState.processNextMidiBuffer (midiMessages, 0, buffer.getNumSamples(), true);
+    const int  nSamp    = buffer.getNumSamples();
 
-    synth.renderNextBlock (buffer, midiMessages, 0, buffer.getNumSamples());
+    // Merge on-screen / computer-keyboard notes into the incoming MIDI stream.
+    keyboardState.processNextMidiBuffer (midiMessages, 0, nSamp, true);
+    // Chord-preview MIDI (editor play buttons): kept SEPARATE - it feeds only the
+    // synth, never the rhythm engine (a preview must not trigger pulse trains or
+    // leak to the DAW's MIDI out).
+    previewMidi.clear();
+    previewCollector.removeNextBlockOfMessages (previewMidi, nSamp);
+
+    // Note-start gate (all default off): quantize note starts to the host's beat
+    // grid, mono behaviour, and/or quantize to the running pattern's reset.
+    {
+        const bool qTempo = apvts.getRawParameterValue ("rhythmQTempo")->load() > 0.5f;
+        const bool mono   = apvts.getRawParameterValue ("rhythmMono")->load()   > 0.5f;
+        const bool qPulse = apvts.getRawParameterValue ("rhythmQPulse")->load() > 0.5f;
+        double beatOff = -1.0, beatPer = -1.0;
+        if (qTempo)
+            if (auto* ph = getPlayHead())
+                if (auto pos = ph->getPosition())
+                    if (pos->getIsPlaying() && pos->getBpm().hasValue() && pos->getPpqPosition().hasValue())
+                    {
+                        const double bpm = *pos->getBpm();
+                        if (bpm > 1.0 && lastSr > 0.0)
+                        {
+                            beatPer = lastSr * 60.0 / bpm;
+                            const double frac = *pos->getPpqPosition() - std::floor (*pos->getPpqPosition());
+                            beatOff = frac < 1.0e-9 ? 0.0 : (1.0 - frac) * beatPer;
+                        }
+                    }
+        noteGate.process (midiMessages, nSamp, qTempo, mono, qPulse,
+                          beatOff, beatPer, qPulse ? rhythm.samplesToNextReset() : -1.0);
+    }
+    const bool midiOut  = apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f;
+    const bool selfWant = apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f;
+    const bool drone    = apvts.getRawParameterValue ("rhythmDrone")->load()    > 0.5f;
+    // Self-play only ENGAGES once a partial is routed - otherwise the synth would go
+    // silent out of the box (held notes consumed, no pulses to replace them with).
+    const bool selfPlay = selfWant && rhythm.hasEnabledSlot();
+
+    if (selfPlay)
+    {
+        // "Play in Fibló": the rhythm MIDI feeds THIS synth. The played note is only a
+        // TRIGGER - it drives the trains but does not sound (unless "note under pulses"
+        // is on). NO feedback loop: rhythm.process reads the ORIGINAL played MIDI, never
+        // its own pulse output, so pulses never spawn pulses.
+        juce::MidiBuffer held;
+        held.addEvents (midiMessages, 0, nSamp, 0);        // keep the played notes (for the drone)
+        rhythm.process (midiMessages, nSamp);              // midiMessages := pulse MIDI
+
+        juce::MidiBuffer synthMidi;
+        synthMidi.addEvents (midiMessages, 0, nSamp, 0);   // synth plays the pulses...
+        if (drone) synthMidi.addEvents (held, 0, nSamp, 0);// ...and the held note underneath if asked
+        synthMidi.addEvents (previewMidi, 0, nSamp, 0);    // chord preview always audible AS a chord
+        synth.renderNextBlock (buffer, synthMidi, 0, nSamp);
+
+        if (! midiOut) midiMessages.clear();               // internal-only: don't leak pulses to the DAW
+    }
+    else if (! previewMidi.isEmpty())
+    {
+        // Preview active: the synth hears played notes + the preview; the rhythm
+        // engine still sees ONLY the played notes.
+        juce::MidiBuffer synthMidi;
+        synthMidi.addEvents (midiMessages, 0, nSamp, 0);
+        synthMidi.addEvents (previewMidi, 0, nSamp, 0);
+        synth.renderNextBlock (buffer, synthMidi, 0, nSamp);
+        rhythm.process (midiMessages, nSamp);
+    }
+    else
+    {
+        synth.renderNextBlock (buffer, midiMessages, 0, nSamp); // held notes sound normally
+        // Timbre -> rhythm MIDI out: generated in this very block with exact sample
+        // stamps, from the same f0/tuning maths as the voices -> sample-locked to the
+        // audio. Consumes the input events; only the pulse MIDI leaves the plugin.
+        rhythm.process (midiMessages, nSamp);
+    }
 
     const auto gain = juce::Decibels::decibelsToGain (
         apvts.getRawParameterValue ("masterGain")->load());
-    buffer.applyGainRamp (0, buffer.getNumSamples(), lastGain, gain);
+    buffer.applyGainRamp (0, nSamp, lastGain, gain);
     lastGain = gain;
-
-    // Timbre -> rhythm MIDI out: generated in this very block with exact sample
-    // stamps, from the same f0/tuning maths as the voices -> sample-locked to the
-    // audio. Consumes the input events; only the pulse MIDI leaves the plugin.
-    rhythm.process (midiMessages, buffer.getNumSamples());
 }
 
 //==============================================================================
@@ -869,6 +1086,7 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
                 slot.setProperty ("useRatio", s.useRatio.load(),    nullptr);
                 slot.setProperty ("ratio",    s.ratio.load(),       nullptr);
                 slot.setProperty ("durMs",    (double) s.durMs.load(), nullptr);
+                slot.setProperty ("vel",      s.vel.load(),         nullptr);
                 slot.setProperty ("on",       s.enabled.load(),     nullptr);
                 ry.appendChild (slot, nullptr);
             }
@@ -905,7 +1123,7 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
 
     // Rhythm (spectrum->MIDI) slots.
     for (auto& s : rhythm.slots)
-    { s.partial = -1; s.enabled = false; s.steps = 0; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f; }
+    { s.partial = -1; s.enabled = false; s.steps = 0; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f; s.vel = 100; }
     if (auto ry = tree.getChildWithName ("RHYTHM"); ry.isValid())
         for (auto slot : ry)
         {
@@ -917,6 +1135,7 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
                 rhythm.slots[i].useRatio = (bool)   slot.getProperty ("useRatio", false);
                 rhythm.slots[i].ratio    = (double) slot.getProperty ("ratio", 1.0);
                 rhythm.slots[i].durMs    = (float) (double) slot.getProperty ("durMs", 60.0);
+                rhythm.slots[i].vel      = (int)    slot.getProperty ("vel", 100);
                 rhythm.slots[i].enabled  = (bool)   slot.getProperty ("on", false);
             }
         }

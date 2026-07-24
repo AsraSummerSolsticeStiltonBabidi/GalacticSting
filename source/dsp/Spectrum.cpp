@@ -5,8 +5,15 @@
 
 namespace spectrum
 {
-    static bool selectionPass (int k, Selection sel)
+    // The played harmonic k==N (the fundamental) is ALWAYS kept: otherwise, in
+    // Transposed mode, "Even" (2,4,6...) would be transposed down onto the fundamental
+    // and become an ordinary 1,2,3,4 series - i.e. IDENTICAL to "All" (even harmonics
+    // ARE a full series an octave up). Keeping the fundamental makes Even = fundamental
+    // + even (1,2,4,6...), a genuinely hollow, distinct timbre. Even N already keeps
+    // itself; the fix matters most for the default N=1.
+    static bool selectionPass (int k, int N, Selection sel)
     {
+        if (k == N) return true;
         switch (sel)
         {
             case Selection::All:   return true;
@@ -216,7 +223,7 @@ namespace spectrum
 
         for (int k = N; k <= Kmax; ++k)
         {
-            if (! selectionPass (k, s.selection))   continue;
+            if (! selectionPass (k, N, s.selection))   continue;
             const bool primeOk = s.primeUseWhitelist ? primeWhitelistOk (k, s.primeWhitelistMask)
                                                       : primeLimitOk (k, s.primeLimit);
             if (! primeOk) continue;

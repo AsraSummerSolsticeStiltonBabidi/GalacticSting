@@ -5,8 +5,10 @@
 #include <juce_dsp/juce_dsp.h>
 
 #include <set>
+#include <thread>
 
 #include "dsp/AdditiveVoice.h"
+#include "dsp/NoteGate.h"
 #include "dsp/RhythmEngine.h"
 #include "dsp/SpectrumEngine.h"
 #include "dsp/TuningManager.h"
@@ -111,6 +113,28 @@ public:
         return f0 > 0.0 ? f / f0 : 1.0;
     }
 
+    // Genuine JI test BY SOURCE: is scale degree `d` (0..getScaleDegrees(), where the
+    // top index is the period) a rational-sourced interval, and if so its exact p/q?
+    //  - Scala mode (incl. segment + dissonance scales built as .scl): from the .scl's
+    //    per-degree source, so a ratio degree "3/2" is genuine but a cents degree
+    //    "701.955" is NOT (it only approximates one).
+    //  - Any other mode (equal divisions, MTS, MPE): only the unison and an exact 2/1
+    //    octave are rational; every tempered step is shown as cents (+ "≈p/q *").
+    // The one exact cents interval, 1200c = 2/1, is the period case handled here.
+    bool getDegreeIsRational (int d, long long& p, long long& q) const
+    {
+        const int D = juce::jmax (1, tuning.degreesPerPeriod());
+        if (getTuningMode() == (int) TuningManager::Mode::Scala)
+            return tuning.scalaDegreeRational (d, p, q);
+        if (d <= 0) { p = 1; q = 1; return true; }        // unison
+        if (d >= D)                                        // the period/octave
+        {
+            const double r = getDegreeRatio (d);
+            if (r > 0.0 && std::abs (1200.0 * std::log2 (r) - 1200.0) < 0.05) { p = 2; q = 1; return true; }
+        }
+        return false;                                      // tempered step
+    }
+
     //==========================================================================
     // Scala-as-timbre: a loaded .scl becomes the partial set instead of the
     // harmonic engine. Called from the editor.
@@ -166,6 +190,26 @@ public:
     struct DissDegreeInfo { int degree; double ratio; double height; };
     const std::vector<DissDegreeInfo>& getDissDegrees() const noexcept { return dissDegrees; }
 
+    //==========================================================================
+    // N-note CHORD search (Sethares union measure, TTSS §6.8/App.E) - runs on a
+    // BACKGROUND thread (grid + refine is deliberately not realtime); the editor
+    // polls progress/generation and copies the results.
+    struct ChordHit { std::vector<double> alphas; double value; }; // alphas[0] = 1 (root)
+    bool startChordSearch (int notes, double periodRatio, const juce::String& periodSclLine,
+                           int count, bool maxima, juce::String& errorOut);
+    void cancelChordSearch();
+    bool  isChordSearchRunning()  const noexcept { return chordRunning.load(); }
+    float getChordSearchProgress() const noexcept { return chordProgress.load(); }
+    int   getChordResultsGeneration() const noexcept { return chordGeneration.load(); }
+    std::vector<ChordHit> getChordResults() const
+    {
+        const juce::ScopedLock sl (chordLock);
+        return chordResults;
+    }
+    // Double-click a result: the chord becomes the active scale (.scl, degrees in
+    // cents + the exact typed period), loaded like any generated tuning.
+    bool loadChordAsScale (int index, juce::String& errorOut);
+
     // Per-degree Sethares dissonance of the ACTIVE tuning (any mode - 12ED2, MTS,
     // Scala, generated), against the CURRENT timbre, for the live scale-analysis
     // list in the Tuning panel. Row for step s in [0, getScaleDegrees()] : degree
@@ -212,6 +256,11 @@ public:
     // Shared with the editor:
     juce::MidiKeyboardState keyboardState;
     juce::AudioProcessorValueTreeState apvts;
+    // Chord-preview injection: the editor queues timestamped MIDI (note+per-channel
+    // bend) here; processBlock feeds it to the SYNTH ONLY (never the rhythm engine,
+    // never the MIDI out). MidiMessageCollector is thread-safe by design.
+    juce::MidiMessageCollector previewCollector;
+    juce::MidiBuffer           previewMidi; // reused per block (audio thread)
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
@@ -236,6 +285,7 @@ private:
     juce::MPESynthesiser        synth;
     spectrum::SpectrumSettings  lastPushed;
     RhythmEngine                rhythm { apvts, spectrumEngine, tuning };
+    NoteGate                    noteGate; // quantize-to-tempo / mono / quantize-to-pulse
 
     // Scala-as-timbre state (message thread; read into SpectrumSettings each poll).
     std::vector<float> timbreDegrees;
@@ -254,6 +304,19 @@ private:
     // Last dissonance-generated .scl (text + display name), for saving to disk,
     // plus the degree/height data shown in the Spectrum-to-Scale panel.
     juce::String lastDissScl, lastDissName;
+
+    // Chord-search worker state (worker writes, message thread reads/copies).
+    std::unique_ptr<std::thread> chordThread;
+    std::atomic<bool>  chordRunning  { false }, chordCancel { false };
+    std::atomic<float> chordProgress { 0.0f };
+    std::atomic<int>   chordGeneration { 0 };
+    mutable juce::CriticalSection chordLock;
+    std::vector<ChordHit> chordResults;
+    juce::String chordResultsPeriodLine { "2/1" }; // the period the PUBLISHED results were searched in
+                                                   // (guarded by chordLock - a new search must not
+                                                   // re-label old results until its worker publishes)
+    juce::String chordPeriodSclLine { "2/1" };
+    double       chordPeriodRatio = 2.0;
     std::vector<DissDegreeInfo> dissDegrees;
     double dissGreenH = 0.0, dissRedH = 1.0;
     int    dissRequested = 0, dissFound = 0, dissGeneration = 0;
@@ -272,6 +335,7 @@ private:
     void clearSegmentSource() noexcept { segSourceByDegree.clear(); segSel.clear(); segAnchor = -1; }
 
     float lastGain = 0.0f;
+    double lastSr  = 0.0; // from prepareToPlay (getSampleRate() can be 0 in offline harnesses)
     int   lastBendApplied = 48; // matches enableLegacyMode(48) in the constructor
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FractalAdditiveAudioProcessor)

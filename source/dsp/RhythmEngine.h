@@ -39,11 +39,15 @@
 
 #include <atomic>
 #include <cmath>
+#include <numeric>
 
 class RhythmEngine
 {
 public:
-    static constexpr int kSlots    = 8;
+    // "Unlimited" pulses: bounded only by what the machine can hold. 128 simultaneous
+    // trains is far beyond any musical use; state arrays stay a few tens of KB and the
+    // per-sample loop only walks the ACTIVE slots (work list), so unused slots cost 0.
+    static constexpr int kSlots    = 128;
     static constexpr int kMaxNotes = 10; // simultaneous held notes driving trains
 
     // One routable pulse train. The editor writes these atomics (message thread);
@@ -57,6 +61,7 @@ public:
         std::atomic<bool>   useRatio { false }; // ratio pitch: f0 * ratio via MPE bend
         std::atomic<double> ratio    { 1.0 };   // linear ratio (from "3", "3/2" or "...c")
         std::atomic<float>  durMs    { 60.0f }; // gate = how long each sent note lasts
+        std::atomic<int>    vel      { 100 };   // MIDI velocity of every pulse this slot sends (1..127)
         std::atomic<bool>   enabled  { false };
     };
 
@@ -65,6 +70,10 @@ public:
         : apvts (s), engine (eng), tuning (tun)
     {
         onParam   = apvts.getRawParameterValue ("rhythmOn");
+        selfParam = apvts.getRawParameterValue ("rhythmSelfPlay");
+        fbParam   = apvts.getRawParameterValue ("rhythmFeedback");
+        fbDecayParam = apvts.getRawParameterValue ("rhythmFeedbackDecay");
+        octParam  = apvts.getRawParameterValue ("rhythmOctAll");
         xParam    = apvts.getRawParameterValue ("rhythmDivX");
         nParam    = apvts.getRawParameterValue ("rhythmDivN");
         modeParam = apvts.getRawParameterValue ("rhythmMode");
@@ -75,18 +84,37 @@ public:
     void prepare (double sampleRate)
     {
         sr = sampleRate > 0.0 ? sampleRate : 44100.0;
+        // Pre-size the output buffer to the worst-case event burst (echo bend+on+off,
+        // main trains, pending flush) so out.addEvent never allocates in processBlock.
+        out.ensureSize ((size_t) (3 * kFbMaxOn + kFbMaxOff + 4 * kSlots * kMaxNotes
+                                  + kSlots * kMaxNotes + kFbMaxOff) * 16);
         // Before wiping the gate state, remember any OUTPUT notes that are still
         // sounding so the next block can send their note-offs. Otherwise a re-prepare
         // (sample-rate/block-size change, plugin re-init, transport re-arm...) would
         // abandon them, leaving stuck "suspended notes without rhythm" in the receiver.
         flushOpenGates();
+        flushEchoes();
         for (int i = 0; i < kSlots; ++i)
             for (int j = 0; j < kMaxNotes; ++j)
             { phase[i][j] = 0.0; gateLeft[i][j] = 0; wasOn[i][j] = false; }
         for (auto& h : heldCol) h.active = false;
         for (auto& b : channelBend) b = 0.0;
         driverCol = -1; lastDriver = -1;
+        engineClock = 0; patternAnchor = -1; patternCycle = 0;
         displayF0.store (0.0f, std::memory_order_relaxed);
+    }
+
+    // Quantize-to-pulse support: samples (from the CURRENT block start, i.e. call
+    // this from processBlock BEFORE rhythm.process) until the running pattern's next
+    // full reset - the moment every train's subdivision coincides on the 1. Returns
+    // < 0 when no pattern is running (nothing to sync to).
+    double samplesToNextReset() const noexcept
+    {
+        if (driverCol < 0 || patternCycle <= 0 || patternAnchor < 0) return -1.0;
+        const juce::int64 dt = engineClock - patternAnchor;
+        if (dt <= 0) return (double) -dt; // anchor still ahead (same-block note-on)
+        const juce::int64 k = (dt + patternCycle - 1) / patternCycle; // ceil
+        return (double) (patternAnchor + k * patternCycle - engineClock);
     }
 
     // Queue note-offs for every currently-open gate (message thread, when audio is
@@ -95,8 +123,22 @@ public:
     {
         for (int i = 0; i < kSlots; ++i)
             for (int j = 0; j < kMaxNotes; ++j)
-                if (gateLeft[i][j] > 0 && pendingOffN < (int) (kSlots * kMaxNotes))
-                    pendingOff[pendingOffN++] = { gateChn[i][j], gateNote[i][j] };
+                if (gateLeft[i][j] > 0)
+                {
+                    if (pendingOffN < (int) (sizeof (pendingOff) / sizeof (pendingOff[0])))
+                        pendingOff[pendingOffN++] = { gateChn[i][j], gateNote[i][j] };
+                    gateLeft[i][j] = 0; // idempotent: a bare reset() must not double-off later
+                }
+    }
+
+    // Owe a note-off for every echo that is currently sounding, then drop all pending
+    // echoes. Unfired echo note-ons never sounded, so they need no note-off.
+    void flushEchoes() noexcept
+    {
+        for (int k = 0; k < echoOffN; ++k)
+            if (pendingOffN < (int) (sizeof (pendingOff) / sizeof (pendingOff[0])))
+                pendingOff[pendingOffN++] = { echoOff[k].ch, echoOff[k].note };
+        echoOnN = 0; echoOffN = 0;
     }
 
     // Message thread: ask the audio thread to emit a controller (e.g. the DAW-tempo
@@ -127,12 +169,39 @@ public:
         const auto* tmpl = engine.getLive();
         refreshTemplateCache (tmpl);
 
-        const bool on  = onParam   != nullptr && onParam->load()   > 0.5f;
+        // Generate pulses whenever EITHER the MIDI-out master or the "play in Fibló"
+        // (self-play) toggle is on - self-play must still make pulses when MIDI-out is off.
+        const bool on  = (onParam   != nullptr && onParam->load()   > 0.5f)
+                      || (selfParam != nullptr && selfParam->load() > 0.5f);
         const bool all = modeParam != nullptr && modeParam->load() > 0.5f;
         mpeOut         = mpeParam  != nullptr && mpeParam->load()  > 0.5f;
         const int  x   = juce::jlimit (2, 12, (int) xParam->load());
         const int  nD  = juce::jlimit (1, 16, (int) nParam->load());
         divisor = std::pow ((double) x, (double) nD);
+
+        // Internal feedback: only inside the "play in Fibló" loop (the user's "without
+        // MIDI out" case) - it must not flood a DAW track with recursive pulses.
+        feedbackActive = (fbParam   != nullptr && fbParam->load()   > 0.5f)
+                      && (selfParam != nullptr && selfParam->load() > 0.5f);
+        feedbackDecay  = fbDecayParam != nullptr
+                       ? (double) juce::jlimit (0.05f, 0.95f, fbDecayParam->load()) : 0.5;
+
+        // FRACTAL feedback snapshot: the routed slots' partial ratios (child pulse
+        // RATES) and pitch specs (child pulse PITCHES), so echoes can spawn their own
+        // children outside render(). Rebuilt every block (cheap, atomics only).
+        fbN = 0;
+        if (feedbackActive && tmpl != nullptr)
+            for (int i = 0; i < kSlots && fbN < kSlots; ++i)
+            {
+                const int p = slots[i].partial.load (std::memory_order_relaxed);
+                if (! slots[i].enabled.load (std::memory_order_relaxed) || p < 0 || p >= (int) tmpl->partials.size())
+                    continue;
+                fbPartialRatio[fbN] = (double) tmpl->partials[(size_t) p].ratio;
+                fbUseRatio[fbN]     = slots[i].useRatio.load (std::memory_order_relaxed);
+                fbPitchRatio[fbN]   = juce::jmax (1.0e-6, slots[i].ratio.load (std::memory_order_relaxed));
+                fbSteps[fbN]        = slots[i].steps.load (std::memory_order_relaxed);
+                ++fbN;
+            }
 
         int cursor = 0;
         for (const auto meta : io)
@@ -145,7 +214,111 @@ public:
         }
         render (tmpl, on, all, cursor, numSamples);
 
+        fireEchoes (numSamples); // emit due feedback pulses (fired ones spawn children)
+
+        engineClock += numSamples; // absolute sample frame (pattern anchor/cycle)
+
         io.swapWith (out); // input events consumed; only our pulses leave the plugin
+    }
+
+    // Emit every feedback echo whose time has come this block and carry the rest
+    // forward. Fired echoes then spawn their own children (the recursion step) -
+    // appended AFTER the pass, which is exact because a child's delay is >= one train
+    // period (>= sr/30 samples), always beyond the current sample. MidiBuffer sorts by
+    // sample, so add order does not matter.
+    void fireEchoes (int numSamples)
+    {
+        // Note-offs owed by echoes that sounded in earlier blocks.
+        int w = 0;
+        for (int k = 0; k < echoOffN; ++k)
+        {
+            if (echoOff[k].at < numSamples)
+                out.addEvent (juce::MidiMessage::noteOff (echoOff[k].ch, echoOff[k].note), juce::jmax (0, echoOff[k].at));
+            else { echoOff[k].at -= numSamples; echoOff[w++] = echoOff[k]; }
+        }
+        echoOffN = w;
+
+        // Due echo note-ons. An echo is only EMITTED if its note-off has a guaranteed
+        // place (same block, or room in echoOff) - a saturated queue drops the echo
+        // entirely rather than ever leaving a hanging note. The note-off is computed
+        // from the CLAMPED fire sample so a rebased-negative `at` (large host buffers)
+        // can never produce an off before its on.
+        w = 0;
+        firedN = 0;
+        const int n0 = echoOnN; // children appended below are NOT part of this pass
+        for (int k = 0; k < n0; ++k)
+        {
+            EchoOn e = echoOn[k];
+            if (e.at < numSamples)
+            {
+                const int s     = juce::jmax (0, e.at);
+                const int offAt = s + juce::jmax (1, e.gate);
+                if (offAt >= numSamples && echoOffN >= kFbMaxOff)
+                    continue; // no room to owe the note-off -> drop the echo (never hang)
+                if (mpeOut) out.addEvent (juce::MidiMessage::pitchWheel (e.ch, e.bend), s);
+                out.addEvent (juce::MidiMessage::noteOn (e.ch, e.note, (juce::uint8) e.vel), s);
+                if (offAt < numSamples)
+                    out.addEvent (juce::MidiMessage::noteOff (e.ch, e.note), offAt);
+                else
+                    echoOff[echoOffN++] = { offAt - numSamples, e.note, e.ch };
+                if (firedN < kFbMaxFired) fired[firedN++] = e; // spawn its children after the pass
+            }
+            else { e.at -= numSamples; echoOn[w++] = e; }
+        }
+        echoOnN = w;
+
+        // Recursion: every fired echo becomes a parent - "the pulses of each pulse".
+        // Their children's `at` is written relative to THIS block's start, but the
+        // carry pass above has already rebased everything else to the NEXT block -
+        // so rebase the freshly spawned children too, or every generation >= 2 would
+        // land one block late (a buffer-size-dependent drift between fractal levels).
+        const int spawnBase = echoOnN;
+        for (int k = 0; k < firedN; ++k)
+            spawnChildren (juce::jmax (0, fired[k].at), fired[k].hz, fired[k].note,
+                           fired[k].vel, fired[k].gate);
+        for (int i = spawnBase; i < echoOnN; ++i)
+            echoOn[i].at -= numSamples;
+    }
+
+    // A pulse (main or echo) fired at sample `s`, sounding pitch `parentHz` / note
+    // `parentNote`, velocity `parentVel`, gate `gate`: spawn ONE child per routed slot -
+    // the child's RATE comes from the slot's partial ratio applied to the PARENT'S pitch
+    // (rate = parentHz * r_j / divisor, so the child set is the whole rhythm pattern
+    // rebuilt one level down, time-scaled by the parent's pitch), its PITCH is the
+    // slot's interval FROM the parent's pitch, its velocity is the parent's * decay,
+    // and it inherits the parent's gate. Each child spawns again when it fires -> a
+    // self-similar fractal cascade. STRICTLY convergent: the child velocity is forced
+    // below the parent's (jmin with parentVel-1), so depth is finite; queue caps bound
+    // width; a full queue drops children (density saturated), never hangs.
+    void spawnChildren (int s, double parentHz, int parentNote, int parentVel, int gate)
+    {
+        if (! feedbackActive || parentHz <= 0.0 || fbN == 0) return;
+        const int cv = juce::jmin ((int) std::lround ((double) parentVel * feedbackDecay),
+                                   parentVel - 1); // strict decrease -> guaranteed to die out
+        if (cv < 1) return;
+        for (int k = 0; k < fbN; ++k)
+        {
+            if (echoOnN >= kFbMaxOn) return; // saturated: drop (bounded density), never hang
+            const double rate = juce::jlimit (0.01, 30.0, parentHz * fbPartialRatio[k] / divisor);
+            const int    at   = s + (int) std::llround (sr / rate);
+            int note; int bend = 8192; double hz;
+            if (fbUseRatio[k])
+            {
+                hz = parentHz * fbPitchRatio[k];
+                const double semis = 69.0 + 12.0 * std::log2 (hz / 440.0);
+                note = juce::jlimit (0, 127, (int) std::lround (semis));
+                if (mpeOut)
+                    bend = juce::jlimit (0, 16383,
+                        8192 + (int) std::lround ((semis - (double) note) / 48.0 * 8192.0));
+            }
+            else
+            {
+                note = juce::jlimit (0, 127, parentNote + fbSteps[k]);
+                hz   = tuning.frequencyForNote (note); // lock-free atomic read (RT-safe)
+            }
+            const int ch = mpeOut ? 2 + (echoChanRot++ % 15) : 1;
+            echoOn[echoOnN++] = { at, note, ch, cv, bend, juce::jmax (1, gate), hz };
+        }
     }
 
 private:
@@ -164,8 +337,11 @@ private:
                 h.ch     = juce::jlimit (1, 16, msg.getChannel());
                 h.f0     = noteHz (h.note, h.ch);
                 for (int i = 0; i < kSlots; ++i) phase[i][col] = 1.0; // downbeat at note-on
+                updateDriver();
+                if (driverCol == col) patternAnchor = engineClock + pos; // the pattern's "1"
             }
-            updateDriver();
+            else
+                updateDriver();
         }
         else if (msg.isNoteOff())
         {
@@ -206,7 +382,10 @@ private:
         if (driverCol != lastDriver)
         {
             if (! all && driverCol >= 0)
+            {
                 for (int i = 0; i < kSlots; ++i) phase[i][driverCol] = 1.0;
+                patternAnchor = engineClock + pos; // fresh downbeat = the pattern's new "1"
+            }
             lastDriver = driverCol;
         }
     }
@@ -217,6 +396,16 @@ public:
     float getRateHz (int slot) const noexcept
     { return juce::isPositiveAndBelow (slot, kSlots) ? lastRateHz[(size_t) slot].load (std::memory_order_relaxed) : 0.0f; }
     float getDriverF0() const noexcept { return displayF0.load (std::memory_order_relaxed); }
+    // True when at least one partial is routed - self-play only engages then, so the
+    // synth still plays its held notes normally when no rhythm is set up.
+    bool hasEnabledSlot() const noexcept
+    {
+        for (int i = 0; i < kSlots; ++i)
+            if (slots[i].enabled.load (std::memory_order_relaxed)
+                && slots[i].partial.load (std::memory_order_relaxed) >= 0)
+                return true;
+        return false;
+    }
 
     Slot slots[kSlots];
 
@@ -274,32 +463,35 @@ private:
         if (to <= from) return;
 
         const int count = tmpl != nullptr ? (int) tmpl->partials.size() : 0;
+        // Global octave shift of ALL pulses (+-4): ratio pitches x 2^oct; steps pitches
+        // shift by whole periods of the active scale. Level-0 only - echoes inherit it
+        // through their parent's pitch.
+        const int octAll = octParam != nullptr ? juce::jlimit (-4, 4, (int) octParam->load()) : 0;
+        const int octSteps = octAll * juce::jmax (1, tuning.degreesPerPeriod());
+        const double octMul = std::exp2 ((double) octAll);
 
-        // Per-segment constants per train (f0 constant between MIDI events).
-        double inc[kSlots][kMaxNotes];
-        int    gateLen[kSlots], sendNote[kSlots][kMaxNotes], sendBend[kSlots][kMaxNotes];
-        juce::uint8 vel[kSlots];
-        bool slotOk[kSlots];
+        // Per-segment constants per train (f0 constant between MIDI events), and the
+        // WORK LIST: only slots that can pulse now or still have an open gate are
+        // visited in the per-sample loop - unused slots (kSlots is large) cost nothing.
+        nWork = 0;
         for (int i = 0; i < kSlots; ++i)
         {
             const int  p  = slots[i].partial.load (std::memory_order_relaxed);
-            slotOk[i] = on && slots[i].enabled.load (std::memory_order_relaxed)
-                     && p >= 0 && p < count;
+            const bool ok = on && slots[i].enabled.load (std::memory_order_relaxed)
+                         && p >= 0 && p < count;
             gateLen[i] = juce::jmax (1, (int) ((double) slots[i].durMs.load (std::memory_order_relaxed) * 0.001 * sr));
-            if (slotOk[i])
-            {
-                const float a = tmpl->partials[(size_t) p].amp;
-                vel[i] = (juce::uint8) juce::jlimit (1, 127, (int) std::lround (127.0 * std::sqrt ((double) (a / maxAmp))));
-            }
-            else vel[i] = 1;
+            // Velocity of every pulse this slot sends: a per-slot user value (1..127).
+            velArr[i] = (juce::uint8) juce::jlimit (1, 127, slots[i].vel.load (std::memory_order_relaxed));
 
+            bool anyGate = false;
             float uiRate = 0.0f;
             for (int j = 0; j < kMaxNotes; ++j)
             {
+                if (gateLeft[i][j] > 0) anyGate = true;
                 inc[i][j] = 0.0;
                 const auto& h = heldCol[(size_t) j];
                 const bool colOn = h.active && (all || j == driverCol);
-                if (! (slotOk[i] && colOn && h.f0 > 0.0)) continue;
+                if (! (ok && colOn && h.f0 > 0.0)) continue;
 
                 const double ratio = (double) tmpl->partials[(size_t) p].ratio;
                 const double hz    = h.f0 * ratio / divisor;
@@ -316,13 +508,15 @@ private:
 
                 // Sent pitch: ratio slots = the EXACT pitch f0*slotRatio (note+bend);
                 // plain slots = the typed note transposed by this held note's interval
-                // from the lowest held note.
+                // from the lowest held note. sendHz = the sounding pitch (drives the
+                // fractal children's rates).
                 if (slots[i].useRatio.load (std::memory_order_relaxed))
                 {
-                    const double tHz   = h.f0 * juce::jmax (1.0e-6, slots[i].ratio.load (std::memory_order_relaxed));
+                    const double tHz   = h.f0 * juce::jmax (1.0e-6, slots[i].ratio.load (std::memory_order_relaxed)) * octMul;
                     const double semis = 69.0 + 12.0 * std::log2 (tHz / 440.0);
                     const int    m     = juce::jlimit (0, 127, (int) std::lround (semis));
                     sendNote[i][j] = m;
+                    sendHz  [i][j] = tHz;
                     // Per-note bend, assuming the MPE-default +-48 st range downstream.
                     sendBend[i][j] = juce::jlimit (0, 16383,
                         8192 + (int) std::lround ((semis - (double) m) / 48.0 * 8192.0));
@@ -332,16 +526,58 @@ private:
                     // Scale steps FROM the played note (each MIDI note = one scale
                     // step of the active tuning), never a fixed pitch.
                     sendNote[i][j] = juce::jlimit (0, 127,
-                        h.note + slots[i].steps.load (std::memory_order_relaxed));
+                        h.note + slots[i].steps.load (std::memory_order_relaxed) + octSteps);
+                    sendHz  [i][j] = tuning.frequencyForNote (sendNote[i][j]);
                     sendBend[i][j] = 8192; // centre
                 }
             }
             for (int j = 0; j < kMaxNotes; ++j) wasOn[i][j] = inc[i][j] > 0.0;
             lastRateHz[(size_t) i].store (uiRate, std::memory_order_relaxed);
+            if (ok || anyGate) workList[nWork++] = i;
         }
 
+        // Pattern cycle (quantize-to-pulse): the driver's trains all coincide on the
+        // "1" every  L / baseRate  seconds, where the rates rationalize to n_k/d_k of
+        // the slowest and L = lcm(d_k). L is capped (an absurd rationalization would
+        // mean waiting minutes) - the cap only coarsens WHERE a new note may join.
+        if (driverCol >= 0)
+        {
+            double base = 0.0;
+            for (int wi = 0; wi < nWork; ++wi)
+            {
+                const double r = inc[workList[wi]][driverCol] * sr;
+                if (r > 0.0 && (base <= 0.0 || r < base)) base = r;
+            }
+            if (base > 0.0)
+            {
+                long long L = 1;
+                for (int wi = 0; wi < nWork; ++wi)
+                {
+                    const double r = inc[workList[wi]][driverCol] * sr;
+                    if (! (r > 0.0)) continue;
+                    // best small fraction n/d ~ r/base (continued-fraction style scan)
+                    long long bn = 1, bd = 1; double be = 1.0e18;
+                    for (long long d = 1; d <= 16; ++d)
+                    {
+                        const long long n = (long long) std::llround (r / base * (double) d);
+                        if (n <= 0) continue;
+                        const double err = std::abs (r / base - (double) n / (double) d);
+                        if (err < be - 1.0e-12) { be = err; bn = n; bd = d; }
+                    }
+                    const long long g = std::gcd (bn, bd);
+                    L = std::lcm (L, bd / (g > 0 ? g : 1));
+                    if (L > 96) { L = 96; break; } // practical cap
+                }
+                patternCycle = (juce::int64) std::llround ((double) L / base * sr);
+            }
+            else patternCycle = 0;
+        }
+        else patternCycle = 0;
+
         for (int s = from; s < to; ++s)
-            for (int i = 0; i < kSlots; ++i)
+            for (int wi = 0; wi < nWork; ++wi)
+            {
+                const int i = workList[wi];
                 for (int j = 0; j < kMaxNotes; ++j)
                 {
                     // Gate countdown runs regardless of held/enabled -> no stuck notes.
@@ -359,19 +595,29 @@ private:
                             { out.addEvent (juce::MidiMessage::noteOff (gateChn[i][j], gateNote[i][j]), s); gateLeft[i][j] = 0; }
                             if (mpeOut) // per-note bend BEFORE the note-on (MPE convention)
                                 out.addEvent (juce::MidiMessage::pitchWheel (ch, sendBend[i][j]), s);
-                            out.addEvent (juce::MidiMessage::noteOn (ch, sendNote[i][j], vel[i]), s);
+                            out.addEvent (juce::MidiMessage::noteOn (ch, sendNote[i][j], velArr[i]), s);
                             gateNote[i][j] = sendNote[i][j];
                             gateChn [i][j] = ch;
                             gateLeft[i][j] = gateLen[i];
+                            // Fractal feedback: this pulse becomes a parent - it spawns
+                            // the full set of routed trains one level down, anchored at
+                            // ITS pitch, velocity and gate.
+                            if (feedbackActive)
+                                spawnChildren (s, sendHz[i][j], sendNote[i][j], (int) velArr[i], gateLen[i]);
                         }
                     }
                 }
+            }
     }
 
     juce::AudioProcessorValueTreeState& apvts;
     const spectrum::SpectrumEngine&     engine;
     const TuningManager&                tuning;
     std::atomic<float>* onParam = nullptr;
+    std::atomic<float>* selfParam = nullptr; // "play in Fibló" - interpret pulses internally
+    std::atomic<float>* fbParam   = nullptr; // internal feedback loop on/off
+    std::atomic<float>* fbDecayParam = nullptr; // feedback volume slope (velocity kept per loop)
+    std::atomic<float>* octParam  = nullptr; // global octave shift of all pulses (-4..+4)
     std::atomic<float>* xParam  = nullptr;
     std::atomic<float>* nParam  = nullptr;
     std::atomic<float>* modeParam = nullptr;
@@ -383,6 +629,11 @@ private:
     double sr      = 44100.0;
     double divisor = 1.0;
     bool   mpeOut  = false;
+    bool   feedbackActive = false; // this block: self-play + feedback on -> schedule echoes
+    double feedbackDecay  = 0.5;   // velocity kept per loop
+    juce::int64 engineClock   = 0;  // absolute sample frame
+    juce::int64 patternAnchor = -1; // sample of the driver's last downbeat (the pattern's "1")
+    juce::int64 patternCycle  = 0;  // samples until the whole polyrhythm coincides again (0 = none)
     Held   heldCol[kMaxNotes];
     int    driverCol  = -1;
     int    lastDriver = -1; // to detect driver changes (fresh downbeat in Lowest mode)
@@ -394,10 +645,47 @@ private:
     int    gateNote[kSlots][kMaxNotes] = {};
     int    gateChn [kSlots][kMaxNotes] = {};
 
+    // render() per-segment caches (members, not stack: kSlots is large) + the work
+    // list of slots the per-sample loop actually visits.
+    double      inc     [kSlots][kMaxNotes] = {};
+    int         sendNote[kSlots][kMaxNotes] = {};
+    int         sendBend[kSlots][kMaxNotes] = {};
+    double      sendHz  [kSlots][kMaxNotes] = {}; // sounding pitch of each train (fractal children's rates)
+    int         gateLen [kSlots] = {};
+    juce::uint8 velArr  [kSlots] = {};
+    int         workList[kSlots] = {};
+    int         nWork = 0;
+
+    //-- Internal FRACTAL feedback ("the pulses of each pulse") -----------------
+    // Every fired pulse spawns one child per routed slot (rate from the slot's partial
+    // ratio applied to the PARENT's pitch; pitch = the slot's interval from the parent;
+    // velocity = parent's * decay, strictly decreasing; gate inherited). Children spawn
+    // again when they fire -> a self-similar cascade, bounded by the velocity floor
+    // (depth) and these fixed queues (width). echoOn holds future note-ons; echoOff the
+    // note-offs owed by echoes already sounding, so a reset can flush them cleanly.
+    static constexpr int kFbMaxOn    = 4096; // pending echo note-ons
+    static constexpr int kFbMaxOff   = 1024; // owed echo note-offs (sounding echoes)
+    static constexpr int kFbMaxFired = 256;  // echoes fired per block that get to spawn
+    struct EchoOn  { int at, note, ch, vel, bend, gate; double hz; }; // at = samples until it fires; hz = its sounding pitch (children's rates)
+    struct EchoOff { int at, note, ch; };
+    EchoOn  echoOn [kFbMaxOn]  = {};
+    EchoOff echoOff[kFbMaxOff] = {};
+    EchoOn  fired  [kFbMaxFired] = {};       // this block's fired echoes (spawn after the pass)
+    int     echoOnN = 0, echoOffN = 0, firedN = 0;
+    unsigned echoChanRot = 0;                // rotates echo MPE channels over 2..16
+
+    // Per-block snapshot of the routed slots for spawning (audio thread only).
+    int    fbN = 0;
+    double fbPartialRatio[kSlots] = {};      // child RATE = parentHz * this / divisor
+    bool   fbUseRatio[kSlots] = {};          // child PITCH: ratio from parent vs steps from parent
+    double fbPitchRatio[kSlots] = {};
+    int    fbSteps[kSlots] = {};
+
     // Note-offs owed to the receiver after a reset abandoned open gates (emitted at
-    // the start of the next process block so no note hangs).
+    // the start of the next process block so no note hangs). Sized to also absorb a
+    // full flush of sounding echoes.
     struct Pending { int ch, note; };
-    Pending pendingOff[kSlots * kMaxNotes] = {};
+    Pending pendingOff[kSlots * kMaxNotes + kFbMaxOff] = {};
     int     pendingOffN = 0;
 
     juce::uint32 cachedGen = 0;

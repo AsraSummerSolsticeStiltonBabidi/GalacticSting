@@ -154,10 +154,20 @@ int main()
         check (std::abs (tt.partials.front().ratio - 1.0f) < 1e-3f,
                "Transposed + Prime (harmonic 1 excluded): lowest still at played pitch");
 
+        // The FUNDAMENTAL (k == N) is now ALWAYS kept by the selection filter -
+        // otherwise Transposed "Even" would collapse onto a full 1,2,3,4 series
+        // (identical to All) and the whitelist would audibly do nothing. So in
+        // Original mode with Prime, the lowest partial is harmonic 1 (the kept
+        // fundamental), with harmonic 2 (prime) present above it.
         SpectrumSettings o = t; o.baseMode = BaseMode::Original;
         auto oo = compileSpectrum (o);
-        check (std::abs (oo.partials.front().ratio - 2.0f) < 1e-3f,
-               "Original + Prime: lowest partial at its natural position (harmonic 2)");
+        check (std::abs (oo.partials.front().ratio - 1.0f) < 1e-3f,
+               "Original + Prime: fundamental kept (lowest at harmonic 1)");
+        {
+            bool hasH2 = false;
+            for (const auto& p : oo.partials) if (std::abs (p.ratio - 2.0f) < 1e-3f) hasH2 = true;
+            check (hasH2, "Original + Prime: harmonic 2 present above the kept fundamental");
+        }
 
         // Prime-limit 2 = octaves. In Transposed mode the sound is independent of base N
         // (this is the bug the user hit: base 3 used to sound a fourth higher).
@@ -308,6 +318,68 @@ int main()
         check (p == 3 && q == 2, "bestFraction(1.5) = 3/2");
         dissonance::bestFraction (std::pow (2.0, 4.0/12.0), p, q);
         check (p == 5 && q == 4, "bestFraction(12-TET third) = 5/4 (for the hover hint)");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("N-note chords (Sethares union measure, TTSS 6.8/App.E):\n");
+    {
+        // A harmonic timbre, 7 partials, saw-ish roll-off, anchored at middle C.
+        std::vector<dissonance::Partial> spec;
+        for (int k = 1; k <= 7; ++k)
+            spec.push_back ({ 261.6255653 * k, 1.0 / k });
+
+        // (1) The grid decomposition used by the search must equal the true union
+        //     measure EXACTLY (they are the same pairs, just grouped).
+        {
+            const std::vector<double> tri { 1.0, 1.25, 1.5 };
+            const double whole = dissonance::chordDissonance (spec, tri);
+            double dec = 0.0;
+            for (const double a : tri) dec += dissonance::selfDissonance (spec, a);
+            dec += dissonance::crossDissonance (spec, 1.0, 1.25);
+            dec += dissonance::crossDissonance (spec, 1.0, 1.5);
+            dec += dissonance::crossDissonance (spec, 1.25, 1.5);
+            check (std::abs (whole - dec) < 1.0e-9 * std::max (1.0, std::abs (whole)),
+                   "self+cross decomposition == dissmeasure of the union (exact)");
+        }
+
+        // (2) Sanity of the measure itself: the just major triad must be far more
+        //     consonant than a cluster of seconds for a harmonic timbre.
+        {
+            const double good = dissonance::chordDissonance (spec, { 1.0, 1.25, 1.5 });
+            const double bad  = dissonance::chordDissonance (spec, { 1.0, std::pow (2.0, 1.0/12.0), std::pow (2.0, 2.0/12.0) });
+            check (good < bad, "just major triad beats a semitone cluster (harmonic timbre)");
+        }
+
+        // (3) The full search (3 notes in an octave) must FIND recognisable just
+        //     triads: some result within 12 cents of 5/4 or 3/2 style intervals.
+        {
+            auto res = dissonance::searchChords (spec, 2.0, 3, 8, false);
+            check (! res.empty(), "chord search returns results");
+            bool foundJustish = false;
+            for (const auto& r : res)
+                for (size_t k = 1; k < r.alphas.size(); ++k)
+                {
+                    const double cents = 1200.0 * std::log2 (r.alphas[k]);
+                    for (const double just : { 386.31, 498.04, 701.955, 884.36 }) // 5/4 4/3 3/2 5/3
+                        if (std::abs (cents - just) < 12.0) foundJustish = true;
+                }
+            check (foundJustish, "top consonant triads include just-interval notes (5/4, 4/3, 3/2, 5/3)");
+            // Ranking is by ascending dissonance in minima mode.
+            for (size_t i = 1; i < res.size(); ++i)
+                check (res[i].value >= res[i-1].value - 1.0e-12, "minima ranking is ascending in dissonance");
+            // Every note strictly inside (1, period).
+            for (const auto& r : res)
+                for (size_t k = 1; k < r.alphas.size(); ++k)
+                    check (r.alphas[k] > 1.0 && r.alphas[k] < 2.0, "chord notes strictly inside the period");
+        }
+
+        // (4) Maxima mode ranks descending and returns something.
+        {
+            auto res = dissonance::searchChords (spec, 2.0, 3, 4, true);
+            check (! res.empty(), "maxima chord search returns results");
+            for (size_t i = 1; i < res.size(); ++i)
+                check (res[i].value <= res[i-1].value + 1.0e-12, "maxima ranking is descending in dissonance");
+        }
     }
 
     //--------------------------------------------------------------------------
