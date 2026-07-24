@@ -58,6 +58,16 @@ public:
     // the computer keyboard's left/right arrows to it.
     void scrollView (int deltaKeys) { scrollBy (deltaKeys); }
 
+    // Auto-follow: shift the visible window the MINIMUM amount that brings the
+    // played range [lo..hi] on screen (no jump when it already is).
+    void ensureVisible (int lo, int hi)
+    {
+        const int cells = numCells();
+        if (! isScrollable() || hi < lo) return;
+        if (lo < baseKey)                 scrollBy (lo - baseKey);
+        else if (hi >= baseKey + cells)   scrollBy (hi - (baseKey + cells - 1));
+    }
+
     // Screen position of the hovered key's eye (top-centre of its strip cell), so the
     // floating hover window can park right above it with a pointer down to the key.
     // Returns (0,0) when nothing is hovered.
@@ -213,8 +223,17 @@ public:
                 const double hz = getNoteHz (note);
                 if (hz > 0.0)
                 {
-                    // MIDI C3 = the tuning's C3 reference itself: Essentials green + bold.
+                    // MIDI C3 = the tuning's C3 reference itself: Essentials green +
+                    // bold, with REFERENCE spelled out above the number.
                     const bool isRef = note == kRefKey;
+                    auto hzArea = sc;
+                    if (isRef)
+                    {
+                        g.setColour (juce::Colour (0xff4fe09a));
+                        g.setFont (juce::Font (juce::FontOptions (juce::jmin (10.0f, w * 0.30f)).withStyle ("Bold")));
+                        g.drawFittedText ("REFERENCE", hzArea.removeFromTop (12.0f).toNearestInt(),
+                                          juce::Justification::centred, 1, 0.5f);
+                    }
                     g.setColour (isRef ? juce::Colour (0xff4fe09a) : juce::Colour (0xffc4ccda));
                     g.setFont (isRef
                         ? juce::Font (juce::FontOptions (juce::jmin (12.0f, w * 0.36f)).withStyle ("Bold"))
@@ -222,7 +241,7 @@ public:
                     const juce::String t = juce::String::fromUTF8 ("\xe2\x89\x88 ")
                         + (hz >= 1000.0 ? juce::String (hz / 1000.0, 2) + "khz"
                                         : juce::String ((int) std::lround (hz)) + "hz");
-                    g.drawFittedText (t, sc.toNearestInt(), juce::Justification::centred, 1, 0.4f);
+                    g.drawFittedText (t, hzArea.toNearestInt(), juce::Justification::centred, 1, 0.4f);
                 }
             }
         }

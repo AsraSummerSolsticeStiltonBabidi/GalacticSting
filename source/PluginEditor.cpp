@@ -96,13 +96,15 @@ namespace
         // complex ones only a hair. A continued-fraction "best" pick would prefer
         // obscure closer fractions (800c is nearer 19/12 than 8/5) - not helpful.
         long long bestP = 0, bestQ = 1; double bestErr = 0.0; double bestSimp = 1.0e18;
-        for (long long q2 = 1; q2 <= 12; ++q2)
+        for (long long q2 = 1; q2 <= 17; ++q2)
         {
             const long long p2 = (long long) std::llround (ratio * (double) q2);
             if (p2 <= 0 || std::gcd (p2, q2) != 1) continue;
             const double err  = d.cents - 1200.0 * std::log2 ((double) p2 / (double) q2);
             const double simp = (double) (p2 * q2);
-            const double tol  = simp <= 40.0 ? 17.0 : (simp <= 80.0 ? 8.0 : 3.5);
+            // Simplicity-tiered windows; the last tier catches VERY close but less
+            // simple ratios like 17/16 (100c is only ~1c away from it).
+            const double tol  = simp <= 40.0 ? 17.0 : (simp <= 80.0 ? 8.0 : (simp <= 300.0 ? 2.5 : 0.0));
             if (std::abs (err) <= tol && simp < bestSimp)
             { bestSimp = simp; bestP = p2; bestQ = q2; bestErr = err; }
         }
@@ -116,7 +118,7 @@ namespace
     {
         const auto d = analyzeDegree (proc, degree);
         if (d.genuine) return juce::String (d.p) + "/" + juce::String (d.q);
-        return juce::String ((long long) std::llround (d.cents)) + "c" + (d.hasApprox ? "*" : "");
+        return juce::String ((long long) std::llround (d.cents)) + juce::String::fromUTF8 ("¢") + (d.hasApprox ? "*" : "");
     }
 
     // Contiguous scale-degree layout (not a piano): the home row A..L is degrees
@@ -637,24 +639,78 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         makeLabel (pitchAdsrLbl[i], cPitch);  pitchAdsrLbl[i].setText (adsrTxt[i], juce::dontSendNotification);
     }
 
-    // CUSTOM envelope tab: A D S R + the movement's Start and Range on the mapped
-    // parameter (map any fader via right-click -> "Map to custom envelope").
+    // CUSTOM tab: 6 modulators (3 envelopes + 3 LFOs). The controls below re-attach
+    // to whichever modulator the selector shows; map any fader via right-click.
     {
         const juce::Colour cCustom (0xff9a7bff);
-        const char* custIds[] = { "custEnvAttack", "custEnvDecay", "custEnvSustain", "custEnvRelease" };
         for (int i = 0; i < 4; ++i)
         {
-            configFader (custAdsr[i], custIds[i], custAdsrAtt[i], cCustom, "Custom envelope");
+            configFader (custAdsr[i], "modE1" + juce::String (adsrTxt[i]), custAdsrAtt[i], cCustom, "Custom envelope");
             custAdsr[i].setName (adsrTxt[i]);
             makeLabel (custAdsrLbl[i], cCustom);
             custAdsrLbl[i].setText (adsrTxt[i], juce::dontSendNotification);
         }
-        configFader (custStartFader, "custEnvStart", custStartAtt, cCustom,
-                     "Where the mapped parameter SITS at rest (normalized 0-1). Set automatically to the knob's position when you map it.");
-        configFader (custRangeFader, "custEnvRange", custRangeAtt, cCustom,
-                     "How far the envelope MOVES the mapped parameter (+/- of its full range).");
-        makeLabel (lblCustStart, cCustom);
+        configFader (custRangeFader, "modE1Range", custRangeAtt, cCustom,
+                     "How far this modulator MOVES its mapped parameters (+/- of their full range), riding on each knob's own value.");
         makeLabel (lblCustRange, cCustom);
+        configFader (lfoDivSlider, "modL1Div", lfoDivAtt, cCustom,
+                     "Rate divider: halves the base rate per step (base = project BPM or the lowest held note's frequency).");
+        configFader (lfoHzSlider, "modL1Hz", lfoHzAtt, cCustom, "Free LFO rate in Hz.");
+        configFader (lfoPhaseSlider, "modL1Phase", lfoPhaseAtt, cCustom,
+                     "Phase offset: where in the wave the oscillation starts.");
+        makeLabel (lblLfoDiv, cCustom);   lblLfoDiv.setText ("Div", juce::dontSendNotification);
+        makeLabel (lblLfoHz, cCustom);    lblLfoHz.setText ("Hz", juce::dontSendNotification);
+        makeLabel (lblLfoPhase, cCustom); lblLfoPhase.setText ("Ph", juce::dontSendNotification);
+
+        modSelBox.addItem ("Env 1", 1); modSelBox.addItem ("Env 2", 2); modSelBox.addItem ("Env 3", 3);
+        modSelBox.addItem ("LFO 1", 4); modSelBox.addItem ("LFO 2", 5); modSelBox.addItem ("LFO 3", 6);
+        modSelBox.setSelectedId (1, juce::dontSendNotification);
+        modSelBox.setColour (juce::ComboBox::outlineColourId, cCustom.withAlpha (0.7f));
+        modSelBox.setMouseClickGrabsKeyboardFocus (false);
+        modSelBox.onChange = [this] { modSel = modSelBox.getSelectedId() - 1; attachCustomTab(); resized(); refocus(); };
+        addChildComponent (modSelBox);
+        for (auto* cb : { &lfoWaveBox, &lfoRateModeBox, &lfoPhaseModeBox })
+        {
+            cb->setColour (juce::ComboBox::outlineColourId, cCustom.withAlpha (0.7f));
+            cb->setMouseClickGrabsKeyboardFocus (false);
+            addChildComponent (*cb);
+        }
+        lfoWaveBox.onChange = [this]
+        {
+            lfoWaveEditBtn.setVisible (envTab == 3 && modSel >= 3 && lfoWaveBox.getSelectedId() == 6);
+        };
+        modOnT.setName ("onled");
+        addChildComponent (modOnT);
+        modUnmapBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xffe0453f));
+        modUnmapBtn.setMouseClickGrabsKeyboardFocus (false);
+        modUnmapBtn.onClick = [this]
+        {
+            processorRef.getModEngine().unmapAll (modSel);
+            refocus();
+        };
+        addChildComponent (modUnmapBtn);
+        lfoWaveEditBtn.setColour (juce::TextButton::buttonColourId, cCustom.withAlpha (0.85f));
+        lfoWaveEditBtn.setMouseClickGrabsKeyboardFocus (false);
+        lfoWaveEditBtn.onClick = [this]
+        {
+            const int l = modSel - 3;
+            if (l < 0) return;
+            waveEditor.fromText (processorRef.getLfoWavePoints (l));
+            waveEditor.setVisible (true);
+            waveEditor.toFront (false);
+        };
+        addChildComponent (lfoWaveEditBtn);
+        waveEditor.onChange = [this]
+        {
+            const int l = modSel - 3;
+            if (l < 0) return;
+            float table[ModEngine::kWaveN];
+            waveEditor.fillTable (table, ModEngine::kWaveN);
+            processorRef.setLfoWave (l, table, waveEditor.toText());
+        };
+        waveEditor.onClose = [this] { waveEditor.setVisible (false); refocus(); };
+        addChildComponent (waveEditor);
+        attachCustomTab();
     }
 
     // Tuning (scale) + Recent .scl.
@@ -739,6 +795,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     clearTimbreButton.setTooltip ("Back to the harmonic engine.");
     clearTimbreButton.onClick = [this] { processorRef.clearTimbre(); intervalEdit.clear(); refocus(); };
     addAndMakeVisible (clearTimbreButton);
+    temperToggle.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
+    temperToggle.setMouseClickGrabsKeyboardFocus (false);
+    temperAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "timbreTemper", temperToggle);
+    addAndMakeVisible (temperToggle);
     configFader (timbreRepeatsFader, "timbreRepeats", timbreRepeatsAtt, cTimbre,
                  "How many times the scale's period stacks into the timbre. More = reaches higher.");
     timbreRepeatsFader.setSliderStyle (juce::Slider::LinearHorizontal); // compact box
@@ -905,7 +965,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     {
         const auto name = presetBox.getText();
         if (name.isNotEmpty() && processorRef.loadPreset (name))
-            applyTimbreEnablement (processorRef.isTimbreActive());
+            applyTimbreEnablement (processorRef.timbreReplacesEngine());
         refocus();
     };
     addAndMakeVisible (presetBox);
@@ -938,8 +998,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     dissCountBox.onChange = [this] { refocus(); };
     addAndMakeVisible (dissCountBox);
     // Min / Max consonance target (replaces the old "Max" checkbox): default Min.
-    dissModeBox.addItem ("Min", 1);
-    dissModeBox.addItem ("Max", 2);
+    dissModeBox.addItem ("Minima", 1);
+    dissModeBox.addItem ("Maxima", 2);
     dissModeBox.setSelectedId (1, juce::dontSendNotification);
     dissModeBox.setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
     dissModeBox.setMouseClickGrabsKeyboardFocus (false);
@@ -987,17 +1047,15 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         resized(); refocus();
     };
     addAndMakeVisible (specModeBox);
-    // Back/forward between the all-chords list and a loaded chord's ranked degrees.
-    chordViewBack.setButtonText (juce::String::fromUTF8 ("\xe2\x97\x80"));
-    chordViewFwd.setButtonText  (juce::String::fromUTF8 ("\xe2\x96\xb6"));
+    // Two labelled view buttons: "Results" = the list of ALL found chords;
+    // "Tuning info" = the LOADED chord's degrees ranked like any scale.
     for (auto* b : { &chordViewBack, &chordViewFwd })
     {
-        b->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
         b->setMouseClickGrabsKeyboardFocus (false);
         addChildComponent (*b);
     }
-    chordViewBack.onClick = [this] { chordDegView = false; resized(); refocus(); };
-    chordViewFwd.onClick  = [this] { chordDegView = true;  resized(); refocus(); };
+    chordViewBack.onClick = [this] { chordDegView = false; resized(); repaint(); refocus(); };
+    chordViewFwd.onClick  = [this] { chordDegView = true;  resized(); repaint(); refocus(); };
 
     // --- Chord search (mode 3): n notes, period, min/max, list count, Transmute ---
     for (int n = 2; n <= 8; ++n) chordNotesBox.addItem (juce::String (n), n);
@@ -1067,6 +1125,27 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     chordView.setViewedComponent (&chordList, false);
     chordView.setScrollBarsShown (true, false);
     addChildComponent (chordView);
+
+    // n-AD selector: "Degrees" = the classic per-degree list (each step vs the
+    // tonic); Dyads/Triads/... = ALL combinations of n scale degrees ranked by
+    // their TOTAL beating (every pair counted). Items rebuilt live per tuning.
+    nadBox.setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
+    nadBox.setMouseClickGrabsKeyboardFocus (false);
+    nadBox.setTooltip (tr (
+        "What the list below shows: Degrees = each scale step against the tonic. Dyads, triads, tetrads... = EVERY combination of that many scale notes, ranked by total beating (all pairs counted, not just against 0).",
+        "Qu\xc3\xa8 mostra la llista: Graus = cada pas contra la t\xc3\xb2nica. D\xc3\xad""ades, tr\xc3\xad""ades, t\xc3\xa8trades... = TOTES les combinacions d'aquest nombre de notes, ordenades pel batec total (tots els parells, no nom\xc3\xa9s contra el 0)."));
+    nadBox.onChange = [this]
+    {
+        if (nadBox.getSelectedId() > 1)
+            processorRef.startNadCompute (nadBox.getSelectedId());
+        resized(); refocus();
+    };
+    addChildComponent (nadBox);
+    nadView.setViewedComponent (&nadList, false);
+    nadView.setScrollBarsShown (true, false);
+    addChildComponent (nadView);
+    nadList.tip = tr ("Combinations of scale degrees with the LEAST total beating first (colour = the value's height on the beating range).",
+                      "Combinacions de graus de l'escala amb MENYS batec total primer (color = al\xc3\xa7""ada del valor dins el rang de batec).");
 
     segList.proc      = &processorRef;
     segList.ratioName = [] (double r) { return justName (r); };
@@ -1209,7 +1288,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         juce::String s;
         if (di.hasApprox) // tempered, near a simple ratio: just the hint
             s << "\xe2\x89\x88 " << juce::String (di.ap) << "/" << juce::String (di.aq)
-              << " (" << (di.approxErr >= 0 ? "+" : "-") << juce::String (std::abs (di.approxErr)) << "c)";
+              << " (" << (di.approxErr >= 0 ? "+" : "-") << juce::String (std::abs (di.approxErr)) << "¢)";
         return s;
     });
     // Segment scales: append the hovered degree's SOURCE partial to the hover window
@@ -1248,7 +1327,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             const double cents = 1200.0 * std::log2 (f1 / f0);
             juce::String s; // steps (no "st" - that reads as semitone), then cents
             s << (steps > 0 ? "+" : "") << steps << "\n"
-              << (cents >= 0 ? "+" : "-") << juce::String ((int) std::llround (std::abs (cents))) << "c";
+              << (cents >= 0 ? "+" : "-") << juce::String ((int) std::llround (std::abs (cents))) << juce::String::fromUTF8 ("¢");
             // Exact ratio ONLY when BOTH keys are genuine just degrees - then the ratio
             // between them is truly rational. Bounded to READABLE fractions: the ratio
             // between two large-ratio degrees is real but useless as "986/831" - those
@@ -1345,8 +1424,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addAndMakeVisible (keyboard);
 
     applyLanguage();
-    applyTimbreEnablement (processorRef.isTimbreActive());
-    lastTimbreActive = processorRef.isTimbreActive();
+    applyTimbreEnablement (processorRef.timbreReplacesEngine());
+    lastTimbreActive = processorRef.timbreReplacesEngine();
 
     // The tooltip window must NEVER swallow clicks: with the shorter hover delay a
     // tip could pop under the cursor and eat the next mouse-down - that was the
@@ -1507,7 +1586,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     gFractal.setText       (tr ("Fractal", "Fractal"));
     gPrime.setText         (tr ("Prime Control", "Control primers"));
     gFilter.setText        (tr ("Filter", "Filtre"));
-    gAmpEnv.setText        (tr ("Envelopes", "Envolupants")); // shared chip-tabbed box
+    gAmpEnv.setText        (tr ("Modulators", "Moduladors")); // shared chip-tabbed box
     gPitchEnv.setText      (tr ("Pitch Envelope", "Envolupant to"));
     envTabB[0].setButtonText (tr ("AMP",    "AMP"));
     envTabB[1].setButtonText (tr ("PITCH",  "TO"));
@@ -1516,12 +1595,22 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     for (auto* b : { &envTabB[0], &envTabB[1], &envTabB[2] })
         b->setTooltip (tr ("The envelopes share this box - click a title to switch.",
                            "Les envolupants comparteixen aquesta caixa - clica un t\xc3\xadtol per canviar."));
-    envTabB[3].setTooltip (processorRef.getCustomEnvTarget().isEmpty()
-        ? tr ("CUSTOM envelope: right-click ANY fader and choose \"Map to custom envelope\" - this ADSR then drives that parameter from Start over Range on every note.",
-              "Envolupant CUSTOM: clic dret a QUALSEVOL fader i tria \"Map to custom envelope\" - aquest ADSR mou aquell par\xc3\xa0metre des de Start sobre Range a cada nota.")
-        : tr ("Custom envelope -> ", "Envolupant custom -> ") + processorRef.getCustomEnvTarget());
-    lblCustStart.setText (tr ("Start", "Inici"), dontSendNotification);
+    envTabB[3].setTooltip (tr (
+        "6 modulators: 3 note-retriggered envelopes + 3 LFOs. Right-click ANY fader -> \"Map to\" routes a modulator onto it (several parameters per modulator allowed); it rides on the knob's own value over +-Range. Each modulator has On/Off and \"Unmap all\".",
+        "6 moduladors: 3 envolupants redisparades per nota + 3 LFOs. Clic dret a QUALSEVOL fader -> \"Assigna a\" hi encamina un modulador (diversos par\xc3\xa0metres per modulador); cavalca sobre el valor del knob amb +-Range. Cada modulador t\xc3\xa9 On/Off i \"Unmap all\"."));
     lblCustRange.setText (tr ("Range", "Rang"),  dontSendNotification);
+    modUnmapBtn.setButtonText (tr ("Unmap", "Desassigna"));
+    modUnmapBtn.setTooltip (tr ("Unmap this modulator from EVERYTHING it modulates.",
+                                "Desassigna aquest modulador de TOT el que modula."));
+    lfoWaveEditBtn.setButtonText (tr ("Draw", "Dibuixa"));
+    lfoWaveEditBtn.setTooltip (tr ("Draw this LFO's wave: points + curved segments, like automation.",
+                                   "Dibuixa l'ona d'aquest LFO: punts + segments corbats, com una automatitzaci\xc3\xb3."));
+    modOnT.setTooltip (tr ("This modulator on/off (off restores its targets to their own values).",
+                           "Aquest modulador on/off (off retorna els seus dest\xc3\xadns al seu valor propi)."));
+    temperToggle.setButtonText (tr ("Temper harmonics", "Tempera harm\xc3\xb2nics"));
+    temperToggle.setTooltip (tr (
+        "ON: the HARMONIC ENGINE keeps generating partials and each one is snapped to the nearest pitch of the .scl loaded here (degree x period^k) - both engines work TOGETHER. OFF: the loaded .scl IS the spectrum by itself and the harmonic engine stands down.",
+        "ON: el MOTOR HARM\xc3\x92NIC segueix generant parcials i cadascun s'ajusta al to m\xc3\xa9s proper de l'.scl carregat aqu\xc3\xad (grau x per\xc3\xado" "de^k) - els dos motors treballen JUNTS. OFF: l'.scl carregat \xc3\x89S l'espectre per si mateix i el motor harm\xc3\xb2nic s'atura."));
     gTuning.setText        (tr ("Tuning", "Afinaci\xc3\xb3"));
     gTimbre.setText        (tr ("Custom Engine", "Motor propi"));
     intervalEdit.setTextToShowWhenEmpty (tr ("intervals: 3/2 2 700c ...", "intervals: 3/2 2 700c ..."),
@@ -1693,7 +1782,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     dissMinLbl.setText    (tr ("smallest interval (c)", "interval m\xc3\xa9s petit (c)"), dontSendNotification);
     chordMinLbl.setText   (tr ("smallest interval (c)", "interval m\xc3\xa9s petit (c)"), dontSendNotification);
     chordCountLbl.setText (tr ("Chords", "Acords"), dontSendNotification);
-    chordViewBack.setTooltip (tr ("Back to the list of ALL found chords.", "Torna a la llista de TOTS els acords trobats."));
+    chordViewBack.setButtonText (tr ("Results", "Resultats"));
+    chordViewFwd.setButtonText  (tr ("Tuning info", "Info afinaci\xc3\xb3"));
+    chordViewBack.setTooltip (tr ("Show the list of ALL found chords.", "Mostra la llista de TOTS els acords trobats."));
     chordViewFwd.setTooltip  (tr ("Show the LOADED chord's degrees, ranked like any scale.",
                                   "Mostra els graus de l'acord CARREGAT, rankejats com qualsevol escala."));
     saveTuningBtn.setButtonText (tr ("Save tuning .scl", "Desa afinaci\xc3\xb3 .scl"));
@@ -1816,6 +1907,8 @@ void FractalAdditiveAudioProcessorEditor::runChordSearch()
         refocus();
         return;
     }
+    chordDegView = false; // Transmute always returns to the results list below
+    resized();
     juce::String err;
     if (! processorRef.startChordSearch (juce::jmax (2, chordNotesBox.getSelectedId()), periodRatio, periodLine,
                                          juce::jmax (1, chordCountBox.getSelectedId()),
@@ -2287,21 +2380,58 @@ void FractalAdditiveAudioProcessorEditor::configFader (juce::Slider& s, const ju
     mapListeners.push_back (std::move (ml));
 }
 
-// Right-click menu on any fader: route the CUSTOM envelope to that parameter (its
-// movement starts wherever the knob sits now; set the Range in the Custom tab).
+// Re-bind the CUSTOM tab's controls to the selected modulator's parameters.
+void FractalAdditiveAudioProcessorEditor::attachCustomTab()
+{
+    const bool isEnv = modSel < 3;
+    const auto pfx = (isEnv ? "modE" : "modL") + juce::String (isEnv ? modSel + 1 : modSel - 2);
+    if (isEnv)
+    {
+        const char* sfx[] = { "A", "D", "S", "R" };
+        for (int i = 0; i < 4; ++i)
+            custAdsrAtt[i] = std::make_unique<SliderAttachment> (processorRef.apvts, pfx + sfx[i], custAdsr[i]);
+        lfoWaveAtt.reset(); lfoRateModeAtt.reset(); lfoPhaseModeAtt.reset();
+        lfoDivAtt.reset(); lfoHzAtt.reset(); lfoPhaseAtt.reset();
+    }
+    else
+    {
+        for (auto& a : custAdsrAtt) a.reset();
+        lfoWaveAtt      = std::make_unique<ComboBoxAttachment> (processorRef.apvts, pfx + "Wave", lfoWaveBox);
+        lfoRateModeAtt  = std::make_unique<ComboBoxAttachment> (processorRef.apvts, pfx + "RateMode", lfoRateModeBox);
+        lfoPhaseModeAtt = std::make_unique<ComboBoxAttachment> (processorRef.apvts, pfx + "PhaseMode", lfoPhaseModeBox);
+        lfoDivAtt   = std::make_unique<SliderAttachment> (processorRef.apvts, pfx + "Div",   lfoDivSlider);
+        lfoHzAtt    = std::make_unique<SliderAttachment> (processorRef.apvts, pfx + "Hz",    lfoHzSlider);
+        lfoPhaseAtt = std::make_unique<SliderAttachment> (processorRef.apvts, pfx + "Phase", lfoPhaseSlider);
+    }
+    custRangeAtt = std::make_unique<SliderAttachment> (processorRef.apvts, pfx + "Range", custRangeFader);
+    modOnAtt     = std::make_unique<ButtonAttachment> (processorRef.apvts, pfx + "On",    modOnT);
+}
+
+// Right-click menu on any fader: route one of the 6 modulators to that parameter
+// (it rides on the knob's own value; set its Range in the Custom tab).
 void FractalAdditiveAudioProcessorEditor::showEnvMapMenu (const juce::String& paramID)
 {
-    if (paramID.startsWith ("custEnv")) return;
-    const bool mapped = processorRef.getCustomEnvTarget() == paramID;
+    if (paramID.startsWith ("mod")) return;
+    static const char* names[6] = { "Env 1", "Env 2", "Env 3", "LFO 1", "LFO 2", "LFO 3" };
     juce::PopupMenu m;
-    m.addItem (1, mapped ? tr ("Unmap from custom envelope", "Desassigna de l'envolupant custom")
-                         : tr ("Map to custom envelope", "Assigna a l'envolupant custom"));
-    m.showMenuAsync (juce::PopupMenu::Options(), [this, paramID, mapped] (int r)
+    juce::PopupMenu mapTo;
+    for (int i = 0; i < 6; ++i)
+        if (! processorRef.getModEngine().isMappedTo (paramID, i))
+            mapTo.addItem (100 + i, names[i]);
+    m.addSubMenu (tr ("Map to", "Assigna a"), mapTo);
+    for (int i = 0; i < 6; ++i)
+        if (processorRef.getModEngine().isMappedTo (paramID, i))
+            m.addItem (200 + i, tr ("Unmap from ", "Desassigna de ") + names[i]);
+    m.showMenuAsync (juce::PopupMenu::Options(), [this, paramID] (int r)
     {
-        if (r == 1)
+        if (r >= 200)      processorRef.getModEngine().removeTarget (r - 200, paramID);
+        else if (r >= 100)
         {
-            processorRef.setCustomEnvTarget (mapped ? juce::String() : paramID);
-            if (! mapped) { envTab = 3; resized(); repaint(); } // jump to the Custom tab
+            processorRef.getModEngine().addTarget (r - 100, paramID);
+            envTab = 3; modSel = r - 100;
+            modSelBox.setSelectedId (modSel + 1, juce::dontSendNotification);
+            attachCustomTab();
+            resized(); repaint();
         }
         refocus();
     });
@@ -2437,7 +2567,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     {
         // Grey the Harmonic Engine INTERIOR (fill + dividers + labels) when a custom
         // engine is driving the timbre - the engine's controls do nothing then.
-        const float dimF = processorRef.isTimbreActive() ? 0.4f : 1.0f;
+        const float dimF = processorRef.timbreReplacesEngine() ? 0.4f : 1.0f;
         macroFrameTitle (harmonicEngineBounds, cHarmonic, tr ("HARMONIC ENGINE", "MOTOR HARM\xc3\x92NIC"), dimF);
         g.setColour (cHarmonic.withAlpha (0.5f * dimF)); // shared internal dividers
         const float top = (float) harmonicEngineBounds.getY() + 11.5f; // frame's inner top edge (was hcBase.getY(), ~10px low)
@@ -2464,10 +2594,17 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         const float rx = (float) essentialsBounds.getRight() - 4.0f;
         for (auto* cell : { &ecGain, &ecRef, &ecOct })
             g.drawLine (lx, (float) cell->getY(), rx, (float) cell->getY(), 1.0f);
-        subLabel (ecPhase, cEssentials, tr ("PHASE", "FASE"),        1.0f);
-        subLabel (ecGain,  cEssentials, tr ("GAIN", "GUANY"),        1.0f);
-        subLabel (ecRef,   cEssentials, tr ("REFERENCE", "REFER\xc3\x88NCIA"), 1.0f);
-        subLabel (ecOct,   cEssentials, tr ("OCTAVE", "OCTAVA"),     1.0f);
+        // Sub-labels sit LEFT of their control (vertically centred), not above it.
+        auto subLeft = [&] (const juce::Rectangle<int>& c, const juce::String& s)
+        {
+            g.setColour (cEssentials);
+            g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+            g.drawText (s, c.withWidth (78).reduced (6, 0), juce::Justification::centredLeft, false);
+        };
+        subLeft (ecPhase, tr ("PHASE", "FASE"));
+        subLeft (ecGain,  tr ("GAIN", "GUANY"));
+        subLeft (ecRef,   tr ("REFERENCE", "REFER\xc3\x88NCIA"));
+        subLabel (ecOct,  cEssentials, tr ("OCTAVE", "OCTAVA"), 1.0f);
     }
 
     // TUNING box: a plain macro-style box now (the result lists moved INTO the
@@ -2589,11 +2726,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
             dissBtn.setBounds (r1.reduced (1, 0));
             si.removeFromTop (4);
             auto r2 = si.removeFromTop (24);   // Min/Max | Steps (below Transmute)
-            compact (dissModeBox, r2.removeFromLeft (54));
+            compact (dissModeBox, r2.removeFromLeft (78));
             r2.removeFromLeft (6);
             lblSteps.setJustificationType (juce::Justification::centredLeft);
-            lblSteps.setBounds (r2.removeFromLeft (38));
-            compact (dissCountBox, r2);
+            lblSteps.setBounds (r2.removeFromLeft (40));
+            compact (dissCountBox, r2.removeFromLeft (52));
             si.removeFromTop (4);
             auto r3 = si.removeFromTop (24);   // Period
             lblPeriod.setJustificationType (juce::Justification::centredLeft);
@@ -2640,13 +2777,18 @@ void FractalAdditiveAudioProcessorEditor::resized()
             chordMinEdit.setBounds (r3.removeFromLeft (48).reduced (0, 1));
             si.removeFromTop (4);
             auto r4 = si.removeFromTop (24);
-            if (fromChord) // back to the all-chords list / forward to the loaded chord's degrees
-            {
-                chordViewBack.setBounds (r4.removeFromRight (24).reduced (1, 0));
-                chordViewFwd.setBounds  (r4.removeFromRight (24).reduced (1, 0));
-                r4.removeFromRight (4);
-            }
             chordGoBtn.setBounds (r4.reduced (1, 0)); // Transmute
+            if (fromChord) // labelled view switch: all results vs the loaded chord's degrees
+            {
+                si.removeFromTop (3);
+                auto r5 = si.removeFromTop (22);
+                chordViewBack.setColour (juce::TextButton::buttonColourId,
+                    ! chordDegView ? cSpecScale.withAlpha (0.85f) : juce::Colour (0xff44445e));
+                chordViewFwd.setColour (juce::TextButton::buttonColourId,
+                    chordDegView ? cSpecScale.withAlpha (0.85f) : juce::Colour (0xff44445e));
+                chordViewBack.setBounds (r5.removeFromLeft (r5.getWidth() / 2).reduced (1, 0));
+                chordViewFwd.setBounds  (r5.reduced (1, 0));
+            }
             si.removeFromTop (2);
             chordProgLbl.setBounds (si.removeFromTop (14)); // search progress only
         }
@@ -2654,8 +2796,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // The result list fills the REST of this same box.
         si.removeFromTop (4);
         const bool showDeg = (dy) || (chord && fromChord && chordDegView);
-        dissHeader.setVisible (showDeg);
-        dissView.setVisible (showDeg);
+        const int  nadSel  = juce::jmax (1, nadBox.getSelectedId());
+        nadBox.setVisible (showDeg);
+        dissHeader.setVisible (showDeg && nadSel == 1);
+        dissView.setVisible (showDeg && nadSel == 1);
+        nadView.setVisible (showDeg && nadSel > 1);
         chordView.setVisible (chord && ! showDeg);
         if (seg)
         {
@@ -2667,13 +2812,42 @@ void FractalAdditiveAudioProcessorEditor::resized()
         }
         else if (showDeg)
         {
-            dissHeader.splitX = 92;
-            dissHeader.setBounds (si.removeFromTop (24));
-            dissView.setBounds (si);
-            const int ch     = degreeList.contentHeight();
-            const bool scroll = ch > si.getHeight();
-            degreeList.setSize (scroll ? si.getWidth() - 10 : si.getWidth(),
-                                juce::jmax (si.getHeight(), ch));
+            // n-ad selector (items follow the scale's degree count, live).
+            const int D = juce::jmax (1, processorRef.getScaleDegrees());
+            if (D != lastNadD)
+            {
+                lastNadD = D;
+                const int keepSel = nadBox.getSelectedId();
+                nadBox.clear (juce::dontSendNotification);
+                nadBox.addItem (tr ("Degrees (vs 0)", "Graus (vs 0)"), 1);
+                static const char* names[] = { "Dyads", "Triads", "Tetrads", "Pentads" };
+                for (int n = 2; n <= juce::jmin (D, 12); ++n)
+                    nadBox.addItem (n <= 5 ? juce::String (names[n - 2])
+                                           : juce::String (n) + tr ("-note chords", "-note chords"), n);
+                nadBox.setSelectedId (keepSel > 0 && keepSel <= juce::jmin (D, 12) ? keepSel : 1,
+                                      juce::dontSendNotification);
+            }
+            nadBox.setBounds (si.removeFromTop (22));
+            si.removeFromTop (3);
+            if (nadSel == 1)
+            {
+                dissHeader.splitX = 92;
+                dissHeader.setBounds (si.removeFromTop (24));
+                dissView.setBounds (si);
+                const int ch     = degreeList.contentHeight();
+                const bool scroll = ch > si.getHeight();
+                degreeList.setSize (scroll ? si.getWidth() - 10 : si.getWidth(),
+                                    juce::jmax (si.getHeight(), ch));
+            }
+            else
+            {
+                nadView.setBounds (si);
+                nadList.degreesPerPeriod = D;
+                const int nh    = nadList.contentHeight();
+                const bool scrl = nh > si.getHeight();
+                nadList.setSize (scrl ? si.getWidth() - 10 : si.getWidth(),
+                                 juce::jmax (si.getHeight(), nh));
+            }
         }
         else if (chord)
         {
@@ -2775,15 +2949,15 @@ void FractalAdditiveAudioProcessorEditor::resized()
             ecOct   = e;
             // Tighter label band + slimmer padding = the controls breathe (the
             // Reference value used to clip its descenders).
-            const int lblH = 13; // inline PHASE / GAIN / REFERENCE / OCTAVE band
-            { auto c = ecPhase.reduced (6, 1); c.removeFromTop (lblH);
-              compact (phaseBox, c.removeFromLeft (juce::jmin (116, c.getWidth()))); } // fits "Scattered", not the whole row
-            { auto c = ecGain.reduced (6, 1);  c.removeFromTop (lblH);
+            // PHASE / GAIN / REFERENCE: the control sits to the RIGHT of its inline
+            // sub-label (drawn in paint at the cell's left), slightly narrower.
+            { auto c = ecPhase.reduced (6, 1); c.removeFromLeft (78);
+              compact (phaseBox, c.removeFromLeft (juce::jmin (112, c.getWidth()))); }
+            { auto c = ecGain.reduced (6, 1);  c.removeFromLeft (78);
               gainFader.setBounds (c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))); }
-            { auto c = ecRef.reduced (6, 1);   c.removeFromTop (lblH);
-              // Left-aligned like the other cells (not centred), compact width - the
-              // field shows C3's full unrounded Hz (e.g. 261.6255653).
-              auto rr = c.removeFromTop (juce::jmin (22, c.getHeight())).withWidth (juce::jmin (c.getWidth(), 176));
+            { auto c = ecRef.reduced (6, 1);   c.removeFromLeft (78);
+              auto rr = c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))
+                          .withWidth (juce::jmin (c.getWidth(), 158));
               lblRefA.setJustificationType (juce::Justification::centredLeft);
               lblRefA.setBounds (rr.removeFromLeft (34));
               lblRefHz.setBounds (rr.removeFromRight (22));
@@ -2840,6 +3014,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
             lblTimbreRepeats.setJustificationType (juce::Justification::centredLeft);
             lblTimbreRepeats.setBounds (fr.removeFromLeft (38));
             timbreRepeatsFader.setBounds (fr);
+            ti.removeFromTop (3);
+            temperToggle.setBounds (ti.removeFromTop (20)); // temper harmonics to this .scl
         }
 
         // ONE shared envelope box with three colour-chip tabs (Volume / Pitch /
@@ -2875,12 +3051,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
             juce::Label*  labP[] = { &lblPitchAmt, &pitchAdsrLbl[0], &pitchAdsrLbl[1], &pitchAdsrLbl[2], &pitchAdsrLbl[3] };
             juce::Slider* setF[] = { &cutoffFader, &resFader, &fEnvAmtFader, &filtAdsr[0], &filtAdsr[1], &filtAdsr[2], &filtAdsr[3] };
             juce::Label*  labF[] = { &lblCutoff, &lblRes, &lblEnvAmt, &filtAdsrLbl[0], &filtAdsrLbl[1], &filtAdsrLbl[2], &filtAdsrLbl[3] };
-            juce::Slider* setC[] = { &custAdsr[0], &custAdsr[1], &custAdsr[2], &custAdsr[3], &custStartFader, &custRangeFader };
-            juce::Label*  labC[] = { &custAdsrLbl[0], &custAdsrLbl[1], &custAdsrLbl[2], &custAdsrLbl[3], &lblCustStart, &lblCustRange };
-            juce::Slider** sets[] = { setV, setP, setF, setC };
-            juce::Label**  labs[] = { labV, labP, labF, labC };
-            const int counts[] = { 4, 5, 7, 6 };
-            for (int t = 0; t < 4; ++t)
+            juce::Slider** sets[] = { setV, setP, setF };
+            juce::Label**  labs[] = { labV, labP, labF };
+            const int counts[] = { 4, 5, 7 };
+            for (int t = 0; t < 3; ++t)
             {
                 const bool on = t == envTab;
                 if (on)
@@ -2901,6 +3075,57 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 else
                     for (int i = 0; i < counts[t]; ++i)
                     { sets[t][i]->setVisible (false); labs[t][i]->setVisible (false); }
+            }
+
+            // CUSTOM tab: modulator selector + On + Unmap-all row, then the selected
+            // modulator's own controls (envelope ADSR+Range, or the LFO set).
+            const bool cust  = envTab == 3;
+            const bool isEnv = modSel < 3;
+            juce::Component* selRowC[] = { &modSelBox, &modOnT, &modUnmapBtn };
+            for (auto* c : selRowC) c->setVisible (cust);
+            lfoWaveEditBtn.setVisible (cust && ! isEnv && lfoWaveBox.getSelectedId() == 6);
+            for (int i = 0; i < 4; ++i)
+            { custAdsr[i].setVisible (cust && isEnv); custAdsrLbl[i].setVisible (false); }
+            custRangeFader.setVisible (cust);
+            lblCustRange.setVisible (cust);
+            juce::Component* lfoC[] = { &lfoWaveBox, &lfoRateModeBox, &lfoPhaseModeBox,
+                                        &lfoDivSlider, &lfoHzSlider, &lfoPhaseSlider,
+                                        &lblLfoDiv, &lblLfoHz, &lblLfoPhase };
+            for (auto* c : lfoC) c->setVisible (cust && ! isEnv);
+            if (cust)
+            {
+                auto selRow = in.removeFromTop (20);
+                modSelBox.setBounds (selRow.removeFromLeft (72));
+                selRow.removeFromLeft (4);
+                modOnT.setBounds (selRow.removeFromLeft (46));
+                selRow.removeFromLeft (4);
+                modUnmapBtn.setBounds (selRow.removeFromLeft (58));
+                selRow.removeFromLeft (4);
+                if (lfoWaveEditBtn.isVisible()) lfoWaveEditBtn.setBounds (selRow);
+                in.removeFromTop (3);
+                if (isEnv)
+                {
+                    const int cw = in.getWidth() / 5;
+                    auto a2 = in;
+                    for (int i = 0; i < 4; ++i) custAdsr[i].setBounds (a2.removeFromLeft (cw));
+                    lblCustRange.setBounds (a2.removeFromTop (13));
+                    custRangeFader.setBounds (a2);
+                }
+                else
+                {
+                    auto combos = in.removeFromTop (20);
+                    lfoWaveBox.setBounds (combos.removeFromLeft (combos.getWidth() / 2).reduced (1, 0));
+                    lfoRateModeBox.setBounds (combos.reduced (1, 0));
+                    in.removeFromTop (2);
+                    lfoPhaseModeBox.setBounds (in.removeFromTop (20).reduced (1, 0));
+                    in.removeFromTop (2);
+                    const int cw = in.getWidth() / 4;
+                    auto a2 = in;
+                    { auto c = a2.removeFromLeft (cw); lblLfoDiv.setBounds (c.removeFromTop (12));   lfoDivSlider.setBounds (c); }
+                    { auto c = a2.removeFromLeft (cw); lblLfoHz.setBounds (c.removeFromTop (12));    lfoHzSlider.setBounds (c); }
+                    { auto c = a2.removeFromLeft (cw); lblLfoPhase.setBounds (c.removeFromTop (12)); lfoPhaseSlider.setBounds (c); }
+                    { auto c = a2;                     lblCustRange.setBounds (c.removeFromTop (12)); custRangeFader.setBounds (c); }
+                }
             }
         }
 
@@ -2935,9 +3160,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 else if (loadVis)  loadSclButton.setBounds (brow.reduced (2, 0));
                 else               clearSclButton.setBounds (brow.reduced (2, 0));
             }
-            // Save the CURRENT tuning (any mode) as .scl - always available.
-            ti.removeFromTop (4);
-            saveTuningBtn.setBounds (ti.removeFromTop (23).reduced (2, 0));
+            // Save the CURRENT tuning as .scl - pointless in plain 12ED2, hidden there.
+            saveTuningBtn.setVisible (tmode != 0);
+            if (tmode != 0)
+            {
+                ti.removeFromTop (4);
+                saveTuningBtn.setBounds (ti.removeFromTop (23).reduced (2, 0));
+            }
             // Pitch bend ABOVE Recent; hidden in MPE-input mode (the MPE zone fixes
             // the per-note range at +-48, so the choice is irrelevant there).
             const bool sclMode = tmode == 2;
@@ -2983,6 +3212,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
     noticeOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (560, 220));
     rhythmScrim.setBounds (getLocalBounds());
     rhythmPanel.setBounds (getLocalBounds().withSizeKeepingCentre (820, 640));
+    waveEditor.setBounds (getLocalBounds().withSizeKeepingCentre (640, 360));
     rhythmScrim.toFront (false);
     rhythmPanel.toFront (false);
 }
@@ -3118,6 +3348,39 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             refreshTuningBank();
     }
 
+    // n-AD list: recompute when the selection or the scale/timbre changes; publish
+    // results when the worker finishes (values coloured green -> red like the list).
+    if (nadBox.isVisible() && nadBox.getSelectedId() > 1)
+    {
+        if (lastScaleSig != lastNadSig || nadBox.getSelectedId() != lastNadSel)
+        {
+            lastNadSig = lastScaleSig;
+            lastNadSel = nadBox.getSelectedId();
+            processorRef.startNadCompute (lastNadSel);
+        }
+        if (processorRef.getNadGeneration() != lastNadGen)
+        {
+            lastNadGen = processorRef.getNadGeneration();
+            const auto res = processorRef.getNadResults();
+            double lo = 1.0e30, hi = -1.0e30;
+            for (const auto& r : res) { lo = juce::jmin (lo, r.value); hi = juce::jmax (hi, r.value); }
+            nadList.rows.clear();
+            for (const auto& r : res)
+            {
+                NadList::Row row;
+                row.degs  = r.degs;
+                row.value = juce::String (r.value, 2);
+                const double t = juce::jlimit (0.0, 1.0, (r.value - lo) / juce::jmax (1.0e-12, hi - lo));
+                const juce::Colour green (0xff3ec659), yellow (0xffe8d44d), red (0xffe0453f);
+                row.valCol = t < 0.5 ? green.interpolatedWith (yellow, (float) (t * 2.0))
+                                     : yellow.interpolatedWith (red, (float) ((t - 0.5) * 2.0));
+                nadList.rows.push_back (std::move (row));
+            }
+            resized();
+            nadList.repaint();
+        }
+    }
+
     // Keyboard hovers park their floating window ABOVE the keyboard (never covering
     // keys or the numbers over them) - keep the LnF's notion of that area current.
     // NOTE: the TooltipWindow is parented to this editor, so getTooltipBounds works
@@ -3179,7 +3442,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                     if (p * q <= 150 && std::abs (cents - 1200.0 * std::log2 ((double) p / (double) q)) < 0.3)
                         row.notes.push_back (juce::String (p) + "/" + juce::String (q));
                     else
-                        row.notes.push_back (juce::String ((int) std::lround (cents)) + "c");
+                        row.notes.push_back (juce::String ((int) std::lround (cents)) + juce::String::fromUTF8 ("¢"));
                 }
                 chordList.rows.push_back (std::move (row));
             }
@@ -3267,11 +3530,15 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                 kbLo  = juce::jmin (kbLo, heldLo);
                 kbNum = hi - kbLo;
             }
-        }
-        if (kbLo != lastKbLo || kbNum != lastKbNum)
-        {
-            lastKbLo = kbLo; lastKbNum = kbNum;
-            keyboard.setRange (kbLo, kbNum);
+            if (kbLo != lastKbLo || kbNum != lastKbNum)
+            {
+                lastKbLo = kbLo; lastKbNum = kbNum;
+                keyboard.setRange (kbLo, kbNum);
+            }
+            // Auto-follow: the view shifts just enough to always SHOW what is being
+            // played (minimal movement, no jump when it is already on screen).
+            if (heldHi >= 0)
+                keyboard.ensureVisible (heldLo, heldHi);
         }
     }
 
@@ -3350,11 +3617,12 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // Period of the active scale (red readout in the Tuning box).
     {
         const int D = juce::jmax (1, processorRef.getScaleDegrees());
-        tuningPeriodLbl.setText (tr ("Period  ", "Per\xc3\xado" "de  ") + degreeLabel (processorRef, D),
-                                 juce::dontSendNotification);
+        auto per = degreeLabel (processorRef, D);
+        if (per.endsWith ("/1")) per = per.dropLastCharacters (2); // "2/1" reads better as "2"
+        tuningPeriodLbl.setText (tr ("Period  ", "Per\xc3\xado" "de  ") + per, juce::dontSendNotification);
     }
 
-    const bool timbre = processorRef.isTimbreActive();
+    const bool timbre = processorRef.timbreReplacesEngine();
     if (timbre != lastTimbreActive)
     {
         if (timbre)

@@ -305,11 +305,11 @@ int main()
         check (justIntervalName (2.5) == "5/2", "2.5 -> 5/2 (non-octave degree, literal)");
         check (justIntervalName (3.0) == "3/1", "3.0 -> 3/1 (tritave period, literal)");
         // 12-TET intervals are NOT exact just ratios -> cents, never a fraction.
-        check (justIntervalName (std::pow (2.0, 7.0/12.0)) == "700c", "12-TET fifth -> 700c (not 3/2)");
-        check (justIntervalName (std::pow (2.0, 4.0/12.0)) == "400c", "12-TET third -> 400c (not 5/4)");
+        check (justIntervalName (std::pow (2.0, 7.0/12.0)) == "700¢", "12-TET fifth -> 700 cent-sign (not 3/2)");
+        check (justIntervalName (std::pow (2.0, 4.0/12.0)) == "400¢", "12-TET third -> 400 cent-sign (not 5/4)");
         {
             const auto s = justIntervalName (1.37); // ~545c, no exact simple ratio
-            check (! s.empty() && s.back() == 'c', "inexact interval -> cents label");
+            check (! s.empty() && (unsigned char) s.back() == 0xa2, "inexact interval -> cents label");
         }
         check (justIntervalName (0.0).empty() && justIntervalName (-1.0).empty(), "non-positive ratio -> blank");
 

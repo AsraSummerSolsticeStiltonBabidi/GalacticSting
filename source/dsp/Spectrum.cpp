@@ -338,6 +338,33 @@ namespace spectrum
                 for (auto& p : parts) p.ratio = (float) ((double) p.ratio / minRatio);
         }
 
+        // TEMPER mode: snap every harmonic-engine partial onto the loaded scale's
+        // pitch grid (degree * period^k, nearest in log-frequency) - the engine keeps
+        // generating structure while the .scl decides where partials may sit.
+        if (s.temperToTimbre && ! s.timbreDegrees.empty() && s.timbrePeriod > 1.0001f && ! parts.empty())
+        {
+            const double per    = (double) s.timbrePeriod;
+            const double logPer = std::log (per);
+            for (auto& p : parts)
+            {
+                const double r = (double) p.ratio;
+                if (! (r > 0.0)) continue;
+                const int kBase = (int) std::floor (std::log (r) / logPer);
+                double best = r, bestErr = 1.0e30;
+                for (int k = kBase - 1; k <= kBase + 1; ++k)
+                {
+                    const double scale = std::pow (per, (double) k);
+                    for (const float dg : s.timbreDegrees)
+                    {
+                        const double cand = (double) dg * scale;
+                        const double err  = std::abs (std::log (cand / r));
+                        if (err < bestErr) { bestErr = err; best = cand; }
+                    }
+                }
+                p.ratio = (float) best;
+            }
+        }
+
         applyRangeCut (parts, s); // hard spectrum-range cut, relative to the played pitch
 
         out.rawCount = (int) parts.size();

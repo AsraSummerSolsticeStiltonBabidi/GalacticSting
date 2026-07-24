@@ -76,6 +76,9 @@ namespace spectrum
         std::vector<float> timbreDegrees;            // scale degree ratios (index 0 = 1.0)
         float              timbrePeriod = 2.0f;      // period ratio (e.g. 2/1)
         int                timbrePeriodRepeats = 3;  // how many periods stack into the timbre
+        // Temper mode: the HARMONIC engine's partials are snapped onto the loaded
+        // scale's pitch grid (degree * period^k) - both engines work together.
+        bool               temperToTimbre = false;
 
         bool operator== (const SpectrumSettings& o) const
         {
@@ -94,6 +97,7 @@ namespace spectrum
                 && source == o.source
                 && timbrePeriod == o.timbrePeriod
                 && timbrePeriodRepeats == o.timbrePeriodRepeats
+                && temperToTimbre == o.temperToTimbre
                 && timbreDegrees == o.timbreDegrees;
         }
         bool operator!= (const SpectrumSettings& o) const { return ! (*this == o); }

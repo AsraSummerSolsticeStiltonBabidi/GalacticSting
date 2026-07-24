@@ -75,7 +75,7 @@ namespace dissonance
         const double centsPQ = (p > 0 && q > 0) ? 1200.0 * std::log2 ((double) p / (double) q) : 1.0e9;
         if (std::abs (centsR - centsPQ) < exactTolCents)
             return std::to_string (p) + "/" + std::to_string (q); // exact match only
-        return std::to_string ((long long) std::llround (centsR)) + "c";
+        return std::to_string ((long long) std::llround (centsR)) + "\xc2\xa2"; // cent sign
     }
 
     // Sethares' pairwise sensory-dissonance measure (verbatim constants).

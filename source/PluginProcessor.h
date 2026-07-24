@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "dsp/AdditiveVoice.h"
+#include "dsp/ModEngine.h"
 #include "dsp/NoteGate.h"
 #include "dsp/RhythmEngine.h"
 #include "dsp/SpectrumEngine.h"
@@ -214,13 +215,38 @@ public:
     bool loadChordAsScale (int index, juce::String& errorOut);
 
     //==========================================================================
+    // n-AD ranking of the ACTIVE scale: all combinations of n scale degrees, ranked
+    // by their TOTAL beating (union dissmeasure - every pair counted, not just each
+    // degree vs the tonic). Background worker; editor polls the generation.
+    struct NadRow { std::vector<int> degs; double value = 0.0; };
+    void startNadCompute (int notes); // 2 = dyads, 3 = triads, ...
+    int  getNadGeneration() const noexcept { return nadGeneration.load(); }
+    bool isNadBusy() const noexcept { return nadBusy.load(); }
+    std::vector<NadRow> getNadResults() const
+    {
+        const juce::ScopedLock sl (nadLock);
+        return nadResults;
+    }
+
+    //==========================================================================
     // Scale EDITING on the keyboard. Works from ANY loaded tuning (the current
     // tuning is first rendered to .scl form, degree sources preserved).
+    // Does the Custom-Engine scale REPLACE the harmonic engine (temper mode off)?
+    // With temper ON both run together, so the engine's controls stay live.
+    bool timbreReplacesEngine() const noexcept
+    { return timbreActive && ! (apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f); }
+
     //==========================================================================
-    // CUSTOM envelope -> any parameter (right-click a fader to map). Runs on the
-    // message-thread timer; the target is stored by paramID (persisted).
-    void setCustomEnvTarget (const juce::String& paramID); // empty = unmap
-    juce::String getCustomEnvTarget() const { return custEnvTargetID; }
+    // MODULATORS (3 custom envelopes + 3 LFOs) -> any parameters. Editor calls.
+    ModEngine& getModEngine() noexcept { return modEngine; }
+    // Custom LFO wave: the drawn table + its editor breakpoints (persisted).
+    void setLfoWave (int lfo, const float* table256, const juce::String& pointsText)
+    {
+        modEngine.setCustomWave (lfo, table256);
+        if (juce::isPositiveAndBelow (lfo, 3)) lfoWavePoints[(size_t) lfo] = pointsText;
+    }
+    juce::String getLfoWavePoints (int lfo) const
+    { return juce::isPositiveAndBelow (lfo, 3) ? lfoWavePoints[(size_t) lfo] : juce::String(); }
 
     juce::String currentTuningAsScl (const juce::String& name) const; // rationals stay ratios, rest cents
     bool addNoteToTuning  (double ratioFromTonic, juce::String& errorOut);   // ctrl+click: folded into the period, sorted
@@ -336,11 +362,17 @@ private:
     juce::String chordPeriodSclLine { "2/1" };
     double       chordPeriodRatio = 2.0;
 
-    // Custom-envelope state (message thread; the ADSR steps at the 30 Hz timer).
-    juce::String custEnvTargetID;
-    juce::ADSR   custEnv;
-    bool         custHeldPrev = false;
-    float        custLastSent = -1.0f;
+    // n-ad worker state.
+    std::unique_ptr<std::thread> nadThread;
+    std::atomic<bool> nadCancel { false }, nadBusy { false };
+    std::atomic<int>  nadGeneration { 0 };
+    mutable juce::CriticalSection nadLock;
+    std::vector<NadRow> nadResults;
+
+    // Modulator engine state.
+    ModEngine    modEngine { apvts };
+    juce::String lfoWavePoints[3];   // drawn-wave breakpoints (for re-editing)
+    juce::uint32 modNoteOns = 0;     // running note-on counter (envelope retrigger)
     std::vector<DissDegreeInfo> dissDegrees;
     double dissGreenH = 0.0, dissRedH = 1.0;
     int    dissRequested = 0, dissFound = 0, dissGeneration = 0;

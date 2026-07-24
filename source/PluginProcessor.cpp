@@ -54,10 +54,13 @@ void FractalAdditiveAudioProcessor::addRecentScl (const juce::File& f)
 FractalAdditiveAudioProcessor::~FractalAdditiveAudioProcessor()
 {
     stopTimer();
-    // Stop and reap the chord-search worker before members are destroyed.
+    // Stop and reap the background workers before members are destroyed.
     chordCancel = true;
+    nadCancel   = true;
     if (chordThread != nullptr && chordThread->joinable())
         chordThread->join();
+    if (nadThread != nullptr && nadThread->joinable())
+        nadThread->join();
 }
 
 //==============================================================================
@@ -122,24 +125,57 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         ParameterID { "masterGain", 1 }, "Master Gain",
         NormalisableRange<float> (-60.0f, 6.0f, 0.01f), 0.0f));
 
-    //-- CUSTOM envelope: a note-driven ADSR mappable onto ANY parameter ---------
-    // (right-click a fader -> "Map to custom envelope"). Start = where the target
-    // sits at rest (normalized); Range = how far the envelope moves it (+-).
-    params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "custEnvAttack", 1 }, "Custom Env Attack", timeRange (5.0f), 0.100f));
-    params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "custEnvDecay", 1 }, "Custom Env Decay", timeRange (5.0f), 0.300f));
-    params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "custEnvSustain", 1 }, "Custom Env Sustain",
-        NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.70f));
-    params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "custEnvRelease", 1 }, "Custom Env Release", timeRange (8.0f), 0.400f));
-    params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "custEnvStart", 1 }, "Custom Env Start",
-        NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.5f));
-    params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "custEnvRange", 1 }, "Custom Env Range",
-        NormalisableRange<float> (-1.0f, 1.0f, 0.001f), 0.5f));
+    //-- MODULATORS: 3 custom envelopes + 3 LFOs, each mappable onto ANY number of
+    // parameters (right-click a fader -> "Map to..."). They ride ON TOP of the
+    // parameter's own value over +-Range and are stepped per audio block.
+    for (int n = 1; n <= 3; ++n)
+    {
+        const auto pfx = "modE" + String (n);
+        params.push_back (std::make_unique<AudioParameterFloat>(
+            ParameterID { pfx + "A", 1 }, "Env " + String (n) + " Attack", timeRange (5.0f), 0.100f));
+        params.push_back (std::make_unique<AudioParameterFloat>(
+            ParameterID { pfx + "D", 1 }, "Env " + String (n) + " Decay", timeRange (5.0f), 0.300f));
+        params.push_back (std::make_unique<AudioParameterFloat>(
+            ParameterID { pfx + "S", 1 }, "Env " + String (n) + " Sustain",
+            NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.70f));
+        params.push_back (std::make_unique<AudioParameterFloat>(
+            ParameterID { pfx + "R", 1 }, "Env " + String (n) + " Release", timeRange (8.0f), 0.400f));
+        params.push_back (std::make_unique<AudioParameterFloat>(
+            ParameterID { pfx + "Range", 1 }, "Env " + String (n) + " Range",
+            NormalisableRange<float> (-1.0f, 1.0f, 0.001f), 0.5f));
+        params.push_back (std::make_unique<AudioParameterBool>(
+            ParameterID { pfx + "On", 1 }, "Env " + String (n) + " On", true));
+    }
+    for (int n = 1; n <= 3; ++n)
+    {
+        const auto pfx = "modL" + String (n);
+        params.push_back (std::make_unique<AudioParameterChoice>(
+            ParameterID { pfx + "Wave", 1 }, "LFO " + String (n) + " Wave",
+            StringArray { "Sine", "Triangle", "Saw up", "Saw down", "Square", "Custom" }, 0));
+        // Rate: BPM-divided / fundamental-divided (default - follows the lowest held
+        // note) / free Hz. Div halves the rate per step (deep enough to bring an
+        // audio-rate fundamental down to slow sweeps).
+        params.push_back (std::make_unique<AudioParameterChoice>(
+            ParameterID { pfx + "RateMode", 1 }, "LFO " + String (n) + " Rate Mode",
+            StringArray { "BPM / 2^n", "Fundamental / 2^n", "Free Hz" }, 1));
+        params.push_back (std::make_unique<AudioParameterInt>(
+            ParameterID { pfx + "Div", 1 }, "LFO " + String (n) + " Divide", 0, 24, 8));
+        params.push_back (std::make_unique<AudioParameterFloat>(
+            ParameterID { pfx + "Hz", 1 }, "LFO " + String (n) + " Hz",
+            NormalisableRange<float> (0.01f, 30.0f, 0.001f, 0.4f), 1.0f));
+        // Phase: restart at every note-on (default) or locked to the host transport.
+        params.push_back (std::make_unique<AudioParameterChoice>(
+            ParameterID { pfx + "PhaseMode", 1 }, "LFO " + String (n) + " Phase Mode",
+            StringArray { "Note restart", "Project transport" }, 0));
+        params.push_back (std::make_unique<AudioParameterFloat>(
+            ParameterID { pfx + "Phase", 1 }, "LFO " + String (n) + " Phase",
+            NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.0f));
+        params.push_back (std::make_unique<AudioParameterFloat>(
+            ParameterID { pfx + "Range", 1 }, "LFO " + String (n) + " Range",
+            NormalisableRange<float> (-1.0f, 1.0f, 0.001f), 0.5f));
+        params.push_back (std::make_unique<AudioParameterBool>(
+            ParameterID { pfx + "On", 1 }, "LFO " + String (n) + " On", true));
+    }
 
     //-- Filter + filter envelope ----------------------------------------------
     // Cutoff is an INTERVAL above the played note (cents, 1200 = one octave), not
@@ -265,6 +301,12 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "rhythmTempoSync", 1 }, "Rhythm Tempo Sync", false));
 
+    // Temper the HARMONIC ENGINE's partials to the Custom-Engine .scl: with this ON
+    // both engines work together (the engine generates, the scale tempers); OFF =
+    // the loaded scale IS the spectrum and the harmonic engine stands down.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "timbreTemper", 1 }, "Temper Harmonics To Scale", false));
+
     //-- Scala-as-timbre --------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "timbreRepeats", 1 }, "Timbre Period Repeats", 1, 8, 3));
@@ -296,8 +338,18 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
     s.ampFloorDb     = -120.0f;
     s.maxPartials    = spectrum::kMaxPartials;
 
-    // Scala-as-timbre overrides the harmonic engine; slope + fractal still apply.
-    if (timbreActive && ! timbreDegrees.empty())
+    // Scala-as-timbre: with TEMPER on, the harmonic engine keeps running and its
+    // partials are snapped to the scale's grid (both engines together); with it off
+    // the scale replaces the engine as the spectrum itself.
+    const bool temper = apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f;
+    if (timbreActive && ! timbreDegrees.empty() && temper)
+    {
+        s.source         = spectrum::Source::Harmonic;
+        s.temperToTimbre = true;
+        s.timbreDegrees  = timbreDegrees;
+        s.timbrePeriod   = timbrePeriod;
+    }
+    else if (timbreActive && ! timbreDegrees.empty())
     {
         s.source              = spectrum::Source::ScalaTimbre;
         s.timbreDegrees       = timbreDegrees;
@@ -318,38 +370,6 @@ void FractalAdditiveAudioProcessor::timerCallback()
     {
         spectrumEngine.requestRebuild (s);
         lastPushed = s;
-    }
-
-    // CUSTOM envelope -> mapped parameter: a monophonic ADSR gated by "any note
-    // held" (the rhythm engine's atomic driver read-out), stepped at this 30 Hz
-    // timer over [start, start + range] of the target's normalized range. A step is
-    // only SENT when the quantized value moves, so undo history stays usable.
-    if (custEnvTargetID.isNotEmpty())
-    {
-        juce::ADSR::Parameters ap;
-        ap.attack  = apvts.getRawParameterValue ("custEnvAttack")->load();
-        ap.decay   = apvts.getRawParameterValue ("custEnvDecay")->load();
-        ap.sustain = apvts.getRawParameterValue ("custEnvSustain")->load();
-        ap.release = apvts.getRawParameterValue ("custEnvRelease")->load();
-        custEnv.setParameters (ap);
-        const bool held = rhythm.getDriverF0() > 0.0f;
-        if (held != custHeldPrev)
-        {
-            held ? custEnv.noteOn() : custEnv.noteOff();
-            custHeldPrev = held;
-        }
-        const float v = custEnv.getNextSample();
-        if (auto* p = apvts.getParameter (custEnvTargetID))
-        {
-            const float start = apvts.getRawParameterValue ("custEnvStart")->load();
-            const float range = apvts.getRawParameterValue ("custEnvRange")->load();
-            const float tgt   = juce::jlimit (0.0f, 1.0f, start + v * range);
-            if (std::abs (tgt - custLastSent) > 0.004f)
-            {
-                custLastSent = tgt;
-                p->setValueNotifyingHost (tgt);
-            }
-        }
     }
 
     // Segment scale tracks the timbre live: whenever the spectrum template changes
@@ -1130,15 +1150,92 @@ bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::St
     return true;
 }
 
-void FractalAdditiveAudioProcessor::setCustomEnvTarget (const juce::String& paramID)
+//==============================================================================
+// n-ad ranking: combinations of n scale degrees ranked by TOTAL beating (union
+// dissmeasure, exact pair decomposition - every pair of degrees counted).
+void FractalAdditiveAudioProcessor::startNadCompute (int notes)
 {
-    if (paramID.startsWith ("custEnv")) return; // never self-modulate
-    custEnvTargetID = paramID;
-    custLastSent    = -1.0f;
-    if (paramID.isNotEmpty())
-        if (auto* p = apvts.getParameter (paramID))
-            if (auto* sp = apvts.getParameter ("custEnvStart"))
-                sp->setValueNotifyingHost (p->getValue()); // the movement starts where the knob sits now
+    notes = juce::jlimit (2, 12, notes);
+    nadCancel = true;
+    if (nadThread != nullptr && nadThread->joinable()) nadThread->join();
+    nadCancel = false;
+
+    // Snapshot on the message thread: the degrees' absolute frequencies + spectrum.
+    const int D = juce::jlimit (1, 64, tuning.degreesPerPeriod());
+    std::vector<double> ratios ((size_t) D);
+    for (int d = 0; d < D; ++d) ratios[(size_t) d] = getDegreeRatio (d);
+    const auto tmpl = spectrum::compileSpectrum (currentSettings());
+    const double f0 = TuningManager::kRefFreq * tuning.referenceScale();
+    std::vector<dissonance::Partial> spec;
+    spec.reserve (tmpl.partials.size());
+    for (const auto& p : tmpl.partials) spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
+    if (spec.size() > 64)
+    {
+        std::sort (spec.begin(), spec.end(),
+                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
+        spec.resize (64);
+    }
+
+    nadBusy = true;
+    nadThread = std::make_unique<std::thread> ([this, notes, D, ratios = std::move (ratios), spec = std::move (spec)]()
+    {
+        std::vector<FractalAdditiveAudioProcessor::NadRow> out;
+        long long combos = 1;
+        for (int i = 0; i < notes; ++i) combos = combos * (long long) (D - i) / (long long) (i + 1);
+        if (D >= notes && combos > 0 && combos <= 4'000'000LL && ! spec.empty())
+        {
+            // Exact pair tables over the degree set.
+            std::vector<double> dself ((size_t) D);
+            std::vector<double> dcross ((size_t) D * (size_t) D, 0.0);
+            for (int i = 0; i < D && ! nadCancel.load(); ++i)
+            {
+                dself[(size_t) i] = dissonance::selfDissonance (spec, ratios[(size_t) i]);
+                for (int j = i + 1; j < D; ++j)
+                {
+                    const double v = dissonance::crossDissonance (spec, ratios[(size_t) i], ratios[(size_t) j]);
+                    dcross[(size_t) i * (size_t) D + (size_t) j] = v;
+                    dcross[(size_t) j * (size_t) D + (size_t) i] = v;
+                }
+            }
+            // Bounded best-K enumeration (ascending beating).
+            const int keep = 40;
+            std::vector<FractalAdditiveAudioProcessor::NadRow> best;
+            int c[12];
+            for (int i = 0; i < notes; ++i) c[i] = i;
+            while (! nadCancel.load())
+            {
+                double v = 0.0;
+                for (int i = 0; i < notes; ++i)
+                {
+                    v += dself[(size_t) c[i]];
+                    for (int j = i + 1; j < notes; ++j)
+                        v += dcross[(size_t) c[i] * (size_t) D + (size_t) c[j]];
+                }
+                if ((int) best.size() < keep || v < best.back().value)
+                {
+                    FractalAdditiveAudioProcessor::NadRow row;
+                    row.value = v;
+                    row.degs.assign (c, c + notes);
+                    const auto pos = std::lower_bound (best.begin(), best.end(), row,
+                        [] (const NadRow& a, const NadRow& b) { return a.value < b.value; });
+                    best.insert (pos, std::move (row));
+                    if ((int) best.size() > keep) best.pop_back();
+                }
+                int i = notes - 1;
+                while (i >= 0 && c[i] == D - (notes - i)) --i;
+                if (i < 0) break;
+                ++c[i];
+                for (int j = i + 1; j < notes; ++j) c[j] = c[j - 1] + 1;
+            }
+            out = std::move (best);
+        }
+        {
+            const juce::ScopedLock sl (nadLock);
+            nadResults = std::move (out);
+        }
+        nadGeneration.fetch_add (1);
+        nadBusy = false;
+    });
 }
 
 bool FractalAdditiveAudioProcessor::saveCurrentTuningScl (const juce::File& f, juce::String& errorOut)
@@ -1160,6 +1257,7 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     synth.setCurrentPlaybackSampleRate (sampleRate);
     previewCollector.reset (sampleRate);
     noteGate.prepare (sampleRate);
+    modEngine.prepare (sampleRate);
     lastSr = sampleRate;
     lastGain = juce::Decibels::decibelsToGain (apvts.getRawParameterValue ("masterGain")->load());
 
@@ -1170,7 +1268,6 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     applyTuningMode ((int) apvts.getRawParameterValue ("tuningMode")->load());
     rhythm.prepare (sampleRate);
 
-    custEnv.setSampleRate (30.0); // the custom envelope steps once per timer tick
     startTimerHz (30); // poll spectrum params and rebuild off the audio thread
 }
 
@@ -1221,6 +1318,23 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         noteGate.process (midiMessages, nSamp, qTempo, mono, qPulse,
                           beatOff, beatPer, qPulse ? rhythm.samplesToNextReset() : -1.0,
                           qPulse ? rhythm.samplesSinceAnchor()  : -1.0);
+    }
+
+    // MODULATORS (3 envelopes + 3 LFOs): stepped once per block, writing straight
+    // into the target parameters' raw atomics (base value + modulation) - smooth,
+    // host/undo-silent, RT-safe.
+    {
+        for (const auto meta : midiMessages)
+            if (meta.getMessage().isNoteOn()) ++modNoteOns;
+        double bpm = -1.0, ppq = -1.0;
+        if (auto* ph = getPlayHead())
+            if (auto pos = ph->getPosition())
+            {
+                if (pos->getBpm().hasValue()) bpm = *pos->getBpm();
+                if (pos->getIsPlaying() && pos->getPpqPosition().hasValue()) ppq = *pos->getPpqPosition();
+            }
+        const double f0 = (double) rhythm.getDriverF0();
+        modEngine.processBlock (nSamp, modNoteOns, f0 > 0.0, f0, bpm, ppq);
     }
     const bool midiOut  = apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f;
     const bool selfWant = apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f;
@@ -1353,12 +1467,29 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
             state.appendChild (ry, nullptr);
     }
 
-    // Custom-envelope mapping target (by paramID).
-    if (custEnvTargetID.isNotEmpty())
+    // Modulator routings + drawn LFO waves.
     {
-        juce::ValueTree ce ("CUSTENV");
-        ce.setProperty ("target", custEnvTargetID, nullptr);
-        state.appendChild (ce, nullptr);
+        juce::ValueTree ms ("MODS");
+        for (int m = 0; m < ModEngine::kMods; ++m)
+        {
+            juce::String csv;
+            for (int t = 0; t < modEngine.numTargets (m); ++t)
+                csv += (csv.isEmpty() ? "" : ",") + modEngine.targetId (m, t);
+            if (csv.isNotEmpty()) ms.setProperty ("t" + juce::String (m), csv, nullptr);
+        }
+        for (int l = 0; l < ModEngine::kLfos; ++l)
+        {
+            if (lfoWavePoints[(size_t) l].isNotEmpty())
+                ms.setProperty ("pts" + juce::String (l), lfoWavePoints[(size_t) l], nullptr);
+            if (const float* w = modEngine.getCustomWave (l))
+            {
+                juce::String tw;
+                for (int i = 0; i < ModEngine::kWaveN; ++i)
+                    tw += (i ? "," : "") + juce::String (w[i], 4);
+                ms.setProperty ("w" + juce::String (l), tw, nullptr);
+            }
+        }
+        if (ms.getNumProperties() > 0) state.appendChild (ms, nullptr);
     }
 
     // "From spectrum's segment": the mode, the picked partials, the period spec, and
@@ -1387,9 +1518,33 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
 
     apvts.replaceState (tree);
 
-    // Custom-envelope mapping target.
-    custEnvTargetID = tree.getChildWithName ("CUSTENV").getProperty ("target").toString();
-    custLastSent = -1.0f;
+    // Modulator routings + drawn LFO waves.
+    for (int m = 0; m < ModEngine::kMods; ++m) modEngine.unmapAll (m);
+    if (auto ms = tree.getChildWithName ("MODS"); ms.isValid())
+    {
+        for (int m = 0; m < ModEngine::kMods; ++m)
+        {
+            juce::StringArray ids;
+            ids.addTokens (ms.getProperty ("t" + juce::String (m)).toString(), ",", "");
+            for (const auto& id : ids)
+                if (id.isNotEmpty()) modEngine.addTarget (m, id);
+        }
+        for (int l = 0; l < ModEngine::kLfos; ++l)
+        {
+            lfoWavePoints[(size_t) l] = ms.getProperty ("pts" + juce::String (l)).toString();
+            juce::StringArray vals;
+            vals.addTokens (ms.getProperty ("w" + juce::String (l)).toString(), ",", "");
+            if (vals.size() == ModEngine::kWaveN)
+            {
+                float w[ModEngine::kWaveN];
+                for (int i = 0; i < ModEngine::kWaveN; ++i) w[i] = vals[i].getFloatValue();
+                modEngine.setCustomWave (l, w);
+            }
+        }
+    }
+    // Legacy single custom-env target (older sessions) -> envelope 1.
+    if (auto ce = tree.getChildWithName ("CUSTENV"); ce.isValid())
+        modEngine.addTarget (0, ce.getProperty ("target").toString());
 
     // Rhythm (spectrum->MIDI) slots.
     for (auto& s : rhythm.slots)
