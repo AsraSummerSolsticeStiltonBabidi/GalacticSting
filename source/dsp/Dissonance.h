@@ -219,8 +219,11 @@ namespace dissonance
     // the best combinations (most consonant, or most dissonant with `maxima`) are
     // deduped and refined per-coordinate by golden section on the TRUE union measure.
     // `progress` (0..1) is polled for cancellation (return false to abort).
+    // `minGapCents`: no two chord notes (nor a note and the root/period) may sit
+    // closer than this - keeps results playable as scales (default 33 cents).
     inline std::vector<ChordResult> searchChords (const std::vector<Partial>& spectrum,
                                                   double period, int notes, int count, bool maxima,
+                                                  double minGapCents = 33.0,
                                                   const std::function<bool(float)>& progress = {})
     {
         std::vector<ChordResult> out;
@@ -281,8 +284,28 @@ namespace dissonance
         for (int i = 0; i < m; ++i) c[i] = i + 1;
         long long done = 0;
         const double rootTerm = dSelf[0];
+        const double minGap = std::max (0.0, minGapCents);
         while (true)
         {
+            // Minimum-interval rule: every adjacent pair (incl. root->first and
+            // last->period) must be at least minGap cents apart.
+            bool gapOk = (double) c[0] * step >= minGap
+                      && totalCents - (double) c[m - 1] * step >= minGap;
+            for (int i = 1; i < m && gapOk; ++i)
+                if ((double) (c[i] - c[i - 1]) * step < minGap) gapOk = false;
+            if (! gapOk)
+            {
+                if (++done % 65536 == 0 && progress
+                    && ! progress (0.25f + 0.65f * (float) done / (float) combosEst))
+                    return out;
+                int i = m - 1;
+                while (i >= 0 && c[i] == G - (m - 1 - i)) --i;
+                if (i < 0) break;
+                ++c[i];
+                for (int j = i + 1; j < m; ++j) c[j] = c[j - 1] + 1;
+                continue;
+            }
+
             // Total = union-of-copies dissmeasure, decomposed exactly into the tables.
             double v = rootTerm;
             for (int i = 0; i < m; ++i)

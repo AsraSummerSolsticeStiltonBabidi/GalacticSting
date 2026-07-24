@@ -73,6 +73,7 @@ public:
         selfParam = apvts.getRawParameterValue ("rhythmSelfPlay");
         fbParam   = apvts.getRawParameterValue ("rhythmFeedback");
         fbDecayParam = apvts.getRawParameterValue ("rhythmFeedbackDecay");
+        qPulseParam  = apvts.getRawParameterValue ("rhythmQPulse");
         octParam  = apvts.getRawParameterValue ("rhythmOctAll");
         xParam    = apvts.getRawParameterValue ("rhythmDivX");
         nParam    = apvts.getRawParameterValue ("rhythmDivN");
@@ -98,6 +99,7 @@ public:
             for (int j = 0; j < kMaxNotes; ++j)
             { phase[i][j] = 0.0; gateLeft[i][j] = 0; wasOn[i][j] = false; }
         for (auto& h : heldCol) h.active = false;
+        for (auto& a : alignCol) a = false;
         for (auto& b : channelBend) b = 0.0;
         driverCol = -1; lastDriver = -1;
         engineClock = 0; patternAnchor = -1; patternCycle = 0;
@@ -115,6 +117,13 @@ public:
         if (dt <= 0) return (double) -dt; // anchor still ahead (same-block note-on)
         const juce::int64 k = (dt + patternCycle - 1) / patternCycle; // ceil
         return (double) (patternAnchor + k * patternCycle - engineClock);
+    }
+    // Samples since the running pattern's anchor (< 0 = no pattern) - lets the gate
+    // treat near-simultaneous presses as "join in phase now" instead of deferring.
+    double samplesSinceAnchor() const noexcept
+    {
+        if (driverCol < 0 || patternAnchor < 0) return -1.0;
+        return (double) (engineClock - patternAnchor);
     }
 
     // Queue note-offs for every currently-open gate (message thread, when audio is
@@ -316,7 +325,7 @@ public:
                 note = juce::jlimit (0, 127, parentNote + fbSteps[k]);
                 hz   = tuning.frequencyForNote (note); // lock-free atomic read (RT-safe)
             }
-            const int ch = mpeOut ? 2 + (echoChanRot++ % 15) : 1;
+            const int ch = mpeOut ? 2 + (echoChanRot++ % 14) : 1; // 16 reserved for the drone
             echoOn[echoOnN++] = { at, note, ch, cv, bend, juce::jmax (1, gate), hz };
         }
     }
@@ -326,6 +335,7 @@ private:
     {
         if (msg.isNoteOn())
         {
+            const bool wasEmpty = driverCol < 0; // no note was driving -> this one anchors the grid
             int col = -1; // first free column
             for (int j = 0; j < kMaxNotes; ++j)
                 if (! heldCol[(size_t) j].active) { col = j; break; }
@@ -338,7 +348,19 @@ private:
                 h.f0     = noteHz (h.note, h.ch);
                 for (int i = 0; i < kSlots; ++i) phase[i][col] = 1.0; // downbeat at note-on
                 updateDriver();
-                if (driverCol == col) patternAnchor = engineClock + pos; // the pattern's "1"
+                const bool qp = qPulseParam != nullptr && qPulseParam->load() > 0.5f;
+                if (wasEmpty || patternAnchor < 0)
+                    patternAnchor = engineClock + pos;   // fresh grid: this note is the "1"
+                else if (qp)
+                {
+                    // Landing exactly ON a pattern reset (the gate defers late joiners
+                    // there) = "se suma en el 1": plain downbeat. Anywhere else (the
+                    // near-simultaneous window) = join IN PHASE with the running grid.
+                    const juce::int64 since = engineClock + pos - patternAnchor;
+                    const juce::int64 rem   = patternCycle > 0 ? since % patternCycle : 1;
+                    if (! (rem <= 3 || (patternCycle > 0 && patternCycle - rem <= 3)))
+                        alignCol[col] = true;
+                }
             }
             else
                 updateDriver();
@@ -352,6 +374,7 @@ private:
                 {
                     closeColumnGates (j, pos);
                     h.active = false;
+                    alignCol[j] = false;
                     break;
                 }
             }
@@ -360,7 +383,7 @@ private:
         else if (msg.isAllNotesOff() || msg.isAllSoundOff())
         {
             for (int j = 0; j < kMaxNotes; ++j)
-                if (heldCol[(size_t) j].active) { closeColumnGates (j, pos); heldCol[(size_t) j].active = false; }
+                if (heldCol[(size_t) j].active) { closeColumnGates (j, pos); heldCol[(size_t) j].active = false; alignCol[j] = false; }
             updateDriver();
         }
         else if (msg.isPitchWheel())
@@ -451,11 +474,13 @@ private:
         }
     }
 
-    // The MIDI channel a train sends on: MPE out spreads the trains over the
-    // member channels 2..16 (channel 1 = zone master); plain mode uses channel 1.
+    // The MIDI channel a train sends on: MPE out spreads the trains over member
+    // channels 2..15; plain mode uses channel 1. Channel 16 is RESERVED for the
+    // self-play drone ("note under pulses") - a pulse sharing the drone's channel
+    // and note would kill the drone voice with its gate note-off.
     int trainChannel (int slot, int col) const noexcept
     {
-        return mpeOut ? 2 + ((slot * kMaxNotes + col) % 15) : 1;
+        return mpeOut ? 2 + ((slot * kMaxNotes + col) % 14) : 1;
     }
 
     void render (const spectrum::SpectrumTemplate* tmpl, bool on, bool all, int from, int to)
@@ -504,7 +529,20 @@ private:
                 // Fresh DOWNBEAT whenever a train BECOMES active mid-hold (slot just
                 // routed, On just flipped, mode switched...): otherwise it would start
                 // from a stale mid-phase and the first cycle sounds early/shifted.
-                if (! wasOn[i][j]) phase[i][j] = 1.0;
+                // Quantize-to-pulse joiners instead align to the RUNNING grid: phases
+                // as if the train had started at the pattern anchor, so its pulses
+                // land on the shared subdivisions (slightly advanced, in phase).
+                if (! wasOn[i][j])
+                {
+                    if (alignCol[j] && patternAnchor >= 0)
+                    {
+                        const double cyc = (double) (engineClock + from - patternAnchor) * inc[i][j];
+                        const double ph  = cyc - std::floor (cyc);
+                        phase[i][j] = ph < 1.0e-9 ? 1.0 : ph; // exactly on a grid point -> fire now
+                    }
+                    else
+                        phase[i][j] = 1.0;
+                }
 
                 // Sent pitch: ratio slots = the EXACT pitch f0*slotRatio (note+bend);
                 // plain slots = the typed note transposed by this held note's interval
@@ -617,6 +655,7 @@ private:
     std::atomic<float>* selfParam = nullptr; // "play in Fibló" - interpret pulses internally
     std::atomic<float>* fbParam   = nullptr; // internal feedback loop on/off
     std::atomic<float>* fbDecayParam = nullptr; // feedback volume slope (velocity kept per loop)
+    std::atomic<float>* qPulseParam = nullptr; // quantize-to-pulse (phase-aligned joiners)
     std::atomic<float>* octParam  = nullptr; // global octave shift of all pulses (-4..+4)
     std::atomic<float>* xParam  = nullptr;
     std::atomic<float>* nParam  = nullptr;
@@ -635,6 +674,7 @@ private:
     juce::int64 patternAnchor = -1; // sample of the driver's last downbeat (the pattern's "1")
     juce::int64 patternCycle  = 0;  // samples until the whole polyrhythm coincides again (0 = none)
     Held   heldCol[kMaxNotes];
+    bool   alignCol[kMaxNotes] = {}; // quantize-to-pulse joiner: align phases to the grid
     int    driverCol  = -1;
     int    lastDriver = -1; // to detect driver changes (fresh downbeat in Lowest mode)
     double channelBend[16] = {};

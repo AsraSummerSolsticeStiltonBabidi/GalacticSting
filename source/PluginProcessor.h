@@ -168,6 +168,8 @@ public:
     int  getTuningBankSlotParam() const noexcept { return (int) apvts.getRawParameterValue ("tuningBankSlot")->load(); }
     void setTuningBankSlotParam (int slot);                        // 0 = none, 1..N = slot (drives automation + load)
     int  firstEmptyBankSlot() const noexcept;
+    void bankAutoAdd (const juce::String& name, const juce::String& source); // every loaded tuning joins the bank
+    void bankClearSlot (int slot0);                                          // the bank's X button
 
     //==========================================================================
     // File presets (.gsting). Called from the editor.
@@ -181,7 +183,8 @@ public:
     // .scl from the curve's minima (or maxima in reverse mode) over the chosen
     // period, loads it as the active scale and keeps the text for saving.
     bool generateDissonanceScale (int count, bool useMaxima, double periodRatio,
-                                  const juce::String& periodSclLine, juce::String& errorOut);
+                                  const juce::String& periodSclLine, double minGapCents,
+                                  juce::String& errorOut);
     bool saveGeneratedScl (const juce::File& f, juce::String& errorOut);
     bool hasGeneratedScl() const noexcept { return lastDissScl.isNotEmpty(); }
     juce::String getGeneratedSclName() const { return lastDissName; }
@@ -196,7 +199,7 @@ public:
     // polls progress/generation and copies the results.
     struct ChordHit { std::vector<double> alphas; double value; }; // alphas[0] = 1 (root)
     bool startChordSearch (int notes, double periodRatio, const juce::String& periodSclLine,
-                           int count, bool maxima, juce::String& errorOut);
+                           int count, bool maxima, double minGapCents, juce::String& errorOut);
     void cancelChordSearch();
     bool  isChordSearchRunning()  const noexcept { return chordRunning.load(); }
     float getChordSearchProgress() const noexcept { return chordProgress.load(); }
@@ -209,6 +212,14 @@ public:
     // Double-click a result: the chord becomes the active scale (.scl, degrees in
     // cents + the exact typed period), loaded like any generated tuning.
     bool loadChordAsScale (int index, juce::String& errorOut);
+
+    //==========================================================================
+    // Scale EDITING on the keyboard. Works from ANY loaded tuning (the current
+    // tuning is first rendered to .scl form, degree sources preserved).
+    juce::String currentTuningAsScl (const juce::String& name) const; // rationals stay ratios, rest cents
+    bool addNoteToTuning  (double ratioFromTonic, juce::String& errorOut);   // ctrl+click: folded into the period, sorted
+    bool editTuningDegree (int degree, const juce::String& valueText, juce::String& errorOut); // right-click (Scala mode)
+    bool saveCurrentTuningScl (const juce::File& f, juce::String& errorOut); // Tuning box "Save .scl"
 
     // Per-degree Sethares dissonance of the ACTIVE tuning (any mode - 12ED2, MTS,
     // Scala, generated), against the CURRENT timbre, for the live scale-analysis
@@ -255,6 +266,7 @@ public:
     //==========================================================================
     // Shared with the editor:
     juce::MidiKeyboardState keyboardState;
+    juce::UndoManager undoManager; // parameter undo/redo (MUST outlive + precede apvts)
     juce::AudioProcessorValueTreeState apvts;
     // Chord-preview injection: the editor queues timestamped MIDI (note+per-channel
     // bend) here; processBlock feeds it to the SYNTH ONLY (never the rhythm engine,

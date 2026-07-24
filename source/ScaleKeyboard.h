@@ -83,6 +83,12 @@ public:
     struct DissInfo { juce::String text; juce::Colour colour; };
     void setHoverDissProvider (std::function<DissInfo(int,int)> fn) { getHoverDiss = std::move (fn); }
 
+    // Scale editing: right-click a key -> onEditKey(note) (Scala mode: type a new
+    // cents/ratio value); Ctrl+left-click -> onAddKey(note, fracWithinKey) adds a
+    // note at that spot (folded into every period repetition).
+    std::function<void(int)>        onEditKey;
+    std::function<void(int,double)> onAddKey;
+
     juce::String getTooltip() override
     {
         if (hoverArmed && hoverCell >= 0 && getHoverText != nullptr)
@@ -122,6 +128,9 @@ public:
             const bool held = state.isNoteOnForChannels (0xffff, note);
 
             auto cell = juce::Rectangle<float> (aw + i * w, keysY, w, keysH).reduced (0.6f);
+            // The hovered key stretches a little into the strip - a clear "this one".
+            if (note == hoveredNote && degree != 0)
+                cell = cell.withTop (cell.getY() - 7.0f);
             auto col = juce::Colour::fromHSV (hue, 0.62f, held ? 1.0f : 0.86f, 1.0f);
             g.setColour (held ? col.brighter (0.35f) : col);
             g.fillRect (cell);
@@ -147,47 +156,49 @@ public:
             // Strip cell (above the key): hover deltas; the hovered key itself gets an
             // EYE whose pupil takes the key's colour (a "you are looking here" marker
             // that covers nothing - the strip is empty space). No hover: period Hz.
+            // Hovering a PERIOD key shows no per-key info (it is already on the keys).
+            const int  hoveredDeg  = hoveredNote >= 0 ? ((hoveredNote - kRefKey) % D + D) % D : -1;
+            const bool infoActive  = hoveredNote >= 0 && hoveredDeg != 0;
             auto sc = juce::Rectangle<float> (aw + i * w, 0.0f, w, (float) stripH).reduced (1.5f, 3.0f);
-            if (hoveredNote >= 0)
+            if (hoveredNote >= 0 && note == hoveredNote)
             {
-                if (note == hoveredNote)
+                auto eyeArea = sc.withTrimmedBottom (8.0f); // clear of the stretched key top
+                auto eye = eyeArea.withSizeKeepingCentre (juce::jmin (eyeArea.getWidth() - 2.0f, 26.0f),
+                                                          juce::jmin (eyeArea.getHeight(), 16.0f));
+                g.setColour (juce::Colour (0xffe8ecf4));           // sclera outline
+                g.drawEllipse (eye, 1.4f);
+                auto iris = eye.withSizeKeepingCentre (eye.getHeight() * 0.78f, eye.getHeight() * 0.78f);
+                g.setColour (col);                                  // iris = the key's colour
+                g.fillEllipse (iris);
+                g.setColour (juce::Colours::black);                 // pupil
+                g.fillEllipse (iris.withSizeKeepingCentre (iris.getWidth() * 0.42f, iris.getHeight() * 0.42f));
+            }
+            else if (infoActive)
+            {
+                // Bottom BAND: this key's Sethares dissonance AGAINST the hovered one,
+                // in its consonance colour; the delta lines live strictly ABOVE it so
+                // the white numbers can never overlap the coloured values.
+                auto dc = sc;
+                auto db = dc.removeFromBottom (14.0f);
+                if (getHoverDiss)
                 {
-                    auto eye = sc.withSizeKeepingCentre (juce::jmin (sc.getWidth() - 2.0f, 26.0f),
-                                                         juce::jmin (sc.getHeight(), 16.0f));
-                    g.setColour (juce::Colour (0xffe8ecf4));           // sclera outline
-                    g.drawEllipse (eye, 1.4f);
-                    auto iris = eye.withSizeKeepingCentre (eye.getHeight() * 0.78f, eye.getHeight() * 0.78f);
-                    g.setColour (col);                                  // iris = the key's colour
-                    g.fillEllipse (iris);
-                    g.setColour (juce::Colours::black);                 // pupil
-                    g.fillEllipse (iris.withSizeKeepingCentre (iris.getWidth() * 0.42f, iris.getHeight() * 0.42f));
+                    const auto info = getHoverDiss (hoveredNote, note);
+                    if (info.text.isNotEmpty())
+                    {
+                        g.setColour (info.colour);
+                        g.setFont (juce::Font (juce::FontOptions (juce::jmin (11.0f, w * 0.34f)).withStyle ("Bold")));
+                        g.drawFittedText (info.text, db.toNearestInt(), juce::Justification::centred, 1, 0.4f);
+                    }
                 }
-                else
+                const juce::String d = getDeltaLabel ? getDeltaLabel (hoveredNote, note) : juce::String();
+                if (d.isNotEmpty())
                 {
-                    // Bottom line: this key's Sethares dissonance AGAINST the hovered
-                    // one, in the consonance colour; above it, the interval deltas.
-                    auto dc = sc;
-                    if (getHoverDiss)
-                    {
-                        const auto info = getHoverDiss (hoveredNote, note);
-                        if (info.text.isNotEmpty())
-                        {
-                            auto db = dc.removeFromBottom (12.0f);
-                            g.setColour (info.colour);
-                            g.setFont (juce::Font (juce::FontOptions (juce::jmin (10.5f, w * 0.32f)).withStyle ("Bold")));
-                            g.drawFittedText (info.text, db.toNearestInt(), juce::Justification::centred, 1, 0.4f);
-                        }
-                    }
-                    const juce::String d = getDeltaLabel ? getDeltaLabel (hoveredNote, note) : juce::String();
-                    if (d.isNotEmpty())
-                    {
-                        g.setColour (juce::Colour (0xffc4ccda));
-                        g.setFont (juce::Font (juce::FontOptions (juce::jmin (10.0f, w * 0.30f))));
-                        g.drawFittedText (d, dc.toNearestInt(), juce::Justification::centred, 3, 0.4f);
-                    }
+                    g.setColour (juce::Colour (0xffc4ccda));
+                    g.setFont (juce::Font (juce::FontOptions (juce::jmin (10.5f, w * 0.32f))));
+                    g.drawFittedText (d, dc.toNearestInt(), juce::Justification::centred, 3, 0.5f);
                 }
             }
-            else if (degree == 0 && getNoteHz) // period keys: their frequency (khz over 1000)
+            else if ((hoveredNote < 0 || ! infoActive) && degree == 0 && getNoteHz) // period keys: their frequency (khz over 1000)
             {
                 const double hz = getNoteHz (note);
                 if (hz > 0.0)
@@ -273,6 +284,24 @@ public:
         const int aw = arrowW();
         if (aw > 0 && e.x < aw)                { scrollBy (-scrollStep()); return; }
         if (aw > 0 && e.x >= getWidth() - aw)  { scrollBy ( scrollStep()); return; }
+        if (e.mods.isRightButtonDown())        // edit this degree (Scala mode)
+        {
+            if (onEditKey) { const int n = noteAt (e.x); if (n >= 0) onEditKey (n); }
+            return;
+        }
+        if (e.mods.isCtrlDown())               // add a note at this exact spot
+        {
+            if (onAddKey)
+            {
+                const int n = noteAt (e.x);
+                if (n >= 0)
+                {
+                    const double pos = (double) (e.x - aw) * (double) numCells() / (double) keysWidth();
+                    onAddKey (n, juce::jlimit (0.0, 0.999, pos - std::floor (pos)));
+                }
+            }
+            return;
+        }
         playAt (e.x);
     }
     void mouseDrag (const juce::MouseEvent& e) override
@@ -376,7 +405,7 @@ private:
     std::function<double(int)>           getNoteHz;      // note -> frequency (period keys show it)
     std::function<DissInfo(int,int)>     getHoverDiss;   // (hovered, other) -> dissonance line + colour
     juce::Colour sourceColour { 0xffff9a3c };            // Spectrum-to-Tuning colour for the source label
-    static constexpr int stripH = 44;                    // top info strip (deltas + dissonance line)
+    static constexpr int stripH = 56;                    // top info strip (3 delta lines + dissonance band)
     int baseKey   = 48; // leftmost VISIBLE key (the scroll position)
     int rangeLo   = 48; // full playable range start
     int rangeCount = 40; // full playable range length (keys); a window of it is shown

@@ -12,7 +12,7 @@ namespace
 FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     : AudioProcessor (BusesProperties()
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
-      apvts (*this, nullptr, "PARAMS", createParameterLayout())
+      apvts (*this, &undoManager, "PARAMS", createParameterLayout())
 {
     // Legacy mode lets the MPE engine also respond to ordinary MIDI, so the
     // computer keyboard and plain Ableton MIDI clips produce sound. Each MIDI
@@ -225,8 +225,10 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         ParameterID { "rhythmQTempo", 1 }, "Quantize To Project Tempo", false));
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "rhythmMono", 1 }, "Mono Mode", false));
+    // ON by default: it only acts while a pattern is actually running, and joiners
+    // within ~120 ms enter immediately, phase-aligned - so it never eats clicks.
     params.push_back (std::make_unique<AudioParameterBool>(
-        ParameterID { "rhythmQPulse", 1 }, "Quantize To Pulse", false));
+        ParameterID { "rhythmQPulse", 1 }, "Quantize To Pulse", true));
     // Default: divide 8 times by 2 (x^n = 2^8 = 256). Base 1 is not offered - it
     // turned the pulses into an audio-rate MIDI flood.
     params.push_back (std::make_unique<AudioParameterInt>(
@@ -235,7 +237,7 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         ParameterID { "rhythmDivN", 1 }, "Rhythm Divide Times (n)", 1, 16, 8));
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "rhythmMode", 1 }, "Rhythm Mode",
-        StringArray { "Lowest note", "All notes" }, 0));
+        StringArray { "Lowest note", "All notes" }, 1)); // default: every held note drives its trains
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "rhythmMpe", 1 }, "Rhythm MPE Out", false));
     // DAW-tempo sync toggle: a persisted parameter (not editor-only state) so it
@@ -353,7 +355,34 @@ bool FractalAdditiveAudioProcessor::loadScalaFile (const juce::File& f, juce::St
     tuning.setMode (TuningManager::Mode::Scala);
     addRecentScl (f);
     clearSegmentSource(); // this .scl is not the spectrum segment - drop its "from n/1" mapping
+    bankAutoAdd (tuning.getScalaName(), tuning.getScalaSource());
     return true;
+}
+
+//==============================================================================
+// Every tuning loaded into this Fibló joins the bank (first empty slot; exact
+// duplicates skipped; a full bank is left for the user to curate with the X).
+void FractalAdditiveAudioProcessor::bankAutoAdd (const juce::String& name, const juce::String& source)
+{
+    if (source.isEmpty()) return;
+    for (int i = 0; i < kBankSlots; ++i)
+        if (bankSource[(size_t) i] == source) return;
+    for (int i = 0; i < kBankSlots; ++i)
+        if (bankSource[(size_t) i].isEmpty())
+        {
+            bankSource[(size_t) i] = source;
+            bankName[(size_t) i]   = name.isNotEmpty() ? name : juce::String ("scale");
+            return;
+        }
+}
+
+void FractalAdditiveAudioProcessor::bankClearSlot (int slot0)
+{
+    if (! juce::isPositiveAndBelow (slot0, kBankSlots)) return;
+    bankSource[(size_t) slot0].clear();
+    bankName[(size_t) slot0].clear();
+    if (getTuningBankSlotParam() == slot0 + 1)
+        setTuningBankSlotParam (0); // the removed slot was selected -> back to "none"
 }
 
 void FractalAdditiveAudioProcessor::clearScala()
@@ -528,6 +557,7 @@ juce::String FractalAdditiveAudioProcessor::getTimbreStatus() const
 bool FractalAdditiveAudioProcessor::generateDissonanceScale (int count, bool useMaxima,
                                                              double periodRatio,
                                                              const juce::String& periodSclLine,
+                                                             double minGapCents,
                                                              juce::String& errorOut)
 {
     count = juce::jlimit (1, 24, count);
@@ -563,7 +593,27 @@ bool FractalAdditiveAudioProcessor::generateDissonanceScale (int count, bool use
     }
 
     const auto curve = dissonance::dissonanceCurve (spec, periodRatio, 1.0);
-    const auto found = dissonance::pickExtremes (spec, curve, count, useMaxima, periodRatio);
+    auto found = dissonance::pickExtremes (spec, curve, count, useMaxima, periodRatio);
+    // Minimum-interval rule (default 33c): drop extremes closer than minGap to their
+    // neighbour (keeping the stronger one), to the tonic, or to the period.
+    if (minGapCents > 0.0 && ! found.empty())
+    {
+        const double periodCents = 1200.0 * std::log2 (periodRatio);
+        std::vector<dissonance::ExtremeInfo> kept;
+        for (const auto& e : found) // found is sorted ascending by ratio
+        {
+            const double c = 1200.0 * std::log2 (e.ratio);
+            if (c < minGapCents || periodCents - c < minGapCents) continue;
+            if (! kept.empty() && c - 1200.0 * std::log2 (kept.back().ratio) < minGapCents)
+            {
+                const bool better = useMaxima ? e.value > kept.back().value
+                                              : e.value < kept.back().value;
+                if (better) kept.back() = e;
+            }
+            else kept.push_back (e);
+        }
+        found = std::move (kept);
+    }
     if (found.empty())
     {
         errorOut = juce::String ("This timbre's dissonance curve has no interior ")
@@ -595,6 +645,7 @@ bool FractalAdditiveAudioProcessor::generateDissonanceScale (int count, bool use
 
     lastDissScl  = scl;
     lastDissName = name;
+    bankAutoAdd (name, scl);
 
     // Degree list for the UI: degree i+1 = i-th interval ascending; plus the
     // period as degree 0 (its height anchors the green end of the gradient).
@@ -803,7 +854,8 @@ bool FractalAdditiveAudioProcessor::saveGeneratedScl (const juce::File& f, juce:
 // N-note chord search (Sethares union measure) - background worker.
 bool FractalAdditiveAudioProcessor::startChordSearch (int notes, double periodRatio,
                                                       const juce::String& periodSclLine,
-                                                      int count, bool maxima, juce::String& errorOut)
+                                                      int count, bool maxima, double minGapCents,
+                                                      juce::String& errorOut)
 {
     notes = juce::jlimit (2, 8, notes);
     count = juce::jlimit (1, 24, count);
@@ -846,10 +898,10 @@ bool FractalAdditiveAudioProcessor::startChordSearch (int notes, double periodRa
     chordRunning       = true;
 
     chordThread = std::make_unique<std::thread> (
-        [this, spec = std::move (spec), periodRatio, notes, count, maxima,
+        [this, spec = std::move (spec), periodRatio, notes, count, maxima, minGapCents,
          periodLine = periodSclLine]()
         {
-            auto res = dissonance::searchChords (spec, periodRatio, notes, count, maxima,
+            auto res = dissonance::searchChords (spec, periodRatio, notes, count, maxima, minGapCents,
                 [this] (float p) { chordProgress.store (p); return ! chordCancel.load(); });
             {
                 const juce::ScopedLock sl (chordLock);
@@ -904,6 +956,138 @@ bool FractalAdditiveAudioProcessor::loadChordAsScale (int index, juce::String& e
     clearSegmentSource(); // a chord scale replaces any segment mapping
     lastDissScl  = scl;
     lastDissName = name;
+    bankAutoAdd (name, scl);
+    return true;
+}
+
+//==============================================================================
+// Scale editing on the keyboard (any tuning -> .scl form, then edit + reload).
+juce::String FractalAdditiveAudioProcessor::currentTuningAsScl (const juce::String& name) const
+{
+    const int D = juce::jmax (1, tuning.degreesPerPeriod());
+    juce::String scl;
+    scl << "! Edited in Fibló Galàctic\n" << name << "\n " << D << "\n!\n";
+    for (int d = 1; d <= D; ++d)
+    {
+        long long p = 1, q = 1;
+        if (getDegreeIsRational (d, p, q))
+            scl << " " << juce::String (p) << "/" << juce::String (q) << "\n";
+        else
+            scl << " " << juce::String (1200.0 * std::log2 (juce::jmax (1.0e-9, getDegreeRatio (d))), 5) << "\n";
+    }
+    return scl;
+}
+
+bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce::String& errorOut)
+{
+    const int    D      = juce::jmax (1, tuning.degreesPerPeriod());
+    const double period = getDegreeRatio (D);
+    if (! (period > 1.0001) || ! (ratioFromTonic > 0.0) || ! std::isfinite (ratioFromTonic))
+    {
+        errorOut = "Invalid pitch.";
+        return false;
+    }
+    // Fold into [1, period): the note joins EVERY repetition of the period.
+    double r = ratioFromTonic;
+    while (r >= period) r /= period;
+    while (r < 1.0)     r *= period;
+
+    // Existing degrees (rationals preserved as text) + the new one, sorted.
+    struct Deg { double ratio; juce::String text; };
+    std::vector<Deg> degs;
+    for (int d = 1; d < D; ++d)
+    {
+        long long p = 1, q = 1;
+        const double dr = getDegreeRatio (d);
+        degs.push_back ({ dr, getDegreeIsRational (d, p, q)
+                                  ? juce::String (p) + "/" + juce::String (q)
+                                  : juce::String (1200.0 * std::log2 (dr), 5) });
+    }
+    const double newCents = 1200.0 * std::log2 (r);
+    for (const auto& dg : degs) // duplicate (within half a cent) -> nothing to add
+        if (std::abs (1200.0 * std::log2 (dg.ratio) - newCents) < 0.5)
+        {
+            errorOut = "That pitch is already a degree of the scale.";
+            return false;
+        }
+    if (r > 1.0 + 1.0e-9)
+        degs.push_back ({ r, juce::String (newCents, 5) });
+    std::sort (degs.begin(), degs.end(), [] (const Deg& a, const Deg& b) { return a.ratio < b.ratio; });
+
+    long long pp = 1, pq = 1;
+    const juce::String periodText = getDegreeIsRational (D, pp, pq)
+                                        ? juce::String (pp) + "/" + juce::String (pq)
+                                        : juce::String (1200.0 * std::log2 (period), 5);
+    juce::String scl;
+    const auto name = (tuning.getScalaName().isNotEmpty() ? tuning.getScalaName() : juce::String ("scale")) + "+";
+    scl << "! Edited in Fibló Galàctic (note added)\n" << name << "\n " << (int) degs.size() + 1 << "\n!\n";
+    for (const auto& dg : degs) scl << " " << dg.text << "\n";
+    scl << " " << periodText << "\n";
+
+    if (! tuning.loadScalaString (scl, name, errorOut))
+        return false;
+    if (auto* p = apvts.getParameter ("tuningMode"))
+        p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
+    tuning.setMode (TuningManager::Mode::Scala);
+    clearSegmentSource();
+    lastDissScl = scl; lastDissName = name;
+    bankAutoAdd (name, scl);
+    return true;
+}
+
+bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::String& valueText,
+                                                      juce::String& errorOut)
+{
+    const int D = juce::jmax (1, tuning.degreesPerPeriod());
+    if (degree < 1 || degree > D)
+    {
+        errorOut = "The tonic is fixed at 1/1 - edit any other degree.";
+        return false;
+    }
+    double newRatio = 0.0;
+    TuningManager::DegreeSrc src;
+    if (! TuningManager::parsePitchSpec (valueText, newRatio, src) || ! (newRatio > 0.0))
+    {
+        errorOut = "Invalid value. Use cents with a decimal point (\"702.0\") or a ratio (\"3/2\").";
+        return false;
+    }
+
+    juce::String scl;
+    const auto name = (tuning.getScalaName().isNotEmpty() ? tuning.getScalaName() : juce::String ("scale")) + "*";
+    scl << "! Edited in Fibló Galàctic (degree " << degree << " changed)\n" << name << "\n " << D << "\n!\n";
+    for (int d = 1; d <= D; ++d)
+    {
+        if (d == degree)
+            scl << " " << valueText.trim() << "\n"; // the user's exact spec (keeps its source form)
+        else
+        {
+            long long p = 1, q = 1;
+            scl << " " << (getDegreeIsRational (d, p, q)
+                               ? juce::String (p) + "/" + juce::String (q)
+                               : juce::String (1200.0 * std::log2 (juce::jmax (1.0e-9, getDegreeRatio (d))), 5))
+                << "\n";
+        }
+    }
+    if (! tuning.loadScalaString (scl, name, errorOut))
+        return false;
+    if (auto* p = apvts.getParameter ("tuningMode"))
+        p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
+    tuning.setMode (TuningManager::Mode::Scala);
+    clearSegmentSource();
+    lastDissScl = scl; lastDissName = name;
+    bankAutoAdd (name, scl);
+    return true;
+}
+
+bool FractalAdditiveAudioProcessor::saveCurrentTuningScl (const juce::File& f, juce::String& errorOut)
+{
+    const auto scl = currentTuningAsScl (f.getFileNameWithoutExtension());
+    if (! f.replaceWithText (scl))
+    {
+        errorOut = "Could not write the file.";
+        return false;
+    }
+    addRecentScl (f);
     return true;
 }
 
@@ -972,7 +1156,8 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                         }
                     }
         noteGate.process (midiMessages, nSamp, qTempo, mono, qPulse,
-                          beatOff, beatPer, qPulse ? rhythm.samplesToNextReset() : -1.0);
+                          beatOff, beatPer, qPulse ? rhythm.samplesToNextReset() : -1.0,
+                          qPulse ? rhythm.samplesSinceAnchor()  : -1.0);
     }
     const bool midiOut  = apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f;
     const bool selfWant = apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f;
@@ -987,13 +1172,23 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         // TRIGGER - it drives the trains but does not sound (unless "note under pulses"
         // is on). NO feedback loop: rhythm.process reads the ORIGINAL played MIDI, never
         // its own pulse output, so pulses never spawn pulses.
+        // Drone ("note under pulses") lives on RESERVED channel 16: a pulse landing on
+        // the same channel+note would otherwise kill the drone voice with its gate
+        // note-off. Note-offs are forwarded ALWAYS (so switching the drone off with a
+        // note sounding can never strand its voice); note-ons/bends only while on.
         juce::MidiBuffer held;
-        held.addEvents (midiMessages, 0, nSamp, 0);        // keep the played notes (for the drone)
+        for (const auto meta : midiMessages)
+        {
+            auto m = meta.getMessage();
+            if (m.isNoteOff())                       { m.setChannel (16); held.addEvent (m, meta.samplePosition); }
+            else if (drone && (m.isNoteOn() || m.isPitchWheel() || m.isAftertouch() || m.isChannelPressure()))
+                                                     { m.setChannel (16); held.addEvent (m, meta.samplePosition); }
+        }
         rhythm.process (midiMessages, nSamp);              // midiMessages := pulse MIDI
 
         juce::MidiBuffer synthMidi;
         synthMidi.addEvents (midiMessages, 0, nSamp, 0);   // synth plays the pulses...
-        if (drone) synthMidi.addEvents (held, 0, nSamp, 0);// ...and the held note underneath if asked
+        synthMidi.addEvents (held, 0, nSamp, 0);           // ...and the drone channel (ch 16)
         synthMidi.addEvents (previewMidi, 0, nSamp, 0);    // chord preview always audible AS a chord
         synth.renderNextBlock (buffer, synthMidi, 0, nSamp);
 

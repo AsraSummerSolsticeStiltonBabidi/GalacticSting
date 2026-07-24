@@ -48,7 +48,8 @@ public:
     //              (< 0 = no pattern running)
     void process (juce::MidiBuffer& io, int numSamples,
                   bool qTempo, bool mono, bool qPulse,
-                  double beatOff, double beatPer, double resetOff)
+                  double beatOff, double beatPer, double resetOff,
+                  double sinceAnchor = -1.0)
     {
         // Fast path: nothing enabled and nothing pending -> just keep the active-note
         // tally in sync (so Mono works the instant it is switched on).
@@ -73,15 +74,24 @@ public:
         };
         const juce::int64 patternReset = (qPulse && resetOff >= 0.0)
                                        ? blockStart + (juce::int64) std::llround (resetOff) : -1;
+        // Pressed only a hair after the pattern started? Let it through NOW - the
+        // engine aligns its phases to the running grid, so it enters IN PHASE with a
+        // slightly advanced cycle instead of waiting a whole pattern.
+        const bool nearAnchor = sinceAnchor >= 0.0 && sinceAnchor <= 0.12 * sr;
 
         auto startTimeFor = [&] (juce::int64 pressedAt) -> juce::int64
         {
-            if (patternReset >= 0 && patternReset >= pressedAt)
+            // Quantize-to-pulse only defers while something IS sounding (activeN
+            // tracks that): with nothing held there is no pattern to join - deferring
+            // would just swallow clicks (press+release before the stale reset point).
+            if (patternReset >= 0 && patternReset >= pressedAt && activeN > 0 && ! nearAnchor)
                 return patternReset;             // join the running pattern on its 1
             return nextBeatAt (pressedAt);       // else the beat grid (or immediately)
         };
 
-        // Emit a note-on at `s` (block-relative), applying Mono first.
+        // Emit a note-on at `s` (block-relative), applying Mono first. A retrigger of
+        // an already-sounding note gets a pre-off so voices can never stack with only
+        // one note-off owed (the "eternal pulse").
         auto emitOn = [&] (int s, int note, int ch, juce::uint8 vel)
         {
             if (mono)
@@ -90,6 +100,14 @@ public:
                     out.addEvent (juce::MidiMessage::noteOff (active[i].ch, active[i].note), s);
                 activeN = 0;
             }
+            else
+                for (int i = 0; i < activeN; ++i)
+                    if (active[i].note == note && active[i].ch == ch)
+                    {
+                        out.addEvent (juce::MidiMessage::noteOff (ch, note), s);
+                        active[i] = active[--activeN];
+                        break;
+                    }
             out.addEvent (juce::MidiMessage::noteOn (ch, note, vel), s);
             if (activeN < kMaxActive) active[activeN++] = { note, ch };
         };
@@ -116,6 +134,12 @@ public:
 
             if (msg.isNoteOn())
             {
+                // A retrigger REPLACES any pending copy of the same key (two pendings
+                // sharing one future note-off was the stuck-note bug).
+                for (int i = 0; i < pendingN; ++i)
+                    if (pending[i].note == msg.getNoteNumber() && pending[i].ch == msg.getChannel())
+                    { pending[i] = pending[--pendingN]; break; }
+
                 const juce::int64 at  = blockStart + pos;
                 const juce::int64 due = startTimeFor (at);
                 if (due <= at)

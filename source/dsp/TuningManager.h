@@ -346,6 +346,11 @@ public:
     juce::String getScalaName()   const { return scalaName; }
     juce::String getScalaSource() const { return scalaSource; }
 
+    // Public wrapper over the .scl pitch-line parser ("702.0" cents / "3/2" ratio),
+    // for the keyboard's scale-editing prompts.
+    static bool parsePitchSpec (const juce::String& text, double& ratioOut, DegreeSrc& srcOut)
+    { return parsePitchSrc (text, ratioOut, srcOut); }
+
     // Name of the scale actually in effect (MTS master's, or the loaded .scl), for the UI.
     juce::String currentScaleName() const
     {

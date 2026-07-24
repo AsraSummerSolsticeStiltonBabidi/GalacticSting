@@ -1136,11 +1136,18 @@ private:
     juce::ToggleButton primeToggle[9], morphToggle;
     juce::Slider       morphTimeFader;
     juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
+    juce::TextButton   undoB, redoB; // parameter undo/redo (Ctrl-Z / Ctrl-Y), bottom-right above the keyboard
+    int                undoTxnTick = 0; // groups edits into ~1s undo transactions
+    // The three envelopes share ONE compact box; these chips switch which one shows.
+    juce::TextButton   envTabB[3];
+    int                envTab = 0; // 0 = Volume, 1 = Pitch, 2 = Filter
     juce::TextButton   rhythmBtn;  // top-bar: opens the spectrum->rhythm MIDI panel
     juce::TextButton   octDn, octUp, sprDn, sprUp; // OCTAVE cell: -1/+1 steppers
     juce::Label        octVal, sprVal;             // their value read-outs
+    juce::TextButton saveTuningBtn; // save the CURRENT tuning (any mode) as .scl to a chosen folder
     juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
-                     langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3], tuningBankLoadBtn;
+                     langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3], tuningBankLoadBtn,
+                     tuningBankClearBtn;
     juce::Label          vibeLabel;   // "Vibe coded by" credit, left of the language button
     juce::HyperlinkButton vibeLink;   // "Asra3" -> Instagram
     juce::TextEditor periodEdit;
@@ -1158,6 +1165,9 @@ private:
     juce::ComboBox   chordNotesBox, chordCountBox, chordMinMaxBox;
     juce::Label      chordNotesLbl, chordPerLbl, chordProgLbl;
     juce::TextEditor chordPeriodEdit;
+    // Minimum interval between generated notes (cents, default 33) - both creators.
+    juce::TextEditor dissMinEdit, chordMinEdit;
+    juce::Label      dissMinLbl, chordMinLbl;
     juce::TextButton chordGoBtn;
     ChordList        chordList;
     juce::Viewport   chordView;

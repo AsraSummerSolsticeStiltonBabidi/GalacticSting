@@ -416,20 +416,82 @@ int main()
         check (any64,    "mono: the NEW note's pulses take over");
         check (! late60, "mono: the previous note's pulses STOP when the new one starts");
 
-        // (c) Quantize to pulse: 60 held from 0 (single train, period 23484 = the
-        //     pattern cycle); 64 pressed at ~5000 in All-notes mode must join exactly
-        //     at the pattern reset (23484), where its own downbeat fires.
+        // (c) Quantize to pulse, NEAR-simultaneous press: 64 at ~5000 (within the
+        //     ~120ms window) enters IMMEDIATELY but PHASE-ALIGNED: its train behaves
+        //     as if it had started AT the shared anchor (t=0), so its first pulse
+        //     lands on ITS OWN first grid crossing = one 64-period from the anchor.
         resetState();
         setParam ("rhythmQPulse", 1.0f);
         setParam ("rhythmMode", 1.0f); // All notes: each held note drives its own copy
+        const double f64  = 261.6255653 * std::pow (2.0, 4.0 / 12.0);
+        const int    per64 = (int) std::llround (sr / juce::jlimit (0.01, 30.0, f64 * 2.0 / 256.0));
         auto evC = run ((int) (1.2 * sr / blk),
                         { { 0,    juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100) },
                           { 5000, juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100) } });
         int first64 = -1;
         for (const auto& e : evC) if (e.note == 64 && first64 < 0) first64 = e.sample;
-        std::printf ("   qPulse: note 64 first pulse at %d (expect ~23484) ==\n", first64);
-        check (first64 >= 0 && std::abs (first64 - 23484) <= 2,
-               "quantize-to-pulse: the new note joins EXACTLY when the pattern resets on the 1");
+        std::printf ("   qPulse near-press: note 64 first pulse at %d (expect ~%d)\n", first64, per64);
+        check (first64 >= 0 && std::abs (first64 - per64) <= 2,
+               "quantize-to-pulse: a near-simultaneous joiner enters IN PHASE on the shared grid");
+
+        // (d) Quantize to pulse, LATE press: 64 at 40000 (past the window) waits for
+        //     the pattern reset at 2 x 23484 = 46968 and enters exactly there.
+        resetState();
+        setParam ("rhythmQPulse", 1.0f);
+        setParam ("rhythmMode", 1.0f);
+        auto evD = run ((int) (1.5 * sr / blk),
+                        { { 0,     juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100) },
+                          { 40000, juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100) } });
+        int firstD = -1;
+        for (const auto& e : evD) if (e.note == 64 && firstD < 0) firstD = e.sample;
+        std::printf ("   qPulse late press: note 64 first pulse at %d (expect ~46968)\n", firstD);
+        check (firstD >= 0 && std::abs (firstD - 46968) <= 2,
+               "quantize-to-pulse: a late joiner waits for the pattern reset on the 1");
+
+        // (e) Mouse-style sequence (off 60 then on 64 in the same block) with qPulse
+        //     on: nothing is left sounding, so 64 must start PROMPTLY (this was the
+        //     everything-goes-silent bug: the stale reset point swallowed the click).
+        resetState();
+        setParam ("rhythmQPulse", 1.0f);
+        setParam ("rhythmMode", 1.0f);
+        auto evE = run ((int) (1.0 * sr / blk),
+                        { { 0,     juce::MidiMessage::noteOn  (1, 60, (juce::uint8) 100) },
+                          { 30000, juce::MidiMessage::noteOff (1, 60) },
+                          { 30010, juce::MidiMessage::noteOn  (1, 64, (juce::uint8) 100) } });
+        int firstE = -1;
+        for (const auto& e : evE) if (e.note == 64 && firstE < 0) firstE = e.sample;
+        std::printf ("   qPulse click-to-click: note 64 first pulse at %d (expect ~30010)\n", firstE);
+        check (firstE >= 0 && firstE - 30010 <= blk,
+               "quantize-to-pulse: with nothing sounding a new click starts promptly (no swallowed notes)");
+
+        // (f) Rapid RETRIGGER of the same key with qPulse on must leave nothing
+        //     hanging (duplicate-pending stuck-note bug).
+        resetState();
+        setParam ("rhythmQPulse", 1.0f);
+        std::map<int,int> netR;
+        {
+            std::vector<std::pair<int,juce::MidiMessage>> evs = {
+                { 0,     juce::MidiMessage::noteOn  (1, 60, (juce::uint8) 100) },
+                { 30000, juce::MidiMessage::noteOn  (1, 64, (juce::uint8) 100) }, // deferred
+                { 30500, juce::MidiMessage::noteOn  (1, 64, (juce::uint8) 100) }, // retrigger replaces pending
+                { 31000, juce::MidiMessage::noteOff (1, 64) },                    // cancels it entirely
+                { 60000, juce::MidiMessage::noteOff (1, 60) } };
+            for (int b = 0; b < (int) (2.0 * sr / blk); ++b)
+            {
+                juce::MidiBuffer midi;
+                for (auto& [atSample, m] : evs) if (atSample / blk == b) midi.addEvent (m, atSample % blk);
+                proc.processBlock (audio, midi);
+                fph.samplePos += blk;
+                for (const auto meta : midi)
+                {
+                    const auto m = meta.getMessage();
+                    if (m.isNoteOn())  netR[(m.getChannel()<<8)|m.getNoteNumber()]++;
+                    if (m.isNoteOff()) netR[(m.getChannel()<<8)|m.getNoteNumber()]--;
+                }
+            }
+        }
+        int hangR = 0; for (const auto& kv : netR) if (kv.second > 0) hangR += kv.second;
+        check (hangR == 0, "qPulse retrigger + early release leaves NOTHING hanging (eternal-pulse fix)");
 
         proc.setPlayHead (nullptr);
         setParam ("rhythmQTempo", 0.0f); setParam ("rhythmMono", 0.0f); setParam ("rhythmQPulse", 0.0f);
