@@ -216,6 +216,12 @@ public:
     //==========================================================================
     // Scale EDITING on the keyboard. Works from ANY loaded tuning (the current
     // tuning is first rendered to .scl form, degree sources preserved).
+    //==========================================================================
+    // CUSTOM envelope -> any parameter (right-click a fader to map). Runs on the
+    // message-thread timer; the target is stored by paramID (persisted).
+    void setCustomEnvTarget (const juce::String& paramID); // empty = unmap
+    juce::String getCustomEnvTarget() const { return custEnvTargetID; }
+
     juce::String currentTuningAsScl (const juce::String& name) const; // rationals stay ratios, rest cents
     bool addNoteToTuning  (double ratioFromTonic, juce::String& errorOut);   // ctrl+click: folded into the period, sorted
     bool editTuningDegree (int degree, const juce::String& valueText, juce::String& errorOut); // right-click (Scala mode)
@@ -329,6 +335,12 @@ private:
                                                    // re-label old results until its worker publishes)
     juce::String chordPeriodSclLine { "2/1" };
     double       chordPeriodRatio = 2.0;
+
+    // Custom-envelope state (message thread; the ADSR steps at the 30 Hz timer).
+    juce::String custEnvTargetID;
+    juce::ADSR   custEnv;
+    bool         custHeldPrev = false;
+    float        custLastSent = -1.0f;
     std::vector<DissDegreeInfo> dissDegrees;
     double dissGreenH = 0.0, dissRedH = 1.0;
     int    dissRequested = 0, dissFound = 0, dissGeneration = 0;

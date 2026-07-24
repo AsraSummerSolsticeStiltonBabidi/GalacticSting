@@ -122,6 +122,25 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         ParameterID { "masterGain", 1 }, "Master Gain",
         NormalisableRange<float> (-60.0f, 6.0f, 0.01f), 0.0f));
 
+    //-- CUSTOM envelope: a note-driven ADSR mappable onto ANY parameter ---------
+    // (right-click a fader -> "Map to custom envelope"). Start = where the target
+    // sits at rest (normalized); Range = how far the envelope moves it (+-).
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "custEnvAttack", 1 }, "Custom Env Attack", timeRange (5.0f), 0.100f));
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "custEnvDecay", 1 }, "Custom Env Decay", timeRange (5.0f), 0.300f));
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "custEnvSustain", 1 }, "Custom Env Sustain",
+        NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.70f));
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "custEnvRelease", 1 }, "Custom Env Release", timeRange (8.0f), 0.400f));
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "custEnvStart", 1 }, "Custom Env Start",
+        NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.5f));
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "custEnvRange", 1 }, "Custom Env Range",
+        NormalisableRange<float> (-1.0f, 1.0f, 0.001f), 0.5f));
+
     //-- Filter + filter envelope ----------------------------------------------
     // Cutoff is an INTERVAL above the played note (cents, 1200 = one octave), not
     // absolute Hz: the filter tracks the note, so it always cuts the SAME partials
@@ -299,6 +318,38 @@ void FractalAdditiveAudioProcessor::timerCallback()
     {
         spectrumEngine.requestRebuild (s);
         lastPushed = s;
+    }
+
+    // CUSTOM envelope -> mapped parameter: a monophonic ADSR gated by "any note
+    // held" (the rhythm engine's atomic driver read-out), stepped at this 30 Hz
+    // timer over [start, start + range] of the target's normalized range. A step is
+    // only SENT when the quantized value moves, so undo history stays usable.
+    if (custEnvTargetID.isNotEmpty())
+    {
+        juce::ADSR::Parameters ap;
+        ap.attack  = apvts.getRawParameterValue ("custEnvAttack")->load();
+        ap.decay   = apvts.getRawParameterValue ("custEnvDecay")->load();
+        ap.sustain = apvts.getRawParameterValue ("custEnvSustain")->load();
+        ap.release = apvts.getRawParameterValue ("custEnvRelease")->load();
+        custEnv.setParameters (ap);
+        const bool held = rhythm.getDriverF0() > 0.0f;
+        if (held != custHeldPrev)
+        {
+            held ? custEnv.noteOn() : custEnv.noteOff();
+            custHeldPrev = held;
+        }
+        const float v = custEnv.getNextSample();
+        if (auto* p = apvts.getParameter (custEnvTargetID))
+        {
+            const float start = apvts.getRawParameterValue ("custEnvStart")->load();
+            const float range = apvts.getRawParameterValue ("custEnvRange")->load();
+            const float tgt   = juce::jlimit (0.0f, 1.0f, start + v * range);
+            if (std::abs (tgt - custLastSent) > 0.004f)
+            {
+                custLastSent = tgt;
+                p->setValueNotifyingHost (tgt);
+            }
+        }
     }
 
     // Segment scale tracks the timbre live: whenever the spectrum template changes
@@ -1079,6 +1130,17 @@ bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::St
     return true;
 }
 
+void FractalAdditiveAudioProcessor::setCustomEnvTarget (const juce::String& paramID)
+{
+    if (paramID.startsWith ("custEnv")) return; // never self-modulate
+    custEnvTargetID = paramID;
+    custLastSent    = -1.0f;
+    if (paramID.isNotEmpty())
+        if (auto* p = apvts.getParameter (paramID))
+            if (auto* sp = apvts.getParameter ("custEnvStart"))
+                sp->setValueNotifyingHost (p->getValue()); // the movement starts where the knob sits now
+}
+
 bool FractalAdditiveAudioProcessor::saveCurrentTuningScl (const juce::File& f, juce::String& errorOut)
 {
     const auto scl = currentTuningAsScl (f.getFileNameWithoutExtension());
@@ -1108,6 +1170,7 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     applyTuningMode ((int) apvts.getRawParameterValue ("tuningMode")->load());
     rhythm.prepare (sampleRate);
 
+    custEnv.setSampleRate (30.0); // the custom envelope steps once per timer tick
     startTimerHz (30); // poll spectrum params and rebuild off the audio thread
 }
 
@@ -1290,6 +1353,14 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
             state.appendChild (ry, nullptr);
     }
 
+    // Custom-envelope mapping target (by paramID).
+    if (custEnvTargetID.isNotEmpty())
+    {
+        juce::ValueTree ce ("CUSTENV");
+        ce.setProperty ("target", custEnvTargetID, nullptr);
+        state.appendChild (ce, nullptr);
+    }
+
     // "From spectrum's segment": the mode, the picked partials, the period spec, and
     // the generated .scl text (so the picker + Save survive a reopen; the tuning
     // itself already persists via the SCALA child).
@@ -1315,6 +1386,10 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
         return;
 
     apvts.replaceState (tree);
+
+    // Custom-envelope mapping target.
+    custEnvTargetID = tree.getChildWithName ("CUSTENV").getProperty ("target").toString();
+    custLastSent = -1.0f;
 
     // Rhythm (spectrum->MIDI) slots.
     for (auto& s : rhythm.slots)

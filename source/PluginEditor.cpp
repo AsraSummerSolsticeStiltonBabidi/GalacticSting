@@ -89,18 +89,25 @@ namespace
         if (p * q <= 150 && std::abs (d.cents - 1200.0 * std::log2 ((double) p / (double) q)) < 0.3)
         { d.genuine = true; d.p = p; d.q = q; return d; } // float-exact (e.g. a dissonance-curve pick)
 
-        long long ap = 1, aq = 1;
-        dissonance::bestFraction (ratio, ap, aq, 16); // SIMPLE nearest interval only
-        const double aerr = d.cents - 1200.0 * std::log2 ((double) ap / (double) aq);
-        // The "≈ p/q *" hint appears as a function of the nearby ratio's SIMPLICITY
-        // and of the proximity: VERY simple ratios get a wide window (so 697c AND the
-        // 12-EDO fifth both show "≈ 3/2", and the 12-EDO third shows "≈ 5/4 (+14c)" -
-        // the famous syntonic-comma gap), moderately simple ones a medium window
-        // (200c -> "≈ 9/8 (+4c)"), complex ones only a hair's width.
-        const double simp = (double) (ap * aq);
-        const double tol  = simp <= 36.0 ? 17.0 : (simp <= 80.0 ? 8.0 : 3.5);
-        if (std::abs (aerr) <= tol)
-        { d.hasApprox = true; d.ap = ap; d.aq = aq; d.approxErr = (int) std::llround (aerr); }
+        // The "≈ p/q" hint: scan the SIMPLE fractions directly (denominators 1..12)
+        // and prefer the SIMPLEST one whose distance fits its simplicity window - very
+        // simple ratios get ~17c (697c AND 700c -> "≈ 3/2"; 400c -> "≈ 5/4 (+14c)";
+        // 800c -> "≈ 8/5 (-14c)"), moderately simple ones ~8c (200c -> "≈ 9/8"),
+        // complex ones only a hair. A continued-fraction "best" pick would prefer
+        // obscure closer fractions (800c is nearer 19/12 than 8/5) - not helpful.
+        long long bestP = 0, bestQ = 1; double bestErr = 0.0; double bestSimp = 1.0e18;
+        for (long long q2 = 1; q2 <= 12; ++q2)
+        {
+            const long long p2 = (long long) std::llround (ratio * (double) q2);
+            if (p2 <= 0 || std::gcd (p2, q2) != 1) continue;
+            const double err  = d.cents - 1200.0 * std::log2 ((double) p2 / (double) q2);
+            const double simp = (double) (p2 * q2);
+            const double tol  = simp <= 40.0 ? 17.0 : (simp <= 80.0 ? 8.0 : 3.5);
+            if (std::abs (err) <= tol && simp < bestSimp)
+            { bestSimp = simp; bestP = p2; bestQ = q2; bestErr = err; }
+        }
+        if (bestP > 0)
+        { d.hasApprox = true; d.ap = bestP; d.aq = bestQ; d.approxErr = (int) std::llround (bestErr); }
         return d;
     }
     // Compact scale-degree label: the exact ratio when genuine, else its cents (with a
@@ -630,6 +637,26 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         makeLabel (pitchAdsrLbl[i], cPitch);  pitchAdsrLbl[i].setText (adsrTxt[i], juce::dontSendNotification);
     }
 
+    // CUSTOM envelope tab: A D S R + the movement's Start and Range on the mapped
+    // parameter (map any fader via right-click -> "Map to custom envelope").
+    {
+        const juce::Colour cCustom (0xff9a7bff);
+        const char* custIds[] = { "custEnvAttack", "custEnvDecay", "custEnvSustain", "custEnvRelease" };
+        for (int i = 0; i < 4; ++i)
+        {
+            configFader (custAdsr[i], custIds[i], custAdsrAtt[i], cCustom, "Custom envelope");
+            custAdsr[i].setName (adsrTxt[i]);
+            makeLabel (custAdsrLbl[i], cCustom);
+            custAdsrLbl[i].setText (adsrTxt[i], juce::dontSendNotification);
+        }
+        configFader (custStartFader, "custEnvStart", custStartAtt, cCustom,
+                     "Where the mapped parameter SITS at rest (normalized 0-1). Set automatically to the knob's position when you map it.");
+        configFader (custRangeFader, "custEnvRange", custRangeAtt, cCustom,
+                     "How far the envelope MOVES the mapped parameter (+/- of its full range).");
+        makeLabel (lblCustStart, cCustom);
+        makeLabel (lblCustRange, cCustom);
+    }
+
     // Tuning (scale) + Recent .scl.
     configGroup (gTuning, cTuning);
     configCombo (tuningBox, "tuningMode", tuningAtt, cTuning,
@@ -769,8 +796,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     };
     addAndMakeVisible (menuButton);
 
-    // Envelope tabs: Volume / Pitch / Filter share one compact box.
-    for (int k = 0; k < 3; ++k)
+    // Envelope tabs: Amp / Pitch / Filter / Custom share one compact box.
+    for (int k = 0; k < 4; ++k)
     {
         envTabB[k].setMouseClickGrabsKeyboardFocus (false);
         envTabB[k].onClick = [this, k] { envTab = k; resized(); repaint(); refocus(); };
@@ -1180,11 +1207,9 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             return "= " + juce::String (di.cents, 1) + tr (" cents", " cents");
 
         juce::String s;
-        if (di.hasApprox) // tempered, near a simple ratio: the hint + what the * means
+        if (di.hasApprox) // tempered, near a simple ratio: just the hint
             s << "\xe2\x89\x88 " << juce::String (di.ap) << "/" << juce::String (di.aq)
-              << " (" << (di.approxErr >= 0 ? "+" : "-") << juce::String (std::abs (di.approxErr)) << "c) *"
-              << tr ("\n* approximate: this degree is defined in cents, not as a ratio.",
-                     "\n* aproximat: aquest grau est\xc3\xa0 definit en cents, no com a ratio.");
+              << " (" << (di.approxErr >= 0 ? "+" : "-") << juce::String (std::abs (di.approxErr)) << "c)";
         return s;
     });
     // Segment scales: append the hovered degree's SOURCE partial to the hover window
@@ -1484,12 +1509,19 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     gFilter.setText        (tr ("Filter", "Filtre"));
     gAmpEnv.setText        (tr ("Envelopes", "Envolupants")); // shared chip-tabbed box
     gPitchEnv.setText      (tr ("Pitch Envelope", "Envolupant to"));
-    envTabB[0].setButtonText (tr ("VOLUME", "VOLUM"));
+    envTabB[0].setButtonText (tr ("AMP",    "AMP"));
     envTabB[1].setButtonText (tr ("PITCH",  "TO"));
     envTabB[2].setButtonText (tr ("FILTER", "FILTRE"));
+    envTabB[3].setButtonText (tr ("CUSTOM", "CUSTOM"));
     for (auto* b : { &envTabB[0], &envTabB[1], &envTabB[2] })
-        b->setTooltip (tr ("The three envelopes share this box - click a title to switch.",
-                           "Les tres envolupants comparteixen aquesta caixa - clica un t\xc3\xadtol per canviar."));
+        b->setTooltip (tr ("The envelopes share this box - click a title to switch.",
+                           "Les envolupants comparteixen aquesta caixa - clica un t\xc3\xadtol per canviar."));
+    envTabB[3].setTooltip (processorRef.getCustomEnvTarget().isEmpty()
+        ? tr ("CUSTOM envelope: right-click ANY fader and choose \"Map to custom envelope\" - this ADSR then drives that parameter from Start over Range on every note.",
+              "Envolupant CUSTOM: clic dret a QUALSEVOL fader i tria \"Map to custom envelope\" - aquest ADSR mou aquell par\xc3\xa0metre des de Start sobre Range a cada nota.")
+        : tr ("Custom envelope -> ", "Envolupant custom -> ") + processorRef.getCustomEnvTarget());
+    lblCustStart.setText (tr ("Start", "Inici"), dontSendNotification);
+    lblCustRange.setText (tr ("Range", "Rang"),  dontSendNotification);
     gTuning.setText        (tr ("Tuning", "Afinaci\xc3\xb3"));
     gTimbre.setText        (tr ("Custom Engine", "Motor propi"));
     intervalEdit.setTextToShowWhenEmpty (tr ("intervals: 3/2 2 700c ...", "intervals: 3/2 2 700c ..."),
@@ -2248,6 +2280,31 @@ void FractalAdditiveAudioProcessorEditor::configFader (juce::Slider& s, const ju
     // Double-click ANY fader = straight back to its default value.
     if (auto* prm = processorRef.apvts.getParameter (paramID))
         s.setDoubleClickReturnValue (true, prm->convertFrom0to1 (prm->getDefaultValue()));
+    // Right-click ANY fader -> map/unmap it as the CUSTOM envelope's target.
+    auto ml = std::make_unique<ParamMapListener>();
+    ml->ed = this; ml->pid = paramID;
+    s.addMouseListener (ml.get(), false);
+    mapListeners.push_back (std::move (ml));
+}
+
+// Right-click menu on any fader: route the CUSTOM envelope to that parameter (its
+// movement starts wherever the knob sits now; set the Range in the Custom tab).
+void FractalAdditiveAudioProcessorEditor::showEnvMapMenu (const juce::String& paramID)
+{
+    if (paramID.startsWith ("custEnv")) return;
+    const bool mapped = processorRef.getCustomEnvTarget() == paramID;
+    juce::PopupMenu m;
+    m.addItem (1, mapped ? tr ("Unmap from custom envelope", "Desassigna de l'envolupant custom")
+                         : tr ("Map to custom envelope", "Assigna a l'envolupant custom"));
+    m.showMenuAsync (juce::PopupMenu::Options(), [this, paramID, mapped] (int r)
+    {
+        if (r == 1)
+        {
+            processorRef.setCustomEnvTarget (mapped ? juce::String() : paramID);
+            if (! mapped) { envTab = 3; resized(); repaint(); } // jump to the Custom tab
+        }
+        refocus();
+    });
 }
 
 void FractalAdditiveAudioProcessorEditor::configCombo (juce::ComboBox& b, const juce::String& paramID,
@@ -2526,26 +2583,27 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
         if (dy)
         {
-            auto r1 = si.removeFromTop (24);
-            dissBtn.setBounds (r1.removeFromLeft (r1.getWidth() - 92).reduced (1, 0));
-            r1.removeFromLeft (3);
-            lblSteps.setJustificationType (juce::Justification::centredLeft);
-            lblSteps.setBounds (r1.removeFromLeft (38));
-            compact (dissCountBox, r1);
+            auto r1 = si.removeFromTop (24);   // Transmute | Save
+            dissSaveBtn.setBounds (r1.removeFromRight (88).reduced (0, 1));
+            r1.removeFromRight (4);
+            dissBtn.setBounds (r1.reduced (1, 0));
             si.removeFromTop (4);
-            auto r2 = si.removeFromTop (24);
-            lblPeriod.setJustificationType (juce::Justification::centredLeft);
-            lblPeriod.setBounds (r2.removeFromLeft (44));
-            periodEdit.setBounds (r2.removeFromLeft (36).reduced (0, 1));
-            r2.removeFromLeft (3);
+            auto r2 = si.removeFromTop (24);   // Min/Max | Steps (below Transmute)
             compact (dissModeBox, r2.removeFromLeft (54));
-            r2.removeFromLeft (3);
-            dissSaveBtn.setBounds (r2.reduced (0, 1));
+            r2.removeFromLeft (6);
+            lblSteps.setJustificationType (juce::Justification::centredLeft);
+            lblSteps.setBounds (r2.removeFromLeft (38));
+            compact (dissCountBox, r2);
             si.removeFromTop (4);
-            auto r3 = si.removeFromTop (22);
+            auto r3 = si.removeFromTop (24);   // Period
+            lblPeriod.setJustificationType (juce::Justification::centredLeft);
+            lblPeriod.setBounds (r3.removeFromLeft (44));
+            periodEdit.setBounds (r3.removeFromLeft (40).reduced (0, 1));
+            si.removeFromTop (4);
+            auto r4 = si.removeFromTop (22);   // smallest interval
             dissMinLbl.setJustificationType (juce::Justification::centredLeft);
-            dissMinLbl.setBounds (r3.removeFromLeft (112)); // "smallest interval (c)"
-            dissMinEdit.setBounds (r3.removeFromLeft (48).reduced (0, 1));
+            dissMinLbl.setBounds (r4.removeFromLeft (112));
+            dissMinEdit.setBounds (r4.removeFromLeft (48).reduced (0, 1));
         }
         else if (seg)
         {
@@ -2790,7 +2848,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // everything saved goes to the Tuning box on the right.
         {
             auto eb = row.removeFromLeft (juce::jmin (262, W * 24 / 100));
-            const juce::Colour tabCols[3] = { cEnv, cPitch, cFilter };
+            const juce::Colour tabCols[4] = { cEnv, cPitch, cFilter, juce::Colour (0xff9a7bff) };
             gAmpEnv.setColour (juce::GroupComponent::outlineColourId, tabCols[envTab]);
             gAmpEnv.setColour (juce::GroupComponent::textColourId,    tabCols[envTab]);
             gAmpEnv.setBounds (eb.reduced (3));   // title = "Envelopes" (set in applyLanguage)
@@ -2800,14 +2858,14 @@ void FractalAdditiveAudioProcessorEditor::resized()
             auto in = eb.reduced (3).reduced (5, 4);
             in.removeFromTop (17);                // clear the box title - chips sit BELOW it
             auto chips = in.removeFromTop (19);
-            const int cw3 = chips.getWidth() / 3;
-            for (int k = 0; k < 3; ++k)
+            const int cw4 = chips.getWidth() / 4;
+            for (int k = 0; k < 4; ++k)
             {
                 envTabB[k].setColour (juce::TextButton::buttonColourId,
                                       envTab == k ? tabCols[k] : tabCols[k].withAlpha (0.20f));
                 envTabB[k].setColour (juce::TextButton::textColourOffId,
                                       envTab == k ? juce::Colours::black : juce::Colour (0xffb9c0d0));
-                envTabB[k].setBounds (chips.removeFromLeft (k == 2 ? chips.getWidth() : cw3).reduced (1, 0));
+                envTabB[k].setBounds (chips.removeFromLeft (k == 3 ? chips.getWidth() : cw4).reduced (1, 0));
             }
             in.removeFromTop (4);
 
@@ -2817,10 +2875,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
             juce::Label*  labP[] = { &lblPitchAmt, &pitchAdsrLbl[0], &pitchAdsrLbl[1], &pitchAdsrLbl[2], &pitchAdsrLbl[3] };
             juce::Slider* setF[] = { &cutoffFader, &resFader, &fEnvAmtFader, &filtAdsr[0], &filtAdsr[1], &filtAdsr[2], &filtAdsr[3] };
             juce::Label*  labF[] = { &lblCutoff, &lblRes, &lblEnvAmt, &filtAdsrLbl[0], &filtAdsrLbl[1], &filtAdsrLbl[2], &filtAdsrLbl[3] };
-            juce::Slider** sets[] = { setV, setP, setF };
-            juce::Label**  labs[] = { labV, labP, labF };
-            const int counts[] = { 4, 5, 7 };
-            for (int t = 0; t < 3; ++t)
+            juce::Slider* setC[] = { &custAdsr[0], &custAdsr[1], &custAdsr[2], &custAdsr[3], &custStartFader, &custRangeFader };
+            juce::Label*  labC[] = { &custAdsrLbl[0], &custAdsrLbl[1], &custAdsrLbl[2], &custAdsrLbl[3], &lblCustStart, &lblCustRange };
+            juce::Slider** sets[] = { setV, setP, setF, setC };
+            juce::Label**  labs[] = { labV, labP, labF, labC };
+            const int counts[] = { 4, 5, 7, 6 };
+            for (int t = 0; t < 4; ++t)
             {
                 const bool on = t == envTab;
                 if (on)
@@ -3060,10 +3120,14 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
 
     // Keyboard hovers park their floating window ABOVE the keyboard (never covering
     // keys or the numbers over them) - keep the LnF's notion of that area current.
+    // NOTE: the TooltipWindow is parented to this editor, so getTooltipBounds works
+    // in EDITOR-LOCAL coordinates - feed it local rects/points, not screen ones.
     if (auto* gl = dynamic_cast<GalacticLnF*> (lnf.get()))
     {
-        gl->keyboardScreenArea = keyboard.getScreenBounds();
-        gl->hoverAnchor = keyboard.isHoverActive() ? keyboard.getHoverAnchorScreen() : juce::Point<int>();
+        gl->keyboardScreenArea = keyboard.getBounds();
+        gl->hoverAnchor = keyboard.isHoverActive()
+                              ? getLocalPoint (nullptr, keyboard.getHoverAnchorScreen())
+                              : juce::Point<int>();
     }
 
     // Chord preview: send the scheduled MIDI events whose time has come.

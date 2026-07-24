@@ -1145,9 +1145,22 @@ private:
     juce::Slider       morphTimeFader;
     juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
     int                undoTxnTick = 0; // groups edits into ~1s undo transactions (Ctrl-Z / Ctrl-Y)
-    // The three envelopes share ONE compact box; these chips switch which one shows.
-    juce::TextButton   envTabB[3];
-    int                envTab = 0; // 0 = Volume, 1 = Pitch, 2 = Filter
+    // The envelopes share ONE compact box; these chips switch which one shows.
+    juce::TextButton   envTabB[4];
+    int                envTab = 0; // 0 = Amp, 1 = Pitch, 2 = Filter, 3 = Custom
+    // CUSTOM envelope: mappable to any parameter (right-click a fader).
+    juce::Slider       custAdsr[4], custStartFader, custRangeFader;
+    juce::Label        custAdsrLbl[4], lblCustStart, lblCustRange;
+    std::unique_ptr<SliderAttachment> custAdsrAtt[4], custStartAtt, custRangeAtt;
+    void showEnvMapMenu (const juce::String& paramID);
+    struct ParamMapListener : juce::MouseListener
+    {
+        FractalAdditiveAudioProcessorEditor* ed = nullptr;
+        juce::String pid;
+        void mouseDown (const juce::MouseEvent& e) override
+        { if (e.mods.isRightButtonDown() && ed != nullptr) ed->showEnvMapMenu (pid); }
+    };
+    std::vector<std::unique_ptr<ParamMapListener>> mapListeners;
     juce::TextButton   rhythmBtn;  // top-bar: opens the spectrum->rhythm MIDI panel
     juce::TextButton   octDn, octUp, sprDn, sprUp; // OCTAVE cell: -1/+1 steppers
     juce::Label        octVal, sprVal;             // their value read-outs
