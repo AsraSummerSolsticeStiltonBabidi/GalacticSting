@@ -58,6 +58,18 @@ public:
     // the computer keyboard's left/right arrows to it.
     void scrollView (int deltaKeys) { scrollBy (deltaKeys); }
 
+    // Screen position of the hovered key's eye (top-centre of its strip cell), so the
+    // floating hover window can park right above it with a pointer down to the key.
+    // Returns (0,0) when nothing is hovered.
+    juce::Point<int> getHoverAnchorScreen() const
+    {
+        if (hoverCell < 0) return {};
+        const int aw = arrowW();
+        const float w = (float) keysWidth() / (float) juce::jmax (1, numCells());
+        return localPointToGlobal (juce::Point<int> (aw + (int) (((float) hoverCell + 0.5f) * w), 0));
+    }
+    bool isHoverActive() const noexcept { return hoverArmed && hoverCell >= 0; }
+
     // Optional: a short just-intonation label per degree (e.g. "3/2"), drawn
     // under the degree number - the interval each Sethares minimum lands on.
     void setDegreeLabeller (std::function<juce::String(int)> fn) { getLabel = std::move (fn); }
@@ -156,9 +168,7 @@ public:
             // Strip cell (above the key): hover deltas; the hovered key itself gets an
             // EYE whose pupil takes the key's colour (a "you are looking here" marker
             // that covers nothing - the strip is empty space). No hover: period Hz.
-            // Hovering a PERIOD key shows no per-key info (it is already on the keys).
-            const int  hoveredDeg  = hoveredNote >= 0 ? ((hoveredNote - kRefKey) % D + D) % D : -1;
-            const bool infoActive  = hoveredNote >= 0 && hoveredDeg != 0;
+            const bool infoActive  = hoveredNote >= 0;
             auto sc = juce::Rectangle<float> (aw + i * w, 0.0f, w, (float) stripH).reduced (1.5f, 3.0f);
             if (hoveredNote >= 0 && note == hoveredNote)
             {
@@ -203,10 +213,15 @@ public:
                 const double hz = getNoteHz (note);
                 if (hz > 0.0)
                 {
-                    g.setColour (juce::Colour (0xffc4ccda));
-                    g.setFont (juce::Font (juce::FontOptions (juce::jmin (11.0f, w * 0.34f)).withStyle ("Bold")));
-                    const juce::String t = hz >= 1000.0 ? juce::String (hz / 1000.0, 2) + "khz"
-                                                        : juce::String ((int) std::lround (hz)) + "hz";
+                    // MIDI C3 = the tuning's C3 reference itself: Essentials green + bold.
+                    const bool isRef = note == kRefKey;
+                    g.setColour (isRef ? juce::Colour (0xff4fe09a) : juce::Colour (0xffc4ccda));
+                    g.setFont (isRef
+                        ? juce::Font (juce::FontOptions (juce::jmin (12.0f, w * 0.36f)).withStyle ("Bold"))
+                        : juce::Font (juce::FontOptions (juce::jmin (11.0f, w * 0.34f))));
+                    const juce::String t = juce::String::fromUTF8 ("\xe2\x89\x88 ")
+                        + (hz >= 1000.0 ? juce::String (hz / 1000.0, 2) + "khz"
+                                        : juce::String ((int) std::lround (hz)) + "hz");
                     g.drawFittedText (t, sc.toNearestInt(), juce::Justification::centred, 1, 0.4f);
                 }
             }

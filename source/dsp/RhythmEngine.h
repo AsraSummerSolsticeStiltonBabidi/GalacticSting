@@ -631,6 +631,14 @@ private:
                             const int ch = trainChannel (i, j);
                             if (gateLeft[i][j] > 0)
                             { out.addEvent (juce::MidiMessage::noteOff (gateChn[i][j], gateNote[i][j]), s); gateLeft[i][j] = 0; }
+                            // Another column already gating the SAME channel+note (two
+                            // held notes whose steps land on one pitch): close it first,
+                            // or the receiver stacks two voices sharing one note-off -
+                            // the "eternal pulse".
+                            for (int j2 = 0; j2 < kMaxNotes; ++j2)
+                                if (j2 != j && gateLeft[i][j2] > 0
+                                    && gateNote[i][j2] == sendNote[i][j] && gateChn[i][j2] == ch)
+                                { out.addEvent (juce::MidiMessage::noteOff (ch, sendNote[i][j]), s); gateLeft[i][j2] = 0; }
                             if (mpeOut) // per-note bend BEFORE the note-on (MPE convention)
                                 out.addEvent (juce::MidiMessage::pitchWheel (ch, sendBend[i][j]), s);
                             out.addEvent (juce::MidiMessage::noteOn (ch, sendNote[i][j], velArr[i]), s);

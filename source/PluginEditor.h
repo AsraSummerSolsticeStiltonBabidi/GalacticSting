@@ -183,6 +183,14 @@ private:
         }
         void paint (juce::Graphics& g) override
         {
+            if (rows.empty())
+            {
+                g.setColour (juce::Colour (0xff8f96a8));
+                g.setFont (juce::Font (juce::FontOptions (12.5f)));
+                g.drawFittedText ("Transmute to search.\n\xe2\x96\xb6 hears a chord\ndouble-click loads it as the scale",
+                                  getLocalBounds().reduced (8), juce::Justification::centred, 4, 0.8f);
+                return;
+            }
             int y = 0, row = 0;
             for (const auto& r : rows)
             {
@@ -1136,8 +1144,7 @@ private:
     juce::ToggleButton primeToggle[9], morphToggle;
     juce::Slider       morphTimeFader;
     juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
-    juce::TextButton   undoB, redoB; // parameter undo/redo (Ctrl-Z / Ctrl-Y), bottom-right above the keyboard
-    int                undoTxnTick = 0; // groups edits into ~1s undo transactions
+    int                undoTxnTick = 0; // groups edits into ~1s undo transactions (Ctrl-Z / Ctrl-Y)
     // The three envelopes share ONE compact box; these chips switch which one shows.
     juce::TextButton   envTabB[3];
     int                envTab = 0; // 0 = Volume, 1 = Pitch, 2 = Filter
@@ -1167,7 +1174,10 @@ private:
     juce::TextEditor chordPeriodEdit;
     // Minimum interval between generated notes (cents, default 33) - both creators.
     juce::TextEditor dissMinEdit, chordMinEdit;
-    juce::Label      dissMinLbl, chordMinLbl;
+    juce::Label      dissMinLbl, chordMinLbl, chordCountLbl;
+    // Loaded-chord degree view: back (all chords) / forward (this chord's ranked degrees).
+    juce::TextButton chordViewBack, chordViewFwd;
+    bool             chordDegView = false;
     juce::TextButton chordGoBtn;
     ChordList        chordList;
     juce::Viewport   chordView;
