@@ -363,6 +363,48 @@ namespace
         // HEPTAGRAM - a 7-pointed star - used for every fader thumb. Drawn as a
         // 14-gon alternating the outer radius with an inner one, so it fills as a
         // solid star and its middle stays wide enough for the ADSR letter.
+        // SPIRAL knob, finished like the star thumbs: an almost-closed spiral with a
+        // pointer growing outwards from where its outer end sits, so the direction it
+        // points IS the value.
+        void drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h,
+                               float pos, float startAngle, float endAngle,
+                               juce::Slider& s) override
+        {
+            const auto col = s.findColour (juce::Slider::thumbColourId);
+            auto area = juce::Rectangle<float> ((float) x, (float) y, (float) w, (float) h);
+            const float r = juce::jmin (area.getWidth(), area.getHeight()) * 0.5f - 2.0f;
+            if (r <= 2.0f) return;
+            const auto c = area.getCentre();
+            const float ang = startAngle + pos * (endAngle - startAngle);
+
+            g.setColour (col.withAlpha (0.16f)); // seat
+            g.fillEllipse (c.x - r, c.y - r, r * 2.0f, r * 2.0f);
+
+            // The spiral itself: 2.25 turns growing from the middle out to r.
+            juce::Path sp;
+            constexpr int steps = 120;
+            constexpr float turns = 2.25f;
+            for (int i = 0; i <= steps; ++i)
+            {
+                const float t  = (float) i / (float) steps;
+                const float a  = -juce::MathConstants<float>::halfPi + t * turns * juce::MathConstants<float>::twoPi;
+                const float rr = r * (0.16f + 0.84f * t);
+                const juce::Point<float> p (c.x + rr * std::cos (a), c.y + rr * std::sin (a));
+                if (i == 0) sp.startNewSubPath (p); else sp.lineTo (p);
+            }
+            g.setColour (col);
+            g.strokePath (sp, juce::PathStrokeType (juce::jmax (1.4f, r * 0.14f),
+                                                    juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+            // The pointer: it leaves the spiral's outer rim and sticks out.
+            const juce::Point<float> from (c.x + r * 0.86f * std::cos (ang), c.y + r * 0.86f * std::sin (ang));
+            const juce::Point<float> to   (c.x + (r + 3.5f) * std::cos (ang), c.y + (r + 3.5f) * std::sin (ang));
+            g.setColour (juce::Colours::black.withAlpha (0.55f));
+            g.drawLine ({ from, to }, juce::jmax (3.0f, r * 0.30f));
+            g.setColour (col.brighter (0.35f));
+            g.drawLine ({ from, to }, juce::jmax (1.8f, r * 0.20f));
+        }
+
         static juce::Path heptagon (juce::Point<float> c, float r)
         {
             juce::Path p;
@@ -847,6 +889,15 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         configFader (lfoHzSlider, "modL1Hz", lfoHzAtt, cCustom, "Free LFO rate in Hz.");
         configFader (lfoPhaseSlider, "modL1Phase", lfoPhaseAtt, cCustom,
                      "Phase offset: where in the wave the oscillation starts.");
+        // The LFO values are KNOBS (spiral - see GalacticLnF::drawRotarySlider). This
+        // must come AFTER configFader, which sets a linear style.
+        for (auto* k : { &lfoDivSlider, &lfoHzSlider, &lfoPhaseSlider, &custRangeFader })
+        {
+            k->setSliderStyle (juce::Slider::RotaryVerticalDrag);
+            k->setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
+                                    juce::MathConstants<float>::pi * 2.75f, true);
+            k->setTextBoxStyle (juce::Slider::TextBoxBelow, false, 44, 13);
+        }
         makeLabel (lblLfoDiv, cCustom);   lblLfoDiv.setText ("Div", juce::dontSendNotification);
         makeLabel (lblLfoHz, cCustom);    lblLfoHz.setText ("Hz", juce::dontSendNotification);
         makeLabel (lblLfoPhase, cCustom); lblLfoPhase.setText ("Ph", juce::dontSendNotification);
@@ -3141,9 +3192,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
         chordViewBack.setVisible (chord && fromChord);
         chordViewFwd.setVisible  (chord && fromChord);
 
-        if (dy)
+        if (dy && ! fromCurrent)   // from-current-tuning needs none of these: it is live
         {
-            auto r1 = si.removeFromTop (24);   // Transmute | Save
+            auto r1 = si.removeFromTop (24);   // Find | Save
             dissSaveBtn.setBounds (r1.removeFromRight (88).reduced (0, 1));
             r1.removeFromRight (4);
             dissBtn.setBounds (r1.reduced (1, 0));
@@ -3176,7 +3227,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             si.removeFromTop (2);
             segHelpLbl.setBounds (si.removeFromTop (26));
         }
-        else // chord search: tidy stacked rows, each thing labelled
+        else if (chord) // chord search: tidy stacked rows, each thing labelled
         {
             auto r1 = si.removeFromTop (24);
             chordNotesLbl.setJustificationType (juce::Justification::centredLeft);
@@ -3520,7 +3571,27 @@ void FractalAdditiveAudioProcessorEditor::resized()
             const bool isEnv = modSel < 3;
             juce::Component* selRowC[] = { &modSelBox, &modOnT, &modUnmapBtn };
             for (auto* c : selRowC) c->setVisible (cust);
-            lfoWaveEditBtn.setVisible (cust && ! isEnv && lfoWaveBox.getSelectedId() == 6);
+            // Drawn wave: the editor OPENS BY ITSELF, docked to the right of this box,
+            // for as long as the selected LFO is on "Custom (draw)" - no button to
+            // find, and it disappears when you leave that LFO or change its wave.
+            const bool drawMode = cust && ! isEnv && lfoWaveBox.getSelectedId() == 6;
+            lfoWaveEditBtn.setVisible (false);
+            if (drawMode)
+            {
+                const int l = modSel - 3;
+                if (! waveEditor.isVisible() || lastDrawLfo != l)
+                {
+                    lastDrawLfo = l;
+                    waveEditor.fromText (processorRef.getLfoWavePoints (juce::jmax (0, l)));
+                }
+                auto box = eb;                       // the Modulators box
+                const int w = juce::jmin (300, getWidth() - box.getRight() - 12);
+                waveEditor.setBounds (box.getRight() + 6, box.getY(), juce::jmax (160, w),
+                                      juce::jmax (120, box.getHeight()));
+                waveEditor.setVisible (true);
+                waveEditor.toFront (false);
+            }
+            else { waveEditor.setVisible (false); lastDrawLfo = -1; }
             for (int i = 0; i < 4; ++i)
             { custAdsr[i].setVisible (false); custAdsrLbl[i].setVisible (false); } // replaced by the curve editor
             envEditor.setVisible (cust && isEnv);
@@ -3676,7 +3747,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
     if (recentOverlay.isVisible()) recentOverlay.toFront (false);
     rhythmScrim.setBounds (getLocalBounds());
     rhythmPanel.setBounds (getLocalBounds().withSizeKeepingCentre (820, 640));
-    waveEditor.setBounds (getLocalBounds().withSizeKeepingCentre (640, 360));
     rhythmScrim.toFront (false);
     rhythmPanel.toFront (false);
 }

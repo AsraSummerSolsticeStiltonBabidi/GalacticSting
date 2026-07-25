@@ -1795,6 +1795,7 @@ private:
     EnvEditor  envEditor;                           // the selected MODULATOR envelope, as a curve
     EnvEditor  voiceEnv;                            // the Amp / Pitch / Filter envelope, same editor
     int        voiceEnvTab = 0;                     // which one voiceEnv is showing
+    int        lastDrawLfo = -1;                    // which LFO the docked wave editor is on
     void attachCustomTab();                         // rebind attachments to the selected modulator
     void showEnvMapMenu (const juce::String& paramID);
     juce::String currentModParamId (const juce::String& templateId) const; // modE1A -> modE2A...
