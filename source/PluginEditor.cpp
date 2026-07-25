@@ -1361,8 +1361,11 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuneSourceBox.addItem ("From current tuning", 1);
     tuneSourceBox.addItem ("From all possible tunings", 2);
     tuneSourceBox.setSelectedId (1, juce::dontSendNotification);
-    tuneScopeBox.addItem ("Based on the beating between 0 and each other note", 1);
-    tuneScopeBox.addItem ("Based on all the beatings between each note and each other note", 2);
+    tuneScopeBox.addItem ("0 vs all", 1);
+    tuneScopeBox.addItem ("all vs all", 2);
+    tuneScopeBox.setTooltip (
+        "0 vs all: each note is judged only by its beating against the root (0).\n"
+        "all vs all: every pair of notes in the combination counts.");
     tuneScopeBox.setSelectedId (1, juce::dontSendNotification);
     for (auto* b : { &tuneSourceBox, &tuneScopeBox })
     {
@@ -1488,17 +1491,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     nadBox.setTooltip (tr (
         "What the list below shows: Degrees = each scale step against the tonic. Dyads, triads, tetrads... = EVERY combination of that many scale notes, ranked by total beating (all pairs counted, not just against 0).",
         "Qu\xc3\xa8 mostra la llista: Graus = cada pas contra la t\xc3\xb2nica. D\xc3\xad""ades, tr\xc3\xad""ades, t\xc3\xa8trades... = TOTES les combinacions d'aquest nombre de notes, ordenades pel batec total (tots els parells, no nom\xc3\xa9s contra el 0)."));
-    nadBox.onChange = [this]
-    {
-        if (nadBox.getSelectedId() > 1)
-        {
-            processorRef.startNadCompute (nadBox.getSelectedId());
-            lastNadSel = nadBox.getSelectedId(); // the timer must not re-spawn the
-            lastNadSig = lastScaleSig;           // worker it would immediately cancel
-        }
-        resized(); refocus();
-    };
-    addChildComponent (nadBox);
+    addChildComponent (nadBox); // kept for state; the shared "Notes" box drives it now
     nadView.setViewedComponent (&nadList, false);
     nadView.setScrollBarsShown (true, false);
     addChildComponent (nadView);
@@ -2161,10 +2154,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     specModeBox.setSelectedId (specModeBox.getSelectedId(), juce::dontSendNotification);
     localise (tuneSourceBox, { tr ("From current tuning", "De l'afinaci\xc3\xb3 actual"),
                                tr ("From all possible tunings", "De totes les afinacions possibles") });
-    localise (tuneScopeBox,  { tr ("Based on the beating between 0 and each other note",
-                                   "Pel batec entre 0 i cada altra nota"),
-                               tr ("Based on all the beatings between each note and each other note",
-                                   "Per tots els batecs entre cada nota i cada altra nota") });
+    localise (tuneScopeBox,  { tr ("0 vs all", "0 vs tot"), tr ("all vs all", "tot vs tot") });
     lastNadD = 0; // force the n-ad selector's items to rebuild in the new language
 
     // Chord-search mode texts.
@@ -2184,15 +2174,15 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Desa l'afinaci\xc3\xb3 ACTUAL com a fitxer .scl a qualsevol carpeta - incloses les escales editades al teclat (clic dret per reescriure un grau, Ctrl+clic per afegir una nota)."));
     chordGoBtn.setButtonText (tr ("Find", "Troba"));
     chordNotesBox.setTooltip (tr (
-        "How many notes each chord has (the root 1/1 is included). More notes = a heavier search - it runs in the background with a progress read-out.",
-        "Quantes notes t\xc3\xa9 cada acord (l'arrel 1/1 hi \xc3\xa9s inclosa). M\xc3\xa9s notes = cerca m\xc3\xa9s pesada - corre en segon pla amb progr\xc3\xa9s."));
+        "How many notes each combination has (the root 1/1 is included). From the current tuning it stops at the number of degrees the scale has; from all possible tunings it goes to 8. More notes = a heavier search.",
+        "Quantes notes t\xc3\xa9 cada combinaci\xc3\xb3 (l'arrel 1/1 hi \xc3\xa9s inclosa). Des de l'afinaci\xc3\xb3 actual arriba fins als graus que t\xc3\xa9 l'escala; des de totes les afinacions possibles arriba a 8. M\xc3\xa9s notes = cerca m\xc3\xa9s pesada."));
     chordCountBox.setTooltip (tr ("How many chords to list.", "Quants acords llistar."));
     chordMinMaxBox.setTooltip (tr (
         "Min = the most CONSONANT combinations with this exact timbre (Sethares sensory dissonance of all partial pairs). Max = the roughest.",
         "Min = les combinacions m\xc3\xa9s CONSONANTS amb aquest timbre exacte (disson\xc3\xa0ncia sensorial de Sethares de tots els parells de parcials). Max = les m\xc3\xa9s aspres."));
     chordPeriodEdit.setTooltip (tr (
-        "The chord notes are searched inside this period: an integer (\"3\"), a fraction (\"3/2\") or cents (\"1200.0c\").",
-        "Les notes de l'acord es cerquen dins d'aquest per\xc3\xado" "de: un enter (\"3\"), una fracci\xc3\xb3 (\"3/2\") o cents (\"1200.0c\")."));
+        "The period the search works in - write it as a whole number (\"3\"), a fraction (\"3/2\") or cents (\"1200c\", \"1200 cents\", or just \"1200\").",
+        "El per\xc3\xado" "de amb qu\xc3\xa8 treballa la cerca - escriu-lo com a nombre enter (\"3\"), fracci\xc3\xb3 (\"3/2\") o cents (\"1200c\", \"1200 cents\", o nom\xc3\xa9s \"1200\")."));
     chordGoBtn.setTooltip (tr (
         "Rank all n-note combinations by their Sethares sensory dissonance against the CURRENT spectrum (grid search + exact refinement, on a background thread). Play previews a chord; double-click loads it as the active scale (.scl).",
         "Ordena totes les combinacions de n notes per la seva disson\xc3\xa0ncia sensorial de Sethares contra l'espectre ACTUAL (cerca en graella + refinament exacte, en segon pla). Play pre-escolta un acord; doble clic el carrega com a escala activa (.scl)."));
@@ -3157,7 +3147,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
         const bool beat = mode == 1;                       // "Find tunings based on beating"
         const bool seg  = mode == 3;                       // From spectrum's segment
         const bool fromCurrent = tuneSourceBox.getSelectedId() != 2;
-        const bool allPairs    = tuneScopeBox.getSelectedId() == 2;
         const bool chord = beat && ! fromCurrent;          // the free chord search
         const bool dy    = beat && fromCurrent;            // combinations of this tuning
 
@@ -3176,47 +3165,28 @@ void FractalAdditiveAudioProcessorEditor::resized()
         }
         si.removeFromTop (1);
 
-        // Mode-gated visibility.
+        // Mode-gated visibility. BOTH beating sources now share ONE set of controls
+        // - Notes, Min/Max, Period, smallest interval - so the two submenus differ
+        // only in what they search, never in how they are operated. The old
+        // dyad-only row (Find/Save/Steps/Period/min) is superseded by them.
         juce::Component* sethC[]  = { &dissBtn, &dissCountBox, &lblSteps, &periodEdit, &dissModeBox, &dissSaveBtn, &lblPeriod,
                                       &dissMinEdit, &dissMinLbl };
         juce::Component* segC[]   = { &segView, &segPeriodEdit, &segTopToggle, &segPeriodLbl, &segHelpLbl };
-        juce::Component* chordC[] = { &chordNotesBox, &chordMinMaxBox, &chordNotesLbl,
-                                      &chordPerLbl, &chordProgLbl, &chordPeriodEdit, &chordGoBtn,
-                                      &chordMinEdit, &chordMinLbl };
-        // "From current tuning" updates live - no Find, and Save makes no sense there.
-        for (auto* c : sethC)  c->setVisible (dy && ! fromCurrent);
+        juce::Component* beatC[]  = { &chordNotesBox, &chordMinMaxBox, &chordNotesLbl,
+                                      &chordPerLbl, &chordPeriodEdit, &chordMinEdit, &chordMinLbl };
+        for (auto* c : sethC)  c->setVisible (false);
         for (auto* c : segC)   c->setVisible (seg);
-        for (auto* c : chordC) c->setVisible (chord);
+        for (auto* c : beatC)  c->setVisible (beat);
+        // "From current tuning" updates live: no Find button, and Save makes no sense.
+        chordGoBtn.setVisible   (chord);
+        chordProgLbl.setVisible (chord);
+        nadBox.setVisible (false); // the note count is the shared "Notes" box now
 
         const bool fromChord = processorRef.getGeneratedSclName().startsWith ("chord-");
         chordViewBack.setVisible (chord && fromChord);
         chordViewFwd.setVisible  (chord && fromChord);
 
-        if (dy && ! fromCurrent)   // from-current-tuning needs none of these: it is live
-        {
-            auto r1 = si.removeFromTop (24);   // Find | Save
-            dissSaveBtn.setBounds (r1.removeFromRight (88).reduced (0, 1));
-            r1.removeFromRight (4);
-            dissBtn.setBounds (r1.reduced (1, 0));
-            si.removeFromTop (4);
-            auto r2 = si.removeFromTop (24);   // Min/Max | Steps (below Transmute)
-            compact (dissModeBox, r2.removeFromLeft (78));
-            r2.removeFromLeft (6);
-            lblSteps.setJustificationType (juce::Justification::centredLeft);
-            lblSteps.setBounds (r2.removeFromLeft (40));
-            compact (dissCountBox, r2.removeFromLeft (52));
-            si.removeFromTop (4);
-            auto r3 = si.removeFromTop (24);   // Period
-            lblPeriod.setJustificationType (juce::Justification::centredLeft);
-            lblPeriod.setBounds (r3.removeFromLeft (44));
-            periodEdit.setBounds (r3.removeFromLeft (40).reduced (0, 1));
-            si.removeFromTop (4);
-            auto r4 = si.removeFromTop (22);   // smallest interval
-            dissMinLbl.setJustificationType (juce::Justification::centredLeft);
-            dissMinLbl.setBounds (r4.removeFromLeft (112));
-            dissMinEdit.setBounds (r4.removeFromLeft (48).reduced (0, 1));
-        }
-        else if (seg)
+        if (seg)
         {
             auto pr = si.removeFromTop (22);
             segPeriodLbl.setJustificationType (juce::Justification::centredLeft);
@@ -3227,8 +3197,23 @@ void FractalAdditiveAudioProcessorEditor::resized()
             si.removeFromTop (2);
             segHelpLbl.setBounds (si.removeFromTop (26));
         }
-        else if (chord) // chord search: tidy stacked rows, each thing labelled
+        else if (beat) // the SAME stacked rows for both beating sources
         {
+            // "Notes" spans 2..8 in the free search and 2..the tuning's degrees when
+            // combining the current tuning: one control, always honest about what
+            // it can produce.
+            const int D    = juce::jmax (2, processorRef.getScaleDegrees());
+            const int maxN = fromCurrent ? juce::jlimit (2, 12, D) : 8;
+            if (maxN != lastNotesMax)
+            {
+                lastNotesMax = maxN;
+                const int keep = chordNotesBox.getSelectedId();
+                chordNotesBox.clear (juce::dontSendNotification);
+                for (int n = 2; n <= maxN; ++n) chordNotesBox.addItem (juce::String (n), n);
+                chordNotesBox.setSelectedId (juce::jlimit (2, maxN, keep < 2 ? 3 : keep),
+                                             juce::dontSendNotification);
+            }
+
             auto r1 = si.removeFromTop (24);
             chordNotesLbl.setJustificationType (juce::Justification::centredLeft);
             chordNotesLbl.setBounds (r1.removeFromLeft (44));
@@ -3247,10 +3232,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
             chordMinLbl.setJustificationType (juce::Justification::centredLeft);
             chordMinLbl.setBounds (r3.removeFromLeft (112)); // "smallest interval (c)"
             chordMinEdit.setBounds (r3.removeFromLeft (48).reduced (0, 1));
-            si.removeFromTop (4);
-            auto r4 = si.removeFromTop (24);
-            chordGoBtn.setBounds (r4.reduced (1, 0)); // Transmute
-            if (fromChord) // labelled view switch: all results vs the loaded chord's degrees
+            if (chord)
+            {
+                si.removeFromTop (4);
+                auto r4 = si.removeFromTop (24);
+                chordGoBtn.setBounds (r4.reduced (1, 0)); // Find
+            }
+            if (chord && fromChord) // labelled view switch: all results vs the loaded chord's degrees
             {
                 si.removeFromTop (3);
                 auto r5 = si.removeFromTop (22);
@@ -3268,12 +3256,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // The result list fills the REST of this same box.
         si.removeFromTop (4);
         const bool showDeg = (dy) || (chord && fromChord && chordDegView);
-        // The SCOPE selector decides between "vs 0 only" (the degree list) and "all
-        // pairs" (the n-ad combinations); the n-ad size box only appears for the latter.
-        // "Notes" (how many notes per combination) applies to BOTH scopes now; the
-        // scope only decides how they are ranked.
-        const int  nadSel  = juce::jmax (2, nadBox.getSelectedId());
-        nadBox.setVisible (showDeg);
+        // The SCOPE selector only decides how a combination is RANKED (against 0, or
+        // over every pair); how many notes it has is the shared "Notes" box above.
         dissHeader.setVisible (false);
         dissView.setVisible (false);
         nadView.setVisible (showDeg);
@@ -3288,30 +3272,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         }
         else if (showDeg)
         {
-            // n-ad selector (items follow the scale's degree count, live).
             const int D = juce::jmax (1, processorRef.getScaleDegrees());
-            if (D != lastNadD)
-            {
-                lastNadD = D;
-                const int keepSel = nadBox.getSelectedId();
-                nadBox.clear (juce::dontSendNotification);
-                for (int n = 2; n <= juce::jmin (D, 12); ++n)
-                {
-                    juce::String name;
-                    switch (n)
-                    {
-                        case 2:  name = tr ("Dyads",   "D\xc3\xad""ades");  break;
-                        case 3:  name = tr ("Triads",  "Tr\xc3\xad""ades"); break;
-                        case 4:  name = tr ("Tetrads", "T\xc3\xa8trades");  break;
-                        case 5:  name = tr ("Pentads", "P\xc3\xa8ntades");  break;
-                        default: name = juce::String (n) + tr ("-note chords", " notes"); break;
-                    }
-                    nadBox.addItem (name, n);
-                }
-                nadBox.setSelectedId (keepSel >= 2 && keepSel <= juce::jmin (D, 12) ? keepSel : 2,
-                                      juce::dontSendNotification);
-            }
-            nadBox.setBounds (si.removeFromTop (22)); si.removeFromTop (3);
             {
                 nadView.setBounds (si);
                 nadList.degreesPerPeriod = D;
@@ -3888,18 +3849,26 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
 
     // n-AD list: recompute when the selection or the scale/timbre changes; publish
     // results when the worker finishes (values coloured green -> red like the list).
-    if (nadBox.isVisible() && nadBox.getSelectedId() > 1)
+    if (nadView.isVisible() && specModeBox.getSelectedId() == 1 && tuneSourceBox.getSelectedId() != 2)
     {
-        // Live: any change to the tuning, the timbre, the note count or the SCOPE
-        // recomputes on its own - "From current tuning" has no Find button.
-        const bool rootOnly = tuneScopeBox.getSelectedId() != 2;
-        if (lastScaleSig != lastNadSig || nadBox.getSelectedId() != lastNadSel
-            || rootOnly != lastNadRootOnly)
+        // Live: any change to the tuning, the timbre or ANY of the four shared
+        // controls recomputes on its own - "From current tuning" has no Find button.
+        const bool   rootOnly = tuneScopeBox.getSelectedId() != 2;
+        const bool   maxMode  = chordMinMaxBox.getSelectedId() == 2;
+        const double minGap   = juce::jlimit (0.0, 600.0, chordMinEdit.getText().getDoubleValue());
+        double periodRatio = 0.0; juce::String periodLine;
+        if (! TuningManager::parsePeriodSpec (chordPeriodEdit.getText(), periodRatio, periodLine))
+            periodRatio = 0.0;   // unreadable: the tuning's own period is used
+        const auto opts = juce::String ((int) maxMode) + "|" + juce::String (periodRatio, 6)
+                        + "|" + juce::String (minGap, 3);
+        if (lastScaleSig != lastNadSig || chordNotesBox.getSelectedId() != lastNadSel
+            || rootOnly != lastNadRootOnly || opts != lastNadOpts)
         {
             lastNadSig = lastScaleSig;
-            lastNadSel = nadBox.getSelectedId();
+            lastNadSel = juce::jmax (2, chordNotesBox.getSelectedId());
             lastNadRootOnly = rootOnly;
-            processorRef.startNadCompute (lastNadSel, rootOnly);
+            lastNadOpts = opts;
+            processorRef.startNadCompute (lastNadSel, rootOnly, maxMode, periodRatio, minGap);
         }
         if (processorRef.getNadGeneration() != lastNadGen)
         {

@@ -245,7 +245,11 @@ public:
     struct NadRow { std::vector<int> degs; double value = 0.0; };
     // notes = how many notes per combination; rootOnly = rank by the beating against
     // note 0 only (instead of every pair).
-    void startNadCompute (int notes, bool rootOnly = false); // 2 = dyads, 3 = triads, ...
+    // 2 = dyads, 3 = triads, ...  The searcher takes the same four controls as the
+    // free chord search: how many notes, most consonant or most dissonant, which
+    // interval counts as the period, and the smallest interval allowed (cents).
+    void startNadCompute (int notes, bool rootOnly = false, bool maxMode = false,
+                          double periodOverride = 0.0, double minGapCents = 0.0);
     int  getNadGeneration() const noexcept { return nadGeneration.load(); }
     bool isNadBusy() const noexcept { return nadBusy.load(); }
     // Honesty surface: never hide a coverage limit silently.

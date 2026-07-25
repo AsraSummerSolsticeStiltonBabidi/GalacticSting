@@ -324,17 +324,28 @@ public:
         return true;
     }
 
-    // Parse a scale-period spec typed by the user: an integer ("3"), a fraction
-    // ("3/2"), or cents with a trailing 'c' ("701.955c"). On success returns the
-    // ratio and the exact line to write as the .scl period (ratio kept as a
-    // fraction so it stays exact; cents kept as cents).
+    // Parse a scale-period spec typed by the user, in any of the three notations:
+    //   whole number   "3"        (a ratio 3/1)
+    //   fraction       "3/2", "5/4.5"
+    //   cents          "701.955c", "701.955 cents", "701.955\xc2\xa2", or a bare
+    //                  number too big to be a ratio ("1200" -> 1200 c)
+    // On success returns the ratio and the exact line to write as the .scl period
+    // (ratios kept as fractions so they stay exact; cents kept as cents).
     static bool parsePeriodSpec (const juce::String& textIn, double& ratioOut, juce::String& sclLineOut)
     {
-        const auto t = textIn.trim().removeCharacters (" \t");
+        auto t = textIn.trim().removeCharacters (" \t")
+                    .replace (juce::String::fromUTF8 ("\xc2\xa2"), "c")   // the cent sign
+                    .replace ("cents", "c", true).replace ("cent", "c", true);
         if (t.isEmpty())
             return false;
 
         const auto validRatio = [&] (double r) { return std::isfinite (r) && r > 1.02 && r <= 16.0; };
+
+        // A bare number that is too large to be a ratio can only have been meant as
+        // cents - accept it rather than rejecting what the user clearly intended.
+        if (! t.endsWithIgnoreCase ("c") && ! t.containsChar ('/')
+            && t.containsOnly ("0123456789.") && t.getDoubleValue() > 16.0)
+            t += "c";
 
         if (t.endsWithIgnoreCase ("c"))
         {
@@ -355,7 +366,9 @@ public:
         {
             const auto a = t.upToFirstOccurrenceOf ("/", false, false);
             const auto b = t.fromFirstOccurrenceOf ("/", false, false);
-            if (! a.containsOnly ("0123456789") || ! b.containsOnly ("0123456789")
+            if (! a.containsOnly ("0123456789.") || ! b.containsOnly ("0123456789.")
+                || a.indexOfChar ('.') != a.lastIndexOfChar ('.')
+                || b.indexOfChar ('.') != b.lastIndexOfChar ('.')
                 || a.isEmpty() || b.isEmpty())
                 return false;
             const double num = a.getDoubleValue(), den = b.getDoubleValue();
@@ -369,13 +382,16 @@ public:
             return true;
         }
 
-        if (! t.containsOnly ("0123456789"))
+        if (! t.containsOnly ("0123456789.") || t.indexOfChar ('.') != t.lastIndexOfChar ('.'))
             return false;
         const double r = t.getDoubleValue();
         if (! validRatio (r))
             return false;
         ratioOut   = r;
-        sclLineOut = t + "/1";
+        // A decimal ratio has no exact fraction: write it as cents, which is exact
+        // in the .scl sense (the file keeps what the user asked for).
+        sclLineOut = t.containsChar ('.') ? juce::String (1200.0 * std::log2 (r), 5)
+                                          : t + "/1";
         return true;
     }
 

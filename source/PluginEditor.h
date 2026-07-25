@@ -1853,8 +1853,9 @@ private:
     juce::ComboBox   nadBox;
     NadList          nadList;
     juce::Viewport   nadView;
-    int              lastNadGen = 0, lastNadSel = 1, lastNadD = 0;
+    int              lastNadGen = 0, lastNadSel = 1, lastNadD = 0, lastNotesMax = 0;
     bool             lastNadRootOnly = true;
+    juce::String     lastNadOpts;   // Min/Max + period + smallest interval, as typed
     double           lastNadSig = -1.0e30;
     juce::TextButton chordGoBtn;
     ChordList        chordList;

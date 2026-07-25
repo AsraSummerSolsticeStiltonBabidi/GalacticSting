@@ -1289,7 +1289,8 @@ bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::St
 //==============================================================================
 // n-ad ranking: combinations of n scale degrees ranked by TOTAL beating (union
 // dissmeasure, exact pair decomposition - every pair of degrees counted).
-void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly)
+void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, bool maxMode,
+                                                     double periodOverride, double minGapCents)
 {
     notes = juce::jlimit (2, 12, notes);
     nadCancel = true;
@@ -1304,7 +1305,12 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly)
     std::vector<double> ratios ((size_t) D);
     for (int d = 0; d < D; ++d) ratios[(size_t) d] = getDegreeRatio (d);
     const auto tmpl = spectrum::compileSpectrum (currentSettings());
-    const double periodC = 1200.0 * std::log2 (std::max (1.0e-9, tuning.periodRatio()));
+    // The period the search reasons with: the tuning's own unless the user typed a
+    // different one in the box (it decides what counts as an equal-step scale and
+    // which intervals are just the same pitch class again).
+    const double periodC = 1200.0 * std::log2 (std::max (1.0e-9,
+                              periodOverride > 1.0 ? periodOverride : tuning.periodRatio()));
+    const double minGap = juce::jlimit (0.0, 600.0, minGapCents);
     // Same absolute anchor as the Degrees list (computeActiveScaleDissonance):
     // Sethares roughness depends on register, so both lists must agree.
     double f0 = tuning.frequencyForNote (60);
@@ -1321,7 +1327,7 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly)
     }
 
     nadBusy = true;
-    nadThread = std::make_unique<std::thread> ([this, notes, D, periodC, rootOnly,
+    nadThread = std::make_unique<std::thread> ([this, notes, D, periodC, rootOnly, maxMode, minGap,
                                                 ratios = std::move (ratios), spec = std::move (spec)]()
     {
         std::vector<FractalAdditiveAudioProcessor::NadRow> out;
@@ -1387,12 +1393,15 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly)
             // Bounded best-K enumeration (ascending beating). A combination that is
             // just the unison repeated, or that pairs 0 with the period (the same
             // pitch class an octave up), says nothing - those are skipped.
-            const auto degenerate = [&cents, notes, periodC] (const int* cc)
+            // ...and neither does a combination whose closest two notes are nearer
+            // than the smallest interval the user allows.
+            const double floorC = std::max (0.5, minGap);
+            const auto degenerate = [&cents, notes, periodC, floorC] (const int* cc)
             {
                 for (int i = 1; i < notes; ++i)
                 {
                     const double gap = std::abs (cents[(size_t) cc[i]] - cents[(size_t) cc[i - 1]]);
-                    if (gap < 0.5 || std::abs (gap - periodC) < 0.5) return true;
+                    if (gap < floorC || std::abs (gap - periodC) < 0.5) return true;
                 }
                 return false;
             };
@@ -1411,7 +1420,9 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly)
                     else for (int j = i + 1; j < notes; ++j)
                         v += dcross[(size_t) c[i] * (size_t) D + (size_t) c[j]];
                 }
-                if (! degenerate (c) && ((int) best.size() < keep || v < best.back().value))
+                // Min = the quietest beating first, Max = the roughest first.
+                const auto better = [maxMode] (double a, double b) { return maxMode ? a > b : a < b; };
+                if (! degenerate (c) && ((int) best.size() < keep || better (v, best.back().value)))
                 {
                     // In the irregular path the FIRST time a shape is seen is its
                     // lowest-rooted copy (lexicographic order), so keeping that one
@@ -1424,7 +1435,8 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly)
                         row.value = v;
                         row.degs.assign (c, c + notes);
                         const auto pos = std::lower_bound (best.begin(), best.end(), row,
-                            [] (const NadRow& a, const NadRow& b) { return a.value < b.value; });
+                            [maxMode] (const NadRow& a, const NadRow& b)
+                            { return maxMode ? a.value > b.value : a.value < b.value; });
                         best.insert (pos, std::move (row));
                         if ((int) best.size() > keep) best.pop_back();
                     }
