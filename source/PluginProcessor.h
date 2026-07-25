@@ -399,6 +399,25 @@ public:
     juce::MidiBuffer           previewMidi; // reused per block (audio thread)
 
 private:
+    // A one-shot startup jingle: plays once from THIS instance's own output the
+    // first time it renders audio, then never again for the lifetime of this
+    // object. Deliberately untouched by getStateInformation/setStateInformation -
+    // a project reload/preset/undo must never retrigger it; only a genuinely NEW
+    // instance (this constructor running again) does.
+    juce::AudioBuffer<float> jingleNative;   // decoded once at construction, file's own rate
+    double jingleNativeSr = 44100.0;
+    juce::AudioBuffer<float> jingleOut;      // resampled to the session rate, built once
+    bool   jingleResampled = false;
+    int    jingleReadPos   = 0;
+    bool   jingleActive    = true;           // false once fully played (or on decode failure)
+    void   playJingleInto (juce::AudioBuffer<float>& buffer);
+public:
+    // Verifier/test hook ONLY - production code must never call this. The offline
+    // verifiers render raw audio and analyse its level/spectrum; without this their
+    // very first render would always contain the jingle and never be silent/clean.
+    void skipStartupJingleForTests() noexcept { jingleActive = false; }
+private:
+
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
     spectrum::SpectrumSettings currentSettings() const;

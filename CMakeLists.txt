@@ -48,8 +48,8 @@ juce_add_plugin(FractalAdditive
     FORMATS                     Standalone VST3
     PRODUCT_NAME                "Fibló Galàctic")
 
-# Embedded assets (title font).
-juce_add_binary_data(GalacticAssets SOURCES assets/fonts/Kablammo.ttf)
+# Embedded assets (title font + the one-shot startup jingle).
+juce_add_binary_data(GalacticAssets SOURCES assets/fonts/Kablammo.ttf assets/audio/jingle.wav)
 
 target_sources(FractalAdditive PRIVATE
     source/PluginProcessor.cpp

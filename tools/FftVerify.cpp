@@ -78,6 +78,7 @@ static void report (const char* name, std::function<void (AudioProcessorValueTre
                     const spectrum::SpectrumSettings& expected, int note)
 {
     FractalAdditiveAudioProcessor proc;
+    proc.skipStartupJingleForTests(); // this tool FFTs the rendered audio - the jingle would skew it
     setP (proc.apvts, "ampAttack", 0.001f);
     setP (proc.apvts, "ampDecay", 0.001f);
     setP (proc.apvts, "ampSustain", 1.0f);
@@ -152,6 +153,7 @@ static double envAt (const std::vector<float>& mag, double freq, float maxMag)
 static void reportEnvelope (const char* name, std::function<void (AudioProcessorValueTreeState&)> setParams, int note)
 {
     FractalAdditiveAudioProcessor proc;
+    proc.skipStartupJingleForTests(); // this tool FFTs the rendered audio - the jingle would skew it
     setP (proc.apvts, "ampAttack", 0.001f); setP (proc.apvts, "ampDecay", 0.001f);
     setP (proc.apvts, "ampSustain", 1.0f);  setP (proc.apvts, "masterGain", 0.0f);
     setParams (proc.apvts);

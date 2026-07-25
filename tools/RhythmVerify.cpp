@@ -34,6 +34,7 @@ int main()
     constexpr int    blk = 256;
 
     FractalAdditiveAudioProcessor proc;
+    proc.skipStartupJingleForTests(); // this file checks raw audio content/timing - see run 16 for the jingle itself
     proc.prepareToPlay (sr, blk);
 
     // Route P1 (harmonic 1) and P2 (harmonic 2) and P3: slots sorted by partial.
@@ -859,6 +860,7 @@ int main()
     {
         std::printf ("preset/project reload silences any sounding note:\n");
         FractalAdditiveAudioProcessor p2;
+        p2.skipStartupJingleForTests(); // this test measures silence, not the jingle
         p2.prepareToPlay (sr, blk);
         auto maxAbs = [] (const juce::AudioBuffer<float>& b)
         {
@@ -978,6 +980,75 @@ int main()
 
         setParam ("masterGain", 0.0f);
         FractalAdditiveAudioProcessor::getPresetFolder().getChildFile (presetName + ".gsting").deleteFile();
+    }
+
+    // --- run 18: the startup jingle plays once per instance, never again ----------
+    {
+        std::printf ("startup jingle: once per instance, never retriggered:\n");
+        constexpr int jblk = 4096;
+        auto maxAbsOf = [] (const juce::AudioBuffer<float>& b)
+        {
+            float m = 0.0f;
+            for (int ch = 0; ch < b.getNumChannels(); ++ch)
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                    m = std::max (m, std::abs (b.getSample (ch, i)));
+            return m;
+        };
+
+        // Heap-allocated: this class is too large for a THIRD instance (on top of
+        // `proc`, already live for the rest of main()) to share the stack safely.
+        auto pj = std::make_unique<FractalAdditiveAudioProcessor>();
+        pj->prepareToPlay (sr, jblk);
+        juce::AudioBuffer<float> jaudio (2, jblk);
+
+        // No MIDI at all - anything heard can ONLY be the jingle.
+        bool heardSomething = false;
+        const int blocksFor7s = (int) std::ceil (7.0 * sr / jblk); // the jingle is ~5.4 s
+        for (int b = 0; b < blocksFor7s; ++b)
+        {
+            juce::MidiBuffer m;
+            pj->processBlock (jaudio, m);
+            if (maxAbsOf (jaudio) > 1.0e-4f) heardSomething = true;
+        }
+        check (heardSomething, "the jingle is actually heard on a fresh instance");
+
+        // Well past its length now: dead silence from here on, MIDI or not.
+        bool stillSilent = true;
+        for (int b = 0; b < 20; ++b)
+        {
+            juce::MidiBuffer m;
+            pj->processBlock (jaudio, m);
+            if (maxAbsOf (jaudio) > 1.0e-6f) stillSilent = false;
+        }
+        check (stillSilent, "silent again once the jingle has fully played");
+
+        // A full state swap on the SAME instance (preset load / project reload /
+        // Init) must NEVER bring it back - only a genuinely new instance may.
+        juce::MemoryBlock state;
+        pj->getStateInformation (state);
+        pj->setStateInformation (state.getData(), (int) state.getSize());
+        bool silentAfterReload = true;
+        for (int b = 0; b < 20; ++b)
+        {
+            juce::MidiBuffer m;
+            pj->processBlock (jaudio, m);
+            if (maxAbsOf (jaudio) > 1.0e-6f) silentAfterReload = false;
+        }
+        check (silentAfterReload, "a state reload on the SAME instance does not retrigger it");
+        pj.reset(); // free it before building the second one
+
+        // A genuinely NEW instance (a second Fibló, or reopening the project) gets
+        // its own independent play - this is per-INSTANCE, not a global one-shot.
+        auto pj2 = std::make_unique<FractalAdditiveAudioProcessor>();
+        pj2->prepareToPlay (sr, jblk);
+        bool heardOnSecond = false;
+        for (int b = 0; b < blocksFor7s; ++b)
+        {
+            juce::MidiBuffer m;
+            pj2->processBlock (jaudio, m);
+            if (maxAbsOf (jaudio) > 1.0e-4f) heardOnSecond = true;
+        }
+        check (heardOnSecond, "a second, independent instance plays its own jingle too");
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);

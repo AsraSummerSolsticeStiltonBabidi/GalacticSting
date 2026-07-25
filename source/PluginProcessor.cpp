@@ -1,6 +1,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "dsp/Dissonance.h"
+#include "BinaryData.h"
 
 #include <string>
 #include <unordered_map>
@@ -40,6 +41,25 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     appProps = std::make_unique<juce::PropertiesFile> (o);
     recentSclPaths.addLines (appProps->getValue ("recentScl"));
     recentSclPaths.removeEmptyStrings();
+
+    // Decode the startup jingle ONCE, here in the constructor - i.e. exactly once
+    // per real "load" of this Fibló. jingleActive stays true only for THIS object;
+    // it is never written to/from getStateInformation, so nothing but a fresh
+    // instance can ever set it true again.
+    {
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatReader> reader (wav.createReaderFor (
+            new juce::MemoryInputStream (BinaryData::jingle_wav, (size_t) BinaryData::jingle_wavSize, false),
+            true));
+        if (reader != nullptr && reader->lengthInSamples > 0)
+        {
+            jingleNativeSr = reader->sampleRate > 0.0 ? reader->sampleRate : 44100.0;
+            jingleNative.setSize ((int) reader->numChannels, (int) reader->lengthInSamples);
+            reader->read (&jingleNative, 0, (int) reader->lengthInSamples, 0, true, true);
+        }
+        else
+            jingleActive = false; // nothing to play - never crash/loop trying
+    }
 }
 
 void FractalAdditiveAudioProcessor::addRecentScl (const juce::File& f)
@@ -1579,6 +1599,32 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     // Slope, Fractal, Prime, Range, Reps) is only sampled here, so a fast envelope
     // used to be caught on some notes and missed on others.
     startTimerHz (60);
+
+    // Resample the jingle to THIS session's rate once (guarded so a later
+    // buffer-size-only prepareToPlay doesn't redo it) - never touches jingleActive,
+    // so it cannot cause or prevent playback, only prepare the samples for it.
+    if (jingleActive && ! jingleResampled && jingleNative.getNumSamples() > 0)
+    {
+        jingleResampled = true;
+        const double ratio = jingleNativeSr / (sampleRate > 0.0 ? sampleRate : jingleNativeSr);
+        const int    outN  = juce::jmax (1, (int) std::ceil ((double) jingleNative.getNumSamples() / ratio));
+        jingleOut.setSize (jingleNative.getNumChannels(), outN);
+        for (int ch = 0; ch < jingleNative.getNumChannels(); ++ch)
+        {
+            const float* src = jingleNative.getReadPointer (ch);
+            float*       dst = jingleOut.getWritePointer (ch);
+            const int    srcN = jingleNative.getNumSamples();
+            for (int i = 0; i < outN; ++i)
+            {
+                const double pos  = (double) i * ratio;
+                const int    i0   = juce::jlimit (0, srcN - 1, (int) pos);
+                const int    i1   = juce::jmin (srcN - 1, i0 + 1);
+                const float  frac = (float) (pos - (double) i0);
+                dst[i] = src[i0] + (src[i1] - src[i0]) * frac;
+            }
+        }
+        jingleNative.setSize (0, 0); // the native copy has done its job
+    }
 }
 
 bool FractalAdditiveAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -1586,6 +1632,25 @@ bool FractalAdditiveAudioProcessor::isBusesLayoutSupported (const BusesLayout& l
     const auto& out = layouts.getMainOutputChannelSet();
     return out == juce::AudioChannelSet::mono()
         || out == juce::AudioChannelSet::stereo();
+}
+
+// Mixes (adds, never overwrites) the next chunk of the resampled jingle into this
+// block, advancing jingleReadPos; once exhausted, jingleActive is cleared FOR GOOD
+// - nothing else in this file ever sets it back to true, so it cannot replay for
+// the rest of this instance's life (a new preset, undo, automation, project
+// save/reload on the SAME instance all leave it alone).
+void FractalAdditiveAudioProcessor::playJingleInto (juce::AudioBuffer<float>& buffer)
+{
+    if (jingleOut.getNumSamples() == 0) { jingleActive = false; return; } // not resampled yet or empty
+    const int remaining = jingleOut.getNumSamples() - jingleReadPos;
+    if (remaining <= 0) { jingleActive = false; return; }
+    const int n = juce::jmin (remaining, buffer.getNumSamples());
+    const int outCh = buffer.getNumChannels();
+    const int jinCh  = jingleOut.getNumChannels();
+    for (int ch = 0; ch < outCh; ++ch)
+        buffer.addFrom (ch, 0, jingleOut, juce::jmin (ch, jinCh - 1), jingleReadPos, n);
+    jingleReadPos += n;
+    if (jingleReadPos >= jingleOut.getNumSamples()) jingleActive = false;
 }
 
 void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
@@ -1596,6 +1661,8 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
     buffer.clear();
 
     const int  nSamp    = buffer.getNumSamples();
+
+    if (jingleActive) playJingleInto (buffer); // one-shot startup jingle - see the header
 
     // A full state swap (preset load, project reload, "load its original spectrum")
     // was seen leaving a note stuck sounding forever: it rewrites every DSP
