@@ -25,6 +25,7 @@
 
 #include "Spectrum.h"
 #include "SpectrumEngine.h"
+#include "CurvedEnv.h"
 #include "SineTable.h"
 #include "TuningManager.h"
 
@@ -57,6 +58,16 @@ public:
         pDecayParam  = apvts.getRawParameterValue ("pitchDecay");
         pSustainParam= apvts.getRawParameterValue ("pitchSustain");
         pReleaseParam= apvts.getRawParameterValue ("pitchRelease");
+
+        ampCurveA = apvts.getRawParameterValue ("ampCurveA");
+        ampCurveD = apvts.getRawParameterValue ("ampCurveD");
+        ampCurveR = apvts.getRawParameterValue ("ampCurveR");
+        filtCurveA = apvts.getRawParameterValue ("filterCurveA");
+        filtCurveD = apvts.getRawParameterValue ("filterCurveD");
+        filtCurveR = apvts.getRawParameterValue ("filterCurveR");
+        pitchCurveA = apvts.getRawParameterValue ("pitchCurveA");
+        pitchCurveD = apvts.getRawParameterValue ("pitchCurveD");
+        pitchCurveR = apvts.getRawParameterValue ("pitchCurveR");
 
         morphParam     = apvts.getRawParameterValue ("morph");
         morphTimeParam = apvts.getRawParameterValue ("morphTime");
@@ -178,11 +189,8 @@ public:
             filterAdsr.setSampleRate (sr);
             pitchAdsr.setSampleRate (sr);
             filter.prepare ({ sr, 8192, 1 });
-            // The ADSR rates are sample-rate dependent, so force a re-apply on the
-            // next block instead of skipping it as an unchanged parameter set.
-            ampParamsApplied  = { -1.0f, -1.0f, -1.0f, -1.0f };
-            filtParamsApplied = { -1.0f, -1.0f, -1.0f, -1.0f };
-            pitchParamsApplied= { -1.0f, -1.0f, -1.0f, -1.0f };
+            // CurvedEnv works in SECONDS, so a sample-rate change needs no re-apply
+            // dance: the times are already right, only its sample rate had to change.
         }
     }
 
@@ -514,55 +522,25 @@ private:
     //   2. change detection - even before release, only re-apply when a value
     //      actually changed, so we never touch the envelope needlessly.
     // (JUCE's own docs: "Do not change the parameters during playback.")
-    static bool paramsEqual (const juce::ADSR::Parameters& a, const juce::ADSR::Parameters& b) noexcept
-    {
-        return a.attack == b.attack && a.decay == b.decay
-            && a.sustain == b.sustain && a.release == b.release;
-    }
-
     void updateAdsrParameters()
     {
         if (releasing) return; // never disturb a release tail's rate
-        juce::ADSR::Parameters p;
-        p.attack  = attackParam->load();
-        p.decay   = decayParam->load();
-        p.sustain = sustainParam->load();
-        p.release = releaseParam->load();
-        if (! paramsEqual (p, ampParamsApplied))
-        {
-            ampParamsApplied = p;
-            adsr.setParameters (p);
-        }
+        adsr.setParameters (attackParam->load(), decayParam->load(), sustainParam->load(),
+                            releaseParam->load(), ampCurveA->load(), ampCurveD->load(), ampCurveR->load());
     }
 
     void updateFilterAdsrParameters()
     {
-        if (releasing) return; // never disturb a release tail's rate
-        juce::ADSR::Parameters p;
-        p.attack  = fAttackParam->load();
-        p.decay   = fDecayParam->load();
-        p.sustain = fSustainParam->load();
-        p.release = fReleaseParam->load();
-        if (! paramsEqual (p, filtParamsApplied))
-        {
-            filtParamsApplied = p;
-            filterAdsr.setParameters (p);
-        }
+        if (releasing) return;
+        filterAdsr.setParameters (fAttackParam->load(), fDecayParam->load(), fSustainParam->load(),
+                                  fReleaseParam->load(), filtCurveA->load(), filtCurveD->load(), filtCurveR->load());
     }
 
     void updatePitchAdsrParameters()
     {
-        if (releasing) return; // never disturb a release tail's rate
-        juce::ADSR::Parameters p;
-        p.attack  = pAttackParam->load();
-        p.decay   = pDecayParam->load();
-        p.sustain = pSustainParam->load();
-        p.release = pReleaseParam->load();
-        if (! paramsEqual (p, pitchParamsApplied))
-        {
-            pitchParamsApplied = p;
-            pitchAdsr.setParameters (p);
-        }
+        if (releasing) return;
+        pitchAdsr.setParameters (pAttackParam->load(), pDecayParam->load(), pSustainParam->load(),
+                                 pReleaseParam->load(), pitchCurveA->load(), pitchCurveD->load(), pitchCurveR->load());
     }
 
     void beginFastKill()
@@ -606,15 +584,15 @@ private:
     std::atomic<float>* pDecayParam    = nullptr;
     std::atomic<float>* pSustainParam  = nullptr;
     std::atomic<float>* pReleaseParam  = nullptr;
+    std::atomic<float>* ampCurveA = nullptr, * ampCurveD = nullptr, * ampCurveR = nullptr;
+    std::atomic<float>* filtCurveA = nullptr, * filtCurveD = nullptr, * filtCurveR = nullptr;
+    std::atomic<float>* pitchCurveA = nullptr, * pitchCurveD = nullptr, * pitchCurveR = nullptr;
     std::atomic<float>* morphParam     = nullptr;
     std::atomic<float>* morphTimeParam = nullptr;
 
-    juce::ADSR adsr, filterAdsr, pitchAdsr;
+    spectrum::CurvedEnv adsr, filterAdsr, pitchAdsr; // per-segment curves (see CurvedEnv.h)
     // Last parameters actually pushed to each ADSR (sentinel = force first apply).
     // See updateAdsrParameters() for why we gate on change.
-    juce::ADSR::Parameters ampParamsApplied   { -1.0f, -1.0f, -1.0f, -1.0f };
-    juce::ADSR::Parameters filtParamsApplied  { -1.0f, -1.0f, -1.0f, -1.0f };
-    juce::ADSR::Parameters pitchParamsApplied { -1.0f, -1.0f, -1.0f, -1.0f };
     juce::dsp::StateVariableTPTFilter<float> filter;
     float filterEnvValue = 0.0f;
     float pitchEnvValue   = 0.0f;

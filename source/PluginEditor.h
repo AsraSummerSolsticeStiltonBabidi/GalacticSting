@@ -383,6 +383,97 @@ private:
     };
 
     // Closable floating notice (e.g. "only N minima exist"). Click X to dismiss.
+    // Floating "Recent" window: every scale file loaded in this plugin, newest first,
+    // scrollable, click one to load it.
+    struct RecentOverlay : juce::Component
+    {
+        struct List : juce::Component
+        {
+            juce::StringArray paths;
+            std::function<void (int)> onPick;
+            static constexpr int kRowH = 22;
+            int contentHeight() const { return juce::jmax (kRowH, paths.size() * kRowH); }
+            void paint (juce::Graphics& g) override
+            {
+                int y = 0;
+                for (int i = 0; i < paths.size(); ++i)
+                {
+                    if (i % 2 == 1) { g.setColour (juce::Colour (0x14ffffff)); g.fillRect (0, y, getWidth(), kRowH); }
+                    if (i == hoverRow) { g.setColour (juce::Colour (0x33b27bff)); g.fillRect (0, y, getWidth(), kRowH); }
+                    const juce::File f (paths[i]);
+                    g.setColour (juce::Colour (0xff8f96a8));
+                    g.setFont (juce::Font (juce::FontOptions (10.5f).withStyle ("Bold")));
+                    g.drawText ("#" + juce::String (i + 1), 4, y, 26, kRowH, juce::Justification::centredLeft, false);
+                    g.setColour (juce::Colours::white);
+                    g.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
+                    g.drawText (f.getFileNameWithoutExtension(), 32, y, getWidth() - 200, kRowH,
+                                juce::Justification::centredLeft, false);
+                    g.setColour (juce::Colour (0xff6c7488));
+                    g.setFont (juce::Font (juce::FontOptions (11.0f)));
+                    g.drawText (f.getParentDirectory().getFileName(), getWidth() - 166, y, 160, kRowH,
+                                juce::Justification::centredRight, false);
+                    y += kRowH;
+                }
+                if (paths.isEmpty())
+                {
+                    g.setColour (juce::Colour (0xff8f96a8));
+                    g.setFont (juce::Font (juce::FontOptions (12.5f)));
+                    g.drawText ("nothing loaded yet", getLocalBounds(), juce::Justification::centred, false);
+                }
+            }
+            int hoverRow = -1;
+            void mouseMove (const juce::MouseEvent& e) override
+            { const int r = e.y / kRowH; if (r != hoverRow) { hoverRow = r; repaint(); } }
+            void mouseExit (const juce::MouseEvent&) override { hoverRow = -1; repaint(); }
+            void mouseDown (const juce::MouseEvent& e) override
+            {
+                const int r = e.y / kRowH;
+                if (juce::isPositiveAndBelow (r, paths.size()) && onPick) onPick (r);
+            }
+        };
+
+        juce::String title { "Recent" };
+        juce::TextButton closeBtn { "X" };
+        juce::Viewport view;
+        List list;
+        RecentOverlay()
+        {
+            closeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
+            closeBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+            closeBtn.onClick = [this] { setVisible (false); };
+            addAndMakeVisible (closeBtn);
+            view.setViewedComponent (&list, false);
+            view.setScrollBarsShown (true, false);
+            addAndMakeVisible (view);
+        }
+        void setPaths (const juce::StringArray& p)
+        {
+            list.paths = p;
+            list.setSize (juce::jmax (10, view.getWidth() - 10), list.contentHeight());
+            list.repaint();
+        }
+        void resized() override
+        {
+            closeBtn.setBounds (getWidth() - 28, 6, 22, 22);
+            auto r = getLocalBounds().reduced (14, 12);
+            r.removeFromTop (24);
+            view.setBounds (r);
+            list.setSize (juce::jmax (10, r.getWidth() - 10), list.contentHeight());
+        }
+        void paint (juce::Graphics& g) override
+        {
+            auto r = getLocalBounds().toFloat();
+            g.setColour (juce::Colour (0xf2141a24));
+            g.fillRoundedRectangle (r, 10.0f);
+            g.setColour (juce::Colour (0xffb27bff));
+            g.drawRoundedRectangle (r.reduced (1.5f), 10.0f, 3.0f);
+            g.setColour (juce::Colour (0xffb27bff));
+            g.setFont (juce::Font (juce::FontOptions (16.0f).withStyle ("Bold")));
+            g.drawText (title, getLocalBounds().reduced (16, 10).removeFromTop (22),
+                        juce::Justification::centredLeft, false);
+        }
+    };
+
     struct NoticeOverlay : juce::Component
     {
         juce::String title, body;
@@ -1344,23 +1435,24 @@ private:
             g.setColour (col);
             g.strokePath (p, juce::PathStrokeType (2.0f));
 
-            // Nodes 1..4 are all draggable (2 and 3 both set the sustain level).
+            // Each draggable node IS its letter - bold, a size up from the old dots,
+            // with a thin black outline so it reads over the curve and the fill.
+            static const char* letters[5] = { "", "A", "D", "S", "R" };
             for (int i : { 1, 2, 3, 4 })
             {
                 const auto n = node (i);
                 const bool hot = i == hover || i == dragNode;
+                juce::GlyphArrangement ga;
+                ga.addLineOfText (juce::Font (juce::FontOptions (15.0f).withStyle ("Bold")), letters[i], 0.0f, 0.0f);
+                juce::Path gp;
+                ga.createPath (gp);
+                const auto gb = gp.getBounds();
+                gp.applyTransform (juce::AffineTransform::translation (n.x - gb.getCentreX(), n.y - gb.getCentreY()));
+                g.setColour (juce::Colours::black.withAlpha (0.9f));
+                g.strokePath (gp, juce::PathStrokeType (2.4f));
                 g.setColour (hot ? juce::Colours::white : col);
-                g.fillEllipse (n.x - 5.0f, n.y - 5.0f, 10.0f, 10.0f);
-                g.setColour (juce::Colours::black.withAlpha (0.55f));
-                g.drawEllipse (n.x - 5.0f, n.y - 5.0f, 10.0f, 10.0f, 1.2f);
+                g.fillPath (gp);
             }
-            g.setColour (col.withAlpha (0.75f));
-            g.setFont (juce::Font (juce::FontOptions (9.5f).withStyle ("Bold")));
-            const float ly = lToY (0.0f) + 1.0f;
-            g.drawText ("A", node (0).x, ly - 11.0f, node (1).x - node (0).x, 10.0f, juce::Justification::centred, false);
-            g.drawText ("D", node (1).x, ly - 11.0f, node (2).x - node (1).x, 10.0f, juce::Justification::centred, false);
-            g.drawText ("S", node (2).x, node (2).y - 12.0f, node (3).x - node (2).x, 10.0f, juce::Justification::centred, false);
-            g.drawText ("R", node (3).x, ly - 11.0f, node (4).x - node (3).x, 10.0f, juce::Justification::centred, false);
         }
 
         //== interaction ======================================================
@@ -1370,7 +1462,7 @@ private:
         int nodeAt (juce::Point<float> pos) const
         {
             for (int i : { 1, 2, 3, 4 })
-                if (pos.getDistanceFrom (node (i)) < 11.0f) return i;
+                if (pos.getDistanceFrom (node (i)) < 12.0f) return i; // letter-sized grab area
             return -1;
         }
         int segAt (juce::Point<float> pos) const   // 0 = attack leg, 1 = decay leg, 2 = release leg
@@ -1651,7 +1743,7 @@ private:
     ScaleKeyboard keyboard;
 
     SteppedSlider baseNFader, spectrumRangeFader, timbreRepeatsFader;
-    MagneticSlider fractalFader, harmonicsFader; // magnetic detents at each whole level
+    MagneticSlider fractalFader, harmonicsFader, primeLimitFader; // magnetic whole-value detents
     juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, octaveFader, pEnvAmtFader;
     juce::Slider  ampAdsr[4], filtAdsr[4], pitchAdsr[4];
     juce::ComboBox basePitchBox, whitelistBox, phaseBox, primeModeBox, primeLimitBox, tuningBox, bendBox,
@@ -1660,7 +1752,6 @@ private:
     juce::ToggleButton primeToggle[9], morphToggle;
     juce::ToggleButton temperToggle; // Custom Engine: temper harmonic partials to the loaded .scl
     std::unique_ptr<ButtonAttachment> temperAtt;
-    juce::Slider primeLimitFader;    // prime limit as a fader -> modulator-drivable
     std::unique_ptr<SliderAttachment> primeLimitFaderAtt;
     juce::Slider       morphTimeFader;
     juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
@@ -1684,7 +1775,9 @@ private:
     std::unique_ptr<ButtonAttachment>   modOnAtt;
     int  modSel = 0;                                // 0..2 env, 3..5 lfo
     WaveEditor waveEditor;                          // drawn-LFO wave overlay
-    EnvEditor  envEditor;                           // the selected envelope, as a curve with nodes
+    EnvEditor  envEditor;                           // the selected MODULATOR envelope, as a curve
+    EnvEditor  voiceEnv;                            // the Amp / Pitch / Filter envelope, same editor
+    int        voiceEnvTab = 0;                     // which one voiceEnv is showing
     void attachCustomTab();                         // rebind attachments to the selected modulator
     void showEnvMapMenu (const juce::String& paramID);
     juce::String currentModParamId (const juce::String& templateId) const; // modE1A -> modE2A...
@@ -1708,6 +1801,7 @@ private:
     juce::Label        octVal, sprVal;             // their value read-outs
     juce::TextButton saveTuningBtn;    // save the CURRENT tuning (any mode) as .scl to a chosen folder
     juce::TextButton tuningBankAddBtn;  // put the CURRENT tuning into the bank
+    juce::TextButton recentOpenBtn;     // opens the floating Recent list
     juce::TextButton loadItsSpectrumBtn; // .scl written by this synth: restore its patch
     juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
                      langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3], tuningBankLoadBtn,
@@ -1720,6 +1814,7 @@ private:
     juce::TextEditor refAEdit;     // Reference A: type the Hz directly ("hz" shown to its right)
     WarningOverlay warningOverlay;
     NoticeOverlay  noticeOverlay;
+    RecentOverlay  recentOverlay;   // floating list of every scale file loaded
     DissDegreeList degreeList;   // active-scale dissonance list (lives inside dissView)
     DissHeader     dissHeader;   // Step / Sethares-dissonance column header
     juce::Viewport dissView;     // scrolls degreeList when a scale has many steps

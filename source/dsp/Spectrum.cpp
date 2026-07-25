@@ -314,15 +314,30 @@ namespace spectrum
 
         std::vector<double> selW; // selection weight (1, 0, or a blend in between)
         selW.reserve ((size_t) (Kmax - N + 1));
+        // How far between this prime-limit stop and the NEXT (narrower) one the fader
+        // sits: 0 = exactly on this stop, 1 = on the next. In between, a harmonic the
+        // next stop would remove is still there but fading down - so the fader sweeps
+        // continuously instead of jumping from one prime limit to the next.
+        const double primeMix = std::min (1.0, std::max (0.0, (double) s.primeLimitPos - std::floor ((double) s.primeLimitPos)));
         for (int k = N; k <= Kmax; ++k)
         {
             const double wSel = selectionWeight (k, N, s.selection);
             if (wSel <= 1.0e-6) continue;
-            const bool primeOk = s.primeUseWhitelist ? primeWhitelistOk (k, s.primeWhitelistMask)
-                                                      : primeLimitOk (k, s.primeLimit);
-            if (! primeOk) continue;
+            double wPrime = 1.0;
+            if (s.primeUseWhitelist)
+            {
+                if (! primeWhitelistOk (k, s.primeWhitelistMask)) continue;
+            }
+            else
+            {
+                if (! primeLimitOk (k, s.primeLimit)) continue;      // this stop already vetoes it
+                if (primeMix > 1.0e-6 && s.primeLimitNext != s.primeLimit
+                    && ! primeLimitOk (k, s.primeLimitNext))
+                    wPrime = 1.0 - primeMix;                          // the NEXT stop drops it: fade
+            }
+            if (wPrime <= 1.0e-6) continue;
             base.emplace_back (k, 0.0);
-            selW.push_back (wSel);
+            selW.push_back (wSel * wPrime);
         }
 
         if (base.empty())

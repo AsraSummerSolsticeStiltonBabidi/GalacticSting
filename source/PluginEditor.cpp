@@ -715,10 +715,17 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                  "Largest prime factor allowed (Limit mode). Right-click to map a modulator onto it.");
     primeLimitFader.setSliderStyle (juce::Slider::LinearHorizontal);
     primeLimitFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 40, 15);
+    primeLimitFader.setSliderSnapsToMousePosition (false);
+    primeLimitFader.normalSensitivity = 300;
     primeLimitFader.textFromValueFunction = [] (double v)
     {
         static const char* names[] = { "Off", "23", "19", "17", "13", "11", "7", "5", "3", "2" };
-        return juce::String (names[juce::jlimit (0, 9, (int) std::lround (v))]);
+        const int lo = juce::jlimit (0, 9, (int) std::floor (v));
+        const double t = v - (double) lo;
+        if (t < 0.01) return juce::String (names[lo]);
+        return juce::String (names[lo]) + juce::String::fromUTF8 ("\xe2\x86\x92")
+             + juce::String (names[juce::jmin (9, lo + 1)])
+             + " " + juce::String ((int) std::lround (t * 100.0)) + "%";
     };
     primeLimitFader.updateText();
     makeLabel (lblPrimeLimit, cHarmonic);
@@ -795,6 +802,35 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             auto* p = processorRef.apvts.getRawParameterValue (currentModParamId ("modE1" + suffix));
             return p != nullptr ? p->load() : 0.0f;
         };
+
+        // The SAME editor drives the Amp / Pitch / Filter envelopes. Their parameter
+        // ids differ per tab, so the id is built from whichever tab is showing.
+        const auto voiceId = [this] (const juce::String& suffix)
+        {
+            static const char* pfx[3] = { "amp", "pitch", "filter" };
+            const juce::String base (pfx[juce::jlimit (0, 2, voiceEnvTab)]);
+            if (suffix.startsWith ("Curve")) return base + suffix;             // ampCurveD...
+            static const char* full[4] = { "Attack", "Decay", "Sustain", "Release" };
+            const int i = suffix == "A" ? 0 : suffix == "D" ? 1 : suffix == "S" ? 2 : 3;
+            return base + full[i];                                             // ampDecay...
+        };
+        voiceEnv.onGesture = [this, voiceId] (const juce::String& suffix, bool starting)
+        {
+            if (suffix.isEmpty()) return;
+            if (auto* p = processorRef.apvts.getParameter (voiceId (suffix)))
+            { if (starting) p->beginChangeGesture(); else p->endChangeGesture(); }
+        };
+        voiceEnv.onEdit = [this, voiceId] (const juce::String& suffix, float v)
+        {
+            if (auto* p = processorRef.apvts.getParameter (voiceId (suffix)))
+                p->setValueNotifyingHost (p->convertTo0to1 (v));
+        };
+        voiceEnv.getParam = [this, voiceId] (const juce::String& suffix)
+        {
+            auto* p = processorRef.apvts.getRawParameterValue (voiceId (suffix));
+            return p != nullptr ? p->load() : 0.0f;
+        };
+        addChildComponent (voiceEnv);
         addChildComponent (envEditor);
         for (int i = 0; i < 4; ++i)
         {
@@ -962,6 +998,24 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         resized(); repaint(); refocus();
     };
     addChildComponent (loadItsSpectrumBtn);
+    // Recent: one button that opens the floating list of everything ever loaded.
+    recentOpenBtn.setColour (juce::TextButton::buttonColourId, cTuning.withAlpha (0.28f));
+    recentOpenBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    recentOpenBtn.setMouseClickGrabsKeyboardFocus (false);
+    recentOpenBtn.onClick = [this]
+    {
+        recentOverlay.setPaths (processorRef.getRecentSclPaths());
+        recentOverlay.setVisible (true);
+        recentOverlay.toFront (true);
+    };
+    addChildComponent (recentOpenBtn);
+    recentOverlay.list.onPick = [this] (int i)
+    {
+        loadRecent (i);
+        recentOverlay.setVisible (false);
+        refocus();
+    };
+    addChildComponent (recentOverlay);
     addAndMakeVisible (tuningBankLoadBtn);
     // X: remove the SELECTED tuning from the bank (the scale itself is untouched).
     tuningBankClearBtn.setButtonText ("X");
@@ -1867,6 +1921,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Sethares dissonance: how ROUGH each scale step sounds with the CURRENT timbre. It is not fixed - it recomputes live from the synth's actual partials, so editing the timbre (N, fractal, slope, primes, .scl...) changes these values in real time. Lower = more consonant; the rows are ordered most consonant first.",
         "Dissonancia de Sethares: com d'ASPRE sona cada pas de l'escala amb el timbre ACTUAL. No \xc3\xa9s fixa - es recalcula en viu a partir dels parcials reals del sinte, aix\xc3\xad que editar el timbre (N, fractal, pendent, primers, .scl...) canvia aquests valors en temps real. M\xc3\xa9s baix = m\xc3\xa9s consonant; les files van de m\xc3\xa9s consonant primer.");
     recentLabel.setText  (tr ("Recent", "Recents"), dontSendNotification);
+    recentOpenBtn.setButtonText (tr ("Recent...", "Recents..."));
+    recentOpenBtn.setTooltip (tr ("Every scale file loaded in this plugin, newest first. Click one to load it.",
+                                  "Tots els fitxers d'""escala carregats en aquest plugin, del més recent al més antic. Clica'n un per carregar-lo."));
+    recentOverlay.title = tr ("Recent scales", "Escales recents");
 
     loadSclButton.setButtonText    (tr ("Load .scl", "Obrir .scl"));
     clearSclButton.setButtonText   (tr ("Reset", "Reinicia"));
@@ -1990,6 +2048,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (phaseBox,     { tr ("Aligned", "Alineat"), tr ("Scattered", "Dispers") });
     localise (primeModeBox, { tr ("Limit", "L\xc3\xadmit"), tr ("Whitelist", "Llista") });
     localise (bendBox,      { "\xc2\xb1""2 st", "\xc2\xb1""12 st", "\xc2\xb1""48 st (MPE)" });
+    voiceEnv.tip = tr (
+        "This envelope, drawn as a line with nodes. Drag a node for the attack time, the decay time + sustain level, or the release time; drag the LINE between nodes to bend it concave or convex; double-click a segment to straighten it.",
+        "Aquesta envolupant, dibuixada com una línia amb nodes. Arrossega un node per al temps d'""atac, el de caï""da + nivell de sosteniment, o el d'""alliberament; arrossega la LÍNIA entre nodes per corbar-la; doble clic en un tram per aplanar-lo.");
     envEditor.tip = tr (
         "The selected envelope, drawn as a line with nodes. DRAG A NODE to set the attack time, the decay time + sustain level, or the release time. DRAG THE LINE between two nodes to bend it concave or convex - that curve is exactly what the modulator sends. Double-click a segment for a straight line again.",
         "L'envolupant seleccionada, dibuixada com una l\xc3\xadnia amb nodes. ARROSSEGA UN NODE per fixar el temps d'atac, el de ca\xc3\xaf""da + nivell de sosteniment, o el d'alliberament. ARROSSEGA LA L\xc3\x8dNIA entre dos nodes per corbar-la c\xc3\xb2ncava o convexa - aquesta corba \xc3\xa9s exactament el que envia el modulador. Doble clic en un tram per tornar a la recta.");
@@ -3193,7 +3254,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             else
             {
                 lblPrimeLimit.setBounds (pi.removeFromLeft (42).withSizeKeepingCentre (42, 22));
-                primeLimitFader.setBounds (pi.removeFromLeft (juce::jmin (150, pi.getWidth())).withSizeKeepingCentre (juce::jmin (150, 150), 22));
+                primeLimitFader.setBounds (pi.removeFromLeft (juce::jmin (170, pi.getWidth())).withSizeKeepingCentre (juce::jmin (170, 170), 22));
             }
         }
         {
@@ -3326,31 +3387,37 @@ void FractalAdditiveAudioProcessorEditor::resized()
             juce::Label*  labP[] = { &lblPitchAmt, &pitchAdsrLbl[0], &pitchAdsrLbl[1], &pitchAdsrLbl[2], &pitchAdsrLbl[3] };
             juce::Slider* setF[] = { &cutoffFader, &resFader, &fEnvAmtFader, &filtAdsr[0], &filtAdsr[1], &filtAdsr[2], &filtAdsr[3] };
             juce::Label*  labF[] = { &lblCutoff, &lblRes, &lblEnvAmt, &filtAdsrLbl[0], &filtAdsrLbl[1], &filtAdsrLbl[2], &filtAdsrLbl[3] };
+            // The four A/D/S/R faders of each voice envelope are replaced by the same
+            // curve editor the modulators use; the tab's OTHER controls (pitch amount,
+            // cutoff, resonance, filter-env amount) keep their faders beside it.
             juce::Slider** sets[] = { setV, setP, setF };
             juce::Label**  labs[] = { labV, labP, labF };
-            const int counts[] = { 4, 5, 7 };
+            const int counts[]    = { 4, 5, 7 };
+            const int extras[]    = { 0, 1, 3 };   // leading faders that are NOT the ADSR
             for (int t = 0; t < 3; ++t)
             {
                 const bool on = t == envTab;
+                auto area2 = in;
+                for (int i = 0; i < counts[t]; ++i)
+                {
+                    const bool isExtra = i < extras[t];
+                    if (! on || ! isExtra) { sets[t][i]->setVisible (false); labs[t][i]->setVisible (false); continue; }
+                    auto c = area2.removeFromLeft (juce::jmax (34, in.getWidth() / 7));
+                    sets[t][i]->setVisible (true);
+                    labs[t][i]->setVisible (true);
+                    labs[t][i]->setBounds (c.removeFromTop (13));
+                    sets[t][i]->setBounds (c);
+                }
                 if (on)
                 {
-                    const int n  = counts[t];
-                    const int cw = in.getWidth() / juce::jmax (1, n);
-                    auto area2 = in;
-                    for (int i = 0; i < n; ++i)
-                    {
-                        auto c = area2.removeFromLeft (cw);
-                        const bool inThumb = sets[t][i]->getName().isNotEmpty();
-                        sets[t][i]->setVisible (true);
-                        labs[t][i]->setVisible (! inThumb);
-                        if (! inThumb) labs[t][i]->setBounds (c.removeFromTop (13));
-                        sets[t][i]->setBounds (c);
-                    }
+                    voiceEnv.setVisible (true);
+                    voiceEnv.setBounds (area2.withTrimmedLeft (4));
+                    voiceEnvTab = t;
+                    voiceEnv.col = tabCols[t];
+                    voiceEnv.refresh();
                 }
-                else
-                    for (int i = 0; i < counts[t]; ++i)
-                    { sets[t][i]->setVisible (false); labs[t][i]->setVisible (false); }
             }
+            if (envTab == 3) voiceEnv.setVisible (false);
 
             // CUSTOM tab: modulator selector + On + Unmap-all row, then the selected
             // modulator's own controls (envelope ADSR+Range, or the LFO set).
@@ -3362,7 +3429,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
             for (int i = 0; i < 4; ++i)
             { custAdsr[i].setVisible (false); custAdsrLbl[i].setVisible (false); } // replaced by the curve editor
             envEditor.setVisible (cust && isEnv);
-            if (envEditor.isVisible()) envEditor.refresh(); // (the 30 Hz timer keeps it live)
+            if (envEditor.isVisible()) envEditor.refresh();
+    if (voiceEnv.isVisible())  voiceEnv.refresh(); // (the 30 Hz timer keeps it live)
             custRangeFader.setVisible (cust);
             lblCustRange.setVisible (cust);
             juce::Component* lfoC[] = { &lfoWaveBox, &lfoRateModeBox, &lfoPhaseModeBox,
@@ -3473,19 +3541,18 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 lblBend.setBounds (bendRow.removeFromLeft (74));
                 compact (bendBox, bendRow.removeFromLeft (juce::jmin (120, bendRow.getWidth())));
             }
-            // Recent + Tuning bank only make sense in Scala (.scl) mode.
-            recentLabel.setVisible (sclMode);
-            for (int i = 0; i < 3; ++i) recentBtn[i].setVisible (sclMode && recentBtn[i].getButtonText().isNotEmpty());
+            // Recent is ONE button that opens a floating list of every file loaded;
+            // the bank stays inline. Both only make sense in Scala (.scl) mode.
+            recentLabel.setVisible (false);
+            for (int i = 0; i < 3; ++i) recentBtn[i].setVisible (false);
+            recentOpenBtn.setVisible (sclMode);
             lblTuningBank.setVisible (sclMode); tuningBankBox.setVisible (sclMode);
             tuningBankLoadBtn.setVisible (sclMode);
             tuningBankClearBtn.setVisible (sclMode);
             if (sclMode)
             {
                 ti.removeFromTop (3);
-                recentLabel.setBounds (ti.removeFromTop (13));
-                auto rrow = ti.removeFromTop (23);
-                const int rw = rrow.getWidth() / 3;
-                for (int i = 0; i < 3; ++i) recentBtn[i].setBounds (rrow.removeFromLeft (rw).reduced (2, 1));
+                recentOpenBtn.setBounds (ti.removeFromTop (22).reduced (2, 0));
                 ti.removeFromTop (3);
                 // Bank row: the label rides on the LEFT of the row (a separate label
                 // row no longer fits) - [BANK][combo (flex)][+ .scl][X remove].
@@ -3510,6 +3577,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
     warningOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (580, 200));
     warningOverlay.toFront (false);
     noticeOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (560, 220));
+    recentOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (520, 380));
+    if (recentOverlay.isVisible()) recentOverlay.toFront (false);
     rhythmScrim.setBounds (getLocalBounds());
     rhythmPanel.setBounds (getLocalBounds().withSizeKeepingCentre (820, 640));
     waveEditor.setBounds (getLocalBounds().withSizeKeepingCentre (640, 360));

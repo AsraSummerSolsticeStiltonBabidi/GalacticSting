@@ -68,6 +68,11 @@ namespace spectrum
         float     selection     = (float) Selection::All; // 0=Even 1=All 2=Odd 3=Prime (blended in between)
         float     curveSlope    = 1.0f;              // s in (k/kMin)^(-s); 1 -> saw-type roll-off
         int       primeLimit    = 0;                 // 0 = off, else largest prime allowed
+        // Continuous prime limit: the position on the Off - 23 - 19 ... - 2 fader.
+        // A whole value is one of those limits; in between, the harmonics that the
+        // NEXT (narrower) limit would remove fade down instead of vanishing.
+        float     primeLimitPos = 0.0f;
+        int       primeLimitNext = 0;                // the limit at the next stop (0 = same)
         bool      primeUseWhitelist = false;         // true -> use the whitelist instead of the limit
         unsigned  primeWhitelistMask = 0xFFFFFFFFu;  // which listed primes are allowed
         float     fractalLevel  = 1.0f;              // 1 = off .. 4; decimals blend in the next level's new partials LOW to HIGH
@@ -92,6 +97,8 @@ namespace spectrum
                 && selection == o.selection
                 && curveSlope == o.curveSlope
                 && primeLimit == o.primeLimit
+                && primeLimitPos == o.primeLimitPos
+                && primeLimitNext == o.primeLimitNext
                 && primeUseWhitelist == o.primeUseWhitelist
                 && primeWhitelistMask == o.primeWhitelistMask
                 && fractalLevel == o.fractalLevel

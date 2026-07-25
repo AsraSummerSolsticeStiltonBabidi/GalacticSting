@@ -163,7 +163,11 @@ public:
     // interval becomes the period (the Reps repeat point).
     bool loadTimbreText (const juce::String& text, juce::String& errorOut);
     void clearTimbre();
-    bool isTimbreActive() const noexcept { return timbreActive; }
+    // The Custom Engine's on/off is a real PARAMETER, so it is automatable and -
+    // the reason it moved here - Ctrl+Z undoes it like every other control. It only
+    // counts as on while a scale is actually loaded.
+    bool isTimbreActive() const noexcept
+    { return ! timbreDegrees.empty() && apvts.getRawParameterValue ("timbreOn")->load() > 0.5f; }
 
     // Recently-used .scl files (persisted across sessions, newest first, max 3).
     juce::StringArray getRecentSclPaths() const { return recentSclPaths; }
@@ -256,13 +260,29 @@ public:
     // Scale EDITING on the keyboard. Works from ANY loaded tuning (the current
     // tuning is first rendered to .scl form, degree sources preserved).
     // Custom-Engine On/Off WITHOUT losing the loaded scale (plain toggle).
-    void setTimbreEnabled (bool b) noexcept { if (! timbreDegrees.empty()) timbreActive = b; }
+    // Through the parameter (with a gesture) so the change lands in the undo history.
+    // Same, without a gesture: for loads/restores that are not a user edit.
+    void setTimbreOnParam (bool b)
+    {
+        if (auto* p = apvts.getParameter ("timbreOn"))
+            p->setValueNotifyingHost (b ? 1.0f : 0.0f);
+    }
+    void setTimbreEnabled (bool b)
+    {
+        if (timbreDegrees.empty()) return;
+        if (auto* p = apvts.getParameter ("timbreOn"))
+        {
+            p->beginChangeGesture();
+            p->setValueNotifyingHost (b ? 1.0f : 0.0f);
+            p->endChangeGesture();
+        }
+    }
     bool timbreLoaded() const noexcept { return ! timbreDegrees.empty(); }
 
     // Does the Custom-Engine scale REPLACE the harmonic engine (temper mode off)?
     // With temper ON both run together, so the engine's controls stay live.
     bool timbreReplacesEngine() const noexcept
-    { return timbreActive && ! (apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f); }
+    { return isTimbreActive() && ! (apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f); }
 
     //==========================================================================
     // MODULATORS (3 custom envelopes + 3 LFOs) -> any parameters. Editor calls.
@@ -375,7 +395,6 @@ private:
     // Scala-as-timbre state (message thread; read into SpectrumSettings each poll).
     std::vector<float> timbreDegrees;
     float              timbrePeriod = 2.0f;
-    bool               timbreActive = false;
     juce::String       timbreName, timbreSource;
 
     // Persistent recent-.scl list (global app settings, shared across instances).

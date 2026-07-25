@@ -47,7 +47,7 @@ void FractalAdditiveAudioProcessor::addRecentScl (const juce::File& f)
     const auto path = f.getFullPathName();
     recentSclPaths.removeString (path);
     recentSclPaths.insert (0, path);
-    while (recentSclPaths.size() > 3)
+    while (recentSclPaths.size() > 64)   // the Recent window lists them all, newest first
         recentSclPaths.remove (recentSclPaths.size() - 1);
     if (appProps != nullptr)
     {
@@ -91,9 +91,12 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "curveSlope", 1 }, "Partial Amp Decay Slope",
         NormalisableRange<float> (0.0f, 4.0f, 0.001f), 1.0f));
-    params.push_back (std::make_unique<AudioParameterChoice>(
+    // Continuous prime limit: whole values are the classic limits (Off, 23, 19 ... 2)
+    // and the fader snaps to them, but it can rest in between - there the harmonics
+    // the NEXT limit would remove fade down instead of disappearing.
+    params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "primeLimit", 1 }, "Prime Limit",
-        StringArray { "Off", "23", "19", "17", "13", "11", "7", "5", "3", "2" }, 0));
+        NormalisableRange<float> (0.0f, 9.0f, 0.01f), 0.0f));
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "primeMode", 1 }, "Prime Mode",
         StringArray { "Limit", "Whitelist" }, 0));
@@ -126,12 +129,28 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "ampAttack", 1 }, "Amp Attack", timeRange (5.0f), 0.005f));
     params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "ampDecay", 1 }, "Amp Decay", timeRange (5.0f), 0.120f));
+        ParameterID { "ampDecay", 1 }, "Amp Decay", timeRange (20.0f), 0.120f));
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "ampSustain", 1 }, "Amp Sustain",
         NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.80f));
     params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "ampRelease", 1 }, "Amp Release", timeRange (8.0f), 0.300f));
+        ParameterID { "ampRelease", 1 }, "Amp Release", timeRange (30.0f), 0.300f));
+    // Segment shapes for the three voice envelopes (0 = straight, + convex, - concave)
+    // - the same family the modulators and the envelope editor use.
+    {
+        auto curve = [] { return NormalisableRange<float> (-1.0f, 1.0f, 0.001f); };
+        for (const char* pfx : { "amp", "filter", "pitch" })
+        {
+            const String base (pfx);
+            const String nice = base.substring (0, 1).toUpperCase() + base.substring (1);
+            params.push_back (std::make_unique<AudioParameterFloat>(
+                ParameterID { base + "CurveA", 1 }, nice + " Attack Curve", curve(), 0.0f));
+            params.push_back (std::make_unique<AudioParameterFloat>(
+                ParameterID { base + "CurveD", 1 }, nice + " Decay Curve", curve(), 0.55f));
+            params.push_back (std::make_unique<AudioParameterFloat>(
+                ParameterID { base + "CurveR", 1 }, nice + " Release Curve", curve(), 0.55f));
+        }
+    }
 
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "masterGain", 1 }, "Master Gain",
@@ -146,12 +165,12 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         params.push_back (std::make_unique<AudioParameterFloat>(
             ParameterID { pfx + "A", 1 }, "Env " + String (n) + " Attack", timeRange (5.0f), 0.100f));
         params.push_back (std::make_unique<AudioParameterFloat>(
-            ParameterID { pfx + "D", 1 }, "Env " + String (n) + " Decay", timeRange (5.0f), 0.300f));
+            ParameterID { pfx + "D", 1 }, "Env " + String (n) + " Decay", timeRange (20.0f), 0.300f));
         params.push_back (std::make_unique<AudioParameterFloat>(
             ParameterID { pfx + "S", 1 }, "Env " + String (n) + " Sustain",
             NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.70f));
         params.push_back (std::make_unique<AudioParameterFloat>(
-            ParameterID { pfx + "R", 1 }, "Env " + String (n) + " Release", timeRange (8.0f), 0.400f));
+            ParameterID { pfx + "R", 1 }, "Env " + String (n) + " Release", timeRange (30.0f), 0.400f));
         params.push_back (std::make_unique<AudioParameterFloat>(
             ParameterID { pfx + "Range", 1 }, "Env " + String (n) + " Range",
             NormalisableRange<float> (-1.0f, 1.0f, 0.001f), 0.5f));
@@ -217,12 +236,12 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "filterAttack", 1 }, "Filter Attack", timeRange (5.0f), 0.010f));
     params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "filterDecay", 1 }, "Filter Decay", timeRange (5.0f), 0.200f));
+        ParameterID { "filterDecay", 1 }, "Filter Decay", timeRange (20.0f), 0.200f));
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "filterSustain", 1 }, "Filter Sustain",
         NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 1.0f));
     params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "filterRelease", 1 }, "Filter Release", timeRange (8.0f), 0.300f));
+        ParameterID { "filterRelease", 1 }, "Filter Release", timeRange (30.0f), 0.300f));
 
     //-- Pitch envelope (bends the played pitch, in semitones) ------------------
     params.push_back (std::make_unique<AudioParameterFloat>(
@@ -231,12 +250,12 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "pitchAttack", 1 }, "Pitch Attack", timeRange (5.0f), 0.005f));
     params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "pitchDecay", 1 }, "Pitch Decay", timeRange (5.0f), 0.150f));
+        ParameterID { "pitchDecay", 1 }, "Pitch Decay", timeRange (20.0f), 0.150f));
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "pitchSustain", 1 }, "Pitch Sustain",
         NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.0f));   // min by default
     params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "pitchRelease", 1 }, "Pitch Release", timeRange (8.0f), 0.001f)); // min by default
+        ParameterID { "pitchRelease", 1 }, "Pitch Release", timeRange (30.0f), 0.001f)); // min by default
 
     //-- Spectral morphing (glide partials to their new positions on a spectrum change)
     params.push_back (std::make_unique<AudioParameterBool>(
@@ -339,6 +358,10 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     // own scale is bypassed. The id stays "timbreTemper" so old projects load.
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "timbreTemper", 1 }, "Temper To Tuning", false));
+    // Custom Engine on/off. A parameter (not plain state) so it is automatable and
+    // Ctrl+Z undoes switching it, like every other control.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "timbreOn", 1 }, "Custom Engine On", true));
 
     //-- Scala-as-timbre --------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterInt>(
@@ -356,8 +379,14 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
     s.selection     = apvts.getRawParameterValue ("harmonics")->load();
     s.curveSlope    = apvts.getRawParameterValue ("curveSlope")->load();
 
-    const int plIdx = juce::jlimit (0, 9, (int) apvts.getRawParameterValue ("primeLimit")->load());
-    s.primeLimit    = primeLimitValues[plIdx];
+    // Prime limit is a CONTINUOUS position on the Off - 23 - 19 ... - 2 fader: the
+    // whole value below is the limit in force, the one above is the next stop, and
+    // the fraction between them fades out the harmonics that stop would remove.
+    const float plPos = juce::jlimit (0.0f, 9.0f, apvts.getRawParameterValue ("primeLimit")->load());
+    const int plIdx   = juce::jlimit (0, 9, (int) std::floor (plPos));
+    s.primeLimitPos  = plPos;
+    s.primeLimit     = primeLimitValues[plIdx];
+    s.primeLimitNext = primeLimitValues[juce::jmin (9, plIdx + 1)];
 
     s.primeUseWhitelist = apvts.getRawParameterValue ("primeMode")->load() > 0.5f;
     unsigned mask = 0;
@@ -388,7 +417,7 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
         s.timbrePeriod = (float) tuning.periodRatio(); // the tuning's OWN period, not a key lookup
         if (! (s.timbrePeriod > 1.0001f)) { s.timbrePeriod = 2.0f; }
     }
-    else if (timbreActive && ! timbreDegrees.empty())
+    else if (isTimbreActive())
     {
         s.source              = spectrum::Source::ScalaTimbre;
         s.timbreDegrees       = timbreDegrees;
@@ -576,7 +605,7 @@ bool FractalAdditiveAudioProcessor::loadTimbreFile (const juce::File& f, juce::S
     timbrePeriod = (float) period;
     timbreName   = f.getFileNameWithoutExtension();
     timbreSource = text;
-    timbreActive = true;
+    setTimbreOnParam (true);
     addRecentScl (f);
     return true;
 }
@@ -644,13 +673,15 @@ bool FractalAdditiveAudioProcessor::loadTimbreText (const juce::String& text, ju
     timbrePeriod  = (float) period;
     timbreName    = "typed";
     timbreSource  = text;
-    timbreActive  = true;
+    setTimbreOnParam (true);
     return true;
 }
 
 void FractalAdditiveAudioProcessor::clearTimbre()
 {
-    timbreActive = false;
+    // Only the SCALE is dropped: the on/off parameter is left alone (it is part of
+    // the saved state, and isTimbreActive() already reports off with no scale
+    // loaded). Clearing it here overwrote the value a state restore had just set.
     timbreDegrees.clear();
     timbreName.clear();
     timbreSource.clear();
@@ -1658,7 +1689,7 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         juce::ValueTree tim ("TIMBRE");
         tim.setProperty ("name",   timbreName,   nullptr);
         tim.setProperty ("source", timbreSource, nullptr);
-        tim.setProperty ("on",     timbreActive, nullptr);
+        tim.setProperty ("on",     isTimbreActive(), nullptr);
         state.appendChild (tim, nullptr);
     }
 
@@ -1886,12 +1917,12 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
             timbrePeriod = (float) period;
             timbreName   = name;
             timbreSource = src;
-            timbreActive = (bool) tim.getProperty ("on", true);
+            setTimbreOnParam ((bool) tim.getProperty ("on", true));
         }
         else if (src.isNotEmpty()) // typed intervals (Spectrum Builder)
         {
             loadTimbreText (src, err);
-            timbreActive = (bool) tim.getProperty ("on", true) && ! timbreDegrees.empty();
+            setTimbreOnParam ((bool) tim.getProperty ("on", true) && ! timbreDegrees.empty());
         }
     }
 }
