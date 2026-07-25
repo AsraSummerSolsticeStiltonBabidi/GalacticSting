@@ -174,7 +174,10 @@ FractalAdditiveAudioProcessor::createParameterLayout()
 
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "masterGain", 1 }, "Master Gain",
-        NormalisableRange<float> (-60.0f, 6.0f, 0.01f), 0.0f));
+        // +6 dB at the top used to be the ceiling - even maxed out, the synth read
+        // noticeably quieter than reference plugins. Raised to +12 dB: the default
+        // (0 dB) is untouched, this only gives more room to push into on purpose.
+        NormalisableRange<float> (-60.0f, 12.0f, 0.01f), 0.0f));
 
     //-- MODULATORS: 3 custom envelopes + 3 LFOs, each mappable onto ANY number of
     // parameters (right-click a fader -> "Map to..."). They ride ON TOP of the
@@ -1647,8 +1650,11 @@ void FractalAdditiveAudioProcessor::playJingleInto (juce::AudioBuffer<float>& bu
     const int n = juce::jmin (remaining, buffer.getNumSamples());
     const int outCh = buffer.getNumChannels();
     const int jinCh  = jingleOut.getNumChannels();
+    // The file's own level read noticeably louder than the synth itself - trimmed
+    // here, at the mix, rather than baking a lower level into the asset.
+    constexpr float kJingleGain = 0.35f; // ~ -9 dB
     for (int ch = 0; ch < outCh; ++ch)
-        buffer.addFrom (ch, 0, jingleOut, juce::jmin (ch, jinCh - 1), jingleReadPos, n);
+        buffer.addFrom (ch, 0, jingleOut, juce::jmin (ch, jinCh - 1), jingleReadPos, n, kJingleGain);
     jingleReadPos += n;
     if (jingleReadPos >= jingleOut.getNumSamples()) jingleActive = false;
 }
