@@ -105,13 +105,17 @@ public:
     double getDegreeRatio (int d) const
     {
         const int D = juce::jmax (1, tuning.degreesPerPeriod());
-        int key = 60 + d;
-        while (key > 127 && key - D >= 0) key -= D;
-        while (key < 0   && key + D <= 127) key += D;
+        const double per = tuning.periodRatio();
+        int key = 60 + d, wraps = 0;
+        while (key > 127 && key - D >= 0) { key -= D; ++wraps; }
+        while (key < 0   && key + D <= 127) { key += D; --wraps; }
         key = juce::jlimit (0, 127, key);
         const double f0 = tuning.frequencyForNote (60);
         const double f  = tuning.frequencyForNote (key);
-        return f0 > 0.0 ? f / f0 : 1.0;
+        // Each wrap moved the lookup down a whole PERIOD - put it back, or a dense
+        // scale (>67 degrees, whose upper degrees do not fit above key 60) would
+        // report its high degrees a period too low.
+        return f0 > 0.0 ? (f / f0) * std::pow (per, (double) wraps) : 1.0;
     }
 
     // Genuine JI test BY SOURCE: is scale degree `d` (0..getScaleDegrees(), where the
@@ -222,6 +226,10 @@ public:
     void startNadCompute (int notes); // 2 = dyads, 3 = triads, ...
     int  getNadGeneration() const noexcept { return nadGeneration.load(); }
     bool isNadBusy() const noexcept { return nadBusy.load(); }
+    // Honesty surface: never hide a coverage limit silently.
+    bool nadWasOverBudget() const noexcept { return nadOverBudget.load(); }
+    int  getNadUsedDegrees()  const noexcept { return nadUsedD.load(); }
+    int  getNadTotalDegrees() const noexcept { return nadTotalD.load(); }
     std::vector<NadRow> getNadResults() const
     {
         const juce::ScopedLock sl (nadLock);
@@ -231,6 +239,10 @@ public:
     //==========================================================================
     // Scale EDITING on the keyboard. Works from ANY loaded tuning (the current
     // tuning is first rendered to .scl form, degree sources preserved).
+    // Custom-Engine On/Off WITHOUT losing the loaded scale (plain toggle).
+    void setTimbreEnabled (bool b) noexcept { if (! timbreDegrees.empty()) timbreActive = b; }
+    bool timbreLoaded() const noexcept { return ! timbreDegrees.empty(); }
+
     // Does the Custom-Engine scale REPLACE the harmonic engine (temper mode off)?
     // With temper ON both run together, so the engine's controls stay live.
     bool timbreReplacesEngine() const noexcept
@@ -364,8 +376,8 @@ private:
 
     // n-ad worker state.
     std::unique_ptr<std::thread> nadThread;
-    std::atomic<bool> nadCancel { false }, nadBusy { false };
-    std::atomic<int>  nadGeneration { 0 };
+    std::atomic<bool> nadCancel { false }, nadBusy { false }, nadOverBudget { false };
+    std::atomic<int>  nadGeneration { 0 }, nadUsedD { 0 }, nadTotalD { 0 };
     mutable juce::CriticalSection nadLock;
     std::vector<NadRow> nadResults;
 
@@ -373,6 +385,8 @@ private:
     ModEngine    modEngine { apvts };
     juce::String lfoWavePoints[3];   // drawn-wave breakpoints (for re-editing)
     juce::uint32 modNoteOns = 0;     // running note-on counter (envelope retrigger)
+    int          modHeld    = 0;     // notes currently held (audio thread; envelope gate)
+    std::array<std::array<bool, 128>, 16> modKeyHeld {}; // which (channel, key) are down
     std::vector<DissDegreeInfo> dissDegrees;
     double dissGreenH = 0.0, dissRedH = 1.0;
     int    dissRequested = 0, dissFound = 0, dissGeneration = 0;

@@ -2,6 +2,9 @@
 #include "PluginEditor.h"
 #include "dsp/Dissonance.h"
 
+#include <string>
+#include <unordered_map>
+
 namespace
 {
     // Prime-limit choice index -> largest prime allowed (0 = off).
@@ -77,9 +80,12 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "baseMode", 1 }, "Base Pitch",
         StringArray { "Transposed down", "Original" }, 0));
-    params.push_back (std::make_unique<AudioParameterChoice>(
-        ParameterID { "selection", 1 }, "Partial Whitelist",
-        StringArray { "All", "Even", "Odd", "Prime" }, 0));
+    // Harmonics: a continuous fader Even - All - Odd - Prime (default All). Whole
+    // values are the classic sets; in between, the harmonics that belong to only
+    // one of the two neighbouring sets fade in/out (see spectrum::selectionWeight).
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "harmonics", 1 }, "Harmonics",
+        NormalisableRange<float> (0.0f, 3.0f, 0.01f), 1.0f));
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "curveSlope", 1 }, "Partial Amp Decay Slope",
         NormalisableRange<float> (0.0f, 4.0f, 0.001f), 1.0f));
@@ -95,8 +101,12 @@ FractalAdditiveAudioProcessor::createParameterLayout()
             params.push_back (std::make_unique<AudioParameterBool>(
                 ParameterID { "primeWL" + String (i), 1 }, "Prime " + String (pn[i]), true));
     }
-    params.push_back (std::make_unique<AudioParameterInt>(
-        ParameterID { "fractalLevel", 1 }, "Fractal Level", 1, 4, 1));
+    // Continuous fractality: 1..4 with decimals; fractional levels add the next
+    // level's NEW partials progressively from LOW to HIGH. Same normalised mapping
+    // as the old 1..4 integer param, so saved projects load to the same spot.
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "fractalLevel", 1 }, "Fractal Level",
+        NormalisableRange<float> (1.0f, 4.0f, 0.01f), 1.0f));
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "spectrumRange", 1 }, "Spectrum Range (oct)", 1, 10, 10));
     params.push_back (std::make_unique<AudioParameterChoice>(
@@ -320,7 +330,7 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
     spectrum::SpectrumSettings s;
     s.baseN         = (int) apvts.getRawParameterValue ("baseN")->load();
     s.baseMode      = (spectrum::BaseMode) (int) apvts.getRawParameterValue ("baseMode")->load();
-    s.selection     = (spectrum::Selection) (int) apvts.getRawParameterValue ("selection")->load();
+    s.selection     = apvts.getRawParameterValue ("harmonics")->load();
     s.curveSlope    = apvts.getRawParameterValue ("curveSlope")->load();
 
     const int plIdx = juce::jlimit (0, 9, (int) apvts.getRawParameterValue ("primeLimit")->load());
@@ -333,21 +343,27 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
             mask |= (1u << i);
     s.primeWhitelistMask = mask;
 
-    s.fractalLevel   = (int) apvts.getRawParameterValue ("fractalLevel")->load();
+    s.fractalLevel   = apvts.getRawParameterValue ("fractalLevel")->load();
     s.spectrumRangeOct = (int) apvts.getRawParameterValue ("spectrumRange")->load();
     s.ampFloorDb     = -120.0f;
     s.maxPartials    = spectrum::kMaxPartials;
 
-    // Scala-as-timbre: with TEMPER on, the harmonic engine keeps running and its
-    // partials are snapped to the scale's grid (both engines together); with it off
-    // the scale replaces the engine as the spectrum itself.
+    // TEMPER mode: the harmonic engine keeps running and its partials snap to the
+    // grid of the ACTIVE TUNING (whatever is loaded in the Tuning box - .scl, MTS,
+    // MPE...), read live every poll so tuning changes retune the spectrum in real
+    // time. Independent of the Custom Engine's own loaded scale.
     const bool temper = apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f;
-    if (timbreActive && ! timbreDegrees.empty() && temper)
+    if (temper)
     {
         s.source         = spectrum::Source::Harmonic;
         s.temperToTimbre = true;
-        s.timbreDegrees  = timbreDegrees;
-        s.timbrePeriod   = timbrePeriod;
+        const int D = juce::jmax (1, tuning.degreesPerPeriod()); // no cap: every degree is a grid point
+        s.timbreDegrees.clear();
+        s.timbreDegrees.reserve ((size_t) D);
+        for (int d = 0; d < D; ++d)
+            s.timbreDegrees.push_back ((float) getDegreeRatio (d));
+        s.timbrePeriod = (float) tuning.periodRatio(); // the tuning's OWN period, not a key lookup
+        if (! (s.timbrePeriod > 1.0001f)) { s.timbrePeriod = 2.0f; }
     }
     else if (timbreActive && ! timbreDegrees.empty())
     {
@@ -1161,11 +1177,19 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes)
     nadCancel = false;
 
     // Snapshot on the message thread: the degrees' absolute frequencies + spectrum.
-    const int D = juce::jlimit (1, 64, tuning.degreesPerPeriod());
+    const int totalD = tuning.degreesPerPeriod();
+    const int D = juce::jlimit (1, 128, totalD);
+    nadTotalD = totalD;
+    nadUsedD  = D;
     std::vector<double> ratios ((size_t) D);
     for (int d = 0; d < D; ++d) ratios[(size_t) d] = getDegreeRatio (d);
     const auto tmpl = spectrum::compileSpectrum (currentSettings());
-    const double f0 = TuningManager::kRefFreq * tuning.referenceScale();
+    const double periodC = 1200.0 * std::log2 (std::max (1.0e-9, tuning.periodRatio()));
+    // Same absolute anchor as the Degrees list (computeActiveScaleDissonance):
+    // Sethares roughness depends on register, so both lists must agree.
+    double f0 = tuning.frequencyForNote (60);
+    if (! (f0 > 0.0) || ! std::isfinite (f0))
+        f0 = TuningManager::kRefFreq * tuning.referenceScale();
     std::vector<dissonance::Partial> spec;
     spec.reserve (tmpl.partials.size());
     for (const auto& p : tmpl.partials) spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
@@ -1177,14 +1201,33 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes)
     }
 
     nadBusy = true;
-    nadThread = std::make_unique<std::thread> ([this, notes, D, ratios = std::move (ratios), spec = std::move (spec)]()
+    nadThread = std::make_unique<std::thread> ([this, notes, D, periodC,
+                                                ratios = std::move (ratios), spec = std::move (spec)]()
     {
         std::vector<FractalAdditiveAudioProcessor::NadRow> out;
+
+        // Equal-step scale? Then only 0-rooted combinations are enumerated (see
+        // below), which also shrinks the search space from C(D,n) to C(D-1,n-1).
+        std::vector<double> cents ((size_t) D);
+        for (int d = 0; d < D; ++d) cents[(size_t) d] = 1200.0 * std::log2 (std::max (1.0e-9, ratios[(size_t) d]));
+        bool regular = D >= 2;
+        {
+            const double step = periodC / (double) D;
+            for (int d = 0; d < D && regular; ++d)
+                if (std::abs (cents[(size_t) d] - step * (double) d) > 0.5) regular = false;
+        }
+
         long long combos = 1;
-        for (int i = 0; i < notes; ++i) combos = combos * (long long) (D - i) / (long long) (i + 1);
+        {
+            const int nSel = regular ? notes - 1 : notes;   // regular: degree 0 is fixed
+            const int pool = regular ? D - 1     : D;
+            for (int i = 0; i < nSel; ++i) combos = combos * (long long) (pool - i) / (long long) (i + 1);
+        }
+        nadOverBudget = ! (combos > 0 && combos <= 4'000'000LL); // surfaced in the list, never silent
         if (D >= notes && combos > 0 && combos <= 4'000'000LL && ! spec.empty())
         {
-            // Exact pair tables over the degree set.
+            // Exact pair tables over the degree set (cancel-polled per row AND per
+            // column: a cancel must not stall the message thread's join()).
             std::vector<double> dself ((size_t) D);
             std::vector<double> dcross ((size_t) D * (size_t) D, 0.0);
             for (int i = 0; i < D && ! nadCancel.load(); ++i)
@@ -1192,16 +1235,40 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes)
                 dself[(size_t) i] = dissonance::selfDissonance (spec, ratios[(size_t) i]);
                 for (int j = i + 1; j < D; ++j)
                 {
+                    if ((j & 15) == 0 && nadCancel.load()) break;
                     const double v = dissonance::crossDissonance (spec, ratios[(size_t) i], ratios[(size_t) j]);
                     dcross[(size_t) i * (size_t) D + (size_t) j] = v;
                     dcross[(size_t) j * (size_t) D + (size_t) i] = v;
                 }
             }
+
+            // In REGULAR tunings (EDOs, any equal-step scale) every chord shape exists
+            // at every degree, so listing all transpositions would repeat the same
+            // shape D times: there the enumeration is ROOTED AT 0 (see `regular`
+            // above) - exactly the "only from 0" the list promises. Irregular scales
+            // keep the full enumeration (their transpositions are genuinely different
+            // chords) with a pattern dedup for shapes that DO repeat (symmetric
+            // scales), where the first copy seen is the lowest-rooted one.
+
+            // Pattern key for the irregular path: the consecutive interval sizes,
+            // quantised to 0.5 c and packed into one integer (no allocation).
+            const auto patternKey = [&cents, notes] (const int* cc)
+            {
+                unsigned long long k = 1469598103934665603ull; // FNV-1a over the intervals
+                for (int i = 1; i < notes; ++i)
+                {
+                    const long long q = (long long) std::llround ((cents[(size_t) cc[i]] - cents[(size_t) cc[i - 1]]) * 2.0);
+                    k = (k ^ (unsigned long long) q) * 1099511628211ull;
+                }
+                return k;
+            };
+            std::unordered_map<unsigned long long, int> seen; // shapes already listed
+
             // Bounded best-K enumeration (ascending beating).
             const int keep = 40;
             std::vector<FractalAdditiveAudioProcessor::NadRow> best;
             int c[12];
-            for (int i = 0; i < notes; ++i) c[i] = i;
+            for (int i = 0; i < notes; ++i) c[i] = i;   // regular: c[0] stays 0
             while (! nadCancel.load())
             {
                 double v = 0.0;
@@ -1213,27 +1280,41 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes)
                 }
                 if ((int) best.size() < keep || v < best.back().value)
                 {
-                    FractalAdditiveAudioProcessor::NadRow row;
-                    row.value = v;
-                    row.degs.assign (c, c + notes);
-                    const auto pos = std::lower_bound (best.begin(), best.end(), row,
-                        [] (const NadRow& a, const NadRow& b) { return a.value < b.value; });
-                    best.insert (pos, std::move (row));
-                    if ((int) best.size() > keep) best.pop_back();
+                    // In the irregular path the FIRST time a shape is seen is its
+                    // lowest-rooted copy (lexicographic order), so keeping that one
+                    // keeps the 0-rooted copy whenever it exists.
+                    const bool fresh = regular || seen.find (patternKey (c)) == seen.end();
+                    if (fresh)
+                    {
+                        if (! regular) seen.emplace (patternKey (c), 1);
+                        FractalAdditiveAudioProcessor::NadRow row;
+                        row.value = v;
+                        row.degs.assign (c, c + notes);
+                        const auto pos = std::lower_bound (best.begin(), best.end(), row,
+                            [] (const NadRow& a, const NadRow& b) { return a.value < b.value; });
+                        best.insert (pos, std::move (row));
+                        if ((int) best.size() > keep) best.pop_back();
+                    }
                 }
+                // Next combination. In the regular path index 0 is pinned to degree 0.
                 int i = notes - 1;
-                while (i >= 0 && c[i] == D - (notes - i)) --i;
-                if (i < 0) break;
+                while (i >= (regular ? 1 : 0) && c[i] == D - (notes - i)) --i;
+                if (i < (regular ? 1 : 0)) break;
                 ++c[i];
                 for (int j = i + 1; j < notes; ++j) c[j] = c[j - 1] + 1;
             }
             out = std::move (best);
         }
+        // A cancelled run must NOT publish its partial ranking (rows would be
+        // missing because enumeration stopped, not because they lost).
+        if (! nadCancel.load())
         {
-            const juce::ScopedLock sl (nadLock);
-            nadResults = std::move (out);
+            {
+                const juce::ScopedLock sl (nadLock);
+                nadResults = std::move (out);
+            }
+            nadGeneration.fetch_add (1);
         }
-        nadGeneration.fetch_add (1);
         nadBusy = false;
     });
 }
@@ -1257,7 +1338,9 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     synth.setCurrentPlaybackSampleRate (sampleRate);
     previewCollector.reset (sampleRate);
     noteGate.prepare (sampleRate);
-    modEngine.prepare (sampleRate);
+    modEngine.prepare (sampleRate); // resyncs its note counter (no phantom retrigger)
+    modHeld = 0;
+    for (auto& row : modKeyHeld) row.fill (false);
     lastSr = sampleRate;
     lastGain = juce::Decibels::decibelsToGain (apvts.getRawParameterValue ("masterGain")->load());
 
@@ -1268,7 +1351,11 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     applyTuningMode ((int) apvts.getRawParameterValue ("tuningMode")->load());
     rhythm.prepare (sampleRate);
 
-    startTimerHz (30); // poll spectrum params and rebuild off the audio thread
+    // Poll the spectrum parameters and rebuild off the audio thread. 60 Hz (not 30):
+    // a modulator driving a parameter that REBUILDS the spectrum (Base N, Harmonics,
+    // Slope, Fractal, Prime, Range, Reps) is only sampled here, so a fast envelope
+    // used to be caught on some notes and missed on others.
+    startTimerHz (60);
 }
 
 bool FractalAdditiveAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -1322,10 +1409,41 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 
     // MODULATORS (3 envelopes + 3 LFOs): stepped once per block, writing straight
     // into the target parameters' raw atomics (base value + modulation) - smooth,
-    // host/undo-silent, RT-safe.
+    // host-silent, RT-safe. Held state is tallied from THIS block's events (post-
+    // gate stream is consistent) so releases are sample-accurate to the block and
+    // a note that starts and ends inside one block still releases. Chord-preview
+    // notes count too: the preview must sound with the same envelopes as playing.
     {
-        for (const auto meta : midiMessages)
-            if (meta.getMessage().isNoteOn()) ++modNoteOns;
+        // Held state is a SET of (channel, key), not a counter: mono kills and
+        // preview stops can emit a note-off for a key that is already silent, and a
+        // plain counter would then under-run and release the envelopes while real
+        // keys are still down.
+        const auto tally = [this] (const juce::MidiBuffer& buf)
+        {
+            for (const auto meta : buf)
+            {
+                const auto& m = meta.getMessage();
+                const int ch = juce::jlimit (1, 16, m.getChannel()) - 1;
+                if (m.isNoteOn())
+                {
+                    ++modNoteOns;
+                    auto& f = modKeyHeld[(size_t) ch][(size_t) m.getNoteNumber()];
+                    if (! f) { f = true; ++modHeld; }
+                }
+                else if (m.isNoteOff())
+                {
+                    auto& f = modKeyHeld[(size_t) ch][(size_t) m.getNoteNumber()];
+                    if (f) { f = false; modHeld = std::max (0, modHeld - 1); }
+                }
+                else if (m.isAllNotesOff() || m.isAllSoundOff())
+                {
+                    for (auto& row : modKeyHeld) row.fill (false);
+                    modHeld = 0;
+                }
+            }
+        };
+        tally (midiMessages);
+        tally (previewMidi);
         double bpm = -1.0, ppq = -1.0;
         if (auto* ph = getPlayHead())
             if (auto pos = ph->getPosition())
@@ -1333,8 +1451,20 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                 if (pos->getBpm().hasValue()) bpm = *pos->getBpm();
                 if (pos->getIsPlaying() && pos->getPpqPosition().hasValue()) ppq = *pos->getPpqPosition();
             }
-        const double f0 = (double) rhythm.getDriverF0();
-        modEngine.processBlock (nSamp, modNoteOns, f0 > 0.0, f0, bpm, ppq);
+        // LFO fundamental = the LOWEST key currently held, computed from the same
+        // set (so a chord preview drives it exactly like playing those keys would;
+        // rhythm.getDriverF0() only knows the played notes and lags a block).
+        double f0 = 0.0;
+        if (modHeld > 0)
+        {
+            int lowest = 128;
+            for (int ch = 0; ch < 16; ++ch)
+                for (int k = 0; k < lowest; ++k)
+                    if (modKeyHeld[(size_t) ch][(size_t) k]) { lowest = k; break; }
+            if (lowest < 128) f0 = getNoteFrequency (lowest);
+        }
+        if (! (f0 > 0.0)) f0 = (double) rhythm.getDriverF0();
+        modEngine.processBlock (nSamp, modNoteOns, modHeld > 0, f0, bpm, ppq);
     }
     const bool midiOut  = apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f;
     const bool selfWant = apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f;
@@ -1409,6 +1539,19 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
 {
     auto state = apvts.copyState();
 
+    // The ModEngine writes base+mod into the raw atomics the flush/copy above
+    // snapshots, so a saved value would otherwise drift towards its momentary
+    // modulated position. Re-write the user's BASE for EVERY parameter (the
+    // parameter object always holds the base - modulation never goes through
+    // setValue), which also cleans up targets that were unmapped while displaced.
+    for (auto* ap : getParameters())
+        if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (ap))
+        {
+            auto child = state.getChildWithProperty ("id", p->paramID);
+            if (child.isValid())
+                child.setProperty ("value", p->convertFrom0to1 (p->getValue()), nullptr);
+        }
+
     state.removeChild (state.getChildWithName ("SCALA"), nullptr);
     if (tuning.getScalaSource().isNotEmpty())
     {
@@ -1419,11 +1562,12 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
     }
 
     state.removeChild (state.getChildWithName ("TIMBRE"), nullptr);
-    if (timbreActive && timbreSource.isNotEmpty())
+    if (timbreSource.isNotEmpty()) // kept even while switched OFF (On/Off toggle)
     {
         juce::ValueTree tim ("TIMBRE");
         tim.setProperty ("name",   timbreName,   nullptr);
         tim.setProperty ("source", timbreSource, nullptr);
+        tim.setProperty ("on",     timbreActive, nullptr);
         state.appendChild (tim, nullptr);
     }
 
@@ -1468,6 +1612,7 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
     }
 
     // Modulator routings + drawn LFO waves.
+    state.removeChild (state.getChildWithName ("MODS"), nullptr); // never stack a stale copy
     {
         juce::ValueTree ms ("MODS");
         for (int m = 0; m < ModEngine::kMods; ++m)
@@ -1495,6 +1640,7 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
     // "From spectrum's segment": the mode, the picked partials, the period spec, and
     // the generated .scl text (so the picker + Save survive a reopen; the tuning
     // itself already persists via the SCALA child).
+    state.removeChild (state.getChildWithName ("SEGMENT"), nullptr); // never stack a stale copy
     {
         juce::ValueTree sg ("SEGMENT");
         sg.setProperty ("modeActive", segmentModeActive, nullptr);
@@ -1516,10 +1662,24 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     if (! tree.isValid() || ! tree.hasType (apvts.state.getType()))
         return;
 
+    // Unmap BEFORE replaceState: replaceState's internal flush must not capture
+    // base+mod for the OLD routings into the fresh tree.
+    for (int m = 0; m < ModEngine::kMods; ++m) modEngine.unmapAll (m);
     apvts.replaceState (tree);
 
-    // Modulator routings + drawn LFO waves.
-    for (int m = 0; m < ModEngine::kMods; ++m) modEngine.unmapAll (m);
+    // Legacy "selection" choice (0=All 1=Even 2=Odd 3=Prime) -> the continuous
+    // "harmonics" fader axis (0=Even 1=All 2=Odd 3=Prime), so old projects sound
+    // the same after the fader replaced the drop-down.
+    if (! tree.getChildWithProperty ("id", "harmonics").isValid())
+        if (auto legacy = tree.getChildWithProperty ("id", "selection"); legacy.isValid())
+        {
+            static const float map[4] = { (float) spectrum::All, (float) spectrum::Even,
+                                          (float) spectrum::Odd, (float) spectrum::Prime };
+            const int idx = juce::jlimit (0, 3, (int) (double) legacy.getProperty ("value", 0.0));
+            if (auto* p = apvts.getParameter ("harmonics"))
+                p->setValueNotifyingHost (p->convertTo0to1 (map[idx]));
+        }
+
     if (auto ms = tree.getChildWithName ("MODS"); ms.isValid())
     {
         for (int m = 0; m < ModEngine::kMods; ++m)
@@ -1621,11 +1781,12 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
             timbrePeriod = (float) period;
             timbreName   = name;
             timbreSource = src;
-            timbreActive = true;
+            timbreActive = (bool) tim.getProperty ("on", true);
         }
         else if (src.isNotEmpty()) // typed intervals (Spectrum Builder)
         {
             loadTimbreText (src, err);
+            timbreActive = (bool) tim.getProperty ("on", true) && ! timbreDegrees.empty();
         }
     }
 }

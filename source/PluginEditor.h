@@ -45,7 +45,6 @@ private:
     void openTuningBankChooser();
     void refreshTuningBank(); // sync the bank combo items + selection with the processor
     void loadRecent (int index);
-    void forceDefault (const juce::String& paramID);
     void applyTimbreEnablement (bool active);
     void applyLanguage();
     void refreshPresetList();
@@ -88,6 +87,44 @@ private:
         }
     };
 
+    // Continuous fader with magnetic integer detents (Ctrl = free fine drag) and
+    // tick marks painted at each whole level. Used by the fractal-level fader.
+    struct MagneticSlider : SteppedSlider
+    {
+        double snapValue (double v, juce::Slider::DragMode dm) override
+        {
+            if (dm == juce::Slider::notDragging) return v;
+            if (juce::ModifierKeys::currentModifiers.isCtrlDown()) return v;
+            const double n = std::round (v);
+            return (std::abs (v - n) < 0.12 && n >= getMinimum() && n <= getMaximum()) ? n : v;
+        }
+        void paint (juce::Graphics& g) override
+        {
+            juce::Slider::paint (g);
+            const auto r = getLookAndFeel().getSliderLayout (*this).sliderBounds.toFloat();
+            if (r.isEmpty()) return;
+            g.setColour (findColour (juce::Slider::trackColourId).withAlpha (0.9f));
+            const int lo = (int) std::ceil (getMinimum()), hi = (int) std::floor (getMaximum());
+            const bool vertical = isVertical();
+            for (int i = lo; i <= hi; ++i)
+            {
+                const float p = (float) valueToProportionOfLength ((double) i);
+                if (vertical) // proportion 0 = bottom of the track
+                {
+                    const float y = r.getBottom() - p * r.getHeight();
+                    g.fillRect (r.getX(), y - 0.5f, 4.0f, 1.0f);
+                    g.fillRect (r.getRight() - 4.0f, y - 0.5f, 4.0f, 1.0f);
+                }
+                else
+                {
+                    const float x = r.getX() + p * r.getWidth();
+                    g.fillRect (x - 0.5f, r.getY(), 1.0f, 4.0f);
+                    g.fillRect (x - 0.5f, r.getBottom() - 4.0f, 1.0f, 4.0f);
+                }
+            }
+        }
+    };
+
     // Live list of the ACTIVE scale's degrees: colour chip + interval label +
     // Sethares dissonance (green->yellow->red). Fixed row height so it can live in
     // a Viewport and scroll when a scale has more steps than fit. Rows carry their
@@ -103,14 +140,19 @@ private:
         int contentHeight() const { return (int) rows.size() * kRowH; }
         void paint (juce::Graphics& g) override
         {
+            // Every row is the DYAD "0 + that degree": a red "0" chip (the root key,
+            // drawn like the keyboard's period boundary) always precedes the degree
+            // chip, so the pairing is explicit at a glance.
             const int rowH   = kRowH;
             const int W      = getWidth();
-            const int labelX = rowH + 4, labelW = 62;
+            const int chipW  = rowH - 2;
+            const int labelX = 2 * chipW + 6, labelW = 50;
             const int valueX = labelX + labelW + 2;
             int y = 0;
             for (const auto& r : rows)
             {
-                auto chipR = juce::Rectangle<int> (0, y + 1, rowH - 2, rowH - 2);
+                auto zeroR = juce::Rectangle<int> (0, y + 1, chipW, chipW);
+                auto chipR = juce::Rectangle<int> (chipW + 2, y + 1, chipW, chipW);
                 if (r.isPeriod)
                 {
                     // The period: one red box covering the "0" AND the interval, white text.
@@ -118,16 +160,20 @@ private:
                     g.fillRoundedRectangle (juce::Rectangle<int> (0, y + 1, valueX - 3, rowH - 2).toFloat(), 3.0f);
                     g.setColour (juce::Colours::white);
                     g.setFont (juce::Font (juce::FontOptions ((float) rowH * 0.6f).withStyle ("Bold")));
-                    g.drawText (r.num, chipR, juce::Justification::centred, false);
+                    g.drawText (r.num, zeroR, juce::Justification::centred, false);
                     g.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
                     g.drawText (r.label, labelX, y, labelW, rowH, juce::Justification::centredLeft, false);
                 }
                 else
                 {
+                    g.setColour (juce::Colour (0xffe0453f)); // red root chip "0"
+                    g.fillRoundedRectangle (zeroR.toFloat(), 3.0f);
+                    g.setColour (juce::Colours::white);
+                    g.setFont (juce::Font (juce::FontOptions ((float) rowH * 0.6f).withStyle ("Bold")));
+                    g.drawText ("0", zeroR, juce::Justification::centred, false);
                     g.setColour (r.chip);
                     g.fillRoundedRectangle (chipR.toFloat(), 3.0f);
                     g.setColour (r.chip.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-                    g.setFont (juce::Font (juce::FontOptions ((float) rowH * 0.6f).withStyle ("Bold")));
                     g.drawText (r.num, chipR, juce::Justification::centred, false);
                     g.setColour (juce::Colour (0xffb9c0d0));
                     g.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
@@ -147,9 +193,9 @@ private:
         struct Row { std::vector<int> degs; juce::String value; juce::Colour valCol; };
         std::vector<Row> rows;
         int degreesPerPeriod = 12;
-        juce::String tip;
+        juce::String tip, emptyText; // status/coverage line (computing / over budget / partial)
         static constexpr int kRowH = 21;
-        int contentHeight() const { return (int) rows.size() * kRowH; }
+        int contentHeight() const { return (int) rows.size() * kRowH + (emptyText.isNotEmpty() ? kRowH : 0); }
         juce::String getTooltip() override { return tip; }
         void paint (juce::Graphics& g) override
         {
@@ -177,6 +223,12 @@ private:
                 g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
                 g.drawText (row.value, x + 4, y, getWidth() - x - 6, kRowH, juce::Justification::centredLeft, false);
                 y += kRowH; ++r;
+            }
+            if (emptyText.isNotEmpty()) // status line: computing / over budget / coverage
+            {
+                g.setColour (juce::Colour (0xff8f96a8));
+                g.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Italic")));
+                g.drawText (emptyText, 4, y, getWidth() - 8, kRowH, juce::Justification::centredLeft, false);
             }
         }
     };
@@ -211,8 +263,16 @@ private:
         std::vector<Row> rows;
         juce::String tip;
         std::function<void (int)> onPlay, onLoad;
-        static constexpr int kRowH = 22, kRankW = 30, kPlayW = 22;
+        static constexpr int kRowH = 22, kRankW = 30, kPlayW = 22, kNoteW = 62;
         int contentHeight() const { return (int) rows.size() * kRowH; }
+        // Every note gets a fixed readable column; when a chord has more notes than
+        // fit, the Viewport scrolls HORIZONTALLY instead of squeezing the text away.
+        int contentWidth() const
+        {
+            size_t maxN = 0;
+            for (const auto& r : rows) maxN = std::max (maxN, r.notes.size());
+            return kRankW + kPlayW + (int) maxN * kNoteW + 4;
+        }
         juce::String getTooltip() override { return tip; }
         static juce::Colour noteColour (int k)
         {
@@ -245,9 +305,10 @@ private:
                     g.setColour (juce::Colour (0xff2fb155));
                     g.fillPath (tri);
                 }
-                // the chord's notes, one colour per note index
+                // the chord's notes, one colour per note index (fixed column width -
+                // the view scrolls sideways rather than shrinking the text to dust)
                 const int x0 = kRankW + kPlayW;
-                const int nw = juce::jmax (28, (getWidth() - x0) / juce::jmax (1, (int) r.notes.size()));
+                const int nw = juce::jmax (kNoteW, (getWidth() - x0) / juce::jmax (1, (int) r.notes.size()));
                 for (int k = 0; k < (int) r.notes.size(); ++k)
                 {
                     g.setColour (noteColour (k));
@@ -1326,7 +1387,8 @@ private:
     juce::TooltipWindow tooltipWindow { this, 350 }; // subtly quicker hover read-outs
     ScaleKeyboard keyboard;
 
-    SteppedSlider baseNFader, spectrumRangeFader, fractalFader, timbreRepeatsFader;
+    SteppedSlider baseNFader, spectrumRangeFader, timbreRepeatsFader;
+    MagneticSlider fractalFader, harmonicsFader; // magnetic detents at each whole level
     juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, octaveFader, pEnvAmtFader;
     juce::Slider  ampAdsr[4], filtAdsr[4], pitchAdsr[4];
     juce::ComboBox basePitchBox, whitelistBox, phaseBox, primeModeBox, primeLimitBox, tuningBox, bendBox,
@@ -1335,6 +1397,8 @@ private:
     juce::ToggleButton primeToggle[9], morphToggle;
     juce::ToggleButton temperToggle; // Custom Engine: temper harmonic partials to the loaded .scl
     std::unique_ptr<ButtonAttachment> temperAtt;
+    juce::Slider primeLimitFader;    // prime limit as a fader -> modulator-drivable
+    std::unique_ptr<SliderAttachment> primeLimitFaderAtt;
     juce::Slider       morphTimeFader;
     juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
     int                undoTxnTick = 0; // groups edits into ~1s undo transactions (Ctrl-Z / Ctrl-Y)
@@ -1359,12 +1423,20 @@ private:
     WaveEditor waveEditor;                          // drawn-LFO wave overlay
     void attachCustomTab();                         // rebind attachments to the selected modulator
     void showEnvMapMenu (const juce::String& paramID);
+    juce::String currentModParamId (const juce::String& templateId) const; // modE1A -> modE2A...
+    void addMapListener (juce::Component& c, const juce::String& paramID, bool dynamicMod = false);
     struct ParamMapListener : juce::MouseListener
     {
         FractalAdditiveAudioProcessorEditor* ed = nullptr;
         juce::String pid;
+        // CUSTOM-tab controls are re-bound to whichever modulator is selected, so
+        // their parameter id changes at runtime: those listeners resolve it live.
+        bool dynamicMod = false;
         void mouseDown (const juce::MouseEvent& e) override
-        { if (e.mods.isRightButtonDown() && ed != nullptr) ed->showEnvMapMenu (pid); }
+        {
+            if (e.mods.isRightButtonDown() && ed != nullptr)
+                ed->showEnvMapMenu (dynamicMod ? ed->currentModParamId (pid) : pid);
+        }
     };
     std::vector<std::unique_ptr<ParamMapListener>> mapListeners;
     juce::TextButton   rhythmBtn;  // top-bar: opens the spectrum->rhythm MIDI panel
@@ -1450,7 +1522,8 @@ private:
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], pitchAdsrLbl[4], primeLbl[9];
 
     std::unique_ptr<SliderAttachment>   baseNAtt, slopeAtt, spectrumRangeAtt, fractalAtt, gainAtt,
-                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, octaveAtt, pEnvAmtAtt;
+                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, octaveAtt, pEnvAmtAtt,
+                                        harmonicsAtt;
     std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4], pitchAdsrAtt[4];
     std::unique_ptr<ComboBoxAttachment> basePitchAtt, whitelistAtt, phaseAtt,
                                         primeModeAtt, primeLimitAtt, tuningAtt, bendAtt, tuningBankAtt;

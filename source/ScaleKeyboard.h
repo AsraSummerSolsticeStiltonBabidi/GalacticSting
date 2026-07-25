@@ -44,10 +44,8 @@ public:
         if (lo != rangeLo || cnt != rangeCount)
         {
             rangeLo = lo; rangeCount = cnt;
-            // Keep the current view when it is still inside the new range (the range
-            // grows/shrinks live, e.g. to include notes being played off-view); only
-            // reset when the view no longer fits at all.
-            if (baseKey < lo || baseKey >= lo + cnt) baseKey = lo;
+            // Keep the current view; clampView() below slides it the MINIMUM amount
+            // into the new range (never teleport to the far end of the keyboard).
         }
         clampView();
         repaint();
@@ -64,6 +62,8 @@ public:
     {
         const int cells = numCells();
         if (! isScrollable() || hi < lo) return;
+        if (hi - lo + 1 > cells) return; // span wider than the window: following one
+                                         // end would ping-pong at timer rate - stay put
         if (lo < baseKey)                 scrollBy (lo - baseKey);
         else if (hi >= baseKey + cells)   scrollBy (hi - (baseKey + cells - 1));
     }
@@ -229,10 +229,15 @@ public:
                     auto hzArea = sc;
                     if (isRef)
                     {
+                        // Sits DIRECTLY above its Hz number (tight band, no gap) and is
+                        // allowed to spill over the neighbouring key widths instead of
+                        // being squeezed horizontally into unreadable letters.
+                        auto band = hzArea.removeFromTop (11.0f);
+                        band = band.withSizeKeepingCentre (juce::jmax (band.getWidth(), 74.0f), band.getHeight());
                         g.setColour (juce::Colour (0xff4fe09a));
-                        g.setFont (juce::Font (juce::FontOptions (juce::jmin (10.0f, w * 0.30f)).withStyle ("Bold")));
-                        g.drawFittedText ("REFERENCE", hzArea.removeFromTop (12.0f).toNearestInt(),
-                                          juce::Justification::centred, 1, 0.5f);
+                        g.setFont (juce::Font (juce::FontOptions (9.5f).withStyle ("Bold")));
+                        g.drawText ("REFERENCE", band.toNearestInt(), juce::Justification::centred, false);
+                        hzArea.setTop (hzArea.getY() - 3.0f); // pull the number up to the word
                     }
                     g.setColour (isRef ? juce::Colour (0xff4fe09a) : juce::Colour (0xffc4ccda));
                     g.setFont (isRef

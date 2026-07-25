@@ -180,7 +180,10 @@ namespace
     void drawTitleChip (juce::Graphics& g, juce::Rectangle<float> box, juce::Colour col, const juce::String& text)
     {
         constexpr float stretch = 1.34f; // letters stretched taller (upward)
-        constexpr float chipH   = 16.0f; // stays INSIDE the box (never clipped at the top)
+        // The chip sits ABOVE the frame: its BASE lands exactly on the box's top
+        // line (frame top = titleH * 0.5 = 16), so the chip reads as a tab on the
+        // box instead of a rectangle cutting through its border.
+        constexpr float chipH   = 15.0f;
         const juce::String upper = text.toUpperCase();
         const float maxW = box.getWidth() - 4.0f;
 
@@ -276,7 +279,7 @@ namespace
                                         const juce::Justification&, juce::GroupComponent& group) override
         {
             const auto col = group.findColour (juce::GroupComponent::outlineColourId);
-            constexpr float titleH = 21.0f;
+            constexpr float titleH = 32.0f; // room ABOVE the frame for the title chip
             auto frame = juce::Rectangle<float> (1.3f, titleH * 0.5f,
                                                  (float) w - 2.6f, (float) h - titleH * 0.5f - 1.3f);
 
@@ -334,29 +337,95 @@ namespace
         // ADSR-style faders carry their letter INSIDE the drag thumb (the slider's
         // name, e.g. "A"): bigger thumb, letter black/white by the thumb's colour -
         // the same rule as the keyboard keys and the title letters.
-        static constexpr float kAdsrThumbR = 18.0f; // ADSR thumb circle radius
+        static constexpr float kAdsrThumbR = 20.0f; // named (ADSR) thumb radius
+        static constexpr float kThumbR     = 13.0f; // every other fader's thumb radius
+        static float thumbRadiusFor (juce::Slider& s)
+        { return s.getName().isNotEmpty() ? kAdsrThumbR : kThumbR; }
         int getSliderThumbRadius (juce::Slider& s) override
         {
-            if (s.getName().isNotEmpty() && s.isVertical())
-                return (int) kAdsrThumbR;
+            if (s.getSliderStyle() == juce::Slider::LinearVertical
+                || s.getSliderStyle() == juce::Slider::LinearHorizontal)
+                return (int) thumbRadiusFor (s);
             return juce::LookAndFeel_V4::getSliderThumbRadius (s);
         }
+
+        // Regular heptagon (flat-ish top), used for every fader thumb: its inscribed
+        // circle is ~0.90 of the radius, so a letter drawn at 0.8 R sits inside with
+        // real margin and never has to be squeezed to fit.
+        static juce::Path heptagon (juce::Point<float> c, float r)
+        {
+            juce::Path p;
+            constexpr float twoPi = juce::MathConstants<float>::twoPi;
+            for (int i = 0; i < 7; ++i)
+            {
+                const float a = -juce::MathConstants<float>::halfPi + (float) i * twoPi / 7.0f;
+                const juce::Point<float> pt (c.x + r * std::cos (a), c.y + r * std::sin (a));
+                if (i == 0) p.startNewSubPath (pt); else p.lineTo (pt);
+            }
+            p.closeSubPath();
+            return p;
+        }
+
         void drawLinearSlider (juce::Graphics& g, int x, int y, int w, int h,
                                float sliderPos, float minPos, float maxPos,
                                juce::Slider::SliderStyle style, juce::Slider& s) override
         {
-            juce::LookAndFeel_V4::drawLinearSlider (g, x, y, w, h, sliderPos, minPos, maxPos, style, s);
-            if (s.getName().isNotEmpty() && s.isVertical())
+            const bool vert  = style == juce::Slider::LinearVertical;
+            const bool horiz = style == juce::Slider::LinearHorizontal;
+            if (! vert && ! horiz)
             {
-                const auto col = s.findColour (juce::Slider::thumbColourId);
-                g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-                // Letter sized to sit INSIDE the circle (~0.8 of the diameter) so it
-                // never spills over the edges.
-                g.setFont (juce::Font (juce::FontOptions (kAdsrThumbR * 0.85f).withStyle ("Bold")));
-                const float d = kAdsrThumbR * 2.0f;
-                g.drawText (s.getName(),
-                            juce::Rectangle<float> ((float) x + (float) w * 0.5f - kAdsrThumbR, sliderPos - kAdsrThumbR, d, d),
-                            juce::Justification::centred, false);
+                juce::LookAndFeel_V4::drawLinearSlider (g, x, y, w, h, sliderPos, minPos, maxPos, style, s);
+                return;
+            }
+            juce::ignoreUnused (minPos, maxPos);
+
+            const auto col   = s.findColour (juce::Slider::thumbColourId);
+            const auto track = s.findColour (juce::Slider::trackColourId);
+            const float r    = thumbRadiusFor (s);
+            constexpr float tw = 5.0f; // track thickness
+
+            if (vert)
+            {
+                const float cx = (float) x + (float) w * 0.5f;
+                const float top = (float) y, bot = (float) (y + h);
+                g.setColour (track.withMultipliedAlpha (0.35f));
+                g.fillRoundedRectangle (cx - tw * 0.5f, top, tw, bot - top, tw * 0.5f);
+                g.setColour (track);
+                g.fillRoundedRectangle (cx - tw * 0.5f, sliderPos, tw, juce::jmax (0.0f, bot - sliderPos), tw * 0.5f);
+                const auto hept = heptagon ({ cx, sliderPos }, r);
+                g.setColour (col);
+                g.fillPath (hept);
+                g.setColour (juce::Colours::black.withAlpha (0.35f));
+                g.strokePath (hept, juce::PathStrokeType (1.0f));
+                if (s.getName().isNotEmpty())
+                {
+                    g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
+                    g.setFont (juce::Font (juce::FontOptions (r * 0.8f).withStyle ("Bold")));
+                    g.drawText (s.getName(), juce::Rectangle<float> (cx - r, sliderPos - r, r * 2.0f, r * 2.0f),
+                                juce::Justification::centred, false);
+                }
+            }
+            else
+            {
+                const float cy = (float) y + (float) h * 0.5f;
+                const float l = (float) x, rt = (float) (x + w);
+                g.setColour (track.withMultipliedAlpha (0.35f));
+                g.fillRoundedRectangle (l, cy - tw * 0.5f, rt - l, tw, tw * 0.5f);
+                g.setColour (track);
+                g.fillRoundedRectangle (l, cy - tw * 0.5f, juce::jmax (0.0f, sliderPos - l), tw, tw * 0.5f);
+                const float rr = juce::jmin (r, (float) h * 0.5f);
+                const auto hept = heptagon ({ sliderPos, cy }, rr);
+                g.setColour (col);
+                g.fillPath (hept);
+                g.setColour (juce::Colours::black.withAlpha (0.35f));
+                g.strokePath (hept, juce::PathStrokeType (1.0f));
+                if (s.getName().isNotEmpty())
+                {
+                    g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
+                    g.setFont (juce::Font (juce::FontOptions (rr * 0.8f).withStyle ("Bold")));
+                    g.drawText (s.getName(), juce::Rectangle<float> (sliderPos - rr, cy - rr, rr * 2.0f, rr * 2.0f),
+                                juce::Justification::centred, false);
+                }
             }
         }
 
@@ -530,12 +599,31 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     morphToggle.onClick = [this] { refocus(); };
     addAndMakeVisible (morphToggle);
     morphAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "morph", morphToggle);
+    addMapListener (morphToggle, "morph");
     configFader (morphTimeFader, "morphTime", morphTimeAtt, cHarmonic, "Morph transition time in seconds: how long partials take to glide to the new spectrum.");
     morphTimeFader.setSliderStyle (juce::Slider::LinearHorizontal);
     morphTimeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 14);
     makeLabel (lblMorphTime, cHarmonic);
 
-    configCombo (whitelistBox, "selection", whitelistAtt, cHarmonic, "Which harmonics may sound: All / Even / Odd / Prime");
+    // Harmonics is a magnetic FADER now (Even - All - Odd - Prime), so a modulator
+    // can sweep it and it can sit BETWEEN two sets (blended).
+    configFader (harmonicsFader, "harmonics", harmonicsAtt, cHarmonic,
+                 "Which harmonics sound: Even - All - Odd - Prime. It snaps to those four, but you can stop between two of them (hold Ctrl for free fine setting): there the harmonics that belong to only one of the pair come in at part volume, so the timbre morphs instead of switching.");
+    harmonicsFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    harmonicsFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 15);
+    harmonicsFader.setSliderSnapsToMousePosition (false);
+    harmonicsFader.normalSensitivity = 240;
+    harmonicsFader.textFromValueFunction = [] (double v)
+    {
+        static const char* names[] = { "Even", "All", "Odd", "Prime" };
+        const int lo = juce::jlimit (0, 3, (int) std::floor (v));
+        const double t = v - (double) lo;
+        if (t < 0.01) return juce::String (names[lo]);
+        if (t > 0.99) return juce::String (names[juce::jmin (3, lo + 1)]);
+        return juce::String (names[lo]) + "-" + juce::String (names[juce::jmin (3, lo + 1)])
+             + " " + juce::String ((int) std::lround (t * 100.0)) + "%";
+    };
+    harmonicsFader.updateText();
     configFader (slopeFader, "curveSlope", slopeAtt, cHarmonic, "Amplitude roll-off. 0 = flat/bright, 1 = saw, 2 = triangle.  (Also thins the highs in Timbre mode.)");
     // "Range" (spectrum hard-cut) removed from the UI - redundant with the Filter.
     // The parameter defaults to 10 (= no cut), so it has no effect.
@@ -593,7 +681,18 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     sprVal.setTooltip (sprTip);
 
     configCombo (primeModeBox,  "primeMode",  primeModeAtt,  cHarmonic, "Limit = drop harmonics with a prime factor above the value.  Whitelist = only the ticked primes.");
-    configCombo (primeLimitBox, "primeLimit", primeLimitAtt, cHarmonic, "Largest prime factor allowed (Limit mode).");
+    // Prime LIMIT as a FADER (so it can be driven by the modulators). The value is
+    // the index into {Off, 2, 3, 5, 7, 11, 13, 17, 19, 23}, shown by name.
+    configFader (primeLimitFader, "primeLimit", primeLimitFaderAtt, cHarmonic,
+                 "Largest prime factor allowed (Limit mode). Right-click to map a modulator onto it.");
+    primeLimitFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    primeLimitFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 40, 15);
+    primeLimitFader.textFromValueFunction = [] (double v)
+    {
+        static const char* names[] = { "Off", "2", "3", "5", "7", "11", "13", "17", "19", "23" };
+        return juce::String (names[juce::jlimit (0, 9, (int) std::lround (v))]);
+    };
+    primeLimitFader.updateText();
     makeLabel (lblPrimeLimit, cHarmonic);
     const char* pn[] = { "2","3","5","7","11","13","17","19","23" };
     for (int i = 0; i < 9; ++i)
@@ -606,18 +705,24 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         primeToggle[i].onClick = [this] { refocus(); };
         addAndMakeVisible (primeToggle[i]);
         primeToggleAtt[i] = std::make_unique<ButtonAttachment> (processorRef.apvts, "primeWL" + juce::String (i), primeToggle[i]);
+        addMapListener (primeToggle[i], "primeWL" + juce::String (i));
         makeLabel (primeLbl[i], cHarmonic); primeLbl[i].setText (pn[i], juce::dontSendNotification);
     }
 
     configGroup (gFilter, cFilter);
+    // The GROUP PANELS must be added BEFORE any control that will sit on top of
+    // them: the LnF fills the group body with an OPAQUE panel, and siblings paint
+    // in add-order - a control added earlier gets buried under the panel (it stays
+    // hit-testable because GroupComponent lets clicks through, which is why the
+    // "invisible" FILTER faders still showed their hover tooltips).
+    configGroup (gAmpEnv, cEnv);
+    configGroup (gPitchEnv, cPitch);
     configFader (cutoffFader,  "filterCutoff",    cutoffAtt,  cFilter, "Low-pass cutoff");
     cutoffFader.setTextValueSuffix (" c"); // cents above the played note (note-tracking)
     configFader (resFader,     "filterResonance", resAtt,     cFilter, "Resonance");
     configFader (fEnvAmtFader, "filterEnvAmount", fEnvAmtAtt, cFilter, "How far the filter envelope moves the cutoff (octaves)");
     makeLabel (lblCutoff, cFilter); makeLabel (lblRes, cFilter); makeLabel (lblEnvAmt, cFilter);
 
-    configGroup (gAmpEnv, cEnv);
-    configGroup (gPitchEnv, cPitch);
     configFader (pEnvAmtFader, "pitchEnvAmount", pEnvAmtAtt, cPitch, "How far the pitch envelope bends the pitch (semitones, +/-).");
     makeLabel (lblPitchAmt, cPitch);
     const char* ampIds[]   = { "ampAttack","ampDecay","ampSustain","ampRelease" };
@@ -651,7 +756,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             custAdsrLbl[i].setText (adsrTxt[i], juce::dontSendNotification);
         }
         configFader (custRangeFader, "modE1Range", custRangeAtt, cCustom,
-                     "How far this modulator MOVES its mapped parameters (+/- of their full range), riding on each knob's own value.");
+                     "How far this modulator MOVES its mapped parameters (+/- of their full range), riding on each knob's own value. Note: parameters that REBUILD the spectrum (Base, Harmonics, Slope, Fractal, Prime, Range, Reps) follow the modulator at the 60 Hz rebuild rate and glide when Morph is on - everything else follows per audio block.");
         makeLabel (lblCustRange, cCustom);
         configFader (lfoDivSlider, "modL1Div", lfoDivAtt, cCustom,
                      "Rate divider: halves the base rate per step (base = project BPM or the lowest held note's frequency).");
@@ -669,18 +774,32 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         modSelBox.setMouseClickGrabsKeyboardFocus (false);
         modSelBox.onChange = [this] { modSel = modSelBox.getSelectedId() - 1; attachCustomTab(); resized(); refocus(); };
         addChildComponent (modSelBox);
+        // The attachments only SYNC the selection - the items themselves must be
+        // added here (an empty combo was why the LFO menus showed nothing).
+        lfoWaveBox.addItem ("Sine", 1);        lfoWaveBox.addItem ("Triangle", 2);
+        lfoWaveBox.addItem ("Saw up", 3);      lfoWaveBox.addItem ("Saw down", 4);
+        lfoWaveBox.addItem ("Square", 5);      lfoWaveBox.addItem ("Custom (draw)", 6);
+        lfoRateModeBox.addItem ("BPM / 2^n", 1);
+        lfoRateModeBox.addItem ("Fundamental / 2^n", 2);
+        lfoRateModeBox.addItem ("Free Hz", 3);
+        lfoPhaseModeBox.addItem ("Restart each note", 1);
+        lfoPhaseModeBox.addItem ("Project transport", 2);
         for (auto* cb : { &lfoWaveBox, &lfoRateModeBox, &lfoPhaseModeBox })
         {
             cb->setColour (juce::ComboBox::outlineColourId, cCustom.withAlpha (0.7f));
             cb->setMouseClickGrabsKeyboardFocus (false);
             addChildComponent (*cb);
         }
-        lfoWaveBox.onChange = [this]
-        {
-            lfoWaveEditBtn.setVisible (envTab == 3 && modSel >= 3 && lfoWaveBox.getSelectedId() == 6);
-        };
+        lfoWaveBox.onChange = [this] { resized(); }; // Draw button appears with "Custom (draw)"
+        // The LFO combos and the On switch are modulator parameters too: right-click
+        // routes ANOTHER modulator to them (a modulator never drives itself).
+        addMapListener (lfoWaveBox,      "modL1Wave",      true);
+        addMapListener (lfoRateModeBox,  "modL1RateMode",  true);
+        addMapListener (lfoPhaseModeBox, "modL1PhaseMode", true);
         modOnT.setName ("onled");
-        addChildComponent (modOnT);
+        addChildComponent (modOnT); // NOT modulatable: a modulator gating another
+                                    // modulator that gates it back has no defined state
+
         modUnmapBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xffe0453f));
         modUnmapBtn.setMouseClickGrabsKeyboardFocus (false);
         modUnmapBtn.onClick = [this]
@@ -789,15 +908,21 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     loadTimbreButton.setTooltip ("Use a Scala file's intervals AS the timbre (partials). Slope + fractal + repeats shape it; the harmonic controls turn off.");
     loadTimbreButton.onClick = [this] { openTimbreChooser(); };
     addAndMakeVisible (loadTimbreButton);
+    // On/Off toggle: switching OFF keeps the loaded .scl (nothing is erased) - the
+    // engine just goes back to harmonic mode until switched on again.
     clearTimbreButton.setColour (juce::TextButton::buttonColourId, cReset);
     clearTimbreButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
     clearTimbreButton.setMouseClickGrabsKeyboardFocus (false);
-    clearTimbreButton.setTooltip ("Back to the harmonic engine.");
-    clearTimbreButton.onClick = [this] { processorRef.clearTimbre(); intervalEdit.clear(); refocus(); };
+    clearTimbreButton.onClick = [this]
+    {
+        processorRef.setTimbreEnabled (! processorRef.isTimbreActive());
+        resized(); refocus();
+    };
     addAndMakeVisible (clearTimbreButton);
     temperToggle.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
     temperToggle.setMouseClickGrabsKeyboardFocus (false);
     temperAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "timbreTemper", temperToggle);
+    addMapListener (temperToggle, "timbreTemper");
     addAndMakeVisible (temperToggle);
     configFader (timbreRepeatsFader, "timbreRepeats", timbreRepeatsAtt, cTimbre,
                  "How many times the scale's period stacks into the timbre. More = reaches higher.");
@@ -1123,7 +1248,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         refocus();
     };
     chordView.setViewedComponent (&chordList, false);
-    chordView.setScrollBarsShown (true, false);
+    chordView.setScrollBarsShown (true, true); // wide chords scroll sideways
     addChildComponent (chordView);
 
     // n-AD selector: "Degrees" = the classic per-degree list (each step vs the
@@ -1137,7 +1262,11 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     nadBox.onChange = [this]
     {
         if (nadBox.getSelectedId() > 1)
+        {
             processorRef.startNadCompute (nadBox.getSelectedId());
+            lastNadSel = nadBox.getSelectedId(); // the timer must not re-spawn the
+            lastNadSig = lastScaleSig;           // worker it would immediately cancel
+        }
         resized(); refocus();
     };
     addChildComponent (nadBox);
@@ -1258,7 +1387,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // Integer faders: relative drag (no snap-to-click) so the drag distance,
     // not the track length, sets the resolution; Ctrl stretches it x4 (see
     // SteppedSlider). Base N (1..64) gets the longest travel = least sensitive.
-    for (auto* s : { &baseNFader, &fractalFader, &timbreRepeatsFader })
+    for (juce::Slider* s : { (juce::Slider*) &baseNFader, (juce::Slider*) &fractalFader,
+                             (juce::Slider*) &timbreRepeatsFader })
         s->setSliderSnapsToMousePosition (false);
     baseNFader.normalSensitivity         = 520;
     fractalFader.normalSensitivity       = 260;
@@ -1459,12 +1589,6 @@ FractalAdditiveAudioProcessorEditor::~FractalAdditiveAudioProcessorEditor()
 //==============================================================================
 void FractalAdditiveAudioProcessorEditor::refocus() { grabKeyboardFocus(); }
 
-void FractalAdditiveAudioProcessorEditor::forceDefault (const juce::String& paramID)
-{
-    if (auto* prm = processorRef.apvts.getParameter (paramID))
-        prm->setValueNotifyingHost (prm->getDefaultValue());
-}
-
 void FractalAdditiveAudioProcessorEditor::loadRecent (int index)
 {
     const auto paths = processorRef.getRecentSclPaths();
@@ -1607,10 +1731,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
                                    "Dibuixa l'ona d'aquest LFO: punts + segments corbats, com una automatitzaci\xc3\xb3."));
     modOnT.setTooltip (tr ("This modulator on/off (off restores its targets to their own values).",
                            "Aquest modulador on/off (off retorna els seus dest\xc3\xadns al seu valor propi)."));
-    temperToggle.setButtonText (tr ("Temper harmonics", "Tempera harm\xc3\xb2nics"));
+    temperToggle.setButtonText (tr ("Temper to tuning", "Tempera a l'afinaci\xc3\xb3"));
     temperToggle.setTooltip (tr (
-        "ON: the HARMONIC ENGINE keeps generating partials and each one is snapped to the nearest pitch of the .scl loaded here (degree x period^k) - both engines work TOGETHER. OFF: the loaded .scl IS the spectrum by itself and the harmonic engine stands down.",
-        "ON: el MOTOR HARM\xc3\x92NIC segueix generant parcials i cadascun s'ajusta al to m\xc3\xa9s proper de l'.scl carregat aqu\xc3\xad (grau x per\xc3\xado" "de^k) - els dos motors treballen JUNTS. OFF: l'.scl carregat \xc3\x89S l'espectre per si mateix i el motor harm\xc3\xb2nic s'atura."));
+        "ON: the HARMONIC ENGINE keeps generating partials and each one is snapped to the nearest pitch of the ACTIVE TUNING loaded in the Tuning box (degree x period^k), following it live - both engines work TOGETHER and the Custom Engine's own scale is bypassed. In MPE input mode the host does not hand the plugin a scale, so the grid there is plain 12-TET. OFF: no snapping (the Custom Engine's .scl, if loaded and ON, is the spectrum by itself).",
+        "ON: el MOTOR HARM\xc3\x92NIC segueix generant parcials i cadascun s'ajusta al to m\xc3\xa9s proper de l'AFINACI\xc3\x93 ACTIVA carregada a la caixa Tuning (grau x per\xc3\xado" "de^k), seguint-la en viu - els dos motors treballen JUNTS i l'escala del Motor propi queda de banda. En mode d'entrada MPE l'amfitri\xc3\xb3 no d\xc3\xb3na cap escala al plugin, aix\xc3\xad que all\xc3\xa0 la graella \xc3\xa9s 12-TET. OFF: sense ajust (l'.scl del Motor propi, si est\xc3\xa0 carregat i actiu, \xc3\xa9s l'espectre per si mateix)."));
     gTuning.setText        (tr ("Tuning", "Afinaci\xc3\xb3"));
     gTimbre.setText        (tr ("Custom Engine", "Motor propi"));
     intervalEdit.setTextToShowWhenEmpty (tr ("intervals: 3/2 2 700c ...", "intervals: 3/2 2 700c ..."),
@@ -1644,10 +1768,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblPeriod.setText    (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
     lblSteps.setText     (tr ("Steps", "Passos"), dontSendNotification);
     lblRefA.setText      ("C3 =", dontSendNotification); // the tuning anchor key itself, not A
-    lblTuningBank.setText (tr ("Tuning bank", "Banc d'afinacions"), dontSendNotification);
+    lblTuningBank.setText (tr ("Bank", "Banc"), dontSendNotification);
     degreeList.tip = tr (
-        "Each row is a degree of the ACTIVE scale (any tuning): colour chip = its keyboard colour, then its interval, then its Sethares DISSONANCE against the current timbre (how rough it sounds) - lower = more consonant. Ordered most consonant first. The period is the red row.",
-        "Cada fila \xc3\xa9s un grau de l'escala ACTIVA (qualsevol afinaci\xc3\xb3): xip de color = el seu color al teclat, despr\xc3\xa9s l'interval, i la DISSONANCIA de Sethares contra el timbre actual (com d'aspre sona) - m\xc3\xa9s baix = m\xc3\xa9s consonant. Ordenats de m\xc3\xa9s consonant primer. El per\xc3\xado""de \xc3\xa9s la fila vermella.");
+        "Each row is a DYAD: the red \"0\" chip (the root key) plus that degree, played together. Colour chip = the degree's keyboard colour, then its interval from 0, then the dyad's Sethares BEATING against the current timbre (how rough 0 + that degree sound together) - lower = more consonant. Ordered most consonant first. The period is the red row.",
+        "Cada fila \xc3\xa9s una D\xc3\x8d""ADA: el xip vermell \"0\" (la tecla arrel) m\xc3\xa9s aquell grau, tocats junts. Xip de color = el color del grau al teclat, despr\xc3\xa9s el seu interval des de 0, i el BATEC de Sethares de la d\xc3\xad""ada contra el timbre actual (com d'aspre sonen 0 + aquell grau junts) - m\xc3\xa9s baix = m\xc3\xa9s consonant. Ordenats de m\xc3\xa9s consonant primer. El per\xc3\xado""de \xc3\xa9s la fila vermella.");
     dissHeader.tip = tr (
         "Sethares dissonance: how ROUGH each scale step sounds with the CURRENT timbre. It is not fixed - it recomputes live from the synth's actual partials, so editing the timbre (N, fractal, slope, primes, .scl...) changes these values in real time. Lower = more consonant; the rows are ordered most consonant first.",
         "Dissonancia de Sethares: com d'ASPRE sona cada pas de l'escala amb el timbre ACTUAL. No \xc3\xa9s fixa - es recalcula en viu a partir dels parcials reals del sinte, aix\xc3\xad que editar el timbre (N, fractal, pendent, primers, .scl...) canvia aquests valors en temps real. M\xc3\xa9s baix = m\xc3\xa9s consonant; les files van de m\xc3\xa9s consonant primer.");
@@ -1657,10 +1781,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     clearSclButton.setButtonText   (tr ("Reset", "Reinicia"));
     tuningBankLoadBtn.setButtonText (tr ("+ .scl", "+ .scl"));
     loadTimbreButton.setButtonText (tr ("Load .scl", "Obrir .scl"));
-    clearTimbreButton.setButtonText(tr ("Off", "Apaga"));
+    clearTimbreButton.setButtonText (processorRef.isTimbreActive() ? tr ("On", "Actiu") : tr ("Off", "Apagat"));
     savePresetButton.setButtonText (tr ("Save", "Desa"));
     presetBox.setTextWhenNothingSelected (tr ("Presets...", "Presets..."));
-    dissBtn.setButtonText          (tr ("Transmute", "Transmuta"));
+    dissBtn.setButtonText          (tr ("Find", "Troba"));
     dissSaveBtn.setButtonText      (tr ("Save", "Desa"));
 
     helpLabel.setText (tr ("Play: A S D F G H J K L = the scale in order, then Q W E R T Y U I O P continue higher.   Z / X = down / up one scale period.",
@@ -1674,15 +1798,15 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     basePitchBox.setTooltip (tr (
         "Where that series sits. 'Transposed down': the lowest surviving partial is moved onto the played pitch; with high N and Aligned phase this creates an audible slow pulse (the difference tone) - that is the intended effect, not extra notes. 'Original': harmonics stay at their natural frequencies, so raising N just makes the sound brighter and thinner.",
         "On queda la s\xc3\xa8rie. 'Transposada avall': el parcial m\xc3\xa9s greu es mou al to tocat; amb N alta i fase Alineada apareix un pols greu audible (el to diferencial) - \xc3\xa9s l'efecte buscat, no notes extra. 'Original': els harm\xc3\xb2nics queden a la seva freq\xc3\xbc\xc3\xa8ncia natural, i pujar N nom\xc3\xa9s fa el so m\xc3\xa9s brillant i prim."));
-    whitelistBox.setTooltip (tr (
-        "Keeps the fundamental PLUS these harmonic numbers: All, Even (1,2,4,6...), Odd (1,3,5...) or Prime (1,2,3,5,7...). The fundamental is always kept so the played pitch stays (otherwise 'transposed-down' Even would just be a full series an octave up). A harmonic must ALSO pass Prime Control - both filters apply at once, and if together they exclude everything the sound is silent.",
-        "Mant\xc3\xa9 el fonamental M\xc3\x89S aquests n\xc3\xbameros d'harm\xc3\xb2nic: Tots, Parells (1,2,4,6...), Senars (1,3,5...) o Primers (1,2,3,5,7...). El fonamental sempre es mant\xc3\xa9 perqu\xc3\xa8 quedi el to tocat (si no, en 'transposada avall' els Parells nom\xc3\xa9s serien una s\xc3\xa8rie completa una octava amunt). L'harm\xc3\xb2nic TAMB\xc3\x89 ha de passar el Control de primers - els dos filtres s'apliquen alhora, i si entre tots dos ho exclouen tot, no sona res."));
+    harmonicsFader.setTooltip (tr (
+        "Sweeps which harmonic numbers sound: Even (1,2,4,6...) - All - Odd (1,3,5...) - Prime (1,2,3,5,7...). It snaps magnetically to those four, but you can stop BETWEEN two of them (hold Ctrl for a free setting): there the harmonics belonging to only one of the pair sound at part volume, so the timbre morphs continuously. The fundamental is always kept so the played pitch stays. A harmonic must ALSO pass Prime Control - both filters apply at once, and if together they exclude everything the sound is silent.",
+        "Escombra quins n\xc3\xbameros d'harm\xc3\xb2nic sonen: Parells (1,2,4,6...) - Tots - Senars (1,3,5...) - Primers (1,2,3,5,7...). S'imanta a aquests quatre, per\xc3\xb2 pots quedar-te ENTRE dos (mant\xc3\xa9n Ctrl per a un valor lliure): all\xc3\xa0 els harm\xc3\xb2nics que nom\xc3\xa9s pertanyen a un dels dos sonen a volum parcial, aix\xc3\xad que el timbre es transforma de manera cont\xc3\xadnua. El fonamental sempre es mant\xc3\xa9 perqu\xc3\xa8 quedi el to tocat. L'harm\xc3\xb2nic TAMB\xc3\x89 ha de passar el Control de primers - els dos filtres s'apliquen alhora, i si entre tots dos ho exclouen tot, no sona res."));
     slopeFader.setTooltip (tr (
         "How fast higher partials lose volume: 0 = all equal (brightest), 1 = like a saw (1/n), 2 = like a triangle, higher = darker. Also shapes the stacked scale in Timbre mode.",
         "Com de r\xc3\xa0pid perden volum els parcials aguts: 0 = tots iguals (m\xc3\xa9s brillant), 1 = com una serra (1/n), 2 = com un triangle, m\xc3\xa9s = m\xc3\xa9s fosc. Tamb\xc3\xa9 d\xc3\xb3na forma a l'escala apilada en mode Timbre."));
     fractalFader.setTooltip (tr (
-        "Replaces each partial with a scaled copy of the whole spectrum, this many levels deep. 1 = off. Each level multiplies density and adds self-similar, inharmonic detail.",
-        "Substitueix cada parcial per una c\xc3\xb2pia escalada de tot l'espectre, tants nivells com indiquis. 1 = apagat. Cada nivell multiplica la densitat i afegeix detall autosemblant i inharm\xc3\xb2nic."));
+        "Replaces each partial with a scaled copy of the whole spectrum, this many levels deep. 1 = off. Continuous: between whole levels the next level's new partials fade in from low to high. Snaps to the 4 marked levels - hold Ctrl for free fine setting.",
+        "Substitueix cada parcial per una c\xc3\xb2pia escalada de tot l'espectre, tants nivells com indiquis. 1 = apagat. Continu: entre nivells sencers els parcials nous del nivell seg\xc3\xbc""ent entren de greu a agut. S'imanta als 4 nivells marcats - mant\xc3\xa9n Ctrl per ajust fi lliure."));
     phaseBox.setTooltip (tr (
         "Starting phase of the partials. 'Aligned': all peak together, forming a periodic pulse - tonal, never clips, and with dense spectra the pulse itself is heard as a low difference tone. 'Scattered': random phases - smoother, louder, no pulse.",
         "Fase inicial dels parcials. 'Alineat': tots fan el pic alhora i formen un pols peri\xc3\xb2""dic - tonal, mai clipa, i amb espectres densos el pols s'escolta com un to diferencial greu. 'Dispers': fases aleat\xc3\xb2ries - m\xc3\xa9s suau, m\xc3\xa9s fort, sense pols."));
@@ -1690,7 +1814,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     primeModeBox.setTooltip (tr (
         "How prime numbers filter the harmonics. 'Limit': a harmonic passes only if its largest prime factor is at most the chosen limit. 'Whitelist': it passes only if EVERY prime factor is ticked below.",
         "Com filtren els primers els harm\xc3\xb2nics. 'L\xc3\xadmit': un harm\xc3\xb2nic passa nom\xc3\xa9s si el seu factor primer m\xc3\xa9s gran \xc3\xa9s com a molt el l\xc3\xadmit triat. 'Llista': passa nom\xc3\xa9s si TOTS els seus factors primers estan marcats a sota."));
-    primeLimitBox.setTooltip (tr (
+    primeLimitFader.setTooltip (tr (
         "Largest prime factor a harmonic may contain. Example: limit 7 keeps 14 (2*7) and 25 (5*5) but drops 11 and 22 (2*11). Off = no prime filtering.",
         "Factor primer m\xc3\xa9s gran que pot tenir un harm\xc3\xb2nic. Exemple: l\xc3\xadmit 7 mant\xc3\xa9 14 (2*7) i 25 (5*5) per\xc3\xb2 elimina 11 i 22 (2*11). No = sense filtre de primers."));
     const char* pn2[] = { "2","3","5","7","11","13","17","19","23" };
@@ -1731,7 +1855,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     loadTimbreButton.setTooltip (tr (
         "Load a .scl/.ascl whose intervals become the PARTIALS of the sound, replacing the harmonic engine. Slope, Fractal, Range and Reps still shape it; the greyed-out controls do not apply.",
         "Carrega un .scl/.ascl els intervals del qual passen a ser els PARCIALS del so, substituint el motor harm\xc3\xb2nic. Pendent, Fractal, Rang i Reps encara hi actuen; els controls en gris no apliquen."));
-    clearTimbreButton.setTooltip (tr ("Turn Timbre mode off and return to the harmonic engine.",
+    clearTimbreButton.setTooltip (tr ("Custom engine ON/OFF. Off keeps the loaded scale - nothing is erased; switch back on any time.",
                                       "Apaga el mode Timbre i torna al motor harm\xc3\xb2nic."));
     timbreRepeatsFader.setTooltip (tr (
         "How many periods of the scale are stacked as partials. More repeats = the timbre reaches higher in the spectrum.",
@@ -1767,14 +1891,13 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         b.setSelectedId (b.getSelectedId(), juce::dontSendNotification); // refresh displayed text
     };
     localise (basePitchBox, { tr ("Transposed down", "Transposada avall"), tr ("Original", "Original") });
-    localise (whitelistBox, { tr ("All", "Tots"), tr ("Even", "Parells"), tr ("Odd", "Senars"), tr ("Prime", "Primers") });
     localise (phaseBox,     { tr ("Aligned", "Alineat"), tr ("Scattered", "Dispers") });
     localise (primeModeBox, { tr ("Limit", "L\xc3\xadmit"), tr ("Whitelist", "Llista") });
-    localise (primeLimitBox,{ tr ("Off", "No"), "2","3","5","7","11","13","17","19","23" });
     localise (bendBox,      { "\xc2\xb1""2 st", "\xc2\xb1""12 st", "\xc2\xb1""48 st (MPE)" });
     localise (specModeBox,  { tr ("Chords based on beating", "Acords basats en batec"),
                               tr ("Dyads based on beating", "D\xc3\xad""ades basades en batec"),
                               tr ("From spectrum's segment", "Del segment de l'espectre") });
+    lastNadD = 0; // force the n-ad selector's items to rebuild in the new language
 
     // Chord-search mode texts.
     chordNotesLbl.setText (tr ("Notes", "Notes"), dontSendNotification);
@@ -1791,7 +1914,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     saveTuningBtn.setTooltip (tr (
         "Save the CURRENT tuning as a .scl file to any folder - including scales you edited on the keyboard (right-click a key to retype a degree, Ctrl+click to add a note).",
         "Desa l'afinaci\xc3\xb3 ACTUAL com a fitxer .scl a qualsevol carpeta - incloses les escales editades al teclat (clic dret per reescriure un grau, Ctrl+clic per afegir una nota)."));
-    chordGoBtn.setButtonText (tr ("Transmute", "Transmuta"));
+    chordGoBtn.setButtonText (tr ("Find", "Troba"));
     chordNotesBox.setTooltip (tr (
         "How many notes each chord has (the root 1/1 is included). More notes = a heavier search - it runs in the background with a progress read-out.",
         "Quantes notes t\xc3\xa9 cada acord (l'arrel 1/1 hi \xc3\xa9s inclosa). M\xc3\xa9s notes = cerca m\xc3\xa9s pesada - corre en segon pla amb progr\xc3\xa9s."));
@@ -2287,14 +2410,16 @@ void FractalAdditiveAudioProcessorEditor::applyTimbreEnablement (bool active)
 {
     const bool en = ! active;
     baseNFader.setEnabled (en);
-    for (auto* c : { &basePitchBox, &whitelistBox, &phaseBox, &primeModeBox, &primeLimitBox })
+    for (auto* c : { (juce::Component*) &basePitchBox, (juce::Component*) &phaseBox,
+                     (juce::Component*) &primeModeBox, (juce::Component*) &primeLimitFader,
+                     (juce::Component*) &harmonicsFader })
         c->setEnabled (en);
     for (auto& t : primeToggle) t.setEnabled (en);
 
     const float a = active ? 0.4f : 1.0f;
     phaseBox.setAlpha (a);
-    baseNFader.setAlpha (a); basePitchBox.setAlpha (a); whitelistBox.setAlpha (a);
-    phaseBox.setAlpha (a); primeModeBox.setAlpha (a); primeLimitBox.setAlpha (a);
+    baseNFader.setAlpha (a); basePitchBox.setAlpha (a); harmonicsFader.setAlpha (a);
+    phaseBox.setAlpha (a); primeModeBox.setAlpha (a); primeLimitFader.setAlpha (a);
     for (auto& t : primeToggle) t.setAlpha (a);
     for (auto& l : primeLbl)    l.setAlpha (a);
     lblBaseN.setAlpha (a); lblBasePitch.setAlpha (a); lblPrimeLimit.setAlpha (a);
@@ -2373,10 +2498,30 @@ void FractalAdditiveAudioProcessorEditor::configFader (juce::Slider& s, const ju
     // Double-click ANY fader = straight back to its default value.
     if (auto* prm = processorRef.apvts.getParameter (paramID))
         s.setDoubleClickReturnValue (true, prm->convertFrom0to1 (prm->getDefaultValue()));
-    // Right-click ANY fader -> map/unmap it as the CUSTOM envelope's target.
+    // Right-click ANY fader -> map/unmap it to any of the 6 modulators. The CUSTOM
+    // tab's own faders carry a modulator id that changes with the selector, so they
+    // resolve their target id at click time.
+    addMapListener (s, paramID, paramID.startsWith ("modE1") || paramID.startsWith ("modL1"));
+}
+
+// A CUSTOM-tab control is built against modulator 1's ids but re-attached to the
+// SELECTED modulator: translate the template id to the live one.
+juce::String FractalAdditiveAudioProcessorEditor::currentModParamId (const juce::String& templateId) const
+{
+    const bool isEnv = modSel < 3;
+    if (templateId.startsWith ("modE1")) return (isEnv ? "modE" : "modL")
+        + juce::String (isEnv ? modSel + 1 : modSel - 2) + templateId.substring (5);
+    if (templateId.startsWith ("modL1")) return (isEnv ? "modE" : "modL")
+        + juce::String (isEnv ? modSel + 1 : modSel - 2) + templateId.substring (5);
+    return templateId;
+}
+
+void FractalAdditiveAudioProcessorEditor::addMapListener (juce::Component& c, const juce::String& paramID,
+                                                          bool dynamicMod)
+{
     auto ml = std::make_unique<ParamMapListener>();
-    ml->ed = this; ml->pid = paramID;
-    s.addMouseListener (ml.get(), false);
+    ml->ed = this; ml->pid = paramID; ml->dynamicMod = dynamicMod;
+    c.addMouseListener (ml.get(), false);
     mapListeners.push_back (std::move (ml));
 }
 
@@ -2411,13 +2556,20 @@ void FractalAdditiveAudioProcessorEditor::attachCustomTab()
 // (it rides on the knob's own value; set its Range in the Custom tab).
 void FractalAdditiveAudioProcessorEditor::showEnvMapMenu (const juce::String& paramID)
 {
-    if (paramID.startsWith ("mod")) return;
+    if (processorRef.apvts.getParameter (paramID) == nullptr) return;
+    if (paramID.startsWith ("mod") && paramID.endsWith ("On")) return; // see modOnT
     static const char* names[6] = { "Env 1", "Env 2", "Env 3", "LFO 1", "LFO 2", "LFO 3" };
     juce::PopupMenu m;
     juce::PopupMenu mapTo;
     for (int i = 0; i < 6; ++i)
-        if (! processorRef.getModEngine().isMappedTo (paramID, i))
-            mapTo.addItem (100 + i, names[i]);
+    {
+        // A modulator can drive ANOTHER modulator's parameters, never its own.
+        if (processorRef.getModEngine().isMappedTo (paramID, i)
+            || paramID.startsWith (ModEngine::ownPrefix (i)))
+            continue;
+        const bool full = processorRef.getModEngine().isFull (i);
+        mapTo.addItem (100 + i, juce::String (names[i]) + (full ? " (8/8 full)" : ""), ! full);
+    }
     m.addSubMenu (tr ("Map to", "Assigna a"), mapTo);
     for (int i = 0; i < 6; ++i)
         if (processorRef.getModEngine().isMappedTo (paramID, i))
@@ -2450,6 +2602,9 @@ void FractalAdditiveAudioProcessorEditor::configCombo (juce::ComboBox& b, const 
     b.onChange = [this] { refocus(); };
     addAndMakeVisible (b);
     att = std::make_unique<ComboBoxAttachment> (processorRef.apvts, paramID, b);
+    // Choice params are modulable too (the raw write snaps to a valid index), so
+    // every combo gets the same right-click routing menu as the faders.
+    addMapListener (b, paramID, paramID.startsWith ("modE1") || paramID.startsWith ("modL1"));
 }
 
 void FractalAdditiveAudioProcessorEditor::layoutFaders (juce::GroupComponent& g, juce::Rectangle<int> area, juce::Colour,
@@ -2457,7 +2612,7 @@ void FractalAdditiveAudioProcessorEditor::layoutFaders (juce::GroupComponent& g,
                                                         std::initializer_list<juce::Label*> labels)
 {
     g.setBounds (area.reduced (3));
-    auto in = area.reduced (3).reduced (5, 4); in.removeFromTop (17); // clear the title chip
+    auto in = area.reduced (3).reduced (5, 4); in.removeFromTop (20); // clear the title band
     const int n = (int) faders.size();
     const int cw = in.getWidth() / juce::jmax (1, n);
     auto fit = faders.begin(); auto lit = labels.begin();
@@ -2477,7 +2632,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colour (0xff0c0c12));
 
-    auto titleArea = getLocalBounds().removeFromTop (68);
+    auto titleArea = getLocalBounds().removeFromTop (78); // a little more air under the title
 
     // Title layout is computed FIRST (positions + colours + glyph paths) but the
     // squares are DRAWN LAST, so the connector lines can tuck their ends under the
@@ -2508,7 +2663,9 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         float x = ((float) getWidth() - total) * 0.5f;
         x = juce::jmax (x, freeLeft);
         if (x + total > freeRight) x = freeRight - total;
-        const float cy = (float) titleArea.getCentreY();
+        // Anchored near the TOP of the title band, so the extra height becomes
+        // breathing room between the title and the UI below it.
+        const float cy = (float) titleArea.getY() + 8.0f + side * 0.5f;
         for (int i = 0; i < L; ++i)
         {
             if (title[i] == ' ') { x += side * 0.5f; continue; }
@@ -2545,7 +2702,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     auto macroFrameTitle = [&] (juce::Rectangle<int> boxI, juce::Colour col, const juce::String& ttl,
                                 float interiorAlpha)
     {
-        constexpr float titleH = 21.0f;
+        constexpr float titleH = 32.0f; // matches drawGroupComponentOutline
         auto box = boxI.toFloat();
         auto frame = juce::Rectangle<float> (box.getX() + 1.3f, box.getY() + titleH * 0.5f,
                                              box.getWidth() - 2.6f, box.getHeight() - titleH * 0.5f - 1.3f);
@@ -2599,7 +2756,9 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         {
             g.setColour (cEssentials);
             g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
-            g.drawText (s, c.withWidth (78).reduced (6, 0), juce::Justification::centredLeft, false);
+            // Same band resized() reserves for the label (6 px in + 78 wide, minus a
+            // 2 px gap to the control) so long labels ("REFERENCIA") don't clip.
+            g.drawText (s, c.reduced (6, 0).withWidth (76), juce::Justification::centredLeft, false);
         };
         subLeft (ecPhase, tr ("PHASE", "FASE"));
         subLeft (ecGain,  tr ("GAIN", "GUANY"));
@@ -2630,7 +2789,7 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 void FractalAdditiveAudioProcessorEditor::resized()
 {
     auto full = getLocalBounds();
-    auto titleBar = full.removeFromTop (68);
+    auto titleBar = full.removeFromTop (78); // matches paint()'s titleArea
     langButton.setVisible (false); // language now lives inside the Menu popup
     {
         // Left cluster, two rows: the credit at the very top-left (just above the
@@ -2675,14 +2834,14 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // Box top aligned to the row top (like the Harmonic-Engine / Essentials macro
         // boxes) so all Row-1 titles sit on the same line; the CONTENT is unchanged.
         grp.setBounds (b.reduced (3, 0));
-        auto r = b.reduced (3).reduced (5, 4); r.removeFromTop (14);
+        auto r = b.reduced (3).reduced (5, 4); r.removeFromTop (19);
         if (lbl) lbl->setBounds (r.removeFromTop (13));
         s.setBounds (r);
     };
     auto oneCombo = [&] (juce::Rectangle<int> b, juce::GroupComponent& grp, juce::Component& c)
     {
         grp.setBounds (b.reduced (3));
-        auto r = b.reduced (3).reduced (6, 4); r.removeFromTop (16);
+        auto r = b.reduced (3).reduced (6, 4); r.removeFromTop (20);
         compact (c, r);
     };
 
@@ -2698,8 +2857,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
         const bool dy    = mode == 2; // Dyads based on beating
         const bool seg   = mode == 3; // From spectrum's segment
 
-        gSpecScale.setBounds (sp.reduced (3));
-        auto si = sp.reduced (3).reduced (8, 5); si.removeFromTop (16);
+        gSpecScale.setBounds (sp.reduced (3, 2)); // same top/bottom lines as rows 1-2
+        auto si = sp.reduced (3).reduced (8, 5); si.removeFromTop (20);
         specModeBox.setBounds (si.removeFromTop (34));     // two lines: full mode names fit
         si.removeFromTop (4);
 
@@ -2820,10 +2979,19 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 const int keepSel = nadBox.getSelectedId();
                 nadBox.clear (juce::dontSendNotification);
                 nadBox.addItem (tr ("Degrees (vs 0)", "Graus (vs 0)"), 1);
-                static const char* names[] = { "Dyads", "Triads", "Tetrads", "Pentads" };
                 for (int n = 2; n <= juce::jmin (D, 12); ++n)
-                    nadBox.addItem (n <= 5 ? juce::String (names[n - 2])
-                                           : juce::String (n) + tr ("-note chords", "-note chords"), n);
+                {
+                    juce::String name;
+                    switch (n)
+                    {
+                        case 2:  name = tr ("Dyads",   "D\xc3\xad""ades");  break;
+                        case 3:  name = tr ("Triads",  "Tr\xc3\xad""ades"); break;
+                        case 4:  name = tr ("Tetrads", "T\xc3\xa8trades");  break;
+                        case 5:  name = tr ("Pentads", "P\xc3\xa8ntades");  break;
+                        default: name = juce::String (n) + tr ("-note chords", " notes"); break;
+                    }
+                    nadBox.addItem (name, n);
+                }
                 nadBox.setSelectedId (keepSel > 0 && keepSel <= juce::jmin (D, 12) ? keepSel : 1,
                                       juce::dontSendNotification);
             }
@@ -2853,9 +3021,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
         {
             chordView.setBounds (si);
             const int chh    = chordList.contentHeight();
-            const bool scrl  = chh > si.getHeight();
-            chordList.setSize (scrl ? si.getWidth() - 10 : si.getWidth(),
-                               juce::jmax (si.getHeight(), chh));
+            const int chw    = chordList.contentWidth();
+            const bool scrlV = chh > si.getHeight();
+            const bool scrlH = chw > si.getWidth();
+            // Wide chords (many notes) scroll SIDEWAYS - nothing is left unreachable
+            // off the right edge any more.
+            chordList.setSize (juce::jmax (chw, si.getWidth() - (scrlV ? 10 : 0)),
+                               juce::jmax (si.getHeight() - (scrlH ? 10 : 0), chh));
         }
     }
 
@@ -2870,9 +3042,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // Prime | Slope, separated by SHARED divider lines + small inline uppercase
         // labels drawn in paint() (from the hc* cell rects stored here).
         const int macroW = W * 60 / 100;
-        harmonicEngineBounds = row.removeFromLeft (macroW);
+        // Every macro box uses the SAME 3 px horizontal inset as the group-component
+        // boxes, so all frames in both rows share their left and right lines.
+        harmonicEngineBounds = row.removeFromLeft (macroW).reduced (3, 0);
         auto macro = harmonicEngineBounds.reduced (5, 4);
-        macro.removeFromTop (17); // clear the "HARMONIC ENGINE" title
+        macro.removeFromTop (20); // clear the "HARMONIC ENGINE" title band
         const int mW = macro.getWidth();
 
         // Base is a touch wider (and Harmonics/Prime a touch narrower) so the Base
@@ -2900,10 +3074,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
         }
         {
             auto hi = hcHarm.reduced (5, 3); hi.removeFromTop (lblH);
-            compact (whitelistBox, hi);
+            harmonicsFader.setBounds (hi.withSizeKeepingCentre (hi.getWidth(), juce::jmin (24, hi.getHeight())));
 
             const bool wl = processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f;
-            primeLimitBox.setVisible (! wl); lblPrimeLimit.setVisible (! wl);
+            primeLimitFader.setVisible (! wl); lblPrimeLimit.setVisible (! wl);
             for (int i = 0; i < 9; ++i) { primeToggle[i].setVisible (wl); primeLbl[i].setVisible (wl); }
 
             auto pi = hcPrime.reduced (5, 3); pi.removeFromTop (lblH);
@@ -2922,7 +3096,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             else
             {
                 lblPrimeLimit.setBounds (pi.removeFromLeft (42).withSizeKeepingCentre (42, 22));
-                compact (primeLimitBox, pi.removeFromLeft (juce::jmin (110, pi.getWidth())));
+                primeLimitFader.setBounds (pi.removeFromLeft (juce::jmin (150, pi.getWidth())).withSizeKeepingCentre (juce::jmin (150, 150), 22));
             }
         }
         {
@@ -2936,9 +3110,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // the Harmonic Engine: 4 stacked cells, shared horizontal dividers + inline
         // labels drawn in paint() (from the ec* cell rects stored here).
         {
-            essentialsBounds = row;
+            essentialsBounds = row.reduced (3, 0);
             auto e = essentialsBounds.reduced (5, 4);
-            e.removeFromTop (17); // clear the "ESSENTIALS" title
+            e.removeFromTop (20); // clear the "ESSENTIALS" title band
             // OCTAVE hosts TWO stepper rows -> it gets a fixed, taller share and the
             // other three cells split the rest evenly.
             const int octH = juce::jmin (58, e.getHeight() / 2);
@@ -2982,16 +3156,20 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
     //== Row 2: Custom Engine | Volume Env | Pitch Env | Filter | Tuning =========
     {
-        auto row = area.removeFromTop (rowH).reduced (0, 2);
+        // Takes ALL the remaining height (not another rowH slice) so its boxes end
+        // on exactly the same line as the full-height right column: the frames are
+        // drawn from the box rect, so every box in this row must share one rect.
+        auto row = area.reduced (0, 2);
         const int W = row.getWidth();
 
         // Custom Engine (leftmost now): load .scl OR type intervals + Reps.
         {
             auto sb = row.removeFromLeft (W * 14 / 100);
-            gTimbre.setBounds (sb.reduced (3));
-            auto ti = sb.reduced (3).reduced (8, 5); ti.removeFromTop (16);
+            gTimbre.setBounds (sb.reduced (3, 0)); // gutter sideways only: tops/bottoms
+                                                   // line up with every other box in the row
+            auto ti = sb.reduced (3).reduced (8, 5); ti.removeFromTop (20);
             auto brow = ti.removeFromTop (24);
-            const bool offVis = processorRef.isTimbreActive();
+            const bool offVis = processorRef.timbreLoaded();
             clearTimbreButton.setVisible (offVis);
             if (offVis)
             {
@@ -3027,12 +3205,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
             const juce::Colour tabCols[4] = { cEnv, cPitch, cFilter, juce::Colour (0xff9a7bff) };
             gAmpEnv.setColour (juce::GroupComponent::outlineColourId, tabCols[envTab]);
             gAmpEnv.setColour (juce::GroupComponent::textColourId,    tabCols[envTab]);
-            gAmpEnv.setBounds (eb.reduced (3));   // title = "Envelopes" (set in applyLanguage)
+            gAmpEnv.setBounds (eb.reduced (3, 0)); // title = "Envelopes" (set in applyLanguage)
             gPitchEnv.setVisible (false);
             gFilter.setVisible (false);
 
             auto in = eb.reduced (3).reduced (5, 4);
-            in.removeFromTop (17);                // clear the box title - chips sit BELOW it
+            in.removeFromTop (20);                // clear the box title - chips sit BELOW it
             auto chips = in.removeFromTop (19);
             const int cw4 = chips.getWidth() / 4;
             for (int k = 0; k < 4; ++k)
@@ -3132,40 +3310,41 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // Tuning = the FOOT of the inverted-L box (the dissonance BAR is above-right);
         // mode + the loaded .scl name, the PERIOD (red), load/reset, recent, bend, bank.
         {
-            lFootBounds = row; // frame painted in paint() as one L with the bar
-            auto ti = row.reduced (3).reduced (8, 4); ti.removeFromTop (17); // clear the TUNING title chip
+            lFootBounds = row.reduced (3, 0); // frame painted in paint()
+            auto ti = row.reduced (3).reduced (8, 4); ti.removeFromTop (20); // clear the TUNING title band
             auto mrow = ti.removeFromTop (24);
             compact (tuningBox, mrow.removeFromLeft (mrow.getWidth() * 50 / 100));
             mrow.removeFromLeft (5);
             tuningNameLabel.setBounds (mrow); // shows the loaded scale's file name
             // Period of the active scale, in red, always visible.
-            ti.removeFromTop (3);
-            tuningPeriodLbl.setBounds (ti.removeFromTop (18));
+            ti.removeFromTop (2);
+            tuningPeriodLbl.setBounds (ti.removeFromTop (17));
             // Load .scl only exists in Scala mode; Reset appears whenever there is
-            // something to reset (any non-12ED2 mode or a loaded scale).
+            // something to reset (any non-12ED2 mode or a loaded scale). Load / Reset /
+            // Save share ONE row: stacking them overflowed the box in Scala mode and
+            // squeezed the tuning-bank controls to zero height (invisible).
             const int  tmode    = processorRef.getTuningMode();
             const bool loadVis  = tmode == 2;
             const bool resetVis = tmode != 0 || processorRef.tuningHasScala();
+            const bool saveVis  = tmode != 0;
             loadSclButton.setVisible (loadVis);
             clearSclButton.setVisible (resetVis);
-            if (loadVis || resetVis)
+            saveTuningBtn.setVisible (saveVis);
+            if (loadVis || resetVis || saveVis)
             {
-                ti.removeFromTop (4);
+                ti.removeFromTop (3);
                 auto brow = ti.removeFromTop (23);
-                if (loadVis && resetVis)
+                const int nBtn = (loadVis ? 1 : 0) + (resetVis ? 1 : 0) + (saveVis ? 1 : 0);
+                const int bw   = brow.getWidth() / juce::jmax (1, nBtn);
+                int left = nBtn;
+                const auto place = [&] (juce::TextButton& b, bool vis)
                 {
-                    loadSclButton.setBounds (brow.removeFromLeft (brow.getWidth() / 2).reduced (2, 0));
-                    clearSclButton.setBounds (brow.reduced (2, 0));
-                }
-                else if (loadVis)  loadSclButton.setBounds (brow.reduced (2, 0));
-                else               clearSclButton.setBounds (brow.reduced (2, 0));
-            }
-            // Save the CURRENT tuning as .scl - pointless in plain 12ED2, hidden there.
-            saveTuningBtn.setVisible (tmode != 0);
-            if (tmode != 0)
-            {
-                ti.removeFromTop (4);
-                saveTuningBtn.setBounds (ti.removeFromTop (23).reduced (2, 0));
+                    if (! vis) return;
+                    b.setBounds ((--left > 0 ? brow.removeFromLeft (bw) : brow).reduced (2, 0));
+                };
+                place (loadSclButton,  loadVis);
+                place (clearSclButton, resetVis);
+                place (saveTuningBtn,  saveVis);
             }
             // Pitch bend ABOVE Recent; hidden in MPE-input mode (the MPE zone fixes
             // the per-note range at +-48, so the choice is irrelevant there).
@@ -3188,20 +3367,27 @@ void FractalAdditiveAudioProcessorEditor::resized()
             tuningBankClearBtn.setVisible (sclMode);
             if (sclMode)
             {
-                ti.removeFromTop (4);
-                recentLabel.setBounds (ti.removeFromTop (14));
-                auto rrow = ti.removeFromTop (24);
+                ti.removeFromTop (3);
+                recentLabel.setBounds (ti.removeFromTop (13));
+                auto rrow = ti.removeFromTop (23);
                 const int rw = rrow.getWidth() / 3;
                 for (int i = 0; i < 3; ++i) recentBtn[i].setBounds (rrow.removeFromLeft (rw).reduced (2, 1));
-                ti.removeFromTop (5);
-                lblTuningBank.setBounds (ti.removeFromTop (14));
-                // Bank row, un-squashed: [combo (flex)] [+ .scl] [X remove].
-                auto bkrow = ti.removeFromTop (26);
+                ti.removeFromTop (3);
+                // Bank row: the label rides on the LEFT of the row (a separate label
+                // row no longer fits) - [BANK][combo (flex)][+ .scl][X remove].
+                auto bkrow = ti.removeFromTop (juce::jmax (0, juce::jmin (24, ti.getHeight())));
+                lblTuningBank.setJustificationType (juce::Justification::centredLeft);
+                lblTuningBank.setBounds (bkrow.removeFromLeft (38));
                 tuningBankClearBtn.setBounds (bkrow.removeFromRight (24).reduced (1, 1));
                 bkrow.removeFromRight (3);
-                tuningBankLoadBtn.setBounds (bkrow.removeFromRight (48).reduced (1, 0));
+                tuningBankLoadBtn.setBounds (bkrow.removeFromRight (46).reduced (1, 0));
                 bkrow.removeFromRight (4);
                 compact (tuningBankBox, bkrow);
+                // Honest failure instead of zero-height ghosts: if the box ran out of
+                // room, hide what did not fit rather than laying it out invisibly.
+                const bool fits = bkrow.getHeight() >= 14;
+                lblTuningBank.setVisible (fits); tuningBankBox.setVisible (fits);
+                tuningBankLoadBtn.setVisible (fits); tuningBankClearBtn.setVisible (fits);
             }
         }
     }
@@ -3379,6 +3565,20 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             resized();
             nadList.repaint();
         }
+        // Honest empty states: computing, over budget, or partial degree coverage.
+        {
+            juce::String txt;
+            if (processorRef.isNadBusy())
+                txt = tr ("computing...", "calculant...");
+            else if (nadList.rows.empty() && processorRef.nadWasOverBudget())
+                txt = tr ("Too many combinations for this scale - pick fewer notes.",
+                          "Massa combinacions per a aquesta escala - tria menys notes.");
+            else if (processorRef.getNadUsedDegrees() < processorRef.getNadTotalDegrees())
+                txt = tr ("first ", "nom\xc3\xa9s els primers ") + juce::String (processorRef.getNadUsedDegrees())
+                    + tr (" of ", " de ") + juce::String (processorRef.getNadTotalDegrees())
+                    + tr (" degrees analysed", " graus analitzats");
+            if (txt != nadList.emptyText) { nadList.emptyText = txt; resized(); nadList.repaint(); }
+        }
     }
 
     // Keyboard hovers park their floating window ABOVE the keyboard (never covering
@@ -3447,9 +3647,11 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                 chordList.rows.push_back (std::move (row));
             }
             const int ch = chordList.contentHeight();
-            const bool scroll = ch > chordView.getHeight() && chordView.getHeight() > 0;
-            chordList.setSize (scroll ? chordView.getWidth() - 10 : juce::jmax (60, chordView.getWidth()),
-                               juce::jmax (chordView.getHeight(), ch));
+            const int cw = chordList.contentWidth();
+            const bool scroll  = ch > chordView.getHeight() && chordView.getHeight() > 0;
+            const bool scrollH = cw > chordView.getWidth();
+            chordList.setSize (juce::jmax (cw, juce::jmax (60, chordView.getWidth()) - (scroll ? 10 : 0)),
+                               juce::jmax (chordView.getHeight() - (scrollH ? 10 : 0), ch));
             chordList.repaint();
         }
     }
@@ -3598,7 +3800,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // so the Load button expands to fill the freed space. The tuning MODE is packed
     // in too: Recent/Tuning-bank/Pitch-bend visibility depends on it.
     const bool resetVis = processorRef.getTuningMode() != 0 || processorRef.tuningHasScala();
-    const bool offVis   = processorRef.isTimbreActive();
+    const bool offVis   = processorRef.timbreLoaded();
     const int  packed   = (resetVis ? 1 : 0) | (offVis ? 2 : 0) | (processorRef.getTuningMode() << 2);
     if (packed != lastResetOffState) { lastResetOffState = packed; resized(); }
 
@@ -3625,13 +3827,12 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     const bool timbre = processorRef.timbreReplacesEngine();
     if (timbre != lastTimbreActive)
     {
-        if (timbre)
-        {
-            forceDefault ("baseN");     forceDefault ("baseMode"); forceDefault ("selection");
-            forceDefault ("phaseMode"); forceDefault ("primeMode"); forceDefault ("primeLimit");
-            for (int i = 0; i < 9; ++i) forceDefault ("primeWL" + juce::String (i));
-        }
+        // The harmonic-engine controls are DIMMED while a custom engine drives the
+        // timbre - they are never reset. (They used to be forced back to their
+        // defaults here, which silently destroyed the user's settings the moment a
+        // .scl was loaded, and made the sound depend on the editor being open.)
         applyTimbreEnablement (timbre);
         lastTimbreActive = timbre;
+        clearTimbreButton.setButtonText (processorRef.isTimbreActive() ? tr ("On", "Actiu") : tr ("Off", "Apagat"));
     }
 }

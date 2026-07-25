@@ -109,7 +109,7 @@ int main()
     std::printf ("fractal L=2 (base {1,2,3}, slope=1):\n");
     {
         SpectrumSettings s; s.baseN = 1; s.reach = 3; s.selection = Selection::All;
-        s.curveSlope = 1.0f; s.fractalLevel = 2;
+        s.curveSlope = 1.0f; s.fractalLevel = 2.0f;
         auto t = compileSpectrum (s);
         check (t.partials.size() == 6, "6 merged partials {1,2,3,4,6,9}");
         check (hasRatio (t, 1) && hasRatio (t, 2) && hasRatio (t, 3)
@@ -118,6 +118,77 @@ int main()
         check (a1 > 0 && std::abs (ampAtRatio (t, 2.0) / a1 - 1.0)    < 2e-3, "amp(2)/amp(1) ~ 1.0 (coincidence sum)");
         check (a1 > 0 && std::abs (ampAtRatio (t, 4.0) / a1 - 0.25)   < 2e-3, "amp(4)/amp(1) ~ 0.25");
         check (a1 > 0 && std::abs (ampAtRatio (t, 9.0) / a1 - 0.1111) < 2e-3, "amp(9)/amp(1) ~ 0.1111");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("fractional fractal level (continuous fader, low->high entry):\n");
+    {
+        // Base {1,2,3}: level 1 = {1,2,3}; level 2 = {1,2,3,4,6,9}. The NEW partials
+        // at level 2 are 4, 6, 9 - they must enter LOW to HIGH as the level rises,
+        // and the endpoints must reproduce the integer levels exactly.
+        SpectrumSettings s; s.baseN = 1; s.reach = 3; s.selection = Selection::All;
+        s.curveSlope = 1.0f;
+        s.fractalLevel = 1.0f; auto t1 = compileSpectrum (s);
+        s.fractalLevel = 2.0f; auto t2 = compileSpectrum (s);
+        check (t1.partials.size() == 3 && t2.partials.size() == 6, "endpoints: 3 and 6 partials");
+
+        s.fractalLevel = 1.2f; auto ta = compileSpectrum (s);
+        s.fractalLevel = 1.5f; auto tb = compileSpectrum (s);
+        s.fractalLevel = 1.9f; auto tc = compileSpectrum (s);
+        check (hasRatio (ta, 4.0) && ! hasRatio (ta, 9.0),
+               "at 1.2 the LOWEST new partial (4) is in, the highest (9) is not");
+        check (hasRatio (tb, 4.0) && hasRatio (tb, 6.0) && ! hasRatio (tb, 9.0),
+               "at 1.5 partials 4 and 6 are in, 9 still out (low->high)");
+        check (hasRatio (tc, 4.0) && hasRatio (tc, 6.0) && hasRatio (tc, 9.0),
+               "at 1.9 all three new partials are in");
+        check (ta.partials.size() <= tb.partials.size() && tb.partials.size() <= tc.partials.size(),
+               "partial count grows monotonically with the fractal level");
+        // Continuity at the top end: 1.99 must be within one partial of level 2.
+        s.fractalLevel = 1.99f; auto td = compileSpectrum (s);
+        check (td.partials.size() == t2.partials.size(), "1.99 already has level 2's partial set");
+        // The blended amplitudes must stay RMS-normalised like every other template.
+        double sq = 0.0; for (const auto& p : tb.partials) sq += (double) p.amp * (double) p.amp;
+        check (std::abs (sq - 1.0) < 1e-3, "blended template is RMS-normalised");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("continuous Harmonics axis (Even - All - Odd - Prime):\n");
+    {
+        SpectrumSettings s; s.baseN = 1; s.reach = 9; s.curveSlope = 0.0f;
+        s.selection = (float) Selection::Even; auto tE = compileSpectrum (s);
+        s.selection = (float) Selection::All;  auto tA = compileSpectrum (s);
+        s.selection = (float) Selection::Odd;  auto tO = compileSpectrum (s);
+        check (! hasRatio (tE, 3.0) && hasRatio (tE, 2.0), "Even: harmonic 3 out, 2 in");
+        check (hasRatio (tA, 3.0) && hasRatio (tA, 2.0),   "All: both in");
+        check (hasRatio (tO, 3.0) && ! hasRatio (tO, 2.0), "Odd: 3 in, 2 out (fundamental aside)");
+        // Half-way Even<->All: the odd harmonics (in All only) come in at HALF weight,
+        // the even ones (in both) stay at full - the timbre morphs, it does not switch.
+        s.selection = 0.5f; auto tHalf = compileSpectrum (s);
+        const float a2 = ampAtRatio (tHalf, 2.0), a3 = ampAtRatio (tHalf, 3.0);
+        check (a2 > 0.0f && a3 > 0.0f, "half-way: both even and odd harmonics are present");
+        check (a2 > 0.0f && std::abs (a3 / a2 - 0.5f) < 1e-3f, "half-way: the odd ones sound at half amplitude");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("temper mode snaps partials onto the scale grid and merges coincidences:\n");
+    {
+        // A 1-degree "scale" (bare octaves): every harmonic must land on a power of 2,
+        // duplicates must MERGE (no coherent stacking), and the played pitch stays at 1.
+        SpectrumSettings s; s.baseN = 1; s.reach = 9; s.selection = Selection::All;
+        s.curveSlope = 0.0f;
+        s.temperToTimbre = true; s.timbreDegrees = { 1.0f }; s.timbrePeriod = 2.0f;
+        auto t = compileSpectrum (s);
+        check (std::abs (t.partials.front().ratio - 1.0f) < 1e-3f, "played pitch still at ratio 1");
+        bool allOctaves = true, distinct = true;
+        for (size_t i = 0; i < t.partials.size(); ++i)
+        {
+            const double l = std::log2 ((double) t.partials[i].ratio);
+            if (std::abs (l - std::round (l)) > 1e-3) allOctaves = false;
+            if (i > 0 && std::abs ((double) t.partials[i].ratio - (double) t.partials[i - 1].ratio) < 1e-6)
+                distinct = false;
+        }
+        check (allOctaves, "every tempered partial sits on the scale grid (a power of 2 here)");
+        check (distinct, "coincident partials were merged, not duplicated");
     }
 
     //--------------------------------------------------------------------------
@@ -226,7 +297,7 @@ int main()
         s.timbrePeriod = 2.0f;
         s.timbrePeriodRepeats = 2;
         s.curveSlope = 0.0f;
-        s.fractalLevel = 1;
+        s.fractalLevel = 1.0f;
         s.timbreDegrees.clear();
         for (int k = 0; k < 12; ++k) s.timbreDegrees.push_back ((float) std::pow (2.0, k / 12.0));
 
@@ -242,7 +313,7 @@ int main()
     std::printf ("Scala-as-timbre: more period repeats reach higher (more partials):\n");
     {
         SpectrumSettings a; a.source = Source::ScalaTimbre; a.timbrePeriod = 2.0f;
-        a.curveSlope = 0.0f; a.fractalLevel = 1; a.timbrePeriodRepeats = 2;
+        a.curveSlope = 0.0f; a.fractalLevel = 1.0f; a.timbrePeriodRepeats = 2;
         for (int k = 0; k < 5; ++k) a.timbreDegrees.push_back ((float) std::pow (2.0, k / 5.0)); // 5-EDO
         SpectrumSettings b = a; b.timbrePeriodRepeats = 4;
         auto ta = compileSpectrum (a);

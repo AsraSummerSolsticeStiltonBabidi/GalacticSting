@@ -168,11 +168,15 @@ int main()
     ScopedJuceInitialiser_GUI juceInit;
     using B = spectrum::BaseMode; using Se = spectrum::Selection;
     auto mk = [] (int n, B m, Se sel, float slope, int fr, int pl)
-    { spectrum::SpectrumSettings s; s.baseN = n; s.baseMode = m; s.selection = sel; s.curveSlope = slope; s.fractalLevel = fr; s.primeLimit = pl; return s; };
-    // set(): baseMode idx 0=Transposed 1=Original;  selection idx 0=All..3=Prime;  primeLimit idx 0=off
+    { spectrum::SpectrumSettings s; s.baseN = n; s.baseMode = m; s.selection = sel; s.curveSlope = slope; s.fractalLevel = (float) fr; s.primeLimit = pl; return s; };
+    // set(): baseMode idx 0=Transposed 1=Original;  selection idx 0=All..3=Prime (the
+    // legacy order, mapped onto the continuous Harmonics axis);  primeLimit idx 0=off
     auto set = [] (int n, int mode, int sel, float slope, int fr, int plIdx, int phase = 0)
     { return [=] (AudioProcessorValueTreeState& a) {
-        setP (a, "baseN", (float) n); setP (a, "baseMode", (float) mode); setP (a, "selection", (float) sel);
+        static const float selAxis[4] = { (float) spectrum::All, (float) spectrum::Even,
+                                          (float) spectrum::Odd, (float) spectrum::Prime };
+        setP (a, "baseN", (float) n); setP (a, "baseMode", (float) mode);
+        setP (a, "harmonics", selAxis[juce::jlimit (0, 3, sel)]);
         setP (a, "curveSlope", slope); setP (a, "fractalLevel", (float) fr); setP (a, "primeLimit", (float) plIdx);
         setP (a, "phaseMode", (float) phase); }; };
 

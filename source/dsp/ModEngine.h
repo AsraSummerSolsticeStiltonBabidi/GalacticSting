@@ -6,20 +6,34 @@
 // and written into the parameters' RAW VALUE ATOMICS (the values the DSP reads),
 // NOT through setValueNotifyingHost:
 //   - smooth (block-rate, not 30 Hz timer steps), no zipper at UI level
-//   - no host-automation spam, no undo pollution, RT-safe (atomic stores only)
+//   - no host-automation spam, RT-safe (every audio-thread access is an atomic
+//     load/store on pointers cached at construction - no String building, no map
+//     lookups, no allocation)
 //   - the parameter itself keeps the user's BASE setting; modulation rides on it
-//     (base + value * range, clamped to the parameter's range) and the base is
-//     restored when a modulator is switched off or unmapped.
+//     (base + sum of contributions, clamped to the range). Restoration is done
+//     BY THE AUDIO THREAD: any target written last block but not this block gets
+//     its base back (see lastW), so unmapping/switching off can never race the
+//     audio thread into a stuck value. NOTE: the raw atomics DO carry base+mod,
+//     so state capture must re-write the BASE for mapped targets (see
+//     captureState in PluginProcessor.cpp).
 //
 // Envelopes: ADSR, retriggered by EVERY note-on (so each new key restarts the
-// movement), released when no note is held.
+// movement), released when no note is held; a note that starts and ends inside
+// one block still releases (never parks at sustain).
 // LFOs: sine / triangle / saw up / saw down / square / custom drawn wave; rate
 // modes: BPM-divided, fundamental-divided (default; follows the lowest held
 // note's frequency), or free Hz; phase modes: restart at each note-on (default)
-// or locked to the host transport.
+// or locked to the host transport (BPM / free-Hz rates; the fundamental rate has
+// no transport-stable phase, so it falls back to note-restart).
+//
+// Routing edits happen on the message thread under routingLock; the audio thread
+// never takes the lock - it only reads the per-slot atomic pointers. Slots are
+// NEVER compacted: removal nulls the slot (the audio loop skips nulls), so an
+// in-flight block can at worst apply one stale block of the old routing.
 //==============================================================================
 
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <array>
 #include <atomic>
 #include <cmath>
 
@@ -30,68 +44,105 @@ public:
     static constexpr int kMaxTargets = 8;    // params one modulator can drive
     static constexpr int kWaveN = 256;       // custom-wave table resolution
 
-    ModEngine (juce::AudioProcessorValueTreeState& s) : apvts (s) {}
+    ModEngine (juce::AudioProcessorValueTreeState& s) : apvts (s)
+    {
+        // Cache every modulator parameter's raw atomic once: processBlock then
+        // runs with ZERO string building / map lookups on the audio thread.
+        for (int i = 0; i < kMods; ++i)
+        {
+            const auto pre = ownPrefix (i);
+            const auto rv  = [this, &pre] (const char* suf) { return apvts.getRawParameterValue (pre + suf); };
+            auto& q = prm[(size_t) i];
+            q.on = rv ("On"); q.range = rv ("Range");
+            onParam[(size_t) i] = apvts.getParameter (pre + "On");
+            if (i < kEnvs) { q.a = rv ("A"); q.d = rv ("D"); q.s = rv ("S"); q.r = rv ("R"); }
+            else
+            {
+                q.wave = rv ("Wave"); q.rateMode = rv ("RateMode"); q.divN = rv ("Div");
+                q.hz = rv ("Hz"); q.phaseMode = rv ("PhaseMode"); q.phase = rv ("Phase");
+            }
+        }
+    }
 
     void prepare (double sampleRate)
     {
         sr = sampleRate > 0.0 ? sampleRate : 44100.0;
-        for (auto& e : env) { e.adsr.setSampleRate (sr); e.adsr.reset(); }
-        noteSeen = 0;
+        for (auto& e : env) { e.adsr.setSampleRate (sr); e.adsr.reset(); e.held = false; }
+        resyncNotes = true; // adopt the processor's counter without a phantom retrigger
     }
 
-    // Message thread: routing management. Targets are cached RangedAudioParameter
-    // pointers + their raw atomics (both stable for the processor's lifetime).
+    // Message thread: routing management. A modulator may drive OTHER modulators'
+    // parameters (rates, ranges, ADSR...) but never its own (direct self-loop).
+    // The per-block evaluation order is fixed (mod 0..5), so cross-modulation is
+    // well-defined with one block of latency at most.
+    static juce::String ownPrefix (int mod)
+    { return (mod < kEnvs ? "modE" : "modL") + juce::String (mod < kEnvs ? mod + 1 : mod - kEnvs + 1); }
+
     void addTarget (int mod, const juce::String& pid)
     {
-        if (! juce::isPositiveAndBelow (mod, kMods) || pid.startsWith ("mod")) return;
-        auto& m = mods[(size_t) mod];
-        for (int i = 0; i < m.numTargets.load(); ++i)
-            if (m.tgtId[(size_t) i] == pid) return;
-        const int n = m.numTargets.load();
-        if (n >= kMaxTargets) return;
+        if (! juce::isPositiveAndBelow (mod, kMods) || pid.startsWith (ownPrefix (mod))) return;
         auto* p   = apvts.getParameter (pid);
         auto* raw = apvts.getRawParameterValue (pid);
         if (p == nullptr || raw == nullptr) return;
-        m.tgtId[(size_t) n]    = pid;
-        m.tgtParam[(size_t) n] = p;
-        m.tgtRaw[(size_t) n]   = raw;
-        m.numTargets.store (n + 1);
+        const juce::ScopedLock sl (routingLock);
+        auto& m = mods[(size_t) mod];
+        for (auto& id : m.tgtId) if (id == pid) return;
+        for (int i = 0; i < kMaxTargets; ++i)
+            if (m.tgtId[(size_t) i].isEmpty())
+            {
+                m.tgtId[(size_t) i] = pid;
+                m.slot[(size_t) i].raw.store (raw);                                   // raw first,
+                m.slot[(size_t) i].param.store (p, std::memory_order_release);        // param last
+                return;
+            }
     }
     void removeTarget (int mod, const juce::String& pid)
     {
         if (! juce::isPositiveAndBelow (mod, kMods)) return;
+        const juce::ScopedLock sl (routingLock);
         auto& m = mods[(size_t) mod];
-        const int n = m.numTargets.load();
-        for (int i = 0; i < n; ++i)
+        for (int i = 0; i < kMaxTargets; ++i)
             if (m.tgtId[(size_t) i] == pid)
             {
-                restoreTarget (m, i);
-                m.numTargets.store (n - 1);      // audio thread stops using the tail first
-                m.tgtId[(size_t) i]    = m.tgtId[(size_t) (n - 1)];
-                m.tgtParam[(size_t) i] = m.tgtParam[(size_t) (n - 1)];
-                m.tgtRaw[(size_t) i]   = m.tgtRaw[(size_t) (n - 1)];
+                m.slot[(size_t) i].param.store (nullptr); // audio skips null slots; it
+                m.slot[(size_t) i].raw.store (nullptr);   // restores the base next block
+                m.tgtId[(size_t) i].clear();
                 return;
             }
     }
     void unmapAll (int mod)
     {
         if (! juce::isPositiveAndBelow (mod, kMods)) return;
+        const juce::ScopedLock sl (routingLock);
         auto& m = mods[(size_t) mod];
-        for (int i = 0; i < m.numTargets.load(); ++i) restoreTarget (m, i);
-        m.numTargets.store (0);
+        for (int i = 0; i < kMaxTargets; ++i)
+        {
+            m.slot[(size_t) i].param.store (nullptr);
+            m.slot[(size_t) i].raw.store (nullptr);
+            m.tgtId[(size_t) i].clear();
+        }
     }
-    int  numTargets (int mod) const { return juce::isPositiveAndBelow (mod, kMods) ? mods[(size_t) mod].numTargets.load() : 0; }
-    juce::String targetId (int mod, int i) const
+    int numTargets (int mod) const
     {
-        return juce::isPositiveAndBelow (mod, kMods) && juce::isPositiveAndBelow (i, mods[(size_t) mod].numTargets.load())
-                   ? mods[(size_t) mod].tgtId[(size_t) i] : juce::String();
+        if (! juce::isPositiveAndBelow (mod, kMods)) return 0;
+        const juce::ScopedLock sl (routingLock);
+        int n = 0;
+        for (auto& id : mods[(size_t) mod].tgtId) n += id.isNotEmpty() ? 1 : 0;
+        return n;
+    }
+    juce::String targetId (int mod, int i) const // i-th mapped id (skips empty slots)
+    {
+        if (! juce::isPositiveAndBelow (mod, kMods)) return {};
+        const juce::ScopedLock sl (routingLock);
+        for (auto& id : mods[(size_t) mod].tgtId)
+            if (id.isNotEmpty() && i-- == 0) return id;
+        return {};
     }
     bool isMappedTo (const juce::String& pid, int mod) const
     {
         if (! juce::isPositiveAndBelow (mod, kMods)) return false;
-        const auto& m = mods[(size_t) mod];
-        for (int i = 0; i < m.numTargets.load(); ++i)
-            if (m.tgtId[(size_t) i] == pid) return true;
+        const juce::ScopedLock sl (routingLock);
+        for (auto& id : mods[(size_t) mod].tgtId) if (id == pid) return true;
         return false;
     }
 
@@ -105,101 +156,164 @@ public:
     const float* getCustomWave (int lfo) const
     { return juce::isPositiveAndBelow (lfo, kLfos) ? customWave[(size_t) lfo].data() : nullptr; }
 
+    // True while an LFO's requested rate exceeds what a block-stepped LFO can
+    // represent (the UI says so rather than the engine capping in silence).
+    bool isRateLimited (int lfo) const noexcept
+    { return juce::isPositiveAndBelow (lfo, kLfos) && rateLimited[(size_t) lfo].load(); }
+
+    // How many of this modulator's 8 target slots are in use (the map menu shows it).
+    bool isFull (int mod) const { return numTargets (mod) >= kMaxTargets; }
+
     // Audio thread: called once per block from processBlock BEFORE the synth renders.
     //   noteOnsSoFar - running note-on counter (retrigger detection)
-    //   anyHeld      - is any note currently held
+    //   anyHeld      - is any note currently held (accurate THIS block)
     //   fundamental  - lowest held note's Hz (0 if none)
     //   bpm/ppq      - host transport (bpm <= 0 = unknown; ppq < 0 = not playing)
     void processBlock (int numSamples, juce::uint32 noteOnsSoFar, bool anyHeld,
                        double fundamental, double bpm, double ppq)
     {
+        if (numSamples <= 0) return; // an empty block must not freeze the envelopes at 0
+        if (resyncNotes) { noteSeen = noteOnsSoFar; resyncNotes = false; }
         const bool newNote = noteOnsSoFar != noteSeen;
         noteSeen = noteOnsSoFar;
         const double dt = (double) numSamples / sr;
 
+        // Pass 1: every modulator's output value (0..1). Fixed order 0..5, so a
+        // modulator driving ANOTHER modulator's parameters acts with at most one
+        // block of latency and never re-enters itself.
+        double vals[kMods] = {};
+        bool   act[kMods]  = {};
         for (int i = 0; i < kMods; ++i)
         {
             auto& m = mods[(size_t) i];
-            const bool isEnv = i < kEnvs;
-            const auto id = [i, isEnv] (const char* suffix)
-            { return (isEnv ? "modE" : "modL") + juce::String (isEnv ? i + 1 : i - kEnvs + 1) + suffix; };
+            const auto& q = prm[(size_t) i];
+            bool anyTarget = false;
+            for (int t = 0; t < kMaxTargets; ++t)
+                if (m.slot[(size_t) t].param.load (std::memory_order_relaxed) != nullptr) { anyTarget = true; break; }
+            // Gate on the USER's On setting, never on a modulated copy of it: two
+            // modulators cross-mapped onto each other's On would otherwise form a
+            // block-rate limit cycle (both off -> restored -> both on -> ...).
+            act[i] = (onParam[(size_t) i] != nullptr ? onParam[(size_t) i]->getValue() > 0.5f
+                                                     : q.on->load() > 0.5f) && anyTarget;
 
-            const bool on = apvts.getRawParameterValue (id ("On"))->load() > 0.5f;
-            if (! on || m.numTargets.load() == 0)
+            if (i < kEnvs)
             {
-                if (m.wasActive) { for (int t = 0; t < m.numTargets.load(); ++t) restoreTarget (m, t); m.wasActive = false; }
-                continue;
-            }
-            m.wasActive = true;
-
-            double v = 0.0; // modulator output 0..1
-            if (isEnv)
-            {
+                // The envelope keeps RUNNING even while unmapped/off so its state is
+                // sane the moment it is engaged.
                 auto& e = env[(size_t) i];
                 juce::ADSR::Parameters ap;
-                ap.attack  = apvts.getRawParameterValue (id ("A"))->load();
-                ap.decay   = apvts.getRawParameterValue (id ("D"))->load();
-                ap.sustain = apvts.getRawParameterValue (id ("S"))->load();
-                ap.release = apvts.getRawParameterValue (id ("R"))->load();
+                ap.attack  = q.a->load();
+                ap.decay   = q.d->load();
+                ap.sustain = q.s->load();
+                ap.release = q.r->load();
                 e.adsr.setParameters (ap);
-                if (newNote)              e.adsr.noteOn();   // EVERY key restarts the envelope
-                else if (! anyHeld && e.held) e.adsr.noteOff();
+                if (newNote) e.adsr.noteOn();                       // EVERY key restarts the envelope
+                if (! anyHeld && (e.held || newNote)) e.adsr.noteOff(); // incl. notes on+off within one block
                 e.held = anyHeld;
-                // advance block-wise (values in between are not observable anyway)
+                double v = 0.0;
                 for (int k = 0; k < numSamples; ++k) v = (double) e.adsr.getNextSample();
+                vals[i] = v;
             }
             else
             {
                 auto& l = lfo[(size_t) (i - kEnvs)];
-                const int  rateMode  = (int) apvts.getRawParameterValue (id ("RateMode"))->load();
-                const int  divN      = (int) apvts.getRawParameterValue (id ("Div"))->load();
-                const int  phaseMode = (int) apvts.getRawParameterValue (id ("PhaseMode"))->load();
-                const double phOff   = (double) apvts.getRawParameterValue (id ("Phase"))->load();
+                const int  rateMode  = (int) q.rateMode->load();
+                const int  divN      = (int) q.divN->load();
+                const int  phaseMode = (int) q.phaseMode->load();
+                const double phOff   = (double) q.phase->load();
                 double rate = 0.0;
                 if (rateMode == 0)      rate = bpm > 1.0 ? (bpm / 60.0) / std::exp2 ((double) divN) : 0.0;
                 else if (rateMode == 1) rate = fundamental > 0.0 ? fundamental / std::exp2 ((double) divN) : 0.0;
-                else                    rate = (double) apvts.getRawParameterValue (id ("Hz"))->load();
-                rate = juce::jlimit (0.0, 40.0, rate);
+                else                    rate = (double) q.hz->load();
+                // The phase steps once per block, so the honest ceiling is the BLOCK
+                // rate's Nyquist, not an arbitrary 40 Hz: with a 64-sample buffer a
+                // fundamental-tracking LFO can run into the hundreds of Hz. The
+                // limit is reported to the UI (lfoRateLimited) instead of hiding.
+                const double ceiling = std::max (1.0, 0.5 * sr / (double) numSamples);
+                if (rate > ceiling) { rate = ceiling; rateLimited[(size_t) (i - kEnvs)] = true; }
+                else                { rateLimited[(size_t) (i - kEnvs)] = false; }
+                rate = std::max (0.0, rate);
 
-                if (phaseMode == 1 && ppq >= 0.0 && bpm > 1.0 && rateMode == 0)
-                    l.phase = std::fmod (ppq / 60.0 * 60.0 / std::exp2 ((double) divN) + phOff, 1.0); // transport-locked (beats)
+                if (phaseMode == 1 && rateMode != 1 && ppq >= 0.0 && bpm > 1.0)
+                {
+                    // Transport-locked. Cycles elapsed since the timeline start:
+                    //   BPM mode : beats / 2^div
+                    //   free Hz  : seconds * Hz  (seconds = ppq * 60 / bpm)
+                    const double cycles = rateMode == 0 ? ppq / std::exp2 ((double) divN)
+                                                        : ppq * (60.0 / bpm) * rate;
+                    l.phase = std::fmod (cycles + phOff, 1.0);
+                }
                 else
                 {
-                    if (newNote && phaseMode == 0) l.phase = phOff; // note-retrigger (default)
+                    // Note-restart (default). The fundamental rate has no transport-
+                    // stable phase, so transport mode also restarts per note there.
+                    if (newNote && (phaseMode == 0 || rateMode == 1)) l.phase = phOff;
                     l.phase = std::fmod (l.phase + rate * dt, 1.0);
                 }
-                v = evalWave (i - kEnvs, (int) apvts.getRawParameterValue (id ("Wave"))->load(), l.phase);
-            }
-
-            const float range = apvts.getRawParameterValue (id ("Range"))->load();
-            for (int t = 0; t < m.numTargets.load(); ++t)
-            {
-                auto* p = m.tgtParam[(size_t) t];
-                if (p == nullptr) continue;
-                // base = the parameter's OWN setting; modulation rides on top of it.
-                const float norm = juce::jlimit (0.0f, 1.0f, p->getValue() + (float) v * range);
-                m.tgtRaw[(size_t) t]->store (p->convertFrom0to1 (norm));
+                vals[i] = evalWave (i - kEnvs, (int) q.wave->load(), l.phase);
             }
         }
+
+        // Pass 2: SUM every active modulator's contribution per UNIQUE target, then
+        // write base + sum once (two modulators on one knob add, they don't fight).
+        struct W { juce::RangedAudioParameter* p; std::atomic<float>* raw; float sum; };
+        W writes[kMods * kMaxTargets];
+        int nW = 0;
+        for (int i = 0; i < kMods; ++i)
+        {
+            if (! act[i]) continue;
+            auto& m = mods[(size_t) i];
+            const float contrib = (float) vals[i] * prm[(size_t) i].range->load();
+            for (int t = 0; t < kMaxTargets; ++t)
+            {
+                auto* p   = m.slot[(size_t) t].param.load (std::memory_order_acquire);
+                auto* raw = m.slot[(size_t) t].raw.load();
+                if (p == nullptr || raw == nullptr) continue;
+                int f = -1;
+                for (int k = 0; k < nW; ++k) if (writes[k].raw == raw) { f = k; break; }
+                if (f >= 0) writes[f].sum += contrib;
+                else if (nW < kMods * kMaxTargets) writes[nW++] = { p, raw, contrib };
+            }
+        }
+        for (int k = 0; k < nW; ++k)
+        {
+            const float norm = juce::jlimit (0.0f, 1.0f, writes[k].p->getValue() + writes[k].sum);
+            writes[k].raw->store (writes[k].p->convertFrom0to1 (norm));
+        }
+        // Whatever was modulated LAST block but not this one returns to its own
+        // value - the audio thread is always the last writer, so an unmap or a
+        // modulator switched off can never leave a parameter stuck displaced.
+        for (int k = 0; k < nLastW; ++k)
+        {
+            bool still = false;
+            for (int j = 0; j < nW; ++j) if (writes[j].raw == lastW[k].raw) { still = true; break; }
+            if (! still && lastW[k].p != nullptr)
+                lastW[k].raw->store (lastW[k].p->convertFrom0to1 (lastW[k].p->getValue()));
+        }
+        nLastW = nW;
+        for (int k = 0; k < nW; ++k) lastW[k] = { writes[k].p, writes[k].raw };
     }
 
 private:
+    struct Slot
+    {
+        std::atomic<juce::RangedAudioParameter*> param { nullptr };
+        std::atomic<std::atomic<float>*>         raw   { nullptr };
+    };
     struct Mod
     {
-        juce::String               tgtId[kMaxTargets];
-        juce::RangedAudioParameter* tgtParam[kMaxTargets] = {};
-        std::atomic<float>*         tgtRaw[kMaxTargets]   = {};
-        std::atomic<int>            numTargets { 0 };
-        bool                        wasActive = false;
+        juce::String tgtId[kMaxTargets]; // message thread only (under routingLock)
+        Slot         slot[kMaxTargets];  // audio-thread view of the routing
     };
     struct Env { juce::ADSR adsr; bool held = false; };
     struct Lfo { double phase = 0.0; };
-
-    void restoreTarget (Mod& m, int i)
+    struct Ptrs
     {
-        if (m.tgtParam[(size_t) i] != nullptr && m.tgtRaw[(size_t) i] != nullptr)
-            m.tgtRaw[(size_t) i]->store (m.tgtParam[(size_t) i]->convertFrom0to1 (m.tgtParam[(size_t) i]->getValue()));
-    }
+        std::atomic<float>* on = nullptr, * range = nullptr;
+        std::atomic<float>* a = nullptr, * d = nullptr, * s = nullptr, * r = nullptr;   // envs
+        std::atomic<float>* wave = nullptr, * rateMode = nullptr, * divN = nullptr,     // lfos
+                          * hz = nullptr, * phaseMode = nullptr, * phase = nullptr;
+    };
 
     double evalWave (int lfoIdx, int wave, double ph) const
     {
@@ -222,12 +336,20 @@ private:
     }
 
     juce::AudioProcessorValueTreeState& apvts;
+    mutable juce::CriticalSection routingLock; // message-thread routing edits/reads; never audio
     Mod  mods[kMods];
+    Ptrs prm[kMods];
+    juce::RangedAudioParameter* onParam[kMods] = {}; // base (unmodulated) On state
     Env  env[kEnvs];
     Lfo  lfo[kLfos];
+    struct Last { juce::RangedAudioParameter* p = nullptr; std::atomic<float>* raw = nullptr; };
+    Last lastW[kMods * kMaxTargets];
+    int  nLastW = 0;
+    std::array<std::atomic<bool>, kLfos> rateLimited {};
     std::array<std::array<float, kWaveN>, kLfos> customWave {};
     double sr = 44100.0;
     juce::uint32 noteSeen = 0;
+    bool resyncNotes = true;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ModEngine)
 };

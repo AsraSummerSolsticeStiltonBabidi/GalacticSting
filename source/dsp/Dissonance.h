@@ -362,7 +362,15 @@ namespace dissonance
                 for (int i = 1; i <= m; ++i)
                 {
                     const double c0 = 1200.0 * std::log2 (a[(size_t) i]);
-                    double lo = std::max (1.0, c0 - win), hi = std::min (totalCents - 1.0, c0 + win);
+                    // The minimum interval applies to EVERY pair of notes, not just to
+                    // the root: the refinement window is clamped so this note can never
+                    // come closer than minGap to its neighbours (and, since the notes
+                    // stay ordered, to any other note), the root, or the period.
+                    const double prevC = i == 1 ? 0.0 : 1200.0 * std::log2 (a[(size_t) i - 1]);
+                    const double nextC = i == m ? totalCents : 1200.0 * std::log2 (a[(size_t) i + 1]);
+                    double lo = std::max (std::max (1.0, prevC + minGap), c0 - win);
+                    double hi = std::min (std::min (totalCents - 1.0, nextC - minGap), c0 + win);
+                    if (! (hi > lo)) continue; // no legal room: leave the note where it is
                     auto eval = [&] (double cts)
                     {
                         auto t = a; t[(size_t) i] = std::pow (2.0, cts / 1200.0);

@@ -119,6 +119,36 @@ public:
         return 12;
     }
 
+    // Period (repeat interval) of the ACTIVE tuning as a frequency ratio: 2/1 for
+    // 12-TET and for octave scales, the .scl's last listed interval in Scala mode
+    // (3/1 for Bohlen-Pierce...), the master's period in MTS. Needed wherever a
+    // degree index has to be wrapped into the MIDI range without losing octaves:
+    // deriving it from the key table breaks for scales with >67 degrees.
+    double periodRatio() const noexcept
+    {
+        switch (mode.load (std::memory_order_relaxed))
+        {
+            case Mode::Scala:
+                if (scalaValid.load (std::memory_order_relaxed))
+                {
+                    const double p = scalaPeriod.load (std::memory_order_relaxed);
+                    if (p > 1.0001 && std::isfinite (p)) return p;
+                }
+                break;
+            case Mode::MtsEsp:
+                if (client != nullptr && MTS_HasMaster (client))
+                {
+                    const double p = (double) MTS_GetPeriodRatio (client);
+                    if (p > 1.0001 && std::isfinite (p)) return p;
+                }
+                break;
+            case Mode::Equal:
+            default:
+                break;
+        }
+        return 2.0;
+    }
+
     //== Audio thread =========================================================
     // Note-on gate: an MTS-ESP master with a partial keyboard map can mark keys
     // as unmapped, which must NOT sound. 12-TET and Scala never filter.
@@ -235,6 +265,7 @@ public:
 
         scalaName   = name.isNotEmpty() ? name : desc;
         scalaSource = text;
+        scalaPeriod.store (period, std::memory_order_relaxed);
         scalaDegSrc    = std::move (degSrc);   // message-thread only (display/source queries)
         scalaPeriodSrc = periodSrc;
         scalaDegreeCount.store (count, std::memory_order_relaxed);
@@ -562,6 +593,7 @@ private:
     std::array<std::atomic<double>, 128> table {};
     std::atomic<bool> scalaValid { false };
     std::atomic<int>  scalaDegreeCount { 12 };
+    std::atomic<double> scalaPeriod { 2.0 };
 
     juce::String scalaName, scalaSource; // message-thread only
     std::vector<DegreeSrc> scalaDegSrc;  // per-degree ratio-vs-cents source (message-thread only)
