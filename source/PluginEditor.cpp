@@ -70,6 +70,10 @@ namespace
         double    cents     = 0.0;
         bool      genuine   = false;  long long p  = 1, q  = 1; // exact ratio when genuine
         bool      hasApprox = false;  long long ap = 1, aq = 1; int approxErr = 0; // nearest just when tempered
+        // The simplest just interval anywhere NEAR it, even when it is too far to be
+        // called an approximation - so the hover can always say what the closest
+        // thing is instead of showing nothing at all.
+        bool      hasNear   = false;  long long np = 1, nq = 1; int nearErr = 0;
     };
     DegInterval analyzeDegree (FractalAdditiveAudioProcessor& proc, int degree)
     {
@@ -96,6 +100,7 @@ namespace
         // complex ones only a hair. A continued-fraction "best" pick would prefer
         // obscure closer fractions (800c is nearer 19/12 than 8/5) - not helpful.
         long long bestP = 0, bestQ = 1; double bestErr = 0.0; double bestSimp = 1.0e18;
+        long long nearP = 0, nearQ = 1; double nearErr = 0.0, nearSimp = 1.0e18;
         for (long long q2 = 1; q2 <= 17; ++q2)
         {
             const long long p2 = (long long) std::llround (ratio * (double) q2);
@@ -107,9 +112,15 @@ namespace
             const double tol  = simp <= 40.0 ? 17.0 : (simp <= 80.0 ? 8.0 : (simp <= 300.0 ? 2.5 : 0.0));
             if (std::abs (err) <= tol && simp < bestSimp)
             { bestSimp = simp; bestP = p2; bestQ = q2; bestErr = err; }
+            // ...and, separately, the simplest ratio within earshot at all (35c), so
+            // an interval like 600c can still name its closest just neighbour.
+            if (std::abs (err) <= 35.0 && simp <= 200.0 && simp < nearSimp)
+            { nearSimp = simp; nearP = p2; nearQ = q2; nearErr = err; }
         }
         if (bestP > 0)
         { d.hasApprox = true; d.ap = bestP; d.aq = bestQ; d.approxErr = (int) std::llround (bestErr); }
+        if (nearP > 0)
+        { d.hasNear = true; d.np = nearP; d.nq = nearQ; d.nearErr = (int) std::llround (nearErr); }
         return d;
     }
     // Compact scale-degree label: the exact ratio when genuine, else its cents (with a
@@ -558,6 +569,10 @@ namespace
         }
         void drawTooltip (juce::Graphics& g, const juce::String& text, int width, int height) override
         {
+            // The rounded corners used to leave the window's own (unpainted) canvas
+            // showing through as a pale border. Nothing may be left uncovered: the
+            // whole rectangle is filled opaque first, then the card is drawn on it.
+            g.fillAll (juce::Colour (0xff141420));
             auto body = juce::Rectangle<float> (0, 0, (float) width, (float) height);
             if (lastWasCallout)
             {
@@ -569,7 +584,7 @@ namespace
                 g.setColour (juce::Colour (0xff5cb8ff).withAlpha (0.9f));
                 g.fillPath (ptr);
             }
-            g.setColour (juce::Colour (0xf2141420));
+            g.setColour (juce::Colour (0xff141420));
             g.fillRoundedRectangle (body, 6.0f);
             g.setColour (juce::Colour (0xff5cb8ff).withAlpha (0.8f));
             g.drawRoundedRectangle (body.reduced (0.8f), 6.0f, 1.4f);
@@ -1628,19 +1643,29 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     keyboard.setDegreeLabeller ([this] (int d) { return degreeLabel (processorRef, d); });
     keyboard.setHoverTextProvider ([this] (int d) -> juce::String
     {
-        // Floating window: ONLY information the key does not already show - never a
-        // repetition of its own label.
+        // Floating window: EVERY key answers. A degree with no just interval near
+        // enough to approximate used to return nothing at all, which read as a
+        // broken hover - now it says so, and names its closest neighbour anyway.
         const auto di = analyzeDegree (processorRef, d);
-        if (di.cents == 0.0 && ! di.genuine && ! di.hasApprox && processorRef.getDegreeRatio (d) <= 0.0)
+        if (processorRef.getDegreeRatio (d) <= 0.0)
             return {};
 
         if (di.genuine) // a true just interval: the key shows the ratio; add its cents
             return "= " + juce::String (di.cents, 1) + tr (" cents", " cents");
 
         juce::String s;
-        if (di.hasApprox) // tempered, near a simple ratio: just the hint
-            s << "\xe2\x89\x88 " << juce::String (di.ap) << "/" << juce::String (di.aq)
+        s << juce::String (di.cents, 1) << tr (" cents", " cents");
+        if (di.hasApprox) // tempered, near a simple ratio: the hint the "*" promises
+            s << "\n\xe2\x89\x88 " << juce::String (di.ap) << "/" << juce::String (di.aq)
               << " (" << (di.approxErr >= 0 ? "+" : "-") << juce::String (std::abs (di.approxErr)) << "¢)";
+        else if (di.hasNear) // too far to claim it, but the user still gets told
+            s << tr ("\nno just interval this close.\nthe nearest simple one is ",
+                     "\ncap interval just tan a prop.\nel simple m\xc3\xa9s proper \xc3\xa9s ")
+              << juce::String (di.np) << "/" << juce::String (di.nq)
+              << " (" << (di.nearErr >= 0 ? "+" : "-") << juce::String (std::abs (di.nearErr)) << "¢)";
+        else
+            s << tr ("\nno simple just interval anywhere near it.",
+                     "\ncap interval just simple a prop.");
         return s;
     });
     // Segment scales: append the hovered degree's SOURCE partial to the hover window
