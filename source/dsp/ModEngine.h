@@ -68,7 +68,10 @@ public:
     {
         sr = sampleRate > 0.0 ? sampleRate : 44100.0;
         for (auto& e : env) { e.adsr.setSampleRate (sr); e.adsr.reset(); e.held = false; }
-        resyncNotes = true; // adopt the processor's counter without a phantom retrigger
+        // The processor zeroes its note counter here too, so this stays in step
+        // WITHOUT swallowing the first note-on: adopting the counter lazily on the
+        // first block ate the retrigger of a note that arrived in that same block.
+        noteSeen = 0;
     }
 
     // Message thread: routing management. A modulator may drive OTHER modulators'
@@ -173,7 +176,6 @@ public:
                        double fundamental, double bpm, double ppq)
     {
         if (numSamples <= 0) return; // an empty block must not freeze the envelopes at 0
-        if (resyncNotes) { noteSeen = noteOnsSoFar; resyncNotes = false; }
         const bool newNote = noteOnsSoFar != noteSeen;
         noteSeen = noteOnsSoFar;
         const double dt = (double) numSamples / sr;
@@ -349,7 +351,6 @@ private:
     std::array<std::array<float, kWaveN>, kLfos> customWave {};
     double sr = 44100.0;
     juce::uint32 noteSeen = 0;
-    bool resyncNotes = true;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ModEngine)
 };

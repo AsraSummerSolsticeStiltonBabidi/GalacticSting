@@ -368,8 +368,12 @@ namespace dissonance
                     // stay ordered, to any other note), the root, or the period.
                     const double prevC = i == 1 ? 0.0 : 1200.0 * std::log2 (a[(size_t) i - 1]);
                     const double nextC = i == m ? totalCents : 1200.0 * std::log2 (a[(size_t) i + 1]);
-                    double lo = std::max (std::max (1.0, prevC + minGap), c0 - win);
-                    double hi = std::min (std::min (totalCents - 1.0, nextC - minGap), c0 + win);
+                    // At least 1 cent even when the user sets 0, so two notes can
+                    // never converge onto the same pitch (that would be a duplicate,
+                    // not a chord).
+                    const double gap = std::max (1.0, minGap);
+                    double lo = std::max (std::max (1.0, prevC + gap), c0 - win);
+                    double hi = std::min (std::min (totalCents - 1.0, nextC - gap), c0 + win);
                     if (! (hi > lo)) continue; // no legal room: leave the note where it is
                     auto eval = [&] (double cts)
                     {

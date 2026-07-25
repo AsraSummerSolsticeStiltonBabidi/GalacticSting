@@ -266,12 +266,26 @@ public:
         scalaName   = name.isNotEmpty() ? name : desc;
         scalaSource = text;
         scalaPeriod.store (period, std::memory_order_relaxed);
+        scalaPerDegree = perDegree;            // the AUTHORITATIVE degree ratios: the 128-key
+                                               // table cannot represent a scale with >128 degrees
         scalaDegSrc    = std::move (degSrc);   // message-thread only (display/source queries)
         scalaPeriodSrc = periodSrc;
         scalaDegreeCount.store (count, std::memory_order_relaxed);
         // release: publishes all the table writes above to the audio thread.
         scalaValid.store (true, std::memory_order_release);
         return true;
+    }
+
+    // Exact ratio of scale degree `step` (0..count-1) from the loaded .scl itself,
+    // NOT via the 128-key table - the table only holds 128 degree classes, so a
+    // scale with more degrees than that cannot be read back through it.
+    // Message thread only (same rule as scalaDegSrc).
+    bool scalaDegreeRatio (int step, double& ratioOut) const
+    {
+        if (! scalaValid.load (std::memory_order_acquire)) return false;
+        if (! juce::isPositiveAndBelow (step, (int) scalaPerDegree.size())) return false;
+        ratioOut = scalaPerDegree[(size_t) step];
+        return ratioOut > 0.0;
     }
 
     // Did scale degree `degree` (0..count-1, or `count` for the period) come from a
@@ -370,6 +384,7 @@ public:
         scalaValid.store (false, std::memory_order_relaxed);
         scalaName.clear();
         scalaSource.clear();
+        scalaPerDegree.clear();
         for (int n = 0; n < 128; ++n)
             table[(size_t) n].store (equalFreq (n), std::memory_order_relaxed);
     }
@@ -597,5 +612,6 @@ private:
 
     juce::String scalaName, scalaSource; // message-thread only
     std::vector<DegreeSrc> scalaDegSrc;  // per-degree ratio-vs-cents source (message-thread only)
+    std::vector<double> scalaPerDegree;  // exact degree ratios (message-thread only)
     DegreeSrc    scalaPeriodSrc;         // the period's source
 };

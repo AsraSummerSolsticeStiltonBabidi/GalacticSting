@@ -343,9 +343,12 @@ namespace
         { return s.getName().isNotEmpty() ? kAdsrThumbR : kThumbR; }
         int getSliderThumbRadius (juce::Slider& s) override
         {
-            if (s.getSliderStyle() == juce::Slider::LinearVertical
-                || s.getSliderStyle() == juce::Slider::LinearHorizontal)
-                return (int) thumbRadiusFor (s);
+            // Clamped to half the cross-dimension like V4 does, so a short fader keeps
+            // its usable travel instead of losing 26 px of it to the thumb.
+            if (s.getSliderStyle() == juce::Slider::LinearVertical)
+                return (int) juce::jmin (thumbRadiusFor (s), (float) s.getWidth() * 0.5f);
+            if (s.getSliderStyle() == juce::Slider::LinearHorizontal)
+                return (int) juce::jmin (thumbRadiusFor (s), (float) s.getHeight() * 0.5f);
             return juce::LookAndFeel_V4::getSliderThumbRadius (s);
         }
 
@@ -392,7 +395,10 @@ namespace
                 g.fillRoundedRectangle (cx - tw * 0.5f, top, tw, bot - top, tw * 0.5f);
                 g.setColour (track);
                 g.fillRoundedRectangle (cx - tw * 0.5f, sliderPos, tw, juce::jmax (0.0f, bot - sliderPos), tw * 0.5f);
-                const auto hept = heptagon ({ cx, sliderPos }, r);
+                // Never wider than the fader's own column (narrow ADSR columns would
+                // otherwise have their thumbs overlap the neighbouring fader).
+                const float rv = juce::jmin (r, (float) w * 0.5f);
+                const auto hept = heptagon ({ cx, sliderPos }, rv);
                 g.setColour (col);
                 g.fillPath (hept);
                 g.setColour (juce::Colours::black.withAlpha (0.35f));
@@ -400,8 +406,8 @@ namespace
                 if (s.getName().isNotEmpty())
                 {
                     g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-                    g.setFont (juce::Font (juce::FontOptions (r * 0.8f).withStyle ("Bold")));
-                    g.drawText (s.getName(), juce::Rectangle<float> (cx - r, sliderPos - r, r * 2.0f, r * 2.0f),
+                    g.setFont (juce::Font (juce::FontOptions (rv * 0.8f).withStyle ("Bold")));
+                    g.drawText (s.getName(), juce::Rectangle<float> (cx - rv, sliderPos - rv, rv * 2.0f, rv * 2.0f),
                                 juce::Justification::centred, false);
                 }
             }
@@ -622,6 +628,17 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         if (t > 0.99) return juce::String (names[juce::jmin (3, lo + 1)]);
         return juce::String (names[lo]) + "-" + juce::String (names[juce::jmin (3, lo + 1)])
              + " " + juce::String ((int) std::lround (t * 100.0)) + "%";
+    };
+    // The attachment installs a NUMERIC text parser, so typing one of the names
+    // shown above would otherwise read as 0 (= Even). Accept both.
+    harmonicsFader.valueFromTextFunction = [] (const juce::String& t)
+    {
+        const auto s = t.trim().toLowerCase();
+        if (s.startsWith ("even") || s.startsWith ("parell")) return (double) spectrum::Even;
+        if (s.startsWith ("all")  || s.startsWith ("tot"))    return (double) spectrum::All;
+        if (s.startsWith ("odd")  || s.startsWith ("senar"))  return (double) spectrum::Odd;
+        if (s.startsWith ("prim"))                            return (double) spectrum::Prime;
+        return juce::jlimit (0.0, 3.0, s.getDoubleValue());
     };
     harmonicsFader.updateText();
     configFader (slopeFader, "curveSlope", slopeAtt, cHarmonic, "Amplitude roll-off. 0 = flat/bright, 1 = saw, 2 = triangle.  (Also thins the highs in Timbre mode.)");
@@ -2306,10 +2323,12 @@ void FractalAdditiveAudioProcessorEditor::updateWarning (int templatePartials)
     }
 
     const auto& ap = processorRef.apvts;
-    const int  sel       = (int) ap.getRawParameterValue ("selection")->load();
+    // Harmonics is the continuous axis now (Even 0 - All 1 - Odd 2 - Prime 3): reading
+    // the old "selection" id returned NULLPTR and crashed the host on this very path.
+    const float selAx    = ap.getRawParameterValue ("harmonics")->load();
+    const bool  isPrime  = selAx > 2.5f;
     const bool wl        = ap.getRawParameterValue ("primeMode")->load() > 0.5f;
     const int  limitIdx  = (int) ap.getRawParameterValue ("primeLimit")->load();
-    const int  baseN     = (int) ap.getRawParameterValue ("baseN")->load();
     unsigned mask = 0;
     for (int i = 0; i < 9; ++i)
         if (ap.getRawParameterValue ("primeWL" + juce::String (i))->load() > 0.5f)
@@ -2319,20 +2338,19 @@ void FractalAdditiveAudioProcessorEditor::updateWarning (int templatePartials)
     // harmonic filters (Harmonics and Prime Control) that BOTH must let a
     // harmonic through; when they overlap to nothing, every partial is removed.
     juce::String why;
-    if (sel == 3 && wl)
+    if (isPrime && wl)
         why = tr ("Two filters are cancelling out.  'Harmonics = Prime' keeps only prime-numbered harmonics, and the Prime whitelist then keeps only harmonics built from the ticked primes.  A prime is only itself, so together they can keep nothing above 23.\n\nFix: set Harmonics to 'All', or set Prime Control to 'Limit / Off'.",
                   "Dos filtres s'anul\xc2\xb7len.  'Harm\xc3\xb2nics = Primers' nom\xc3\xa9s deixa els harm\xc3\xb2nics de n\xc3\xbamero primer, i la Llista de primers nom\xc3\xa9s deixa els fets amb els primers marcats.  Un primer nom\xc3\xa9s \xc3\xa9s ell mateix, aix\xc3\xad que junts no poden deixar res per sobre de 23.\n\nSoluci\xc3\xb3: posa Harm\xc3\xb2nics en 'Tots', o el Control de primers en 'L\xc3\xadmit / No'.");
     else if (wl && mask == 0)
         why = tr ("The Prime whitelist has no primes ticked, so no harmonic is allowed through.\n\nFix: tick at least one prime, or switch Prime Control to 'Limit'.",
                   "La Llista de primers no t\xc3\xa9 cap primer marcat, aix\xc3\xad que no passa cap harm\xc3\xb2nic.\n\nSoluci\xc3\xb3: marca almenys un primer, o posa el Control de primers en 'L\xc3\xadmit'.");
-    else if (sel == 3 && ! wl && limitIdx > 0)
+    else if (isPrime && ! wl && limitIdx > 0)
         why = tr ("'Harmonics = Prime' keeps only prime harmonics, but the Prime Limit then removes every prime bigger than the limit - and your Base N starts the series above it.\n\nFix: raise the Prime Limit (or set it to Off), or lower Base N.",
                   "'Harm\xc3\xb2nics = Primers' nom\xc3\xa9s deixa harm\xc3\xb2nics primers, per\xc3\xb2 el L\xc3\xadmit de primers treu tot primer m\xc3\xa9s gran que el l\xc3\xadmit - i la teva Base N comen\xc3\xa7""a la s\xc3\xa8rie per sobre.\n\nSoluci\xc3\xb3: puja el L\xc3\xadmit de primers (o posa'l en No), o abaixa la Base N.");
     else
         why = tr ("The Harmonics filter and the Prime Control filter, applied together, remove every harmonic of the current Base N.\n\nFix: relax either filter (Harmonics = All, or Prime Control = Off), or change Base N.",
                   "El filtre d'Harm\xc3\xb2nics i el de Control de primers, aplicats alhora, treuen tots els harm\xc3\xb2nics de la Base N actual.\n\nSoluci\xc3\xb3: relaxa qualsevol dels dos (Harm\xc3\xb2nics = Tots, o Control de primers = No), o canvia la Base N.");
 
-    juce::ignoreUnused (baseN);
     warningOverlay.title = tr ("No sound: every partial is filtered out",
                                "Sense so: s'han filtrat tots els parcials");
     warningOverlay.body  = why;
@@ -2727,7 +2745,9 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         const float dimF = processorRef.timbreReplacesEngine() ? 0.4f : 1.0f;
         macroFrameTitle (harmonicEngineBounds, cHarmonic, tr ("HARMONIC ENGINE", "MOTOR HARM\xc3\x92NIC"), dimF);
         g.setColour (cHarmonic.withAlpha (0.5f * dimF)); // shared internal dividers
-        const float top = (float) harmonicEngineBounds.getY() + 11.5f; // frame's inner top edge (was hcBase.getY(), ~10px low)
+        // Inside the frame: its top line is at box.y + titleH*0.5 (16) and the stroke
+        // is 2.6 wide, so start just under it or the dividers poke out of the box.
+        const float top = (float) harmonicEngineBounds.getY() + 17.5f;
         const float bot = (float) harmonicEngineBounds.getBottom() - 3.0f;
         g.drawLine ((float) hcHarm.getX(),  top, (float) hcHarm.getX(),  bot, 1.0f);
         g.drawLine ((float) hcSlope.getX(), top, (float) hcSlope.getX(), bot, 1.0f);
@@ -3272,14 +3292,19 @@ void FractalAdditiveAudioProcessorEditor::resized()
             for (auto* c : lfoC) c->setVisible (cust && ! isEnv);
             if (cust)
             {
+                // [modulator][On][Unmap] and, for a drawn LFO wave, [Draw] - which
+                // gets a readable share of the row instead of whatever is left over.
                 auto selRow = in.removeFromTop (20);
-                modSelBox.setBounds (selRow.removeFromLeft (72));
-                selRow.removeFromLeft (4);
-                modOnT.setBounds (selRow.removeFromLeft (46));
-                selRow.removeFromLeft (4);
-                modUnmapBtn.setBounds (selRow.removeFromLeft (58));
-                selRow.removeFromLeft (4);
-                if (lfoWaveEditBtn.isVisible()) lfoWaveEditBtn.setBounds (selRow);
+                const bool drawVis = lfoWaveEditBtn.isVisible();
+                if (drawVis) lfoWaveEditBtn.setBounds (selRow.removeFromRight (56));
+                if (drawVis) selRow.removeFromRight (4);
+                const int nCell = 3;
+                const int cw3 = juce::jmax (30, selRow.getWidth() / nCell - 3);
+                modSelBox.setBounds (selRow.removeFromLeft (cw3));
+                selRow.removeFromLeft (3);
+                modOnT.setBounds (selRow.removeFromLeft (juce::jmin (46, cw3)));
+                selRow.removeFromLeft (3);
+                modUnmapBtn.setBounds (selRow);
                 in.removeFromTop (3);
                 if (isEnv)
                 {
@@ -3653,6 +3678,28 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             chordList.setSize (juce::jmax (cw, juce::jmax (60, chordView.getWidth()) - (scroll ? 10 : 0)),
                                juce::jmax (chordView.getHeight() - (scrollH ? 10 : 0), ch));
             chordList.repaint();
+
+            // Say WHY a search came back empty or short instead of just blanking the
+            // list: with n notes the minimum interval needs n gaps inside the period,
+            // so a large setting can make the request impossible.
+            const int req = processorRef.getChordRequested(), got = processorRef.getChordFound();
+            if (req > 0 && got < req)
+            {
+                const juce::String gap ((int) std::lround (processorRef.getChordMinGap()));
+                noticeOverlay.title = got == 0
+                    ? tr ("No chord fits that smallest interval", "Cap acord no cap amb aquest interval m\xc3\xadnim")
+                    : tr ("Fewer chords than requested", "Menys acords dels demanats");
+                noticeOverlay.body = got == 0
+                    ? tr ("Every note pair must be at least ", "Cada parella de notes ha d'estar a ") + gap
+                      + tr (" cents apart, and that many gaps do not fit inside the period. Lower 'smallest interval', use fewer notes, or widen the period.",
+                            " cents com a m\xc3\xadnim, i tants espais no caben dins el per\xc3\xado" "de. Abaixa 'interval m\xc3\xa9s petit', posa menys notes o eixampla el per\xc3\xado" "de.")
+                    : tr ("Only ", "Nom\xc3\xa9s ") + juce::String (got) + tr (" of the ", " dels ") + juce::String (req)
+                      + tr (" chords you asked for satisfy a smallest interval of ", " acords demanats compleixen l'interval m\xc3\xadnim de ")
+                      + gap + tr (" cents.", " cents.");
+                noticeOverlay.setVisible (true);
+                noticeOverlay.toFront (false);
+                noticeOverlay.repaint();
+            }
         }
     }
 

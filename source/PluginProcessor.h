@@ -106,15 +106,19 @@ public:
     {
         const int D = juce::jmax (1, tuning.degreesPerPeriod());
         const double per = tuning.periodRatio();
-        int key = 60 + d, wraps = 0;
-        while (key > 127 && key - D >= 0) { key -= D; ++wraps; }
-        while (key < 0   && key + D <= 127) { key += D; --wraps; }
-        key = juce::jlimit (0, 127, key);
+        // Degree index -> (period count, step inside the period), floored so negative
+        // degrees work too. The PERIOD factor is applied explicitly, never inferred
+        // from where the degree happens to land on the keyboard.
+        const int wraps = (int) std::floor ((double) d / (double) D);
+        const int step  = d - wraps * D;
+        // Scala: read the scale's own degree ratio. The 128-key table only holds 128
+        // degree classes, so a scale with more degrees than that CANNOT be read back
+        // through it (degrees 68..D-61 used to all collapse onto key 127's value).
+        double r = 0.0;
+        if (tuning.scalaDegreeRatio (step, r))
+            return r * std::pow (per, (double) wraps);
         const double f0 = tuning.frequencyForNote (60);
-        const double f  = tuning.frequencyForNote (key);
-        // Each wrap moved the lookup down a whole PERIOD - put it back, or a dense
-        // scale (>67 degrees, whose upper degrees do not fit above key 60) would
-        // report its high degrees a period too low.
+        const double f  = tuning.frequencyForNote (juce::jlimit (0, 127, 60 + step));
         return f0 > 0.0 ? (f / f0) * std::pow (per, (double) wraps) : 1.0;
     }
 
@@ -209,6 +213,9 @@ public:
     bool  isChordSearchRunning()  const noexcept { return chordRunning.load(); }
     float getChordSearchProgress() const noexcept { return chordProgress.load(); }
     int   getChordResultsGeneration() const noexcept { return chordGeneration.load(); }
+    int   getChordRequested() const noexcept { return chordRequested.load(); }
+    int   getChordFound()     const noexcept { return chordFound.load(); }
+    double getChordMinGap()   const noexcept { return chordMinGap.load(); }
     std::vector<ChordHit> getChordResults() const
     {
         const juce::ScopedLock sl (chordLock);
@@ -365,7 +372,8 @@ private:
     std::unique_ptr<std::thread> chordThread;
     std::atomic<bool>  chordRunning  { false }, chordCancel { false };
     std::atomic<float> chordProgress { 0.0f };
-    std::atomic<int>   chordGeneration { 0 };
+    std::atomic<int>   chordGeneration { 0 }, chordRequested { 0 }, chordFound { 0 };
+    std::atomic<double> chordMinGap { 33.0 };
     mutable juce::CriticalSection chordLock;
     std::vector<ChordHit> chordResults;
     juce::String chordResultsPeriodLine { "2/1" }; // the period the PUBLISHED results were searched in

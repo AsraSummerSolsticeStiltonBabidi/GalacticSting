@@ -983,6 +983,9 @@ bool FractalAdditiveAudioProcessor::startChordSearch (int notes, double periodRa
     chordPeriodRatio   = periodRatio;
     chordProgress      = 0.0f;
     chordRunning       = true;
+    chordRequested     = count;   // so a search the minimum-interval rule prunes to
+    chordFound         = 0;       // nothing can SAY so instead of just going blank
+    chordMinGap        = minGapCents;
 
     chordThread = std::make_unique<std::thread> (
         [this, spec = std::move (spec), periodRatio, notes, count, maxima, minGapCents,
@@ -996,6 +999,7 @@ bool FractalAdditiveAudioProcessor::startChordSearch (int notes, double periodRa
                 for (auto& r : res)
                     chordResults.push_back ({ std::move (r.alphas), r.value });
                 chordResultsPeriodLine = periodLine; // results + their period publish TOGETHER
+                chordFound = (int) chordResults.size();
             }
             chordProgress = 1.0f;
             chordGeneration.fetch_add (1);
@@ -1338,7 +1342,8 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     synth.setCurrentPlaybackSampleRate (sampleRate);
     previewCollector.reset (sampleRate);
     noteGate.prepare (sampleRate);
-    modEngine.prepare (sampleRate); // resyncs its note counter (no phantom retrigger)
+    modEngine.prepare (sampleRate);
+    modNoteOns = 0; // in step with ModEngine::prepare - the first note-on must retrigger
     modHeld = 0;
     for (auto& row : modKeyHeld) row.fill (false);
     lastSr = sampleRate;
@@ -1451,11 +1456,13 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                 if (pos->getBpm().hasValue()) bpm = *pos->getBpm();
                 if (pos->getIsPlaying() && pos->getPpqPosition().hasValue()) ppq = *pos->getPpqPosition();
             }
-        // LFO fundamental = the LOWEST key currently held, computed from the same
-        // set (so a chord preview drives it exactly like playing those keys would;
-        // rhythm.getDriverF0() only knows the played notes and lags a block).
-        double f0 = 0.0;
-        if (modHeld > 0)
+        // LFO fundamental: the driver pitch the rhythm engine tracks (it follows the
+        // held note INCLUDING its per-note pitch bend, which matters in MPE). Only
+        // when that is silent - e.g. during a chord preview, which is deliberately
+        // kept out of the rhythm engine - fall back to the lowest key we know is down
+        // so the preview modulates exactly like playing those keys would.
+        double f0 = (double) rhythm.getDriverF0();
+        if (! (f0 > 0.0) && modHeld > 0)
         {
             int lowest = 128;
             for (int ch = 0; ch < 16; ++ch)
@@ -1463,7 +1470,6 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                     if (modKeyHeld[(size_t) ch][(size_t) k]) { lowest = k; break; }
             if (lowest < 128) f0 = getNoteFrequency (lowest);
         }
-        if (! (f0 > 0.0)) f0 = (double) rhythm.getDriverF0();
         modEngine.processBlock (nSamp, modNoteOns, modHeld > 0, f0, bpm, ppq);
     }
     const bool midiOut  = apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f;

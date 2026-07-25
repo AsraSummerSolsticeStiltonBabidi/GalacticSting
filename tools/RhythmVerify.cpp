@@ -497,6 +497,69 @@ int main()
         setParam ("rhythmQTempo", 0.0f); setParam ("rhythmMono", 0.0f); setParam ("rhythmQPulse", 0.0f);
     }
 
+    // --- run 10: MODULATORS - every note must move the mapped parameter ----------
+    // The reported bug was "an envelope on Base fires on some keys and not others".
+    // Play the SAME note ten times in a row and require the mapped parameter to be
+    // displaced during every single one of them, and to return to its base after
+    // each release - including a note that starts AND ends inside one block.
+    {
+        proc.prepareToPlay (sr, blk);
+        setParam ("rhythmOn", 0.0f); setParam ("rhythmSelfPlay", 0.0f);
+        setParam ("modE1A", 0.001f); setParam ("modE1D", 0.5f);
+        setParam ("modE1S", 1.0f);   setParam ("modE1R", 0.001f);
+        setParam ("modE1Range", 0.5f); setParam ("modE1On", 1.0f);
+        setParam ("curveSlope", 1.0f);           // base value; the env rides on top
+        proc.getModEngine().addTarget (0, "curveSlope");
+
+        auto* raw  = proc.apvts.getRawParameterValue ("curveSlope");
+        const float base = 1.0f;
+        int firedOn = 0, restored = 0;
+        for (int rep = 0; rep < 10; ++rep)
+        {
+            float peak = base;
+            for (int b = 0; b < 8; ++b)   // note held for 8 blocks (~43 ms)
+            {
+                juce::MidiBuffer midi;
+                if (b == 0) midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+                proc.processBlock (audio, midi);
+                peak = std::max (peak, raw->load());
+            }
+            if (peak > base + 0.05f) ++firedOn;
+            for (int b = 0; b < 12; ++b)  // release + settle
+            {
+                juce::MidiBuffer midi;
+                if (b == 0) midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+                proc.processBlock (audio, midi);
+            }
+            if (std::abs (raw->load() - base) < 0.02f) ++restored;
+        }
+        std::printf ("== MODULATORS: env fired on %d/10 notes, returned to base %d/10 times ==\n",
+                     firedOn, restored);
+        check (firedOn == 10,  "a mapped envelope moves its target on EVERY note (no missed keys)");
+        check (restored == 10, "the target returns to the knob's own value after every release");
+
+        // A note that starts and ends inside ONE block must still release.
+        {
+            juce::MidiBuffer midi;
+            midi.addEvent (juce::MidiMessage::noteOn (1, 62, (juce::uint8) 100), 0);
+            midi.addEvent (juce::MidiMessage::noteOff (1, 62), blk / 2);
+            proc.processBlock (audio, midi);
+        }
+        for (int b = 0; b < 20; ++b) { juce::MidiBuffer midi; proc.processBlock (audio, midi); }
+        check (std::abs (raw->load() - base) < 0.02f,
+               "a note that starts AND ends inside one block still releases (no stuck sustain)");
+
+        // Unmapping while modulated must hand the parameter straight back.
+        {
+            juce::MidiBuffer midi; midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+            proc.processBlock (audio, midi);
+        }
+        proc.getModEngine().unmapAll (0);
+        for (int b = 0; b < 3; ++b) { juce::MidiBuffer midi; proc.processBlock (audio, midi); }
+        check (std::abs (raw->load() - base) < 0.02f, "unmapping restores the base value (never stuck)");
+        { juce::MidiBuffer midi; midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0); proc.processBlock (audio, midi); }
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }
