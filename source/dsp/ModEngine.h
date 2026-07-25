@@ -40,7 +40,7 @@
 #include <atomic>
 #include <cmath>
 
-class ModEngine : private juce::AudioProcessorValueTreeState::Listener
+class ModEngine : private juce::AudioProcessorParameter::Listener
 {
 public:
     static constexpr int kEnvs = 3, kLfos = 3, kMods = kEnvs + kLfos; // 0..2 env, 3..5 lfo
@@ -69,9 +69,8 @@ public:
 
     ~ModEngine() override
     {
-        for (auto& m : mods)
-            for (auto& id : m.tgtId)
-                if (id.isNotEmpty()) apvts.removeParameterListener (id, this);
+        for (auto& w : watched)
+            if (auto* p = w.p.load()) p->removeListener (this);
     }
 
     void prepare (double sampleRate)
@@ -106,7 +105,7 @@ public:
                 m.tgtId[(size_t) i] = pid;
                 m.slot[(size_t) i].raw.store (raw);                                   // raw first,
                 m.slot[(size_t) i].param.store (p, std::memory_order_release);        // param last
-                if (mapCount (pid) == 1) { watchAdd (pid, p); apvts.addParameterListener (pid, this); }
+                if (mapCount (pid) == 1) watchAdd (pid, p);
                 return;
             }
     }
@@ -121,7 +120,7 @@ public:
                 m.slot[(size_t) i].param.store (nullptr); // audio skips null slots; it
                 m.slot[(size_t) i].raw.store (nullptr);   // restores the base next block
                 m.tgtId[(size_t) i].clear();
-                if (mapCount (pid) == 0) { apvts.removeParameterListener (pid, this); watchRemove (pid); }
+                if (mapCount (pid) == 0) watchRemove (pid);
                 return;
             }
     }
@@ -136,7 +135,7 @@ public:
             m.slot[(size_t) i].param.store (nullptr);
             m.slot[(size_t) i].raw.store (nullptr);
             m.tgtId[(size_t) i].clear();
-            if (pid.isNotEmpty() && mapCount (pid) == 0) { apvts.removeParameterListener (pid, this); watchRemove (pid); }
+            if (pid.isNotEmpty() && mapCount (pid) == 0) watchRemove (pid);
         }
     }
     int numTargets (int mod) const
@@ -338,41 +337,72 @@ private:
         return n;
     }
 
-    // The user (or the host) just moved a MAPPED parameter. JUCE's APVTS copies the
-    // parameter's raw atomic into its ValueTree ~100 ms later, THROUGH the undo
-    // manager - and that atomic is where this engine writes base+modulation. So for
-    // a short window we hand the atomic back to its plain base value: what gets
-    // stored, undone and shown is then exactly the value you set, never a snapshot
-    // of the modulation. The modulation resumes by itself right after.
-    // May be called from the AUDIO thread (host automation), so it only does atomic
-    // loads/stores and a linear scan over ids we already hold - no map lookup, no
-    // allocation.
-    void parameterChanged (const juce::String& id, float) override
+    // The user is TOUCHING a mapped parameter (a UI gesture: drag, double-click,
+    // wheel, typed value - JUCE's attachments wrap all of them in begin/end
+    // gesture). JUCE's APVTS copies the parameter's raw atomic into its ValueTree
+    // ~100 ms later THROUGH the undo manager, and that atomic is where this engine
+    // writes base+modulation. So while the gesture lasts - and for a moment after -
+    // the atomic is handed back to its plain base value: what gets stored, undone
+    // and redone is exactly the value that was set. HOST AUTOMATION does not emit
+    // gestures, so it never pauses the modulation (automating a knob and modulating
+    // it at the same time keeps working).
+    // Called from the message thread (UI) or the audio thread (automation), so it
+    // only does atomic loads/stores over a fixed array - no lookup, no allocation.
+    void parameterGestureChanged (int index, bool starting) override
     {
-        juce::RangedAudioParameter* p = nullptr;
-        for (auto& w : watched)
-            if (w.p.load() != nullptr && w.id == id) { p = w.p.load(); break; }
+        auto* p = watchedByIndex (index);
         if (p == nullptr) return;
+        setHold (p, starting ? kHoldWhileGrabbed : holdBlocks());
+    }
+    void parameterValueChanged (int index, float) override
+    {
+        auto* p = watchedByIndex (index);          // renew only while the user holds it,
+        if (p == nullptr) return;                  // so automation is never throttled
+        for (auto& h : holds)
+            if (h.param.load() == p && h.blocks.load() > 0)
+            { h.blocks.store (kHoldWhileGrabbed); return; }
+    }
+
+    juce::RangedAudioParameter* watchedByIndex (int index) const
+    {
+        for (auto& w : watched)
+            if (w.index.load() == index) { if (auto* p = w.p.load()) return p; }
+        return nullptr;
+    }
+    void setHold (juce::RangedAudioParameter* p, int blocks)
+    {
         for (auto& h : holds)
         {
             juce::RangedAudioParameter* expected = nullptr;
             if (h.param.load() == p || h.param.compare_exchange_strong (expected, p))
-            { h.blocks.store (holdBlocks()); return; }
+            { h.blocks.store (blocks); return; }
         }
     }
 
-    // id -> parameter cache for the listener above (message thread maintains it).
+    // index -> parameter cache for the listener above (message thread maintains it).
     void watchAdd (const juce::String& pid, juce::RangedAudioParameter* p)
     {
         for (auto& w : watched)
-            if (w.p.load() == nullptr) { w.id = pid; w.p.store (p); return; }
+            if (w.p.load() == nullptr)
+            {
+                w.id = pid; w.index.store (p->getParameterIndex()); w.p.store (p);
+                p->addListener (this);
+                return;
+            }
     }
     void watchRemove (const juce::String& pid)
     {
         for (auto& w : watched)
-            if (w.p.load() != nullptr && w.id == pid) { w.p.store (nullptr); w.id.clear(); return; }
+            if (w.p.load() != nullptr && w.id == pid)
+            {
+                if (auto* p = w.p.load()) p->removeListener (this);
+                w.p.store (nullptr); w.index.store (-1); w.id.clear();
+                return;
+            }
     }
     int holdBlocks() const noexcept { return juce::jlimit (1, 4096, (int) (0.3 * sr / std::max (1.0, (double) lastBlock))); }
+    // While the control is grabbed the hold is simply re-armed every event.
+    static constexpr int kHoldWhileGrabbed = 1 << 20;
 
     struct Slot
     {
@@ -425,7 +455,7 @@ private:
     Last lastW[kMods * kMaxTargets];
     int  nLastW = 0;
     struct Hold { std::atomic<juce::RangedAudioParameter*> param { nullptr }; std::atomic<int> blocks { 0 }; };
-    struct Watch { juce::String id; std::atomic<juce::RangedAudioParameter*> p { nullptr }; };
+    struct Watch { juce::String id; std::atomic<juce::RangedAudioParameter*> p { nullptr }; std::atomic<int> index { -1 }; };
     Watch watched[kMods * kMaxTargets];  // id -> param, for the RT-safe listener
     Hold holds[16];              // parameters temporarily handed back to their base
     int  lastBlock = 256;        // last block size, for the hold duration

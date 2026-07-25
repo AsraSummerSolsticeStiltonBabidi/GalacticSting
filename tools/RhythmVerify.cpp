@@ -558,12 +558,25 @@ int main()
             for (int b = 0; b < 6; ++b) { juce::MidiBuffer m2; proc.processBlock (audio, m2); }
         }
         check (raw->load() > base + 0.05f, "precondition: the envelope is displacing the value");
-        setParam ("curveSlope", 2.0f);
+        // Exactly what a UI control does: a complete gesture around the change.
+        {
+            auto* p = proc.apvts.getParameter ("curveSlope");
+            p->beginChangeGesture();
+            p->setValueNotifyingHost (p->convertTo0to1 (2.0f));
+            p->endChangeGesture();
+        }
         { juce::MidiBuffer midi; proc.processBlock (audio, midi); }
         check (std::abs (raw->load() - 2.0f) < 0.02f,
                "a knob set while modulated reads back as the value you set (clean undo/save)");
         for (int b = 0; b < (int) (0.5 * sr / blk); ++b) { juce::MidiBuffer midi; proc.processBlock (audio, midi); }
         check (raw->load() > 2.0f + 0.05f, "modulation resumes by itself after the hold window");
+        // HOST AUTOMATION (no gesture) must NOT pause the modulation.
+        {
+            auto* p = proc.apvts.getParameter ("curveSlope");
+            p->setValueNotifyingHost (p->convertTo0to1 (1.5f));
+            juce::MidiBuffer midi; proc.processBlock (audio, midi);
+            check (raw->load() > 1.5f + 0.05f, "automation (no gesture) keeps modulating - not throttled");
+        }
         { juce::MidiBuffer midi; midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0); proc.processBlock (audio, midi); }
         setParam ("curveSlope", base);
 
