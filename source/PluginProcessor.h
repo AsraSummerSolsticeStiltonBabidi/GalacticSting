@@ -277,6 +277,15 @@ public:
     { return juce::isPositiveAndBelow (lfo, 3) ? lfoWavePoints[(size_t) lfo] : juce::String(); }
 
     juce::String currentTuningAsScl (const juce::String& name) const; // rationals stay ratios, rest cents
+    // Scales this synth writes carry the patch they were made with, as Scala
+    // comments (invisible to other programs). "Load its original spectrum" reads
+    // it back without disturbing the tuning that is loaded.
+    static constexpr const char* kPresetTag = "FIBLO-PATCH";
+    juce::String embeddedPresetComment() const;
+    static juce::ValueTree presetFromScl (const juce::String& sclText);
+    bool loadSpectrumFromScl (const juce::String& sclText);
+    bool activeSclHasPreset() const { return presetFromScl (tuning.getScalaSource()).isValid(); }
+    juce::String activeSclSource() const { return tuning.getScalaSource(); }
     bool addNoteToTuning  (double ratioFromTonic, juce::String& errorOut);   // ctrl+click: folded into the period, sorted
     bool editTuningDegree (int degree, const juce::String& valueText, juce::String& errorOut); // right-click (Scala mode)
     bool saveCurrentTuningScl (const juce::File& f, juce::String& errorOut); // Tuning box "Save .scl"

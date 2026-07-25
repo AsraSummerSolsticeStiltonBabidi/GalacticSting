@@ -9,7 +9,9 @@
 #include "dsp/Spectrum.h"
 #include "dsp/Dissonance.h"
 
+#include <algorithm>
 #include <chrono>
+#include <vector>
 #include <cstdio>
 #include <cmath>
 
@@ -119,6 +121,41 @@ int main()
         check (a1 > 0 && std::abs (ampAtRatio (t, 2.0) / a1 - 1.0)    < 2e-3, "amp(2)/amp(1) ~ 1.0 (coincidence sum)");
         check (a1 > 0 && std::abs (ampAtRatio (t, 4.0) / a1 - 0.25)   < 2e-3, "amp(4)/amp(1) ~ 0.25");
         check (a1 > 0 && std::abs (ampAtRatio (t, 9.0) / a1 - 0.1111) < 2e-3, "amp(9)/amp(1) ~ 0.1111");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("fractal = a copy of the spectrum built on EVERY partial:\n");
+    {
+        // The definition being checked: at level 2 the partial set must be exactly
+        // the union over every base partial r of (r * the whole base set).
+        SpectrumSettings s; s.baseN = 1; s.reach = 5; s.selection = Selection::All;
+        s.curveSlope = 0.0f;
+        s.fractalLevel = 1.0f; auto base = compileSpectrum (s);
+        s.fractalLevel = 2.0f; auto lvl2 = compileSpectrum (s);
+
+        // `reach` bounds the BASE set; the copies built on each partial legitimately
+        // reach higher (that is the point), so every product counts.
+        std::vector<double> expect;
+        for (const auto& a : base.partials)
+            for (const auto& b : base.partials)
+                expect.push_back ((double) a.ratio * (double) b.ratio);
+        std::sort (expect.begin(), expect.end());
+        expect.erase (std::unique (expect.begin(), expect.end(),
+                                   [] (double x, double y) { return std::abs (x - y) < 1e-6; }), expect.end());
+
+        bool allThere = true;
+        for (const double r : expect) if (! hasRatio (lvl2, r)) { allThere = false; break; }
+        bool noExtra = true;
+        for (const auto& p : lvl2.partials)
+        {
+            bool found = false;
+            for (const double r : expect) if (std::abs (r - (double) p.ratio) < 1e-3) { found = true; break; }
+            if (! found) { noExtra = false; break; }
+        }
+        std::printf ("   (base %d partials -> level 2 has %d, expected %d)\n",
+                     (int) base.partials.size(), (int) lvl2.partials.size(), (int) expect.size());
+        check (allThere, "every partial of the base spawns a full scaled copy of the spectrum");
+        check (noExtra,  "and NOTHING else appears (the set is exactly that union)");
     }
 
     //--------------------------------------------------------------------------

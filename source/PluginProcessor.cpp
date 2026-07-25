@@ -1077,7 +1077,67 @@ juce::String FractalAdditiveAudioProcessor::currentTuningAsScl (const juce::Stri
         else
             scl << " " << juce::String (1200.0 * std::log2 (juce::jmax (1.0e-9, getDegreeRatio (d))), 5) << "\n";
     }
+    scl << embeddedPresetComment();
     return scl;
+}
+
+// The whole plugin state, folded into "!" comment lines at the end of a .scl. Any
+// other Scala host ignores comments, but WE can read the sound the scale was made
+// with back out of it ("Load its original spectrum").
+juce::String FractalAdditiveAudioProcessor::embeddedPresetComment() const
+{
+    auto state = const_cast<FractalAdditiveAudioProcessor*> (this)->captureState();
+    // The scale itself is already in the file - no need to carry it twice.
+    state.removeChild (state.getChildWithName ("SCALA"), nullptr);
+    auto xml = state.createXml();
+    if (xml == nullptr) return {};
+    const auto b64 = juce::Base64::toBase64 (xml->toString (juce::XmlElement::TextFormat().singleLine()));
+
+    juce::String out;
+    out << "!\n! " << kPresetTag << " v1 - the Fibló Galàctic patch this scale was made with.\n"
+        << "! (Plain Scala comments: every other program ignores them.)\n";
+    for (int i = 0; i < b64.length(); i += 120)
+        out << "! " << kPresetTag << ":" << b64.substring (i, i + 120) << "\n";
+    return out;
+}
+
+// Pull that patch back out of a .scl (empty if the file carries none).
+juce::ValueTree FractalAdditiveAudioProcessor::presetFromScl (const juce::String& sclText)
+{
+    juce::String b64;
+    for (const auto& line : juce::StringArray::fromLines (sclText))
+    {
+        const auto t = line.trim();
+        if (t.startsWith ("! " + juce::String (kPresetTag) + ":"))
+            b64 += t.fromFirstOccurrenceOf (":", false, false).trim();
+    }
+    if (b64.isEmpty()) return {};
+    juce::MemoryOutputStream mo;
+    if (! juce::Base64::convertFromBase64 (mo, b64)) return {};
+    if (auto xml = juce::parseXML (mo.toString()))
+        return juce::ValueTree::fromXml (*xml);
+    return {};
+}
+
+// Restore ONLY the sound from an embedded patch: the tuning the user just loaded
+// stays exactly as it is.
+bool FractalAdditiveAudioProcessor::loadSpectrumFromScl (const juce::String& sclText)
+{
+    auto tree = presetFromScl (sclText);
+    if (! tree.isValid() || ! tree.hasType (apvts.state.getType())) return false;
+    const auto keepName   = tuning.getScalaName();
+    const auto keepSource = tuning.getScalaSource();
+    const int  keepMode   = getTuningMode();
+    restoreState (tree);
+    // Put the tuning back (restoreState may have carried the patch's own).
+    if (keepSource.isNotEmpty())
+    {
+        juce::String err;
+        tuning.loadScalaString (keepSource, keepName, err);
+    }
+    if (auto* p = apvts.getParameter ("tuningMode"))
+        p->setValueNotifyingHost (p->convertTo0to1 ((float) keepMode));
+    return true;
 }
 
 bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce::String& errorOut)

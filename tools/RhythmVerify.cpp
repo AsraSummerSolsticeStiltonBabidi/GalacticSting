@@ -709,6 +709,27 @@ int main()
                "saving twice produces the same state size (no duplicated children)");
     }
 
+    // --- run 13: a generated .scl carries its own patch ---------------------------
+    {
+        setParam ("curveSlope", 3.21f);
+        setParam ("baseN", 11.0f);
+        const auto scl = proc.currentTuningAsScl ("with-patch");
+        check (scl.contains ("FIBLO-PATCH"), "a written .scl carries the patch as comments");
+        // A plain Scala parser must still read it: the payload is comment lines only.
+        juce::String err;
+        check (proc.loadScalaText (scl, "with-patch", err), "the .scl with a patch still parses as a scale");
+
+        setParam ("curveSlope", 0.5f);
+        setParam ("baseN", 1.0f);
+        const int degreesBefore = proc.getScaleDegrees();
+        check (proc.loadSpectrumFromScl (scl), "the embedded patch loads back");
+        check (std::abs (proc.apvts.getRawParameterValue ("curveSlope")->load() - 3.21f) < 1e-3f
+               && (int) proc.apvts.getRawParameterValue ("baseN")->load() == 11,
+               "it restores the SOUND it was saved with");
+        check (proc.getScaleDegrees() == degreesBefore, "and leaves the loaded tuning alone");
+        proc.clearScala();
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }
