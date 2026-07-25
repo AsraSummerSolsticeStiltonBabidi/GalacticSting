@@ -938,6 +938,48 @@ int main()
         proc.clearScala();
     }
 
+    // --- run 17: preset drift - a knob counts, a modulator's own motion doesn't ---
+    {
+        std::printf ("preset drift detection:\n");
+        setParam ("masterGain", -3.0f);
+        // The modulator that will drive masterGain is configured BEFORE saving, so
+        // its own A/D/S/On settings are part of this preset's baseline - only
+        // masterGain's RAW atomic should move once it starts modulating, never its
+        // (or the envelope's own) base value.
+        proc.getModEngine().unmapAll (0);
+        proc.getModEngine().addTarget (0, "masterGain");
+        setParam ("modE1A", 0.001f); setParam ("modE1D", 0.001f);
+        setParam ("modE1S", 1.0f);   setParam ("modE1On", 1.0f);
+        const auto presetName = proc.savePreset ("__rhythmverify_tmp_drift");
+        check (presetName.isNotEmpty(), "drift-test preset saves");
+        check (! proc.presetHasDrifted(), "freshly saved: no drift");
+
+        check (proc.loadPreset (presetName), "it reloads");
+        check (! proc.presetHasDrifted(), "freshly loaded: no drift");
+
+        // The preset's OWN modulator driving masterGain must NOT count as drift -
+        // it writes only the raw atomic, never the base value this compares against.
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+          proc.processBlock (audio, m); }
+        for (int b = 0; b < 10; ++b) { juce::MidiBuffer m; proc.processBlock (audio, m); }
+        check (! proc.presetHasDrifted(), "the preset's OWN modulator moving a target is not drift");
+        proc.getModEngine().unmapAll (0);
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOff (1, 60), 0); proc.processBlock (audio, m); }
+
+        // A plain knob move - what an envelope/LFO NEVER does - IS drift.
+        setParam ("masterGain", -9.0f);
+        check (proc.presetHasDrifted(), "moving a knob by hand IS drift");
+        check (proc.getLoadedPresetName() == presetName, "still tracking the same preset's name");
+
+        // Saving again re-baselines: the fresh file matches itself.
+        const auto resaved = proc.savePreset (presetName);
+        check (resaved == presetName, "re-saving under the same name works");
+        check (! proc.presetHasDrifted(), "and drift clears - the new file matches now");
+
+        setParam ("masterGain", 0.0f);
+        FractalAdditiveAudioProcessor::getPresetFolder().getChildFile (presetName + ".gsting").deleteFile();
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

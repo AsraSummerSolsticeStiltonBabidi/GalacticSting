@@ -1789,6 +1789,8 @@ private:
     juce::ComboBox basePitchBox, whitelistBox, phaseBox, primeModeBox, primeLimitBox, tuningBox, bendBox,
                    dissCountBox, dissModeBox, tuningBankBox;
     RefreshingComboBox presetBox;
+    juce::Label presetDirtyMark; // "*" - some parameter drifted from the loaded preset
+    void refreshPresetDirtyMark();
     juce::ToggleButton primeToggle[9], morphToggle;
     juce::ToggleButton temperToggle; // Custom Engine: temper harmonic partials to the loaded .scl
     std::unique_ptr<ButtonAttachment> temperAtt;

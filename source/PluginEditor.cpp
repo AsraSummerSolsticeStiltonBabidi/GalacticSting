@@ -1364,9 +1364,21 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         const auto name = presetBox.getText();
         if (name.isNotEmpty() && processorRef.loadPreset (name))
             applyTimbreEnablement (processorRef.timbreReplacesEngine());
+        refreshPresetDirtyMark();
         resized(); repaint(); refocus(); // the Tuning panel's "Load preset's tuning" button may now show
     };
     addAndMakeVisible (presetBox);
+    // "*" after the preset name: some parameter's BASE value (a knob, automation,
+    // undo...) no longer matches what is saved in the preset - see presetHasDrifted().
+    presetDirtyMark.setText ("*", juce::dontSendNotification);
+    presetDirtyMark.setColour (juce::Label::textColourId, juce::Colour (0xffffc95c));
+    presetDirtyMark.setFont (juce::Font (juce::FontOptions (16.0f).withStyle ("Bold")));
+    presetDirtyMark.setJustificationType (juce::Justification::centredLeft);
+    presetDirtyMark.setInterceptsMouseClicks (false, false);
+    presetDirtyMark.setTooltip (tr (
+        "Some parameter no longer matches this preset - it was moved by something other than one of ITS OWN modulators (a knob, host automation, undo...). Save stores this as a new preset rather than overwriting the original.",
+        "Alg\xc3\xba par\xc3\xa0metre ja no coincideix amb aquest preset - l'ha mogut alguna cosa que no \xc3\xa9s un dels SEUS PROPIS moduladors (un botó, automatitzaci\xc3\xb3, un desfer...). Desar el guarda com un preset nou en lloc de sobreescriure l'original."));
+    addChildComponent (presetDirtyMark);
     refreshPresetList();
 
     savePresetButton.setColour (juce::TextButton::buttonColourId, cLoad);
@@ -2328,10 +2340,23 @@ void FractalAdditiveAudioProcessorEditor::refreshPresetList()
 
 void FractalAdditiveAudioProcessorEditor::savePresetFlow()
 {
+    // Drifted (some parameter no longer matches what THIS preset was saved with):
+    // suggest a name that is NOT the original, so a reflex Save/Enter creates a
+    // separate preset instead of silently overwriting the one that still sounds
+    // as originally saved.
+    auto suggested = presetBox.getText();
+    if (processorRef.presetHasDrifted())
+    {
+        auto base = suggested.trimCharactersAtEnd ("*").trim();
+        const auto existing = processorRef.getPresetNames();
+        int n = 2;
+        suggested = base + " " + juce::String (n);
+        while (existing.contains (suggested)) suggested = base + " " + juce::String (++n);
+    }
     auto* aw = new juce::AlertWindow (tr ("Save preset", "Desar preset"),
                                       tr ("Name for this preset:", "Nom per a aquest preset:"),
                                       juce::MessageBoxIconType::NoIcon, this);
-    aw->addTextEditor ("name", presetBox.getText(), {});
+    aw->addTextEditor ("name", suggested, {});
     aw->addButton (tr ("Save", "Desa"), 1, juce::KeyPress (juce::KeyPress::returnKey));
     aw->addButton (tr ("Cancel", "Cancel\xc2\xb7la"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
     activePrompt = aw; // so the destructor can dismiss an orphaned dialog
@@ -2353,6 +2378,7 @@ void FractalAdditiveAudioProcessorEditor::savePresetFlow()
                 {
                     safe->refreshPresetList();
                     safe->presetBox.setText (stored, juce::dontSendNotification);
+                    safe->refreshPresetDirtyMark(); // the fresh save matches itself - no drift
                 }
                 else
                 {
@@ -2936,6 +2962,19 @@ void FractalAdditiveAudioProcessorEditor::refreshModWatch()
     }
 }
 
+void FractalAdditiveAudioProcessorEditor::refreshPresetDirtyMark()
+{
+    const bool drifted = ! processorRef.getLoadedPresetName().isEmpty() && processorRef.presetHasDrifted();
+    if (drifted != presetDirtyMark.isVisible())
+    {
+        presetDirtyMark.setVisible (drifted);
+        // The tuning offer is specific to the preset AS SAVED; once it has drifted,
+        // showing it (or letting Load-tuning silently re-sync it) would be lying
+        // about what "this preset" even means any more.
+        resized();
+    }
+}
+
 void FractalAdditiveAudioProcessorEditor::configFader (juce::Slider& s, const juce::String& paramID,
                                                        std::unique_ptr<SliderAttachment>& att, juce::Colour col,
                                                        const juce::String& tooltip)
@@ -3261,6 +3300,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         menuButton.setBounds (r1.removeFromLeft (46).withHeight (22));
         auto r2 = lc.withTrimmedTop (2).withHeight (22);
         presetBox.setBounds (r2.removeFromLeft (150));
+        presetDirtyMark.setBounds (presetBox.getRight() - 15, presetBox.getY() - 3, 14, 14);
         r2.removeFromLeft (4);
         savePresetButton.setBounds (r2.removeFromLeft (46));
     }
@@ -3823,8 +3863,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
             // Only when the preset just loaded carries a tuning that actually
             // differs from the one active now (recomputed live: loading it, or
-            // changing the tuning some other way, makes the button disappear again).
-            const bool hasPresetTuning = processorRef.hasPendingPresetTuning();
+            // changing the tuning some other way, makes the button disappear again) -
+            // AND the preset itself has not drifted (a knob/automation/undo moved
+            // something outside its own modulators): once it has drifted, "this
+            // preset's tuning" is no longer an honest thing to offer.
+            const bool hasPresetTuning = processorRef.hasPendingPresetTuning()
+                                       && ! processorRef.presetHasDrifted();
             loadPresetTuningBtn.setVisible (hasPresetTuning);
             if (hasPresetTuning)
             {
@@ -4008,6 +4052,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     if (envEditor.isVisible()) envEditor.refresh();
 
     refreshModWatch(); // live-modulation marker on every watched fader (see the header)
+    refreshPresetDirtyMark();
     refreshRefAText();       // keep the Reference-A box in sync with the parameter (automation)
 
     // Undo granularity: group parameter edits into ~1-second transactions (a slider

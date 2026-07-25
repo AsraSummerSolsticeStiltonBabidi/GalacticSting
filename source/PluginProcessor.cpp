@@ -2092,6 +2092,30 @@ juce::StringArray FractalAdditiveAudioProcessor::getPresetNames()
     return names;
 }
 
+// Remember the BASE value of every parameter right now, under this preset's name -
+// presetHasDrifted() compares against this. Called right after a preset is loaded
+// (once the caller's own tuning has been put back) or freshly saved (the new file
+// exactly matches the current state, so nothing has drifted from it yet).
+void FractalAdditiveAudioProcessor::snapshotLoadedPreset (const juce::String& name)
+{
+    loadedPresetName = name;
+    loadedPresetSnapshot.clear();
+    for (auto* ap : getParameters())
+        if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (ap))
+            loadedPresetSnapshot.push_back ({ p->paramID, p->getValue() });
+}
+
+bool FractalAdditiveAudioProcessor::presetHasDrifted() const
+{
+    if (loadedPresetName.isEmpty())
+        return false;
+    for (const auto& [pid, v] : loadedPresetSnapshot)
+        if (auto* p = apvts.getParameter (pid))
+            if (std::abs (p->getValue() - v) > 1.0e-4f)
+                return true;
+    return false;
+}
+
 juce::String FractalAdditiveAudioProcessor::savePreset (const juce::String& name)
 {
     // Returns the name actually stored (filename characters are sanitised, so it
@@ -2102,7 +2126,10 @@ juce::String FractalAdditiveAudioProcessor::savePreset (const juce::String& name
     auto file = getPresetFolder().getChildFile (safe + ".gsting");
     if (auto xml = captureState().createXml())
         if (xml->writeTo (file))
+        {
+            snapshotLoadedPreset (safe);
             return safe;
+        }
     return {};
 }
 
@@ -2149,6 +2176,7 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
         if (auto* p = apvts.getParameter ("tuningMode"))
             p->setValueNotifyingHost (p->convertTo0to1 ((float) keepMode));
         applyTuningMode (keepMode);
+        snapshotLoadedPreset (name); // AFTER the tuning revert - that is the real final state
         return true;
     }
     return false;

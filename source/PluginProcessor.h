@@ -199,6 +199,12 @@ public:
     juce::StringArray getPresetNames();
     juce::String savePreset (const juce::String& name); // returns the stored name, or empty on failure
     bool loadPreset (const juce::String& name);
+    // True once ANY parameter's BASE value (a knob turned, host automation, undo...)
+    // no longer matches what was in the loaded preset - modulation from the
+    // preset's OWN envelopes/LFOs never counts: it writes only the raw atomic
+    // (see ModEngine.h), never the base value this compares against.
+    bool presetHasDrifted() const;
+    juce::String getLoadedPresetName() const { return loadedPresetName; }
 
     //==========================================================================
     // "Spectrum to Scale" (Sethares): analyses the CURRENT spectrum, builds a
@@ -438,6 +444,9 @@ private:
     // plus the degree/height data shown in the Spectrum-to-Scale panel.
     juce::String lastDissScl, lastDissName;
     juce::String presetPendingSclSource, presetPendingSclName; // see hasPendingPresetTuning()
+    juce::String loadedPresetName; // empty = no preset is currently being tracked for drift
+    std::vector<std::pair<juce::String, float>> loadedPresetSnapshot; // paramID -> base value at load/save
+    void snapshotLoadedPreset (const juce::String& name);
 
     // Chord-search worker state (worker writes, message thread reads/copies).
     std::unique_ptr<std::thread> chordThread;
