@@ -283,15 +283,29 @@ private:
         juce::String emptyText { "Press Find to search.\n\xe2\x96\xb6 hears a chord\ndouble-click loads it as the scale" };
         std::function<void (int)> onPlay, onLoad, onHover; // onHover(-1) = pointer left
         // No play column any more (hover sounds it), so the notes get that space.
-        static constexpr int kRowH = 22, kRankW = 4, kNoteW = 74;  // no rank column
+        static constexpr int kRowH = 22, kRankW = 2, kGapW = 7;
         int contentHeight() const { return (int) rows.size() * kRowH; }
-        // Every note gets a fixed readable column; when a chord has more notes than
-        // fit, the Viewport scrolls HORIZONTALLY instead of squeezing the text away.
-        int contentWidth() const
+        static juce::Font rowFont() { return juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")); }
+        // Columns are only as wide as the widest text they actually hold, so the
+        // intervals start hard left and sit as close together as they can while the
+        // columns still line up down the list. Nothing is ever squeezed or hidden:
+        // if the widest row still overflows, the Viewport scrolls sideways.
+        std::vector<int> columnWidths() const
         {
             size_t maxN = 0;
             for (const auto& r : rows) maxN = std::max (maxN, r.notes.size());
-            return kRankW + (int) maxN * kNoteW + 4;
+            std::vector<int> w (maxN, 0);
+            const auto f = rowFont();
+            for (const auto& r : rows)
+                for (size_t k = 0; k < r.notes.size(); ++k)
+                    w[k] = juce::jmax (w[k], (int) std::ceil (juce::GlyphArrangement::getStringWidth (f, r.notes[k])));
+            return w;
+        }
+        int contentWidth() const
+        {
+            int total = kRankW;
+            for (const int w : columnWidths()) total += w + kGapW;
+            return total + 2;
         }
         juce::String getTooltip() override { return tip; }
         static juce::Colour noteColour (int k)
@@ -310,23 +324,24 @@ private:
                                   getLocalBounds().reduced (8), juce::Justification::centred, 4, 0.8f);
                 return;
             }
+            const auto cols = columnWidths();
             int y = 0, row = 0;
             for (const auto& r : rows)
             {
                 if (row % 2 == 1) { g.setColour (juce::Colour (0x14ffffff)); g.fillRect (0, y, getWidth(), kRowH); }
                 if (row == hoverRow) // the row you are hearing
                 { g.setColour (juce::Colour (0x332fb155)); g.fillRect (0, y, getWidth(), kRowH); }
-                // the chord's notes, one colour per note index (fixed column width -
-                // the view scrolls sideways rather than shrinking the text to dust)
-                const int x0 = kRankW;
-                const int nw = juce::jmax (kNoteW, (getWidth() - x0) / juce::jmax (1, (int) r.notes.size()));
+                // the chord's notes, one colour per note index, packed left with just
+                // enough room for the widest entry of each column
+                int x = kRankW;
+                g.setFont (rowFont());
                 for (int k = 0; k < (int) r.notes.size(); ++k)
                 {
+                    const int cw = k < (int) cols.size() ? cols[(size_t) k] : 0;
                     g.setColour (noteColour (k));
-                    g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
-                    g.drawFittedText (r.notes[(size_t) k],
-                                      juce::Rectangle<int> (x0 + k * nw, y, nw - 2, kRowH),
-                                      juce::Justification::centred, 1, 0.5f);
+                    g.drawFittedText (r.notes[(size_t) k], juce::Rectangle<int> (x, y, cw, kRowH),
+                                      juce::Justification::centredLeft, 1, 0.5f);
+                    x += cw + kGapW;
                 }
                 y += kRowH; ++row;
             }

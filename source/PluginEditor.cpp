@@ -2324,7 +2324,9 @@ void FractalAdditiveAudioProcessorEditor::runChordSearch()
                                          16, // fixed result count
 
                                          chordMinMaxBox.getSelectedId() == 2,
-                                         juce::jlimit (0.0, 600.0, chordMinEdit.getText().getDoubleValue()), err))
+                                         juce::jlimit (0.0, 600.0, chordMinEdit.getText().getDoubleValue()),
+                                         tuneScopeBox.getSelectedId() != 2, // SCOPE: 0 vs all
+                                         err))
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
             tr ("Chords based on beating", "Acords basats en batec"), err, this);
     refocus();

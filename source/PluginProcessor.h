@@ -221,7 +221,8 @@ public:
     // polls progress/generation and copies the results.
     struct ChordHit { std::vector<double> alphas; double value; }; // alphas[0] = 1 (root)
     bool startChordSearch (int notes, double periodRatio, const juce::String& periodSclLine,
-                           int count, bool maxima, double minGapCents, juce::String& errorOut);
+                           int count, bool maxima, double minGapCents, bool rootOnly,
+                           juce::String& errorOut);
     void cancelChordSearch();
     bool  isChordSearchRunning()  const noexcept { return chordRunning.load(); }
     float getChordSearchProgress() const noexcept { return chordProgress.load(); }

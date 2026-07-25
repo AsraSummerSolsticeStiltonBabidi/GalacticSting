@@ -998,7 +998,7 @@ bool FractalAdditiveAudioProcessor::saveGeneratedScl (const juce::File& f, juce:
 bool FractalAdditiveAudioProcessor::startChordSearch (int notes, double periodRatio,
                                                       const juce::String& periodSclLine,
                                                       int count, bool maxima, double minGapCents,
-                                                      juce::String& errorOut)
+                                                      bool rootOnly, juce::String& errorOut)
 {
     notes = juce::jlimit (2, 8, notes);
     count = juce::jlimit (1, 24, count);
@@ -1044,10 +1044,10 @@ bool FractalAdditiveAudioProcessor::startChordSearch (int notes, double periodRa
     chordMinGap        = minGapCents;
 
     chordThread = std::make_unique<std::thread> (
-        [this, spec = std::move (spec), periodRatio, notes, count, maxima, minGapCents,
+        [this, spec = std::move (spec), periodRatio, notes, count, maxima, minGapCents, rootOnly,
          periodLine = periodSclLine]()
         {
-            auto res = dissonance::searchChords (spec, periodRatio, notes, count, maxima, minGapCents,
+            auto res = dissonance::searchChords (spec, periodRatio, notes, count, maxima, minGapCents, rootOnly,
                 [this] (float p) { chordProgress.store (p); return ! chordCancel.load(); });
             {
                 const juce::ScopedLock sl (chordLock);

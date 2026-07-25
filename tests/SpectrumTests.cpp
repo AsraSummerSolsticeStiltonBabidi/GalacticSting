@@ -513,6 +513,36 @@ int main()
             for (size_t i = 1; i < res.size(); ++i)
                 check (res[i].value <= res[i-1].value + 1.0e-12, "maxima ranking is descending in dissonance");
         }
+
+        // (5) SCOPE: "0 vs all" scores only self + beating against the root, so it is
+        //     a genuinely different surface from "all vs all" - the two must not be
+        //     the same search wearing two names.
+        {
+            auto all  = dissonance::searchChords (spec, 2.0, 4, 6, false, 33.0, false);
+            auto root = dissonance::searchChords (spec, 2.0, 4, 6, false, 33.0, true);
+            check (! root.empty(), "0-vs-all chord search returns results");
+            // The reported value IS the root-only measure, not the full union one.
+            if (! root.empty())
+            {
+                const auto& a = root[0].alphas;
+                double expect = 0.0;
+                for (size_t i = 0; i < a.size(); ++i)
+                {
+                    expect += dissonance::selfDissonance (spec, a[i]);
+                    if (i > 0) expect += dissonance::crossDissonance (spec, a[0], a[i]);
+                }
+                check (std::abs (root[0].value - expect) < 1.0e-6,
+                       "its value is the 0-vs-all measure (self + beating against the root)");
+                check (std::abs (root[0].value - dissonance::chordDissonance (spec, a)) > 1.0e-6,
+                       "which is NOT the all-vs-all measure of the same chord");
+            }
+            bool differs = all.size() != root.size();
+            for (size_t i = 0; i < std::min (all.size(), root.size()) && ! differs; ++i)
+                for (size_t k = 1; k < all[i].alphas.size() && ! differs; ++k)
+                    if (std::abs (1200.0 * std::log2 (all[i].alphas[k] / root[i].alphas[k])) > 1.0)
+                        differs = true;
+            check (differs, "0 vs all and all vs all do NOT return the same chords");
+        }
     }
 
     //--------------------------------------------------------------------------

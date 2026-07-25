@@ -223,7 +223,7 @@ namespace dissonance
     // closer than this - keeps results playable as scales (default 33 cents).
     inline std::vector<ChordResult> searchChords (const std::vector<Partial>& spectrum,
                                                   double period, int notes, int count, bool maxima,
-                                                  double minGapCents = 33.0,
+                                                  double minGapCents = 33.0, bool rootOnly = false,
                                                   const std::function<bool(float)>& progress = {})
     {
         std::vector<ChordResult> out;
@@ -232,6 +232,22 @@ namespace dissonance
         if (notes > 8) notes = 8;                      // idx arrays support up to 8 notes
         const int m = notes - 1;                       // free notes above the fixed root
         const double totalCents = 1200.0 * std::log2 (period);
+
+        // SCOPE: "all vs all" is the full union measure; "0 vs all" judges each note
+        // only by its own roughness plus its beating against the root. The grid pass
+        // and the refinement below MUST score the same way, or the refinement would
+        // walk towards an extreme of a different surface than the one enumerated.
+        const auto score = [&spectrum, rootOnly] (const std::vector<double>& al)
+        {
+            if (! rootOnly) return chordDissonance (spectrum, al);
+            double v = 0.0;
+            for (size_t i = 0; i < al.size(); ++i)
+            {
+                v += selfDissonance (spectrum, al[i]);
+                if (i > 0) v += crossDissonance (spectrum, al[0], al[i]);
+            }
+            return v;
+        };
 
         // Adaptive grid: the finest step whose combination count stays tractable
         // (~12M) - n=3 gets ~5c, n=6 ~20c; the coarse tail keeps wide periods with
@@ -311,8 +327,9 @@ namespace dissonance
             for (int i = 0; i < m; ++i)
             {
                 v += dSelf[(size_t) c[i]] + dCross[(size_t) c[i]]; // cross with the root (index 0)
-                for (int j = i + 1; j < m; ++j)
-                    v += dCross[(size_t) c[i] * (size_t) (G + 1) + (size_t) c[j]];
+                if (! rootOnly)                                    // "all vs all" only
+                    for (int j = i + 1; j < m; ++j)
+                        v += dCross[(size_t) c[i] * (size_t) (G + 1) + (size_t) c[j]];
             }
 
             if ((int) best.size() < keep || ! worseThan (v, best.back().value))
@@ -356,7 +373,7 @@ namespace dissonance
             std::vector<double> a ((size_t) notes);
             a[0] = 1.0;
             for (int i = 0; i < m; ++i) a[(size_t) i + 1] = std::pow (2.0, cents[(size_t) i] / 1200.0);
-            const double seedValue = chordDissonance (spectrum, a);
+            const double seedValue = score (a);
             constexpr double invPhi = 0.6180339887498949;
             for (int sweep = 0; sweep < 2 && ! cancelled; ++sweep)
                 for (int i = 1; i <= m; ++i)
@@ -378,7 +395,7 @@ namespace dissonance
                     auto eval = [&] (double cts)
                     {
                         auto t = a; t[(size_t) i] = std::pow (2.0, cts / 1200.0);
-                        const double v = chordDissonance (spectrum, t);
+                        const double v = score (t);
                         return maxima ? -v : v;
                     };
                     double x1 = hi - (hi - lo) * invPhi, x2 = lo + (hi - lo) * invPhi;
@@ -396,7 +413,7 @@ namespace dissonance
 
             // Keep the better of refined vs its grid seed (a clamped/multimodal window
             // must never make a result WORSE than the grid point that seeded it).
-            double v = chordDissonance (spectrum, a);
+            double v = score (a);
             if (maxima ? (v < seedValue) : (v > seedValue))
             {
                 a[0] = 1.0;
