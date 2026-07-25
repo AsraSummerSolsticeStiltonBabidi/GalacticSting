@@ -653,6 +653,12 @@ int main()
         proc.getRhythm().slots[5].partial = 4; proc.getRhythm().slots[5].enabled = true;
         proc.getRhythm().slots[5].steps = 3;   proc.getRhythm().slots[5].durMs = 77.0f;
         proc.getRhythm().slots[5].vel = 99;
+        // Tuning bank + Scala-as-timbre: both carry their own .scl text and must
+        // never be silently dropped by a save/load round-trip (project reopen,
+        // an update...), same as the active tuning itself.
+        proc.bankAutoAdd ("rt-bank-11", edoScl (11));
+        proc.bankAutoAdd ("rt-bank-13", edoScl (13));
+        check (proc.loadTimbreText ("1/1 5/4 3/2 2/1", err), "round-trip: a typed timbre loads");
         float wave[ModEngine::kWaveN];
         for (int i = 0; i < ModEngine::kWaveN; ++i) wave[i] = 0.5f + 0.5f * std::sin (0.05f * (float) i);
         proc.getModEngine().setCustomWave (0, wave);
@@ -675,6 +681,8 @@ int main()
         float flat[ModEngine::kWaveN];
         for (auto& f : flat) f = 0.0f;
         proc.getModEngine().setCustomWave (0, flat);
+        for (int i = 0; i < FractalAdditiveAudioProcessor::kBankSlots; ++i) proc.bankClearSlot (i);
+        proc.clearTimbre();
 
         proc.setStateInformation (saved.getData(), (int) saved.getSize());
 
@@ -702,6 +710,21 @@ int main()
                 if (std::abs (w[i] - wave[i]) > 2.0e-4f) { waveOk = false; break; }
         }
         check (waveOk, "the drawn LFO wave survives");
+        {
+            int filled = 0; bool namesOk = true;
+            for (int i = 0; i < FractalAdditiveAudioProcessor::kBankSlots; ++i)
+                if (proc.getTuningBankName (i).isNotEmpty())
+                {
+                    ++filled;
+                    if (proc.getTuningBankName (i) != "rt-bank-11" && proc.getTuningBankName (i) != "rt-bank-13")
+                        namesOk = false;
+                }
+            check (filled == 2 && namesOk, "both tuning-bank .scl entries survive, by name");
+        }
+        // "1/1 5/4 3/2 2/1": 1/1 is the implicit fundamental (not a partial above
+        // it), 2/1 is the period - loadTimbreText keeps 1/1 + 5/4 + 3/2 = 3 degrees.
+        check (proc.timbreLoaded() && proc.getTimbreNoteCount() == 3,
+               "the Scala-as-timbre .scl survives (its 3 degrees are back)");
 
         juce::MemoryBlock again;
         proc.getStateInformation (again);
@@ -829,6 +852,89 @@ int main()
                "and the period is still the octave (kept across every repetition)");
         check (! proc.deleteTuningDegree (0, err), "the tonic cannot be deleted");
         check (! proc.deleteTuningDegree (proc.getScaleDegrees(), err), "nor can the period");
+        proc.clearScala();
+    }
+
+    // --- run 15: a full state swap must never leave a note stuck sounding ---------
+    {
+        std::printf ("preset/project reload silences any sounding note:\n");
+        FractalAdditiveAudioProcessor p2;
+        p2.prepareToPlay (sr, blk);
+        auto maxAbs = [] (const juce::AudioBuffer<float>& b)
+        {
+            float m = 0.0f;
+            for (int ch = 0; ch < b.getNumChannels(); ++ch)
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                    m = std::max (m, std::abs (b.getSample (ch, i)));
+            return m;
+        };
+
+        juce::AudioBuffer<float> audio (2, blk);
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+          p2.processBlock (audio, m); }
+        // A few more blocks so the attack settles into a genuinely sounding note.
+        float peak = 0.0f;
+        for (int b = 0; b < 20; ++b)
+        { juce::MidiBuffer m; p2.processBlock (audio, m); peak = std::max (peak, maxAbs (audio)); }
+        check (peak > 0.001f, "the note is genuinely sounding before the swap");
+
+        // A full state swap (what a preset load / project reload does), WITHOUT any
+        // note-off - simulates the exact bug report: reset while a note sounds.
+        juce::MemoryBlock state;
+        p2.getStateInformation (state);
+        p2.setStateInformation (state.getData(), (int) state.getSize());
+
+        // The kill is armed at the top of the NEXT processBlock (audio-thread only -
+        // see restoreState/processBlock): the voice enters its 5 ms fast-kill fade
+        // right there, so the first block may still carry its tail, but it must be
+        // fully silent well before "infinite" - a couple of blocks, not forever.
+        { juce::MidiBuffer m; p2.processBlock (audio, m); }
+        check (maxAbs (audio) < peak, "already fading on the very first block after the swap");
+        for (int b = 0; b < 3; ++b) { juce::MidiBuffer m; p2.processBlock (audio, m); }
+        for (int b = 0; b < 30; ++b)
+        { juce::MidiBuffer m; p2.processBlock (audio, m); check (maxAbs (audio) < 1.0e-6f, "stays silent"); }
+    }
+
+    // --- run 16: a preset carries its tuning but never applies it -----------------
+    {
+        std::printf ("preset load leaves the tuning alone, but offers it:\n");
+        juce::String err;
+
+        // Scale A is active, then saved into preset "A" (so the file's SCALA child
+        // is A's).
+        check (proc.loadScalaText ("! A\ntest-a\n 3\n 100.0\n 200.0\n 2/1\n", "test-a", err),
+               "scale A loads");
+        const auto presetName = proc.savePreset ("__rhythmverify_tmp_a");
+        check (presetName.isNotEmpty(), "preset A saves (tuning A travels in the file)");
+
+        // Switch to a DIFFERENT scale B, then load the preset back.
+        check (proc.loadScalaText ("! B\ntest-b\n 4\n 150.0\n 300.0\n 450.0\n 2/1\n", "test-b", err),
+               "scale B loads");
+        const int degreesB = proc.getScaleDegrees();
+        check (proc.loadPreset (presetName), "the preset loads");
+        check (proc.getScaleDegrees() == degreesB, "loading it did NOT change the tuning - B is still active");
+        check (proc.hasPendingPresetTuning(), "but its own (different) tuning is offered");
+        check (proc.getPendingPresetTuningName() == "test-a", "and it is named after the one that was saved");
+
+        // The offer disappears once loaded, and B's degree count changes to A's (3).
+        check (proc.loadPendingPresetTuning (err), "\"Load preset's tuning\" applies it");
+        check (proc.getScaleDegrees() == 3, "tuning A is now active");
+        check (! proc.hasPendingPresetTuning(), "the offer is gone now that it matches");
+
+        // A preset saved from a NON-Scala tuning carries no SCALA child - the button
+        // must not falsely offer something that was never there.
+        proc.clearScala();
+        if (auto* p = proc.apvts.getParameter ("tuningMode"))
+            p->setValueNotifyingHost (p->convertTo0to1 (0.0f)); // 12ED2
+        const auto presetName2 = proc.savePreset ("__rhythmverify_tmp_b");
+        check (presetName2.isNotEmpty(), "a 12ED2 preset saves");
+        check (proc.loadScalaText ("! C\ntest-c\n 2\n 500.0\n 2/1\n", "test-c", err), "scale C loads");
+        check (proc.loadPreset (presetName2), "that 12ED2 preset loads");
+        check (! proc.hasPendingPresetTuning(), "no tuning is falsely offered - it never had one");
+
+        // Cleanup: remove the temp preset files this test created.
+        FractalAdditiveAudioProcessor::getPresetFolder().getChildFile (presetName  + ".gsting").deleteFile();
+        FractalAdditiveAudioProcessor::getPresetFolder().getChildFile (presetName2 + ".gsting").deleteFile();
         proc.clearScala();
     }
 

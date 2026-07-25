@@ -1597,6 +1597,22 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 
     const int  nSamp    = buffer.getNumSamples();
 
+    // A full state swap (preset load, project reload, "load its original spectrum")
+    // was seen leaving a note stuck sounding forever: it rewrites every DSP
+    // parameter - envelope times, curves, the additive spectrum itself - under an
+    // active voice's feet, and could hand it a contradictory mix of old and new
+    // values that never reaches silence. restoreState() only flags the request
+    // (it can run on the message thread); the actual kill happens HERE, on the
+    // audio thread, so no voice/NoteGate state is ever touched from two threads.
+    if (pendingHardSilence.exchange (false, std::memory_order_acq_rel))
+    {
+        keyboardState.allNotesOff (0);  // any physically-held key gets its note-off THIS block
+        synth.turnOffAllVoices (false);        // backstop: instant silence regardless of the cause
+        noteGate.prepare (lastSr > 0.0 ? lastSr : getSampleRate());
+        modHeld = 0; modNoteOns = 0;
+        for (auto& row : modKeyHeld) row.fill (false);
+    }
+
     // Merge on-screen / computer-keyboard notes into the incoming MIDI stream.
     keyboardState.processNextMidiBuffer (midiMessages, 0, nSamp, true);
     // Chord-preview MIDI (editor play buttons): kept SEPARATE - it feeds only the
@@ -1886,6 +1902,11 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     if (! tree.isValid() || ! tree.hasType (apvts.state.getType()))
         return;
 
+    // Every parameter is about to be rewritten under any note that is currently
+    // sounding - silence it cleanly rather than risk it never stopping (see the
+    // top of processBlock for the actual kill, which must happen on the audio thread).
+    pendingHardSilence.store (true, std::memory_order_release);
+
     // Unmap BEFORE replaceState: replaceState's internal flush must not capture
     // base+mod for the OLD routings into the fresh tree.
     for (int m = 0; m < ModEngine::kMods; ++m) modEngine.unmapAll (m);
@@ -2098,10 +2119,57 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
         auto tree = juce::ValueTree::fromXml (*xml);
         if (! tree.hasType (apvts.state.getType()))
             return false;
+
+        // The preset's OWN tuning travels IN the file (so it is never lost) but is
+        // never applied by loading the preset: only the SOUND changes, never the
+        // scale under whatever is already loaded or being played on. It is offered
+        // separately - see hasPendingPresetTuning() / loadPendingPresetTuning() -
+        // the Tuning panel shows a button for it only when the two actually differ.
+        if (auto scl = tree.getChildWithName ("SCALA"); scl.isValid())
+        {
+            presetPendingSclName   = scl.getProperty ("name").toString();
+            presetPendingSclSource = scl.getProperty ("source").toString();
+        }
+        else { presetPendingSclName.clear(); presetPendingSclSource.clear(); }
+
+        const auto keepName   = tuning.getScalaName();
+        const auto keepSource = tuning.getScalaSource();
+        const int  keepMode   = getTuningMode();
+
         restoreState (tree);
+
+        // Put the CURRENTLY ACTIVE tuning back exactly as it was.
+        if (keepSource.isNotEmpty())
+        {
+            juce::String err;
+            tuning.loadScalaString (keepSource, keepName, err);
+        }
+        else
+            tuning.clearScala();
+        if (auto* p = apvts.getParameter ("tuningMode"))
+            p->setValueNotifyingHost (p->convertTo0to1 ((float) keepMode));
+        applyTuningMode (keepMode);
         return true;
     }
     return false;
+}
+
+// The Tuning panel's "Load preset's tuning" button.
+bool FractalAdditiveAudioProcessor::loadPendingPresetTuning (juce::String& errorOut)
+{
+    if (presetPendingSclSource.isEmpty())
+    {
+        errorOut = "This preset carries no tuning of its own.";
+        return false;
+    }
+    if (! tuning.loadScalaString (presetPendingSclSource, presetPendingSclName, errorOut))
+        return false;
+    if (auto* p = apvts.getParameter ("tuningMode"))
+        p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
+    applyTuningMode ((int) TuningManager::Mode::Scala);
+    clearSegmentSource();
+    bankAutoAdd (presetPendingSclName, presetPendingSclSource);
+    return true;
 }
 
 //==============================================================================

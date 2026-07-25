@@ -1836,6 +1836,7 @@ private:
     juce::TextButton tuningBankAddBtn;  // put the CURRENT tuning into the bank
     juce::TextButton recentOpenBtn;     // opens the floating Recent list
     juce::TextButton loadItsSpectrumBtn; // .scl written by this synth: restore its patch
+    juce::TextButton loadPresetTuningBtn; // the loaded PRESET carries a different tuning
     juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
                      langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3], tuningBankLoadBtn,
                      tuningBankClearBtn;

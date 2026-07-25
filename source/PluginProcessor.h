@@ -220,6 +220,9 @@ public:
     // BACKGROUND thread (grid + refine is deliberately not realtime); the editor
     // polls progress/generation and copies the results.
     struct ChordHit { std::vector<double> alphas; double value; }; // alphas[0] = 1 (root)
+    // "Reset all parameters" (Init) sets every parameter individually, not through
+    // restoreState() - it needs the same guarantee: no note may be left sounding.
+    void requestHardSilence() { pendingHardSilence.store (true, std::memory_order_release); }
     bool startChordSearch (int notes, double periodRatio, const juce::String& periodSclLine,
                            int count, bool maxima, double minGapCents, bool rootOnly,
                            juce::String& errorOut);
@@ -313,6 +316,17 @@ public:
     bool loadSpectrumFromScl (const juce::String& sclText);
     bool activeSclHasPreset() const { return presetFromScl (tuning.getScalaSource()).isValid(); }
     juce::String activeSclSource() const { return tuning.getScalaSource(); }
+
+    // A .gsting preset carries the tuning it was saved with, but LOADING a preset
+    // never applies it - only the sound changes, never the scale under whatever is
+    // already loaded/playing. The Tuning panel offers it separately, only when it
+    // actually differs from what is active now.
+    bool hasPendingPresetTuning() const
+    {
+        return presetPendingSclSource.isNotEmpty() && presetPendingSclSource != tuning.getScalaSource();
+    }
+    juce::String getPendingPresetTuningName() const { return presetPendingSclName; }
+    bool loadPendingPresetTuning (juce::String& errorOut);
     // ctrl+click: folded into the period, sorted. exactText, when given, is the
     // spec the user typed, kept verbatim so a ratio stays a ratio in the .scl.
     bool addNoteToTuning  (double ratioFromTonic, juce::String& errorOut,
@@ -402,6 +416,10 @@ private:
     spectrum::SpectrumSettings  lastPushed;
     RhythmEngine                rhythm { apvts, spectrumEngine, tuning };
     NoteGate                    noteGate; // quantize-to-tempo / mono / quantize-to-pulse
+    // Set by restoreState() (any thread); consumed at the top of the next processBlock
+    // (audio thread) - see there for why. A preset/project load must never leave a
+    // note stuck sounding.
+    std::atomic<bool>           pendingHardSilence { false };
 
     // Scala-as-timbre state (message thread; read into SpectrumSettings each poll).
     std::vector<float> timbreDegrees;
@@ -419,6 +437,7 @@ private:
     // Last dissonance-generated .scl (text + display name), for saving to disk,
     // plus the degree/height data shown in the Spectrum-to-Scale panel.
     juce::String lastDissScl, lastDissName;
+    juce::String presetPendingSclSource, presetPendingSclName; // see hasPendingPresetTuning()
 
     // Chord-search worker state (worker writes, message thread reads/copies).
     std::unique_ptr<std::thread> chordThread;
