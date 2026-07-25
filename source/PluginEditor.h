@@ -224,10 +224,8 @@ private:
             for (const auto& row : rows)
             {
                 if (r % 2 == 1) { g.setColour (juce::Colour (0x14ffffff)); g.fillRect (0, y, getWidth(), kRowH); }
-                g.setColour (juce::Colour (0xff8f96a8));
-                g.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
-                g.drawText ("#" + juce::String (r + 1), 2, y, 26, kRowH, juce::Justification::centredLeft, false);
-                int x = 30;
+                if (r == hoverRow) { g.setColour (juce::Colour (0x332fb155)); g.fillRect (0, y, getWidth(), kRowH); }
+                int x = 4;   // no rank number: the beating value already orders them
                 for (const int d : row.degs) // chips coloured like the keyboard keys
                 {
                     const auto col = juce::Colour::fromHSV (0.82f * (float) (d % D) / (float) D, 0.62f, 0.9f, 1.0f);
@@ -285,7 +283,7 @@ private:
         juce::String emptyText { "Press Find to search.\n\xe2\x96\xb6 hears a chord\ndouble-click loads it as the scale" };
         std::function<void (int)> onPlay, onLoad, onHover; // onHover(-1) = pointer left
         // No play column any more (hover sounds it), so the notes get that space.
-        static constexpr int kRowH = 22, kRankW = 30, kNoteW = 68;
+        static constexpr int kRowH = 22, kRankW = 4, kNoteW = 74;  // no rank column
         int contentHeight() const { return (int) rows.size() * kRowH; }
         // Every note gets a fixed readable column; when a chord has more notes than
         // fit, the Viewport scrolls HORIZONTALLY instead of squeezing the text away.
@@ -316,9 +314,6 @@ private:
             for (const auto& r : rows)
             {
                 if (row % 2 == 1) { g.setColour (juce::Colour (0x14ffffff)); g.fillRect (0, y, getWidth(), kRowH); }
-                g.setColour (juce::Colour (0xff8f96a8));  // numbered ranking
-                g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
-                g.drawText ("#" + juce::String (row + 1), 2, y, kRankW - 4, kRowH, juce::Justification::centredLeft, false);
                 if (row == hoverRow) // the row you are hearing
                 { g.setColour (juce::Colour (0x332fb155)); g.fillRect (0, y, getWidth(), kRowH); }
                 // the chord's notes, one colour per note index (fixed column width -
@@ -1858,6 +1853,7 @@ private:
     NadList          nadList;
     juce::Viewport   nadView;
     int              lastNadGen = 0, lastNadSel = 1, lastNadD = 0;
+    bool             lastNadRootOnly = true;
     double           lastNadSig = -1.0e30;
     juce::TextButton chordGoBtn;
     ChordList        chordList;

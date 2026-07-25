@@ -243,7 +243,9 @@ public:
     // by their TOTAL beating (union dissmeasure - every pair counted, not just each
     // degree vs the tonic). Background worker; editor polls the generation.
     struct NadRow { std::vector<int> degs; double value = 0.0; };
-    void startNadCompute (int notes); // 2 = dyads, 3 = triads, ...
+    // notes = how many notes per combination; rootOnly = rank by the beating against
+    // note 0 only (instead of every pair).
+    void startNadCompute (int notes, bool rootOnly = false); // 2 = dyads, 3 = triads, ...
     int  getNadGeneration() const noexcept { return nadGeneration.load(); }
     bool isNadBusy() const noexcept { return nadBusy.load(); }
     // Honesty surface: never hide a coverage limit silently.

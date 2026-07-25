@@ -184,6 +184,11 @@ public:
         // (self-play) toggle is on - self-play must still make pulses when MIDI-out is off.
         const bool on  = (onParam   != nullptr && onParam->load()   > 0.5f)
                       || (selfParam != nullptr && selfParam->load() > 0.5f);
+        // Switching the engine OFF must not strand whatever is sounding: close every
+        // open gate and drop the queued echoes, so no pulse note is left held (that
+        // is what droned on under the spectrum after toggling the panel's buttons).
+        if (wasOnEngine && ! on) { flushOpenGates(); flushEchoes(); }
+        wasOnEngine = on;
         const bool all = modeParam != nullptr && modeParam->load() > 0.5f;
         mpeOut         = mpeParam  != nullptr && mpeParam->load()  > 0.5f;
         const int  x   = juce::jlimit (2, 12, (int) xParam->load());
@@ -527,8 +532,12 @@ private:
                     // A straight ramp anchored at the near end. k = 0.5 reaches zero
                     // exactly at the far end; beyond that it keeps steepening, and at
                     // the very top it is vertical - no pulse keeps any velocity.
-                    v *= k >= 0.999f ? 0.0f
-                                     : juce::jlimit (0.0f, 1.0f, 1.0f - x * k / std::max (1.0e-3f, 1.0f - k));
+                    // Ramp: zero at the far end by k = 0.5, steeper after that. The
+                    // last stretch ALSO fades the near end, so the whole column walks
+                    // down to silence instead of jumping there at the very top.
+                    const float ramp = juce::jlimit (0.0f, 1.0f, 1.0f - x * k / std::max (1.0e-3f, 1.0f - k));
+                    const float tail = k > 0.8f ? juce::jlimit (0.0f, 1.0f, (1.0f - k) / 0.2f) : 1.0f;
+                    v *= ramp * tail;
                 }
                 velArr[i] = (juce::uint8) juce::jlimit (0, 127, (int) std::lround (v));
             }
@@ -705,6 +714,7 @@ private:
     bool   mpeOut  = false;
     bool   feedbackActive = false; // this block: self-play + feedback on -> schedule echoes
     double feedbackDecay  = 0.5;   // velocity kept per loop
+    bool   wasOnEngine    = false; // engine state last block (to close gates when it goes off)
     juce::int64 engineClock   = 0;  // absolute sample frame
     juce::int64 patternAnchor = -1; // sample of the driver's last downbeat (the pattern's "1")
     juce::int64 patternCycle  = 0;  // samples until the whole polyrhythm coincides again (0 = none)

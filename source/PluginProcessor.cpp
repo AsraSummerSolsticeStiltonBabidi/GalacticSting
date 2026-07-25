@@ -1289,7 +1289,7 @@ bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::St
 //==============================================================================
 // n-ad ranking: combinations of n scale degrees ranked by TOTAL beating (union
 // dissmeasure, exact pair decomposition - every pair of degrees counted).
-void FractalAdditiveAudioProcessor::startNadCompute (int notes)
+void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly)
 {
     notes = juce::jlimit (2, 12, notes);
     nadCancel = true;
@@ -1321,7 +1321,7 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes)
     }
 
     nadBusy = true;
-    nadThread = std::make_unique<std::thread> ([this, notes, D, periodC,
+    nadThread = std::make_unique<std::thread> ([this, notes, D, periodC, rootOnly,
                                                 ratios = std::move (ratios), spec = std::move (spec)]()
     {
         std::vector<FractalAdditiveAudioProcessor::NadRow> out;
@@ -1384,21 +1384,34 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes)
             };
             std::unordered_map<unsigned long long, int> seen; // shapes already listed
 
-            // Bounded best-K enumeration (ascending beating).
+            // Bounded best-K enumeration (ascending beating). A combination that is
+            // just the unison repeated, or that pairs 0 with the period (the same
+            // pitch class an octave up), says nothing - those are skipped.
+            const auto degenerate = [&cents, notes, periodC] (const int* cc)
+            {
+                for (int i = 1; i < notes; ++i)
+                {
+                    const double gap = std::abs (cents[(size_t) cc[i]] - cents[(size_t) cc[i - 1]]);
+                    if (gap < 0.5 || std::abs (gap - periodC) < 0.5) return true;
+                }
+                return false;
+            };
             const int keep = 40;
             std::vector<FractalAdditiveAudioProcessor::NadRow> best;
             int c[12];
             for (int i = 0; i < notes; ++i) c[i] = i;   // regular: c[0] stays 0
             while (! nadCancel.load())
             {
+                // SCOPE: rank by every pair's beating, or only by each note against 0.
                 double v = 0.0;
                 for (int i = 0; i < notes; ++i)
                 {
                     v += dself[(size_t) c[i]];
-                    for (int j = i + 1; j < notes; ++j)
+                    if (rootOnly) { if (i > 0) v += dcross[(size_t) c[0] * (size_t) D + (size_t) c[i]]; }
+                    else for (int j = i + 1; j < notes; ++j)
                         v += dcross[(size_t) c[i] * (size_t) D + (size_t) c[j]];
                 }
-                if ((int) best.size() < keep || v < best.back().value)
+                if (! degenerate (c) && ((int) best.size() < keep || v < best.back().value))
                 {
                     // In the irregular path the FIRST time a shape is seen is its
                     // lowest-rooted copy (lexicographic order), so keeping that one

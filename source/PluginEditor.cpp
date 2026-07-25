@@ -1944,7 +1944,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblTimbreRepeats.setText (tr ("Reps", "Reps"), dontSendNotification);
     lblBend.setText      (tr ("Pitch bend", "Pitch bend"), dontSendNotification);
     lblPeriod.setText    (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
-    lblSteps.setText     (tr ("Steps", "Passos"), dontSendNotification);
+    lblSteps.setText     (tr ("Notes", "Notes"), dontSendNotification);
     lblRefA.setText      ("C3 =", dontSendNotification); // the tuning anchor key itself, not A
     lblTuningBank.setText (tr ("Bank", "Banc"), dontSendNotification);
     degreeList.tip = tr (
@@ -2359,6 +2359,8 @@ void FractalAdditiveAudioProcessorEditor::hoverPreview (const std::vector<double
 {
     stopChordPreview();
     if (ratios.empty() || ! (processorRef.getSampleRate() > 0.0)) return;
+    // Heard as before: the whole chord together, then an ascending arpeggio - and
+    // it stops the moment the pointer leaves the row (stopChordPreview above).
 
     static constexpr int bendValues[] = { 2, 12, 48 };
     const int bendRange = processorRef.getTuningMode() == 3 ? 48
@@ -2385,7 +2387,12 @@ void FractalAdditiveAudioProcessorEditor::hoverPreview (const std::vector<double
         const int ch = 9 + (k % 8);
         previewQueue.push_back ({ now, juce::MidiMessage::pitchWheel (ch, wheel) });
         previewQueue.push_back ({ now, juce::MidiMessage::noteOn (ch, bestKey, (juce::uint8) 100) });
-        previewNotes.push_back ({ ch, bestKey });   // held until the pointer leaves
+        previewNotes.push_back ({ ch, bestKey });
+        // ...then the same notes again, ascending, as an arpeggio. Everything is
+        // cut the instant the pointer leaves (stopChordPreview sends all the offs).
+        const juce::uint32 arpAt = now + 1500 + (juce::uint32) k * 200;
+        previewQueue.push_back ({ arpAt,       juce::MidiMessage::noteOff (ch, bestKey) });
+        previewQueue.push_back ({ arpAt + 10,  juce::MidiMessage::noteOn  (ch, bestKey, (juce::uint8) 100) });
         ++k;
     }
 }
@@ -3125,7 +3132,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
         juce::Component* chordC[] = { &chordNotesBox, &chordMinMaxBox, &chordNotesLbl,
                                       &chordPerLbl, &chordProgLbl, &chordPeriodEdit, &chordGoBtn,
                                       &chordMinEdit, &chordMinLbl };
-        for (auto* c : sethC)  c->setVisible (dy);
+        // "From current tuning" updates live - no Find, and Save makes no sense there.
+        for (auto* c : sethC)  c->setVisible (dy && ! fromCurrent);
         for (auto* c : segC)   c->setVisible (seg);
         for (auto* c : chordC) c->setVisible (chord);
 
@@ -3211,11 +3219,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
         const bool showDeg = (dy) || (chord && fromChord && chordDegView);
         // The SCOPE selector decides between "vs 0 only" (the degree list) and "all
         // pairs" (the n-ad combinations); the n-ad size box only appears for the latter.
-        const int  nadSel  = allPairs ? juce::jmax (2, nadBox.getSelectedId()) : 1;
-        nadBox.setVisible (showDeg && allPairs);
-        dissHeader.setVisible (showDeg && nadSel == 1);
-        dissView.setVisible (showDeg && nadSel == 1);
-        nadView.setVisible (showDeg && nadSel > 1);
+        // "Notes" (how many notes per combination) applies to BOTH scopes now; the
+        // scope only decides how they are ranked.
+        const int  nadSel  = juce::jmax (2, nadBox.getSelectedId());
+        nadBox.setVisible (showDeg);
+        dissHeader.setVisible (false);
+        dissView.setVisible (false);
+        nadView.setVisible (showDeg);
         chordView.setVisible (chord && ! showDeg);
         if (seg)
         {
@@ -3250,18 +3260,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 nadBox.setSelectedId (keepSel >= 2 && keepSel <= juce::jmin (D, 12) ? keepSel : 2,
                                       juce::dontSendNotification);
             }
-            if (allPairs) { nadBox.setBounds (si.removeFromTop (22)); si.removeFromTop (3); }
-            if (nadSel == 1)
-            {
-                dissHeader.splitX = 92;
-                dissHeader.setBounds (si.removeFromTop (24));
-                dissView.setBounds (si);
-                const int ch     = degreeList.contentHeight();
-                const bool scroll = ch > si.getHeight();
-                degreeList.setSize (scroll ? si.getWidth() - 10 : si.getWidth(),
-                                    juce::jmax (si.getHeight(), ch));
-            }
-            else
+            nadBox.setBounds (si.removeFromTop (22)); si.removeFromTop (3);
             {
                 nadView.setBounds (si);
                 nadList.degreesPerPeriod = D;
@@ -3821,11 +3820,16 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // results when the worker finishes (values coloured green -> red like the list).
     if (nadBox.isVisible() && nadBox.getSelectedId() > 1)
     {
-        if (lastScaleSig != lastNadSig || nadBox.getSelectedId() != lastNadSel)
+        // Live: any change to the tuning, the timbre, the note count or the SCOPE
+        // recomputes on its own - "From current tuning" has no Find button.
+        const bool rootOnly = tuneScopeBox.getSelectedId() != 2;
+        if (lastScaleSig != lastNadSig || nadBox.getSelectedId() != lastNadSel
+            || rootOnly != lastNadRootOnly)
         {
             lastNadSig = lastScaleSig;
             lastNadSel = nadBox.getSelectedId();
-            processorRef.startNadCompute (lastNadSel);
+            lastNadRootOnly = rootOnly;
+            processorRef.startNadCompute (lastNadSel, rootOnly);
         }
         if (processorRef.getNadGeneration() != lastNadGen)
         {
