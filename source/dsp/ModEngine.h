@@ -58,7 +58,8 @@ public:
             auto& q = prm[(size_t) i];
             q.on = rv ("On"); q.range = rv ("Range");
             onParam[(size_t) i] = apvts.getParameter (pre + "On");
-            if (i < kEnvs) { q.a = rv ("A"); q.d = rv ("D"); q.s = rv ("S"); q.r = rv ("R"); }
+            if (i < kEnvs) { q.a = rv ("A"); q.d = rv ("D"); q.s = rv ("S"); q.r = rv ("R");
+                             q.cA = rv ("CurveA"); q.cD = rv ("CurveD"); q.cR = rv ("CurveR"); }
             else
             {
                 q.wave = rv ("Wave"); q.rateMode = rv ("RateMode"); q.divN = rv ("Div");
@@ -76,7 +77,7 @@ public:
     void prepare (double sampleRate)
     {
         sr = sampleRate > 0.0 ? sampleRate : 44100.0;
-        for (auto& e : env) { e.adsr.setSampleRate (sr); e.adsr.reset(); e.held = false; }
+        for (auto& e : env) { e = Env{}; }
         // The processor zeroes its note counter here too, so this stays in step
         // WITHOUT swallowing the first note-on: adopting the counter lazily on the
         // first block ate the retrigger of a note that arrived in that same block.
@@ -215,20 +216,40 @@ public:
             if (i < kEnvs)
             {
                 // The envelope keeps RUNNING even while unmapped/off so its state is
-                // sane the moment it is engaged.
+                // sane the moment it is engaged. It is generated here rather than by
+                // juce::ADSR because each segment carries its own CURVE (concave <->
+                // convex): a straight line ramp is what made the decay feel like it
+                // "drops" instead of falling away.
                 auto& e = env[(size_t) i];
-                juce::ADSR::Parameters ap;
-                ap.attack  = q.a->load();
-                ap.decay   = q.d->load();
-                ap.sustain = q.s->load();
-                ap.release = q.r->load();
-                e.adsr.setParameters (ap);
-                if (newNote) e.adsr.noteOn();                       // EVERY key restarts the envelope
-                if (! anyHeld && (e.held || newNote)) e.adsr.noteOff(); // incl. notes on+off within one block
+                if (newNote) { e.stage = Env::attack; e.pos = 0.0; e.from = e.value; }
+                if (! anyHeld && (e.held || newNote))
+                { e.stage = Env::release; e.pos = 0.0; e.from = e.value; }
                 e.held = anyHeld;
-                double v = 0.0;
-                for (int k = 0; k < numSamples; ++k) v = (double) e.adsr.getNextSample();
-                vals[i] = v;
+
+                const double dt = (double) numSamples / sr;
+                const double S  = juce::jlimit (0.0, 1.0, (double) q.s->load());
+                const auto adv = [&e, dt] (float secs)
+                { e.pos += dt / std::max (1.0e-4, (double) secs); return e.pos >= 1.0; };
+
+                switch (e.stage)
+                {
+                    case Env::attack:
+                        if (adv (q.a->load())) { e.stage = Env::decay; e.pos = 0.0; e.value = 1.0; }
+                        else e.value = e.from + (1.0 - e.from) * shape (e.pos, q.cA->load());
+                        break;
+                    case Env::decay:
+                        if (adv (q.d->load())) { e.stage = Env::sustain; e.pos = 0.0; e.value = S; }
+                        else e.value = 1.0 + (S - 1.0) * shape (e.pos, q.cD->load());
+                        break;
+                    case Env::sustain: e.value = S; break;
+                    case Env::release:
+                        if (adv (q.r->load())) { e.stage = Env::idle; e.pos = 0.0; e.value = 0.0; }
+                        else e.value = e.from * (1.0 - shape (e.pos, q.cR->load()));
+                        break;
+                    case Env::idle:
+                    default: e.value = 0.0; break;
+                }
+                vals[i] = juce::jlimit (0.0, 1.0, e.value);
             }
             else
             {
@@ -414,17 +435,47 @@ private:
         juce::String tgtId[kMaxTargets]; // message thread only (under routingLock)
         Slot         slot[kMaxTargets];  // audio-thread view of the routing
     };
-    struct Env { juce::ADSR adsr; bool held = false; };
+    // Curve shaper shared by every envelope segment: c = 0 is a straight line,
+    // c < 0 bends it concave (slow start, fast finish), c > 0 convex (fast start,
+    // long tail - the classic "natural" decay). Same family as the drawn waves.
+    static double shape (double t, float c) noexcept
+    {
+        t = juce::jlimit (0.0, 1.0, t);
+        const double k = std::pow (2.0, -3.0 * (double) juce::jlimit (-1.0f, 1.0f, c));
+        return std::pow (t, k);
+    }
+
+    struct Env
+    {
+        enum Stage { idle, attack, decay, sustain, release };
+        Stage  stage = idle;
+        double pos = 0.0;    // 0..1 through the current segment
+        double value = 0.0;  // current output
+        double from = 0.0;   // level the segment started from (retrigger / release)
+        bool   held = false;
+    };
     struct Lfo { double phase = 0.0; };
+    // Deterministic little RNG for the Random wave (no allocation, no global state).
+    struct Rnd
+    {
+        juce::uint32 state = 0x9E3779B9u;
+        double from = 0.5, target = 0.5, lastPhase = 0.0;
+        double next() noexcept
+        {
+            state = state * 1664525u + 1013904223u;
+            return (double) ((state >> 8) & 0xFFFFFF) / (double) 0xFFFFFF;
+        }
+    };
     struct Ptrs
     {
         std::atomic<float>* on = nullptr, * range = nullptr;
         std::atomic<float>* a = nullptr, * d = nullptr, * s = nullptr, * r = nullptr;   // envs
+        std::atomic<float>* cA = nullptr, * cD = nullptr, * cR = nullptr;              // segment curves
         std::atomic<float>* wave = nullptr, * rateMode = nullptr, * divN = nullptr,     // lfos
                           * hz = nullptr, * phaseMode = nullptr, * phase = nullptr;
     };
 
-    double evalWave (int lfoIdx, int wave, double ph) const
+    double evalWave (int lfoIdx, int wave, double ph)
     {
         switch (wave)
         {
@@ -433,6 +484,13 @@ private:
             case 2:  return ph;                                                              // saw up
             case 3:  return 1.0 - ph;                                                        // saw down
             case 4:  return ph < 0.5 ? 1.0 : 0.0;                                            // square
+            case 6:  // RANDOM: a new level each cycle, glided into (sample & hold that
+            {       //          does not step - the target changes, the value walks to it)
+                auto& rs = rnd[(size_t) lfoIdx];
+                if (ph < rs.lastPhase) { rs.from = rs.target; rs.target = rs.next(); } // wrapped
+                rs.lastPhase = ph;
+                return rs.from + (rs.target - rs.from) * (ph * ph * (3.0 - 2.0 * ph)); // smoothstep
+            }
             default: // custom drawn wave (linear interp over the 256-point table)
             {
                 const auto& w = customWave[(size_t) lfoIdx];
@@ -451,6 +509,7 @@ private:
     juce::RangedAudioParameter* onParam[kMods] = {}; // base (unmodulated) On state
     Env  env[kEnvs];
     Lfo  lfo[kLfos];
+    Rnd  rnd[kLfos];   // per-LFO random-wave state
     struct Last { juce::RangedAudioParameter* p = nullptr; std::atomic<float>* raw = nullptr; };
     Last lastW[kMods * kMaxTargets];
     int  nLastW = 0;

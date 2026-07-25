@@ -73,6 +73,7 @@ public:
         selfParam = apvts.getRawParameterValue ("rhythmSelfPlay");
         fbParam   = apvts.getRawParameterValue ("rhythmFeedback");
         fbDecayParam = apvts.getRawParameterValue ("rhythmFeedbackDecay");
+        velSlopeParam = apvts.getRawParameterValue ("rhythmVelSlope");
         qPulseParam  = apvts.getRawParameterValue ("rhythmQPulse");
         octParam  = apvts.getRawParameterValue ("rhythmOctAll");
         xParam    = apvts.getRawParameterValue ("rhythmDivX");
@@ -505,8 +506,26 @@ private:
             const bool ok = on && slots[i].enabled.load (std::memory_order_relaxed)
                          && p >= 0 && p < count;
             gateLen[i] = juce::jmax (1, (int) ((double) slots[i].durMs.load (std::memory_order_relaxed) * 0.001 * sr));
-            // Velocity of every pulse this slot sends: a per-slot user value (1..127).
-            velArr[i] = (juce::uint8) juce::jlimit (1, 127, slots[i].vel.load (std::memory_order_relaxed));
+            // Velocity of every pulse this slot sends: the per-slot user value (1..127)
+            // times the VELOCITY SLOPE, a tilt across the spectrum. 0 = flat (every
+            // slot keeps its own velocity). Positive tilts the HIGH partials down (at
+            // the top of the range nothing is left); negative tilts the low ones down.
+            {
+                float v = (float) juce::jlimit (1, 127, slots[i].vel.load (std::memory_order_relaxed));
+                const float sl = velSlopeParam != nullptr ? velSlopeParam->load() : 0.0f;
+                const float k  = std::abs (sl);
+                if (k > 1.0e-4f && count > 1 && p >= 0)
+                {
+                    const float u = (float) p / (float) (count - 1);   // 0 = lowest partial
+                    const float x = sl > 0.0f ? u : 1.0f - u;          // which end fades first
+                    // A straight ramp anchored at the near end. k = 0.5 reaches zero
+                    // exactly at the far end; beyond that it keeps steepening, and at
+                    // the very top it is vertical - no pulse keeps any velocity.
+                    v *= k >= 0.999f ? 0.0f
+                                     : juce::jlimit (0.0f, 1.0f, 1.0f - x * k / std::max (1.0e-3f, 1.0f - k));
+                }
+                velArr[i] = (juce::uint8) juce::jlimit (0, 127, (int) std::lround (v));
+            }
 
             bool anyGate = false;
             float uiRate = 0.0f;
@@ -663,6 +682,7 @@ private:
     std::atomic<float>* selfParam = nullptr; // "play in Fibló" - interpret pulses internally
     std::atomic<float>* fbParam   = nullptr; // internal feedback loop on/off
     std::atomic<float>* fbDecayParam = nullptr; // feedback volume slope (velocity kept per loop)
+    std::atomic<float>* velSlopeParam = nullptr; // velocity tilt across the spectrum
     std::atomic<float>* qPulseParam = nullptr; // quantize-to-pulse (phase-aligned joiners)
     std::atomic<float>* octParam  = nullptr; // global octave shift of all pulses (-4..+4)
     std::atomic<float>* xParam  = nullptr;

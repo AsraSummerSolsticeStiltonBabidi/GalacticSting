@@ -155,6 +155,18 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         params.push_back (std::make_unique<AudioParameterFloat>(
             ParameterID { pfx + "Range", 1 }, "Env " + String (n) + " Range",
             NormalisableRange<float> (-1.0f, 1.0f, 0.001f), 0.5f));
+        // Segment SHAPE: 0 = straight line, negative = concave, positive = convex.
+        // The decay defaults convex, which is how a natural decay actually falls
+        // (fast at first, long tail) - a straight ramp reads as an abrupt drop.
+        params.push_back (std::make_unique<AudioParameterFloat>(
+            ParameterID { pfx + "CurveA", 1 }, "Env " + String (n) + " Attack Curve",
+            NormalisableRange<float> (-1.0f, 1.0f, 0.001f), 0.0f));
+        params.push_back (std::make_unique<AudioParameterFloat>(
+            ParameterID { pfx + "CurveD", 1 }, "Env " + String (n) + " Decay Curve",
+            NormalisableRange<float> (-1.0f, 1.0f, 0.001f), 0.55f));
+        params.push_back (std::make_unique<AudioParameterFloat>(
+            ParameterID { pfx + "CurveR", 1 }, "Env " + String (n) + " Release Curve",
+            NormalisableRange<float> (-1.0f, 1.0f, 0.001f), 0.55f));
         params.push_back (std::make_unique<AudioParameterBool>(
             ParameterID { pfx + "On", 1 }, "Env " + String (n) + " On", true));
     }
@@ -163,7 +175,7 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         const auto pfx = "modL" + String (n);
         params.push_back (std::make_unique<AudioParameterChoice>(
             ParameterID { pfx + "Wave", 1 }, "LFO " + String (n) + " Wave",
-            StringArray { "Sine", "Triangle", "Saw up", "Saw down", "Square", "Custom" }, 0));
+            StringArray { "Sine", "Triangle", "Saw up", "Saw down", "Square", "Custom", "Random" }, 0));
         // Rate: BPM-divided / fundamental-divided (default - follows the lowest held
         // note) / free Hz. Div halves the rate per step (deep enough to bring an
         // audio-rate fundamental down to slow sweeps).
@@ -277,6 +289,9 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         ParameterID { "rhythmFeedback", 1 }, "Rhythm Feedback", false));
     // The volume slope: fraction of velocity kept per loop. 0.5 = halve each repeat
     // (short tail); higher = longer, louder tail.
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "rhythmVelSlope", 1 }, "Rhythm Velocity Slope",
+        NormalisableRange<float> (-1.0f, 1.0f, 0.001f), 0.0f));
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "rhythmFeedbackDecay", 1 }, "Rhythm Feedback Decay",
         juce::NormalisableRange<float> (0.05f, 0.95f, 0.01f), 0.5f));

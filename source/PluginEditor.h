@@ -442,6 +442,7 @@ private:
         juce::Label        secGate;                   // "NOTE START" group header
         juce::ToggleButton feedbackT;                 // internal recursive feedback loop
         juce::Slider       feedbackS;                 // its volume slope (decay per loop)
+        juce::Slider       velSlopeS;                 // velocity tilt across the spectrum
         juce::Label        feedbackLbl;               // "Feedback" caption
         juce::Label        outLbl, selfLbl;           // captions under the two big pill toggles
         juce::ComboBox     modeBox;
@@ -694,6 +695,15 @@ private:
                 h->setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
                 addAndMakeVisible (*h);
             }
+            // Velocity SLOPE: a tilt over the whole column of per-pulse velocities.
+            // 0 = flat; up = the high partials fade out first, down = the low ones;
+            // at the top of its travel the ramp is vertical and nothing is left.
+            velSlopeS.setSliderStyle (juce::Slider::LinearHorizontal);
+            velSlopeS.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+            velSlopeS.setColour (juce::Slider::trackColourId, juce::Colour (0xffff77c8));
+            velSlopeS.setColour (juce::Slider::thumbColourId, juce::Colour (0xffff77c8));
+            velSlopeS.setMouseClickGrabsKeyboardFocus (false);
+            addAndMakeVisible (velSlopeS);
             closeB.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
             closeB.onClick = [this] { if (onClose) onClose(); };
             addAndMakeVisible (closeB);
@@ -1154,7 +1164,10 @@ private:
                 head.removeFromRight (28);        // over delB (24 + gap)
                 durHead.setBounds (head.removeFromRight (104));
                 head.removeFromRight (4);
-                velHead.setBounds (head.removeFromRight (76));
+                // The velocity SLOPE knob sits right above the VEL column it tilts.
+                auto velCol = head.removeFromRight (76);
+                velSlopeS.setBounds (velCol.withY (velCol.getY() - 1).withHeight (15));
+                velHead.setBounds (velCol.withY (velCol.getY() + 14).withHeight (13));
                 head.removeFromRight (4 + 30 + 3 + 30 + 6); // over the -12/+12 pair + gaps
                 noteHead.setBounds (head);        // over the pitch box
             }
@@ -1219,6 +1232,158 @@ private:
     // Drawn-LFO wave editor (Ableton-automation style): drag points; double-click
     // adds a point; right-click deletes one; dragging a segment's MIDDLE bends it
     // (power curve), like curving an automation line. One cycle, x 0..1, y 0..1.
+    // Envelope drawn as a LINE WITH NODES instead of four faders: drag a node to set
+    // a time or the sustain level, drag the LINE between two nodes to bend it
+    // concave/convex. Everything it moves is a real parameter, so the shape shown is
+    // exactly the signal the modulator sends (see ModEngine::shape).
+    struct EnvEditor : juce::Component, juce::TooltipClient
+    {
+        // times in seconds, levels 0..1, curves -1..1
+        float a = 0.1f, d = 0.3f, s = 0.7f, r = 0.4f, cA = 0.0f, cD = 0.55f, cR = 0.55f;
+        juce::Colour col { 0xff9a7bff };
+        juce::String tip;
+        // (param suffix, new value) - the editor never writes parameters itself.
+        std::function<void (const juce::String&, float)> onEdit;
+        std::function<void (const juce::String&, bool)>  onGesture;
+        juce::String getTooltip() override { return tip; }
+
+        static float shape (float t, float c)
+        {
+            t = juce::jlimit (0.0f, 1.0f, t);
+            return std::pow (t, std::pow (2.0f, -3.0f * juce::jlimit (-1.0f, 1.0f, c)));
+        }
+        static constexpr float kMaxT = 5.0f;   // seconds shown across the whole width
+        float tToX (float secs) const  { return 6.0f + (float) (getWidth() - 12) * std::sqrt (juce::jlimit (0.0f, kMaxT, secs) / kMaxT); }
+        float xToT (float x) const
+        { const float u = juce::jlimit (0.0f, 1.0f, (x - 6.0f) / (float) juce::jmax (1, getWidth() - 12)); return u * u * kMaxT; }
+        float lToY (float lvl) const   { return (float) getHeight() - 8.0f - juce::jlimit (0.0f, 1.0f, lvl) * (float) (getHeight() - 16); }
+        float yToL (float y) const     { return juce::jlimit (0.0f, 1.0f, ((float) getHeight() - 8.0f - y) / (float) juce::jmax (1, getHeight() - 16)); }
+
+        // Node positions: 0 = start, 1 = peak (end of attack), 2 = end of decay
+        // (sustain level), 3 = end of the sustain leg, 4 = end of release.
+        juce::Point<float> node (int i) const
+        {
+            const float sustainLeg = juce::jmax (14.0f, (float) getWidth() * 0.12f);
+            switch (i)
+            {
+                case 0:  return { 6.0f, lToY (0.0f) };
+                case 1:  return { tToX (a), lToY (1.0f) };
+                case 2:  return { tToX (a) + tToX (d) - 6.0f, lToY (s) };
+                case 3:  return { tToX (a) + tToX (d) - 6.0f + sustainLeg, lToY (s) };
+                default: return { tToX (a) + tToX (d) - 6.0f + sustainLeg + tToX (r) - 6.0f, lToY (0.0f) };
+            }
+        }
+        void paint (juce::Graphics& g) override
+        {
+            auto b = getLocalBounds().toFloat();
+            g.setColour (juce::Colour (0xff101018));
+            g.fillRoundedRectangle (b, 3.0f);
+            g.setColour (col.withAlpha (0.20f));
+            g.drawRoundedRectangle (b.reduced (0.5f), 3.0f, 1.0f);
+
+            // The curve itself: each leg drawn through its own shaping function.
+            juce::Path p;
+            const auto seg = [&] (juce::Point<float> from, juce::Point<float> to, float curve, bool first)
+            {
+                if (first) p.startNewSubPath (from);
+                constexpr int steps = 24;
+                for (int i = 1; i <= steps; ++i)
+                {
+                    const float t = (float) i / (float) steps;
+                    const float w = shape (t, curve);
+                    p.lineTo (from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * w);
+                }
+            };
+            seg (node (0), node (1), cA, true);
+            seg (node (1), node (2), cD, false);
+            p.lineTo (node (3));
+            seg (node (3), node (4), cR, false);
+            g.setColour (col);
+            g.strokePath (p, juce::PathStrokeType (2.0f));
+            // Filled area under it, so the shape reads at a glance.
+            auto fill = p;
+            fill.lineTo (node (4).x, lToY (0.0f));
+            fill.lineTo (node (0).x, lToY (0.0f));
+            fill.closeSubPath();
+            g.setColour (col.withAlpha (0.12f));
+            g.fillPath (fill);
+
+            for (int i : { 1, 2, 4 }) // draggable nodes
+            {
+                const auto n = node (i);
+                g.setColour (col);
+                g.fillEllipse (n.x - 4.0f, n.y - 4.0f, 8.0f, 8.0f);
+                g.setColour (juce::Colours::black.withAlpha (0.5f));
+                g.drawEllipse (n.x - 4.0f, n.y - 4.0f, 8.0f, 8.0f, 1.0f);
+            }
+            g.setColour (col.withAlpha (0.55f));
+            g.setFont (juce::Font (juce::FontOptions (9.5f).withStyle ("Bold")));
+            g.drawText ("A", node (1).x - 12.0f, lToY (1.0f) - 12.0f, 12.0f, 11.0f, juce::Justification::centred, false);
+            g.drawText ("D", node (2).x - 6.0f, node (2).y - 14.0f, 12.0f, 11.0f, juce::Justification::centred, false);
+            g.drawText ("R", node (4).x - 14.0f, lToY (0.0f) - 12.0f, 12.0f, 11.0f, juce::Justification::centred, false);
+        }
+
+        int    dragNode = -1, dragSeg = -1;
+        float  dragStartCurve = 0.0f, dragStartY = 0.0f;
+        juce::String dragParam;
+
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            const juce::Point<float> pos = e.position;
+            dragNode = -1; dragSeg = -1;
+            for (int i : { 1, 2, 4 })
+                if (pos.getDistanceFrom (node (i)) < 9.0f) { dragNode = i; break; }
+            if (dragNode < 0) // no node hit: bend the leg the click landed on
+            {
+                const float x = pos.x;
+                if      (x < node (1).x) { dragSeg = 0; dragParam = "CurveA"; dragStartCurve = cA; }
+                else if (x < node (2).x) { dragSeg = 1; dragParam = "CurveD"; dragStartCurve = cD; }
+                else if (x > node (3).x) { dragSeg = 2; dragParam = "CurveR"; dragStartCurve = cR; }
+                dragStartY = pos.y;
+            }
+            if (onGesture) onGesture (paramForDrag(), true);
+        }
+        juce::String paramForDrag() const
+        {
+            if (dragNode == 1) return "A";
+            if (dragNode == 2) return "D";
+            if (dragNode == 4) return "R";
+            return dragParam;
+        }
+        void mouseDrag (const juce::MouseEvent& e) override
+        {
+            if (! onEdit) return;
+            const auto pos = e.position;
+            if (dragNode == 1)      onEdit ("A", xToT (pos.x));
+            else if (dragNode == 2)
+            {
+                onEdit ("D", juce::jmax (0.001f, xToT (pos.x - tToX (a) + 6.0f)));
+                onEdit ("S", yToL (pos.y));
+            }
+            else if (dragNode == 4) onEdit ("R", juce::jmax (0.001f, xToT (pos.x - node (3).x + 6.0f)));
+            else if (dragSeg >= 0)
+            {
+                // Up = convex (fast then slow), down = concave.
+                const float dy = (dragStartY - pos.y) / juce::jmax (20.0f, (float) getHeight() * 0.5f);
+                onEdit (dragParam, juce::jlimit (-1.0f, 1.0f, dragStartCurve + dy));
+            }
+        }
+        void mouseUp (const juce::MouseEvent&) override
+        {
+            if (onGesture) onGesture (paramForDrag(), false);
+            dragNode = -1; dragSeg = -1;
+        }
+        void mouseDoubleClick (const juce::MouseEvent& e) override
+        {
+            if (! onEdit) return; // double-click a leg = straight line again
+            const float x = e.position.x;
+            const juce::String which = x < node (1).x ? "CurveA" : (x < node (2).x ? "CurveD" : "CurveR");
+            if (onGesture) onGesture (which, true);
+            onEdit (which, 0.0f);
+            if (onGesture) onGesture (which, false);
+        }
+    };
+
     struct WaveEditor : juce::Component
     {
         struct Pt { float x = 0, y = 0, curve = 0; }; // curve bends the segment AFTER this point
@@ -1431,6 +1596,7 @@ private:
     std::unique_ptr<ButtonAttachment>   modOnAtt;
     int  modSel = 0;                                // 0..2 env, 3..5 lfo
     WaveEditor waveEditor;                          // drawn-LFO wave overlay
+    EnvEditor  envEditor;                           // the selected envelope, as a curve with nodes
     void attachCustomTab();                         // rebind attachments to the selected modulator
     void showEnvMapMenu (const juce::String& paramID);
     juce::String currentModParamId (const juce::String& templateId) const; // modE1A -> modE2A...
@@ -1518,7 +1684,7 @@ private:
     RhythmPanel    rhythmPanel;
     std::unique_ptr<ButtonAttachment>   rhythmOnAtt, rhythmSelfAtt, rhythmDroneAtt, rhythmFbAtt, rhythmMpeAtt, rhythmTempoAtt,
                                         rhythmQTempoAtt, rhythmMonoAtt, rhythmQPulseAtt;
-    std::unique_ptr<SliderAttachment>   rhythmFbDecayAtt;
+    std::unique_ptr<SliderAttachment>   rhythmFbDecayAtt, rhythmVelSlopeAtt;
     std::unique_ptr<ComboBoxAttachment> rhythmModeAtt;
     juce::uint32 lastRhythmGen = 0; // refresh the partial list when the template changes
     juce::uint32 lastSegGen = 0;    // refresh the segment picker on template change

@@ -776,6 +776,21 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // to whichever modulator the selector shows; map any fader via right-click.
     {
         const juce::Colour cCustom (0xff9a7bff);
+        // The envelope is EDITED as a curve with nodes (the faders below stay as the
+        // automation targets, but are no longer shown).
+        envEditor.col = cCustom;
+        envEditor.onGesture = [this] (const juce::String& suffix, bool starting)
+        {
+            if (suffix.isEmpty()) return;
+            if (auto* p = processorRef.apvts.getParameter (currentModParamId ("modE1" + suffix)))
+            { if (starting) p->beginChangeGesture(); else p->endChangeGesture(); }
+        };
+        envEditor.onEdit = [this] (const juce::String& suffix, float v)
+        {
+            if (auto* p = processorRef.apvts.getParameter (currentModParamId ("modE1" + suffix)))
+                p->setValueNotifyingHost (p->convertTo0to1 (v));
+        };
+        addChildComponent (envEditor);
         for (int i = 0; i < 4; ++i)
         {
             configFader (custAdsr[i], "modE1" + juce::String (adsrTxt[i]), custAdsrAtt[i], cCustom, "Custom envelope");
@@ -807,6 +822,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         lfoWaveBox.addItem ("Sine", 1);        lfoWaveBox.addItem ("Triangle", 2);
         lfoWaveBox.addItem ("Saw up", 3);      lfoWaveBox.addItem ("Saw down", 4);
         lfoWaveBox.addItem ("Square", 5);      lfoWaveBox.addItem ("Custom (draw)", 6);
+        lfoWaveBox.addItem ("Random", 7);
         lfoRateModeBox.addItem ("BPM / 2^n", 1);
         lfoRateModeBox.addItem ("Fundamental / 2^n", 2);
         lfoRateModeBox.addItem ("Free Hz", 3);
@@ -1102,6 +1118,13 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     rhythmMonoAtt   = std::make_unique<ButtonAttachment> (processorRef.apvts, "rhythmMono",   rhythmPanel.monoT);
     rhythmQPulseAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "rhythmQPulse", rhythmPanel.qPulseT);
     rhythmFbDecayAtt = std::make_unique<SliderAttachment>(processorRef.apvts, "rhythmFeedbackDecay", rhythmPanel.feedbackS);
+    rhythmVelSlopeAtt = std::make_unique<SliderAttachment>(processorRef.apvts, "rhythmVelSlope", rhythmPanel.velSlopeS);
+    // Modulatable, like every other fader: right-click to route a modulator.
+    addMapListener (rhythmPanel.velSlopeS, "rhythmVelSlope");
+    addMapListener (rhythmPanel.octAllVal, "rhythmOctAll");     // Octave (all pulses)
+    rhythmPanel.velSlopeS.setTooltip (tr (
+        "Velocity SLOPE across the spectrum. 0 = flat (every pulse keeps its own velocity). To the right the HIGH partials start losing velocity; to the left the low ones. At the end of its travel the ramp is vertical and no pulse has any velocity left. Right-click to map a modulator.",
+        "PENDENT de velocitat sobre l'espectre. 0 = plana (cada pols mant\xc3\xa9 la seva). Cap a la dreta els parcials AGUTS comencen a perdre velocitat; cap a l'esquerra els greus. Al final del recorregut la pendent \xc3\xa9s vertical i cap pols conserva velocitat. Clic dret per assignar-hi un modulador."));
     rhythmMpeAtt  = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmMpe",  rhythmPanel.mpeT);
     rhythmTempoAtt = std::make_unique<ButtonAttachment>  (processorRef.apvts, "rhythmTempoSync", rhythmPanel.tempoT);
     rhythmModeAtt = std::make_unique<ComboBoxAttachment> (processorRef.apvts, "rhythmMode", rhythmPanel.modeBox);
@@ -1937,11 +1960,15 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (phaseBox,     { tr ("Aligned", "Alineat"), tr ("Scattered", "Dispers") });
     localise (primeModeBox, { tr ("Limit", "L\xc3\xadmit"), tr ("Whitelist", "Llista") });
     localise (bendBox,      { "\xc2\xb1""2 st", "\xc2\xb1""12 st", "\xc2\xb1""48 st (MPE)" });
+    envEditor.tip = tr (
+        "The selected envelope, drawn as a line with nodes. DRAG A NODE to set the attack time, the decay time + sustain level, or the release time. DRAG THE LINE between two nodes to bend it concave or convex - that curve is exactly what the modulator sends. Double-click a segment for a straight line again.",
+        "L'envolupant seleccionada, dibuixada com una l\xc3\xadnia amb nodes. ARROSSEGA UN NODE per fixar el temps d'atac, el de ca\xc3\xaf""da + nivell de sosteniment, o el d'alliberament. ARROSSEGA LA L\xc3\x8dNIA entre dos nodes per corbar-la c\xc3\xb2ncava o convexa - aquesta corba \xc3\xa9s exactament el que envia el modulador. Doble clic en un tram per tornar a la recta.");
     // The CUSTOM (modulators) tab: its combos and tooltips used to be English-only.
     localise (modSelBox,      { "Env 1", "Env 2", "Env 3", "LFO 1", "LFO 2", "LFO 3" });
     localise (lfoWaveBox,     { tr ("Sine", "Sinus"), tr ("Triangle", "Triangle"),
                                 tr ("Saw up", "Serra amunt"), tr ("Saw down", "Serra avall"),
-                                tr ("Square", "Quadrada"), tr ("Custom (draw)", "Pr\xc3\xb2pia (dibuixa)") });
+                                tr ("Square", "Quadrada"), tr ("Custom (draw)", "Pr\xc3\xb2pia (dibuixa)"),
+                                tr ("Random", "Aleat\xc3\xb2ria") });
     localise (lfoRateModeBox, { tr ("BPM / 2^n", "BPM / 2^n"),
                                 tr ("Fundamental / 2^n", "Fonamental / 2^n"),
                                 tr ("Free Hz", "Hz lliures") });
@@ -3303,7 +3330,20 @@ void FractalAdditiveAudioProcessorEditor::resized()
             for (auto* c : selRowC) c->setVisible (cust);
             lfoWaveEditBtn.setVisible (cust && ! isEnv && lfoWaveBox.getSelectedId() == 6);
             for (int i = 0; i < 4; ++i)
-            { custAdsr[i].setVisible (cust && isEnv); custAdsrLbl[i].setVisible (false); }
+            { custAdsr[i].setVisible (false); custAdsrLbl[i].setVisible (false); } // replaced by the curve editor
+            envEditor.setVisible (cust && isEnv);
+            if (envEditor.isVisible()) // keep the drawn curve in step with the parameters
+            {
+                const auto get = [this] (const char* suffix)
+                {
+                    auto* p = processorRef.apvts.getRawParameterValue (currentModParamId ("modE1" + juce::String (suffix)));
+                    return p != nullptr ? p->load() : 0.0f;
+                };
+                envEditor.a = get ("A");  envEditor.d  = get ("D");  envEditor.s  = get ("S");
+                envEditor.r = get ("R");  envEditor.cA = get ("CurveA");
+                envEditor.cD = get ("CurveD"); envEditor.cR = get ("CurveR");
+                envEditor.repaint();
+            }
             custRangeFader.setVisible (cust);
             lblCustRange.setVisible (cust);
             juce::Component* lfoC[] = { &lfoWaveBox, &lfoRateModeBox, &lfoPhaseModeBox,
@@ -3328,11 +3368,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 in.removeFromTop (3);
                 if (isEnv)
                 {
-                    const int cw = in.getWidth() / 5;
+                    // Curve editor + the Range fader beside it.
                     auto a2 = in;
-                    for (int i = 0; i < 4; ++i) custAdsr[i].setBounds (a2.removeFromLeft (cw));
-                    lblCustRange.setBounds (a2.removeFromTop (13));
-                    custRangeFader.setBounds (a2);
+                    auto rangeCol = a2.removeFromRight (46);
+                    envEditor.setBounds (a2.withTrimmedRight (4));
+                    lblCustRange.setBounds (rangeCol.removeFromTop (13));
+                    custRangeFader.setBounds (rangeCol);
                 }
                 else
                 {
