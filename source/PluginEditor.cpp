@@ -616,7 +616,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     configFader (harmonicsFader, "harmonics", harmonicsAtt, cHarmonic,
                  "Which harmonics sound: Even - All - Odd - Prime. It snaps to those four, but you can stop between two of them (hold Ctrl for free fine setting): there the harmonics that belong to only one of the pair come in at part volume, so the timbre morphs instead of switching.");
     harmonicsFader.setSliderStyle (juce::Slider::LinearHorizontal);
-    harmonicsFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 15);
+    harmonicsFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 86, 15); // fits "Even-All 50%"
     harmonicsFader.setSliderSnapsToMousePosition (false);
     harmonicsFader.normalSensitivity = 240;
     harmonicsFader.textFromValueFunction = [] (double v)

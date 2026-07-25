@@ -63,6 +63,16 @@ public:
     //==========================================================================
     // Microtuning (12-TET / MTS-ESP / Scala). Called from the editor.
     bool loadScalaFile (const juce::File& f, juce::String& errorOut);
+    // Load a .scl straight from text (used by the tuning bank, the generators and
+    // the verifiers). Switches the tuning mode to Scala on success.
+    bool loadScalaText (const juce::String& scl, const juce::String& name, juce::String& errorOut)
+    {
+        if (! tuning.loadScalaString (scl, name, errorOut)) return false;
+        if (auto* p = apvts.getParameter ("tuningMode"))
+            p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
+        tuning.setMode (TuningManager::Mode::Scala);
+        return true;
+    }
     void clearScala();
     juce::String getTuningStatus() const { return tuning.getStatusText(); }
 

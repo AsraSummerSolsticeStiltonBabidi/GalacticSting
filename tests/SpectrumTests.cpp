@@ -9,6 +9,7 @@
 #include "dsp/Spectrum.h"
 #include "dsp/Dissonance.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cmath>
 
@@ -189,6 +190,30 @@ int main()
         }
         check (allOctaves, "every tempered partial sits on the scale grid (a power of 2 here)");
         check (distinct, "coincident partials were merged, not duplicated");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("temper with a DENSE scale (311-EDO): exact grid, no collapse, fast:\n");
+    {
+        SpectrumSettings s; s.baseN = 1; s.reach = 64; s.curveSlope = 1.0f;
+        s.temperToTimbre = true; s.timbrePeriod = 2.0f;
+        s.timbreDegrees.clear();
+        for (int d = 0; d < 311; ++d) s.timbreDegrees.push_back ((float) std::pow (2.0, (double) d / 311.0));
+        const auto t0 = std::chrono::steady_clock::now();
+        auto t = compileSpectrum (s);
+        const double ms = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - t0).count();
+        std::printf ("   (%d partials, %.0f ms)\n", (int) t.partials.size(), ms);
+        check (! t.partials.empty(), "the dense-grid spectrum is not empty");
+        // Every partial must sit on a 311-EDO step (within half a step = 1.93 c).
+        bool onGrid = true;
+        for (const auto& p : t.partials)
+        {
+            const double steps = 311.0 * std::log2 (std::max (1.0e-9, (double) p.ratio));
+            if (std::abs (steps - std::round (steps)) > 0.01) { onGrid = false; break; }
+        }
+        check (onGrid, "every partial lands exactly on a scale degree of the dense grid");
+        check (t.partials.size() > 30, "a fine grid does NOT collapse the spectrum onto a few pitches");
+        check (ms < 2000.0, "the dense-grid snap stays fast (no seconds-long rebuild)");
     }
 
     //--------------------------------------------------------------------------

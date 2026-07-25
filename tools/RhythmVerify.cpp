@@ -549,6 +549,24 @@ int main()
         check (std::abs (raw->load() - base) < 0.02f,
                "a note that starts AND ends inside one block still releases (no stuck sustain)");
 
+        // Setting a knob WHILE it is being modulated must leave the raw value (what
+        // JUCE copies into its tree, and therefore into undo/redo and the saved
+        // project) at exactly the value that was set - not at base+modulation.
+        {
+            juce::MidiBuffer midi; midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+            proc.processBlock (audio, midi);
+            for (int b = 0; b < 6; ++b) { juce::MidiBuffer m2; proc.processBlock (audio, m2); }
+        }
+        check (raw->load() > base + 0.05f, "precondition: the envelope is displacing the value");
+        setParam ("curveSlope", 2.0f);
+        { juce::MidiBuffer midi; proc.processBlock (audio, midi); }
+        check (std::abs (raw->load() - 2.0f) < 0.02f,
+               "a knob set while modulated reads back as the value you set (clean undo/save)");
+        for (int b = 0; b < (int) (0.5 * sr / blk); ++b) { juce::MidiBuffer midi; proc.processBlock (audio, midi); }
+        check (raw->load() > 2.0f + 0.05f, "modulation resumes by itself after the hold window");
+        { juce::MidiBuffer midi; midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0); proc.processBlock (audio, midi); }
+        setParam ("curveSlope", base);
+
         // Unmapping while modulated must hand the parameter straight back.
         {
             juce::MidiBuffer midi; midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
@@ -558,6 +576,124 @@ int main()
         for (int b = 0; b < 3; ++b) { juce::MidiBuffer midi; proc.processBlock (audio, midi); }
         check (std::abs (raw->load() - base) < 0.02f, "unmapping restores the base value (never stuck)");
         { juce::MidiBuffer midi; midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0); proc.processBlock (audio, midi); }
+    }
+
+    // --- run 11: degree ratios are exact for ANY scale size -----------------------
+    // The 128-key MIDI table only holds 128 degree CLASSES, so a scale with more
+    // degrees than that cannot be read back through it. Every degree must still
+    // report period^(d/N) for an N-EDO, including well past 128 degrees.
+    {
+        auto edoScl = [] (int n)
+        {
+            juce::String s;                       // ! file, description, count, !, intervals
+            s << "! test.scl\n" << juce::String (n) << "-EDO test\n " << juce::String (n) << "\n!\n";
+            for (int i = 1; i <= n; ++i) s << " " << juce::String (1200.0 * (double) i / (double) n, 6) << "\n";
+            return s;
+        };
+        for (int n : { 12, 31, 72, 128, 129, 200, 311 })
+        {
+            juce::String err;
+            const bool ok = proc.loadScalaText (edoScl (n), "edo" + juce::String (n), err);
+            double worst = 0.0;
+            int worstD = -1;
+            if (ok)
+                for (int d = 0; d <= n; ++d)
+                {
+                    const double want = std::pow (2.0, (double) d / (double) n);
+                    const double got  = proc.getDegreeRatio (d);
+                    const double errC = std::abs (1200.0 * std::log2 (got / want));
+                    if (errC > worst) { worst = errC; worstD = d; }
+                }
+            std::printf ("== %d-EDO: worst degree error %.4f cents (degree %d) ==\n", n, worst, worstD);
+            check (ok, "the synthetic .scl loads");
+            check (ok && worst < 0.01, "every degree ratio is exact (no period lost, no duplicates)");
+        }
+        proc.clearScala();
+    }
+
+    // --- run 12: FULL STATE ROUND-TRIP -------------------------------------------
+    // Configure everything at once, save through the host API, wipe the plugin
+    // state, restore, and require every parameter AND every side structure to come
+    // back identical - then save again and require the two blobs to match (that
+    // catches state children stacking up on repeated saves).
+    {
+        auto edoScl = [] (int n)
+        {
+            juce::String s;
+            s << "! rt.scl\n" << juce::String (n) << "-EDO\n " << juce::String (n) << "\n!\n";
+            for (int i = 1; i <= n; ++i) s << " " << juce::String (1200.0 * (double) i / (double) n, 6) << "\n";
+            return s;
+        };
+        juce::String err;
+
+        // A state that touches every subsystem.
+        setParam ("baseN", 7.0f);          setParam ("curveSlope", 2.345f);
+        setParam ("harmonics", 2.5f);      setParam ("fractalLevel", 2.7f);
+        setParam ("filterCutoff", 5500.0f); setParam ("masterGain", -6.5f);
+        setParam ("modE2A", 0.234f);       setParam ("modL1Div", 5.0f);
+        setParam ("timbreTemper", 1.0f);
+        proc.getModEngine().unmapAll (0);
+        proc.getModEngine().addTarget (1, "filterCutoff");
+        proc.getModEngine().addTarget (3, "curveSlope");
+        proc.getModEngine().addTarget (3, "masterGain");
+        check (proc.loadScalaText (edoScl (19), "edo19", err), "round-trip: the 19-EDO scale loads");
+        proc.getRhythm().slots[5].partial = 4; proc.getRhythm().slots[5].enabled = true;
+        proc.getRhythm().slots[5].steps = 3;   proc.getRhythm().slots[5].durMs = 77.0f;
+        proc.getRhythm().slots[5].vel = 99;
+        float wave[ModEngine::kWaveN];
+        for (int i = 0; i < ModEngine::kWaveN; ++i) wave[i] = 0.5f + 0.5f * std::sin (0.05f * (float) i);
+        proc.getModEngine().setCustomWave (0, wave);
+
+        std::map<juce::String, float> before;
+        for (auto* ap : proc.getParameters())
+            if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (ap))
+                before[p->paramID] = p->getValue();
+
+        juce::MemoryBlock saved;
+        proc.getStateInformation (saved);
+
+        // Wipe: defaults, no routings, no scale, no rhythm slot, flat wave.
+        for (auto* ap : proc.getParameters())
+            if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (ap))
+                p->setValueNotifyingHost (p->getDefaultValue());
+        for (int m = 0; m < ModEngine::kMods; ++m) proc.getModEngine().unmapAll (m);
+        proc.clearScala();
+        proc.getRhythm().slots[5].partial = -1; proc.getRhythm().slots[5].enabled = false;
+        float flat[ModEngine::kWaveN];
+        for (auto& f : flat) f = 0.0f;
+        proc.getModEngine().setCustomWave (0, flat);
+
+        proc.setStateInformation (saved.getData(), (int) saved.getSize());
+
+        int paramMismatch = 0;
+        juce::String firstBad;
+        for (auto* ap : proc.getParameters())
+            if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (ap))
+                if (std::abs (p->getValue() - before[p->paramID]) > 1.0e-5f)
+                { if (firstBad.isEmpty()) firstBad = p->paramID; ++paramMismatch; }
+        std::printf ("== ROUND-TRIP: %d parameter mismatches%s ==\n", paramMismatch,
+                     firstBad.isEmpty() ? "" : (" (first: " + firstBad + ")").toRawUTF8());
+        check (paramMismatch == 0, "every parameter survives a save/load round-trip");
+
+        check (proc.getModEngine().numTargets (1) == 1
+               && proc.getModEngine().targetId (1, 0) == "filterCutoff", "modulator 2's routing survives");
+        check (proc.getModEngine().numTargets (3) == 2, "modulator 4 keeps BOTH of its targets");
+        check (proc.getScaleDegrees() == 19, "the loaded scale survives");
+        check (proc.getRhythm().slots[5].partial.load() == 4
+               && proc.getRhythm().slots[5].vel.load() == 99, "the rhythm slot survives");
+        bool waveOk = false;
+        if (const float* w = proc.getModEngine().getCustomWave (0))
+        {
+            waveOk = true;
+            for (int i = 0; i < ModEngine::kWaveN; ++i)
+                if (std::abs (w[i] - wave[i]) > 2.0e-4f) { waveOk = false; break; }
+        }
+        check (waveOk, "the drawn LFO wave survives");
+
+        juce::MemoryBlock again;
+        proc.getStateInformation (again);
+        check (again.getSize() == saved.getSize(),
+               "saving twice produces the same state size (no duplicated children)");
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);

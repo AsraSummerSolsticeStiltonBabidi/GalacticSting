@@ -14,8 +14,11 @@
 //     BY THE AUDIO THREAD: any target written last block but not this block gets
 //     its base back (see lastW), so unmapping/switching off can never race the
 //     audio thread into a stuck value. NOTE: the raw atomics DO carry base+mod,
-//     so state capture must re-write the BASE for mapped targets (see
-//     captureState in PluginProcessor.cpp).
+//     so (a) state capture re-writes the BASE for every parameter (captureState in
+//     PluginProcessor.cpp) and (b) while the user is SETTING a mapped parameter,
+//     this engine hands that atomic back to its plain base for ~300 ms - long
+//     enough for JUCE's own 10 Hz flush to copy the intended value (not a snapshot
+//     of the modulation) into the ValueTree and the undo history.
 //
 // Envelopes: ADSR, retriggered by EVERY note-on (so each new key restarts the
 // movement), released when no note is held; a note that starts and ends inside
@@ -37,7 +40,7 @@
 #include <atomic>
 #include <cmath>
 
-class ModEngine
+class ModEngine : private juce::AudioProcessorValueTreeState::Listener
 {
 public:
     static constexpr int kEnvs = 3, kLfos = 3, kMods = kEnvs + kLfos; // 0..2 env, 3..5 lfo
@@ -62,6 +65,13 @@ public:
                 q.hz = rv ("Hz"); q.phaseMode = rv ("PhaseMode"); q.phase = rv ("Phase");
             }
         }
+    }
+
+    ~ModEngine() override
+    {
+        for (auto& m : mods)
+            for (auto& id : m.tgtId)
+                if (id.isNotEmpty()) apvts.removeParameterListener (id, this);
     }
 
     void prepare (double sampleRate)
@@ -96,6 +106,7 @@ public:
                 m.tgtId[(size_t) i] = pid;
                 m.slot[(size_t) i].raw.store (raw);                                   // raw first,
                 m.slot[(size_t) i].param.store (p, std::memory_order_release);        // param last
+                if (mapCount (pid) == 1) { watchAdd (pid, p); apvts.addParameterListener (pid, this); }
                 return;
             }
     }
@@ -110,6 +121,7 @@ public:
                 m.slot[(size_t) i].param.store (nullptr); // audio skips null slots; it
                 m.slot[(size_t) i].raw.store (nullptr);   // restores the base next block
                 m.tgtId[(size_t) i].clear();
+                if (mapCount (pid) == 0) { apvts.removeParameterListener (pid, this); watchRemove (pid); }
                 return;
             }
     }
@@ -120,9 +132,11 @@ public:
         auto& m = mods[(size_t) mod];
         for (int i = 0; i < kMaxTargets; ++i)
         {
+            const auto pid = m.tgtId[(size_t) i];
             m.slot[(size_t) i].param.store (nullptr);
             m.slot[(size_t) i].raw.store (nullptr);
             m.tgtId[(size_t) i].clear();
+            if (pid.isNotEmpty() && mapCount (pid) == 0) { apvts.removeParameterListener (pid, this); watchRemove (pid); }
         }
     }
     int numTargets (int mod) const
@@ -176,6 +190,7 @@ public:
                        double fundamental, double bpm, double ppq)
     {
         if (numSamples <= 0) return; // an empty block must not freeze the envelopes at 0
+        lastBlock = numSamples;      // used to size the parameter-hold window
         const bool newNote = noteOnsSoFar != noteSeen;
         noteSeen = noteOnsSoFar;
         const double dt = (double) numSamples / sr;
@@ -277,6 +292,20 @@ public:
                 else if (nW < kMods * kMaxTargets) writes[nW++] = { p, raw, contrib };
             }
         }
+        // A target the user is CURRENTLY setting is held at its plain base for a
+        // moment (see parameterChanged), so the value JUCE stores in its tree - and
+        // therefore the value undo/redo and the saved project see - is exactly the
+        // one that was set, never a snapshot of the modulation riding on it.
+        for (auto& h : holds)
+        {
+            if (h.blocks.load() <= 0) continue;
+            h.blocks.fetch_sub (1);
+            auto* hp = h.param.load();
+            if (hp == nullptr) continue;
+            for (int k = 0; k < nW; ++k)
+                if (writes[k].p == hp) writes[k].sum = 0.0f;
+            if (h.blocks.load() <= 0) h.param.store (nullptr); // free the slot
+        }
         for (int k = 0; k < nW; ++k)
         {
             const float norm = juce::jlimit (0.0f, 1.0f, writes[k].p->getValue() + writes[k].sum);
@@ -297,6 +326,54 @@ public:
     }
 
 private:
+    // How many slots currently hold this id (routingLock is held by the caller).
+    // The parameter listener is added when the FIRST slot takes an id and removed
+    // when the LAST one lets it go.
+    int mapCount (const juce::String& pid) const
+    {
+        int n = 0;
+        for (auto& m : mods)
+            for (auto& id : m.tgtId)
+                if (id == pid) ++n;
+        return n;
+    }
+
+    // The user (or the host) just moved a MAPPED parameter. JUCE's APVTS copies the
+    // parameter's raw atomic into its ValueTree ~100 ms later, THROUGH the undo
+    // manager - and that atomic is where this engine writes base+modulation. So for
+    // a short window we hand the atomic back to its plain base value: what gets
+    // stored, undone and shown is then exactly the value you set, never a snapshot
+    // of the modulation. The modulation resumes by itself right after.
+    // May be called from the AUDIO thread (host automation), so it only does atomic
+    // loads/stores and a linear scan over ids we already hold - no map lookup, no
+    // allocation.
+    void parameterChanged (const juce::String& id, float) override
+    {
+        juce::RangedAudioParameter* p = nullptr;
+        for (auto& w : watched)
+            if (w.p.load() != nullptr && w.id == id) { p = w.p.load(); break; }
+        if (p == nullptr) return;
+        for (auto& h : holds)
+        {
+            juce::RangedAudioParameter* expected = nullptr;
+            if (h.param.load() == p || h.param.compare_exchange_strong (expected, p))
+            { h.blocks.store (holdBlocks()); return; }
+        }
+    }
+
+    // id -> parameter cache for the listener above (message thread maintains it).
+    void watchAdd (const juce::String& pid, juce::RangedAudioParameter* p)
+    {
+        for (auto& w : watched)
+            if (w.p.load() == nullptr) { w.id = pid; w.p.store (p); return; }
+    }
+    void watchRemove (const juce::String& pid)
+    {
+        for (auto& w : watched)
+            if (w.p.load() != nullptr && w.id == pid) { w.p.store (nullptr); w.id.clear(); return; }
+    }
+    int holdBlocks() const noexcept { return juce::jlimit (1, 4096, (int) (0.3 * sr / std::max (1.0, (double) lastBlock))); }
+
     struct Slot
     {
         std::atomic<juce::RangedAudioParameter*> param { nullptr };
@@ -347,6 +424,11 @@ private:
     struct Last { juce::RangedAudioParameter* p = nullptr; std::atomic<float>* raw = nullptr; };
     Last lastW[kMods * kMaxTargets];
     int  nLastW = 0;
+    struct Hold { std::atomic<juce::RangedAudioParameter*> param { nullptr }; std::atomic<int> blocks { 0 }; };
+    struct Watch { juce::String id; std::atomic<juce::RangedAudioParameter*> p { nullptr }; };
+    Watch watched[kMods * kMaxTargets];  // id -> param, for the RT-safe listener
+    Hold holds[16];              // parameters temporarily handed back to their base
+    int  lastBlock = 256;        // last block size, for the hold duration
     std::array<std::atomic<bool>, kLfos> rateLimited {};
     std::array<std::array<float, kWaveN>, kLfos> customWave {};
     double sr = 44100.0;
