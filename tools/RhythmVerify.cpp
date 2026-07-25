@@ -786,6 +786,52 @@ int main()
         proc.clearScala();
     }
 
+    // --- run 14: keyboard scale editing (add / edit / delete a degree) ------------
+    {
+        std::printf ("keyboard scale editing:\n");
+        juce::String err;
+        check (proc.loadScalaText ("! 5 equal steps\ntest\n 5\n!\n 240.0\n 480.0\n 720.0\n 960.0\n 2/1\n",
+                                   "test", err), "a 5-degree test scale loads");
+        check (proc.getScaleDegrees() == 5, "it has 5 degrees per period");
+
+        // Ctrl+click's window types the interval against 0 - a ratio stays a ratio.
+        check (proc.addNoteToTuning (1.5, err, "3/2"), "a typed 3/2 is added");
+        check (proc.getScaleDegrees() == 6, "the scale grew by one degree");
+        {
+            long long p = 0, q = 0;
+            bool found = false;
+            for (int d = 1; d <= 6 && ! found; ++d)
+                found = proc.getDegreeIsRational (d, p, q) && p == 3 && q == 2;
+            check (found, "and it is stored as the exact ratio 3/2, not as cents");
+        }
+        check (! proc.addNoteToTuning (1.5, err, "3/2"), "adding the same pitch twice is refused");
+
+        // A spec outside the period folds in, and is then written folded.
+        check (proc.addNoteToTuning (2.5, err, "5/2"), "a 5/2 folds into the octave");
+        {
+            long long p = 0, q = 0; bool found = false;
+            for (int d = 1; d <= 7 && ! found; ++d)
+                found = proc.getDegreeIsRational (d, p, q) && p == 5 && q == 4;
+            check (found, "and lands as 5/4, not as the unfolded 5/2");
+        }
+
+        // Delete: the degree leaves the scale, so it is gone from every period.
+        const double gone = proc.getDegreeRatio (2);
+        check (proc.deleteTuningDegree (2, err), "degree 2 is deleted");
+        check (proc.getScaleDegrees() == 6, "the scale shrank by exactly one degree");
+        {
+            bool still = false;
+            for (int d = 1; d <= 6; ++d)
+                if (std::abs (proc.getDegreeRatio (d) - gone) < 1.0e-9) still = true;
+            check (! still, "that pitch class is gone");
+        }
+        check (std::abs (proc.getDegreeRatio (proc.getScaleDegrees()) - 2.0) < 1.0e-9,
+               "and the period is still the octave (kept across every repetition)");
+        check (! proc.deleteTuningDegree (0, err), "the tonic cannot be deleted");
+        check (! proc.deleteTuningDegree (proc.getScaleDegrees(), err), "nor can the period");
+        proc.clearScala();
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

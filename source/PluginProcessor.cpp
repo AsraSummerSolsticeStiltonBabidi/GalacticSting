@@ -1185,7 +1185,8 @@ bool FractalAdditiveAudioProcessor::loadSpectrumFromScl (const juce::String& scl
     return true;
 }
 
-bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce::String& errorOut)
+bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce::String& errorOut,
+                                                     const juce::String& exactText)
 {
     const int    D      = juce::jmax (1, tuning.degreesPerPeriod());
     const double period = getDegreeRatio (D);
@@ -1217,8 +1218,45 @@ bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce
             errorOut = "That pitch is already a degree of the scale.";
             return false;
         }
+    // The typed spec is kept verbatim when it IS the folded pitch. When it is not
+    // ("3/1" under an octave period), a RATIONAL spec is folded as a fraction so it
+    // still lands as an exact ratio (3/1 -> 3/2), never as rounded cents.
+    juce::String newText = juce::String (newCents, 5);
+    if (exactText.isNotEmpty())
+    {
+        double tr_ = 0.0; TuningManager::DegreeSrc s{};
+        if (TuningManager::parsePitchSpec (exactText, tr_, s))
+        {
+            if (std::abs (1200.0 * std::log2 (juce::jmax (1.0e-9, tr_)) - newCents) < 1.0e-6)
+                newText = exactText.trim();
+            else if (long long ppL = 1, pqL = 1;
+                     s.rational && s.q > 0 && getDegreeIsRational (D, ppL, pqL) && ppL > pqL && pqL > 0)
+            {
+                long long np = s.p, nq = s.q;
+                bool ok = true;
+                const auto mul = [&ok] (long long& a, long long b)
+                {
+                    if (b == 0 || std::llabs (a) > (long long) 3'000'000'000LL / std::llabs (b)) ok = false;
+                    else a *= b;
+                };
+                // Fold by whole periods, as fractions - overflow ends the attempt.
+                for (int guard = 0; ok && guard < 64 && (double) np * (double) pqL >= (double) nq * (double) ppL; ++guard)
+                    { mul (nq, ppL); mul (np, pqL); }
+                for (int guard = 0; ok && guard < 64 && (double) np < (double) nq; ++guard)
+                    { mul (np, ppL); mul (nq, pqL); }
+                if (ok)
+                {
+                    long long a = np < 0 ? -np : np, b = nq < 0 ? -nq : nq;
+                    while (b != 0) { const long long t = a % b; a = b; b = t; }
+                    if (a > 1) { np /= a; nq /= a; }
+                    if (std::abs (1200.0 * std::log2 ((double) np / (double) nq) - newCents) < 1.0e-6)
+                        newText = juce::String (np) + "/" + juce::String (nq);
+                }
+            }
+        }
+    }
     if (r > 1.0 + 1.0e-9)
-        degs.push_back ({ r, juce::String (newCents, 5) });
+        degs.push_back ({ r, newText });
     std::sort (degs.begin(), degs.end(), [] (const Deg& a, const Deg& b) { return a.ratio < b.ratio; });
 
     long long pp = 1, pq = 1;
@@ -1274,6 +1312,45 @@ bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::St
                                : juce::String (1200.0 * std::log2 (juce::jmax (1.0e-9, getDegreeRatio (d))), 5))
                 << "\n";
         }
+    }
+    if (! tuning.loadScalaString (scl, name, errorOut))
+        return false;
+    if (auto* p = apvts.getParameter ("tuningMode"))
+        p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
+    tuning.setMode (TuningManager::Mode::Scala);
+    clearSegmentSource();
+    lastDissScl = scl; lastDissName = name;
+    bankAutoAdd (name, scl);
+    return true;
+}
+
+// Right-click -> Delete: the degree leaves the scale, so the key is gone from
+// EVERY repetition of the period (a scale degree is a pitch class, not one key).
+bool FractalAdditiveAudioProcessor::deleteTuningDegree (int degree, juce::String& errorOut)
+{
+    const int D = juce::jmax (1, tuning.degreesPerPeriod());
+    if (degree < 1 || degree >= D)
+    {
+        errorOut = "The tonic and the period cannot be deleted - delete any degree between them.";
+        return false;
+    }
+    if (D < 2)
+    {
+        errorOut = "A scale needs at least one degree per period.";
+        return false;
+    }
+
+    juce::String scl;
+    const auto name = (tuning.getScalaName().isNotEmpty() ? tuning.getScalaName() : juce::String ("scale")) + "-";
+    scl << "! Edited in Fibló Galàctic (degree " << degree << " deleted)\n" << name << "\n " << D - 1 << "\n!\n";
+    for (int d = 1; d <= D; ++d)   // d == D is the period line, always kept
+    {
+        if (d == degree) continue;
+        long long p = 1, q = 1;
+        scl << " " << (getDegreeIsRational (d, p, q)
+                           ? juce::String (p) + "/" + juce::String (q)
+                           : juce::String (1200.0 * std::log2 (juce::jmax (1.0e-9, getDegreeRatio (d))), 5))
+            << "\n";
     }
     if (! tuning.loadScalaString (scl, name, errorOut))
         return false;

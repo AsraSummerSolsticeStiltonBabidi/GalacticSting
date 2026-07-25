@@ -312,8 +312,12 @@ public:
     bool loadSpectrumFromScl (const juce::String& sclText);
     bool activeSclHasPreset() const { return presetFromScl (tuning.getScalaSource()).isValid(); }
     juce::String activeSclSource() const { return tuning.getScalaSource(); }
-    bool addNoteToTuning  (double ratioFromTonic, juce::String& errorOut);   // ctrl+click: folded into the period, sorted
+    // ctrl+click: folded into the period, sorted. exactText, when given, is the
+    // spec the user typed, kept verbatim so a ratio stays a ratio in the .scl.
+    bool addNoteToTuning  (double ratioFromTonic, juce::String& errorOut,
+                           const juce::String& exactText = {});
     bool editTuningDegree (int degree, const juce::String& valueText, juce::String& errorOut); // right-click (Scala mode)
+    bool deleteTuningDegree (int degree, juce::String& errorOut); // right-click -> Delete: gone from every period
     bool saveCurrentTuningScl (const juce::File& f, juce::String& errorOut); // Tuning box "Save .scl"
 
     // Per-degree Sethares dissonance of the ACTIVE tuning (any mode - 12ED2, MTS,

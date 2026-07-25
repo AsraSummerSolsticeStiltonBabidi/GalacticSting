@@ -1726,19 +1726,22 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             juce::MessageBoxIconType::NoIcon, this);
         w->addTextEditor ("v", pre);
         w->addButton (tr ("OK", "OK"), 1, juce::KeyPress (juce::KeyPress::returnKey));
+        // Delete takes the degree out of the scale, so the key disappears from
+        // EVERY period, not just the one that was right-clicked.
+        w->addButton (tr ("Delete", "Esborra"), 2);
         w->addButton (tr ("Cancel", "Cancel\xc2\xb7la"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
         w->enterModalState (true, juce::ModalCallbackFunction::create (
             [this, safe = juce::Component::SafePointer<juce::AlertWindow> (w), deg] (int r)
             {
                 if (safe == nullptr) return;
                 const auto txt = safe->getTextEditorContents ("v");
-                if (r == 1)
-                {
-                    juce::String err;
-                    if (! processorRef.editTuningDegree (deg, txt, err))
-                        juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                            tr ("Edit degree", "Edita el grau"), err, this);
-                }
+                juce::String err;
+                if (r == 1 && ! processorRef.editTuningDegree (deg, txt, err))
+                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                        tr ("Edit degree", "Edita el grau"), err, this);
+                if (r == 2 && ! processorRef.deleteTuningDegree (deg, err))
+                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                        tr ("Delete degree", "Esborra el grau"), err, this);
                 refocus();
             }), true);
     };
@@ -1752,11 +1755,37 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         if (! (f0 > 0.0) || ! (fa > 0.0)) return;
         if (! (fb > fa)) fb = fa * 1.0594630943592953; // top edge: semitone-ish step
         const double f = fa * std::pow (fb / fa, frac);
-        juce::String err;
-        if (! processorRef.addNoteToTuning (f / f0, err))
-            juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                tr ("Add note", "Afegeix nota"), err, this);
-        refocus();
+        // The same window as Edit, minus Delete: the spot that was clicked is only
+        // the STARTING value - the interval against 0 is typed, exactly.
+        const auto pre = juce::String (1200.0 * std::log2 (juce::jmax (1.0e-9, f / f0)), 3);
+        auto* w = new juce::AlertWindow (tr ("Add note", "Afegeix nota"),
+            tr ("Interval from 0: cents with a decimal point (\"702.0\") or a ratio (\"3/2\"). It joins every period.",
+                "Interval respecte 0: cents amb punt decimal (\"702.0\") o un ratio (\"3/2\"). S'afegeix a tots els per\xc3\xado" "des."),
+            juce::MessageBoxIconType::NoIcon, this);
+        w->addTextEditor ("v", pre);
+        w->addButton (tr ("OK", "OK"), 1, juce::KeyPress (juce::KeyPress::returnKey));
+        w->addButton (tr ("Cancel", "Cancel\xc2\xb7la"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+        w->enterModalState (true, juce::ModalCallbackFunction::create (
+            [this, safe = juce::Component::SafePointer<juce::AlertWindow> (w)] (int r)
+            {
+                if (safe == nullptr) return;
+                const auto txt = safe->getTextEditorContents ("v").trim();
+                if (r == 1)
+                {
+                    double ratio = 0.0;
+                    TuningManager::DegreeSrc src;
+                    juce::String err;
+                    if (! TuningManager::parsePitchSpec (txt, ratio, src) || ! (ratio > 0.0))
+                        err = tr ("Invalid value. Use cents with a decimal point (\"702.0\") or a ratio (\"3/2\").",
+                                  "Valor inv\xc3\xa0lid. Fes servir cents amb punt decimal (\"702.0\") o un ratio (\"3/2\").");
+                    else
+                        processorRef.addNoteToTuning (ratio, err, txt);
+                    if (err.isNotEmpty())
+                        juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                            tr ("Add note", "Afegeix nota"), err, this);
+                }
+                refocus();
+            }), true);
     };
     // Hover dissonance: every other key shows its Sethares roughness AGAINST the
     // hovered one, coloured green (consonant) -> red (rough) like the interval list.
