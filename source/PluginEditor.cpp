@@ -339,16 +339,22 @@ namespace
         // the same rule as the keyboard keys and the title letters.
         static constexpr float kAdsrThumbR = 20.0f; // named (ADSR) thumb radius
         static constexpr float kThumbR     = 13.0f; // every other fader's thumb radius
+        // Never taller than the fader's own row minus a margin, so a thin slider (the
+        // rhythm panel's 22 px slot faders) still shows its track either side.
         static float thumbRadiusFor (juce::Slider& s)
-        { return s.getName().isNotEmpty() ? kAdsrThumbR : kThumbR; }
+        {
+            const float r = s.getName().isNotEmpty() ? kAdsrThumbR : kThumbR;
+            const bool horiz = s.getSliderStyle() == juce::Slider::LinearHorizontal;
+            const float cross = horiz ? (float) s.getHeight() : (float) s.getWidth();
+            return cross > 8.0f ? juce::jmin (r, cross * 0.5f - 2.0f) : r;
+        }
         int getSliderThumbRadius (juce::Slider& s) override
         {
             // Clamped to half the cross-dimension like V4 does, so a short fader keeps
             // its usable travel instead of losing 26 px of it to the thumb.
-            if (s.getSliderStyle() == juce::Slider::LinearVertical)
-                return (int) juce::jmin (thumbRadiusFor (s), (float) s.getWidth() * 0.5f);
-            if (s.getSliderStyle() == juce::Slider::LinearHorizontal)
-                return (int) juce::jmin (thumbRadiusFor (s), (float) s.getHeight() * 0.5f);
+            if (s.getSliderStyle() == juce::Slider::LinearVertical
+                || s.getSliderStyle() == juce::Slider::LinearHorizontal)
+                return (int) thumbRadiusFor (s);
             return juce::LookAndFeel_V4::getSliderThumbRadius (s);
         }
 
@@ -619,14 +625,15 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     harmonicsFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 86, 15); // fits "Even-All 50%"
     harmonicsFader.setSliderSnapsToMousePosition (false);
     harmonicsFader.normalSensitivity = 240;
-    harmonicsFader.textFromValueFunction = [] (double v)
+    harmonicsFader.textFromValueFunction = [this] (double v)
     {
-        static const char* names[] = { "Even", "All", "Odd", "Prime" };
+        const juce::String names[] = { tr ("Even", "Parells"), tr ("All", "Tots"),
+                                       tr ("Odd", "Senars"),   tr ("Prime", "Primers") };
         const int lo = juce::jlimit (0, 3, (int) std::floor (v));
         const double t = v - (double) lo;
-        if (t < 0.01) return juce::String (names[lo]);
-        if (t > 0.99) return juce::String (names[juce::jmin (3, lo + 1)]);
-        return juce::String (names[lo]) + "-" + juce::String (names[juce::jmin (3, lo + 1)])
+        if (t < 0.01) return names[lo];
+        if (t > 0.99) return names[juce::jmin (3, lo + 1)];
+        return names[lo] + "-" + names[juce::jmin (3, lo + 1)]
              + " " + juce::String ((int) std::lround (t * 100.0)) + "%";
     };
     // The attachment installs a NUMERIC text parser, so typing one of the names
@@ -641,7 +648,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         return juce::jlimit (0.0, 3.0, s.getDoubleValue());
     };
     harmonicsFader.updateText();
-    configFader (slopeFader, "curveSlope", slopeAtt, cHarmonic, "Amplitude roll-off. 0 = flat/bright, 1 = saw, 2 = triangle.  (Also thins the highs in Timbre mode.)");
+    configFader (slopeFader, "curveSlope", slopeAtt, cHarmonic, "Amplitude roll-off. 0 = flat/bright, 1 = saw, 2 = triangle.  (Also thins the highs when a Custom Engine scale is the spectrum.)");
     // "Range" (spectrum hard-cut) removed from the UI - redundant with the Filter.
     // The parameter defaults to 10 (= no cut), so it has no effect.
     configGroup (gFractal, cFractal);
@@ -1819,8 +1826,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Sweeps which harmonic numbers sound: Even (1,2,4,6...) - All - Odd (1,3,5...) - Prime (1,2,3,5,7...). It snaps magnetically to those four, but you can stop BETWEEN two of them (hold Ctrl for a free setting): there the harmonics belonging to only one of the pair sound at part volume, so the timbre morphs continuously. The fundamental is always kept so the played pitch stays. A harmonic must ALSO pass Prime Control - both filters apply at once, and if together they exclude everything the sound is silent.",
         "Escombra quins n\xc3\xbameros d'harm\xc3\xb2nic sonen: Parells (1,2,4,6...) - Tots - Senars (1,3,5...) - Primers (1,2,3,5,7...). S'imanta a aquests quatre, per\xc3\xb2 pots quedar-te ENTRE dos (mant\xc3\xa9n Ctrl per a un valor lliure): all\xc3\xa0 els harm\xc3\xb2nics que nom\xc3\xa9s pertanyen a un dels dos sonen a volum parcial, aix\xc3\xad que el timbre es transforma de manera cont\xc3\xadnua. El fonamental sempre es mant\xc3\xa9 perqu\xc3\xa8 quedi el to tocat. L'harm\xc3\xb2nic TAMB\xc3\x89 ha de passar el Control de primers - els dos filtres s'apliquen alhora, i si entre tots dos ho exclouen tot, no sona res."));
     slopeFader.setTooltip (tr (
-        "How fast higher partials lose volume: 0 = all equal (brightest), 1 = like a saw (1/n), 2 = like a triangle, higher = darker. Also shapes the stacked scale in Timbre mode.",
-        "Com de r\xc3\xa0pid perden volum els parcials aguts: 0 = tots iguals (m\xc3\xa9s brillant), 1 = com una serra (1/n), 2 = com un triangle, m\xc3\xa9s = m\xc3\xa9s fosc. Tamb\xc3\xa9 d\xc3\xb3na forma a l'escala apilada en mode Timbre."));
+        "How fast higher partials lose volume: 0 = all equal (brightest), 1 = like a saw (1/n), 2 = like a triangle, higher = darker. Also shapes the stacked scale when a Custom Engine scale is the spectrum.",
+        "Com de r\xc3\xa0pid perden volum els parcials aguts: 0 = tots iguals (m\xc3\xa9s brillant), 1 = com una serra (1/n), 2 = com un triangle, m\xc3\xa9s = m\xc3\xa9s fosc. Tamb\xc3\xa9 d\xc3\xb3na forma a l'escala apilada quan una escala del Motor propi \xc3\xa9s l'espectre."));
     fractalFader.setTooltip (tr (
         "Replaces each partial with a scaled copy of the whole spectrum, this many levels deep. 1 = off. Continuous: between whole levels the next level's new partials fade in from low to high. Snaps to the 4 marked levels - hold Ctrl for free fine setting.",
         "Substitueix cada parcial per una c\xc3\xb2pia escalada de tot l'espectre, tants nivells com indiquis. 1 = apagat. Continu: entre nivells sencers els parcials nous del nivell seg\xc3\xbc""ent entren de greu a agut. S'imanta als 4 nivells marcats - mant\xc3\xa9n Ctrl per ajust fi lliure."));
@@ -1872,8 +1879,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     loadTimbreButton.setTooltip (tr (
         "Load a .scl/.ascl whose intervals become the PARTIALS of the sound, replacing the harmonic engine. Slope, Fractal, Range and Reps still shape it; the greyed-out controls do not apply.",
         "Carrega un .scl/.ascl els intervals del qual passen a ser els PARCIALS del so, substituint el motor harm\xc3\xb2nic. Pendent, Fractal, Rang i Reps encara hi actuen; els controls en gris no apliquen."));
-    clearTimbreButton.setTooltip (tr ("Custom engine ON/OFF. Off keeps the loaded scale - nothing is erased; switch back on any time.",
-                                      "Apaga el mode Timbre i torna al motor harm\xc3\xb2nic."));
+    clearTimbreButton.setTooltip (tr ("Custom engine ON/OFF. Off keeps the loaded scale - nothing is erased; switch it back on any time.",
+                                      "Motor propi ON/OFF. En apagar-lo NO s'esborra l'escala carregada; el pots tornar a encendre quan vulguis."));
     timbreRepeatsFader.setTooltip (tr (
         "How many periods of the scale are stacked as partials. More repeats = the timbre reaches higher in the spectrum.",
         "Quants per\xc3\xado""des de l'escala s'apilen com a parcials. M\xc3\xa9s repeticions = el timbre arriba m\xc3\xa9s amunt de l'espectre."));
@@ -1911,6 +1918,21 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (phaseBox,     { tr ("Aligned", "Alineat"), tr ("Scattered", "Dispers") });
     localise (primeModeBox, { tr ("Limit", "L\xc3\xadmit"), tr ("Whitelist", "Llista") });
     localise (bendBox,      { "\xc2\xb1""2 st", "\xc2\xb1""12 st", "\xc2\xb1""48 st (MPE)" });
+    // The CUSTOM (modulators) tab: its combos and tooltips used to be English-only.
+    localise (modSelBox,      { "Env 1", "Env 2", "Env 3", "LFO 1", "LFO 2", "LFO 3" });
+    localise (lfoWaveBox,     { tr ("Sine", "Sinus"), tr ("Triangle", "Triangle"),
+                                tr ("Saw up", "Serra amunt"), tr ("Saw down", "Serra avall"),
+                                tr ("Square", "Quadrada"), tr ("Custom (draw)", "Pr\xc3\xb2pia (dibuixa)") });
+    localise (lfoRateModeBox, { tr ("BPM / 2^n", "BPM / 2^n"),
+                                tr ("Fundamental / 2^n", "Fonamental / 2^n"),
+                                tr ("Free Hz", "Hz lliures") });
+    localise (lfoPhaseModeBox,{ tr ("Restart each note", "Reinicia a cada nota"),
+                                tr ("Project transport", "Transport del projecte") });
+    modUnmapBtn.setButtonText  (tr ("Unmap", "Desassigna"));
+    lfoWaveEditBtn.setButtonText (tr ("Draw", "Dibuixa"));
+    rhythmPanel.helpB.setButtonText (tr ("How to route", "Com encaminar"));
+    chordList.emptyText = tr ("Press Find to search.\n\xe2\x96\xb6 hears a chord\ndouble-click loads it as the scale",
+                              "Prem Troba per cercar.\n\xe2\x96\xb6 escolta un acord\ndoble clic el carrega com a escala");
     localise (specModeBox,  { tr ("Chords based on beating", "Acords basats en batec"),
                               tr ("Dyads based on beating", "D\xc3\xad""ades basades en batec"),
                               tr ("From spectrum's segment", "Del segment de l'espectre") });
@@ -2289,8 +2311,8 @@ void FractalAdditiveAudioProcessorEditor::saveDissonanceScl()
     {
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon,
             tr ("Save scale", "Desar escala"),
-            tr ("Generate a dissonance scale first (the 'Diss. tune' button).",
-                "Primer genera una escala de dissonancia (bot\xc3\xb3 'Afina diss.')."), this);
+            tr ("Generate a scale first - press 'Find'.",
+                "Primer genera una escala - prem 'Troba'."), this);
         return;
     }
 
@@ -2623,26 +2645,6 @@ void FractalAdditiveAudioProcessorEditor::configCombo (juce::ComboBox& b, const 
     // Choice params are modulable too (the raw write snaps to a valid index), so
     // every combo gets the same right-click routing menu as the faders.
     addMapListener (b, paramID, paramID.startsWith ("modE1") || paramID.startsWith ("modL1"));
-}
-
-void FractalAdditiveAudioProcessorEditor::layoutFaders (juce::GroupComponent& g, juce::Rectangle<int> area, juce::Colour,
-                                                        std::initializer_list<juce::Slider*> faders,
-                                                        std::initializer_list<juce::Label*> labels)
-{
-    g.setBounds (area.reduced (3));
-    auto in = area.reduced (3).reduced (5, 4); in.removeFromTop (20); // clear the title band
-    const int n = (int) faders.size();
-    const int cw = in.getWidth() / juce::jmax (1, n);
-    auto fit = faders.begin(); auto lit = labels.begin();
-    for (int i = 0; i < n; ++i, ++fit, ++lit)
-    {
-        auto c = in.removeFromLeft (cw);
-        // Named faders (A/D/S/R) carry the letter inside the thumb -> no label above.
-        const bool inThumb = (*fit)->getName().isNotEmpty();
-        (*lit)->setVisible (! inThumb);
-        if (! inThumb) (*lit)->setBounds (c.removeFromTop (13));
-        (*fit)->setBounds (c);
-    }
 }
 
 //==============================================================================
@@ -3797,9 +3799,9 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     juce::String meter;
     if (templ == 0)
     {
-        // Empty template = the selection + prime rules (intersected) left nothing.
-        meter = tr ("0 partials \xe2\x80\x94 the selection / prime filters leave nothing to sound",
-                    "0 parcials \xe2\x80\x94 la selecci\xc3\xb3 / els filtres de primers no deixen sonar res");
+        // Empty template = the Harmonics + prime rules (intersected) left nothing.
+        meter = tr ("0 partials \xe2\x80\x94 the Harmonics / Prime filters leave nothing to sound",
+                    "0 parcials \xe2\x80\x94 els filtres d'Harm\xc3\xb2nics / de primers no deixen sonar res");
         meterLabel.setColour (juce::Label::textColourId, juce::Colours::orange);
     }
     else
@@ -3826,10 +3828,17 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     }
     tuningNameLabel.setText (sname, juce::dontSendNotification);
 
-    juce::String tms = processorRef.isTimbreActive()
-        ? "Custom: " + processorRef.getTimbreName() + "  (" + juce::String (processorRef.getTimbreNoteCount())
-          + tr (" notes/period)", " notes/per\xc3\xadode)")
-        : tr ("Custom engine off", "Motor propi apagat");
+    // Say what is loaded even while the engine is OFF - switching it off no longer
+    // discards the scale, so the box must not look empty.
+    juce::String tms;
+    if (processorRef.isTimbreActive())
+        tms = "Custom: " + processorRef.getTimbreName() + "  (" + juce::String (processorRef.getTimbreNoteCount())
+            + tr (" notes/period)", " notes/per\xc3\xadode)");
+    else if (processorRef.timbreLoaded())
+        tms = tr ("Off - ", "Apagat - ") + processorRef.getTimbreName()
+            + tr (" still loaded", " segueix carregat");
+    else
+        tms = tr ("Custom engine off", "Motor propi apagat");
     timbreStatusLabel.setText (tms, juce::dontSendNotification);
 
     // Recent .scl buttons (only in Scala mode - resized() also gates them).
@@ -3843,7 +3852,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     }
 
     // Hide the "undo" buttons when there is nothing to undo: Reset only matters
-    // away from plain 12-TET, Off only when Timbre mode is actually on. Relayout
+    // away from plain 12-TET, the Custom-Engine On/Off only when a scale is loaded. Relayout
     // so the Load button expands to fill the freed space. The tuning MODE is packed
     // in too: Recent/Tuning-bank/Pitch-bend visibility depends on it.
     const bool resetVis = processorRef.getTuningMode() != 0 || processorRef.tuningHasScala();

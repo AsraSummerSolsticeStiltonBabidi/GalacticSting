@@ -35,8 +35,6 @@ private:
     void configCombo (juce::ComboBox&, const juce::String& paramID,
                       std::unique_ptr<ComboBoxAttachment>&, juce::Colour, const juce::String& tooltip);
     void makeLabel (juce::Label&, juce::Colour);
-    void layoutFaders (juce::GroupComponent&, juce::Rectangle<int>, juce::Colour,
-                       std::initializer_list<juce::Slider*>, std::initializer_list<juce::Label*>);
     void refocus();
     void reclaimFocusUnlessTyping(); // regrab keyboard focus after a window switch (not while typing)
     void pollComputerKeyboard(); // reconcile held keys against the real key state
@@ -262,6 +260,7 @@ private:
         struct Row { std::vector<juce::String> notes; double value = 0.0; };
         std::vector<Row> rows;
         juce::String tip;
+        juce::String emptyText { "Press Find to search.\n\xe2\x96\xb6 hears a chord\ndouble-click loads it as the scale" };
         std::function<void (int)> onPlay, onLoad;
         static constexpr int kRowH = 22, kRankW = 30, kPlayW = 22, kNoteW = 62;
         int contentHeight() const { return (int) rows.size() * kRowH; }
@@ -286,7 +285,7 @@ private:
             {
                 g.setColour (juce::Colour (0xff8f96a8));
                 g.setFont (juce::Font (juce::FontOptions (12.5f)));
-                g.drawFittedText ("Transmute to search.\n\xe2\x96\xb6 hears a chord\ndouble-click loads it as the scale",
+                g.drawFittedText (emptyText,
                                   getLocalBounds().reduced (8), juce::Justification::centred, 4, 0.8f);
                 return;
             }
@@ -511,6 +510,10 @@ private:
         static double parseRatioSpec (juce::String t)
         {
             t = t.trim();
+            // Accept BOTH "700c" and the "700\xc2\xa2" the rest of the UI prints: without
+            // the cent sign a pasted-back value was read as a linear RATIO of 700.
+            if (t.endsWith (juce::String::fromUTF8 ("\xc2\xa2")))
+                t = t.dropLastCharacters (1).trim() + "c";
             if (t.endsWithIgnoreCase ("c"))
                 return std::exp2 (t.dropLastCharacters (1).getDoubleValue() / 1200.0);
             if (t.containsChar ('/'))
@@ -951,8 +954,15 @@ private:
                 {
                     auto& s = proc->getRhythm().slots[i];
                     juce::String rl;
-                    if (t != nullptr && p < (int) t->partials.size() && ratioName)
+                    // A routed partial that the CURRENT spectrum no longer has cannot
+                    // pulse: say so on the row instead of leaving it looking active.
+                    const bool missing = t != nullptr && p >= (int) t->partials.size();
+                    if (t != nullptr && ! missing && ratioName)
                         rl = juce::String::fromUTF8 (" \xc2\xb7 ") + ratioName ((double) t->partials[(size_t) p].ratio);
+                    else if (missing)
+                        rl = " - not in this spectrum";
+                    slotLbl[i].setColour (juce::Label::textColourId,
+                                          missing ? juce::Colour (0xffe0453f) : juce::Colour (0xffc4ccda));
                     slotLbl[i].setText ("P" + juce::String (p + 1) + rl, juce::dontSendNotification);
                     if (! pitchE[i].hasKeyboardFocus (false))
                         pitchE[i].setText (s.useRatio.load() && ratioName

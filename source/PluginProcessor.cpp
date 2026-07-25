@@ -311,11 +311,12 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "rhythmTempoSync", 1 }, "Rhythm Tempo Sync", false));
 
-    // Temper the HARMONIC ENGINE's partials to the Custom-Engine .scl: with this ON
-    // both engines work together (the engine generates, the scale tempers); OFF =
-    // the loaded scale IS the spectrum and the harmonic engine stands down.
+    // Temper the HARMONIC ENGINE's partials to the ACTIVE TUNING's grid (whatever
+    // is loaded in the Tuning box), followed live: with this ON both engines work
+    // together (the engine generates, the tuning tempers) and the Custom Engine's
+    // own scale is bypassed. The id stays "timbreTemper" so old projects load.
     params.push_back (std::make_unique<AudioParameterBool>(
-        ParameterID { "timbreTemper", 1 }, "Temper Harmonics To Scale", false));
+        ParameterID { "timbreTemper", 1 }, "Temper To Tuning", false));
 
     //-- Scala-as-timbre --------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterInt>(
@@ -631,13 +632,6 @@ void FractalAdditiveAudioProcessor::clearTimbre()
     timbreDegrees.clear();
     timbreName.clear();
     timbreSource.clear();
-}
-
-juce::String FractalAdditiveAudioProcessor::getTimbreStatus() const
-{
-    if (timbreActive && ! timbreDegrees.empty())
-        return "Timbre: " + timbreName + "  (" + juce::String ((int) timbreDegrees.size()) + " notes/period)";
-    return "Timbre off (harmonic engine)";
 }
 
 //==============================================================================

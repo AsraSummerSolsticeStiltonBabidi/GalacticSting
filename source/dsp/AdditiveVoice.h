@@ -104,16 +104,25 @@ public:
             }
         }
 
-        velocityLevel = 0.10f + 0.90f * currentlyPlayingNote.noteOnVelocity.asUnsignedFloat();
+        // Velocity and pressure are GAIN terms, so on a steal they must glide like the
+        // amplitudes do: assigning them outright stepped the output by up to ~15 dB
+        // (velocity) or ~9 dB (pressure) in a single sample - exactly the click this
+        // reuse path exists to avoid. On a cold start the envelope begins at zero, so
+        // there they are set directly.
+        velTarget = 0.10f + 0.90f * currentlyPlayingNote.noteOnVelocity.asUnsignedFloat();
+        if (! reuse) velocityLevel = velTarget;
         // Do NOT seed from currentlyPlayingNote.pressure: under enableLegacyMode() JUCE
         // returns the CHANNEL'S sticky last-received aftertouch, which legacy mode never
         // resets on note-off - so a note on an aftertouch-touched channel would start up
         // to ~9 dB louder than one on a fresh channel. Start at rest; genuine aftertouch
         // still swells in through notePressureChanged().
-        pressure      = 0.0f;
+        pressureTarget = 0.0f;
+        if (! reuse) pressure = 0.0f;
 
-        fastKill     = false;
-        fastKillGain = 1.0f;
+        fastKill = false;
+        // A steal that interrupts a fast kill keeps the faded gain and ramps it back
+        // up with the same slew (jumping straight to 1 was a second step).
+        if (! reuse) fastKillGain = 1.0f;
         snapAmps     = ! reuse; // cold: snap amps to the template; reuse: slew them (no jump)
         releasing    = false;   // fresh note: parameter re-apply is allowed again
 
@@ -153,7 +162,8 @@ public:
         else              beginFastKill();
     }
 
-    void notePressureChanged() override  { pressure = currentlyPlayingNote.pressure.asUnsignedFloat(); }
+    // Aftertouch is a gain term too: set the TARGET so a jumpy 7-bit stream glides.
+    void notePressureChanged() override  { pressureTarget = currentlyPlayingNote.pressure.asUnsignedFloat(); }
     void notePitchbendChanged() override {}
     void noteTimbreChanged() override    {}
     void noteKeyStateChanged() override  {}
@@ -272,7 +282,21 @@ public:
                     }
                     for (int j = 0; j < hi; ++j)
                         curRatio[(size_t) j] = std::exp2 (morphStartLog[(size_t) j]);
-                    morphN = hi; morphPos = 0.0; morphActive = true;
+
+                    // A change arriving MID-MORPH must not restart the phase crossfade:
+                    // its weight would collapse from ~1 back to 0 in one sample, which
+                    // is a per-partial waveform step. The output at that instant already
+                    // sits on the aligned reference, so adopt it as the running phase and
+                    // continue the crossfade from where it is.
+                    const bool wasMorphing = morphActive;
+                    if (wasMorphing)
+                    {
+                        const double wNow = morphPos * morphPos;
+                        if (wNow > 0.5)
+                            for (int j = 0; j < hi; ++j) phase[(size_t) j] = alignPhase[(size_t) j];
+                    }
+                    morphN = hi; morphActive = true;
+                    if (! wasMorphing) morphPos = 0.0; // else keep gliding, no weight jump
 
                     // Coherent phase reference for the DESTINATION (as if the new
                     // spectrum were freshly played now); the audio crossfades from the
@@ -379,19 +403,27 @@ public:
         // Filter cutoff TRACKS the played note: cutoff = f0 * 2^(cents/1200 + envOct).
         // Cents (not Hz) means the same INTERVAL above every note -> the same
         // partials are cut regardless of pitch (a partial at ratio r sits at
-        // 1200*log2(r) cents). Updated per block; the env advances every sample.
+        // 1200*log2(r) cents). Refreshed every kCutoffChunk samples, NOT once per
+        // block: at a 512-sample buffer a 5 ms filter envelope (or an LFO on the
+        // cutoff) was never actually rendered, and the sound depended on the host's
+        // buffer size.
+        constexpr int kCutoffChunk = 32;
+        int sinceCutoff = kCutoffChunk;
+        const auto refreshCutoff = [&]
         {
             const double octs = (double) fCutoffParam->load() / 1200.0
                               + (double) fEnvAmtParam->load() * (double) filterEnvValue;
             const double co = f0 * std::exp2 (octs);
             filter.setCutoffFrequency ((float) juce::jlimit (20.0, 0.49 * sr, co));
             filter.setResonance (juce::jlimit (0.1f, 40.0f, fResParam->load()));
-        }
+        };
+        refreshCutoff();
 
         const int    numChannels = output.getNumChannels();
 
         while (--numSamples >= 0)
         {
+            if (--sinceCutoff <= 0) { refreshCutoff(); sinceCutoff = kCutoffChunk; }
             // Exact per-sample normalisation from the closed-form running sums (no lag).
             rk *= oneMinusSlew;
             const double sumCur = sumTarget   + (sumCur0 - sumTarget) * rk;
@@ -421,8 +453,15 @@ public:
                 acc += curAmp[(size_t) i] * s;
             }
 
+            // Velocity / pressure / the fast-kill recovery glide with the same ~7 ms
+            // constant as the amplitudes, so a stolen voice hands over without a step.
+            velocityLevel += (velTarget      - velocityLevel) * (float) slew;
+            pressure      += (pressureTarget - pressure)      * (float) slew;
+            if (! fastKill && fastKillGain < 1.0f)
+                fastKillGain += (1.0f - fastKillGain) * (float) slew;
+
             const float env    = adsr.getNextSample();
-            const float killG  = fastKill ? fastKillGain : 1.0f;
+            const float killG  = fastKillGain; // 1 normally; fading out, or ramping back after a steal
             const float gain   = env * killG * velocityLevel * (0.35f + 0.65f * pressure) * normGain;
             const float s      = filter.processSample (0, (float) acc * gain);
             filterEnvValue     = filterAdsr.getNextSample();
@@ -600,8 +639,8 @@ private:
     bool  snapAmps    = true;  // snap amps to target this block (cold note start)
     float normGain    = 1.0f;  // per-voice normalisation gain (recomputed per sample)
 
-    float velocityLevel = 0.0f;
-    float pressure = 0.0f;
+    float velocityLevel = 0.0f, velTarget = 0.0f;
+    float pressure = 0.0f, pressureTarget = 0.0f;
 
     bool  fastKill = false;
     float fastKillGain = 1.0f;

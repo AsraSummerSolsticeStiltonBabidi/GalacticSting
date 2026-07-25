@@ -164,7 +164,6 @@ public:
     bool loadTimbreText (const juce::String& text, juce::String& errorOut);
     void clearTimbre();
     bool isTimbreActive() const noexcept { return timbreActive; }
-    juce::String getTimbreStatus() const;
 
     // Recently-used .scl files (persisted across sessions, newest first, max 3).
     juce::StringArray getRecentSclPaths() const { return recentSclPaths; }
