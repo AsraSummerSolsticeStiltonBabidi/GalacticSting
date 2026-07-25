@@ -1134,6 +1134,12 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     rhythmQPulseAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "rhythmQPulse", rhythmPanel.qPulseT);
     rhythmFbDecayAtt = std::make_unique<SliderAttachment>(processorRef.apvts, "rhythmFeedbackDecay", rhythmPanel.feedbackS);
     rhythmVelSlopeAtt = std::make_unique<SliderAttachment>(processorRef.apvts, "rhythmVelSlope", rhythmPanel.velSlopeS);
+    rhythmStepsAllAtt = std::make_unique<SliderAttachment>(processorRef.apvts, "rhythmStepsAll", rhythmPanel.stepsAllS);
+    addMapListener (rhythmPanel.stepsAllS, "rhythmStepsAll");
+    rhythmPanel.stepsAllLbl.setText (tr ("Steps", "Passos"), juce::dontSendNotification);
+    rhythmPanel.stepsAllS.setTooltip (tr (
+        "Shifts EVERY step-pitched pulse by this many scale steps from the played note (JI/ratio pulses have no step, so they are unaffected). Right-click to map a modulator.",
+        "Desplaç""a TOTS els polsos amb to per passos aquests passos d'""escala des de la nota tocada (els polsos JI/raó no en tenen, i no els afecta). Clic dret per assignar-hi un modulador."));
     // Modulatable, like every other fader: right-click to route a modulator.
     addMapListener (rhythmPanel.velSlopeS, "rhythmVelSlope");
     addMapListener (rhythmPanel.octAllVal, "rhythmOctAll");     // Octave (all pulses)

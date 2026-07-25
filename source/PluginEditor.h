@@ -464,6 +464,8 @@ private:
         juce::Slider       velS[RhythmEngine::kSlots]; // per-slot MIDI velocity of each pulse
         juce::TextButton   delB[RhythmEngine::kSlots];
         juce::Label        octLbl, octAllVal;          // "Octave (all pulses)" stepper
+        juce::Label        stepsAllLbl;                // "Steps (all pulses)" caption
+        juce::Slider       stepsAllS;                  // global scale-step offset (modulatable)
         juce::TextButton   octAllUp, octAllDn;
         int numRows = 0, tempoOct = 0;
 
@@ -704,6 +706,18 @@ private:
             velSlopeS.setColour (juce::Slider::thumbColourId, juce::Colour (0xffff77c8));
             velSlopeS.setMouseClickGrabsKeyboardFocus (false);
             addAndMakeVisible (velSlopeS);
+            // Global STEPS offset for step-pitched pulses (ratio/JI slots ignore it).
+            stepsAllS.setSliderStyle (juce::Slider::LinearHorizontal);
+            stepsAllS.setTextBoxStyle (juce::Slider::TextBoxRight, false, 34, 15);
+            stepsAllS.setColour (juce::Slider::trackColourId, juce::Colour (0xff4fe6ff));
+            stepsAllS.setColour (juce::Slider::thumbColourId, juce::Colour (0xff4fe6ff));
+            stepsAllS.setMouseClickGrabsKeyboardFocus (false);
+            addAndMakeVisible (stepsAllS);
+            stepsAllLbl.setJustificationType (juce::Justification::centredRight);
+            stepsAllLbl.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
+            stepsAllLbl.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
+            addAndMakeVisible (stepsAllLbl);
+
             closeB.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
             closeB.onClick = [this] { if (onClose) onClose(); };
             addAndMakeVisible (closeB);
@@ -1130,6 +1144,9 @@ private:
                 octAllDn.setBounds (g2.removeFromLeft (20).reduced (0, 2));
                 octAllVal.setBounds (g2.removeFromLeft (26));
                 octAllUp.setBounds (g2.removeFromLeft (20).reduced (0, 2));
+                g2.removeFromLeft (10);
+                stepsAllLbl.setBounds (g2.removeFromLeft (44));   // "Steps"
+                stepsAllS.setBounds (g2.removeFromLeft (juce::jmin (120, g2.getWidth())).reduced (0, 3));
             }
             r.removeFromTop (4);
             {
@@ -1685,7 +1702,7 @@ private:
     RhythmPanel    rhythmPanel;
     std::unique_ptr<ButtonAttachment>   rhythmOnAtt, rhythmSelfAtt, rhythmDroneAtt, rhythmFbAtt, rhythmMpeAtt, rhythmTempoAtt,
                                         rhythmQTempoAtt, rhythmMonoAtt, rhythmQPulseAtt;
-    std::unique_ptr<SliderAttachment>   rhythmFbDecayAtt, rhythmVelSlopeAtt;
+    std::unique_ptr<SliderAttachment>   rhythmFbDecayAtt, rhythmVelSlopeAtt, rhythmStepsAllAtt;
     std::unique_ptr<ComboBoxAttachment> rhythmModeAtt;
     juce::uint32 lastRhythmGen = 0; // refresh the partial list when the template changes
     juce::uint32 lastSegGen = 0;    // refresh the segment picker on template change

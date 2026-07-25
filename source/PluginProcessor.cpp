@@ -298,6 +298,11 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     // Global octave shift of ALL pulses at once (+-4 octaves).
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "rhythmOctAll", 1 }, "Rhythm Pulses Octave", -4, 4, 0));
+    // Global steps offset on every step-pitched pulse (modulatable; JI/ratio slots
+    // are unaffected because they have no step to shift).
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "rhythmStepsAll", 1 }, "Rhythm Pulses Steps",
+        NormalisableRange<float> (-24.0f, 24.0f, 1.0f), 0.0f));
     // Note-gate modes (all default OFF, independent):
     //  - Quantize to project tempo: a note may only START on a beat of the host BPM.
     //  - Mono: a new note stops the one currently sounding.

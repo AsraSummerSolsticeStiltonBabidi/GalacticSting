@@ -76,6 +76,7 @@ public:
         velSlopeParam = apvts.getRawParameterValue ("rhythmVelSlope");
         qPulseParam  = apvts.getRawParameterValue ("rhythmQPulse");
         octParam  = apvts.getRawParameterValue ("rhythmOctAll");
+        stepsAllParam = apvts.getRawParameterValue ("rhythmStepsAll");
         xParam    = apvts.getRawParameterValue ("rhythmDivX");
         nParam    = apvts.getRawParameterValue ("rhythmDivN");
         modeParam = apvts.getRawParameterValue ("rhythmMode");
@@ -493,6 +494,11 @@ private:
         // shift by whole periods of the active scale. Level-0 only - echoes inherit it
         // through their parent's pitch.
         const int octAll = octParam != nullptr ? juce::jlimit (-4, 4, (int) octParam->load()) : 0;
+        // Global STEPS offset on top of each slot's own "steps from the note". Only
+        // applies to step-pitched slots (a ratio slot has no step to shift), and it
+        // is a plain parameter so a modulator can sweep it.
+        const int stepsAll = stepsAllParam != nullptr
+                           ? juce::jlimit (-48, 48, (int) std::lround (stepsAllParam->load())) : 0;
         const int octSteps = octAll * juce::jmax (1, tuning.degreesPerPeriod());
         const double octMul = std::exp2 ((double) octAll);
 
@@ -583,7 +589,7 @@ private:
                     // Scale steps FROM the played note (each MIDI note = one scale
                     // step of the active tuning), never a fixed pitch.
                     sendNote[i][j] = juce::jlimit (0, 127,
-                        h.note + slots[i].steps.load (std::memory_order_relaxed) + octSteps);
+                        h.note + slots[i].steps.load (std::memory_order_relaxed) + octSteps + stepsAll);
                     sendHz  [i][j] = tuning.frequencyForNote (sendNote[i][j]);
                     sendBend[i][j] = 8192; // centre
                 }
@@ -685,6 +691,7 @@ private:
     std::atomic<float>* velSlopeParam = nullptr; // velocity tilt across the spectrum
     std::atomic<float>* qPulseParam = nullptr; // quantize-to-pulse (phase-aligned joiners)
     std::atomic<float>* octParam  = nullptr; // global octave shift of all pulses (-4..+4)
+    std::atomic<float>* stepsAllParam = nullptr; // global scale-step offset of step-pitched pulses
     std::atomic<float>* xParam  = nullptr;
     std::atomic<float>* nParam  = nullptr;
     std::atomic<float>* modeParam = nullptr;
