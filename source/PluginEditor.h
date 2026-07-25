@@ -32,6 +32,14 @@ private:
     void configGroup (juce::GroupComponent&, juce::Colour);
     void configFader (juce::Slider&, const juce::String& paramID,
                       std::unique_ptr<SliderAttachment>&, juce::Colour, const juce::String& tooltip);
+    // Every fader configFader touches is watched: whenever an envelope/LFO/host
+    // automation is actually driving its parameter right now, the LookAndFeel draws
+    // a second marker at that LIVE position (see GalacticLnF's "modLive" property
+    // read in drawLinearSlider/drawRotarySlider) alongside the thumb's own base
+    // value - so picking e.g. the right sustain point under modulation is visual,
+    // not guesswork. Polled on the existing 30 Hz timer; see timerCallback().
+    std::vector<juce::Slider*> modWatchSliders;
+    void refreshModWatch();
     void configCombo (juce::ComboBox&, const juce::String& paramID,
                       std::unique_ptr<ComboBoxAttachment>&, juce::Colour, const juce::String& tooltip);
     void makeLabel (juce::Label&, juce::Colour);

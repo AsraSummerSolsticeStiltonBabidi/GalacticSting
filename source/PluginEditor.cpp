@@ -377,6 +377,18 @@ namespace
         // SPIRAL knob, finished like the star thumbs: an almost-closed spiral with a
         // pointer growing outwards from where its outer end sits, so the direction it
         // points IS the value.
+        // Both draw calls read this: an envelope/LFO/automation currently driving the
+        // slider's own parameter stashes its LIVE plain value here (see
+        // refreshModWatch()); the marker below is drawn wherever that value actually
+        // sits, separate from the thumb, which stays at the user's BASE setting.
+        static bool liveModProportion (juce::Slider& s, float& proportionOut)
+        {
+            const auto& props = s.getProperties();
+            if (! props.contains ("modLive")) return false;
+            proportionOut = (float) s.valueToProportionOfLength ((double) props["modLive"]);
+            return true;
+        }
+
         void drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h,
                                float pos, float startAngle, float endAngle,
                                juce::Slider& s) override
@@ -414,6 +426,20 @@ namespace
             g.drawLine ({ from, to }, juce::jmax (3.0f, r * 0.30f));
             g.setColour (col.brighter (0.35f));
             g.drawLine ({ from, to }, juce::jmax (1.8f, r * 0.20f));
+
+            // Live modulation marker: a small bright dot riding the spiral's rim at
+            // the ACTUAL (base + modulation) position, distinct from the pointer
+            // above (which always shows the user's base setting).
+            float modProp = 0.0f;
+            if (liveModProportion (s, modProp))
+            {
+                const float mang = startAngle + juce::jlimit (0.0f, 1.0f, modProp) * (endAngle - startAngle);
+                const juce::Point<float> mp (c.x + r * 0.86f * std::cos (mang), c.y + r * 0.86f * std::sin (mang));
+                g.setColour (juce::Colours::white);
+                g.fillEllipse (mp.x - 3.2f, mp.y - 3.2f, 6.4f, 6.4f);
+                g.setColour (juce::Colours::black.withAlpha (0.6f));
+                g.drawEllipse (mp.x - 3.2f, mp.y - 3.2f, 6.4f, 6.4f, 1.0f);
+            }
         }
 
         static juce::Path heptagon (juce::Point<float> c, float r)
@@ -473,6 +499,17 @@ namespace
                     g.drawText (s.getName(), juce::Rectangle<float> (cx - rv, sliderPos - rv, rv * 2.0f, rv * 2.0f),
                                 juce::Justification::centred, false);
                 }
+                // Live modulation marker: a bright bar across the track at the ACTUAL
+                // position (base + modulation), separate from the thumb above (base only).
+                float modProp = 0.0f;
+                if (liveModProportion (s, modProp))
+                {
+                    const float my = bot - juce::jlimit (0.0f, 1.0f, modProp) * (bot - top);
+                    g.setColour (juce::Colours::white);
+                    g.fillRect (cx - tw * 0.9f, my - 1.2f, tw * 1.8f, 2.4f);
+                    g.setColour (juce::Colours::black.withAlpha (0.5f));
+                    g.drawRect (cx - tw * 0.9f, my - 1.2f, tw * 1.8f, 2.4f, 0.6f);
+                }
             }
             else
             {
@@ -494,6 +531,15 @@ namespace
                     g.setFont (juce::Font (juce::FontOptions (rr * 0.8f).withStyle ("Bold")));
                     g.drawText (s.getName(), juce::Rectangle<float> (sliderPos - rr, cy - rr, rr * 2.0f, rr * 2.0f),
                                 juce::Justification::centred, false);
+                }
+                float modProp = 0.0f;
+                if (liveModProportion (s, modProp))
+                {
+                    const float mx = l + juce::jlimit (0.0f, 1.0f, modProp) * (rt - l);
+                    g.setColour (juce::Colours::white);
+                    g.fillRect (mx - 1.2f, cy - tw * 0.9f, 2.4f, tw * 1.8f);
+                    g.setColour (juce::Colours::black.withAlpha (0.5f));
+                    g.drawRect (mx - 1.2f, cy - tw * 0.9f, 2.4f, tw * 1.8f, 0.6f);
                 }
             }
         }
@@ -2858,6 +2904,38 @@ void FractalAdditiveAudioProcessorEditor::configGroup (juce::GroupComponent& g, 
     addAndMakeVisible (g);
 }
 
+// For every watched fader, check whether ANY of the 6 modulators currently
+// targets its parameter; if so, read the RAW atomic ModEngine writes into
+// (base + modulation, in the parameter's own plain units - see ModEngine.h) and
+// stash it as a "modLive" property so GalacticLnF can draw a second marker at
+// that live position. A fader with nothing mapped simply loses the property
+// (no marker) the tick after it is unmapped.
+void FractalAdditiveAudioProcessorEditor::refreshModWatch()
+{
+    auto& mod = processorRef.getModEngine();
+    for (auto* s : modWatchSliders)
+    {
+        const auto pid = s->getProperties()["modId"].toString();
+        bool mapped = false;
+        for (int m = 0; m < ModEngine::kMods && ! mapped; ++m)
+            mapped = mod.isMappedTo (pid, m);
+
+        if (! mapped)
+        {
+            if (s->getProperties().contains ("modLive"))
+            { s->getProperties().remove ("modLive"); s->repaint(); }
+            continue;
+        }
+        auto* raw = processorRef.apvts.getRawParameterValue (pid);
+        if (raw == nullptr) continue;
+        const float live = raw->load();
+        const auto& props = s->getProperties();
+        const bool hadIt = props.contains ("modLive");
+        if (! hadIt || std::abs ((float) (double) props["modLive"] - live) > 1.0e-4f)
+        { s->getProperties().set ("modLive", (double) live); s->repaint(); }
+    }
+}
+
 void FractalAdditiveAudioProcessorEditor::configFader (juce::Slider& s, const juce::String& paramID,
                                                        std::unique_ptr<SliderAttachment>& att, juce::Colour col,
                                                        const juce::String& tooltip)
@@ -2883,6 +2961,11 @@ void FractalAdditiveAudioProcessorEditor::configFader (juce::Slider& s, const ju
     // tab's own faders carry a modulator id that changes with the selector, so they
     // resolve their target id at click time.
     addMapListener (s, paramID, paramID.startsWith ("modE1") || paramID.startsWith ("modL1"));
+    // Watch it for live modulation (see modWatchSliders above). CUSTOM-tab faders
+    // start with a template id ("modE1A"...); attachCustomTab() keeps this property
+    // pointed at whichever modulator is actually selected.
+    s.getProperties().set ("modId", paramID);
+    modWatchSliders.push_back (&s);
 }
 
 // A CUSTOM-tab control is built against modulator 1's ids but re-attached to the
@@ -2915,7 +2998,10 @@ void FractalAdditiveAudioProcessorEditor::attachCustomTab()
     {
         const char* sfx[] = { "A", "D", "S", "R" };
         for (int i = 0; i < 4; ++i)
+        {
             custAdsrAtt[i] = std::make_unique<SliderAttachment> (processorRef.apvts, pfx + sfx[i], custAdsr[i]);
+            custAdsr[i].getProperties().set ("modId", pfx + sfx[i]); // keep the live-mod watch pointed here
+        }
         lfoWaveAtt.reset(); lfoRateModeAtt.reset(); lfoPhaseModeAtt.reset();
         lfoDivAtt.reset(); lfoHzAtt.reset(); lfoPhaseAtt.reset();
     }
@@ -2928,8 +3014,12 @@ void FractalAdditiveAudioProcessorEditor::attachCustomTab()
         lfoDivAtt   = std::make_unique<SliderAttachment> (processorRef.apvts, pfx + "Div",   lfoDivSlider);
         lfoHzAtt    = std::make_unique<SliderAttachment> (processorRef.apvts, pfx + "Hz",    lfoHzSlider);
         lfoPhaseAtt = std::make_unique<SliderAttachment> (processorRef.apvts, pfx + "Phase", lfoPhaseSlider);
+        lfoDivSlider.getProperties().set   ("modId", pfx + "Div");
+        lfoHzSlider.getProperties().set    ("modId", pfx + "Hz");
+        lfoPhaseSlider.getProperties().set ("modId", pfx + "Phase");
     }
     custRangeAtt = std::make_unique<SliderAttachment> (processorRef.apvts, pfx + "Range", custRangeFader);
+    custRangeFader.getProperties().set ("modId", pfx + "Range");
     modOnAtt     = std::make_unique<ButtonAttachment> (processorRef.apvts, pfx + "On",    modOnT);
 }
 
@@ -3917,6 +4007,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // driving them, the selector switching modulator, an undo...).
     if (envEditor.isVisible()) envEditor.refresh();
 
+    refreshModWatch(); // live-modulation marker on every watched fader (see the header)
     refreshRefAText();       // keep the Reference-A box in sync with the parameter (automation)
 
     // Undo granularity: group parameter edits into ~1-second transactions (a slider
