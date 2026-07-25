@@ -416,7 +416,7 @@ void FractalAdditiveAudioProcessor::timerCallback()
     // from the current partials so the scale + "from n/1" mapping stay correct.
     if (segmentModeActive && ! segSel.empty())
         if (const auto* lt = spectrumEngine.getLive(); lt != nullptr && lt->generation != segRebuiltGen)
-            rebuildSegmentScale();
+            rebuildSegmentScale (false); // auto-refresh: never steals the tuning mode
 
     // Tuning-bank slot switched (UI or host automation): load that slot's .scl.
     // Runs on the message thread (timerCallback), so the parse/load is safe here.
@@ -862,7 +862,7 @@ int  FractalAdditiveAudioProcessor::segmentCount() const { return (int) segSel.s
 void FractalAdditiveAudioProcessor::setSegmentPeriodText (const juce::String& s) { segPeriodText = s; rebuildSegmentScale(); }
 void FractalAdditiveAudioProcessor::setSegmentUseTopPeriod (bool b) { segUseTopPeriod = b; rebuildSegmentScale(); }
 
-void FractalAdditiveAudioProcessor::rebuildSegmentScale()
+void FractalAdditiveAudioProcessor::rebuildSegmentScale (bool userInitiated)
 {
     const auto* t = spectrumEngine.getLive();
     if (t == nullptr || segSel.empty()) return;
@@ -923,12 +923,21 @@ void FractalAdditiveAudioProcessor::rebuildSegmentScale()
             << " " << juce::String (1200.0 * std::log2 (d.folded), 5) << "\n";
     scl << "! period\n " << juce::String (1200.0 * std::log2 (period), 5) << "\n";
 
+    // The 30 Hz auto-refresh must NOT re-impose Scala mode: doing so made a segment
+    // scale impossible to leave (choosing 12ED2, or undoing, was undone again on the
+    // next spectrum change). Only an actual user action switches the mode.
+    if (! userInitiated && getTuningMode() != (int) TuningManager::Mode::Scala)
+        return;
+
     juce::String err;
     if (tuning.loadScalaString (scl, "segment", err))
     {
-        if (auto* p = apvts.getParameter ("tuningMode"))
-            p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
-        tuning.setMode (TuningManager::Mode::Scala);
+        if (userInitiated || getTuningMode() == (int) TuningManager::Mode::Scala)
+        {
+            if (auto* p = apvts.getParameter ("tuningMode"))
+                p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
+            tuning.setMode (TuningManager::Mode::Scala);
+        }
         lastDissScl = scl; lastDissName = "spectrum-segment";
         segRebuiltGen = t->generation;
         ++dissGeneration; // nudge the UI (keyboard/dissonance list) to refresh

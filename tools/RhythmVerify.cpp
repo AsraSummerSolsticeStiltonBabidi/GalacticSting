@@ -709,6 +709,62 @@ int main()
                "saving twice produces the same state size (no duplicated children)");
     }
 
+    // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
+    // The editor draws value = shape(t, curve); this checks the engine agrees, that
+    // the sustain node really sets the level, and that a second key retriggers from
+    // zero (attack + decay audible again, not stuck at the top).
+    {
+        proc.prepareToPlay (sr, blk);
+        for (int m = 0; m < ModEngine::kMods; ++m) proc.getModEngine().unmapAll (m);
+        setParam ("modE1A", 0.001f); setParam ("modE1D", 0.400f);
+        setParam ("modE1S", 0.000f); setParam ("modE1R", 0.001f);
+        setParam ("modE1Range", 1.0f); setParam ("modE1On", 1.0f);
+        setParam ("curveSlope", 0.0f);
+        proc.getModEngine().addTarget (0, "curveSlope");
+        auto* raw = proc.apvts.getRawParameterValue ("curveSlope");
+        const float full = 4.0f; // curveSlope range 0..4 -> Range 1 spans the lot
+
+        // Sample the decay leg half way through, for three curve settings.
+        auto midDecay = [&] (float curve)
+        {
+            setParam ("modE1CurveD", curve);
+            { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+              proc.processBlock (audio, m); }
+            const int halfBlocks = (int) (0.200 * sr / blk);           // 0.2 s = half of D
+            for (int b = 0; b < halfBlocks; ++b) { juce::MidiBuffer m; proc.processBlock (audio, m); }
+            const float v = raw->load() / full;                        // 0..1
+            { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+              proc.processBlock (audio, m); }
+            for (int b = 0; b < 20; ++b) { juce::MidiBuffer m; proc.processBlock (audio, m); }
+            return v;
+        };
+        const float lin = midDecay (0.0f), convex = midDecay (0.9f), concave = midDecay (-0.9f);
+        std::printf ("== ENVELOPE CURVE: half-way down the decay - concave %.3f  straight %.3f  convex %.3f ==\n",
+                     concave, lin, convex);
+        check (std::abs (lin - 0.5f) < 0.08f, "a STRAIGHT decay is half way down at half the decay time");
+        check (convex < lin - 0.08f, "a CONVEX decay has already fallen further (fast, then a long tail)");
+        check (concave > lin + 0.08f, "a CONCAVE decay is still high (slow at first, then drops)");
+
+        // Sustain: the level the editor's S node sets is where the envelope rests.
+        setParam ("modE1D", 0.05f); setParam ("modE1S", 0.25f); setParam ("modE1CurveD", 0.0f);
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+          proc.processBlock (audio, m); }
+        for (int b = 0; b < (int) (0.4 * sr / blk); ++b) { juce::MidiBuffer m; proc.processBlock (audio, m); }
+        check (std::abs (raw->load() / full - 0.25f) < 0.03f, "the sustain node sets the level it rests at");
+
+        // A second key while the first sustains must restart from zero.
+        setParam ("modE1A", 0.30f);
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100), 0);
+          proc.processBlock (audio, m); }
+        check (raw->load() / full < 0.10f, "a second key RESTARTS the envelope from zero (attack audible again)");
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+          m.addEvent (juce::MidiMessage::noteOff (1, 64), 1); proc.processBlock (audio, m); }
+        for (int b = 0; b < 30; ++b) { juce::MidiBuffer m; proc.processBlock (audio, m); }
+        proc.getModEngine().unmapAll (0);
+        setParam ("modE1A", 0.1f); setParam ("modE1D", 0.3f); setParam ("modE1S", 0.7f);
+        setParam ("modE1R", 0.4f); setParam ("curveSlope", 1.0f);
+    }
+
     // --- run 13: a generated .scl carries its own patch ---------------------------
     {
         setParam ("curveSlope", 3.21f);

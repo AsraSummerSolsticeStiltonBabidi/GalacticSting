@@ -1246,161 +1246,232 @@ private:
         }
     };
 
-    // Drawn-LFO wave editor (Ableton-automation style): drag points; double-click
-    // adds a point; right-click deletes one; dragging a segment's MIDDLE bends it
-    // (power curve), like curving an automation line. One cycle, x 0..1, y 0..1.
-    // Envelope drawn as a LINE WITH NODES instead of four faders: drag a node to set
-    // a time or the sustain level, drag the LINE between two nodes to bend it
-    // concave/convex. Everything it moves is a real parameter, so the shape shown is
-    // exactly the signal the modulator sends (see ModEngine::shape).
+    // The selected envelope drawn as a LINE WITH NODES. Every node is draggable and
+    // every leg between nodes can be bent by dragging it; both write straight into
+    // the real parameters, so the curve on screen IS the signal the modulator sends
+    // (ModEngine::shape uses the identical formula).
     struct EnvEditor : juce::Component, juce::TooltipClient
     {
-        // times in seconds, levels 0..1, curves -1..1
+        // Live values (times in seconds, level 0..1, curves -1..1). refresh() pulls
+        // them from the parameters; a drag updates them immediately so the node
+        // follows the mouse without waiting for a repaint from elsewhere.
         float a = 0.1f, d = 0.3f, s = 0.7f, r = 0.4f, cA = 0.0f, cD = 0.55f, cR = 0.55f;
         juce::Colour col { 0xff9a7bff };
         juce::String tip;
-        // (param suffix, new value) - the editor never writes parameters itself.
-        std::function<void (const juce::String&, float)> onEdit;
-        std::function<void (const juce::String&, bool)>  onGesture;
+        std::function<void (const juce::String&, float)> onEdit;    // suffix, plain value
+        std::function<void (const juce::String&, bool)>  onGesture; // suffix, starting
+        std::function<float (const juce::String&)>       getParam;  // suffix -> plain value
         juce::String getTooltip() override { return tip; }
+
+        void refresh()
+        {
+            if (! getParam) return;
+            const float na = getParam ("A"),  nd = getParam ("D"),  ns = getParam ("S"),  nr = getParam ("R");
+            const float ka = getParam ("CurveA"), kd = getParam ("CurveD"), kr = getParam ("CurveR");
+            if (na == a && nd == d && ns == s && nr == r && ka == cA && kd == cD && kr == cR) return;
+            a = na; d = nd; s = ns; r = nr; cA = ka; cD = kd; cR = kr;
+            repaint();
+        }
 
         static float shape (float t, float c)
         {
             t = juce::jlimit (0.0f, 1.0f, t);
             return std::pow (t, std::pow (2.0f, -3.0f * juce::jlimit (-1.0f, 1.0f, c)));
         }
-        static constexpr float kMaxT = 5.0f;   // seconds shown across the whole width
-        float tToX (float secs) const  { return 6.0f + (float) (getWidth() - 12) * std::sqrt (juce::jlimit (0.0f, kMaxT, secs) / kMaxT); }
-        float xToT (float x) const
-        { const float u = juce::jlimit (0.0f, 1.0f, (x - 6.0f) / (float) juce::jmax (1, getWidth() - 12)); return u * u * kMaxT; }
-        float lToY (float lvl) const   { return (float) getHeight() - 8.0f - juce::jlimit (0.0f, 1.0f, lvl) * (float) (getHeight() - 16); }
-        float yToL (float y) const     { return juce::jlimit (0.0f, 1.0f, ((float) getHeight() - 8.0f - y) / (float) juce::jmax (1, getHeight() - 16)); }
 
-        // Node positions: 0 = start, 1 = peak (end of attack), 2 = end of decay
-        // (sustain level), 3 = end of the sustain leg, 4 = end of release.
+        // Geometry. Times use a square-root scale so short times still get real estate.
+        static constexpr float kMaxT = 5.0f, kPad = 8.0f;
+        float sustainW() const { return juce::jmax (12.0f, (float) getWidth() * 0.10f); }
+        float legW() const     { return juce::jmax (10.0f, ((float) getWidth() - 2.0f * kPad - sustainW()) / 3.0f); }
+        float tToW (float secs) const { return legW() * std::sqrt (juce::jlimit (0.0f, kMaxT, secs) / kMaxT); }
+        float wToT (float w) const
+        { const float u = juce::jlimit (0.0f, 1.0f, w / juce::jmax (1.0f, legW())); return u * u * kMaxT; }
+        float lToY (float lvl) const { return (float) getHeight() - kPad - juce::jlimit (0.0f, 1.0f, lvl) * ((float) getHeight() - 2.0f * kPad); }
+        float yToL (float y) const   { return juce::jlimit (0.0f, 1.0f, ((float) getHeight() - kPad - y) / juce::jmax (1.0f, (float) getHeight() - 2.0f * kPad)); }
+
+        // 0 start | 1 attack end (peak) | 2 decay end = SUSTAIN LEVEL | 3 sustain end | 4 release end
         juce::Point<float> node (int i) const
         {
-            const float sustainLeg = juce::jmax (14.0f, (float) getWidth() * 0.12f);
+            const float x0 = kPad;
+            const float x1 = x0 + tToW (a);
+            const float x2 = x1 + tToW (d);
+            const float x3 = x2 + sustainW();
+            const float x4 = x3 + tToW (r);
             switch (i)
             {
-                case 0:  return { 6.0f, lToY (0.0f) };
-                case 1:  return { tToX (a), lToY (1.0f) };
-                case 2:  return { tToX (a) + tToX (d) - 6.0f, lToY (s) };
-                case 3:  return { tToX (a) + tToX (d) - 6.0f + sustainLeg, lToY (s) };
-                default: return { tToX (a) + tToX (d) - 6.0f + sustainLeg + tToX (r) - 6.0f, lToY (0.0f) };
+                case 0:  return { x0, lToY (0.0f) };
+                case 1:  return { x1, lToY (1.0f) };
+                case 2:  return { x2, lToY (s) };
+                case 3:  return { x3, lToY (s) };
+                default: return { x4, lToY (0.0f) };
             }
         }
+
         void paint (juce::Graphics& g) override
         {
             auto b = getLocalBounds().toFloat();
             g.setColour (juce::Colour (0xff101018));
             g.fillRoundedRectangle (b, 3.0f);
-            g.setColour (col.withAlpha (0.20f));
+            g.setColour (col.withAlpha (0.18f));
             g.drawRoundedRectangle (b.reduced (0.5f), 3.0f, 1.0f);
+            g.setColour (col.withAlpha (0.10f));
+            g.drawHorizontalLine ((int) lToY (1.0f), b.getX() + 2.0f, b.getRight() - 2.0f);
+            g.drawHorizontalLine ((int) lToY (0.0f), b.getX() + 2.0f, b.getRight() - 2.0f);
 
-            // The curve itself: each leg drawn through its own shaping function.
             juce::Path p;
-            const auto seg = [&] (juce::Point<float> from, juce::Point<float> to, float curve, bool first)
+            p.startNewSubPath (node (0));
+            const auto leg = [&] (juce::Point<float> from, juce::Point<float> to, float curve)
             {
-                if (first) p.startNewSubPath (from);
-                constexpr int steps = 24;
+                constexpr int steps = 28;
                 for (int i = 1; i <= steps; ++i)
                 {
                     const float t = (float) i / (float) steps;
-                    const float w = shape (t, curve);
-                    p.lineTo (from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * w);
+                    p.lineTo (from.x + (to.x - from.x) * t,
+                              from.y + (to.y - from.y) * shape (t, curve));
                 }
             };
-            seg (node (0), node (1), cA, true);
-            seg (node (1), node (2), cD, false);
+            leg (node (0), node (1), cA);
+            leg (node (1), node (2), cD);
             p.lineTo (node (3));
-            seg (node (3), node (4), cR, false);
-            g.setColour (col);
-            g.strokePath (p, juce::PathStrokeType (2.0f));
-            // Filled area under it, so the shape reads at a glance.
+            leg (node (3), node (4), cR);
+
             auto fill = p;
             fill.lineTo (node (4).x, lToY (0.0f));
             fill.lineTo (node (0).x, lToY (0.0f));
             fill.closeSubPath();
-            g.setColour (col.withAlpha (0.12f));
+            g.setColour (col.withAlpha (0.13f));
             g.fillPath (fill);
+            g.setColour (col);
+            g.strokePath (p, juce::PathStrokeType (2.0f));
 
-            for (int i : { 1, 2, 4 }) // draggable nodes
+            // Nodes 1..4 are all draggable (2 and 3 both set the sustain level).
+            for (int i : { 1, 2, 3, 4 })
             {
                 const auto n = node (i);
-                g.setColour (col);
-                g.fillEllipse (n.x - 4.0f, n.y - 4.0f, 8.0f, 8.0f);
-                g.setColour (juce::Colours::black.withAlpha (0.5f));
-                g.drawEllipse (n.x - 4.0f, n.y - 4.0f, 8.0f, 8.0f, 1.0f);
+                const bool hot = i == hover || i == dragNode;
+                g.setColour (hot ? juce::Colours::white : col);
+                g.fillEllipse (n.x - 5.0f, n.y - 5.0f, 10.0f, 10.0f);
+                g.setColour (juce::Colours::black.withAlpha (0.55f));
+                g.drawEllipse (n.x - 5.0f, n.y - 5.0f, 10.0f, 10.0f, 1.2f);
             }
-            g.setColour (col.withAlpha (0.55f));
+            g.setColour (col.withAlpha (0.75f));
             g.setFont (juce::Font (juce::FontOptions (9.5f).withStyle ("Bold")));
-            g.drawText ("A", node (1).x - 12.0f, lToY (1.0f) - 12.0f, 12.0f, 11.0f, juce::Justification::centred, false);
-            g.drawText ("D", node (2).x - 6.0f, node (2).y - 14.0f, 12.0f, 11.0f, juce::Justification::centred, false);
-            g.drawText ("R", node (4).x - 14.0f, lToY (0.0f) - 12.0f, 12.0f, 11.0f, juce::Justification::centred, false);
+            const float ly = lToY (0.0f) + 1.0f;
+            g.drawText ("A", node (0).x, ly - 11.0f, node (1).x - node (0).x, 10.0f, juce::Justification::centred, false);
+            g.drawText ("D", node (1).x, ly - 11.0f, node (2).x - node (1).x, 10.0f, juce::Justification::centred, false);
+            g.drawText ("S", node (2).x, node (2).y - 12.0f, node (3).x - node (2).x, 10.0f, juce::Justification::centred, false);
+            g.drawText ("R", node (3).x, ly - 11.0f, node (4).x - node (3).x, 10.0f, juce::Justification::centred, false);
         }
 
-        int    dragNode = -1, dragSeg = -1;
-        float  dragStartCurve = 0.0f, dragStartY = 0.0f;
-        juce::String dragParam;
+        //== interaction ======================================================
+        int   dragNode = -1, dragSeg = -1, hover = -1;
+        float dragStartCurve = 0.0f, dragStartY = 0.0f;
+
+        int nodeAt (juce::Point<float> pos) const
+        {
+            for (int i : { 1, 2, 3, 4 })
+                if (pos.getDistanceFrom (node (i)) < 11.0f) return i;
+            return -1;
+        }
+        int segAt (juce::Point<float> pos) const   // 0 = attack leg, 1 = decay leg, 2 = release leg
+        {
+            if (pos.x < node (1).x) return 0;
+            if (pos.x < node (2).x) return 1;
+            if (pos.x > node (3).x) return 2;
+            return -1;                              // the flat sustain leg has no curve
+        }
+        static const char* segParam (int seg)
+        { return seg == 0 ? "CurveA" : (seg == 1 ? "CurveD" : "CurveR"); }
+        float segCurve (int seg) const { return seg == 0 ? cA : (seg == 1 ? cD : cR); }
+
+        juce::String draggedParam() const
+        {
+            switch (dragNode)
+            {
+                case 1:  return "A";
+                case 2:  return "D";
+                case 3:  return "S";
+                case 4:  return "R";
+                default: return dragSeg >= 0 ? juce::String (segParam (dragSeg)) : juce::String();
+            }
+        }
+
+        // Writes the parameter AND the local value, so the node follows the mouse now.
+        void put (const juce::String& suffix, float v)
+        {
+            if      (suffix == "A") a = v;
+            else if (suffix == "D") d = v;
+            else if (suffix == "S") s = v;
+            else if (suffix == "R") r = v;
+            else if (suffix == "CurveA") cA = v;
+            else if (suffix == "CurveD") cD = v;
+            else if (suffix == "CurveR") cR = v;
+            if (onEdit) onEdit (suffix, v);
+            repaint();
+        }
+
+        void mouseMove (const juce::MouseEvent& e) override
+        {
+            const int h = nodeAt (e.position);
+            if (h != hover) { hover = h; repaint(); }
+            setMouseCursor (h >= 0 ? juce::MouseCursor::DraggingHandCursor
+                                   : (segAt (e.position) >= 0 ? juce::MouseCursor::UpDownResizeCursor
+                                                              : juce::MouseCursor::NormalCursor));
+        }
+        void mouseExit (const juce::MouseEvent&) override { if (hover >= 0) { hover = -1; repaint(); } }
 
         void mouseDown (const juce::MouseEvent& e) override
         {
-            const juce::Point<float> pos = e.position;
-            dragNode = -1; dragSeg = -1;
-            for (int i : { 1, 2, 4 })
-                if (pos.getDistanceFrom (node (i)) < 9.0f) { dragNode = i; break; }
-            if (dragNode < 0) // no node hit: bend the leg the click landed on
-            {
-                const float x = pos.x;
-                if      (x < node (1).x) { dragSeg = 0; dragParam = "CurveA"; dragStartCurve = cA; }
-                else if (x < node (2).x) { dragSeg = 1; dragParam = "CurveD"; dragStartCurve = cD; }
-                else if (x > node (3).x) { dragSeg = 2; dragParam = "CurveR"; dragStartCurve = cR; }
-                dragStartY = pos.y;
-            }
-            if (onGesture) onGesture (paramForDrag(), true);
-        }
-        juce::String paramForDrag() const
-        {
-            if (dragNode == 1) return "A";
-            if (dragNode == 2) return "D";
-            if (dragNode == 4) return "R";
-            return dragParam;
+            dragNode = nodeAt (e.position);
+            dragSeg  = dragNode >= 0 ? -1 : segAt (e.position);
+            if (dragSeg >= 0) { dragStartCurve = segCurve (dragSeg); dragStartY = e.position.y; }
+            const auto pid = draggedParam();
+            if (pid.isNotEmpty() && onGesture) onGesture (pid, true);
+            repaint();
         }
         void mouseDrag (const juce::MouseEvent& e) override
         {
-            if (! onEdit) return;
             const auto pos = e.position;
-            if (dragNode == 1)      onEdit ("A", xToT (pos.x));
-            else if (dragNode == 2)
+            switch (dragNode)
             {
-                onEdit ("D", juce::jmax (0.001f, xToT (pos.x - tToX (a) + 6.0f)));
-                onEdit ("S", yToL (pos.y));
-            }
-            else if (dragNode == 4) onEdit ("R", juce::jmax (0.001f, xToT (pos.x - node (3).x + 6.0f)));
-            else if (dragSeg >= 0)
-            {
-                // Up = convex (fast then slow), down = concave.
-                const float dy = (dragStartY - pos.y) / juce::jmax (20.0f, (float) getHeight() * 0.5f);
-                onEdit (dragParam, juce::jlimit (-1.0f, 1.0f, dragStartCurve + dy));
+                case 1: put ("A", juce::jlimit (0.0f, kMaxT, wToT (pos.x - node (0).x))); break;
+                case 2: // the SUSTAIN node: decay time across, sustain level up/down
+                    put ("D", juce::jlimit (0.0f, kMaxT, wToT (pos.x - node (1).x)));
+                    put ("S", yToL (pos.y));
+                    break;
+                case 3: put ("S", yToL (pos.y)); break;   // sustain level only
+                case 4: put ("R", juce::jlimit (0.0f, kMaxT, wToT (pos.x - node (3).x))); break;
+                default:
+                    if (dragSeg >= 0)
+                    {
+                        // Drag the LINE: up bends it convex, down concave.
+                        const float dy = (dragStartY - pos.y) / juce::jmax (24.0f, (float) getHeight() * 0.6f);
+                        put (segParam (dragSeg), juce::jlimit (-1.0f, 1.0f, dragStartCurve + dy * 2.0f));
+                    }
+                    break;
             }
         }
         void mouseUp (const juce::MouseEvent&) override
         {
-            if (onGesture) onGesture (paramForDrag(), false);
+            const auto pid = draggedParam();
+            if (pid.isNotEmpty() && onGesture) onGesture (pid, false);
             dragNode = -1; dragSeg = -1;
+            repaint();
         }
         void mouseDoubleClick (const juce::MouseEvent& e) override
         {
-            if (! onEdit) return; // double-click a leg = straight line again
-            const float x = e.position.x;
-            const juce::String which = x < node (1).x ? "CurveA" : (x < node (2).x ? "CurveD" : "CurveR");
-            if (onGesture) onGesture (which, true);
-            onEdit (which, 0.0f);
-            if (onGesture) onGesture (which, false);
+            const int seg = segAt (e.position);      // straighten that leg again
+            if (seg < 0) return;
+            const juce::String pid = segParam (seg);
+            if (onGesture) onGesture (pid, true);
+            put (pid, 0.0f);
+            if (onGesture) onGesture (pid, false);
         }
     };
 
+    // Drawn-LFO wave editor (Ableton-automation style): drag points; double-click
+    // adds a point; right-click deletes one; dragging a segment's MIDDLE bends it
+    // (power curve), like curving an automation line. One cycle, x 0..1, y 0..1.
     struct WaveEditor : juce::Component
     {
         struct Pt { float x = 0, y = 0, curve = 0; }; // curve bends the segment AFTER this point

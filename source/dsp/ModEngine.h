@@ -221,7 +221,11 @@ public:
                 // convex): a straight line ramp is what made the decay feel like it
                 // "drops" instead of falling away.
                 auto& e = env[(size_t) i];
-                if (newNote) { e.stage = Env::attack; e.pos = 0.0; e.from = e.value; }
+                // EVERY note-on restarts the envelope FROM ZERO: retriggering from
+                // wherever it happened to be meant a second key pressed while the
+                // first was sustaining had almost no attack and no decay left to
+                // travel - it just sat near the top.
+                if (newNote) { e.stage = Env::attack; e.pos = 0.0; e.from = 0.0; e.value = 0.0; }
                 if (! anyHeld && (e.held || newNote))
                 { e.stage = Env::release; e.pos = 0.0; e.from = e.value; }
                 e.held = anyHeld;

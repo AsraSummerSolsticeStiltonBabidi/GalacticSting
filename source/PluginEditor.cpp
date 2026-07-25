@@ -790,6 +790,11 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             if (auto* p = processorRef.apvts.getParameter (currentModParamId ("modE1" + suffix)))
                 p->setValueNotifyingHost (p->convertTo0to1 (v));
         };
+        envEditor.getParam = [this] (const juce::String& suffix)
+        {
+            auto* p = processorRef.apvts.getRawParameterValue (currentModParamId ("modE1" + suffix));
+            return p != nullptr ? p->load() : 0.0f;
+        };
         addChildComponent (envEditor);
         for (int i = 0; i < 4; ++i)
         {
@@ -3357,18 +3362,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             for (int i = 0; i < 4; ++i)
             { custAdsr[i].setVisible (false); custAdsrLbl[i].setVisible (false); } // replaced by the curve editor
             envEditor.setVisible (cust && isEnv);
-            if (envEditor.isVisible()) // keep the drawn curve in step with the parameters
-            {
-                const auto get = [this] (const char* suffix)
-                {
-                    auto* p = processorRef.apvts.getRawParameterValue (currentModParamId ("modE1" + juce::String (suffix)));
-                    return p != nullptr ? p->load() : 0.0f;
-                };
-                envEditor.a = get ("A");  envEditor.d  = get ("D");  envEditor.s  = get ("S");
-                envEditor.r = get ("R");  envEditor.cA = get ("CurveA");
-                envEditor.cD = get ("CurveD"); envEditor.cR = get ("CurveR");
-                envEditor.repaint();
-            }
+            if (envEditor.isVisible()) envEditor.refresh(); // (the 30 Hz timer keeps it live)
             custRangeFader.setVisible (cust);
             lblCustRange.setVisible (cust);
             juce::Component* lfoC[] = { &lfoWaveBox, &lfoRateModeBox, &lfoPhaseModeBox,
@@ -3637,6 +3631,10 @@ void FractalAdditiveAudioProcessorEditor::pollComputerKeyboard()
 void FractalAdditiveAudioProcessorEditor::timerCallback()
 {
     pollComputerKeyboard(); // safety net for missed KEYUPs / ghost keys / focus loss
+
+    // The envelope curve follows its parameters live (automation, a modulator
+    // driving them, the selector switching modulator, an undo...).
+    if (envEditor.isVisible()) envEditor.refresh();
 
     refreshRefAText();       // keep the Reference-A box in sync with the parameter (automation)
 

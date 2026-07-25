@@ -318,7 +318,11 @@ public:
     juce::String getSegmentPeriodText() const { return segPeriodText; }
     void setSegmentUseTopPeriod (bool b);
     bool getSegmentUseTopPeriod() const noexcept { return segUseTopPeriod; }
-    void rebuildSegmentScale();       // build + load the .scl from the current selection
+    // Build + load the .scl from the current partial selection. `userInitiated` marks
+    // the calls that come from an actual user action: only those may switch the
+    // tuning MODE to Scala. The 30 Hz refresh must never override the mode the user
+    // chose (that is what made a segment scale impossible to leave).
+    void rebuildSegmentScale (bool userInitiated = true);
     // Which Spectrum-to-Tuning mode is active (persisted so it survives reopen).
     void setSegmentModeActive (bool b) noexcept { segmentModeActive = b; if (! b) segSourceByDegree.clear(); }
     bool isSegmentModeActive() const noexcept { return segmentModeActive; }
