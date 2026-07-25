@@ -8,7 +8,9 @@
 namespace
 {
     // Prime-limit choice index -> largest prime allowed (0 = off).
-    constexpr int primeLimitValues[] = { 0, 2, 3, 5, 7, 11, 13, 17, 19, 23 };
+    // Fader order: Off first, then the WIDEST limit down to the narrowest, so pushing
+    // the fader up always means "filter more".
+    constexpr int primeLimitValues[] = { 0, 23, 19, 17, 13, 11, 7, 5, 3, 2 };
 }
 
 //==============================================================================
@@ -91,7 +93,7 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         NormalisableRange<float> (0.0f, 4.0f, 0.001f), 1.0f));
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "primeLimit", 1 }, "Prime Limit",
-        StringArray { "Off", "2", "3", "5", "7", "11", "13", "17", "19", "23" }, 0));
+        StringArray { "Off", "23", "19", "17", "13", "11", "7", "5", "3", "2" }, 0));
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "primeMode", 1 }, "Prime Mode",
         StringArray { "Limit", "Whitelist" }, 0));
@@ -1667,10 +1669,12 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     for (int m = 0; m < ModEngine::kMods; ++m) modEngine.unmapAll (m);
     apvts.replaceState (tree);
 
-    // Legacy "selection" choice (0=All 1=Even 2=Odd 3=Prime) -> the continuous
-    // "harmonics" fader axis (0=Even 1=All 2=Odd 3=Prime), so old projects sound
-    // the same after the fader replaced the drop-down.
+    // A state saved BEFORE the Harmonics fader existed needs two migrations (the
+    // absence of a "harmonics" child is what marks it as old).
     if (! tree.getChildWithProperty ("id", "harmonics").isValid())
+    {
+        // 1. The "selection" choice (0=All 1=Even 2=Odd 3=Prime) -> the continuous
+        //    Harmonics axis (0=Even 1=All 2=Odd 3=Prime).
         if (auto legacy = tree.getChildWithProperty ("id", "selection"); legacy.isValid())
         {
             static const float map[4] = { (float) spectrum::All, (float) spectrum::Even,
@@ -1679,6 +1683,18 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
             if (auto* p = apvts.getParameter ("harmonics"))
                 p->setValueNotifyingHost (p->convertTo0to1 (map[idx]));
         }
+        // 2. Prime Limit was listed ascending (Off,2,3,5..23); it now runs the other
+        //    way (Off,23,19..2) so raising the fader always filters MORE.
+        if (auto legacy = tree.getChildWithProperty ("id", "primeLimit"); legacy.isValid())
+        {
+            static const int oldOrder[10] = { 0, 2, 3, 5, 7, 11, 13, 17, 19, 23 };
+            const int oldIdx = juce::jlimit (0, 9, (int) (double) legacy.getProperty ("value", 0.0));
+            int newIdx = 0;
+            for (int i = 0; i < 10; ++i) if (primeLimitValues[i] == oldOrder[oldIdx]) { newIdx = i; break; }
+            if (auto* p = apvts.getParameter ("primeLimit"))
+                p->setValueNotifyingHost (p->convertTo0to1 ((float) newIdx));
+        }
+    }
 
     if (auto ms = tree.getChildWithName ("MODS"); ms.isValid())
     {

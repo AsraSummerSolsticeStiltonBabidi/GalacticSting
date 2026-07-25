@@ -1452,7 +1452,8 @@ private:
     juce::TextButton   rhythmBtn;  // top-bar: opens the spectrum->rhythm MIDI panel
     juce::TextButton   octDn, octUp, sprDn, sprUp; // OCTAVE cell: -1/+1 steppers
     juce::Label        octVal, sprVal;             // their value read-outs
-    juce::TextButton saveTuningBtn; // save the CURRENT tuning (any mode) as .scl to a chosen folder
+    juce::TextButton saveTuningBtn;    // save the CURRENT tuning (any mode) as .scl to a chosen folder
+    juce::TextButton tuningBankAddBtn; // put the CURRENT tuning into the bank
     juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
                      langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3], tuningBankLoadBtn,
                      tuningBankClearBtn;

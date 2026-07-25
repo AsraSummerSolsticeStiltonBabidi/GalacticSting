@@ -136,9 +136,11 @@ namespace
     {
         rad = juce::jmin (rad, r.getWidth() * 0.5f, r.getHeight() * 0.5f);
         juce::Path p;
+        // The TOP-LEFT corner is square: the title chip sits on that corner, and a
+        // rounded corner curving away to the right left a visible gap between the
+        // chip and the box's left line. The other top corner stays rounded.
         p.startNewSubPath (r.getX(), r.getBottom());
-        p.lineTo (r.getX(), r.getY() + rad);
-        p.quadraticTo (r.getX(), r.getY(), r.getX() + rad, r.getY());
+        p.lineTo (r.getX(), r.getY());
         p.lineTo (r.getRight() - rad, r.getY());
         p.quadraticTo (r.getRight(), r.getY(), r.getRight(), r.getY() + rad);
         p.lineTo (r.getRight(), r.getBottom());
@@ -211,12 +213,12 @@ namespace
         const float chipW = juce::jmin (maxW, bb.getWidth() + 11.0f);
         auto chip = juce::Rectangle<float> (box.getX(), box.getY() + 1.0f, chipW, chipH);
 
-        // Rounded TOP corners, sharp (angular) BOTTOM corners.
+        // Top-LEFT square (it continues the box's left line, which is square too),
+        // top-right rounded, bottom corners angular.
         const float rad = juce::jmin (6.0f, chipW * 0.5f);
         juce::Path shape;
         shape.startNewSubPath (chip.getX(), chip.getBottom());
-        shape.lineTo (chip.getX(), chip.getY() + rad);
-        shape.quadraticTo (chip.getX(), chip.getY(), chip.getX() + rad, chip.getY());
+        shape.lineTo (chip.getX(), chip.getY());
         shape.lineTo (chip.getRight() - rad, chip.getY());
         shape.quadraticTo (chip.getRight(), chip.getY(), chip.getRight(), chip.getY() + rad);
         shape.lineTo (chip.getRight(), chip.getBottom());
@@ -358,17 +360,19 @@ namespace
             return juce::LookAndFeel_V4::getSliderThumbRadius (s);
         }
 
-        // Regular heptagon (flat-ish top), used for every fader thumb: its inscribed
-        // circle is ~0.90 of the radius, so a letter drawn at 0.8 R sits inside with
-        // real margin and never has to be squeezed to fit.
+        // HEPTAGRAM - a 7-pointed star - used for every fader thumb. Drawn as a
+        // 14-gon alternating the outer radius with an inner one, so it fills as a
+        // solid star and its middle stays wide enough for the ADSR letter.
         static juce::Path heptagon (juce::Point<float> c, float r)
         {
             juce::Path p;
             constexpr float twoPi = juce::MathConstants<float>::twoPi;
-            for (int i = 0; i < 7; ++i)
+            const float rIn = r * 0.62f;              // {7/2}-like proportions
+            for (int i = 0; i < 14; ++i)
             {
-                const float a = -juce::MathConstants<float>::halfPi + (float) i * twoPi / 7.0f;
-                const juce::Point<float> pt (c.x + r * std::cos (a), c.y + r * std::sin (a));
+                const float a  = -juce::MathConstants<float>::halfPi + (float) i * twoPi / 14.0f;
+                const float rr = (i % 2 == 0) ? r : rIn;
+                const juce::Point<float> pt (c.x + rr * std::cos (a), c.y + rr * std::sin (a));
                 if (i == 0) p.startNewSubPath (pt); else p.lineTo (pt);
             }
             p.closeSubPath();
@@ -713,7 +717,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     primeLimitFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 40, 15);
     primeLimitFader.textFromValueFunction = [] (double v)
     {
-        static const char* names[] = { "Off", "2", "3", "5", "7", "11", "13", "17", "19", "23" };
+        static const char* names[] = { "Off", "23", "19", "17", "13", "11", "7", "5", "3", "2" };
         return juce::String (names[juce::jlimit (0, 9, (int) std::lround (v))]);
     };
     primeLimitFader.updateText();
@@ -908,6 +912,20 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuningBankLoadBtn.setTooltip (tr ("Load a .scl into the selected bank slot.",
                                       "Carrega un .scl a la ranura seleccionada del banc."));
     tuningBankLoadBtn.onClick = [this] { openTuningBankChooser(); };
+    // Put the tuning that is playing RIGHT NOW into the bank (any mode: a generated
+    // scale, an edited one, an EDO...), without going through a file.
+    tuningBankAddBtn.setColour (juce::TextButton::buttonColourId, cTuning.withAlpha (0.5f));
+    tuningBankAddBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    tuningBankAddBtn.setMouseClickGrabsKeyboardFocus (false);
+    tuningBankAddBtn.onClick = [this]
+    {
+        auto name = processorRef.tuningScaleName();
+        if (name.isEmpty()) name = "tuning " + juce::String (processorRef.getScaleDegrees()) + " notes";
+        processorRef.bankAutoAdd (name, processorRef.currentTuningAsScl (name));
+        refreshTuningBank();
+        refocus();
+    };
+    addChildComponent (tuningBankAddBtn);
     addAndMakeVisible (tuningBankLoadBtn);
     // X: remove the SELECTED tuning from the bank (the scale itself is untouched).
     tuningBankClearBtn.setButtonText ("X");
@@ -1803,6 +1821,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
 
     loadSclButton.setButtonText    (tr ("Load .scl", "Obrir .scl"));
     clearSclButton.setButtonText   (tr ("Reset", "Reinicia"));
+    tuningBankAddBtn.setButtonText (tr ("+ to bank", "+ al banc"));
     tuningBankLoadBtn.setButtonText (tr ("+ .scl", "+ .scl"));
     loadTimbreButton.setButtonText (tr ("Load .scl", "Obrir .scl"));
     clearTimbreButton.setButtonText (processorRef.isTimbreActive() ? tr ("On", "Actiu") : tr ("Off", "Apagat"));
@@ -2073,7 +2092,8 @@ void FractalAdditiveAudioProcessorEditor::runChordSearch()
     resized();
     juce::String err;
     if (! processorRef.startChordSearch (juce::jmax (2, chordNotesBox.getSelectedId()), periodRatio, periodLine,
-                                         juce::jmax (1, chordCountBox.getSelectedId()),
+                                         16, // fixed result count
+
                                          chordMinMaxBox.getSelectedId() == 2,
                                          juce::jlimit (0.0, 600.0, chordMinEdit.getText().getDoubleValue()), err))
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
@@ -2888,9 +2908,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
         juce::Component* sethC[]  = { &dissBtn, &dissCountBox, &lblSteps, &periodEdit, &dissModeBox, &dissSaveBtn, &lblPeriod,
                                       &dissMinEdit, &dissMinLbl };
         juce::Component* segC[]   = { &segView, &segPeriodEdit, &segTopToggle, &segPeriodLbl, &segHelpLbl };
-        juce::Component* chordC[] = { &chordNotesBox, &chordCountBox, &chordMinMaxBox, &chordNotesLbl,
+        juce::Component* chordC[] = { &chordNotesBox, &chordMinMaxBox, &chordNotesLbl,
                                       &chordPerLbl, &chordProgLbl, &chordPeriodEdit, &chordGoBtn,
-                                      &chordMinEdit, &chordMinLbl, &chordCountLbl };
+                                      &chordMinEdit, &chordMinLbl };
         for (auto* c : sethC)  c->setVisible (dy);
         for (auto* c : segC)   c->setVisible (seg);
         for (auto* c : chordC) c->setVisible (chord);
@@ -2947,10 +2967,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
             chordPerLbl.setJustificationType (juce::Justification::centredLeft);
             chordPerLbl.setBounds (r2.removeFromLeft (44));
             chordPeriodEdit.setBounds (r2.removeFromLeft (44).reduced (0, 1));
-            r2.removeFromLeft (6);
-            chordCountLbl.setJustificationType (juce::Justification::centredLeft);
-            chordCountLbl.setBounds (r2.removeFromLeft (48)); // "Chords"
-            compact (chordCountBox, r2);
+            // The result count is fixed at 16 - one control less to think about.
+            chordCountLbl.setVisible (false); chordCountBox.setVisible (false);
             si.removeFromTop (4);
             auto r3 = si.removeFromTop (22);
             chordMinLbl.setJustificationType (juce::Justification::centredLeft);
@@ -3352,16 +3370,17 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // squeezed the tuning-bank controls to zero height (invisible).
             const int  tmode    = processorRef.getTuningMode();
             const bool loadVis  = tmode == 2;
-            const bool resetVis = tmode != 0 || processorRef.tuningHasScala();
             const bool saveVis  = tmode != 0;
+            const bool bankVis  = tmode != 0;   // "add the ACTIVE tuning to the bank"
             loadSclButton.setVisible (loadVis);
-            clearSclButton.setVisible (resetVis);
+            clearSclButton.setVisible (false);  // Reset removed - the mode selector does it
             saveTuningBtn.setVisible (saveVis);
-            if (loadVis || resetVis || saveVis)
+            tuningBankAddBtn.setVisible (bankVis);
+            if (loadVis || saveVis || bankVis)
             {
                 ti.removeFromTop (3);
                 auto brow = ti.removeFromTop (23);
-                const int nBtn = (loadVis ? 1 : 0) + (resetVis ? 1 : 0) + (saveVis ? 1 : 0);
+                const int nBtn = (loadVis ? 1 : 0) + (saveVis ? 1 : 0) + (bankVis ? 1 : 0);
                 const int bw   = brow.getWidth() / juce::jmax (1, nBtn);
                 int left = nBtn;
                 const auto place = [&] (juce::TextButton& b, bool vis)
@@ -3369,9 +3388,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     if (! vis) return;
                     b.setBounds ((--left > 0 ? brow.removeFromLeft (bw) : brow).reduced (2, 0));
                 };
-                place (loadSclButton,  loadVis);
-                place (clearSclButton, resetVis);
-                place (saveTuningBtn,  saveVis);
+                place (loadSclButton,    loadVis);
+                place (saveTuningBtn,    saveVis);
+                place (tuningBankAddBtn, bankVis);
             }
             // Pitch bend ABOVE Recent; hidden in MPE-input mode (the MPE zone fixes
             // the per-note range at +-48, so the choice is irrelevant there).
