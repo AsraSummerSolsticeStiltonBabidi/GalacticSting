@@ -1155,7 +1155,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     rhythmBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::black);
     rhythmBtn.setMouseClickGrabsKeyboardFocus (false);
     rhythmBtn.setTooltip (tr (
-        "SPECTRUM TO RHYTHM: turns partials of the current patch into MIDI pulse trains - exact polyrhythms derived from the spectrum's frequency ratios, sample-locked to the sound - sent out of this plugin's MIDI OUTPUT to any other track/instrument. Click to open the panel.",
+        "SPECTRUM VS RHYTHM: turns partials of the current patch into MIDI pulse trains - exact polyrhythms derived from the spectrum's frequency ratios, sample-locked to the sound - sent out of this plugin's MIDI OUTPUT to any other track/instrument. Click to open the panel.",
         "ESPECTRE A RITME: converteix parcials del patch actual en trens de polsos MIDI - poliritmes exactes derivats de les relacions de freq\xc3\xbc\xc3\xa8ncia de l'espectre, clavats al so mostra a mostra - que surten per la SORTIDA MIDI del plugin cap a qualsevol altra pista/instrument. Clica per obrir el panell."));
     rhythmBtn.onClick = [this]
     {
@@ -1303,10 +1303,24 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 
     // Spectrum-to-Tuning MODE selector (order: chords, dyads, segment). The combo is
     // two lines tall so the full mode names fit. Relayout on change.
-    specModeBox.addItem ("Chords based on beating", 1);
-    specModeBox.addItem ("Dyads based on beating",  2);
+    // One beating mode (its two former entries are the SOURCE selector below) plus
+    // the segment picker.
+    specModeBox.addItem ("Find tunings based on beating", 1);
     specModeBox.addItem ("From spectrum's segment", 3);
-    specModeBox.setSelectedId (processorRef.isSegmentModeActive() ? 3 : 2, juce::dontSendNotification); // restored state
+    tuneSourceBox.addItem ("From current tuning", 1);
+    tuneSourceBox.addItem ("From all possible tunings", 2);
+    tuneSourceBox.setSelectedId (1, juce::dontSendNotification);
+    tuneScopeBox.addItem ("Based on the beating between 0 and each other note", 1);
+    tuneScopeBox.addItem ("Based on all the beatings between each note and each other note", 2);
+    tuneScopeBox.setSelectedId (1, juce::dontSendNotification);
+    for (auto* b : { &tuneSourceBox, &tuneScopeBox })
+    {
+        b->setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
+        b->setMouseClickGrabsKeyboardFocus (false);
+        b->onChange = [this] { resized(); repaint(); refocus(); };
+        addChildComponent (*b);
+    }
+    specModeBox.setSelectedId (processorRef.isSegmentModeActive() ? 3 : 1, juce::dontSendNotification); // restored state
     specModeBox.setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
     specModeBox.setMouseClickGrabsKeyboardFocus (false);
     specModeBox.onChange = [this]
@@ -1382,7 +1396,26 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     chordProgLbl.setColour (juce::Label::textColourId, cSpecScale.brighter (0.2f));
     chordProgLbl.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
     addChildComponent (chordProgLbl);
-    chordList.onPlay = [this] (int row) { playChordPreview (row); };
+    // Hover a row to hear it (no play button): the chord search results, the n-ad
+    // combinations of the current tuning, and the per-degree dyads all behave the same.
+    chordList.onHover = [this] (int row)
+    {
+        const auto res = processorRef.getChordResults();
+        if (! juce::isPositiveAndBelow (row, (int) res.size())) { hoverPreview ({}); return; }
+        hoverPreview (res[(size_t) row].alphas);
+    };
+    nadList.onHover = [this] (int row)
+    {
+        if (! juce::isPositiveAndBelow (row, (int) nadList.rows.size())) { hoverPreview ({}); return; }
+        std::vector<double> r;
+        for (const int d : nadList.rows[(size_t) row].degs) r.push_back (processorRef.getDegreeRatio (d));
+        hoverPreview (r);
+    };
+    degreeList.onHover = [this] (int row)
+    {
+        if (! juce::isPositiveAndBelow (row, (int) degreeList.rows.size())) { hoverPreview ({}); return; }
+        hoverPreview ({ 1.0, degreeList.rows[(size_t) row].ratio });  // the dyad 0 + this degree
+    };
     chordList.onLoad = [this] (int row)
     {
         juce::String err;
@@ -1751,8 +1784,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     using juce::dontSendNotification;
     langButton.setButtonText (catalan ? "ENG" : "CAT");
     menuButton.setButtonText (tr ("Menu", "Men\xc3\xba"));
-    rhythmBtn.setButtonText (tr ("Spectrum to Rhythm", "Espectre a ritme"));
-    rhythmPanel.heading.setText (tr ("SPECTRUM TO RHYTHM", "ESPECTRE A RITME"), dontSendNotification);
+    rhythmBtn.setButtonText (tr ("Spectrum vs Rhythm", "Espectre vs ritme"));
+    rhythmPanel.heading.setText (tr ("SPECTRUM VS RHYTHM", "ESPECTRE VS RITME"), dontSendNotification);
     rhythmPanel.outLbl.setText  (tr ("MIDI out (to DAW)", "Sortida MIDI (al DAW)"), dontSendNotification);
     rhythmPanel.selfLbl.setText (juce::String::fromUTF8 (catalan ? "Sona al Fibl\xc3\xb3" : "Play in Fibl\xc3\xb3"), dontSendNotification);
     rhythmPanel.droneT.setButtonText (tr ("Note under pulses", "Nota sota els polsos"));
@@ -1884,7 +1917,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     gTimbre.setText        (tr ("Custom Engine", "Motor propi"));
     intervalEdit.setTextToShowWhenEmpty (tr ("intervals: 3/2 2 700c ...", "intervals: 3/2 2 700c ..."),
                                          juce::Colour (0xff8f96a8));
-    gSpecScale.setText     (tr ("Spectrum to Tuning", "Espectre a afinaci\xc3\xb3"));
+    gSpecScale.setText     (tr ("Spectrum vs Tuning", "Espectre vs afinaci\xc3\xb3"));
     gScaleDiss.setText     (tr ("Scale Dissonance", "Dissonancia de l'escala"));
     segPeriodLbl.setText   (tr ("Period", "Per\xc3\xado" "de"), juce::dontSendNotification);
     segTopToggle.setButtonText (tr ("= top", "= sup"));
@@ -2070,9 +2103,17 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.helpB.setButtonText (tr ("How to route", "Com encaminar"));
     chordList.emptyText = tr ("Press Find to search.\n\xe2\x96\xb6 hears a chord\ndouble-click loads it as the scale",
                               "Prem Troba per cercar.\n\xe2\x96\xb6 escolta un acord\ndoble clic el carrega com a escala");
-    localise (specModeBox,  { tr ("Chords based on beating", "Acords basats en batec"),
-                              tr ("Dyads based on beating", "D\xc3\xad""ades basades en batec"),
-                              tr ("From spectrum's segment", "Del segment de l'espectre") });
+    // specModeBox's ids are 1 and 3 (2 was retired), so it cannot use localise()'s
+    // "ids are 1..N" shortcut.
+    specModeBox.changeItemText (1, tr ("Find tunings based on beating", "Troba afinacions pel batec"));
+    specModeBox.changeItemText (3, tr ("From spectrum's segment", "Del segment de l'espectre"));
+    specModeBox.setSelectedId (specModeBox.getSelectedId(), juce::dontSendNotification);
+    localise (tuneSourceBox, { tr ("From current tuning", "De l'afinaci\xc3\xb3 actual"),
+                               tr ("From all possible tunings", "De totes les afinacions possibles") });
+    localise (tuneScopeBox,  { tr ("Based on the beating between 0 and each other note",
+                                   "Pel batec entre 0 i cada altra nota"),
+                               tr ("Based on all the beatings between each note and each other note",
+                                   "Per tots els batecs entre cada nota i cada altra nota") });
     lastNadD = 0; // force the n-ad selector's items to rebuild in the new language
 
     // Chord-search mode texts.
@@ -2309,6 +2350,44 @@ void FractalAdditiveAudioProcessorEditor::playChordPreview (int row)
     // a later note landing on the same channel, and forget the tracked notes.
     for (int ch = 9; ch <= 9 + juce::jmin (7, (int) send.size() - 1); ++ch)
         queue (lastOff + 50, juce::MidiMessage::pitchWheel (ch, 8192));
+}
+
+// HOVER preview: sound a set of ratios (relative to middle C) for as long as the
+// pointer stays on that row. Any previous preview is stopped first, so only one
+// combination ever sounds; hoverPreview({}) just stops.
+void FractalAdditiveAudioProcessorEditor::hoverPreview (const std::vector<double>& ratios)
+{
+    stopChordPreview();
+    if (ratios.empty() || ! (processorRef.getSampleRate() > 0.0)) return;
+
+    static constexpr int bendValues[] = { 2, 12, 48 };
+    const int bendRange = processorRef.getTuningMode() == 3 ? 48
+        : bendValues[juce::jlimit (0, 2, (int) processorRef.apvts.getRawParameterValue ("bendRange")->load())];
+    const double f60 = processorRef.getNoteFrequency (60);
+    if (! (f60 > 0.0)) return;
+
+    const juce::uint32 now = juce::Time::getMillisecondCounter();
+    int k = 0;
+    for (const double a : ratios)
+    {
+        if (! (a > 0.0)) continue;
+        const double target = f60 * a;
+        int bestKey = 60; double bestErr = 1.0e18;
+        for (int m = 0; m <= 127; ++m)
+        {
+            const double f = processorRef.getNoteFrequency (m);
+            if (! (f > 0.0)) continue;
+            const double e = std::abs (std::log2 (target / f));
+            if (e < bestErr) { bestErr = e; bestKey = m; }
+        }
+        const double semis = 12.0 * std::log2 (target / processorRef.getNoteFrequency (bestKey));
+        const int wheel = juce::jlimit (0, 16383, 8192 + (int) std::lround (semis / (double) bendRange * 8192.0));
+        const int ch = 9 + (k % 8);
+        previewQueue.push_back ({ now, juce::MidiMessage::pitchWheel (ch, wheel) });
+        previewQueue.push_back ({ now, juce::MidiMessage::noteOn (ch, bestKey, (juce::uint8) 100) });
+        previewNotes.push_back ({ ch, bestKey });   // held until the pointer leaves
+        ++k;
+    }
 }
 
 // Sethares dissonance of every key AGAINST the hovered one, cached: recomputed only
@@ -3012,15 +3091,32 @@ void FractalAdditiveAudioProcessorEditor::resized()
         auto sp = area.removeFromRight (208);
         area.removeFromRight (6); // uniform gutter to Essentials/Filter
 
-        const int  mode  = specModeBox.getSelectedId();
-        const bool chord = mode == 1; // Chords based on beating
-        const bool dy    = mode == 2; // Dyads based on beating
-        const bool seg   = mode == 3; // From spectrum's segment
+        // ONE beating mode now, with two selectors inside it:
+        //   SOURCE - from the current tuning (combinations of its own degrees) or
+        //            from all possible tunings (a free search, loadable as a tuning)
+        //   SCOPE  - rank by the beating against 0 only, or by every pair's beating
+        const int  mode = specModeBox.getSelectedId();
+        const bool beat = mode == 1;                       // "Find tunings based on beating"
+        const bool seg  = mode == 3;                       // From spectrum's segment
+        const bool fromCurrent = tuneSourceBox.getSelectedId() != 2;
+        const bool allPairs    = tuneScopeBox.getSelectedId() == 2;
+        const bool chord = beat && ! fromCurrent;          // the free chord search
+        const bool dy    = beat && fromCurrent;            // combinations of this tuning
 
         gSpecScale.setBounds (sp.reduced (3, 2)); // same top/bottom lines as rows 1-2
         auto si = sp.reduced (3).reduced (8, 5); si.removeFromTop (20);
         specModeBox.setBounds (si.removeFromTop (34));     // two lines: full mode names fit
-        si.removeFromTop (4);
+        si.removeFromTop (3);
+        tuneSourceBox.setVisible (beat);
+        tuneScopeBox.setVisible (beat);
+        if (beat)
+        {
+            tuneSourceBox.setBounds (si.removeFromTop (22));
+            si.removeFromTop (2);
+            tuneScopeBox.setBounds (si.removeFromTop (30)); // two lines: the long scope names
+            si.removeFromTop (3);
+        }
+        si.removeFromTop (1);
 
         // Mode-gated visibility.
         juce::Component* sethC[]  = { &dissBtn, &dissCountBox, &lblSteps, &periodEdit, &dissModeBox, &dissSaveBtn, &lblPeriod,
@@ -3113,8 +3209,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // The result list fills the REST of this same box.
         si.removeFromTop (4);
         const bool showDeg = (dy) || (chord && fromChord && chordDegView);
-        const int  nadSel  = juce::jmax (1, nadBox.getSelectedId());
-        nadBox.setVisible (showDeg);
+        // The SCOPE selector decides between "vs 0 only" (the degree list) and "all
+        // pairs" (the n-ad combinations); the n-ad size box only appears for the latter.
+        const int  nadSel  = allPairs ? juce::jmax (2, nadBox.getSelectedId()) : 1;
+        nadBox.setVisible (showDeg && allPairs);
         dissHeader.setVisible (showDeg && nadSel == 1);
         dissView.setVisible (showDeg && nadSel == 1);
         nadView.setVisible (showDeg && nadSel > 1);
@@ -3136,7 +3234,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 lastNadD = D;
                 const int keepSel = nadBox.getSelectedId();
                 nadBox.clear (juce::dontSendNotification);
-                nadBox.addItem (tr ("Degrees (vs 0)", "Graus (vs 0)"), 1);
                 for (int n = 2; n <= juce::jmin (D, 12); ++n)
                 {
                     juce::String name;
@@ -3150,11 +3247,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     }
                     nadBox.addItem (name, n);
                 }
-                nadBox.setSelectedId (keepSel > 0 && keepSel <= juce::jmin (D, 12) ? keepSel : 1,
+                nadBox.setSelectedId (keepSel >= 2 && keepSel <= juce::jmin (D, 12) ? keepSel : 2,
                                       juce::dontSendNotification);
             }
-            nadBox.setBounds (si.removeFromTop (22));
-            si.removeFromTop (3);
+            if (allPairs) { nadBox.setBounds (si.removeFromTop (22)); si.removeFromTop (3); }
             if (nadSel == 1)
             {
                 dissHeader.splitX = 92;

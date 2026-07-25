@@ -134,6 +134,17 @@ private:
         std::vector<Row> rows;
         juce::String tip;
         static constexpr int kRowH = 19;
+        // Hovering a row SOUNDS that dyad (0 + this degree); only one sounds at a time.
+        std::function<void (int)> onHover;
+        int hoverRow = -1;
+        void mouseMove (const juce::MouseEvent& e) override
+        {
+            const int r0 = e.y / kRowH;
+            const int r = juce::isPositiveAndBelow (r0, (int) rows.size()) ? r0 : -1;
+            if (r != hoverRow) { hoverRow = r; if (onHover) onHover (r); repaint(); }
+        }
+        void mouseExit (const juce::MouseEvent&) override
+        { if (hoverRow != -1) { hoverRow = -1; if (onHover) onHover (-1); repaint(); } }
         juce::String getTooltip() override { return tip; }
         int contentHeight() const { return (int) rows.size() * kRowH; }
         void paint (juce::Graphics& g) override
@@ -193,6 +204,17 @@ private:
         int degreesPerPeriod = 12;
         juce::String tip, emptyText; // status/coverage line (computing / over budget / partial)
         static constexpr int kRowH = 21;
+        // Hovering a row SOUNDS that combination; only one sounds at a time.
+        std::function<void (int)> onHover;
+        int hoverRow = -1;
+        void mouseMove (const juce::MouseEvent& e) override
+        {
+            const int r0 = e.y / kRowH;
+            const int r = juce::isPositiveAndBelow (r0, (int) rows.size()) ? r0 : -1;
+            if (r != hoverRow) { hoverRow = r; if (onHover) onHover (r); repaint(); }
+        }
+        void mouseExit (const juce::MouseEvent&) override
+        { if (hoverRow != -1) { hoverRow = -1; if (onHover) onHover (-1); repaint(); } }
         int contentHeight() const { return (int) rows.size() * kRowH + (emptyText.isNotEmpty() ? kRowH : 0); }
         juce::String getTooltip() override { return tip; }
         void paint (juce::Graphics& g) override
@@ -261,8 +283,9 @@ private:
         std::vector<Row> rows;
         juce::String tip;
         juce::String emptyText { "Press Find to search.\n\xe2\x96\xb6 hears a chord\ndouble-click loads it as the scale" };
-        std::function<void (int)> onPlay, onLoad;
-        static constexpr int kRowH = 22, kRankW = 30, kPlayW = 22, kNoteW = 62;
+        std::function<void (int)> onPlay, onLoad, onHover; // onHover(-1) = pointer left
+        // No play column any more (hover sounds it), so the notes get that space.
+        static constexpr int kRowH = 22, kRankW = 30, kNoteW = 68;
         int contentHeight() const { return (int) rows.size() * kRowH; }
         // Every note gets a fixed readable column; when a chord has more notes than
         // fit, the Viewport scrolls HORIZONTALLY instead of squeezing the text away.
@@ -270,7 +293,7 @@ private:
         {
             size_t maxN = 0;
             for (const auto& r : rows) maxN = std::max (maxN, r.notes.size());
-            return kRankW + kPlayW + (int) maxN * kNoteW + 4;
+            return kRankW + (int) maxN * kNoteW + 4;
         }
         juce::String getTooltip() override { return tip; }
         static juce::Colour noteColour (int k)
@@ -296,17 +319,11 @@ private:
                 g.setColour (juce::Colour (0xff8f96a8));  // numbered ranking
                 g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
                 g.drawText ("#" + juce::String (row + 1), 2, y, kRankW - 4, kRowH, juce::Justification::centredLeft, false);
-                // play glyph
-                {
-                    auto pr = juce::Rectangle<float> ((float) kRankW, (float) y + 5.0f, (float) kPlayW - 8.0f, (float) kRowH - 10.0f);
-                    juce::Path tri;
-                    tri.addTriangle (pr.getX(), pr.getY(), pr.getX(), pr.getBottom(), pr.getRight(), pr.getCentreY());
-                    g.setColour (juce::Colour (0xff2fb155));
-                    g.fillPath (tri);
-                }
+                if (row == hoverRow) // the row you are hearing
+                { g.setColour (juce::Colour (0x332fb155)); g.fillRect (0, y, getWidth(), kRowH); }
                 // the chord's notes, one colour per note index (fixed column width -
                 // the view scrolls sideways rather than shrinking the text to dust)
-                const int x0 = kRankW + kPlayW;
+                const int x0 = kRankW;
                 const int nw = juce::jmax (kNoteW, (getWidth() - x0) / juce::jmax (1, (int) r.notes.size()));
                 for (int k = 0; k < (int) r.notes.size(); ++k)
                 {
@@ -319,17 +336,21 @@ private:
                 y += kRowH; ++row;
             }
         }
-        void mouseDown (const juce::MouseEvent& e) override
+        // HOVER plays it - there is no play button any more, and only one chord ever
+        // sounds: moving to another row (or off the list) stops the previous one.
+        int hoverRow = -1;
+        void mouseMove (const juce::MouseEvent& e) override
         {
             const int row = e.y / kRowH;
-            if (! juce::isPositiveAndBelow (row, (int) rows.size())) return;
-            if (e.x >= kRankW - 2 && e.x < kRankW + kPlayW && onPlay) onPlay (row);
+            const int r = juce::isPositiveAndBelow (row, (int) rows.size()) ? row : -1;
+            if (r != hoverRow) { hoverRow = r; if (onHover) onHover (r); repaint(); }
         }
+        void mouseExit (const juce::MouseEvent&) override
+        { if (hoverRow != -1) { hoverRow = -1; if (onHover) onHover (-1); repaint(); } }
         void mouseDoubleClick (const juce::MouseEvent& e) override
         {
             const int row = e.y / kRowH;
-            if (juce::isPositiveAndBelow (row, (int) rows.size()) && e.x >= kRankW + kPlayW && onLoad)
-                onLoad (row);
+            if (juce::isPositiveAndBelow (row, (int) rows.size()) && onLoad) onLoad (row);
         }
     };
 
@@ -733,7 +754,7 @@ private:
             helpB.onClick = [this]
             {
                 juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon,
-                    "Spectrum to Rhythm", helpText, this);
+                    "Spectrum vs Rhythm", helpText, this);
             };
             addAndMakeVisible (helpB);
 
@@ -1746,6 +1767,7 @@ private:
     MagneticSlider fractalFader, harmonicsFader, primeLimitFader; // magnetic whole-value detents
     juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, octaveFader, pEnvAmtFader;
     juce::Slider  ampAdsr[4], filtAdsr[4], pitchAdsr[4];
+    juce::ComboBox tuneSourceBox, tuneScopeBox; // beating mode: source + scope
     juce::ComboBox basePitchBox, whitelistBox, phaseBox, primeModeBox, primeLimitBox, tuningBox, bendBox,
                    dissCountBox, dissModeBox, tuningBankBox;
     RefreshingComboBox presetBox;
@@ -1847,6 +1869,7 @@ private:
     std::vector<std::pair<int,int>> previewNotes; // (ch,key) of the current preview - for explicit stops
     void stopChordPreview();                      // explicit note-offs + bend recentre (MPE-safe)
     void playChordPreview (int row);
+    void hoverPreview (const std::vector<double>& ratios); // sounds while hovering a row
     void runChordSearch();
     // Hover-dissonance cache: Sethares dissonance of every key AGAINST the hovered
     // one (recomputed only when the hovered note / timbre / tuning changes).
