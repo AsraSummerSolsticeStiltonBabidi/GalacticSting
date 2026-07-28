@@ -84,6 +84,12 @@ static void report (const char* name, std::function<void (AudioProcessorValueTre
     setP (proc.apvts, "masterGain", 0.0f);
     setParams (proc.apvts);
     proc.prepareToPlay (sampleRate, blockSize);
+    // prepareToPlay builds the spectrum from the parameters as they stand, so setting
+    // them BEFORE it (as above) is what makes this correct. The explicit poll keeps it
+    // correct if that order is ever disturbed: outside a host there is no message loop
+    // to run the parameter poll, and a spectrum still on its startup values would make
+    // every partial check here meaningless.
+    proc.pollParametersForTests();
 
     auto win = renderWindow (proc, note);
     double sumSq = 0.0; float peak = 0.0f;
@@ -156,6 +162,12 @@ static void reportEnvelope (const char* name, std::function<void (AudioProcessor
     setP (proc.apvts, "ampSustain", 1.0f);  setP (proc.apvts, "masterGain", 0.0f);
     setParams (proc.apvts);
     proc.prepareToPlay (sampleRate, blockSize);
+    // prepareToPlay builds the spectrum from the parameters as they stand, so setting
+    // them BEFORE it (as above) is what makes this correct. The explicit poll keeps it
+    // correct if that order is ever disturbed: outside a host there is no message loop
+    // to run the parameter poll, and a spectrum still on its startup values would make
+    // every partial check here meaningless.
+    proc.pollParametersForTests();
     auto mag = magnitudeOf (renderWindow (proc, note));
     const float maxMag = *std::max_element (mag.begin(), mag.end());
     std::printf ("  %-16s spectral tilt:  400Hz %5.1f   1.5k %5.1f   5k %5.1f   15k %5.1f  (dB below peak)\n",
@@ -224,6 +236,53 @@ int main()
     reportEnvelope ("N=1 Orig",  set (1, 1,0,1.0f,1,0,0), 60);
     reportEnvelope ("N=4 Orig",  set (4, 1,0,1.0f,1,0,0), 60);
     reportEnvelope ("N=8 Orig",  set (8, 1,0,1.0f,1,0,0), 60);
+
+    // == INDEPENDENT check: the expectation is generated HERE, not by the engine ==
+    // Everything above compares the rendered audio against compileSpectrum(expected)
+    // - the very function the synth renders from. That catches anything the RENDERER
+    // loses (a voice not sounding a partial, the filter, Nyquist, normalisation), but
+    // it cannot catch a partial the COMPILER itself drops: the partial would vanish
+    // from the measurement and the expectation together and the comparison would
+    // still agree. Verified by deliberately deleting a partial inside
+    // compileSpectrum: every check above still passed.
+    // So here the expected ratios are written out by hand. A plain harmonic spectrum
+    // (base 1, All, no fractal, no prime limit) must contain EVERY integer multiple
+    // of the played pitch up to the audible ceiling - no exceptions, no thinning.
+    {
+        std::printf ("== INDEPENDENT: plain harmonic series, expectation not from the engine ==\n");
+        FractalAdditiveAudioProcessor proc;
+        setP (proc.apvts, "ampAttack", 0.001f);
+        setP (proc.apvts, "ampDecay", 0.001f);
+        setP (proc.apvts, "ampSustain", 1.0f);
+        setP (proc.apvts, "masterGain", 0.0f);
+        set (1, 0, 0, 1.0f, 1, 0, 0) (proc.apvts);   // N=1, All, slope 1, no fractal, no limit
+        setP (proc.apvts, "spectrumRange", 10.0f);   // no octave cut
+        setP (proc.apvts, "filterCutoff", 20000.0f); // keep the filter out of the way
+        proc.prepareToPlay (sampleRate, blockSize);
+        proc.pollParametersForTests();
+
+        constexpr int note = 36;                     // C2 - room for many harmonics
+        const double f0 = MidiMessage::getMidiNoteInHertz (note);
+        auto mag = magnitudeOf (renderWindow (proc, note));
+        const float maxMag = *std::max_element (mag.begin(), mag.end());
+        const float thresh = maxMag * 3.16e-4f;      // -70 dB below the peak
+
+        int missing = 0, firstMissing = 0;
+        // Up to 18 kHz, and staying clear of Nyquist.
+        for (int h = 1; h * f0 < std::min (18000.0, sampleRate * 0.5 - 20.0); ++h)
+            if (peakNear (mag, (double) h * f0) <= thresh)
+            { ++missing; if (firstMissing == 0) firstMissing = h; }
+
+        if (missing > 0)
+        {
+            std::printf ("  %d harmonic(s) of the plain series ABSENT (first: harmonic %d at %.1f Hz)\n",
+                         missing, firstMissing, (double) firstMissing * f0);
+            ++failures;
+        }
+        else
+            std::printf ("  every harmonic of the plain series is present, 1..%d\n",
+                         (int) (std::min (18000.0, sampleRate * 0.5 - 20.0) / f0));
+    }
 
     std::printf ("\n%s\n", failures == 0 ? "no partials dropped" : "PARTIALS DROPPED");
     return failures == 0 ? 0 : 1;

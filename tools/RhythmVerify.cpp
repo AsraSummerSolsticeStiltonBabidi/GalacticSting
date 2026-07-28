@@ -37,10 +37,17 @@ int main()
     proc.prepareToPlay (sr, blk);
 
     // Route P1 (harmonic 1) and P2 (harmonic 2) and P3: slots sorted by partial.
+    // Every set is followed by a parameter POLL, because that is what a real host
+    // does: the spectrum rebuild, the tuning mode, Reference A, Octave Transpose and
+    // the bend range all reach the DSP from the processor's message timer, and an
+    // offline harness has no message loop to run it. Without this the tests here
+    // would quietly exercise a plugin still on its startup values - which is exactly
+    // how a ratio-pulse test passed both with and without the bug it was written for.
     auto setParam = [&] (const char* id, float plain)
     {
         auto* p = proc.apvts.getParameter (id);
         p->setValueNotifyingHost (p->convertTo0to1 (plain));
+        proc.pollParametersForTests();
     };
     setParam ("rhythmOn", 1.0f);
     proc.getRhythm().slots[0].partial = 1; proc.getRhythm().slots[0].enabled = true; // P2 (ratio 2)
@@ -857,8 +864,7 @@ int main()
         // MTS-ESP/12ED2 used to be refused silently, which read as "right-click is
         // broken". It renders the current tuning to .scl form and edits that.
         proc.clearScala();
-        if (auto* p = proc.apvts.getParameter ("tuningMode"))
-            p->setValueNotifyingHost (p->convertTo0to1 (1.0f)); // MTS-ESP (no master -> 12ED2)
+        setParam ("tuningMode", 1.0f); // MTS-ESP (no master -> 12ED2); polls, so it really applies
         check (proc.getScaleDegrees() == 12, "a non-Scala tuning reports its 12 degrees");
         check (proc.editTuningDegree (7, "3/2", err), "a degree can be edited straight from it");
         check (proc.getTuningMode() == 2, "which lands the result in Scala mode");
@@ -941,8 +947,7 @@ int main()
         // A preset saved from a NON-Scala tuning carries no SCALA child - the button
         // must not falsely offer something that was never there.
         proc.clearScala();
-        if (auto* p = proc.apvts.getParameter ("tuningMode"))
-            p->setValueNotifyingHost (p->convertTo0to1 (0.0f)); // 12ED2
+        setParam ("tuningMode", 0.0f); // plain 12ED2
         const auto presetName2 = proc.savePreset ("__rhythmverify_tmp_b");
         check (presetName2.isNotEmpty(), "a 12ED2 preset saves");
         check (proc.loadScalaText ("! C\ntest-c\n 2\n 500.0\n 2/1\n", "test-c", err), "scale C loads");
@@ -1128,7 +1133,8 @@ int main()
         auto pr = std::make_unique<FractalAdditiveAudioProcessor>();
         pr->prepareToPlay (sr, blk);
         auto sp = [&] (const char* id, float v)
-        { auto* p = pr->apvts.getParameter (id); p->setValueNotifyingHost (p->convertTo0to1 (v)); };
+        { auto* p = pr->apvts.getParameter (id); p->setValueNotifyingHost (p->convertTo0to1 (v));
+          pr->pollParametersForTests(); };
 
         sp ("rhythmOn", 1.0f);
         sp ("rhythmSelfPlay", 1.0f);   // pulses feed THIS synth -> tuning-aware encoding
