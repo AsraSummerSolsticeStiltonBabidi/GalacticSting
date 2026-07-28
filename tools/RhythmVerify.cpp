@@ -1186,6 +1186,37 @@ int main()
         sp ("refA", 440.0f); sp ("octaveShift", 0.0f);
     }
 
+    // --- run 21: equal-step detection drives the "any +10 +18" chord notation -----
+    {
+        std::printf ("equal-step tuning detection:\n");
+        juce::String err;
+        auto edo = [] (int n)
+        {
+            juce::String s;
+            s << "! e.scl\n" << juce::String (n) << "-EDO\n " << juce::String (n) << "\n!\n";
+            for (int i = 1; i <= n; ++i) s << " " << juce::String (1200.0 * (double) i / (double) n, 6) << "\n";
+            return s;
+        };
+        check (proc.loadScalaText (edo (31), "edo31", err), "31-EDO loads");
+        check (proc.tuningIsEqualStep(), "31-EDO is equal-step (chords are valid from any degree)");
+        check (proc.loadScalaText (edo (12), "edo12", err), "12-EDO loads");
+        check (proc.tuningIsEqualStep(), "12-EDO is equal-step");
+
+        // A just scale is NOT equal-step - its chords are tied to specific degrees.
+        check (proc.loadScalaText ("! ji.scl\n5-limit\n 5\n!\n 9/8\n 5/4\n 3/2\n 5/3\n 2/1\n", "ji", err),
+               "a just pentatonic loads");
+        check (! proc.tuningIsEqualStep(), "and it is NOT equal-step");
+
+        // One degree nudged off the grid is enough to disqualify a scale.
+        juce::String bent;
+        bent << "! b.scl\nbent-12\n 12\n!\n";
+        for (int i = 1; i <= 12; ++i)
+            bent << " " << juce::String (100.0 * (double) i + (i == 5 ? 9.0 : 0.0), 6) << "\n";
+        check (proc.loadScalaText (bent, "bent", err), "a 12-EDO with one degree bent 9 c loads");
+        check (! proc.tuningIsEqualStep(), "and that alone makes it not equal-step");
+        proc.clearScala();
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

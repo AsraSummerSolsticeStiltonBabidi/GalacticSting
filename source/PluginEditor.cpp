@@ -637,20 +637,43 @@ namespace
         juce::Rectangle<int> getTooltipBounds (const juce::String& tipText, juce::Point<int> screenPos,
                                                juce::Rectangle<int> parentArea) override
         {
-            const auto tl = layoutFor (tipText, 340.0f);
-            const int w = juce::jmax (40, (int) std::ceil (tl.getWidth()) + 18);
-            int h = (int) std::ceil (tl.getHeight()) + 10;
             // Keyboard hovers become a CALLOUT: parked right above the hovered key's
-            // eye, with a pointer down to it - never covering keys or their numbers.
+            // eye, with a pointer down to it - it must NEVER cover keys or numbers.
             lastWasCallout = ! keyboardScreenArea.isEmpty() && keyboardScreenArea.contains (screenPos)
                           && hoverAnchor != juce::Point<int>();
+
             if (lastWasCallout)
             {
-                h += kPtrH;
-                return juce::Rectangle<int> (juce::jlimit (parentArea.getX(), parentArea.getRight() - w, hoverAnchor.x - w / 2),
-                                             juce::jmax (parentArea.getY(), keyboardScreenArea.getY() - h - 1), w, h)
-                           .constrainedWithin (parentArea);
+                // Only the strip ABOVE the keyboard is fair game. A tall read-out used
+                // to be clamped to the top of that strip and then simply overflow DOWN
+                // across the keys - and how bad it looked depended on where the editor
+                // sat, which is why it behaved differently in a host and standalone.
+                // Instead, widen the layout until the text is short enough to fit the
+                // strip: a wide-and-short card always beats covering the keys.
+                const int availH = keyboardScreenArea.getY() - 1 - parentArea.getY();
+                const int maxW   = juce::jmax (200, parentArea.getWidth() - 16);
+                int bw = 0, bh = 0;
+                for (const float tryW : { 340.0f, 460.0f, 620.0f, 820.0f })
+                {
+                    const auto t = layoutFor (tipText, juce::jmin ((float) maxW, tryW));
+                    bw = juce::jmax (40, (int) std::ceil (t.getWidth()) + 18);
+                    bh = (int) std::ceil (t.getHeight()) + 10 + kPtrH;
+                    if (bh <= availH) break;                 // fits the strip: done
+                    if (juce::jmin ((float) maxW, tryW) >= (float) maxW) break; // no room to widen
+                }
+                bw = juce::jmin (bw, parentArea.getWidth());
+                // If even the widest layout is taller than the strip, sit flush with
+                // the top and let the CARD be clipped there - never over the keys.
+                const int top = juce::jmax (parentArea.getY(), keyboardScreenArea.getY() - 1 - bh);
+                const int bot = juce::jmax (top + 1, keyboardScreenArea.getY() - 1);
+                return juce::Rectangle<int> (juce::jlimit (parentArea.getX(), juce::jmax (parentArea.getX(),
+                                                            parentArea.getRight() - bw), hoverAnchor.x - bw / 2),
+                                             top, bw, juce::jmin (bh, bot - top));
             }
+
+            const auto tl = layoutFor (tipText, 340.0f);
+            const int w = juce::jmax (40, (int) std::ceil (tl.getWidth()) + 18);
+            const int h = (int) std::ceil (tl.getHeight()) + 10;
             return juce::Rectangle<int> (screenPos.x > parentArea.getCentreX() ? screenPos.x - (w + 12) : screenPos.x + 24,
                                          screenPos.y > parentArea.getCentreY() ? screenPos.y - (h + 6)  : screenPos.y + 6,
                                          w, h).constrainedWithin (parentArea);
@@ -4211,6 +4234,9 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             const auto res = processorRef.getNadResults();
             double lo = 1.0e30, hi = -1.0e30;
             for (const auto& r : res) { lo = juce::jmin (lo, r.value); hi = juce::jmax (hi, r.value); }
+            // In an equal-step tuning every shape is valid from every degree, so the
+            // list drops the key colours and shows offsets from "any".
+            nadList.equalStep = processorRef.tuningIsEqualStep();
             nadList.rows.clear();
             for (const auto& r : res)
             {

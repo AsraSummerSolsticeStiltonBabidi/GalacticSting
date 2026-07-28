@@ -215,6 +215,11 @@ private:
         struct Row { std::vector<int> degs; juce::String value; juce::Colour valCol; };
         std::vector<Row> rows;
         int degreesPerPeriod = 12;
+        // Set when every degree of the tuning is one equal step from the last. Then a
+        // shape found on degree 0 has the same intervals started from ANY degree, so
+        // the row is shown as "any +10 +18" in neutral grey rather than as coloured
+        // key numbers - the colours would claim specific keys the result is not tied to.
+        bool equalStep = false;
         juce::String tip, emptyText; // status/coverage line (computing / over budget / partial)
         static constexpr int kRowH = 21;
         // Hovering a row SOUNDS that combination; only one sounds at a time.
@@ -239,16 +244,30 @@ private:
                 if (r % 2 == 1) { g.setColour (juce::Colour (0x14ffffff)); g.fillRect (0, y, getWidth(), kRowH); }
                 if (r == hoverRow) { g.setColour (juce::Colour (0x332fb155)); g.fillRect (0, y, getWidth(), kRowH); }
                 int x = 4;   // no rank number: the beating value already orders them
-                for (const int d : row.degs) // chips coloured like the keyboard keys
+                const juce::Font chipFont (juce::FontOptions (11.0f).withStyle ("Bold"));
+                for (size_t k = 0; k < row.degs.size(); ++k)
                 {
-                    const auto col = juce::Colour::fromHSV (0.82f * (float) (d % D) / (float) D, 0.62f, 0.9f, 1.0f);
-                    auto chip = juce::Rectangle<int> (x, y + 2, 18, kRowH - 4);
+                    const int d = row.degs[k];
+                    // Equal-step tuning: the shape is rootless, so the first chip says
+                    // "any" and the rest are OFFSETS from it, all in neutral grey.
+                    // Otherwise each chip is the actual degree, in its keyboard colour.
+                    const bool grey = equalStep;
+                    const juce::String txt = grey
+                        ? (k == 0 ? juce::String ("any")
+                                  : "+" + juce::String (d - row.degs[0]))
+                        : juce::String (d);
+                    const auto col = grey
+                        ? juce::Colour (0xff6b6b78)
+                        : juce::Colour::fromHSV (0.82f * (float) (d % D) / (float) D, 0.62f, 0.9f, 1.0f);
+                    const int w = juce::jmax (18, (int) std::ceil (
+                        juce::GlyphArrangement::getStringWidth (chipFont, txt)) + 8);
+                    auto chip = juce::Rectangle<int> (x, y + 2, w, kRowH - 4);
                     g.setColour (col);
                     g.fillRoundedRectangle (chip.toFloat(), 3.0f);
                     g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-                    g.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
-                    g.drawText (juce::String (d), chip, juce::Justification::centred, false);
-                    x += 20;
+                    g.setFont (chipFont);
+                    g.drawText (txt, chip, juce::Justification::centred, false);
+                    x += w + 2;
                 }
                 g.setColour (row.valCol);
                 g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));

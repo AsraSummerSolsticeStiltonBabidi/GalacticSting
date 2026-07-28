@@ -93,6 +93,25 @@ public:
     // Degrees per period of the active tuning (for the colour keyboard).
     int getScaleDegrees() const noexcept { return tuning.degreesPerPeriod(); }
 
+    // True when EVERY degree sits one equal step from the last (any N-EDO, or any
+    // scale that happens to be equal-stepped). In such a tuning a chord shape has
+    // the SAME intervals wherever you start it, so a result found on degree 0 is
+    // valid from every degree - which is what the n-ad list shows with "any".
+    // Same 0.5-cent criterion the n-ad search itself uses to root at 0.
+    bool tuningIsEqualStep() const
+    {
+        const int D = tuning.degreesPerPeriod();
+        if (D < 2) return false;
+        const double periodC = 1200.0 * std::log2 (std::max (1.0e-9, tuning.periodRatio()));
+        const double step    = periodC / (double) D;
+        for (int d = 0; d < D; ++d)
+        {
+            const double c = 1200.0 * std::log2 (std::max (1.0e-9, getDegreeRatio (d)));
+            if (std::abs (c - step * (double) d) > 0.5) return false;
+        }
+        return true;
+    }
+
     // The FULL playable MIDI range the colour keyboard should offer, adapted to the
     // active tuning so wide-period scales only expose keys in the musical band
     // [loHz, hiHz]. The keyboard itself shows a readable-width WINDOW of this and
