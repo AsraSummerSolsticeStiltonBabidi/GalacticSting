@@ -76,6 +76,12 @@ public:
     void clearScala();
     juce::String getTuningStatus() const { return tuning.getStatusText(); }
 
+    // Run one parameter-poll tick by hand. The poll normally rides the message
+    // timer, which needs a running message loop - the offline verifiers have none,
+    // so without this they would silently test a plugin whose tuning never picked
+    // up Reference A / Octave Transpose / the tuning mode at all.
+    void pollParametersForTests() { timerCallback(); }
+
     // Raw tuning/timbre state so the editor can format localised status strings.
     int  getTuningMode()    const noexcept { return (int) apvts.getRawParameterValue ("tuningMode")->load(); }
     bool tuningHasMaster()  const noexcept { return tuning.hasMtsMaster(); }

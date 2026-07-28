@@ -1118,6 +1118,68 @@ int main()
         check (! everUnclosed, "and no note-on is left without its note-off");
     }
 
+    // --- run 20: a ratio pulse fed back into THIS synth lands on the pitch asked --
+    // The pulse pitch used to be encoded as a 12-TET/440 key even when self-play
+    // routed it straight back into the synth, which then resolved that key through
+    // the active tuning AGAIN - applying Reference A and Octave Transpose twice.
+    // octave = -1 put every ratio pulse exactly an octave flat.
+    {
+        std::printf ("self-play ratio pulses land on the pitch they ask for:\n");
+        auto pr = std::make_unique<FractalAdditiveAudioProcessor>();
+        pr->prepareToPlay (sr, blk);
+        auto sp = [&] (const char* id, float v)
+        { auto* p = pr->apvts.getParameter (id); p->setValueNotifyingHost (p->convertTo0to1 (v)); };
+
+        sp ("rhythmOn", 1.0f);
+        sp ("rhythmSelfPlay", 1.0f);   // pulses feed THIS synth -> tuning-aware encoding
+        sp ("rhythmMpe", 1.0f);        // ratio slots need per-note bend
+        pr->getRhythm().slots[0].partial  = 1;
+        pr->getRhythm().slots[0].enabled  = true;
+        pr->getRhythm().slots[0].useRatio = true;
+        pr->getRhythm().slots[0].ratio    = 2.0;   // exactly one octave above the played note
+        pr->getRhythm().slots[0].durMs    = 40.0f;
+
+        juce::AudioBuffer<float> ra (2, blk);
+
+        // Resolve the (note, bend) actually sent EXACTLY as the receiving synth will:
+        // key -> the active tuning's frequency, then the bend on top. That is what
+        // exposes the double application - reading the engine's own intended sendHz
+        // never could, because it equals the target by construction.
+        auto pulseErrorCents = [&] (float refAHz, int octaveShift) -> double
+        {
+            sp ("refA", refAHz);
+            sp ("octaveShift", (float) octaveShift);
+            // Reference A and Octave Transpose reach the TuningManager from the
+            // processor's parameter poll, which normally rides the message timer -
+            // and this harness has no message loop. Without pumping it by hand the
+            // tuning would stay at its defaults and the test would pass whatever the
+            // encoding does.
+            pr->pollParametersForTests();
+            for (int b = 0; b < 4; ++b) { juce::MidiBuffer m; pr->processBlock (ra, m); }
+            { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+              pr->processBlock (ra, m); }
+            for (int b = 0; b < 20; ++b) { juce::MidiBuffer m; pr->processBlock (ra, m); }
+
+            const double want = pr->getNoteFrequency (60) * 2.0;   // f0 * ratio
+            const int    key  = pr->getRhythm().getSendNote (0, 0);
+            const int    bend = pr->getRhythm().getSendBend (0, 0);
+            const double semis = ((double) bend - 8192.0) / 8192.0 * pr->getRhythm().getBendRangeSemis();
+            const double got  = key >= 0 ? pr->getNoteFrequency (key) * std::exp2 (semis / 12.0) : 0.0;
+
+            { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+              pr->processBlock (ra, m); }
+            for (int b = 0; b < 20; ++b) { juce::MidiBuffer m; pr->processBlock (ra, m); }
+            if (! (want > 0.0) || ! (got > 0.0)) return 1.0e9;
+            return std::abs (1200.0 * std::log2 (got / want));
+        };
+
+        check (pulseErrorCents (440.0f,  0) < 1.0, "at A=440, octave 0: on pitch");
+        check (pulseErrorCents (440.0f, -1) < 1.0, "with Octave Transpose -1: still on pitch (was an octave flat)");
+        check (pulseErrorCents (432.0f,  0) < 1.0, "at A=432: still on pitch (was ~32 cents flat)");
+        check (pulseErrorCents (432.0f,  1) < 1.0, "at A=432 with Octave +1: still on pitch");
+        sp ("refA", 440.0f); sp ("octaveShift", 0.0f);
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

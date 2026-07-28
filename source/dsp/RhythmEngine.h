@@ -37,6 +37,7 @@
 #include "SpectrumEngine.h"
 #include "TuningManager.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <numeric>
@@ -179,6 +180,7 @@ public:
 
         const auto* tmpl = engine.getLive();
         refreshTemplateCache (tmpl);
+        keyHzValid = false; // the tuning cannot change mid-block: rebuild at most once here
 
         // Generate pulses whenever EITHER the MIDI-out master or the "play in Fibló"
         // (self-play) toggle is on - self-play must still make pulses when MIDI-out is off.
@@ -320,11 +322,15 @@ public:
             int note; int bend = 8192; double hz;
             if (fbUseRatio[k])
             {
-                hz = parentHz * fbPitchRatio[k];
-                const double semis = 69.0 + 12.0 * std::log2 (hz / 440.0);
-                note = juce::jlimit (0, 127, (int) std::lround (semis));
-                if (mpeOut)
-                    bend = encodeBend (semis - (double) note); // uses the ACTIVE bend range
+                // Same receiver-dependent encoding as the parent trains, and hz is
+                // set to what will REALLY sound so the next generation's rates
+                // follow the pitch actually produced rather than an intended one.
+                const double want = parentHz * fbPitchRatio[k];
+                int m = 0, b = 8192; double produced = want;
+                encodePitch (want, pulsesFeedOwnSynth(), m, b, produced);
+                note = m;
+                hz   = produced;
+                if (mpeOut) bend = b;
             }
             else
             {
@@ -425,6 +431,27 @@ public:
     float getRateHz (int slot) const noexcept
     { return juce::isPositiveAndBelow (slot, kSlots) ? lastRateHz[(size_t) slot].load (std::memory_order_relaxed) : 0.0f; }
     float getDriverF0() const noexcept { return displayF0.load (std::memory_order_relaxed); }
+    // The pitch a slot's pulses will REALLY sound at, for the given held-note column
+    // (0 = the driver). Published for the verifiers, which check that a ratio pulse
+    // lands on f0 * ratio under any Reference A / Octave Transpose.
+    float getSendHz (int slot, int col) const noexcept
+    {
+        return (juce::isPositiveAndBelow (slot, kSlots) && juce::isPositiveAndBelow (col, kMaxNotes))
+             ? lastSendHz[(size_t) slot][(size_t) col].load (std::memory_order_relaxed) : 0.0f;
+    }
+    // The (note, bend) actually PUT ON THE WIRE for a slot/column - so a verifier can
+    // resolve them the way the receiver will and check the pitch that results.
+    int getSendNote (int slot, int col) const noexcept
+    {
+        return (juce::isPositiveAndBelow (slot, kSlots) && juce::isPositiveAndBelow (col, kMaxNotes))
+             ? lastSendNote[(size_t) slot][(size_t) col].load (std::memory_order_relaxed) : -1;
+    }
+    int getSendBend (int slot, int col) const noexcept
+    {
+        return (juce::isPositiveAndBelow (slot, kSlots) && juce::isPositiveAndBelow (col, kMaxNotes))
+             ? lastSendBend[(size_t) slot][(size_t) col].load (std::memory_order_relaxed) : 8192;
+    }
+    double getBendRangeSemis() const noexcept { return bendRangeSemis(); }
     // True when at least one partial is routed - self-play only engages then, so the
     // synth still plays its held notes normally when no rhythm is set up.
     bool hasEnabledSlot() const noexcept
@@ -505,6 +532,8 @@ private:
                            ? juce::jlimit (-48, 48, (int) std::lround (stepsAllParam->load())) : 0;
         const int octSteps = octAll * juce::jmax (1, tuning.degreesPerPeriod());
         const double octMul = std::exp2 ((double) octAll);
+        // Who hears these pulses decides how their pitch is encoded (see encodePitch).
+        const bool toOwnSynth = pulsesFeedOwnSynth();
 
         // Per-segment constants per train (f0 constant between MIDI events), and the
         // WORK LIST: only slots that can pulse now or still have an open gate are
@@ -577,18 +606,19 @@ private:
                         phase[i][j] = 1.0;
                 }
 
-                // Sent pitch: ratio slots = the EXACT pitch f0*slotRatio (note+bend);
-                // plain slots = the typed note transposed by this held note's interval
-                // from the lowest held note. sendHz = the sounding pitch (drives the
-                // fractal children's rates).
+                // Sent pitch: ratio slots = the EXACT pitch f0*slotRatio (note+bend),
+                // encoded for whoever RECEIVES it (see encodePitch); plain slots = the
+                // typed note transposed by this held note's interval from the lowest
+                // held note. sendHz = the pitch that will really sound, which is what
+                // the fractal children's rates are derived from.
                 if (slots[i].useRatio.load (std::memory_order_relaxed))
                 {
-                    const double tHz   = h.f0 * juce::jmax (1.0e-6, slots[i].ratio.load (std::memory_order_relaxed)) * octMul;
-                    const double semis = 69.0 + 12.0 * std::log2 (tHz / 440.0);
-                    const int    m     = juce::jlimit (0, 127, (int) std::lround (semis));
+                    const double tHz = h.f0 * juce::jmax (1.0e-6, slots[i].ratio.load (std::memory_order_relaxed)) * octMul;
+                    int m = 0, bend = 8192; double produced = tHz;
+                    encodePitch (tHz, toOwnSynth, m, bend, produced);
                     sendNote[i][j] = m;
-                    sendHz  [i][j] = tHz;
-                    sendBend[i][j] = encodeBend (semis - (double) m); // uses the ACTIVE bend range
+                    sendHz  [i][j] = produced;
+                    sendBend[i][j] = bend;
                 }
                 else
                 {
@@ -601,6 +631,12 @@ private:
                 }
             }
             for (int j = 0; j < kMaxNotes; ++j) wasOn[i][j] = inc[i][j] > 0.0;
+            for (int j = 0; j < kMaxNotes; ++j)
+            {
+                lastSendHz  [(size_t) i][(size_t) j].store ((float) sendHz[i][j], std::memory_order_relaxed);
+                lastSendNote[(size_t) i][(size_t) j].store (sendNote[i][j], std::memory_order_relaxed);
+                lastSendBend[(size_t) i][(size_t) j].store (sendBend[i][j], std::memory_order_relaxed);
+            }
             lastRateHz[(size_t) i].store (uiRate, std::memory_order_relaxed);
             if (ok || anyGate) workList[nWork++] = i;
         }
@@ -715,6 +751,82 @@ private:
         const double range = bendValues[idx];
         return juce::jlimit (0, 16383, 8192 + (int) std::lround (semitoneOffset / range * 8192.0));
     }
+    // Widest detune the current bend range can actually express, for clamping.
+    double bendRangeSemis() const noexcept
+    {
+        static constexpr double bendValues[] = { 2.0, 12.0, 48.0 };
+        return bendValues[juce::jlimit (0, 2, bendParam != nullptr ? (int) bendParam->load() : 2)];
+    }
+
+    // Ascending table of the ACTIVE tuning's frequency for every MIDI key, rebuilt
+    // once per render segment (the tuning cannot change mid-block). Lets a target
+    // pitch be turned into "nearest key of THIS tuning + residual bend" with a
+    // binary search instead of a 128-entry scan per slot per held note.
+    double keyHz[128] {};
+    bool   keyHzValid = false;
+    void buildKeyTable() noexcept
+    {
+        for (int n = 0; n < 128; ++n) keyHz[n] = tuning.frequencyForNote (n);
+        keyHzValid = true;
+    }
+
+    // Turn an absolute target frequency into the (note, bend) pair to SEND, and
+    // report the pitch that will actually result.
+    //
+    // Which encoding is right depends on WHO receives it:
+    //  - external MIDI out: the receiver has its own tuning, so the only meaningful
+    //    thing to hand it is the absolute pitch as a 12-TET/440 key plus bend.
+    //  - self-play: the note goes back into THIS synth, which resolves the key
+    //    through the active tuning again. Sending a 12-TET key there applied the
+    //    tuning (and Reference A, and Octave Transpose) a SECOND time - with
+    //    octave = -1 every ratio pulse came out exactly an octave flat, at A=432
+    //    about 32 cents flat, and in a Scala tuning arbitrarily off. So here the
+    //    key is picked from the tuning's own table and the bend is the residual
+    //    against THAT key, which lands the pulse on the pitch actually asked for.
+    void encodePitch (double targetHz, bool forSynth,
+                      int& noteOut, int& bendOut, double& producedHz) noexcept
+    {
+        targetHz = juce::jmax (1.0e-6, targetHz);
+        if (! forSynth)
+        {
+            const double semis = 69.0 + 12.0 * std::log2 (targetHz / 440.0);
+            const int    m     = juce::jlimit (0, 127, (int) std::lround (semis));
+            noteOut    = m;
+            bendOut    = encodeBend (semis - (double) m);
+            producedHz = targetHz;
+            return;
+        }
+
+        if (! keyHzValid) buildKeyTable();
+        // Nearest key by frequency. The table is ascending for every tuning we can
+        // produce, so lower_bound gives the insertion point and the answer is one of
+        // its two neighbours.
+        const auto* first = keyHz;
+        const auto* it = std::lower_bound (first, first + 128, targetHz);
+        int m = (int) (it - first);
+        if (m >= 128) m = 127;
+        if (m > 0 && std::abs (std::log2 (keyHz[m - 1] / targetHz))
+                   <= std::abs (std::log2 (keyHz[m] / targetHz))) --m;
+
+        const double base = juce::jmax (1.0e-9, keyHz[m]);
+        const double want = 12.0 * std::log2 (targetHz / base);
+        // A pulse further from every key than the bend range can reach cannot be
+        // placed exactly; report what will really sound so the fractal children's
+        // rates stay in step with it rather than with a pitch nobody hears.
+        const double lim  = bendRangeSemis();
+        const double used = juce::jlimit (-lim, lim, want);
+        noteOut    = m;
+        bendOut    = encodeBend (used);
+        producedHz = base * std::exp2 (used / 12.0);
+    }
+
+    // Self-play routes the pulses back into this synth, so it decides the encoding.
+    // (When the MIDI output is on as well, self-play still wins: that is the path
+    // the user is actually hearing.)
+    bool pulsesFeedOwnSynth() const noexcept
+    {
+        return selfParam != nullptr && selfParam->load() > 0.5f && hasEnabledSlot();
+    }
 
     juce::MidiBuffer out; // reused every block (capacity persists after warm-up)
 
@@ -788,6 +900,9 @@ private:
     std::atomic<int> pendingCC { -1 }; // packed (cc<<8)|value, -1 = none
 
     mutable std::atomic<float> lastRateHz[kSlots] = {};
+    mutable std::atomic<float> lastSendHz[kSlots][kMaxNotes] = {}; // see getSendHz
+    mutable std::atomic<int>   lastSendNote[kSlots][kMaxNotes] = {};
+    mutable std::atomic<int>   lastSendBend[kSlots][kMaxNotes] = {};
     std::atomic<float> displayF0 { 0.0f };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (RhythmEngine)
