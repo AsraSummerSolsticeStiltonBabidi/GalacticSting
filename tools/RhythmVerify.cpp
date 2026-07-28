@@ -1609,6 +1609,77 @@ int main()
         check (stol[2] < stol[0] * 0.02f, "and also releases to silence");
     }
 
+    // --- run 26: a fast morph must not CLICK -------------------------------------
+    // "Two notes with an LFO on Base and morph on click very loudly - the same clicks
+    // as morph speed at minimum with one note."
+    // A click IS a discontinuity, so measure the thing itself: the largest jump from
+    // one sample to the next, normalised by the signal's own peak. A smooth additive
+    // tone has a bounded per-sample slope; a coherent switch of the whole partial bank
+    // does not. Morph OFF is the control - the same template stream without any
+    // crossfade - so the comparison isolates the morph rather than the rebuilds.
+    {
+        std::printf ("morph discontinuity under a stream of new templates:\n");
+        constexpr int eb = 64;
+        auto run = [&] (bool morphOn, float morphTime, const char* label)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (48000.0, eb);
+            auto s = [&] (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            // Flat, fully-sustained envelope: any jump we measure is the morph, not the ADSR.
+            s ("ampAttack", 0.002f); s ("ampDecay", 0.002f); s ("ampSustain", 1.0f);
+            s ("ampCurveA", 0.0f);   s ("ampCurveD", 0.0f);
+            s ("fractalLevel", 1.0f); s ("curveSlope", 2.0f); s ("baseN", 1.0f);
+            s ("morph", morphOn ? 1.0f : 0.0f);
+            s ("morphTime", morphTime);
+
+            juce::AudioBuffer<float> b (2, eb);
+            for (int i = 0; i < 60; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+            { // two notes, exactly as reported
+                juce::MidiBuffer m;
+                m.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+                m.addEvent (juce::MidiMessage::noteOn (1, 67, 0.8f), 1);
+                b.clear(); p->processBlock (b, m);
+            }
+            for (int i = 0; i < 60; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+
+            float maxJump = 0.0f, peak = 0.0f, prev = 0.0f;
+            bool  have = false;
+            for (int step = 0; step < 20; ++step)
+            {
+                s ("baseN", 1.0f + (float) (step % 6));  // sweep Base the way the LFO does
+                juce::Thread::sleep (14);                 // let the builder thread publish
+                for (int i = 0; i < 10; ++i)
+                {
+                    juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                    const float* L = b.getReadPointer (0);
+                    for (int k = 0; k < eb; ++k)
+                    {
+                        const float x = L[k];
+                        peak = std::max (peak, std::abs (x));
+                        if (have) maxJump = std::max (maxJump, std::abs (x - prev));
+                        prev = x; have = true;
+                    }
+                }
+            }
+            const float ratio = peak > 0.0f ? maxJump / peak : 0.0f;
+            std::printf ("  %-24s peak=%.4f  maxJump=%.4f  jump/peak=%.3f\n",
+                         label, peak, maxJump, ratio);
+            return ratio;
+        };
+
+        const float off  = run (false, 0.001f, "morph off (control)");
+        const float fast = run (true,  0.001f, "morph on, time=minimum");
+        const float slow = run (true,  0.300f, "morph on, time=300 ms");
+
+        check (off > 0.0f, "the control case actually made sound");
+        // Generous margin: we are catching a full-scale coherent impulse (jump/peak near
+        // 1), not a few percent of extra slope.
+        check (fast <= off * 2.5f + 0.02f, "a minimum-time morph does not click");
+        check (slow <= off * 2.5f + 0.02f, "a morph restarted every rebuild does not click");
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }
