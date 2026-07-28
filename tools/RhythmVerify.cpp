@@ -1521,6 +1521,94 @@ int main()
         }
     }
 
+    // --- run 25: the WHOLE amp envelope, cold and after stealing ------------------
+    // "Notes sound as if they had no envelope until I press many, then some work."
+    // So measure the full shape: does it attack, does it fall to the sustain level,
+    // and does it actually stop after the note-off - on a fresh voice AND on a
+    // stolen one.
+    {
+        std::printf ("full amp envelope, cold voice and stolen voice:\n");
+        constexpr int eb = 64;
+        auto envOf = [&] (FractalAdditiveAudioProcessor& p, const std::vector<float>& mono, double f0)
+        {
+            juce::ignoreUnused (p);
+            const int w = juce::jmax (16, (int) std::lround (48000.0 / juce::jmax (20.0, f0)));
+            std::vector<float> e; e.reserve (mono.size());
+            double a2 = 0.0;
+            for (int k = 0; k < w && k < (int) mono.size(); ++k) a2 += (double) mono[(size_t) k] * mono[(size_t) k];
+            for (size_t i = 0; i + (size_t) w < mono.size(); ++i)
+            { // clamp: the running sum drifts slightly negative on silence and
+              // sqrt() of that is NaN - a measurement artefact, not the plugin's.
+              e.push_back ((float) std::sqrt (std::max (0.0, a2) / (double) w));
+              a2 -= (double) mono[i] * mono[i];
+              a2 += (double) mono[i + (size_t) w] * mono[i + (size_t) w]; }
+            return e;
+        };
+
+        auto run = [&] (int extraNotes, const char* label)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (48000.0, eb);
+            auto s = [&] (const char* id, float v)
+            { auto* q = p->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            s ("ampAttack", 0.050f);   // 50 ms - long enough to SEE
+            s ("ampDecay",  0.100f);   // 100 ms down to...
+            s ("ampSustain", 0.25f);   // ...a quarter level
+            s ("ampRelease", 0.050f);
+            s ("baseN", 1.0f); s ("fractalLevel", 1.0f); s ("curveSlope", 2.0f);
+            s ("ampCurveA", 0.0f); s ("ampCurveD", 0.0f); s ("ampCurveR", 0.0f);
+            p->pollParametersForTests();
+            juce::AudioBuffer<float> b (2, eb);
+            for (int i = 0; i < 100; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+
+            // Optionally burn voices first, so the measured note is a STEAL. They are
+            // released again straight away and given time to die, so the measurement
+            // below is of note 60 ALONE - otherwise the "tail" would just be the other
+            // notes still held, which says nothing about note 60's envelope.
+            if (extraNotes > 0)
+            {
+                for (int k = 0; k < extraNotes; ++k)
+                { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 20 + k, (juce::uint8) 100), 0);
+                  b.clear(); p->processBlock (b, m); }
+                for (int k = 0; k < extraNotes; ++k)
+                { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOff (1, 20 + k), 0);
+                  b.clear(); p->processBlock (b, m); }
+                for (int i = 0; i < 400; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+            }
+
+            std::vector<float> mono;
+            const int holdBlocks = (int) (0.30 * 48000.0 / eb);   // 300 ms held
+            for (int blk = 0; blk < holdBlocks + 400; ++blk)
+            {
+                juce::MidiBuffer m;
+                if (blk == 0)          m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 110), 0);
+                if (blk == holdBlocks) m.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+                b.clear(); p->processBlock (b, m);
+                for (int i = 0; i < eb; ++i) mono.push_back (b.getSample (0, i));
+            }
+            const auto e = envOf (*p, mono, p->getNoteFrequency (60));
+            auto at = [&] (double ms) { const size_t i = (size_t) (ms * 48.0);
+                                        return i < e.size() ? e[i] : 0.0f; };
+            const float peak = at (55.0);                  // just after the 50 ms attack
+            const float sus  = at (250.0);                 // well into sustain
+            const float tail = at (300.0 + 200.0);         // 200 ms after note-off
+            std::printf ("  %-8s peak@55ms=%.4f  sustain@250ms=%.4f (%.0f%% of peak)  tail@+200ms=%.5f\n",
+                         label, peak, sus, peak > 0 ? 100.0 * sus / peak : 0.0, tail);
+            return std::array<float, 3> { peak, sus, tail };
+        };
+
+        const auto cold = run (0,  "cold");
+        const auto stol = run (34, "stolen");   // 34 > 32 voices -> the last note steals
+
+        check (cold[0] > 1.0e-4f, "a cold note sounds at all");
+        check (cold[1] < cold[0] * 0.55f, "a cold note DECAYS to its 25% sustain (it has an envelope)");
+        check (cold[2] < cold[0] * 0.02f, "and it releases to silence after the note-off");
+        check (stol[0] > 1.0e-4f, "a stolen note sounds too");
+        check (stol[1] < stol[0] * 0.55f, "a stolen note also decays to sustain");
+        check (stol[2] < stol[0] * 0.02f, "and also releases to silence");
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }
