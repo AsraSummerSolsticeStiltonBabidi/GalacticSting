@@ -852,6 +852,23 @@ int main()
                "and the period is still the octave (kept across every repetition)");
         check (! proc.deleteTuningDegree (0, err), "the tonic cannot be deleted");
         check (! proc.deleteTuningDegree (proc.getScaleDegrees(), err), "nor can the period");
+
+        // Editing must work from a NON-Scala tuning too - right-clicking a key in
+        // MTS-ESP/12ED2 used to be refused silently, which read as "right-click is
+        // broken". It renders the current tuning to .scl form and edits that.
+        proc.clearScala();
+        if (auto* p = proc.apvts.getParameter ("tuningMode"))
+            p->setValueNotifyingHost (p->convertTo0to1 (1.0f)); // MTS-ESP (no master -> 12ED2)
+        check (proc.getScaleDegrees() == 12, "a non-Scala tuning reports its 12 degrees");
+        check (proc.editTuningDegree (7, "3/2", err), "a degree can be edited straight from it");
+        check (proc.getTuningMode() == 2, "which lands the result in Scala mode");
+        {
+            long long p = 0, q = 0;
+            check (proc.getDegreeIsRational (7, p, q) && p == 3 && q == 2,
+                   "and degree 7 is now exactly 3/2");
+        }
+        check (proc.deleteTuningDegree (7, err), "and it can be deleted from there too");
+        check (proc.getScaleDegrees() == 11, "leaving 11 degrees");
         proc.clearScala();
     }
 

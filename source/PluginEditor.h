@@ -598,7 +598,7 @@ private:
         juce::Label        stepsAllLbl;                // "Steps (all pulses)" caption
         juce::Slider       stepsAllS;                  // global scale-step offset (modulatable)
         juce::TextButton   octAllUp, octAllDn;
-        int numRows = 0, tempoOct = 0;
+        int numRows = 0;
 
         // Clicking any empty spot of the panel gives keyboard focus back to the
         // editor (text boxes commit + collapse; the play keys work again).
@@ -830,8 +830,10 @@ private:
             }
             tempoX2.setButtonText ("x2");
             tempoD2.setButtonText ("/2");
-            tempoX2.onClick = [this] { tempoOct = juce::jlimit (-6, 6, tempoOct + 1); refreshLive(); };
-            tempoD2.onClick = [this] { tempoOct = juce::jlimit (-6, 6, tempoOct - 1); refreshLive(); };
+            // The octave scaling is a PARAMETER now (the processor drives the tempo,
+            // so it has to be reachable from there - and it survives a reload).
+            tempoX2.onClick = [this] { nudgeTempoOct (+1); };
+            tempoD2.onClick = [this] { nudgeTempoOct (-1); };
             info.setJustificationType (juce::Justification::topLeft);
             info.setColour (juce::Label::textColourId, juce::Colour (0xff7ff59a));
             info.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
@@ -1094,14 +1096,26 @@ private:
             }
             refreshSlots(); // reverts the shown text to the stored value when rejected
         }
-        double tempoBpm() const // pulse 1 (first enabled slot) in BPM, times 2^tempoOct
+        int tempoOctValue() const
+        {
+            return proc != nullptr
+                 ? (int) proc->apvts.getRawParameterValue ("rhythmTempoOct")->load() : 0;
+        }
+        void nudgeTempoOct (int d)
+        {
+            if (proc == nullptr) return;
+            if (auto* p = proc->apvts.getParameter ("rhythmTempoOct"))
+                p->setValueNotifyingHost (p->convertTo0to1 ((float) juce::jlimit (-6, 6, tempoOctValue() + d)));
+            refreshLive();
+        }
+        double tempoBpm() const // pulse 1 (first enabled slot) in BPM, times 2^octave
         {
             if (proc == nullptr) return 0.0;
             for (int i = 0; i < RhythmEngine::kSlots; ++i)
                 if (proc->getRhythm().slots[i].enabled.load())
                 {
                     const double r = (double) proc->getRhythm().getRateHz (i);
-                    if (r > 0.0) return r * 60.0 * std::exp2 ((double) tempoOct);
+                    if (r > 0.0) return r * 60.0 * std::exp2 ((double) tempoOctValue());
                 }
             return 0.0;
         }
@@ -1936,7 +1950,6 @@ private:
     std::unique_ptr<ComboBoxAttachment> rhythmModeAtt;
     juce::uint32 lastRhythmGen = 0; // refresh the partial list when the template changes
     juce::uint32 lastSegGen = 0;    // refresh the segment picker on template change
-    int lastTempoSent = -1;         // last CC20 BPM sent by the tempo-sync toggle
 
     juce::GroupComponent gHarmonic, gBase, gWhitelist, gSlope, gSpectrumRange, gFractal,
                          gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale, gScaleDiss;

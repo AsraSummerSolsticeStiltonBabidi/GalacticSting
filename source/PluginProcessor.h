@@ -465,6 +465,7 @@ private:
     // `known` starts false so the very first block only records the state - flushing
     // there would kill a note that arrived in that same block.
     bool wasSelfPlay = false, selfPlayKnown = false;
+    int  lastTempoSent = -1; // last CC20 BPM sent by the tempo sync (see timerCallback)
 
     // MTS-ESP adoption is a ONE-SHOT check at load (see timerCallback), never repeated.
     bool  mtsCheckPending = true;

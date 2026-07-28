@@ -1811,7 +1811,11 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // Right-click a key (Scala mode): retype that degree as cents or a ratio.
     keyboard.onEditKey = [this] (int note)
     {
-        if (processorRef.getTuningMode() != 2) return; // .scl tunings only
+        // Works from ANY tuning, exactly like Ctrl+click's "add a note": the edit
+        // renders the CURRENT tuning to .scl form and reloads it. Refusing unless
+        // the mode already happened to be Scala made right-click look broken - it
+        // silently did nothing, which is now the common case since MTS-ESP became
+        // the default mode.
         const int D   = juce::jmax (1, processorRef.getScaleDegrees());
         const int deg = ((note - 60) % D + D) % D;
         if (deg == 0)
@@ -4295,19 +4299,8 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             segList.repaint();
         }
     }
-    // Continuous DAW-tempo sync: while the toggle is on, re-send CC20 whenever the
-    // rounded target BPM changes (a new note re-speeds pulse 1 -> the tempo follows).
-    if (rhythmPanel.tempoT.getToggleState())
-    {
-        const double bpm = rhythmPanel.tempoBpm();
-        const int b = bpm > 0.0 ? (int) std::lround (bpm) : -1;
-        if (b > 0 && b != lastTempoSent)
-        {
-            lastTempoSent = b;
-            processorRef.getRhythm().sendController (20, juce::jlimit (0, 127, b - 20));
-        }
-    }
-    else lastTempoSent = -1;
+    // (DAW-tempo sync itself now lives in the PROCESSOR's timer, so it keeps working
+    // with this window closed - see FractalAdditiveAudioProcessor::timerCallback.)
     // Keep the tuning-bank combo's selection in sync with the parameter (host
     // automation can move it) without rebuilding the list every tick.
     if (tuningBankBox.getSelectedId() - 1 != processorRef.getTuningBankSlotParam())

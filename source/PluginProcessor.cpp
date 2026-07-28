@@ -374,6 +374,11 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     // resetting itself when Ableton re-created the plugin editor on record/play.
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "rhythmTempoSync", 1 }, "Rhythm Tempo Sync", false));
+    // The x2 / /2 octave scaling of the synced tempo. A PARAMETER (not editor-only
+    // state) because the tempo is now driven by the processor, so it must work with
+    // the window closed - and it survives a project reload as a bonus.
+    params.push_back (std::make_unique<AudioParameterInt>(
+        ParameterID { "rhythmTempoOct", 1 }, "Rhythm Tempo Octave", -6, 6, 0));
 
     // Temper the HARMONIC ENGINE's partials to the ACTIVE TUNING's grid (whatever
     // is loaded in the Tuning box), followed live: with this ON both engines work
@@ -532,6 +537,32 @@ void FractalAdditiveAudioProcessor::timerCallback()
         tuning.setReferenceA ((double) apvts.getRawParameterValue ("refA")->load());
     }
     tuning.setOctaveShift ((int) apvts.getRawParameterValue ("octaveShift")->load());
+
+    // DAW-tempo sync (CC20). This lives HERE, not in the editor: driven from the
+    // editor's timer it only worked while the plugin window was open and had been
+    // clicked, so the project tempo silently stopped following as soon as you looked
+    // away. The processor's timer runs regardless of the editor.
+    if (apvts.getRawParameterValue ("rhythmTempoSync")->load() > 0.5f)
+    {
+        double bpm = 0.0;
+        for (int i = 0; i < RhythmEngine::kSlots; ++i)
+            if (rhythm.slots[i].enabled.load())
+            {
+                const double r = (double) rhythm.getRateHz (i);
+                if (r > 0.0)
+                {
+                    bpm = r * 60.0 * std::exp2 ((double) apvts.getRawParameterValue ("rhythmTempoOct")->load());
+                    break;
+                }
+            }
+        const int b = bpm > 0.0 ? (int) std::lround (bpm) : -1;
+        if (b > 0 && b != lastTempoSent)
+        {
+            lastTempoSent = b;
+            rhythm.sendController (20, juce::jlimit (0, 127, b - 20));
+        }
+    }
+    else lastTempoSent = -1;
 
     // Apply the bend-range choice only when it changes: setLegacyModePitchbendRange
     // releases all held notes, so it must never be called redundantly.
