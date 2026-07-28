@@ -606,7 +606,19 @@ private:
         juce::Label        divLbl, timesLbl, nVal, xVal;      // "divide [n] times by [x]"
         juce::TextButton   nUp, nDn, xUp, xDn;                // tiny round steppers
         juce::TextButton   closeB { "X" }, helpB, jiB, tempoX2, tempoD2;
-        bool jiForcedMpe = false; // JI switched MPE out on -> JI off switches it back
+        // "JI switched MPE out on, so JI off should switch it back" - a PARAMETER, not
+        // an editor member: as a member it was lost on reopen and the restore never fired.
+        bool jiForcedMpe() const
+        {
+            return proc != nullptr
+                && proc->apvts.getRawParameterValue ("rhythmJiForcedMpe")->load() > 0.5f;
+        }
+        void setJiForcedMpe (bool b)
+        {
+            if (proc == nullptr) return;
+            if (auto* p = proc->apvts.getParameter ("rhythmJiForcedMpe"))
+                p->setValueNotifyingHost (b ? 1.0f : 0.0f);
+        }
         juce::String       helpText;                          // shown by the Help button
         // Slot rows live in a scrollable container: kSlots is large ("unlimited"
         // pulses), so the panel shows a window onto however many are routed.
@@ -822,17 +834,19 @@ private:
                     // off leaves the panel exactly as it found it. Without this the
                     // toggle was not an involution: MPE stayed on for ever after, and
                     // its channel spreading kept detuning notes that shared a channel.
-                    jiForcedMpe = ! mpeOn();
-                    if (jiForcedMpe)
+                    setJiForcedMpe (! mpeOn());
+                    if (jiForcedMpe())
                         if (auto* p = proc->apvts.getParameter ("rhythmMpe"))
                             p->setValueNotifyingHost (1.0f);
                 }
-                else if (jiForcedMpe)
+                else if (jiForcedMpe())
                 {
-                    jiForcedMpe = false;
+                    setJiForcedMpe (false);
                     if (auto* p = proc->apvts.getParameter ("rhythmMpe"))
                         p->setValueNotifyingHost (0.0f);
                 }
+                if (auto* p = proc->apvts.getParameter ("rhythmJi")) // persist the switch itself
+                    p->setValueNotifyingHost (on ? 1.0f : 0.0f);
                 applyJiToSlots();
                 updateJiText();
                 refreshSlots();
@@ -1852,7 +1866,8 @@ private:
     std::unique_ptr<SliderAttachment> primeLimitFaderAtt;
     juce::Slider       morphTimeFader;
     juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
-    int                undoTxnTick = 0; // groups edits into ~1s undo transactions (Ctrl-Z / Ctrl-Y)
+    int                undoTxnTick = 0; // paces the tuning-bank combo refresh
+    juce::String       lastSeenTimbreSource; // re-seeds intervalEdit when the timbre changes elsewhere
     // The envelopes share ONE compact box; these chips switch which one shows.
     juce::TextButton   envTabB[4];
     int                envTab = 0; // 0 = Amp, 1 = Pitch, 2 = Filter, 3 = Custom

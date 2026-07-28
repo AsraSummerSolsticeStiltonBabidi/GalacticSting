@@ -379,6 +379,15 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     // the window closed - and it survives a project reload as a bonus.
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "rhythmTempoOct", 1 }, "Rhythm Tempo Octave", -6, 6, 0));
+    // The rhythm panel's JI switch, and whether IT was the one that turned MPE out on.
+    // Both were editor-only, so the effect (slots on their partial's just ratio)
+    // persisted while the button did not: a reopened window read "JI: OFF" over JI
+    // pulses, newly routed partials silently got scale steps instead of ratios, and
+    // the "put MPE back as I found it" branch was disarmed.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "rhythmJi", 1 }, "Rhythm JI", false));
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "rhythmJiForcedMpe", 1 }, "Rhythm JI Forced MPE", false));
 
     // Temper the HARMONIC ENGINE's partials to the ACTIVE TUNING's grid (whatever
     // is loaded in the Tuning box), followed live: with this ON both engines work
@@ -564,6 +573,18 @@ void FractalAdditiveAudioProcessor::timerCallback()
     }
     else lastTempoSent = -1;
 
+    // Undo granularity: cut parameter edits into ~1-second transactions, so a slider
+    // drag (or an automation ramp) undoes as one step instead of hundreds of
+    // micro-moves. This lived in the editor, which meant that with the window shut
+    // NOTHING ever opened a transaction: every automated change piled into one
+    // unbounded ActionSet and the first Ctrl+Z after opening the window reverted the
+    // lot back to the values the plugin was instantiated with.
+    if (++undoTxnTick >= 60) // 60 Hz timer -> ~1 s, same grouping as before
+    {
+        undoTxnTick = 0;
+        undoManager.beginNewTransaction();
+    }
+
     // Apply the bend-range choice only when it changes: setLegacyModePitchbendRange
     // releases all held notes, so it must never be called redundantly.
     static constexpr int bendValues[] = { 2, 12, 48 };
@@ -587,25 +608,42 @@ bool FractalAdditiveAudioProcessor::loadScalaFile (const juce::File& f, juce::St
     tuning.setMode (TuningManager::Mode::Scala);
     addRecentScl (f);
     clearSegmentSource(); // this .scl is not the spectrum segment - drop its "from n/1" mapping
-    bankAutoAdd (tuning.getScalaName(), tuning.getScalaSource());
+    syncBankSelector (bankAutoAdd (tuning.getScalaName(), tuning.getScalaSource()));
     return true;
 }
 
 //==============================================================================
 // Every tuning loaded into this Fibló joins the bank (first empty slot; exact
 // duplicates skipped; a full bank is left for the user to curate with the X).
-void FractalAdditiveAudioProcessor::bankAutoAdd (const juce::String& name, const juce::String& source)
+// Returns the 0-based slot the scale ended up in (an existing duplicate counts), or
+// -1 if it could not be stored. The caller points the bank selector at it: without
+// that the combo kept displaying whatever was selected before, and re-picking the
+// entry you are actually on is a no-op in JUCE (a ComboBox fires nothing when the
+// already-selected id is chosen again), so the list needed TWO selections to recover.
+int FractalAdditiveAudioProcessor::bankAutoAdd (const juce::String& name, const juce::String& source)
 {
-    if (source.isEmpty()) return;
+    if (source.isEmpty()) return -1;
     for (int i = 0; i < kBankSlots; ++i)
-        if (bankSource[(size_t) i] == source) return;
+        if (bankSource[(size_t) i] == source) return i;
     for (int i = 0; i < kBankSlots; ++i)
         if (bankSource[(size_t) i].isEmpty())
         {
             bankSource[(size_t) i] = source;
             bankName[(size_t) i]   = name.isNotEmpty() ? name : juce::String ("scale");
-            return;
+            return i;
         }
+    return -1; // bank full - the user curates it with the X
+}
+
+// Point the bank selector at `slot0` without the timer then re-loading that slot's
+// .scl on top of what is already active (which would stomp the tuning mode back to
+// Scala and drop any segment mapping). lastBankSlot is set FIRST for that reason.
+void FractalAdditiveAudioProcessor::syncBankSelector (int slot0)
+{
+    if (! juce::isPositiveAndBelow (slot0, kBankSlots)) return;
+    lastBankSlot = slot0 + 1;
+    if (auto* p = apvts.getParameter ("tuningBankSlot"))
+        p->setValueNotifyingHost (p->convertTo0to1 ((float) (slot0 + 1)));
 }
 
 void FractalAdditiveAudioProcessor::bankClearSlot (int slot0)
@@ -872,7 +910,7 @@ bool FractalAdditiveAudioProcessor::generateDissonanceScale (int count, bool use
 
     lastDissScl  = scl;
     lastDissName = name;
-    bankAutoAdd (name, scl);
+    syncBankSelector (bankAutoAdd (name, scl));
 
     // Degree list for the UI: degree i+1 = i-th interval ascending; plus the
     // period as degree 0 (its height anchors the green end of the gradient).
@@ -1196,7 +1234,7 @@ bool FractalAdditiveAudioProcessor::loadChordAsScale (int index, juce::String& e
     clearSegmentSource(); // a chord scale replaces any segment mapping
     lastDissScl  = scl;
     lastDissName = name;
-    bankAutoAdd (name, scl);
+    syncBankSelector (bankAutoAdd (name, scl));
     return true;
 }
 
@@ -1369,7 +1407,7 @@ bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce
     tuning.setMode (TuningManager::Mode::Scala);
     clearSegmentSource();
     lastDissScl = scl; lastDissName = name;
-    bankAutoAdd (name, scl);
+    syncBankSelector (bankAutoAdd (name, scl));
     return true;
 }
 
@@ -1413,7 +1451,7 @@ bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::St
     tuning.setMode (TuningManager::Mode::Scala);
     clearSegmentSource();
     lastDissScl = scl; lastDissName = name;
-    bankAutoAdd (name, scl);
+    syncBankSelector (bankAutoAdd (name, scl));
     return true;
 }
 
@@ -1452,7 +1490,7 @@ bool FractalAdditiveAudioProcessor::deleteTuningDegree (int degree, juce::String
     tuning.setMode (TuningManager::Mode::Scala);
     clearSegmentSource();
     lastDissScl = scl; lastDissName = name;
-    bankAutoAdd (name, scl);
+    syncBankSelector (bankAutoAdd (name, scl));
     return true;
 }
 
@@ -2372,7 +2410,7 @@ bool FractalAdditiveAudioProcessor::loadPendingPresetTuning (juce::String& error
         p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
     applyTuningMode ((int) TuningManager::Mode::Scala);
     clearSegmentSource();
-    bankAutoAdd (presetPendingSclName, presetPendingSclSource);
+    syncBankSelector (bankAutoAdd (presetPendingSclName, presetPendingSclSource));
     return true;
 }
 

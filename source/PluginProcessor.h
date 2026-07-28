@@ -88,6 +88,11 @@ public:
     bool tuningHasScala()   const noexcept { return tuning.hasScala(); }
     juce::String tuningScaleName() const { return tuning.currentScaleName(); }
     juce::String getTimbreName()   const { return timbreName; }
+    // The exact text a typed Spectrum-Builder spectrum was entered as. It is saved in
+    // the state, but the box that edits it had no way to read it back, so a reopened
+    // window showed an empty field and the spectrum could only be edited by retyping
+    // it from memory.
+    juce::String getTimbreSource() const { return timbreSource; }
     int  getTimbreNoteCount() const noexcept { return (int) timbreDegrees.size(); }
 
     // Degrees per period of the active tuning (for the colour keyboard).
@@ -215,7 +220,10 @@ public:
     int  getTuningBankSlotParam() const noexcept { return (int) apvts.getRawParameterValue ("tuningBankSlot")->load(); }
     void setTuningBankSlotParam (int slot);                        // 0 = none, 1..N = slot (drives automation + load)
     int  firstEmptyBankSlot() const noexcept;
-    void bankAutoAdd (const juce::String& name, const juce::String& source); // every loaded tuning joins the bank
+    // Every loaded tuning joins the bank. Returns the 0-based slot it landed in (or
+    // an existing duplicate's), -1 if the bank is full.
+    int  bankAutoAdd (const juce::String& name, const juce::String& source);
+    void syncBankSelector (int slot0); // point the selector at a slot without re-loading it
     void bankClearSlot (int slot0);                                          // the bank's X button
 
     //==========================================================================
@@ -491,6 +499,7 @@ private:
     // there would kill a note that arrived in that same block.
     bool wasSelfPlay = false, selfPlayKnown = false;
     int  lastTempoSent = -1; // last CC20 BPM sent by the tempo sync (see timerCallback)
+    int  undoTxnTick   = 0;  // groups edits into ~1 s undo transactions (see timerCallback)
 
     // MTS-ESP adoption is a ONE-SHOT check at load (see timerCallback), never repeated.
     bool  mtsCheckPending = true;

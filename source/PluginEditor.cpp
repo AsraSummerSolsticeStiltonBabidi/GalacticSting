@@ -1167,7 +1167,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     {
         auto name = processorRef.tuningScaleName();
         if (name.isEmpty()) name = "tuning " + juce::String (processorRef.getScaleDegrees()) + " notes";
-        processorRef.bankAutoAdd (name, processorRef.currentTuningAsScl (name));
+        processorRef.syncBankSelector (
+            processorRef.bankAutoAdd (name, processorRef.currentTuningAsScl (name)));
         refreshTuningBank();
         refocus();
     };
@@ -1388,6 +1389,14 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     rhythmScrim.onClick   = rhythmPanel.onClose; // click OUTSIDE the panel = close
     addChildComponent (rhythmScrim);
     rhythmPanel.init();
+    // Seed the JI switch from its parameter, so a reopened window agrees with what the
+    // pulses are actually doing. Seeded from the PARAMETER only - never inferred from
+    // "some slot has useRatio", because a hand-typed ratio sets that with JI off and
+    // the next click would then wipe those hand-typed ratios.
+    rhythmPanel.jiB.setToggleState (
+        processorRef.apvts.getRawParameterValue ("rhythmJi")->load() > 0.5f,
+        juce::dontSendNotification);
+    rhythmPanel.updateJiText();
     addChildComponent (rhythmPanel);
     rhythmOnAtt   = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmOn",   rhythmPanel.onT);
     rhythmSelfAtt = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmSelfPlay", rhythmPanel.selfT);
@@ -1736,6 +1745,14 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         }
     };
     addAndMakeVisible (intervalEdit);
+    // Show the typed spectrum that is ALREADY loaded (a reopened window used to come
+    // up blank even though the text was sitting in the state). Only for a typed one:
+    // a .scl-derived timbre keeps its own name, not an interval list.
+    if (processorRef.getTimbreName() == "typed")
+    {
+        intervalEdit.setText (processorRef.getTimbreSource(), false);
+        lastSeenTimbreSource = processorRef.getTimbreSource();
+    }
 
     // Master reference A = <hz> (transposes everything, all tuning modes). A text
     // box you type the Hz into (with "hz" shown to its right), not a fader.
@@ -4170,6 +4187,18 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
 
     refreshModWatch(); // live-modulation marker on every watched fader (see the header)
     refreshPresetDirtyMark();
+    // Keep the Spectrum-Builder box showing the typed spectrum that is actually
+    // loaded - it can change under us (a preset, an undo, "load its original
+    // spectrum"). Never while it has focus: that would overwrite what is being typed.
+    {
+        const auto src = processorRef.getTimbreName() == "typed" ? processorRef.getTimbreSource()
+                                                                 : juce::String();
+        if (src != lastSeenTimbreSource && ! intervalEdit.hasKeyboardFocus (false))
+        {
+            lastSeenTimbreSource = src;
+            intervalEdit.setText (src, false);
+        }
+    }
     refreshRefAText();       // keep the Reference-A box in sync with the parameter (automation)
     // While an MTS-ESP master is connected it OWNS the reference (see the processor's
     // timerCallback), which rewrites the parameter 60x a second - so anything typed
@@ -4191,13 +4220,13 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         }
     }
 
-    // Undo granularity: group parameter edits into ~1-second transactions (a slider
-    // drag undoes as one step, not hundreds of micro-moves). Same tick keeps the
-    // tuning-bank combo in sync with auto-added entries.
+    // (Undo transaction grouping itself now lives in the PROCESSOR's timer, so host
+    // automation with this window shut is still cut into ~1 s steps instead of piling
+    // into one unbounded transaction - see FractalAdditiveAudioProcessor::timerCallback.)
+    // This tick only keeps the tuning-bank combo in sync with auto-added entries.
     if (++undoTxnTick >= 30)
     {
         undoTxnTick = 0;
-        processorRef.undoManager.beginNewTransaction();
         int filled = 0;
         for (int i = 0; i < FractalAdditiveAudioProcessor::kBankSlots; ++i)
             if (processorRef.getTuningBankName (i).isNotEmpty()) ++filled;

@@ -38,10 +38,21 @@ namespace spectrum
             cA = curveA; cD = curveD; cR = curveR;
         }
 
-        // A note-on ALWAYS restarts from zero: retriggering from wherever the
-        // envelope happened to be left a second note with no attack and no decay
-        // left to travel.
-        void noteOn() noexcept  { stage = Attack; pos = 0.0; from = 0.0; value = 0.0; }
+        // A note-on restarts the attack from ZERO by default: retriggering from
+        // wherever the envelope happened to be left a second note with no attack and
+        // no decay left to travel.
+        // fromCurrent = start the attack from the level the envelope is ALREADY at.
+        // Only for a voice STEAL, where the previous note is still sounding: dropping
+        // its gain to zero in one sample is a click, and it also threw away the
+        // glided velocity/pressure targets and the preserved fast-kill gain that the
+        // steal path goes to the trouble of keeping continuous. The Attack branch
+        // already interpolates from `from`, so the ramp simply starts higher.
+        void noteOn (bool fromCurrent = false) noexcept
+        {
+            stage = Attack; pos = 0.0;
+            from  = fromCurrent ? value : 0.0;
+            value = from;
+        }
         void noteOff() noexcept { if (stage != Idle) { stage = Release; pos = 0.0; from = value; } }
         void reset() noexcept   { stage = Idle; pos = 0.0; value = 0.0; from = 0.0; }
         bool isActive() const noexcept { return stage != Idle; }

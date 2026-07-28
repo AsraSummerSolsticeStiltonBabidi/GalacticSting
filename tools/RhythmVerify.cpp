@@ -1217,6 +1217,61 @@ int main()
         proc.clearScala();
     }
 
+    // --- run 22: audit fixes - bank selector, timbre source, undo, steal envelope --
+    {
+        std::printf ("audit fixes:\n");
+        juce::String err;
+
+        // (a) Adding a tuning to the bank must report WHICH slot it landed in, and
+        // the selector must follow. It used to be void and leave the combo on the
+        // previous slot - and re-picking the entry you are already on does nothing in
+        // JUCE, so recovering the right selection needed two separate picks.
+        for (int i = 0; i < FractalAdditiveAudioProcessor::kBankSlots; ++i) proc.bankClearSlot (i);
+        const juce::String sclA = "! a\nbank-a\n 2\n 500.0\n 2/1\n";
+        const juce::String sclB = "! b\nbank-b\n 3\n 300.0\n 700.0\n 2/1\n";
+        const int slotA = proc.bankAutoAdd ("bank-a", sclA);
+        const int slotB = proc.bankAutoAdd ("bank-b", sclB);
+        check (slotA == 0 && slotB == 1, "each added tuning reports its own slot");
+        check (proc.bankAutoAdd ("bank-a", sclA) == slotA,
+               "re-adding the same scale reports the EXISTING slot, not a duplicate");
+        proc.syncBankSelector (slotB);
+        check (proc.getTuningBankSlotParam() == slotB + 1, "the selector follows the slot");
+        proc.syncBankSelector (slotA);
+        check (proc.getTuningBankSlotParam() == slotA + 1, "and follows it back");
+        // A real call site: editing a degree stores the edited scale and must select it.
+        check (proc.loadScalaText ("! c\nbank-c\n 3\n 300.0\n 700.0\n 2/1\n", "bank-c", err), "scale C loads");
+        check (proc.editTuningDegree (1, "6/5", err), "a degree is edited (which banks the result)");
+        check (proc.getTuningBankName (proc.getTuningBankSlotParam() - 1).isNotEmpty(),
+               "and the selector points at a filled slot, not a stale one");
+
+        // (b) A typed spectrum's source text must be readable back, or the Spectrum
+        // Builder box comes up empty and the spectrum can only be edited from memory.
+        check (proc.loadTimbreText ("1/1 5/4 3/2 2/1", err), "a typed spectrum loads");
+        check (proc.getTimbreName() == "typed", "it is marked as typed");
+        check (proc.getTimbreSource() == "1/1 5/4 3/2 2/1", "and its exact text can be read back");
+
+        // (c) The PROCESSOR must open undo transactions, so edits made with the window
+        // shut are still cut into ~1 s steps instead of piling into one unbounded one
+        // (the first Ctrl+Z after opening the window then reverted everything back to
+        // the values the plugin was instantiated with). Driven through the ValueTree
+        // with the same UndoManager, which is what the grouping actually guards.
+        proc.undoManager.clearUndoHistory();
+        proc.undoManager.beginNewTransaction();
+        proc.apvts.state.setProperty ("rvTestA", 1, &proc.undoManager);
+        for (int i = 0; i < 70; ++i) proc.pollParametersForTests(); // > 60 ticks = > 1 s
+        proc.apvts.state.setProperty ("rvTestB", 1, &proc.undoManager);
+        check (proc.undoManager.undo(), "there is something to undo");
+        check (! proc.apvts.state.hasProperty ("rvTestB"), "the LAST edit is undone");
+        check (proc.apvts.state.hasProperty ("rvTestA"),
+               "and the earlier one survives - the poll opened a transaction between them");
+        proc.undoManager.undo();
+        proc.apvts.state.removeProperty ("rvTestA", nullptr);
+        proc.apvts.state.removeProperty ("rvTestB", nullptr);
+        proc.undoManager.clearUndoHistory();
+        proc.clearScala();
+        proc.clearTimbre();
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

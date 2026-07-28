@@ -161,7 +161,13 @@ public:
         updateAdsrParameters();
         adsr.setSampleRate (sr);
         if (! reuse) adsr.reset(); // cold: start from silence; reuse: keep the envelope continuous
-        adsr.noteOn();             // reuse: re-attacks from the CURRENT level -> no step
+        // The comment here always CLAIMED the reuse case re-attacks from the current
+        // level, but noteOn() zeroed it unconditionally - so a steal dropped the amp
+        // to silence in one sample, which is the click the whole reuse path exists to
+        // avoid. Only the AMP envelope does this: handing `reuse` to the filter
+        // envelope would let a stolen voice inherit filterEnvValue ~1 (its sustain
+        // defaults to 1.0) and skip its sweep entirely.
+        adsr.noteOn (reuse);
 
         updateFilterAdsrParameters();
         filterAdsr.setSampleRate (sr);
