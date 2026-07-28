@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <chrono>
 #include <vector>
+#include <map>
 #include <cstdio>
 #include <cmath>
 
@@ -542,6 +543,68 @@ int main()
                     if (std::abs (1200.0 * std::log2 (all[i].alphas[k] / root[i].alphas[k])) > 1.0)
                         differs = true;
             check (differs, "0 vs all and all vs all do NOT return the same chords");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Fractal must be CONTINUOUS: nudging it off "off" is a nudge, not a new timbre.
+    // "Raising fractal from 0 to a little more changed the sound irreversibly."
+    // The fader quantises to 0.01, so 1.01 is the smallest move a user can make; it
+    // used to admit ~1% of the next level's partials at FULL amplitude, and the RMS
+    // normalisation then pushed everything else down ~20 dB.
+    {
+        std::printf ("\nfractal continuity (a 1%% move must be a 1%% change):\n");
+        auto tmplAt = [] (float level, int baseN)
+        {
+            SpectrumSettings s;
+            s.baseN        = baseN;
+            s.fractalLevel = level;
+            s.curveSlope   = 1.0f;
+            return compileSpectrum (s);
+        };
+        // Cosine similarity of the two amplitude spectra, matched by ~1 cent bins.
+        // Both templates are RMS-normalised, so 1.0 = identical timbre, 0 = disjoint.
+        auto similarity = [] (const SpectrumTemplate& a, const SpectrumTemplate& b)
+        {
+            const auto key = [] (float r)
+            { return (long long) std::llround (1200.0 * std::log2 (std::max (1.0e-9, (double) r))); };
+            std::map<long long, double> A, B;
+            for (const auto& p : a.partials) A[key (p.ratio)] += (double) p.amp;
+            for (const auto& p : b.partials) B[key (p.ratio)] += (double) p.amp;
+            double dot = 0.0, na = 0.0, nb = 0.0;
+            for (const auto& kv : A) { na += kv.second * kv.second;
+                                       const auto it = B.find (kv.first);
+                                       if (it != B.end()) dot += kv.second * it->second; }
+            for (const auto& kv : B) nb += kv.second * kv.second;
+            return (na > 0.0 && nb > 0.0) ? dot / std::sqrt (na * nb) : 0.0;
+        };
+
+        for (const int N : { 1, 16 })
+        {
+            const auto off  = tmplAt (1.00f, N);
+            const auto nudge= tmplAt (1.01f, N);
+            const auto half = tmplAt (1.50f, N);
+            const auto full = tmplAt (2.00f, N);
+            const double sNudge = similarity (off, nudge);
+            const double sHalf  = similarity (off, half);
+            const double sFull  = similarity (off, full);
+            std::printf ("  Base %-3d  sim(1.00,1.01)=%.4f  sim(1.00,1.50)=%.4f  sim(1.00,2.00)=%.4f\n",
+                         N, sNudge, sHalf, sFull);
+            std::printf ("            partials: off=%d nudge=%d full=%d   truncated: off=%d nudge=%d full=%d\n",
+                         (int) off.partials.size(), (int) nudge.partials.size(), (int) full.partials.size(),
+                         (int) off.truncated, (int) nudge.truncated, (int) full.truncated);
+            check (sNudge > 0.97,
+                   "the smallest possible fractal move barely changes the timbre");
+            check (sNudge > sHalf && sHalf >= sFull - 1.0e-9,
+                   "and the timbre moves away monotonically as fractal rises");
+        }
+        // The endpoints must still be EXACT - the ramp must not smear level 2 into 1.
+        {
+            SpectrumSettings s; s.baseN = 4; s.curveSlope = 1.0f;
+            s.fractalLevel = 2.0f;  const auto exact = compileSpectrum (s);
+            s.fractalLevel = 1.999f; const auto near_ = compileSpectrum (s);
+            check (similarity (exact, near_) > 0.99,
+                   "and fractal just below an integer level matches that level");
         }
     }
 

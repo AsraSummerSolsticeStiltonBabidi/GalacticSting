@@ -2747,7 +2747,17 @@ void FractalAdditiveAudioProcessorEditor::updateScaleDissonance()
                + (double) processorRef.apvts.getRawParameterValue ("refA")->load() * 0.01;
     for (int d = 1; d <= juce::jmin (D, 16); ++d) sig += processorRef.getDegreeRatio (d) * (double) (d + 3);
     if (std::abs (sig - lastScaleSig) < 1.0e-6) return;
-    lastScaleSig = sig;
+
+    // The signature includes the template generation, so a modulator on ANY spectrum
+    // control makes it change on essentially every tick. The analysis is advisory UI, so
+    // rate-limit it to ~4 Hz: without this it ran at the full 30 Hz timer rate for as
+    // long as the modulator kept moving. (The analysis itself no longer recompiles the
+    // spectrum - see computeActiveScaleDissonance - but it is still an O(partials x
+    // degrees) roughness sweep and there is no reason to run it faster than the eye.)
+    const juce::uint32 nowMs = juce::Time::getMillisecondCounter();
+    if (nowMs - lastScaleDissMs < 250) return;
+    lastScaleDissMs = nowMs;
+    lastScaleSig    = sig;
 
     activeDiss = processorRef.computeActiveScaleDissonance();
     rebuildScaleDissList();

@@ -954,11 +954,23 @@ FractalAdditiveAudioProcessor::computeActiveScaleDissonance() const
 {
     std::vector<DissDegreeInfo> out;
 
-    // Same analysis spectrum the generator uses: recompiled from the current
-    // settings (message thread, deterministic, no audio-thread interaction).
-    const auto tmpl = spectrum::compileSpectrum (currentSettings());
-    if (tmpl.partials.empty())
-        return out;
+    // Read the template that is ALREADY PUBLISHED rather than compiling a fresh one.
+    //
+    // This used to call compileSpectrum() synchronously, on the message thread, with no
+    // abort flag - and the editor's 30 Hz timer re-runs it whenever the template
+    // generation changes. Put a modulator on any spectrum control and the generation
+    // changes on essentially every tick, so the message thread spent all its time
+    // compiling. At fractalLevel > 1 one compile is hundreds of milliseconds, and the
+    // processor's own 60 Hz timerCallback - the ONLY place a modulated Base is ever
+    // sampled into a rebuild request - was starved. The spectrum froze at whatever Base
+    // value was caught last and the fader's modulation marker stopped moving: exactly
+    // "Base no longer moves and the LFO doesn't move it", and it never recovered because
+    // the starvation persisted for as long as fractal stayed above 1.
+    //
+    // The analysis keeps only the 64 loudest partials anyway, so being at most one
+    // publish behind is invisible here. A fresh compile is kept only as the cold-start
+    // fallback, before the builder has published anything at all.
+    std::vector<dissonance::Partial> spec;
 
     // Anchor the partials at the ACTUAL sounding tonic of the active tuning, so the
     // absolute frequencies (which Sethares roughness depends on) are correct.
@@ -966,10 +978,23 @@ FractalAdditiveAudioProcessor::computeActiveScaleDissonance() const
     if (! (f0 > 0.0) || ! std::isfinite (f0))
         f0 = TuningManager::kRefFreq * tuning.referenceScale();
 
-    std::vector<dissonance::Partial> spec;
-    spec.reserve (tmpl.partials.size());
-    for (const auto& p : tmpl.partials)
-        spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
+    if (const auto* live = spectrumEngine.getLive(); live != nullptr && ! live->partials.empty())
+    {
+        spec.reserve (live->partials.size());
+        for (const auto& p : live->partials)
+            spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
+    }
+    else
+    {
+        const auto tmpl = spectrum::compileSpectrum (currentSettings());
+        if (tmpl.partials.empty())
+            return out;
+        spec.reserve (tmpl.partials.size());
+        for (const auto& p : tmpl.partials)
+            spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
+    }
+    if (spec.empty())
+        return out;
     if (spec.size() > 64) // analysis cap only; the SOUND is never capped
     {
         std::sort (spec.begin(), spec.end(),
@@ -1522,7 +1547,18 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
     nadUsedD  = D;
     std::vector<double> ratios ((size_t) D);
     for (int d = 0; d < D; ++d) ratios[(size_t) d] = getDegreeRatio (d);
-    const auto tmpl = spectrum::compileSpectrum (currentSettings());
+    // Take the PUBLISHED template, not a fresh compile. Two reasons: this runs on the
+    // message thread and a compile at fractalLevel > 1 costs hundreds of milliseconds
+    // (which starved the 60 Hz timer that samples a modulated Base - see
+    // computeActiveScaleDissonance); and the Degrees list now reads the published one, so
+    // recompiling here would let the two lists disagree, which the anchor comment below
+    // explicitly forbids. Copied, because the search continues on a worker thread and the
+    // engine's slot can be recycled under it.
+    spectrum::SpectrumTemplate tmpl;
+    if (const auto* live = spectrumEngine.getLive(); live != nullptr && ! live->partials.empty())
+        tmpl.partials = live->partials;
+    else
+        tmpl = spectrum::compileSpectrum (currentSettings());
     // The period the search reasons with: the tuning's own unless the user typed a
     // different one in the box (it decides what counts as an equal-step scale and
     // which intervals are just the same pitch class again).
