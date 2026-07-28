@@ -1856,6 +1856,49 @@ int main()
         }
     }
 
+    // --- run 29: a downward slope modulation must WIDEN the compiled template --------
+    // A voice rescales amplitudes from the template's slope to its own, exactly - but
+    // only for partials the template actually holds, and the amplitude floor culls by an
+    // amplitude that depends on slope. Compiled steep, the template physically lacks what
+    // a shallower voice needs, and partials would go missing. So the compile has to use
+    // the LOWEST slope the modulation can reach.
+    {
+        std::printf ("slope modulation widens the compiled spectrum:\n");
+        constexpr int eb = 64;
+        auto build = [&] (bool mapDownwards)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (48000.0, eb);
+            auto s = [&] (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            s ("rhythmOn", 0.0f); s ("rhythmSelfPlay", 0.0f);
+            s ("baseN", 1.0f); s ("fractalLevel", 1.0f);
+            s ("curveSlope", 3.0f);          // steep: the -120 dB floor culls hard
+            if (mapDownwards)
+            {
+                p->getModEngine().addTarget (0, "curveSlope");
+                s ("modE1Range", -1.0f);     // reaches all the way down to slope 0
+                s ("modE1On", 1.0f);
+            }
+            p->pollParametersForTests();
+            juce::AudioBuffer<float> b (2, eb);
+            for (int i = 0; i < 30; ++i)
+            { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); juce::Thread::sleep (4); }
+            p->pollParametersForTests();
+            for (int i = 0; i < 30; ++i)
+            { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); juce::Thread::sleep (4); }
+            const auto* t = p->getLiveTemplate();
+            return t != nullptr ? (int) t->partials.size() : 0;
+        };
+        const int plain  = build (false);
+        const int mapped = build (true);
+        std::printf ("  partials: slope 3 alone=%d   with a downward modulation=%d\n", plain, mapped);
+        check (plain > 0, "the plain template built at all");
+        check (mapped > plain,
+               "a modulator reaching down to a shallower slope compiles a WIDER template");
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

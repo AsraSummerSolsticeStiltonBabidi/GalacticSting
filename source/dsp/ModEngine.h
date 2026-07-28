@@ -287,6 +287,30 @@ public:
     // How many of this modulator's 8 target slots are in use (the map menu shows it).
     bool isFull (int mod) const { return numTargets (mod) >= kMaxTargets; }
 
+    // The span a parameter can be carried across, in NORMALISED units, relative to its
+    // base: each active modulator's output sweeps 0..1 and is scaled by its Range, so a
+    // positive Range reaches upwards and a negative one downwards, and several mapped
+    // modulators add. Used for the band the editor draws around a per-voice target, and
+    // to decide the lowest slope the spectrum must be compiled at.
+    // Message thread (takes routingLock).
+    void modulationSpan (const juce::String& pid, float& lo, float& hi) const
+    {
+        lo = hi = 0.0f;
+        const juce::ScopedLock sl (routingLock);
+        for (int i = 0; i < kMods; ++i)
+        {
+            bool drives = false;
+            for (int t = 0; t < kMaxTargets && ! drives; ++t)
+                drives = mods[(size_t) i].tgtId[(size_t) t] == pid;
+            if (! drives) continue;
+            const bool on = onParam[(size_t) i] != nullptr ? onParam[(size_t) i]->getValue() > 0.5f
+                                                           : prm[(size_t) i].on->load() > 0.5f;
+            if (! on) continue;
+            const float rg = prm[(size_t) i].range->load();
+            if (rg >= 0.0f) hi += rg; else lo += rg;
+        }
+    }
+
     // Audio thread: called once per block from processBlock BEFORE the synth renders.
     //   noteOnsSoFar - running note-on counter (retrigger detection)
     //   anyHeld      - is any note currently held (accurate THIS block)

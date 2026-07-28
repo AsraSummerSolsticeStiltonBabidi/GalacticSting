@@ -414,7 +414,24 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
     s.baseN         = (int) apvts.getRawParameterValue ("baseN")->load();
     s.baseMode      = (spectrum::BaseMode) (int) apvts.getRawParameterValue ("baseMode")->load();
     s.selection     = apvts.getRawParameterValue ("harmonics")->load();
-    s.curveSlope    = apvts.getRawParameterValue ("curveSlope")->load();
+    // Compile at the LOWEST slope the modulation can REACH, not at the knob's value.
+    //
+    // Each voice rescales the published amplitudes from the template's slope to its own,
+    // which is exact - but only for partials the template actually contains, and the
+    // amplitude floor culls by an amplitude that DOES depend on slope (at -120 dB it
+    // removes everything above ratio 10^(6/s): nothing at slope 1, but only up to ratio
+    // ~32 at slope 4). A template compiled steep therefore physically lacks the partials
+    // a shallower voice would need, and the fidelity rule is that nothing goes missing.
+    // With nothing mapped the reachable minimum IS the knob value, so this costs exactly
+    // nothing until a modulator is pointed at slope.
+    {
+        auto* p = apvts.getParameter ("curveSlope");
+        float lo = 0.0f, hi = 0.0f;
+        modEngine.modulationSpan ("curveSlope", lo, hi);
+        s.curveSlope = p != nullptr
+                     ? p->convertFrom0to1 (juce::jlimit (0.0f, 1.0f, p->getValue() + lo))
+                     : apvts.getRawParameterValue ("curveSlope")->load();
+    }
 
     // Prime limit is a CONTINUOUS position on the Off - 23 - 19 ... - 2 fader: the
     // whole value below is the limit in force, the one above is the next stop, and
