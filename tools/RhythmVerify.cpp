@@ -12,6 +12,8 @@
 
 #include "PluginProcessor.h"
 
+#include <juce_dsp/juce_dsp.h>
+
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -1270,6 +1272,119 @@ int main()
         proc.undoManager.clearUndoHistory();
         proc.clearScala();
         proc.clearTimbre();
+    }
+
+    // --- run 23: per-note pitch bend must actually retune the voice ---------------
+    // Reported: feeding MPE-retuned MIDI (31-EDO) makes some notes silent and others
+    // sound identical, as if everything collapsed onto 12-EDO. That is what dropping
+    // the bend looks like: several 31-EDO steps share a nearest 12-EDO key, so they
+    // become the same pitch, and repeated note-ons on that same key steal each other.
+    // Measure the RENDERED fundamental, which is the only thing that settles it.
+    {
+        std::printf ("per-note pitch bend retunes the voice:\n");
+        constexpr int    fftOrder = 15;
+        constexpr int    fftN     = 1 << fftOrder;
+        constexpr int    pblk     = 512;
+
+        auto renderFundamental = [&] (FractalAdditiveAudioProcessor& p, int ch, int note, int bend14)
+        {
+            juce::AudioBuffer<float> b (2, pblk);
+            std::vector<float> mono;
+            mono.reserve ((size_t) fftN + pblk);
+            bool sent = false;
+            while ((int) mono.size() < fftN + (int) (48000.0 * 0.25))
+            {
+                juce::MidiBuffer m;
+                if (! sent)
+                {
+                    // Bend FIRST, then the note - the order a host uses for MPE.
+                    m.addEvent (juce::MidiMessage::pitchWheel (ch, bend14), 0);
+                    m.addEvent (juce::MidiMessage::noteOn (ch, note, (juce::uint8) 110), 1);
+                    sent = true;
+                }
+                b.clear();
+                p.processBlock (b, m);
+                for (int i = 0; i < pblk; ++i) mono.push_back (b.getSample (0, i));
+            }
+            std::vector<float> w (mono.end() - fftN, mono.end());
+            for (int i = 0; i < fftN; ++i)
+                w[(size_t) i] *= 0.5f * (1.0f - std::cos (2.0f * juce::MathConstants<float>::pi
+                                                          * (float) i / (float) (fftN - 1)));
+            std::vector<float> fd ((size_t) fftN * 2, 0.0f);
+            for (int i = 0; i < fftN; ++i) fd[(size_t) i] = w[(size_t) i];
+            juce::dsp::FFT fft (fftOrder);
+            fft.performRealOnlyForwardTransform (fd.data());
+            // Lowest strong peak = the fundamental (partial 1 is the loudest here).
+            double bestHz = 0.0; float bestMag = 0.0f;
+            for (int k = 1; k <= fftN / 2; ++k)
+            {
+                const float re = fd[(size_t) (2 * k)], im = fd[(size_t) (2 * k + 1)];
+                const float mg = std::sqrt (re * re + im * im);
+                if (mg > bestMag) { bestMag = mg; bestHz = (double) k * 48000.0 / (double) fftN; }
+            }
+            return bestHz;
+        };
+
+        auto pm = std::make_unique<FractalAdditiveAudioProcessor>();
+        auto sp = [&] (const char* id, float v)
+        { auto* q = pm->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v));
+          pm->pollParametersForTests(); };
+        pm->prepareToPlay (48000.0, pblk);
+        sp ("ampAttack", 0.001f); sp ("ampDecay", 0.001f); sp ("ampSustain", 1.0f);
+        sp ("baseN", 1.0f);           // partial 1 = the played pitch, easiest to measure
+        sp ("fractalLevel", 1.0f);
+        sp ("tuningMode", 3.0f);      // MPE (bend input) - the reported case
+        pm->pollParametersForTests();
+
+        // +24 semitones of a +-48 range = quarter of the way up from centre.
+        const int    bendUp   = 8192 + 8192 / 2;          // +24 st at +-48
+        const double f0Plain  = pm->getNoteFrequency (60);
+        const double got      = renderFundamental (*pm, 2, 60, bendUp);
+        const double expect   = f0Plain * std::exp2 (24.0 / 12.0);
+        const double errCents = (got > 0.0 && expect > 0.0)
+                              ? std::abs (1200.0 * std::log2 (got / expect)) : 1.0e9;
+        std::printf ("  ch2 note60 bend+24st: expected %.1f Hz, rendered %.1f Hz (%.0f c off)\n",
+                     expect, got, errCents);
+        check (errCents < 25.0, "a member-channel per-note bend really moves the pitch");
+
+        // The MASTER channel of the zone. A host that does not know we accept MPE
+        // sends notes and bend on channel 1, where the zone's MASTER bend range
+        // applies - not the per-note one. If those ranges differ, the same bend
+        // bytes mean a different pitch and the retuning silently collapses.
+        {
+            auto pm1 = std::make_unique<FractalAdditiveAudioProcessor>();
+            auto sp1 = [&] (const char* id, float v)
+            { auto* q = pm1->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v));
+              pm1->pollParametersForTests(); };
+            pm1->prepareToPlay (48000.0, pblk);
+            sp1 ("ampAttack", 0.001f); sp1 ("ampDecay", 0.001f); sp1 ("ampSustain", 1.0f);
+            sp1 ("baseN", 1.0f); sp1 ("fractalLevel", 1.0f);
+            sp1 ("tuningMode", 3.0f);
+            pm1->pollParametersForTests();
+            const double got1 = renderFundamental (*pm1, 1, 60, bendUp);
+            const double err1 = (got1 > 0.0) ? std::abs (1200.0 * std::log2 (got1 / expect)) : 1.0e9;
+            std::printf ("  ch1 note60 bend+24st: expected %.1f Hz, rendered %.1f Hz (%.0f c off)\n",
+                         expect, got1, err1);
+            check (err1 < 25.0, "the SAME bend on channel 1 moves the pitch by the same amount");
+        }
+
+        // And in a non-MPE mode (legacy), where the bend range is the bendRange param.
+        {
+            auto pl = std::make_unique<FractalAdditiveAudioProcessor>();
+            auto spl = [&] (const char* id, float v)
+            { auto* q = pl->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v));
+              pl->pollParametersForTests(); };
+            pl->prepareToPlay (48000.0, pblk);
+            spl ("ampAttack", 0.001f); spl ("ampDecay", 0.001f); spl ("ampSustain", 1.0f);
+            spl ("baseN", 1.0f); spl ("fractalLevel", 1.0f);
+            spl ("tuningMode", 1.0f);   // MTS-ESP (no master -> 12ED2), legacy zone
+            pl->pollParametersForTests();
+            const double gotL = renderFundamental (*pl, 1, 60, bendUp);
+            const double errL = (gotL > 0.0) ? std::abs (1200.0 * std::log2 (gotL / expect)) : 1.0e9;
+            std::printf ("  legacy ch1 bend+24st: expected %.1f Hz, rendered %.1f Hz (%.0f c off)\n",
+                         expect, gotL, errL);
+            check (errL < 25.0, "legacy mode applies the +-48 bend too");
+        }
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);

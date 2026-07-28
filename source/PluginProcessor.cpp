@@ -676,7 +676,17 @@ void FractalAdditiveAudioProcessor::applyTuningMode (int paramIndex)
         if (mpe)
         {
             juce::MPEZoneLayout zone;
-            zone.setLowerZone (15, 48, 2); // 15 member channels, +-48 st per-note bend
+            // (members, per-note bend, MASTER bend). The master range used to be the
+            // conventional 2 semitones, which quietly broke retuning whenever the host
+            // put notes on channel 1 - the zone's master channel - instead of on a
+            // member channel: the very same bend bytes then meant 1/24 of the pitch,
+            // so a 31-EDO retuning collapsed to within a couple of cents of 12-EDO,
+            // and steps sharing a nearest 12-EDO key became the same note (some of
+            // them stealing each other's voice, so they did not sound at all).
+            // Both ranges are +-48 here, so the retuning survives whichever channel
+            // the host chooses. That is also exactly what the UI promises: the bend
+            // selector is hidden in this mode because "the MPE zone fixes it at +-48".
+            zone.setLowerZone (15, 48, 48);
             synth.setZoneLayout (zone);
         }
         else
