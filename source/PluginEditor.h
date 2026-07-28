@@ -582,6 +582,7 @@ private:
         juce::Label        divLbl, timesLbl, nVal, xVal;      // "divide [n] times by [x]"
         juce::TextButton   nUp, nDn, xUp, xDn;                // tiny round steppers
         juce::TextButton   closeB { "X" }, helpB, jiB, tempoX2, tempoD2;
+        bool jiForcedMpe = false; // JI switched MPE out on -> JI off switches it back
         juce::String       helpText;                          // shown by the Help button
         // Slot rows live in a scrollable container: kSlots is large ("unlimited"
         // pulses), so the panel shows a window onto however many are routed.
@@ -790,9 +791,24 @@ private:
             {
                 if (proc == nullptr) return;
                 const bool on = jiB.getToggleState();
-                if (on && ! mpeOn()) // JI needs per-note bend -> enable MPE out with it
+                if (on)
+                {
+                    // JI needs per-note bend -> MPE out goes on with it. Remember
+                    // whether WE were the ones who switched it on, so turning JI back
+                    // off leaves the panel exactly as it found it. Without this the
+                    // toggle was not an involution: MPE stayed on for ever after, and
+                    // its channel spreading kept detuning notes that shared a channel.
+                    jiForcedMpe = ! mpeOn();
+                    if (jiForcedMpe)
+                        if (auto* p = proc->apvts.getParameter ("rhythmMpe"))
+                            p->setValueNotifyingHost (1.0f);
+                }
+                else if (jiForcedMpe)
+                {
+                    jiForcedMpe = false;
                     if (auto* p = proc->apvts.getParameter ("rhythmMpe"))
-                        p->setValueNotifyingHost (1.0f);
+                        p->setValueNotifyingHost (0.0f);
+                }
                 applyJiToSlots();
                 updateJiText();
                 refreshSlots();
@@ -1791,6 +1807,7 @@ private:
     RefreshingComboBox presetBox;
     juce::Label presetDirtyMark; // "*" - some parameter drifted from the loaded preset
     void refreshPresetDirtyMark();
+    juce::Rectangle<int> titleClickArea; // the title squares; clicking them plays the jingle
     juce::ToggleButton primeToggle[9], morphToggle;
     juce::ToggleButton temperToggle; // Custom Engine: temper harmonic partials to the loaded .scl
     std::unique_ptr<ButtonAttachment> temperAtt;

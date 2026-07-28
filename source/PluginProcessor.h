@@ -398,25 +398,23 @@ public:
     juce::MidiMessageCollector previewCollector;
     juce::MidiBuffer           previewMidi; // reused per block (audio thread)
 
+public:
+    // The jingle is ON DEMAND only: clicking the title asks for it. It never plays
+    // by itself - not on load, not on a preset/project reload - so it can never
+    // sound at a moment the user did not choose. A second request while it is
+    // already sounding restarts it from the top rather than overlapping.
+    void triggerJingle() noexcept { jingleRestart.store (true, std::memory_order_release); }
+    bool isJinglePlaying() const noexcept { return jingleActive; }
+
 private:
-    // A one-shot startup jingle: plays once from THIS instance's own output the
-    // first time it renders audio, then never again for the lifetime of this
-    // object. Deliberately untouched by getStateInformation/setStateInformation -
-    // a project reload/preset/undo must never retrigger it; only a genuinely NEW
-    // instance (this constructor running again) does.
     juce::AudioBuffer<float> jingleNative;   // decoded once at construction, file's own rate
     double jingleNativeSr = 44100.0;
     juce::AudioBuffer<float> jingleOut;      // resampled to the session rate, built once
     bool   jingleResampled = false;
     int    jingleReadPos   = 0;
-    bool   jingleActive    = true;           // false once fully played (or on decode failure)
+    bool   jingleActive    = false;          // true only while a requested play is running
+    std::atomic<bool> jingleRestart { false }; // set by the editor, consumed on the audio thread
     void   playJingleInto (juce::AudioBuffer<float>& buffer);
-public:
-    // Verifier/test hook ONLY - production code must never call this. The offline
-    // verifiers render raw audio and analyse its level/spectrum; without this their
-    // very first render would always contain the jingle and never be silent/clean.
-    void skipStartupJingleForTests() noexcept { jingleActive = false; }
-private:
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
@@ -463,6 +461,16 @@ private:
     // plus the degree/height data shown in the Spectrum-to-Scale panel.
     juce::String lastDissScl, lastDissName;
     juce::String presetPendingSclSource, presetPendingSclName; // see hasPendingPresetTuning()
+    // Self-play routing as of the last block: a CHANGE strands notes (see processBlock).
+    // `known` starts false so the very first block only records the state - flushing
+    // there would kill a note that arrived in that same block.
+    bool wasSelfPlay = false, selfPlayKnown = false;
+
+    // MTS-ESP adoption is a ONE-SHOT check at load (see timerCallback), never repeated.
+    bool  mtsCheckPending = true;
+    bool  mtsHadRef       = false; // MTS is currently driving the reference
+    float manualRefA      = 440.0f; // the hand-set reference, parked while MTS owns it
+
     juce::String loadedPresetName; // empty = no preset is currently being tracked for drift
     std::vector<std::pair<juce::String, float>> loadedPresetSnapshot; // paramID -> base value at load/save
     void snapshotLoadedPreset (const juce::String& name);

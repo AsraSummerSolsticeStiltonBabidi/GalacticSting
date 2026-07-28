@@ -324,8 +324,7 @@ public:
                 const double semis = 69.0 + 12.0 * std::log2 (hz / 440.0);
                 note = juce::jlimit (0, 127, (int) std::lround (semis));
                 if (mpeOut)
-                    bend = juce::jlimit (0, 16383,
-                        8192 + (int) std::lround ((semis - (double) note) / 48.0 * 8192.0));
+                    bend = encodeBend (semis - (double) note); // uses the ACTIVE bend range
             }
             else
             {
@@ -589,9 +588,7 @@ private:
                     const int    m     = juce::jlimit (0, 127, (int) std::lround (semis));
                     sendNote[i][j] = m;
                     sendHz  [i][j] = tHz;
-                    // Per-note bend, assuming the MPE-default +-48 st range downstream.
-                    sendBend[i][j] = juce::jlimit (0, 16383,
-                        8192 + (int) std::lround ((semis - (double) m) / 48.0 * 8192.0));
+                    sendBend[i][j] = encodeBend (semis - (double) m); // uses the ACTIVE bend range
                 }
                 else
                 {
@@ -706,6 +703,18 @@ private:
     std::atomic<float>* modeParam = nullptr;
     std::atomic<float>* mpeParam  = nullptr;
     std::atomic<float>* bendParam = nullptr;
+
+    // Encode a fractional-semitone offset as a 14-bit pitch wheel value using the
+    // range the SYNTH is actually set to. This used to assume the MPE default of
+    // +-48 unconditionally, so with the range on +-2 or +-12 every JI pulse landed
+    // at 1/24 or 1/4 of its intended detune - the "JI breaks the sound" report.
+    int encodeBend (double semitoneOffset) const noexcept
+    {
+        static constexpr double bendValues[] = { 2.0, 12.0, 48.0 };
+        const int idx = juce::jlimit (0, 2, bendParam != nullptr ? (int) bendParam->load() : 2);
+        const double range = bendValues[idx];
+        return juce::jlimit (0, 16383, 8192 + (int) std::lround (semitoneOffset / range * 8192.0));
+    }
 
     juce::MidiBuffer out; // reused every block (capacity persists after warm-up)
 

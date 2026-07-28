@@ -34,7 +34,6 @@ int main()
     constexpr int    blk = 256;
 
     FractalAdditiveAudioProcessor proc;
-    proc.skipStartupJingleForTests(); // this file checks raw audio content/timing - see run 16 for the jingle itself
     proc.prepareToPlay (sr, blk);
 
     // Route P1 (harmonic 1) and P2 (harmonic 2) and P3: slots sorted by partial.
@@ -860,7 +859,6 @@ int main()
     {
         std::printf ("preset/project reload silences any sounding note:\n");
         FractalAdditiveAudioProcessor p2;
-        p2.skipStartupJingleForTests(); // this test measures silence, not the jingle
         p2.prepareToPlay (sr, blk);
         auto maxAbs = [] (const juce::AudioBuffer<float>& b)
         {
@@ -982,9 +980,9 @@ int main()
         FractalAdditiveAudioProcessor::getPresetFolder().getChildFile (presetName + ".gsting").deleteFile();
     }
 
-    // --- run 18: the startup jingle plays once per instance, never again ----------
+    // --- run 18: the jingle is ON DEMAND only, never on its own -------------------
     {
-        std::printf ("startup jingle: once per instance, never retriggered:\n");
+        std::printf ("jingle: only ever when the title is clicked:\n");
         constexpr int jblk = 4096;
         auto maxAbsOf = [] (const juce::AudioBuffer<float>& b)
         {
@@ -995,35 +993,24 @@ int main()
             return m;
         };
 
-        // Heap-allocated: this class is too large for a THIRD instance (on top of
-        // `proc`, already live for the rest of main()) to share the stack safely.
+        // Heap-allocated: this class is too large for a second live instance (on top
+        // of `proc`, still alive for the rest of main()) to share the stack safely.
         auto pj = std::make_unique<FractalAdditiveAudioProcessor>();
         pj->prepareToPlay (sr, jblk);
         juce::AudioBuffer<float> jaudio (2, jblk);
-
-        // No MIDI at all - anything heard can ONLY be the jingle.
-        bool heardSomething = false;
         const int blocksFor7s = (int) std::ceil (7.0 * sr / jblk); // the jingle is ~5.4 s
+
+        // A brand-new instance renders SILENCE: no MIDI, no click, no jingle.
+        bool silentOnLoad = true;
         for (int b = 0; b < blocksFor7s; ++b)
         {
             juce::MidiBuffer m;
             pj->processBlock (jaudio, m);
-            if (maxAbsOf (jaudio) > 1.0e-4f) heardSomething = true;
+            if (maxAbsOf (jaudio) > 1.0e-6f) silentOnLoad = false;
         }
-        check (heardSomething, "the jingle is actually heard on a fresh instance");
+        check (silentOnLoad, "a freshly loaded instance is SILENT - the jingle does not self-start");
 
-        // Well past its length now: dead silence from here on, MIDI or not.
-        bool stillSilent = true;
-        for (int b = 0; b < 20; ++b)
-        {
-            juce::MidiBuffer m;
-            pj->processBlock (jaudio, m);
-            if (maxAbsOf (jaudio) > 1.0e-6f) stillSilent = false;
-        }
-        check (stillSilent, "silent again once the jingle has fully played");
-
-        // A full state swap on the SAME instance (preset load / project reload /
-        // Init) must NEVER bring it back - only a genuinely new instance may.
+        // Nor does a full state swap (preset load / project reload / Init) start it.
         juce::MemoryBlock state;
         pj->getStateInformation (state);
         pj->setStateInformation (state.getData(), (int) state.getSize());
@@ -1034,22 +1021,39 @@ int main()
             pj->processBlock (jaudio, m);
             if (maxAbsOf (jaudio) > 1.0e-6f) silentAfterReload = false;
         }
-        check (silentAfterReload, "a state reload on the SAME instance does not retrigger it");
-        pj.reset(); // free it before building the second one
+        check (silentAfterReload, "a state reload does not start it either");
 
-        // A genuinely NEW instance (a second Fibló, or reopening the project) gets
-        // its own independent play - this is per-INSTANCE, not a global one-shot.
-        auto pj2 = std::make_unique<FractalAdditiveAudioProcessor>();
-        pj2->prepareToPlay (sr, jblk);
-        bool heardOnSecond = false;
+        // Clicking the title (triggerJingle) is the ONLY thing that makes it sound.
+        pj->triggerJingle();
+        bool heardAfterClick = false;
+        float loudest = 0.0f;
         for (int b = 0; b < blocksFor7s; ++b)
         {
             juce::MidiBuffer m;
-            pj2->processBlock (jaudio, m);
-            if (maxAbsOf (jaudio) > 1.0e-4f) heardOnSecond = true;
+            pj->processBlock (jaudio, m);
+            const float pk = maxAbsOf (jaudio);
+            loudest = std::max (loudest, pk);
+            if (pk > 1.0e-4f) heardAfterClick = true;
         }
-        check (heardOnSecond, "a second, independent instance plays its own jingle too");
+        check (heardAfterClick, "clicking the title DOES play it");
+        check (loudest < 0.5f, "and it is levelled well below full scale (sits with the synth)");
+
+        // It stops on its own and stays stopped.
+        bool silentAgain = true;
+        for (int b = 0; b < 20; ++b)
+        {
+            juce::MidiBuffer m;
+            pj->processBlock (jaudio, m);
+            if (maxAbsOf (jaudio) > 1.0e-6f) silentAgain = false;
+        }
+        check (silentAgain, "silent again once it has finished, with no second play");
+
+        // Clicking again replays it - from the top, not overlapped.
+        pj->triggerJingle();
+        { juce::MidiBuffer m; pj->processBlock (jaudio, m); }
+        check (maxAbsOf (jaudio) > 1.0e-6f, "a second click replays it");
     }
+
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;

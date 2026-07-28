@@ -81,6 +81,13 @@ public:
         // An MTS-ESP master may leave this key unmapped -> it must not sound.
         if (tuning.shouldFilterNote ((int) currentlyPlayingNote.initialNote))
         {
+            // If this note-on was a STEAL, the voice is still rendering the previous
+            // note. clearCurrentNote() alone only tells the synthesiser we are free -
+            // the envelope stays active, so renderNextBlock keeps producing sound for
+            // a note nobody owns any more and no note-off can ever reach: a permanent
+            // drone. Fade it out properly instead.
+            if (adsr.isActive() || fastKill) beginFastKill();
+            else                             finishNote();
             clearCurrentNote();
             return;
         }
@@ -148,7 +155,7 @@ public:
         // spectrum, then snap abruptly when the stale morph finishes. prevN=0 also makes
         // the first block cleanly SNAP curRatio onto the current template (a frequency
         // snap with continuous phase = click-free) instead of gliding from a stale ratio.
-        morphActive = false; morphPos = 1.0; prevN = 0;
+        morphActive = false; morphPos = 1.0; prevN = 0; morphWeight = 0.0;
 
         const double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
         updateAdsrParameters();
@@ -210,7 +217,11 @@ public:
         // Pitch env: amount (semitones) * the envelope value [0..1], evaluated once
         // per block (like the filter cutoff) - the env itself advances per sample.
         int n = 0;
-        double morphW = 0.0; // 0..1 crossfade weight from running phases -> coherent alignPhase
+        // 0..1 crossfade weight from the running phases -> the coherent alignPhase.
+        // It is a MEMBER and only ever rises while a note sounds: restarting the
+        // morph clock (which now happens on every new template - see below) must
+        // never drop it, because a falling weight is a per-partial waveform step.
+        double& morphW = morphWeight;
         const auto* tmpl = engine.getLive();
         const double baseFreq = tuning.frequencyForNote ((int) currentlyPlayingNote.initialNote);
         const double pitchEnvSemis = (double) pEnvAmtParam->load() * (double) pitchEnvValue;
@@ -304,7 +315,14 @@ public:
                             for (int j = 0; j < hi; ++j) phase[(size_t) j] = alignPhase[(size_t) j];
                     }
                     morphN = hi; morphActive = true;
-                    if (! wasMorphing) morphPos = 0.0; // else keep gliding, no weight jump
+                    // EVERY new target restarts the glide clock. Keeping the old
+                    // morphPos was what made a continuous move (a knob drag, or a
+                    // modulator: both re-emit a template ~60x a second) degenerate
+                    // into a staircase - once morphPos had run up to ~1, each new
+                    // template was applied at full strength immediately, i.e. a hard
+                    // snap per rebuild. morphStartLog below is re-aimed from where the
+                    // partials ACTUALLY are, so restarting the clock is seamless.
+                    morphPos = 0.0;
 
                     // Coherent phase reference for the DESTINATION (as if the new
                     // spectrum were freshly played now); the audio crossfades from the
@@ -332,7 +350,7 @@ public:
                 // Phase-lock PROGRESSIVELY across the WHOLE morph (gentle ease-in that
                 // reaches perfect coherence exactly at the end - the Morph Time), so the
                 // pulse comes into phase very gradually rather than snapping near the end.
-                morphW = t * t; // quadratic ease-in across the whole morph (very gradual)
+                morphW = std::max (morphW, t * t); // ease-in, never falls back (see the declaration)
                 for (int j = 0; j < morphN; ++j)
                     curRatio[(size_t) j] = std::exp2 (morphStartLog[(size_t) j]
                                             + (morphTgtLog[(size_t) j] - morphStartLog[(size_t) j]) * t);
@@ -387,7 +405,15 @@ public:
         // tracked with two scalar multiplies per sample - no O(n) re-sum, no lag, no clip.
         const int    span = std::max (n, activeCount);
         const double sr   = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
-        const double slew         = 1.0 - std::exp (-1.0 / (0.007 * sr));
+        // AMPLITUDES glide over the Morph Time too. This used to be a hardcoded 7 ms
+        // whatever Morph said, so only the partial FREQUENCIES ever glided: the whole
+        // loudness/timbre profile still arrived in 7 ms and a big Base jump read as a
+        // step followed by a sweep. With Morph off, the 7 ms stays - it is the
+        // click-free minimum, not a glide.
+        const double ampGlideSec = (morphActive && morphTimeParam != nullptr)
+                                 ? std::max (0.007, (double) morphTimeParam->load())
+                                 : 0.007;
+        const double slew         = 1.0 - std::exp (-1.0 / (ampGlideSec * sr));
         const double oneMinusSlew = 1.0 - slew;
         double sumCur0 = 0.0, sumTarget = 0.0, sumTargetSq = 0.0, coefA = 0.0, coefB = 0.0;
         for (int i = 0; i < span; ++i)
@@ -604,6 +630,7 @@ private:
     std::array<double, spectrum::kMaxPartials> curRatio      {}; // current (gliding) ratio per partial
     std::array<double, spectrum::kMaxPartials> morphStartLog {}; // log2 start ratio during a morph
     std::array<double, spectrum::kMaxPartials> morphTgtLog   {}; // log2 target ratio during a morph
+    double morphWeight = 0.0; // see the reference bound to it in renderNextBlock
     std::array<double, spectrum::kMaxPartials> alignPhase    {}; // coherent destination phase (morph crossfade)
     std::array<double, spectrum::kMaxPartials> alignInc      {}; // destination-frequency increment for alignPhase
 

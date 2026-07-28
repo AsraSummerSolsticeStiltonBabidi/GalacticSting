@@ -94,6 +94,15 @@ public:
 
     bool hasScala() const noexcept { return scalaValid.load (std::memory_order_relaxed); }
 
+    // The master's OWN frequency for a key, with no reference multiplier applied -
+    // so the UI can show what MTS is really doing (see the reference handling in
+    // the processor's timerCallback). 0 when no master is connected.
+    double mtsFrequencyForKey (int midiNote) const noexcept
+    {
+        if (! hasMtsMaster()) return 0.0;
+        return MTS_NoteToFrequency (client, (char) juce::jlimit (0, 127, midiNote), -1);
+    }
+
     // Degrees (notes) per period of the ACTIVE tuning, for the colour keyboard.
     // 12 for 12-TET; the loaded scale's count in Scala mode; the master's map size
     // (or 12) in MTS mode.
@@ -433,7 +442,7 @@ public:
             case Mode::MtsEsp:
                 if (hasMtsMaster())
                     return "MTS-ESP: " + juce::String (MTS_GetScaleName (client));
-                return "MTS-ESP (no master -> 12-TET)";
+                return "MTS-ESP - 12ED2"; // nothing is sending: 12ED2 is what sounds
 
             case Mode::Scala:
                 if (scalaValid.load (std::memory_order_relaxed))

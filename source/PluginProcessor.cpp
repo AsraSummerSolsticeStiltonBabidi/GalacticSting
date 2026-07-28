@@ -42,10 +42,8 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     recentSclPaths.addLines (appProps->getValue ("recentScl"));
     recentSclPaths.removeEmptyStrings();
 
-    // Decode the startup jingle ONCE, here in the constructor - i.e. exactly once
-    // per real "load" of this Fibló. jingleActive stays true only for THIS object;
-    // it is never written to/from getStateInformation, so nothing but a fresh
-    // instance can ever set it true again.
+    // Decode the jingle once, here, so clicking the title never has to touch a
+    // decoder on the audio thread. It does NOT start playing - see triggerJingle().
     {
         juce::WavAudioFormat wav;
         std::unique_ptr<juce::AudioFormatReader> reader (wav.createReaderFor (
@@ -57,8 +55,6 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
             jingleNative.setSize ((int) reader->numChannels, (int) reader->lengthInSamples);
             reader->read (&jingleNative, 0, (int) reader->lengthInSamples, 0, true, true);
         }
-        else
-            jingleActive = false; // nothing to play - never crash/loop trying
     }
 }
 
@@ -287,9 +283,13 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         ParameterID { "morphTime", 1 }, "Morph Time", timeRange (5.0f), 0.300f));
 
     //-- Tuning ----------------------------------------------------------------
+    // Index 0 (plain 12ED2) is no longer OFFERED - MTS-ESP already falls back to
+    // 12-TET on its own when no master is connected, so it is the honest default
+    // and 12ED2 became a redundant duplicate of that fallback. The entry stays in
+    // the list so projects saved with it still restore to exactly what they had.
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "tuningMode", 1 }, "Tuning",
-        StringArray { "12ED2", "MTS-ESP", "Scala (.scl)", "MPE (bend input)" }, 0));
+        StringArray { "12ED2", "MTS-ESP", "Scala (.scl)", "MPE (bend input)" }, 1));
     // Per-note pitch-bend range. +-48 st is the MPE default and what Ableton
     // Live 12's tuning systems / Microtuner assume; +-2 suits classic keyboards.
     params.push_back (std::make_unique<AudioParameterChoice>(
@@ -490,8 +490,47 @@ void FractalAdditiveAudioProcessor::timerCallback()
         }
     }
 
-    applyTuningMode ((int) apvts.getRawParameterValue ("tuningMode")->load());
-    tuning.setReferenceA ((double) apvts.getRawParameterValue ("refA")->load());
+    // ONE-SHOT MTS-ESP adoption, exactly like the jingle's single trigger: if a
+    // master is up when this Fibló loads, it opens following it. It is consumed
+    // here whether or not a master was found, so switching to another mode later
+    // can never be undone by a second check - there is no second check.
+    if (mtsCheckPending)
+    {
+        mtsCheckPending = false;
+        if (tuning.hasMtsMaster())
+            if (auto* pm = apvts.getParameter ("tuningMode"))
+                pm->setValueNotifyingHost (pm->convertTo0to1 ((float) (int) TuningManager::Mode::MtsEsp));
+    }
+
+    const int tmode = (int) apvts.getRawParameterValue ("tuningMode")->load();
+    applyTuningMode (tmode);
+
+    // The REFERENCE belongs to MTS-ESP while - and only while - that is the mode.
+    // A master already bakes its own reference into the frequencies it hands out,
+    // so applying the user's refA on top would double it. In MTS mode the box
+    // therefore SHOWS what the master is really doing and the multiplier is left
+    // at 1; the hand-set value is parked and handed straight back on the way out,
+    // so MTS can never permanently overwrite a reference the user typed.
+    const bool mtsOwnsRef = tmode == (int) TuningManager::Mode::MtsEsp && tuning.hasMtsMaster();
+    if (mtsOwnsRef)
+    {
+        if (! mtsHadRef) { manualRefA = apvts.getRawParameterValue ("refA")->load(); mtsHadRef = true; }
+        tuning.setReferenceA (440.0); // no multiplier: the master's own tuning is absolute
+        const double mtsA = tuning.mtsFrequencyForKey (69);
+        if (mtsA > 0.0 && std::abs (mtsA - (double) apvts.getRawParameterValue ("refA")->load()) > 0.001)
+            if (auto* p = apvts.getParameter ("refA"))
+                p->setValueNotifyingHost (p->convertTo0to1 ((float) mtsA)); // display only
+    }
+    else
+    {
+        if (mtsHadRef) // just left MTS (or the master went away): give the user theirs back
+        {
+            mtsHadRef = false;
+            if (auto* p = apvts.getParameter ("refA"))
+                p->setValueNotifyingHost (p->convertTo0to1 (manualRefA));
+        }
+        tuning.setReferenceA ((double) apvts.getRawParameterValue ("refA")->load());
+    }
     tuning.setOctaveShift ((int) apvts.getRawParameterValue ("octaveShift")->load());
 
     // Apply the bend-range choice only when it changes: setLegacyModePitchbendRange
@@ -1606,7 +1645,7 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     // Resample the jingle to THIS session's rate once (guarded so a later
     // buffer-size-only prepareToPlay doesn't redo it) - never touches jingleActive,
     // so it cannot cause or prevent playback, only prepare the samples for it.
-    if (jingleActive && ! jingleResampled && jingleNative.getNumSamples() > 0)
+    if (! jingleResampled && jingleNative.getNumSamples() > 0)
     {
         jingleResampled = true;
         const double ratio = jingleNativeSr / (sampleRate > 0.0 ? sampleRate : jingleNativeSr);
@@ -1638,10 +1677,8 @@ bool FractalAdditiveAudioProcessor::isBusesLayoutSupported (const BusesLayout& l
 }
 
 // Mixes (adds, never overwrites) the next chunk of the resampled jingle into this
-// block, advancing jingleReadPos; once exhausted, jingleActive is cleared FOR GOOD
-// - nothing else in this file ever sets it back to true, so it cannot replay for
-// the rest of this instance's life (a new preset, undo, automation, project
-// save/reload on the SAME instance all leave it alone).
+// block. Only ever runs while a title click has asked for it; when it reaches the
+// end it stops and stays stopped until the next explicit request.
 void FractalAdditiveAudioProcessor::playJingleInto (juce::AudioBuffer<float>& buffer)
 {
     if (jingleOut.getNumSamples() == 0) { jingleActive = false; return; } // not resampled yet or empty
@@ -1650,9 +1687,8 @@ void FractalAdditiveAudioProcessor::playJingleInto (juce::AudioBuffer<float>& bu
     const int n = juce::jmin (remaining, buffer.getNumSamples());
     const int outCh = buffer.getNumChannels();
     const int jinCh  = jingleOut.getNumChannels();
-    // The file's own level read noticeably louder than the synth itself - trimmed
-    // here, at the mix, rather than baking a lower level into the asset.
-    constexpr float kJingleGain = 0.35f; // ~ -9 dB
+    // Levelled to sit WITH the synth's own output rather than over it.
+    constexpr float kJingleGain = 0.12f; // ~ -18 dB
     for (int ch = 0; ch < outCh; ++ch)
         buffer.addFrom (ch, 0, jingleOut, juce::jmin (ch, jinCh - 1), jingleReadPos, n, kJingleGain);
     jingleReadPos += n;
@@ -1668,7 +1704,14 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 
     const int  nSamp    = buffer.getNumSamples();
 
-    if (jingleActive) playJingleInto (buffer); // one-shot startup jingle - see the header
+    // The title was clicked: (re)start the jingle from the top. Consumed here so
+    // the read position is only ever touched on the audio thread.
+    if (jingleRestart.exchange (false, std::memory_order_acq_rel))
+    {
+        jingleReadPos = 0;
+        jingleActive  = jingleOut.getNumSamples() > 0;
+    }
+    if (jingleActive) playJingleInto (buffer);
 
     // A full state swap (preset load, project reload, "load its original spectrum")
     // was seen leaving a note stuck sounding forever: it rewrites every DSP
@@ -1785,6 +1828,31 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
     // Self-play only ENGAGES once a partial is routed - otherwise the synth would go
     // silent out of the box (held notes consumed, no pulses to replace them with).
     const bool selfPlay = selfWant && rhythm.hasEnabledSlot();
+
+    // THE stuck-note bug: self-play rewrites note-OFFs onto channel 16, but a note
+    // that started before self-play engaged is sounding on the channel it was
+    // played on. MPE legacy mode matches note-offs by (channel, note), so after the
+    // switch its note-off never reaches the voice and it sustains forever. Routing a
+    // partial auto-enables self-play, so this flipped mid-hold constantly.
+    // Any change of the routing - either direction - therefore ends every sounding
+    // note and closes every open pulse gate, so nothing can be stranded on the far
+    // side of the switch.
+    if (! selfPlayKnown)
+    {
+        selfPlayKnown = true;      // first block: just adopt the state, nothing to strand yet
+        wasSelfPlay   = selfPlay;
+    }
+    else if (selfPlay != wasSelfPlay)
+    {
+        wasSelfPlay = selfPlay;
+        keyboardState.allNotesOff (0);
+        synth.turnOffAllVoices (false);
+        rhythm.flushOpenGates();
+        rhythm.flushEchoes();
+        noteGate.prepare (lastSr > 0.0 ? lastSr : getSampleRate());
+        modHeld = 0;
+        for (auto& row : modKeyHeld) row.fill (false);
+    }
 
     if (selfPlay)
     {
@@ -1979,6 +2047,10 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     // sounding - silence it cleanly rather than risk it never stopping (see the
     // top of processBlock for the actual kill, which must happen on the audio thread).
     pendingHardSilence.store (true, std::memory_order_release);
+
+    // A restored project carries an EXPLICIT tuning mode the user chose and saved.
+    // The one-shot MTS adoption must not second-guess it.
+    mtsCheckPending = false;
 
     // Unmap BEFORE replaceState: replaceState's internal flush must not capture
     // base+mod for the OLD routings into the fresh tree.

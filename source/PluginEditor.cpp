@@ -987,7 +987,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             cb->setMouseClickGrabsKeyboardFocus (false);
             addChildComponent (*cb);
         }
-        lfoWaveBox.onChange = [this] { resized(); }; // Draw button appears with "Custom (draw)"
+        lfoWaveBox.onChange     = [this] { resized(); }; // Draw button appears with "Custom (draw)"
+        lfoRateModeBox.onChange = [this] { resized(); }; // Div vs Hz: only the one in use is shown
         // The LFO combos and the On switch are modulator parameters too: right-click
         // routes ANOTHER modulator to them (a modulator never drives itself).
         addMapListener (lfoWaveBox,      "modL1Wave",      true);
@@ -1032,7 +1033,12 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // Tuning (scale) + Recent .scl.
     configGroup (gTuning, cTuning);
     configCombo (tuningBox, "tuningMode", tuningAtt, cTuning,
-                 "12-TET = standard.  MTS-ESP = follow a connected ODDSound master.  Scala = the loaded .scl scale.");
+                 "MTS-ESP = follow a connected ODDSound master (plain 12ED2 when none is).  Scala = the loaded .scl scale.  MPE = the host sends the tuning as per-note bend.");
+    // Plain 12ED2 is not offered any more: MTS-ESP already IS 12ED2 whenever no
+    // master is connected, so the separate entry only duplicated that fallback.
+    // Projects saved on it still restore (the parameter keeps the entry) - it just
+    // cannot be picked by hand, so item 1 is disabled rather than removed.
+    tuningBox.setItemEnabled (1, false);
     loadSclButton.setColour (juce::TextButton::buttonColourId, cLoad);
     loadSclButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
     loadSclButton.setMouseClickGrabsKeyboardFocus (false);
@@ -1455,7 +1461,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuneScopeBox.setTooltip (
         "0 vs all: each note is judged only by its beating against the root (0).\n"
         "all vs all: every pair of notes in the combination counts.");
-    tuneScopeBox.setSelectedId (1, juce::dontSendNotification);
+    tuneScopeBox.setSelectedId (2, juce::dontSendNotification); // "all vs all" by default
     for (auto* b : { &tuneSourceBox, &tuneScopeBox })
     {
         b->setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
@@ -1519,7 +1525,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                      std::pair<juce::TextEditor*, juce::Label*> { &chordMinEdit, &chordMinLbl } })
     {
         auto* ed = pr.first;
-        ed->setText ("33", juce::dontSendNotification);
+        ed->setText ("50", juce::dontSendNotification);
         ed->setJustification (juce::Justification::centred);
         ed->setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
         ed->setColour (juce::TextEditor::outlineColourId, cSpecScale.withAlpha (0.7f));
@@ -3181,6 +3187,12 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
             x += side + gap;
         }
     }
+    // Remember where the title landed: clicking it plays the jingle (see mouseDown).
+    {
+        juce::Rectangle<float> tb;
+        for (const auto& s : squares) tb = tb.isEmpty() ? s.rect : tb.getUnion (s.rect);
+        titleClickArea = tb.isEmpty() ? juce::Rectangle<int>() : tb.getSmallestIntegerContainer();
+    }
 
     // Harmonic Engine macro-group: the WHOLE box is drawn here - frame + fill + title
     // (like the other boxes but in ONE colour) + the SHARED internal dividers between
@@ -3767,9 +3779,17 @@ void FractalAdditiveAudioProcessorEditor::resized()
             custRangeFader.setVisible (cust);
             lblCustRange.setVisible (cust);
             juce::Component* lfoC[] = { &lfoWaveBox, &lfoRateModeBox, &lfoPhaseModeBox,
-                                        &lfoDivSlider, &lfoHzSlider, &lfoPhaseSlider,
-                                        &lblLfoDiv, &lblLfoHz, &lblLfoPhase };
+                                        &lfoPhaseSlider, &lblLfoPhase };
             for (auto* c : lfoC) c->setVisible (cust && ! isEnv);
+            // Rate mode 1 (BPM / 2^n) and 2 (Fundamental / 2^n) are driven by the
+            // DIVISOR; mode 3 (Free Hz) by the Hz knob. Only the one that actually
+            // does something is shown - a knob that cannot affect the sound is worse
+            // than no knob at all.
+            const int  rateMode = lfoRateModeBox.getSelectedId();
+            const bool showDiv  = cust && ! isEnv && rateMode != 3;
+            const bool showHz   = cust && ! isEnv && rateMode == 3;
+            lfoDivSlider.setVisible (showDiv); lblLfoDiv.setVisible (showDiv);
+            lfoHzSlider.setVisible  (showHz);  lblLfoHz.setVisible  (showHz);
             if (cust)
             {
                 // [modulator][On][Unmap] and, for a drawn LFO wave, [Draw] - which
@@ -3803,10 +3823,14 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     in.removeFromTop (2);
                     lfoPhaseModeBox.setBounds (in.removeFromTop (20).reduced (1, 0));
                     in.removeFromTop (2);
-                    const int cw = in.getWidth() / 4;
+                    // Three columns, not four: whichever of Div/Hz applies, plus
+                    // Phase and Range. The hidden one leaves no gap behind.
+                    const int cw = in.getWidth() / 3;
                     auto a2 = in;
-                    { auto c = a2.removeFromLeft (cw); lblLfoDiv.setBounds (c.removeFromTop (12));   lfoDivSlider.setBounds (c); }
-                    { auto c = a2.removeFromLeft (cw); lblLfoHz.setBounds (c.removeFromTop (12));    lfoHzSlider.setBounds (c); }
+                    if (showDiv)
+                    { auto c = a2.removeFromLeft (cw); lblLfoDiv.setBounds (c.removeFromTop (12)); lfoDivSlider.setBounds (c); }
+                    if (showHz)
+                    { auto c = a2.removeFromLeft (cw); lblLfoHz.setBounds (c.removeFromTop (12));  lfoHzSlider.setBounds (c); }
                     { auto c = a2.removeFromLeft (cw); lblLfoPhase.setBounds (c.removeFromTop (12)); lfoPhaseSlider.setBounds (c); }
                     { auto c = a2;                     lblCustRange.setBounds (c.removeFromTop (12)); custRangeFader.setBounds (c); }
                 }
@@ -3932,7 +3956,14 @@ void FractalAdditiveAudioProcessorEditor::resized()
     rhythmPanel.toFront (false);
 }
 
-void FractalAdditiveAudioProcessorEditor::mouseDown (const juce::MouseEvent&) { grabKeyboardFocus(); }
+void FractalAdditiveAudioProcessorEditor::mouseDown (const juce::MouseEvent& e)
+{
+    // Clicking the title plays the jingle. It is the ONLY way it ever sounds - it
+    // never plays on its own, so it can't surprise anyone mid-session.
+    if (! titleClickArea.isEmpty() && titleClickArea.contains (e.getPosition()))
+        processorRef.triggerJingle();
+    grabKeyboardFocus();
+}
 
 // After switching to another plugin window (or app) and back, nothing in our
 // hierarchy holds keyboard focus, so the computer keyboard can't play (and with no
