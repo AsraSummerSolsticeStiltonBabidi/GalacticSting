@@ -1072,6 +1072,52 @@ int main()
     }
 
 
+    // --- run 19: NoteGate never emits a note-off ahead of its own note-on ---------
+    // A key released inside the very block that holds its deferred note-on used to
+    // produce off-then-on: the receiver drops the orphan off and the on that follows
+    // is never closed, so the voice drones until an all-notes-off. Ordering, not
+    // timing, is what matters here - so the check is the ordering invariant itself.
+    {
+        std::printf ("note gate: a note-off can never precede its own note-on:\n");
+        NoteGate gate;
+        gate.prepare (sr);
+
+        bool everBadOrder = false, everUnclosed = false;
+        // Sweep the release across the whole block so no single lucky offset can
+        // hide the bug, and sweep the beat grid so the deferral lands at many points.
+        for (int beatOff = 16; beatOff <= 240 && ! everBadOrder; beatOff += 16)
+        {
+            NoteGate g;
+            g.prepare (sr);
+            for (int release = 1; release < 256; release += 7)
+            {
+                juce::MidiBuffer io;
+                io.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+                io.addEvent (juce::MidiMessage::noteOff (1, 60), release);
+                // qTempo on, with the next beat inside this block at `beatOff`.
+                g.process (io, 256, true, false, false, (double) beatOff, 24000.0, -1.0, -1.0);
+
+                int onAt = -1, offAt = -1;
+                for (const auto meta : io)
+                {
+                    const auto m = meta.getMessage();
+                    if (m.getNoteNumber() != 60) continue;
+                    if (m.isNoteOn()  && onAt  < 0) onAt  = (int) meta.samplePosition;
+                    if (m.isNoteOff() && offAt < 0) offAt = (int) meta.samplePosition;
+                }
+                if (offAt >= 0 && (onAt < 0 || offAt < onAt)) everBadOrder = true;
+                // A note-on emitted with no note-off anywhere after it, in this block
+                // or owed later, is exactly the stuck note.
+                if (onAt >= 0 && offAt < 0) everUnclosed = true;
+                // Drain any deferred remainder so the next iteration starts clean.
+                for (int k = 0; k < 200; ++k)
+                { juce::MidiBuffer flush; g.process (flush, 256, true, false, false, -1.0, -1.0, -1.0, -1.0); }
+            }
+        }
+        check (! everBadOrder, "no note-off is ever emitted before the matching note-on");
+        check (! everUnclosed, "and no note-on is left without its note-off");
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

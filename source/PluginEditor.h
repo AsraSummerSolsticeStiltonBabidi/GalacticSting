@@ -97,12 +97,17 @@ private:
     // tick marks painted at each whole level. Used by the fractal-level fader.
     struct MagneticSlider : SteppedSlider
     {
+        // How close to a whole value the drag must come before it snaps onto it.
+        // Per-slider because the axes differ in how much room they have: a 0..3
+        // axis (Harmonics) needs a NARROWER window than a 1..4 one, or most of the
+        // blend between the named points is simply unreachable.
+        double snapWindow = 0.12;
         double snapValue (double v, juce::Slider::DragMode dm) override
         {
             if (dm == juce::Slider::notDragging) return v;
             if (juce::ModifierKeys::currentModifiers.isCtrlDown()) return v;
             const double n = std::round (v);
-            return (std::abs (v - n) < 0.12 && n >= getMinimum() && n <= getMaximum()) ? n : v;
+            return (std::abs (v - n) < snapWindow && n >= getMinimum() && n <= getMaximum()) ? n : v;
         }
         void paint (juce::Graphics& g) override
         {
@@ -288,7 +293,7 @@ private:
         struct Row { std::vector<juce::String> notes; double value = 0.0; };
         std::vector<Row> rows;
         juce::String tip;
-        juce::String emptyText { "Press Find to search.\n\xe2\x96\xb6 hears a chord\ndouble-click loads it as the scale" };
+        juce::String emptyText { "Press Find to search.\nhover a row to hear it\ndouble-click loads it as the scale" };
         std::function<void (int)> onPlay, onLoad, onHover; // onHover(-1) = pointer left
         // No play column any more (hover sounds it), so the notes get that space.
         static constexpr int kRowH = 22, kRankW = 2, kGapW = 7;

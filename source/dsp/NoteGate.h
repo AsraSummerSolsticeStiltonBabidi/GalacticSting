@@ -109,26 +109,45 @@ public:
                         break;
                     }
             out.addEvent (juce::MidiMessage::noteOn (ch, note, vel), s);
-            if (activeN < kMaxActive) active[activeN++] = { note, ch };
+            if (activeN < kMaxActive) active[activeN++] = { note, ch, s };
+        };
+        // The sample this (ch,note) was turned on at, if it was turned on during THIS
+        // block; -1 otherwise. A note-on deferred to a later sample of the same block
+        // (quantise-to-beat) must never be closed by a note-off stamped EARLIER than
+        // it - the receiver would drop the orphan off and sustain the note for ever.
+        auto onSampleOf = [&] (int note, int ch) -> int
+        {
+            for (int i = 0; i < activeN; ++i)
+                if (active[i].note == note && active[i].ch == ch) return active[i].onAt;
+            return -1;
         };
 
-        // 1) Held-back notes whose start falls inside THIS block.
+        // 1) Held-back notes are released IN ORDER, interleaved with this block's own
+        // events - never all at once up front. Flushing them first could emit a
+        // pending note's ON at a LATER sample than the note-OFF that this same block
+        // carries for it: the receiver then sees an orphan off (discarded, it matches
+        // nothing yet) followed by an on that nobody will ever close, i.e. a note
+        // stuck for good. Releasing only what is due before each event keeps every
+        // on/off pair in the right order.
+        auto flushPendingUpTo = [&] (juce::int64 upto)
         {
             int w = 0;
             for (int i = 0; i < pendingN; ++i)
             {
-                if (pending[i].due < blockStart + numSamples)
+                if (pending[i].due <= upto)
                     emitOn ((int) juce::jmax ((juce::int64) 0, pending[i].due - blockStart),
                             pending[i].note, pending[i].ch, pending[i].vel);
                 else
                     pending[w++] = pending[i];
             }
             pendingN = w;
-        }
+        };
 
         // 2) This block's events.
         for (const auto meta : io)
         {
+            flushPendingUpTo (blockStart + juce::jlimit (0, juce::jmax (0, numSamples - 1),
+                                                        (int) meta.samplePosition));
             const auto msg = meta.getMessage();
             const int  pos = juce::jlimit (0, juce::jmax (0, numSamples - 1), (int) meta.samplePosition);
 
@@ -164,7 +183,9 @@ public:
                     }
                 if (! cancelled)
                 {
-                    out.addEvent (msg, pos);
+                    // Never stamp the off before the on that opened it in this block.
+                    const int onAt = onSampleOf (msg.getNoteNumber(), msg.getChannel());
+                    out.addEvent (msg, onAt >= 0 ? juce::jmax (pos, onAt) : pos);
                     removeActive (msg.getNoteNumber(), msg.getChannel());
                 }
             }
@@ -174,6 +195,8 @@ public:
                 out.addEvent (msg, pos);
             }
         }
+        // Anything still due inside this block, after the last event.
+        flushPendingUpTo (blockStart + numSamples - 1);
 
         io.swapWith (out);
         clock += numSamples;
@@ -199,7 +222,7 @@ private:
     }
 
     struct Pending { juce::int64 due; int note, ch; juce::uint8 vel; };
-    struct Active  { int note, ch; };
+    struct Active  { int note, ch; int onAt = -1; }; // onAt = sample it started at, this block
 
     juce::MidiBuffer out; // reused every block (pre-sized in prepare)
     Pending pending[kMaxPending] = {};

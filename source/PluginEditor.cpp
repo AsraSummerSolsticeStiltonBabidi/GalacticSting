@@ -578,16 +578,58 @@ namespace
         bool                 lastWasCallout = false;
         static constexpr int kPtrH = 9;          // callout pointer height
 
-        // Word-wrapped, per-line coloured layout ("from the partial" lines in orange).
+        // Word-wrapped, per-line coloured layout, with a tiny inline markup so the
+        // hover texts can point the eye straight at what matters instead of being a
+        // wall of prose:
+        //     *term*   -> BOLD + amber: the thing the control IS (a concept/mode name)
+        //     `value`  -> BOLD + blue:  a literal value, unit or example you can type
+        //     !warn!   -> BOLD + red:   a consequence worth noticing before you act
+        // Anything unmarked stays plain white; a "from the partial" line stays orange.
         static juce::TextLayout layoutFor (const juce::String& text, float maxW)
         {
+            const juce::Font plain (juce::FontOptions (13.5f));
+            const juce::Font bold  (juce::FontOptions (13.5f).withStyle ("Bold"));
+            const juce::Colour cPlain  { juce::Colours::white };
+            const juce::Colour cTerm   { 0xffffc95c }; // amber - concepts
+            const juce::Colour cValue  { 0xff7fd4ff }; // blue  - literals you can type
+            const juce::Colour cWarn   { 0xffff8a7a }; // red   - consequences
+            const juce::Colour cSource { 0xffff9a3c }; // orange - "from the partial"
+
             juce::AttributedString as;
             juce::StringArray lines;
             lines.addLines (text);
             for (int i = 0; i < lines.size(); ++i)
-                as.append (lines[i] + (i < lines.size() - 1 ? "\n" : ""),
-                           juce::Font (juce::FontOptions (13.5f)),
-                           isSourceLine (lines[i]) ? juce::Colour (0xffff9a3c) : juce::Colours::white);
+            {
+                const auto& line = lines[i];
+                const auto tail = (i < lines.size() - 1 ? juce::String ("\n") : juce::String());
+                if (isSourceLine (line)) { as.append (line + tail, plain, cSource); continue; }
+
+                // Walk the line, splitting on the three delimiters. An unmatched
+                // delimiter is treated as ordinary text, so a stray * never eats
+                // the rest of a tooltip.
+                int pos = 0;
+                while (pos < line.length())
+                {
+                    const int a = line.indexOfChar (pos, '*');
+                    const int b = line.indexOfChar (pos, '`');
+                    const int c = line.indexOfChar (pos, '!');
+                    int at = -1; juce::juce_wchar delim = 0;
+                    for (auto cand : { std::pair<int, juce::juce_wchar> { a, '*' },
+                                       std::pair<int, juce::juce_wchar> { b, '`' },
+                                       std::pair<int, juce::juce_wchar> { c, '!' } })
+                        if (cand.first >= 0 && (at < 0 || cand.first < at)) { at = cand.first; delim = cand.second; }
+
+                    if (at < 0) { as.append (line.substring (pos), plain, cPlain); break; }
+                    const int close = line.indexOfChar (at + 1, delim);
+                    if (close < 0) { as.append (line.substring (pos), plain, cPlain); break; }
+
+                    if (at > pos) as.append (line.substring (pos, at), plain, cPlain);
+                    const auto inner = line.substring (at + 1, close);
+                    as.append (inner, bold, delim == '*' ? cTerm : delim == '`' ? cValue : cWarn);
+                    pos = close + 1;
+                }
+                if (tail.isNotEmpty()) as.append (tail, plain, cPlain);
+            }
             juce::TextLayout tl;
             tl.createLayout (as, maxW);
             return tl;
@@ -727,11 +769,17 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // Harmonics is a magnetic FADER now (Even - All - Odd - Prime), so a modulator
     // can sweep it and it can sit BETWEEN two sets (blended).
     configFader (harmonicsFader, "harmonics", harmonicsAtt, cHarmonic,
-                 "Which harmonics sound: Even - All - Odd - Prime. It snaps to those four, but you can stop between two of them (hold Ctrl for free fine setting): there the harmonics that belong to only one of the pair come in at part volume, so the timbre morphs instead of switching.");
+                 "Which harmonics sound: *Even* - *All* - *Odd* - *Prime*.\nIt snaps to those four, but you can stop BETWEEN two of them (hold `Ctrl` to drag free): there the harmonics belonging to only one of the pair come in at part volume, so the timbre *morphs* instead of switching.");
     harmonicsFader.setSliderStyle (juce::Slider::LinearHorizontal);
     harmonicsFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 86, 15); // fits "Even-All 50%"
     harmonicsFader.setSliderSnapsToMousePosition (false);
-    harmonicsFader.normalSensitivity = 240;
+    // Finer than the other magnetic faders: this axis is only 0..3 wide but the
+    // interesting part is the BLEND between two named sets, so it needs real room
+    // per step (~160 px) instead of 80. The detent window is narrowed to match -
+    // at 0.12 on a 3-wide axis the first and last 12% of every blend were simply
+    // unreachable, which is what made it feel coarse and jumpy.
+    harmonicsFader.normalSensitivity = 480;
+    harmonicsFader.snapWindow = 0.06;
     harmonicsFader.textFromValueFunction = [this] (double v)
     {
         const juce::String names[] = { tr ("Even", "Parells"), tr ("All", "Tots"),
@@ -1033,7 +1081,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // Tuning (scale) + Recent .scl.
     configGroup (gTuning, cTuning);
     configCombo (tuningBox, "tuningMode", tuningAtt, cTuning,
-                 "MTS-ESP = follow a connected ODDSound master (plain 12ED2 when none is).  Scala = the loaded .scl scale.  MPE = the host sends the tuning as per-note bend.");
+                 "Where the tuning comes from.\n*MTS-ESP* - follow a connected ODDSound master; with none connected this is plain `12ED2`.\n*Scala* - the loaded `.scl` scale.\n*MPE* - the host sends the tuning as per-note bend.");
     // Plain 12ED2 is not offered any more: MTS-ESP already IS 12ED2 whenever no
     // master is connected, so the separate entry only duplicated that fallback.
     // Projects saved on it still restore (the parameter keeps the entry) - it just
@@ -1382,8 +1430,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     presetDirtyMark.setJustificationType (juce::Justification::centredLeft);
     presetDirtyMark.setInterceptsMouseClicks (false, false);
     presetDirtyMark.setTooltip (tr (
-        "Some parameter no longer matches this preset - it was moved by something other than one of ITS OWN modulators (a knob, host automation, undo...). Save stores this as a new preset rather than overwriting the original.",
-        "Alg\xc3\xba par\xc3\xa0metre ja no coincideix amb aquest preset - l'ha mogut alguna cosa que no \xc3\xa9s un dels SEUS PROPIS moduladors (un botó, automatitzaci\xc3\xb3, un desfer...). Desar el guarda com un preset nou en lloc de sobreescriure l'original."));
+        "*Changed since loaded.*\nSome parameter no longer matches this preset - moved by something other than one of its OWN modulators (a knob, host automation, an undo).\n!Save stores it as a NEW preset! instead of overwriting the original.",
+        "*Canviat des de la c\xc3\xa0rrega.*\nAlg\xc3\xban par\xc3\xa0metre ja no coincideix amb aquest preset - l'ha mogut alguna cosa que no \xc3\xa9s un dels seus PROPIS moduladors (un bot\xc3\xb3, automatitzaci\xc3\xb3, un desfer).\n!Desar el guarda com un preset NOU! en lloc de sobreescriure l'original."));
     addChildComponent (presetDirtyMark);
     refreshPresetList();
 
@@ -1459,8 +1507,9 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuneScopeBox.addItem ("0 vs all", 1);
     tuneScopeBox.addItem ("all vs all", 2);
     tuneScopeBox.setTooltip (
-        "0 vs all: each note is judged only by its beating against the root (0).\n"
-        "all vs all: every pair of notes in the combination counts.");
+        "How a combination is SCORED.\n"
+        "*0 vs all* - each note is judged only by its beating against the root (0).\n"
+        "*all vs all* - every pair of notes in the combination counts.");
     tuneScopeBox.setSelectedId (2, juce::dontSendNotification); // "all vs all" by default
     for (auto* b : { &tuneSourceBox, &tuneScopeBox })
     {
@@ -2141,7 +2190,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
                                   "Tots els fitxers d'""escala carregats en aquest plugin, del més recent al més antic. Clica'n un per carregar-lo."));
     recentOverlay.title = tr ("Recent scales", "Escales recents");
 
-    loadSclButton.setButtonText    (tr ("Load .scl", "Obrir .scl"));
+    // These two used to BOTH read "Load .scl" in adjacent boxes, and clicking the
+    // wrong one greys out the whole Harmonic Engine (it loads a TIMBRE), which reads
+    // as the plugin breaking. They say what they load now.
+    loadSclButton.setButtonText    (tr ("Load tuning", "Obrir afinaci\xc3\xb3"));
     clearSclButton.setButtonText   (tr ("Reset", "Reinicia"));
     tuningBankAddBtn.setButtonText (tr ("+ to bank", "+ al banc"));
     loadItsSpectrumBtn.setButtonText (tr ("Load its original spectrum", "Carrega el seu espectre original"));
@@ -2150,10 +2202,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Aquesta escala l'ha generada Fibló Galà""ctic i porta a dins el patch amb què es va fer. Això en recupera el SO; l'""afinació que acabes de carregar es queda com està."));
     loadPresetTuningBtn.setButtonText (tr ("Load preset's tuning", "Carrega l'afinaci\xc3\xb3 del preset"));
     loadPresetTuningBtn.setTooltip (tr (
-        "The preset you just loaded was saved with a DIFFERENT tuning - loading a preset only changes the sound, never the scale. Click to bring that tuning in too.",
-        "El preset que acabes de carregar es va desar amb una afinaci\xc3\xb3 DIFERENT - carregar un preset nom\xc3\xa9s canvia el so, mai l'escala. Clica per portar tamb\xc3\xa9 aquella afinaci\xc3\xb3."));
+        "The preset you just loaded was saved with a *different tuning*.\nLoading a preset only changes the *sound*, !never the scale!. Click to bring that tuning in too.",
+        "El preset que acabes de carregar es va desar amb una *afinaci\xc3\xb3 diferent*.\nCarregar un preset nom\xc3\xa9s canvia el *so*, !mai l'escala!. Clica per portar tamb\xc3\xa9 aquella afinaci\xc3\xb3."));
     tuningBankLoadBtn.setButtonText (tr ("+ .scl", "+ .scl"));
-    loadTimbreButton.setButtonText (tr ("Load .scl", "Obrir .scl"));
+    loadTimbreButton.setButtonText (tr ("Spectrum\xe2\x80\xa6", "Espectre\xe2\x80\xa6"));
     clearTimbreButton.setButtonText (processorRef.isTimbreActive() ? tr ("On", "Actiu") : tr ("Off", "Apagat"));
     savePresetButton.setButtonText (tr ("Save", "Desa"));
     presetBox.setTextWhenNothingSelected (tr ("Presets...", "Presets..."));
@@ -2287,8 +2339,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     modUnmapBtn.setButtonText  (tr ("Unmap", "Desassigna"));
     lfoWaveEditBtn.setButtonText (tr ("Draw", "Dibuixa"));
     rhythmPanel.helpB.setButtonText (tr ("How to route", "Com encaminar"));
-    chordList.emptyText = tr ("Press Find to search.\n\xe2\x96\xb6 hears a chord\ndouble-click loads it as the scale",
-                              "Prem Troba per cercar.\n\xe2\x96\xb6 escolta un acord\ndoble clic el carrega com a escala");
+    chordList.emptyText = tr ("Press Find to search.\nhover a row to hear it\ndouble-click loads it as the scale",
+                              "Prem Troba per cercar.\npassa-hi el cursor per escoltar-lo\ndoble clic el carrega com a escala");
     // specModeBox's ids are 1 and 3 (2 was retired), so it cannot use localise()'s
     // "ids are 1..N" shortcut.
     specModeBox.changeItemText (1, tr ("Find tunings based on beating", "Troba afinacions pel batec"));
@@ -2323,13 +2375,13 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Min = the most CONSONANT combinations with this exact timbre (Sethares sensory dissonance of all partial pairs). Max = the roughest.",
         "Min = les combinacions m\xc3\xa9s CONSONANTS amb aquest timbre exacte (disson\xc3\xa0ncia sensorial de Sethares de tots els parells de parcials). Max = les m\xc3\xa9s aspres."));
     chordPeriodEdit.setTooltip (tr (
-        "The period the search works in - write it as a whole number (\"3\"), a fraction (\"3/2\") or cents (\"1200c\", \"1200 cents\", or just \"1200\").",
-        "El per\xc3\xado" "de amb qu\xc3\xa8 treballa la cerca - escriu-lo com a nombre enter (\"3\"), fracci\xc3\xb3 (\"3/2\") o cents (\"1200c\", \"1200 cents\", o nom\xc3\xa9s \"1200\")."));
+        "The *period* the search works in.\nWrite it as a whole number `3`, a fraction `3/2`, or cents `1200c` / `1200 cents` / just `1200`.",
+        "El *per\xc3\xado" "de* amb qu\xc3\xa8 treballa la cerca.\nEscriu-lo com a nombre enter `3`, fracci\xc3\xb3 `3/2`, o cents `1200c` / `1200 cents` / nom\xc3\xa9s `1200`."));
     chordGoBtn.setTooltip (tr (
         "Rank all n-note combinations by their Sethares sensory dissonance against the CURRENT spectrum (grid search + exact refinement, on a background thread). Play previews a chord; double-click loads it as the active scale (.scl).",
         "Ordena totes les combinacions de n notes per la seva disson\xc3\xa0ncia sensorial de Sethares contra l'espectre ACTUAL (cerca en graella + refinament exacte, en segon pla). Play pre-escolta un acord; doble clic el carrega com a escala activa (.scl)."));
-    chordList.tip = tr ("Each note in its own colour. Click the green triangle to hear it (all together, then an ascending strum); double-click the notes to LOAD the chord as the active scale.",
-                        "Cada nota amb el seu color. Clica el triangle verd per escoltar-lo (tot alhora i despr\xc3\xa9s un strum ascendent); doble clic a les notes per CARREGAR l'acord com a escala activa.");
+    chordList.tip = tr ("Each note in its own colour.\n*Hover* a row to hear it (all together, then an ascending strum).\n*Double-click* it to LOAD the chord as the active scale.",
+                        "Cada nota amb el seu color.\n*Passa-hi el cursor* per escoltar-lo (tot alhora i despr\xc3\xa9s un strum ascendent).\n*Doble clic* per CARREGAR l'acord com a escala activa.");
 
     repaint(); // title uses the language
 }
@@ -3853,14 +3905,17 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // Period of the active scale, in red, always visible.
             ti.removeFromTop (2);
             tuningPeriodLbl.setBounds (ti.removeFromTop (17));
-            // Load .scl only exists in Scala mode; Reset appears whenever there is
-            // something to reset (any non-12ED2 mode or a loaded scale). Load / Reset /
-            // Save share ONE row: stacking them overflowed the box in Scala mode and
-            // squeezed the tuning-bank controls to zero height (invisible).
+            // Load / Save / + to bank share ONE row: stacking them overflowed the box
+            // and squeezed the tuning-bank controls to zero height (invisible).
+            // "Load tuning" is ALWAYS available. Hiding it outside Scala mode left a
+            // fresh instance - which now opens in MTS-ESP - with no way at all to load
+            // a scale: there is no drag-and-drop and no menu route, and the only other
+            // .scl chooser on screen loads a TIMBRE, which is the wrong thing entirely.
+            // The gate was redundant anyway: loadScalaFile() switches to Scala itself.
             const int  tmode    = processorRef.getTuningMode();
-            const bool loadVis  = tmode == 2;
-            const bool saveVis  = tmode != 0;
-            const bool bankVis  = tmode != 0;   // "add the ACTIVE tuning to the bank"
+            const bool loadVis  = true;
+            const bool saveVis  = true;
+            const bool bankVis  = true;   // "add the ACTIVE tuning to the bank"
             loadSclButton.setVisible (loadVis);
             clearSclButton.setVisible (false);  // Reset removed - the mode selector does it
             saveTuningBtn.setVisible (saveVis);
@@ -3917,14 +3972,18 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 compact (bendBox, bendRow.removeFromLeft (juce::jmin (120, bendRow.getWidth())));
             }
             // Recent is ONE button that opens a floating list of every file loaded;
-            // the bank stays inline. Both only make sense in Scala (.scl) mode.
+            // the bank stays inline. Both stay reachable in every mode, for the same
+            // reason as "Load tuning" above - picking one of them IS how you get into
+            // Scala mode, so gating them on already being there was a dead end. It
+            // also keeps "+ to bank" from ever feeding a list you cannot see.
             recentLabel.setVisible (false);
             for (int i = 0; i < 3; ++i) recentBtn[i].setVisible (false);
-            recentOpenBtn.setVisible (sclMode);
-            lblTuningBank.setVisible (sclMode); tuningBankBox.setVisible (sclMode);
-            tuningBankLoadBtn.setVisible (sclMode);
-            tuningBankClearBtn.setVisible (sclMode);
-            if (sclMode)
+            const bool bankUi = true;
+            recentOpenBtn.setVisible (bankUi);
+            lblTuningBank.setVisible (bankUi); tuningBankBox.setVisible (bankUi);
+            tuningBankLoadBtn.setVisible (bankUi);
+            tuningBankClearBtn.setVisible (bankUi);
+            if (bankUi)
             {
                 ti.removeFromTop (3);
                 recentOpenBtn.setBounds (ti.removeFromTop (22).reduced (2, 0));
@@ -4089,6 +4148,25 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     refreshModWatch(); // live-modulation marker on every watched fader (see the header)
     refreshPresetDirtyMark();
     refreshRefAText();       // keep the Reference-A box in sync with the parameter (automation)
+    // While an MTS-ESP master is connected it OWNS the reference (see the processor's
+    // timerCallback), which rewrites the parameter 60x a second - so anything typed
+    // here was reverted within ~17 ms and silently lost. Show that it is not yours to
+    // set right now instead of eating the value. Never while it has focus, or the
+    // pending focus-lost commit would be dropped mid-edit.
+    {
+        const bool mtsOwnsRef = processorRef.getTuningMode() == (int) TuningManager::Mode::MtsEsp
+                             && processorRef.tuningHasMaster();
+        if (! refAEdit.hasKeyboardFocus (false) && refAEdit.isEnabled() == mtsOwnsRef)
+        {
+            refAEdit.setEnabled (! mtsOwnsRef);
+            refAEdit.setAlpha (mtsOwnsRef ? 0.55f : 1.0f);
+            refAEdit.setTooltip (mtsOwnsRef
+                ? tr ("The connected *MTS-ESP master* is setting the reference right now, so this is what IT says.\nLeave MTS-ESP mode to set it by hand again - !your own value is kept! and comes straight back.",
+                      "El *master MTS-ESP* connectat est\xc3\xa0 fixant la refer\xc3\xa8ncia ara mateix, aix\xc3\xb2 \xc3\xa9s el que diu ELL.\nSurt del mode MTS-ESP per posar-la a m\xc3\xa0 - !el teu valor es conserva! i torna tot seguit.")
+                : tr ("Frequency of *C3* - transposes the whole tuning.",
+                      "Freq\xc3\xbc\xc3\xa8ncia de *C3* - transposa tota l'afinaci\xc3\xb3."));
+        }
+    }
 
     // Undo granularity: group parameter edits into ~1-second transactions (a slider
     // drag undoes as one step, not hundreds of micro-moves). Same tick keeps the
@@ -4188,12 +4266,25 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                 auto m = previewQueue[i].msg;
                 m.setTimeStamp (nowS);
                 processorRef.previewCollector.addMessageToQueue (m);
+                // Keep previewNotes in step with what is REALLY sounding, in both
+                // directions. It used to be wiped wholesale once the queue drained -
+                // but a hover preview's last event per voice is a note-ON (it sustains
+                // while you hover), so that wipe threw away the only record of notes
+                // that were still gated on. stopChordPreview() then early-returned on
+                // an empty list, which made mouse-exit, moving to another row AND the
+                // editor's own destructor all no-ops: every hovered chord droned for
+                // ever and they piled up. THE stuck-note bug.
+                const std::pair<int, int> k { m.getChannel(), m.getNoteNumber() };
+                if (m.isNoteOff())
+                    previewNotes.erase (std::remove (previewNotes.begin(), previewNotes.end(), k),
+                                        previewNotes.end());
+                else if (m.isNoteOn()
+                         && std::find (previewNotes.begin(), previewNotes.end(), k) == previewNotes.end())
+                    previewNotes.push_back (k);
                 previewQueue.erase (previewQueue.begin() + (long) i);
             }
             else ++i;
         }
-        if (previewQueue.empty())
-            previewNotes.clear(); // the preview finished naturally - nothing left to stop
     }
 
     // Chord search: progress read-out while running; rebuild the list on completion.

@@ -308,11 +308,23 @@ public:
                     // sits on the aligned reference, so adopt it as the running phase and
                     // continue the crossfade from where it is.
                     const bool wasMorphing = morphActive;
+                    bool adoptedAlign = false;
                     if (wasMorphing)
                     {
-                        const double wNow = morphPos * morphPos;
-                        if (wNow > 0.5)
+                        if (morphWeight > 0.5)
+                        {
                             for (int j = 0; j < hi; ++j) phase[(size_t) j] = alignPhase[(size_t) j];
+                            adoptedAlign = true;
+                        }
+                    }
+                    else
+                    {
+                        // A morph that ENDED left morphWeight pinned at 1, so the next
+                        // one started fully crossfaded onto the destination-phase
+                        // oscillator: the glide was inaudible and the waveform jumped
+                        // in a single sample. Every fresh morph starts from the running
+                        // phases again.
+                        morphWeight = 0.0;
                     }
                     morphN = hi; morphActive = true;
                     // EVERY new target restarts the glide clock. Keeping the old
@@ -329,12 +341,19 @@ public:
                     // current running phases to this over the morph, so the note ends
                     // phase-coherent (a real pulse in Aligned mode) instead of a drifted
                     // smear. Without this the sustain after a morph sounds "wrong".
-                    const bool alg = phaseModeParam->load() < 0.5f;
-                    for (int j = 0; j < hi; ++j)
+                    // NOT re-seeded when we just adopted alignPhase as the running
+                    // phase above: re-seeding it there would move the very phase the
+                    // output has just been handed, which is a waveform step on every
+                    // template change - i.e. ~60 of them a second during a knob drag.
+                    if (! adoptedAlign)
                     {
-                        if (alg) alignPhase[(size_t) j] = 0.25;
-                        else { const double h = std::sin ((double) j * 12.9898) * 43758.5453;
-                               alignPhase[(size_t) j] = h - std::floor (h); }
+                        const bool alg = phaseModeParam->load() < 0.5f;
+                        for (int j = 0; j < hi; ++j)
+                        {
+                            if (alg) alignPhase[(size_t) j] = 0.25;
+                            else { const double h = std::sin ((double) j * 12.9898) * 43758.5453;
+                                   alignPhase[(size_t) j] = h - std::floor (h); }
+                        }
                     }
                 }
                 else

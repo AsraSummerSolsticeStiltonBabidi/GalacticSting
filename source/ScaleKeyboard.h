@@ -144,6 +144,7 @@ public:
         {
             const int note = baseKey + i;
             if (note > 127) break;
+            if (note >= rangeLo + rangeCount) break; // past the tuning's playable range
 
             const int degree = ((note - kRefKey) % D + D) % D;
             const float hue = 0.82f * (float) degree / (float) D;
@@ -375,22 +376,28 @@ public:
 private:
     static constexpr int kRefKey = 60;
 
-    static constexpr int kMinCellW = 32; // a key never gets narrower than this (readability)
-    static constexpr int kArrowW   = 22; // scroll-arrow zone width when the scale doesn't fit
+    static constexpr int kCellW  = 32; // FIXED key width - see numCells()
+    static constexpr int kArrowW = 22; // scroll-arrow zone, ALWAYS reserved
 
-    // How many keys are shown at once: everything if it fits at the min width, else a
-    // window (with arrows reserved) sized to the min width.
+    // Keys have a CONSTANT width. How many are on screen therefore follows the
+    // window size and nothing else - never the tuning's degree count. Switching to
+    // a denser or sparser scale, or reaching a note outside the current view, now
+    // SCROLLS; it can no longer resize every key, which made the whole keyboard
+    // visibly jump under your fingers. The arrow zones are always reserved for the
+    // same reason: their appearing/disappearing used to shift the geometry too.
     int numCells() const
     {
-        const int fit = juce::jmax (1, getWidth() / kMinCellW);
-        if (rangeCount <= fit) return rangeCount;
-        return juce::jlimit (1, rangeCount, juce::jmax (1, (getWidth() - 2 * kArrowW) / kMinCellW));
+        const int usable = juce::jmax (1, getWidth() - 2 * kArrowW);
+        return juce::jmax (1, usable / kCellW);
     }
-    bool isScrollable() const { return numCells() < rangeCount; }
-    int  arrowW()      const { return isScrollable() ? kArrowW : 0; }
+    bool isScrollable() const { return rangeCount > numCells(); }
+    int  arrowW()      const { return kArrowW; }
     int  keysWidth()   const { return juce::jmax (1, getWidth() - 2 * arrowW()); }
-    void clampView() { baseKey = juce::jlimit (rangeLo, rangeLo + rangeCount - numCells(), baseKey); }
-    void scrollBy (int d) { baseKey = juce::jlimit (rangeLo, rangeLo + rangeCount - numCells(), baseKey + d); repaint(); }
+    // Highest baseKey that still shows keys (never negative when the range is
+    // smaller than the window - there is simply nothing to scroll).
+    int  maxBaseKey()  const { return juce::jmax (rangeLo, rangeLo + rangeCount - numCells()); }
+    void clampView() { baseKey = juce::jlimit (rangeLo, maxBaseKey(), baseKey); }
+    void scrollBy (int d) { baseKey = juce::jlimit (rangeLo, maxBaseKey(), baseKey + d); repaint(); }
 
     // Screen x -> MIDI note (only within the keys area; the arrow zones return -1).
     int noteAt (int x) const
@@ -400,7 +407,8 @@ private:
         if (cells <= 0 || x < aw || x >= getWidth() - aw) return -1;
         const int i = juce::jlimit (0, cells - 1, (x - aw) * cells / keysWidth());
         const int note = baseKey + i;
-        return note <= 127 ? note : -1;
+        // Past the tuning's range the cells are blank - they must not play either.
+        return (note <= 127 && note < rangeLo + rangeCount) ? note : -1;
     }
 
     void playAt (int x)
