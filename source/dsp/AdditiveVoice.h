@@ -28,6 +28,7 @@
 #include "CurvedEnv.h"
 #include "SineTable.h"
 #include "TuningManager.h"
+#include "ModEngine.h"
 
 #include <array>
 #include <cmath>
@@ -36,8 +37,9 @@ class AdditiveVoice : public juce::MPESynthesiserVoice
 {
 public:
     AdditiveVoice (juce::AudioProcessorValueTreeState& state, const spectrum::SpectrumEngine& eng,
-                   const TuningManager& tuningManager)
-        : apvts (state), engine (eng), tuning (tuningManager), sine (spectrum::sineTable())
+                   const TuningManager& tuningManager, const ModEngine& modulators)
+        : apvts (state), engine (eng), tuning (tuningManager), mods (modulators),
+          sine (spectrum::sineTable())
     {
         attackParam  = apvts.getRawParameterValue ("ampAttack");
         decayParam   = apvts.getRawParameterValue ("ampDecay");
@@ -59,6 +61,7 @@ public:
         pSustainParam= apvts.getRawParameterValue ("pitchSustain");
         pReleaseParam= apvts.getRawParameterValue ("pitchRelease");
 
+        curveSlopeParam = apvts.getRawParameterValue ("curveSlope");
         ampCurveA = apvts.getRawParameterValue ("ampCurveA");
         ampCurveD = apvts.getRawParameterValue ("ampCurveD");
         ampCurveR = apvts.getRawParameterValue ("ampCurveR");
@@ -169,6 +172,11 @@ public:
         morphActive = false; morphPos = 1.0; prevN = 0; morphWeight = 0.0;
         morphWPos = 0.0; morphFadeOut = false;
 
+        // Retrigger this voice's modulators. A stolen voice retriggers too: it is a new
+        // note, and its envelopes must start from the beginning like any other.
+        modNewNote = true;
+        modHeld    = true;
+
         const double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
         updateAdsrParameters();
         adsr.setSampleRate (sr);
@@ -194,9 +202,14 @@ public:
 
     void noteStopped (bool allowTailOff) override
     {
+        modHeld = false; // this voice's modulator envelopes go to their release
         if (allowTailOff) { adsr.noteOff(); filterAdsr.noteOff(); pitchAdsr.noteOff(); releasing = true; }
         else              beginFastKill();
     }
+
+    // The transport, pushed in once per block by the processor: a per-voice LFO can be
+    // locked to the host timeline exactly like the global one.
+    void setTransportForMod (double bpm, double ppq) noexcept { modBpm = bpm; modPpq = ppq; }
 
     // Aftertouch is a gain term too: set the TARGET so a jumpy 7-bit stream glides.
     void notePressureChanged() override
@@ -231,6 +244,19 @@ public:
         if (! adsr.isActive() && ! fastKill)
             return;
 
+        // THIS VOICE's modulators, advanced by one block. Its own envelopes, its own LFO
+        // phases, retriggered by its own note-on - so a chord is six independent
+        // envelopes, not one shared envelope restarted by the last key pressed.
+        {
+            double vals[ModEngine::kMods] = {};
+            bool   act [ModEngine::kMods] = {};
+            const double lfoF0 = tuning.frequencyForNote ((int) currentlyPlayingNote.initialNote);
+            mods.evaluateMods (modState, numSamples, modNewNote, modHeld,
+                               lfoF0, modBpm, modPpq, vals, act, false);
+            mods.collectVoiceOffsets (vals, act, modOff, modOwner);
+            modNewNote = false;
+        }
+
         updateAdsrParameters();
         updateFilterAdsrParameters();
         updatePitchAdsrParameters();
@@ -255,7 +281,8 @@ public:
         double morphWStep = 0.0;
         const auto* tmpl = engine.getLive();
         const double baseFreq = tuning.frequencyForNote ((int) currentlyPlayingNote.initialNote);
-        const double pitchEnvSemis = (double) pEnvAmtParam->load() * (double) pitchEnvValue;
+        const double pitchEnvSemis = (double) modded (ModEngine::PvPEnvAmt, pEnvAmtParam)
+                                   * (double) pitchEnvValue;
         const double f0 = baseFreq * std::pow (2.0,
             ((double) currentlyPlayingNote.totalPitchbendInSemitones + pitchEnvSemis) / 12.0);
 
@@ -457,6 +484,21 @@ public:
             for (int j = 0; j < n; ++j)
                 tgtAmp[(size_t) j] = (j < newN) ? ps[(size_t) j].amp : 0.0;
 
+            // PER-VOICE SLOPE - the one spectrum control a voice can move on its own.
+            // The compiler gives each base harmonic amp = (k/kMin)^(-slope) and the
+            // fractal convolution only multiplies those, so a published amplitude is
+            // exactly ratio^(-slope) times a factor that does NOT depend on slope.
+            // Rescaling by ratio^-(dS) therefore lands on precisely the spectrum the
+            // compiler would have produced at this voice's slope - no recompile, no
+            // approximation, and nothing dropped: every partial is still here, just at a
+            // different amplitude. The per-sample normalisation downstream is derived
+            // from these targets, so loudness follows automatically.
+            const double dS = (double) modded (ModEngine::PvSlope, curveSlopeParam)
+                            - (double) tmpl->curveSlope;
+            if (std::abs (dS) > 1.0e-6)
+                for (int j = 0; j < newN; ++j)
+                    tgtAmp[(size_t) j] *= std::pow (std::max (1.0e-9, (double) ps[(size_t) j].ratio), -dS);
+
             for (int j = 0; j < n; ++j) // clamp guards a partial pushed past Nyquist by pitch bend
                 inc[(size_t) j] = std::min (curRatio[(size_t) j] * f0 / currentSampleRate, 0.4999);
 
@@ -545,11 +587,11 @@ public:
         int sinceCutoff = kCutoffChunk;
         const auto refreshCutoff = [&]
         {
-            const double octs = (double) fCutoffParam->load() / 1200.0
-                              + (double) fEnvAmtParam->load() * (double) filterEnvValue;
+            const double octs = (double) modded (ModEngine::PvFCutoff, fCutoffParam) / 1200.0
+                              + (double) modded (ModEngine::PvFEnvAmt, fEnvAmtParam) * (double) filterEnvValue;
             const double co = f0 * std::exp2 (octs);
             filter.setCutoffFrequency ((float) juce::jlimit (20.0, 0.49 * sr, co));
-            filter.setResonance (juce::jlimit (0.1f, 40.0f, fResParam->load()));
+            filter.setResonance (juce::jlimit (0.1f, 40.0f, modded (ModEngine::PvFRes, fResParam)));
         };
         refreshCutoff();
 
@@ -684,22 +726,37 @@ private:
     void updateAdsrParameters()
     {
         if (releasing) return; // never disturb a release tail's rate
-        adsr.setParameters (attackParam->load(), decayParam->load(), sustainParam->load(),
-                            releaseParam->load(), ampCurveA->load(), ampCurveD->load(), ampCurveR->load());
+        adsr.setParameters (modded (ModEngine::PvAmpA,  attackParam),
+                            modded (ModEngine::PvAmpD,  decayParam),
+                            modded (ModEngine::PvAmpS,  sustainParam),
+                            modded (ModEngine::PvAmpR,  releaseParam),
+                            modded (ModEngine::PvAmpCA, ampCurveA),
+                            modded (ModEngine::PvAmpCD, ampCurveD),
+                            modded (ModEngine::PvAmpCR, ampCurveR));
     }
 
     void updateFilterAdsrParameters()
     {
         if (releasing) return;
-        filterAdsr.setParameters (fAttackParam->load(), fDecayParam->load(), fSustainParam->load(),
-                                  fReleaseParam->load(), filtCurveA->load(), filtCurveD->load(), filtCurveR->load());
+        filterAdsr.setParameters (modded (ModEngine::PvFA,  fAttackParam),
+                                  modded (ModEngine::PvFD,  fDecayParam),
+                                  modded (ModEngine::PvFS,  fSustainParam),
+                                  modded (ModEngine::PvFR,  fReleaseParam),
+                                  modded (ModEngine::PvFCA, filtCurveA),
+                                  modded (ModEngine::PvFCD, filtCurveD),
+                                  modded (ModEngine::PvFCR, filtCurveR));
     }
 
     void updatePitchAdsrParameters()
     {
         if (releasing) return;
-        pitchAdsr.setParameters (pAttackParam->load(), pDecayParam->load(), pSustainParam->load(),
-                                 pReleaseParam->load(), pitchCurveA->load(), pitchCurveD->load(), pitchCurveR->load());
+        pitchAdsr.setParameters (modded (ModEngine::PvPA,  pAttackParam),
+                                 modded (ModEngine::PvPD,  pDecayParam),
+                                 modded (ModEngine::PvPS,  pSustainParam),
+                                 modded (ModEngine::PvPR,  pReleaseParam),
+                                 modded (ModEngine::PvPCA, pitchCurveA),
+                                 modded (ModEngine::PvPCD, pitchCurveD),
+                                 modded (ModEngine::PvPCR, pitchCurveR));
     }
 
     void beginFastKill()
@@ -738,6 +795,37 @@ private:
     juce::AudioProcessorValueTreeState& apvts;
     const spectrum::SpectrumEngine&     engine;
     const TuningManager&                tuning;
+    const ModEngine&                    mods;
+
+    //==========================================================================
+    // PER-VOICE MODULATION.
+    //
+    // This voice runs its OWN copy of the six modulators - its own envelopes, its own
+    // LFO phases - retriggered by its own note-on and released when its own key comes
+    // up. The settings live in one shared place (the user has one set of controls);
+    // only the running state is per voice. That is how every other synth does it, and
+    // it is why the global bank felt broken: one envelope for all the voices, restarted
+    // by whichever note arrived last.
+    //
+    // The parameter itself is never written. Each read site asks modded() for
+    // "base + this voice's modulation", so the on-screen control keeps showing the value
+    // the user set - the honest thing to show when eight notes each have a different one.
+    ModEngine::VoiceState       modState;
+    float                       modOff  [ModEngine::PvCount] = {};
+    juce::RangedAudioParameter* modOwner[ModEngine::PvCount] = {};
+    bool   modNewNote = false;   // set by noteStarted, consumed by the first render block
+    bool   modHeld    = false;   // this voice's own key state, gating its envelopes
+    double modBpm = -1.0, modPpq = -1.0;  // transport, pushed in per block by the processor
+
+    // base + this voice's modulation, converted back through the parameter's own range
+    // (the same normalised-space maths the global path uses, so a control behaves
+    // identically whichever route it takes). Unmapped targets cost one atomic load.
+    float modded (int t, const std::atomic<float>* fallback) const noexcept
+    {
+        if (auto* p = modOwner[(size_t) t])
+            return p->convertFrom0to1 (juce::jlimit (0.0f, 1.0f, p->getValue() + modOff[(size_t) t]));
+        return fallback->load();
+    }
     const spectrum::SineTable&          sine;
 
     std::atomic<float>* attackParam    = nullptr;
@@ -760,6 +848,7 @@ private:
     std::atomic<float>* ampCurveA = nullptr, * ampCurveD = nullptr, * ampCurveR = nullptr;
     std::atomic<float>* filtCurveA = nullptr, * filtCurveD = nullptr, * filtCurveR = nullptr;
     std::atomic<float>* pitchCurveA = nullptr, * pitchCurveD = nullptr, * pitchCurveR = nullptr;
+    std::atomic<float>* curveSlopeParam = nullptr; // base slope; per-voice modulated
     std::atomic<float>* morphParam     = nullptr;
     std::atomic<float>* morphTimeParam = nullptr;
 

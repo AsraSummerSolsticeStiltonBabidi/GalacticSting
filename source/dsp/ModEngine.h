@@ -47,6 +47,108 @@ public:
     static constexpr int kMaxTargets = 8;    // params one modulator can drive
     static constexpr int kWaveN = 256;       // custom-wave table resolution
 
+    struct Env
+    {
+        enum Stage { idle, attack, decay, sustain, release };
+        Stage  stage = idle;
+        double pos = 0.0;    // 0..1 through the current segment
+        double value = 0.0;  // current output
+        double from = 0.0;   // level the segment started from (retrigger / release)
+        bool   held = false;
+    };
+    struct Lfo { double phase = 0.0; };
+    // Deterministic little RNG for the Random wave (no allocation, no global state).
+    struct Rnd
+    {
+        juce::uint32 state = 0x9E3779B9u;
+        double from = 0.5, target = 0.5, lastPhase = 0.0;
+        double next() noexcept
+        {
+            state = state * 1664525u + 1013904223u;
+            return (double) ((state >> 8) & 0xFFFFFF) / (double) 0xFFFFFF;
+        }
+    };
+
+    // The RUNNING STATE of the six modulators, split out so it can be owned from
+    // OUTSIDE. The maths and the user's settings stay in here - there is exactly one
+    // implementation of them - but each AdditiveVoice keeps its own VoiceState, so
+    // every note gets its own envelopes and LFOs, retriggered by its own note-on.
+    // That is what every other synth does, and it is precisely what a single global
+    // bank could not do: one envelope shared by every voice, restarted by whichever
+    // note happened to arrive last, which is why a mapped control sounded frozen.
+    struct VoiceState
+    {
+        Env env[kEnvs];
+        Lfo lfo[kLfos];
+        Rnd rnd[kLfos];   // per-LFO random-wave state
+        void reset() noexcept
+        {
+            for (auto& e : env) e = Env {};
+            for (auto& l : lfo) l = Lfo {};
+        }
+    };
+
+    //--------------------------------------------------------------------------
+    // The targets a VOICE can modulate on its own. Everything not on this list stays
+    // GLOBAL, because there is exactly one compiled spectrum shared by every voice:
+    // Base, Fractal, the prime controls and the rest change WHICH partials exist, and
+    // one note cannot have a different partial set from another without compiling a
+    // spectrum per voice.
+    //
+    // curveSlope is the exception that earns its place here. It is a spectrum control,
+    // but a purely AMPLITUDE one: the compiler gives each partial amp = ratio^(-slope)
+    // and the fractal convolution only multiplies those, so the published amplitude of
+    // a partial is exactly ratio^(-s) times a slope-INDEPENDENT factor. A voice can
+    // therefore move slope by scaling each partial by ratio^-(s - sTemplate), which is
+    // exact - not an approximation - and needs no recompile at all.
+    enum PvTarget
+    {
+        PvAmpA = 0, PvAmpD, PvAmpS, PvAmpR, PvAmpCA, PvAmpCD, PvAmpCR,
+        PvFCutoff, PvFRes, PvFEnvAmt, PvFA, PvFD, PvFS, PvFR, PvFCA, PvFCD, PvFCR,
+        PvPEnvAmt, PvPA, PvPD, PvPS, PvPR, PvPCA, PvPCD, PvPCR,
+        PvSlope,
+        PvCount
+    };
+
+    static int perVoiceTargetIndex (const juce::String& pid) noexcept
+    {
+        static const char* ids[PvCount] =
+        {
+            "ampAttack", "ampDecay", "ampSustain", "ampRelease", "ampCurveA", "ampCurveD", "ampCurveR",
+            "filterCutoff", "filterResonance", "filterEnvAmount",
+            "filterAttack", "filterDecay", "filterSustain", "filterRelease",
+            "filterCurveA", "filterCurveD", "filterCurveR",
+            "pitchEnvAmount", "pitchAttack", "pitchDecay", "pitchSustain", "pitchRelease",
+            "pitchCurveA", "pitchCurveD", "pitchCurveR",
+            "curveSlope"
+        };
+        for (int i = 0; i < PvCount; ++i) if (pid == ids[i]) return i;
+        return -1;
+    }
+
+    // Sum this block's per-voice modulation for ONE voice. offNorm is in the parameter's
+    // own normalised 0..1 space (the same space the global path works in, so a knob
+    // behaves identically whichever route it takes), and owner[] carries the parameter
+    // each target belongs to so the voice can convert back through its range.
+    void collectVoiceOffsets (const double* vals, const bool* act,
+                              float* offNorm, juce::RangedAudioParameter** owner) const
+    {
+        for (int t = 0; t < PvCount; ++t) { offNorm[t] = 0.0f; owner[t] = nullptr; }
+        for (int i = 0; i < kMods; ++i)
+        {
+            if (! act[i]) continue;
+            const float contrib = (float) vals[i] * prm[(size_t) i].range->load();
+            for (int s = 0; s < kMaxTargets; ++s)
+            {
+                const auto& sl = mods[(size_t) i].slot[(size_t) s];
+                const int t = sl.pv.load (std::memory_order_relaxed);
+                if (t < 0 || t >= PvCount) continue;
+                if (auto* p = sl.param.load (std::memory_order_acquire))
+                { offNorm[t] += contrib; owner[t] = p; }
+            }
+        }
+    }
+
     ModEngine (juce::AudioProcessorValueTreeState& s) : apvts (s)
     {
         // Cache every modulator parameter's raw atomic once: processBlock then
@@ -77,7 +179,7 @@ public:
     void prepare (double sampleRate)
     {
         sr = sampleRate > 0.0 ? sampleRate : 44100.0;
-        for (auto& e : env) { e = Env{}; }
+        globalState.reset();
         // The processor zeroes its note counter here too, so this stays in step
         // WITHOUT swallowing the first note-on: adopting the counter lazily on the
         // first block ate the retrigger of a note that arrived in that same block.
@@ -104,7 +206,9 @@ public:
             if (m.tgtId[(size_t) i].isEmpty())
             {
                 m.tgtId[(size_t) i] = pid;
-                m.slot[(size_t) i].raw.store (raw);                                   // raw first,
+                m.slot[(size_t) i].pv.store (perVoiceTargetIndex (pid),               // class first,
+                                             std::memory_order_relaxed);
+                m.slot[(size_t) i].raw.store (raw);                                   // raw next,
                 m.slot[(size_t) i].param.store (p, std::memory_order_release);        // param last
                 if (mapCount (pid) == 1) watchAdd (pid, p);
                 return;
@@ -120,6 +224,7 @@ public:
             {
                 m.slot[(size_t) i].param.store (nullptr); // audio skips null slots; it
                 m.slot[(size_t) i].raw.store (nullptr);   // restores the base next block
+                m.slot[(size_t) i].pv.store (-1, std::memory_order_relaxed);
                 m.tgtId[(size_t) i].clear();
                 if (mapCount (pid) == 0) watchRemove (pid);
                 return;
@@ -135,6 +240,7 @@ public:
             const auto pid = m.tgtId[(size_t) i];
             m.slot[(size_t) i].param.store (nullptr);
             m.slot[(size_t) i].raw.store (nullptr);
+            m.slot[(size_t) i].pv.store (-1, std::memory_order_relaxed);
             m.tgtId[(size_t) i].clear();
             if (pid.isNotEmpty() && mapCount (pid) == 0) watchRemove (pid);
         }
@@ -186,20 +292,19 @@ public:
     //   anyHeld      - is any note currently held (accurate THIS block)
     //   fundamental  - lowest held note's Hz (0 if none)
     //   bpm/ppq      - host transport (bpm <= 0 = unknown; ppq < 0 = not playing)
-    void processBlock (int numSamples, juce::uint32 noteOnsSoFar, bool anyHeld,
-                       double fundamental, double bpm, double ppq)
+    // Pass 1, split out so that a VOICE can run it on its OWN state: every modulator's
+    // output value (0..1). Fixed order 0..5, so a modulator driving ANOTHER modulator's
+    // parameters acts with at most one block of latency and never re-enters itself.
+    //
+    // The settings (attack, wave, rate...) are shared - they are the user's single set of
+    // controls - but the running state comes in by reference, so each voice advances and
+    // retriggers its own copy. `act` is the On gate combined with "drives something
+    // somewhere"; each caller then decides which of those targets are its business.
+    void evaluateMods (VoiceState& st, int numSamples, bool newNote, bool anyHeld,
+                       double fundamental, double bpm, double ppq,
+                       double* vals, bool* act, bool reportRateLimit) const
     {
-        if (numSamples <= 0) return; // an empty block must not freeze the envelopes at 0
-        lastBlock = numSamples;      // used to size the parameter-hold window
-        const bool newNote = noteOnsSoFar != noteSeen;
-        noteSeen = noteOnsSoFar;
         const double dt = (double) numSamples / sr;
-
-        // Pass 1: every modulator's output value (0..1). Fixed order 0..5, so a
-        // modulator driving ANOTHER modulator's parameters acts with at most one
-        // block of latency and never re-enters itself.
-        double vals[kMods] = {};
-        bool   act[kMods]  = {};
         for (int i = 0; i < kMods; ++i)
         {
             auto& m = mods[(size_t) i];
@@ -220,7 +325,7 @@ public:
                 // juce::ADSR because each segment carries its own CURVE (concave <->
                 // convex): a straight line ramp is what made the decay feel like it
                 // "drops" instead of falling away.
-                auto& e = env[(size_t) i];
+                auto& e = st.env[(size_t) i];
                 // EVERY note-on restarts the envelope FROM ZERO: retriggering from
                 // wherever it happened to be meant a second key pressed while the
                 // first was sustaining had almost no attack and no decay left to
@@ -257,7 +362,7 @@ public:
             }
             else
             {
-                auto& l = lfo[(size_t) (i - kEnvs)];
+                auto& l = st.lfo[(size_t) (i - kEnvs)];
                 const int  rateMode  = (int) q.rateMode->load();
                 const int  divN      = (int) q.divN->load();
                 const int  phaseMode = (int) q.phaseMode->load();
@@ -271,8 +376,8 @@ public:
                 // fundamental-tracking LFO can run into the hundreds of Hz. The
                 // limit is reported to the UI (lfoRateLimited) instead of hiding.
                 const double ceiling = std::max (1.0, 0.5 * sr / (double) numSamples);
-                if (rate > ceiling) { rate = ceiling; rateLimited[(size_t) (i - kEnvs)] = true; }
-                else                { rateLimited[(size_t) (i - kEnvs)] = false; }
+                if (rate > ceiling) { rate = ceiling; if (reportRateLimit) rateLimited[(size_t) (i - kEnvs)] = true; }
+                else                { if (reportRateLimit) rateLimited[(size_t) (i - kEnvs)] = false; }
                 rate = std::max (0.0, rate);
 
                 if (phaseMode == 1 && rateMode != 1 && ppq >= 0.0 && bpm > 1.0)
@@ -291,9 +396,24 @@ public:
                     if (newNote && (phaseMode == 0 || rateMode == 1)) l.phase = phOff;
                     l.phase = std::fmod (l.phase + rate * dt, 1.0);
                 }
-                vals[i] = evalWave (i - kEnvs, (int) q.wave->load(), l.phase);
+                vals[i] = evalWave (i - kEnvs, (int) q.wave->load(), l.phase, st.rnd[(size_t) (i - kEnvs)]);
             }
         }
+    }
+
+    //--------------------------------------------------------------------------
+    void processBlock (int numSamples, juce::uint32 noteOnsSoFar, bool anyHeld,
+                       double fundamental, double bpm, double ppq)
+    {
+        if (numSamples <= 0) return; // an empty block must not freeze the envelopes at 0
+        lastBlock = numSamples;      // used to size the parameter-hold window
+        const bool newNote = noteOnsSoFar != noteSeen;
+        noteSeen = noteOnsSoFar;
+
+        double vals[kMods] = {};
+        bool   act[kMods]  = {};
+        evaluateMods (globalState, numSamples, newNote, anyHeld, fundamental, bpm, ppq,
+                      vals, act, true);
 
         // Pass 2: SUM every active modulator's contribution per UNIQUE target, then
         // write base + sum once (two modulators on one knob add, they don't fight).
@@ -310,6 +430,12 @@ public:
                 auto* p   = m.slot[(size_t) t].param.load (std::memory_order_acquire);
                 auto* raw = m.slot[(size_t) t].raw.load();
                 if (p == nullptr || raw == nullptr) continue;
+                // Per-voice targets are NOT written here. Each voice adds its own
+                // modulation on top of the base, so the parameter keeps the value the
+                // user set - which is also why the on-screen control no longer moves
+                // for them: with several notes sounding there is no single value it
+                // could show. The editor draws the reachable RANGE as an arc instead.
+                if (m.slot[(size_t) t].pv.load (std::memory_order_relaxed) >= 0) continue;
                 int f = -1;
                 for (int k = 0; k < nW; ++k) if (writes[k].raw == raw) { f = k; break; }
                 if (f >= 0) writes[f].sum += contrib;
@@ -433,6 +559,9 @@ private:
     {
         std::atomic<juce::RangedAudioParameter*> param { nullptr };
         std::atomic<std::atomic<float>*>         raw   { nullptr };
+        // >= 0 -> this target is modulated PER VOICE, so the global pass must not write
+        // it (each voice applies its own value); -1 -> global, written as before.
+        std::atomic<int>                         pv    { -1 };
     };
     struct Mod
     {
@@ -449,27 +578,6 @@ private:
         return std::pow (t, k);
     }
 
-    struct Env
-    {
-        enum Stage { idle, attack, decay, sustain, release };
-        Stage  stage = idle;
-        double pos = 0.0;    // 0..1 through the current segment
-        double value = 0.0;  // current output
-        double from = 0.0;   // level the segment started from (retrigger / release)
-        bool   held = false;
-    };
-    struct Lfo { double phase = 0.0; };
-    // Deterministic little RNG for the Random wave (no allocation, no global state).
-    struct Rnd
-    {
-        juce::uint32 state = 0x9E3779B9u;
-        double from = 0.5, target = 0.5, lastPhase = 0.0;
-        double next() noexcept
-        {
-            state = state * 1664525u + 1013904223u;
-            return (double) ((state >> 8) & 0xFFFFFF) / (double) 0xFFFFFF;
-        }
-    };
     struct Ptrs
     {
         std::atomic<float>* on = nullptr, * range = nullptr;
@@ -479,7 +587,7 @@ private:
                           * hz = nullptr, * phaseMode = nullptr, * phase = nullptr;
     };
 
-    double evalWave (int lfoIdx, int wave, double ph)
+    double evalWave (int lfoIdx, int wave, double ph, Rnd& rs) const
     {
         switch (wave)
         {
@@ -490,7 +598,6 @@ private:
             case 4:  return ph < 0.5 ? 1.0 : 0.0;                                            // square
             case 6:  // RANDOM: a new level each cycle, glided into (sample & hold that
             {       //          does not step - the target changes, the value walks to it)
-                auto& rs = rnd[(size_t) lfoIdx];
                 if (ph < rs.lastPhase) { rs.from = rs.target; rs.target = rs.next(); } // wrapped
                 rs.lastPhase = ph;
                 return rs.from + (rs.target - rs.from) * (ph * ph * (3.0 - 2.0 * ph)); // smoothstep
@@ -511,9 +618,10 @@ private:
     Mod  mods[kMods];
     Ptrs prm[kMods];
     juce::RangedAudioParameter* onParam[kMods] = {}; // base (unmodulated) On state
-    Env  env[kEnvs];
-    Lfo  lfo[kLfos];
-    Rnd  rnd[kLfos];   // per-LFO random-wave state
+    // The engine's OWN modulator state, used for the targets that cannot be per-voice
+    // (the spectrum controls: one spectrum is shared by every voice) and as the source
+    // for the editor's modulation display.
+    VoiceState globalState;
     struct Last { juce::RangedAudioParameter* p = nullptr; std::atomic<float>* raw = nullptr; };
     Last lastW[kMods * kMaxTargets];
     int  nLastW = 0;
@@ -522,7 +630,9 @@ private:
     Watch watched[kMods * kMaxTargets];  // id -> param, for the RT-safe listener
     Hold holds[16];              // parameters temporarily handed back to their base
     int  lastBlock = 256;        // last block size, for the hold duration
-    std::array<std::atomic<bool>, kLfos> rateLimited {};
+    // Written from evaluateMods(), which is const so a voice can call it; only the
+    // engine's own pass reports (reportRateLimit), so 32 voices do not all write it.
+    mutable std::array<std::atomic<bool>, kLfos> rateLimited {};
     std::array<std::array<float, kWaveN>, kLfos> customWave {};
     double sr = 44100.0;
     juce::uint32 noteSeen = 0;

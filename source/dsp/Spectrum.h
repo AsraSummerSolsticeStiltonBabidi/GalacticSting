@@ -124,6 +124,13 @@ namespace spectrum
         // reads a template and its generation as ONE consistent pair (no gen/template
         // tearing that would leave a morph gliding to a stale spectrum).
         unsigned int generation = 0;
+        // The slope this template was COMPILED at. A voice modulating slope re-derives
+        // its own amplitudes from here without any recompile: the compiler gives each
+        // base harmonic amp = (k/kMin)^(-slope) and the fractal convolution only
+        // multiplies those, so a published amplitude is exactly ratio^(-slope) times a
+        // slope-INDEPENDENT factor. Scaling by ratio^-(sVoice - curveSlope) is therefore
+        // EXACT, not an approximation.
+        float curveSlope = 1.0f;
     };
 
     //==========================================================================

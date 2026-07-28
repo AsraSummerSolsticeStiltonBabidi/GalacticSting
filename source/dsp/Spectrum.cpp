@@ -59,6 +59,7 @@ namespace spectrum
     static void finalisePartials (std::vector<Partial>& parts, const SpectrumSettings& s,
                                   SpectrumTemplate& out)
     {
+        out.curveSlope = s.curveSlope; // what a per-voice slope modulation scales FROM
         applyRangeCut (parts, s);
         out.rawCount = (int) parts.size();
 
@@ -96,6 +97,12 @@ namespace spectrum
     static SpectrumTemplate compileScalaTimbre (const SpectrumSettings& s, const std::atomic<bool>* abort)
     {
         SpectrumTemplate out;
+        // Stamp the slope on EVERY exit path, including the early returns below. The
+        // harmonic engine has its own inline tail and never reaches finalisePartials, so
+        // its template kept the default 1.0 - and every voice then believed it had to
+        // rescale from 1.0 to the real slope, pushing the upper partials far enough down
+        // that FftVerify reported them dropped.
+        out.curveSlope = s.curveSlope;
 
         const auto aborted = [abort]() noexcept
         { return abort != nullptr && abort->load (std::memory_order_relaxed); };
@@ -299,6 +306,12 @@ namespace spectrum
             return compileScalaTimbre (s, abort);
 
         SpectrumTemplate out;
+        // Stamp the slope on EVERY exit path, including the early returns below. The
+        // harmonic engine has its own inline tail and never reaches finalisePartials, so
+        // its template kept the default 1.0 - and every voice then believed it had to
+        // rescale from 1.0 to the real slope, pushing the upper partials far enough down
+        // that FftVerify reported them dropped.
+        out.curveSlope = s.curveSlope;
 
         const auto aborted = [abort]() noexcept
         {

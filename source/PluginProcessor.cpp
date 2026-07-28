@@ -30,7 +30,7 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     synth.setVoiceStealingEnabled (true);
 
     for (int i = 0; i < 32; ++i)
-        synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning));
+        synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning, modEngine));
 
     // Global app settings (recent .scl files), shared across all instances.
     juce::PropertiesFile::Options o;
@@ -1945,6 +1945,12 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
             if (lowest < 128) f0 = getNoteFrequency (lowest);
         }
         modEngine.processBlock (nSamp, modNoteOns, modHeld > 0, f0, bpm, ppq);
+        // Each voice runs its OWN modulators (see AdditiveVoice), so it needs the
+        // transport to lock a per-voice LFO to the host timeline. Its LFO fundamental is
+        // its own played pitch, which it already knows.
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                av->setTransportForMod (bpm, ppq);
     }
     const bool midiOut  = apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f;
     const bool selfWant = apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f;
