@@ -1680,6 +1680,61 @@ int main()
         check (slow <= off * 2.5f + 0.02f, "a morph restarted every rebuild does not click");
     }
 
+    // --- run 27: MTS-ESP is adopted on a NEW instance only, never on a restored one --
+    // "I only wanted it to happen when Fibló loads for the FIRST time. If the project is
+    // reopened I don't want it, because it would break the settings the user put in -
+    // that would be a hard blow for the user."
+    // The adoption itself needs a live MTS master, which an offline harness cannot
+    // provide, so what is checked here is the gate in front of it: is it still armed?
+    {
+        std::printf ("MTS-ESP adoption is armed only for a brand-new instance:\n");
+        constexpr int eb = 64;
+        auto fresh = [&]
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (48000.0, eb);
+            return p;
+        };
+
+        {   // a brand-new instance stays armed while the host is still handing things over
+            auto p = fresh();
+            for (int i = 0; i < 5; ++i) p->pollParametersForTests();
+            check (p->mtsAdoptionArmedForTests(),
+                   "a new instance is still armed a few ticks in (the host may yet send state)");
+            for (int i = 0; i < 40; ++i) p->pollParametersForTests();
+            check (! p->mtsAdoptionArmedForTests(),
+                   "and it is consumed once, shortly after load");
+        }
+        {   // a REOPENED project: the host hands over saved state
+            auto src = fresh();
+            if (auto* q = src->apvts.getParameter ("tuningMode"))
+                q->setValueNotifyingHost (q->convertTo0to1 (2.0f)); // Scala
+            juce::MemoryBlock saved;
+            src->getStateInformation (saved);
+
+            auto p = fresh();
+            p->setStateInformation (saved.getData(), (int) saved.getSize());
+            check (! p->mtsAdoptionArmedForTests(),
+                   "a restored project disarms it, so the saved tuning mode is never overwritten");
+            for (int i = 0; i < 60; ++i) p->pollParametersForTests();
+            const float mode = p->apvts.getRawParameterValue ("tuningMode")->load();
+            check (std::abs (mode - 2.0f) < 0.5f,
+                   "and the restored tuning mode survives the load (still Scala)");
+        }
+        {   // a host handing over EMPTY or unreadable state must not look brand new
+            auto p = fresh();
+            p->setStateInformation (nullptr, 0);
+            check (! p->mtsAdoptionArmedForTests(),
+                   "empty state disarms it too (restoreState bails out before its own reset)");
+
+            auto q = fresh();
+            const char junk[] = "not a valid plugin chunk at all";
+            q->setStateInformation (junk, (int) sizeof (junk));
+            check (! q->mtsAdoptionArmedForTests(),
+                   "and so does unreadable state");
+        }
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

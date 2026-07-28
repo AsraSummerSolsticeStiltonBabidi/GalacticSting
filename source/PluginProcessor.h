@@ -81,6 +81,11 @@ public:
     // so without this they would silently test a plugin whose tuning never picked
     // up Reference A / Octave Transpose / the tuning mode at all.
     void pollParametersForTests() { timerCallback(); }
+    // Is the one-shot MTS-ESP adoption still armed? It must stay armed on a brand-new
+    // instance and be disarmed the moment the host hands over ANY saved state, so that
+    // reopening a project never overwrites the tuning the user saved. Tests only - the
+    // adoption itself cannot be exercised offline because it needs a live MTS master.
+    bool mtsAdoptionArmedForTests() const noexcept { return mtsCheckPending; }
 
     // Raw tuning/timbre state so the editor can format localised status strings.
     int  getTuningMode()    const noexcept { return (int) apvts.getRawParameterValue ("tuningMode")->load(); }
@@ -503,6 +508,10 @@ private:
 
     // MTS-ESP adoption is a ONE-SHOT check at load (see timerCallback), never repeated.
     bool  mtsCheckPending = true;
+    // Timer ticks waited before the one-shot above is allowed to decide, so a host that
+    // calls prepareToPlay before setStateInformation cannot make a restored instance look
+    // brand new. Only ever counted once, at load.
+    int   mtsCheckTicks   = 0;
     bool  mtsHadRef       = false; // MTS is currently driving the reference
     float manualRefA      = 440.0f; // the hand-set reference, parked while MTS owns it
 

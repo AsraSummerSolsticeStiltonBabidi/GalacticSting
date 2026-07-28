@@ -508,7 +508,16 @@ void FractalAdditiveAudioProcessor::timerCallback()
     // master is up when this Fibló loads, it opens following it. It is consumed
     // here whether or not a master was found, so switching to another mode later
     // can never be undone by a second check - there is no second check.
-    if (mtsCheckPending)
+    //
+    // It fires ONLY for a genuinely NEW instance: setStateInformation disarms it, so a
+    // restored project or preset keeps whatever the user saved.
+    //
+    // The wait matters. This timer is started by prepareToPlay, and a host is free to
+    // call prepareToPlay BEFORE it hands over the saved state - so deciding on the very
+    // first tick could adopt MTS-ESP a moment before the project arrives to say this
+    // instance already has a tuning of its own. Half a second is far beyond any host's
+    // hand-over and is only ever waited once, at load.
+    if (mtsCheckPending && ++mtsCheckTicks >= 30)
     {
         mtsCheckPending = false;
         if (tuning.hasMtsMaster())
@@ -2318,6 +2327,18 @@ void FractalAdditiveAudioProcessor::getStateInformation (juce::MemoryBlock& dest
 
 void FractalAdditiveAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
+    // ANY call here means the host is handing this instance a previous life - a reopened
+    // project, a preset, a duplicated or copy-pasted plugin. Disarm the one-shot MTS-ESP
+    // adoption BEFORE parsing, so it is disarmed even when the chunk turns out to be
+    // empty, foreign or unreadable: restoreState() returns early on those and used to
+    // leave the one-shot armed, which made a corrupt-state instance look brand new.
+    //
+    // This matters a lot. Adopting MTS-ESP on a RESTORED instance would overwrite the
+    // tuning mode the user saved, and with it the reference (MTS owns refA while it is
+    // the active mode, parking the user's own value) and any loaded Scala scale. Someone
+    // reopening yesterday's project would find their tuning silently replaced.
+    mtsCheckPending = false;
+
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
         restoreState (juce::ValueTree::fromXml (*xml));
 }
