@@ -1387,6 +1387,140 @@ int main()
         }
     }
 
+    // --- run 24: POLYPHONIC per-note retuning, and the attack of a cold note ------
+    {
+        std::printf ("polyphonic MPE retuning and cold-note attack:\n");
+        constexpr int    fo = 15, fn = 1 << fo, pb = 512;
+
+        auto mk = [&] (float tuningMode)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (48000.0, pb);
+            auto s = [&] (const char* id, float v)
+            { auto* q = p->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            s ("ampAttack", 0.001f); s ("ampDecay", 0.001f); s ("ampSustain", 1.0f);
+            s ("baseN", 1.0f); s ("fractalLevel", 1.0f); s ("curveSlope", 2.0f);
+            s ("tuningMode", tuningMode);
+            p->pollParametersForTests();
+            return p;
+        };
+
+        // (a) Three notes held at once, each on its OWN channel with its OWN bend -
+        // exactly what a host sends for a microtonal chord. All three pitches must be
+        // present at the same time; if per-note bend is lost they collapse together.
+        {
+            auto p = mk (3.0f); // MPE
+            juce::AudioBuffer<float> b (2, pb);
+            std::vector<float> mono; mono.reserve ((size_t) fn + pb);
+            bool sent = false;
+            while ((int) mono.size() < fn + 12000)
+            {
+                juce::MidiBuffer m;
+                if (! sent)
+                {
+                    // +4, +8, +12 semitones, each on its own member channel.
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        const double st = 4.0 * (double) (k + 1);
+                        const int bend = 8192 + (int) std::lround (st / 48.0 * 8192.0);
+                        m.addEvent (juce::MidiMessage::pitchWheel (2 + k, bend), 0);
+                        m.addEvent (juce::MidiMessage::noteOn (2 + k, 60, (juce::uint8) 110), 1);
+                    }
+                    sent = true;
+                }
+                b.clear(); p->processBlock (b, m);
+                for (int i = 0; i < pb; ++i) mono.push_back (b.getSample (0, i));
+            }
+            std::vector<float> w (mono.end() - fn, mono.end());
+            for (int i = 0; i < fn; ++i)
+                w[(size_t) i] *= 0.5f * (1.0f - std::cos (2.0f * juce::MathConstants<float>::pi
+                                                           * (float) i / (float) (fn - 1)));
+            std::vector<float> fd ((size_t) fn * 2, 0.0f);
+            for (int i = 0; i < fn; ++i) fd[(size_t) i] = w[(size_t) i];
+            juce::dsp::FFT fft (fo);
+            fft.performRealOnlyForwardTransform (fd.data());
+            std::vector<float> mag ((size_t) fn / 2 + 1);
+            float peak = 0.0f;
+            for (int k = 0; k <= fn / 2; ++k)
+            {
+                const float re = fd[(size_t) (2 * k)], im = fd[(size_t) (2 * k + 1)];
+                mag[(size_t) k] = std::sqrt (re * re + im * im);
+                peak = std::max (peak, mag[(size_t) k]);
+            }
+            auto present = [&] (double hz)
+            {
+                const int c = (int) std::lround (hz * (double) fn / 48000.0);
+                float best = 0.0f;
+                for (int k = c - 6; k <= c + 6; ++k)
+                    if (k >= 0 && k < (int) mag.size()) best = std::max (best, mag[(size_t) k]);
+                return best > peak * 0.02f; // -34 dB below the loudest thing present
+            };
+            const double f0 = p->getNoteFrequency (60);
+            int found = 0;
+            for (int k = 0; k < 3; ++k)
+                if (present (f0 * std::exp2 (4.0 * (double) (k + 1) / 12.0))) ++found;
+            std::printf ("  three per-note-bent notes: %d of 3 distinct pitches sounding\n", found);
+            check (found == 3, "a microtonal chord keeps THREE separate pitches, not one");
+        }
+
+        // (b) A COLD note with attack at minimum must reach full level almost at once.
+        // A stolen voice deliberately glides (~7 ms) to hand over without a click; a
+        // fresh one must not, or every note has an attack the envelope never asked for.
+        {
+            auto p = mk (1.0f);
+            juce::AudioBuffer<float> b (2, 64);
+            p->prepareToPlay (48000.0, 64);
+            p->pollParametersForTests();
+            // Let the spectrum settle BEFORE playing. The rebuild runs on a background
+            // thread, so a note struck while it is still in flight legitimately slews
+            // its partial amplitudes onto the arriving template - that is the morph
+            // machinery doing its job, not an attack. Measuring without this settle
+            // was measuring the test's own parameter changes.
+            for (int i = 0; i < 200; ++i) { juce::MidiBuffer none; b.clear(); p->processBlock (b, none); }
+            std::vector<float> mono;
+            bool sent = false;
+            for (int blk = 0; blk < 400; ++blk)
+            {
+                juce::MidiBuffer m;
+                if (! sent) { m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 110), 0); sent = true; }
+                b.clear(); p->processBlock (b, m);
+                for (int i = 0; i < 64; ++i) mono.push_back (b.getSample (0, i));
+            }
+            // Envelope = RMS over a sliding window of one fundamental period. NOT the
+            // peak: the peak of a sum of partials wanders with their phase relationship,
+            // so a "rising peak" is mostly luck about which window caught them aligned.
+            // RMS is stable for a steady tone whatever the phases do.
+            const int win = (int) std::lround (48000.0 / p->getNoteFrequency (60));
+            std::vector<float> env;
+            env.reserve (mono.size());
+            double acc2 = 0.0;
+            for (int k = 0; k < win && k < (int) mono.size(); ++k) acc2 += (double) mono[(size_t) k] * mono[(size_t) k];
+            for (size_t i = 0; i + (size_t) win < mono.size(); ++i)
+            {
+                env.push_back ((float) std::sqrt (acc2 / (double) win));
+                acc2 -= (double) mono[i] * mono[i];
+                acc2 += (double) mono[i + (size_t) win] * mono[i + (size_t) win];
+            }
+            float steady = 0.0f;
+            for (size_t i = env.size() / 2; i < env.size(); ++i) steady = std::max (steady, env[i]);
+            int to90 = -1;
+            for (size_t i = 0; i < env.size(); ++i)
+                if (env[i] >= steady * 0.9f) { to90 = (int) i; break; }
+            const double msTo90 = to90 < 0 ? 1.0e9 : (double) to90 / 48.0;
+            std::printf ("  cold note, attack 1 ms: reaches 90%% of level in %.2f ms\n", msTo90);
+            std::printf ("    envelope shape:");
+            for (double ms : { 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0 })
+            {
+                const size_t i = (size_t) (ms * 48.0);
+                if (i < env.size() && steady > 0.0f)
+                    std::printf ("  %gms=%.0f%%", ms, 100.0 * (double) env[i] / (double) steady);
+            }
+            std::printf ("\n");
+            check (msTo90 < 8.0, "a fresh note has no attack the envelope did not ask for");
+        }
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

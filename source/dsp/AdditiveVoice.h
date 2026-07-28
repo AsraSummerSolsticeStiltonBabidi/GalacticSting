@@ -135,7 +135,18 @@ public:
         // to ~9 dB louder than one on a fresh channel. Start at rest; genuine aftertouch
         // still swells in through notePressureChanged().
         pressureTarget = 0.0f;
-        if (! reuse) pressure = 0.0f;
+        if (! reuse)
+        {
+            pressure = 0.0f;
+            // ...but if the pressure that BELONGS to this note arrives with it (an MPE
+            // host sends it before the first block renders), take it immediately
+            // instead of gliding up to it. Gliding turned every fresh note into a
+            // 35%->100% swell over ~30 ms - an attack the envelope never asked for,
+            // most obvious when several notes are struck at once. The steady level is
+            // unchanged; only the ramp to it is gone. Anything arriving LATER is real
+            // aftertouch and still glides.
+            pressureSnap = true;
+        }
 
         fastKill = false;
         // A steal that interrupts a fast kill keeps the faded gain and ramps it back
@@ -187,7 +198,13 @@ public:
     }
 
     // Aftertouch is a gain term too: set the TARGET so a jumpy 7-bit stream glides.
-    void notePressureChanged() override  { pressureTarget = currentlyPlayingNote.pressure.asUnsignedFloat(); }
+    void notePressureChanged() override
+    {
+        pressureTarget = currentlyPlayingNote.pressure.asUnsignedFloat();
+        // Delivered together with the note-on (before its first block): that is this
+        // note's OWN starting pressure, not a gesture, so it applies at once.
+        if (pressureSnap) pressure = pressureTarget;
+    }
     void notePitchbendChanged() override {}
     void noteTimbreChanged() override    {}
     void noteKeyStateChanged() override  {}
@@ -409,14 +426,20 @@ public:
 
             prevN = n;
             engine.reportRendered (newN); // meter: the true (target) partial count
-        }
 
-        if (snapAmps)
-        {
-            for (int i = 0; i < n; ++i)               curAmp[(size_t) i] = tgtAmp[(size_t) i];
-            for (int i = n; i < activeCount; ++i)     curAmp[(size_t) i] = 0.0;
-            activeCount = n;
-            snapAmps = false;
+            // A cold note starts ON its target amplitudes - no fade-in. This MUST sit
+            // inside the block that fills tgtAmp: outside it, a first block with no
+            // usable template (none published yet, or f0 not resolved) consumed the
+            // flag against empty targets, and every later block then slewed up from
+            // silence - a ~15 ms fade-in on a note whose attack was set to 1 ms, worst
+            // when several notes are struck at once.
+            if (snapAmps)
+            {
+                for (int i = 0; i < n; ++i)           curAmp[(size_t) i] = tgtAmp[(size_t) i];
+                for (int i = n; i < activeCount; ++i) curAmp[(size_t) i] = 0.0;
+                activeCount = n;
+                snapAmps = false;
+            }
         }
 
         // Per-voice normalisation, recomputed PER SAMPLE from the amplitudes that are
@@ -543,6 +566,10 @@ public:
             }
         }
 
+        // The note has now rendered: any pressure arriving from here on is a real
+        // gesture during the note, so it glides rather than snapping.
+        pressureSnap = false;
+
         // Morph finished this block: adopt the coherent destination phases (the
         // crossfade already reached them) so the sustained note carries on exactly
         // like a freshly-played new spectrum, not a phase-drifted version.
@@ -596,6 +623,20 @@ private:
 
     void beginFastKill()
     {
+        // Nothing is sounding: there is no tail to fade, so DO NOT arm the fade.
+        // Arming it on an idle voice left fastKill stuck true for ever, because the
+        // synthesiser never renders an inactive voice and only the render loop can
+        // clear it. The next real note on that voice then saw fastKill and took the
+        // voice-STEAL path: amplitudes and velocity slewed up from zero instead of
+        // starting on target, i.e. a ~15 ms fade-in on every note however short the
+        // attack was set. turnOffAllVoices() hits every voice, and JUCE calls it on
+        // any zone-layout change - which happens as soon as the tuning mode is first
+        // applied - so in practice this affected the first note on all 32 voices.
+        if (! adsr.isActive())
+        {
+            finishNote();
+            return;
+        }
         constexpr double fadeSeconds = 0.005; // 5 ms
         const auto sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
         fastKill      = true;
@@ -671,6 +712,7 @@ private:
 
     float velocityLevel = 0.0f, velTarget = 0.0f;
     float pressure = 0.0f, pressureTarget = 0.0f;
+    bool  pressureSnap = false; // take the note's own initial pressure instantly (see noteStarted)
 
     bool  fastKill = false;
     float fastKillGain = 1.0f;
