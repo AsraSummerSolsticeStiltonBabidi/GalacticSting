@@ -5,16 +5,41 @@
 
 namespace spectrum
 {
-    static bool selectionPass (int k, Selection sel)
+    // The played harmonic k==N (the fundamental) is ALWAYS kept: otherwise, in
+    // Transposed mode, "Even" (2,4,6...) would be transposed down onto the fundamental
+    // and become an ordinary 1,2,3,4 series - i.e. IDENTICAL to "All" (even harmonics
+    // ARE a full series an octave up). Keeping the fundamental makes Even = fundamental
+    // + even (1,2,4,6...), a genuinely hollow, distinct timbre. Even N already keeps
+    // itself; the fix matters most for the default N=1.
+    static double juce_selClamp (float v)
+    { return v < (float) Selection::Even ? (double) Selection::Even
+           : v > (float) Selection::Prime ? (double) Selection::Prime : (double) v; }
+
+    static bool inSelectionSet (int k, int which)
     {
-        switch (sel)
+        switch (which)
         {
-            case Selection::All:   return true;
             case Selection::Even:  return (k % 2) == 0;
             case Selection::Odd:   return (k % 2) == 1;
             case Selection::Prime: return isPrime (k);
+            default:               return true;   // All
         }
-        return true;
+    }
+
+    // Continuous selector: whole values are the classic sets, values in between
+    // CROSSFADE them - a harmonic that is only in one of the two neighbouring sets
+    // comes in at partial amplitude, so the fader sweeps smoothly from Even through
+    // All and Odd to Prime instead of stepping.
+    static double selectionWeight (int k, int N, float sel)
+    {
+        if (k == N) return 1.0;   // the played harmonic is always kept
+        const double x  = (double) juce_selClamp (sel);
+        const int    lo = (int) std::floor (x);
+        const int    hi = std::min ((int) Selection::Prime, lo + 1);
+        const double t  = x - (double) lo;
+        const double a  = inSelectionSet (k, lo) ? 1.0 : 0.0;
+        const double b  = inSelectionSet (k, hi) ? 1.0 : 0.0;
+        return a + t * (b - a);
     }
 
     // Spectrum range: hard-cut every partial more than 2^N octaves above the played
@@ -80,7 +105,7 @@ namespace spectrum
 
         const double P     = std::max (1.0001, (double) s.timbrePeriod);
         const int    R     = std::max (1, s.timbrePeriodRepeats);
-        const int    L     = std::max (1, s.fractalLevel);
+        const int    L     = std::max (1, (int) std::lround ((double) s.fractalLevel));
         const double slope = (double) s.curveSlope;
         const double reach = (double) std::max (1, s.reach);
         const double floorLin = std::pow (10.0, (double) s.ampFloorDb / 20.0);
@@ -175,8 +200,81 @@ namespace spectrum
         return out;
     }
 
+    //==========================================================================
+    // Fractional fractality: blend the integer level below (lo) with the one above
+    // (hi). Partials present in BOTH crossfade their amplitudes; partials that only
+    // exist at the higher level enter progressively from LOW to HIGH ratio as the
+    // fraction rises (the newest one ramps in, so nothing pops); lo-only partials
+    // fade out. At t=0 this is exactly lo, at t=1 exactly hi.
+    static SpectrumTemplate blendFractalTemplates (const SpectrumTemplate& lo,
+                                                   const SpectrumTemplate& hi,
+                                                   double t, const SpectrumSettings& s)
+    {
+        if (lo.partials.empty()) return hi;
+        if (hi.partials.empty()) return lo;
+
+        // Match partials across levels by quantised cents (~1 c).
+        const auto key = [] (float r)
+        { return (long long) std::llround (1200.0 * std::log2 (std::max (1.0e-9, (double) r))); };
+
+        std::unordered_map<long long, double> loAmp;
+        loAmp.reserve (lo.partials.size() * 2);
+        for (const auto& p : lo.partials) loAmp[key (p.ratio)] += (double) p.amp;
+
+        std::vector<Partial> parts, fresh;
+        parts.reserve (hi.partials.size() + lo.partials.size());
+        std::unordered_map<long long, char> inHi;
+        inHi.reserve (hi.partials.size() * 2);
+
+        for (const auto& p : hi.partials)
+        {
+            const auto k = key (p.ratio);
+            inHi[k] = 1;
+            const auto it = loAmp.find (k);
+            if (it != loAmp.end())
+                parts.push_back ({ p.ratio, (float) (it->second + t * ((double) p.amp - it->second)) });
+            else
+                fresh.push_back (p);
+        }
+        for (const auto& p : lo.partials)
+            if (inHi.find (key (p.ratio)) == inHi.end())
+                parts.push_back ({ p.ratio, (float) ((double) p.amp * (1.0 - t)) });
+
+        std::sort (fresh.begin(), fresh.end(),
+                   [] (const Partial& a, const Partial& b) { return a.ratio < b.ratio; });
+        const double pos = t * (double) fresh.size(); // low->high entry, newest ramps in
+        for (size_t i = 0; i < fresh.size(); ++i)
+        {
+            const double w = std::min (1.0, pos - (double) i);
+            if (w <= 0.0) break;
+            parts.push_back ({ fresh[i].ratio, (float) ((double) fresh[i].amp * w) });
+        }
+
+        SpectrumTemplate out;
+        out.truncated = lo.truncated || hi.truncated;
+        finalisePartials (parts, s, out); // cap + sort + RMS-normalise + moves into out
+        return out;
+    }
+
     SpectrumTemplate compileSpectrum (const SpectrumSettings& s, const std::atomic<bool>* abort)
     {
+        // Decimal fractal level -> compile the two neighbouring integer levels and blend.
+        {
+            const double Lf  = std::min (8.0, std::max (1.0, (double) s.fractalLevel));
+            const int    Llo = (int) std::floor (Lf);
+            const double t   = Lf - (double) Llo;
+            if (t > 1.0e-3)
+            {
+                SpectrumSettings a = s, b = s;
+                a.fractalLevel = (float) Llo;
+                b.fractalLevel = (float) (Llo + 1);
+                const auto tLo = compileSpectrum (a, abort);
+                const auto tHi = compileSpectrum (b, abort);
+                if (abort != nullptr && abort->load (std::memory_order_relaxed)) return {};
+                return blendFractalTemplates (tLo, tHi, t, s);
+            }
+        }
+
         if (s.source == Source::ScalaTimbre)
             return compileScalaTimbre (s, abort);
 
@@ -188,7 +286,7 @@ namespace spectrum
         };
 
         const int N = std::max (1, s.baseN);
-        const int L = std::max (1, s.fractalLevel);
+        const int L = std::max (1, (int) std::lround ((double) s.fractalLevel));
 
         // Generate up to `kSpectrumReach` in final ratio (relative to the played note)
         // so the spectrum reaches past the audible ceiling for the whole musical range;
@@ -214,13 +312,32 @@ namespace spectrum
         std::vector<std::pair<int, double>> base; // (harmonic number k, amplitude), ascending in k
         base.reserve ((size_t) (Kmax - N + 1));
 
+        std::vector<double> selW; // selection weight (1, 0, or a blend in between)
+        selW.reserve ((size_t) (Kmax - N + 1));
+        // How far between this prime-limit stop and the NEXT (narrower) one the fader
+        // sits: 0 = exactly on this stop, 1 = on the next. In between, a harmonic the
+        // next stop would remove is still there but fading down - so the fader sweeps
+        // continuously instead of jumping from one prime limit to the next.
+        const double primeMix = std::min (1.0, std::max (0.0, (double) s.primeLimitPos - std::floor ((double) s.primeLimitPos)));
         for (int k = N; k <= Kmax; ++k)
         {
-            if (! selectionPass (k, s.selection))   continue;
-            const bool primeOk = s.primeUseWhitelist ? primeWhitelistOk (k, s.primeWhitelistMask)
-                                                      : primeLimitOk (k, s.primeLimit);
-            if (! primeOk) continue;
+            const double wSel = selectionWeight (k, N, s.selection);
+            if (wSel <= 1.0e-6) continue;
+            double wPrime = 1.0;
+            if (s.primeUseWhitelist)
+            {
+                if (! primeWhitelistOk (k, s.primeWhitelistMask)) continue;
+            }
+            else
+            {
+                if (! primeLimitOk (k, s.primeLimit)) continue;      // this stop already vetoes it
+                if (primeMix > 1.0e-6 && s.primeLimitNext != s.primeLimit
+                    && ! primeLimitOk (k, s.primeLimitNext))
+                    wPrime = 1.0 - primeMix;                          // the NEXT stop drops it: fade
+            }
+            if (wPrime <= 1.0e-6) continue;
             base.emplace_back (k, 0.0);
+            selW.push_back (wSel * wPrime);
         }
 
         if (base.empty())
@@ -231,9 +348,12 @@ namespace spectrum
         // Stage D: amplitude curve, relative to the LOWEST present harmonic so the
         // played-pitch partial is always the reference (amp 1) and the roll-off fills
         // the band. This makes a higher base sound richer (more partials under the same
-        // envelope), not quieter.
-        for (auto& b : base)
-            b.second = std::pow ((double) b.first / (double) kMin, - (double) s.curveSlope);
+        // envelope), not quieter. The selection weight rides on top of it, so a
+        // half-way Harmonics setting fades its extra harmonics in instead of adding
+        // them at once.
+        for (size_t i = 0; i < base.size(); ++i)
+            base[i].second = std::pow ((double) base[i].first / (double) kMin, - (double) s.curveSlope)
+                           * selW[i];
 
         // Ratio->partial mapping. Ratio relative to the played note:
         //   Transposed : R = kappa / (N * kMin^(L-1)) -> lowest partial at kMin/N (played pitch)
@@ -329,6 +449,71 @@ namespace spectrum
             for (const auto& p : parts) minRatio = std::min (minRatio, (double) p.ratio);
             if (minRatio > 0.0)
                 for (auto& p : parts) p.ratio = (float) ((double) p.ratio / minRatio);
+        }
+
+        // TEMPER mode: snap every harmonic-engine partial onto the loaded scale's
+        // pitch grid (degree * period^k, nearest in log-frequency) - the engine keeps
+        // generating structure while the .scl decides where partials may sit.
+        if (s.temperToTimbre && ! s.timbreDegrees.empty() && s.timbrePeriod > 1.0001f && ! parts.empty())
+        {
+            // Work in LOG space with a sorted grid: one binary search per partial
+            // instead of a 3xD scan with a log() per candidate (a 200-degree scale
+            // over thousands of partials used to add seconds to every rebuild).
+            const double logPer = std::log ((double) s.timbrePeriod);
+            std::vector<double> logDeg;
+            logDeg.reserve (s.timbreDegrees.size());
+            for (const float dg : s.timbreDegrees)
+                if (dg > 0.0f) logDeg.push_back (std::log ((double) dg));
+            std::sort (logDeg.begin(), logDeg.end());
+            // Fold every degree into [0, logPer) so the grid is periodic and complete.
+            for (auto& l : logDeg) l -= logPer * std::floor (l / logPer);
+            std::sort (logDeg.begin(), logDeg.end());
+            logDeg.erase (std::unique (logDeg.begin(), logDeg.end(),
+                                       [] (double a, double b) { return std::abs (a - b) < 1.0e-9; }),
+                          logDeg.end());
+
+            if (! logDeg.empty())
+            {
+                int tick = 0;
+                for (auto& p : parts)
+                {
+                    if ((++tick & 4095) == 0 && aborted()) return {};
+                    const double r = (double) p.ratio;
+                    if (! (r > 0.0)) continue;
+                    const double lr = std::log (r);
+                    const double k  = std::floor (lr / logPer);
+                    const double x  = lr - k * logPer;             // position inside the period
+                    // Nearest grid point: the two neighbours of x, plus the wrapped
+                    // ends (first degree of the next period / last of this one).
+                    const auto it = std::lower_bound (logDeg.begin(), logDeg.end(), x);
+                    double best = 0.0, bestErr = 1.0e30;
+                    const auto consider = [&] (double cand)
+                    { const double e = std::abs (cand - lr); if (e < bestErr) { bestErr = e; best = cand; } };
+                    if (it != logDeg.end())    consider (k * logPer + *it);
+                    if (it != logDeg.begin())  consider (k * logPer + *(it - 1));
+                    consider ((k + 1.0) * logPer + logDeg.front());
+                    consider ((k - 1.0) * logPer + logDeg.back());
+                    p.ratio = (float) std::exp (best);
+                }
+            }
+
+            // Snapping can land several partials on the same grid point: merge them
+            // (amp-sum, the same 0.5 c convention as the other coincidence paths) so
+            // Aligned phase does not stack coherent duplicates past the RMS model and
+            // the partial meter counts distinct frequencies.
+            std::sort (parts.begin(), parts.end(),
+                       [] (const Partial& a, const Partial& b) { return a.ratio < b.ratio; });
+            std::vector<Partial> merged;
+            merged.reserve (parts.size());
+            for (const auto& p : parts)
+            {
+                if (! merged.empty()
+                    && std::abs (1200.0 * std::log2 ((double) p.ratio / (double) merged.back().ratio)) < 0.5)
+                    merged.back().amp += p.amp;
+                else
+                    merged.push_back (p);
+            }
+            parts = std::move (merged);
         }
 
         applyRangeCut (parts, s); // hard spectrum-range cut, relative to the played pitch

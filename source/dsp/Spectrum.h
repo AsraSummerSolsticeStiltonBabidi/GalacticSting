@@ -27,7 +27,11 @@ namespace spectrum
     // Nyquist cull keeps the actually-rendered count much lower.
     inline constexpr int kMaxPartials = 16384;
 
-    enum class Selection { All = 0, Even = 1, Odd = 2, Prime = 3 };
+    // Harmonics selector, now a CONTINUOUS axis: Even - All - Odd - Prime. Whole
+    // values are the four classic sets; anything in between blends the two it sits
+    // between, so a harmonic that belongs to only one of them fades in or out
+    // instead of switching. (Plain enum: it converts to the float axis directly.)
+    enum Selection { Even = 0, All = 1, Odd = 2, Prime = 3 };
 
     // Where the partials come from:
     //   Harmonic    - the integer-harmonic engine (base-N, selection, prime, fractal).
@@ -61,12 +65,17 @@ namespace spectrum
         int       baseN         = 1;                 // played note = harmonic N of implied f0
         BaseMode  baseMode      = BaseMode::Transposed; // how N maps to frequency (see BaseMode)
         int       reach         = kSpectrumReach;    // top ratio generated (internal; not a UI knob)
-        Selection selection     = Selection::All;
+        float     selection     = (float) Selection::All; // 0=Even 1=All 2=Odd 3=Prime (blended in between)
         float     curveSlope    = 1.0f;              // s in (k/kMin)^(-s); 1 -> saw-type roll-off
         int       primeLimit    = 0;                 // 0 = off, else largest prime allowed
+        // Continuous prime limit: the position on the Off - 23 - 19 ... - 2 fader.
+        // A whole value is one of those limits; in between, the harmonics that the
+        // NEXT (narrower) limit would remove fade down instead of vanishing.
+        float     primeLimitPos = 0.0f;
+        int       primeLimitNext = 0;                // the limit at the next stop (0 = same)
         bool      primeUseWhitelist = false;         // true -> use the whitelist instead of the limit
         unsigned  primeWhitelistMask = 0xFFFFFFFFu;  // which listed primes are allowed
-        int       fractalLevel  = 1;                 // 1 = normal, 2, 3, ...
+        float     fractalLevel  = 1.0f;              // 1 = off .. 4; decimals blend in the next level's new partials LOW to HIGH
         float     ampFloorDb    = -120.0f;           // partials below this (rel. to max) are dropped
         int       maxPartials   = kMaxPartials;      // safety cap (keep loudest)
         int       spectrumRangeOct = 10;             // hard-cut partials above 2^this x the played pitch (10 = full)
@@ -76,6 +85,9 @@ namespace spectrum
         std::vector<float> timbreDegrees;            // scale degree ratios (index 0 = 1.0)
         float              timbrePeriod = 2.0f;      // period ratio (e.g. 2/1)
         int                timbrePeriodRepeats = 3;  // how many periods stack into the timbre
+        // Temper mode: the HARMONIC engine's partials are snapped onto the loaded
+        // scale's pitch grid (degree * period^k) - both engines work together.
+        bool               temperToTimbre = false;
 
         bool operator== (const SpectrumSettings& o) const
         {
@@ -85,6 +97,8 @@ namespace spectrum
                 && selection == o.selection
                 && curveSlope == o.curveSlope
                 && primeLimit == o.primeLimit
+                && primeLimitPos == o.primeLimitPos
+                && primeLimitNext == o.primeLimitNext
                 && primeUseWhitelist == o.primeUseWhitelist
                 && primeWhitelistMask == o.primeWhitelistMask
                 && fractalLevel == o.fractalLevel
@@ -94,6 +108,7 @@ namespace spectrum
                 && source == o.source
                 && timbrePeriod == o.timbrePeriod
                 && timbrePeriodRepeats == o.timbrePeriodRepeats
+                && temperToTimbre == o.temperToTimbre
                 && timbreDegrees == o.timbreDegrees;
         }
         bool operator!= (const SpectrumSettings& o) const { return ! (*this == o); }

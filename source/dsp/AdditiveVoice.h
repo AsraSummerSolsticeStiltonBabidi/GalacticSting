@@ -25,6 +25,7 @@
 
 #include "Spectrum.h"
 #include "SpectrumEngine.h"
+#include "CurvedEnv.h"
 #include "SineTable.h"
 #include "TuningManager.h"
 
@@ -58,6 +59,16 @@ public:
         pSustainParam= apvts.getRawParameterValue ("pitchSustain");
         pReleaseParam= apvts.getRawParameterValue ("pitchRelease");
 
+        ampCurveA = apvts.getRawParameterValue ("ampCurveA");
+        ampCurveD = apvts.getRawParameterValue ("ampCurveD");
+        ampCurveR = apvts.getRawParameterValue ("ampCurveR");
+        filtCurveA = apvts.getRawParameterValue ("filterCurveA");
+        filtCurveD = apvts.getRawParameterValue ("filterCurveD");
+        filtCurveR = apvts.getRawParameterValue ("filterCurveR");
+        pitchCurveA = apvts.getRawParameterValue ("pitchCurveA");
+        pitchCurveD = apvts.getRawParameterValue ("pitchCurveD");
+        pitchCurveR = apvts.getRawParameterValue ("pitchCurveR");
+
         morphParam     = apvts.getRawParameterValue ("morph");
         morphTimeParam = apvts.getRawParameterValue ("morphTime");
 
@@ -70,6 +81,13 @@ public:
         // An MTS-ESP master may leave this key unmapped -> it must not sound.
         if (tuning.shouldFilterNote ((int) currentlyPlayingNote.initialNote))
         {
+            // If this note-on was a STEAL, the voice is still rendering the previous
+            // note. clearCurrentNote() alone only tells the synthesiser we are free -
+            // the envelope stays active, so renderNextBlock keeps producing sound for
+            // a note nobody owns any more and no note-off can ever reach: a permanent
+            // drone. Fade it out properly instead.
+            if (adsr.isActive() || fastKill) beginFastKill();
+            else                             finishNote();
             clearCurrentNote();
             return;
         }
@@ -104,16 +122,36 @@ public:
             }
         }
 
-        velocityLevel = 0.10f + 0.90f * currentlyPlayingNote.noteOnVelocity.asUnsignedFloat();
+        // Velocity and pressure are GAIN terms, so on a steal they must glide like the
+        // amplitudes do: assigning them outright stepped the output by up to ~15 dB
+        // (velocity) or ~9 dB (pressure) in a single sample - exactly the click this
+        // reuse path exists to avoid. On a cold start the envelope begins at zero, so
+        // there they are set directly.
+        velTarget = 0.10f + 0.90f * currentlyPlayingNote.noteOnVelocity.asUnsignedFloat();
+        if (! reuse) velocityLevel = velTarget;
         // Do NOT seed from currentlyPlayingNote.pressure: under enableLegacyMode() JUCE
         // returns the CHANNEL'S sticky last-received aftertouch, which legacy mode never
         // resets on note-off - so a note on an aftertouch-touched channel would start up
         // to ~9 dB louder than one on a fresh channel. Start at rest; genuine aftertouch
         // still swells in through notePressureChanged().
-        pressure      = 0.0f;
+        pressureTarget = 0.0f;
+        if (! reuse)
+        {
+            pressure = 0.0f;
+            // ...but if the pressure that BELONGS to this note arrives with it (an MPE
+            // host sends it before the first block renders), take it immediately
+            // instead of gliding up to it. Gliding turned every fresh note into a
+            // 35%->100% swell over ~30 ms - an attack the envelope never asked for,
+            // most obvious when several notes are struck at once. The steady level is
+            // unchanged; only the ramp to it is gone. Anything arriving LATER is real
+            // aftertouch and still glides.
+            pressureSnap = true;
+        }
 
-        fastKill     = false;
-        fastKillGain = 1.0f;
+        fastKill = false;
+        // A steal that interrupts a fast kill keeps the faded gain and ramps it back
+        // up with the same slew (jumping straight to 1 was a second step).
+        if (! reuse) fastKillGain = 1.0f;
         snapAmps     = ! reuse; // cold: snap amps to the template; reuse: slew them (no jump)
         releasing    = false;   // fresh note: parameter re-apply is allowed again
 
@@ -128,13 +166,19 @@ public:
         // spectrum, then snap abruptly when the stale morph finishes. prevN=0 also makes
         // the first block cleanly SNAP curRatio onto the current template (a frequency
         // snap with continuous phase = click-free) instead of gliding from a stale ratio.
-        morphActive = false; morphPos = 1.0; prevN = 0;
+        morphActive = false; morphPos = 1.0; prevN = 0; morphWeight = 0.0;
 
         const double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
         updateAdsrParameters();
         adsr.setSampleRate (sr);
         if (! reuse) adsr.reset(); // cold: start from silence; reuse: keep the envelope continuous
-        adsr.noteOn();             // reuse: re-attacks from the CURRENT level -> no step
+        // The comment here always CLAIMED the reuse case re-attacks from the current
+        // level, but noteOn() zeroed it unconditionally - so a steal dropped the amp
+        // to silence in one sample, which is the click the whole reuse path exists to
+        // avoid. Only the AMP envelope does this: handing `reuse` to the filter
+        // envelope would let a stolen voice inherit filterEnvValue ~1 (its sustain
+        // defaults to 1.0) and skip its sweep entirely.
+        adsr.noteOn (reuse);
 
         updateFilterAdsrParameters();
         filterAdsr.setSampleRate (sr);
@@ -153,7 +197,14 @@ public:
         else              beginFastKill();
     }
 
-    void notePressureChanged() override  { pressure = currentlyPlayingNote.pressure.asUnsignedFloat(); }
+    // Aftertouch is a gain term too: set the TARGET so a jumpy 7-bit stream glides.
+    void notePressureChanged() override
+    {
+        pressureTarget = currentlyPlayingNote.pressure.asUnsignedFloat();
+        // Delivered together with the note-on (before its first block): that is this
+        // note's OWN starting pressure, not a gesture, so it applies at once.
+        if (pressureSnap) pressure = pressureTarget;
+    }
     void notePitchbendChanged() override {}
     void noteTimbreChanged() override    {}
     void noteKeyStateChanged() override  {}
@@ -168,11 +219,8 @@ public:
             filterAdsr.setSampleRate (sr);
             pitchAdsr.setSampleRate (sr);
             filter.prepare ({ sr, 8192, 1 });
-            // The ADSR rates are sample-rate dependent, so force a re-apply on the
-            // next block instead of skipping it as an unchanged parameter set.
-            ampParamsApplied  = { -1.0f, -1.0f, -1.0f, -1.0f };
-            filtParamsApplied = { -1.0f, -1.0f, -1.0f, -1.0f };
-            pitchParamsApplied= { -1.0f, -1.0f, -1.0f, -1.0f };
+            // CurvedEnv works in SECONDS, so a sample-rate change needs no re-apply
+            // dance: the times are already right, only its sample rate had to change.
         }
     }
 
@@ -192,7 +240,11 @@ public:
         // Pitch env: amount (semitones) * the envelope value [0..1], evaluated once
         // per block (like the filter cutoff) - the env itself advances per sample.
         int n = 0;
-        double morphW = 0.0; // 0..1 crossfade weight from running phases -> coherent alignPhase
+        // 0..1 crossfade weight from the running phases -> the coherent alignPhase.
+        // It is a MEMBER and only ever rises while a note sounds: restarting the
+        // morph clock (which now happens on every new template - see below) must
+        // never drop it, because a falling weight is a per-partial waveform step.
+        double& morphW = morphWeight;
         const auto* tmpl = engine.getLive();
         const double baseFreq = tuning.frequencyForNote ((int) currentlyPlayingNote.initialNote);
         const double pitchEnvSemis = (double) pEnvAmtParam->load() * (double) pitchEnvValue;
@@ -272,19 +324,59 @@ public:
                     }
                     for (int j = 0; j < hi; ++j)
                         curRatio[(size_t) j] = std::exp2 (morphStartLog[(size_t) j]);
-                    morphN = hi; morphPos = 0.0; morphActive = true;
+
+                    // A change arriving MID-MORPH must not restart the phase crossfade:
+                    // its weight would collapse from ~1 back to 0 in one sample, which
+                    // is a per-partial waveform step. The output at that instant already
+                    // sits on the aligned reference, so adopt it as the running phase and
+                    // continue the crossfade from where it is.
+                    const bool wasMorphing = morphActive;
+                    bool adoptedAlign = false;
+                    if (wasMorphing)
+                    {
+                        if (morphWeight > 0.5)
+                        {
+                            for (int j = 0; j < hi; ++j) phase[(size_t) j] = alignPhase[(size_t) j];
+                            adoptedAlign = true;
+                        }
+                    }
+                    else
+                    {
+                        // A morph that ENDED left morphWeight pinned at 1, so the next
+                        // one started fully crossfaded onto the destination-phase
+                        // oscillator: the glide was inaudible and the waveform jumped
+                        // in a single sample. Every fresh morph starts from the running
+                        // phases again.
+                        morphWeight = 0.0;
+                    }
+                    morphN = hi; morphActive = true;
+                    // EVERY new target restarts the glide clock. Keeping the old
+                    // morphPos was what made a continuous move (a knob drag, or a
+                    // modulator: both re-emit a template ~60x a second) degenerate
+                    // into a staircase - once morphPos had run up to ~1, each new
+                    // template was applied at full strength immediately, i.e. a hard
+                    // snap per rebuild. morphStartLog below is re-aimed from where the
+                    // partials ACTUALLY are, so restarting the clock is seamless.
+                    morphPos = 0.0;
 
                     // Coherent phase reference for the DESTINATION (as if the new
                     // spectrum were freshly played now); the audio crossfades from the
                     // current running phases to this over the morph, so the note ends
                     // phase-coherent (a real pulse in Aligned mode) instead of a drifted
                     // smear. Without this the sustain after a morph sounds "wrong".
-                    const bool alg = phaseModeParam->load() < 0.5f;
-                    for (int j = 0; j < hi; ++j)
+                    // NOT re-seeded when we just adopted alignPhase as the running
+                    // phase above: re-seeding it there would move the very phase the
+                    // output has just been handed, which is a waveform step on every
+                    // template change - i.e. ~60 of them a second during a knob drag.
+                    if (! adoptedAlign)
                     {
-                        if (alg) alignPhase[(size_t) j] = 0.25;
-                        else { const double h = std::sin ((double) j * 12.9898) * 43758.5453;
-                               alignPhase[(size_t) j] = h - std::floor (h); }
+                        const bool alg = phaseModeParam->load() < 0.5f;
+                        for (int j = 0; j < hi; ++j)
+                        {
+                            if (alg) alignPhase[(size_t) j] = 0.25;
+                            else { const double h = std::sin ((double) j * 12.9898) * 43758.5453;
+                                   alignPhase[(size_t) j] = h - std::floor (h); }
+                        }
                     }
                 }
                 else
@@ -300,7 +392,7 @@ public:
                 // Phase-lock PROGRESSIVELY across the WHOLE morph (gentle ease-in that
                 // reaches perfect coherence exactly at the end - the Morph Time), so the
                 // pulse comes into phase very gradually rather than snapping near the end.
-                morphW = t * t; // quadratic ease-in across the whole morph (very gradual)
+                morphW = std::max (morphW, t * t); // ease-in, never falls back (see the declaration)
                 for (int j = 0; j < morphN; ++j)
                     curRatio[(size_t) j] = std::exp2 (morphStartLog[(size_t) j]
                                             + (morphTgtLog[(size_t) j] - morphStartLog[(size_t) j]) * t);
@@ -334,14 +426,20 @@ public:
 
             prevN = n;
             engine.reportRendered (newN); // meter: the true (target) partial count
-        }
 
-        if (snapAmps)
-        {
-            for (int i = 0; i < n; ++i)               curAmp[(size_t) i] = tgtAmp[(size_t) i];
-            for (int i = n; i < activeCount; ++i)     curAmp[(size_t) i] = 0.0;
-            activeCount = n;
-            snapAmps = false;
+            // A cold note starts ON its target amplitudes - no fade-in. This MUST sit
+            // inside the block that fills tgtAmp: outside it, a first block with no
+            // usable template (none published yet, or f0 not resolved) consumed the
+            // flag against empty targets, and every later block then slewed up from
+            // silence - a ~15 ms fade-in on a note whose attack was set to 1 ms, worst
+            // when several notes are struck at once.
+            if (snapAmps)
+            {
+                for (int i = 0; i < n; ++i)           curAmp[(size_t) i] = tgtAmp[(size_t) i];
+                for (int i = n; i < activeCount; ++i) curAmp[(size_t) i] = 0.0;
+                activeCount = n;
+                snapAmps = false;
+            }
         }
 
         // Per-voice normalisation, recomputed PER SAMPLE from the amplitudes that are
@@ -355,7 +453,15 @@ public:
         // tracked with two scalar multiplies per sample - no O(n) re-sum, no lag, no clip.
         const int    span = std::max (n, activeCount);
         const double sr   = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
-        const double slew         = 1.0 - std::exp (-1.0 / (0.007 * sr));
+        // AMPLITUDES glide over the Morph Time too. This used to be a hardcoded 7 ms
+        // whatever Morph said, so only the partial FREQUENCIES ever glided: the whole
+        // loudness/timbre profile still arrived in 7 ms and a big Base jump read as a
+        // step followed by a sweep. With Morph off, the 7 ms stays - it is the
+        // click-free minimum, not a glide.
+        const double ampGlideSec = (morphActive && morphTimeParam != nullptr)
+                                 ? std::max (0.007, (double) morphTimeParam->load())
+                                 : 0.007;
+        const double slew         = 1.0 - std::exp (-1.0 / (ampGlideSec * sr));
         const double oneMinusSlew = 1.0 - slew;
         double sumCur0 = 0.0, sumTarget = 0.0, sumTargetSq = 0.0, coefA = 0.0, coefB = 0.0;
         for (int i = 0; i < span; ++i)
@@ -379,19 +485,27 @@ public:
         // Filter cutoff TRACKS the played note: cutoff = f0 * 2^(cents/1200 + envOct).
         // Cents (not Hz) means the same INTERVAL above every note -> the same
         // partials are cut regardless of pitch (a partial at ratio r sits at
-        // 1200*log2(r) cents). Updated per block; the env advances every sample.
+        // 1200*log2(r) cents). Refreshed every kCutoffChunk samples, NOT once per
+        // block: at a 512-sample buffer a 5 ms filter envelope (or an LFO on the
+        // cutoff) was never actually rendered, and the sound depended on the host's
+        // buffer size.
+        constexpr int kCutoffChunk = 32;
+        int sinceCutoff = kCutoffChunk;
+        const auto refreshCutoff = [&]
         {
             const double octs = (double) fCutoffParam->load() / 1200.0
                               + (double) fEnvAmtParam->load() * (double) filterEnvValue;
             const double co = f0 * std::exp2 (octs);
             filter.setCutoffFrequency ((float) juce::jlimit (20.0, 0.49 * sr, co));
             filter.setResonance (juce::jlimit (0.1f, 40.0f, fResParam->load()));
-        }
+        };
+        refreshCutoff();
 
         const int    numChannels = output.getNumChannels();
 
         while (--numSamples >= 0)
         {
+            if (--sinceCutoff <= 0) { refreshCutoff(); sinceCutoff = kCutoffChunk; }
             // Exact per-sample normalisation from the closed-form running sums (no lag).
             rk *= oneMinusSlew;
             const double sumCur = sumTarget   + (sumCur0 - sumTarget) * rk;
@@ -421,8 +535,15 @@ public:
                 acc += curAmp[(size_t) i] * s;
             }
 
+            // Velocity / pressure / the fast-kill recovery glide with the same ~7 ms
+            // constant as the amplitudes, so a stolen voice hands over without a step.
+            velocityLevel += (velTarget      - velocityLevel) * (float) slew;
+            pressure      += (pressureTarget - pressure)      * (float) slew;
+            if (! fastKill && fastKillGain < 1.0f)
+                fastKillGain += (1.0f - fastKillGain) * (float) slew;
+
             const float env    = adsr.getNextSample();
-            const float killG  = fastKill ? fastKillGain : 1.0f;
+            const float killG  = fastKillGain; // 1 normally; fading out, or ramping back after a steal
             const float gain   = env * killG * velocityLevel * (0.35f + 0.65f * pressure) * normGain;
             const float s      = filter.processSample (0, (float) acc * gain);
             filterEnvValue     = filterAdsr.getNextSample();
@@ -444,6 +565,10 @@ public:
                 break;
             }
         }
+
+        // The note has now rendered: any pressure arriving from here on is a real
+        // gesture during the note, so it glides rather than snapping.
+        pressureSnap = false;
 
         // Morph finished this block: adopt the coherent destination phases (the
         // crossfade already reached them) so the sustained note carries on exactly
@@ -475,59 +600,43 @@ private:
     //   2. change detection - even before release, only re-apply when a value
     //      actually changed, so we never touch the envelope needlessly.
     // (JUCE's own docs: "Do not change the parameters during playback.")
-    static bool paramsEqual (const juce::ADSR::Parameters& a, const juce::ADSR::Parameters& b) noexcept
-    {
-        return a.attack == b.attack && a.decay == b.decay
-            && a.sustain == b.sustain && a.release == b.release;
-    }
-
     void updateAdsrParameters()
     {
         if (releasing) return; // never disturb a release tail's rate
-        juce::ADSR::Parameters p;
-        p.attack  = attackParam->load();
-        p.decay   = decayParam->load();
-        p.sustain = sustainParam->load();
-        p.release = releaseParam->load();
-        if (! paramsEqual (p, ampParamsApplied))
-        {
-            ampParamsApplied = p;
-            adsr.setParameters (p);
-        }
+        adsr.setParameters (attackParam->load(), decayParam->load(), sustainParam->load(),
+                            releaseParam->load(), ampCurveA->load(), ampCurveD->load(), ampCurveR->load());
     }
 
     void updateFilterAdsrParameters()
     {
-        if (releasing) return; // never disturb a release tail's rate
-        juce::ADSR::Parameters p;
-        p.attack  = fAttackParam->load();
-        p.decay   = fDecayParam->load();
-        p.sustain = fSustainParam->load();
-        p.release = fReleaseParam->load();
-        if (! paramsEqual (p, filtParamsApplied))
-        {
-            filtParamsApplied = p;
-            filterAdsr.setParameters (p);
-        }
+        if (releasing) return;
+        filterAdsr.setParameters (fAttackParam->load(), fDecayParam->load(), fSustainParam->load(),
+                                  fReleaseParam->load(), filtCurveA->load(), filtCurveD->load(), filtCurveR->load());
     }
 
     void updatePitchAdsrParameters()
     {
-        if (releasing) return; // never disturb a release tail's rate
-        juce::ADSR::Parameters p;
-        p.attack  = pAttackParam->load();
-        p.decay   = pDecayParam->load();
-        p.sustain = pSustainParam->load();
-        p.release = pReleaseParam->load();
-        if (! paramsEqual (p, pitchParamsApplied))
-        {
-            pitchParamsApplied = p;
-            pitchAdsr.setParameters (p);
-        }
+        if (releasing) return;
+        pitchAdsr.setParameters (pAttackParam->load(), pDecayParam->load(), pSustainParam->load(),
+                                 pReleaseParam->load(), pitchCurveA->load(), pitchCurveD->load(), pitchCurveR->load());
     }
 
     void beginFastKill()
     {
+        // Nothing is sounding: there is no tail to fade, so DO NOT arm the fade.
+        // Arming it on an idle voice left fastKill stuck true for ever, because the
+        // synthesiser never renders an inactive voice and only the render loop can
+        // clear it. The next real note on that voice then saw fastKill and took the
+        // voice-STEAL path: amplitudes and velocity slewed up from zero instead of
+        // starting on target, i.e. a ~15 ms fade-in on every note however short the
+        // attack was set. turnOffAllVoices() hits every voice, and JUCE calls it on
+        // any zone-layout change - which happens as soon as the tuning mode is first
+        // applied - so in practice this affected the first note on all 32 voices.
+        if (! adsr.isActive())
+        {
+            finishNote();
+            return;
+        }
         constexpr double fadeSeconds = 0.005; // 5 ms
         const auto sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
         fastKill      = true;
@@ -567,15 +676,15 @@ private:
     std::atomic<float>* pDecayParam    = nullptr;
     std::atomic<float>* pSustainParam  = nullptr;
     std::atomic<float>* pReleaseParam  = nullptr;
+    std::atomic<float>* ampCurveA = nullptr, * ampCurveD = nullptr, * ampCurveR = nullptr;
+    std::atomic<float>* filtCurveA = nullptr, * filtCurveD = nullptr, * filtCurveR = nullptr;
+    std::atomic<float>* pitchCurveA = nullptr, * pitchCurveD = nullptr, * pitchCurveR = nullptr;
     std::atomic<float>* morphParam     = nullptr;
     std::atomic<float>* morphTimeParam = nullptr;
 
-    juce::ADSR adsr, filterAdsr, pitchAdsr;
+    spectrum::CurvedEnv adsr, filterAdsr, pitchAdsr; // per-segment curves (see CurvedEnv.h)
     // Last parameters actually pushed to each ADSR (sentinel = force first apply).
     // See updateAdsrParameters() for why we gate on change.
-    juce::ADSR::Parameters ampParamsApplied   { -1.0f, -1.0f, -1.0f, -1.0f };
-    juce::ADSR::Parameters filtParamsApplied  { -1.0f, -1.0f, -1.0f, -1.0f };
-    juce::ADSR::Parameters pitchParamsApplied { -1.0f, -1.0f, -1.0f, -1.0f };
     juce::dsp::StateVariableTPTFilter<float> filter;
     float filterEnvValue = 0.0f;
     float pitchEnvValue   = 0.0f;
@@ -587,6 +696,7 @@ private:
     std::array<double, spectrum::kMaxPartials> curRatio      {}; // current (gliding) ratio per partial
     std::array<double, spectrum::kMaxPartials> morphStartLog {}; // log2 start ratio during a morph
     std::array<double, spectrum::kMaxPartials> morphTgtLog   {}; // log2 target ratio during a morph
+    double morphWeight = 0.0; // see the reference bound to it in renderNextBlock
     std::array<double, spectrum::kMaxPartials> alignPhase    {}; // coherent destination phase (morph crossfade)
     std::array<double, spectrum::kMaxPartials> alignInc      {}; // destination-frequency increment for alignPhase
 
@@ -600,8 +710,9 @@ private:
     bool  snapAmps    = true;  // snap amps to target this block (cold note start)
     float normGain    = 1.0f;  // per-voice normalisation gain (recomputed per sample)
 
-    float velocityLevel = 0.0f;
-    float pressure = 0.0f;
+    float velocityLevel = 0.0f, velTarget = 0.0f;
+    float pressure = 0.0f, pressureTarget = 0.0f;
+    bool  pressureSnap = false; // take the note's own initial pressure instantly (see noteStarted)
 
     bool  fastKill = false;
     float fastKillGain = 1.0f;

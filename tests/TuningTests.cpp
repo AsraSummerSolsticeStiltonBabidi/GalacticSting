@@ -211,6 +211,18 @@ int main()
         check (! TuningManager::parsePeriodSpec ("abc", r, line), "garbage rejected");
         check (! TuningManager::parsePeriodSpec ("0/3", r, line), "zero numerator rejected");
         check (! TuningManager::parsePeriodSpec ("-700c", r, line), "negative cents rejected");
+        // The three notations the period box promises, in every spelling.
+        check (TuningManager::parsePeriodSpec ("1200", r, line) && approxHz (r, 2.0, 1e-9),
+               "bare \"1200\" read as cents (too big for a ratio)");
+        check (TuningManager::parsePeriodSpec ("701.955 cents", r, line) && approxHz (r, 1.5, 1e-4),
+               "\"701.955 cents\" -> ~1.5");
+        check (TuningManager::parsePeriodSpec (juce::String::fromUTF8 ("1200\xc2\xa2"), r, line)
+                   && approxHz (r, 2.0, 1e-9), "the cent sign is accepted");
+        check (TuningManager::parsePeriodSpec ("3/2.0", r, line) && approxHz (r, 1.5, 1e-9),
+               "decimals allowed inside a fraction");
+        check (TuningManager::parsePeriodSpec ("2.5", r, line) && approxHz (r, 2.5, 1e-9)
+                   && line.getDoubleValue() > 1500.0, "decimal ratio kept exactly, written as cents");
+        check (! TuningManager::parsePeriodSpec ("2.5.5", r, line), "two dots rejected");
     }
 
     //--------------------------------------------------------------------------

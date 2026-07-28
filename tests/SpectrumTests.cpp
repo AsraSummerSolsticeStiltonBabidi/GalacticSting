@@ -9,6 +9,9 @@
 #include "dsp/Spectrum.h"
 #include "dsp/Dissonance.h"
 
+#include <algorithm>
+#include <chrono>
+#include <vector>
 #include <cstdio>
 #include <cmath>
 
@@ -109,7 +112,7 @@ int main()
     std::printf ("fractal L=2 (base {1,2,3}, slope=1):\n");
     {
         SpectrumSettings s; s.baseN = 1; s.reach = 3; s.selection = Selection::All;
-        s.curveSlope = 1.0f; s.fractalLevel = 2;
+        s.curveSlope = 1.0f; s.fractalLevel = 2.0f;
         auto t = compileSpectrum (s);
         check (t.partials.size() == 6, "6 merged partials {1,2,3,4,6,9}");
         check (hasRatio (t, 1) && hasRatio (t, 2) && hasRatio (t, 3)
@@ -118,6 +121,136 @@ int main()
         check (a1 > 0 && std::abs (ampAtRatio (t, 2.0) / a1 - 1.0)    < 2e-3, "amp(2)/amp(1) ~ 1.0 (coincidence sum)");
         check (a1 > 0 && std::abs (ampAtRatio (t, 4.0) / a1 - 0.25)   < 2e-3, "amp(4)/amp(1) ~ 0.25");
         check (a1 > 0 && std::abs (ampAtRatio (t, 9.0) / a1 - 0.1111) < 2e-3, "amp(9)/amp(1) ~ 0.1111");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("fractal = a copy of the spectrum built on EVERY partial:\n");
+    {
+        // The definition being checked: at level 2 the partial set must be exactly
+        // the union over every base partial r of (r * the whole base set).
+        SpectrumSettings s; s.baseN = 1; s.reach = 5; s.selection = Selection::All;
+        s.curveSlope = 0.0f;
+        s.fractalLevel = 1.0f; auto base = compileSpectrum (s);
+        s.fractalLevel = 2.0f; auto lvl2 = compileSpectrum (s);
+
+        // `reach` bounds the BASE set; the copies built on each partial legitimately
+        // reach higher (that is the point), so every product counts.
+        std::vector<double> expect;
+        for (const auto& a : base.partials)
+            for (const auto& b : base.partials)
+                expect.push_back ((double) a.ratio * (double) b.ratio);
+        std::sort (expect.begin(), expect.end());
+        expect.erase (std::unique (expect.begin(), expect.end(),
+                                   [] (double x, double y) { return std::abs (x - y) < 1e-6; }), expect.end());
+
+        bool allThere = true;
+        for (const double r : expect) if (! hasRatio (lvl2, r)) { allThere = false; break; }
+        bool noExtra = true;
+        for (const auto& p : lvl2.partials)
+        {
+            bool found = false;
+            for (const double r : expect) if (std::abs (r - (double) p.ratio) < 1e-3) { found = true; break; }
+            if (! found) { noExtra = false; break; }
+        }
+        std::printf ("   (base %d partials -> level 2 has %d, expected %d)\n",
+                     (int) base.partials.size(), (int) lvl2.partials.size(), (int) expect.size());
+        check (allThere, "every partial of the base spawns a full scaled copy of the spectrum");
+        check (noExtra,  "and NOTHING else appears (the set is exactly that union)");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("fractional fractal level (continuous fader, low->high entry):\n");
+    {
+        // Base {1,2,3}: level 1 = {1,2,3}; level 2 = {1,2,3,4,6,9}. The NEW partials
+        // at level 2 are 4, 6, 9 - they must enter LOW to HIGH as the level rises,
+        // and the endpoints must reproduce the integer levels exactly.
+        SpectrumSettings s; s.baseN = 1; s.reach = 3; s.selection = Selection::All;
+        s.curveSlope = 1.0f;
+        s.fractalLevel = 1.0f; auto t1 = compileSpectrum (s);
+        s.fractalLevel = 2.0f; auto t2 = compileSpectrum (s);
+        check (t1.partials.size() == 3 && t2.partials.size() == 6, "endpoints: 3 and 6 partials");
+
+        s.fractalLevel = 1.2f; auto ta = compileSpectrum (s);
+        s.fractalLevel = 1.5f; auto tb = compileSpectrum (s);
+        s.fractalLevel = 1.9f; auto tc = compileSpectrum (s);
+        check (hasRatio (ta, 4.0) && ! hasRatio (ta, 9.0),
+               "at 1.2 the LOWEST new partial (4) is in, the highest (9) is not");
+        check (hasRatio (tb, 4.0) && hasRatio (tb, 6.0) && ! hasRatio (tb, 9.0),
+               "at 1.5 partials 4 and 6 are in, 9 still out (low->high)");
+        check (hasRatio (tc, 4.0) && hasRatio (tc, 6.0) && hasRatio (tc, 9.0),
+               "at 1.9 all three new partials are in");
+        check (ta.partials.size() <= tb.partials.size() && tb.partials.size() <= tc.partials.size(),
+               "partial count grows monotonically with the fractal level");
+        // Continuity at the top end: 1.99 must be within one partial of level 2.
+        s.fractalLevel = 1.99f; auto td = compileSpectrum (s);
+        check (td.partials.size() == t2.partials.size(), "1.99 already has level 2's partial set");
+        // The blended amplitudes must stay RMS-normalised like every other template.
+        double sq = 0.0; for (const auto& p : tb.partials) sq += (double) p.amp * (double) p.amp;
+        check (std::abs (sq - 1.0) < 1e-3, "blended template is RMS-normalised");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("continuous Harmonics axis (Even - All - Odd - Prime):\n");
+    {
+        SpectrumSettings s; s.baseN = 1; s.reach = 9; s.curveSlope = 0.0f;
+        s.selection = (float) Selection::Even; auto tE = compileSpectrum (s);
+        s.selection = (float) Selection::All;  auto tA = compileSpectrum (s);
+        s.selection = (float) Selection::Odd;  auto tO = compileSpectrum (s);
+        check (! hasRatio (tE, 3.0) && hasRatio (tE, 2.0), "Even: harmonic 3 out, 2 in");
+        check (hasRatio (tA, 3.0) && hasRatio (tA, 2.0),   "All: both in");
+        check (hasRatio (tO, 3.0) && ! hasRatio (tO, 2.0), "Odd: 3 in, 2 out (fundamental aside)");
+        // Half-way Even<->All: the odd harmonics (in All only) come in at HALF weight,
+        // the even ones (in both) stay at full - the timbre morphs, it does not switch.
+        s.selection = 0.5f; auto tHalf = compileSpectrum (s);
+        const float a2 = ampAtRatio (tHalf, 2.0), a3 = ampAtRatio (tHalf, 3.0);
+        check (a2 > 0.0f && a3 > 0.0f, "half-way: both even and odd harmonics are present");
+        check (a2 > 0.0f && std::abs (a3 / a2 - 0.5f) < 1e-3f, "half-way: the odd ones sound at half amplitude");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("temper mode snaps partials onto the scale grid and merges coincidences:\n");
+    {
+        // A 1-degree "scale" (bare octaves): every harmonic must land on a power of 2,
+        // duplicates must MERGE (no coherent stacking), and the played pitch stays at 1.
+        SpectrumSettings s; s.baseN = 1; s.reach = 9; s.selection = Selection::All;
+        s.curveSlope = 0.0f;
+        s.temperToTimbre = true; s.timbreDegrees = { 1.0f }; s.timbrePeriod = 2.0f;
+        auto t = compileSpectrum (s);
+        check (std::abs (t.partials.front().ratio - 1.0f) < 1e-3f, "played pitch still at ratio 1");
+        bool allOctaves = true, distinct = true;
+        for (size_t i = 0; i < t.partials.size(); ++i)
+        {
+            const double l = std::log2 ((double) t.partials[i].ratio);
+            if (std::abs (l - std::round (l)) > 1e-3) allOctaves = false;
+            if (i > 0 && std::abs ((double) t.partials[i].ratio - (double) t.partials[i - 1].ratio) < 1e-6)
+                distinct = false;
+        }
+        check (allOctaves, "every tempered partial sits on the scale grid (a power of 2 here)");
+        check (distinct, "coincident partials were merged, not duplicated");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("temper with a DENSE scale (311-EDO): exact grid, no collapse, fast:\n");
+    {
+        SpectrumSettings s; s.baseN = 1; s.reach = 64; s.curveSlope = 1.0f;
+        s.temperToTimbre = true; s.timbrePeriod = 2.0f;
+        s.timbreDegrees.clear();
+        for (int d = 0; d < 311; ++d) s.timbreDegrees.push_back ((float) std::pow (2.0, (double) d / 311.0));
+        const auto t0 = std::chrono::steady_clock::now();
+        auto t = compileSpectrum (s);
+        const double ms = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - t0).count();
+        std::printf ("   (%d partials, %.0f ms)\n", (int) t.partials.size(), ms);
+        check (! t.partials.empty(), "the dense-grid spectrum is not empty");
+        // Every partial must sit on a 311-EDO step (within half a step = 1.93 c).
+        bool onGrid = true;
+        for (const auto& p : t.partials)
+        {
+            const double steps = 311.0 * std::log2 (std::max (1.0e-9, (double) p.ratio));
+            if (std::abs (steps - std::round (steps)) > 0.01) { onGrid = false; break; }
+        }
+        check (onGrid, "every partial lands exactly on a scale degree of the dense grid");
+        check (t.partials.size() > 30, "a fine grid does NOT collapse the spectrum onto a few pitches");
+        check (ms < 2000.0, "the dense-grid snap stays fast (no seconds-long rebuild)");
     }
 
     //--------------------------------------------------------------------------
@@ -154,10 +287,20 @@ int main()
         check (std::abs (tt.partials.front().ratio - 1.0f) < 1e-3f,
                "Transposed + Prime (harmonic 1 excluded): lowest still at played pitch");
 
+        // The FUNDAMENTAL (k == N) is now ALWAYS kept by the selection filter -
+        // otherwise Transposed "Even" would collapse onto a full 1,2,3,4 series
+        // (identical to All) and the whitelist would audibly do nothing. So in
+        // Original mode with Prime, the lowest partial is harmonic 1 (the kept
+        // fundamental), with harmonic 2 (prime) present above it.
         SpectrumSettings o = t; o.baseMode = BaseMode::Original;
         auto oo = compileSpectrum (o);
-        check (std::abs (oo.partials.front().ratio - 2.0f) < 1e-3f,
-               "Original + Prime: lowest partial at its natural position (harmonic 2)");
+        check (std::abs (oo.partials.front().ratio - 1.0f) < 1e-3f,
+               "Original + Prime: fundamental kept (lowest at harmonic 1)");
+        {
+            bool hasH2 = false;
+            for (const auto& p : oo.partials) if (std::abs (p.ratio - 2.0f) < 1e-3f) hasH2 = true;
+            check (hasH2, "Original + Prime: harmonic 2 present above the kept fundamental");
+        }
 
         // Prime-limit 2 = octaves. In Transposed mode the sound is independent of base N
         // (this is the bug the user hit: base 3 used to sound a fourth higher).
@@ -216,7 +359,7 @@ int main()
         s.timbrePeriod = 2.0f;
         s.timbrePeriodRepeats = 2;
         s.curveSlope = 0.0f;
-        s.fractalLevel = 1;
+        s.fractalLevel = 1.0f;
         s.timbreDegrees.clear();
         for (int k = 0; k < 12; ++k) s.timbreDegrees.push_back ((float) std::pow (2.0, k / 12.0));
 
@@ -232,7 +375,7 @@ int main()
     std::printf ("Scala-as-timbre: more period repeats reach higher (more partials):\n");
     {
         SpectrumSettings a; a.source = Source::ScalaTimbre; a.timbrePeriod = 2.0f;
-        a.curveSlope = 0.0f; a.fractalLevel = 1; a.timbrePeriodRepeats = 2;
+        a.curveSlope = 0.0f; a.fractalLevel = 1.0f; a.timbrePeriodRepeats = 2;
         for (int k = 0; k < 5; ++k) a.timbreDegrees.push_back ((float) std::pow (2.0, k / 5.0)); // 5-EDO
         SpectrumSettings b = a; b.timbrePeriodRepeats = 4;
         auto ta = compileSpectrum (a);
@@ -295,11 +438,11 @@ int main()
         check (justIntervalName (2.5) == "5/2", "2.5 -> 5/2 (non-octave degree, literal)");
         check (justIntervalName (3.0) == "3/1", "3.0 -> 3/1 (tritave period, literal)");
         // 12-TET intervals are NOT exact just ratios -> cents, never a fraction.
-        check (justIntervalName (std::pow (2.0, 7.0/12.0)) == "700c", "12-TET fifth -> 700c (not 3/2)");
-        check (justIntervalName (std::pow (2.0, 4.0/12.0)) == "400c", "12-TET third -> 400c (not 5/4)");
+        check (justIntervalName (std::pow (2.0, 7.0/12.0)) == "700¢", "12-TET fifth -> 700 cent-sign (not 3/2)");
+        check (justIntervalName (std::pow (2.0, 4.0/12.0)) == "400¢", "12-TET third -> 400 cent-sign (not 5/4)");
         {
             const auto s = justIntervalName (1.37); // ~545c, no exact simple ratio
-            check (! s.empty() && s.back() == 'c', "inexact interval -> cents label");
+            check (! s.empty() && (unsigned char) s.back() == 0xa2, "inexact interval -> cents label");
         }
         check (justIntervalName (0.0).empty() && justIntervalName (-1.0).empty(), "non-positive ratio -> blank");
 
@@ -308,6 +451,98 @@ int main()
         check (p == 3 && q == 2, "bestFraction(1.5) = 3/2");
         dissonance::bestFraction (std::pow (2.0, 4.0/12.0), p, q);
         check (p == 5 && q == 4, "bestFraction(12-TET third) = 5/4 (for the hover hint)");
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("N-note chords (Sethares union measure, TTSS 6.8/App.E):\n");
+    {
+        // A harmonic timbre, 7 partials, saw-ish roll-off, anchored at middle C.
+        std::vector<dissonance::Partial> spec;
+        for (int k = 1; k <= 7; ++k)
+            spec.push_back ({ 261.6255653 * k, 1.0 / k });
+
+        // (1) The grid decomposition used by the search must equal the true union
+        //     measure EXACTLY (they are the same pairs, just grouped).
+        {
+            const std::vector<double> tri { 1.0, 1.25, 1.5 };
+            const double whole = dissonance::chordDissonance (spec, tri);
+            double dec = 0.0;
+            for (const double a : tri) dec += dissonance::selfDissonance (spec, a);
+            dec += dissonance::crossDissonance (spec, 1.0, 1.25);
+            dec += dissonance::crossDissonance (spec, 1.0, 1.5);
+            dec += dissonance::crossDissonance (spec, 1.25, 1.5);
+            check (std::abs (whole - dec) < 1.0e-9 * std::max (1.0, std::abs (whole)),
+                   "self+cross decomposition == dissmeasure of the union (exact)");
+        }
+
+        // (2) Sanity of the measure itself: the just major triad must be far more
+        //     consonant than a cluster of seconds for a harmonic timbre.
+        {
+            const double good = dissonance::chordDissonance (spec, { 1.0, 1.25, 1.5 });
+            const double bad  = dissonance::chordDissonance (spec, { 1.0, std::pow (2.0, 1.0/12.0), std::pow (2.0, 2.0/12.0) });
+            check (good < bad, "just major triad beats a semitone cluster (harmonic timbre)");
+        }
+
+        // (3) The full search (3 notes in an octave) must FIND recognisable just
+        //     triads: some result within 12 cents of 5/4 or 3/2 style intervals.
+        {
+            auto res = dissonance::searchChords (spec, 2.0, 3, 8, false);
+            check (! res.empty(), "chord search returns results");
+            bool foundJustish = false;
+            for (const auto& r : res)
+                for (size_t k = 1; k < r.alphas.size(); ++k)
+                {
+                    const double cents = 1200.0 * std::log2 (r.alphas[k]);
+                    for (const double just : { 386.31, 498.04, 701.955, 884.36 }) // 5/4 4/3 3/2 5/3
+                        if (std::abs (cents - just) < 12.0) foundJustish = true;
+                }
+            check (foundJustish, "top consonant triads include just-interval notes (5/4, 4/3, 3/2, 5/3)");
+            // Ranking is by ascending dissonance in minima mode.
+            for (size_t i = 1; i < res.size(); ++i)
+                check (res[i].value >= res[i-1].value - 1.0e-12, "minima ranking is ascending in dissonance");
+            // Every note strictly inside (1, period).
+            for (const auto& r : res)
+                for (size_t k = 1; k < r.alphas.size(); ++k)
+                    check (r.alphas[k] > 1.0 && r.alphas[k] < 2.0, "chord notes strictly inside the period");
+        }
+
+        // (4) Maxima mode ranks descending and returns something.
+        {
+            auto res = dissonance::searchChords (spec, 2.0, 3, 4, true);
+            check (! res.empty(), "maxima chord search returns results");
+            for (size_t i = 1; i < res.size(); ++i)
+                check (res[i].value <= res[i-1].value + 1.0e-12, "maxima ranking is descending in dissonance");
+        }
+
+        // (5) SCOPE: "0 vs all" scores only self + beating against the root, so it is
+        //     a genuinely different surface from "all vs all" - the two must not be
+        //     the same search wearing two names.
+        {
+            auto all  = dissonance::searchChords (spec, 2.0, 4, 6, false, 33.0, false);
+            auto root = dissonance::searchChords (spec, 2.0, 4, 6, false, 33.0, true);
+            check (! root.empty(), "0-vs-all chord search returns results");
+            // The reported value IS the root-only measure, not the full union one.
+            if (! root.empty())
+            {
+                const auto& a = root[0].alphas;
+                double expect = 0.0;
+                for (size_t i = 0; i < a.size(); ++i)
+                {
+                    expect += dissonance::selfDissonance (spec, a[i]);
+                    if (i > 0) expect += dissonance::crossDissonance (spec, a[0], a[i]);
+                }
+                check (std::abs (root[0].value - expect) < 1.0e-6,
+                       "its value is the 0-vs-all measure (self + beating against the root)");
+                check (std::abs (root[0].value - dissonance::chordDissonance (spec, a)) > 1.0e-6,
+                       "which is NOT the all-vs-all measure of the same chord");
+            }
+            bool differs = all.size() != root.size();
+            for (size_t i = 0; i < std::min (all.size(), root.size()) && ! differs; ++i)
+                for (size_t k = 1; k < all[i].alphas.size() && ! differs; ++k)
+                    if (std::abs (1200.0 * std::log2 (all[i].alphas[k] / root[i].alphas[k])) > 1.0)
+                        differs = true;
+            check (differs, "0 vs all and all vs all do NOT return the same chords");
+        }
     }
 
     //--------------------------------------------------------------------------

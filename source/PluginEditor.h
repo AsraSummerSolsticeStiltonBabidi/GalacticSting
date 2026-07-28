@@ -32,11 +32,17 @@ private:
     void configGroup (juce::GroupComponent&, juce::Colour);
     void configFader (juce::Slider&, const juce::String& paramID,
                       std::unique_ptr<SliderAttachment>&, juce::Colour, const juce::String& tooltip);
+    // Every fader configFader touches is watched: whenever an envelope/LFO/host
+    // automation is actually driving its parameter right now, the LookAndFeel draws
+    // a second marker at that LIVE position (see GalacticLnF's "modLive" property
+    // read in drawLinearSlider/drawRotarySlider) alongside the thumb's own base
+    // value - so picking e.g. the right sustain point under modulation is visual,
+    // not guesswork. Polled on the existing 30 Hz timer; see timerCallback().
+    std::vector<juce::Slider*> modWatchSliders;
+    void refreshModWatch();
     void configCombo (juce::ComboBox&, const juce::String& paramID,
                       std::unique_ptr<ComboBoxAttachment>&, juce::Colour, const juce::String& tooltip);
     void makeLabel (juce::Label&, juce::Colour);
-    void layoutFaders (juce::GroupComponent&, juce::Rectangle<int>, juce::Colour,
-                       std::initializer_list<juce::Slider*>, std::initializer_list<juce::Label*>);
     void refocus();
     void reclaimFocusUnlessTyping(); // regrab keyboard focus after a window switch (not while typing)
     void pollComputerKeyboard(); // reconcile held keys against the real key state
@@ -45,7 +51,6 @@ private:
     void openTuningBankChooser();
     void refreshTuningBank(); // sync the bank combo items + selection with the processor
     void loadRecent (int index);
-    void forceDefault (const juce::String& paramID);
     void applyTimbreEnablement (bool active);
     void applyLanguage();
     void refreshPresetList();
@@ -88,6 +93,49 @@ private:
         }
     };
 
+    // Continuous fader with magnetic integer detents (Ctrl = free fine drag) and
+    // tick marks painted at each whole level. Used by the fractal-level fader.
+    struct MagneticSlider : SteppedSlider
+    {
+        // How close to a whole value the drag must come before it snaps onto it.
+        // Per-slider because the axes differ in how much room they have: a 0..3
+        // axis (Harmonics) needs a NARROWER window than a 1..4 one, or most of the
+        // blend between the named points is simply unreachable.
+        double snapWindow = 0.12;
+        double snapValue (double v, juce::Slider::DragMode dm) override
+        {
+            if (dm == juce::Slider::notDragging) return v;
+            if (juce::ModifierKeys::currentModifiers.isCtrlDown()) return v;
+            const double n = std::round (v);
+            return (std::abs (v - n) < snapWindow && n >= getMinimum() && n <= getMaximum()) ? n : v;
+        }
+        void paint (juce::Graphics& g) override
+        {
+            juce::Slider::paint (g);
+            const auto r = getLookAndFeel().getSliderLayout (*this).sliderBounds.toFloat();
+            if (r.isEmpty()) return;
+            g.setColour (findColour (juce::Slider::trackColourId).withAlpha (0.9f));
+            const int lo = (int) std::ceil (getMinimum()), hi = (int) std::floor (getMaximum());
+            const bool vertical = isVertical();
+            for (int i = lo; i <= hi; ++i)
+            {
+                const float p = (float) valueToProportionOfLength ((double) i);
+                if (vertical) // proportion 0 = bottom of the track
+                {
+                    const float y = r.getBottom() - p * r.getHeight();
+                    g.fillRect (r.getX(), y - 0.5f, 4.0f, 1.0f);
+                    g.fillRect (r.getRight() - 4.0f, y - 0.5f, 4.0f, 1.0f);
+                }
+                else
+                {
+                    const float x = r.getX() + p * r.getWidth();
+                    g.fillRect (x - 0.5f, r.getY(), 1.0f, 4.0f);
+                    g.fillRect (x - 0.5f, r.getBottom() - 4.0f, 1.0f, 4.0f);
+                }
+            }
+        }
+    };
+
     // Live list of the ACTIVE scale's degrees: colour chip + interval label +
     // Sethares dissonance (green->yellow->red). Fixed row height so it can live in
     // a Viewport and scroll when a scale has more steps than fit. Rows carry their
@@ -99,18 +147,34 @@ private:
         std::vector<Row> rows;
         juce::String tip;
         static constexpr int kRowH = 19;
+        // Hovering a row SOUNDS that dyad (0 + this degree); only one sounds at a time.
+        std::function<void (int)> onHover;
+        int hoverRow = -1;
+        void mouseMove (const juce::MouseEvent& e) override
+        {
+            const int r0 = e.y / kRowH;
+            const int r = juce::isPositiveAndBelow (r0, (int) rows.size()) ? r0 : -1;
+            if (r != hoverRow) { hoverRow = r; if (onHover) onHover (r); repaint(); }
+        }
+        void mouseExit (const juce::MouseEvent&) override
+        { if (hoverRow != -1) { hoverRow = -1; if (onHover) onHover (-1); repaint(); } }
         juce::String getTooltip() override { return tip; }
         int contentHeight() const { return (int) rows.size() * kRowH; }
         void paint (juce::Graphics& g) override
         {
+            // Every row is the DYAD "0 + that degree": a red "0" chip (the root key,
+            // drawn like the keyboard's period boundary) always precedes the degree
+            // chip, so the pairing is explicit at a glance.
             const int rowH   = kRowH;
             const int W      = getWidth();
-            const int labelX = rowH + 4, labelW = 62;
+            const int chipW  = rowH - 2;
+            const int labelX = 2 * chipW + 6, labelW = 50;
             const int valueX = labelX + labelW + 2;
             int y = 0;
             for (const auto& r : rows)
             {
-                auto chipR = juce::Rectangle<int> (0, y + 1, rowH - 2, rowH - 2);
+                auto zeroR = juce::Rectangle<int> (0, y + 1, chipW, chipW);
+                auto chipR = juce::Rectangle<int> (chipW + 2, y + 1, chipW, chipW);
                 if (r.isPeriod)
                 {
                     // The period: one red box covering the "0" AND the interval, white text.
@@ -118,16 +182,20 @@ private:
                     g.fillRoundedRectangle (juce::Rectangle<int> (0, y + 1, valueX - 3, rowH - 2).toFloat(), 3.0f);
                     g.setColour (juce::Colours::white);
                     g.setFont (juce::Font (juce::FontOptions ((float) rowH * 0.6f).withStyle ("Bold")));
-                    g.drawText (r.num, chipR, juce::Justification::centred, false);
+                    g.drawText (r.num, zeroR, juce::Justification::centred, false);
                     g.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
                     g.drawText (r.label, labelX, y, labelW, rowH, juce::Justification::centredLeft, false);
                 }
                 else
                 {
+                    g.setColour (juce::Colour (0xffe0453f)); // red root chip "0"
+                    g.fillRoundedRectangle (zeroR.toFloat(), 3.0f);
+                    g.setColour (juce::Colours::white);
+                    g.setFont (juce::Font (juce::FontOptions ((float) rowH * 0.6f).withStyle ("Bold")));
+                    g.drawText ("0", zeroR, juce::Justification::centred, false);
                     g.setColour (r.chip);
                     g.fillRoundedRectangle (chipR.toFloat(), 3.0f);
                     g.setColour (r.chip.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-                    g.setFont (juce::Font (juce::FontOptions ((float) rowH * 0.6f).withStyle ("Bold")));
                     g.drawText (r.num, chipR, juce::Justification::centred, false);
                     g.setColour (juce::Colour (0xffb9c0d0));
                     g.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
@@ -137,6 +205,80 @@ private:
                 g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
                 g.drawText (r.value, valueX, y, W - valueX, rowH, juce::Justification::centredLeft, false);
                 y += rowH;
+            }
+        }
+    };
+
+    // n-AD list: rows of degree chips (keyboard hues) + total-beating value.
+    struct NadList : juce::Component, juce::TooltipClient
+    {
+        struct Row { std::vector<int> degs; juce::String value; juce::Colour valCol; };
+        std::vector<Row> rows;
+        int degreesPerPeriod = 12;
+        // Set when every degree of the tuning is one equal step from the last. Then a
+        // shape found on degree 0 has the same intervals started from ANY degree, so
+        // the row is shown as "any +10 +18" in neutral grey rather than as coloured
+        // key numbers - the colours would claim specific keys the result is not tied to.
+        bool equalStep = false;
+        juce::String tip, emptyText; // status/coverage line (computing / over budget / partial)
+        static constexpr int kRowH = 21;
+        // Hovering a row SOUNDS that combination; only one sounds at a time.
+        std::function<void (int)> onHover;
+        int hoverRow = -1;
+        void mouseMove (const juce::MouseEvent& e) override
+        {
+            const int r0 = e.y / kRowH;
+            const int r = juce::isPositiveAndBelow (r0, (int) rows.size()) ? r0 : -1;
+            if (r != hoverRow) { hoverRow = r; if (onHover) onHover (r); repaint(); }
+        }
+        void mouseExit (const juce::MouseEvent&) override
+        { if (hoverRow != -1) { hoverRow = -1; if (onHover) onHover (-1); repaint(); } }
+        int contentHeight() const { return (int) rows.size() * kRowH + (emptyText.isNotEmpty() ? kRowH : 0); }
+        juce::String getTooltip() override { return tip; }
+        void paint (juce::Graphics& g) override
+        {
+            int y = 0, r = 0;
+            const int D = juce::jmax (1, degreesPerPeriod);
+            for (const auto& row : rows)
+            {
+                if (r % 2 == 1) { g.setColour (juce::Colour (0x14ffffff)); g.fillRect (0, y, getWidth(), kRowH); }
+                if (r == hoverRow) { g.setColour (juce::Colour (0x332fb155)); g.fillRect (0, y, getWidth(), kRowH); }
+                int x = 4;   // no rank number: the beating value already orders them
+                const juce::Font chipFont (juce::FontOptions (11.0f).withStyle ("Bold"));
+                for (size_t k = 0; k < row.degs.size(); ++k)
+                {
+                    const int d = row.degs[k];
+                    // Equal-step tuning: the shape is rootless, so the first chip says
+                    // "any" and the rest are OFFSETS from it, all in neutral grey.
+                    // Otherwise each chip is the actual degree, in its keyboard colour.
+                    const bool grey = equalStep;
+                    const juce::String txt = grey
+                        ? (k == 0 ? juce::String ("any")
+                                  : "+" + juce::String (d - row.degs[0]))
+                        : juce::String (d);
+                    const auto col = grey
+                        ? juce::Colour (0xff6b6b78)
+                        : juce::Colour::fromHSV (0.82f * (float) (d % D) / (float) D, 0.62f, 0.9f, 1.0f);
+                    const int w = juce::jmax (18, (int) std::ceil (
+                        juce::GlyphArrangement::getStringWidth (chipFont, txt)) + 8);
+                    auto chip = juce::Rectangle<int> (x, y + 2, w, kRowH - 4);
+                    g.setColour (col);
+                    g.fillRoundedRectangle (chip.toFloat(), 3.0f);
+                    g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
+                    g.setFont (chipFont);
+                    g.drawText (txt, chip, juce::Justification::centred, false);
+                    x += w + 2;
+                }
+                g.setColour (row.valCol);
+                g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+                g.drawText (row.value, x + 4, y, getWidth() - x - 6, kRowH, juce::Justification::centredLeft, false);
+                y += kRowH; ++r;
+            }
+            if (emptyText.isNotEmpty()) // status line: computing / over budget / coverage
+            {
+                g.setColour (juce::Colour (0xff8f96a8));
+                g.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Italic")));
+                g.drawText (emptyText, 4, y, getWidth() - 8, kRowH, juce::Justification::centredLeft, false);
             }
         }
     };
@@ -157,9 +299,100 @@ private:
             g.drawText ("Step", juce::Rectangle<int> (0, 0, splitX, getHeight()),
                         juce::Justification::centredLeft, false);
             auto rr = juce::Rectangle<int> (splitX, 0, getWidth() - splitX, getHeight());
-            g.setFont (juce::Font (juce::FontOptions (10.0f).withStyle ("Bold")));
-            g.drawText ("Sethares", rr.removeFromTop (rr.getHeight() / 2), juce::Justification::bottomLeft, false);
-            g.drawText ("dissonance", rr, juce::Justification::topLeft, false);
+            g.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
+            g.drawText ("beating", rr, juce::Justification::centredLeft, false);
+        }
+    };
+
+    // Chord-search results: "#rank  [play]  note note note..." - one colour PER NOTE
+    // INDEX; the play glyph previews (all together, then an ascending strum);
+    // double-clicking a row loads the chord as the active .scl scale.
+    struct ChordList : juce::Component, juce::TooltipClient
+    {
+        struct Row { std::vector<juce::String> notes; double value = 0.0; };
+        std::vector<Row> rows;
+        juce::String tip;
+        juce::String emptyText { "Press Find to search.\nhover a row to hear it\ndouble-click loads it as the scale" };
+        std::function<void (int)> onPlay, onLoad, onHover; // onHover(-1) = pointer left
+        // No play column any more (hover sounds it), so the notes get that space.
+        static constexpr int kRowH = 22, kRankW = 2, kGapW = 7;
+        int contentHeight() const { return (int) rows.size() * kRowH; }
+        static juce::Font rowFont() { return juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")); }
+        // Columns are only as wide as the widest text they actually hold, so the
+        // intervals start hard left and sit as close together as they can while the
+        // columns still line up down the list. Nothing is ever squeezed or hidden:
+        // if the widest row still overflows, the Viewport scrolls sideways.
+        std::vector<int> columnWidths() const
+        {
+            size_t maxN = 0;
+            for (const auto& r : rows) maxN = std::max (maxN, r.notes.size());
+            std::vector<int> w (maxN, 0);
+            const auto f = rowFont();
+            for (const auto& r : rows)
+                for (size_t k = 0; k < r.notes.size(); ++k)
+                    w[k] = juce::jmax (w[k], (int) std::ceil (juce::GlyphArrangement::getStringWidth (f, r.notes[k])));
+            return w;
+        }
+        int contentWidth() const
+        {
+            int total = kRankW;
+            for (const int w : columnWidths()) total += w + kGapW;
+            return total + 2;
+        }
+        juce::String getTooltip() override { return tip; }
+        static juce::Colour noteColour (int k)
+        {
+            static const juce::uint32 pal[] = { 0xffe0453f, 0xffffc95c, 0xff4fe09a, 0xff4fe6ff,
+                                                0xff9a7bff, 0xffff77c8, 0xffff9a3c, 0xffc4ccda };
+            return juce::Colour (pal[(size_t) (k % 8)]);
+        }
+        void paint (juce::Graphics& g) override
+        {
+            if (rows.empty())
+            {
+                g.setColour (juce::Colour (0xff8f96a8));
+                g.setFont (juce::Font (juce::FontOptions (12.5f)));
+                g.drawFittedText (emptyText,
+                                  getLocalBounds().reduced (8), juce::Justification::centred, 4, 0.8f);
+                return;
+            }
+            const auto cols = columnWidths();
+            int y = 0, row = 0;
+            for (const auto& r : rows)
+            {
+                if (row % 2 == 1) { g.setColour (juce::Colour (0x14ffffff)); g.fillRect (0, y, getWidth(), kRowH); }
+                if (row == hoverRow) // the row you are hearing
+                { g.setColour (juce::Colour (0x332fb155)); g.fillRect (0, y, getWidth(), kRowH); }
+                // the chord's notes, one colour per note index, packed left with just
+                // enough room for the widest entry of each column
+                int x = kRankW;
+                g.setFont (rowFont());
+                for (int k = 0; k < (int) r.notes.size(); ++k)
+                {
+                    const int cw = k < (int) cols.size() ? cols[(size_t) k] : 0;
+                    g.setColour (noteColour (k));
+                    g.drawFittedText (r.notes[(size_t) k], juce::Rectangle<int> (x, y, cw, kRowH),
+                                      juce::Justification::centredLeft, 1, 0.5f);
+                    x += cw + kGapW;
+                }
+                y += kRowH; ++row;
+            }
+        }
+        // HOVER plays it - there is no play button any more, and only one chord ever
+        // sounds: moving to another row (or off the list) stops the previous one.
+        int hoverRow = -1;
+        void mouseMove (const juce::MouseEvent& e) override
+        {
+            const int row = e.y / kRowH;
+            const int r = juce::isPositiveAndBelow (row, (int) rows.size()) ? row : -1;
+            if (r != hoverRow) { hoverRow = r; if (onHover) onHover (r); repaint(); }
+        }
+        void mouseExit (const juce::MouseEvent&) override
+        { if (hoverRow != -1) { hoverRow = -1; if (onHover) onHover (-1); repaint(); } }
+        void mouseDoubleClick (const juce::MouseEvent& e) override
+        {
+            const int row = e.y / kRowH;
+            if (juce::isPositiveAndBelow (row, (int) rows.size()) && onLoad) onLoad (row);
         }
     };
 
@@ -213,6 +446,97 @@ private:
     };
 
     // Closable floating notice (e.g. "only N minima exist"). Click X to dismiss.
+    // Floating "Recent" window: every scale file loaded in this plugin, newest first,
+    // scrollable, click one to load it.
+    struct RecentOverlay : juce::Component
+    {
+        struct List : juce::Component
+        {
+            juce::StringArray paths;
+            std::function<void (int)> onPick;
+            static constexpr int kRowH = 22;
+            int contentHeight() const { return juce::jmax (kRowH, paths.size() * kRowH); }
+            void paint (juce::Graphics& g) override
+            {
+                int y = 0;
+                for (int i = 0; i < paths.size(); ++i)
+                {
+                    if (i % 2 == 1) { g.setColour (juce::Colour (0x14ffffff)); g.fillRect (0, y, getWidth(), kRowH); }
+                    if (i == hoverRow) { g.setColour (juce::Colour (0x33b27bff)); g.fillRect (0, y, getWidth(), kRowH); }
+                    const juce::File f (paths[i]);
+                    g.setColour (juce::Colour (0xff8f96a8));
+                    g.setFont (juce::Font (juce::FontOptions (10.5f).withStyle ("Bold")));
+                    g.drawText ("#" + juce::String (i + 1), 4, y, 26, kRowH, juce::Justification::centredLeft, false);
+                    g.setColour (juce::Colours::white);
+                    g.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
+                    g.drawText (f.getFileNameWithoutExtension(), 32, y, getWidth() - 200, kRowH,
+                                juce::Justification::centredLeft, false);
+                    g.setColour (juce::Colour (0xff6c7488));
+                    g.setFont (juce::Font (juce::FontOptions (11.0f)));
+                    g.drawText (f.getParentDirectory().getFileName(), getWidth() - 166, y, 160, kRowH,
+                                juce::Justification::centredRight, false);
+                    y += kRowH;
+                }
+                if (paths.isEmpty())
+                {
+                    g.setColour (juce::Colour (0xff8f96a8));
+                    g.setFont (juce::Font (juce::FontOptions (12.5f)));
+                    g.drawText ("nothing loaded yet", getLocalBounds(), juce::Justification::centred, false);
+                }
+            }
+            int hoverRow = -1;
+            void mouseMove (const juce::MouseEvent& e) override
+            { const int r = e.y / kRowH; if (r != hoverRow) { hoverRow = r; repaint(); } }
+            void mouseExit (const juce::MouseEvent&) override { hoverRow = -1; repaint(); }
+            void mouseDown (const juce::MouseEvent& e) override
+            {
+                const int r = e.y / kRowH;
+                if (juce::isPositiveAndBelow (r, paths.size()) && onPick) onPick (r);
+            }
+        };
+
+        juce::String title { "Recent" };
+        juce::TextButton closeBtn { "X" };
+        juce::Viewport view;
+        List list;
+        RecentOverlay()
+        {
+            closeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
+            closeBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+            closeBtn.onClick = [this] { setVisible (false); };
+            addAndMakeVisible (closeBtn);
+            view.setViewedComponent (&list, false);
+            view.setScrollBarsShown (true, false);
+            addAndMakeVisible (view);
+        }
+        void setPaths (const juce::StringArray& p)
+        {
+            list.paths = p;
+            list.setSize (juce::jmax (10, view.getWidth() - 10), list.contentHeight());
+            list.repaint();
+        }
+        void resized() override
+        {
+            closeBtn.setBounds (getWidth() - 28, 6, 22, 22);
+            auto r = getLocalBounds().reduced (14, 12);
+            r.removeFromTop (24);
+            view.setBounds (r);
+            list.setSize (juce::jmax (10, r.getWidth() - 10), list.contentHeight());
+        }
+        void paint (juce::Graphics& g) override
+        {
+            auto r = getLocalBounds().toFloat();
+            g.setColour (juce::Colour (0xf2141a24));
+            g.fillRoundedRectangle (r, 10.0f);
+            g.setColour (juce::Colour (0xffb27bff));
+            g.drawRoundedRectangle (r.reduced (1.5f), 10.0f, 3.0f);
+            g.setColour (juce::Colour (0xffb27bff));
+            g.setFont (juce::Font (juce::FontOptions (16.0f).withStyle ("Bold")));
+            g.drawText (title, getLocalBounds().reduced (16, 10).removeFromTop (22),
+                        juce::Justification::centredLeft, false);
+        }
+    };
+
     struct NoticeOverlay : juce::Component
     {
         juce::String title, body;
@@ -266,20 +590,51 @@ private:
         std::function<void()> onClose;                                        // hide panel + scrim
 
         juce::ListBox      list { "partials", this };
-        juce::ToggleButton onT, mpeT, tempoT; // tempoT = continuous DAW-tempo sync (CC20)
+        juce::ToggleButton onT, selfT, mpeT, tempoT; // onT = MIDI out; selfT = play in Fibló; tempoT = DAW-tempo sync (CC20)
+        juce::ToggleButton droneT;                    // also sound the held note under the pulses
+        juce::ToggleButton qTempoT, monoT, qPulseT;   // note-start gate: beat-quantize / mono / pattern-quantize
+        juce::Label        secGate;                   // "NOTE START" group header
+        juce::ToggleButton feedbackT;                 // internal recursive feedback loop
+        juce::Slider       feedbackS;                 // its volume slope (decay per loop)
+        juce::Slider       velSlopeS;                 // velocity tilt across the spectrum
+        juce::Label        feedbackLbl;               // "Feedback" caption
+        juce::Label        outLbl, selfLbl;           // captions under the two big pill toggles
         juce::ComboBox     modeBox;
-        juce::Label        heading, listHead, info, noteHead, durHead, bpmLbl, pickHint;
+        juce::Label        heading, listHead, info, noteHead, durHead, velHead, bpmLbl, pickHint;
+        juce::Rectangle<int> rateBox;                 // framed box around the PULSE RATE group
         juce::Label        secRate, secOut, secTempo;         // coloured group headers
         juce::Label        divLbl, timesLbl, nVal, xVal;      // "divide [n] times by [x]"
         juce::TextButton   nUp, nDn, xUp, xDn;                // tiny round steppers
         juce::TextButton   closeB { "X" }, helpB, jiB, tempoX2, tempoD2;
+        // "JI switched MPE out on, so JI off should switch it back" - a PARAMETER, not
+        // an editor member: as a member it was lost on reopen and the restore never fired.
+        bool jiForcedMpe() const
+        {
+            return proc != nullptr
+                && proc->apvts.getRawParameterValue ("rhythmJiForcedMpe")->load() > 0.5f;
+        }
+        void setJiForcedMpe (bool b)
+        {
+            if (proc == nullptr) return;
+            if (auto* p = proc->apvts.getParameter ("rhythmJiForcedMpe"))
+                p->setValueNotifyingHost (b ? 1.0f : 0.0f);
+        }
         juce::String       helpText;                          // shown by the Help button
+        // Slot rows live in a scrollable container: kSlots is large ("unlimited"
+        // pulses), so the panel shows a window onto however many are routed.
+        juce::Viewport     slotView;
+        juce::Component    slotRows;
         juce::Label        slotLbl[RhythmEngine::kSlots];
         juce::TextEditor   pitchE[RhythmEngine::kSlots];
         juce::TextButton   s12M[RhythmEngine::kSlots], s12P[RhythmEngine::kSlots]; // -12/+12 (steps only)
         juce::Slider       durS[RhythmEngine::kSlots];
+        juce::Slider       velS[RhythmEngine::kSlots]; // per-slot MIDI velocity of each pulse
         juce::TextButton   delB[RhythmEngine::kSlots];
-        int numRows = 0, tempoOct = 0;
+        juce::Label        octLbl, octAllVal;          // "Octave (all pulses)" stepper
+        juce::Label        stepsAllLbl;                // "Steps (all pulses)" caption
+        juce::Slider       stepsAllS;                  // global scale-step offset (modulatable)
+        juce::TextButton   octAllUp, octAllDn;
+        int numRows = 0;
 
         // Clicking any empty spot of the panel gives keyboard focus back to the
         // editor (text boxes commit + collapse; the play keys work again).
@@ -325,6 +680,10 @@ private:
         static double parseRatioSpec (juce::String t)
         {
             t = t.trim();
+            // Accept BOTH "700c" and the "700\xc2\xa2" the rest of the UI prints: without
+            // the cent sign a pasted-back value was read as a linear RATIO of 700.
+            if (t.endsWith (juce::String::fromUTF8 ("\xc2\xa2")))
+                t = t.dropLastCharacters (1).trim() + "c";
             if (t.endsWithIgnoreCase ("c"))
                 return std::exp2 (t.dropLastCharacters (1).getDoubleValue() / 1200.0);
             if (t.containsChar ('/'))
@@ -341,7 +700,7 @@ private:
         {
             heading.setJustificationType (juce::Justification::centredLeft);
             heading.setColour (juce::Label::textColourId, juce::Colour (0xff5cb8ff));
-            heading.setFont (juce::Font (juce::FontOptions (16.0f).withStyle ("Bold")));
+            heading.setFont (juce::Font (juce::FontOptions (21.0f).withStyle ("Bold")));
             addAndMakeVisible (heading);
             listHead.setJustificationType (juce::Justification::centredLeft);
             listHead.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
@@ -357,6 +716,32 @@ private:
             addAndMakeVisible (list);
             onT.setName ("onled"); // big green(on)/red(off) pill, drawn by GalacticLnF
             addAndMakeVisible (onT);
+            selfT.setName ("onled"); // second big pill: "play in Fibló" (interpret internally)
+            addAndMakeVisible (selfT);
+            // Captions under the two big pill toggles.
+            for (auto* l : { &outLbl, &selfLbl })
+            {
+                l->setJustificationType (juce::Justification::centred);
+                l->setColour (juce::Label::textColourId, juce::Colour (0xffb9c0d0));
+                l->setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+                addAndMakeVisible (*l);
+            }
+            droneT.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
+            addAndMakeVisible (droneT);
+            // Internal feedback loop + its volume slope (only meaningful with self-play).
+            feedbackT.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
+            addAndMakeVisible (feedbackT);
+            feedbackLbl.setJustificationType (juce::Justification::centredRight);
+            feedbackLbl.setColour (juce::Label::textColourId, juce::Colour (0xffb9c0d0));
+            feedbackLbl.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+            addAndMakeVisible (feedbackLbl);
+            feedbackS.setSliderStyle (juce::Slider::LinearHorizontal);
+            feedbackS.setRange (0.05, 0.95, 0.01);
+            feedbackS.setDoubleClickReturnValue (true, 0.5); // double-click = default
+            feedbackS.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 16);
+            feedbackS.textFromValueFunction = [] (double v) { return juce::String ((int) std::lround (v * 100.0)) + " %"; };
+            feedbackS.setColour (juce::Slider::trackColourId, juce::Colour (0xffff77c8));
+            addAndMakeVisible (feedbackS);
             addAndMakeVisible (mpeT);
             modeBox.addItem ("Lowest note", 1); // idx-mapped to the rhythmMode parameter
             modeBox.addItem ("All notes",   2);
@@ -373,6 +758,12 @@ private:
             sec (secRate,  juce::Colour (0xff4fe6ff)); // cyan   - PULSE RATE
             sec (secOut,   juce::Colour (0xffff77c8)); // pink   - OUTPUT
             sec (secTempo, juce::Colour (0xffffc95c)); // yellow - DAW TEMPO
+            sec (secGate,  juce::Colour (0xff7ff59a)); // green  - NOTE START (quantize/mono)
+            for (auto* t : { &qTempoT, &monoT, &qPulseT })
+            {
+                t->setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
+                addAndMakeVisible (*t);
+            }
 
             // "divide [n] times by [x]": two tiny +/- steppers driving the params.
             for (auto* l : { &divLbl, &timesLbl })
@@ -418,7 +809,7 @@ private:
             helpB.onClick = [this]
             {
                 juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon,
-                    "Spectrum to Rhythm", helpText, this);
+                    "Spectrum vs Rhythm", helpText, this);
             };
             addAndMakeVisible (helpB);
 
@@ -436,9 +827,26 @@ private:
             {
                 if (proc == nullptr) return;
                 const bool on = jiB.getToggleState();
-                if (on && ! mpeOn()) // JI needs per-note bend -> enable MPE out with it
+                if (on)
+                {
+                    // JI needs per-note bend -> MPE out goes on with it. Remember
+                    // whether WE were the ones who switched it on, so turning JI back
+                    // off leaves the panel exactly as it found it. Without this the
+                    // toggle was not an involution: MPE stayed on for ever after, and
+                    // its channel spreading kept detuning notes that shared a channel.
+                    setJiForcedMpe (! mpeOn());
+                    if (jiForcedMpe())
+                        if (auto* p = proc->apvts.getParameter ("rhythmMpe"))
+                            p->setValueNotifyingHost (1.0f);
+                }
+                else if (jiForcedMpe())
+                {
+                    setJiForcedMpe (false);
                     if (auto* p = proc->apvts.getParameter ("rhythmMpe"))
-                        p->setValueNotifyingHost (1.0f);
+                        p->setValueNotifyingHost (0.0f);
+                }
+                if (auto* p = proc->apvts.getParameter ("rhythmJi")) // persist the switch itself
+                    p->setValueNotifyingHost (on ? 1.0f : 0.0f);
                 applyJiToSlots();
                 updateJiText();
                 refreshSlots();
@@ -460,29 +868,69 @@ private:
             }
             tempoX2.setButtonText ("x2");
             tempoD2.setButtonText ("/2");
-            tempoX2.onClick = [this] { tempoOct = juce::jlimit (-6, 6, tempoOct + 1); refreshLive(); };
-            tempoD2.onClick = [this] { tempoOct = juce::jlimit (-6, 6, tempoOct - 1); refreshLive(); };
+            // The octave scaling is a PARAMETER now (the processor drives the tempo,
+            // so it has to be reachable from there - and it survives a reload).
+            tempoX2.onClick = [this] { nudgeTempoOct (+1); };
+            tempoD2.onClick = [this] { nudgeTempoOct (-1); };
             info.setJustificationType (juce::Justification::topLeft);
             info.setColour (juce::Label::textColourId, juce::Colour (0xff7ff59a));
             info.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
             addAndMakeVisible (info);
-            for (auto* h : { &noteHead, &durHead })
+            for (auto* h : { &noteHead, &durHead, &velHead })
             {
                 h->setJustificationType (juce::Justification::centredLeft);
                 h->setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
                 h->setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
                 addAndMakeVisible (*h);
             }
+            // Velocity SLOPE: a tilt over the whole column of per-pulse velocities.
+            // 0 = flat; up = the high partials fade out first, down = the low ones;
+            // at the top of its travel the ramp is vertical and nothing is left.
+            velSlopeS.setSliderStyle (juce::Slider::LinearHorizontal);
+            velSlopeS.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+            velSlopeS.setColour (juce::Slider::trackColourId, juce::Colour (0xffff77c8));
+            velSlopeS.setColour (juce::Slider::thumbColourId, juce::Colour (0xffff77c8));
+            velSlopeS.setMouseClickGrabsKeyboardFocus (false);
+            addAndMakeVisible (velSlopeS);
+            // Global STEPS offset for step-pitched pulses (ratio/JI slots ignore it).
+            stepsAllS.setSliderStyle (juce::Slider::LinearHorizontal);
+            stepsAllS.setTextBoxStyle (juce::Slider::TextBoxRight, false, 34, 15);
+            stepsAllS.setColour (juce::Slider::trackColourId, juce::Colour (0xff4fe6ff));
+            stepsAllS.setColour (juce::Slider::thumbColourId, juce::Colour (0xff4fe6ff));
+            stepsAllS.setMouseClickGrabsKeyboardFocus (false);
+            addAndMakeVisible (stepsAllS);
+            stepsAllLbl.setJustificationType (juce::Justification::centredRight);
+            stepsAllLbl.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
+            stepsAllLbl.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
+            addAndMakeVisible (stepsAllLbl);
+
             closeB.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
             closeB.onClick = [this] { if (onClose) onClose(); };
             addAndMakeVisible (closeB);
+
+            // Scrollable slot-rows container ("unlimited" pulses).
+            slotView.setViewedComponent (&slotRows, false);
+            slotView.setScrollBarsShown (true, false);
+            addAndMakeVisible (slotView);
+
+            // Global octave stepper: shifts ALL pulses together (+-4 octaves).
+            octLbl.setJustificationType (juce::Justification::centredRight);
+            octLbl.setColour (juce::Label::textColourId, juce::Colour (0xffb9c0d0));
+            octLbl.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+            addAndMakeVisible (octLbl);
+            octAllVal.setJustificationType (juce::Justification::centred);
+            octAllVal.setColour (juce::Label::textColourId, juce::Colours::white);
+            octAllVal.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
+            addAndMakeVisible (octAllVal);
+            miniStep (octAllUp, "+", "rhythmOctAll",  1);
+            miniStep (octAllDn, "-", "rhythmOctAll", -1);
 
             for (int i = 0; i < RhythmEngine::kSlots; ++i)
             {
                 slotLbl[i].setJustificationType (juce::Justification::centredLeft);
                 slotLbl[i].setColour (juce::Label::textColourId, juce::Colours::white);
                 slotLbl[i].setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
-                addChildComponent (slotLbl[i]);
+                slotRows.addChildComponent (slotLbl[i]);
 
                 pitchE[i].setJustification (juce::Justification::centred);
                 pitchE[i].setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
@@ -491,14 +939,14 @@ private:
                 pitchE[i].setSelectAllWhenFocused (true);
                 pitchE[i].onReturnKey = [this, i] { commitPitch (i); if (onEdited) onEdited(); };
                 pitchE[i].onFocusLost = [this, i] { commitPitch (i); };
-                addChildComponent (pitchE[i]);
+                slotRows.addChildComponent (pitchE[i]);
 
                 // -12 / +12 step an OCTAVE of scale steps; they only apply to steps
-                // values (they do nothing when the slot holds a ratio/cents pitch).
+                // values (hidden when the slot holds a ratio/cents pitch).
                 for (auto* b : { &s12M[i], &s12P[i] })
                 {
                     b->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff33334a));
-                    addChildComponent (*b);
+                    slotRows.addChildComponent (*b);
                 }
                 s12M[i].setButtonText ("-12");
                 s12P[i].setButtonText ("+12");
@@ -515,12 +963,23 @@ private:
 
                 durS[i].setSliderStyle (juce::Slider::LinearHorizontal);
                 durS[i].setRange (5.0, 500.0, 1.0);
+                durS[i].setDoubleClickReturnValue (true, 60.0); // double-click = default
                 durS[i].setSkewFactorFromMidPoint (80.0);
                 durS[i].setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 16);
                 durS[i].textFromValueFunction = [] (double v) { return juce::String ((int) v) + " ms"; };
                 durS[i].onValueChange = [this, i]
                 { if (proc) proc->getRhythm().slots[i].durMs = (float) durS[i].getValue(); };
-                addChildComponent (durS[i]);
+                slotRows.addChildComponent (durS[i]);
+
+                // Per-slot velocity: the MIDI velocity of every pulse this train sends.
+                velS[i].setSliderStyle (juce::Slider::LinearHorizontal);
+                velS[i].setRange (1.0, 127.0, 1.0);
+                velS[i].setDoubleClickReturnValue (true, 100.0); // double-click = default
+                velS[i].setTextBoxStyle (juce::Slider::TextBoxRight, false, 32, 16);
+                velS[i].setColour (juce::Slider::trackColourId, juce::Colour (0xffff77c8)); // pink = output
+                velS[i].onValueChange = [this, i]
+                { if (proc) proc->getRhythm().slots[i].vel = (int) velS[i].getValue(); };
+                slotRows.addChildComponent (velS[i]);
 
                 delB[i].setButtonText ("X");
                 delB[i].setColour (juce::TextButton::buttonColourId, juce::Colour (0xffe0453f));
@@ -532,7 +991,7 @@ private:
                     refreshSlots();
                     list.repaint();
                 };
-                addChildComponent (delB[i]);
+                slotRows.addChildComponent (delB[i]);
             }
         }
 
@@ -555,7 +1014,7 @@ private:
         // The routed trains are kept COMPACT and in LIST ORDER (sorted by partial
         // index): no empty rows between them, no reordering surprises when a
         // partial is added or removed.
-        struct SlotData { int partial, steps; bool useRatio; double ratio; float durMs; };
+        struct SlotData { int partial, steps; bool useRatio; double ratio; float durMs; int vel; };
         std::vector<SlotData> readSlots() const
         {
             std::vector<SlotData> v;
@@ -565,7 +1024,7 @@ private:
                 const auto& s = proc->getRhythm().slots[i];
                 if (s.partial.load() >= 0)
                     v.push_back ({ s.partial.load(), s.steps.load(), s.useRatio.load(),
-                                   s.ratio.load(), s.durMs.load() });
+                                   s.ratio.load(), s.durMs.load(), s.vel.load() });
             }
             return v;
         }
@@ -580,13 +1039,14 @@ private:
                 {
                     s.steps = v[(size_t) i].steps;  s.useRatio = v[(size_t) i].useRatio;
                     s.ratio = v[(size_t) i].ratio;  s.durMs    = v[(size_t) i].durMs;
+                    s.vel   = v[(size_t) i].vel;
                     s.partial = v[(size_t) i].partial;
                     s.enabled = true;
                 }
                 else
                 {
                     s.enabled = false; s.partial = -1;
-                    s.steps = 0; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f;
+                    s.steps = 0; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f; s.vel = 100;
                 }
             }
         }
@@ -599,14 +1059,19 @@ private:
                 v.erase (it);                            // click an assigned partial -> unassign
             else if ((int) v.size() < RhythmEngine::kSlots)
             {
-                v.push_back ({ row, 0, false, 1.0, 60.0f }); // assign (writeSlots sorts + compacts)
-                // Routing a partial means the user WANTS pulses -> flip the master On.
-                if (auto* p = proc->apvts.getParameter ("rhythmOn"))
-                    if (p->getValue() < 0.5f)
+                v.push_back ({ row, 0, false, 1.0, 60.0f, 100 }); // assign (writeSlots sorts + compacts)
+                // Routing a partial means the user WANTS pulses -> make sure SOME output
+                // is on. Self-play is the default sink (plays here); don't force MIDI-out.
+                const bool anyOut = proc->apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f
+                                 || proc->apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f;
+                if (! anyOut)
+                    if (auto* p = proc->apvts.getParameter ("rhythmSelfPlay"))
                         p->setValueNotifyingHost (1.0f);
             }
             writeSlots (std::move (v));
-            if (jiB.getToggleState()) applyJiToSlots(); // new partial adopts JI when the toggle is on
+            // Only the NEWLY routed partial adopts JI - existing slots keep any
+            // hand-edited ratio (routing more partials must never reset them).
+            if (jiB.getToggleState()) applyJiToSlots (row);
             refreshSlots();
             list.repaint();
         }
@@ -625,9 +1090,11 @@ private:
         {
             return proc != nullptr && proc->apvts.getRawParameterValue ("rhythmMpe")->load() > 0.5f;
         }
-        // JI toggle: ON -> every routed slot uses the JUST ratio of its own partial;
-        // OFF -> slots revert to scale steps. Applied to present AND future routes.
-        void applyJiToSlots()
+        // JI toggle: ON -> routed slots use the JUST ratio of their own partial;
+        // OFF -> slots revert to scale steps. `onlyPartial >= 0` applies it to that
+        // newly-routed partial ONLY, so routing another partial never resets a ratio
+        // the user has hand-edited on an existing slot.
+        void applyJiToSlots (int onlyPartial = -1)
         {
             if (proc == nullptr) return;
             const bool on = jiB.getToggleState();
@@ -636,7 +1103,7 @@ private:
             {
                 auto& s = proc->getRhythm().slots[i];
                 const int p = s.partial.load();
-                if (p < 0) continue;
+                if (p < 0 || (onlyPartial >= 0 && p != onlyPartial)) continue;
                 if (on && t != nullptr && p < (int) t->partials.size())
                 { s.ratio = (double) t->partials[(size_t) p].ratio; s.useRatio = true; }
                 else if (! on)
@@ -667,14 +1134,26 @@ private:
             }
             refreshSlots(); // reverts the shown text to the stored value when rejected
         }
-        double tempoBpm() const // pulse 1 (first enabled slot) in BPM, times 2^tempoOct
+        int tempoOctValue() const
+        {
+            return proc != nullptr
+                 ? (int) proc->apvts.getRawParameterValue ("rhythmTempoOct")->load() : 0;
+        }
+        void nudgeTempoOct (int d)
+        {
+            if (proc == nullptr) return;
+            if (auto* p = proc->apvts.getParameter ("rhythmTempoOct"))
+                p->setValueNotifyingHost (p->convertTo0to1 ((float) juce::jlimit (-6, 6, tempoOctValue() + d)));
+            refreshLive();
+        }
+        double tempoBpm() const // pulse 1 (first enabled slot) in BPM, times 2^octave
         {
             if (proc == nullptr) return 0.0;
             for (int i = 0; i < RhythmEngine::kSlots; ++i)
                 if (proc->getRhythm().slots[i].enabled.load())
                 {
                     const double r = (double) proc->getRhythm().getRateHz (i);
-                    if (r > 0.0) return r * 60.0 * std::exp2 ((double) tempoOct);
+                    if (r > 0.0) return r * 60.0 * std::exp2 ((double) tempoOctValue());
                 }
             return 0.0;
         }
@@ -687,15 +1166,25 @@ private:
             {
                 const int p = proc != nullptr ? proc->getRhythm().slots[i].partial.load() : -1;
                 const bool used = p >= 0;
+                const bool stepsPitch = used && ! proc->getRhythm().slots[i].useRatio.load();
                 slotLbl[i].setVisible (used); pitchE[i].setVisible (used);
                 durS[i].setVisible (used);    delB[i].setVisible (used);
-                s12M[i].setVisible (used);    s12P[i].setVisible (used);
+                // +-12 steps only make sense for steps pitches - hidden for ratio/cents.
+                s12M[i].setVisible (stepsPitch); s12P[i].setVisible (stepsPitch);
+                velS[i].setVisible (used);
                 if (used)
                 {
                     auto& s = proc->getRhythm().slots[i];
                     juce::String rl;
-                    if (t != nullptr && p < (int) t->partials.size() && ratioName)
+                    // A routed partial that the CURRENT spectrum no longer has cannot
+                    // pulse: say so on the row instead of leaving it looking active.
+                    const bool missing = t != nullptr && p >= (int) t->partials.size();
+                    if (t != nullptr && ! missing && ratioName)
                         rl = juce::String::fromUTF8 (" \xc2\xb7 ") + ratioName ((double) t->partials[(size_t) p].ratio);
+                    else if (missing)
+                        rl = " - not in this spectrum";
+                    slotLbl[i].setColour (juce::Label::textColourId,
+                                          missing ? juce::Colour (0xffe0453f) : juce::Colour (0xffc4ccda));
                     slotLbl[i].setText ("P" + juce::String (p + 1) + rl, juce::dontSendNotification);
                     if (! pitchE[i].hasKeyboardFocus (false))
                         pitchE[i].setText (s.useRatio.load() && ratioName
@@ -703,12 +1192,16 @@ private:
                                                : stepsText (s.steps.load()),
                                            juce::dontSendNotification);
                     durS[i].setValue ((double) s.durMs.load(), juce::dontSendNotification);
+                    velS[i].setValue ((double) s.vel.load(), juce::dontSendNotification);
                 }
             }
             // Guide the user the moment they switch On with nothing routed yet.
-            const bool on = proc != nullptr && proc->apvts.getRawParameterValue ("rhythmOn")->load() > 0.5f;
+            const bool on = proc != nullptr
+                && (proc->apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f
+                 || proc->apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f);
             const bool none = readSlots().empty();
             pickHint.setVisible (on && none);
+            layoutSlotRows(); // the used-row count may have changed
         }
 
         void refreshLive() // pulse rates + polyrhythm chain, from the audio thread's read-outs
@@ -718,6 +1211,8 @@ private:
                           juce::dontSendNotification);
             xVal.setText (juce::String ((int) proc->apvts.getRawParameterValue ("rhythmDivX")->load()),
                           juce::dontSendNotification);
+            octAllVal.setText (juce::String ((int) proc->apvts.getRawParameterValue ("rhythmOctAll")->load()),
+                               juce::dontSendNotification);
             juce::String s;
             const float f0 = proc->getRhythm().getDriverF0();
             s << (f0 > 0.0f ? "f0 = " + juce::String (f0, 2) + " Hz\n"
@@ -729,10 +1224,12 @@ private:
                 const float r = proc->getRhythm().getRateHz (i);
                 if (r > 0.0f) { rates[m] = r; idx[m] = i; ++m; }
             }
-            for (int k = 0; k < m; ++k)
+            for (int k = 0; k < m && k < 4; ++k) // cap the listing; the polyrhythm line summarises the rest
                 s << "P" << juce::String (proc->getRhythm().slots[idx[k]].partial.load() + 1)
                   << ": " << juce::String (rates[k], 3) << " Hz ("
                   << juce::String (1000.0f / rates[k], 0) << " ms)\n";
+            if (m > 4)
+                s << "+" << juce::String (m - 4) << (trF ? trF (" more trains\n", " trens m\xc3\xa9s\n") : juce::String ("\n"));
             if (m >= 2)
             {
                 // ONE integer chain "1:2:3" over all active trains (not pairwise):
@@ -763,7 +1260,8 @@ private:
 
             // Guide the user the moment they switch On with nothing routed yet
             // (updated here, every tick, so it reacts to the On toggle too).
-            const bool onNow = proc->apvts.getRawParameterValue ("rhythmOn")->load() > 0.5f;
+            const bool onNow = proc->apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f
+                            || proc->apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f;
             pickHint.setVisible (onNow && readSlots().empty());
 
             const double bpm = tempoBpm();
@@ -775,21 +1273,47 @@ private:
         void resized() override
         {
             auto r = getLocalBounds().reduced (14, 10);
-            auto top = r.removeFromTop (26);
+            auto top = r.removeFromTop (30);
             closeB.setBounds (top.removeFromRight (24).withSizeKeepingCentre (22, 22));
             top.removeFromRight (5);
             helpB.setBounds (top.removeFromRight (104).withSizeKeepingCentre (104, 22)); // "How to route"
-            // Master ON/OFF pill: right of the title, green (on) / red (off).
-            auto titleZone = top;
-            heading.setBounds (titleZone.removeFromLeft (juce::jmin (256, titleZone.getWidth() - 76)));
-            titleZone.removeFromLeft (8);
-            onT.setBounds (titleZone.removeFromLeft (64).withSizeKeepingCentre (64, 24));
+            heading.setBounds (top); // big title, no toggle inside it
             r.removeFromTop (6);
 
-            // Three labelled control groups: PULSE RATE / OUTPUT / DAW TEMPO.
-            auto grpRow = [&r] (juce::Label& sec) { sec.setBounds (r.removeFromTop (13)); return r.removeFromTop (24); };
+            // Two big pill toggles, each with a caption: MIDI OUT (send to DAW) and
+            // PLAY IN FIBLÓ (interpret the rhythm here; the held note stays silent).
             {
-                auto g1 = grpRow (secRate);
+                auto tg = r.removeFromTop (46);
+                auto p1 = tg.removeFromLeft (118);
+                onT.setBounds (p1.removeFromTop (26).withSizeKeepingCentre (84, 24));
+                outLbl.setBounds (p1);
+                tg.removeFromLeft (14);
+                auto p2 = tg.removeFromLeft (140);
+                selfT.setBounds (p2.removeFromTop (26).withSizeKeepingCentre (96, 24));
+                selfLbl.setBounds (p2);
+                tg.removeFromLeft (16);
+                droneT.setBounds (tg.withSizeKeepingCentre (tg.getWidth(), 24)); // "note under pulses"
+            }
+            r.removeFromTop (6);
+            // Internal feedback loop + its volume slope.
+            {
+                auto fr = r.removeFromTop (24);
+                feedbackT.setBounds (fr.removeFromLeft (160));
+                fr.removeFromLeft (8);
+                feedbackLbl.setBounds (fr.removeFromLeft (54));
+                fr.removeFromLeft (6);
+                feedbackS.setBounds (fr.removeFromLeft (juce::jmin (240, fr.getWidth())).reduced (0, 1));
+            }
+            r.removeFromTop (8);
+
+            // PULSE RATE group, wrapped in its own framed box (header + divide row).
+            {
+                auto box = r.removeFromTop (13 + 3 + 24 + 8);
+                rateBox = box; // stored for paint()'s frame
+                auto ra = box.reduced (8, 4);
+                secRate.setBounds (ra.removeFromTop (13));
+                ra.removeFromTop (3);
+                auto g1 = ra.removeFromTop (24);
                 divLbl.setBounds (g1.removeFromLeft (50));
                 g1.removeFromLeft (4);
                 nDn.setBounds (g1.removeFromLeft (20).reduced (0, 2));
@@ -801,7 +1325,10 @@ private:
                 xVal.setBounds (g1.removeFromLeft (26));
                 xUp.setBounds (g1.removeFromLeft (20).reduced (0, 2));
             }
-            r.removeFromTop (4);
+            r.removeFromTop (6);
+
+            // OUTPUT and DAW TEMPO groups.
+            auto grpRow = [&r] (juce::Label& sec) { sec.setBounds (r.removeFromTop (13)); return r.removeFromTop (24); };
             {
                 auto g2 = grpRow (secOut);
                 modeBox.setBounds (g2.removeFromLeft (128).reduced (0, 1));
@@ -809,6 +1336,15 @@ private:
                 mpeT.setBounds (g2.removeFromLeft (86));
                 g2.removeFromLeft (8);
                 jiB.setBounds (g2.removeFromLeft (100).reduced (0, 1));
+                g2.removeFromLeft (10);
+                octLbl.setBounds (g2.removeFromLeft (96));       // "Octave (all)"
+                g2.removeFromLeft (4);
+                octAllDn.setBounds (g2.removeFromLeft (20).reduced (0, 2));
+                octAllVal.setBounds (g2.removeFromLeft (26));
+                octAllUp.setBounds (g2.removeFromLeft (20).reduced (0, 2));
+                g2.removeFromLeft (10);
+                stepsAllLbl.setBounds (g2.removeFromLeft (44));   // "Steps"
+                stepsAllS.setBounds (g2.removeFromLeft (juce::jmin (120, g2.getWidth())).reduced (0, 3));
             }
             r.removeFromTop (4);
             {
@@ -821,6 +1357,15 @@ private:
                 g3.removeFromLeft (6);
                 bpmLbl.setBounds (g3);
             }
+            r.removeFromTop (4);
+            {
+                auto g4 = grpRow (secGate); // NOTE START: quantize/mono toggles
+                qTempoT.setBounds (g4.removeFromLeft (218));
+                g4.removeFromLeft (6);
+                monoT.setBounds (g4.removeFromLeft (76));
+                g4.removeFromLeft (6);
+                qPulseT.setBounds (g4);
+            }
             r.removeFromTop (8);
 
             auto left = r.removeFromLeft (236);
@@ -831,29 +1376,53 @@ private:
             {
                 auto head = r.removeFromTop (14);
                 head.removeFromLeft (96);
-                head.removeFromRight (28);
-                durHead.setBounds (head.removeFromRight (114));
+                head.removeFromRight (28);        // over delB (24 + gap)
+                durHead.setBounds (head.removeFromRight (104));
                 head.removeFromRight (4);
-                head.removeFromRight (64); // over the -12/+12 pair
-                noteHead.setBounds (head);
+                // The velocity SLOPE knob sits right above the VEL column it tilts.
+                auto velCol = head.removeFromRight (76);
+                velSlopeS.setBounds (velCol.withY (velCol.getY() - 1).withHeight (15));
+                velHead.setBounds (velCol.withY (velCol.getY() + 14).withHeight (13));
+                head.removeFromRight (4 + 30 + 3 + 30 + 6); // over the -12/+12 pair + gaps
+                noteHead.setBounds (head);        // over the pitch box
             }
-            auto rows = r.removeFromTop (RhythmEngine::kSlots * 26);
+            // Scrollable slot rows: the viewport takes all space above the info
+            // read-out ("unlimited" pulses - the panel shows a window onto them).
+            auto infoArea = r.removeFromBottom (76);
+            slotView.setBounds (r.reduced (0, 2));
+            layoutSlotRows();
+            infoArea.removeFromTop (4);
+            info.setBounds (infoArea);
+        }
+
+        // Lay the slot rows out inside the scrollable container (called from
+        // resized() AND refreshSlots(), since the used count changes the height).
+        void layoutSlotRows()
+        {
+            int used = 0;
+            if (proc != nullptr)
+                for (int i = 0; i < RhythmEngine::kSlots; ++i)
+                    if (proc->getRhythm().slots[i].partial.load() >= 0) ++used;
+            const int rowH = 26;
+            const bool scroll = used * rowH > slotView.getHeight();
+            slotRows.setSize (juce::jmax (60, slotView.getWidth() - (scroll ? 10 : 0)),
+                              juce::jmax (1, used * rowH));
             for (int i = 0; i < RhythmEngine::kSlots; ++i)
             {
-                auto row = rows.removeFromTop (26).reduced (0, 2);
+                auto row = juce::Rectangle<int> (0, i * rowH, slotRows.getWidth(), rowH).reduced (0, 2);
                 slotLbl[i].setBounds (row.removeFromLeft (96));
                 delB[i].setBounds (row.removeFromRight (24));
                 row.removeFromRight (4);
-                durS[i].setBounds (row.removeFromRight (114));
+                durS[i].setBounds (row.removeFromRight (104));
+                row.removeFromRight (4);
+                velS[i].setBounds (row.removeFromRight (76));
                 row.removeFromRight (4);
                 s12P[i].setBounds (row.removeFromRight (30));
                 row.removeFromRight (3);
                 s12M[i].setBounds (row.removeFromRight (30));
-                row.removeFromRight (4);
+                row.removeFromRight (6);
                 pitchE[i].setBounds (row.reduced (0, 1));
             }
-            r.removeFromTop (4);
-            info.setBounds (r);
         }
 
         void paint (juce::Graphics& g) override
@@ -863,7 +1432,392 @@ private:
             g.fillRoundedRectangle (r, 10.0f);
             g.setColour (juce::Colour (0xff5cb8ff));
             g.drawRoundedRectangle (r.reduced (1.5f), 10.0f, 3.0f);
+            // Frame around the PULSE RATE group (drawn behind its controls).
+            if (! rateBox.isEmpty())
+            {
+                auto rb = rateBox.toFloat();
+                g.setColour (juce::Colour (0x224fe6ff)); // faint cyan wash (matches secRate)
+                g.fillRoundedRectangle (rb, 7.0f);
+                g.setColour (juce::Colour (0x664fe6ff));
+                g.drawRoundedRectangle (rb.reduced (0.5f), 7.0f, 1.2f);
+            }
         }
+    };
+
+    // The selected envelope drawn as a LINE WITH NODES. Every node is draggable and
+    // every leg between nodes can be bent by dragging it; both write straight into
+    // the real parameters, so the curve on screen IS the signal the modulator sends
+    // (ModEngine::shape uses the identical formula).
+    struct EnvEditor : juce::Component, juce::TooltipClient
+    {
+        // Live values (times in seconds, level 0..1, curves -1..1). refresh() pulls
+        // them from the parameters; a drag updates them immediately so the node
+        // follows the mouse without waiting for a repaint from elsewhere.
+        float a = 0.1f, d = 0.3f, s = 0.7f, r = 0.4f, cA = 0.0f, cD = 0.55f, cR = 0.55f;
+        juce::Colour col { 0xff9a7bff };
+        juce::String tip;
+        std::function<void (const juce::String&, float)> onEdit;    // suffix, plain value
+        std::function<void (const juce::String&, bool)>  onGesture; // suffix, starting
+        std::function<float (const juce::String&)>       getParam;  // suffix -> plain value
+        juce::String getTooltip() override { return tip; }
+
+        void refresh()
+        {
+            if (! getParam) return;
+            const float na = getParam ("A"),  nd = getParam ("D"),  ns = getParam ("S"),  nr = getParam ("R");
+            const float ka = getParam ("CurveA"), kd = getParam ("CurveD"), kr = getParam ("CurveR");
+            if (na == a && nd == d && ns == s && nr == r && ka == cA && kd == cD && kr == cR) return;
+            a = na; d = nd; s = ns; r = nr; cA = ka; cD = kd; cR = kr;
+            repaint();
+        }
+
+        static float shape (float t, float c)
+        {
+            t = juce::jlimit (0.0f, 1.0f, t);
+            return std::pow (t, std::pow (2.0f, -3.0f * juce::jlimit (-1.0f, 1.0f, c)));
+        }
+
+        // Geometry. Times use a square-root scale so short times still get real estate.
+        static constexpr float kMaxT = 5.0f, kPad = 8.0f;
+        float sustainW() const { return juce::jmax (12.0f, (float) getWidth() * 0.10f); }
+        float legW() const     { return juce::jmax (10.0f, ((float) getWidth() - 2.0f * kPad - sustainW()) / 3.0f); }
+        float tToW (float secs) const { return legW() * std::sqrt (juce::jlimit (0.0f, kMaxT, secs) / kMaxT); }
+        float wToT (float w) const
+        { const float u = juce::jlimit (0.0f, 1.0f, w / juce::jmax (1.0f, legW())); return u * u * kMaxT; }
+        float lToY (float lvl) const { return (float) getHeight() - kPad - juce::jlimit (0.0f, 1.0f, lvl) * ((float) getHeight() - 2.0f * kPad); }
+        float yToL (float y) const   { return juce::jlimit (0.0f, 1.0f, ((float) getHeight() - kPad - y) / juce::jmax (1.0f, (float) getHeight() - 2.0f * kPad)); }
+
+        // 0 start | 1 attack end (peak) | 2 decay end = SUSTAIN LEVEL | 3 sustain end | 4 release end
+        juce::Point<float> node (int i) const
+        {
+            const float x0 = kPad;
+            const float x1 = x0 + tToW (a);
+            const float x2 = x1 + tToW (d);
+            const float x3 = x2 + sustainW();
+            const float x4 = x3 + tToW (r);
+            switch (i)
+            {
+                case 0:  return { x0, lToY (0.0f) };
+                case 1:  return { x1, lToY (1.0f) };
+                case 2:  return { x2, lToY (s) };
+                case 3:  return { x3, lToY (s) };
+                default: return { x4, lToY (0.0f) };
+            }
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            auto b = getLocalBounds().toFloat();
+            g.setColour (juce::Colour (0xff101018));
+            g.fillRoundedRectangle (b, 3.0f);
+            g.setColour (col.withAlpha (0.18f));
+            g.drawRoundedRectangle (b.reduced (0.5f), 3.0f, 1.0f);
+            g.setColour (col.withAlpha (0.10f));
+            g.drawHorizontalLine ((int) lToY (1.0f), b.getX() + 2.0f, b.getRight() - 2.0f);
+            g.drawHorizontalLine ((int) lToY (0.0f), b.getX() + 2.0f, b.getRight() - 2.0f);
+
+            juce::Path p;
+            p.startNewSubPath (node (0));
+            const auto leg = [&] (juce::Point<float> from, juce::Point<float> to, float curve)
+            {
+                constexpr int steps = 28;
+                for (int i = 1; i <= steps; ++i)
+                {
+                    const float t = (float) i / (float) steps;
+                    p.lineTo (from.x + (to.x - from.x) * t,
+                              from.y + (to.y - from.y) * shape (t, curve));
+                }
+            };
+            leg (node (0), node (1), cA);
+            leg (node (1), node (2), cD);
+            p.lineTo (node (3));
+            leg (node (3), node (4), cR);
+
+            auto fill = p;
+            fill.lineTo (node (4).x, lToY (0.0f));
+            fill.lineTo (node (0).x, lToY (0.0f));
+            fill.closeSubPath();
+            g.setColour (col.withAlpha (0.13f));
+            g.fillPath (fill);
+            g.setColour (col);
+            g.strokePath (p, juce::PathStrokeType (2.0f));
+
+            // Each draggable node IS its letter - bold, a size up from the old dots,
+            // with a thin black outline so it reads over the curve and the fill.
+            static const char* letters[5] = { "", "A", "D", "S", "R" };
+            for (int i : { 1, 2, 3, 4 })
+            {
+                const auto n = node (i);
+                const bool hot = i == hover || i == dragNode;
+                juce::GlyphArrangement ga;
+                ga.addLineOfText (juce::Font (juce::FontOptions (15.0f).withStyle ("Bold")), letters[i], 0.0f, 0.0f);
+                juce::Path gp;
+                ga.createPath (gp);
+                const auto gb = gp.getBounds();
+                gp.applyTransform (juce::AffineTransform::translation (n.x - gb.getCentreX(), n.y - gb.getCentreY()));
+                g.setColour (juce::Colours::black.withAlpha (0.9f));
+                g.strokePath (gp, juce::PathStrokeType (2.4f));
+                g.setColour (hot ? juce::Colours::white : col);
+                g.fillPath (gp);
+            }
+        }
+
+        //== interaction ======================================================
+        int   dragNode = -1, dragSeg = -1, hover = -1;
+        float dragStartCurve = 0.0f, dragStartY = 0.0f;
+
+        int nodeAt (juce::Point<float> pos) const
+        {
+            for (int i : { 1, 2, 3, 4 })
+                if (pos.getDistanceFrom (node (i)) < 12.0f) return i; // letter-sized grab area
+            return -1;
+        }
+        int segAt (juce::Point<float> pos) const   // 0 = attack leg, 1 = decay leg, 2 = release leg
+        {
+            if (pos.x < node (1).x) return 0;
+            if (pos.x < node (2).x) return 1;
+            if (pos.x > node (3).x) return 2;
+            return -1;                              // the flat sustain leg has no curve
+        }
+        static const char* segParam (int seg)
+        { return seg == 0 ? "CurveA" : (seg == 1 ? "CurveD" : "CurveR"); }
+        float segCurve (int seg) const { return seg == 0 ? cA : (seg == 1 ? cD : cR); }
+
+        juce::String draggedParam() const
+        {
+            switch (dragNode)
+            {
+                case 1:  return "A";
+                case 2:  return "D";
+                case 3:  return "S";
+                case 4:  return "R";
+                default: return dragSeg >= 0 ? juce::String (segParam (dragSeg)) : juce::String();
+            }
+        }
+
+        // Writes the parameter AND the local value, so the node follows the mouse now.
+        void put (const juce::String& suffix, float v)
+        {
+            if      (suffix == "A") a = v;
+            else if (suffix == "D") d = v;
+            else if (suffix == "S") s = v;
+            else if (suffix == "R") r = v;
+            else if (suffix == "CurveA") cA = v;
+            else if (suffix == "CurveD") cD = v;
+            else if (suffix == "CurveR") cR = v;
+            if (onEdit) onEdit (suffix, v);
+            repaint();
+        }
+
+        void mouseMove (const juce::MouseEvent& e) override
+        {
+            const int h = nodeAt (e.position);
+            if (h != hover) { hover = h; repaint(); }
+            setMouseCursor (h >= 0 ? juce::MouseCursor::DraggingHandCursor
+                                   : (segAt (e.position) >= 0 ? juce::MouseCursor::UpDownResizeCursor
+                                                              : juce::MouseCursor::NormalCursor));
+        }
+        void mouseExit (const juce::MouseEvent&) override { if (hover >= 0) { hover = -1; repaint(); } }
+
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            dragNode = nodeAt (e.position);
+            dragSeg  = dragNode >= 0 ? -1 : segAt (e.position);
+            if (dragSeg >= 0) { dragStartCurve = segCurve (dragSeg); dragStartY = e.position.y; }
+            const auto pid = draggedParam();
+            if (pid.isNotEmpty() && onGesture) onGesture (pid, true);
+            repaint();
+        }
+        void mouseDrag (const juce::MouseEvent& e) override
+        {
+            const auto pos = e.position;
+            switch (dragNode)
+            {
+                case 1: put ("A", juce::jlimit (0.0f, kMaxT, wToT (pos.x - node (0).x))); break;
+                case 2: // the SUSTAIN node: decay time across, sustain level up/down
+                    put ("D", juce::jlimit (0.0f, kMaxT, wToT (pos.x - node (1).x)));
+                    put ("S", yToL (pos.y));
+                    break;
+                case 3: put ("S", yToL (pos.y)); break;   // sustain level only
+                case 4: put ("R", juce::jlimit (0.0f, kMaxT, wToT (pos.x - node (3).x))); break;
+                default:
+                    if (dragSeg >= 0)
+                    {
+                        // Drag the LINE: up bends it convex, down concave.
+                        const float dy = (dragStartY - pos.y) / juce::jmax (24.0f, (float) getHeight() * 0.6f);
+                        put (segParam (dragSeg), juce::jlimit (-1.0f, 1.0f, dragStartCurve + dy * 2.0f));
+                    }
+                    break;
+            }
+        }
+        void mouseUp (const juce::MouseEvent&) override
+        {
+            const auto pid = draggedParam();
+            if (pid.isNotEmpty() && onGesture) onGesture (pid, false);
+            dragNode = -1; dragSeg = -1;
+            repaint();
+        }
+        void mouseDoubleClick (const juce::MouseEvent& e) override
+        {
+            const int seg = segAt (e.position);      // straighten that leg again
+            if (seg < 0) return;
+            const juce::String pid = segParam (seg);
+            if (onGesture) onGesture (pid, true);
+            put (pid, 0.0f);
+            if (onGesture) onGesture (pid, false);
+        }
+    };
+
+    // Drawn-LFO wave editor (Ableton-automation style): drag points; double-click
+    // adds a point; right-click deletes one; dragging a segment's MIDDLE bends it
+    // (power curve), like curving an automation line. One cycle, x 0..1, y 0..1.
+    struct WaveEditor : juce::Component
+    {
+        struct Pt { float x = 0, y = 0, curve = 0; }; // curve bends the segment AFTER this point
+        std::vector<Pt> pts { { 0.0f, 0.0f, 0.0f }, { 1.0f, 1.0f, 0.0f } };
+        std::function<void()> onChange, onClose;
+        juce::TextButton closeB { "X" };
+        int dragIdx = -1, curveIdx = -1;
+        float curveStartVal = 0.0f, curveStartY = 0.0f;
+
+        WaveEditor()
+        {
+            closeB.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
+            closeB.onClick = [this] { if (onClose) onClose(); };
+            addAndMakeVisible (closeB);
+        }
+        void resized() override { closeB.setBounds (getWidth() - 26, 4, 22, 22); }
+
+        static float shaped (float t, float curve) // Ableton-style segment bend
+        { return std::pow (juce::jlimit (0.0f, 1.0f, t), std::exp2 (curve * 3.0f)); }
+        float valueAt (float x) const
+        {
+            if (pts.empty()) return 0.0f;
+            if (x <= pts.front().x) return pts.front().y;
+            for (size_t i = 1; i < pts.size(); ++i)
+                if (x <= pts[i].x)
+                {
+                    const auto& a = pts[i - 1]; const auto& b = pts[i];
+                    const float t = b.x > a.x ? (x - a.x) / (b.x - a.x) : 1.0f;
+                    return a.y + (b.y - a.y) * shaped (t, a.curve);
+                }
+            return pts.back().y;
+        }
+        void fillTable (float* out, int n) const
+        { for (int i = 0; i < n; ++i) out[i] = valueAt ((float) i / (float) (n - 1)); }
+
+        juce::String toText() const
+        {
+            juce::String s;
+            for (const auto& p : pts)
+                s += juce::String (p.x, 4) + ":" + juce::String (p.y, 4) + ":" + juce::String (p.curve, 3) + ";";
+            return s;
+        }
+        void fromText (const juce::String& s)
+        {
+            std::vector<Pt> v;
+            for (const auto& tok : juce::StringArray::fromTokens (s, ";", ""))
+            {
+                auto parts = juce::StringArray::fromTokens (tok, ":", "");
+                if (parts.size() == 3)
+                    v.push_back ({ parts[0].getFloatValue(), parts[1].getFloatValue(), parts[2].getFloatValue() });
+            }
+            if (v.size() >= 2) pts = std::move (v);
+        }
+
+        juce::Rectangle<float> plot() const { return getLocalBounds().toFloat().reduced (14.0f, 30.0f); }
+        juce::Point<float> toScreen (const Pt& p) const
+        { auto r = plot(); return { r.getX() + p.x * r.getWidth(), r.getBottom() - p.y * r.getHeight() }; }
+
+        void paint (juce::Graphics& g) override
+        {
+            g.setColour (juce::Colour (0xf2101018));
+            g.fillRoundedRectangle (getLocalBounds().toFloat(), 10.0f);
+            g.setColour (juce::Colour (0xff9a7bff));
+            g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (1.5f), 10.0f, 3.0f);
+            g.setFont (juce::Font (juce::FontOptions (14.0f).withStyle ("Bold")));
+            g.drawText ("LFO wave  -  drag points, double-click adds, right-click deletes, drag a line's middle to curve it",
+                        14, 6, getWidth() - 48, 20, juce::Justification::centredLeft);
+            auto r = plot();
+            g.setColour (juce::Colour (0xff20202b));
+            g.fillRect (r);
+            g.setColour (juce::Colour (0x33ffffff));
+            for (int i = 1; i < 4; ++i)
+            {
+                g.drawHorizontalLine ((int) (r.getY() + r.getHeight() * i / 4.0f), r.getX(), r.getRight());
+                g.drawVerticalLine   ((int) (r.getX() + r.getWidth()  * i / 4.0f), r.getY(), r.getBottom());
+            }
+            juce::Path curve;
+            for (int i = 0; i <= 256; ++i)
+            {
+                const float x = (float) i / 256.0f;
+                const auto  p = juce::Point<float> (r.getX() + x * r.getWidth(),
+                                                    r.getBottom() - valueAt (x) * r.getHeight());
+                i == 0 ? curve.startNewSubPath (p) : curve.lineTo (p);
+            }
+            g.setColour (juce::Colour (0xff9a7bff));
+            g.strokePath (curve, juce::PathStrokeType (2.2f));
+            for (const auto& p : pts)
+            {
+                g.setColour (juce::Colours::white);
+                g.fillEllipse (juce::Rectangle<float> (11, 11).withCentre (toScreen (p)));
+            }
+        }
+        int hitPoint (juce::Point<float> m) const
+        {
+            for (size_t i = 0; i < pts.size(); ++i)
+                if (toScreen (pts[i]).getDistanceFrom (m) < 9.0f) return (int) i;
+            return -1;
+        }
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            const auto m = e.position;
+            const int hp = hitPoint (m);
+            if (e.mods.isRightButtonDown())
+            {
+                if (hp > 0 && hp < (int) pts.size() - 1) { pts.erase (pts.begin() + hp); changed(); }
+                return;
+            }
+            if (hp >= 0) { dragIdx = hp; return; }
+            // grab the SEGMENT under the mouse to bend it
+            auto r = plot();
+            const float x = juce::jlimit (0.0f, 1.0f, (m.x - r.getX()) / r.getWidth());
+            for (size_t i = 1; i < pts.size(); ++i)
+                if (x <= pts[i].x) { curveIdx = (int) i - 1; break; }
+            if (curveIdx >= 0) { curveStartVal = pts[(size_t) curveIdx].curve; curveStartY = m.y; }
+        }
+        void mouseDrag (const juce::MouseEvent& e) override
+        {
+            auto r = plot();
+            if (dragIdx >= 0)
+            {
+                auto& p = pts[(size_t) dragIdx];
+                p.y = juce::jlimit (0.0f, 1.0f, (r.getBottom() - e.position.y) / r.getHeight());
+                if (dragIdx > 0 && dragIdx < (int) pts.size() - 1) // endpoints keep x = 0 / 1
+                    p.x = juce::jlimit (pts[(size_t) dragIdx - 1].x + 0.01f,
+                                        pts[(size_t) dragIdx + 1].x - 0.01f,
+                                        (e.position.x - r.getX()) / r.getWidth());
+                changed();
+            }
+            else if (curveIdx >= 0)
+            {
+                const bool down = pts[(size_t) curveIdx + 1].y < pts[(size_t) curveIdx].y;
+                const float d = (curveStartY - e.position.y) / 120.0f;
+                pts[(size_t) curveIdx].curve = juce::jlimit (-1.0f, 1.0f, curveStartVal + (down ? -d : d));
+                changed();
+            }
+        }
+        void mouseUp (const juce::MouseEvent&) override { dragIdx = -1; curveIdx = -1; }
+        void mouseDoubleClick (const juce::MouseEvent& e) override
+        {
+            auto r = plot();
+            Pt np { juce::jlimit (0.01f, 0.99f, (e.position.x - r.getX()) / r.getWidth()),
+                    juce::jlimit (0.0f, 1.0f, (r.getBottom() - e.position.y) / r.getHeight()), 0.0f };
+            for (size_t i = 1; i < pts.size(); ++i)
+                if (np.x < pts[i].x) { pts.insert (pts.begin() + (long) i, np); break; }
+            changed();
+        }
+        void changed() { repaint(); if (onChange) onChange(); }
     };
 
     // Floating centre panel that explains WHY the current settings are silent.
@@ -892,23 +1846,80 @@ private:
     FractalAdditiveAudioProcessor& processorRef;
 
     std::unique_ptr<juce::LookAndFeel_V4> lnf;
-    juce::TooltipWindow tooltipWindow { this, 500 };
+    juce::TooltipWindow tooltipWindow { this, 350 }; // subtly quicker hover read-outs
     ScaleKeyboard keyboard;
 
-    SteppedSlider baseNFader, spectrumRangeFader, fractalFader, timbreRepeatsFader;
+    SteppedSlider baseNFader, spectrumRangeFader, timbreRepeatsFader;
+    MagneticSlider fractalFader, harmonicsFader, primeLimitFader; // magnetic whole-value detents
     juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, octaveFader, pEnvAmtFader;
     juce::Slider  ampAdsr[4], filtAdsr[4], pitchAdsr[4];
+    juce::ComboBox tuneSourceBox, tuneScopeBox; // beating mode: source + scope
     juce::ComboBox basePitchBox, whitelistBox, phaseBox, primeModeBox, primeLimitBox, tuningBox, bendBox,
                    dissCountBox, dissModeBox, tuningBankBox;
     RefreshingComboBox presetBox;
+    juce::Label presetDirtyMark; // "*" - some parameter drifted from the loaded preset
+    void refreshPresetDirtyMark();
+    juce::Rectangle<int> titleClickArea; // the title squares; clicking them plays the jingle
     juce::ToggleButton primeToggle[9], morphToggle;
+    juce::ToggleButton temperToggle; // Custom Engine: temper harmonic partials to the loaded .scl
+    std::unique_ptr<ButtonAttachment> temperAtt;
+    std::unique_ptr<SliderAttachment> primeLimitFaderAtt;
     juce::Slider       morphTimeFader;
     juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
+    int                undoTxnTick = 0; // paces the tuning-bank combo refresh
+    juce::String       lastSeenTimbreSource; // re-seeds intervalEdit when the timbre changes elsewhere
+    // The envelopes share ONE compact box; these chips switch which one shows.
+    juce::TextButton   envTabB[4];
+    int                envTab = 0; // 0 = Amp, 1 = Pitch, 2 = Filter, 3 = Custom
+    // CUSTOM tab = 6 modulators (3 envelopes + 3 LFOs), selected by modSelBox; the
+    // faders/combos below re-attach to the selected modulator's parameters.
+    juce::ComboBox     modSelBox;                   // Env 1..3 / LFO 1..3
+    juce::Slider       custAdsr[4], custRangeFader; // env: A D S R + Range (LFO reuses Range)
+    juce::Label        custAdsrLbl[4], lblCustRange;
+    juce::ComboBox     lfoWaveBox, lfoRateModeBox, lfoPhaseModeBox;
+    juce::Slider       lfoDivSlider, lfoHzSlider, lfoPhaseSlider;
+    juce::Label        lblLfoDiv, lblLfoHz, lblLfoPhase;
+    juce::ToggleButton modOnT;                      // per-modulator on/off
+    juce::TextButton   modUnmapBtn;                 // unmap this modulator from everything
+    juce::TextButton   lfoWaveEditBtn;              // opens the drawn-wave editor
+    std::unique_ptr<SliderAttachment>   custAdsrAtt[4], custRangeAtt, lfoDivAtt, lfoHzAtt, lfoPhaseAtt;
+    std::unique_ptr<ComboBoxAttachment> lfoWaveAtt, lfoRateModeAtt, lfoPhaseModeAtt;
+    std::unique_ptr<ButtonAttachment>   modOnAtt;
+    int  modSel = 0;                                // 0..2 env, 3..5 lfo
+    WaveEditor waveEditor;                          // drawn-LFO wave overlay
+    EnvEditor  envEditor;                           // the selected MODULATOR envelope, as a curve
+    EnvEditor  voiceEnv;                            // the Amp / Pitch / Filter envelope, same editor
+    int        voiceEnvTab = 0;                     // which one voiceEnv is showing
+    int        lastDrawLfo = -1;                    // which LFO the docked wave editor is on
+    void attachCustomTab();                         // rebind attachments to the selected modulator
+    void showEnvMapMenu (const juce::String& paramID);
+    juce::String currentModParamId (const juce::String& templateId) const; // modE1A -> modE2A...
+    void addMapListener (juce::Component& c, const juce::String& paramID, bool dynamicMod = false);
+    struct ParamMapListener : juce::MouseListener
+    {
+        FractalAdditiveAudioProcessorEditor* ed = nullptr;
+        juce::String pid;
+        // CUSTOM-tab controls are re-bound to whichever modulator is selected, so
+        // their parameter id changes at runtime: those listeners resolve it live.
+        bool dynamicMod = false;
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            if (e.mods.isRightButtonDown() && ed != nullptr)
+                ed->showEnvMapMenu (dynamicMod ? ed->currentModParamId (pid) : pid);
+        }
+    };
+    std::vector<std::unique_ptr<ParamMapListener>> mapListeners;
     juce::TextButton   rhythmBtn;  // top-bar: opens the spectrum->rhythm MIDI panel
     juce::TextButton   octDn, octUp, sprDn, sprUp; // OCTAVE cell: -1/+1 steppers
     juce::Label        octVal, sprVal;             // their value read-outs
+    juce::TextButton saveTuningBtn;    // save the CURRENT tuning (any mode) as .scl to a chosen folder
+    juce::TextButton tuningBankAddBtn;  // put the CURRENT tuning into the bank
+    juce::TextButton recentOpenBtn;     // opens the floating Recent list
+    juce::TextButton loadItsSpectrumBtn; // .scl written by this synth: restore its patch
+    juce::TextButton loadPresetTuningBtn; // the loaded PRESET carries a different tuning
     juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
-                     langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3], tuningBankLoadBtn;
+                     langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3], tuningBankLoadBtn,
+                     tuningBankClearBtn;
     juce::Label          vibeLabel;   // "Vibe coded by" credit, left of the language button
     juce::HyperlinkButton vibeLink;   // "Asra3" -> Instagram
     juce::TextEditor periodEdit;
@@ -917,11 +1928,50 @@ private:
     juce::TextEditor refAEdit;     // Reference A: type the Hz directly ("hz" shown to its right)
     WarningOverlay warningOverlay;
     NoticeOverlay  noticeOverlay;
+    RecentOverlay  recentOverlay;   // floating list of every scale file loaded
     DissDegreeList degreeList;   // active-scale dissonance list (lives inside dissView)
     DissHeader     dissHeader;   // Step / Sethares-dissonance column header
     juce::Viewport dissView;     // scrolls degreeList when a scale has many steps
     // Spectrum-to-Tuning mode + the "from spectrum's segment" partial picker.
-    juce::ComboBox   specModeBox;                 // Sethares dissonance / from spectrum's segment
+    juce::ComboBox   specModeBox;                 // dyads Sethares / segment / chords Sethares
+    // Chord-search mode (n-note Sethares consonance ranking).
+    juce::ComboBox   chordNotesBox, chordCountBox, chordMinMaxBox;
+    juce::Label      chordNotesLbl, chordPerLbl, chordProgLbl;
+    juce::TextEditor chordPeriodEdit;
+    // Minimum interval between generated notes (cents, default 33) - both creators.
+    juce::TextEditor dissMinEdit, chordMinEdit;
+    juce::Label      dissMinLbl, chordMinLbl, chordCountLbl;
+    // Loaded-chord degree view: back (all chords) / forward (this chord's ranked degrees).
+    juce::TextButton chordViewBack, chordViewFwd;
+    bool             chordDegView = false;
+    // n-AD selector over the degree list (Degrees / Dyads / Triads / ... up to the
+    // scale's own note count, live) + its ranked-combination list.
+    juce::ComboBox   nadBox;
+    NadList          nadList;
+    juce::Viewport   nadView;
+    int              lastNadGen = 0, lastNadSel = 1, lastNadD = 0, lastNotesMax = 0;
+    bool             lastNadRootOnly = true;
+    juce::String     lastNadOpts;   // Min/Max + period + smallest interval, as typed
+    double           lastNadSig = -1.0e30;
+    juce::TextButton chordGoBtn;
+    ChordList        chordList;
+    juce::Viewport   chordView;
+    int              lastChordGen = 0;
+    // Chord preview scheduling (messages sent into the processor's collector when due).
+    struct PrevEv { juce::uint32 dueMs; juce::MidiMessage msg; };
+    std::vector<PrevEv> previewQueue;
+    std::vector<std::pair<int,int>> previewNotes; // (ch,key) of the current preview - for explicit stops
+    void stopChordPreview();                      // explicit note-offs + bend recentre (MPE-safe)
+    void playChordPreview (int row);
+    void hoverPreview (const std::vector<double>& ratios); // sounds while hovering a row
+    void runChordSearch();
+    // Hover-dissonance cache: Sethares dissonance of every key AGAINST the hovered
+    // one (recomputed only when the hovered note / timbre / tuning changes).
+    void updateHoverDissCache (int hoveredNote);
+    int    hoverDissNote = -1;
+    double hoverDissSig  = -1.0e30;
+    std::array<float, 128> hoverDissVal {};
+    float  hoverDissLo = 0.0f, hoverDissHi = 1.0f;
     SegmentList      segList;                     // partial picker (inside segView)
     juce::Viewport   segView;
     juce::TextEditor segPeriodEdit;               // "2" / "3/2" / "500c"
@@ -933,11 +1983,12 @@ private:
     double lastScaleSig   = -1.0e30; // change signature (timbre gen + tuning shape)
     Scrim          rhythmScrim;
     RhythmPanel    rhythmPanel;
-    std::unique_ptr<ButtonAttachment>   rhythmOnAtt, rhythmMpeAtt, rhythmTempoAtt;
+    std::unique_ptr<ButtonAttachment>   rhythmOnAtt, rhythmSelfAtt, rhythmDroneAtt, rhythmFbAtt, rhythmMpeAtt, rhythmTempoAtt,
+                                        rhythmQTempoAtt, rhythmMonoAtt, rhythmQPulseAtt;
+    std::unique_ptr<SliderAttachment>   rhythmFbDecayAtt, rhythmVelSlopeAtt, rhythmStepsAllAtt;
     std::unique_ptr<ComboBoxAttachment> rhythmModeAtt;
     juce::uint32 lastRhythmGen = 0; // refresh the partial list when the template changes
     juce::uint32 lastSegGen = 0;    // refresh the segment picker on template change
-    int lastTempoSent = -1;         // last CC20 BPM sent by the tempo-sync toggle
 
     juce::GroupComponent gHarmonic, gBase, gWhitelist, gSlope, gSpectrumRange, gFractal,
                          gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale, gScaleDiss;
@@ -948,7 +1999,8 @@ private:
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], pitchAdsrLbl[4], primeLbl[9];
 
     std::unique_ptr<SliderAttachment>   baseNAtt, slopeAtt, spectrumRangeAtt, fractalAtt, gainAtt,
-                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, octaveAtt, pEnvAmtAtt;
+                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, octaveAtt, pEnvAmtAtt,
+                                        harmonicsAtt;
     std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4], pitchAdsrAtt[4];
     std::unique_ptr<ComboBoxAttachment> basePitchAtt, whitelistAtt, phaseAtt,
                                         primeModeAtt, primeLimitAtt, tuningAtt, bendAtt, tuningBankAtt;
