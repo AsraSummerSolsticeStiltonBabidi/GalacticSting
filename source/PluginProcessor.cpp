@@ -765,7 +765,18 @@ void FractalAdditiveAudioProcessor::setTuningBankFile (int slot0, const juce::Fi
     if (! juce::isPositiveAndBelow (slot0, kBankSlots) || ! f.existsAsFile())
         return;
 
-    const auto text = f.loadFileAsString();
+    auto text = f.loadFileAsString();
+    // The bank stores .scl TEXT (the state and the slot loader both re-parse it), so a
+    // .tun has to be converted here; storing it raw would fill the slot with something
+    // that silently fails to load again the next time the session is opened.
+    if (f.hasFileExtension ("tun") || TuningManager::looksLikeTun (text))
+    {
+        juce::String scl, tunErr;
+        if (! TuningManager::tunToScala (text, f.getFileNameWithoutExtension(), scl, tunErr))
+            return;
+        text = scl;
+    }
+
     std::vector<double> tmp; double per = 2.0; juce::String err;
     if (! TuningManager::parseScalaScale (text, tmp, per, err)) // validate before storing
         return;
@@ -791,7 +802,18 @@ bool FractalAdditiveAudioProcessor::loadTimbreFile (const juce::File& f, juce::S
         return false;
     }
 
-    const auto text = f.loadFileAsString();
+    auto text = f.loadFileAsString();
+    // Same conversion as the tuning loader: a .tun's degrees are a perfectly good
+    // spectrum, and timbreSource is re-parsed as .scl on state restore, so what gets
+    // stored has to be the converted .scl and not the .tun.
+    if (f.hasFileExtension ("tun") || TuningManager::looksLikeTun (text))
+    {
+        juce::String scl;
+        if (! TuningManager::tunToScala (text, f.getFileNameWithoutExtension(), scl, errorOut))
+            return false;
+        text = scl;
+    }
+
     std::vector<double> perDeg;
     double period = 2.0;
     if (! TuningManager::parseScalaScale (text, perDeg, period, errorOut))

@@ -1273,8 +1273,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addAndMakeVisible (tuningBankBox);
     tuningBankLoadBtn.setColour (juce::TextButton::buttonColourId, cLoad);
     tuningBankLoadBtn.setMouseClickGrabsKeyboardFocus (false);
-    tuningBankLoadBtn.setTooltip (tr ("Load a .scl into the selected bank slot.",
-                                      "Carrega un .scl a la ranura seleccionada del banc."));
+    tuningBankLoadBtn.setTooltip (tr ("Load a .tun / .scl / .ascl into the selected bank slot.",
+                                      "Carrega un .tun / .scl / .ascl a la ranura seleccionada del banc."));
     tuningBankLoadBtn.onClick = [this] { openTuningBankChooser(); };
     // Put the tuning that is playing RIGHT NOW into the bank (any mode: a generated
     // scale, an edited one, an EDO...), without going through a file.
@@ -2438,8 +2438,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Which tuning the keys follow. 12-TET: standard. MTS-ESP: follow an ODDSound MTS-ESP master running in the session. Scala: the .scl/.ascl file loaded below. Note: Ableton Live's own tuning arrives as MPE pitch bend and works in ANY of these modes (set Bend to +-48).",
         "Quina afinaci\xc3\xb3 segueixen les tecles. 12-TET: est\xc3\xa0ndard. MTS-ESP: segueix un mestre MTS-ESP d'ODDSound actiu a la sessi\xc3\xb3. Scala: el fitxer .scl/.ascl carregat a sota. Nota: l'afinaci\xc3\xb3 pr\xc3\xb2pia d'Ableton Live arriba com a pitch bend MPE i funciona en QUALSEVOL d'aquests modes (posa Bend a +-48)."));
     loadSclButton.setTooltip (tr (
-        "Load a Scala .scl or Ableton .ascl file to retune the keys. The 1/1 sits on middle C unless the file sets its own reference (@ABL REFERENCE_PITCH).",
-        "Carrega un fitxer Scala .scl o Ableton .ascl per reafinar les tecles. L'1/1 queda al Do central tret que el fitxer porti la seva refer\xc3\xa8ncia (@ABL REFERENCE_PITCH)."));
+        "Load an AnaMark .tun, a Scala .scl or an Ableton .ascl file to retune the keys. The 1/1 sits on middle C unless the file sets its own reference (@ABL REFERENCE_PITCH, or a .tun's basefreq - a .tun always sounds at the absolute pitches it states). A .tun whose mapping does not repeat cannot be held as a scale and is refused rather than approximated.",
+        "Carrega un fitxer AnaMark .tun, un Scala .scl o un Ableton .ascl per reafinar les tecles. L'1/1 queda al Do central tret que el fitxer porti la seva refer\xc3\xa8ncia (@ABL REFERENCE_PITCH, o el basefreq d'un .tun - un .tun sempre sona als tons absoluts que indica). Un .tun amb un mapatge que no es repeteix no es pot desar com a escala i es rebutja en comptes d'aproximar-lo."));
     clearSclButton.setTooltip (tr ("Unload the scale and return to standard 12-TET.",
                                    "Descarrega l'escala i torna al 12-TET est\xc3\xa0ndard."));
     for (int i = 0; i < 3; ++i)
@@ -2449,8 +2449,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Per-note pitch-bend range. +-48 st is the MPE standard and is REQUIRED for Ableton Live 12's tuning systems and the Microtuner device (enable MPE on this plugin in Live). Use +-2 for a classic keyboard pitch wheel.",
         "Rang del pitch bend per nota. +-48 st \xc3\xa9s l'est\xc3\xa0ndard MPE i \xc3\x89S NECESSARI per als sistemes d'afinaci\xc3\xb3 d'Ableton Live 12 i el Microtuner (activa MPE al plugin dins de Live). Fes servir +-2 per a la roda d'un teclat cl\xc3\xa0ssic."));
     loadTimbreButton.setTooltip (tr (
-        "Load a .scl/.ascl whose intervals become the PARTIALS of the sound, replacing the harmonic engine. Slope, Fractal, Range and Reps still shape it; the greyed-out controls do not apply.",
-        "Carrega un .scl/.ascl els intervals del qual passen a ser els PARCIALS del so, substituint el motor harm\xc3\xb2nic. Pendent, Fractal, Rang i Reps encara hi actuen; els controls en gris no apliquen."));
+        "Load a .tun/.scl/.ascl whose intervals become the PARTIALS of the sound, replacing the harmonic engine. Slope, Fractal, Range and Reps still shape it; the greyed-out controls do not apply.",
+        "Carrega un .tun/.scl/.ascl els intervals del qual passen a ser els PARCIALS del so, substituint el motor harm\xc3\xb2nic. Pendent, Fractal, Rang i Reps encara hi actuen; els controls en gris no apliquen."));
     clearTimbreButton.setTooltip (tr ("Custom engine ON/OFF. Off keeps the loaded scale - nothing is erased; switch it back on any time.",
                                       "Motor propi ON/OFF. En apagar-lo NO s'esborra l'escala carregada; el pots tornar a encendre quan vulguis."));
     timbreRepeatsFader.setTooltip (tr (
@@ -3039,7 +3039,10 @@ void FractalAdditiveAudioProcessorEditor::updateWarning (int templatePartials)
 
 void FractalAdditiveAudioProcessorEditor::openScalaChooser()
 {
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale (.scl / .ascl)", juce::File(), "*.scl;*.ascl");
+    // .tun is offered first because it is what the Save button writes by default:
+    // a tuning exported from here has to be reloadable from here.
+    fileChooser = std::make_unique<juce::FileChooser> ("Load a tuning (.tun / .scl / .ascl)",
+                                                       juce::File(), "*.tun;*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
         {
@@ -3055,7 +3058,8 @@ void FractalAdditiveAudioProcessorEditor::openScalaChooser()
 
 void FractalAdditiveAudioProcessorEditor::openTuningBankChooser()
 {
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a .scl into the tuning bank", juce::File(), "*.scl;*.ascl");
+    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale into the tuning bank (.tun / .scl / .ascl)",
+                                                       juce::File(), "*.tun;*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
         {
@@ -3089,7 +3093,8 @@ void FractalAdditiveAudioProcessorEditor::refreshTuningBank()
 
 void FractalAdditiveAudioProcessorEditor::openTimbreChooser()
 {
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale file as timbre (.scl / .ascl)", juce::File(), "*.scl;*.ascl");
+    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale file as timbre (.tun / .scl / .ascl)",
+                                                       juce::File(), "*.tun;*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
         {
