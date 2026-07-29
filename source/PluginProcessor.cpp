@@ -2128,6 +2128,23 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         state.appendChild (tim, nullptr);
     }
 
+    // Per-partial amplitude edits. Stored as one compact "key:dB" string rather than a
+    // child per edit: there can be thousands of them and a ValueTree node each would
+    // bloat every project file. Keys are ratios in hundredths of a cent (PartialGains.h),
+    // so an edit reopens on the partial it was made on even if the spectrum settings
+    // changed in between.
+    state.removeChild (state.getChildWithName ("PGAINS"), nullptr);
+    if (! partialGains.empty())
+    {
+        juce::String packed;
+        packed.preallocateBytes ((size_t) partialGains.size() * 16);
+        for (const auto& g : partialGains)
+            packed << g.key << ':' << juce::String (g.dB, 3) << ' ';
+        juce::ValueTree pg ("PGAINS");
+        pg.setProperty ("v", packed.trim(), nullptr);
+        state.appendChild (pg, nullptr);
+    }
+
     state.removeChild (state.getChildWithName ("BANK"), nullptr);
     {
         juce::ValueTree bank ("BANK");
@@ -2318,6 +2335,30 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
             if (tok.trim().isNotEmpty()) segSel.insert (tok.getIntValue());
         lastDissScl  = sg.getProperty ("scl").toString();   // so Save works again
         lastDissName = sg.getProperty ("name").toString();
+    }
+
+    // Per-partial amplitude edits (see captureState for the encoding). Restored BEFORE
+    // the first rebuild request so the spectrum comes back with the user's edits already
+    // on it, rather than sounding unedited for a moment and then correcting itself.
+    {
+        partialGains.clear();
+        if (auto pg = tree.getChildWithName ("PGAINS"); pg.isValid())
+        {
+            const auto packed = pg.getProperty ("v").toString();
+            for (const auto& tok : juce::StringArray::fromTokens (packed, " ", ""))
+            {
+                if (tok.isEmpty()) continue;
+                const int c = tok.indexOfChar (':');
+                if (c <= 0) continue;
+                partialGains.push_back ({ tok.substring (0, c).getLargeIntValue(),
+                                          tok.substring (c + 1).getFloatValue() });
+            }
+            std::sort (partialGains.begin(), partialGains.end(),
+                       [] (const spectrum::PartialGain& a, const spectrum::PartialGain& b)
+                       { return a.key < b.key; });
+        }
+        spectrumEngine.setOverrides (partialGains,
+                                     apvts.getRawParameterValue ("partialManual")->load() > 0.5f);
     }
 
     // Tuning bank slots.

@@ -1970,6 +1970,31 @@ int main()
         std::printf ("  brightness  manual ON, fundamental muted=%.4f (vs %.4f unmuted)\n", muted, onS1);
         check (muted > onS1 * 1.15,
                "a per-partial edit reaches the audio (muting the fundamental brightens it)");
+
+        // The edits must come back with the project. Losing a hand-drawn spectrum on
+        // reopening would be the same class of injury as the MTS-ESP overwrite.
+        {
+            auto src = std::make_unique<FractalAdditiveAudioProcessor>();
+            src->prepareToPlay (sr2, eb);
+            std::vector<spectrum::PartialGain> ov;
+            spectrum::setPartialGain (ov, spectrum::gainKey (1.0), -18.5f);
+            spectrum::setPartialGain (ov, spectrum::gainKey (3.0), spectrum::kGainMutedDb);
+            spectrum::setPartialGain (ov, spectrum::gainKey (7.0),  6.25f);
+            src->setPartialGains (ov, true);
+            if (auto* q = src->apvts.getParameter ("partialManual"))
+                q->setValueNotifyingHost (q->convertTo0to1 (1.0f));
+            juce::MemoryBlock saved;
+            src->getStateInformation (saved);
+
+            auto dst = std::make_unique<FractalAdditiveAudioProcessor>();
+            dst->prepareToPlay (sr2, eb);
+            dst->setStateInformation (saved.getData(), (int) saved.getSize());
+            const auto& back = dst->getPartialGains();
+            bool same = back.size() == ov.size();
+            for (size_t i = 0; i < back.size() && same; ++i)
+                same = back[i].key == ov[i].key && std::abs (back[i].dB - ov[i].dB) < 0.01f;
+            check (same, "per-partial edits survive a save and reload, keys and dB intact");
+        }
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
