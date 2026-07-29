@@ -1997,6 +1997,41 @@ int main()
         }
     }
 
+    // --- run 31: undo / redo reach the custom tuning ------------------------------
+    // "CTRL Z CTRL Y DO NOT WORK FOR THE CUSTOM TUNING VALUE."
+    // It is not an APVTS parameter, so nothing ever pushed it onto the undo stack and
+    // Ctrl+Z sailed past it to whatever fader had been touched before.
+    {
+        std::printf ("undo / redo on the custom tuning:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 64);
+
+        const juce::String a = "1 5/4 3/2 2";
+        const juce::String b = "1 6/5 3/2 2";
+        juce::String err;
+        check (p->loadTimbreTextUndoable (a, err), "a custom tuning can be typed in");
+        check (p->loadTimbreTextUndoable (b, err), "and then replaced by another");
+        const auto afterB = p->getTimbreSource();
+
+        p->undoManager.undo();
+        const auto afterUndo = p->getTimbreSource();
+        p->undoManager.redo();
+        const auto afterRedo = p->getTimbreSource();
+        std::printf ("  typed=\"%s\"  after undo=\"%s\"  after redo=\"%s\"\n",
+                     afterB.toRawUTF8(), afterUndo.toRawUTF8(), afterRedo.toRawUTF8());
+
+        check (afterUndo == a, "Ctrl+Z puts the PREVIOUS custom tuning back");
+        check (afterRedo == afterB, "Ctrl+Y brings the newer one forward again");
+
+        // A tuning that does not parse must not push anything onto the stack, or Ctrl+Z
+        // would start eating perfectly good edits.
+        juce::String bad;
+        const bool rejected = ! p->loadTimbreTextUndoable ("not a scale at all", bad);
+        p->undoManager.undo();
+        check (rejected && p->getTimbreSource() == a,
+               "a rejected tuning pushes nothing, so undo still steps back over the real edits");
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

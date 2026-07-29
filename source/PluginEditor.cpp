@@ -1763,7 +1763,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         juce::String err;
         if (intervalEdit.getText().trim().isNotEmpty())
         {
-            if (processorRef.loadTimbreText (intervalEdit.getText(), err))
+            if (processorRef.loadTimbreTextUndoable (intervalEdit.getText(), err))
             {
                 // Same as loading a .scl: switch the engine off, grey the harmonic
                 // controls and show the Off button - immediately, not on the next tick.

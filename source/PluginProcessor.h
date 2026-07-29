@@ -98,6 +98,41 @@ public:
     // window showed an empty field and the spectrum could only be edited by retyping
     // it from memory.
     juce::String getTimbreSource() const { return timbreSource; }
+
+    // The custom-tuning text is not an APVTS parameter, so nothing ever put it on the
+    // undo stack: Ctrl+Z sailed straight past it to whatever fader was touched before,
+    // and a typed scale could not be taken back. This wraps the change in an
+    // UndoableAction so it behaves like every other control.
+    struct TimbreTextAction : public juce::UndoableAction
+    {
+        TimbreTextAction (FractalAdditiveAudioProcessor& p, juce::String prev, juce::String next)
+            : proc (p), after (std::move (next)), before (std::move (prev)) {}
+        bool perform() override { return applyOne (after); }
+        bool undo() override    { return applyOne (before); }
+        int  getSizeInUnits() override { return (int) (after.length() + before.length()) * 2 + 32; }
+        bool applyOne (const juce::String& t)
+        {
+            juce::String e;
+            if (t.trim().isEmpty()) { proc.clearTimbre(); return true; }
+            return proc.loadTimbreText (t, e);
+        }
+        FractalAdditiveAudioProcessor& proc;
+        juce::String after, before;
+    };
+
+    // Type a custom tuning THROUGH the undo stack. Returns false (with errorOut set) if
+    // the text does not parse, in which case nothing is pushed.
+    bool loadTimbreTextUndoable (const juce::String& text, juce::String& errorOut)
+    {
+        // Capture the previous text BEFORE applying anything: loadTimbreText below
+        // already overwrites timbreSource, so asking for it afterwards would record the
+        // NEW value as the one to go back to - an undo that undid nothing.
+        const auto before = timbreSource;
+        if (! loadTimbreText (text, errorOut)) return false;   // rejected: nothing is pushed
+        undoManager.beginNewTransaction();
+        undoManager.perform (new TimbreTextAction (*this, before, text));
+        return true;
+    }
     int  getTimbreNoteCount() const noexcept { return (int) timbreDegrees.size(); }
 
     // Degrees per period of the active tuning (for the colour keyboard).
