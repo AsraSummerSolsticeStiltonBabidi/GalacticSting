@@ -517,11 +517,17 @@ int main()
         setParam ("modE1A", 0.001f); setParam ("modE1D", 0.5f);
         setParam ("modE1S", 1.0f);   setParam ("modE1R", 0.001f);
         setParam ("modE1Range", 0.5f); setParam ("modE1On", 1.0f);
-        setParam ("curveSlope", 1.0f);           // base value; the env rides on top
-        proc.getModEngine().addTarget (0, "curveSlope");
+        // A GLOBAL target. Voice-level controls (and curveSlope, which is amplitude-only)
+        // are modulated inside each voice now, so their parameter deliberately no longer
+        // moves - there is no single value it could show while eight notes each have
+        // their own. What is under test here is the global path, which still carries the
+        // spectrum controls, so it needs a global target: masterGain, whose range is
+        // linear so the displacement maps straight through.
+        setParam ("masterGain", -12.0f);         // base value; the env rides on top
+        proc.getModEngine().addTarget (0, "masterGain");
 
-        auto* raw  = proc.apvts.getRawParameterValue ("curveSlope");
-        const float base = 1.0f;
+        auto* raw  = proc.apvts.getRawParameterValue ("masterGain");
+        const float base = -12.0f;
         int firedOn = 0, restored = 0;
         for (int rep = 0; rep < 10; ++rep)
         {
@@ -569,25 +575,25 @@ int main()
         check (raw->load() > base + 0.05f, "precondition: the envelope is displacing the value");
         // Exactly what a UI control does: a complete gesture around the change.
         {
-            auto* p = proc.apvts.getParameter ("curveSlope");
+            auto* p = proc.apvts.getParameter ("masterGain");
             p->beginChangeGesture();
-            p->setValueNotifyingHost (p->convertTo0to1 (2.0f));
+            p->setValueNotifyingHost (p->convertTo0to1 (-6.0f));
             p->endChangeGesture();
         }
         { juce::MidiBuffer midi; proc.processBlock (audio, midi); }
-        check (std::abs (raw->load() - 2.0f) < 0.02f,
+        check (std::abs (raw->load() - (-6.0f)) < 0.05f,
                "a knob set while modulated reads back as the value you set (clean undo/save)");
         for (int b = 0; b < (int) (0.5 * sr / blk); ++b) { juce::MidiBuffer midi; proc.processBlock (audio, midi); }
-        check (raw->load() > 2.0f + 0.05f, "modulation resumes by itself after the hold window");
+        check (raw->load() > -6.0f + 0.05f, "modulation resumes by itself after the hold window");
         // HOST AUTOMATION (no gesture) must NOT pause the modulation.
         {
-            auto* p = proc.apvts.getParameter ("curveSlope");
-            p->setValueNotifyingHost (p->convertTo0to1 (1.5f));
+            auto* p = proc.apvts.getParameter ("masterGain");
+            p->setValueNotifyingHost (p->convertTo0to1 (-9.0f));
             juce::MidiBuffer midi; proc.processBlock (audio, midi);
-            check (raw->load() > 1.5f + 0.05f, "automation (no gesture) keeps modulating - not throttled");
+            check (raw->load() > -9.0f + 0.05f, "automation (no gesture) keeps modulating - not throttled");
         }
         { juce::MidiBuffer midi; midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0); proc.processBlock (audio, midi); }
-        setParam ("curveSlope", base);
+        setParam ("masterGain", base);
 
         // Unmapping while modulated must hand the parameter straight back.
         {
@@ -751,10 +757,12 @@ int main()
         setParam ("modE1A", 0.001f); setParam ("modE1D", 0.400f);
         setParam ("modE1S", 0.000f); setParam ("modE1R", 0.001f);
         setParam ("modE1Range", 1.0f); setParam ("modE1On", 1.0f);
-        setParam ("curveSlope", 0.0f);
-        proc.getModEngine().addTarget (0, "curveSlope");
-        auto* raw = proc.apvts.getRawParameterValue ("curveSlope");
-        const float full = 4.0f; // curveSlope range 0..4 -> Range 1 spans the lot
+        // Global target (see the note above): the curve maths is shared by both paths,
+        // and masterGain's range is linear so the shape is read back undistorted.
+        setParam ("masterGain", -60.0f);
+        proc.getModEngine().addTarget (0, "masterGain");
+        auto* raw = proc.apvts.getRawParameterValue ("masterGain");
+        const float full = 72.0f; // masterGain range -60..12 -> Range 1 spans the lot
 
         // Sample the decay leg half way through, for three curve settings.
         auto midDecay = [&] (float curve)
@@ -764,7 +772,7 @@ int main()
               proc.processBlock (audio, m); }
             const int halfBlocks = (int) (0.200 * sr / blk);           // 0.2 s = half of D
             for (int b = 0; b < halfBlocks; ++b) { juce::MidiBuffer m; proc.processBlock (audio, m); }
-            const float v = raw->load() / full;                        // 0..1
+            const float v = (raw->load() + 60.0f) / full;                        // 0..1
             { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
               proc.processBlock (audio, m); }
             for (int b = 0; b < 20; ++b) { juce::MidiBuffer m; proc.processBlock (audio, m); }
@@ -782,13 +790,13 @@ int main()
         { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
           proc.processBlock (audio, m); }
         for (int b = 0; b < (int) (0.4 * sr / blk); ++b) { juce::MidiBuffer m; proc.processBlock (audio, m); }
-        check (std::abs (raw->load() / full - 0.25f) < 0.03f, "the sustain node sets the level it rests at");
+        check (std::abs ((raw->load() + 60.0f) / full - 0.25f) < 0.03f, "the sustain node sets the level it rests at");
 
         // A second key while the first sustains must restart from zero.
         setParam ("modE1A", 0.30f);
         { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100), 0);
           proc.processBlock (audio, m); }
-        check (raw->load() / full < 0.10f, "a second key RESTARTS the envelope from zero (attack audible again)");
+        check ((raw->load() + 60.0f) / full < 0.10f, "a second key RESTARTS the envelope from zero (attack audible again)");
         { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
           m.addEvent (juce::MidiMessage::noteOff (1, 64), 1); proc.processBlock (audio, m); }
         for (int b = 0; b < 30; ++b) { juce::MidiBuffer m; proc.processBlock (audio, m); }
@@ -1607,6 +1615,421 @@ int main()
         check (stol[0] > 1.0e-4f, "a stolen note sounds too");
         check (stol[1] < stol[0] * 0.55f, "a stolen note also decays to sustain");
         check (stol[2] < stol[0] * 0.02f, "and also releases to silence");
+    }
+
+    // --- run 26: a fast morph must not CLICK -------------------------------------
+    // "Two notes with an LFO on Base and morph on click very loudly - the same clicks
+    // as morph speed at minimum with one note."
+    // A click IS a discontinuity, so measure the thing itself: the largest jump from
+    // one sample to the next, normalised by the signal's own peak. A smooth additive
+    // tone has a bounded per-sample slope; a coherent switch of the whole partial bank
+    // does not. Morph OFF is the control - the same template stream without any
+    // crossfade - so the comparison isolates the morph rather than the rebuilds.
+    {
+        std::printf ("morph discontinuity under a stream of new templates:\n");
+        constexpr int eb = 64;
+        auto run = [&] (bool morphOn, float morphTime, const char* label)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (48000.0, eb);
+            auto s = [&] (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            // Flat, fully-sustained envelope: any jump we measure is the morph, not the ADSR.
+            s ("ampAttack", 0.002f); s ("ampDecay", 0.002f); s ("ampSustain", 1.0f);
+            s ("ampCurveA", 0.0f);   s ("ampCurveD", 0.0f);
+            s ("fractalLevel", 1.0f); s ("curveSlope", 2.0f); s ("baseN", 1.0f);
+            s ("morph", morphOn ? 1.0f : 0.0f);
+            s ("morphTime", morphTime);
+
+            juce::AudioBuffer<float> b (2, eb);
+            for (int i = 0; i < 60; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+            { // two notes, exactly as reported
+                juce::MidiBuffer m;
+                m.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+                m.addEvent (juce::MidiMessage::noteOn (1, 67, 0.8f), 1);
+                b.clear(); p->processBlock (b, m);
+            }
+            for (int i = 0; i < 60; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+
+            float maxJump = 0.0f, peak = 0.0f, prev = 0.0f;
+            bool  have = false;
+            for (int step = 0; step < 20; ++step)
+            {
+                s ("baseN", 1.0f + (float) (step % 6));  // sweep Base the way the LFO does
+                juce::Thread::sleep (14);                 // let the builder thread publish
+                for (int i = 0; i < 10; ++i)
+                {
+                    juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                    const float* L = b.getReadPointer (0);
+                    for (int k = 0; k < eb; ++k)
+                    {
+                        const float x = L[k];
+                        peak = std::max (peak, std::abs (x));
+                        if (have) maxJump = std::max (maxJump, std::abs (x - prev));
+                        prev = x; have = true;
+                    }
+                }
+            }
+            const float ratio = peak > 0.0f ? maxJump / peak : 0.0f;
+            std::printf ("  %-24s peak=%.4f  maxJump=%.4f  jump/peak=%.3f\n",
+                         label, peak, maxJump, ratio);
+            return ratio;
+        };
+
+        const float off  = run (false, 0.001f, "morph off (control)");
+        const float fast = run (true,  0.001f, "morph on, time=minimum");
+        const float slow = run (true,  0.300f, "morph on, time=300 ms");
+
+        check (off > 0.0f, "the control case actually made sound");
+        // Generous margin: we are catching a full-scale coherent impulse (jump/peak near
+        // 1), not a few percent of extra slope.
+        check (fast <= off * 2.5f + 0.02f, "a minimum-time morph does not click");
+        check (slow <= off * 2.5f + 0.02f, "a morph restarted every rebuild does not click");
+    }
+
+    // --- run 27: MTS-ESP is adopted on a NEW instance only, never on a restored one --
+    // "I only wanted it to happen when Fibló loads for the FIRST time. If the project is
+    // reopened I don't want it, because it would break the settings the user put in -
+    // that would be a hard blow for the user."
+    // The adoption itself needs a live MTS master, which an offline harness cannot
+    // provide, so what is checked here is the gate in front of it: is it still armed?
+    {
+        std::printf ("MTS-ESP adoption is armed only for a brand-new instance:\n");
+        constexpr int eb = 64;
+        auto fresh = [&]
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (48000.0, eb);
+            return p;
+        };
+
+        {   // a brand-new instance stays armed while the host is still handing things over
+            auto p = fresh();
+            for (int i = 0; i < 5; ++i) p->pollParametersForTests();
+            check (p->mtsAdoptionArmedForTests(),
+                   "a new instance is still armed a few ticks in (the host may yet send state)");
+            for (int i = 0; i < 40; ++i) p->pollParametersForTests();
+            check (! p->mtsAdoptionArmedForTests(),
+                   "and it is consumed once, shortly after load");
+        }
+        {   // a REOPENED project: the host hands over saved state
+            auto src = fresh();
+            if (auto* q = src->apvts.getParameter ("tuningMode"))
+                q->setValueNotifyingHost (q->convertTo0to1 (2.0f)); // Scala
+            juce::MemoryBlock saved;
+            src->getStateInformation (saved);
+
+            auto p = fresh();
+            p->setStateInformation (saved.getData(), (int) saved.getSize());
+            check (! p->mtsAdoptionArmedForTests(),
+                   "a restored project disarms it, so the saved tuning mode is never overwritten");
+            for (int i = 0; i < 60; ++i) p->pollParametersForTests();
+            const float mode = p->apvts.getRawParameterValue ("tuningMode")->load();
+            check (std::abs (mode - 2.0f) < 0.5f,
+                   "and the restored tuning mode survives the load (still Scala)");
+        }
+        {   // a host handing over EMPTY or unreadable state must not look brand new
+            auto p = fresh();
+            p->setStateInformation (nullptr, 0);
+            check (! p->mtsAdoptionArmedForTests(),
+                   "empty state disarms it too (restoreState bails out before its own reset)");
+
+            auto q = fresh();
+            const char junk[] = "not a valid plugin chunk at all";
+            q->setStateInformation (junk, (int) sizeof (junk));
+            check (! q->mtsAdoptionArmedForTests(),
+                   "and so does unreadable state");
+        }
+    }
+
+    // --- run 28: modulation is PER VOICE, and it is audible ----------------------
+    // "I want slope and every other parameter to have envelopes working the way I asked."
+    // The parameter deliberately no longer moves, so the only honest place to look is
+    // the SOUND. Brightness proxy: mean|x[n]-x[n-1]| / mean|x[n]| - a crude spectral
+    // centroid that needs no FFT and rises with high-frequency content.
+    {
+        std::printf ("per-voice modulation, measured in the audio:\n");
+        constexpr int eb = 64;
+        constexpr double sr = 48000.0;
+
+        auto bright = [] (const std::vector<float>& x, int from, int to)
+        {
+            double sa = 0.0, sd = 0.0; int n = 0;
+            for (int i = juce::jmax (1, from); i < juce::jmin ((int) x.size(), to); ++i)
+            { sa += std::abs ((double) x[(size_t) i]); sd += std::abs ((double) x[(size_t) i] - x[(size_t) i - 1]); ++n; }
+            return n > 0 && sa > 1.0e-12 ? sd / sa : 0.0;
+        };
+
+        // Render `ms` milliseconds, optionally pressing a SECOND key partway through and
+        // letting it go again, and return the mono signal.
+        auto render = [&] (const char* target, float range, bool secondKey, double ms,
+                           float baseSlope, float baseCutoffCents)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr, eb);
+            auto s = [&] (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            s ("rhythmOn", 0.0f); s ("rhythmSelfPlay", 0.0f); s ("morph", 0.0f);
+            // Flat amp envelope: everything we measure is the MODULATION, not the ADSR.
+            s ("ampAttack", 0.001f); s ("ampDecay", 0.001f); s ("ampSustain", 1.0f); s ("ampRelease", 0.005f);
+            // A long, deep modulation envelope so the sweep is unmistakable.
+            s ("modE1A", 0.001f); s ("modE1D", 0.400f); s ("modE1S", 0.0f); s ("modE1R", 0.005f);
+            s ("modE1CurveD", 0.0f); s ("modE1Range", range); s ("modE1On", 1.0f);
+            // A RICH spectrum and an open filter by default: with a steep slope and a low
+            // cutoff the output is very nearly a pure fundamental (|dx|/|x| lands on
+            // 2*pi*f/fs exactly), and then there is no brightness for anything to move.
+            s ("baseN", 1.0f); s ("fractalLevel", 1.0f); s ("curveSlope", baseSlope);
+            s ("filterCutoff", baseCutoffCents);
+            for (int m = 0; m < ModEngine::kMods; ++m) p->getModEngine().unmapAll (m);
+            p->getModEngine().addTarget (0, target);
+
+            juce::AudioBuffer<float> b (2, eb);
+            for (int i = 0; i < 40; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+
+            std::vector<float> out;
+            const int total = (int) (ms * 0.001 * sr / eb);
+            const int onAt = (int) (0.150 * sr / eb), offAt = (int) (0.170 * sr / eb);
+            { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+              b.clear(); p->processBlock (b, m);
+              for (int k = 0; k < eb; ++k) out.push_back (b.getReadPointer (0)[k]); }
+            for (int i = 1; i < total; ++i)
+            {
+                juce::MidiBuffer m;
+                if (secondKey && i == onAt)  m.addEvent (juce::MidiMessage::noteOn (1, 79, (juce::uint8) 100), 0);
+                if (secondKey && i == offAt) m.addEvent (juce::MidiMessage::noteOff (1, 79), 0);
+                b.clear(); p->processBlock (b, m);
+                for (int k = 0; k < eb; ++k) out.push_back (b.getReadPointer (0)[k]);
+            }
+            return out;
+        };
+        const auto at = [&] (double ms) { return (int) (ms * 0.001 * sr); };
+
+        auto rms = [] (const std::vector<float>& x, int from, int to)
+        {
+            double s2 = 0.0; int n = 0;
+            for (int i = juce::jmax (0, from); i < juce::jmin ((int) x.size(), to); ++i)
+            { s2 += (double) x[(size_t) i] * x[(size_t) i]; ++n; }
+            return n > 0 ? std::sqrt (s2 / n) : 0.0;
+        };
+
+        // 0. PLUMBING, on the least ambiguous target there is. The mod envelope decays
+        //    1 -> 0 over 400 ms; Range -1 means the offset walks -1 -> 0, so the amp
+        //    sustain walks silence -> full. If this does not move, nothing does.
+        {
+            const auto x = render ("ampSustain", -1.0f, false, 700.0, 0.5f, 9600.0f);
+            const double early = rms (x, at (20.0),  at (70.0));
+            const double late  = rms (x, at (550.0), at (650.0));
+            std::printf ("  ampSus  rms early=%.5f late=%.5f\n", early, late);
+            check (late > early * 4.0, "a per-voice envelope reaches the audio at all");
+        }
+
+        // 1. SLOPE. It is a spectrum control, but amplitude-only, so a voice can move it
+        //    on its own - the rescale is exact and needs no recompile. The mod envelope
+        //    DECAYS 1 -> 0, so with Range +1 the slope starts steep (dark) and falls back
+        //    to the knob's own value (bright): brightness must RISE across the note.
+        {
+            const auto x = render ("curveSlope", 1.0f, false, 700.0, 0.5f, 9600.0f);
+            const double early = bright (x, at (20.0),  at (70.0));
+            const double late  = bright (x, at (550.0), at (650.0));
+            std::printf ("  slope   brightness early=%.4f late=%.4f\n", early, late);
+            check (early > 1.0e-6 && late > 1.0e-6, "the note sounds throughout");
+            check (late > early * 1.15, "a per-voice envelope on SLOPE audibly opens the note up");
+        }
+
+        // 2. FILTER CUTOFF, and the decisive one: a SECOND key must not restart the
+        //    FIRST note's envelope. That is exactly what a single global bank did, and
+        //    why pressing more keys made the modulation appear to jump.
+        {
+            const auto alone = render ("filterCutoff", 1.0f, false, 500.0, 0.5f, 1200.0f);
+            const auto withB = render ("filterCutoff", 1.0f, true,  500.0, 0.5f, 1200.0f);
+            const double bA = bright (alone, at (300.0), at (360.0));
+            const double bB = bright (withB, at (300.0), at (360.0));
+            const double sweep = bright (alone, at (20.0), at (70.0));
+            std::printf ("  cutoff  alone=%.4f  after a second key=%.4f  (early sweep ref=%.4f)\n",
+                         bA, bB, sweep);
+            check (std::abs (sweep - bA) > 0.05 * juce::jmax (sweep, bA),
+                   "precondition: the envelope really is sweeping the filter");
+            check (std::abs (bA - bB) < 0.10 * juce::jmax (bA, bB),
+                   "a second key does NOT disturb the first note's envelope (per voice)");
+        }
+    }
+
+    // --- run 29: a downward slope modulation must WIDEN the compiled template --------
+    // A voice rescales amplitudes from the template's slope to its own, exactly - but
+    // only for partials the template actually holds, and the amplitude floor culls by an
+    // amplitude that depends on slope. Compiled steep, the template physically lacks what
+    // a shallower voice needs, and partials would go missing. So the compile has to use
+    // the LOWEST slope the modulation can reach.
+    {
+        std::printf ("slope modulation widens the compiled spectrum:\n");
+        constexpr int eb = 64;
+        auto build = [&] (bool mapDownwards)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (48000.0, eb);
+            auto s = [&] (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            s ("rhythmOn", 0.0f); s ("rhythmSelfPlay", 0.0f);
+            s ("baseN", 1.0f); s ("fractalLevel", 1.0f);
+            s ("curveSlope", 3.0f);          // steep: the -120 dB floor culls hard
+            if (mapDownwards)
+            {
+                p->getModEngine().addTarget (0, "curveSlope");
+                s ("modE1Range", -1.0f);     // reaches all the way down to slope 0
+                s ("modE1On", 1.0f);
+            }
+            p->pollParametersForTests();
+            juce::AudioBuffer<float> b (2, eb);
+            for (int i = 0; i < 30; ++i)
+            { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); juce::Thread::sleep (4); }
+            p->pollParametersForTests();
+            for (int i = 0; i < 30; ++i)
+            { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); juce::Thread::sleep (4); }
+            const auto* t = p->getLiveTemplate();
+            return t != nullptr ? (int) t->partials.size() : 0;
+        };
+        const int plain  = build (false);
+        const int mapped = build (true);
+        std::printf ("  partials: slope 3 alone=%d   with a downward modulation=%d\n", plain, mapped);
+        check (plain > 0, "the plain template built at all");
+        check (mapped > plain,
+               "a modulator reaching down to a shallower slope compiles a WIDER template");
+    }
+
+    // --- run 30: manual per-partial amplitudes, and slope going inert ---------------
+    // "Make slope not work when manual mode is on, which is off by default."
+    {
+        std::printf ("manual per-partial amplitudes:\n");
+        constexpr int eb = 64;
+        constexpr double sr2 = 48000.0;
+
+        auto brightOf = [] (const std::vector<float>& x)
+        {
+            double sa = 0.0, sd = 0.0;
+            for (size_t i = 1; i < x.size(); ++i)
+            { sa += std::abs ((double) x[i]); sd += std::abs ((double) x[i] - x[i - 1]); }
+            return sa > 1.0e-12 ? sd / sa : 0.0;
+        };
+
+        // slopeAfter is set AFTER manual is switched on, so with manual on it must have
+        // no effect at all - the freeze happened at slope 1.
+        auto run = [&] (bool manual, float slopeAfter, bool muteFundamental)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr2, eb);
+            auto s = [&] (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            s ("rhythmOn", 0.0f); s ("rhythmSelfPlay", 0.0f); s ("morph", 0.0f);
+            s ("ampAttack", 0.001f); s ("ampDecay", 0.001f); s ("ampSustain", 1.0f);
+            s ("baseN", 1.0f); s ("fractalLevel", 1.0f); s ("filterCutoff", 9600.0f);
+            s ("curveSlope", 1.0f);
+            if (manual) s ("partialManual", 1.0f);   // freezes slope at 1.0
+            s ("curveSlope", slopeAfter);            // must be inert while manual is on
+
+            if (muteFundamental)
+            {
+                std::vector<spectrum::PartialGain> ov;
+                spectrum::setPartialGain (ov, spectrum::gainKey (1.0), spectrum::kGainMutedDb);
+                p->setPartialGains (ov, true);
+            }
+            p->pollParametersForTests();
+
+            juce::AudioBuffer<float> b (2, eb);
+            for (int i = 0; i < 30; ++i)
+            { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); juce::Thread::sleep (4); }
+            p->pollParametersForTests();
+            { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 48, (juce::uint8) 100), 0);
+              b.clear(); p->processBlock (b, m); }
+            std::vector<float> out;
+            for (int i = 0; i < 120; ++i)
+            {
+                juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                if (i > 40) for (int k = 0; k < eb; ++k) out.push_back (b.getReadPointer (0)[k]);
+            }
+            return brightOf (out);
+        };
+
+        const double offS1 = run (false, 1.0f, false);
+        const double offS4 = run (false, 4.0f, false);
+        const double onS1  = run (true,  1.0f, false);
+        const double onS4  = run (true,  4.0f, false);
+        std::printf ("  brightness  manual OFF: slope1=%.4f slope4=%.4f   manual ON: slope1=%.4f slope4=%.4f\n",
+                     offS1, offS4, onS1, onS4);
+        check (std::abs (offS1 - offS4) > 0.15 * juce::jmax (offS1, offS4),
+               "precondition: with manual OFF, slope changes the timbre a lot");
+        check (std::abs (onS1 - onS4) < 0.02 * juce::jmax (onS1, onS4),
+               "with manual ON, slope has NO effect on the sound");
+        check (std::abs (onS1 - offS1) < 0.02 * juce::jmax (onS1, offS1),
+               "and switching manual on does not change the sound by itself");
+
+        const double muted = run (true, 1.0f, true);
+        std::printf ("  brightness  manual ON, fundamental muted=%.4f (vs %.4f unmuted)\n", muted, onS1);
+        check (muted > onS1 * 1.15,
+               "a per-partial edit reaches the audio (muting the fundamental brightens it)");
+
+        // The edits must come back with the project. Losing a hand-drawn spectrum on
+        // reopening would be the same class of injury as the MTS-ESP overwrite.
+        {
+            auto src = std::make_unique<FractalAdditiveAudioProcessor>();
+            src->prepareToPlay (sr2, eb);
+            std::vector<spectrum::PartialGain> ov;
+            spectrum::setPartialGain (ov, spectrum::gainKey (1.0), -18.5f);
+            spectrum::setPartialGain (ov, spectrum::gainKey (3.0), spectrum::kGainMutedDb);
+            spectrum::setPartialGain (ov, spectrum::gainKey (7.0),  6.25f);
+            src->setPartialGains (ov, true);
+            if (auto* q = src->apvts.getParameter ("partialManual"))
+                q->setValueNotifyingHost (q->convertTo0to1 (1.0f));
+            juce::MemoryBlock saved;
+            src->getStateInformation (saved);
+
+            auto dst = std::make_unique<FractalAdditiveAudioProcessor>();
+            dst->prepareToPlay (sr2, eb);
+            dst->setStateInformation (saved.getData(), (int) saved.getSize());
+            const auto& back = dst->getPartialGains();
+            bool same = back.size() == ov.size();
+            for (size_t i = 0; i < back.size() && same; ++i)
+                same = back[i].key == ov[i].key && std::abs (back[i].dB - ov[i].dB) < 0.01f;
+            check (same, "per-partial edits survive a save and reload, keys and dB intact");
+        }
+    }
+
+    // --- run 31: undo / redo reach the custom tuning ------------------------------
+    // "CTRL Z CTRL Y DO NOT WORK FOR THE CUSTOM TUNING VALUE."
+    // It is not an APVTS parameter, so nothing ever pushed it onto the undo stack and
+    // Ctrl+Z sailed past it to whatever fader had been touched before.
+    {
+        std::printf ("undo / redo on the custom tuning:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 64);
+
+        const juce::String a = "1 5/4 3/2 2";
+        const juce::String b = "1 6/5 3/2 2";
+        juce::String err;
+        check (p->loadTimbreTextUndoable (a, err), "a custom tuning can be typed in");
+        check (p->loadTimbreTextUndoable (b, err), "and then replaced by another");
+        const auto afterB = p->getTimbreSource();
+
+        p->undoManager.undo();
+        const auto afterUndo = p->getTimbreSource();
+        p->undoManager.redo();
+        const auto afterRedo = p->getTimbreSource();
+        std::printf ("  typed=\"%s\"  after undo=\"%s\"  after redo=\"%s\"\n",
+                     afterB.toRawUTF8(), afterUndo.toRawUTF8(), afterRedo.toRawUTF8());
+
+        check (afterUndo == a, "Ctrl+Z puts the PREVIOUS custom tuning back");
+        check (afterRedo == afterB, "Ctrl+Y brings the newer one forward again");
+
+        // A tuning that does not parse must not push anything onto the stack, or Ctrl+Z
+        // would start eating perfectly good edits.
+        juce::String bad;
+        const bool rejected = ! p->loadTimbreTextUndoable ("not a scale at all", bad);
+        p->undoManager.undo();
+        check (rejected && p->getTimbreSource() == a,
+               "a rejected tuning pushes nothing, so undo still steps back over the real edits");
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);

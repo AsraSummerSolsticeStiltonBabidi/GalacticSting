@@ -28,6 +28,7 @@
 #include "CurvedEnv.h"
 #include "SineTable.h"
 #include "TuningManager.h"
+#include "ModEngine.h"
 
 #include <array>
 #include <cmath>
@@ -36,8 +37,9 @@ class AdditiveVoice : public juce::MPESynthesiserVoice
 {
 public:
     AdditiveVoice (juce::AudioProcessorValueTreeState& state, const spectrum::SpectrumEngine& eng,
-                   const TuningManager& tuningManager)
-        : apvts (state), engine (eng), tuning (tuningManager), sine (spectrum::sineTable())
+                   const TuningManager& tuningManager, const ModEngine& modulators)
+        : apvts (state), engine (eng), tuning (tuningManager), mods (modulators),
+          sine (spectrum::sineTable())
     {
         attackParam  = apvts.getRawParameterValue ("ampAttack");
         decayParam   = apvts.getRawParameterValue ("ampDecay");
@@ -59,6 +61,8 @@ public:
         pSustainParam= apvts.getRawParameterValue ("pitchSustain");
         pReleaseParam= apvts.getRawParameterValue ("pitchRelease");
 
+        curveSlopeParam = apvts.getRawParameterValue ("curveSlope");
+        manualParam     = apvts.getRawParameterValue ("partialManual");
         ampCurveA = apvts.getRawParameterValue ("ampCurveA");
         ampCurveD = apvts.getRawParameterValue ("ampCurveD");
         ampCurveR = apvts.getRawParameterValue ("ampCurveR");
@@ -167,6 +171,12 @@ public:
         // the first block cleanly SNAP curRatio onto the current template (a frequency
         // snap with continuous phase = click-free) instead of gliding from a stale ratio.
         morphActive = false; morphPos = 1.0; prevN = 0; morphWeight = 0.0;
+        morphWPos = 0.0; morphFadeOut = false;
+
+        // Retrigger this voice's modulators. A stolen voice retriggers too: it is a new
+        // note, and its envelopes must start from the beginning like any other.
+        modNewNote = true;
+        modHeld    = true;
 
         const double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
         updateAdsrParameters();
@@ -193,9 +203,14 @@ public:
 
     void noteStopped (bool allowTailOff) override
     {
+        modHeld = false; // this voice's modulator envelopes go to their release
         if (allowTailOff) { adsr.noteOff(); filterAdsr.noteOff(); pitchAdsr.noteOff(); releasing = true; }
         else              beginFastKill();
     }
+
+    // The transport, pushed in once per block by the processor: a per-voice LFO can be
+    // locked to the host timeline exactly like the global one.
+    void setTransportForMod (double bpm, double ppq) noexcept { modBpm = bpm; modPpq = ppq; }
 
     // Aftertouch is a gain term too: set the TARGET so a jumpy 7-bit stream glides.
     void notePressureChanged() override
@@ -230,6 +245,19 @@ public:
         if (! adsr.isActive() && ! fastKill)
             return;
 
+        // THIS VOICE's modulators, advanced by one block. Its own envelopes, its own LFO
+        // phases, retriggered by its own note-on - so a chord is six independent
+        // envelopes, not one shared envelope restarted by the last key pressed.
+        {
+            double vals[ModEngine::kMods] = {};
+            bool   act [ModEngine::kMods] = {};
+            const double lfoF0 = tuning.frequencyForNote ((int) currentlyPlayingNote.initialNote);
+            mods.evaluateMods (modState, numSamples, modNewNote, modHeld,
+                               lfoF0, modBpm, modPpq, vals, act, false);
+            mods.collectVoiceOffsets (vals, act, modOff, modOwner);
+            modNewNote = false;
+        }
+
         updateAdsrParameters();
         updateFilterAdsrParameters();
         updatePitchAdsrParameters();
@@ -241,13 +269,21 @@ public:
         // per block (like the filter cutoff) - the env itself advances per sample.
         int n = 0;
         // 0..1 crossfade weight from the running phases -> the coherent alignPhase.
-        // It is a MEMBER and only ever rises while a note sounds: restarting the
-        // morph clock (which now happens on every new template - see below) must
-        // never drop it, because a falling weight is a per-partial waveform step.
+        // It is a MEMBER because it must survive a template change: restarting the morph
+        // clock (which happens on every new template) must never DROP it mid-fade, since
+        // a falling weight is a per-partial waveform step. It rises monotonically during a
+        // morph and is only released to 0 at the two safe points named in the invariant
+        // below (weight already 1, or the fade deliberately ramped out by morphFadeOut).
         double& morphW = morphWeight;
+        // Per-sample increment for that weight, filled in by the morph block below and
+        // consumed inside the render loop. Advancing the weight per BLOCK was the cause of
+        // the loud clicks: at any Morph Time shorter than one buffer it stepped 0 -> 1
+        // between two samples.
+        double morphWStep = 0.0;
         const auto* tmpl = engine.getLive();
         const double baseFreq = tuning.frequencyForNote ((int) currentlyPlayingNote.initialNote);
-        const double pitchEnvSemis = (double) pEnvAmtParam->load() * (double) pitchEnvValue;
+        const double pitchEnvSemis = (double) modded (ModEngine::PvPEnvAmt, pEnvAmtParam)
+                                   * (double) pitchEnvValue;
         const double f0 = baseFreq * std::pow (2.0,
             ((double) currentlyPlayingNote.totalPitchbendInSemitones + pitchEnvSemis) / 12.0);
 
@@ -325,31 +361,40 @@ public:
                     for (int j = 0; j < hi; ++j)
                         curRatio[(size_t) j] = std::exp2 (morphStartLog[(size_t) j]);
 
-                    // A change arriving MID-MORPH must not restart the phase crossfade:
-                    // its weight would collapse from ~1 back to 0 in one sample, which
-                    // is a per-partial waveform step. The output at that instant already
-                    // sits on the aligned reference, so adopt it as the running phase and
-                    // continue the crossfade from where it is.
+                    // THE invariant that makes a morph restart click-free:
+                    //   alignPhase[] is only ever WRITTEN while the crossfade weight is 0,
+                    //   phase[]      is only ever WRITTEN while that weight is 1.
+                    // At those two points the two oscillator banks are respectively
+                    // inaudible and numerically identical, so neither assignment can step
+                    // the output. Anything in between is left strictly alone: a template
+                    // arriving mid-crossfade only re-aims alignInc (the DESTINATION
+                    // frequencies), and a frequency move with continuous phase cannot click.
+                    //
+                    // The old code wrote both arrays at an arbitrary weight - re-seeding
+                    // alignPhase whenever the weight was <= 0.5 and adopting it whenever it
+                    // was > 0.5 - so EVERY template change stepped every partial at once,
+                    // coherently. In Aligned mode alignPhase is the same constant 0.25 for
+                    // all of them, which makes that step a maximal impulse rather than a
+                    // smear, and two voices seeded identically stepped in phase and added.
+                    // With an LFO on Base (a new template ~60x a second) that was a
+                    // continuous train of near-full-scale clicks.
                     const bool wasMorphing = morphActive;
-                    bool adoptedAlign = false;
-                    if (wasMorphing)
+                    const int  seedSpan    = std::max (hi, activeCount); // every slot the render loop touches
+                    if (wasMorphing && morphWeight >= 0.999)
                     {
-                        if (morphWeight > 0.5)
-                        {
-                            for (int j = 0; j < hi; ++j) phase[(size_t) j] = alignPhase[(size_t) j];
-                            adoptedAlign = true;
-                        }
+                        // Fully crossfaded: the output already IS alignPhase, so handing it
+                        // back to the running bank and releasing the weight costs nothing,
+                        // and it lets the next crossfade start from a real 0 again.
+                        for (int j = 0; j < seedSpan; ++j) phase[(size_t) j] = alignPhase[(size_t) j];
+                        morphWeight = 0.0; morphWPos = 0.0;
                     }
-                    else
+                    else if (! wasMorphing)
                     {
-                        // A morph that ENDED left morphWeight pinned at 1, so the next
-                        // one started fully crossfaded onto the destination-phase
-                        // oscillator: the glide was inaudible and the waveform jumped
-                        // in a single sample. Every fresh morph starts from the running
-                        // phases again.
-                        morphWeight = 0.0;
+                        // A morph that ENDED already adopted its phases (see the tail of
+                        // renderNextBlock), so the weight can be released here without a step.
+                        morphWeight = 0.0; morphWPos = 0.0;
                     }
-                    morphN = hi; morphActive = true;
+                    morphN = hi; morphActive = true; morphFadeOut = false;
                     // EVERY new target restarts the glide clock. Keeping the old
                     // morphPos was what made a continuous move (a knob drag, or a
                     // modulator: both re-emit a template ~60x a second) degenerate
@@ -364,14 +409,13 @@ public:
                     // current running phases to this over the morph, so the note ends
                     // phase-coherent (a real pulse in Aligned mode) instead of a drifted
                     // smear. Without this the sustain after a morph sounds "wrong".
-                    // NOT re-seeded when we just adopted alignPhase as the running
-                    // phase above: re-seeding it there would move the very phase the
-                    // output has just been handed, which is a waveform step on every
-                    // template change - i.e. ~60 of them a second during a knob drag.
-                    if (! adoptedAlign)
+                    // Seeded ONLY while the crossfade weight is 0 (see the invariant above):
+                    // at any other weight this array is actively feeding the output, so
+                    // writing it is a waveform step on every single template change.
+                    if (morphWeight <= 0.0)
                     {
                         const bool alg = phaseModeParam->load() < 0.5f;
-                        for (int j = 0; j < hi; ++j)
+                        for (int j = 0; j < seedSpan; ++j)
                         {
                             if (alg) alignPhase[(size_t) j] = 0.25;
                             else { const double h = std::sin ((double) j * 12.9898) * 43758.5453;
@@ -379,12 +423,33 @@ public:
                         }
                     }
                 }
+                else if (morphActive && morphWeight > 1.0e-6)
+                {
+                    // Snapping (Morph switched off, or an empty template) while a crossfade
+                    // is part-way through: dropping the term outright removes
+                    // morphWeight * (aligned - running) from every partial in one sample,
+                    // which is the same coherent step as above. Ramp it out instead.
+                    morphFadeOut = true;
+                }
                 else
-                    morphActive = false; // snap
+                {
+                    morphActive = false; morphFadeOut = false;
+                    morphWeight = 0.0; morphWPos = 0.0;
+                }
                 lastGen = gen;
             }
 
-            if (morphActive)
+            if (morphActive && morphFadeOut)
+            {
+                // Leaving a morph early: the ratios snap (a frequency move on a continuous
+                // phase is inaudible) but the crossfade WEIGHT is walked down to 0 over
+                // ~5 ms by the render loop, so the aligned bank is removed gradually
+                // instead of vanishing between two samples.
+                morphWStep = -1.0 / (0.005 * currentSampleRate);
+                for (int j = 0; j < newN; ++j)
+                    curRatio[(size_t) j] = (double) ps[(size_t) j].ratio;
+            }
+            else if (morphActive)
             {
                 const double mt = std::max (0.001, (double) morphTimeParam->load());
                 morphPos += (double) numSamples / (mt * currentSampleRate);
@@ -392,7 +457,15 @@ public:
                 // Phase-lock PROGRESSIVELY across the WHOLE morph (gentle ease-in that
                 // reaches perfect coherence exactly at the end - the Morph Time), so the
                 // pulse comes into phase very gradually rather than snapping near the end.
-                morphW = std::max (morphW, t * t); // ease-in, never falls back (see the declaration)
+                // The weight now advances PER SAMPLE in the render loop (see morphWStep);
+                // only the ratio glide is evaluated once per block.
+                //
+                // The 5 ms floor applies to the WEIGHT ALONE. Morph Time keeps its full
+                // 1 ms minimum for the ratios, but a phase hand-over shorter than ~5 ms
+                // cannot be made click-free: it switches the entire partial bank onto the
+                // coherent reference, and in Aligned mode every partial sits at its peak
+                // there, so the step is a full-scale impulse rather than a smear.
+                morphWStep = 1.0 / (std::max (0.005, mt) * currentSampleRate);
                 for (int j = 0; j < morphN; ++j)
                     curRatio[(size_t) j] = std::exp2 (morphStartLog[(size_t) j]
                                             + (morphTgtLog[(size_t) j] - morphStartLog[(size_t) j]) * t);
@@ -412,17 +485,63 @@ public:
             for (int j = 0; j < n; ++j)
                 tgtAmp[(size_t) j] = (j < newN) ? ps[(size_t) j].amp : 0.0;
 
+            // PER-VOICE SLOPE - the one spectrum control a voice can move on its own.
+            // The compiler gives each base harmonic amp = (k/kMin)^(-slope) and the
+            // fractal convolution only multiplies those, so a published amplitude is
+            // exactly ratio^(-slope) times a factor that does NOT depend on slope.
+            // Rescaling by ratio^-(dS) therefore lands on precisely the spectrum the
+            // compiler would have produced at this voice's slope - no recompile, no
+            // approximation, and nothing dropped: every partial is still here, just at a
+            // different amplitude. The per-sample normalisation downstream is derived
+            // from these targets, so loudness follows automatically.
+            // MANUAL mode: the amplitudes belong to the user's own per-partial edits, so
+            // slope does nothing at all - not the fader, not a modulator pointed at it.
+            // The template was compiled at the frozen slope, so there is nothing to
+            // rescale from either; skipping the whole thing is what makes it inert.
+            const bool manualAmps = manualParam != nullptr && manualParam->load() > 0.5f;
+            if (! manualAmps)
+            {
+                const double dS = (double) modded (ModEngine::PvSlope, curveSlopeParam)
+                                - (double) tmpl->curveSlope;
+                if (std::abs (dS) > 1.0e-6)
+                    for (int j = 0; j < newN; ++j)
+                        tgtAmp[(size_t) j] *= std::pow (std::max (1.0e-9, (double) ps[(size_t) j].ratio), -dS);
+            }
+
+            // The user's per-partial amplitude edits. Already RESOLVED against this exact
+            // partial list when the template was published, so here it is one multiply
+            // per partial with no searching and no allocation on the audio thread.
+            //
+            // Note what this does NOT do: it never removes a partial. A partial pulled to
+            // silence is still in the template, still counted, and comes back the instant
+            // the edit is undone or manual mode is switched off. And because the voice
+            // rebuilds its normalisation from these targets every sample, pulling one
+            // partial down lifts the rest - it is a redistribution, not an attenuation.
+            if (! tmpl->gain.empty())
+            {
+                const int gn = std::min (newN, (int) tmpl->gain.size());
+                for (int j = 0; j < gn; ++j)
+                    tgtAmp[(size_t) j] *= (double) tmpl->gain[(size_t) j];
+            }
+
             for (int j = 0; j < n; ++j) // clamp guards a partial pushed past Nyquist by pitch bend
                 inc[(size_t) j] = std::min (curRatio[(size_t) j] * f0 / currentSampleRate, 0.4999);
 
             // Increment for the coherent reference: the DESTINATION frequency (not the
             // gliding one), so alignPhase converges to a proper pulse for the new spectrum.
+            // Bounded by the SAME span the render loop crossfades over, not by n: the
+            // fading tails in [n, activeCount) are mixed in at weight morphW too, and
+            // leaving their alignInc stale advanced them at a frequency belonging to an
+            // older template - audible as a detuned ghost during every glide.
             if (morphActive)
-                for (int j = 0; j < n; ++j)
+            {
+                const int incSpan = std::max (n, activeCount);
+                for (int j = 0; j < incSpan; ++j)
                 {
                     const double dr = (j < newN) ? (double) ps[(size_t) j].ratio : curRatio[(size_t) j];
                     alignInc[(size_t) j] = std::min (dr * f0 / currentSampleRate, 0.4999);
                 }
+            }
 
             prevN = n;
             engine.reportRendered (newN); // meter: the true (target) partial count
@@ -493,11 +612,11 @@ public:
         int sinceCutoff = kCutoffChunk;
         const auto refreshCutoff = [&]
         {
-            const double octs = (double) fCutoffParam->load() / 1200.0
-                              + (double) fEnvAmtParam->load() * (double) filterEnvValue;
+            const double octs = (double) modded (ModEngine::PvFCutoff, fCutoffParam) / 1200.0
+                              + (double) modded (ModEngine::PvFEnvAmt, fEnvAmtParam) * (double) filterEnvValue;
             const double co = f0 * std::exp2 (octs);
             filter.setCutoffFrequency ((float) juce::jlimit (20.0, 0.49 * sr, co));
-            filter.setResonance (juce::jlimit (0.1f, 40.0f, fResParam->load()));
+            filter.setResonance (juce::jlimit (0.1f, 40.0f, modded (ModEngine::PvFRes, fResParam)));
         };
         refreshCutoff();
 
@@ -506,6 +625,21 @@ public:
         while (--numSamples >= 0)
         {
             if (--sinceCutoff <= 0) { refreshCutoff(); sinceCutoff = kCutoffChunk; }
+            // Crossfade weight, advanced PER SAMPLE. Doing this once per block meant that
+            // for any Morph Time below one buffer the weight went 0 -> 1 between two
+            // samples, switching every partial onto the coherent reference simultaneously:
+            // a full-scale impulse, i.e. the reported click. Two scalar ops per sample.
+            if (morphActive)
+            {
+                if (morphFadeOut)
+                    morphW = std::max (0.0, morphW + morphWStep);
+                else
+                {
+                    morphWPos += morphWStep;
+                    const double tw = std::min (1.0, morphWPos);
+                    morphW = std::max (morphW, tw * tw); // ease-in, monotonic within a fade
+                }
+            }
             // Exact per-sample normalisation from the closed-form running sums (no lag).
             rk *= oneMinusSlew;
             const double sumCur = sumTarget   + (sumCur0 - sumTarget) * rk;
@@ -573,10 +707,24 @@ public:
         // Morph finished this block: adopt the coherent destination phases (the
         // crossfade already reached them) so the sustained note carries on exactly
         // like a freshly-played new spectrum, not a phase-drifted version.
-        if (morphActive && morphPos >= 1.0)
+        //
+        // Gated on the WEIGHT, not only on morphPos. With a Morph Time under the 5 ms
+        // weight floor the ratios arrive before the phase hand-over has finished, and
+        // adopting there would copy alignPhase over a bank that is still audible at
+        // (1 - morphWeight) - exactly the step this whole path exists to avoid. Bounded
+        // by `span`, not morphN: the render loop crossfades the fading tails too, and
+        // leaving them un-adopted stepped them back onto their old phase.
+        if (morphActive && ! morphFadeOut && morphPos >= 1.0 && morphWeight >= 0.999)
         {
-            for (int i = 0; i < morphN; ++i) phase[(size_t) i] = alignPhase[(size_t) i];
+            for (int i = 0; i < span; ++i) phase[(size_t) i] = alignPhase[(size_t) i];
             morphActive = false;
+            morphWeight = 0.0; morphWPos = 0.0; // safe here: the two banks are identical
+        }
+        else if (morphFadeOut && morphWeight <= 0.0)
+        {
+            // The ramp-out reached silence: the aligned bank contributes nothing now, so
+            // dropping it is a no-op.
+            morphActive = false; morphFadeOut = false; morphWPos = 0.0;
         }
 
         // Keep fading-out tails alive until they are inaudible.
@@ -603,22 +751,37 @@ private:
     void updateAdsrParameters()
     {
         if (releasing) return; // never disturb a release tail's rate
-        adsr.setParameters (attackParam->load(), decayParam->load(), sustainParam->load(),
-                            releaseParam->load(), ampCurveA->load(), ampCurveD->load(), ampCurveR->load());
+        adsr.setParameters (modded (ModEngine::PvAmpA,  attackParam),
+                            modded (ModEngine::PvAmpD,  decayParam),
+                            modded (ModEngine::PvAmpS,  sustainParam),
+                            modded (ModEngine::PvAmpR,  releaseParam),
+                            modded (ModEngine::PvAmpCA, ampCurveA),
+                            modded (ModEngine::PvAmpCD, ampCurveD),
+                            modded (ModEngine::PvAmpCR, ampCurveR));
     }
 
     void updateFilterAdsrParameters()
     {
         if (releasing) return;
-        filterAdsr.setParameters (fAttackParam->load(), fDecayParam->load(), fSustainParam->load(),
-                                  fReleaseParam->load(), filtCurveA->load(), filtCurveD->load(), filtCurveR->load());
+        filterAdsr.setParameters (modded (ModEngine::PvFA,  fAttackParam),
+                                  modded (ModEngine::PvFD,  fDecayParam),
+                                  modded (ModEngine::PvFS,  fSustainParam),
+                                  modded (ModEngine::PvFR,  fReleaseParam),
+                                  modded (ModEngine::PvFCA, filtCurveA),
+                                  modded (ModEngine::PvFCD, filtCurveD),
+                                  modded (ModEngine::PvFCR, filtCurveR));
     }
 
     void updatePitchAdsrParameters()
     {
         if (releasing) return;
-        pitchAdsr.setParameters (pAttackParam->load(), pDecayParam->load(), pSustainParam->load(),
-                                 pReleaseParam->load(), pitchCurveA->load(), pitchCurveD->load(), pitchCurveR->load());
+        pitchAdsr.setParameters (modded (ModEngine::PvPA,  pAttackParam),
+                                 modded (ModEngine::PvPD,  pDecayParam),
+                                 modded (ModEngine::PvPS,  pSustainParam),
+                                 modded (ModEngine::PvPR,  pReleaseParam),
+                                 modded (ModEngine::PvPCA, pitchCurveA),
+                                 modded (ModEngine::PvPCD, pitchCurveD),
+                                 modded (ModEngine::PvPCR, pitchCurveR));
     }
 
     void beginFastKill()
@@ -657,6 +820,37 @@ private:
     juce::AudioProcessorValueTreeState& apvts;
     const spectrum::SpectrumEngine&     engine;
     const TuningManager&                tuning;
+    const ModEngine&                    mods;
+
+    //==========================================================================
+    // PER-VOICE MODULATION.
+    //
+    // This voice runs its OWN copy of the six modulators - its own envelopes, its own
+    // LFO phases - retriggered by its own note-on and released when its own key comes
+    // up. The settings live in one shared place (the user has one set of controls);
+    // only the running state is per voice. That is how every other synth does it, and
+    // it is why the global bank felt broken: one envelope for all the voices, restarted
+    // by whichever note arrived last.
+    //
+    // The parameter itself is never written. Each read site asks modded() for
+    // "base + this voice's modulation", so the on-screen control keeps showing the value
+    // the user set - the honest thing to show when eight notes each have a different one.
+    ModEngine::VoiceState       modState;
+    float                       modOff  [ModEngine::PvCount] = {};
+    juce::RangedAudioParameter* modOwner[ModEngine::PvCount] = {};
+    bool   modNewNote = false;   // set by noteStarted, consumed by the first render block
+    bool   modHeld    = false;   // this voice's own key state, gating its envelopes
+    double modBpm = -1.0, modPpq = -1.0;  // transport, pushed in per block by the processor
+
+    // base + this voice's modulation, converted back through the parameter's own range
+    // (the same normalised-space maths the global path uses, so a control behaves
+    // identically whichever route it takes). Unmapped targets cost one atomic load.
+    float modded (int t, const std::atomic<float>* fallback) const noexcept
+    {
+        if (auto* p = modOwner[(size_t) t])
+            return p->convertFrom0to1 (juce::jlimit (0.0f, 1.0f, p->getValue() + modOff[(size_t) t]));
+        return fallback->load();
+    }
     const spectrum::SineTable&          sine;
 
     std::atomic<float>* attackParam    = nullptr;
@@ -679,6 +873,8 @@ private:
     std::atomic<float>* ampCurveA = nullptr, * ampCurveD = nullptr, * ampCurveR = nullptr;
     std::atomic<float>* filtCurveA = nullptr, * filtCurveD = nullptr, * filtCurveR = nullptr;
     std::atomic<float>* pitchCurveA = nullptr, * pitchCurveD = nullptr, * pitchCurveR = nullptr;
+    std::atomic<float>* curveSlopeParam = nullptr; // base slope; per-voice modulated
+    std::atomic<float>* manualParam     = nullptr; // manual per-partial amps -> slope inert
     std::atomic<float>* morphParam     = nullptr;
     std::atomic<float>* morphTimeParam = nullptr;
 
@@ -701,7 +897,16 @@ private:
     std::array<double, spectrum::kMaxPartials> alignInc      {}; // destination-frequency increment for alignPhase
 
     double        morphPos    = 1.0;   // 0..1 glide progress (>= 1 -> done)
+    // Separate clock for the phase-crossfade WEIGHT, advanced per sample. It is NOT reset
+    // by an incoming template (only morphPos is), so a stream of templates - a knob drag,
+    // or a modulator on a spectrum control - lets the crossfade actually COMPLETE instead
+    // of being pinned near zero for ever, which is what kept every voice permanently stuck
+    // in the mid-fade state where any write to phase[]/alignPhase[] clicks.
+    double        morphWPos   = 0.0;
     bool          morphActive = false;
+    // Ramping the crossfade weight back OUT (Morph switched off, or an empty template)
+    // rather than dropping the term in one sample.
+    bool          morphFadeOut = false;
     int           morphN      = 0;     // partial count captured when the morph started
     int           prevN       = 0;     // partials rendered last block (nearest-neighbour source)
     juce::uint32  lastGen     = 0;     // last template generation seen (detects a spectrum change)

@@ -389,6 +389,22 @@ namespace
             return true;
         }
 
+        // PER-VOICE targets have no single live value to point at: with eight notes
+        // sounding, each one is at a different place along this control. So instead of a
+        // dot they get the REACHABLE RANGE, drawn as a band from the base setting out to
+        // wherever the modulation can carry it - the same convention Serum and Vital use,
+        // and the honest answer to "where is this control right now?" when the answer is
+        // "in eight places at once".
+        static bool modSpanProportions (juce::Slider& s, float& loOut, float& hiOut)
+        {
+            const auto& props = s.getProperties();
+            if (! props.contains ("modLo") || ! props.contains ("modHi")) return false;
+            loOut = (float) s.valueToProportionOfLength ((double) props["modLo"]);
+            hiOut = (float) s.valueToProportionOfLength ((double) props["modHi"]);
+            if (hiOut < loOut) std::swap (loOut, hiOut);
+            return hiOut - loOut > 1.0e-4f;
+        }
+
         void drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h,
                                float pos, float startAngle, float endAngle,
                                juce::Slider& s) override
@@ -427,9 +443,24 @@ namespace
             g.setColour (col.brighter (0.35f));
             g.drawLine ({ from, to }, juce::jmax (1.8f, r * 0.20f));
 
+            // Per-voice modulation: the band this control can be carried across.
+            float mLo = 0.0f, mHi = 0.0f;
+            if (modSpanProportions (s, mLo, mHi))
+            {
+                const float a0 = startAngle + juce::jlimit (0.0f, 1.0f, mLo) * (endAngle - startAngle);
+                const float a1 = startAngle + juce::jlimit (0.0f, 1.0f, mHi) * (endAngle - startAngle);
+                juce::Path arc;
+                arc.addCentredArc (c.x, c.y, r * 0.86f, r * 0.86f, 0.0f, a0, a1, true);
+                g.setColour (col.withAlpha (0.55f));
+                g.strokePath (arc, juce::PathStrokeType (juce::jmax (2.0f, r * 0.13f),
+                                                         juce::PathStrokeType::curved,
+                                                         juce::PathStrokeType::rounded));
+            }
+
             // Live modulation marker: a small bright dot riding the spiral's rim at
             // the ACTUAL (base + modulation) position, distinct from the pointer
-            // above (which always shows the user's base setting).
+            // above (which always shows the user's base setting). Global targets only -
+            // a per-voice one gets the band above instead.
             float modProp = 0.0f;
             if (liveModProportion (s, modProp))
             {
@@ -484,6 +515,15 @@ namespace
                 g.fillRoundedRectangle (cx - tw * 0.5f, top, tw, bot - top, tw * 0.5f);
                 g.setColour (track);
                 g.fillRoundedRectangle (cx - tw * 0.5f, sliderPos, tw, juce::jmax (0.0f, bot - sliderPos), tw * 0.5f);
+                // Per-voice modulation band, under the thumb (see modSpanProportions).
+                { float mLo = 0.0f, mHi = 0.0f;
+                  if (modSpanProportions (s, mLo, mHi))
+                  {
+                      const float ya = bot - juce::jlimit (0.0f, 1.0f, mHi) * (bot - top);
+                      const float yb = bot - juce::jlimit (0.0f, 1.0f, mLo) * (bot - top);
+                      g.setColour (col.withAlpha (0.55f));
+                      g.fillRoundedRectangle (cx - tw * 0.5f, ya, tw, juce::jmax (1.0f, yb - ya), tw * 0.5f);
+                  } }
                 // Never wider than the fader's own column (narrow ADSR columns would
                 // otherwise have their thumbs overlap the neighbouring fader).
                 const float rv = juce::jmin (r, (float) w * 0.5f);
@@ -519,6 +559,15 @@ namespace
                 g.fillRoundedRectangle (l, cy - tw * 0.5f, rt - l, tw, tw * 0.5f);
                 g.setColour (track);
                 g.fillRoundedRectangle (l, cy - tw * 0.5f, juce::jmax (0.0f, sliderPos - l), tw, tw * 0.5f);
+                // Per-voice modulation band, under the thumb (see modSpanProportions).
+                { float mLo = 0.0f, mHi = 0.0f;
+                  if (modSpanProportions (s, mLo, mHi))
+                  {
+                      const float xa = l + juce::jlimit (0.0f, 1.0f, mLo) * (rt - l);
+                      const float xb = l + juce::jlimit (0.0f, 1.0f, mHi) * (rt - l);
+                      g.setColour (col.withAlpha (0.55f));
+                      g.fillRoundedRectangle (xa, cy - tw * 0.5f, juce::jmax (1.0f, xb - xa), tw, tw * 0.5f);
+                  } }
                 const float rr = juce::jmin (r, (float) h * 0.5f);
                 const auto hept = heptagon ({ sliderPos, cy }, rr);
                 g.setColour (col);
@@ -1714,7 +1763,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         juce::String err;
         if (intervalEdit.getText().trim().isNotEmpty())
         {
-            if (processorRef.loadTimbreText (intervalEdit.getText(), err))
+            if (processorRef.loadTimbreTextUndoable (intervalEdit.getText(), err))
             {
                 // Same as loading a .scl: switch the engine off, grey the harmonic
                 // controls and show the Off button - immediately, not on the next tick.
@@ -2747,7 +2796,17 @@ void FractalAdditiveAudioProcessorEditor::updateScaleDissonance()
                + (double) processorRef.apvts.getRawParameterValue ("refA")->load() * 0.01;
     for (int d = 1; d <= juce::jmin (D, 16); ++d) sig += processorRef.getDegreeRatio (d) * (double) (d + 3);
     if (std::abs (sig - lastScaleSig) < 1.0e-6) return;
-    lastScaleSig = sig;
+
+    // The signature includes the template generation, so a modulator on ANY spectrum
+    // control makes it change on essentially every tick. The analysis is advisory UI, so
+    // rate-limit it to ~4 Hz: without this it ran at the full 30 Hz timer rate for as
+    // long as the modulator kept moving. (The analysis itself no longer recompiles the
+    // spectrum - see computeActiveScaleDissonance - but it is still an O(partials x
+    // degrees) roughness sweep and there is no reason to run it faster than the eye.)
+    const juce::uint32 nowMs = juce::Time::getMillisecondCounter();
+    if (nowMs - lastScaleDissMs < 250) return;
+    lastScaleDissMs = nowMs;
+    lastScaleSig    = sig;
 
     activeDiss = processorRef.computeActiveScaleDissonance();
     rebuildScaleDissList();
@@ -3050,10 +3109,36 @@ void FractalAdditiveAudioProcessorEditor::refreshModWatch()
 
         if (! mapped)
         {
-            if (s->getProperties().contains ("modLive"))
-            { s->getProperties().remove ("modLive"); s->repaint(); }
+            auto& pr = s->getProperties();
+            if (pr.contains ("modLive") || pr.contains ("modLo"))
+            { pr.remove ("modLive"); pr.remove ("modLo"); pr.remove ("modHi"); s->repaint(); }
             continue;
         }
+
+        // PER-VOICE target: the parameter deliberately does not move (each voice adds its
+        // own modulation internally), so there is no live value to point at - and with
+        // several notes sounding there would be several. Show the REACHABLE BAND instead.
+        if (ModEngine::perVoiceTargetIndex (pid) >= 0)
+        {
+            auto* p = processorRef.apvts.getParameter (pid);
+            if (p == nullptr) continue;
+            float lo = 0.0f, hi = 0.0f;
+            mod.modulationSpan (pid, lo, hi);
+            const float b = p->getValue();
+            const double vLo = (double) p->convertFrom0to1 (juce::jlimit (0.0f, 1.0f, b + lo));
+            const double vHi = (double) p->convertFrom0to1 (juce::jlimit (0.0f, 1.0f, b + hi));
+            auto& pr = s->getProperties();
+            const bool changed = ! pr.contains ("modLo")
+                              || std::abs ((double) pr["modLo"] - vLo) > 1.0e-6
+                              || std::abs ((double) pr["modHi"] - vHi) > 1.0e-6;
+            if (changed || pr.contains ("modLive"))
+            {
+                pr.set ("modLo", vLo); pr.set ("modHi", vHi); pr.remove ("modLive");
+                s->repaint();
+            }
+            continue;
+        }
+
         auto* raw = processorRef.apvts.getRawParameterValue (pid);
         if (raw == nullptr) continue;
         const float live = raw->load();

@@ -59,6 +59,7 @@ namespace spectrum
     static void finalisePartials (std::vector<Partial>& parts, const SpectrumSettings& s,
                                   SpectrumTemplate& out)
     {
+        out.curveSlope = s.curveSlope; // what a per-voice slope modulation scales FROM
         applyRangeCut (parts, s);
         out.rawCount = (int) parts.size();
 
@@ -96,6 +97,12 @@ namespace spectrum
     static SpectrumTemplate compileScalaTimbre (const SpectrumSettings& s, const std::atomic<bool>* abort)
     {
         SpectrumTemplate out;
+        // Stamp the slope on EVERY exit path, including the early returns below. The
+        // harmonic engine has its own inline tail and never reaches finalisePartials, so
+        // its template kept the default 1.0 - and every voice then believed it had to
+        // rescale from 1.0 to the real slope, pushing the upper partials far enough down
+        // that FftVerify reported them dropped.
+        out.curveSlope = s.curveSlope;
 
         const auto aborted = [abort]() noexcept
         { return abort != nullptr && abort->load (std::memory_order_relaxed); };
@@ -217,31 +224,51 @@ namespace spectrum
         const auto key = [] (float r)
         { return (long long) std::llround (1200.0 * std::log2 (std::max (1.0e-9, (double) r))); };
 
-        std::unordered_map<long long, double> loAmp;
-        loAmp.reserve (lo.partials.size() * 2);
-        for (const auto& p : lo.partials) loAmp[key (p.ratio)] += (double) p.amp;
+        // Accumulate BOTH levels into ONE bin map, so every bin is blended exactly once.
+        //
+        // This used to walk hi's partials and look each one up in a map of lo's: whenever
+        // several hi partials shared a bin with one lo partial - which is the normal case,
+        // because at level L the ratio grid is kMin^(L-1) times finer - EACH of them was
+        // emitted carrying that lo partial's FULL amplitude. The lo energy was duplicated
+        // once per collision, so the timbre jumped the instant Fractal left "off", for any
+        // t however small, and the extra partials pushed the set over the cap. That is the
+        // "raising fractal a hair changed the sound irreversibly" report: at Base 16 the
+        // count went 16369 -> 16384 with the truncation flag set.
+        struct Bin { double loAmp = 0.0, hiAmp = 0.0; };
+        std::unordered_map<long long, Bin> bins;
+        bins.reserve ((lo.partials.size() + hi.partials.size()) * 2);
+        for (const auto& p : lo.partials) bins[key (p.ratio)].loAmp += (double) p.amp;
+        for (const auto& p : hi.partials) bins[key (p.ratio)].hiAmp += (double) p.amp;
 
+        // EVERY lower-level partial survives, at its own ratio - the bins are used only to
+        // work out how much energy each one should carry, never to merge them. It keeps
+        // its share of the bin, so a bin holding several partials splits the blended
+        // energy between them in proportion instead of handing each one the full amount.
+        //   t = 0 -> scale 1, i.e. exactly `lo`.
+        //   t = 1 -> the bin carries the upper level's energy, distributed proportionally.
         std::vector<Partial> parts, fresh;
-        parts.reserve (hi.partials.size() + lo.partials.size());
-        std::unordered_map<long long, char> inHi;
-        inHi.reserve (hi.partials.size() * 2);
-
+        parts.reserve (lo.partials.size());
+        fresh.reserve (hi.partials.size());
+        for (const auto& p : lo.partials)
+        {
+            const auto it = bins.find (key (p.ratio));
+            const double lA = (it != bins.end()) ? it->second.loAmp : 0.0;
+            const double hA = (it != bins.end()) ? it->second.hiAmp : 0.0;
+            const double scale = (1.0 - t) + (lA > 0.0 ? t * hA / lA : 0.0);
+            parts.push_back ({ p.ratio, (float) ((double) p.amp * scale) });
+        }
+        // Upper-level partials with no counterpart below are the genuinely NEW ones.
         for (const auto& p : hi.partials)
         {
-            const auto k = key (p.ratio);
-            inHi[k] = 1;
-            const auto it = loAmp.find (k);
-            if (it != loAmp.end())
-                parts.push_back ({ p.ratio, (float) (it->second + t * ((double) p.amp - it->second)) });
-            else
+            const auto it = bins.find (key (p.ratio));
+            if (it == bins.end() || it->second.loAmp <= 0.0)
                 fresh.push_back (p);
         }
-        for (const auto& p : lo.partials)
-            if (inHi.find (key (p.ratio)) == inHi.end())
-                parts.push_back ({ p.ratio, (float) ((double) p.amp * (1.0 - t)) });
 
         std::sort (fresh.begin(), fresh.end(),
                    [] (const Partial& a, const Partial& b) { return a.ratio < b.ratio; });
+        // Partials that exist ONLY at the upper level enter from low to high: raising
+        // Fractal adds detail progressively rather than crossfading a whole level in.
         const double pos = t * (double) fresh.size(); // low->high entry, newest ramps in
         for (size_t i = 0; i < fresh.size(); ++i)
         {
@@ -279,6 +306,12 @@ namespace spectrum
             return compileScalaTimbre (s, abort);
 
         SpectrumTemplate out;
+        // Stamp the slope on EVERY exit path, including the early returns below. The
+        // harmonic engine has its own inline tail and never reaches finalisePartials, so
+        // its template kept the default 1.0 - and every voice then believed it had to
+        // rescale from 1.0 to the real slope, pushing the upper partials far enough down
+        // that FftVerify reported them dropped.
+        out.curveSlope = s.curveSlope;
 
         const auto aborted = [abort]() noexcept
         {

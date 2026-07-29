@@ -1981,6 +1981,8 @@ private:
     // the sort mode toggled by the header.
     std::vector<FractalAdditiveAudioProcessor::DissDegreeInfo> activeDiss;
     double lastScaleSig   = -1.0e30; // change signature (timbre gen + tuning shape)
+    juce::uint32 lastScaleDissMs = 0; // rate limit: a modulated spectrum changes the
+                                      // signature every tick, and this analysis is advisory
     Scrim          rhythmScrim;
     RhythmPanel    rhythmPanel;
     std::unique_ptr<ButtonAttachment>   rhythmOnAtt, rhythmSelfAtt, rhythmDroneAtt, rhythmFbAtt, rhythmMpeAtt, rhythmTempoAtt,

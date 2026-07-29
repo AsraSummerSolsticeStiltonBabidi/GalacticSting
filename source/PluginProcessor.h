@@ -81,6 +81,11 @@ public:
     // so without this they would silently test a plugin whose tuning never picked
     // up Reference A / Octave Transpose / the tuning mode at all.
     void pollParametersForTests() { timerCallback(); }
+    // Is the one-shot MTS-ESP adoption still armed? It must stay armed on a brand-new
+    // instance and be disarmed the moment the host hands over ANY saved state, so that
+    // reopening a project never overwrites the tuning the user saved. Tests only - the
+    // adoption itself cannot be exercised offline because it needs a live MTS master.
+    bool mtsAdoptionArmedForTests() const noexcept { return mtsCheckPending; }
 
     // Raw tuning/timbre state so the editor can format localised status strings.
     int  getTuningMode()    const noexcept { return (int) apvts.getRawParameterValue ("tuningMode")->load(); }
@@ -93,6 +98,41 @@ public:
     // window showed an empty field and the spectrum could only be edited by retyping
     // it from memory.
     juce::String getTimbreSource() const { return timbreSource; }
+
+    // The custom-tuning text is not an APVTS parameter, so nothing ever put it on the
+    // undo stack: Ctrl+Z sailed straight past it to whatever fader was touched before,
+    // and a typed scale could not be taken back. This wraps the change in an
+    // UndoableAction so it behaves like every other control.
+    struct TimbreTextAction : public juce::UndoableAction
+    {
+        TimbreTextAction (FractalAdditiveAudioProcessor& p, juce::String prev, juce::String next)
+            : proc (p), after (std::move (next)), before (std::move (prev)) {}
+        bool perform() override { return applyOne (after); }
+        bool undo() override    { return applyOne (before); }
+        int  getSizeInUnits() override { return (int) (after.length() + before.length()) * 2 + 32; }
+        bool applyOne (const juce::String& t)
+        {
+            juce::String e;
+            if (t.trim().isEmpty()) { proc.clearTimbre(); return true; }
+            return proc.loadTimbreText (t, e);
+        }
+        FractalAdditiveAudioProcessor& proc;
+        juce::String after, before;
+    };
+
+    // Type a custom tuning THROUGH the undo stack. Returns false (with errorOut set) if
+    // the text does not parse, in which case nothing is pushed.
+    bool loadTimbreTextUndoable (const juce::String& text, juce::String& errorOut)
+    {
+        // Capture the previous text BEFORE applying anything: loadTimbreText below
+        // already overwrites timbreSource, so asking for it afterwards would record the
+        // NEW value as the one to go back to - an undo that undid nothing.
+        const auto before = timbreSource;
+        if (! loadTimbreText (text, errorOut)) return false;   // rejected: nothing is pushed
+        undoManager.beginNewTransaction();
+        undoManager.perform (new TimbreTextAction (*this, before, text));
+        return true;
+    }
     int  getTimbreNoteCount() const noexcept { return (int) timbreDegrees.size(); }
 
     // Degrees per period of the active tuning (for the colour keyboard).
@@ -207,6 +247,19 @@ public:
     // directly (atomics) and reads the live pulse rates for its panel.
     RhythmEngine& getRhythm() noexcept { return rhythm; }
     const spectrum::SpectrumTemplate* getLiveTemplate() const noexcept { return spectrumEngine.getLive(); }
+
+    // Per-partial amplitude edits. The authoritative copy lives HERE, because it has to
+    // be saved with the project; the spectrum engine only ever holds a resolved
+    // index-aligned copy for the voices. Message thread.
+    void setPartialGains (std::vector<spectrum::PartialGain> ov, bool on)
+    {
+        partialGains = ov;
+        spectrumEngine.setOverrides (std::move (ov), on);
+    }
+    const std::vector<spectrum::PartialGain>& getPartialGains() const noexcept { return partialGains; }
+    // How many of those edits currently sit on a partial that actually exists. The rest
+    // are not lost - their partial is simply not in this spectrum right now.
+    int getPartialGainsMatched() const noexcept { return spectrumEngine.getGainMatchedCount(); }
     juce::uint32 getTemplateGeneration() const noexcept { return spectrumEngine.getGeneration(); }
 
     //==========================================================================
@@ -502,7 +555,18 @@ private:
     int  undoTxnTick   = 0;  // groups edits into ~1 s undo transactions (see timerCallback)
 
     // MTS-ESP adoption is a ONE-SHOT check at load (see timerCallback), never repeated.
+    // Manual per-partial amplitudes: slope is frozen at the value it had when manual was
+    // switched on, so switching is silent and the fader is genuinely inert while it lasts.
+    std::vector<spectrum::PartialGain> partialGains;
+
+    float manualSlopeFrozen = 1.0f;
+    bool  lastManualMode    = false;
+
     bool  mtsCheckPending = true;
+    // Timer ticks waited before the one-shot above is allowed to decide, so a host that
+    // calls prepareToPlay before setStateInformation cannot make a restored instance look
+    // brand new. Only ever counted once, at load.
+    int   mtsCheckTicks   = 0;
     bool  mtsHadRef       = false; // MTS is currently driving the reference
     float manualRefA      = 440.0f; // the hand-set reference, parked while MTS owns it
 

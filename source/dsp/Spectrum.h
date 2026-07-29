@@ -124,6 +124,20 @@ namespace spectrum
         // reads a template and its generation as ONE consistent pair (no gen/template
         // tearing that would leave a morph gliding to a stale spectrum).
         unsigned int generation = 0;
+        // The slope this template was COMPILED at. A voice modulating slope re-derives
+        // its own amplitudes from here without any recompile: the compiler gives each
+        // base harmonic amp = (k/kMin)^(-slope) and the fractal convolution only
+        // multiplies those, so a published amplitude is exactly ratio^(-slope) times a
+        // slope-INDEPENDENT factor. Scaling by ratio^-(sVoice - curveSlope) is therefore
+        // EXACT, not an approximation.
+        float curveSlope = 1.0f;
+        // The user's per-partial amplitude edits, already RESOLVED against this exact
+        // partial list, so it is index-aligned with `partials` by construction. Empty
+        // means no edit is in force. It is filled by SpectrumEngine at publish time and
+        // is NEVER written by compileSpectrum: an edit must not reach the amplitude
+        // floor, the keep-loudest cap or the RMS normalisation, all of which would
+        // respond to it by DELETING partials (see PartialGains.h).
+        std::vector<float> gain;
     };
 
     //==========================================================================

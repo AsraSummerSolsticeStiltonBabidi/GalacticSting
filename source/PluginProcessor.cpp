@@ -30,7 +30,7 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     synth.setVoiceStealingEnabled (true);
 
     for (int i = 0; i < 32; ++i)
-        synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning));
+        synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning, modEngine));
 
     // Global app settings (recent .scl files), shared across all instances.
     juce::PropertiesFile::Options o;
@@ -276,6 +276,13 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "pitchRelease", 1 }, "Pitch Release", timeRange (30.0f), 0.001f)); // min by default
 
+    //-- Manual per-partial amplitudes. While this is on the user is drawing the
+    //   spectrum by hand, so SLOPE stops having any effect: it is frozen at whatever it
+    //   was when manual was switched on, which means nothing jumps at the moment of
+    //   switching and the fader simply stops doing anything until manual is off again.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "partialManual", 1 }, "Manual Partial Amps", false));
+
     //-- Spectral morphing (glide partials to their new positions on a spectrum change)
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "morph", 1 }, "Morphing", false));
@@ -414,7 +421,33 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
     s.baseN         = (int) apvts.getRawParameterValue ("baseN")->load();
     s.baseMode      = (spectrum::BaseMode) (int) apvts.getRawParameterValue ("baseMode")->load();
     s.selection     = apvts.getRawParameterValue ("harmonics")->load();
-    s.curveSlope    = apvts.getRawParameterValue ("curveSlope")->load();
+    // Compile at the LOWEST slope the modulation can REACH, not at the knob's value.
+    //
+    // Each voice rescales the published amplitudes from the template's slope to its own,
+    // which is exact - but only for partials the template actually contains, and the
+    // amplitude floor culls by an amplitude that DOES depend on slope (at -120 dB it
+    // removes everything above ratio 10^(6/s): nothing at slope 1, but only up to ratio
+    // ~32 at slope 4). A template compiled steep therefore physically lacks the partials
+    // a shallower voice would need, and the fidelity rule is that nothing goes missing.
+    // With nothing mapped the reachable minimum IS the knob value, so this costs exactly
+    // nothing until a modulator is pointed at slope.
+    if (apvts.getRawParameterValue ("partialManual")->load() > 0.5f)
+    {
+        // MANUAL mode: the amplitudes belong to the user's per-partial edits, so slope
+        // is frozen where it stood when manual was switched on. Freezing rather than
+        // zeroing is what keeps the sound identical at the moment of switching - the
+        // curve slope was drawing simply becomes the starting point of the drawing.
+        s.curveSlope = manualSlopeFrozen;
+    }
+    else
+    {
+        auto* p = apvts.getParameter ("curveSlope");
+        float lo = 0.0f, hi = 0.0f;
+        modEngine.modulationSpan ("curveSlope", lo, hi);
+        s.curveSlope = p != nullptr
+                     ? p->convertFrom0to1 (juce::jlimit (0.0f, 1.0f, p->getValue() + lo))
+                     : apvts.getRawParameterValue ("curveSlope")->load();
+    }
 
     // Prime limit is a CONTINUOUS position on the Off - 23 - 19 ... - 2 fader: the
     // whole value below is the limit in force, the one above is the next stop, and
@@ -470,6 +503,19 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
 
 void FractalAdditiveAudioProcessor::timerCallback()
 {
+    // Catch the moment manual mode is switched on and FREEZE slope there, before
+    // currentSettings() below reads it. Everything the user had is preserved: the sound
+    // does not move by a single dB at the switch, and from then on the slope fader is
+    // inert until manual goes off again.
+    {
+        const bool man = apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+        if (man != lastManualMode)
+        {
+            if (man) manualSlopeFrozen = apvts.getRawParameterValue ("curveSlope")->load();
+            lastManualMode = man;
+        }
+    }
+
     const auto s = currentSettings();
     if (s != lastPushed)
     {
@@ -508,7 +554,16 @@ void FractalAdditiveAudioProcessor::timerCallback()
     // master is up when this Fibló loads, it opens following it. It is consumed
     // here whether or not a master was found, so switching to another mode later
     // can never be undone by a second check - there is no second check.
-    if (mtsCheckPending)
+    //
+    // It fires ONLY for a genuinely NEW instance: setStateInformation disarms it, so a
+    // restored project or preset keeps whatever the user saved.
+    //
+    // The wait matters. This timer is started by prepareToPlay, and a host is free to
+    // call prepareToPlay BEFORE it hands over the saved state - so deciding on the very
+    // first tick could adopt MTS-ESP a moment before the project arrives to say this
+    // instance already has a tuning of its own. Half a second is far beyond any host's
+    // hand-over and is only ever waited once, at load.
+    if (mtsCheckPending && ++mtsCheckTicks >= 30)
     {
         mtsCheckPending = false;
         if (tuning.hasMtsMaster())
@@ -954,11 +1009,23 @@ FractalAdditiveAudioProcessor::computeActiveScaleDissonance() const
 {
     std::vector<DissDegreeInfo> out;
 
-    // Same analysis spectrum the generator uses: recompiled from the current
-    // settings (message thread, deterministic, no audio-thread interaction).
-    const auto tmpl = spectrum::compileSpectrum (currentSettings());
-    if (tmpl.partials.empty())
-        return out;
+    // Read the template that is ALREADY PUBLISHED rather than compiling a fresh one.
+    //
+    // This used to call compileSpectrum() synchronously, on the message thread, with no
+    // abort flag - and the editor's 30 Hz timer re-runs it whenever the template
+    // generation changes. Put a modulator on any spectrum control and the generation
+    // changes on essentially every tick, so the message thread spent all its time
+    // compiling. At fractalLevel > 1 one compile is hundreds of milliseconds, and the
+    // processor's own 60 Hz timerCallback - the ONLY place a modulated Base is ever
+    // sampled into a rebuild request - was starved. The spectrum froze at whatever Base
+    // value was caught last and the fader's modulation marker stopped moving: exactly
+    // "Base no longer moves and the LFO doesn't move it", and it never recovered because
+    // the starvation persisted for as long as fractal stayed above 1.
+    //
+    // The analysis keeps only the 64 loudest partials anyway, so being at most one
+    // publish behind is invisible here. A fresh compile is kept only as the cold-start
+    // fallback, before the builder has published anything at all.
+    std::vector<dissonance::Partial> spec;
 
     // Anchor the partials at the ACTUAL sounding tonic of the active tuning, so the
     // absolute frequencies (which Sethares roughness depends on) are correct.
@@ -966,10 +1033,23 @@ FractalAdditiveAudioProcessor::computeActiveScaleDissonance() const
     if (! (f0 > 0.0) || ! std::isfinite (f0))
         f0 = TuningManager::kRefFreq * tuning.referenceScale();
 
-    std::vector<dissonance::Partial> spec;
-    spec.reserve (tmpl.partials.size());
-    for (const auto& p : tmpl.partials)
-        spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
+    if (const auto* live = spectrumEngine.getLive(); live != nullptr && ! live->partials.empty())
+    {
+        spec.reserve (live->partials.size());
+        for (const auto& p : live->partials)
+            spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
+    }
+    else
+    {
+        const auto tmpl = spectrum::compileSpectrum (currentSettings());
+        if (tmpl.partials.empty())
+            return out;
+        spec.reserve (tmpl.partials.size());
+        for (const auto& p : tmpl.partials)
+            spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
+    }
+    if (spec.empty())
+        return out;
     if (spec.size() > 64) // analysis cap only; the SOUND is never capped
     {
         std::sort (spec.begin(), spec.end(),
@@ -1522,7 +1602,18 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
     nadUsedD  = D;
     std::vector<double> ratios ((size_t) D);
     for (int d = 0; d < D; ++d) ratios[(size_t) d] = getDegreeRatio (d);
-    const auto tmpl = spectrum::compileSpectrum (currentSettings());
+    // Take the PUBLISHED template, not a fresh compile. Two reasons: this runs on the
+    // message thread and a compile at fractalLevel > 1 costs hundreds of milliseconds
+    // (which starved the 60 Hz timer that samples a modulated Base - see
+    // computeActiveScaleDissonance); and the Degrees list now reads the published one, so
+    // recompiling here would let the two lists disagree, which the anchor comment below
+    // explicitly forbids. Copied, because the search continues on a worker thread and the
+    // engine's slot can be recycled under it.
+    spectrum::SpectrumTemplate tmpl;
+    if (const auto* live = spectrumEngine.getLive(); live != nullptr && ! live->partials.empty())
+        tmpl.partials = live->partials;
+    else
+        tmpl = spectrum::compileSpectrum (currentSettings());
     // The period the search reasons with: the tuning's own unless the user typed a
     // different one in the box (it decides what counts as an equal-step scale and
     // which intervals are just the same pitch class again).
@@ -1900,6 +1991,12 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
             if (lowest < 128) f0 = getNoteFrequency (lowest);
         }
         modEngine.processBlock (nSamp, modNoteOns, modHeld > 0, f0, bpm, ppq);
+        // Each voice runs its OWN modulators (see AdditiveVoice), so it needs the
+        // transport to lock a per-voice LFO to the host timeline. Its LFO fundamental is
+        // its own played pitch, which it already knows.
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                av->setTransportForMod (bpm, ppq);
     }
     const bool midiOut  = apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f;
     const bool selfWant = apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f;
@@ -2029,6 +2126,23 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         tim.setProperty ("source", timbreSource, nullptr);
         tim.setProperty ("on",     isTimbreActive(), nullptr);
         state.appendChild (tim, nullptr);
+    }
+
+    // Per-partial amplitude edits. Stored as one compact "key:dB" string rather than a
+    // child per edit: there can be thousands of them and a ValueTree node each would
+    // bloat every project file. Keys are ratios in hundredths of a cent (PartialGains.h),
+    // so an edit reopens on the partial it was made on even if the spectrum settings
+    // changed in between.
+    state.removeChild (state.getChildWithName ("PGAINS"), nullptr);
+    if (! partialGains.empty())
+    {
+        juce::String packed;
+        packed.preallocateBytes ((size_t) partialGains.size() * 16);
+        for (const auto& g : partialGains)
+            packed << g.key << ':' << juce::String (g.dB, 3) << ' ';
+        juce::ValueTree pg ("PGAINS");
+        pg.setProperty ("v", packed.trim(), nullptr);
+        state.appendChild (pg, nullptr);
     }
 
     state.removeChild (state.getChildWithName ("BANK"), nullptr);
@@ -2223,6 +2337,30 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
         lastDissName = sg.getProperty ("name").toString();
     }
 
+    // Per-partial amplitude edits (see captureState for the encoding). Restored BEFORE
+    // the first rebuild request so the spectrum comes back with the user's edits already
+    // on it, rather than sounding unedited for a moment and then correcting itself.
+    {
+        partialGains.clear();
+        if (auto pg = tree.getChildWithName ("PGAINS"); pg.isValid())
+        {
+            const auto packed = pg.getProperty ("v").toString();
+            for (const auto& tok : juce::StringArray::fromTokens (packed, " ", ""))
+            {
+                if (tok.isEmpty()) continue;
+                const int c = tok.indexOfChar (':');
+                if (c <= 0) continue;
+                partialGains.push_back ({ tok.substring (0, c).getLargeIntValue(),
+                                          tok.substring (c + 1).getFloatValue() });
+            }
+            std::sort (partialGains.begin(), partialGains.end(),
+                       [] (const spectrum::PartialGain& a, const spectrum::PartialGain& b)
+                       { return a.key < b.key; });
+        }
+        spectrumEngine.setOverrides (partialGains,
+                                     apvts.getRawParameterValue ("partialManual")->load() > 0.5f);
+    }
+
     // Tuning bank slots.
     for (auto& s : bankName)   s.clear();
     for (auto& s : bankSource) s.clear();
@@ -2282,6 +2420,18 @@ void FractalAdditiveAudioProcessor::getStateInformation (juce::MemoryBlock& dest
 
 void FractalAdditiveAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
+    // ANY call here means the host is handing this instance a previous life - a reopened
+    // project, a preset, a duplicated or copy-pasted plugin. Disarm the one-shot MTS-ESP
+    // adoption BEFORE parsing, so it is disarmed even when the chunk turns out to be
+    // empty, foreign or unreadable: restoreState() returns early on those and used to
+    // leave the one-shot armed, which made a corrupt-state instance look brand new.
+    //
+    // This matters a lot. Adopting MTS-ESP on a RESTORED instance would overwrite the
+    // tuning mode the user saved, and with it the reference (MTS owns refA while it is
+    // the active mode, parking the user's own value) and any loaded Scala scale. Someone
+    // reopening yesterday's project would find their tuning silently replaced.
+    mtsCheckPending = false;
+
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
         restoreState (juce::ValueTree::fromXml (*xml));
 }
