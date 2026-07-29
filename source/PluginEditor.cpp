@@ -656,17 +656,30 @@ namespace
                 // Walk the line, splitting on the three delimiters. An unmatched
                 // delimiter is treated as ordinary text, so a stray * never eats
                 // the rest of a tooltip.
+                // A delimiter only OPENS a span when it starts a word: it must not be
+                // wedged against a letter or digit on its left, and must not be followed
+                // by a space. Without that rule "keeps 14 (2*7) and 25 (5*5)" parsed as a
+                // highlighted "7) and 25 (5" - which is exactly where the meaningless
+                // coloured runs in the prime tooltip came from. Arithmetic in a tooltip
+                // is ordinary text and has to stay that way.
+                const auto opensHere = [&line] (int i)
+                {
+                    if (i + 1 >= line.length()) return false;
+                    const auto prev = i > 0 ? line[i - 1] : (juce::juce_wchar) ' ';
+                    return ! juce::CharacterFunctions::isLetterOrDigit (prev)
+                        && ! juce::CharacterFunctions::isWhitespace (line[i + 1]);
+                };
+
                 int pos = 0;
                 while (pos < line.length())
                 {
-                    const int a = line.indexOfChar (pos, '*');
-                    const int b = line.indexOfChar (pos, '`');
-                    const int c = line.indexOfChar (pos, '!');
                     int at = -1; juce::juce_wchar delim = 0;
-                    for (auto cand : { std::pair<int, juce::juce_wchar> { a, '*' },
-                                       std::pair<int, juce::juce_wchar> { b, '`' },
-                                       std::pair<int, juce::juce_wchar> { c, '!' } })
-                        if (cand.first >= 0 && (at < 0 || cand.first < at)) { at = cand.first; delim = cand.second; }
+                    for (int i = pos; i < line.length(); ++i)
+                    {
+                        const auto ch = line[i];
+                        if ((ch == '*' || ch == '`' || ch == '!') && opensHere (i))
+                        { at = i; delim = ch; break; }
+                    }
 
                     if (at < 0) { as.append (line.substring (pos), plain, cPlain); break; }
                     const int close = line.indexOfChar (at + 1, delim);
@@ -2329,15 +2342,15 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "How prime numbers filter the harmonics. 'Limit': a harmonic passes only if its largest prime factor is at most the chosen limit. 'Whitelist': it passes only if EVERY prime factor is ticked below.",
         "Com filtren els primers els harm\xc3\xb2nics. 'L\xc3\xadmit': un harm\xc3\xb2nic passa nom\xc3\xa9s si el seu factor primer m\xc3\xa9s gran \xc3\xa9s com a molt el l\xc3\xadmit triat. 'Llista': passa nom\xc3\xa9s si TOTS els seus factors primers estan marcats a sota."));
     primeLimitFader.setTooltip (tr (
-        "Largest prime factor a harmonic may contain. Example: limit 7 keeps 14 (2*7) and 25 (5*5) but drops 11 and 22 (2*11). Off = no prime filtering.",
-        "Factor primer m\xc3\xa9s gran que pot tenir un harm\xc3\xb2nic. Exemple: l\xc3\xadmit 7 mant\xc3\xa9 14 (2*7) i 25 (5*5) per\xc3\xb2 elimina 11 i 22 (2*11). No = sense filtre de primers."));
+        "Largest prime factor a harmonic may contain. Example: limit 7 keeps 14 (2×7) and 25 (5×5) but drops 11 and 22 (2×11). Off = no prime filtering.",
+        "Factor primer m\xc3\xa9s gran que pot tenir un harm\xc3\xb2nic. Exemple: l\xc3\xadmit 7 mant\xc3\xa9 14 (2×7) i 25 (5×5) per\xc3\xb2 elimina 11 i 22 (2×11). No = sense filtre de primers."));
     const char* pn2[] = { "2","3","5","7","11","13","17","19","23" };
     for (int i = 0; i < 9; ++i)
         primeToggle[i].setTooltip (tr ("Allow harmonics whose prime factors include ",
                                        "Permet harm\xc3\xb2nics amb el factor primer ") + juce::String (pn2[i]));
     cutoffFader.setTooltip (tr (
-        "Low-pass cutoff as an INTERVAL above the played note, in cents (1200 = one octave, 12000 = fully open). It TRACKS the note, so the same partials are cut at every pitch - a partial at ratio r sits at 1200*log2(r) cents (e.g. harmonic 2 = 1200c, harmonic 3 = 1902c). An absolute-Hz cutoff would eat different partials depending on the note.",
-        "Tall del passa-baixos com a INTERVAL per sobre de la nota tocada, en cents (1200 = una octava, 12000 = tot obert). SEGUEIX la nota, aix\xc3\xad que talla els mateixos parcials a qualsevol al\xc3\xa7""ada - un parcial de ratio r \xc3\xa9s a 1200*log2(r) cents (p. ex. harm\xc3\xb2nic 2 = 1200c, harm\xc3\xb2nic 3 = 1902c). Un tall en Hz absoluts es menjaria parcials diferents segons la nota."));
+        "Low-pass cutoff as an INTERVAL above the played note, in cents (1200 = one octave, 12000 = fully open). It TRACKS the note, so the same partials are cut at every pitch - a partial at ratio r sits at 1200·log2(r) cents (e.g. harmonic 2 = 1200c, harmonic 3 = 1902c). An absolute-Hz cutoff would eat different partials depending on the note.",
+        "Tall del passa-baixos com a INTERVAL per sobre de la nota tocada, en cents (1200 = una octava, 12000 = tot obert). SEGUEIX la nota, aix\xc3\xad que talla els mateixos parcials a qualsevol al\xc3\xa7""ada - un parcial de ratio r \xc3\xa9s a 1200·log2(r) cents (p. ex. harm\xc3\xb2nic 2 = 1200c, harm\xc3\xb2nic 3 = 1902c). Un tall en Hz absoluts es menjaria parcials diferents segons la nota."));
     resFader.setTooltip (tr ("Resonance: a volume peak right at the cutoff frequency.",
                              "Res(son\xc3\xa0ncia): un pic de volum just a la freq\xc3\xbc\xc3\xa8ncia de tall."));
     fEnvAmtFader.setTooltip (tr (
