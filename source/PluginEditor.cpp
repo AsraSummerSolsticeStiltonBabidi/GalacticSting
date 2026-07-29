@@ -2372,7 +2372,11 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "The preset you just loaded was saved with a *different tuning*.\nLoading a preset only changes the *sound*, !never the scale!. Click to bring that tuning in too.",
         "El preset que acabes de carregar es va desar amb una *afinaci\xc3\xb3 diferent*.\nCarregar un preset nom\xc3\xa9s canvia el *so*, !mai l'escala!. Clica per portar tamb\xc3\xa9 aquella afinaci\xc3\xb3."));
     tuningBankLoadBtn.setButtonText (tr ("+ .scl", "+ .scl"));
-    loadTimbreButton.setButtonText (tr ("Spectrum\xe2\x80\xa6", "Espectre\xe2\x80\xa6"));
+    // It loads a SCALE file, same as the tuning Load does - it just points the intervals
+    // at the timbre instead of at the keyboard. Same fork, same word, so the pair reads
+    // as two destinations for one kind of file rather than two unrelated buttons.
+    loadTimbreButton.setButtonText (tr ("Load", "Obrir"));
+    loadTimbreButton.getProperties().set ("fork", true);
     clearTimbreButton.setButtonText (processorRef.isTimbreActive() ? tr ("On", "Actiu") : tr ("Off", "Apagat"));
     savePresetButton.setButtonText (tr ("Save", "Desa"));
     presetBox.setTextWhenNothingSelected (tr ("Presets...", "Presets..."));
