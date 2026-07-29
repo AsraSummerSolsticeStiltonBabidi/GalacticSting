@@ -4422,10 +4422,23 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             periodRatio = 0.0;   // unreadable: the tuning's own period is used
         const auto opts = juce::String ((int) maxMode) + "|" + juce::String (periodRatio, 6)
                         + "|" + juce::String (minGap, 3);
-        if (lastScaleSig != lastNadSig || chordNotesBox.getSelectedId() != lastNadSel
+        // Trigger off the TUNING's own shape, not off lastScaleSig. lastScaleSig is now
+        // rate-limited (it gates the roughness sweep, which a modulated spectrum would
+        // otherwise drive at timer rate), and hanging this on it meant a tuning change
+        // could go unnoticed: the worker never republished, so the list AND the
+        // equal-step flag below stayed frozen on whatever scale was loaded before -
+        // showing 31-EDO's degrees, greyed as if every shape were valid from every
+        // degree, while an unequal scale was actually playing.
+        const int shapeD = processorRef.getScaleDegrees();
+        double shapeSig = (double) shapeD * 7.0 + processorRef.getTuningMode() * 3.0;
+        // The period is degree D itself, so it is covered by the loop below reaching it.
+        for (int d = 1, n = juce::jmin (shapeD, 24); d <= n; ++d)
+            shapeSig += processorRef.getDegreeRatio (d) * (double) (d + 3);
+
+        if (std::abs (shapeSig - lastNadSig) > 1.0e-9 || chordNotesBox.getSelectedId() != lastNadSel
             || rootOnly != lastNadRootOnly || opts != lastNadOpts)
         {
-            lastNadSig = lastScaleSig;
+            lastNadSig = shapeSig;
             lastNadSel = juce::jmax (2, chordNotesBox.getSelectedId());
             lastNadRootOnly = rootOnly;
             lastNadOpts = opts;
