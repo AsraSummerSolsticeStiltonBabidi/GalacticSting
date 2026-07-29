@@ -2032,6 +2032,82 @@ int main()
                "a rejected tuning pushes nothing, so undo still steps back over the real edits");
     }
 
+    // --- run 32: .tun written by the REAL writer must load back identically ---------
+    // TuningTests cannot reach this: it does not link the processor, so its .tun fixtures
+    // REPLICATE the writer's layout instead of calling it. That leaves the one thing that
+    // actually matters untested - the writer and the loader drifting apart - and it is
+    // exactly the kind of gap that goes unnoticed until a user's exported scale reopens
+    // wrong. Here the processor is real, so the round trip can be the real one.
+    {
+        std::printf ("save .tun -> load .tun round trip, through the real writer:\n");
+        auto tmp = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                       .getChildFile ("fiblo_roundtrip_test.tun");
+
+        auto run = [&] (const char* label, const juce::String& scl, const juce::String& name,
+                        float refA)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (48000.0, 64);
+            auto s = [&] (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            s ("refA", refA);
+            juce::String err;
+            if (! scl.isEmpty() && ! p->loadScalaText (scl, name, err))
+            { check (false, "the source scale loaded"); return; }
+            p->pollParametersForTests();
+
+            // Snapshot every key BEFORE writing.
+            std::vector<double> before ((size_t) 128);
+            for (int n = 0; n < 128; ++n) before[(size_t) n] = p->getNoteFrequency (n);
+
+            if (! p->saveCurrentTuningTun (tmp, err))
+            { std::printf ("  %-14s WRITER REFUSED: %s\n", label, err.toRawUTF8());
+              check (false, "the writer accepted this tuning"); return; }
+
+            // Load it back into a FRESH instance - no shared state to flatter the result.
+            auto q = std::make_unique<FractalAdditiveAudioProcessor>();
+            q->prepareToPlay (48000.0, 64);
+            if (! q->loadScalaFile (tmp, err))
+            { std::printf ("  %-14s LOADER REFUSED: %s\n", label, err.toRawUTF8());
+              check (false, "the loader accepted what the writer produced"); return; }
+            q->pollParametersForTests();
+
+            double worst = 0.0; int worstKey = -1;
+            for (int n = 0; n < 128; ++n)
+            {
+                const double a = before[(size_t) n], b = q->getNoteFrequency (n);
+                if (! (a > 0.0) || ! (b > 0.0)) continue;
+                const double cents = std::abs (1200.0 * std::log2 (b / a));
+                if (cents > worst) { worst = cents; worstKey = n; }
+            }
+            std::printf ("  %-14s worst error %.6f cents (key %d)\n", label, worst, worstKey);
+            check (worst < 0.01, "every one of the 128 keys comes back to within 0.01 cents");
+        };
+
+        // 12ED2 - the default, and the one every user will hit first.
+        run ("12ED2", "! t.scl\n!\n12ed2\n 12\n!\n"
+                      " 100.0\n 200.0\n 300.0\n 400.0\n 500.0\n 600.0\n"
+                      " 700.0\n 800.0\n 900.0\n 1000.0\n 1100.0\n 1200.0\n", "12ed2", 440.0f);
+        // 31-EDO: a prime count, so 1/1 does not sit on a 12-key boundary.
+        {
+            juce::String s31 ("! t31.scl\n!\n31edo\n 31\n!\n");
+            for (int i = 1; i <= 31; ++i) s31 << " " << juce::String (i * 1200.0 / 31.0, 6) << "\n";
+            run ("31-EDO", s31, "31edo", 440.0f);
+        }
+        // A non-440 reference is the whole reason .tun exists rather than .scl.
+        run ("12ED2 @ 432", "! t.scl\n!\n12ed2\n 12\n!\n"
+                            " 100.0\n 200.0\n 300.0\n 400.0\n 500.0\n 600.0\n"
+                            " 700.0\n 800.0\n 900.0\n 1000.0\n 1100.0\n 1200.0\n", "12ed2", 432.0f);
+        // Bohlen-Pierce: period 3/1, so the writer's period line is doing real work.
+        {
+            juce::String bp ("! bp.scl\n!\nBohlen-Pierce\n 13\n!\n");
+            for (int i = 1; i <= 13; ++i) bp << " " << juce::String (i * 1200.0 * std::log2 (3.0) / 13.0, 6) << "\n";
+            run ("Bohlen-Pierce", bp, "bp13", 440.0f);
+        }
+        tmp.deleteFile();
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

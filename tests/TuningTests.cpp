@@ -5,6 +5,7 @@
 
 #include "dsp/TuningManager.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cmath>
 
@@ -20,6 +21,43 @@ static void check (bool cond, const char* what)
 static bool approxHz (double a, double b, double tolHz = 0.01)
 {
     return std::abs (a - b) <= tolHz;
+}
+
+// Distance between two frequencies in cents - the unit the .tun conversion makes
+// its promise in (Hz tolerances mean something different at every octave).
+static double centsApart (double a, double b)
+{
+    return std::abs (1200.0 * std::log2 (a / b));
+}
+
+// Write a .tun in EXACTLY the layout FractalAdditiveAudioProcessor::saveCurrentTuningTun
+// produces: integer-cent [Tuning] first, then the authoritative [Exact Tuning].
+// The coarse block comes first on purpose - if the parser let it win, every test
+// below would pass to ~0.5 cent and hide the loss.
+static juce::String makeTun (const double (&freqs)[128], bool withCoarse = true)
+{
+    juce::String s;
+    s << "; AnaMark TUN v2 - written by a unit test\n\n";
+    if (withCoarse)
+    {
+        s << "[Tuning]\n";
+        for (int n = 0; n < 128; ++n)
+            s << "note " << n << "="
+              << juce::String ((int) std::llround (1200.0 * std::log2 (freqs[n] / freqs[0]))) << "\n";
+    }
+    s << "\n[Exact Tuning]\nbasefreq=" << juce::String (freqs[0], 10) << "\n";
+    for (int n = 0; n < 128; ++n)
+        s << "note " << n << "=" << juce::String (1200.0 * std::log2 (freqs[n] / freqs[0]), 6) << "\n";
+    return s;
+}
+
+// Every MIDI note of the loaded tuning against the frequencies the file states.
+static double worstCents (const TuningManager& t, const double (&freqs)[128])
+{
+    double worst = 0.0;
+    for (int n = 0; n < 128; ++n)
+        worst = std::max (worst, centsApart (t.frequencyForNote (n), freqs[n]));
+    return worst;
 }
 
 int main()
@@ -251,6 +289,175 @@ int main()
         // ...but well-formed cents/ratios (incl. descending negative cents) still load.
         check (t.loadScalaString ("desc\n2\n-100.0\n2/1\n", "ok1", err), "negative (descending) cents accepted");
         check (t.loadScalaString ("desc\n1\n1200.0\n", "ok2", err), "plain cents octave accepted");
+    }
+
+    //--------------------------------------------------------------------------
+    // AnaMark .tun. A .tun states 128 ABSOLUTE pitches, so the test that matters is
+    // note-for-note: "it loaded" proves nothing about what the keys now sound at.
+    std::printf ("AnaMark .tun: 12ED2 round trip (every key, 0.01 cent):\n");
+    {
+        double f[128];
+        for (int n = 0; n < 128; ++n) f[n] = 440.0 * std::pow (2.0, (n - 69) / 12.0);
+
+        TuningManager t; juce::String err;
+        const bool ok = t.loadTunString (makeTun (f), "12ed2", err);
+        t.setMode (TuningManager::Mode::Scala);
+        check (ok, ("parsed 12ED2 .tun (" + err + ")").toRawUTF8());
+        const double worst = worstCents (t, f);
+        std::printf ("    worst error over 128 keys: %.8f cents\n", worst);
+        check (worst <= 0.01, "every key within 0.01 cents of the file");
+        check (t.degreesPerPeriod() == 12, "12 degrees per period (not the trivial 1-per-100c)");
+        check (std::abs (t.periodRatio() - 2.0) < 1e-9, "period is 2/1");
+    }
+
+    std::printf ("AnaMark .tun: 31-EDO round trip (prime EDO, 1/1 off the key grid):\n");
+    {
+        // 1/1 deliberately NOT on middle C and NOT at a standard pitch: this catches a
+        // converter that quietly re-anchors the scale to its own reference.
+        double f[128];
+        for (int n = 0; n < 128; ++n) f[n] = 256.0 * std::pow (2.0, (n - 57) / 31.0);
+
+        TuningManager t; juce::String err;
+        const bool ok = t.loadTunString (makeTun (f), "31edo", err);
+        t.setMode (TuningManager::Mode::Scala);
+        check (ok, ("parsed 31-EDO .tun (" + err + ")").toRawUTF8());
+        const double worst = worstCents (t, f);
+        std::printf ("    worst error over 128 keys: %.8f cents\n", worst);
+        check (worst <= 0.01, "every key within 0.01 cents of the file");
+        check (t.degreesPerPeriod() == 31, "31 degrees per period");
+        check (std::abs (t.periodRatio() - 2.0) < 1e-9, "period is 2/1");
+    }
+
+    std::printf ("AnaMark .tun: basefreq is honoured (A=432 stays A=432):\n");
+    {
+        double f[128];
+        for (int n = 0; n < 128; ++n) f[n] = 432.0 * std::pow (2.0, (n - 69) / 12.0);
+
+        TuningManager t; juce::String err;
+        check (t.loadTunString (makeTun (f), "a432", err), "parsed A=432 .tun");
+        t.setMode (TuningManager::Mode::Scala);
+        std::printf ("    A4 loaded as %.6f Hz\n", t.frequencyForNote (69));
+        check (centsApart (t.frequencyForNote (69), 432.0) <= 0.01, "A4 = 432, not 440");
+        check (centsApart (t.frequencyForNote (60), 432.0 * std::pow (2.0, -9.0 / 12.0)) <= 0.01,
+               "C4 moved with it (the whole file, not just A)");
+    }
+
+    std::printf ("AnaMark .tun: 1/4-comma meantone at A=415 (irregular scale, real world):\n");
+    {
+        // Not an equal division: the degrees differ from each other, so a converter
+        // that assumed equal steps would be caught here and nowhere above.
+        const double mt[12] = { 0.0, 76.049, 193.157, 310.265, 386.314, 503.422,
+                                579.471, 696.578, 772.627, 889.735, 1006.843, 1082.892 };
+        double f[128];
+        for (int n = 0; n < 128; ++n)
+        {
+            const int oct = (int) std::floor ((n - 60) / 12.0);   // degree 0 = C
+            const int deg = (n - 60) - oct * 12;
+            f[n] = 415.0 * std::pow (2.0, (mt[deg] - mt[9]) / 1200.0) * std::pow (2.0, (double) oct);
+        }
+        TuningManager t; juce::String err;
+        check (t.loadTunString (makeTun (f), "meantone", err), "parsed meantone .tun");
+        t.setMode (TuningManager::Mode::Scala);
+        const double worst = worstCents (t, f);
+        std::printf ("    worst error over 128 keys: %.8f cents\n", worst);
+        check (worst <= 0.01, "every key within 0.01 cents of the file");
+        check (centsApart (t.frequencyForNote (69), 415.0) <= 0.01, "A4 = 415");
+    }
+
+    std::printf ("AnaMark .tun: tolerant of comments, case and whitespace:\n");
+    {
+        double f[128];
+        for (int n = 0; n < 128; ++n) f[n] = 440.0 * std::pow (2.0, (n - 69) / 12.0);
+
+        juce::String s;
+        s << "# written by some other editor\n"
+          << "[Info]\nName=whatever it likes\n\n"
+          << "  [ EXACT TUNING ]   ; the section that counts\n"
+          << "\tBaseFreq = " << juce::String (f[0], 10) << "   ; MIDI 0\n";
+        for (int n = 0; n < 128; ++n)
+            s << "  NOTE" << n << "\t=  "
+              << juce::String (1200.0 * std::log2 (f[n] / f[0]), 6) << " ; key " << n << "\n";
+
+        TuningManager t; juce::String err;
+        check (t.loadTunString (s, "messy", err), ("parsed messy .tun (" + err + ")").toRawUTF8());
+        t.setMode (TuningManager::Mode::Scala);
+        check (worstCents (t, f) <= 0.01, "messy .tun still exact to 0.01 cents");
+        check (TuningManager::looksLikeTun (s), "content sniff recognises it as .tun");
+    }
+
+    std::printf ("AnaMark .tun: v1 fallback to the integer [Tuning] block:\n");
+    {
+        // No [Exact Tuning] at all: integer cents are all there is, so the result must
+        // match those integers exactly - not be silently "corrected" to 12-TET.
+        double f[128];
+        for (int n = 0; n < 128; ++n) f[n] = 440.0 * std::pow (2.0, (n - 69) / 12.0);
+
+        juce::String s;
+        s << "; AnaMark TUN v1\n[Tuning]\n";
+        for (int n = 0; n < 128; ++n)
+            s << "note " << n << "=" << juce::String (100 * n) << "\n";
+
+        TuningManager t; juce::String err;
+        check (t.loadTunString (s, "v1", err), ("parsed v1 .tun (" + err + ")").toRawUTF8());
+        t.setMode (TuningManager::Mode::Scala);
+        // v1 has no basefreq: the standard's own MIDI-0 = 8.1757989156 Hz applies,
+        // which is 12-TET at A=440.
+        double worst = 0.0;
+        for (int n = 0; n < 128; ++n)
+            worst = std::max (worst, centsApart (t.frequencyForNote (n), f[n]));
+        std::printf ("    worst error vs 12-TET A=440: %.8f cents\n", worst);
+        check (worst <= 0.01, "v1 integer cents land on 12-TET A=440");
+    }
+
+    std::printf ("AnaMark .tun: a non-periodic mapping is REFUSED, not approximated:\n");
+    {
+        // A stretched (Railsback-like) tuning: the interval between key n and n+k grows
+        // with n, so no k repeats. It cannot be held as degrees + period, and the only
+        // honest answer is to refuse it.
+        double f[128];
+        for (int n = 0; n < 128; ++n)
+            f[n] = 8.1757989156 * std::pow (2.0, (100.0 * n + 0.02 * n * n) / 1200.0);
+
+        // Load a known-good tuning first: the refusal must leave THAT one sounding.
+        double ref[128];
+        for (int i = 0; i < 128; ++i) ref[i] = 440.0 * std::pow (2.0, (i - 69) / 12.0);
+        TuningManager t; juce::String err;
+        t.loadTunString (makeTun (ref), "12ed2", err);
+        t.setMode (TuningManager::Mode::Scala);
+
+        juce::String err2;
+        const bool refused = ! t.loadTunString (makeTun (f), "stretched", err2);
+        check (refused, "stretched .tun refused");
+        check (err2.isNotEmpty(), "refusal comes with an error message");
+        std::printf ("    error: %s\n", err2.toRawUTF8());
+        check (worstCents (t, ref) <= 0.01, "the previously loaded tuning is untouched");
+    }
+
+    std::printf ("AnaMark .tun: malformed files are refused without crashing:\n");
+    {
+        TuningManager t; juce::String err;
+        check (! t.loadTunString ("", "empty", err), "empty file refused");
+        check (! t.loadTunString ("just some text\nwith no sections", "text", err),
+               "text with no sections refused");
+        check (! t.loadTunString ("[Exact Tuning]\nbasefreq=440\n", "nonotes", err),
+               "basefreq but no notes refused");
+        check (! t.loadTunString ("[Exact Tuning]\nbasefreq=abc\nnote 0=0\n", "badbase", err),
+               "non-numeric basefreq refused");
+        check (! t.loadTunString ("[Exact Tuning]\nbasefreq=440\nnote 0=0\nnote 1=x\n", "badnote", err),
+               "non-numeric note value refused");
+        {
+            // 100 of the 128 keys: the missing 28 would have to be invented.
+            juce::String s ("[Exact Tuning]\nbasefreq=8.1757989156\n");
+            for (int n = 0; n < 100; ++n) s << "note " << n << "=" << juce::String (100 * n) << "\n";
+            check (! t.loadTunString (s, "partial", err), "partial (100/128 keys) .tun refused");
+            std::printf ("    error: %s\n", err.toRawUTF8());
+        }
+        {
+            // Every key the same pitch: there is no ascending period to be found.
+            juce::String s ("[Exact Tuning]\nbasefreq=440\n");
+            for (int n = 0; n < 128; ++n) s << "note " << n << "=0\n";
+            check (! t.loadTunString (s, "flat", err), "all-128-keys-identical .tun refused");
+        }
     }
 
     std::printf ("\n%s (%d failure%s)\n", failures == 0 ? "ALL PASSED" : "FAILURES",

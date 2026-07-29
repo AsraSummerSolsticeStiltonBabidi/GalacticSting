@@ -343,8 +343,40 @@ namespace
             if (! b.isEnabled()) txt = txt.withAlpha (0.5f);
             g.setColour (txt);
             g.setFont (getTextButtonFont (b, b.getHeight()));
-            g.drawFittedText (b.getButtonText(), b.getLocalBounds().reduced (4, 0),
-                              juce::Justification::centred, 2);
+
+            auto area = b.getLocalBounds().reduced (4, 0);
+            // A button flagged "fork" gets a real tuning fork drawn at its left edge.
+            // There is no tuning-fork character in any font we can rely on - the nearest
+            // candidates (Psi, the pitchfork sign) all have THREE prongs, which reads as a
+            // trident, not a fork. So it is drawn: two prongs, a U-bend and a stem.
+            if (b.getProperties().contains ("fork"))
+            {
+                const float fh = juce::jmin (13.0f, (float) b.getHeight() - 4.0f);
+                auto fr = area.removeFromLeft ((int) std::ceil (fh * 0.62f) + 3).toFloat()
+                              .withSizeKeepingCentre (fh * 0.62f, fh);
+                g.strokePath (tuningForkPath (fr), juce::PathStrokeType (juce::jmax (1.2f, fh * 0.14f),
+                                                                         juce::PathStrokeType::curved,
+                                                                         juce::PathStrokeType::rounded));
+                area.removeFromLeft (2);
+            }
+            g.drawFittedText (b.getButtonText(), area, juce::Justification::centred, 2);
+        }
+
+        // Two prongs joined by a U-bend, on a stem. Drawn rather than typed for the
+        // reason above.
+        static juce::Path tuningForkPath (juce::Rectangle<float> r)
+        {
+            juce::Path p;
+            const float x = r.getX(), y = r.getY(), w = r.getWidth(), h = r.getHeight();
+            const float pl = x + w * 0.18f, pr = x + w * 0.82f, cx = x + w * 0.5f;
+            const float bend = y + h * 0.52f;
+            p.startNewSubPath (pl, y);
+            p.lineTo (pl, bend);
+            p.quadraticTo (cx, y + h * 0.86f, pr, bend);
+            p.lineTo (pr, y);
+            p.startNewSubPath (cx, y + h * 0.70f);
+            p.lineTo (cx, y + h);
+            return p;
         }
 
         // ADSR-style faders carry their letter INSIDE the drag thumb (the slider's
@@ -656,17 +688,30 @@ namespace
                 // Walk the line, splitting on the three delimiters. An unmatched
                 // delimiter is treated as ordinary text, so a stray * never eats
                 // the rest of a tooltip.
+                // A delimiter only OPENS a span when it starts a word: it must not be
+                // wedged against a letter or digit on its left, and must not be followed
+                // by a space. Without that rule "keeps 14 (2*7) and 25 (5*5)" parsed as a
+                // highlighted "7) and 25 (5" - which is exactly where the meaningless
+                // coloured runs in the prime tooltip came from. Arithmetic in a tooltip
+                // is ordinary text and has to stay that way.
+                const auto opensHere = [&line] (int i)
+                {
+                    if (i + 1 >= line.length()) return false;
+                    const auto prev = i > 0 ? line[i - 1] : (juce::juce_wchar) ' ';
+                    return ! juce::CharacterFunctions::isLetterOrDigit (prev)
+                        && ! juce::CharacterFunctions::isWhitespace (line[i + 1]);
+                };
+
                 int pos = 0;
                 while (pos < line.length())
                 {
-                    const int a = line.indexOfChar (pos, '*');
-                    const int b = line.indexOfChar (pos, '`');
-                    const int c = line.indexOfChar (pos, '!');
                     int at = -1; juce::juce_wchar delim = 0;
-                    for (auto cand : { std::pair<int, juce::juce_wchar> { a, '*' },
-                                       std::pair<int, juce::juce_wchar> { b, '`' },
-                                       std::pair<int, juce::juce_wchar> { c, '!' } })
-                        if (cand.first >= 0 && (at < 0 || cand.first < at)) { at = cand.first; delim = cand.second; }
+                    for (int i = pos; i < line.length(); ++i)
+                    {
+                        const auto ch = line[i];
+                        if ((ch == '*' || ch == '`' || ch == '!') && opensHere (i))
+                        { at = i; delim = ch; break; }
+                    }
 
                     if (at < 0) { as.append (line.substring (pos), plain, cPlain); break; }
                     const int close = line.indexOfChar (at + 1, delim);
@@ -1154,11 +1199,35 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     configGroup (gTuning, cTuning);
     configCombo (tuningBox, "tuningMode", tuningAtt, cTuning,
                  "Where the tuning comes from.\n*MTS-ESP* - follow a connected ODDSound master; with none connected this is plain `12ED2`.\n*Scala* - the loaded `.scl` scale.\n*MPE* - the host sends the tuning as per-note bend.");
-    // Plain 12ED2 is not offered any more: MTS-ESP already IS 12ED2 whenever no
-    // master is connected, so the separate entry only duplicated that fallback.
-    // Projects saved on it still restore (the parameter keeps the entry) - it just
-    // cannot be picked by hand, so item 1 is disabled rather than removed.
-    tuningBox.setItemEnabled (1, false);
+    // 12ED2 is NOT a tuning mode - it is just a scale, and it now lives inside Scala as
+    // the default content. It used to sit in this list greyed out, which still made it
+    // look like a mode you were not allowed to pick. It is gone from the list entirely.
+    //
+    // The parameter keeps all four entries so projects saved on 12ED2 restore exactly,
+    // which means the box can no longer use a ComboBoxAttachment: that maps by item
+    // POSITION, and dropping an item would shift every mode by one. Wired by ID instead
+    // (id = parameter index + 1), explicitly, in both directions.
+    tuningAtt.reset();
+    tuningBox.clear (juce::dontSendNotification);
+    if (auto* choice = dynamic_cast<juce::AudioParameterChoice*> (processorRef.apvts.getParameter ("tuningMode")))
+        for (int i = 1; i < choice->choices.size(); ++i)     // skip index 0 (12ED2)
+            tuningBox.addItem (choice->choices[i], i + 1);
+    tuningBox.onChange = [this]
+    {
+        const int id = tuningBox.getSelectedId();
+        if (id <= 0) return;
+        if (auto* p = processorRef.apvts.getParameter ("tuningMode"))
+        {
+            const float want = p->convertTo0to1 ((float) (id - 1));
+            if (std::abs (p->getValue() - want) > 1.0e-4f)
+            {
+                p->beginChangeGesture();
+                p->setValueNotifyingHost (want);
+                p->endChangeGesture();
+            }
+        }
+        refocus();
+    };
     loadSclButton.setColour (juce::TextButton::buttonColourId, cLoad);
     loadSclButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
     loadSclButton.setMouseClickGrabsKeyboardFocus (false);
@@ -1204,8 +1273,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addAndMakeVisible (tuningBankBox);
     tuningBankLoadBtn.setColour (juce::TextButton::buttonColourId, cLoad);
     tuningBankLoadBtn.setMouseClickGrabsKeyboardFocus (false);
-    tuningBankLoadBtn.setTooltip (tr ("Load a .scl into the selected bank slot.",
-                                      "Carrega un .scl a la ranura seleccionada del banc."));
+    tuningBankLoadBtn.setTooltip (tr ("Load a .tun / .scl / .ascl into the selected bank slot.",
+                                      "Carrega un .tun / .scl / .ascl a la ranura seleccionada del banc."));
     tuningBankLoadBtn.onClick = [this] { openTuningBankChooser(); };
     // Put the tuning that is playing RIGHT NOW into the bank (any mode: a generated
     // scale, an edited one, an EDO...), without going through a file.
@@ -1384,19 +1453,26 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     saveTuningBtn.setMouseClickGrabsKeyboardFocus (false);
     saveTuningBtn.onClick = [this]
     {
+        // .tun is the default: it carries the reference frequency, which .scl cannot, so
+        // an exported scale reopens at the same absolute pitch. .scl stays available in
+        // the file-type dropdown for anything that only speaks Scala.
         auto ch = std::make_shared<juce::FileChooser> (
-            tr ("Save tuning as .scl", "Desa l'afinaci\xc3\xb3 com a .scl"),
+            tr ("Save tuning", "Desa l'afinaci\xc3\xb3"),
             juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
-                .getChildFile ("tuning.scl"),
-            "*.scl");
+                .getChildFile ("tuning.tun"),
+            "*.tun;*.scl");
         ch->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
             [this, ch] (const juce::FileChooser& fc)
             {
                 auto f = fc.getResult();
                 if (f == juce::File()) { refocus(); return; }
-                if (! f.hasFileExtension ("scl")) f = f.withFileExtension ("scl");
+                // Whatever the dialog gave back decides the format; no extension at all
+                // means the default, .tun.
+                const bool asScl = f.hasFileExtension ("scl");
+                if (! asScl && ! f.hasFileExtension ("tun")) f = f.withFileExtension ("tun");
                 juce::String err;
-                if (! processorRef.saveCurrentTuningScl (f, err))
+                if (! (asScl ? processorRef.saveCurrentTuningScl (f, err)
+                             : processorRef.saveCurrentTuningTun (f, err)))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
                         tr ("Save tuning", "Desa l'afinaci\xc3\xb3"), err, this);
                 refocus();
@@ -2282,9 +2358,11 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // These two used to BOTH read "Load .scl" in adjacent boxes, and clicking the
     // wrong one greys out the whole Harmonic Engine (it loads a TIMBRE), which reads
     // as the plugin breaking. They say what they load now.
-    loadSclButton.setButtonText    (tr ("Load tuning", "Obrir afinaci\xc3\xb3"));
+    loadSclButton.setButtonText    (tr ("Load", "Obrir"));
+    loadSclButton.getProperties().set ("fork", true);
     clearSclButton.setButtonText   (tr ("Reset", "Reinicia"));
-    tuningBankAddBtn.setButtonText (tr ("+ to bank", "+ al banc"));
+    tuningBankAddBtn.setButtonText ("+");
+    tuningBankAddBtn.getProperties().set ("fork", true);
     loadItsSpectrumBtn.setButtonText (tr ("Load its original spectrum", "Carrega el seu espectre original"));
     loadItsSpectrumBtn.setTooltip (tr (
         "This scale was generated by Fibló Galà""ctic and carries the patch it was made with. This brings that SOUND back; the tuning you just loaded stays as it is.",
@@ -2294,7 +2372,11 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "The preset you just loaded was saved with a *different tuning*.\nLoading a preset only changes the *sound*, !never the scale!. Click to bring that tuning in too.",
         "El preset que acabes de carregar es va desar amb una *afinaci\xc3\xb3 diferent*.\nCarregar un preset nom\xc3\xa9s canvia el *so*, !mai l'escala!. Clica per portar tamb\xc3\xa9 aquella afinaci\xc3\xb3."));
     tuningBankLoadBtn.setButtonText (tr ("+ .scl", "+ .scl"));
-    loadTimbreButton.setButtonText (tr ("Spectrum\xe2\x80\xa6", "Espectre\xe2\x80\xa6"));
+    // It loads a SCALE file, same as the tuning Load does - it just points the intervals
+    // at the timbre instead of at the keyboard. Same fork, same word, so the pair reads
+    // as two destinations for one kind of file rather than two unrelated buttons.
+    loadTimbreButton.setButtonText (tr ("Load", "Obrir"));
+    loadTimbreButton.getProperties().set ("fork", true);
     clearTimbreButton.setButtonText (processorRef.isTimbreActive() ? tr ("On", "Actiu") : tr ("Off", "Apagat"));
     savePresetButton.setButtonText (tr ("Save", "Desa"));
     presetBox.setTextWhenNothingSelected (tr ("Presets...", "Presets..."));
@@ -2329,15 +2411,15 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "How prime numbers filter the harmonics. 'Limit': a harmonic passes only if its largest prime factor is at most the chosen limit. 'Whitelist': it passes only if EVERY prime factor is ticked below.",
         "Com filtren els primers els harm\xc3\xb2nics. 'L\xc3\xadmit': un harm\xc3\xb2nic passa nom\xc3\xa9s si el seu factor primer m\xc3\xa9s gran \xc3\xa9s com a molt el l\xc3\xadmit triat. 'Llista': passa nom\xc3\xa9s si TOTS els seus factors primers estan marcats a sota."));
     primeLimitFader.setTooltip (tr (
-        "Largest prime factor a harmonic may contain. Example: limit 7 keeps 14 (2*7) and 25 (5*5) but drops 11 and 22 (2*11). Off = no prime filtering.",
-        "Factor primer m\xc3\xa9s gran que pot tenir un harm\xc3\xb2nic. Exemple: l\xc3\xadmit 7 mant\xc3\xa9 14 (2*7) i 25 (5*5) per\xc3\xb2 elimina 11 i 22 (2*11). No = sense filtre de primers."));
+        "Largest prime factor a harmonic may contain. Example: limit 7 keeps 14 (2×7) and 25 (5×5) but drops 11 and 22 (2×11). Off = no prime filtering.",
+        "Factor primer m\xc3\xa9s gran que pot tenir un harm\xc3\xb2nic. Exemple: l\xc3\xadmit 7 mant\xc3\xa9 14 (2×7) i 25 (5×5) per\xc3\xb2 elimina 11 i 22 (2×11). No = sense filtre de primers."));
     const char* pn2[] = { "2","3","5","7","11","13","17","19","23" };
     for (int i = 0; i < 9; ++i)
         primeToggle[i].setTooltip (tr ("Allow harmonics whose prime factors include ",
                                        "Permet harm\xc3\xb2nics amb el factor primer ") + juce::String (pn2[i]));
     cutoffFader.setTooltip (tr (
-        "Low-pass cutoff as an INTERVAL above the played note, in cents (1200 = one octave, 12000 = fully open). It TRACKS the note, so the same partials are cut at every pitch - a partial at ratio r sits at 1200*log2(r) cents (e.g. harmonic 2 = 1200c, harmonic 3 = 1902c). An absolute-Hz cutoff would eat different partials depending on the note.",
-        "Tall del passa-baixos com a INTERVAL per sobre de la nota tocada, en cents (1200 = una octava, 12000 = tot obert). SEGUEIX la nota, aix\xc3\xad que talla els mateixos parcials a qualsevol al\xc3\xa7""ada - un parcial de ratio r \xc3\xa9s a 1200*log2(r) cents (p. ex. harm\xc3\xb2nic 2 = 1200c, harm\xc3\xb2nic 3 = 1902c). Un tall en Hz absoluts es menjaria parcials diferents segons la nota."));
+        "Low-pass cutoff as an INTERVAL above the played note, in cents (1200 = one octave, 12000 = fully open). It TRACKS the note, so the same partials are cut at every pitch - a partial at ratio r sits at 1200·log2(r) cents (e.g. harmonic 2 = 1200c, harmonic 3 = 1902c). An absolute-Hz cutoff would eat different partials depending on the note.",
+        "Tall del passa-baixos com a INTERVAL per sobre de la nota tocada, en cents (1200 = una octava, 12000 = tot obert). SEGUEIX la nota, aix\xc3\xad que talla els mateixos parcials a qualsevol al\xc3\xa7""ada - un parcial de ratio r \xc3\xa9s a 1200·log2(r) cents (p. ex. harm\xc3\xb2nic 2 = 1200c, harm\xc3\xb2nic 3 = 1902c). Un tall en Hz absoluts es menjaria parcials diferents segons la nota."));
     resFader.setTooltip (tr ("Resonance: a volume peak right at the cutoff frequency.",
                              "Res(son\xc3\xa0ncia): un pic de volum just a la freq\xc3\xbc\xc3\xa8ncia de tall."));
     fEnvAmtFader.setTooltip (tr (
@@ -2356,8 +2438,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Which tuning the keys follow. 12-TET: standard. MTS-ESP: follow an ODDSound MTS-ESP master running in the session. Scala: the .scl/.ascl file loaded below. Note: Ableton Live's own tuning arrives as MPE pitch bend and works in ANY of these modes (set Bend to +-48).",
         "Quina afinaci\xc3\xb3 segueixen les tecles. 12-TET: est\xc3\xa0ndard. MTS-ESP: segueix un mestre MTS-ESP d'ODDSound actiu a la sessi\xc3\xb3. Scala: el fitxer .scl/.ascl carregat a sota. Nota: l'afinaci\xc3\xb3 pr\xc3\xb2pia d'Ableton Live arriba com a pitch bend MPE i funciona en QUALSEVOL d'aquests modes (posa Bend a +-48)."));
     loadSclButton.setTooltip (tr (
-        "Load a Scala .scl or Ableton .ascl file to retune the keys. The 1/1 sits on middle C unless the file sets its own reference (@ABL REFERENCE_PITCH).",
-        "Carrega un fitxer Scala .scl o Ableton .ascl per reafinar les tecles. L'1/1 queda al Do central tret que el fitxer porti la seva refer\xc3\xa8ncia (@ABL REFERENCE_PITCH)."));
+        "Load an AnaMark .tun, a Scala .scl or an Ableton .ascl file to retune the keys. The 1/1 sits on middle C unless the file sets its own reference (@ABL REFERENCE_PITCH, or a .tun's basefreq - a .tun always sounds at the absolute pitches it states). A .tun whose mapping does not repeat cannot be held as a scale and is refused rather than approximated.",
+        "Carrega un fitxer AnaMark .tun, un Scala .scl o un Ableton .ascl per reafinar les tecles. L'1/1 queda al Do central tret que el fitxer porti la seva refer\xc3\xa8ncia (@ABL REFERENCE_PITCH, o el basefreq d'un .tun - un .tun sempre sona als tons absoluts que indica). Un .tun amb un mapatge que no es repeteix no es pot desar com a escala i es rebutja en comptes d'aproximar-lo."));
     clearSclButton.setTooltip (tr ("Unload the scale and return to standard 12-TET.",
                                    "Descarrega l'escala i torna al 12-TET est\xc3\xa0ndard."));
     for (int i = 0; i < 3; ++i)
@@ -2367,8 +2449,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Per-note pitch-bend range. +-48 st is the MPE standard and is REQUIRED for Ableton Live 12's tuning systems and the Microtuner device (enable MPE on this plugin in Live). Use +-2 for a classic keyboard pitch wheel.",
         "Rang del pitch bend per nota. +-48 st \xc3\xa9s l'est\xc3\xa0ndard MPE i \xc3\x89S NECESSARI per als sistemes d'afinaci\xc3\xb3 d'Ableton Live 12 i el Microtuner (activa MPE al plugin dins de Live). Fes servir +-2 per a la roda d'un teclat cl\xc3\xa0ssic."));
     loadTimbreButton.setTooltip (tr (
-        "Load a .scl/.ascl whose intervals become the PARTIALS of the sound, replacing the harmonic engine. Slope, Fractal, Range and Reps still shape it; the greyed-out controls do not apply.",
-        "Carrega un .scl/.ascl els intervals del qual passen a ser els PARCIALS del so, substituint el motor harm\xc3\xb2nic. Pendent, Fractal, Rang i Reps encara hi actuen; els controls en gris no apliquen."));
+        "Load a .tun/.scl/.ascl whose intervals become the PARTIALS of the sound, replacing the harmonic engine. Slope, Fractal, Range and Reps still shape it; the greyed-out controls do not apply.",
+        "Carrega un .tun/.scl/.ascl els intervals del qual passen a ser els PARCIALS del so, substituint el motor harm\xc3\xb2nic. Pendent, Fractal, Rang i Reps encara hi actuen; els controls en gris no apliquen."));
     clearTimbreButton.setTooltip (tr ("Custom engine ON/OFF. Off keeps the loaded scale - nothing is erased; switch it back on any time.",
                                       "Motor propi ON/OFF. En apagar-lo NO s'esborra l'escala carregada; el pots tornar a encendre quan vulguis."));
     timbreRepeatsFader.setTooltip (tr (
@@ -2451,7 +2533,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     chordViewBack.setTooltip (tr ("Show the list of ALL found chords.", "Mostra la llista de TOTS els acords trobats."));
     chordViewFwd.setTooltip  (tr ("Show the LOADED chord's degrees, ranked like any scale.",
                                   "Mostra els graus de l'acord CARREGAT, rankejats com qualsevol escala."));
-    saveTuningBtn.setButtonText (tr ("Save tuning .scl", "Desa afinaci\xc3\xb3 .scl"));
+    saveTuningBtn.setButtonText (tr ("Save", "Desa"));
+    saveTuningBtn.getProperties().set ("fork", true);
     saveTuningBtn.setTooltip (tr (
         "Save the CURRENT tuning as a .scl file to any folder - including scales you edited on the keyboard (right-click a key to retype a degree, Ctrl+click to add a note).",
         "Desa l'afinaci\xc3\xb3 ACTUAL com a fitxer .scl a qualsevol carpeta - incloses les escales editades al teclat (clic dret per reescriure un grau, Ctrl+clic per afegir una nota)."));
@@ -2956,7 +3039,10 @@ void FractalAdditiveAudioProcessorEditor::updateWarning (int templatePartials)
 
 void FractalAdditiveAudioProcessorEditor::openScalaChooser()
 {
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale (.scl / .ascl)", juce::File(), "*.scl;*.ascl");
+    // .tun is offered first because it is what the Save button writes by default:
+    // a tuning exported from here has to be reloadable from here.
+    fileChooser = std::make_unique<juce::FileChooser> ("Load a tuning (.tun / .scl / .ascl)",
+                                                       juce::File(), "*.tun;*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
         {
@@ -2972,7 +3058,8 @@ void FractalAdditiveAudioProcessorEditor::openScalaChooser()
 
 void FractalAdditiveAudioProcessorEditor::openTuningBankChooser()
 {
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a .scl into the tuning bank", juce::File(), "*.scl;*.ascl");
+    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale into the tuning bank (.tun / .scl / .ascl)",
+                                                       juce::File(), "*.tun;*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
         {
@@ -3006,7 +3093,8 @@ void FractalAdditiveAudioProcessorEditor::refreshTuningBank()
 
 void FractalAdditiveAudioProcessorEditor::openTimbreChooser()
 {
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale file as timbre (.scl / .ascl)", juce::File(), "*.scl;*.ascl");
+    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale file as timbre (.tun / .scl / .ascl)",
+                                                       juce::File(), "*.tun;*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
         {
@@ -4024,8 +4112,31 @@ void FractalAdditiveAudioProcessorEditor::resized()
             lFootBounds = row.reduced (3, 0); // frame painted in paint()
             auto ti = row.reduced (3).reduced (8, 4); ti.removeFromTop (20); // clear the TUNING title band
             auto mrow = ti.removeFromTop (24);
-            compact (tuningBox, mrow.removeFromLeft (mrow.getWidth() * 50 / 100));
+            compact (tuningBox, mrow.removeFromLeft (mrow.getWidth() * 34 / 100));
             mrow.removeFromLeft (5);
+            // Load / Save / + sit immediately to the RIGHT of the mode selector, each at
+            // its OWN minimum width. They used to have a row to themselves underneath,
+            // split into equal thirds of the whole panel, which made three buttons with
+            // four characters of text on them absurdly wide and pushed the tuning bank
+            // down. The word "tuning" is gone from the labels too - a tuning fork in
+            // front of each one says the same thing in a fraction of the space.
+            {
+                loadSclButton.setVisible (true);
+                saveTuningBtn.setVisible (true);
+                tuningBankAddBtn.setVisible (true);
+                clearSclButton.setVisible (false);  // Reset removed - the mode selector does it
+                const juce::Font bf (juce::FontOptions (12.0f));
+                const auto fit = [&] (juce::TextButton& b)
+                {
+                    const int fork = b.getProperties().contains ("fork") ? 13 : 0; // drawn glyph
+                    const int w = juce::GlyphArrangement::getStringWidthInt (bf, b.getButtonText()) + 14 + fork;
+                    b.setBounds (mrow.removeFromLeft (juce::jmin (w, juce::jmax (0, mrow.getWidth()))));
+                    mrow.removeFromLeft (4);
+                };
+                fit (loadSclButton);
+                fit (saveTuningBtn);
+                fit (tuningBankAddBtn);
+            }
             tuningNameLabel.setBounds (mrow); // shows the loaded scale's file name
             // Period of the active scale, in red, always visible.
             ti.removeFromTop (2);
@@ -4037,30 +4148,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // a scale: there is no drag-and-drop and no menu route, and the only other
             // .scl chooser on screen loads a TIMBRE, which is the wrong thing entirely.
             // The gate was redundant anyway: loadScalaFile() switches to Scala itself.
-            const int  tmode    = processorRef.getTuningMode();
-            const bool loadVis  = true;
-            const bool saveVis  = true;
-            const bool bankVis  = true;   // "add the ACTIVE tuning to the bank"
-            loadSclButton.setVisible (loadVis);
-            clearSclButton.setVisible (false);  // Reset removed - the mode selector does it
-            saveTuningBtn.setVisible (saveVis);
-            tuningBankAddBtn.setVisible (bankVis);
-            if (loadVis || saveVis || bankVis)
-            {
-                ti.removeFromTop (3);
-                auto brow = ti.removeFromTop (23);
-                const int nBtn = (loadVis ? 1 : 0) + (saveVis ? 1 : 0) + (bankVis ? 1 : 0);
-                const int bw   = brow.getWidth() / juce::jmax (1, nBtn);
-                int left = nBtn;
-                const auto place = [&] (juce::TextButton& b, bool vis)
-                {
-                    if (! vis) return;
-                    b.setBounds ((--left > 0 ? brow.removeFromLeft (bw) : brow).reduced (2, 0));
-                };
-                place (loadSclButton,    loadVis);
-                place (saveTuningBtn,    saveVis);
-                place (tuningBankAddBtn, bankVis);
-            }
+            // (Load / Save / + are laid out beside the mode selector above; the row that
+            // used to be here is gone, which gives the tuning bank its height back.)
+            const int tmode = processorRef.getTuningMode();
             // Only for scales this synth wrote: they carry their own patch.
             const bool hasPatch = processorRef.activeSclHasPreset();
             loadItsSpectrumBtn.setVisible (hasPatch);
@@ -4085,7 +4175,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
             // Pitch bend ABOVE Recent; hidden in MPE-input mode (the MPE zone fixes
             // the per-note range at +-48, so the choice is irrelevant there).
-            const bool sclMode = tmode == 2;
             const bool bendVis = tmode != 3;
             lblBend.setVisible (bendVis); bendBox.setVisible (bendVis);
             if (bendVis)
@@ -4654,6 +4743,16 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         auto per = degreeLabel (processorRef, D);
         if (per.endsWith ("/1")) per = per.dropLastCharacters (2); // "2/1" reads better as "2"
         tuningPeriodLbl.setText (tr ("Period  ", "Per\xc3\xado" "de  ") + per, juce::dontSendNotification);
+    }
+
+    // The tuning-mode box is wired by hand (12ED2 is not in the list), so it has to be
+    // pulled back into step with the parameter here - after a preset load, host
+    // automation, or an undo. A project saved on 12ED2 restores the mode faithfully and
+    // simply shows nothing selected, which is honest: it is not one of the choices.
+    {
+        const int want = processorRef.getTuningMode() + 1;
+        if (tuningBox.getSelectedId() != want)
+            tuningBox.setSelectedId (want > 1 ? want : 0, juce::dontSendNotification);
     }
 
     const bool timbre = processorRef.timbreReplacesEngine();
