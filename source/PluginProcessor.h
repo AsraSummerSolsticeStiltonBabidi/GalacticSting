@@ -84,6 +84,22 @@ public:
         if (! (f0 > 0.0) || ! std::isfinite (f0))
         { errorOut = "The current tuning has no usable pitch for MIDI note 0."; return false; }
 
+        // What Fiblo exports is always a SCALE, never a bare 128-key table. A .tun can
+        // legitimately hold a non-repeating mapping - a stretched piano curve, per-note
+        // tweaks - but writing one from here would hand out a file that says nothing
+        // about the structure it came from, and that nothing else could reason about.
+        // If the active tuning has no repeating scale behind it, refuse and say why
+        // rather than emit a table dressed up as a tuning.
+        const int    degrees = tuning.degreesPerPeriod();
+        const double period  = tuning.periodRatio();
+        if (degrees <= 0 || ! (period > 1.0001) || ! std::isfinite (period))
+        {
+            errorOut = "This tuning has no repeating scale behind it (an MTS-ESP master can "
+                       "supply an arbitrary 128-key table), so it cannot be written as a scale. "
+                       "Nothing was saved.";
+            return false;
+        }
+
         const auto centsAt = [this, f0] (int n)
         {
             const double fn = tuning.frequencyForNote (n);
@@ -92,8 +108,23 @@ public:
 
         juce::String s;
         s << "; AnaMark TUN v2 - written by Fiblo Galactic\n"
-          << "; " << getTuningStatus() << "\n\n"
-          << "[Tuning]\n";
+          << "; " << getTuningStatus() << "\n\n";
+
+        // Declare the SCALE, so the file says what it is instead of leaving a reader to
+        // infer a period from 128 numbers. Degrees as cents above 1/1, then the period as
+        // the closing interval - the same shape a .scl has, which is what makes this a
+        // scale file rather than a table that happens to repeat.
+        s << "[Scale Begin]\n"
+          << "; " << degrees << " degrees per period of "
+          << juce::String (1200.0 * std::log2 (period), 6) << " cents\n";
+        for (int d = 1; d <= degrees; ++d)
+        {
+            const double r = d < degrees ? getDegreeRatio (d) : period;
+            s << "degree " << d << "=" << juce::String (1200.0 * std::log2 (std::max (1.0e-9, r)), 6) << "\n";
+        }
+        s << "[Scale End]\n\n";
+
+        s << "[Tuning]\n";
         for (int n = 0; n < 128; ++n)
             s << "note " << n << "=" << juce::String ((int) std::llround (centsAt (n))) << "\n";
         // The exact block is what actually carries the pitch: integer cents above are
