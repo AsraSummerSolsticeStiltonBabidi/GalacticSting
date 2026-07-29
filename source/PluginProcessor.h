@@ -73,6 +73,39 @@ public:
         tuning.setMode (TuningManager::Mode::Scala);
         return true;
     }
+    // Write the CURRENT tuning as an AnaMark .tun (v2). This is the primary interchange
+    // format now: unlike .scl it carries the reference frequency, so a scale exported
+    // here reopens at the same absolute pitch instead of losing its A and being guessed
+    // at by whatever loads it. Every MIDI note is written out, so a mapping of any size
+    // survives - a .scl would need a .kbm alongside it to say the same thing.
+    bool saveCurrentTuningTun (const juce::File& f, juce::String& errorOut)
+    {
+        const double f0 = tuning.frequencyForNote (0);
+        if (! (f0 > 0.0) || ! std::isfinite (f0))
+        { errorOut = "The current tuning has no usable pitch for MIDI note 0."; return false; }
+
+        const auto centsAt = [this, f0] (int n)
+        {
+            const double fn = tuning.frequencyForNote (n);
+            return (fn > 0.0 && std::isfinite (fn)) ? 1200.0 * std::log2 (fn / f0) : 0.0;
+        };
+
+        juce::String s;
+        s << "; AnaMark TUN v2 - written by Fiblo Galactic\n"
+          << "; " << getTuningStatus() << "\n\n"
+          << "[Tuning]\n";
+        for (int n = 0; n < 128; ++n)
+            s << "note " << n << "=" << juce::String ((int) std::llround (centsAt (n))) << "\n";
+        // The exact block is what actually carries the pitch: integer cents above are
+        // only the coarse fallback for readers that predate it.
+        s << "\n[Exact Tuning]\nbasefreq=" << juce::String (f0, 10) << "\n";
+        for (int n = 0; n < 128; ++n)
+            s << "note " << n << "=" << juce::String (centsAt (n), 6) << "\n";
+
+        if (! f.replaceWithText (s)) { errorOut = "Could not write " + f.getFullPathName(); return false; }
+        return true;
+    }
+
     void clearScala();
     juce::String getTuningStatus() const { return tuning.getStatusText(); }
 

@@ -1453,19 +1453,26 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     saveTuningBtn.setMouseClickGrabsKeyboardFocus (false);
     saveTuningBtn.onClick = [this]
     {
+        // .tun is the default: it carries the reference frequency, which .scl cannot, so
+        // an exported scale reopens at the same absolute pitch. .scl stays available in
+        // the file-type dropdown for anything that only speaks Scala.
         auto ch = std::make_shared<juce::FileChooser> (
-            tr ("Save tuning as .scl", "Desa l'afinaci\xc3\xb3 com a .scl"),
+            tr ("Save tuning", "Desa l'afinaci\xc3\xb3"),
             juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
-                .getChildFile ("tuning.scl"),
-            "*.scl");
+                .getChildFile ("tuning.tun"),
+            "*.tun;*.scl");
         ch->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
             [this, ch] (const juce::FileChooser& fc)
             {
                 auto f = fc.getResult();
                 if (f == juce::File()) { refocus(); return; }
-                if (! f.hasFileExtension ("scl")) f = f.withFileExtension ("scl");
+                // Whatever the dialog gave back decides the format; no extension at all
+                // means the default, .tun.
+                const bool asScl = f.hasFileExtension ("scl");
+                if (! asScl && ! f.hasFileExtension ("tun")) f = f.withFileExtension ("tun");
                 juce::String err;
-                if (! processorRef.saveCurrentTuningScl (f, err))
+                if (! (asScl ? processorRef.saveCurrentTuningScl (f, err)
+                             : processorRef.saveCurrentTuningTun (f, err)))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
                         tr ("Save tuning", "Desa l'afinaci\xc3\xb3"), err, this);
                 refocus();
