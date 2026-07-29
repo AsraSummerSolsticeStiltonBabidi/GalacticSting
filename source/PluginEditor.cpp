@@ -1199,11 +1199,35 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     configGroup (gTuning, cTuning);
     configCombo (tuningBox, "tuningMode", tuningAtt, cTuning,
                  "Where the tuning comes from.\n*MTS-ESP* - follow a connected ODDSound master; with none connected this is plain `12ED2`.\n*Scala* - the loaded `.scl` scale.\n*MPE* - the host sends the tuning as per-note bend.");
-    // Plain 12ED2 is not offered any more: MTS-ESP already IS 12ED2 whenever no
-    // master is connected, so the separate entry only duplicated that fallback.
-    // Projects saved on it still restore (the parameter keeps the entry) - it just
-    // cannot be picked by hand, so item 1 is disabled rather than removed.
-    tuningBox.setItemEnabled (1, false);
+    // 12ED2 is NOT a tuning mode - it is just a scale, and it now lives inside Scala as
+    // the default content. It used to sit in this list greyed out, which still made it
+    // look like a mode you were not allowed to pick. It is gone from the list entirely.
+    //
+    // The parameter keeps all four entries so projects saved on 12ED2 restore exactly,
+    // which means the box can no longer use a ComboBoxAttachment: that maps by item
+    // POSITION, and dropping an item would shift every mode by one. Wired by ID instead
+    // (id = parameter index + 1), explicitly, in both directions.
+    tuningAtt.reset();
+    tuningBox.clear (juce::dontSendNotification);
+    if (auto* choice = dynamic_cast<juce::AudioParameterChoice*> (processorRef.apvts.getParameter ("tuningMode")))
+        for (int i = 1; i < choice->choices.size(); ++i)     // skip index 0 (12ED2)
+            tuningBox.addItem (choice->choices[i], i + 1);
+    tuningBox.onChange = [this]
+    {
+        const int id = tuningBox.getSelectedId();
+        if (id <= 0) return;
+        if (auto* p = processorRef.apvts.getParameter ("tuningMode"))
+        {
+            const float want = p->convertTo0to1 ((float) (id - 1));
+            if (std::abs (p->getValue() - want) > 1.0e-4f)
+            {
+                p->beginChangeGesture();
+                p->setValueNotifyingHost (want);
+                p->endChangeGesture();
+            }
+        }
+        refocus();
+    };
     loadSclButton.setColour (juce::TextButton::buttonColourId, cLoad);
     loadSclButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
     loadSclButton.setMouseClickGrabsKeyboardFocus (false);
@@ -4703,6 +4727,16 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         auto per = degreeLabel (processorRef, D);
         if (per.endsWith ("/1")) per = per.dropLastCharacters (2); // "2/1" reads better as "2"
         tuningPeriodLbl.setText (tr ("Period  ", "Per\xc3\xado" "de  ") + per, juce::dontSendNotification);
+    }
+
+    // The tuning-mode box is wired by hand (12ED2 is not in the list), so it has to be
+    // pulled back into step with the parameter here - after a preset load, host
+    // automation, or an undo. A project saved on 12ED2 restores the mode faithfully and
+    // simply shows nothing selected, which is honest: it is not one of the choices.
+    {
+        const int want = processorRef.getTuningMode() + 1;
+        if (tuningBox.getSelectedId() != want)
+            tuningBox.setSelectedId (want > 1 ? want : 0, juce::dontSendNotification);
     }
 
     const bool timbre = processorRef.timbreReplacesEngine();

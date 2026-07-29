@@ -296,7 +296,7 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     // the list so projects saved with it still restore to exactly what they had.
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "tuningMode", 1 }, "Tuning",
-        StringArray { "12ED2", "MTS-ESP", "Scala (.scl)", "MPE (bend input)" }, 1));
+        StringArray { "12ED2", "MTS-ESP", "Scala (.scl)", "MPE (bend input)" }, 2));
     // Per-note pitch-bend range. +-48 st is the MPE default and what Ableton
     // Live 12's tuning systems / Microtuner assume; +-2 suits classic keyboards.
     params.push_back (std::make_unique<AudioParameterChoice>(
@@ -1810,6 +1810,18 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     // a modulator driving a parameter that REBUILDS the spectrum (Base N, Harmonics,
     // Slope, Fractal, Prime, Range, Reps) is only sampled here, so a fast envelope
     // used to be caught on some notes and missed on others.
+    // 12ED2 is not a mode, it is a SCALE - so Scala is the default mode and it opens
+    // holding 12ED2. A fresh instance therefore sounds exactly as it always did, but the
+    // twelve-tone scale is now sitting in the editor where it can be seen and replaced,
+    // instead of hiding behind a mode entry that could not be chosen.
+    if (! tuning.hasScala())
+    {
+        juce::String twelve ("! 12ED2.scl\n!\n12 equal divisions of the octave\n 12\n!\n");
+        for (int i = 1; i <= 12; ++i) twelve << " " << juce::String (i * 100.0, 6) << "\n";
+        juce::String err;
+        tuning.loadScalaString (twelve, "12ED2", err);
+    }
+
     startTimerHz (60);
 
     // Resample the jingle to THIS session's rate once (guarded so a later
