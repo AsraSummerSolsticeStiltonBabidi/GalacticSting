@@ -84,15 +84,17 @@ public:
         if (! (f0 > 0.0) || ! std::isfinite (f0))
         { errorOut = "The current tuning has no usable pitch for MIDI note 0."; return false; }
 
-        // What Fiblo exports is always a SCALE, never a bare 128-key table. A .tun can
-        // legitimately hold a non-repeating mapping - a stretched piano curve, per-note
-        // tweaks - but writing one from here would hand out a file that says nothing
-        // about the structure it came from, and that nothing else could reason about.
-        // If the active tuning has no repeating scale behind it, refuse and say why
-        // rather than emit a table dressed up as a tuning.
+        // What Fiblo exports is a SCALE whenever it HAS one, never a scale it merely
+        // guessed at. A .tun can legitimately hold a non-repeating mapping - a stretched
+        // piano curve, per-note tweaks - and Fiblo now holds exactly that as an absolute
+        // 128-key table; for those the [Scale Begin] block is omitted rather than filled
+        // with the estimated period, which would state as fact a structure the tuning
+        // does not have. The 128 exact pitches below carry it losslessly either way, and
+        // reloading the file lands back in table mode.
+        const bool   isTable = tuning.usesAbsoluteTable();
         const int    degrees = tuning.degreesPerPeriod();
         const double period  = tuning.periodRatio();
-        if (degrees <= 0 || ! (period > 1.0001) || ! std::isfinite (period))
+        if (! isTable && (degrees <= 0 || ! (period > 1.0001) || ! std::isfinite (period)))
         {
             errorOut = "This tuning has no repeating scale behind it (an MTS-ESP master can "
                        "supply an arbitrary 128-key table), so it cannot be written as a scale. "
@@ -110,19 +112,33 @@ public:
         s << "; AnaMark TUN v2 - written by Fiblo Galactic\n"
           << "; " << getTuningStatus() << "\n\n";
 
-        // Declare the SCALE, so the file says what it is instead of leaving a reader to
-        // infer a period from 128 numbers. Degrees as cents above 1/1, then the period as
-        // the closing interval - the same shape a .scl has, which is what makes this a
-        // scale file rather than a table that happens to repeat.
-        s << "[Scale Begin]\n"
-          << "; " << degrees << " degrees per period of "
-          << juce::String (1200.0 * std::log2 (period), 6) << " cents\n";
-        for (int d = 1; d <= degrees; ++d)
+        if (isTable)
         {
-            const double r = d < degrees ? getDegreeRatio (d) : period;
-            s << "degree " << d << "=" << juce::String (1200.0 * std::log2 (std::max (1.0e-9, r)), 6) << "\n";
+            // Said in a comment, so no reader can mistake it for structure: the period is
+            // Fiblo's estimate (or the user's own choice), not something the file repeats at.
+            const auto est = tuning.getTablePeriodEstimate();
+            s << "; 128-key tuning table - this mapping does not repeat, so it declares no scale.\n"
+              << "; period used inside Fiblo: " << juce::String (1200.0 * std::log2 (period), 6)
+              << " cents (" << (tuning.tablePeriodIsUserSet() ? "chosen by the user" : "Fiblo's estimate")
+              << ", " << juce::String (tuning.tablePeriodDevCents(), 2) << " cents off at worst"
+              << (est.found ? "" : ", nothing to measure") << ")\n\n";
         }
-        s << "[Scale End]\n\n";
+        else
+        {
+            // Declare the SCALE, so the file says what it is instead of leaving a reader to
+            // infer a period from 128 numbers. Degrees as cents above 1/1, then the period
+            // as the closing interval - the same shape a .scl has, which is what makes this
+            // a scale file rather than a table that happens to repeat.
+            s << "[Scale Begin]\n"
+              << "; " << degrees << " degrees per period of "
+              << juce::String (1200.0 * std::log2 (period), 6) << " cents\n";
+            for (int d = 1; d <= degrees; ++d)
+            {
+                const double r = d < degrees ? getDegreeRatio (d) : period;
+                s << "degree " << d << "=" << juce::String (1200.0 * std::log2 (std::max (1.0e-9, r)), 6) << "\n";
+            }
+            s << "[Scale End]\n\n";
+        }
 
         s << "[Tuning]\n";
         for (int n = 0; n < 128; ++n)
@@ -156,6 +172,18 @@ public:
     bool tuningHasMaster()  const noexcept { return tuning.hasMtsMaster(); }
     bool tuningHasScala()   const noexcept { return tuning.hasScala(); }
     juce::String tuningScaleName() const { return tuning.currentScaleName(); }
+
+    // Absolute 128-key table (a non-repeating .tun): the pitches are the file's own and
+    // the PERIOD is separate metadata, so the Tuning panel offers it as an editable
+    // field marked as Fibló's estimate. Nothing here can move a pitch.
+    bool tuningIsAbsoluteTable() const noexcept { return tuning.usesAbsoluteTable(); }
+    juce::String tuningTablePeriodSpec() const { return tuning.tablePeriodSpec(); }
+    bool   tuningTablePeriodIsUserSet() const noexcept { return tuning.tablePeriodIsUserSet(); }
+    double tuningTablePeriodDevCents()  const noexcept { return tuning.tablePeriodDevCents(); }
+    bool   tuningTablePeriodWasFound()  const { return tuning.getTablePeriodEstimate().found; }
+    bool setTuningTablePeriod (const juce::String& spec, juce::String& errorOut)
+    { return tuning.setTablePeriodSpec (spec, errorOut); }
+    void resetTuningTablePeriod() { tuning.resetTablePeriodToEstimate(); }
     juce::String getTimbreName()   const { return timbreName; }
     // The exact text a typed Spectrum-Builder spectrum was entered as. It is saved in
     // the state, but the box that edits it had no way to read it back, so a reopened
@@ -261,9 +289,16 @@ public:
         double r = 0.0;
         if (tuning.scalaDegreeRatio (step, r))
             return r * std::pow (per, (double) wraps);
+        // No scale to ask (MTS, an absolute 128-key table): read the KEY the degree lands
+        // on, which for a table is the file's own pitch. Keys past 127 are walked DOWN by
+        // whole periods rather than clamped - a table with a wide period spans more than
+        // 68 keys per period, and clamping made every degree above that report key 127.
+        int key = 60 + step, extra = 0;
+        while (key > 127) { key -= D; ++extra; }
+        while (key < 0)   { key += D; --extra; }
         const double f0 = tuning.frequencyForNote (60);
-        const double f  = tuning.frequencyForNote (juce::jlimit (0, 127, 60 + step));
-        return f0 > 0.0 ? (f / f0) * std::pow (per, (double) wraps) : 1.0;
+        const double f  = tuning.frequencyForNote (juce::jlimit (0, 127, key));
+        return f0 > 0.0 ? (f / f0) * std::pow (per, (double) (wraps + extra)) : 1.0;
     }
 
     // Genuine JI test BY SOURCE: is scale degree `d` (0..getScaleDegrees(), where the
@@ -274,10 +309,14 @@ public:
     //  - Any other mode (equal divisions, MTS, MPE): only the unison and an exact 2/1
     //    octave are rational; every tempered step is shown as cents (+ "≈p/q *").
     // The one exact cents interval, 1200c = 2/1, is the period case handled here.
+    //  - Absolute-table mode: the file states cents per KEY and no degrees at all, so
+    //    only the unison is rational. It falls through to the generic branch, whose 2/1
+    //    test is real work here: a stretched table's "octave" is NOT 2/1 and must not be
+    //    labelled as one.
     bool getDegreeIsRational (int d, long long& p, long long& q) const
     {
         const int D = juce::jmax (1, tuning.degreesPerPeriod());
-        if (getTuningMode() == (int) TuningManager::Mode::Scala)
+        if (getTuningMode() == (int) TuningManager::Mode::Scala && ! tuning.usesAbsoluteTable())
             return tuning.scalaDegreeRational (d, p, q);
         if (d <= 0) { p = 1; q = 1; return true; }        // unison
         if (d >= D)                                        // the period/octave
@@ -463,6 +502,12 @@ public:
     { return juce::isPositiveAndBelow (lfo, 3) ? lfoWavePoints[(size_t) lfo] : juce::String(); }
 
     juce::String currentTuningAsScl (const juce::String& name) const; // rationals stay ratios, rest cents
+    // What "put the tuning that is playing into the bank" must STORE. For a scale that is
+    // the .scl Fibló writes. For an absolute 128-key table there is no .scl to write, so
+    // the bank keeps the .tun text itself - currentTuningAsScl() would hand the bank a
+    // flattened copy of the user's tuning under the user's own name for it.
+    juce::String currentTuningAsBankSource (const juce::String& name) const
+    { return tuning.usesAbsoluteTable() ? tuning.getScalaSource() : currentTuningAsScl (name); }
     // Scales this synth writes carry the patch they were made with, as Scala
     // comments (invisible to other programs). "Load its original spectrum" reads
     // it back without disturbing the tuning that is loaded.
@@ -611,6 +656,7 @@ private:
     // plus the degree/height data shown in the Spectrum-to-Scale panel.
     juce::String lastDissScl, lastDissName;
     juce::String presetPendingSclSource, presetPendingSclName; // see hasPendingPresetTuning()
+    juce::String presetPendingTablePeriod;                     // its table period, if it had one
     // Self-play routing as of the last block: a CHANGE strands notes (see processBlock).
     // `known` starts false so the very first block only records the state - flushing
     // there would kill a note that arrived in that same block.

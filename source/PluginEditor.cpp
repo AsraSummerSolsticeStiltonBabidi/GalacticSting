@@ -1260,6 +1260,44 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addAndMakeVisible (tuningPeriodLbl);
     addAndMakeVisible (tuningNameLabel);
 
+    // Absolute 128-key table: the period is Fibló's own ESTIMATE and the user may set it.
+    // It cannot move a pitch (the table fixes all 128) - it only answers the features that
+    // need a period: the keyboard colouring, the snapping grid, the chord search and the
+    // dissonance lists. Applied on Return, so a half-typed "3/" is never read as a period.
+    tablePeriodEdit.setJustification (juce::Justification::centred);
+    tablePeriodEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
+    tablePeriodEdit.setColour (juce::TextEditor::outlineColourId, juce::Colour (0xffe0453f).withAlpha (0.7f));
+    tablePeriodEdit.setIndents (6, 2);
+    tablePeriodEdit.setSelectAllWhenFocused (true);
+    tablePeriodEdit.onReturnKey = [this]
+    {
+        juce::String err;
+        if (! processorRef.setTuningTablePeriod (tablePeriodEdit.getText(), err))
+            juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                                                         tr ("Invalid period", "Per\xc3\xado" "de inv\xc3\xa0lid"),
+                                                         err, this);
+        // Whatever happened, show what is actually in force - never leave the field
+        // displaying a period the tuning did not accept.
+        tablePeriodEdit.setText (processorRef.tuningTablePeriodSpec(), juce::dontSendNotification);
+        refocus();
+    };
+    tablePeriodEdit.onEscapeKey = [this]
+    {
+        tablePeriodEdit.setText (processorRef.tuningTablePeriodSpec(), juce::dontSendNotification);
+        refocus();
+    };
+    addChildComponent (tablePeriodEdit);
+    tablePeriodResetBtn.setColour (juce::TextButton::buttonColourId, cReset.withAlpha (0.55f));
+    tablePeriodResetBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    tablePeriodResetBtn.setMouseClickGrabsKeyboardFocus (false);
+    tablePeriodResetBtn.onClick = [this]
+    {
+        processorRef.resetTuningTablePeriod();
+        tablePeriodEdit.setText (processorRef.tuningTablePeriodSpec(), juce::dontSendNotification);
+        refocus();
+    };
+    addChildComponent (tablePeriodResetBtn);
+
     // Tuning bank: a slot selector (automatable) + a button to load a .scl into it.
     makeLabel (lblTuningBank, cTuning);
     lblTuningBank.setJustificationType (juce::Justification::centredLeft);
@@ -1286,7 +1324,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         auto name = processorRef.tuningScaleName();
         if (name.isEmpty()) name = "tuning " + juce::String (processorRef.getScaleDegrees()) + " notes";
         processorRef.syncBankSelector (
-            processorRef.bankAutoAdd (name, processorRef.currentTuningAsScl (name)));
+            processorRef.bankAutoAdd (name, processorRef.currentTuningAsBankSource (name)));
         refreshTuningBank();
         refocus();
     };
@@ -2372,6 +2410,12 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "The preset you just loaded was saved with a *different tuning*.\nLoading a preset only changes the *sound*, !never the scale!. Click to bring that tuning in too.",
         "El preset que acabes de carregar es va desar amb una *afinaci\xc3\xb3 diferent*.\nCarregar un preset nom\xc3\xa9s canvia el *so*, !mai l'escala!. Clica per portar tamb\xc3\xa9 aquella afinaci\xc3\xb3."));
     tuningBankLoadBtn.setButtonText (tr ("+ .scl", "+ .scl"));
+    tablePeriodResetBtn.setButtonText (tr ("est.", "est."));
+    tablePeriodResetBtn.setTooltip (tr ("Back to Fibló's own estimate of the period.",
+                                        "Torna a l'estimaci\xc3\xb3 del per\xc3\xado" "de que fa Fibl\xc3\xb3."));
+    tablePeriodEdit.setTooltip (tr (
+        "This tuning is a *128-key table* (a .tun whose mapping does not repeat), so its !pitches are the file's own! and are never touched by this field.\nThe period is only needed by the features that assume one: keyboard colours, the snapping grid, the chord search and the dissonance lists. Fibló estimates it (the readout says how far the file strays); type a ratio (\"2\", \"3/2\") or cents (\"1200c\") to set your own, Return to apply.",
+        "Aquesta afinaci\xc3\xb3 \xc3\xa9s una *taula de 128 tecles* (un .tun que no es repeteix), aix\xc3\xad que les !seves altures s\xc3\xb3n les del fitxer! i aquest camp no en toca cap.\nEl per\xc3\xado" "de nom\xc3\xa9s el necessiten les funcions que en pressuposen un: colors del teclat, graella d'imantaci\xc3\xb3, cerca d'acords i llistes de dissonància. Fibl\xc3\xb3 l'estima (el r\xc3\xa8tol diu quant se'n desvia el fitxer); escriu una ra\xc3\xb3 (\"2\", \"3/2\") o cents (\"1200c\") per posar-hi el teu, i Retorn per aplicar-lo."));
     // It loads a SCALE file, same as the tuning Load does - it just points the intervals
     // at the timbre instead of at the keyboard. Same fork, same word, so the pair reads
     // as two destinations for one kind of file rather than two unrelated buttons.
@@ -4138,9 +4182,28 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 fit (tuningBankAddBtn);
             }
             tuningNameLabel.setBounds (mrow); // shows the loaded scale's file name
-            // Period of the active scale, in red, always visible.
+            // Period of the active scale, in red, always visible. For an absolute 128-key
+            // table it is Fibló's ESTIMATE, so the same row also carries the field that
+            // overrides it (and a reset back to the estimate) - the readout alone would
+            // state a guess as if the tuning had declared it.
             ti.removeFromTop (2);
-            tuningPeriodLbl.setBounds (ti.removeFromTop (17));
+            {
+                auto prow = ti.removeFromTop (18);
+                const bool isTable = processorRef.tuningIsAbsoluteTable();
+                tablePeriodEdit.setVisible (isTable);
+                tablePeriodResetBtn.setVisible (isTable && processorRef.tuningTablePeriodIsUserSet());
+                if (isTable)
+                {
+                    if (tablePeriodResetBtn.isVisible())
+                    {
+                        tablePeriodResetBtn.setBounds (prow.removeFromRight (46).reduced (0, 1));
+                        prow.removeFromRight (4);
+                    }
+                    tablePeriodEdit.setBounds (prow.removeFromRight (72).reduced (0, 1));
+                    prow.removeFromRight (5);
+                }
+                tuningPeriodLbl.setBounds (prow);
+            }
             // Load / Save / + to bank share ONE row: stacking them overflowed the box
             // and squeezed the tuning-bank controls to zero height (invisible).
             // "Load tuning" is ALWAYS available. Hiding it outside Scala mode left a
@@ -4735,7 +4798,12 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // in too: Recent/Tuning-bank/Pitch-bend visibility depends on it.
     const bool resetVis = processorRef.getTuningMode() != 0 || processorRef.tuningHasScala();
     const bool offVis   = processorRef.timbreLoaded();
-    const int  packed   = (resetVis ? 1 : 0) | (offVis ? 2 : 0) | (processorRef.getTuningMode() << 2);
+    // The table-period field and its reset only exist in table mode, and the reset only
+    // once the user has typed a period - both are laid out in resized(), so both belong in
+    // this signature or the field appears only after some unrelated relayout.
+    const int  packed   = (resetVis ? 1 : 0) | (offVis ? 2 : 0) | (processorRef.getTuningMode() << 2)
+                        | (processorRef.tuningIsAbsoluteTable()      ? 1 << 4 : 0)
+                        | (processorRef.tuningTablePeriodIsUserSet() ? 1 << 5 : 0);
     if (packed != lastResetOffState) { lastResetOffState = packed; resized(); }
 
     const int mode = (int) (processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f);
@@ -4751,6 +4819,25 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     updateScaleDissonance();
 
     // Period of the active scale (red readout in the Tuning box).
+    if (processorRef.tuningIsAbsoluteTable())
+    {
+        // An absolute table declares no period, so the readout must not claim one: it says
+        // whose period this is (Fibló's estimate, or the user's) and how far the file
+        // strays from it. Silence about the deviation would make a guess look measured.
+        const bool user = processorRef.tuningTablePeriodIsUserSet();
+        juce::String t = tr ("Period  ", "Per\xc3\xado" "de  ");
+        t << (user ? tr ("yours", "el teu")
+                   : (processorRef.tuningTablePeriodWasFound() ? tr ("estimated", "estimat")
+                                                              : tr ("none found", "cap trobat")))
+          << "  \xc2\xb1" << juce::String (processorRef.tuningTablePeriodDevCents(), 1)
+          << juce::String::fromUTF8 ("\xc2\xa2") << "  ("
+          << juce::String (processorRef.getScaleDegrees()) << tr (" keys)", " tecles)");
+        tuningPeriodLbl.setText (t, juce::dontSendNotification);
+        // Never fight the user for the field while they are typing in it.
+        if (! tablePeriodEdit.hasKeyboardFocus (true))
+            tablePeriodEdit.setText (processorRef.tuningTablePeriodSpec(), juce::dontSendNotification);
+    }
+    else
     {
         const int D = juce::jmax (1, processorRef.getScaleDegrees());
         auto per = degreeLabel (processorRef, D);

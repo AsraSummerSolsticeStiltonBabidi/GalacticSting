@@ -1923,6 +1923,11 @@ private:
     juce::Label          vibeLabel;   // "Vibe coded by" credit, left of the language button
     juce::HyperlinkButton vibeLink;   // "Asra3" -> Instagram
     juce::TextEditor periodEdit;
+    // Absolute-table tunings only: the period is METADATA there (the 128 keys already fix
+    // every pitch), so it is Fibló's estimate until the user types over it. Visible only
+    // in table mode - a scale's period comes from the scale and must not look editable.
+    juce::TextEditor tablePeriodEdit;
+    juce::TextButton tablePeriodResetBtn;
     ExpandingEditor  intervalEdit; // Custom Engine: typed intervals -> partials (grows while editing)
     juce::Rectangle<int> intervalEditHome; // its normal (collapsed) bounds
     juce::TextEditor refAEdit;     // Reference A: type the Hz directly ("hz" shown to its right)

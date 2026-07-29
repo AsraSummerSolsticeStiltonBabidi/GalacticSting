@@ -2108,6 +2108,128 @@ int main()
         tmp.deleteFile();
     }
 
+    // --- run 33: an ABSOLUTE 128-key table, all the way through the real plugin -----
+    // A non-repeating .tun (a stretched piano curve) is held as a table of 128 exact
+    // frequencies. TuningTests proves the TuningManager side; what only the real
+    // processor can prove is that the rest of the plugin does not quietly turn it back
+    // into a scale - the saved state, the tuning bank, the .tun writer and the scale
+    // editors all used to assume degrees + period and there was no table to catch them.
+    {
+        std::printf ("absolute 128-key table through the real plugin:\n");
+        auto tmp = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                       .getChildFile ("fiblo_table_test.tun");
+        auto out = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                       .getChildFile ("fiblo_table_written.tun");
+
+        // Railsback-like: flat bass, sharp treble, so no key distance repeats exactly.
+        double want[128];
+        for (int n = 0; n < 128; ++n)
+        {
+            const double d = (double) (n - 60);
+            want[n] = 440.0 * std::pow (2.0, ((n - 69) * 100.0 + 0.002 * d * std::abs (d)) / 1200.0);
+        }
+        {
+            juce::String s ("; stretched piano curve - does not repeat\n[Exact Tuning]\nbasefreq=");
+            s << juce::String (want[0], 10) << "\n";
+            for (int n = 0; n < 128; ++n)
+                s << "note " << n << "=" << juce::String (1200.0 * std::log2 (want[n] / want[0]), 6) << "\n";
+            tmp.replaceWithText (s);
+        }
+
+        const auto worstVs = [&] (FractalAdditiveAudioProcessor& p)
+        {
+            double worst = 0.0;
+            for (int n = 0; n < 128; ++n)
+            {
+                const double got = p.getNoteFrequency (n);
+                if (got > 0.0) worst = std::max (worst, std::abs (1200.0 * std::log2 (got / want[n])));
+            }
+            return worst;
+        };
+
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 64);
+        juce::String err;
+        check (p->loadScalaFile (tmp, err), ("the stretched .tun loads (" + err + ")").toRawUTF8());
+        check (p->tuningIsAbsoluteTable(), "and is held as an absolute 128-key table");
+        p->pollParametersForTests();
+        std::printf ("  loaded            worst error %.6f cents over 128 keys\n", worstVs (*p));
+        check (worstVs (*p) < 0.01, "every key sounds at the frequency the file states");
+        check (p->getScaleDegrees() == 12 && std::abs (p->getDegreeRatio (12) - 2.0) < 0.01,
+               "the estimated period is the octave, 12 keys wide");
+
+        // The period is metadata: typing a different one must not move a pitch.
+        check (p->setTuningTablePeriod ("3/2", err), "a period of the user's own is accepted");
+        p->pollParametersForTests();
+        check (p->getScaleDegrees() == 7, "7 keys span a fifth here");
+        check (worstVs (*p) < 0.01, "and NOT ONE of the 128 pitches moved with it");
+
+        // Saved state: the table AND the chosen period.
+        {
+            juce::MemoryBlock state;
+            p->getStateInformation (state);
+            auto q = std::make_unique<FractalAdditiveAudioProcessor>();
+            q->prepareToPlay (48000.0, 64);
+            q->setStateInformation (state.getData(), (int) state.getSize());
+            q->pollParametersForTests();
+            check (q->tuningIsAbsoluteTable(), "a reopened project is still a table");
+            std::printf ("  after state reload worst error %.6f cents\n", worstVs (*q));
+            check (worstVs (*q) < 0.01, "with every key back to within 0.01 cents");
+            check (q->tuningTablePeriodIsUserSet() && q->getScaleDegrees() == 7,
+                   "and the period the user chose came back too");
+        }
+
+        // The tuning bank stores the .tun VERBATIM (it has no .scl form) and reloads it.
+        {
+            for (int i = 0; i < FractalAdditiveAudioProcessor::kBankSlots; ++i) p->bankClearSlot (i);
+            p->setTuningBankFile (0, tmp);
+            check (p->getTuningBankName (0).isNotEmpty(), "the table takes a bank slot");
+            p->loadScalaText ("! x.scl\nsomething else\n 2\n 500.0\n 2/1\n", "other", err);
+            check (! p->tuningIsAbsoluteTable(), "another tuning takes over");
+            // Off the slot and back onto it: selecting the slot the selector already sits
+            // on is a no-op by design (syncBankSelector), so the switch has to be real.
+            p->setTuningBankSlotParam (0);
+            p->pollParametersForTests();
+            p->setTuningBankSlotParam (1);
+            p->pollParametersForTests();  // the slot switch is picked up on the message thread
+            check (p->tuningIsAbsoluteTable(), "recalling the slot brings the table back");
+            std::printf ("  from bank slot    worst error %.6f cents\n", worstVs (*p));
+            check (worstVs (*p) < 0.01, "exactly, key for key");
+        }
+
+        // The writer: a table goes out as 128 exact pitches and NO fabricated scale.
+        {
+            check (p->saveCurrentTuningTun (out, err), ("a table can be written back out (" + err + ")").toRawUTF8());
+            const auto text = out.loadFileAsString();
+            check (! text.contains ("[Scale Begin]"),
+                   "the file declares no scale - it has none to declare");
+            auto r = std::make_unique<FractalAdditiveAudioProcessor>();
+            r->prepareToPlay (48000.0, 64);
+            check (r->loadScalaFile (out, err), "and loads back into a fresh instance");
+            r->pollParametersForTests();
+            check (r->tuningIsAbsoluteTable(), "still as a table");
+            std::printf ("  written + reread  worst error %.6f cents\n", worstVs (*r));
+            check (worstVs (*r) < 0.01, "every key survives the writer");
+        }
+
+        // The scale editors must refuse rather than replace the table with an invention.
+        {
+            juce::String e1, e2, e3, e4;
+            const bool a = ! p->addNoteToTuning (1.25, e1);
+            const bool b = ! p->editTuningDegree (1, "6/5", e2);
+            const bool c = ! p->deleteTuningDegree (1, e3);
+            const bool d = ! p->saveCurrentTuningScl (out, e4);
+            check (a && b && c && d, "add / edit / delete a degree and 'save .scl' all refuse");
+            check (e1.isNotEmpty() && e2.isNotEmpty() && e3.isNotEmpty() && e4.isNotEmpty(),
+                   "each refusal says why");
+            check (p->tuningIsAbsoluteTable() && worstVs (*p) < 0.01,
+                   "and the table is still exactly what was loaded");
+        }
+
+        tmp.deleteFile();
+        out.deleteFile();
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

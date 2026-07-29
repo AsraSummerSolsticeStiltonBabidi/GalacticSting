@@ -540,7 +540,10 @@ void FractalAdditiveAudioProcessor::timerCallback()
             if (slot >= 1 && slot <= kBankSlots && bankSource[(size_t) (slot - 1)].isNotEmpty())
             {
                 juce::String err;
-                if (tuning.loadScalaString (bankSource[(size_t) (slot - 1)], bankName[(size_t) (slot - 1)], err))
+                // loadTuningString, not loadScalaString: a bank slot may hold .tun text
+                // (a non-repeating .tun has no .scl form), and the .scl parser would
+                // reject it and leave the previous tuning sounding under the new name.
+                if (tuning.loadTuningString (bankSource[(size_t) (slot - 1)], bankName[(size_t) (slot - 1)], err))
                 {
                     if (auto* pm = apvts.getParameter ("tuningMode"))
                         pm->setValueNotifyingHost (pm->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
@@ -766,15 +769,31 @@ void FractalAdditiveAudioProcessor::setTuningBankFile (int slot0, const juce::Fi
         return;
 
     auto text = f.loadFileAsString();
-    // The bank stores .scl TEXT (the state and the slot loader both re-parse it), so a
-    // .tun has to be converted here; storing it raw would fill the slot with something
-    // that silently fails to load again the next time the session is opened.
+    // The bank stores tuning SOURCE text and re-parses it on every slot switch and on
+    // every session reload, so whatever goes in has to be provably loadable - a slot
+    // holding text that fails to parse silently reverts to the previous tuning.
+    //
+    // A .tun that converts to a scale is stored as that .scl (the degrees and period are
+    // what the rest of the plugin reasons about). A non-repeating one is stored VERBATIM:
+    // it has no .scl form at all, and dropping it here is how it used to disappear from
+    // the bank without a word.
     if (f.hasFileExtension ("tun") || TuningManager::looksLikeTun (text))
     {
         juce::String scl, tunErr;
-        if (! TuningManager::tunToScala (text, f.getFileNameWithoutExtension(), scl, tunErr))
+        if (TuningManager::tunToScala (text, f.getFileNameWithoutExtension(), scl, tunErr))
+            text = scl;
+        else
+        {
+            std::array<double, 128> freqs {};
+            juce::String tabErr;
+            if (! TuningManager::readTunTable (text, freqs, tabErr))
+                return;                       // not a readable .tun either: nothing to store
+            bankSource[(size_t) slot0] = text; // the table itself is the source
+            bankName[(size_t) slot0]   = f.getFileNameWithoutExtension();
+            addRecentScl (f);
+            setTuningBankSlotParam (slot0 + 1);
             return;
-        text = scl;
+        }
     }
 
     std::vector<double> tmp; double per = 2.0; juce::String err;
@@ -806,11 +825,22 @@ bool FractalAdditiveAudioProcessor::loadTimbreFile (const juce::File& f, juce::S
     // Same conversion as the tuning loader: a .tun's degrees are a perfectly good
     // spectrum, and timbreSource is re-parsed as .scl on state restore, so what gets
     // stored has to be the converted .scl and not the .tun.
+    //
+    // A NON-repeating .tun is refused here on purpose, even though the tuning side now
+    // loads it as an absolute table: a spectrum IS a set of degrees repeating at a period
+    // (the Reps control stacks it), so there is nothing for the Custom Engine to build
+    // from 128 absolute keys. Saying so beats picking one octave's worth and calling it
+    // the timbre.
     if (f.hasFileExtension ("tun") || TuningManager::looksLikeTun (text))
     {
         juce::String scl;
         if (! TuningManager::tunToScala (text, f.getFileNameWithoutExtension(), scl, errorOut))
+        {
+            errorOut = "This .tun does not repeat at any interval, so it states no degrees "
+                       "for the Custom Engine to use. Load it as a TUNING instead - it will "
+                       "sound exactly as written.";
             return false;
+        }
         text = scl;
     }
 
@@ -1413,24 +1443,40 @@ bool FractalAdditiveAudioProcessor::loadSpectrumFromScl (const juce::String& scl
 {
     auto tree = presetFromScl (sclText);
     if (! tree.isValid() || ! tree.hasType (apvts.state.getType())) return false;
-    const auto keepName   = tuning.getScalaName();
-    const auto keepSource = tuning.getScalaSource();
-    const int  keepMode   = getTuningMode();
+    const auto keep     = tuning.captureTuning();
+    const int  keepMode = getTuningMode();
     restoreState (tree);
-    // Put the tuning back (restoreState may have carried the patch's own).
-    if (keepSource.isNotEmpty())
+    // Put the tuning back (restoreState may have carried the patch's own). The whole
+    // snapshot, not just name+source: a table's user-chosen period is part of the tuning
+    // that was active, and reloading the source alone reset it to Fibló's estimate.
+    if (keep.source.isNotEmpty())
     {
         juce::String err;
-        tuning.loadScalaString (keepSource, keepName, err);
+        tuning.restoreTuning (keep, err);
     }
     if (auto* p = apvts.getParameter ("tuningMode"))
         p->setValueNotifyingHost (p->convertTo0to1 ((float) keepMode));
     return true;
 }
 
+// The three scale editors below (add / edit / delete a degree) all work by writing a
+// NEW .scl out of the current degrees and loading it. An absolute 128-key table has no
+// degrees to write, so doing that would replace the user's file with a scale invented
+// from one period's worth of keys - the whole tuning, silently changed by an edit that
+// looks local. They refuse instead, and say what the tuning actually is.
+static bool refuseTableEdit (bool isTable, juce::String& errorOut)
+{
+    if (! isTable) return false;
+    errorOut = "This tuning is a 128-key table (a .tun that does not repeat), not a scale, "
+               "so its degrees cannot be edited - an edit would have to throw the table "
+               "away. Save it as .tun and edit the keys there.";
+    return true;
+}
+
 bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce::String& errorOut,
                                                      const juce::String& exactText)
 {
+    if (refuseTableEdit (tuning.usesAbsoluteTable(), errorOut)) return false;
     const int    D      = juce::jmax (1, tuning.degreesPerPeriod());
     const double period = getDegreeRatio (D);
     if (! (period > 1.0001) || ! (ratioFromTonic > 0.0) || ! std::isfinite (ratioFromTonic))
@@ -1526,6 +1572,7 @@ bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce
 bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::String& valueText,
                                                       juce::String& errorOut)
 {
+    if (refuseTableEdit (tuning.usesAbsoluteTable(), errorOut)) return false;
     const int D = juce::jmax (1, tuning.degreesPerPeriod());
     if (degree < 1 || degree > D)
     {
@@ -1571,6 +1618,7 @@ bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::St
 // EVERY repetition of the period (a scale degree is a pitch class, not one key).
 bool FractalAdditiveAudioProcessor::deleteTuningDegree (int degree, juce::String& errorOut)
 {
+    if (refuseTableEdit (tuning.usesAbsoluteTable(), errorOut)) return false;
     const int D = juce::jmax (1, tuning.degreesPerPeriod());
     if (degree < 1 || degree >= D)
     {
@@ -1797,6 +1845,16 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
 
 bool FractalAdditiveAudioProcessor::saveCurrentTuningScl (const juce::File& f, juce::String& errorOut)
 {
+    // A .scl can only say "N degrees repeating at a period" (a per-key map needs a .kbm
+    // alongside it), so an absolute table cannot go out this way without being flattened
+    // into a scale it is not. .tun holds it exactly - that is why .tun is the default.
+    if (tuning.usesAbsoluteTable())
+    {
+        errorOut = "This tuning is a 128-key table (a .tun that does not repeat), and a .scl "
+                   "can only hold degrees repeating at a period. Save it as .tun instead - "
+                   "that keeps every key exactly.";
+        return false;
+    }
     const auto scl = currentTuningAsScl (f.getFileNameWithoutExtension());
     if (! f.replaceWithText (scl))
     {
@@ -2144,11 +2202,17 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         }
 
     state.removeChild (state.getChildWithName ("SCALA"), nullptr);
-    if (tuning.getScalaSource().isNotEmpty())
+    if (const auto snap = tuning.captureTuning(); snap.source.isNotEmpty())
     {
         juce::ValueTree scl ("SCALA");
-        scl.setProperty ("name",   tuning.getScalaName(),   nullptr);
-        scl.setProperty ("source", tuning.getScalaSource(), nullptr);
+        scl.setProperty ("name",   snap.name,   nullptr);
+        scl.setProperty ("source", snap.source, nullptr);
+        // The source is the FILE (a .scl, or the .tun text of an absolute 128-key table),
+        // so the table itself reopens byte-exact. What the file does NOT carry is the
+        // period the user chose for a table - it is Fibló's metadata, not the .tun's - so
+        // it rides here, or a reopened project silently fell back to the estimate.
+        if (snap.periodSpec.isNotEmpty())
+            scl.setProperty ("tablePeriod", snap.periodSpec, nullptr);
         state.appendChild (scl, nullptr);
     }
 
@@ -2413,8 +2477,11 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     if (auto scl = tree.getChildWithName ("SCALA"); scl.isValid())
     {
         juce::String err;
-        tuning.loadScalaString (scl.getProperty ("source").toString(),
-                                scl.getProperty ("name").toString(), err);
+        // restoreTuning (not loadScalaString): the source may be .tun text holding an
+        // absolute 128-key table, and it carries the table's chosen period with it.
+        tuning.restoreTuning ({ scl.getProperty ("name").toString(),
+                                scl.getProperty ("source").toString(),
+                                scl.getProperty ("tablePeriod").toString() }, err);
     }
     else
     {
@@ -2564,20 +2631,23 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
         {
             presetPendingSclName   = scl.getProperty ("name").toString();
             presetPendingSclSource = scl.getProperty ("source").toString();
+            // A preset saved on an absolute table carries its period too, so accepting the
+            // preset's tuning later reproduces what the preset's author was hearing.
+            presetPendingTablePeriod = scl.getProperty ("tablePeriod").toString();
         }
-        else { presetPendingSclName.clear(); presetPendingSclSource.clear(); }
+        else { presetPendingSclName.clear(); presetPendingSclSource.clear(); presetPendingTablePeriod.clear(); }
 
-        const auto keepName   = tuning.getScalaName();
-        const auto keepSource = tuning.getScalaSource();
-        const int  keepMode   = getTuningMode();
+        const auto keep     = tuning.captureTuning();
+        const int  keepMode = getTuningMode();
 
         restoreState (tree);
 
-        // Put the CURRENTLY ACTIVE tuning back exactly as it was.
-        if (keepSource.isNotEmpty())
+        // Put the CURRENTLY ACTIVE tuning back exactly as it was - source, name AND a
+        // table's chosen period, which is as much part of "as it was" as the pitches.
+        if (keep.source.isNotEmpty())
         {
             juce::String err;
-            tuning.loadScalaString (keepSource, keepName, err);
+            tuning.restoreTuning (keep, err);
         }
         else
             tuning.clearScala();
@@ -2598,7 +2668,8 @@ bool FractalAdditiveAudioProcessor::loadPendingPresetTuning (juce::String& error
         errorOut = "This preset carries no tuning of its own.";
         return false;
     }
-    if (! tuning.loadScalaString (presetPendingSclSource, presetPendingSclName, errorOut))
+    if (! tuning.restoreTuning ({ presetPendingSclName, presetPendingSclSource,
+                                  presetPendingTablePeriod }, errorOut))
         return false;
     if (auto* p = apvts.getParameter ("tuningMode"))
         p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
