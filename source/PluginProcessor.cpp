@@ -276,6 +276,13 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "pitchRelease", 1 }, "Pitch Release", timeRange (30.0f), 0.001f)); // min by default
 
+    //-- Manual per-partial amplitudes. While this is on the user is drawing the
+    //   spectrum by hand, so SLOPE stops having any effect: it is frozen at whatever it
+    //   was when manual was switched on, which means nothing jumps at the moment of
+    //   switching and the fader simply stops doing anything until manual is off again.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "partialManual", 1 }, "Manual Partial Amps", false));
+
     //-- Spectral morphing (glide partials to their new positions on a spectrum change)
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "morph", 1 }, "Morphing", false));
@@ -424,6 +431,15 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
     // a shallower voice would need, and the fidelity rule is that nothing goes missing.
     // With nothing mapped the reachable minimum IS the knob value, so this costs exactly
     // nothing until a modulator is pointed at slope.
+    if (apvts.getRawParameterValue ("partialManual")->load() > 0.5f)
+    {
+        // MANUAL mode: the amplitudes belong to the user's per-partial edits, so slope
+        // is frozen where it stood when manual was switched on. Freezing rather than
+        // zeroing is what keeps the sound identical at the moment of switching - the
+        // curve slope was drawing simply becomes the starting point of the drawing.
+        s.curveSlope = manualSlopeFrozen;
+    }
+    else
     {
         auto* p = apvts.getParameter ("curveSlope");
         float lo = 0.0f, hi = 0.0f;
@@ -487,6 +503,19 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
 
 void FractalAdditiveAudioProcessor::timerCallback()
 {
+    // Catch the moment manual mode is switched on and FREEZE slope there, before
+    // currentSettings() below reads it. Everything the user had is preserved: the sound
+    // does not move by a single dB at the switch, and from then on the slope fader is
+    // inert until manual goes off again.
+    {
+        const bool man = apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+        if (man != lastManualMode)
+        {
+            if (man) manualSlopeFrozen = apvts.getRawParameterValue ("curveSlope")->load();
+            lastManualMode = man;
+        }
+    }
+
     const auto s = currentSettings();
     if (s != lastPushed)
     {

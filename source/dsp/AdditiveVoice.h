@@ -62,6 +62,7 @@ public:
         pReleaseParam= apvts.getRawParameterValue ("pitchRelease");
 
         curveSlopeParam = apvts.getRawParameterValue ("curveSlope");
+        manualParam     = apvts.getRawParameterValue ("partialManual");
         ampCurveA = apvts.getRawParameterValue ("ampCurveA");
         ampCurveD = apvts.getRawParameterValue ("ampCurveD");
         ampCurveR = apvts.getRawParameterValue ("ampCurveR");
@@ -493,11 +494,35 @@ public:
             // approximation, and nothing dropped: every partial is still here, just at a
             // different amplitude. The per-sample normalisation downstream is derived
             // from these targets, so loudness follows automatically.
-            const double dS = (double) modded (ModEngine::PvSlope, curveSlopeParam)
-                            - (double) tmpl->curveSlope;
-            if (std::abs (dS) > 1.0e-6)
-                for (int j = 0; j < newN; ++j)
-                    tgtAmp[(size_t) j] *= std::pow (std::max (1.0e-9, (double) ps[(size_t) j].ratio), -dS);
+            // MANUAL mode: the amplitudes belong to the user's own per-partial edits, so
+            // slope does nothing at all - not the fader, not a modulator pointed at it.
+            // The template was compiled at the frozen slope, so there is nothing to
+            // rescale from either; skipping the whole thing is what makes it inert.
+            const bool manualAmps = manualParam != nullptr && manualParam->load() > 0.5f;
+            if (! manualAmps)
+            {
+                const double dS = (double) modded (ModEngine::PvSlope, curveSlopeParam)
+                                - (double) tmpl->curveSlope;
+                if (std::abs (dS) > 1.0e-6)
+                    for (int j = 0; j < newN; ++j)
+                        tgtAmp[(size_t) j] *= std::pow (std::max (1.0e-9, (double) ps[(size_t) j].ratio), -dS);
+            }
+
+            // The user's per-partial amplitude edits. Already RESOLVED against this exact
+            // partial list when the template was published, so here it is one multiply
+            // per partial with no searching and no allocation on the audio thread.
+            //
+            // Note what this does NOT do: it never removes a partial. A partial pulled to
+            // silence is still in the template, still counted, and comes back the instant
+            // the edit is undone or manual mode is switched off. And because the voice
+            // rebuilds its normalisation from these targets every sample, pulling one
+            // partial down lifts the rest - it is a redistribution, not an attenuation.
+            if (! tmpl->gain.empty())
+            {
+                const int gn = std::min (newN, (int) tmpl->gain.size());
+                for (int j = 0; j < gn; ++j)
+                    tgtAmp[(size_t) j] *= (double) tmpl->gain[(size_t) j];
+            }
 
             for (int j = 0; j < n; ++j) // clamp guards a partial pushed past Nyquist by pitch bend
                 inc[(size_t) j] = std::min (curRatio[(size_t) j] * f0 / currentSampleRate, 0.4999);
@@ -849,6 +874,7 @@ private:
     std::atomic<float>* filtCurveA = nullptr, * filtCurveD = nullptr, * filtCurveR = nullptr;
     std::atomic<float>* pitchCurveA = nullptr, * pitchCurveD = nullptr, * pitchCurveR = nullptr;
     std::atomic<float>* curveSlopeParam = nullptr; // base slope; per-voice modulated
+    std::atomic<float>* manualParam     = nullptr; // manual per-partial amps -> slope inert
     std::atomic<float>* morphParam     = nullptr;
     std::atomic<float>* morphTimeParam = nullptr;
 

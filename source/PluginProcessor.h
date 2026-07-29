@@ -212,6 +212,19 @@ public:
     // directly (atomics) and reads the live pulse rates for its panel.
     RhythmEngine& getRhythm() noexcept { return rhythm; }
     const spectrum::SpectrumTemplate* getLiveTemplate() const noexcept { return spectrumEngine.getLive(); }
+
+    // Per-partial amplitude edits. The authoritative copy lives HERE, because it has to
+    // be saved with the project; the spectrum engine only ever holds a resolved
+    // index-aligned copy for the voices. Message thread.
+    void setPartialGains (std::vector<spectrum::PartialGain> ov, bool on)
+    {
+        partialGains = ov;
+        spectrumEngine.setOverrides (std::move (ov), on);
+    }
+    const std::vector<spectrum::PartialGain>& getPartialGains() const noexcept { return partialGains; }
+    // How many of those edits currently sit on a partial that actually exists. The rest
+    // are not lost - their partial is simply not in this spectrum right now.
+    int getPartialGainsMatched() const noexcept { return spectrumEngine.getGainMatchedCount(); }
     juce::uint32 getTemplateGeneration() const noexcept { return spectrumEngine.getGeneration(); }
 
     //==========================================================================
@@ -507,6 +520,13 @@ private:
     int  undoTxnTick   = 0;  // groups edits into ~1 s undo transactions (see timerCallback)
 
     // MTS-ESP adoption is a ONE-SHOT check at load (see timerCallback), never repeated.
+    // Manual per-partial amplitudes: slope is frozen at the value it had when manual was
+    // switched on, so switching is silent and the fader is genuinely inert while it lasts.
+    std::vector<spectrum::PartialGain> partialGains;
+
+    float manualSlopeFrozen = 1.0f;
+    bool  lastManualMode    = false;
+
     bool  mtsCheckPending = true;
     // Timer ticks waited before the one-shot above is allowed to decide, so a host that
     // calls prepareToPlay before setStateInformation cannot make a restored instance look

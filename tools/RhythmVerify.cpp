@@ -1899,6 +1899,79 @@ int main()
                "a modulator reaching down to a shallower slope compiles a WIDER template");
     }
 
+    // --- run 30: manual per-partial amplitudes, and slope going inert ---------------
+    // "Make slope not work when manual mode is on, which is off by default."
+    {
+        std::printf ("manual per-partial amplitudes:\n");
+        constexpr int eb = 64;
+        constexpr double sr2 = 48000.0;
+
+        auto brightOf = [] (const std::vector<float>& x)
+        {
+            double sa = 0.0, sd = 0.0;
+            for (size_t i = 1; i < x.size(); ++i)
+            { sa += std::abs ((double) x[i]); sd += std::abs ((double) x[i] - x[i - 1]); }
+            return sa > 1.0e-12 ? sd / sa : 0.0;
+        };
+
+        // slopeAfter is set AFTER manual is switched on, so with manual on it must have
+        // no effect at all - the freeze happened at slope 1.
+        auto run = [&] (bool manual, float slopeAfter, bool muteFundamental)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr2, eb);
+            auto s = [&] (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            s ("rhythmOn", 0.0f); s ("rhythmSelfPlay", 0.0f); s ("morph", 0.0f);
+            s ("ampAttack", 0.001f); s ("ampDecay", 0.001f); s ("ampSustain", 1.0f);
+            s ("baseN", 1.0f); s ("fractalLevel", 1.0f); s ("filterCutoff", 9600.0f);
+            s ("curveSlope", 1.0f);
+            if (manual) s ("partialManual", 1.0f);   // freezes slope at 1.0
+            s ("curveSlope", slopeAfter);            // must be inert while manual is on
+
+            if (muteFundamental)
+            {
+                std::vector<spectrum::PartialGain> ov;
+                spectrum::setPartialGain (ov, spectrum::gainKey (1.0), spectrum::kGainMutedDb);
+                p->setPartialGains (ov, true);
+            }
+            p->pollParametersForTests();
+
+            juce::AudioBuffer<float> b (2, eb);
+            for (int i = 0; i < 30; ++i)
+            { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); juce::Thread::sleep (4); }
+            p->pollParametersForTests();
+            { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 48, (juce::uint8) 100), 0);
+              b.clear(); p->processBlock (b, m); }
+            std::vector<float> out;
+            for (int i = 0; i < 120; ++i)
+            {
+                juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                if (i > 40) for (int k = 0; k < eb; ++k) out.push_back (b.getReadPointer (0)[k]);
+            }
+            return brightOf (out);
+        };
+
+        const double offS1 = run (false, 1.0f, false);
+        const double offS4 = run (false, 4.0f, false);
+        const double onS1  = run (true,  1.0f, false);
+        const double onS4  = run (true,  4.0f, false);
+        std::printf ("  brightness  manual OFF: slope1=%.4f slope4=%.4f   manual ON: slope1=%.4f slope4=%.4f\n",
+                     offS1, offS4, onS1, onS4);
+        check (std::abs (offS1 - offS4) > 0.15 * juce::jmax (offS1, offS4),
+               "precondition: with manual OFF, slope changes the timbre a lot");
+        check (std::abs (onS1 - onS4) < 0.02 * juce::jmax (onS1, onS4),
+               "with manual ON, slope has NO effect on the sound");
+        check (std::abs (onS1 - offS1) < 0.02 * juce::jmax (onS1, offS1),
+               "and switching manual on does not change the sound by itself");
+
+        const double muted = run (true, 1.0f, true);
+        std::printf ("  brightness  manual ON, fundamental muted=%.4f (vs %.4f unmuted)\n", muted, onS1);
+        check (muted > onS1 * 1.15,
+               "a per-partial edit reaches the audio (muting the fundamental brightens it)");
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

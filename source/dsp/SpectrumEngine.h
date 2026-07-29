@@ -15,6 +15,7 @@
 
 #include <juce_core/juce_core.h>
 #include "Spectrum.h"
+#include "PartialGains.h"
 
 #include <array>
 #include <atomic>
@@ -72,6 +73,37 @@ namespace spectrum
         // start a morph) rather than just re-reading it. Read on the audio thread.
         juce::uint32 getGeneration() const noexcept { return generation.load (std::memory_order_acquire); }
 
+        //----------------------------------------------------------------------
+        // Message thread: hand over the user's per-partial amplitude edits and republish
+        // the live template with them resolved.
+        //
+        // The generation is deliberately LEFT ALONE. A voice starts a spectral morph
+        // whenever the generation changes, so bumping it on every drag frame would
+        // restart the glide clock and re-seed the phase reference ~60 times a second -
+        // exactly the staircase that produced the loud clicks. The voice refills its
+        // amplitude targets from the template every block regardless, so a new gain array
+        // is picked up immediately and glides in over the usual 7 ms: click-free, and no
+        // morph in sight.
+        void setOverrides (std::vector<PartialGain> ov, bool on)
+        {
+            {
+                const std::lock_guard<std::mutex> lk (overrideMutex);
+                overrides   = std::move (ov);
+                overridesOn = on;
+            }
+            const std::lock_guard<std::mutex> lk (buildMutex);
+            const int cur = live.load();
+            if (cur < 0) return;                       // nothing published yet; the next publish picks them up
+            const int w = (cur + 1) % (int) pool.size();
+            pool[(size_t) w] = pool[(size_t) cur];     // message thread only - allocation is fine here
+            fillGains (pool[(size_t) w]);
+            live.store (w, std::memory_order_release); // same generation: no morph restart
+        }
+
+        // How many edits actually found a partial in the live spectrum. Surfaced so the
+        // editor can SAY that an edit is currently homeless rather than pretend it applied.
+        int getGainMatchedCount() const noexcept { return gainMatched.load(); }
+
         // Audio thread: a voice reports how many partials it actually renders (after the
         // per-pitch Nyquist cull) so the meter can show the audible count, not the
         // (much larger, pitch-independent) template size.
@@ -102,6 +134,18 @@ namespace spectrum
             }
         }
 
+        // Resolve the user's per-partial edits against THIS template's partial list.
+        // Done here, once per publish, rather than in the compiler: the compiler would
+        // respond to an edit by deleting partials (see PartialGains.h), and doing it in
+        // the voice would repeat the same merge join 32 times a block.
+        void fillGains (SpectrumTemplate& t)
+        {
+            const std::lock_guard<std::mutex> lk (overrideMutex);
+            if (! overridesOn || overrides.empty())
+            { t.gain.clear(); gainMatched.store (0); return; }
+            gainMatched.store (resolveGains (t.partials, overrides, t.gain));
+        }
+
         // Serialised between worker and buildNow (never called on the audio thread).
         void publish (SpectrumTemplate t)
         {
@@ -109,6 +153,7 @@ namespace spectrum
             const int w = (live.load() + 1) % (int) pool.size();
             const juce::uint32 g = generation.load (std::memory_order_relaxed) + 1;
             t.generation = g;                    // stamp BEFORE the slot is written + released
+            fillGains (t);                       // no template is ever live without its gains
             pool[(size_t) w] = std::move (t);
             liveCount.store ((int) pool[(size_t) w].partials.size());
             rawCount .store (pool[(size_t) w].rawCount);
@@ -118,6 +163,11 @@ namespace spectrum
             generation.store (g, std::memory_order_release);
             live.store (w, std::memory_order_release);
         }
+
+        std::vector<PartialGain> overrides;      // the user's edits (message thread writes)
+        bool                     overridesOn = false;
+        std::mutex               overrideMutex;
+        std::atomic<int>         gainMatched { 0 };
 
         static constexpr int kSlots = 8; // margin so a burst of publishes can't wrap onto a slot a voice is mid-read
         std::array<SpectrumTemplate, kSlots> pool;
