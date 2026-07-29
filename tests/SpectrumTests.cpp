@@ -8,6 +8,7 @@
 
 #include "dsp/Spectrum.h"
 #include "dsp/Dissonance.h"
+#include "dsp/PartialGains.h"
 
 #include <algorithm>
 #include <chrono>
@@ -605,6 +606,116 @@ int main()
             s.fractalLevel = 1.999f; const auto near_ = compileSpectrum (s);
             check (similarity (exact, near_) > 0.99,
                    "and fractal just below an integer level matches that level");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Per-partial amplitude edits: they must stay attached to the PARTIAL the user
+    // edited, not to a slot number, because every rebuild re-sorts and reshapes the
+    // set. An edit that drifted onto a neighbour would be worse than no feature.
+    {
+        std::printf ("\npartial-gain identity:\n");
+
+        check (gainKey (1.0) == 0 && gainKey (2.0) == 120000,
+               "the key grid is hundredths of a cent, anchored at ratio 1");
+        {
+            // Half a bin is 0.005 cents, i.e. ~2.9e-6 in relative terms, so the round
+            // trip can never be tighter than that - the grid IS the quantisation.
+            bool roundTrips = true;
+            for (double r : { 1.0, 1.5, 3.0, 7.0, 1023.5 })
+                if (std::abs (gainKeyRatio (gainKey (r)) - r) > 1.0e-5 * r) roundTrips = false;
+            check (roundTrips, "a key converts back to the ratio it came from, to within half a bin");
+        }
+
+        auto spectrumOf = [] (int baseN, float level, BaseMode mode, int primeLimit)
+        {
+            SpectrumSettings s;
+            s.baseN = baseN; s.reach = 16; s.selection = Selection::All;
+            s.curveSlope = 1.0f; s.fractalLevel = level; s.baseMode = mode;
+            s.primeLimit = primeLimit;
+            return compileSpectrum (s);
+        };
+        auto indexOfRatio = [] (const SpectrumTemplate& t, double r)
+        {
+            for (size_t i = 0; i < t.partials.size(); ++i)
+                if (std::abs ((double) t.partials[i].ratio - r) < 1.0e-3) return (int) i;
+            return -1;
+        };
+
+        const auto plain = spectrumOf (1, 1.0f, BaseMode::Transposed, 0);
+        std::vector<float> scale;
+
+        // Edits land on exactly the partials asked for, and on nothing else.
+        {
+            std::vector<PartialGain> ov;
+            setPartialGain (ov, gainKey (2.0), -6.0f);
+            setPartialGain (ov, gainKey (3.0), -6.0f);
+            setPartialGain (ov, gainKey (5.0), -6.0f);
+            const int m = resolveGains (plain.partials, ov, scale);
+            const int i2 = indexOfRatio (plain, 2.0), i3 = indexOfRatio (plain, 3.0),
+                      i5 = indexOfRatio (plain, 5.0);
+            bool onlyThose = (m == 3 && i2 >= 0 && i3 >= 0 && i5 >= 0);
+            for (size_t i = 0; i < scale.size() && onlyThose; ++i)
+            {
+                const bool edited = ((int) i == i2 || (int) i == i3 || (int) i == i5);
+                if (edited ? std::abs (scale[i] - gainScaleOf (-6.0f)) > 1.0e-6f
+                           : scale[i] != 1.0f)
+                    onlyThose = false;
+            }
+            check (onlyThose, "three edits touch exactly their three partials, nothing else");
+        }
+
+        // THE point of keying by ratio: the same edit survives a rebuild that moves
+        // every index - a deeper fractal, a different Base, a different base mode.
+        {
+            std::vector<PartialGain> ov;
+            setPartialGain (ov, gainKey (4.0), -12.0f);
+            bool stable = true;
+            for (const auto& t : { plain,
+                                   spectrumOf (1, 2.0f, BaseMode::Transposed, 0),
+                                   spectrumOf (2, 1.0f, BaseMode::Transposed, 0),
+                                   spectrumOf (4, 1.0f, BaseMode::Original,   0) })
+            {
+                const int m = resolveGains (t.partials, ov, scale);
+                const int i4 = indexOfRatio (t, 4.0);
+                if (m != 1 || i4 < 0 || std::abs (scale[(size_t) i4] - gainScaleOf (-12.0f)) > 1.0e-6f)
+                    stable = false;
+            }
+            check (stable, "an edit stays on ITS partial across fractal, Base and base-mode rebuilds");
+        }
+
+        // Tolerance: a couple of hundredths of a cent of float noise still binds, a
+        // twentieth of a cent is a different partial and must not.
+        {
+            std::vector<PartialGain> near_ { { gainKey (3.0) + 2, -6.0f } };
+            std::vector<PartialGain> far_  { { gainKey (3.0) + 5, -6.0f } };
+            check (resolveGains (plain.partials, near_, scale) == 1,
+                   "an edit within the float-noise tolerance still finds its partial");
+            check (resolveGains (plain.partials, far_, scale) == 0,
+                   "an edit further off binds to nothing rather than to a neighbour");
+        }
+
+        // One-to-one: two edits a hair apart must not BOTH multiply the same partial.
+        {
+            std::vector<PartialGain> ov { { gainKey (3.0), -6.0f }, { gainKey (3.0) + 1, -6.0f } };
+            const int m = resolveGains (plain.partials, ov, scale);
+            const int i3 = indexOfRatio (plain, 3.0);
+            check (m == 1 && i3 >= 0
+                   && std::abs (scale[(size_t) i3] - gainScaleOf (-6.0f)) < 1.0e-6f,
+                   "two edits on one partial do not compound - the second is left orphaned");
+        }
+
+        // An orphan is kept, not pruned: the partial may come back.
+        {
+            std::vector<PartialGain> ov;
+            setPartialGain (ov, gainKey (7.0), -6.0f);
+            const auto no7 = spectrumOf (1, 1.0f, BaseMode::Transposed, 5); // 5-limit drops 7
+            const size_t before = ov.size();
+            const int m = resolveGains (no7.partials, ov, scale);
+            bool allUnity = true;
+            for (float v : scale) if (v != 1.0f) allUnity = false;
+            check (m == 0 && allUnity && ov.size() == before,
+                   "an edit whose partial is not in the spectrum applies to nothing and is kept");
         }
     }
 
