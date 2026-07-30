@@ -1797,6 +1797,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // One beating mode (its two former entries are the SOURCE selector below) plus
     // the segment picker.
     specModeBox.addItem ("Find tunings based on beating", 1);
+    specModeBox.addItem ("Adapt spectrum to tuning based on beating", 2);
     specModeBox.addItem ("From spectrum's segment", 3);
     tuneSourceBox.addItem ("From current tuning", 1);
     tuneSourceBox.addItem ("From all possible tunings", 2);
@@ -1812,7 +1813,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     {
         b->setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
         b->setMouseClickGrabsKeyboardFocus (false);
-        b->onChange = [this] { resized(); repaint(); refocus(); };
+        b->onChange = [this] { syncRealtimeLink(); resized(); repaint(); refocus(); };
         addChildComponent (*b);
     }
     specModeBox.setSelectedId (processorRef.isSegmentModeActive() ? 3 : 1, juce::dontSendNotification); // restored state
@@ -1823,9 +1824,73 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         const bool seg = specModeBox.getSelectedId() == 3;
         processorRef.setSegmentModeActive (seg);
         if (seg) processorRef.rebuildSegmentScale();
+        // Leaving a mode leaves its realtime link: syncRealtimeLink sees the new mode and
+        // switches it off, which is also what COMMITS its one undo step (see
+        // FractalAdditiveAudioProcessor::commitRealtimeBaseline) - so a realtime session
+        // can never be abandoned half-way with no way back.
+        syncRealtimeLink();
         resized(); refocus();
     };
     addAndMakeVisible (specModeBox);
+
+    // --- Adapt-spectrum mode (2): target, partial count, goal, range, amplitudes ---
+    adaptTargetBox.addItem ("To the loaded tuning", 1);
+    adaptTargetBox.addItem ("To the chord held now", 2);
+    adaptTargetBox.setSelectedId (1, juce::dontSendNotification);
+    for (const int n : { 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24 })
+        adaptPartialsBox.addItem (juce::String (n), n);
+    adaptPartialsBox.setSelectedId (8, juce::dontSendNotification);
+    adaptGoalBox.addItem ("Min", 1);
+    adaptGoalBox.addItem ("Max", 2);
+    adaptGoalBox.addItem ("Range", 3);
+    adaptGoalBox.setSelectedId (1, juce::dontSendNotification);
+    for (auto* b : { &adaptTargetBox, &adaptPartialsBox, &adaptGoalBox })
+    {
+        b->setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
+        b->setMouseClickGrabsKeyboardFocus (false);
+        b->onChange = [this] { syncRealtimeLink(); resized(); repaint(); refocus(); };
+        addChildComponent (*b);
+    }
+    for (auto* ed : { &adaptLoEdit, &adaptHiEdit })
+    {
+        ed->setText (ed == &adaptLoEdit ? "0" : "1", juce::dontSendNotification);
+        ed->setJustification (juce::Justification::centred);
+        ed->setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
+        ed->setColour (juce::TextEditor::outlineColourId, cSpecScale.withAlpha (0.7f));
+        ed->setIndents (4, 2);
+        ed->setInputRestrictions (8, "0123456789.-");
+        ed->setSelectAllWhenFocused (true);
+        ed->onReturnKey  = [this] { syncRealtimeLink(); refocus(); };
+        ed->onFocusLost  = [this] { syncRealtimeLink(); };
+        addChildComponent (*ed);
+    }
+    makeLabel (adaptPartialsLbl, cSpecScale); adaptPartialsLbl.setVisible (false);
+    makeLabel (adaptRangeLbl,    cSpecScale); adaptRangeLbl.setVisible (false);
+    adaptInfoLbl.setJustificationType (juce::Justification::topLeft);
+    adaptInfoLbl.setColour (juce::Label::textColourId, cSpecScale.brighter (0.2f));
+    adaptInfoLbl.setFont (juce::Font (juce::FontOptions (10.5f)));
+    addChildComponent (adaptInfoLbl);
+    adaptAmpsToggle.setToggleState (true, juce::dontSendNotification);
+    adaptAmpsToggle.setMouseClickGrabsKeyboardFocus (false);
+    adaptAmpsToggle.onClick = [this] { syncRealtimeLink(); refocus(); };
+    addChildComponent (adaptAmpsToggle);
+    adaptGoBtn.setColour (juce::TextButton::buttonColourId, cSpecScale.withAlpha (0.85f));
+    adaptGoBtn.onClick = [this] { runSpectrumAdapt(); };
+    addChildComponent (adaptGoBtn);
+    adaptView.setViewedComponent (&adaptList, false);
+    adaptView.setScrollBarsShown (true, false);
+    addChildComponent (adaptView);
+
+    // The two REALTIME buttons. They are plain toggles in the editor; everything that
+    // makes them safe - the throttle, the coalescing, the feedback-loop refusal and the
+    // single undo step - lives in the processor, so it also works with this window shut.
+    for (auto* b : { &chordRtBtn, &adaptRtBtn })
+    {
+        b->setMouseClickGrabsKeyboardFocus (false);
+        addChildComponent (*b);
+    }
+    chordRtBtn.onClick = [this] { chordRtOn = ! chordRtOn; syncRealtimeLink(); resized(); refocus(); };
+    adaptRtBtn.onClick = [this] { adaptRtOn = ! adaptRtOn; syncRealtimeLink(); resized(); refocus(); };
     // Two labelled view buttons: "Results" = the list of ALL found chords;
     // "Tuning info" = the LOADED chord's degrees ranked like any scale.
     for (auto* b : { &chordViewBack, &chordViewFwd })
@@ -1848,6 +1913,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     {
         cb->setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
         cb->setMouseClickGrabsKeyboardFocus (false);
+        // A running realtime link searches with whatever these say NOW, so every one of
+        // them has to reach the processor the moment it changes - otherwise the follower
+        // would keep using the note count or the Min/Max the panel had when it engaged.
+        cb->onChange = [this] { syncRealtimeLink(); };
         addChildComponent (*cb);
     }
     makeLabel (chordNotesLbl, cSpecScale);
@@ -1860,8 +1929,9 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     chordPeriodEdit.setColour (juce::TextEditor::outlineColourId, cSpecScale.withAlpha (0.7f));
     chordPeriodEdit.setIndents (8, 2);
     chordPeriodEdit.setSelectAllWhenFocused (true);
-    chordPeriodEdit.onReturnKey = [this] { refocus(); };
+    chordPeriodEdit.onReturnKey = [this] { syncRealtimeLink(); refocus(); };
     chordPeriodEdit.onEscapeKey = [this] { refocus(); };
+    chordPeriodEdit.onFocusLost = [this] { syncRealtimeLink(); };
     addChildComponent (chordPeriodEdit);
     chordGoBtn.setColour (juce::TextButton::buttonColourId, cSpecScale.withAlpha (0.85f));
     chordGoBtn.onClick = [this] { runChordSearch(); };
@@ -1878,7 +1948,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         ed->setIndents (4, 2);
         ed->setInputRestrictions (5, "0123456789.");
         ed->setSelectAllWhenFocused (true);
-        ed->onReturnKey = [this] { refocus(); };
+        ed->onReturnKey  = [this] { syncRealtimeLink(); refocus(); };
+        ed->onFocusLost  = [this] { syncRealtimeLink(); };
         ed->setTooltip (tr ("Minimum interval between generated notes, in cents (also to the tonic and the period).",
                             "Interval m\xc3\xadnim entre notes generades, en cents (tamb\xc3\xa9 respecte a la t\xc3\xb2nica i el per\xc3\xado" "de)."));
         addChildComponent (*ed);
@@ -2688,9 +2759,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.helpB.setButtonText (tr ("How to route", "Com encaminar"));
     chordList.emptyText = tr ("Press Find to search.\nhover a row to hear it\ndouble-click loads it as the scale",
                               "Prem Troba per cercar.\npassa-hi el cursor per escoltar-lo\ndoble clic el carrega com a escala");
-    // specModeBox's ids are 1 and 3 (2 was retired), so it cannot use localise()'s
-    // "ids are 1..N" shortcut.
     specModeBox.changeItemText (1, tr ("Find tunings based on beating", "Troba afinacions pel batec"));
+    specModeBox.changeItemText (2, tr ("Adapt spectrum to tuning based on beating",
+                                       "Adapta l'espectre a l'afinaci\xc3\xb3 pel batec"));
     specModeBox.changeItemText (3, tr ("From spectrum's segment", "Del segment de l'espectre"));
     specModeBox.setSelectedId (specModeBox.getSelectedId(), juce::dontSendNotification);
     localise (tuneSourceBox, { tr ("From current tuning", "De l'afinaci\xc3\xb3 actual"),
@@ -2730,6 +2801,42 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Ordena totes les combinacions de n notes per la seva disson\xc3\xa0ncia sensorial de Sethares contra l'espectre ACTUAL (cerca en graella + refinament exacte, en segon pla). Play pre-escolta un acord; doble clic el carrega com a escala activa (.scl)."));
     chordList.tip = tr ("Each note in its own colour.\n*Hover* a row to hear it (all together, then an ascending strum).\n*Double-click* it to LOAD the chord as the active scale.",
                         "Cada nota amb el seu color.\n*Passa-hi el cursor* per escoltar-lo (tot alhora i despr\xc3\xa9s un strum ascendent).\n*Doble clic* per CARREGAR l'acord com a escala activa.");
+
+    //== "Adapt spectrum to tuning based on beating" + the two REALTIME buttons =====
+    localise (adaptTargetBox, { tr ("To the loaded tuning", "A l'afinaci\xc3\xb3 carregada"),
+                                tr ("To the chord held now", "A l'acord que sona ara") });
+    localise (adaptGoalBox,   { tr ("Min", "Min"), tr ("Max", "Max"), tr ("Range", "Rang") });
+    adaptPartialsLbl.setText (tr ("Partials", "Parcials"), dontSendNotification);
+    adaptRangeLbl.setText    (tr ("between", "entre"), dontSendNotification);
+    adaptGoBtn.setButtonText (tr ("Adapt", "Adapta"));
+    adaptAmpsToggle.setButtonText (tr ("+ amps", "+ amplituds"));
+    chordRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
+    adaptRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
+    adaptTargetBox.setTooltip (tr (
+        "WHICH NOTES the spectrum is adapted to.\n*The loaded tuning* - its degrees.\n*The chord held now* - literally the notes under your fingers, at the pitch they are really sounding. Play a major chord in 31-EDO and the partials go where that chord beats least.",
+        "QUINES NOTES fan d'objectiu.\n*L'afinaci\xc3\xb3 carregada* - els seus graus.\n*L'acord que sona ara* - literalment les notes sota els dits, a l'al\xc3\xa7""ada real. Toca un acord major en 31-EDO i els parcials van on aquell acord bat menys."));
+    adaptPartialsBox.setTooltip (tr (
+        "How many partials the adapted spectrum has. They are all kept: the search MOVES them and never merges or removes one - each keeps at least the smallest interval below from its neighbours.",
+        "Quants parcials t\xc3\xa9 l'espectre adaptat. Es conserven tots: la cerca els MOU i mai no en fusiona ni n'elimina cap - cada un guarda com a m\xc3\xadnim l'interval m\xc3\xa9s petit de sota respecte als ve\xc3\xafns."));
+    adaptGoalBox.setTooltip (tr (
+        "The TARGET. Min = the partials go where these notes beat least. Max = where they beat most. Range = hit a beating value between the two numbers you type (the read-out below shows the scale those numbers are on).",
+        "L'OBJECTIU. Min = els parcials van on aquestes notes baten menys. Max = on baten m\xc3\xa9s. Rang = arriba a un valor de batec entre els dos n\xc3\xbameros que escriguis (el marcador de sota mostra l'escala d'aquests n\xc3\xbameros)."));
+    adaptAmpsToggle.setTooltip (tr (
+        "Also shape each partial's AMPLITUDE, not only where it sits. The amplitudes are written as per-partial edits (the pencil window's own values), bounded and never muted - a silenced partial would be a deleted one.",
+        "Modela tamb\xc3\xa9 l'AMPLITUD de cada parcial, no nom\xc3\xa9s la posici\xc3\xb3. Les amplituds s'escriuen com a edicions per parcial (els mateixos valors de la finestra del llapis), acotades i mai silenciades - un parcial silenciat seria un parcial esborrat."));
+    adaptGoBtn.setTooltip (tr (
+        "Adapt the spectrum once, now. It is written into the Custom Engine (partial ratios) plus the per-partial amplitudes, as ONE undo step.",
+        "Adapta l'espectre un cop, ara. S'escriu al Motor Propi (raons dels parcials) m\xc3\xa9s les amplituds per parcial, com UN sol pas d'anul\xc2\xb7laci\xc3\xb3."));
+    chordRtBtn.setTooltip (tr (
+        "REALTIME: the tuning follows the TOP result on its own, every time the spectrum changes (a knob, a modulator, a preset). At most one search a second, never two at once, and many changes while it is busy collapse into one - so a sweeping modulator cannot pile searches up. A full search takes a moment (about 1.5 s with a rich spectrum), so each retune lands as its own search finishes. Realtime updates do NOT fill the tuning bank: the tuning you had joins it ONCE when you switch this on, and switching it off leaves ONE Ctrl+Z back to it.",
+        "TEMPS REAL: l'afinaci\xc3\xb3 segueix sola el PRIMER resultat cada cop que canvia l'espectre (un potenci\xc3\xb2metre, un modulador, un preset). Com a m\xc3\xa0xim una cerca per segon, mai dues alhora, i molts canvis mentre treballa es fusionen en un - aix\xc3\xad un modulador escombrant no pot acumular cerques. Una cerca completa triga una estona (uns 1,5 s amb un espectre ric), per aix\xc3\xb2 cada reafinaci\xc3\xb3 arriba quan acaba la seva cerca. Les actualitzacions en temps real NO omplen el banc: l'afinaci\xc3\xb3 que tenies hi entra UN sol cop en activar-ho, i en desactivar-ho queda UN Ctrl+Z per recuperar-la."));
+    adaptRtBtn.setTooltip (tr (
+        "REALTIME: the spectrum re-adapts on its own - to the tuning, or to the chord you are holding, whichever the target above says. Throttled to about four adaptations a second and coalesced. Switching it off leaves ONE Ctrl+Z back to the spectrum you had before.",
+        "TEMPS REAL: l'espectre es torna a adaptar sol - a l'afinaci\xc3\xb3, o a l'acord que mantens, seg\xc3\xb3ns l'objectiu de dalt. Limitat a ~quatre adaptacions per segon i fusionat. En desactivar-ho queda UN Ctrl+Z per recuperar l'espectre anterior."));
+    adaptList.tip = tr ("The adapted spectrum: every partial's interval from the played note, and the amplitude the search gave it. All of them are here - the search moves partials, it never drops them.",
+                        "L'espectre adaptat: l'interval de cada parcial respecte a la nota tocada i l'amplitud que li ha donat la cerca. Hi s\xc3\xb3n tots - la cerca mou parcials, no en descarta cap.");
+    adaptList.emptyText = tr ("Press Adapt to move the partials to where these notes beat least (or most).",
+                              "Prem Adapta per moure els parcials on aquestes notes baten menys (o m\xc3\xa9s).");
 
     repaint(); // title uses the language
 }
@@ -2856,6 +2963,106 @@ void FractalAdditiveAudioProcessorEditor::runChordSearch()
                                          err))
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
             tr ("Chords based on beating", "Acords basats en batec"), err, this);
+    refocus();
+}
+
+// Everything the panel's controls say, in the form the processor's realtime links need.
+// ONE place: the two links, the manual Find and the manual Adapt all read the same boxes,
+// and a second copy of "what the panel currently means" would be free to drift out of
+// step with this one - a follower quietly searching with a period the user had changed.
+FractalAdditiveAudioProcessor::RtSettings
+FractalAdditiveAudioProcessorEditor::realtimeSettingsFromPanel() const
+{
+    FractalAdditiveAudioProcessor::RtSettings s;
+    s.notes = juce::jmax (2, chordNotesBox.getSelectedId());
+    if (! TuningManager::parsePeriodSpec (chordPeriodEdit.getText(), s.periodRatio, s.periodLine))
+    { s.periodRatio = 2.0; s.periodLine = "2/1"; }
+    s.maxima      = chordMinMaxBox.getSelectedId() == 2;
+    s.minGapCents = juce::jlimit (0.0, 600.0, chordMinEdit.getText().getDoubleValue());
+    s.rootOnly    = tuneScopeBox.getSelectedId() != 2;
+
+    s.adapt.partials    = juce::jmax (2, adaptPartialsBox.getSelectedId());
+    s.adapt.periodRatio = s.periodRatio;
+    s.adapt.minGapCents = s.minGapCents;
+    s.adapt.rootOnly    = s.rootOnly;
+    s.adapt.goal        = juce::jlimit (0, 2, adaptGoalBox.getSelectedId() - 1);
+    s.adapt.rangeLo     = adaptLoEdit.getText().getDoubleValue();
+    s.adapt.rangeHi     = adaptHiEdit.getText().getDoubleValue();
+    s.adapt.shapeAmps   = adaptAmpsToggle.getToggleState();
+    return s;
+}
+
+void FractalAdditiveAudioProcessorEditor::syncRealtimeLink()
+{
+    using RtLink = FractalAdditiveAudioProcessor::RtLink;
+    const auto s = realtimeSettingsFromPanel();
+
+    const int mode = specModeBox.getSelectedId();
+    // A realtime button only counts while its own submenu is the one on screen: leaving
+    // the mode ends the link (and commits its undo step) instead of leaving it running
+    // invisibly behind another panel.
+    RtLink want = RtLink::Off;
+    if (mode == 1 && tuneSourceBox.getSelectedId() == 2 && chordRtOn)
+        want = RtLink::TuningFromSpectrum;
+    else if (mode == 2 && adaptRtOn)
+        want = adaptTargetBox.getSelectedId() == 2 ? RtLink::SpectrumFromChord
+                                                   : RtLink::SpectrumFromTuning;
+
+    if (want != processorRef.getRealtimeLink()) processorRef.setRealtimeLink (want, s);
+    else                                       processorRef.updateRealtimeSettings (s);
+}
+
+// The two REALTIME buttons' look, plus the one case they must OWN UP to: the processor
+// refused the link (a feedback loop) and switched it off under us. The button has to stop
+// claiming to be on, and the reason has to be said out loud, not swallowed.
+void FractalAdditiveAudioProcessorEditor::paintRealtimeButtons()
+{
+    using RtLink = FractalAdditiveAudioProcessor::RtLink;
+    const auto live = processorRef.getRealtimeLink();
+    if ((chordRtOn || adaptRtOn) && live == RtLink::Off)
+    {
+        const auto why = processorRef.getRealtimeRefusal();
+        if (why.isNotEmpty())
+        {
+            chordRtOn = adaptRtOn = false;
+            noticeOverlay.title = tr ("Realtime switched off", "Temps real desactivat");
+            noticeOverlay.body  = why;
+            noticeOverlay.setVisible (true);
+            noticeOverlay.toFront (false);
+            noticeOverlay.repaint();
+            resized();
+        }
+    }
+    const juce::Colour lit (0xffd23b6b), dim (0xff44445e);
+    chordRtBtn.setColour (juce::TextButton::buttonColourId,
+                          live == RtLink::TuningFromSpectrum ? lit : dim);
+    adaptRtBtn.setColour (juce::TextButton::buttonColourId,
+                          (live == RtLink::SpectrumFromTuning || live == RtLink::SpectrumFromChord)
+                              ? lit : dim);
+}
+
+// The hand-pressed Adapt: one run against the selected target, then apply it as ONE undo
+// step. The realtime button uses the same processor call with undo left to its baseline.
+void FractalAdditiveAudioProcessorEditor::runSpectrumAdapt()
+{
+    const auto s = realtimeSettingsFromPanel();
+    double f0 = 0.0;
+    const bool toChord = adaptTargetBox.getSelectedId() == 2;
+    const auto alphas = toChord ? processorRef.heldChordAsTargetAlphas (f0)
+                                : processorRef.tuningAsTargetAlphas (f0);
+    juce::String err;
+    if (alphas.size() < 2)
+        err = toChord ? tr ("Hold a chord (two notes or more) and press Adapt again - this "
+                            "target IS the notes under your fingers.",
+                            "Mant\xc3\xa9n un acord (dues notes o m\xc3\xa9s) i torna a prémer Adapta - "
+                            "aquest objectiu S\xc3\x93N les notes que tens sota els dits.")
+                      : tr ("The loaded tuning has no degrees to adapt to.",
+                            "L'afinaci\xc3\xb3 carregada no t\xc3\xa9 graus als quals adaptar-se.");
+    else
+        processorRef.startSpectrumAdapt (s.adapt, alphas, f0, err);
+    if (err.isNotEmpty())
+        juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+            tr ("Adapt spectrum to tuning", "Adapta l'espectre a l'afinaci\xc3\xb3"), err, this);
     refocus();
 }
 
@@ -4008,6 +4215,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         //   SCOPE  - rank by the beating against 0 only, or by every pair's beating
         const int  mode = specModeBox.getSelectedId();
         const bool beat = mode == 1;                       // "Find tunings based on beating"
+        const bool adapt = mode == 2;                      // "Adapt spectrum to tuning..."
         const bool seg  = mode == 3;                       // From spectrum's segment
         const bool fromCurrent = tuneSourceBox.getSelectedId() != 2;
         const bool chord = beat && ! fromCurrent;          // the free chord search
@@ -4018,11 +4226,22 @@ void FractalAdditiveAudioProcessorEditor::resized()
         specModeBox.setBounds (si.removeFromTop (34));     // two lines: full mode names fit
         si.removeFromTop (3);
         tuneSourceBox.setVisible (beat);
-        tuneScopeBox.setVisible (beat);
+        // The SCOPE means the same thing in both directions - judge every note against the
+        // root, or every pair - so the adaptation shares the control rather than growing a
+        // second one that could disagree with it.
+        tuneScopeBox.setVisible (beat || adapt);
         if (beat)
         {
             tuneSourceBox.setBounds (si.removeFromTop (22));
             si.removeFromTop (2);
+        }
+        if (adapt)
+        {
+            adaptTargetBox.setBounds (si.removeFromTop (22));
+            si.removeFromTop (2);
+        }
+        if (beat || adapt)
+        {
             tuneScopeBox.setBounds (si.removeFromTop (30)); // two lines: the long scope names
             si.removeFromTop (3);
         }
@@ -4037,12 +4256,25 @@ void FractalAdditiveAudioProcessorEditor::resized()
         juce::Component* segC[]   = { &segView, &segPeriodEdit, &segTopToggle, &segPeriodLbl, &segHelpLbl };
         juce::Component* beatC[]  = { &chordNotesBox, &chordMinMaxBox, &chordNotesLbl,
                                       &chordPerLbl, &chordPeriodEdit, &chordMinEdit, &chordMinLbl };
+        juce::Component* adaptC[] = { &adaptTargetBox, &adaptPartialsBox, &adaptPartialsLbl,
+                                      &adaptGoalBox, &adaptAmpsToggle, &adaptGoBtn, &adaptRtBtn,
+                                      &adaptInfoLbl, &adaptView };
         for (auto* c : sethC)  c->setVisible (false);
         for (auto* c : segC)   c->setVisible (seg);
-        for (auto* c : beatC)  c->setVisible (beat);
+        for (auto* c : beatC)  c->setVisible (beat || adapt); // Period + smallest interval are shared
+        for (auto* c : adaptC) c->setVisible (adapt);
+        // Notes / Min-Max belong to the SEARCH only: the adaptation's count is its own
+        // "Partials" box and its goal has a third option (a range) the search has no
+        // meaning for.
+        chordNotesBox.setVisible (beat); chordNotesLbl.setVisible (beat);
+        chordMinMaxBox.setVisible (beat);
+        adaptRangeLbl.setVisible (adapt && adaptGoalBox.getSelectedId() == 3);
+        adaptLoEdit.setVisible   (adapt && adaptGoalBox.getSelectedId() == 3);
+        adaptHiEdit.setVisible   (adapt && adaptGoalBox.getSelectedId() == 3);
         // "From current tuning" updates live: no Find button, and Save makes no sense.
         chordGoBtn.setVisible   (chord);
-        chordProgLbl.setVisible (chord);
+        chordRtBtn.setVisible   (chord);
+        chordProgLbl.setVisible (chord || adapt);
         nadBox.setVisible (false); // the note count is the shared "Notes" box now
 
         const bool fromChord = processorRef.getGeneratedSclName().startsWith ("chord-");
@@ -4060,7 +4292,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             si.removeFromTop (2);
             segHelpLbl.setBounds (si.removeFromTop (26));
         }
-        else if (beat) // the SAME stacked rows for both beating sources
+        else if (beat || adapt) // the SAME stacked rows for the search and its inverse
         {
             // "Notes" spans 2..8 in the free search and 2..the tuning's degrees when
             // combining the current tuning: one control, always honest about what
@@ -4078,16 +4310,32 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
 
             auto r1 = si.removeFromTop (24);
-            chordNotesLbl.setJustificationType (juce::Justification::centredLeft);
-            chordNotesLbl.setBounds (r1.removeFromLeft (44));
-            compact (chordNotesBox, r1.removeFromLeft (48));
-            r1.removeFromLeft (6);
-            compact (chordMinMaxBox, r1);
+            if (beat)
+            {
+                chordNotesLbl.setJustificationType (juce::Justification::centredLeft);
+                chordNotesLbl.setBounds (r1.removeFromLeft (44));
+                compact (chordNotesBox, r1.removeFromLeft (48));
+                r1.removeFromLeft (6);
+                compact (chordMinMaxBox, r1);
+            }
+            else
+            {
+                adaptPartialsLbl.setJustificationType (juce::Justification::centredLeft);
+                adaptPartialsLbl.setBounds (r1.removeFromLeft (52)); // "Partials"
+                compact (adaptPartialsBox, r1.removeFromLeft (46));
+                r1.removeFromLeft (6);
+                compact (adaptGoalBox, r1);
+            }
             si.removeFromTop (4);
             auto r2 = si.removeFromTop (24);
             chordPerLbl.setJustificationType (juce::Justification::centredLeft);
             chordPerLbl.setBounds (r2.removeFromLeft (44));
             chordPeriodEdit.setBounds (r2.removeFromLeft (44).reduced (0, 1));
+            if (adapt)
+            {
+                r2.removeFromLeft (6);
+                adaptAmpsToggle.setBounds (r2);      // "+ amplitudes"
+            }
             // The result count is fixed at 16 - one control less to think about.
             chordCountLbl.setVisible (false); chordCountBox.setVisible (false);
             si.removeFromTop (4);
@@ -4095,11 +4343,33 @@ void FractalAdditiveAudioProcessorEditor::resized()
             chordMinLbl.setJustificationType (juce::Justification::centredLeft);
             chordMinLbl.setBounds (r3.removeFromLeft (112)); // "smallest interval (c)"
             chordMinEdit.setBounds (r3.removeFromLeft (48).reduced (0, 1));
+            if (adapt && adaptGoalBox.getSelectedId() == 3)
+            {
+                si.removeFromTop (3);
+                auto rr = si.removeFromTop (22);
+                adaptRangeLbl.setJustificationType (juce::Justification::centredLeft);
+                adaptRangeLbl.setBounds (rr.removeFromLeft (58)); // "between"
+                adaptLoEdit.setBounds (rr.removeFromLeft (44).reduced (0, 1));
+                rr.removeFromLeft (4);
+                adaptHiEdit.setBounds (rr.removeFromLeft (44).reduced (0, 1));
+            }
             if (chord)
             {
                 si.removeFromTop (4);
                 auto r4 = si.removeFromTop (24);
-                chordGoBtn.setBounds (r4.reduced (1, 0)); // Find
+                // Find takes the left ~60%, REALTIME the rest: the follower is a mode, not
+                // the primary action, and it must never be the button the hand lands on.
+                chordGoBtn.setBounds (r4.removeFromLeft (r4.getWidth() * 3 / 5).reduced (1, 0));
+                chordRtBtn.setBounds (r4.reduced (1, 0));
+            }
+            if (adapt)
+            {
+                si.removeFromTop (4);
+                auto r4 = si.removeFromTop (24);
+                adaptGoBtn.setBounds (r4.removeFromLeft (r4.getWidth() * 3 / 5).reduced (1, 0));
+                adaptRtBtn.setBounds (r4.reduced (1, 0));
+                si.removeFromTop (2);
+                adaptInfoLbl.setBounds (si.removeFromTop (32));   // before -> after, honestly
             }
             if (chord && fromChord) // labelled view switch: all results vs the loaded chord's degrees
             {
@@ -4125,7 +4395,14 @@ void FractalAdditiveAudioProcessorEditor::resized()
         dissView.setVisible (false);
         nadView.setVisible (showDeg);
         chordView.setVisible (chord && ! showDeg);
-        if (seg)
+        if (adapt)
+        {
+            adaptView.setBounds (si);
+            const int ah  = adaptList.contentHeight();
+            const bool as = ah > si.getHeight();
+            adaptList.setSize (as ? si.getWidth() - 10 : si.getWidth(), juce::jmax (si.getHeight(), ah));
+        }
+        else if (seg)
         {
             segView.setBounds (si);
             segList.numRows = processorRef.getTemplatePartialCount();
@@ -5005,13 +5282,100 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         }
     }
 
+    // The two REALTIME buttons: their lit state, and the refusal notice when a link
+    // switched itself off rather than close a feedback loop.
+    paintRealtimeButtons();
+
+    // Spectrum adaptation (mode 2): progress, the adapted partial list, and the honest
+    // before/after read-out.
+    if (specModeBox.getSelectedId() == 2)
+    {
+        const bool rt = processorRef.getRealtimeLink() != FractalAdditiveAudioProcessor::RtLink::Off;
+        chordProgLbl.setText (processorRef.isSpectrumAdaptRunning()
+                                  ? tr ("Adapting... ", "Adaptant... ")
+                                    + juce::String ((int) std::lround (processorRef.getSpectrumAdaptProgress() * 100.0f)) + "%"
+                                  : rt ? tr ("realtime: ", "temps real: ")
+                                         + juce::String (processorRef.getRealtimeApplies())
+                                         + tr (" updates", " actualitzacions")
+                                       : juce::String(),
+                              juce::dontSendNotification);
+
+        if (processorRef.getSpectrumAdaptGeneration() != lastAdaptGen)
+        {
+            lastAdaptGen = processorRef.getSpectrumAdaptGeneration();
+            // A HAND-PRESSED Adapt is applied HERE, as one undo step. (A realtime link
+            // applies its own results inside the processor's timer, which is what keeps it
+            // working with this window shut - so this must not apply them a second time.)
+            if (! rt)
+            {
+                juce::String aerr;
+                if (! processorRef.applySpectrumAdapt (true, aerr) && aerr.isNotEmpty())
+                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                        tr ("Adapt spectrum to tuning", "Adapta l'espectre a l'afinaci\xc3\xb3"), aerr, this);
+            }
+            const auto info = processorRef.getSpectrumAdaptResult();
+            double aMax = 0.0;
+            for (const double a : info.amps) aMax = juce::jmax (aMax, a);
+            adaptList.rows.clear();
+            for (size_t i = 0; i < info.ratios.size(); ++i)
+            {
+                AdaptList::Row row;
+                // Source-honest: an adapted ratio is a SEARCHED value, so it only claims a
+                // fraction when it really is one (justName's own rule), else cents.
+                row.name  = justName (info.ratios[i]);
+                row.level = aMax > 0.0 ? (float) (info.amps[i] / aMax) : 1.0f;
+                adaptList.rows.push_back (std::move (row));
+            }
+            // "before" is the harmonic seed's beating, "after" the adapted spectrum's, both
+            // on the search's own model; "now" is measured on the partials the synth is
+            // REALLY producing. When the third number differs from the second, the patch has
+            // something the model does not carry (Reps stacking the period, or a fractal
+            // level self-convolving it) - and it says so rather than letting the difference
+            // pass for the adaptation not working.
+            const auto s = realtimeSettingsFromPanel();
+            double f0 = 0.0;
+            const auto alphas = adaptTargetBox.getSelectedId() == 2
+                                    ? processorRef.heldChordAsTargetAlphas (f0)
+                                    : processorRef.tuningAsTargetAlphas (f0);
+            // The union of many notes at 64 analysis partials each is millions of pairs -
+            // fine on a worker thread, not on this one. Above a chord's worth of notes the
+            // "all vs all" measurement is left out rather than freezing the window for it.
+            const bool measurable = s.adapt.rootOnly || alphas.size() <= 8;
+            const double now = measurable
+                                   ? processorRef.measureCurrentAgainstTarget (alphas, f0, s.adapt.rootOnly)
+                                   : 0.0;
+            juce::String t;
+            t << tr ("beating  seed ", "batec  llavor ") << juce::String (info.before, 2)
+              << tr ("  ->  adapted ", "  ->  adaptat ") << juce::String (info.after, 2)
+              << tr ("\nreally sounding: ", "\nsonant realment: ")
+              << (measurable ? juce::String (now, 2)
+                             : tr ("(too many notes to measure here)", "(massa notes per mesurar-ho aqu\xc3\xad)"))
+              << " (" << juce::String (info.targetNotes) << tr (" notes", " notes");
+            // NAME the two things the search does not model, so the gap between the two
+            // numbers above is never a mystery. Reps stacks the whole adapted set again one
+            // period up (those copies follow the slope, not the shaping), and a fractal
+            // level self-convolves it into many more partials than were adapted.
+            const int   reps = (int) processorRef.apvts.getRawParameterValue ("timbreRepeats")->load();
+            const float frac = processorRef.apvts.getRawParameterValue ("fractalLevel")->load();
+            if (reps > 1)  t << tr (", x", ", x") << juce::String (reps) << tr (" Reps", " Reps");
+            if (frac > 1.001f) t << tr (", fractal ", ", fractal ") << juce::String (frac, 2);
+            t << ")";
+            adaptInfoLbl.setText (t, juce::dontSendNotification);
+            resized();
+            adaptList.repaint();
+        }
+    }
+
     // Chord search: progress read-out while running; rebuild the list on completion.
     if (specModeBox.getSelectedId() == 1)
     {
         chordProgLbl.setText (processorRef.isChordSearchRunning()
                                   ? tr ("Searching... ", "Cercant... ")
                                     + juce::String ((int) std::lround (processorRef.getChordSearchProgress() * 100.0f)) + "%"
-                                  : juce::String(),
+                                  : chordRtOn ? tr ("realtime: ", "temps real: ")
+                                                + juce::String (processorRef.getRealtimeApplies())
+                                                + tr (" retunes", " reafinacions")
+                                              : juce::String(),
                               juce::dontSendNotification);
 
         if (processorRef.getChordResultsGeneration() != lastChordGen)

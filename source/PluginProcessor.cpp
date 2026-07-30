@@ -78,10 +78,13 @@ FractalAdditiveAudioProcessor::~FractalAdditiveAudioProcessor()
     // Stop and reap the background workers before members are destroyed.
     chordCancel = true;
     nadCancel   = true;
+    adaptCancel = true;
     if (chordThread != nullptr && chordThread->joinable())
         chordThread->join();
     if (nadThread != nullptr && nadThread->joinable())
         nadThread->join();
+    if (adaptThread != nullptr && adaptThread->joinable())
+        adaptThread->join();
 }
 
 //==============================================================================
@@ -532,6 +535,10 @@ void FractalAdditiveAudioProcessor::timerCallback()
         spectrumEngine.requestRebuild (s);
         lastPushed = s;
     }
+
+    // Spectrum <-> tuning REALTIME links (throttled + coalesced; refuses to close a
+    // feedback loop). Here, not in the editor, so they keep working with the window shut.
+    driveRealtimeLink();
 
     // Segment scale tracks the timbre live: whenever the spectrum template changes
     // (Base N, fractal, a completing morph...) OR after a project reload, rebuild it
@@ -1352,7 +1359,7 @@ void FractalAdditiveAudioProcessor::cancelChordSearch()
     chordCancel = true; // the worker exits at its next progress poll; reaped on next start/destroy
 }
 
-bool FractalAdditiveAudioProcessor::loadChordAsScale (int index, juce::String& errorOut)
+bool FractalAdditiveAudioProcessor::loadChordAsScale (int index, juce::String& errorOut, bool addToBank)
 {
     ChordHit hit;
     juce::String periodLine;
@@ -1386,7 +1393,9 @@ bool FractalAdditiveAudioProcessor::loadChordAsScale (int index, juce::String& e
     clearSegmentSource(); // a chord scale replaces any segment mapping
     lastDissScl  = scl;
     lastDissName = name;
-    syncBankSelector (bankAutoAdd (name, scl));
+    if (addToBank)
+        syncBankSelector (bankAutoAdd (name, scl));
+    ++dissGeneration;   // the keyboard/degree list must refresh even when the bank does not
     return true;
 }
 
@@ -1851,6 +1860,526 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
         }
         nadBusy = false;
     });
+}
+
+//==============================================================================
+// THE INVERSE SEARCH: adapt the SPECTRUM to a set of notes (see Dissonance.h).
+//
+// The analysis spectrum is anchored in absolute Hz exactly like the chord search, for
+// the same reason: Sethares' critical band is a frequency width, not a ratio, so the
+// same chord an octave lower wants a different timbre.
+
+// The active tuning's degrees, as ratios above the tonic, at the tonic's real pitch.
+std::vector<double> FractalAdditiveAudioProcessor::tuningAsTargetAlphas (double& f0Out) const
+{
+    std::vector<double> a;
+    const int D = juce::jmax (1, tuning.degreesPerPeriod());
+    a.reserve ((size_t) D);
+    for (int d = 0; d < D; ++d)
+    {
+        const double r = getDegreeRatio (d);
+        if (r > 0.0 && std::isfinite (r)) a.push_back (r);
+    }
+    // Same absolute anchor as the Degrees list and the n-ad search, so all three agree.
+    f0Out = tuning.frequencyForNote (60);
+    if (! (f0Out > 0.0) || ! std::isfinite (f0Out))
+        f0Out = TuningManager::kRefFreq * tuning.referenceScale();
+    return a;
+}
+
+// The chord under the fingers, as ratios above its lowest note. The frequencies come
+// from the rhythm engine's held-note bookkeeping (see RhythmEngine::getHeldChord), so
+// they are the pitches that are REALLY sounding - the tuning's, per-note bend included.
+std::vector<double> FractalAdditiveAudioProcessor::heldChordAsTargetAlphas (double& f0Out) const
+{
+    double hz[RhythmEngine::kMaxNotes] = {};
+    const int n = rhythm.getHeldChord (hz, RhythmEngine::kMaxNotes);
+    f0Out = 0.0;
+    if (n <= 0 || ! (hz[0] > 0.0))
+        return {};
+    f0Out = hz[0];
+    std::vector<double> a;
+    a.reserve ((size_t) n);
+    for (int i = 0; i < n; ++i)
+        if (hz[i] > 0.0) a.push_back (hz[i] / f0Out);
+    return a;
+}
+
+double FractalAdditiveAudioProcessor::measureCurrentAgainstTarget (const std::vector<double>& alphas,
+                                                                  double f0Hz, bool rootOnly) const
+{
+    if (alphas.empty() || ! (f0Hz > 0.0)) return 0.0;
+    // The PUBLISHED template, not a fresh compile: this runs on the message thread and a
+    // compile at fractalLevel > 1 costs hundreds of milliseconds (the same reason
+    // startNadCompute reads the published one).
+    std::vector<dissonance::Partial> spec;
+    if (const auto* live = spectrumEngine.getLive(); live != nullptr && ! live->partials.empty())
+    {
+        spec.reserve (live->partials.size());
+        for (size_t i = 0; i < live->partials.size(); ++i)
+        {
+            const float g = i < live->gain.size() ? live->gain[i] : 1.0f;
+            spec.push_back ({ (double) live->partials[i].ratio * f0Hz, (double) live->partials[i].amp * g });
+        }
+    }
+    if (spec.empty()) return 0.0;
+    if (spec.size() > 64)   // ANALYSIS ONLY - the sound keeps every partial it has
+    {
+        std::sort (spec.begin(), spec.end(),
+                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
+        spec.resize (64);
+    }
+    return dissonance::targetScore (spec, alphas, rootOnly);
+}
+
+bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSettings& s,
+                                                        const std::vector<double>& targetAlphas,
+                                                        double f0Hz, juce::String& errorOut)
+{
+    const int N = juce::jlimit (2, 24, s.partials);
+    if (targetAlphas.empty() || ! (f0Hz > 0.0) || ! std::isfinite (f0Hz))
+    {
+        errorOut = "No target notes to adapt to.";
+        return false;
+    }
+    const double period = s.periodRatio;
+    if (! (period > 1.02) || ! std::isfinite (period))
+    {
+        errorOut = "Invalid period.";
+        return false;
+    }
+    // The no-merge guarantee has to be POSSIBLE before the search starts, and it needs N
+    // gaps, not N-1: partial 0 sits at 1/1 and the PERIOD itself is occupied - by partial
+    // 0's own copy one period up, which the Custom Engine stacks there. A partial allowed
+    // to reach the period is therefore a duplicate, and it was worse than that in practice:
+    // the .scl text this writes ends with the period line, loadTimbreText dedupes equal
+    // intervals, and a partial that landed exactly on 1200 c was ABSORBED into it - eight
+    // partials asked for, seven compiled, no complaint anywhere. `topRatio` below keeps the
+    // whole gap clear of the period, so that cannot happen.
+    const double totalC = 1200.0 * std::log2 (period);
+    const double gap    = juce::jlimit (0.0, 600.0, s.minGapCents);
+    if (std::max (1.0, gap) * (double) N > totalC)
+    {
+        errorOut = "Those " + juce::String (N) + " partials cannot all keep "
+                 + juce::String (gap, 1) + " cents of air inside a "
+                 + juce::String (totalC, 1) + "-cent period (the period itself counts: the "
+                   "spectrum repeats there). Use fewer partials, a smaller smallest "
+                   "interval, or a wider period.";
+        return false;
+    }
+    const double topRatio = std::exp2 ((totalC - std::max (1.0, gap)) / 1200.0);
+    // "all vs all" sounds every target note at once, so the pair count grows with
+    // (notes x partials)^2 and a 31-note scale at 16 partials is half a million pairs per
+    // evaluation - minutes, not milliseconds. Say so instead of appearing to hang.
+    if (! s.rootOnly && (int) targetAlphas.size() * N > 480)
+    {
+        errorOut = "\"all vs all\" over " + juce::String ((int) targetAlphas.size())
+                 + " notes x " + juce::String (N) + " partials is too heavy to search. "
+                   "Switch the scope to \"0 vs all\", or use fewer partials.";
+        return false;
+    }
+
+    adaptCancel = true;
+    if (adaptThread != nullptr && adaptThread->joinable())
+        adaptThread->join();
+    adaptCancel = false;
+
+    // SEED: the plain harmonic series 1, 2, 3... N folded into the period, at the user's
+    // own slope, spaced evenly if folding would collide. Seeding from a harmonic timbre is
+    // what makes the reported "before" mean something familiar - and it is the spectrum
+    // Fibló makes with everything off.
+    const double slope = juce::jlimit (0.1, 6.0, (double) apvts.getRawParameterValue ("curveSlope")->load());
+    std::vector<dissonance::Partial> seed;
+    seed.reserve ((size_t) N);
+    for (int i = 0; i < N; ++i)
+    {
+        // Evenly spread inside the period: the harmonic series itself would put partial 2
+        // at the octave, which is the period's own edge in the default 2/1 - and the
+        // spread start already satisfies the minimum gap the check above proved possible.
+        const double c = totalC * (double) i / (double) N;
+        const double r = std::exp2 (c / 1200.0);
+        seed.push_back ({ r * f0Hz, std::pow (r, -slope) });
+    }
+    jassert (seed.back().freq <= topRatio * f0Hz * 1.000001); // the spread must start legal
+
+    adaptPeriodRatio = period;
+    adaptProgress    = 0.0f;
+    adaptRunning     = true;
+
+    adaptThread = std::make_unique<std::thread> (
+        [this, seed = std::move (seed), alphas = targetAlphas, f0Hz, s, N, gap, topRatio]()
+        {
+            const auto goal = s.goal == 1 ? dissonance::Goal::Max
+                            : s.goal == 2 ? dissonance::Goal::Range
+                                          : dissonance::Goal::Min;
+            auto res = dissonance::adaptSpectrum (seed, f0Hz, alphas, s.rootOnly, goal,
+                                                  s.rangeLo, s.rangeHi, gap, topRatio,
+                                                  s.shapeAmps, (double) spectrum::kGainMaxDb, 6,
+                                                  [this] (float p) { adaptProgress.store (p); return ! adaptCancel.load(); });
+            if (! adaptCancel.load() && ! res.spectrum.empty())
+            {
+                AdaptInfo info;
+                info.ratios.reserve (res.spectrum.size());
+                info.amps.reserve (res.spectrum.size());
+                for (const auto& p : res.spectrum)
+                {
+                    info.ratios.push_back (p.freq / f0Hz);
+                    info.amps.push_back ((double) p.amp);
+                }
+                info.before      = res.seedScore;
+                info.after       = res.score;
+                info.targetNotes = (int) alphas.size();
+                info.valid       = (int) info.ratios.size() == N;
+                {
+                    const juce::ScopedLock sl (adaptLock);
+                    adaptResult = std::move (info);
+                }
+                adaptGeneration.fetch_add (1);
+            }
+            adaptProgress = 1.0f;
+            adaptRunning  = false;
+        });
+    return true;
+}
+
+// Write the adapted spectrum into the Custom Engine.
+//
+// TWO channels, because the engine has two: the partial RATIOS go in as the Custom
+// Engine's scale (typed intervals, the same path the Spectrum Builder uses), and the
+// per-partial AMPLITUDES go in as manual gain edits (PartialGains.h), which is the ONLY
+// place an amplitude can be set without the compiler's floor/cap/normalisation deleting
+// partials in response to it. The ratios alone would leave the amplitudes on the slope
+// curve - half the adaptation thrown away - so both are used.
+bool FractalAdditiveAudioProcessor::applySpectrumAdapt (bool undoable, juce::String& errorOut)
+{
+    AdaptInfo info;
+    {
+        const juce::ScopedLock sl (adaptLock);
+        info = adaptResult;
+    }
+    if (info.ratios.size() < 2)
+    {
+        errorOut = "Nothing adapted yet.";
+        return false;
+    }
+    // The searcher marks a result invalid if it did not come back with the partial count it
+    // was given. It cannot, by construction - but writing a spectrum with fewer partials
+    // than the user asked for is exactly the failure this whole feature must never have, so
+    // it refuses out loud rather than trusting the construction.
+    if (! info.valid)
+    {
+        errorOut = "The adaptation came back with " + juce::String ((int) info.ratios.size())
+                 + " partials instead of the number asked for. Nothing was written.";
+        return false;
+    }
+    // Temper mode snaps the HARMONIC engine to the tuning and bypasses the Custom-Engine
+    // scale entirely (engineInForce), so this would write a whole adapted spectrum that
+    // never reaches a single voice - and it would overwrite whatever scale the Custom
+    // Engine was holding to do it. Refuse and say which switch is in the way.
+    if (apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f)
+    {
+        errorOut = "Temper mode is on, so the harmonic engine's partials are snapped to the "
+                   "tuning and a Custom-Engine spectrum is bypassed entirely - the adapted "
+                   "spectrum would be written and never heard. Switch temper off first.";
+        return false;
+    }
+
+    const auto before = captureSpecSnapshot();
+
+    // The typed text: every partial above 1/1 in cents, then the PERIOD as the highest
+    // value (loadTimbreText's rule: the top interval is the repeat point). 1/1 is implicit.
+    juce::String txt;
+    for (size_t i = 1; i < info.ratios.size(); ++i)
+        txt << juce::String (1200.0 * std::log2 (juce::jmax (1.0e-9, info.ratios[i])), 5) << "c ";
+    txt << juce::String (1200.0 * std::log2 (juce::jmax (1.0001, adaptPeriodRatio)), 5) << "c";
+
+    if (! loadTimbreText (txt, errorOut))
+        return false;
+
+    // Amplitudes, resolved against what the compiler ACTUALLY produced. The gain is a dB
+    // OFFSET from the compiled amplitude, so it can only be computed once the compiled
+    // amplitudes are known - guessing them from slope would have silently mis-set every
+    // one of them the moment Reps or fractal was not 1.
+    //
+    // The settings are built HERE rather than taken from currentSettings(): loadTimbreText
+    // above turns the Custom Engine on through a PARAMETER, and this runs in the same call,
+    // so currentSettings() could still be reading the old value and hand back the harmonic
+    // engine's partials - against which not one of these gains would bind.
+    auto ts = currentSettings();
+    ts.source              = spectrum::Source::ScalaTimbre;
+    ts.temperToTimbre      = false;
+    ts.timbreDegrees       = timbreDegrees;
+    ts.timbrePeriod        = timbrePeriod;
+    ts.timbrePeriodRepeats = (int) apvts.getRawParameterValue ("timbreRepeats")->load();
+    const auto tmpl = spectrum::compileSpectrum (ts);
+    std::vector<spectrum::PartialGain> gains;
+    if (! tmpl.partials.empty())
+    {
+        // Normalise the adaptation's amplitudes to its own loudest partial, then match the
+        // compiled template's loudest: the search's absolute level is arbitrary (Sethares
+        // dissonance scales with amplitude) and pushing it onto the sound would change the
+        // patch's volume, not its timbre.
+        double aMax = 0.0, cMax = 0.0;
+        for (const double a : info.amps) aMax = juce::jmax (aMax, a);
+        for (const auto& p : tmpl.partials) cMax = juce::jmax (cMax, (double) p.amp);
+        if (aMax > 0.0 && cMax > 0.0)
+            for (size_t i = 0; i < info.ratios.size(); ++i)
+            {
+                // Find the compiled partial this adapted one became (nearest in cents).
+                int best = -1; double bestC = 1.0e9;
+                for (size_t q = 0; q < tmpl.partials.size(); ++q)
+                {
+                    const double d = std::abs (1200.0 * std::log2 (juce::jmax (1.0e-9,
+                                        (double) tmpl.partials[q].ratio / info.ratios[i])));
+                    if (d < bestC) { bestC = d; best = (int) q; }
+                }
+                if (best < 0 || bestC > 1.0) continue;   // not this period's copy: leave it alone
+                const double want = info.amps[i] / aMax * cMax;
+                const double have = (double) tmpl.partials[(size_t) best].amp;
+                if (! (want > 0.0) || ! (have > 0.0)) continue;
+                const float dB = (float) juce::jlimit (-(double) spectrum::kGainMaxDb,
+                                                       (double) spectrum::kGainMaxDb,
+                                                       20.0 * std::log10 (want / have));
+                spectrum::setPartialGain (gains, spectrum::gainKey (info.ratios[i]), dB);
+            }
+    }
+    setPartialGains (gains, true);
+    if (auto* p = apvts.getParameter ("partialManual"))
+        p->setValueNotifyingHost (1.0f);   // the edits only apply while manual mode is on
+
+    if (undoable)
+    {
+        undoManager.beginNewTransaction();
+        undoManager.perform (new SpecSnapshotAction (*this, before, captureSpecSnapshot()));
+    }
+    return true;
+}
+
+//==============================================================================
+// REALTIME links (see the enum's comment in the header).
+FractalAdditiveAudioProcessor::SpecSnapshot FractalAdditiveAudioProcessor::captureSpecSnapshot() const
+{
+    SpecSnapshot s;
+    s.timbreText = timbreSource;
+    s.gains      = partialGains;
+    s.manual     = apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+    s.timbreOn   = apvts.getRawParameterValue ("timbreOn")->load() > 0.5f;
+    s.taken      = true;
+    return s;
+}
+
+void FractalAdditiveAudioProcessor::applySpecSnapshot (const SpecSnapshot& s)
+{
+    juce::String err;
+    if (s.timbreText.trim().isEmpty()) clearTimbre();
+    else                              loadTimbreText (s.timbreText, err);
+    setPartialGains (s.gains, s.manual);
+    if (auto* p = apvts.getParameter ("partialManual"))
+        p->setValueNotifyingHost (s.manual ? 1.0f : 0.0f);
+    // AFTER the timbre text: loadTimbreText switches the Custom Engine ON by itself, and
+    // a snapshot taken with it off has to come back off.
+    if (auto* p = apvts.getParameter ("timbreOn"))
+        p->setValueNotifyingHost (s.timbreOn ? 1.0f : 0.0f);
+}
+
+void FractalAdditiveAudioProcessor::takeRealtimeBaseline (RtLink mode)
+{
+    // BOTH trackers are cleared first. commitRealtimeBaseline returns early when the link
+    // never applied anything, leaving its tracker set - so engaging the tuning link, leaving
+    // it unused, then engaging a SPECTRUM link would have found rtTuneBaseTaken still true
+    // and pushed a tuning undo step for a spectrum change.
+    rtTuneBaseTaken = false;
+    rtSpecBase = {};
+    if (mode == RtLink::TuningFromSpectrum)
+    {
+        rtTuneBase      = tuning.captureTuning();
+        rtTuneBaseMode  = getTuningMode();
+        rtTuneBaseTaken = true;
+        // ...and into the bank ONCE, so the tuning the follower is about to replace is a
+        // single click away even without touching the undo history. bankAutoAdd skips
+        // exact duplicates, so re-engaging does not add a second copy.
+        if (rtTuneBase.source.isNotEmpty())
+            bankAutoAdd (tuning.getScalaName().isNotEmpty() ? tuning.getScalaName()
+                                                            : juce::String ("before realtime"),
+                         rtTuneBase.source);
+    }
+    else
+    {
+        rtSpecBase = captureSpecSnapshot();
+    }
+}
+
+void FractalAdditiveAudioProcessor::commitRealtimeBaseline()
+{
+    if (rtApplies <= 0) return;   // the link never changed anything: nothing to undo
+    if (rtTuneBaseTaken && rtTuneBase.source.isNotEmpty())
+    {
+        undoManager.beginNewTransaction();
+        undoManager.perform (new TuningSnapshotAction (*this, rtTuneBase, rtTuneBaseMode,
+                                                       tuning.captureTuning(), getTuningMode()));
+    }
+    else if (rtSpecBase.taken)
+    {
+        undoManager.beginNewTransaction();
+        undoManager.perform (new SpecSnapshotAction (*this, rtSpecBase, captureSpecSnapshot()));
+    }
+    rtTuneBaseTaken = false;
+    rtSpecBase = {};
+}
+
+void FractalAdditiveAudioProcessor::setRealtimeLink (RtLink mode, const RtSettings& s)
+{
+    rtSet = s;
+    if (mode == rtLink) return;
+
+    if (rtLink != RtLink::Off)
+        commitRealtimeBaseline();      // leaving: one undo step back to what it displaced
+
+    rtLink    = mode;
+    rtRefusal.clear();
+    rtPending = mode != RtLink::Off;   // engaging adapts once immediately
+    rtApplies = 0;
+    rtStarts  = 0;
+    rtLastStart = rtTick - 10000;      // the first launch is not throttled
+    // Adopt the CURRENT result generations, so engaging never republishes a stale search
+    // result as if the link had just produced it.
+    rtSeenSpecGen  = spectrumEngine.getGeneration();
+    rtSeenChordGen = chordGeneration.load();
+    rtSeenAdaptGen = adaptGeneration.load();
+    rtHeldSig = rtTuneSig = -1.0;
+    if (mode != RtLink::Off)
+        takeRealtimeBaseline (mode);
+}
+
+// Signature of a set of ratios: changes iff the set does (and cheap enough for 60 Hz).
+static double ratioSetSig (const std::vector<double>& r)
+{
+    double s = (double) r.size() * 1.7;
+    for (size_t i = 0; i < r.size(); ++i) s += r[i] * (double) (i + 3);
+    return s;
+}
+
+void FractalAdditiveAudioProcessor::driveRealtimeLink()
+{
+    ++rtTick;
+    if (rtLink == RtLink::Off)
+        return;
+
+    // FEEDBACK GUARD. In temper mode the TUNING builds the spectrum (the harmonic engine's
+    // partials are snapped to the tuning's grid), so:
+    //   - "tuning follows the spectrum" closes a loop: a new tuning retunes the spectrum,
+    //     which fires a new search, which lands on another tuning... a runaway that never
+    //     settles, retuning the instrument under the player's hands forever;
+    //   - "spectrum follows the tuning" is pointless there anyway, because temper mode
+    //     bypasses the Custom-Engine scale this writes into entirely.
+    // Refuse and SAY so, rather than oscillate or pretend to work.
+    if (apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f)
+    {
+        rtRefusal = "Temper mode already builds the spectrum FROM the tuning. Running this "
+                    "at the same time would feed each into the other with no end to it, so "
+                    "realtime is off. Switch temper off to use it.";
+        commitRealtimeBaseline();
+        rtLink = RtLink::Off;
+        return;
+    }
+    // The same loop the other way round: "from spectrum's segment" makes the SPECTRUM
+    // build the tuning, so an adaptation driven by that tuning would chase its own tail.
+    if (segmentModeActive && rtLink != RtLink::TuningFromSpectrum)
+    {
+        rtRefusal = "\"From spectrum's segment\" already builds the tuning FROM the spectrum. "
+                    "Adapting the spectrum to that tuning would feed each into the other, so "
+                    "realtime is off.";
+        commitRealtimeBaseline();
+        rtLink = RtLink::Off;
+        return;
+    }
+
+    if (rtLink == RtLink::TuningFromSpectrum)
+    {
+        // THE TRIGGER IS THE SPECTRUM. The template generation is bumped by every rebuild
+        // - a knob, a modulator, a preset - and by nothing else, so it is exactly "the
+        // spectrum changed" and nothing more.
+        if (const auto gen = spectrumEngine.getGeneration(); gen != rtSeenSpecGen)
+        {
+            rtSeenSpecGen = gen;
+            rtPending     = true;      // COALESCED: many changes while busy = one search
+        }
+        if (rtPending && ! chordRunning.load() && rtTick - rtLastStart >= kRtTuneTicks)
+        {
+            rtPending   = false;
+            rtLastStart = rtTick;
+            juce::String err;
+            // Four results, not sixteen: the follower only ever adopts the top one, and
+            // the refinement pass costs per result kept.
+            if (startChordSearch (rtSet.notes, rtSet.periodRatio, rtSet.periodLine, 4,
+                                  rtSet.maxima, rtSet.minGapCents, rtSet.rootOnly, err))
+            {
+                ++rtStarts;
+            }
+            else
+            {
+                // A launch that cannot even start means the link can never do its job with
+                // these settings. Switching it off (and saying why) beats a lit REALTIME
+                // button that silently does nothing for ever.
+                rtRefusal = err;
+                commitRealtimeBaseline();
+                rtLink = RtLink::Off;
+            }
+        }
+        if (const int g = chordGeneration.load(); g != rtSeenChordGen)
+        {
+            rtSeenChordGen = g;
+            juce::String err;
+            if (loadChordAsScale (0, err, /*addToBank*/ false))
+                ++rtApplies;
+        }
+        return;
+    }
+
+    // ...the two SPECTRUM-side links. Same throttle + coalesce, aimed at a different target.
+    double f0 = 0.0;
+    std::vector<double> alphas;
+    if (rtLink == RtLink::SpectrumFromChord)
+    {
+        alphas = heldChordAsTargetAlphas (f0);
+        if (alphas.size() < 2)
+            return;   // nothing (or one note) held: leave the spectrum exactly as it is
+        const double sig = ratioSetSig (alphas);
+        if (std::abs (sig - rtHeldSig) > 1.0e-9) { rtHeldSig = sig; rtPending = true; }
+    }
+    else
+    {
+        alphas = tuningAsTargetAlphas (f0);
+        if (alphas.size() < 2)
+            return;
+        const double sig = ratioSetSig (alphas) + (double) getTuningMode() * 3.0;
+        if (std::abs (sig - rtTuneSig) > 1.0e-9) { rtTuneSig = sig; rtPending = true; }
+    }
+
+    if (rtPending && ! adaptRunning.load() && rtTick - rtLastStart >= kRtAdaptTicks)
+    {
+        rtPending   = false;
+        rtLastStart = rtTick;
+        juce::String err;
+        if (startSpectrumAdapt (rtSet.adapt, alphas, f0, err))
+        {
+            ++rtStarts;
+        }
+        else
+        {
+            rtRefusal = err;          // same rule as above: a link that cannot start, stops
+            commitRealtimeBaseline();
+            rtLink = RtLink::Off;
+            return;
+        }
+    }
+    if (const int g = adaptGeneration.load(); g != rtSeenAdaptGen)
+    {
+        rtSeenAdaptGen = g;
+        juce::String err;
+        if (applySpectrumAdapt (/*undoable*/ false, err))
+            ++rtApplies;
+    }
 }
 
 bool FractalAdditiveAudioProcessor::saveCurrentTuningScl (const juce::File& f, juce::String& errorOut)

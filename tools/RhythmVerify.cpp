@@ -2499,6 +2499,202 @@ int main()
         }
     }
 
+    // --- run 36: the SPECTRUM adapted to notes, and the two REALTIME links ------------
+    // The panel's new inverse direction, through the real plugin: the held chord it aims
+    // at, the partials it writes, and everything that keeps a realtime follower from
+    // running away with the patch (throttle, coalescing, the tuning bank, the feedback
+    // guard, and the single step back).
+    {
+        std::printf ("\nspectrum adapted to notes + the realtime links:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto owned = std::make_unique<Proc>();
+        auto& p = *owned;
+        p.prepareToPlay (sr, blk);
+        auto setP = [&p] (const char* id, float plain)
+        {
+            auto* pp = p.apvts.getParameter (id);
+            pp->setValueNotifyingHost (pp->convertTo0to1 (plain));
+            p.pollParametersForTests();
+        };
+        // Wait for the spectrum worker to publish whatever the current settings ask for.
+        auto waitTemplate = [&p] () -> const spectrum::SpectrumTemplate*
+        {
+            const auto* t0 = p.getLiveTemplate();
+            const auto g0 = t0 != nullptr ? t0->generation : 0u;
+            p.pollParametersForTests();
+            for (int i = 0; i < 400; ++i)
+            {
+                const auto* t = p.getLiveTemplate();
+                if (t != nullptr && t->generation != g0) return t;
+                juce::Thread::sleep (5);
+            }
+            return p.getLiveTemplate();
+        };
+        juce::AudioBuffer<float> buf (2, blk);
+
+        //-- (a) WHICH NOTES ARE HELD, at their exact sounding pitch. The adaptation's
+        //   whole realtime promise rests on this being the real chord, not a guess.
+        {
+            juce::MidiBuffer m;
+            for (const int k : { 60, 64, 67 })
+                m.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0);
+            p.processBlock (buf, m);
+            double f0 = 0.0;
+            const auto held = p.heldChordAsTargetAlphas (f0);
+            std::printf ("  held C-E-G: %d notes, f0 %.3f Hz, ratios", (int) held.size(), f0);
+            for (const double r : held) std::printf (" %.5f", r);
+            std::printf ("\n");
+            check ((int) held.size() == 3, "all three held notes reach the adaptation");
+            check (std::abs (f0 - p.getNoteFrequency (60)) < 1.0e-6,
+                   "and its root IS key 60's tuned frequency");
+            if (held.size() == 3)
+                check (std::abs (held[1] - p.getNoteFrequency (64) / f0) < 1.0e-9
+                       && std::abs (held[2] - p.getNoteFrequency (67) / f0) < 1.0e-9,
+                       "each ratio is the tuning's own, not an assumed 12-TET one");
+            juce::MidiBuffer off;
+            for (const int k : { 60, 64, 67 })
+                off.addEvent (juce::MidiMessage::noteOff (1, k), 0);
+            p.processBlock (buf, off);
+            double f0b = 0.0;
+            check (p.heldChordAsTargetAlphas (f0b).empty(), "and it empties when the keys come up");
+        }
+
+        //-- (b) ADAPT to the loaded tuning, applied through the real Custom Engine.
+        {
+            double f0 = 0.0;
+            const auto alphas = p.tuningAsTargetAlphas (f0);
+            Proc::SpectrumAdaptSettings st;
+            st.partials = 8; st.periodRatio = 2.0; st.minGapCents = 50.0;
+            st.rootOnly = true; st.goal = 0; st.shapeAmps = true;
+
+            const double beforeReal = p.measureCurrentAgainstTarget (alphas, f0, true);
+            juce::String err;
+            check (p.startSpectrumAdapt (st, alphas, f0, err), "the adaptation starts");
+            for (int i = 0; i < 2000 && p.isSpectrumAdaptRunning(); ++i) juce::Thread::sleep (5);
+            const auto info = p.getSpectrumAdaptResult();
+            check (p.applySpectrumAdapt (true, err), "and applies into the Custom Engine");
+            const auto* t = waitTemplate();
+
+            const int reps = (int) p.apvts.getRawParameterValue ("timbreRepeats")->load();
+            const int want = st.partials * juce::jmax (1, reps);
+            const double afterReal = p.measureCurrentAgainstTarget (alphas, f0, true);
+            std::printf ("  12ED2 x 8 partials: model %.2f -> %.2f, really sounding %.2f -> %.2f\n",
+                         info.before, info.after, beforeReal, afterReal);
+            std::printf ("  compiled partials: %d (asked %d x %d periods)\n",
+                         t != nullptr ? (int) t->partials.size() : -1, st.partials, reps);
+            check (afterReal < beforeReal, "the spectrum the synth REALLY makes beats less against that tuning");
+            check (t != nullptr && (int) t->partials.size() == want,
+                   "and it has exactly the partials that were asked for - none merged away");
+
+            // The no-merge guarantee, measured on the partials the voices will render.
+            double worst = 1.0e9;
+            if (t != nullptr)
+                for (size_t i = 1; i < t->partials.size(); ++i)
+                    worst = std::min (worst, 1200.0 * std::log2 ((double) t->partials[i].ratio
+                                                                 / (double) t->partials[i - 1].ratio));
+            std::printf ("  closest two compiled partials: %.2f cents (asked for %.0f)\n", worst, st.minGapCents);
+            check (worst >= st.minGapCents - 0.05, "every pair keeps the smallest interval it was promised");
+
+            // The amplitudes really travelled: they are per-partial edits, and they are
+            // the ONLY thing that can set an amplitude without the compiler deleting
+            // partials in response (PartialGains.h).
+            std::printf ("  per-partial amplitude edits in force: %d of %d\n",
+                         p.getPartialGainsMatched(), (int) p.getPartialGains().size());
+            check (p.getPartialGainsMatched() >= st.partials - 1,
+                   "the adapted amplitudes landed on the adapted partials");
+
+            // ONE undo step takes the whole thing back - ratios AND amplitudes together.
+            const auto adapted = p.getTimbreSource();
+            p.undoManager.undo();
+            std::printf ("  after one undo the Custom Engine text is %s\n",
+                         p.getTimbreSource().isEmpty() ? "empty (as it was)" : "back to its old value");
+            check (p.getTimbreSource() != adapted, "one Ctrl+Z undoes the whole adaptation");
+            p.undoManager.redo();
+        }
+
+        //-- (c) REALTIME "tuning follows the spectrum": throttled, coalesced, and it does
+        //   NOT fill the tuning bank.
+        {
+            // A deliberately tiny spectrum, so the search itself is instant and what this
+            // measures is the THROTTLE and nothing else. (With a full spectrum one search
+            // is ~1.7 s and "was it busy?" would mask the throttle entirely.)
+            setP ("timbreOn", 0.0f);
+            setP ("spectrumRange", 1.0f);
+            // MANUAL amplitude mode FREEZES slope (currentSettings uses manualSlopeFrozen),
+            // and the adaptation above switched it on - so the slope sweep below would not
+            // have rebuilt the spectrum at all and this test would have measured a throttle
+            // that was never asked to throttle anything. Hence the "started at least twice"
+            // check further down: too few starts is as much a failure as too many.
+            setP ("partialManual", 0.0f);
+            waitTemplate();
+
+            Proc::RtSettings rs;
+            rs.notes = 3; rs.periodRatio = 2.0; rs.periodLine = "2/1"; rs.minGapCents = 50.0;
+            auto filledSlots = [&p]
+            {
+                int n = 0;
+                for (int i = 0; i < Proc::kBankSlots; ++i)
+                    if (p.getTuningBankName (i).isNotEmpty()) ++n;
+                return n;
+            };
+            const int bank0 = filledSlots();
+            p.setRealtimeLink (Proc::RtLink::TuningFromSpectrum, rs);
+
+            constexpr int kTicks = 200;
+            for (int i = 0; i < kTicks; ++i)
+            {
+                // A modulator sweeping the spectrum, in the crudest possible form: a
+                // parameter that forces a rebuild on EVERY tick.
+                auto* sl = p.apvts.getParameter ("curveSlope");
+                sl->setValueNotifyingHost (sl->convertTo0to1 (i % 2 == 0 ? 1.0f : 1.4f));
+                p.pollParametersForTests();
+                juce::Thread::sleep (2);
+            }
+            const int starts  = p.getRealtimeStarts();
+            const int applies = p.getRealtimeApplies();
+            // An ABSOLUTE bound, deliberately not derived from kRtTuneTicks: computing the
+            // allowance from the very constant under test made the check pass at any
+            // throttle setting at all, including none (200 changes -> 110 searches sailed
+            // through it). "A handful per 200 spectrum changes" is the behaviour promised.
+            constexpr int allowed = 8;
+            std::printf ("  %d spectrum changes -> %d searches started, %d retunes applied "
+                         "(throttle allows at most %d)\n", kTicks, starts, applies, allowed);
+            check (starts >= 2, "the follower keeps searching as the spectrum keeps moving");
+            check (starts <= allowed, "and the throttle keeps a sweeping modulator from thrashing it");
+            check (applies >= 1, "and the tuning really follows the top result");
+            std::printf ("  tuning bank slots: %d before, %d after %d realtime retunes\n",
+                         bank0, filledSlots(), applies);
+            check (filledSlots() - bank0 <= 1,
+                   "realtime retunes never flood the bank (only the ONE baseline entry joins it)");
+
+            //-- (e) ...and switching it off leaves exactly one step back.
+            const auto rtScale = p.activeSclSource();
+            p.setRealtimeLink (Proc::RtLink::Off, rs);
+            p.undoManager.undo();
+            std::printf ("  after switching realtime off, one undo changes the scale: %s\n",
+                         p.activeSclSource() != rtScale ? "yes" : "NO");
+            check (p.activeSclSource() != rtScale,
+                   "one Ctrl+Z after switching realtime off leaves the follower's tuning behind");
+        }
+
+        //-- (d) THE FEEDBACK GUARD: temper mode makes the tuning build the spectrum, so a
+        //   link the other way would chase itself for ever. It must refuse, not oscillate.
+        {
+            Proc::RtSettings rs;
+            rs.notes = 3; rs.periodRatio = 2.0; rs.periodLine = "2/1";
+            setP ("timbreTemper", 1.0f);
+            p.setRealtimeLink (Proc::RtLink::TuningFromSpectrum, rs);
+            p.pollParametersForTests();
+            std::printf ("  with temper on, the link is %s and says: %s\n",
+                         p.getRealtimeLink() == Proc::RtLink::Off ? "OFF" : "STILL RUNNING",
+                         p.getRealtimeRefusal().toRawUTF8());
+            check (p.getRealtimeLink() == Proc::RtLink::Off,
+                   "a realtime link refuses to run into temper mode's own tuning -> spectrum loop");
+            check (p.getRealtimeRefusal().isNotEmpty(), "and says why instead of going quiet");
+            setP ("timbreTemper", 0.0f);
+        }
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

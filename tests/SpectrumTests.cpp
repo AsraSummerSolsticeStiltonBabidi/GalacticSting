@@ -549,6 +549,143 @@ int main()
     }
 
     //--------------------------------------------------------------------------
+    // THE INVERSE SEARCH: the notes are given and the PARTIALS move (adaptSpectrum).
+    {
+        std::printf ("\nadapting the spectrum to a fixed set of notes:\n");
+        constexpr double f0 = 261.6255653;                 // C3, same anchor the plugin uses
+        // A 31-EDO major triad: 0, 10, 18 steps. This is the case the panel advertises.
+        const std::vector<double> triad { 1.0, std::pow (2.0, 10.0 / 31.0), std::pow (2.0, 18.0 / 31.0) };
+
+        const int N = 8;
+        const double minGap = 50.0, period = 2.0;
+        std::vector<dissonance::Partial> seed;
+        for (int i = 0; i < N; ++i)
+        {
+            const double r = std::exp2 (1200.0 * (double) i / (double) N / 1200.0);
+            seed.push_back ({ f0 * r, std::pow (r, -1.0) });
+        }
+
+        const auto lo = dissonance::adaptSpectrum (seed, f0, triad, false, dissonance::Goal::Min,
+                                                   0.0, 0.0, minGap, period, true, 24.0, 6);
+        const auto hi = dissonance::adaptSpectrum (seed, f0, triad, false, dissonance::Goal::Max,
+                                                   0.0, 0.0, minGap, period, true, 24.0, 6);
+        std::printf ("  31-EDO major triad, %d partials:  seed %.3f   min %.3f   max %.3f\n",
+                     N, lo.seedScore, lo.score, hi.score);
+        check (lo.score < lo.seedScore * 0.9,
+               "Min really lowers the beating of that chord (>10% under the harmonic seed)");
+        check (hi.score > hi.seedScore * 1.05,
+               "Max really raises it");
+        check ((int) lo.spectrum.size() == N && (int) hi.spectrum.size() == N,
+               "and both come back with exactly the partials they were given");
+
+        // THE FIDELITY RULE, as a number: no partial may be merged into another or
+        // squeezed past its neighbour. Without the clamp a minimisation stacks partials
+        // (coincident partials beat with nothing), and the spectrum silently loses notes.
+        double worstGap = 1.0e9;
+        bool   ordered  = true;
+        for (const auto& r : { lo, hi })
+            for (size_t i = 1; i < r.spectrum.size(); ++i)
+            {
+                const double g = 1200.0 * std::log2 (r.spectrum[i].freq / r.spectrum[i - 1].freq);
+                worstGap = std::min (worstGap, g);
+                if (! (g > 0.0)) ordered = false;
+            }
+        std::printf ("  closest two partials in either result: %.2f cents (asked for %.0f)\n",
+                     worstGap, minGap);
+        check (ordered && worstGap >= minGap - 0.05,
+               "no two partials come closer than the smallest interval - nothing merges");
+
+        // ...and none of them is silenced: a muted partial is a deleted partial.
+        double quietest = 1.0e9, loudest = 0.0;
+        for (const auto& p : lo.spectrum) { quietest = std::min (quietest, p.amp); loudest = std::max (loudest, p.amp); }
+        std::printf ("  amplitude spread after shaping: quietest %.5f, loudest %.5f\n", quietest, loudest);
+        check (quietest > 0.0, "every adapted partial keeps a real amplitude");
+
+        // AMPLITUDE SHAPING MUST BE SHAPE, NOT LEVEL. dissmeasure is min(ai,aj) summed over
+        // pairs - homogeneous of degree 1 - so scaling the whole spectrum down scales the
+        // dissonance down with it. That is a free win the search WILL take: before the
+        // objective pinned the peak, every partial came back at exactly the bottom of its
+        // dB bound with its shape untouched, reporting a huge improvement that was nothing
+        // but a volume cut (and one the apply step renormalises straight back out).
+        {
+            double seedPeak = 0.0;
+            for (const auto& p : seed) seedPeak = std::max (seedPeak, p.amp);
+            check (std::abs (loudest - seedPeak) < 1.0e-9,
+                   "the adapted spectrum keeps the seed's PEAK level (so the cost cannot be gamed by volume)");
+            double worstShapeMove = 0.0;
+            for (size_t i = 0; i < lo.spectrum.size() && i < seed.size(); ++i)
+                worstShapeMove = std::max (worstShapeMove,
+                                           std::abs (lo.spectrum[i].amp / loudest - seed[i].amp / seedPeak));
+            std::printf ("  biggest change to the amplitude SHAPE: %.4f of full scale\n", worstShapeMove);
+            check (worstShapeMove > 0.05, "and it really reshaped them rather than just turning them down");
+        }
+
+        // Every partial stays inside (1, period]: above it, the Custom Engine's own period
+        // stacking would bring it back as a duplicate of a lower one.
+        bool inBand = true;
+        for (const auto& p : lo.spectrum)
+            if (p.freq < f0 - 1.0e-9 || p.freq > f0 * period + 1.0e-6) inBand = false;
+        check (inBand && std::abs (lo.spectrum[0].freq - f0) < 1.0e-9,
+               "partial 0 stays at the played pitch and none escapes the period");
+
+        // A RANGE target is a real third option, not min or max wearing a hat: ask for a
+        // beating value between the two extremes and it must land nearer to it than either.
+        {
+            // A band the SEED is not already in, or the search would land in it by doing
+            // nothing at all and the test could never fail.
+            const double bLo = lo.score * 4.0, bHi = lo.score * 6.0;
+            const auto rg = dissonance::adaptSpectrum (seed, f0, triad, false, dissonance::Goal::Range,
+                                                       bLo, bHi, minGap, period, true, 24.0, 6);
+            std::printf ("  range [%.3f, %.3f] -> %.3f   (seed %.3f, min %.3f, max %.3f)\n",
+                         bLo, bHi, rg.score, rg.seedScore, lo.score, hi.score);
+            check (rg.seedScore < bLo || rg.seedScore > bHi,
+                   "the range band starts out of reach of the seed (so the test can fail)");
+            check (rg.score >= bLo - 1.0e-6 && rg.score <= bHi + 1.0e-6,
+                   "Range lands INSIDE the band it was given");
+            check (rg.score > lo.score * 1.5,
+                   "and stops short of the minimum instead of sailing past it");
+        }
+
+        // Shaping amplitudes is not decoration: with it allowed the search must reach at
+        // least as low as with positions alone (it is a strict superset of the moves).
+        {
+            const auto posOnly = dissonance::adaptSpectrum (seed, f0, triad, false, dissonance::Goal::Min,
+                                                            0.0, 0.0, minGap, period, false, 24.0, 6);
+            std::printf ("  positions only %.3f   positions + amplitudes %.3f\n", posOnly.score, lo.score);
+            check (lo.score <= posOnly.score + 1.0e-9,
+                   "letting it move amplitudes too never does worse than positions alone");
+            bool ampsMoved = false;
+            for (size_t i = 0; i < posOnly.spectrum.size() && i < lo.spectrum.size(); ++i)
+                if (std::abs (posOnly.spectrum[i].amp - lo.spectrum[i].amp) > 1.0e-6) ampsMoved = true;
+            check (ampsMoved, "and it really does move them");
+        }
+
+        // The SCOPE means the same thing here as in the forward search.
+        {
+            const std::vector<double> a { 1.0, 1.25, 1.5 };
+            check (std::abs (dissonance::targetScore (seed, a, false)
+                             - dissonance::chordDissonance (seed, a)) < 1.0e-9,
+                   "all-vs-all target score IS the union measure");
+            double expect = 0.0;
+            for (size_t i = 0; i < a.size(); ++i)
+            {
+                expect += dissonance::selfDissonance (seed, a[i]);
+                if (i > 0) expect += dissonance::crossDissonance (seed, a[0], a[i]);
+            }
+            check (std::abs (dissonance::targetScore (seed, a, true) - expect) < 1.0e-9,
+                   "0-vs-all target score is self + beating against the root");
+        }
+
+        // goalCost's contract, since the whole search minimises it.
+        check (dissonance::goalCost (3.0, dissonance::Goal::Min, 0, 0) == 3.0
+               && dissonance::goalCost (3.0, dissonance::Goal::Max, 0, 0) == -3.0
+               && dissonance::goalCost (3.0, dissonance::Goal::Range, 2.0, 4.0) == 0.0
+               && std::abs (dissonance::goalCost (5.0, dissonance::Goal::Range, 2.0, 4.0) - 1.0) < 1.0e-12
+               && std::abs (dissonance::goalCost (1.0, dissonance::Goal::Range, 2.0, 4.0) - 1.0) < 1.0e-12,
+               "goalCost: min, max, and zero cost anywhere inside the range");
+    }
+
+    //--------------------------------------------------------------------------
     // Fractal must be CONTINUOUS: nudging it off "off" is a nudge, not a new timbre.
     // "Raising fractal from 0 to a little more changed the sound irreversibly."
     // The fader quantises to 0.01, so 1.01 is the smallest move a user can make; it

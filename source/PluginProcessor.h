@@ -476,7 +476,14 @@ public:
     }
     // Double-click a result: the chord becomes the active scale (.scl, degrees in
     // cents + the exact typed period), loaded like any generated tuning.
-    bool loadChordAsScale (int index, juce::String& errorOut);
+    //
+    // `addToBank` is false for the REALTIME follower only. Every hand-made load joins
+    // the tuning bank, which is right for a deliberate choice and catastrophic sixty
+    // times a second: a modulator sweeping the spectrum would have filled all 128 bank
+    // slots with near-identical scales in a couple of seconds and evicted the user's own
+    // library from view. The follower's own baseline goes into the bank ONCE, when it is
+    // switched on (see setRealtimeLink).
+    bool loadChordAsScale (int index, juce::String& errorOut, bool addToBank = true);
 
     //==========================================================================
     // n-AD ranking of the ACTIVE scale: all combinations of n scale degrees, ranked
@@ -501,6 +508,100 @@ public:
         const juce::ScopedLock sl (nadLock);
         return nadResults;
     }
+
+    //==========================================================================
+    // THE INVERSE SEARCH: adapt the SPECTRUM to a set of notes (see Dissonance.h).
+    // The notes are the loaded tuning's degrees, or - in realtime - the chord under
+    // the fingers; the partials move. Background worker, same publish-under-lock +
+    // generation-counter pattern as the chord search.
+    struct SpectrumAdaptSettings
+    {
+        int    partials    = 8;      // how many partials the adapted spectrum has
+        double periodRatio = 2.0;    // partials live in (1, period]; the Custom Engine stacks it
+        double minGapCents = 50.0;   // air between partials - the no-merge guarantee
+        bool   rootOnly    = false;  // dyads against the root, or the full union
+        int    goal        = 0;      // 0 = minimum beating, 1 = maximum, 2 = inside a range
+        double rangeLo = 0.0, rangeHi = 0.0;
+        bool   shapeAmps   = true;   // also move per-partial AMPLITUDES, not only positions
+    };
+    // `targetAlphas` are the notes as ratios (alphas[0] is the root, normally 1.0);
+    // `f0Hz` is the root's real frequency - Sethares roughness depends on register, so
+    // the same chord an octave down wants a different spectrum.
+    bool startSpectrumAdapt (const SpectrumAdaptSettings& s, const std::vector<double>& targetAlphas,
+                             double f0Hz, juce::String& errorOut);
+    void cancelSpectrumAdapt() { adaptCancel = true; }
+    bool  isSpectrumAdaptRunning() const noexcept { return adaptRunning.load(); }
+    float getSpectrumAdaptProgress() const noexcept { return adaptProgress.load(); }
+    int   getSpectrumAdaptGeneration() const noexcept { return adaptGeneration.load(); }
+    struct AdaptInfo
+    {
+        std::vector<double> ratios;   // ascending, [0] == 1.0 (the played pitch)
+        std::vector<double> amps;     // linear, index-aligned with `ratios`
+        double before = 0.0;          // what the SEED spectrum beat against the target
+        double after  = 0.0;          // what this one does
+        int    targetNotes = 0;
+        bool   valid = false;
+    };
+    AdaptInfo getSpectrumAdaptResult() const
+    {
+        const juce::ScopedLock sl (adaptLock);
+        return adaptResult;
+    }
+    // The target the adaptation aims at: every degree of the ACTIVE tuning (as ratios),
+    // anchored at the tonic's real frequency. Message thread.
+    std::vector<double> tuningAsTargetAlphas (double& f0Out) const;
+    // The chord being HELD right now, as ratios above its lowest note (empty if nothing
+    // is down). f0Out is that lowest note's exact sounding frequency.
+    std::vector<double> heldChordAsTargetAlphas (double& f0Out) const;
+
+    // Write the adapted spectrum into the Custom Engine: the partial RATIOS become its
+    // scale and the per-partial AMPLITUDES become manual gain edits. `undoable` wraps it
+    // in one undo transaction (the hand-pressed button); the realtime follower passes
+    // false and relies on the baseline it snapshotted when it engaged.
+    bool applySpectrumAdapt (bool undoable, juce::String& errorOut);
+    // What the CURRENT spectrum really beats against the current target, measured on the
+    // compiled partials - so a fractal level or a Reps count the adaptation did not model
+    // shows up as a number the user can see instead of a silent discrepancy.
+    double measureCurrentAgainstTarget (const std::vector<double>& alphas, double f0Hz,
+                                        bool rootOnly) const;
+
+    //==========================================================================
+    // REALTIME links between the spectrum and the tuning ("Spectrum vs Tuning").
+    //   TuningFromSpectrum  - the tuning follows the top beating-search result whenever
+    //                         the SPECTRUM changes.
+    //   SpectrumFromTuning  - the spectrum is adapted to the loaded tuning.
+    //   SpectrumFromChord   - the spectrum is adapted to the chord being held right now.
+    // Driven from timerCallback (60 Hz), so it works with the editor shut and is
+    // exercisable offline through pollParametersForTests().
+    enum class RtLink { Off = 0, TuningFromSpectrum = 1, SpectrumFromTuning = 2, SpectrumFromChord = 3 };
+    struct RtSettings
+    {
+        // TuningFromSpectrum: the chord search's controls.
+        int          notes = 3;
+        double       periodRatio = 2.0;
+        juce::String periodLine  = "2/1";
+        bool         maxima = false;
+        double       minGapCents = 50.0;
+        bool         rootOnly = false;
+        SpectrumAdaptSettings adapt;   // the other two links
+    };
+    void setRealtimeLink (RtLink mode, const RtSettings& s);
+    void updateRealtimeSettings (const RtSettings& s) { rtSet = s; }
+    RtLink getRealtimeLink() const noexcept { return rtLink; }
+    // Non-empty when a link REFUSED to run (and switched itself off). Never silent.
+    juce::String getRealtimeRefusal() const { return rtRefusal; }
+    // Counters for the honesty read-out AND for the throttle tests: how many searches the
+    // follower actually launched, and how many results it actually applied.
+    int getRealtimeStarts()  const noexcept { return rtStarts; }
+    int getRealtimeApplies() const noexcept { return rtApplies; }
+    // How many 60 Hz ticks the two links wait between launches, on top of never running two
+    // at once. Measured on this machine: a 3-note grid+refine chord search over 2/1 with a
+    // rich spectrum (the 64-partial analysis cap) is ~1.7 s, while an 8-partial adaptation
+    // is 9 ms against a triad and ~100 ms against 31 scale degrees. Without a throttle a
+    // modulator sweeping the spectrum starts a new search on EVERY tick - 200 spectrum
+    // changes produced 138 searches - and the worker queue never drains.
+    static constexpr int kRtTuneTicks  = 60;  // ~1 s: the full grid+refine chord search
+    static constexpr int kRtAdaptTicks = 15;  // ~250 ms: the (much cheaper) adaptation
 
     //==========================================================================
     // Scale EDITING on the keyboard. Works from ANY loaded tuning (the current
@@ -756,6 +857,94 @@ private:
                                                    // re-label old results until its worker publishes)
     juce::String chordPeriodSclLine { "2/1" };
     double       chordPeriodRatio = 2.0;
+
+    // Spectrum-adaptation worker state.
+    std::unique_ptr<std::thread> adaptThread;
+    std::atomic<bool>  adaptCancel { false }, adaptRunning { false };
+    std::atomic<float> adaptProgress { 0.0f };
+    std::atomic<int>   adaptGeneration { 0 };
+    mutable juce::CriticalSection adaptLock;
+    AdaptInfo adaptResult;
+    double    adaptPeriodRatio = 2.0;   // the period applied() writes as the Custom Engine's
+
+    //==========================================================================
+    // REALTIME link state (message thread only, driven from timerCallback).
+    RtLink       rtLink = RtLink::Off;
+    RtSettings   rtSet;
+    juce::String rtRefusal;
+    int  rtTick = 0, rtLastStart = -1000, rtStarts = 0, rtApplies = 0;
+    bool rtPending = false;
+    unsigned int rtSeenSpecGen = 0;
+    int  rtSeenChordGen = 0, rtSeenAdaptGen = 0;
+    double rtHeldSig = -1.0;            // the held chord the last adaptation was aimed at
+    double rtTuneSig = -1.0;            // the tuning shape the last adaptation was aimed at
+
+    // WHAT A REALTIME LINK MUST NEVER DO: leave the patch somewhere the user cannot get
+    // back from. Sixty transactions a second is not undo, it is a wall - so the follower
+    // pushes NOTHING while it runs and instead snapshots the state it displaced when it
+    // engaged. Switching the link off then commits ONE transaction from that snapshot to
+    // whatever it ended on: Ctrl+Z afterwards restores exactly the tuning/spectrum you
+    // had before you switched it on, in a single step, and doing nothing keeps the result.
+    struct SpecSnapshot
+    {
+        juce::String timbreText;
+        std::vector<spectrum::PartialGain> gains;
+        bool manual = false;
+        bool timbreOn = false;
+        bool taken = false;
+    };
+    TuningManager::Snapshot rtTuneBase;
+    int  rtTuneBaseMode = 0;
+    bool rtTuneBaseTaken = false;
+    SpecSnapshot rtSpecBase;
+    void takeRealtimeBaseline (RtLink mode);
+    void commitRealtimeBaseline();
+    void applySpecSnapshot (const SpecSnapshot& s);
+    SpecSnapshot captureSpecSnapshot() const;
+    void driveRealtimeLink();
+
+    // One transaction that carries the whole SPECTRUM (Custom-Engine text + per-partial
+    // amplitudes + the manual switch) from one snapshot to another. The individual pieces
+    // already have undo actions of their own, but a realtime adaptation moves all three
+    // at once and they have to travel as ONE step or a single Ctrl+Z would leave the
+    // amplitudes of one spectrum sitting on the ratios of another.
+    struct SpecSnapshotAction : public juce::UndoableAction
+    {
+        SpecSnapshotAction (FractalAdditiveAudioProcessor& p, SpecSnapshot prev, SpecSnapshot next)
+            : proc (p), after (std::move (next)), before (std::move (prev)) {}
+        bool perform() override { proc.applySpecSnapshot (after);  return true; }
+        bool undo() override    { proc.applySpecSnapshot (before); return true; }
+        int  getSizeInUnits() override
+        { return (int) ((after.gains.size() + before.gains.size()) * sizeof (spectrum::PartialGain)
+                        + (size_t) (after.timbreText.length() + before.timbreText.length()) * 2) + 64; }
+        FractalAdditiveAudioProcessor& proc;
+        SpecSnapshot after, before;
+    };
+    // The same for the TUNING, through TuningManager's own whole-tuning snapshot.
+    struct TuningSnapshotAction : public juce::UndoableAction
+    {
+        TuningSnapshotAction (FractalAdditiveAudioProcessor& p, TuningManager::Snapshot prev, int prevMode,
+                              TuningManager::Snapshot next, int nextMode)
+            : proc (p), after (std::move (next)), before (std::move (prev)),
+              afterMode (nextMode), beforeMode (prevMode) {}
+        bool perform() override { return applyOne (after, afterMode); }
+        bool undo() override    { return applyOne (before, beforeMode); }
+        int  getSizeInUnits() override
+        { return (int) (after.source.length() + before.source.length()) * 2 + 64; }
+        bool applyOne (const TuningManager::Snapshot& s, int mode)
+        {
+            juce::String err;
+            if (s.source.isNotEmpty() && ! proc.tuning.restoreTuning (s, err))
+                return false;
+            if (auto* p = proc.apvts.getParameter ("tuningMode"))
+                p->setValueNotifyingHost (p->convertTo0to1 ((float) mode));
+            ++proc.dissGeneration;      // the keyboard + the degree list are showing a scale
+            return true;
+        }
+        FractalAdditiveAudioProcessor& proc;
+        TuningManager::Snapshot after, before;
+        int afterMode = 0, beforeMode = 0;
+    };
 
     // n-ad worker state.
     std::unique_ptr<std::thread> nadThread;

@@ -227,6 +227,44 @@ private:
     };
 
     // n-AD list: rows of degree chips (keyboard hues) + total-beating value.
+    // The ADAPTED SPECTRUM, one row per partial: the interval it landed on and the
+    // amplitude the search gave it, as a bar. Read-only - it is a read-out of what was
+    // written into the Custom Engine, and the pencil/amplitude window still owns editing.
+    struct AdaptList : juce::Component, juce::TooltipClient
+    {
+        struct Row { juce::String name; float level = 1.0f; }; // level = amp / loudest amp
+        std::vector<Row> rows;
+        juce::String tip, emptyText;
+        static constexpr int kRowH = 18;
+        int contentHeight() const { return (int) rows.size() * kRowH + (emptyText.isNotEmpty() ? 2 * kRowH : 0); }
+        juce::String getTooltip() override { return tip; }
+        void paint (juce::Graphics& g) override
+        {
+            int y = 0, r = 0;
+            for (const auto& row : rows)
+            {
+                if (r % 2 == 1) { g.setColour (juce::Colour (0x14ffffff)); g.fillRect (0, y, getWidth(), kRowH); }
+                g.setColour (juce::Colour (0xffd8dbe6));
+                g.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
+                g.drawText (row.name, 4, y, 62, kRowH, juce::Justification::centredLeft, false);
+                const int bx = 70, bw = juce::jmax (10, getWidth() - bx - 6);
+                g.setColour (juce::Colour (0x22ffffff));
+                g.fillRect (bx, y + 5, bw, kRowH - 10);
+                g.setColour (juce::Colour (0xff8f7ad6));
+                g.fillRect (bx, y + 5, (int) std::round ((float) bw * juce::jlimit (0.0f, 1.0f, row.level)),
+                            kRowH - 10);
+                y += kRowH; ++r;
+            }
+            if (emptyText.isNotEmpty())
+            {
+                g.setColour (juce::Colour (0xff8f96a8));
+                g.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Italic")));
+                g.drawFittedText (emptyText, 4, y, getWidth() - 8, 2 * kRowH,
+                                  juce::Justification::topLeft, 3);
+            }
+        }
+    };
+
     struct NadList : juce::Component, juce::TooltipClient
     {
         struct Row { std::vector<int> degs; juce::String value; juce::Colour valCol; };
@@ -2581,6 +2619,26 @@ private:
     ChordList        chordList;
     juce::Viewport   chordView;
     int              lastChordGen = 0;
+    //== "Adapt spectrum to tuning based on beating" - the INVERSE of the search above:
+    //   the notes are given and the PARTIALS move (see Dissonance.h::adaptSpectrum).
+    juce::ComboBox   adaptTargetBox;   // the loaded tuning / the chord held right now
+    juce::ComboBox   adaptPartialsBox; // how many partials the adapted spectrum has
+    juce::ComboBox   adaptGoalBox;     // minimum / maximum / inside a range
+    juce::TextEditor adaptLoEdit, adaptHiEdit;   // the range's two ends (goal = range)
+    juce::Label      adaptPartialsLbl, adaptRangeLbl, adaptInfoLbl;
+    juce::ToggleButton adaptAmpsToggle;          // shape AMPLITUDES as well as positions
+    juce::TextButton adaptGoBtn;
+    AdaptList        adaptList;
+    juce::Viewport   adaptView;
+    int              lastAdaptGen = 0;
+    void runSpectrumAdapt();
+    //== REALTIME: one button per direction, and the one shared place that tells the
+    //   processor what they should be doing (see syncRealtimeLink).
+    juce::TextButton chordRtBtn, adaptRtBtn;
+    bool             chordRtOn = false, adaptRtOn = false;
+    FractalAdditiveAudioProcessor::RtSettings realtimeSettingsFromPanel() const;
+    void syncRealtimeLink();
+    void paintRealtimeButtons();
     // Chord preview scheduling (messages sent into the processor's collector when due).
     struct PrevEv { juce::uint32 dueMs; juce::MidiMessage msg; };
     std::vector<PrevEv> previewQueue;
