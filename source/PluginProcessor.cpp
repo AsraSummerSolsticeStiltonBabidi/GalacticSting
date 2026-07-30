@@ -474,29 +474,33 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
     // grid of the ACTIVE TUNING (whatever is loaded in the Tuning box - .scl, MTS,
     // MPE...), read live every poll so tuning changes retune the spectrum in real
     // time. Independent of the Custom Engine's own loaded scale.
-    const bool temper = apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f;
-    if (temper)
+    // The branch is engineInForce()'s, not a second copy of its rules: the UI names the
+    // engine from that helper, so a spectrum built here by other rules would be labelled
+    // wrongly on screen (that is how temper mode came to be invisible).
+    switch (engineInForce())
     {
-        s.source         = spectrum::Source::Harmonic;
-        s.temperToTimbre = true;
-        const int D = juce::jmax (1, tuning.degreesPerPeriod()); // no cap: every degree is a grid point
-        s.timbreDegrees.clear();
-        s.timbreDegrees.reserve ((size_t) D);
-        for (int d = 0; d < D; ++d)
-            s.timbreDegrees.push_back ((float) getDegreeRatio (d));
-        s.timbrePeriod = (float) tuning.periodRatio(); // the tuning's OWN period, not a key lookup
-        if (! (s.timbrePeriod > 1.0001f)) { s.timbrePeriod = 2.0f; }
-    }
-    else if (isTimbreActive())
-    {
-        s.source              = spectrum::Source::ScalaTimbre;
-        s.timbreDegrees       = timbreDegrees;
-        s.timbrePeriod        = timbrePeriod;
-        s.timbrePeriodRepeats = (int) apvts.getRawParameterValue ("timbreRepeats")->load();
-    }
-    else
-    {
-        s.source = spectrum::Source::Harmonic;
+        case EngineInForce::Tempered:
+        {
+            s.source         = spectrum::Source::Harmonic;
+            s.temperToTimbre = true;
+            const int D = juce::jmax (1, tuning.degreesPerPeriod()); // no cap: every degree is a grid point
+            s.timbreDegrees.clear();
+            s.timbreDegrees.reserve ((size_t) D);
+            for (int d = 0; d < D; ++d)
+                s.timbreDegrees.push_back ((float) getDegreeRatio (d));
+            s.timbrePeriod = (float) tuning.periodRatio(); // the tuning's OWN period, not a key lookup
+            if (! (s.timbrePeriod > 1.0001f)) { s.timbrePeriod = 2.0f; }
+            break;
+        }
+        case EngineInForce::CustomScale:
+            s.source              = spectrum::Source::ScalaTimbre;
+            s.timbreDegrees       = timbreDegrees;
+            s.timbrePeriod        = timbrePeriod;
+            s.timbrePeriodRepeats = (int) apvts.getRawParameterValue ("timbreRepeats")->load();
+            break;
+        case EngineInForce::Harmonic:
+            s.source = spectrum::Source::Harmonic;
+            break;
     }
     return s;
 }

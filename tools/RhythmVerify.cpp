@@ -11,6 +11,7 @@
 //==============================================================================
 
 #include "PluginProcessor.h"
+#include "PluginEditor.h"   // run 35 lays the real editor out and measures it
 
 #include <juce_dsp/juce_dsp.h>
 
@@ -2310,6 +2311,192 @@ int main()
 
         tmp.deleteFile();
         out.deleteFile();
+    }
+
+    // --- run 34: WHICH ENGINE is in force, and whose degrees it uses -----------------
+    // Three mutually exclusive sources build the spectrum: the plain harmonic series, a
+    // Custom Engine scale, or the harmonic engine TEMPERED to the active tuning. Temper
+    // wins over a loaded custom scale, and it takes its grid from the TUNING - not from
+    // that scale. Both facts were implicit in one if/else chain that only the audio path
+    // read, so the UI could (and did) name the wrong engine. engineInForce() is now the
+    // single answer both of them use, and this pins it to the partials that come out.
+    {
+        std::printf ("engine in force (13-EDO tuning + a 3-note custom scale):\n");
+        using E = FractalAdditiveAudioProcessor::EngineInForce;
+        // On the HEAP, like every other extra instance in here: MSVC reserves every scope's
+        // locals in main's frame at once, and one more processor on the stack overflows it
+        // before a single line of output is printed.
+        auto owned = std::make_unique<FractalAdditiveAudioProcessor>();
+        auto& p = *owned;
+        p.prepareToPlay (sr, blk);
+        auto setP2 = [&p] (const char* id, float plain)
+        {
+            auto* pp = p.apvts.getParameter (id);
+            pp->setValueNotifyingHost (pp->convertTo0to1 (plain));
+        };
+        // Wait for the worker thread to publish the template these settings ask for.
+        auto rebuild = [&p] () -> const spectrum::SpectrumTemplate*
+        {
+            const auto* t0 = p.getLiveTemplate();
+            const unsigned g0 = t0 != nullptr ? t0->generation : 0u;
+            p.pollParametersForTests();
+            for (int i = 0; i < 400; ++i)
+            {
+                const auto* t = p.getLiveTemplate();
+                if (t != nullptr && t->generation != g0) return t;
+                juce::Thread::sleep (5);
+            }
+            return p.getLiveTemplate();
+        };
+
+        // A 13-EDO tuning: NONE of its steps is a just interval, so a partial sitting on
+        // 5/4 or 3/2 proves the grid came from the custom scale instead.
+        juce::String err, scl ("! edo13.scl\n13-EDO\n 13\n!\n");
+        for (int i = 1; i <= 13; ++i) scl << " " << juce::String (1200.0 * (double) i / 13.0, 6) << "\n";
+        check (p.loadScalaText (scl, "edo13", err), "the 13-EDO tuning loads");
+        check (p.loadTimbreText ("5/4 3/2 2", err), "a 3-note custom scale is typed in");
+        setP2 ("timbreOn", 1.0f);
+        setP2 ("timbreTemper", 0.0f);
+
+        auto onGrid = [] (double ratio, double stepCents)
+        {
+            const double c = 1200.0 * std::log2 (ratio);
+            return std::abs (c - stepCents * std::round (c / stepCents));
+        };
+
+        {
+            const auto* t = rebuild();
+            check (p.engineInForce() == E::CustomScale, "scale on + temper off = the CUSTOM engine");
+            check (p.timbreReplacesEngine(), "which is what the UI dims the harmonic engine for");
+            // Every partial must be a scale degree times a power of the period.
+            double worst = 0.0;
+            int n = t != nullptr ? (int) t->partials.size() : 0;
+            for (int i = 0; i < n; ++i)
+            {
+                const double r = (double) t->partials[(size_t) i].ratio;
+                const double c = 1200.0 * std::log2 (r);
+                const double inPeriod = c - 1200.0 * std::floor (c / 1200.0);
+                double best = 1.0e9;
+                for (double d : { 0.0, 386.313713864835, 701.955000865387, 1200.0 })
+                    best = std::min (best, std::abs (inPeriod - d));
+                worst = std::max (worst, best);
+            }
+            std::printf ("  custom scale: %d partials, worst distance to a degree %.4f cents\n", n, worst);
+            check (n > 0 && worst < 0.5, "every partial sits on the custom scale's own degrees");
+        }
+        {
+            setP2 ("timbreTemper", 1.0f);
+            const auto* t = rebuild();
+            check (p.engineInForce() == E::Tempered, "temper on = TEMPERED, whatever the custom scale says");
+            check (! p.timbreReplacesEngine(), "so the harmonic controls must NOT be greyed there");
+            double worst = 0.0, worstJust = 1.0e9;
+            int n = t != nullptr ? (int) t->partials.size() : 0;
+            for (int i = 0; i < n; ++i)
+            {
+                const double r = (double) t->partials[(size_t) i].ratio;
+                worst = std::max (worst, onGrid (r, 1200.0 / 13.0));
+                // 5/4 and 3/2 are NOT 13-EDO steps: if the grid had come from the custom
+                // scale, some partial would be sitting on one of them.
+                worstJust = std::min (worstJust, std::min (onGrid (r / 1.25, 1200.0),
+                                                           onGrid (r / 1.5,  1200.0)));
+            }
+            std::printf ("  tempered:     %d partials, worst distance to the 13-EDO grid %.4f cents,"
+                         " nearest custom degree %.2f cents away\n", n, worst, worstJust);
+            check (n > 0 && worst < 0.5, "every partial snapped to the TUNING's 13 degrees");
+            check (n > 0 && worstJust > 5.0, "and none of them to the custom scale's");
+            check (n > 3, "the harmonic engine is still generating (far more partials than the scale has)");
+        }
+        {
+            setP2 ("timbreTemper", 0.0f);
+            setP2 ("timbreOn", 0.0f);
+            rebuild();
+            check (p.engineInForce() == E::Harmonic, "both off = the plain HARMONIC engine");
+            check (p.timbreLoaded(), "and the typed scale is still loaded, not discarded");
+        }
+        p.clearScala();
+    }
+
+    // --- run 35: the SPECTRUM panel's geometry --------------------------------------
+    // The window is a FIXED 1200x650 and every box is laid out by hand, so a rearranged
+    // panel fails by overlapping its neighbour or by pushing its own content out through
+    // its frame - silently, since a Component draws happily outside its parent's box.
+    // Nothing tested the editor at all before this (the verifiers build the processor),
+    // which is why this exists.
+    {
+        std::printf ("SPECTRUM panel layout:\n");
+        auto owned = std::make_unique<FractalAdditiveAudioProcessor>(); // see run 34: heap, not stack
+        auto& p = *owned;
+        p.prepareToPlay (sr, blk);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "the editor builds");
+        // Measured TWICE: once as it opens (prime LIMIT fader, no scale loaded) and once in
+        // the widest configuration there is - the 9 prime-whitelist toggles, plus a loaded
+        // scale, which adds the Off button and the longest status line. Both live in the
+        // narrowest boxes of the panel, so they are where a squeeze shows up first.
+        for (int pass = 0; ed != nullptr && pass < 2; ++pass)
+        {
+            if (pass == 1)
+            {
+                juce::String err;
+                p.loadTimbreText ("5/4 3/2 2", err);
+                auto* pm = p.apvts.getParameter ("primeMode");
+                pm->setValueNotifyingHost (1.0f); // Whitelist
+                ed->resized();                    // no message loop here to do it for us
+                std::printf ("  (prime whitelist + a loaded custom scale)\n");
+            }
+            check (ed->getWidth() == 1200 && ed->getHeight() == 650, "at 1200 x 650");
+            const auto L = ed->layoutProbe();
+            const auto win = ed->getLocalBounds();
+            check (win.contains (L.spectrum) && ! L.spectrum.isEmpty(), "the SPECTRUM panel is on screen");
+            check (win.contains (L.essentials) && win.contains (L.tuning), "so are Essentials and Tuning");
+            check (! L.spectrum.intersects (L.essentials) && ! L.spectrum.intersects (L.tuning),
+                   "and it overlaps neither of them");
+            check (L.spectrum.contains (L.harmonicEngine) && L.spectrum.contains (L.customEngine)
+                   && L.spectrum.contains (L.bothEngines),
+                   "all three nested boxes are inside the panel");
+            check (! L.harmonicEngine.intersects (L.customEngine)
+                   && ! L.harmonicEngine.intersects (L.bothEngines)
+                   && ! L.customEngine.intersects (L.bothEngines),
+                   "the two engines and the shared box never overlap (they are separate spaces)");
+            check (L.spectrum.contains (L.engineChips)
+                   && L.engineChips.getBottom() <= L.harmonicEngine.getY(),
+                   "the engine chips ride in the panel's header, clear of the boxes below");
+            std::printf ("  panel %d x %d   harmonic %d   custom %d   both %d   essentials %d\n",
+                         L.spectrum.getWidth(), L.spectrum.getHeight(), L.harmonicEngine.getWidth(),
+                         L.customEngine.getWidth(), L.bothEngines.getWidth(), L.essentials.getWidth());
+
+            // Every control must be INSIDE the box whose name it carries.
+            int outside = 0;
+            juce::String worstName;
+            for (const auto& c : L.controls)
+            {
+                const auto* box = c.first.startsWith ("harm.") ? &L.harmonicEngine
+                                : c.first.startsWith ("cust.") ? &L.customEngine
+                                : c.first.startsWith ("both.") ? &L.bothEngines
+                                                               : &L.essentials;
+                if (! box->contains (c.second))
+                { ++outside; if (worstName.isEmpty()) worstName = c.first; }
+            }
+            std::printf ("  %d controls probed, %d outside their box%s\n",
+                         (int) L.controls.size(), outside,
+                         outside > 0 ? (" (first: " + worstName + ")").toRawUTF8() : "");
+            check (! L.controls.empty() && outside == 0, "no control spills out of its own box");
+
+            // ...and no two of them may sit on top of each other.
+            int clashes = 0;
+            juce::String clashName;
+            for (size_t i = 0; i < L.controls.size(); ++i)
+                for (size_t j = i + 1; j < L.controls.size(); ++j)
+                    if (L.controls[i].second.intersects (L.controls[j].second))
+                    {
+                        ++clashes;
+                        if (clashName.isEmpty()) clashName = L.controls[i].first + " / " + L.controls[j].first;
+                    }
+            std::printf ("  %d overlapping control pairs%s\n", clashes,
+                         clashes > 0 ? (" (first: " + clashName + ")").toRawUTF8() : "");
+            check (clashes == 0, "and no two controls overlap");
+        }
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);

@@ -26,6 +26,20 @@ public:
     bool keyPressed (const juce::KeyPress&) override;
     bool keyStateChanged (bool isKeyDown) override;
 
+    // Test hook (RhythmVerify): the macro boxes and every control laid out inside the
+    // SPECTRUM panel and Essentials, as name -> bounds. The verifiers build the processor
+    // only, so until this existed a layout change could not be checked by ANYTHING except
+    // opening the plugin and looking - and a box whose content overflows it, or two boxes
+    // that overlap, are exactly what a fixed 1200x650 rearrangement gets wrong.
+    // Nothing in the plugin itself calls this.
+    struct LayoutProbe
+    {
+        juce::Rectangle<int> spectrum, harmonicEngine, customEngine, bothEngines,
+                             essentials, tuning, engineChips;
+        std::vector<std::pair<juce::String, juce::Rectangle<int>>> controls; // "harm.baseN" etc.
+    };
+    LayoutProbe layoutProbe() const;
+
 private:
     using SliderAttachment   = juce::AudioProcessorValueTreeState::SliderAttachment;
     using ComboBoxAttachment = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
@@ -55,7 +69,6 @@ private:
     void openTuningBankChooser();
     void refreshTuningBank(); // sync the bank combo items + selection with the processor
     void loadRecent (int index);
-    void applyTimbreEnablement (bool active);
     void applyLanguage();
     void refreshPresetList();
     void savePresetFlow();
@@ -2435,7 +2448,7 @@ private:
     juce::TooltipWindow tooltipWindow { this, 350 }; // subtly quicker hover read-outs
     ScaleKeyboard keyboard;
 
-    SteppedSlider baseNFader, spectrumRangeFader, timbreRepeatsFader;
+    SteppedSlider baseNFader, timbreRepeatsFader;
     MagneticSlider fractalFader, harmonicsFader, primeLimitFader; // magnetic whole-value detents
     juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, octaveFader, pEnvAmtFader;
     juce::Slider  ampAdsr[4], filtAdsr[4], pitchAdsr[4];
@@ -2447,8 +2460,14 @@ private:
     void refreshPresetDirtyMark();
     juce::Rectangle<int> titleClickArea; // the title squares; clicking them plays the jingle
     juce::ToggleButton primeToggle[9], morphToggle;
-    juce::ToggleButton temperToggle; // Custom Engine: temper harmonic partials to the loaded .scl
+    juce::ToggleButton temperToggle; // HARMONIC engine mode: snap its partials to the active tuning
     std::unique_ptr<ButtonAttachment> temperAtt;
+    // SPECTRUM header: the three mutually exclusive engine states as chips (the same
+    // pattern as the envelope tabs), exactly one lit. They READ engineInForce() and
+    // WRITE the two parameters that decide it, so the override is one click to leave -
+    // and switching away never discards the loaded scale (only "timbreOn" goes down).
+    juce::TextButton engineChip[3];
+    void applyEngineState(); // dim/enable + chip look + repaint, from engineInForce()
     std::unique_ptr<SliderAttachment> primeLimitFaderAtt;
     // SLOPE cell: the pencil that opens the per-partial amplitude window, and the ON/OFF
     // pill under it. The pill and the one INSIDE the window are two attachments to the
@@ -2597,15 +2616,19 @@ private:
     juce::uint32 lastRhythmGen = 0; // refresh the partial list when the template changes
     juce::uint32 lastSegGen = 0;    // refresh the segment picker on template change
 
-    juce::GroupComponent gHarmonic, gBase, gWhitelist, gSlope, gSpectrumRange, gFractal,
-                         gPrime, gFilter, gAmpEnv, gPitchEnv, gTuning, gTimbre, gSpecScale, gScaleDiss;
+    // Only the boxes that really are GroupComponents. The SPECTRUM panel and everything
+    // nested in it (both engines, the shared cell), plus ESSENTIALS and TUNING, are
+    // PAINTED from the rects below - which is what keeps their controls clickable: an
+    // opaque GroupComponent added after its children buries them (they keep their
+    // tooltips, so the bug looks like "the control is there but dead").
+    juce::GroupComponent gFilter, gAmpEnv, gPitchEnv, gTuning, gSpecScale, gScaleDiss;
     juce::Label lblBaseN, lblBasePitch, lblRange, lblFractal, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
                 lblTimbreRepeats, lblBend, lblPeriod, lblSteps, lblRefA, lblRefHz, lblOctave, lblPitchAmt,
                 lblMorphTime, lblTuningBank, tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel,
                 tuningPeriodLbl;
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], pitchAdsrLbl[4], primeLbl[9];
 
-    std::unique_ptr<SliderAttachment>   baseNAtt, slopeAtt, spectrumRangeAtt, fractalAtt, gainAtt,
+    std::unique_ptr<SliderAttachment>   baseNAtt, slopeAtt, fractalAtt, gainAtt,
                                         cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, octaveAtt, pEnvAmtAtt,
                                         harmonicsAtt;
     std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4], pitchAdsrAtt[4];
@@ -2622,12 +2645,23 @@ private:
     bool catalan = false;
     int  baseKey = 60; // MIDI note of the leftmost computer key; Z/X shift it by one period
     int  lastPrimeMode = -1;
-    bool lastTimbreActive = false;
+    // Packs engineInForce() with "is a custom scale loaded at all" - the CUSTOM chip is
+    // only clickable in the second case, and that can change without the first one
+    // moving (loading a scale while the engine is off). -1 = never applied yet.
+    int  lastEngineShown = -1;
     int  lastResetOffState = -1; // packs Reset/Off visibility to detect changes for relayout
     int  lastDissGeneration = 0; // refresh the degree list / shortfall notice once per generation
     int  lastKbLo = -1, lastKbNum = -1; // last keyboard window applied (re-adapt on tuning change)
-    juce::Rectangle<int> harmonicEngineBounds; // macro-group frame
-    juce::Rectangle<int> hcBase, hcHarm, hcPrime, hcSlope; // its 4 sub-cells (dividers/labels in paint)
+    // SPECTRUM macro-panel: the outer frame, its three nested boxes and their sub-cells.
+    // Everything here is a rect only - the frames, the title chips, the dividers, the
+    // sub-labels and the override badges are all drawn in paint() from these.
+    juce::Rectangle<int> spectrumBounds;       // the whole SPECTRUM panel
+    juce::Rectangle<int> engineNoteBounds;     // header strip right of the engine chips
+    juce::Rectangle<int> harmonicEngineBounds; // nested: HARMONIC ENGINE
+    juce::Rectangle<int> hcBase, hcHarm, hcPrime;  // its sub-cells
+    juce::Rectangle<int> customEngineBounds;   // nested: CUSTOM ENGINE (replaces the one above)
+    juce::Rectangle<int> bothEnginesBounds;    // nested: what applies to EITHER engine
+    juce::Rectangle<int> beSlope, beFractal, beMorph, beRange; // its sub-cells
     juce::Rectangle<int> essentialsBounds;     // Essentials macro-group frame
     juce::Rectangle<int> ecPhase, ecGain, ecRef, ecOct; // its 4 sub-cells (dividers/labels in paint)
     juce::Rectangle<int> lBarBounds, lFootBounds; // the inverted-L Tuning box: dissonance BAR (right) + controls FOOT (bottom-left)

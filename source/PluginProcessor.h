@@ -525,10 +525,27 @@ public:
     }
     bool timbreLoaded() const noexcept { return ! timbreDegrees.empty(); }
 
+    // Which of the three MUTUALLY EXCLUSIVE spectrum sources is building the partials
+    // right now. Temper wins first (it keeps the harmonic engine running and snaps its
+    // partials to the ACTIVE TUNING, so a loaded Custom-Engine scale is bypassed
+    // entirely), then a Custom-Engine scale, else the plain harmonic series.
+    //
+    // currentSettings() branches on THIS, and the editor reads it to SAY so on screen.
+    // The two used to decide independently - the editor only knew
+    // timbreReplacesEngine() - which made temper mode invisible: the Custom Engine box
+    // stayed bright and still read "Custom: <name>" while that scale was being ignored.
+    enum class EngineInForce { Harmonic, CustomScale, Tempered };
+    EngineInForce engineInForce() const noexcept
+    {
+        if (apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f) return EngineInForce::Tempered;
+        if (isTimbreActive())                                           return EngineInForce::CustomScale;
+        return EngineInForce::Harmonic;
+    }
+
     // Does the Custom-Engine scale REPLACE the harmonic engine (temper mode off)?
     // With temper ON both run together, so the engine's controls stay live.
     bool timbreReplacesEngine() const noexcept
-    { return isTimbreActive() && ! (apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f); }
+    { return engineInForce() == EngineInForce::CustomScale; }
 
     //==========================================================================
     // MODULATORS (3 custom envelopes + 3 LFOs) -> any parameters. Editor calls.
