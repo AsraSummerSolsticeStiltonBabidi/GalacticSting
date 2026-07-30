@@ -9,6 +9,7 @@
 #include "dsp/Spectrum.h"
 #include "dsp/Dissonance.h"
 #include "dsp/PartialGains.h"
+#include "PartialAmpEdit.h"
 
 #include <algorithm>
 #include <chrono>
@@ -548,6 +549,143 @@ int main()
     }
 
     //--------------------------------------------------------------------------
+    // THE INVERSE SEARCH: the notes are given and the PARTIALS move (adaptSpectrum).
+    {
+        std::printf ("\nadapting the spectrum to a fixed set of notes:\n");
+        constexpr double f0 = 261.6255653;                 // C3, same anchor the plugin uses
+        // A 31-EDO major triad: 0, 10, 18 steps. This is the case the panel advertises.
+        const std::vector<double> triad { 1.0, std::pow (2.0, 10.0 / 31.0), std::pow (2.0, 18.0 / 31.0) };
+
+        const int N = 8;
+        const double minGap = 50.0, period = 2.0;
+        std::vector<dissonance::Partial> seed;
+        for (int i = 0; i < N; ++i)
+        {
+            const double r = std::exp2 (1200.0 * (double) i / (double) N / 1200.0);
+            seed.push_back ({ f0 * r, std::pow (r, -1.0) });
+        }
+
+        const auto lo = dissonance::adaptSpectrum (seed, f0, triad, false, dissonance::Goal::Min,
+                                                   0.0, 0.0, minGap, period, true, 24.0, 6);
+        const auto hi = dissonance::adaptSpectrum (seed, f0, triad, false, dissonance::Goal::Max,
+                                                   0.0, 0.0, minGap, period, true, 24.0, 6);
+        std::printf ("  31-EDO major triad, %d partials:  seed %.3f   min %.3f   max %.3f\n",
+                     N, lo.seedScore, lo.score, hi.score);
+        check (lo.score < lo.seedScore * 0.9,
+               "Min really lowers the beating of that chord (>10% under the harmonic seed)");
+        check (hi.score > hi.seedScore * 1.05,
+               "Max really raises it");
+        check ((int) lo.spectrum.size() == N && (int) hi.spectrum.size() == N,
+               "and both come back with exactly the partials they were given");
+
+        // THE FIDELITY RULE, as a number: no partial may be merged into another or
+        // squeezed past its neighbour. Without the clamp a minimisation stacks partials
+        // (coincident partials beat with nothing), and the spectrum silently loses notes.
+        double worstGap = 1.0e9;
+        bool   ordered  = true;
+        for (const auto& r : { lo, hi })
+            for (size_t i = 1; i < r.spectrum.size(); ++i)
+            {
+                const double g = 1200.0 * std::log2 (r.spectrum[i].freq / r.spectrum[i - 1].freq);
+                worstGap = std::min (worstGap, g);
+                if (! (g > 0.0)) ordered = false;
+            }
+        std::printf ("  closest two partials in either result: %.2f cents (asked for %.0f)\n",
+                     worstGap, minGap);
+        check (ordered && worstGap >= minGap - 0.05,
+               "no two partials come closer than the smallest interval - nothing merges");
+
+        // ...and none of them is silenced: a muted partial is a deleted partial.
+        double quietest = 1.0e9, loudest = 0.0;
+        for (const auto& p : lo.spectrum) { quietest = std::min (quietest, p.amp); loudest = std::max (loudest, p.amp); }
+        std::printf ("  amplitude spread after shaping: quietest %.5f, loudest %.5f\n", quietest, loudest);
+        check (quietest > 0.0, "every adapted partial keeps a real amplitude");
+
+        // AMPLITUDE SHAPING MUST BE SHAPE, NOT LEVEL. dissmeasure is min(ai,aj) summed over
+        // pairs - homogeneous of degree 1 - so scaling the whole spectrum down scales the
+        // dissonance down with it. That is a free win the search WILL take: before the
+        // objective pinned the peak, every partial came back at exactly the bottom of its
+        // dB bound with its shape untouched, reporting a huge improvement that was nothing
+        // but a volume cut (and one the apply step renormalises straight back out).
+        {
+            double seedPeak = 0.0;
+            for (const auto& p : seed) seedPeak = std::max (seedPeak, p.amp);
+            check (std::abs (loudest - seedPeak) < 1.0e-9,
+                   "the adapted spectrum keeps the seed's PEAK level (so the cost cannot be gamed by volume)");
+            double worstShapeMove = 0.0;
+            for (size_t i = 0; i < lo.spectrum.size() && i < seed.size(); ++i)
+                worstShapeMove = std::max (worstShapeMove,
+                                           std::abs (lo.spectrum[i].amp / loudest - seed[i].amp / seedPeak));
+            std::printf ("  biggest change to the amplitude SHAPE: %.4f of full scale\n", worstShapeMove);
+            check (worstShapeMove > 0.05, "and it really reshaped them rather than just turning them down");
+        }
+
+        // Every partial stays inside (1, period]: above it, the Custom Engine's own period
+        // stacking would bring it back as a duplicate of a lower one.
+        bool inBand = true;
+        for (const auto& p : lo.spectrum)
+            if (p.freq < f0 - 1.0e-9 || p.freq > f0 * period + 1.0e-6) inBand = false;
+        check (inBand && std::abs (lo.spectrum[0].freq - f0) < 1.0e-9,
+               "partial 0 stays at the played pitch and none escapes the period");
+
+        // A RANGE target is a real third option, not min or max wearing a hat: ask for a
+        // beating value between the two extremes and it must land nearer to it than either.
+        {
+            // A band the SEED is not already in, or the search would land in it by doing
+            // nothing at all and the test could never fail.
+            const double bLo = lo.score * 4.0, bHi = lo.score * 6.0;
+            const auto rg = dissonance::adaptSpectrum (seed, f0, triad, false, dissonance::Goal::Range,
+                                                       bLo, bHi, minGap, period, true, 24.0, 6);
+            std::printf ("  range [%.3f, %.3f] -> %.3f   (seed %.3f, min %.3f, max %.3f)\n",
+                         bLo, bHi, rg.score, rg.seedScore, lo.score, hi.score);
+            check (rg.seedScore < bLo || rg.seedScore > bHi,
+                   "the range band starts out of reach of the seed (so the test can fail)");
+            check (rg.score >= bLo - 1.0e-6 && rg.score <= bHi + 1.0e-6,
+                   "Range lands INSIDE the band it was given");
+            check (rg.score > lo.score * 1.5,
+                   "and stops short of the minimum instead of sailing past it");
+        }
+
+        // Shaping amplitudes is not decoration: with it allowed the search must reach at
+        // least as low as with positions alone (it is a strict superset of the moves).
+        {
+            const auto posOnly = dissonance::adaptSpectrum (seed, f0, triad, false, dissonance::Goal::Min,
+                                                            0.0, 0.0, minGap, period, false, 24.0, 6);
+            std::printf ("  positions only %.3f   positions + amplitudes %.3f\n", posOnly.score, lo.score);
+            check (lo.score <= posOnly.score + 1.0e-9,
+                   "letting it move amplitudes too never does worse than positions alone");
+            bool ampsMoved = false;
+            for (size_t i = 0; i < posOnly.spectrum.size() && i < lo.spectrum.size(); ++i)
+                if (std::abs (posOnly.spectrum[i].amp - lo.spectrum[i].amp) > 1.0e-6) ampsMoved = true;
+            check (ampsMoved, "and it really does move them");
+        }
+
+        // The SCOPE means the same thing here as in the forward search.
+        {
+            const std::vector<double> a { 1.0, 1.25, 1.5 };
+            check (std::abs (dissonance::targetScore (seed, a, false)
+                             - dissonance::chordDissonance (seed, a)) < 1.0e-9,
+                   "all-vs-all target score IS the union measure");
+            double expect = 0.0;
+            for (size_t i = 0; i < a.size(); ++i)
+            {
+                expect += dissonance::selfDissonance (seed, a[i]);
+                if (i > 0) expect += dissonance::crossDissonance (seed, a[0], a[i]);
+            }
+            check (std::abs (dissonance::targetScore (seed, a, true) - expect) < 1.0e-9,
+                   "0-vs-all target score is self + beating against the root");
+        }
+
+        // goalCost's contract, since the whole search minimises it.
+        check (dissonance::goalCost (3.0, dissonance::Goal::Min, 0, 0) == 3.0
+               && dissonance::goalCost (3.0, dissonance::Goal::Max, 0, 0) == -3.0
+               && dissonance::goalCost (3.0, dissonance::Goal::Range, 2.0, 4.0) == 0.0
+               && std::abs (dissonance::goalCost (5.0, dissonance::Goal::Range, 2.0, 4.0) - 1.0) < 1.0e-12
+               && std::abs (dissonance::goalCost (1.0, dissonance::Goal::Range, 2.0, 4.0) - 1.0) < 1.0e-12,
+               "goalCost: min, max, and zero cost anywhere inside the range");
+    }
+
+    //--------------------------------------------------------------------------
     // Fractal must be CONTINUOUS: nudging it off "off" is a nudge, not a new timbre.
     // "Raising fractal from 0 to a little more changed the sound irreversibly."
     // The fader quantises to 0.01, so 1.01 is the smallest move a user can make; it
@@ -716,6 +854,153 @@ int main()
             for (float v : scale) if (v != 1.0f) allUnity = false;
             check (m == 0 && allUnity && ov.size() == before,
                    "an edit whose partial is not in the spectrum applies to nothing and is kept");
+        }
+
+        // bindGains is what the amplitude EDITOR reads to decide which knob owns which
+        // stored edit; resolveGains is what the AUDIO applies. They are the same pass, so
+        // they can never disagree about the pairing - which is the whole point of it
+        // being one function. If they ever could, a knob would show an edit that a
+        // different partial was actually getting.
+        {
+            std::vector<PartialGain> ov;
+            setPartialGain (ov, gainKey (2.0), -9.0f);
+            setPartialGain (ov, gainKey (7.0), +4.5f);           // present
+            setPartialGain (ov, gainKey (3.0) + 40, -6.0f);      // 0.4 c off: homeless
+            std::vector<int> where;
+            const int m = bindGains (plain.partials, ov, where);
+            const int i2 = indexOfRatio (plain, 2.0), i7 = indexOfRatio (plain, 7.0);
+            check (m == 2 && where.size() == 3
+                   && where[0] == i2 && where[1] == -1 && where[2] == i7,
+                   "bindGains reports the exact partial index of each edit, -1 when homeless");
+
+            resolveGains (plain.partials, ov, scale);
+            bool agree = true;
+            for (size_t j = 0; j < ov.size(); ++j)
+                if (where[j] >= 0
+                    && std::abs (scale[(size_t) where[j]] - gainScaleOf (ov[j].dB)) > 1.0e-6f)
+                    agree = false;
+            check (agree, "the index bindGains reports is the one resolveGains multiplied");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Knob CAPTIONS. The editor labels each knob with the partial number, and a
+    // denominator of 1 is noise there ("3", not "3/1"). Nothing else may change: a
+    // caption that dropped the /2 of 3/2 would name a partial that does not exist.
+    std::printf ("partial-number captions:\n");
+    {
+        using dissonance::partialNumberName;
+        check (partialNumberName (1.0) == "1" && partialNumberName (3.0) == "3"
+               && partialNumberName (16.0) == "16",
+               "whole ratios lose the /1: 3, not 3/1");
+        check (partialNumberName (1.5) == "3/2" && partialNumberName (7.0 / 4.0) == "7/4",
+               "a real fraction keeps its denominator");
+        check (partialNumberName (11.0) == "11" && dissonance::justIntervalName (11.0) == "11/1",
+               "only the caption is shortened - the strict label still says 11/1");
+        // 100 cents is not a ratio this engine can name exactly: it must stay in cents,
+        // or a tempered partial would be captioned as a just interval it is not.
+        check (partialNumberName (std::pow (2.0, 100.0 / 1200.0)).find ("/") == std::string::npos,
+               "an inexact ratio still shows cents, never an invented fraction");
+    }
+
+    //--------------------------------------------------------------------------
+    // The amplitude editor's selection + drag arithmetic (PartialAmpEdit.h). These are
+    // the rules a user notices immediately when they break, and the window itself is
+    // not reachable from any test target - so they live outside the Component.
+    std::printf ("partial amplitude editor, selection and drag:\n");
+    {
+        auto build = [] (int n, bool duplicateKey = false)
+        {
+            partialamp::Model m;
+            std::vector<partialamp::Cell> c;
+            for (int i = 0; i < n; ++i)
+            {
+                const double ratio = (double) (i + 1);
+                c.push_back ({ ratio, 0.5f, gainKey (ratio), 0.0f, false });
+            }
+            // Two partials inside one 0.01 c key bin: only the lower can hold an edit.
+            if (duplicateKey && n >= 3) c[2].key = c[1].key;
+            m.setCells (std::move (c));
+            return m;
+        };
+
+        {
+            auto m = build (10);
+            m.shiftClick (2);
+            check (m.selectionCount() == 1 && m.isSelected (2) && m.anchor == 2,
+                   "the first SHIFT+click selects one knob and arms the anchor");
+            m.shiftClick (6);
+            bool range = m.selectionCount() == 5;
+            for (int k = 2; k <= 6; ++k) range = range && m.isSelected (k);
+            check (range && m.anchor == 2,
+                   "the second SHIFT+click selects both ends and everything between them");
+            m.shiftClick (0);
+            bool back = m.selectionCount() == 3 && m.isSelected (0) && m.isSelected (1)
+                     && m.isSelected (2) && ! m.isSelected (3);
+            check (back, "the anchor stays put, so a further SHIFT+click re-stretches the same range");
+        }
+
+        // A drag on a knob INSIDE the selection moves all of it; on one outside, only it.
+        {
+            auto m = build (10);
+            m.shiftClick (3); m.shiftClick (5);
+            check (m.dragSetFor (4).size() == 3, "dragging inside the selection moves the whole selection");
+            check (m.dragSetFor (8).size() == 1, "dragging outside it moves that knob alone");
+        }
+
+        // One delta, clamped PER knob and measured from each knob's own start: the knob
+        // that hits the ceiling must not freeze the others, and dragging back must
+        // restore the original spacing instead of leaving them collapsed on the limit.
+        {
+            auto m = build (4);
+            m.cells[0].dB = 20.0f;
+            m.cells[1].dB = 0.0f;
+            m.sel[0] = m.sel[1] = 1;
+            m.anchor = 0;
+            m.beginDrag (0);
+            m.applyDragDelta (10.0f);
+            check (m.cells[0].dB == partialamp::kMaxDb && m.cells[1].dB == 10.0f,
+                   "one knob clamping at +24 dB does not stop the rest of the selection");
+            m.applyDragDelta (0.0f);
+            check (m.cells[0].dB == 20.0f && m.cells[1].dB == 0.0f,
+                   "dragging back restores the selection's original spacing exactly");
+            m.applyDragDelta (-500.0f);
+            check (m.cells[0].dB == partialamp::kMinDb && partialamp::isMuted (m.cells[0].dB)
+                   && m.cells[1].dB == partialamp::kMinDb,
+                   "the bottom of the travel is the engine's mute, and it is reachable");
+        }
+
+        // A partial sharing a key with its neighbour cannot receive an edit (the binding
+        // is one-to-one), so it must be locked rather than allowed to move and be ignored.
+        {
+            auto m = build (5, true);
+            check (m.cells[2].locked && m.lockedCount() == 1,
+                   "a partial inside its neighbour's 0.01 c key bin is locked, and counted");
+            m.sel[1] = m.sel[2] = 1;
+            check (m.dragSetFor (1).size() == 1, "a locked knob is left out of a selection drag");
+            m.beginDrag (2);
+            m.applyDragDelta (12.0f);
+            check (m.cells[2].dB == 0.0f, "and dragging it directly does nothing at all");
+        }
+
+        // Writing the knobs back must never delete an edit whose partial is missing from
+        // the CURRENT spectrum: that is a hand-drawn amplitude the user still owns.
+        {
+            auto m = build (4);
+            m.cells[1].dB = -6.0f;
+            m.cells[3].dB = +3.0f;
+            std::vector<PartialGain> homeless { { gainKey (2.5), -12.0f }, { gainKey (9.0), +1.0f } };
+            const auto out = partialamp::mergedGains (m, homeless);
+            bool sorted = true;
+            for (size_t i = 1; i < out.size(); ++i) sorted = sorted && out[i - 1].key < out[i].key;
+            bool hasHomeless = false, hasEdits = false;
+            for (const auto& g : out)
+            {
+                if (g.key == gainKey (2.5) && g.dB == -12.0f) hasHomeless = true;
+                if (g.key == gainKey (4.0) && g.dB == 3.0f)   hasEdits = true;
+            }
+            check (out.size() == 4 && sorted && hasHomeless && hasEdits,
+                   "the written list keeps the homeless edits and stays sorted by key");
         }
     }
 

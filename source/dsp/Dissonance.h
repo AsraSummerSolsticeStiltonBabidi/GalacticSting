@@ -78,6 +78,19 @@ namespace dissonance
         return std::to_string ((long long) std::llround (centsR)) + "\xc2\xa2"; // cent sign
     }
 
+    // The same label with the "/1" left off a whole-number ratio: the amplitude
+    // editor's knob captions are read as PARTIAL NUMBERS - "3", not "3/1" - and a
+    // denominator that is always 1 is noise on a knob 40 px wide. Nothing else is
+    // touched: 3/2 stays 3/2 and an inexact ratio still shows its cents, so the
+    // caption never claims a ratio the partial does not have.
+    inline std::string partialNumberName (double ratio, double exactTolCents = 0.5)
+    {
+        auto s = justIntervalName (ratio, exactTolCents);
+        if (s.size() > 2 && s.compare (s.size() - 2, 2, "/1") == 0)
+            s.erase (s.size() - 2);
+        return s;
+    }
+
     // Sethares' pairwise sensory-dissonance measure (verbatim constants).
     inline double dissmeasure (std::vector<Partial> p)
     {
@@ -440,6 +453,207 @@ namespace dissonance
         std::sort (finals.begin(), finals.end(), [maxima] (const ChordResult& x, const ChordResult& y)
                    { return maxima ? x.value > y.value : x.value < y.value; });
         return finals;
+    }
+
+    //==========================================================================
+    // THE INVERSE PROBLEM: adapt the SPECTRUM to a fixed set of notes.
+    //
+    // searchChords above holds the timbre still and moves the notes. Sethares' own
+    // point (TTSS ch. 6-7, "related scales and spectra") is that the relation goes
+    // both ways: for any set of intervals there are timbres whose partials beat least
+    // (or most) against them. That is what this does - the notes are given (a loaded
+    // tuning's degrees, or the chord under the player's fingers) and the PARTIALS move.
+    //
+    // Coordinate descent, exactly the refinement machinery searchChords already trusts
+    // (golden section per coordinate, several sweeps), over two kinds of coordinate:
+    //   - each partial's RATIO, in log space, clamped between its neighbours
+    //   - optionally each partial's AMPLITUDE, in dB
+    // The ratio of partial 0 is FIXED at 1: it is the played pitch, the thing every
+    // other partial is a ratio OF.
+    //
+    // WHY THE CLAMP IS NOT COSMETIC. Every partial keeps at least `minGapCents` of air
+    // from its neighbours, so two partials can never converge onto one pitch. Without
+    // that, a minimisation would happily stack partials on top of each other (coincident
+    // partials beat with nothing) and the spectrum the user asked for - N partials -
+    // would come back with fewer, merged by the search itself. Partials are never
+    // dropped here, only moved.
+    //
+    // Amplitudes are bounded to +-`ampRangeDb` around their seed and NEVER reach zero
+    // for the same reason: silencing a partial is deleting it, which this is not allowed
+    // to do. The floor is a bound, not a mute.
+
+    enum class Goal { Min = 0, Max = 1, Range = 2 };
+
+    // Total Sethares dissonance of `sp` sounded at every alpha in `alphas`.
+    //   rootOnly == true  -> the DYADS only: each note against the root, plus each
+    //                        note's own intrinsic roughness (the panel's "0 vs all").
+    //   rootOnly == false -> the whole union, every pair of notes ("all vs all").
+    // The absolute frequencies in `sp` matter (Sethares' s depends on register), so the
+    // caller anchors the spectrum at a real f0 before calling.
+    inline double targetScore (const std::vector<Partial>& sp, const std::vector<double>& alphas,
+                               bool rootOnly)
+    {
+        if (sp.empty() || alphas.empty())
+            return 0.0;
+        if (! rootOnly)
+            return chordDissonance (sp, alphas);
+        double v = 0.0;
+        for (size_t i = 0; i < alphas.size(); ++i)
+        {
+            v += selfDissonance (sp, alphas[i]);
+            if (i > 0) v += crossDissonance (sp, alphas[0], alphas[i]);
+        }
+        return v;
+    }
+
+    // What the search MINIMISES, for each goal. Range is a two-sided target: zero cost
+    // anywhere inside [lo, hi], growing with the distance outside it - so "a specific
+    // amount of beating" is a real target and not just min or max in disguise.
+    inline double goalCost (double d, Goal g, double lo, double hi)
+    {
+        switch (g)
+        {
+            case Goal::Max:   return -d;
+            case Goal::Range:
+            {
+                const double a = std::min (lo, hi), b = std::max (lo, hi);
+                if (d < a) return a - d;
+                if (d > b) return d - b;
+                return 0.0;
+            }
+            case Goal::Min:
+            default:          return d;
+        }
+    }
+
+    struct AdaptResult
+    {
+        std::vector<Partial> spectrum;   // freq = ratio * f0, ascending; [0] is the played pitch
+        double score = 0.0;              // the dissonance it achieves against the target
+        double seedScore = 0.0;          // what the SEED spectrum scored, for honest before/after
+        int    sweepsDone = 0;
+    };
+
+    // `seed` must be ascending by freq with seed[0].freq == f0 (the played pitch).
+    // `maxRatio` is the highest ratio a partial may reach; `minGapCents` the air every
+    // pair of partials keeps. `progress` (0..1) returns false to abort.
+    inline AdaptResult adaptSpectrum (std::vector<Partial> seed, double f0,
+                                      const std::vector<double>& alphas, bool rootOnly,
+                                      Goal goal, double rangeLo, double rangeHi,
+                                      double minGapCents, double maxRatio,
+                                      bool shapeAmps, double ampRangeDb, int sweeps,
+                                      const std::function<bool(float)>& progress = {})
+    {
+        AdaptResult out;
+        if (seed.empty() || alphas.empty() || ! (f0 > 0.0))
+            return out;
+
+        const int n = (int) seed.size();
+        std::vector<double> cents ((size_t) n), amp ((size_t) n), seedAmp ((size_t) n);
+        for (int i = 0; i < n; ++i)
+        {
+            cents[(size_t) i] = 1200.0 * std::log2 (std::max (1.0e-12, seed[(size_t) i].freq / f0));
+            amp[(size_t) i]   = seed[(size_t) i].amp;
+            seedAmp[(size_t) i] = seed[(size_t) i].amp;
+        }
+        const double topCents = 1200.0 * std::log2 (std::max (1.0001, maxRatio));
+        const double gap      = std::max (1.0, minGapCents); // at least 1 cent: never two partials on one pitch
+
+        // The loudest seed partial's amplitude: every candidate is rescaled to it (below).
+        double seedPeak = 0.0;
+        for (const double a : seedAmp) seedPeak = std::max (seedPeak, a);
+        if (! (seedPeak > 0.0)) seedPeak = 1.0;
+
+        std::vector<Partial> work ((size_t) n);
+        // WHY THE PEAK IS PINNED. dissmeasure is min(ai, aj) summed over pairs, which is
+        // homogeneous of degree 1 in amplitude: multiply the whole spectrum by g and the
+        // dissonance multiplies by g too. A free amplitude search therefore has a trivial
+        // winning move - turn EVERYTHING down to the bottom of its bound - and it took it:
+        // every partial came back at exactly -24 dB with its shape completely unchanged,
+        // an enormous "improvement" that was nothing but a volume cut (and one the apply
+        // step renormalises straight back out again). Pinning the peak makes the cost
+        // invariant to overall level, so the only way to move it is to change the SHAPE -
+        // which is the whole point of shaping amplitudes. It is also what makes a Range
+        // target mean anything: the numbers now sit on a fixed scale.
+        const auto build = [&]
+        {
+            double peak = 0.0;
+            for (int i = 0; i < n; ++i) peak = std::max (peak, amp[(size_t) i]);
+            const double g = peak > 0.0 ? seedPeak / peak : 1.0;
+            for (int i = 0; i < n; ++i)
+                work[(size_t) i] = { f0 * std::exp2 (cents[(size_t) i] / 1200.0), amp[(size_t) i] * g };
+        };
+        const auto cost = [&]
+        {
+            build();
+            return goalCost (targetScore (work, alphas, rootOnly), goal, rangeLo, rangeHi);
+        };
+
+        build();
+        out.seedScore = targetScore (work, alphas, rootOnly);
+        double best = goalCost (out.seedScore, goal, rangeLo, rangeHi);
+
+        constexpr double invPhi = 0.6180339887498949;
+        // One golden-section line search on coordinate `set`, over [lo, hi]. `restore` is
+        // the coordinate's current value: a clamped or multimodal window must never leave
+        // the coordinate WORSE than it found it, so anything that fails to beat `best`
+        // is rolled back. `best` is therefore monotone across the whole descent.
+        const auto lineSearch = [&] (const std::function<void(double)>& set, double restore,
+                                     double lo, double hi)
+        {
+            if (! (hi > lo + 1.0e-9)) return;
+            double x1 = hi - (hi - lo) * invPhi, x2 = lo + (hi - lo) * invPhi;
+            set (x1); double f1 = cost();
+            set (x2); double f2 = cost();
+            double bx = f1 < f2 ? x1 : x2, bf = std::min (f1, f2);
+            for (int it = 0; it < 26 && (hi - lo) > 1.0e-4; ++it)
+            {
+                if (f1 < f2) { hi = x2; x2 = x1; f2 = f1; x1 = hi - (hi - lo) * invPhi; set (x1); f1 = cost(); }
+                else         { lo = x1; x1 = x2; f1 = f2; x2 = lo + (hi - lo) * invPhi; set (x2); f2 = cost(); }
+                if (f1 < bf) { bf = f1; bx = x1; }
+                if (f2 < bf) { bf = f2; bx = x2; }
+            }
+            const double mid = 0.5 * (lo + hi);
+            set (mid);
+            const double fm = cost();
+            if (fm < bf) { bf = fm; bx = mid; }
+            if (bf < best) { best = bf; set (bx); }
+            else           set (restore);
+        };
+
+        const int nSweeps = std::max (1, sweeps);
+        for (int s = 0; s < nSweeps; ++s)
+        {
+            const double before = best;
+            for (int i = 1; i < n; ++i)   // partial 0 IS the played pitch: it does not move
+            {
+                const double keep = cents[(size_t) i];
+                const double lo = cents[(size_t) i - 1] + gap;
+                const double hi = i + 1 < n ? cents[(size_t) i + 1] - gap : topCents;
+                lineSearch ([&] (double c) { cents[(size_t) i] = c; }, keep, lo, std::min (hi, topCents));
+                if (! (cents[(size_t) i] > cents[(size_t) i - 1] + gap * 0.999))
+                    cents[(size_t) i] = keep;   // the window had no legal room: leave it put
+                if (progress && ! progress (0.05f + 0.9f * (float) (s * n + i) / (float) (nSweeps * n)))
+                { out.spectrum = work; out.score = targetScore (work, alphas, rootOnly); return out; }
+            }
+            if (shapeAmps)
+                for (int i = 0; i < n; ++i)
+                {
+                    // dB around the SEED amplitude, floored well above silence: a bound,
+                    // never a mute (a muted partial is a deleted partial).
+                    const double a0 = std::max (1.0e-9, seedAmp[(size_t) i]);
+                    const double now = 20.0 * std::log10 (std::max (1.0e-12, amp[(size_t) i] / a0));
+                    lineSearch ([&] (double dB) { amp[(size_t) i] = a0 * std::pow (10.0, dB / 20.0); },
+                                now, -std::abs (ampRangeDb), std::abs (ampRangeDb));
+                }
+            out.sweepsDone = s + 1;
+            if (std::abs (before - best) < 1.0e-9) break;  // converged: further sweeps buy nothing
+        }
+
+        build();
+        out.spectrum = work;
+        out.score    = targetScore (work, alphas, rootOnly);
+        return out;
     }
 
     struct ExtremeInfo { double ratio; double value; };

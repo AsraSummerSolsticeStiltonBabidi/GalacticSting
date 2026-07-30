@@ -62,6 +62,8 @@ namespace spectrum
     {
         long long key = 0;
         float     dB  = 0.0f;
+        bool operator== (const PartialGain& o) const noexcept { return key == o.key && dB == o.dB; }
+        bool operator!= (const PartialGain& o) const noexcept { return ! (*this == o); }
     };
 
     inline float gainScaleOf (float dB) noexcept
@@ -70,11 +72,12 @@ namespace spectrum
     }
 
     //==========================================================================
-    // Bind a set of edits to a finished partial list.
+    // Bind a set of edits to a finished partial list, and report WHERE each edit
+    // landed: indexOut[j] is the index in `partials` that ov[j] claimed, or -1 when
+    // that edit's partial is not in this spectrum at all.
     //
     // `partials` must be ascending by ratio (every template is) and `ov` ascending by
-    // key with unique keys. scaleOut is resized to partials.size() and filled with
-    // 1.0f, then each edit that finds a home multiplies its partial.
+    // key with unique keys.
     //
     // The binding is strictly ONE-TO-ONE: an edit claims at most one partial and a
     // partial accepts at most one edit, nearest first, ties going to the lower index.
@@ -82,17 +85,22 @@ namespace spectrum
     // same partial and their gains would compound - the user would have moved one
     // control and heard two.
     //
-    // Returns how many edits actually bound. The caller is expected to SHOW that
-    // number rather than quietly discard the rest: an edit that binds to nothing is
-    // not an error, it just means its partial is not in the current spectrum, and it
-    // must be left in the stored set so it comes back when the partial does. This
-    // function never modifies `ov`.
+    // Returns how many edits actually bound. An edit that binds to nothing is not an
+    // error: its partial is simply not in the current spectrum, and it must be left in
+    // the stored set so it comes back when the partial does. Never modifies `ov`.
+    //
+    // WHY THIS IS ITS OWN FUNCTION. The amplitude editor has to draw the user's dB on
+    // the SAME knob the voice will multiply, and it needs the exact dB (not the scale
+    // factor, which throws away everything below the mute threshold). Re-deriving the
+    // pairing in the UI would be a second copy of this rule, free to drift out of step
+    // with the audio - a knob showing an edit that some other partial is actually
+    // getting. One binding pass, two readers.
     //==========================================================================
-    inline int resolveGains (const std::vector<Partial>& partials,
-                             const std::vector<PartialGain>& ov,
-                             std::vector<float>& scaleOut)
+    inline int bindGains (const std::vector<Partial>& partials,
+                          const std::vector<PartialGain>& ov,
+                          std::vector<int>& indexOut)
     {
-        scaleOut.assign (partials.size(), 1.0f);
+        indexOut.assign (ov.size(), -1);
         if (partials.empty() || ov.empty())
             return 0;
 
@@ -101,8 +109,9 @@ namespace spectrum
         int    matched = 0;
         size_t p       = 0;   // first partial not yet claimed; only ever moves forward,
                               // which is what makes the pass one-to-one and O(n + m)
-        for (const auto& g : ov)
+        for (size_t j = 0; j < ov.size(); ++j)
         {
+            const auto& g = ov[j];
             while (p < partials.size() && gainKey ((double) partials[p].ratio) < g.key - tol)
                 ++p;
             if (p >= partials.size())
@@ -120,11 +129,27 @@ namespace spectrum
 
             if (best < partials.size())
             {
-                scaleOut[best] = gainScaleOf (g.dB);
+                indexOut[j] = (int) best;
                 ++matched;
                 p = best + 1;   // claimed
             }
         }
+        return matched;
+    }
+
+    // The audio-side form: scaleOut is resized to partials.size() and filled with 1.0f,
+    // then each edit that found a home multiplies its partial. Same one-to-one pairing
+    // as bindGains, because it IS bindGains.
+    inline int resolveGains (const std::vector<Partial>& partials,
+                             const std::vector<PartialGain>& ov,
+                             std::vector<float>& scaleOut)
+    {
+        scaleOut.assign (partials.size(), 1.0f);
+        std::vector<int> where;
+        const int matched = bindGains (partials, ov, where);
+        for (size_t j = 0; j < where.size(); ++j)
+            if (where[j] >= 0)
+                scaleOut[(size_t) where[j]] = gainScaleOf (ov[j].dB);
         return matched;
     }
 

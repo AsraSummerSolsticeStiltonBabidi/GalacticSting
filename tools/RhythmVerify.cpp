@@ -11,6 +11,7 @@
 //==============================================================================
 
 #include "PluginProcessor.h"
+#include "PluginEditor.h"   // run 35 lays the real editor out and measures it
 
 #include <juce_dsp/juce_dsp.h>
 
@@ -1971,6 +1972,33 @@ int main()
         check (muted > onS1 * 1.15,
                "a per-partial edit reaches the audio (muting the fundamental brightens it)");
 
+        // The ON/OFF SWITCH itself, which the editor now puts in two places. The engine
+        // only learns whether the edits are in force through setOverrides, so when the
+        // switch moved on its own - the pill in the window, the pill under the pencil,
+        // host automation - a whole hand-drawn spectrum stayed silent and the control
+        // looked broken. It has to work from either direction.
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr2, eb);
+            std::vector<spectrum::PartialGain> ov;
+            spectrum::setPartialGain (ov, spectrum::gainKey (1.0), spectrum::kGainMutedDb);
+            p->setPartialGains (ov, false);            // stored, switch still OFF
+            p->pollParametersForTests();
+            const int offMatched = p->getPartialGainsMatched();
+            if (auto* q = p->apvts.getParameter ("partialManual"))
+                q->setValueNotifyingHost (1.0f);
+            p->pollParametersForTests();               // the switch alone, nothing else
+            const int onMatched = p->getPartialGainsMatched();
+            if (auto* q = p->apvts.getParameter ("partialManual"))
+                q->setValueNotifyingHost (0.0f);
+            p->pollParametersForTests();
+            const int backOff = p->getPartialGainsMatched();
+            std::printf ("  edits in force: switch off=%d  on=%d  off again=%d\n",
+                         offMatched, onMatched, backOff);
+            check (offMatched == 0 && onMatched == 1 && backOff == 0,
+                   "moving the manual switch alone puts the stored edits in force, and takes them back out");
+        }
+
         // The edits must come back with the project. Losing a hand-drawn spectrum on
         // reopening would be the same class of injury as the MTS-ESP overwrite.
         {
@@ -1994,6 +2022,61 @@ int main()
             for (size_t i = 0; i < back.size() && same; ++i)
                 same = back[i].key == ov[i].key && std::abs (back[i].dB - ov[i].dB) < 0.01f;
             check (same, "per-partial edits survive a save and reload, keys and dB intact");
+        }
+
+        // The amplitude WINDOW's two lifelines. Both were absent when the knobs were
+        // first wired up, and both are invisible until they bite:
+        //  - one undo step per drag gesture (the edits are not APVTS parameters, so
+        //    nothing put them on the stack: Ctrl+Z sailed past a hand-drawn spectrum);
+        //  - a revision counter, because the window cannot watch the template generation
+        //    for this (setOverrides deliberately never bumps it) and so had no way to
+        //    notice an undo, a preset or a reload changing the edits underneath it.
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr2, eb);
+
+            std::vector<spectrum::PartialGain> before, after;
+            spectrum::setPartialGain (before, spectrum::gainKey (2.0), -6.0f);
+            after = before;
+            spectrum::setPartialGain (after, spectrum::gainKey (2.0), -18.0f);
+            spectrum::setPartialGain (after, spectrum::gainKey (5.0), spectrum::kGainMutedDb);
+
+            p->setPartialGains (before, true);
+            const unsigned rev0 = p->getPartialGainsRevision();
+            p->setPartialGains (after, true);
+            const unsigned rev1 = p->getPartialGainsRevision();
+            p->commitPartialGains (before, after);
+            const unsigned rev2 = p->getPartialGainsRevision();
+            std::printf ("  gain revision: after 1st write=%u  2nd=%u  after commit=%u\n", rev0, rev1, rev2);
+            check (rev1 != rev0, "every write to the per-partial edits bumps the revision counter");
+
+            p->undoManager.undo();
+            const auto back = p->getPartialGains();
+            bool restored = back.size() == before.size();
+            for (size_t i = 0; i < back.size() && restored; ++i)
+                restored = back[i].key == before[i].key && back[i].dB == before[i].dB;
+            check (restored, "Ctrl+Z takes a whole drag gesture's per-partial edits back at once");
+            check (p->getPartialGainsRevision() != rev2,
+                   "and the undo bumps the revision, so an open editor window resyncs to it");
+
+            p->undoManager.redo();
+            const auto fwd = p->getPartialGains();
+            bool redone = fwd.size() == after.size();
+            for (size_t i = 0; i < fwd.size() && redone; ++i)
+                redone = fwd[i].key == after[i].key && fwd[i].dB == after[i].dB;
+            check (redone, "Ctrl+Y brings the edits forward again, mute included");
+
+            // A click that moved nothing must not push a transaction, or Ctrl+Z would
+            // start eating perfectly good earlier edits.
+            const int depthBefore = p->undoManager.getNumActionsInCurrentTransaction();
+            p->commitPartialGains (fwd, fwd);
+            p->undoManager.undo();
+            const auto still = p->getPartialGains();
+            bool untouched = still.size() == before.size();
+            for (size_t i = 0; i < still.size() && untouched; ++i)
+                untouched = still[i].key == before[i].key && still[i].dB == before[i].dB;
+            juce::ignoreUnused (depthBefore);
+            check (untouched, "a gesture that changed nothing pushes nothing, so undo still steps over real edits");
         }
     }
 
@@ -2106,6 +2189,510 @@ int main()
             run ("Bohlen-Pierce", bp, "bp13", 440.0f);
         }
         tmp.deleteFile();
+    }
+
+    // --- run 33: an ABSOLUTE 128-key table, all the way through the real plugin -----
+    // A non-repeating .tun (a stretched piano curve) is held as a table of 128 exact
+    // frequencies. TuningTests proves the TuningManager side; what only the real
+    // processor can prove is that the rest of the plugin does not quietly turn it back
+    // into a scale - the saved state, the tuning bank, the .tun writer and the scale
+    // editors all used to assume degrees + period and there was no table to catch them.
+    {
+        std::printf ("absolute 128-key table through the real plugin:\n");
+        auto tmp = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                       .getChildFile ("fiblo_table_test.tun");
+        auto out = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                       .getChildFile ("fiblo_table_written.tun");
+
+        // Railsback-like: flat bass, sharp treble, so no key distance repeats exactly.
+        double want[128];
+        for (int n = 0; n < 128; ++n)
+        {
+            const double d = (double) (n - 60);
+            want[n] = 440.0 * std::pow (2.0, ((n - 69) * 100.0 + 0.002 * d * std::abs (d)) / 1200.0);
+        }
+        {
+            juce::String s ("; stretched piano curve - does not repeat\n[Exact Tuning]\nbasefreq=");
+            s << juce::String (want[0], 10) << "\n";
+            for (int n = 0; n < 128; ++n)
+                s << "note " << n << "=" << juce::String (1200.0 * std::log2 (want[n] / want[0]), 6) << "\n";
+            tmp.replaceWithText (s);
+        }
+
+        const auto worstVs = [&] (FractalAdditiveAudioProcessor& p)
+        {
+            double worst = 0.0;
+            for (int n = 0; n < 128; ++n)
+            {
+                const double got = p.getNoteFrequency (n);
+                if (got > 0.0) worst = std::max (worst, std::abs (1200.0 * std::log2 (got / want[n])));
+            }
+            return worst;
+        };
+
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 64);
+        juce::String err;
+        check (p->loadScalaFile (tmp, err), ("the stretched .tun loads (" + err + ")").toRawUTF8());
+        check (p->tuningIsAbsoluteTable(), "and is held as an absolute 128-key table");
+        p->pollParametersForTests();
+        std::printf ("  loaded            worst error %.6f cents over 128 keys\n", worstVs (*p));
+        check (worstVs (*p) < 0.01, "every key sounds at the frequency the file states");
+        check (p->getScaleDegrees() == 12 && std::abs (p->getDegreeRatio (12) - 2.0) < 0.01,
+               "the estimated period is the octave, 12 keys wide");
+
+        // The period is metadata: typing a different one must not move a pitch.
+        check (p->setTuningTablePeriod ("3/2", err), "a period of the user's own is accepted");
+        p->pollParametersForTests();
+        check (p->getScaleDegrees() == 7, "7 keys span a fifth here");
+        check (worstVs (*p) < 0.01, "and NOT ONE of the 128 pitches moved with it");
+
+        // Saved state: the table AND the chosen period.
+        {
+            juce::MemoryBlock state;
+            p->getStateInformation (state);
+            auto q = std::make_unique<FractalAdditiveAudioProcessor>();
+            q->prepareToPlay (48000.0, 64);
+            q->setStateInformation (state.getData(), (int) state.getSize());
+            q->pollParametersForTests();
+            check (q->tuningIsAbsoluteTable(), "a reopened project is still a table");
+            std::printf ("  after state reload worst error %.6f cents\n", worstVs (*q));
+            check (worstVs (*q) < 0.01, "with every key back to within 0.01 cents");
+            check (q->tuningTablePeriodIsUserSet() && q->getScaleDegrees() == 7,
+                   "and the period the user chose came back too");
+        }
+
+        // The tuning bank stores the .tun VERBATIM (it has no .scl form) and reloads it.
+        {
+            for (int i = 0; i < FractalAdditiveAudioProcessor::kBankSlots; ++i) p->bankClearSlot (i);
+            p->setTuningBankFile (0, tmp);
+            check (p->getTuningBankName (0).isNotEmpty(), "the table takes a bank slot");
+            p->loadScalaText ("! x.scl\nsomething else\n 2\n 500.0\n 2/1\n", "other", err);
+            check (! p->tuningIsAbsoluteTable(), "another tuning takes over");
+            // Off the slot and back onto it: selecting the slot the selector already sits
+            // on is a no-op by design (syncBankSelector), so the switch has to be real.
+            p->setTuningBankSlotParam (0);
+            p->pollParametersForTests();
+            p->setTuningBankSlotParam (1);
+            p->pollParametersForTests();  // the slot switch is picked up on the message thread
+            check (p->tuningIsAbsoluteTable(), "recalling the slot brings the table back");
+            std::printf ("  from bank slot    worst error %.6f cents\n", worstVs (*p));
+            check (worstVs (*p) < 0.01, "exactly, key for key");
+        }
+
+        // The writer: a table goes out as 128 exact pitches and NO fabricated scale.
+        {
+            check (p->saveCurrentTuningTun (out, err), ("a table can be written back out (" + err + ")").toRawUTF8());
+            const auto text = out.loadFileAsString();
+            check (! text.contains ("[Scale Begin]"),
+                   "the file declares no scale - it has none to declare");
+            auto r = std::make_unique<FractalAdditiveAudioProcessor>();
+            r->prepareToPlay (48000.0, 64);
+            check (r->loadScalaFile (out, err), "and loads back into a fresh instance");
+            r->pollParametersForTests();
+            check (r->tuningIsAbsoluteTable(), "still as a table");
+            std::printf ("  written + reread  worst error %.6f cents\n", worstVs (*r));
+            check (worstVs (*r) < 0.01, "every key survives the writer");
+        }
+
+        // The scale editors must refuse rather than replace the table with an invention.
+        {
+            juce::String e1, e2, e3, e4;
+            const bool a = ! p->addNoteToTuning (1.25, e1);
+            const bool b = ! p->editTuningDegree (1, "6/5", e2);
+            const bool c = ! p->deleteTuningDegree (1, e3);
+            const bool d = ! p->saveCurrentTuningScl (out, e4);
+            check (a && b && c && d, "add / edit / delete a degree and 'save .scl' all refuse");
+            check (e1.isNotEmpty() && e2.isNotEmpty() && e3.isNotEmpty() && e4.isNotEmpty(),
+                   "each refusal says why");
+            check (p->tuningIsAbsoluteTable() && worstVs (*p) < 0.01,
+                   "and the table is still exactly what was loaded");
+        }
+
+        tmp.deleteFile();
+        out.deleteFile();
+    }
+
+    // --- run 34: WHICH ENGINE is in force, and whose degrees it uses -----------------
+    // Three mutually exclusive sources build the spectrum: the plain harmonic series, a
+    // Custom Engine scale, or the harmonic engine TEMPERED to the active tuning. Temper
+    // wins over a loaded custom scale, and it takes its grid from the TUNING - not from
+    // that scale. Both facts were implicit in one if/else chain that only the audio path
+    // read, so the UI could (and did) name the wrong engine. engineInForce() is now the
+    // single answer both of them use, and this pins it to the partials that come out.
+    {
+        std::printf ("engine in force (13-EDO tuning + a 3-note custom scale):\n");
+        using E = FractalAdditiveAudioProcessor::EngineInForce;
+        // On the HEAP, like every other extra instance in here: MSVC reserves every scope's
+        // locals in main's frame at once, and one more processor on the stack overflows it
+        // before a single line of output is printed.
+        auto owned = std::make_unique<FractalAdditiveAudioProcessor>();
+        auto& p = *owned;
+        p.prepareToPlay (sr, blk);
+        auto setP2 = [&p] (const char* id, float plain)
+        {
+            auto* pp = p.apvts.getParameter (id);
+            pp->setValueNotifyingHost (pp->convertTo0to1 (plain));
+        };
+        // Wait for the worker thread to publish the template these settings ask for.
+        auto rebuild = [&p] () -> const spectrum::SpectrumTemplate*
+        {
+            const auto* t0 = p.getLiveTemplate();
+            const unsigned g0 = t0 != nullptr ? t0->generation : 0u;
+            p.pollParametersForTests();
+            for (int i = 0; i < 400; ++i)
+            {
+                const auto* t = p.getLiveTemplate();
+                if (t != nullptr && t->generation != g0) return t;
+                juce::Thread::sleep (5);
+            }
+            return p.getLiveTemplate();
+        };
+
+        // A 13-EDO tuning: NONE of its steps is a just interval, so a partial sitting on
+        // 5/4 or 3/2 proves the grid came from the custom scale instead.
+        juce::String err, scl ("! edo13.scl\n13-EDO\n 13\n!\n");
+        for (int i = 1; i <= 13; ++i) scl << " " << juce::String (1200.0 * (double) i / 13.0, 6) << "\n";
+        check (p.loadScalaText (scl, "edo13", err), "the 13-EDO tuning loads");
+        check (p.loadTimbreText ("5/4 3/2 2", err), "a 3-note custom scale is typed in");
+        setP2 ("timbreOn", 1.0f);
+        setP2 ("timbreTemper", 0.0f);
+
+        auto onGrid = [] (double ratio, double stepCents)
+        {
+            const double c = 1200.0 * std::log2 (ratio);
+            return std::abs (c - stepCents * std::round (c / stepCents));
+        };
+
+        {
+            const auto* t = rebuild();
+            check (p.engineInForce() == E::CustomScale, "scale on + temper off = the CUSTOM engine");
+            check (p.timbreReplacesEngine(), "which is what the UI dims the harmonic engine for");
+            // Every partial must be a scale degree times a power of the period.
+            double worst = 0.0;
+            int n = t != nullptr ? (int) t->partials.size() : 0;
+            for (int i = 0; i < n; ++i)
+            {
+                const double r = (double) t->partials[(size_t) i].ratio;
+                const double c = 1200.0 * std::log2 (r);
+                const double inPeriod = c - 1200.0 * std::floor (c / 1200.0);
+                double best = 1.0e9;
+                for (double d : { 0.0, 386.313713864835, 701.955000865387, 1200.0 })
+                    best = std::min (best, std::abs (inPeriod - d));
+                worst = std::max (worst, best);
+            }
+            std::printf ("  custom scale: %d partials, worst distance to a degree %.4f cents\n", n, worst);
+            check (n > 0 && worst < 0.5, "every partial sits on the custom scale's own degrees");
+        }
+        {
+            setP2 ("timbreTemper", 1.0f);
+            const auto* t = rebuild();
+            check (p.engineInForce() == E::Tempered, "temper on = TEMPERED, whatever the custom scale says");
+            check (! p.timbreReplacesEngine(), "so the harmonic controls must NOT be greyed there");
+            double worst = 0.0, worstJust = 1.0e9;
+            int n = t != nullptr ? (int) t->partials.size() : 0;
+            for (int i = 0; i < n; ++i)
+            {
+                const double r = (double) t->partials[(size_t) i].ratio;
+                worst = std::max (worst, onGrid (r, 1200.0 / 13.0));
+                // 5/4 and 3/2 are NOT 13-EDO steps: if the grid had come from the custom
+                // scale, some partial would be sitting on one of them.
+                worstJust = std::min (worstJust, std::min (onGrid (r / 1.25, 1200.0),
+                                                           onGrid (r / 1.5,  1200.0)));
+            }
+            std::printf ("  tempered:     %d partials, worst distance to the 13-EDO grid %.4f cents,"
+                         " nearest custom degree %.2f cents away\n", n, worst, worstJust);
+            check (n > 0 && worst < 0.5, "every partial snapped to the TUNING's 13 degrees");
+            check (n > 0 && worstJust > 5.0, "and none of them to the custom scale's");
+            check (n > 3, "the harmonic engine is still generating (far more partials than the scale has)");
+        }
+        {
+            setP2 ("timbreTemper", 0.0f);
+            setP2 ("timbreOn", 0.0f);
+            rebuild();
+            check (p.engineInForce() == E::Harmonic, "both off = the plain HARMONIC engine");
+            check (p.timbreLoaded(), "and the typed scale is still loaded, not discarded");
+        }
+        p.clearScala();
+    }
+
+    // --- run 35: the SPECTRUM panel's geometry --------------------------------------
+    // The window is a FIXED 1200x650 and every box is laid out by hand, so a rearranged
+    // panel fails by overlapping its neighbour or by pushing its own content out through
+    // its frame - silently, since a Component draws happily outside its parent's box.
+    // Nothing tested the editor at all before this (the verifiers build the processor),
+    // which is why this exists.
+    {
+        std::printf ("SPECTRUM panel layout:\n");
+        auto owned = std::make_unique<FractalAdditiveAudioProcessor>(); // see run 34: heap, not stack
+        auto& p = *owned;
+        p.prepareToPlay (sr, blk);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "the editor builds");
+        // Measured TWICE: once as it opens (prime LIMIT fader, no scale loaded) and once in
+        // the widest configuration there is - the 9 prime-whitelist toggles, plus a loaded
+        // scale, which adds the Off button and the longest status line. Both live in the
+        // narrowest boxes of the panel, so they are where a squeeze shows up first.
+        for (int pass = 0; ed != nullptr && pass < 2; ++pass)
+        {
+            if (pass == 1)
+            {
+                juce::String err;
+                p.loadTimbreText ("5/4 3/2 2", err);
+                auto* pm = p.apvts.getParameter ("primeMode");
+                pm->setValueNotifyingHost (1.0f); // Whitelist
+                ed->resized();                    // no message loop here to do it for us
+                std::printf ("  (prime whitelist + a loaded custom scale)\n");
+            }
+            check (ed->getWidth() == 1200 && ed->getHeight() == 650, "at 1200 x 650");
+            const auto L = ed->layoutProbe();
+            const auto win = ed->getLocalBounds();
+            check (win.contains (L.spectrum) && ! L.spectrum.isEmpty(), "the SPECTRUM panel is on screen");
+            check (win.contains (L.essentials) && win.contains (L.tuning), "so are Essentials and Tuning");
+            check (! L.spectrum.intersects (L.essentials) && ! L.spectrum.intersects (L.tuning),
+                   "and it overlaps neither of them");
+            check (L.spectrum.contains (L.harmonicEngine) && L.spectrum.contains (L.customEngine)
+                   && L.spectrum.contains (L.bothEngines),
+                   "all three nested boxes are inside the panel");
+            check (! L.harmonicEngine.intersects (L.customEngine)
+                   && ! L.harmonicEngine.intersects (L.bothEngines)
+                   && ! L.customEngine.intersects (L.bothEngines),
+                   "the two engines and the shared box never overlap (they are separate spaces)");
+            check (L.spectrum.contains (L.engineChips)
+                   && L.engineChips.getBottom() <= L.harmonicEngine.getY(),
+                   "the engine chips ride in the panel's header, clear of the boxes below");
+            std::printf ("  panel %d x %d   harmonic %d   custom %d   both %d   essentials %d\n",
+                         L.spectrum.getWidth(), L.spectrum.getHeight(), L.harmonicEngine.getWidth(),
+                         L.customEngine.getWidth(), L.bothEngines.getWidth(), L.essentials.getWidth());
+
+            // Every control must be INSIDE the box whose name it carries.
+            int outside = 0;
+            juce::String worstName;
+            for (const auto& c : L.controls)
+            {
+                const auto* box = c.first.startsWith ("harm.") ? &L.harmonicEngine
+                                : c.first.startsWith ("cust.") ? &L.customEngine
+                                : c.first.startsWith ("both.") ? &L.bothEngines
+                                                               : &L.essentials;
+                if (! box->contains (c.second))
+                { ++outside; if (worstName.isEmpty()) worstName = c.first; }
+            }
+            std::printf ("  %d controls probed, %d outside their box%s\n",
+                         (int) L.controls.size(), outside,
+                         outside > 0 ? (" (first: " + worstName + ")").toRawUTF8() : "");
+            check (! L.controls.empty() && outside == 0, "no control spills out of its own box");
+
+            // ...and no two of them may sit on top of each other.
+            int clashes = 0;
+            juce::String clashName;
+            for (size_t i = 0; i < L.controls.size(); ++i)
+                for (size_t j = i + 1; j < L.controls.size(); ++j)
+                    if (L.controls[i].second.intersects (L.controls[j].second))
+                    {
+                        ++clashes;
+                        if (clashName.isEmpty()) clashName = L.controls[i].first + " / " + L.controls[j].first;
+                    }
+            std::printf ("  %d overlapping control pairs%s\n", clashes,
+                         clashes > 0 ? (" (first: " + clashName + ")").toRawUTF8() : "");
+            check (clashes == 0, "and no two controls overlap");
+        }
+    }
+
+    // --- run 36: the SPECTRUM adapted to notes, and the two REALTIME links ------------
+    // The panel's new inverse direction, through the real plugin: the held chord it aims
+    // at, the partials it writes, and everything that keeps a realtime follower from
+    // running away with the patch (throttle, coalescing, the tuning bank, the feedback
+    // guard, and the single step back).
+    {
+        std::printf ("\nspectrum adapted to notes + the realtime links:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto owned = std::make_unique<Proc>();
+        auto& p = *owned;
+        p.prepareToPlay (sr, blk);
+        auto setP = [&p] (const char* id, float plain)
+        {
+            auto* pp = p.apvts.getParameter (id);
+            pp->setValueNotifyingHost (pp->convertTo0to1 (plain));
+            p.pollParametersForTests();
+        };
+        // Wait for the spectrum worker to publish whatever the current settings ask for.
+        auto waitTemplate = [&p] () -> const spectrum::SpectrumTemplate*
+        {
+            const auto* t0 = p.getLiveTemplate();
+            const auto g0 = t0 != nullptr ? t0->generation : 0u;
+            p.pollParametersForTests();
+            for (int i = 0; i < 400; ++i)
+            {
+                const auto* t = p.getLiveTemplate();
+                if (t != nullptr && t->generation != g0) return t;
+                juce::Thread::sleep (5);
+            }
+            return p.getLiveTemplate();
+        };
+        juce::AudioBuffer<float> buf (2, blk);
+
+        //-- (a) WHICH NOTES ARE HELD, at their exact sounding pitch. The adaptation's
+        //   whole realtime promise rests on this being the real chord, not a guess.
+        {
+            juce::MidiBuffer m;
+            for (const int k : { 60, 64, 67 })
+                m.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0);
+            p.processBlock (buf, m);
+            double f0 = 0.0;
+            const auto held = p.heldChordAsTargetAlphas (f0);
+            std::printf ("  held C-E-G: %d notes, f0 %.3f Hz, ratios", (int) held.size(), f0);
+            for (const double r : held) std::printf (" %.5f", r);
+            std::printf ("\n");
+            check ((int) held.size() == 3, "all three held notes reach the adaptation");
+            check (std::abs (f0 - p.getNoteFrequency (60)) < 1.0e-6,
+                   "and its root IS key 60's tuned frequency");
+            if (held.size() == 3)
+                check (std::abs (held[1] - p.getNoteFrequency (64) / f0) < 1.0e-9
+                       && std::abs (held[2] - p.getNoteFrequency (67) / f0) < 1.0e-9,
+                       "each ratio is the tuning's own, not an assumed 12-TET one");
+            juce::MidiBuffer off;
+            for (const int k : { 60, 64, 67 })
+                off.addEvent (juce::MidiMessage::noteOff (1, k), 0);
+            p.processBlock (buf, off);
+            double f0b = 0.0;
+            check (p.heldChordAsTargetAlphas (f0b).empty(), "and it empties when the keys come up");
+        }
+
+        //-- (b) ADAPT to the loaded tuning, applied through the real Custom Engine.
+        {
+            double f0 = 0.0;
+            const auto alphas = p.tuningAsTargetAlphas (f0);
+            Proc::SpectrumAdaptSettings st;
+            st.partials = 8; st.periodRatio = 2.0; st.minGapCents = 50.0;
+            st.rootOnly = true; st.goal = 0; st.shapeAmps = true;
+
+            const double beforeReal = p.measureCurrentAgainstTarget (alphas, f0, true);
+            juce::String err;
+            check (p.startSpectrumAdapt (st, alphas, f0, err), "the adaptation starts");
+            for (int i = 0; i < 2000 && p.isSpectrumAdaptRunning(); ++i) juce::Thread::sleep (5);
+            const auto info = p.getSpectrumAdaptResult();
+            check (p.applySpectrumAdapt (true, err), "and applies into the Custom Engine");
+            const auto* t = waitTemplate();
+
+            const int reps = (int) p.apvts.getRawParameterValue ("timbreRepeats")->load();
+            const int want = st.partials * juce::jmax (1, reps);
+            const double afterReal = p.measureCurrentAgainstTarget (alphas, f0, true);
+            std::printf ("  12ED2 x 8 partials: model %.2f -> %.2f, really sounding %.2f -> %.2f\n",
+                         info.before, info.after, beforeReal, afterReal);
+            std::printf ("  compiled partials: %d (asked %d x %d periods)\n",
+                         t != nullptr ? (int) t->partials.size() : -1, st.partials, reps);
+            check (afterReal < beforeReal, "the spectrum the synth REALLY makes beats less against that tuning");
+            check (t != nullptr && (int) t->partials.size() == want,
+                   "and it has exactly the partials that were asked for - none merged away");
+
+            // The no-merge guarantee, measured on the partials the voices will render.
+            double worst = 1.0e9;
+            if (t != nullptr)
+                for (size_t i = 1; i < t->partials.size(); ++i)
+                    worst = std::min (worst, 1200.0 * std::log2 ((double) t->partials[i].ratio
+                                                                 / (double) t->partials[i - 1].ratio));
+            std::printf ("  closest two compiled partials: %.2f cents (asked for %.0f)\n", worst, st.minGapCents);
+            check (worst >= st.minGapCents - 0.05, "every pair keeps the smallest interval it was promised");
+
+            // The amplitudes really travelled: they are per-partial edits, and they are
+            // the ONLY thing that can set an amplitude without the compiler deleting
+            // partials in response (PartialGains.h).
+            std::printf ("  per-partial amplitude edits in force: %d of %d\n",
+                         p.getPartialGainsMatched(), (int) p.getPartialGains().size());
+            check (p.getPartialGainsMatched() >= st.partials - 1,
+                   "the adapted amplitudes landed on the adapted partials");
+
+            // ONE undo step takes the whole thing back - ratios AND amplitudes together.
+            const auto adapted = p.getTimbreSource();
+            p.undoManager.undo();
+            std::printf ("  after one undo the Custom Engine text is %s\n",
+                         p.getTimbreSource().isEmpty() ? "empty (as it was)" : "back to its old value");
+            check (p.getTimbreSource() != adapted, "one Ctrl+Z undoes the whole adaptation");
+            p.undoManager.redo();
+        }
+
+        //-- (c) REALTIME "tuning follows the spectrum": throttled, coalesced, and it does
+        //   NOT fill the tuning bank.
+        {
+            // A deliberately tiny spectrum, so the search itself is instant and what this
+            // measures is the THROTTLE and nothing else. (With a full spectrum one search
+            // is ~1.7 s and "was it busy?" would mask the throttle entirely.)
+            setP ("timbreOn", 0.0f);
+            setP ("spectrumRange", 1.0f);
+            // MANUAL amplitude mode FREEZES slope (currentSettings uses manualSlopeFrozen),
+            // and the adaptation above switched it on - so the slope sweep below would not
+            // have rebuilt the spectrum at all and this test would have measured a throttle
+            // that was never asked to throttle anything. Hence the "started at least twice"
+            // check further down: too few starts is as much a failure as too many.
+            setP ("partialManual", 0.0f);
+            waitTemplate();
+
+            Proc::RtSettings rs;
+            rs.notes = 3; rs.periodRatio = 2.0; rs.periodLine = "2/1"; rs.minGapCents = 50.0;
+            auto filledSlots = [&p]
+            {
+                int n = 0;
+                for (int i = 0; i < Proc::kBankSlots; ++i)
+                    if (p.getTuningBankName (i).isNotEmpty()) ++n;
+                return n;
+            };
+            const int bank0 = filledSlots();
+            p.setRealtimeLink (Proc::RtLink::TuningFromSpectrum, rs);
+
+            constexpr int kTicks = 200;
+            for (int i = 0; i < kTicks; ++i)
+            {
+                // A modulator sweeping the spectrum, in the crudest possible form: a
+                // parameter that forces a rebuild on EVERY tick.
+                auto* sl = p.apvts.getParameter ("curveSlope");
+                sl->setValueNotifyingHost (sl->convertTo0to1 (i % 2 == 0 ? 1.0f : 1.4f));
+                p.pollParametersForTests();
+                juce::Thread::sleep (2);
+            }
+            const int starts  = p.getRealtimeStarts();
+            const int applies = p.getRealtimeApplies();
+            // An ABSOLUTE bound, deliberately not derived from kRtTuneTicks: computing the
+            // allowance from the very constant under test made the check pass at any
+            // throttle setting at all, including none (200 changes -> 110 searches sailed
+            // through it). "A handful per 200 spectrum changes" is the behaviour promised.
+            constexpr int allowed = 8;
+            std::printf ("  %d spectrum changes -> %d searches started, %d retunes applied "
+                         "(throttle allows at most %d)\n", kTicks, starts, applies, allowed);
+            check (starts >= 2, "the follower keeps searching as the spectrum keeps moving");
+            check (starts <= allowed, "and the throttle keeps a sweeping modulator from thrashing it");
+            check (applies >= 1, "and the tuning really follows the top result");
+            std::printf ("  tuning bank slots: %d before, %d after %d realtime retunes\n",
+                         bank0, filledSlots(), applies);
+            check (filledSlots() - bank0 <= 1,
+                   "realtime retunes never flood the bank (only the ONE baseline entry joins it)");
+
+            //-- (e) ...and switching it off leaves exactly one step back.
+            const auto rtScale = p.activeSclSource();
+            p.setRealtimeLink (Proc::RtLink::Off, rs);
+            p.undoManager.undo();
+            std::printf ("  after switching realtime off, one undo changes the scale: %s\n",
+                         p.activeSclSource() != rtScale ? "yes" : "NO");
+            check (p.activeSclSource() != rtScale,
+                   "one Ctrl+Z after switching realtime off leaves the follower's tuning behind");
+        }
+
+        //-- (d) THE FEEDBACK GUARD: temper mode makes the tuning build the spectrum, so a
+        //   link the other way would chase itself for ever. It must refuse, not oscillate.
+        {
+            Proc::RtSettings rs;
+            rs.notes = 3; rs.periodRatio = 2.0; rs.periodLine = "2/1";
+            setP ("timbreTemper", 1.0f);
+            p.setRealtimeLink (Proc::RtLink::TuningFromSpectrum, rs);
+            p.pollParametersForTests();
+            std::printf ("  with temper on, the link is %s and says: %s\n",
+                         p.getRealtimeLink() == Proc::RtLink::Off ? "OFF" : "STILL RUNNING",
+                         p.getRealtimeRefusal().toRawUTF8());
+            check (p.getRealtimeLink() == Proc::RtLink::Off,
+                   "a realtime link refuses to run into temper mode's own tuning -> spectrum loop");
+            check (p.getRealtimeRefusal().isNotEmpty(), "and says why instead of going quiet");
+            setP ("timbreTemper", 0.0f);
+        }
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);

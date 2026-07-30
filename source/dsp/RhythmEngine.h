@@ -232,6 +232,8 @@ public:
         }
         render (tmpl, on, all, cursor, numSamples);
 
+        publishHeld();   // the chord under the fingers, for the realtime spectrum adaptation
+
         fireEchoes (numSamples); // emit due feedback pulses (fired ones spawn children)
 
         engineClock += numSamples; // absolute sample frame (pattern anchor/cycle)
@@ -452,6 +454,40 @@ public:
              ? lastSendBend[(size_t) slot][(size_t) col].load (std::memory_order_relaxed) : 8192;
     }
     double getBendRangeSemis() const noexcept { return bendRangeSemis(); }
+
+    //==========================================================================
+    // THE CHORD BEING HELD RIGHT NOW, with each note's EXACT sounding frequency
+    // (the tuning's pitch for that key INCLUDING its channel bend), ascending.
+    //
+    // This engine already tracks the held notes sample-accurately - that is what the
+    // pulse trains are driven from - so "the chord being held" here means literally the
+    // notes that are sounding, not a second guess at them from a copy of the MIDI. The
+    // realtime spectrum adaptation reads it on the message thread.
+    //
+    // Republished every block, not only on note events, because a note's frequency also
+    // moves when the TUNING changes underneath it (a bank switch, a scale edit, MTS)
+    // and that produces no MIDI at all - a publish only on note-on/off would have kept
+    // handing out the pitches of the scale that was loaded before.
+    //
+    // Seqlock: the reader sees an ODD counter while the writer is mid-update and retries.
+    // A plain "count last" publish can tear (the count of the new chord with one
+    // frequency of the old one), and the adaptation latches onto whatever it reads until
+    // the held set changes again - so a single torn read would stick.
+    int getHeldChord (double* outHz, int maxOut) const noexcept
+    {
+        for (int attempt = 0; attempt < 8; ++attempt)
+        {
+            const unsigned s0 = heldSeq.load (std::memory_order_acquire);
+            if ((s0 & 1u) != 0) continue;
+            const int n = std::min (maxOut, heldPubN.load (std::memory_order_relaxed));
+            for (int i = 0; i < n; ++i)
+                outHz[i] = heldPubHz[(size_t) i].load (std::memory_order_relaxed);
+            std::atomic_thread_fence (std::memory_order_acquire);
+            if (heldSeq.load (std::memory_order_relaxed) == s0)
+                return n;
+        }
+        return 0;   // contended beyond reason: report nothing rather than a torn chord
+    }
     // True when at least one partial is routed - self-play only engages then, so the
     // synth still plays its held notes normally when no rhythm is set up.
     bool hasEnabledSlot() const noexcept
@@ -904,6 +940,33 @@ private:
     mutable std::atomic<int>   lastSendNote[kSlots][kMaxNotes] = {};
     mutable std::atomic<int>   lastSendBend[kSlots][kMaxNotes] = {};
     std::atomic<float> displayF0 { 0.0f };
+
+    // Held-chord publication (see getHeldChord). Written on the audio thread only.
+    // DOUBLE, not float, unlike displayF0 next door: displayF0 only has to be readable on
+    // a label, while these frequencies become the RATIOS the adaptation aims at. Rounded
+    // to float, key 60 came back as 261.626 instead of 261.6255653 and every ratio was
+    // wrong in the 6th decimal - a tuning silently reshaped by the read-out that reported it.
+    std::atomic<double>   heldPubHz[kMaxNotes] = {};
+    std::atomic<int>      heldPubN { 0 };
+    std::atomic<unsigned> heldSeq  { 0 };
+
+    void publishHeld() noexcept
+    {
+        double f[kMaxNotes];
+        int n = 0;
+        for (auto& h : heldCol)
+            if (h.active)
+            {
+                h.f0 = noteHz (h.note, h.ch); // picks up a tuning change with no MIDI event
+                if (h.f0 > 0.0 && n < kMaxNotes) f[n++] = h.f0;
+            }
+        std::sort (f, f + n);
+        heldSeq.fetch_add (1, std::memory_order_release);   // -> odd: readers retry
+        for (int i = 0; i < n; ++i)
+            heldPubHz[(size_t) i].store (f[i], std::memory_order_relaxed);
+        heldPubN.store (n, std::memory_order_relaxed);
+        heldSeq.fetch_add (1, std::memory_order_release);   // -> even: consistent again
+    }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (RhythmEngine)
 };

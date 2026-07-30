@@ -409,28 +409,162 @@ int main()
         check (worst <= 0.01, "v1 integer cents land on 12-TET A=440");
     }
 
-    std::printf ("AnaMark .tun: a non-periodic mapping is REFUSED, not approximated:\n");
+    //--------------------------------------------------------------------------
+    // A non-repeating .tun is held as an ABSOLUTE 128-key table. It used to be refused,
+    // which made ordinary .tun content - a stretched piano, per-note tweaks - unloadable.
+    std::printf ("AnaMark .tun: a stretched (non-repeating) mapping loads as a table:\n");
     {
-        // A stretched (Railsback-like) tuning: the interval between key n and n+k grows
-        // with n, so no k repeats. It cannot be held as degrees + period, and the only
-        // honest answer is to refuse it.
+        // A Railsback-like piano curve: flat in the bass, sharp in the treble, ~+-8 cents
+        // at the ends. Every interval therefore changes with position, so NO key distance
+        // repeats exactly and the scale path (degrees + period) cannot hold it.
         double f[128];
         for (int n = 0; n < 128; ++n)
-            f[n] = 8.1757989156 * std::pow (2.0, (100.0 * n + 0.02 * n * n) / 1200.0);
+        {
+            const double d = (double) (n - 60);
+            f[n] = 440.0 * std::pow (2.0, ((n - 69) * 100.0 + 0.002 * d * std::abs (d)) / 1200.0);
+        }
 
-        // Load a known-good tuning first: the refusal must leave THAT one sounding.
-        double ref[128];
-        for (int i = 0; i < 128; ++i) ref[i] = 440.0 * std::pow (2.0, (i - 69) / 12.0);
+        // Load a scale first, so the table has to actually REPLACE it (and so none of the
+        // table metadata below can be a leftover from the scale).
         TuningManager t; juce::String err;
-        t.loadTunString (makeTun (ref), "12ed2", err);
+        {
+            double ref[128];
+            for (int i = 0; i < 128; ++i) ref[i] = 440.0 * std::pow (2.0, (i - 69) / 12.0);
+            juce::String e2;
+            check (t.loadTunString (makeTun (ref), "12ed2", e2), "12ED2 seed scale loaded");
+            check (! t.usesAbsoluteTable(), "the seed is a SCALE, not a table");
+        }
         t.setMode (TuningManager::Mode::Scala);
 
-        juce::String err2;
-        const bool refused = ! t.loadTunString (makeTun (f), "stretched", err2);
-        check (refused, "stretched .tun refused");
-        check (err2.isNotEmpty(), "refusal comes with an error message");
-        std::printf ("    error: %s\n", err2.toRawUTF8());
-        check (worstCents (t, ref) <= 0.01, "the previously loaded tuning is untouched");
+        const bool ok = t.loadTunString (makeTun (f), "railsback", err);
+        check (ok, ("stretched .tun loaded (" + err + ")").toRawUTF8());
+        check (t.usesAbsoluteTable(), "held as an absolute 128-key table");
+
+        const double worst = worstCents (t, f);
+        std::printf ("    worst error over 128 keys: %.8f cents\n", worst);
+        check (worst <= 0.01, "every key within 0.01 cents of the file");
+
+        // The estimate: a stretched octave scale is 2/1, a couple of cents out.
+        const auto est = t.getTablePeriodEstimate();
+        std::printf ("    estimated period: %.6f (%d keys), worst deviation %.3f cents, %s\n",
+                     est.ratio, est.keys, est.devCents,
+                     est.snapped ? "canonical" : "raw measurement");
+        check (est.found, "a period was found");
+        check (est.snapped && est.p == 2 && est.q == 1, "estimated period is 2/1");
+        check (std::abs (t.periodRatio() - 2.0) < 1e-12, "periodRatio() answers 2/1");
+        check (t.degreesPerPeriod() == 12, "12 keys per period (not the trivial 1-per-100c)");
+        check (est.devCents > 0.01 && est.devCents < 6.0,
+               "the deviation is reported, not hidden (a few cents)");
+    }
+
+    std::printf ("Table mode: the period is METADATA - it cannot move a pitch:\n");
+    {
+        double f[128];
+        for (int n = 0; n < 128; ++n)
+        {
+            const double d = (double) (n - 60);
+            f[n] = 440.0 * std::pow (2.0, ((n - 69) * 100.0 + 0.002 * d * std::abs (d)) / 1200.0);
+        }
+        TuningManager t; juce::String err;
+        check (t.loadTunString (makeTun (f), "railsback", err), "table loaded");
+        t.setMode (TuningManager::Mode::Scala);
+        const double before = worstCents (t, f);
+
+        juce::String perr;
+        check (t.setTablePeriodSpec ("3/1", perr), ("period override accepted (" + perr + ")").toRawUTF8());
+        check (t.tablePeriodIsUserSet(), "the period is now the user's");
+        check (std::abs (t.periodRatio() - 3.0) < 1e-12, "periodRatio() follows the override");
+        std::printf ("    3/1 override -> %d keys per period, %.3f cents off\n",
+                     t.degreesPerPeriod(), t.tablePeriodDevCents());
+        check (t.degreesPerPeriod() == 19, "19 keys span a tritave in a 100-cent-step table");
+        const double after = worstCents (t, f);
+        std::printf ("    worst key error before %.8f -> after %.8f cents\n", before, after);
+        check (after <= 0.01 && after == before, "NOT ONE of the 128 pitches moved");
+
+        check (! t.setTablePeriodSpec ("banana", perr), "unreadable period refused");
+        check (std::abs (t.periodRatio() - 3.0) < 1e-12, "and the accepted one still stands");
+
+        t.resetTablePeriodToEstimate();
+        check (! t.tablePeriodIsUserSet() && std::abs (t.periodRatio() - 2.0) < 1e-12,
+               "reset goes back to the estimate");
+        check (worstCents (t, f) == before, "the reset moved no pitch either");
+    }
+
+    std::printf ("Table mode: a stretched TRITAVE table estimates 3/1, not 2/1:\n");
+    {
+        // Proof that the estimate follows the file rather than assuming an octave: 13
+        // steps per (stretched) 3/1, Bohlen-Pierce-like.
+        const double step = 1200.0 * std::log2 (3.0) / 13.0;
+        double f[128];
+        for (int n = 0; n < 128; ++n)
+        {
+            const double d = (double) (n - 60);
+            f[n] = 261.6255653 * std::pow (2.0, (d * step + 0.002 * d * std::abs (d)) / 1200.0);
+        }
+        TuningManager t; juce::String err;
+        check (t.loadTunString (makeTun (f), "bp-stretched", err), "stretched tritave table loaded");
+        t.setMode (TuningManager::Mode::Scala);
+        check (t.usesAbsoluteTable(), "held as a table (it does not repeat)");
+        const auto est = t.getTablePeriodEstimate();
+        std::printf ("    estimated period: %.6f (%d keys), %.3f cents off\n",
+                     est.ratio, est.keys, est.devCents);
+        check (est.snapped && est.p == 3 && est.q == 1, "estimated period is 3/1");
+        check (t.degreesPerPeriod() == 13, "13 keys per tritave");
+        check (worstCents (t, f) <= 0.01, "every key still exact to 0.01 cents");
+    }
+
+    std::printf ("Table mode: survives a save/reload round trip (source + period):\n");
+    {
+        double f[128];
+        for (int n = 0; n < 128; ++n)
+        {
+            const double d = (double) (n - 60);
+            f[n] = 440.0 * std::pow (2.0, ((n - 69) * 100.0 + 0.002 * d * std::abs (d)) / 1200.0);
+        }
+        TuningManager t; juce::String err;
+        check (t.loadTunString (makeTun (f), "railsback", err), "table loaded");
+        t.setMode (TuningManager::Mode::Scala);
+        check (t.setTablePeriodSpec ("1200.0c", err), "user period set");
+
+        // Exactly what getStateInformation stores and setStateInformation gives back.
+        const auto snap = t.captureTuning();
+        check (snap.source.isNotEmpty(), "the state carries the tuning source");
+        check (snap.periodSpec == "1200.0c", "and the period the user chose");
+
+        TuningManager t2; juce::String err2;
+        check (t2.restoreTuning (snap, err2), ("restored into a fresh instance (" + err2 + ")").toRawUTF8());
+        t2.setMode (TuningManager::Mode::Scala);
+        check (t2.usesAbsoluteTable(), "still a table after the round trip");
+        const double worst = worstCents (t2, f);
+        std::printf ("    worst error over 128 keys after reload: %.8f cents\n", worst);
+        check (worst <= 0.01, "every key comes back within 0.01 cents");
+        check (t2.tablePeriodIsUserSet(), "the period is still the USER's, not the estimate");
+        check (std::abs (t2.periodRatio() - 2.0) < 1e-9, "and it is the one they chose");
+        check (t2.degreesPerPeriod() == 12, "degrees per period come back with it");
+    }
+
+    std::printf ("A .tun that DOES repeat still takes the scale path:\n");
+    {
+        double f[128];
+        for (int n = 0; n < 128; ++n) f[n] = 440.0 * std::pow (2.0, (n - 69) / 12.0);
+        TuningManager t; juce::String err;
+        check (t.loadTunString (makeTun (f), "12ed2", err), "12ED2 .tun loaded");
+        t.setMode (TuningManager::Mode::Scala);
+        check (! t.usesAbsoluteTable(), "NOT a table: degrees + period are available");
+        double r = 0.0;
+        check (t.scalaDegreeRatio (7, r) && std::abs (1200.0 * std::log2 (r) - 700.0) < 1e-6,
+               "the scale's own degree ratios are readable");
+        // And the table path must NOT pretend to have degrees.
+        double f2[128];
+        for (int n = 0; n < 128; ++n)
+        {
+            const double d = (double) (n - 60);
+            f2[n] = 440.0 * std::pow (2.0, ((n - 69) * 100.0 + 0.002 * d * std::abs (d)) / 1200.0);
+        }
+        check (t.loadTunString (makeTun (f2), "railsback", err), "stretched .tun loaded over it");
+        check (! t.scalaDegreeRatio (7, r), "a table reports NO degree ratios (nothing invents them)");
+        long long p = 0, q = 0;
+        check (! t.scalaDegreeRational (0, p, q), "and no rational degree sources either");
     }
 
     std::printf ("AnaMark .tun: malformed files are refused without crashing:\n");
@@ -453,10 +587,17 @@ int main()
             std::printf ("    error: %s\n", err.toRawUTF8());
         }
         {
-            // Every key the same pitch: there is no ascending period to be found.
+            // Every key the same pitch. There is no period here at all, but the 128 pitches
+            // are perfectly usable, so the table takes it and says the period is unknown
+            // instead of refusing a file whose every key it can sound exactly.
             juce::String s ("[Exact Tuning]\nbasefreq=440\n");
             for (int n = 0; n < 128; ++n) s << "note " << n << "=0\n";
-            check (! t.loadTunString (s, "flat", err), "all-128-keys-identical .tun refused");
+            check (t.loadTunString (s, "flat", err), "all-128-keys-identical .tun loads as a table");
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.usesAbsoluteTable(), "held as a table");
+            check (centsApart (t.frequencyForNote (0), 440.0) <= 0.01
+                   && centsApart (t.frequencyForNote (127), 440.0) <= 0.01, "every key is 440 Hz, as written");
+            check (! t.getTablePeriodEstimate().found, "and NO period is claimed for it");
         }
     }
 
