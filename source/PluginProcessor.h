@@ -357,9 +357,50 @@ public:
     void setPartialGains (std::vector<spectrum::PartialGain> ov, bool on)
     {
         partialGains = ov;
+        ++partialGainsRev;
         spectrumEngine.setOverrides (std::move (ov), on);
     }
     const std::vector<spectrum::PartialGain>& getPartialGains() const noexcept { return partialGains; }
+    // Bumped on every write. The editor window has to notice edits that did NOT come
+    // from its own knobs - an undo, a preset, a project reload - and it cannot watch the
+    // template generation for that: setOverrides deliberately leaves the generation
+    // alone (a bump there would restart every voice's spectral morph mid-drag). Without
+    // this counter an undo left the window showing the values it had just undone.
+    unsigned getPartialGainsRevision() const noexcept { return partialGainsRev; }
+
+    // The per-partial edits are not APVTS parameters, so nothing put them on the undo
+    // stack: Ctrl+Z after drawing a spectrum by hand sailed past it to whatever fader
+    // was touched before, and a hand-drawn spectrum could not be taken back. One
+    // transaction per drag gesture (the editor commits on mouse-up), not per frame.
+    struct PartialGainsAction : public juce::UndoableAction
+    {
+        PartialGainsAction (FractalAdditiveAudioProcessor& p,
+                            std::vector<spectrum::PartialGain> prev,
+                            std::vector<spectrum::PartialGain> next)
+            : proc (p), after (std::move (next)), before (std::move (prev)) {}
+        bool perform() override { return applyOne (after); }
+        bool undo() override    { return applyOne (before); }
+        int  getSizeInUnits() override
+        { return (int) ((after.size() + before.size()) * sizeof (spectrum::PartialGain)) + 32; }
+        bool applyOne (const std::vector<spectrum::PartialGain>& g)
+        {
+            proc.setPartialGains (g, proc.apvts.getRawParameterValue ("partialManual")->load() > 0.5f);
+            return true;
+        }
+        FractalAdditiveAudioProcessor& proc;
+        std::vector<spectrum::PartialGain> after, before;
+    };
+
+    // Commit one gesture's worth of edits THROUGH the undo stack. `before` is the list
+    // as it stood when the gesture started - captured by the caller, because by the time
+    // the mouse comes up the live list is already the new one.
+    void commitPartialGains (std::vector<spectrum::PartialGain> before,
+                             std::vector<spectrum::PartialGain> after)
+    {
+        if (before == after) return;                 // a click that moved nothing
+        undoManager.beginNewTransaction();
+        undoManager.perform (new PartialGainsAction (*this, std::move (before), std::move (after)));
+    }
     // How many of those edits currently sit on a partial that actually exists. The rest
     // are not lost - their partial is simply not in this spectrum right now.
     int getPartialGainsMatched() const noexcept { return spectrumEngine.getGainMatchedCount(); }
@@ -668,6 +709,7 @@ private:
     // Manual per-partial amplitudes: slope is frozen at the value it had when manual was
     // switched on, so switching is silent and the fader is genuinely inert while it lasts.
     std::vector<spectrum::PartialGain> partialGains;
+    unsigned partialGainsRev = 0;   // see getPartialGainsRevision()
 
     float manualSlopeFrozen = 1.0f;
     bool  lastManualMode    = false;

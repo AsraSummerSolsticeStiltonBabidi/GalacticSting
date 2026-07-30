@@ -921,6 +921,27 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     };
     harmonicsFader.updateText();
     configFader (slopeFader, "curveSlope", slopeAtt, cHarmonic, "Amplitude roll-off. 0 = flat/bright, 1 = saw, 2 = triangle.  (Also thins the highs when a Custom Engine scale is the spectrum.)");
+    //== Per-partial amplitudes: the pencil + its ON/OFF pill, both in the SLOPE cell ==
+    partialEditBtn.col = cHarmonic;
+    partialEditBtn.onClick = [this] { openPartialAmpWindow(); };
+    addAndMakeVisible (partialEditBtn);
+    partialManualT.setName ("onled"); // big green(on)/red(off) pill, drawn by GalacticLnF
+    partialManualT.setMouseClickGrabsKeyboardFocus (false);
+    addAndMakeVisible (partialManualT);
+    // The SAME parameter as the pill inside the window: two attachments, one value, so
+    // switching either one moves the other with no code to keep them in step (and both
+    // land on the undo stack and in host automation like every other control).
+    partialManualAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "partialManual", partialManualT);
+    partialPanel.trF      = [this] (const char* en, const char* ca) { return tr (en, ca); };
+    partialPanel.grid.trF = partialPanel.trF;
+    // The panel lives in its OWN top-level window, so it is not a descendant of this
+    // editor and does NOT inherit the LookAndFeel from it. Without this the ON/OFF pill
+    // fell back to a stock JUCE tick-box and the tooltips lost their colour markup.
+    partialPanel.setLookAndFeel (lnf.get());
+    // No onEdited hook: the main window shows nothing that a knob move changes (the
+    // FROZEN tag follows the PARAMETER, and refreshSlopeFreeze already watches that),
+    // and repainting the whole Harmonic Engine box on every drag frame was pure cost.
+    partialPanel.init (processorRef);
     // "Range" (spectrum hard-cut) removed from the UI - redundant with the Filter.
     // The parameter defaults to 10 (= no cut), so it has no effect.
     configGroup (gFractal, cFractal);
@@ -2184,6 +2205,12 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 FractalAdditiveAudioProcessorEditor::~FractalAdditiveAudioProcessorEditor()
 {
     stopTimer();
+    // The amplitude window is a real top-level window: it must go before the panel it
+    // shows (which is a member of this editor) and before the editor leaves the desktop,
+    // or a host that keeps the process alive is left with an orphaned window pointing at
+    // freed content.
+    partialWindow.reset();
+    partialPanel.setLookAndFeel (nullptr); // it borrowed this editor's lnf (see the ctor)
     // A preview playing when the UI closes would otherwise ring forever (its
     // scheduled note-offs live in this editor's queue) - stop it explicitly.
     stopChordPreview();
@@ -2219,6 +2246,16 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     langButton.setButtonText (catalan ? "ENG" : "CAT");
     menuButton.setButtonText (tr ("Menu", "Men\xc3\xba"));
     rhythmBtn.setButtonText (tr ("Spectrum vs Rhythm", "Espectre vs ritme"));
+    partialEditBtn.setTooltip (tr (
+        "Draw the spectrum by hand: opens a resizable window with *one knob per partial* of the current sound. Every partial is there, however many - nothing is hidden or capped.\nThe switch below is the same switch as the one inside the window; while it is on, !SLOPE is frozen!.",
+        "Dibuixa l'espectre a m\xc3\xa0: obre una finestra redimensionable amb *un control per parcial* del so actual. Hi ha tots els parcials, siguin quants siguin - res amagat ni limitat.\nL'interruptor de sota \xc3\xa9s el mateix que el de dins la finestra; mentre estigui actiu, !el PENDENT queda congelat!."));
+    partialManualT.setTooltip (tr (
+        "Manual per-partial amplitudes on/off. The SAME switch as the one inside the pencil's window - one control in two places. Off by default; while it is on, !SLOPE is frozen! where it stood and the amplitudes come from the knobs.",
+        "Activa/desactiva les amplituds manuals per parcial. \xc3\x89s EL MATEIX interruptor que el de dins la finestra del llapis - un control en dos llocs. Apagat per defecte; mentre estigui actiu, !el PENDENT queda congelat! on era i les amplituds venen dels controls."));
+    if (partialWindow != nullptr)
+        partialWindow->setName (tr ("Fibl\xc3\xb3 - partial amplitudes", "Fibl\xc3\xb3 - amplituds dels parcials"));
+    partialPanel.applyLanguage();
+    lastManualFrozenShown = -1;   // re-apply the slope fader's tooltip in the new language
     rhythmPanel.heading.setText (tr ("SPECTRUM VS RHYTHM", "ESPECTRE VS RITME"), dontSendNotification);
     rhythmPanel.outLbl.setText  (tr ("MIDI out (to DAW)", "Sortida MIDI (al DAW)"), dontSendNotification);
     rhythmPanel.selfLbl.setText (juce::String::fromUTF8 (catalan ? "Sona al Fibl\xc3\xb3" : "Play in Fibl\xc3\xb3"), dontSendNotification);
@@ -3081,6 +3118,52 @@ void FractalAdditiveAudioProcessorEditor::updateWarning (int templatePartials)
     warningOverlay.repaint();
 }
 
+//==============================================================================
+// The pencil's window. Built on first use and then kept alive (hidden) for the rest of
+// the session, so reopening it lands on the size and scroll position you left it at.
+void FractalAdditiveAudioProcessorEditor::openPartialAmpWindow()
+{
+    if (partialWindow == nullptr)
+    {
+        partialWindow = std::make_unique<PartialAmpWindow> (
+            tr ("Fibl\xc3\xb3 - partial amplitudes", "Fibl\xc3\xb3 - amplituds dels parcials"));
+        partialWindow->setLookAndFeel (lnf.get());   // ditto for the frame and the resizer
+        partialWindow->setContentNonOwned (&partialPanel, false);
+        // Wide enough for ~13 columns: a harmonic patch's first two octaves of partials
+        // are then on screen without scrolling at all.
+        partialWindow->centreWithSize (860, 560);
+        partialWindow->onHide = [this] { if (partialWindow != nullptr) partialWindow->setVisible (false); refocus(); };
+    }
+    partialPanel.applyLanguage();
+    partialPanel.resync();          // never open on a stale partial list
+    partialWindow->setVisible (true);
+    partialWindow->toFront (true);
+}
+
+// SLOPE is frozen while manual per-partial amplitudes are on (the processor freezes it
+// at the value it had when manual came on, so switching is silent). A fader that quietly
+// does nothing is the worst of both worlds: grey it out, take its mouse away, and let
+// paint() write FROZEN next to the SLOPE label.
+void FractalAdditiveAudioProcessorEditor::refreshSlopeFreeze()
+{
+    const bool frozen = processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+    if ((frozen ? 1 : 0) == lastManualFrozenShown) return;
+    lastManualFrozenShown = frozen ? 1 : 0;
+    slopeFader.setEnabled (! frozen);
+    slopeFader.setColour (juce::Slider::thumbColourId,
+                          frozen ? juce::Colour (0xff5a6070) : cHarmonic);
+    slopeFader.setColour (juce::Slider::trackColourId,
+                          (frozen ? juce::Colour (0xff5a6070) : cHarmonic).withAlpha (0.55f));
+    slopeFader.setTooltip (frozen
+        ? tr ("!Frozen!: *manual per-partial amplitudes* are on, so the amplitudes come from the pencil's knobs and this fader does nothing. It is kept exactly where it stood - switch manual off and it applies again.",
+              "!Congelat!: les *amplituds manuals per parcial* estan actives, les amplituds venen dels controls del llapis i aquest fader no fa res. Es conserva tal com estava - apaga el manual i torna a aplicar-se.")
+        : tr ("Amplitude roll-off. 0 = flat/bright, 1 = saw, 2 = triangle.  (Also thins the highs when a Custom Engine scale is the spectrum.)",
+              "Caiguda d'amplitud. 0 = pla/brillant, 1 = serra, 2 = triangle.  (Tamb\xc3\xa9 aprima els aguts quan l'espectre ve d'una escala del Motor Personalitzat.)"));
+    repaint (harmonicEngineBounds);
+    if (partialWindow != nullptr && partialWindow->isVisible())
+        partialPanel.refreshText();
+}
+
 void FractalAdditiveAudioProcessorEditor::openScalaChooser()
 {
     // .tun is offered first because it is what the Save button writes by default:
@@ -3554,7 +3637,20 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         subLabel (hcHarm,  cHarmonic, tr ("HARMONICS", "HARM\xc3\x92NICS"), dimF);
         // PRIME sits right under the shared divider -> nudge it down for breathing room.
         subLabel (hcPrime.translated (0, 5), cHarmonic, tr ("PRIME", "PRIMERS"), dimF);
-        subLabel (hcSlope, cHarmonic, tr ("SLOPE", "PENDENT"),       dimF);
+        // SLOPE says so when it is inert. With manual per-partial amplitudes on, the
+        // processor freezes the compile slope where it stood, so this fader stops
+        // affecting the sound entirely - and nothing on screen used to admit it.
+        if (processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f)
+        {
+            subLabel (hcSlope, juce::Colour (0xff8f96a8), tr ("SLOPE", "PENDENT"), dimF);
+            g.setColour (juce::Colour (0xffffb020).withMultipliedAlpha (dimF));
+            g.setFont (juce::Font (juce::FontOptions (10.0f).withStyle ("Bold")));
+            g.drawText (tr ("FROZEN", "CONGELAT"),
+                        hcSlope.withHeight (13).reduced (5, 0).withTrimmedLeft (44),
+                        juce::Justification::centredLeft, false);
+        }
+        else
+            subLabel (hcSlope, cHarmonic, tr ("SLOPE", "PENDENT"),   dimF);
     }
 
     // Essentials macro-group: one framed box, one colour, PHASE / GAIN / REFERENCE /
@@ -3897,7 +3993,16 @@ void FractalAdditiveAudioProcessorEditor::resized()
         }
         {
             auto si = hcSlope.reduced (6, 3); si.removeFromTop (lblH);
+            // The pencil and its ON/OFF pill take a narrow column on the RIGHT of the
+            // cell, the pill directly BELOW the pencil (they are one feature and read as
+            // a pair); the fader keeps the rest.
+            auto pcol = si.removeFromRight (46);
+            si.removeFromRight (4);
             slopeFader.setBounds (si);
+            const int pencilH = juce::jmin (30, juce::jmax (20, pcol.getHeight() / 3));
+            partialEditBtn.setBounds (pcol.removeFromTop (pencilH).withSizeKeepingCentre (pencilH, pencilH));
+            pcol.removeFromTop (4);
+            partialManualT.setBounds (pcol.removeFromTop (juce::jmin (22, pcol.getHeight())));
         }
 
         oneFader (row.removeFromLeft (W * 12 / 100), gFractal,       fractalFader,       &lblFractal);
@@ -4423,6 +4528,13 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     if (envEditor.isVisible()) envEditor.refresh();
 
     refreshModWatch(); // live-modulation marker on every watched fader (see the header)
+    refreshSlopeFreeze(); // SLOPE goes grey + "FROZEN" while manual amplitudes are on
+    // The amplitude window follows the spectrum: the template is rebuilt on a background
+    // thread whenever Base/Fractal/primes/tuning move, and the stored edits can change
+    // with no rebuild at all (an undo, a preset, a reload). Both are polled here rather
+    // than by a second timer inside the window.
+    if (partialWindow != nullptr && partialWindow->isVisible())
+        partialPanel.syncIfNeeded();
     refreshPresetDirtyMark();
     // Keep the Spectrum-Builder box showing the typed spectrum that is actually
     // loaded - it can change under us (a preset, an undo, "load its original

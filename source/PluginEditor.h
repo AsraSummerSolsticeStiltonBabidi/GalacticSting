@@ -2,6 +2,8 @@
 
 #include "PluginProcessor.h"
 #include "ScaleKeyboard.h"
+#include "PartialAmpEdit.h"
+#include "dsp/Dissonance.h"
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -47,6 +49,8 @@ private:
     void reclaimFocusUnlessTyping(); // regrab keyboard focus after a window switch (not while typing)
     void pollComputerKeyboard(); // reconcile held keys against the real key state
     void openScalaChooser();
+    void openPartialAmpWindow();   // the pencil in the SLOPE cell
+    void refreshSlopeFreeze();     // shows that SLOPE is inert while manual mode is on
     void openTimbreChooser();
     void openTuningBankChooser();
     void refreshTuningBank(); // sync the bank combo items + selection with the processor
@@ -1820,6 +1824,588 @@ private:
         void changed() { repaint(); if (onChange) onChange(); }
     };
 
+    //==========================================================================
+    // Per-partial amplitude editor (the pencil next to the SLOPE fader).
+    //==========================================================================
+
+    // The pencil itself, drawn as a path: at the 24 px this cell can spare, a letter
+    // or the word "Edit" was unreadable, and the icon says "draw the spectrum" in a
+    // way no abbreviation did.
+    struct PencilButton : juce::Button
+    {
+        juce::Colour col { 0xff5cb8ff };
+        PencilButton() : juce::Button ("pencil") { setMouseClickGrabsKeyboardFocus (false); }
+        void paintButton (juce::Graphics& g, bool over, bool down) override
+        {
+            auto r = getLocalBounds().toFloat().reduced (1.0f);
+            g.setColour (juce::Colour (down ? 0xff2c3648 : (over ? 0xff232c3c : 0xff171d29)));
+            g.fillRoundedRectangle (r, 4.0f);
+            g.setColour (col.withAlpha (over || down ? 1.0f : 0.8f));
+            g.drawRoundedRectangle (r.reduced (0.5f), 4.0f, 1.0f);
+
+            // Tip at the bottom-left, blunt end at the top-right; the nib is a triangle
+            // so the icon still reads as a pencil and not as a slash.
+            const float pad = juce::jmax (3.0f, r.getWidth() * 0.24f);
+            const juce::Point<float> tip { r.getX() + pad, r.getBottom() - pad };
+            const juce::Point<float> end { r.getRight() - pad, r.getY() + pad };
+            const float len = tip.getDistanceFrom (end);
+            if (len < 2.0f) return;
+            const juce::Point<float> dir { (end.x - tip.x) / len, (end.y - tip.y) / len };
+            const juce::Point<float> nrm { -dir.y, dir.x };
+            const float w = juce::jmax (1.2f, r.getWidth() * 0.11f);
+            const auto shoulder = tip + dir * (len * 0.26f);
+            juce::Path body;
+            body.startNewSubPath (shoulder + nrm * w);
+            body.lineTo (end + nrm * w);
+            body.lineTo (end - nrm * w);
+            body.lineTo (shoulder - nrm * w);
+            body.closeSubPath();
+            g.fillPath (body);
+            juce::Path nib;
+            nib.addTriangle (tip, shoulder + nrm * w, shoulder - nrm * w);
+            g.fillPath (nib);
+        }
+    };
+
+    // The knob grid.
+    //
+    // ONE Component draws every partial. A juce::Slider per partial is not an option:
+    // kMaxPartials is 16384 and a thousand partials is an ordinary patch, and JUCE's
+    // per-child hit-testing, focus and repaint bookkeeping collapses long before that
+    // (the window took seconds to open and then dropped frames on every mouse move).
+    // So this paints only the rows the clip region touches and does its own hit
+    // testing, exactly the way ScaleKeyboard draws and dispatches its keys.
+    //
+    // EVERY partial of the template is listed. There is no "first N" window and no
+    // cap: a partial the user cannot see is a partial they cannot un-mute.
+    struct PartialAmpGrid : juce::Component, juce::TooltipClient
+    {
+        partialamp::Model model;
+        std::function<juce::String (const char*, const char*)> trF;
+        std::function<void()> onGestureStart, onEdited, onGestureEnd;
+        bool manualOn = false;   // dims the whole grid when the edits are not sounding
+
+        static constexpr int kCellW = 62, kCellH = 80;
+
+        int   columns()  const { return juce::jmax (1, getWidth() / kCellW); }
+        float colWidth() const { return (float) getWidth() / (float) columns(); }
+        int   rows()     const { return (model.count() + columns() - 1) / columns(); }
+        int   contentHeight() const { return juce::jmax (kCellH, rows() * kCellH); }
+
+        juce::Rectangle<float> cellBounds (int i) const
+        {
+            const int c = columns();
+            const float cw = colWidth();
+            return { (float) (i % c) * cw, (float) (i / c) * (float) kCellH, cw, (float) kCellH };
+        }
+        int cellAt (juce::Point<float> p) const
+        {
+            const int c = columns();
+            const int col = juce::jlimit (0, c - 1, (int) (p.x / colWidth()));
+            const int row = (int) (p.y / (float) kCellH);
+            if (row < 0) return -1;
+            const int i = row * c + col;
+            return model.valid (i) ? i : -1;
+        }
+
+        //-- painting ----------------------------------------------------------
+        void paint (juce::Graphics& g) override
+        {
+            const int n = model.count();
+            if (n == 0)
+            {
+                g.setColour (juce::Colour (0xff8f96a8));
+                g.setFont (juce::Font (juce::FontOptions (13.0f)));
+                g.drawText (trF ? trF ("No partials in the current spectrum.",
+                                       "Cap parcial a l'espectre actual.")
+                                : juce::String(),
+                            getLocalBounds(), juce::Justification::centred, false);
+                return;
+            }
+            const auto clip = g.getClipBounds();
+            const int c = columns();
+            const int r0 = juce::jmax (0, clip.getY() / kCellH);
+            const int r1 = juce::jmin (rows() - 1, clip.getBottom() / kCellH);
+            for (int r = r0; r <= r1; ++r)
+                for (int k = 0; k < c; ++k)
+                {
+                    const int i = r * c + k;
+                    if (i >= n) return;
+                    drawCell (g, i, cellBounds (i));
+                }
+        }
+
+        void drawCell (juce::Graphics& g, int i, juce::Rectangle<float> cell)
+        {
+            const auto& cd = model.cells[(size_t) i];
+            const bool sel = model.isSelected (i);
+            const float dim = (manualOn ? 1.0f : 0.55f) * (cd.locked ? 0.45f : 1.0f);
+
+            if (sel)
+            {
+                g.setColour (juce::Colour (0xff2fb0c8).withAlpha (0.28f));
+                g.fillRoundedRectangle (cell.reduced (1.5f), 4.0f);
+                g.setColour (juce::Colour (0xff2fb0c8).withAlpha (i == model.anchor ? 0.95f : 0.5f));
+                g.drawRoundedRectangle (cell.reduced (1.5f), 4.0f, i == model.anchor ? 1.6f : 1.0f);
+            }
+            else if (i == hover)
+            {
+                g.setColour (juce::Colour (0x18ffffff));
+                g.fillRoundedRectangle (cell.reduced (1.5f), 4.0f);
+            }
+
+            auto body = cell.reduced (2.0f, 3.0f);
+            auto top  = body.removeFromTop (13.0f);
+            auto bot  = body.removeFromBottom (12.0f);
+
+            // Caption = the PARTIAL NUMBER: "3", never "3/1" (see partialNumberName).
+            g.setColour (juce::Colours::white.withAlpha (0.92f * dim));
+            g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+            g.drawText (juce::String::fromUTF8 (dissonance::partialNumberName (cd.ratio).c_str()),
+                        top.toNearestInt(), juce::Justification::centred, false);
+
+            // Knob: the arc runs the engine's whole range, and the coloured sweep starts
+            // at the ZERO tick, so the eye reads "how far from the compiled amplitude"
+            // rather than an absolute position that means nothing on its own.
+            const float rad = juce::jmin (body.getWidth(), body.getHeight()) * 0.44f;
+            const juce::Point<float> ctr { body.getCentreX(), body.getCentreY() };
+            constexpr float a0 = -2.356f, a1 = 2.356f;   // -135 deg .. +135 deg
+            const auto angleOf = [&] (float dB)
+            {
+                const float t = (dB - partialamp::kMinDb) / (partialamp::kMaxDb - partialamp::kMinDb);
+                return a0 + juce::jlimit (0.0f, 1.0f, t) * (a1 - a0);
+            };
+            const float aZero = angleOf (0.0f);
+            const float aVal  = angleOf (cd.dB);
+
+            juce::Path back;
+            back.addCentredArc (ctr.x, ctr.y, rad, rad, 0.0f, a0, a1, true);
+            g.setColour (juce::Colour (0xff39414f).withAlpha (dim));
+            g.strokePath (back, juce::PathStrokeType (2.5f));
+
+            const bool muted = partialamp::isMuted (cd.dB);
+            const juce::Colour vc = muted        ? juce::Colour (0xffe0453f)
+                                  : cd.dB > 0.0f ? juce::Colour (0xffffb020)
+                                  : cd.dB < 0.0f ? juce::Colour (0xff5cb8ff)
+                                                 : juce::Colour (0xff6c7488);
+            if (cd.dB != 0.0f)
+            {
+                juce::Path val;
+                val.addCentredArc (ctr.x, ctr.y, rad, rad, 0.0f,
+                                   juce::jmin (aZero, aVal), juce::jmax (aZero, aVal), true);
+                g.setColour (vc.withAlpha (dim));
+                g.strokePath (val, juce::PathStrokeType (2.8f));
+            }
+            // Zero tick: where this partial's own compiled amplitude sits.
+            g.setColour (juce::Colours::white.withAlpha (0.45f * dim));
+            {
+                const juce::Point<float> d { std::sin (aZero), -std::cos (aZero) };
+                g.drawLine (ctr.x + d.x * (rad - 3.0f), ctr.y + d.y * (rad - 3.0f),
+                            ctr.x + d.x * (rad + 3.0f), ctr.y + d.y * (rad + 3.0f), 1.0f);
+            }
+            // Pointer.
+            {
+                const juce::Point<float> d { std::sin (aVal), -std::cos (aVal) };
+                g.setColour (vc.withAlpha (dim));
+                g.drawLine (ctr.x + d.x * rad * 0.25f, ctr.y + d.y * rad * 0.25f,
+                            ctr.x + d.x * (rad - 1.0f), ctr.y + d.y * (rad - 1.0f), 2.0f);
+            }
+
+            // Read-out. MUTE is spelled out: "-120.0" would read as a number the user
+            // could nudge, when it is the point at which the partial stops sounding.
+            juce::String vt;
+            if (cd.locked)     vt = juce::String::fromUTF8 ("\xe2\x9c\x95");  // locked (see Cell::locked)
+            else if (muted)    vt = "MUTE";
+            else if (cd.dB == 0.0f) vt = "0.0";
+            else               vt = (cd.dB > 0.0f ? "+" : "") + juce::String (cd.dB, 1);
+            g.setColour ((cd.dB == 0.0f ? juce::Colour (0xff8f96a8) : vc).withAlpha (dim));
+            g.setFont (juce::Font (juce::FontOptions (10.5f).withStyle (cd.dB == 0.0f ? "Regular" : "Bold")));
+            g.drawText (vt, bot.toNearestInt(), juce::Justification::centred, false);
+        }
+
+        //-- interaction -------------------------------------------------------
+        int   hover = -1;
+        float dragStartY = 0.0f;
+
+        juce::String getTooltip() override
+        {
+            if (! model.valid (hover) || trF == nullptr) return {};
+            const auto& cd = model.cells[(size_t) hover];
+            const double natDb = cd.natural > 0.0f ? 20.0 * std::log10 ((double) cd.natural) : -144.0;
+            juce::String s;
+            s << trF ("Partial ", "Parcial ") << (hover + 1) << " / " << model.count()
+              << "   *" << juce::String::fromUTF8 (dissonance::partialNumberName (cd.ratio).c_str()) << "*\n"
+              << trF ("As compiled: `", "Tal com es compila: `") << juce::String (natDb, 1) << " dB`\n";
+            if (cd.locked)
+                s << trF ("!Locked!: this partial sits under 0.01 cent from the one below it, so an edit cannot be aimed at it separately.",
+                          "!Blocat!: aquest parcial \xc3\xa9s a menys de 0,01 cent del de sota, i una edici\xc3\xb3 no es pot dirigir nom\xc3\xa9s a ell.");
+            else if (partialamp::isMuted (cd.dB))
+                s << trF ("Your edit: *MUTE*. The partial is !still in the template! - it comes back on undo, or when manual mode goes off.",
+                          "La teva edici\xc3\xb3: *MUT*. El parcial !segueix a la plantilla! - torna amb un desfer, o quan apagues el mode manual.");
+            else
+                s << trF ("Your edit: `", "La teva edici\xc3\xb3: `") << (cd.dB > 0.0f ? "+" : "")
+                  << juce::String (cd.dB, 1) << trF (" dB`\nDrag up/down; Ctrl = fine; double-click = back to compiled.",
+                                                     " dB`\nArrossega amunt/avall; Ctrl = fi; doble clic = torna al compilat.");
+            return s;
+        }
+
+        void mouseMove (const juce::MouseEvent& e) override
+        {
+            const int h = cellAt (e.position);
+            if (h != hover)
+            {
+                if (model.valid (hover)) repaint (cellBounds (hover).getSmallestIntegerContainer());
+                hover = h;
+                if (model.valid (hover)) repaint (cellBounds (hover).getSmallestIntegerContainer());
+            }
+        }
+        void mouseExit (const juce::MouseEvent&) override
+        {
+            if (model.valid (hover)) repaint (cellBounds (hover).getSmallestIntegerContainer());
+            hover = -1;
+        }
+
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            const int i = cellAt (e.position);
+            if (i < 0) { model.clearSelection(); repaint(); return; }
+            if (e.mods.isShiftDown())
+            {
+                model.shiftClick (i);   // arm, then stretch (see Model::shiftClick)
+                repaint();
+                return;
+            }
+            if (! model.isSelected (i)) { model.clearSelection(); repaint(); }
+            dragStartY = e.position.y;
+            model.beginDrag (i);
+            if (onGestureStart) onGestureStart();
+        }
+        void mouseDrag (const juce::MouseEvent& e) override
+        {
+            if (! model.dragging()) return;
+            const float perPx = e.mods.isCtrlDown() ? partialamp::kDbPerPixelFine
+                                                    : partialamp::kDbPerPixel;
+            if (model.applyDragDelta ((dragStartY - e.position.y) * perPx))
+            {
+                repaintDragSet();
+                if (onEdited) onEdited();
+            }
+        }
+        void mouseUp (const juce::MouseEvent&) override
+        {
+            if (! model.dragging()) return;
+            model.endDrag();
+            if (onGestureEnd) onGestureEnd();
+        }
+        void mouseDoubleClick (const juce::MouseEvent& e) override
+        {
+            const int i = cellAt (e.position);
+            if (i < 0) return;
+            const auto set = model.dragSetFor (i);
+            if (onGestureStart) onGestureStart();
+            if (model.resetSet (set)) { repaint(); if (onEdited) onEdited(); }
+            if (onGestureEnd) onGestureEnd();
+        }
+        void repaintDragSet()
+        {
+            // A selection can be thousands of cells; repainting each rect separately is
+            // slower than one pass over the visible rows.
+            if (model.dragIdx.size() > 24) repaint();
+            else for (int k : model.dragIdx) repaint (cellBounds (k).getSmallestIntegerContainer());
+        }
+    };
+
+    // The window's contents: the linked ON/OFF, the two facts that surprise everyone,
+    // the honest counters, and the scrolling grid.
+    struct PartialAmpPanel : juce::Component
+    {
+        FractalAdditiveAudioProcessor* proc = nullptr;
+        std::function<juce::String (const char*, const char*)> trF;
+        std::function<void()> onEdited;                     // editor: refresh the slope cell
+
+        juce::ToggleButton onT;                             // twin of the pill under the pencil
+        std::unique_ptr<ButtonAttachment> onAtt;
+        juce::TextButton   resetAllB;
+        juce::Label        headLbl, factsLbl, statLbl, warnLbl;
+        juce::Viewport     view;
+        PartialAmpGrid     grid;
+        // Its own TooltipWindow, PARENTED to this panel. The editor's is parented to the
+        // editor, and a tooltip window only serves its own parent's subtree - so in a
+        // separate top-level window every hover read-out here was simply invisible.
+        juce::TooltipWindow tooltips { this, 350 };
+
+        // Edits that bound to no partial of the CURRENT spectrum. Kept verbatim and
+        // merged back on every write - see partialamp::mergedGains.
+        std::vector<spectrum::PartialGain> homeless;
+        std::vector<spectrum::PartialGain> gestureBefore;   // for one undo step per drag
+        juce::uint32 lastGen = 0;
+        unsigned     lastRev = 0;
+        bool         haveSynced = false;
+
+        PartialAmpPanel()
+        {
+            onT.setName ("onled");
+            addAndMakeVisible (onT);
+            resetAllB.setColour (juce::TextButton::buttonColourId, juce::Colour (0xffe0453f));
+            resetAllB.setMouseClickGrabsKeyboardFocus (false);
+            resetAllB.onClick = [this] { resetEverything(); };
+            addAndMakeVisible (resetAllB);
+            for (auto* l : { &headLbl, &factsLbl, &statLbl, &warnLbl })
+            {
+                l->setInterceptsMouseClicks (false, false);
+                addAndMakeVisible (*l);
+            }
+            headLbl.setFont (juce::Font (juce::FontOptions (15.0f).withStyle ("Bold")));
+            headLbl.setColour (juce::Label::textColourId, juce::Colour (0xff5cb8ff));
+            factsLbl.setFont (juce::Font (juce::FontOptions (11.5f)));
+            factsLbl.setColour (juce::Label::textColourId, juce::Colour (0xffc4ccda));
+            statLbl.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+            statLbl.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
+            warnLbl.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+            warnLbl.setColour (juce::Label::textColourId, juce::Colour (0xffffb020));
+            view.setViewedComponent (&grid, false);
+            view.setScrollBarsShown (true, false);
+            addAndMakeVisible (view);
+        }
+
+        void init (FractalAdditiveAudioProcessor& p)
+        {
+            proc = &p;
+            grid.onGestureStart = [this] { gestureBefore = proc->getPartialGains(); };
+            grid.onEdited       = [this] { pushGains(); };
+            grid.onGestureEnd   = [this]
+            {
+                // ONE undo step per gesture: pushing per frame filled the stack with
+                // hundreds of micro-moves and made Ctrl+Z useless on a hand-drawn curve.
+                proc->commitPartialGains (gestureBefore, proc->getPartialGains());
+                lastRev = proc->getPartialGainsRevision();
+                refreshText();
+            };
+            onAtt = std::make_unique<ButtonAttachment> (proc->apvts, "partialManual", onT);
+        }
+
+        bool manualOn() const
+        {
+            return proc != nullptr && proc->apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+        }
+
+        void pushGains()
+        {
+            if (proc == nullptr) return;
+            proc->setPartialGains (partialamp::mergedGains (grid.model, homeless), manualOn());
+            lastRev = proc->getPartialGainsRevision();
+            refreshText();
+            if (onEdited) onEdited();
+        }
+
+        void resetEverything()
+        {
+            if (proc == nullptr) return;
+            // Clears the visible knobs AND the homeless edits: this button says "no
+            // hand-drawn amplitudes at all", so leaving invisible ones behind to
+            // reappear later would be a lie. One undo step brings the lot back.
+            const auto before = proc->getPartialGains();
+            for (auto& c : grid.model.cells) c.dB = 0.0f;
+            homeless.clear();
+            proc->setPartialGains ({}, manualOn());
+            proc->commitPartialGains (before, {});
+            lastRev = proc->getPartialGainsRevision();
+            grid.repaint();
+            refreshText();
+            if (onEdited) onEdited();
+        }
+
+        //-- keeping up with the spectrum --------------------------------------
+        // Called on the editor's 30 Hz timer. The template is rebuilt by a background
+        // thread on every Base/Fractal/prime/tuning change, so the knob list has to
+        // follow it; and the stored edits can change without any template change at all
+        // (an undo, a preset, a reload), which is what the revision counter catches.
+        void syncIfNeeded()
+        {
+            if (proc == nullptr || grid.model.dragging()) return;   // never mid-gesture
+            const auto gen = proc->getTemplateGeneration();
+            const auto rev = proc->getPartialGainsRevision();
+            if (haveSynced && gen == lastGen && rev == lastRev) return;
+            lastGen = gen; lastRev = rev; haveSynced = true;
+            resync();
+        }
+
+        void resync()
+        {
+            if (proc == nullptr) return;
+            const auto* t = proc->getLiveTemplate();
+
+            std::vector<partialamp::Cell> cells;
+            if (t != nullptr)
+            {
+                cells.reserve (t->partials.size());
+                for (const auto& p : t->partials)
+                    cells.push_back ({ (double) p.ratio, p.amp, spectrum::gainKey ((double) p.ratio), 0.0f, false });
+            }
+
+            // Which stored edit belongs to which knob is decided by the SAME pass the
+            // audio uses (bindGains), never by a second rule invented here - a knob must
+            // not show an edit that some other partial is actually getting.
+            const auto& stored = proc->getPartialGains();
+            homeless.clear();
+            if (t != nullptr && ! stored.empty())
+            {
+                std::vector<int> where;
+                spectrum::bindGains (t->partials, stored, where);
+                for (size_t j = 0; j < stored.size(); ++j)
+                {
+                    if (where[j] >= 0) cells[(size_t) where[j]].dB = stored[j].dB;
+                    else               homeless.push_back (stored[j]);
+                }
+            }
+            else
+            {
+                homeless = stored;
+            }
+
+            // Keep the selection across a rebuild that did not actually move the
+            // partials (the spectrum is republished on every override write, and losing
+            // a 200-knob selection to that would make range editing impossible).
+            const bool same = grid.model.cells.size() == cells.size()
+                && std::equal (cells.begin(), cells.end(), grid.model.cells.begin(),
+                               [] (const partialamp::Cell& a, const partialamp::Cell& b)
+                               { return a.key == b.key; });
+            std::vector<char> keepSel;
+            int keepAnchor = -1;
+            if (same) { keepSel = grid.model.sel; keepAnchor = grid.model.anchor; }
+            grid.model.setCells (std::move (cells));
+            if (same) { grid.model.sel = std::move (keepSel); grid.model.anchor = keepAnchor; }
+
+            layoutGrid();
+            refreshText();
+            grid.repaint();
+        }
+
+        void refreshText()
+        {
+            if (proc == nullptr || trF == nullptr) return;
+            grid.manualOn = manualOn();
+
+            const int n       = grid.model.count();
+            const int edited  = grid.model.editedCount();
+            const int lockedN = grid.model.lockedCount();
+            juce::String s;
+            s << n << trF (" partials", " parcials") << "   \xc2\xb7   "
+              << edited << trF (" edited", " editats");
+            if (! homeless.empty())
+                s << "   \xc2\xb7   " << (int) homeless.size()
+                  << trF (" waiting for their partial (kept)", " esperant el seu parcial (desats)");
+            if (lockedN > 0)
+                s << "   \xc2\xb7   " << lockedN << trF (" locked (under 0.01\xc2\xa2 apart)",
+                                                          " blocats (a menys de 0,01\xc2\xa2)");
+            statLbl.setText (s, juce::dontSendNotification);
+
+            juce::String w;
+            if (! manualOn())
+                w << trF ("MANUAL IS OFF - these knobs are stored but not sounding. Switch it on here or under the pencil.",
+                          "EL MODE MANUAL \xc3\x89S APAGAT - aquests controls es desen per\xc3\xb2 no sonen. Activa'l aqu\xc3\xad o sota el llapis.");
+            if (proc->isSpectrumTruncated())
+            {
+                if (w.isNotEmpty()) w << "\n";
+                w << trF ("TRUNCATED: the spectrum hit the ", "TRUNCAT: l'espectre ha topat amb el sostre de ")
+                  << spectrum::kMaxPartials
+                  << trF ("-partial ceiling (", " parcials (") << proc->getRawPartialCount()
+                  << trF (" wanted). The partials the cap removed are NOT in this list.",
+                          " en volia). Els parcials que el sostre ha tret NO s\xc3\xb3n en aquesta llista.");
+            }
+            const bool hadBanner = warnLbl.getText().isNotEmpty();
+            warnLbl.setText (w, juce::dontSendNotification);
+            warnLbl.setColour (juce::Label::textColourId,
+                               proc->isSpectrumTruncated() ? juce::Colour (0xffe0453f)
+                                                           : juce::Colour (0xffffb020));
+            // The banner's row is zero-height when there is nothing to say, so its
+            // appearing has to re-run the layout or the text would land in a 0 px strip
+            // and the truncation warning - the one message that must never be missed -
+            // would be invisible.
+            if (hadBanner != w.isNotEmpty()) resized();
+        }
+
+        void applyLanguage()
+        {
+            if (trF == nullptr) return;
+            headLbl.setText (trF ("PARTIAL AMPLITUDES", "AMPLITUDS DELS PARCIALS"), juce::dontSendNotification);
+            onT.setButtonText ({});
+            resetAllB.setButtonText (trF ("Reset all", "Reinicia-ho tot"));
+            resetAllB.setTooltip (trF ("Drop every per-partial edit, including the ones whose partial is not in this spectrum right now. One Ctrl+Z brings them all back.",
+                                       "Descarta totes les edicions per parcial, incloses les dels parcials que ara no hi s\xc3\xb3n. Un sol Ctrl+Z les torna totes."));
+            onT.setTooltip (trF ("Manual per-partial amplitudes. The SAME switch as the one under the pencil - one control in two places. While it is on, SLOPE is frozen.",
+                                 "Amplituds manuals per parcial. \xc3\x89s EL MATEIX interruptor que el de sota el llapis - un control en dos llocs. Mentre estigui actiu, el PENDENT queda congelat."));
+            // The two things that surprise everyone, on screen rather than in a tooltip
+            // nobody opens: they are not bugs and they are not reversible by guessing.
+            factsLbl.setText (trF (
+                "Pulling one partial DOWN lifts the others: the voice rebuilds its normalisation from these targets every sample, so this redistributes the sound, it does not attenuate it.\n"
+                "A partial at MUTE is still in the template - it comes straight back with Ctrl+Z, or when manual mode goes off. Nothing here removes a partial.\n"
+                "SHIFT+click a knob, then SHIFT+click another: both and everything between are selected, and a drag moves the whole selection.",
+                "Abaixar un parcial PUJA els altres: la veu reconstrueix la normalitzaci\xc3\xb3 des d'aquests objectius a cada mostra, aix\xc3\xad que aix\xc3\xb2 redistribueix el so, no l'atenua.\n"
+                "Un parcial en MUT segueix a la plantilla - torna de seguida amb Ctrl+Z, o quan apagues el mode manual. Res d'aqu\xc3\xad no treu cap parcial.\n"
+                "SHIFT+clic en un control i SHIFT+clic en un altre: se seleccionen tots dos i tot el que hi ha entremig, i arrossegar mou tota la selecci\xc3\xb3."),
+                juce::dontSendNotification);
+            refreshText();
+        }
+
+        void layoutGrid()
+        {
+            grid.setSize (juce::jmax (60, view.getWidth() - (view.isVerticalScrollBarShown() ? 10 : 0)),
+                          grid.contentHeight());
+            // The height depends on the column count, which depends on the width the
+            // scrollbar leaves: settle it in a second pass or a spectrum that only just
+            // needs scrolling ends one row short of its last partials.
+            grid.setSize (juce::jmax (60, view.getWidth() - (view.isVerticalScrollBarShown() ? 10 : 0)),
+                          grid.contentHeight());
+        }
+
+        void resized() override
+        {
+            auto r = getLocalBounds().reduced (10, 8);
+            auto head = r.removeFromTop (26);
+            resetAllB.setBounds (head.removeFromRight (96).reduced (0, 2));
+            head.removeFromRight (8);
+            onT.setBounds (head.removeFromRight (58).reduced (0, 2));
+            head.removeFromRight (8);
+            headLbl.setBounds (head);
+            r.removeFromTop (2);
+            statLbl.setBounds (r.removeFromTop (16));
+            factsLbl.setBounds (r.removeFromTop (52));
+            warnLbl.setBounds (r.removeFromTop (warnLbl.getText().isEmpty() ? 0 : 32));
+            r.removeFromTop (4);
+            view.setBounds (r);
+            layoutGrid();
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            g.fillAll (juce::Colour (0xff0e1118));
+            g.setColour (juce::Colour (0xff5cb8ff).withAlpha (0.25f));
+            g.drawHorizontalLine (view.getY() - 3, (float) view.getX(), (float) view.getRight());
+        }
+
+        // Clicking anywhere empty drops the selection - the same "click outside to
+        // deselect" every list in this plugin has.
+        void mouseDown (const juce::MouseEvent&) override
+        { grid.model.clearSelection(); grid.repaint(); }
+    };
+
+    // A REAL window, not an in-editor overlay: with up to 16384 knobs the useful size
+    // is "as big as the screen", which a panel clipped to the plugin's own 1200x650
+    // could never be. Resizable, and it keeps its size for the session.
+    struct PartialAmpWindow : juce::DocumentWindow
+    {
+        std::function<void()> onHide;
+        explicit PartialAmpWindow (const juce::String& name)
+            : juce::DocumentWindow (name, juce::Colour (0xff0e1118), juce::DocumentWindow::closeButton)
+        {
+            setUsingNativeTitleBar (true);
+            setResizable (true, false);
+            setResizeLimits (320, 240, 6000, 4000);
+        }
+        void closeButtonPressed() override { if (onHide) onHide(); }
+    };
+
     // Floating centre panel that explains WHY the current settings are silent.
     struct WarningOverlay : juce::Component
     {
@@ -1864,6 +2450,20 @@ private:
     juce::ToggleButton temperToggle; // Custom Engine: temper harmonic partials to the loaded .scl
     std::unique_ptr<ButtonAttachment> temperAtt;
     std::unique_ptr<SliderAttachment> primeLimitFaderAtt;
+    // SLOPE cell: the pencil that opens the per-partial amplitude window, and the ON/OFF
+    // pill under it. The pill and the one INSIDE the window are two attachments to the
+    // same "partialManual" parameter - that is what makes them one control in two
+    // places, and it is why switching either one is automatable and undoable.
+    PencilButton                      partialEditBtn;
+    juce::ToggleButton                partialManualT;
+    std::unique_ptr<ButtonAttachment> partialManualAtt;
+    PartialAmpPanel                   partialPanel;
+    // Declared AFTER the panel it shows, so it is torn down FIRST: the window holds the
+    // panel as non-owned content and must not outlive it.
+    std::unique_ptr<PartialAmpWindow> partialWindow;
+    // -1 = not applied yet, so the first timer tick (and every language switch, which
+    // resets it) writes the slope fader's frozen/normal look and its bilingual tooltip.
+    int   lastManualFrozenShown = -1;
     juce::Slider       morphTimeFader;
     juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
     int                undoTxnTick = 0; // paces the tuning-bank combo refresh

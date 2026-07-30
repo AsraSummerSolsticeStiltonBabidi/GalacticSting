@@ -9,6 +9,7 @@
 #include "dsp/Spectrum.h"
 #include "dsp/Dissonance.h"
 #include "dsp/PartialGains.h"
+#include "PartialAmpEdit.h"
 
 #include <algorithm>
 #include <chrono>
@@ -716,6 +717,153 @@ int main()
             for (float v : scale) if (v != 1.0f) allUnity = false;
             check (m == 0 && allUnity && ov.size() == before,
                    "an edit whose partial is not in the spectrum applies to nothing and is kept");
+        }
+
+        // bindGains is what the amplitude EDITOR reads to decide which knob owns which
+        // stored edit; resolveGains is what the AUDIO applies. They are the same pass, so
+        // they can never disagree about the pairing - which is the whole point of it
+        // being one function. If they ever could, a knob would show an edit that a
+        // different partial was actually getting.
+        {
+            std::vector<PartialGain> ov;
+            setPartialGain (ov, gainKey (2.0), -9.0f);
+            setPartialGain (ov, gainKey (7.0), +4.5f);           // present
+            setPartialGain (ov, gainKey (3.0) + 40, -6.0f);      // 0.4 c off: homeless
+            std::vector<int> where;
+            const int m = bindGains (plain.partials, ov, where);
+            const int i2 = indexOfRatio (plain, 2.0), i7 = indexOfRatio (plain, 7.0);
+            check (m == 2 && where.size() == 3
+                   && where[0] == i2 && where[1] == -1 && where[2] == i7,
+                   "bindGains reports the exact partial index of each edit, -1 when homeless");
+
+            resolveGains (plain.partials, ov, scale);
+            bool agree = true;
+            for (size_t j = 0; j < ov.size(); ++j)
+                if (where[j] >= 0
+                    && std::abs (scale[(size_t) where[j]] - gainScaleOf (ov[j].dB)) > 1.0e-6f)
+                    agree = false;
+            check (agree, "the index bindGains reports is the one resolveGains multiplied");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // Knob CAPTIONS. The editor labels each knob with the partial number, and a
+    // denominator of 1 is noise there ("3", not "3/1"). Nothing else may change: a
+    // caption that dropped the /2 of 3/2 would name a partial that does not exist.
+    std::printf ("partial-number captions:\n");
+    {
+        using dissonance::partialNumberName;
+        check (partialNumberName (1.0) == "1" && partialNumberName (3.0) == "3"
+               && partialNumberName (16.0) == "16",
+               "whole ratios lose the /1: 3, not 3/1");
+        check (partialNumberName (1.5) == "3/2" && partialNumberName (7.0 / 4.0) == "7/4",
+               "a real fraction keeps its denominator");
+        check (partialNumberName (11.0) == "11" && dissonance::justIntervalName (11.0) == "11/1",
+               "only the caption is shortened - the strict label still says 11/1");
+        // 100 cents is not a ratio this engine can name exactly: it must stay in cents,
+        // or a tempered partial would be captioned as a just interval it is not.
+        check (partialNumberName (std::pow (2.0, 100.0 / 1200.0)).find ("/") == std::string::npos,
+               "an inexact ratio still shows cents, never an invented fraction");
+    }
+
+    //--------------------------------------------------------------------------
+    // The amplitude editor's selection + drag arithmetic (PartialAmpEdit.h). These are
+    // the rules a user notices immediately when they break, and the window itself is
+    // not reachable from any test target - so they live outside the Component.
+    std::printf ("partial amplitude editor, selection and drag:\n");
+    {
+        auto build = [] (int n, bool duplicateKey = false)
+        {
+            partialamp::Model m;
+            std::vector<partialamp::Cell> c;
+            for (int i = 0; i < n; ++i)
+            {
+                const double ratio = (double) (i + 1);
+                c.push_back ({ ratio, 0.5f, gainKey (ratio), 0.0f, false });
+            }
+            // Two partials inside one 0.01 c key bin: only the lower can hold an edit.
+            if (duplicateKey && n >= 3) c[2].key = c[1].key;
+            m.setCells (std::move (c));
+            return m;
+        };
+
+        {
+            auto m = build (10);
+            m.shiftClick (2);
+            check (m.selectionCount() == 1 && m.isSelected (2) && m.anchor == 2,
+                   "the first SHIFT+click selects one knob and arms the anchor");
+            m.shiftClick (6);
+            bool range = m.selectionCount() == 5;
+            for (int k = 2; k <= 6; ++k) range = range && m.isSelected (k);
+            check (range && m.anchor == 2,
+                   "the second SHIFT+click selects both ends and everything between them");
+            m.shiftClick (0);
+            bool back = m.selectionCount() == 3 && m.isSelected (0) && m.isSelected (1)
+                     && m.isSelected (2) && ! m.isSelected (3);
+            check (back, "the anchor stays put, so a further SHIFT+click re-stretches the same range");
+        }
+
+        // A drag on a knob INSIDE the selection moves all of it; on one outside, only it.
+        {
+            auto m = build (10);
+            m.shiftClick (3); m.shiftClick (5);
+            check (m.dragSetFor (4).size() == 3, "dragging inside the selection moves the whole selection");
+            check (m.dragSetFor (8).size() == 1, "dragging outside it moves that knob alone");
+        }
+
+        // One delta, clamped PER knob and measured from each knob's own start: the knob
+        // that hits the ceiling must not freeze the others, and dragging back must
+        // restore the original spacing instead of leaving them collapsed on the limit.
+        {
+            auto m = build (4);
+            m.cells[0].dB = 20.0f;
+            m.cells[1].dB = 0.0f;
+            m.sel[0] = m.sel[1] = 1;
+            m.anchor = 0;
+            m.beginDrag (0);
+            m.applyDragDelta (10.0f);
+            check (m.cells[0].dB == partialamp::kMaxDb && m.cells[1].dB == 10.0f,
+                   "one knob clamping at +24 dB does not stop the rest of the selection");
+            m.applyDragDelta (0.0f);
+            check (m.cells[0].dB == 20.0f && m.cells[1].dB == 0.0f,
+                   "dragging back restores the selection's original spacing exactly");
+            m.applyDragDelta (-500.0f);
+            check (m.cells[0].dB == partialamp::kMinDb && partialamp::isMuted (m.cells[0].dB)
+                   && m.cells[1].dB == partialamp::kMinDb,
+                   "the bottom of the travel is the engine's mute, and it is reachable");
+        }
+
+        // A partial sharing a key with its neighbour cannot receive an edit (the binding
+        // is one-to-one), so it must be locked rather than allowed to move and be ignored.
+        {
+            auto m = build (5, true);
+            check (m.cells[2].locked && m.lockedCount() == 1,
+                   "a partial inside its neighbour's 0.01 c key bin is locked, and counted");
+            m.sel[1] = m.sel[2] = 1;
+            check (m.dragSetFor (1).size() == 1, "a locked knob is left out of a selection drag");
+            m.beginDrag (2);
+            m.applyDragDelta (12.0f);
+            check (m.cells[2].dB == 0.0f, "and dragging it directly does nothing at all");
+        }
+
+        // Writing the knobs back must never delete an edit whose partial is missing from
+        // the CURRENT spectrum: that is a hand-drawn amplitude the user still owns.
+        {
+            auto m = build (4);
+            m.cells[1].dB = -6.0f;
+            m.cells[3].dB = +3.0f;
+            std::vector<PartialGain> homeless { { gainKey (2.5), -12.0f }, { gainKey (9.0), +1.0f } };
+            const auto out = partialamp::mergedGains (m, homeless);
+            bool sorted = true;
+            for (size_t i = 1; i < out.size(); ++i) sorted = sorted && out[i - 1].key < out[i].key;
+            bool hasHomeless = false, hasEdits = false;
+            for (const auto& g : out)
+            {
+                if (g.key == gainKey (2.5) && g.dB == -12.0f) hasHomeless = true;
+                if (g.key == gainKey (4.0) && g.dB == 3.0f)   hasEdits = true;
+            }
+            check (out.size() == 4 && sorted && hasHomeless && hasEdits,
+                   "the written list keeps the homeless edits and stays sorted by key");
         }
     }
 

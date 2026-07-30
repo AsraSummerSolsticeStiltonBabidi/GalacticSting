@@ -78,6 +78,19 @@ namespace dissonance
         return std::to_string ((long long) std::llround (centsR)) + "\xc2\xa2"; // cent sign
     }
 
+    // The same label with the "/1" left off a whole-number ratio: the amplitude
+    // editor's knob captions are read as PARTIAL NUMBERS - "3", not "3/1" - and a
+    // denominator that is always 1 is noise on a knob 40 px wide. Nothing else is
+    // touched: 3/2 stays 3/2 and an inexact ratio still shows its cents, so the
+    // caption never claims a ratio the partial does not have.
+    inline std::string partialNumberName (double ratio, double exactTolCents = 0.5)
+    {
+        auto s = justIntervalName (ratio, exactTolCents);
+        if (s.size() > 2 && s.compare (s.size() - 2, 2, "/1") == 0)
+            s.erase (s.size() - 2);
+        return s;
+    }
+
     // Sethares' pairwise sensory-dissonance measure (verbatim constants).
     inline double dissmeasure (std::vector<Partial> p)
     {

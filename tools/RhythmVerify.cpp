@@ -1971,6 +1971,33 @@ int main()
         check (muted > onS1 * 1.15,
                "a per-partial edit reaches the audio (muting the fundamental brightens it)");
 
+        // The ON/OFF SWITCH itself, which the editor now puts in two places. The engine
+        // only learns whether the edits are in force through setOverrides, so when the
+        // switch moved on its own - the pill in the window, the pill under the pencil,
+        // host automation - a whole hand-drawn spectrum stayed silent and the control
+        // looked broken. It has to work from either direction.
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr2, eb);
+            std::vector<spectrum::PartialGain> ov;
+            spectrum::setPartialGain (ov, spectrum::gainKey (1.0), spectrum::kGainMutedDb);
+            p->setPartialGains (ov, false);            // stored, switch still OFF
+            p->pollParametersForTests();
+            const int offMatched = p->getPartialGainsMatched();
+            if (auto* q = p->apvts.getParameter ("partialManual"))
+                q->setValueNotifyingHost (1.0f);
+            p->pollParametersForTests();               // the switch alone, nothing else
+            const int onMatched = p->getPartialGainsMatched();
+            if (auto* q = p->apvts.getParameter ("partialManual"))
+                q->setValueNotifyingHost (0.0f);
+            p->pollParametersForTests();
+            const int backOff = p->getPartialGainsMatched();
+            std::printf ("  edits in force: switch off=%d  on=%d  off again=%d\n",
+                         offMatched, onMatched, backOff);
+            check (offMatched == 0 && onMatched == 1 && backOff == 0,
+                   "moving the manual switch alone puts the stored edits in force, and takes them back out");
+        }
+
         // The edits must come back with the project. Losing a hand-drawn spectrum on
         // reopening would be the same class of injury as the MTS-ESP overwrite.
         {
@@ -1994,6 +2021,61 @@ int main()
             for (size_t i = 0; i < back.size() && same; ++i)
                 same = back[i].key == ov[i].key && std::abs (back[i].dB - ov[i].dB) < 0.01f;
             check (same, "per-partial edits survive a save and reload, keys and dB intact");
+        }
+
+        // The amplitude WINDOW's two lifelines. Both were absent when the knobs were
+        // first wired up, and both are invisible until they bite:
+        //  - one undo step per drag gesture (the edits are not APVTS parameters, so
+        //    nothing put them on the stack: Ctrl+Z sailed past a hand-drawn spectrum);
+        //  - a revision counter, because the window cannot watch the template generation
+        //    for this (setOverrides deliberately never bumps it) and so had no way to
+        //    notice an undo, a preset or a reload changing the edits underneath it.
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr2, eb);
+
+            std::vector<spectrum::PartialGain> before, after;
+            spectrum::setPartialGain (before, spectrum::gainKey (2.0), -6.0f);
+            after = before;
+            spectrum::setPartialGain (after, spectrum::gainKey (2.0), -18.0f);
+            spectrum::setPartialGain (after, spectrum::gainKey (5.0), spectrum::kGainMutedDb);
+
+            p->setPartialGains (before, true);
+            const unsigned rev0 = p->getPartialGainsRevision();
+            p->setPartialGains (after, true);
+            const unsigned rev1 = p->getPartialGainsRevision();
+            p->commitPartialGains (before, after);
+            const unsigned rev2 = p->getPartialGainsRevision();
+            std::printf ("  gain revision: after 1st write=%u  2nd=%u  after commit=%u\n", rev0, rev1, rev2);
+            check (rev1 != rev0, "every write to the per-partial edits bumps the revision counter");
+
+            p->undoManager.undo();
+            const auto back = p->getPartialGains();
+            bool restored = back.size() == before.size();
+            for (size_t i = 0; i < back.size() && restored; ++i)
+                restored = back[i].key == before[i].key && back[i].dB == before[i].dB;
+            check (restored, "Ctrl+Z takes a whole drag gesture's per-partial edits back at once");
+            check (p->getPartialGainsRevision() != rev2,
+                   "and the undo bumps the revision, so an open editor window resyncs to it");
+
+            p->undoManager.redo();
+            const auto fwd = p->getPartialGains();
+            bool redone = fwd.size() == after.size();
+            for (size_t i = 0; i < fwd.size() && redone; ++i)
+                redone = fwd[i].key == after[i].key && fwd[i].dB == after[i].dB;
+            check (redone, "Ctrl+Y brings the edits forward again, mute included");
+
+            // A click that moved nothing must not push a transaction, or Ctrl+Z would
+            // start eating perfectly good earlier edits.
+            const int depthBefore = p->undoManager.getNumActionsInCurrentTransaction();
+            p->commitPartialGains (fwd, fwd);
+            p->undoManager.undo();
+            const auto still = p->getPartialGains();
+            bool untouched = still.size() == before.size();
+            for (size_t i = 0; i < still.size() && untouched; ++i)
+                untouched = still[i].key == before[i].key && still[i].dB == before[i].dB;
+            juce::ignoreUnused (depthBefore);
+            check (untouched, "a gesture that changed nothing pushes nothing, so undo still steps over real edits");
         }
     }
 

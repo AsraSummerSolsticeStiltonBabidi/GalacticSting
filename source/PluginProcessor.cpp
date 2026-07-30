@@ -513,6 +513,12 @@ void FractalAdditiveAudioProcessor::timerCallback()
         {
             if (man) manualSlopeFrozen = apvts.getRawParameterValue ("curveSlope")->load();
             lastManualMode = man;
+            // ...and hand the engine the switch's new state. It only learns whether the
+            // edits are in force through setOverrides, so with nothing pushing here the
+            // parameter could go ON with a whole hand-drawn spectrum stored and NOTHING
+            // would happen - the switch looked broken. Also the reverse: OFF has to
+            // release the edits so the compiled amplitudes come back.
+            setPartialGains (partialGains, man);
         }
     }
 
@@ -2455,8 +2461,11 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
                        [] (const spectrum::PartialGain& a, const spectrum::PartialGain& b)
                        { return a.key < b.key; });
         }
-        spectrumEngine.setOverrides (partialGains,
-                                     apvts.getRawParameterValue ("partialManual")->load() > 0.5f);
+        // Through setPartialGains, not the engine directly, so the revision counter is
+        // bumped: an open amplitude window would otherwise keep showing the PREVIOUS
+        // project's knob positions after a reload (its resync watches that counter).
+        setPartialGains (partialGains,
+                         apvts.getRawParameterValue ("partialManual")->load() > 0.5f);
     }
 
     // Tuning bank slots.
