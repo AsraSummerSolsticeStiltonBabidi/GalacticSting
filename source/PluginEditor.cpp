@@ -189,11 +189,8 @@ namespace
         return p;
     }
 
-    // Measure a title chip EXACTLY as drawTitleChip will draw it: same 13px bold font,
-    // same auto-shrink for long Catalan titles, same 11px of padding. The SPECTRUM
-    // header lays real child buttons out to the RIGHT of a chip that is PAINTED, so the
-    // measurement and the drawing must agree to the pixel or the first chip lands on
-    // top of the title. (Hence one function, called from both.)
+    // The font a title chip is drawn in, and the width the chip ends up: 13px bold,
+    // auto-shrunk for a long Catalan title, plus 11px of padding.
     juce::Font titleChipFont (const juce::String& upper, float maxW, float& chipWOut)
     {
         auto measure = [&] (const juce::Font& f)
@@ -214,12 +211,10 @@ namespace
         chipWOut = juce::jmin (maxW, w + 11.0f);
         return tf;
     }
-    float titleChipWidth (const juce::String& text, float boxW)
-    {
-        float w = 0.0f;
-        titleChipFont (text.toUpperCase(), boxW - 4.0f, w);
-        return w;
-    }
+    // (titleChipWidth() lived here: it measured the painted SPECTRUM title so real child
+    // buttons could be laid out to its RIGHT, on the panel's top line. The engine chips
+    // sit UNDER the title now, like the modulator tabs, so nothing needs that measurement
+    // and a helper with no callers is dead weight.)
 
     // Draws a menu title inside an ANGULAR (sharp-cornered) chip filled with the
     // section colour, bounded to the text, at the top-left of `box` - just like the
@@ -882,15 +877,20 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         catalan = (lang == "ca" || lang.startsWith ("ca-") || lang.startsWith ("ca_"));
     }
 
-    //== SPECTRUM header: the three engine states as chips ======================
-    // The whole point: the three branches of engineInForce() are mutually exclusive, so
-    // they get one strip with exactly one chip lit, and clicking a chip is how you leave
-    // an override. Before this, temper mode was invisible - nothing on screen said the
-    // Custom Engine's scale was being bypassed.
+    //== SPECTRUM: the two ENGINES as a tab strip under the panel title =========
+    // Built like the modulator tabs (AMP / PITCH / FILTER / CUSTOM): a chip row
+    // directly under the box title, exactly one lit, and the selected one's colour
+    // worn by the WHOLE panel - frame, title chip and interior tint - so which engine
+    // is making the sound is readable from across the room instead of from one small
+    // highlighted rectangle on a neutral steel box.
+    //
+    // Two chips, not three: TEMPERED is a MODE of the harmonic engine, not a third
+    // engine, and it is back where it belongs - a tick box inside the CUSTOM ENGINE
+    // box, whose scale it bypasses. So the strip names the two things that can build a
+    // spectrum, and temper mode lights HARMONIC (which is what is generating then).
     {
-        const juce::Colour chipCol[3] = { cHarmonic, cTimbre, cTuning }; // TEMPERED is the
-                                        // TUNING box's colour: that is where its grid comes from
-        for (int i = 0; i < 3; ++i)
+        const juce::Colour chipCol[2] = { cHarmonic, cTimbre };
+        for (int i = 0; i < 2; ++i)
         {
             engineChip[i].setColour (juce::TextButton::buttonColourId, chipCol[i]);
             engineChip[i].setMouseClickGrabsKeyboardFocus (false);
@@ -914,11 +914,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         { setTemper (false); processorRef.setTimbreEnabled (false); applyEngineState(); resized(); refocus(); };
         engineChip[1].onClick = [this, setTemper]
         { setTemper (false); processorRef.setTimbreEnabled (true);  applyEngineState(); resized(); refocus(); };
-        engineChip[2].onClick = [this, setTemper]
-        { setTemper (true);                                          applyEngineState(); resized(); refocus(); };
-        // Right-click still maps a modulator onto the parameter each chip owns.
+        // Right-click still maps a modulator onto the parameter the CUSTOM chip owns.
         addMapListener (engineChip[1], "timbreOn");
-        addMapListener (engineChip[2], "timbreTemper");
     }
 
     // Harmonic Engine box (nested in SPECTRUM): one framed box, one colour, with the
@@ -1507,11 +1504,13 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         resized(); refocus();
     };
     addAndMakeVisible (clearTimbreButton);
-    // TEMPER is the HARMONIC engine's own mode (its partials snap to the ACTIVE TUNING),
-    // so it lives in THAT box - not, as before, inside the Custom Engine box whose scale
-    // it bypasses. It is also the one control in there that keeps working while the box
-    // is dimmed by a custom scale (switching it on is how you take the engine back), so
-    // applyEngineState() deliberately never greys it.
+    // TEMPER is chosen from inside the CUSTOM ENGINE box, where it always was: it is the
+    // switch that decides whether this box's scale is the spectrum or is bypassed, so it
+    // belongs with the thing it acts on. Its TICK is the harmonic engine's blue, because
+    // that is the engine it hands the spectrum back to.
+    // It is never greyed: it works whatever engine is in force (it is the way OUT of a
+    // custom-scale override), so applyEngineState() leaves it alone even when the box
+    // around it dims - a control is greyed ONLY when it cannot affect the sound.
     temperToggle.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
     temperToggle.setColour (juce::ToggleButton::tickColourId, cHarmonic);
     temperToggle.setColour (juce::ToggleButton::tickDisabledColourId, cHarmonic.withAlpha (0.4f));
@@ -1557,7 +1556,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                         p->setValueNotifyingHost (p->getDefaultValue());
                     processorRef.clearScala();
                     processorRef.clearTimbre();
-                    intervalEdit.clear();
+                    setIntervalText ({});
                     // Init also unroutes every Spectrum-to-Rhythm pulse.
                     for (auto& s : processorRef.getRhythm().slots)
                     {
@@ -2067,6 +2066,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         refocus();
     };
     intervalEdit.onEscapeKey = [this] { refocus(); };
+    // Every value in its own colour, re-done on each edit. See recolourIntervalTokens().
+    intervalEdit.onTextChange = [this] { recolourIntervalTokens(); };
     // While typing, the box grows to the window's right edge so long interval
     // lists stay readable; on blur it collapses back and shows the text's start.
     intervalEdit.onFocusChanged = [this] (bool focused)
@@ -2089,7 +2090,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // a .scl-derived timbre keeps its own name, not an interval list.
     if (processorRef.getTimbreName() == "typed")
     {
-        intervalEdit.setText (processorRef.getTimbreSource(), false);
+        setIntervalText (processorRef.getTimbreSource());
         lastSeenTimbreSource = processorRef.getTimbreSource();
     }
 
@@ -2538,20 +2539,17 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "ON: the HARMONIC ENGINE keeps generating partials and each one is snapped to the nearest pitch of the ACTIVE TUNING loaded in the Tuning box (degree x period^k), following it live - both engines work TOGETHER and the Custom Engine's own scale is bypassed. In MPE input mode the host does not hand the plugin a scale, so the grid there is plain 12-TET. OFF: no snapping (the Custom Engine's .scl, if loaded and ON, is the spectrum by itself).",
         "ON: el MOTOR HARM\xc3\x92NIC segueix generant parcials i cadascun s'ajusta al to m\xc3\xa9s proper de l'AFINACI\xc3\x93 ACTIVA carregada a la caixa Tuning (grau x per\xc3\xado" "de^k), seguint-la en viu - els dos motors treballen JUNTS i l'escala del Motor propi queda de banda. En mode d'entrada MPE l'amfitri\xc3\xb3 no d\xc3\xb3na cap escala al plugin, aix\xc3\xad que all\xc3\xa0 la graella \xc3\xa9s 12-TET. OFF: sense ajust (l'.scl del Motor propi, si est\xc3\xa0 carregat i actiu, \xc3\xa9s l'espectre per si mateix)."));
     gTuning.setText        (tr ("Tuning", "Afinaci\xc3\xb3"));
-    // The SPECTRUM header's three engine chips. Their tooltips spell out what each state
-    // does to the OTHER engine - that is the question the panel exists to answer.
+    // The SPECTRUM panel's two engine chips. Their tooltips spell out what each state
+    // does to the OTHER engine, and where temper sits now - that is the question the
+    // panel exists to answer.
     engineChip[0].setButtonText (tr ("HARMONIC", "HARM\xc3\x92NIC"));
     engineChip[1].setButtonText (tr ("CUSTOM",   "PROPI"));
-    engineChip[2].setButtonText (tr ("TEMPERED", "TEMPERAT"));
     engineChip[0].setTooltip (tr (
-        "The plain HARMONIC ENGINE builds the spectrum. Click to leave any override: it switches temper off and the Custom Engine off - the loaded custom scale is KEPT, just not used.",
-        "El MOTOR HARM\xc3\x92NIC pur fa l'espectre. Clica per sortir de qualsevol substituci\xc3\xb3: apaga el temperament i el Motor propi - l'escala pr\xc3\xb2pia carregada es CONSERVA, nom\xc3\xa9s que no s'usa."));
+        "The HARMONIC ENGINE builds the spectrum, and the whole panel takes its colour. Click to leave any override: it switches temper off and the Custom Engine off - the loaded custom scale is KEPT, just not used. It also stays lit with *Temper to tuning* on, because the harmonic engine is still the one generating every partial there.",
+        "El MOTOR HARM\xc3\x92NIC fa l'espectre, i tot el panell n'agafa el color. Clica per sortir de qualsevol substituci\xc3\xb3: apaga el temperament i el Motor propi - l'escala pr\xc3\xb2pia carregada es CONSERVA, nom\xc3\xa9s que no s'usa. Tamb\xc3\xa9 queda enc\xc3\xa8s amb *Tempera a l'afinaci\xc3\xb3* activat, perqu\xc3\xa8 all\xc3\xa0 el motor harm\xc3\xb2nic segueix generant tots els parcials."));
     engineChip[1].setTooltip (tr (
-        "The CUSTOM ENGINE's scale IS the spectrum: it REPLACES the harmonic engine, whose controls go inert (they are never reset). Needs a scale loaded or typed first.",
-        "L'escala del MOTOR PROPI \xc3\x89S l'espectre: SUBSTITUEIX el motor harm\xc3\xb2nic, els controls del qual queden inerts (mai no es reinicien). Cal tenir-hi una escala carregada o escrita."));
-    engineChip[2].setTooltip (tr (
-        "The HARMONIC ENGINE runs and every partial is snapped onto the ACTIVE TUNING's grid (the one in the Tuning box), followed live. This BEATS the Custom Engine: while it is lit, a loaded custom scale is bypassed.",
-        "El MOTOR HARM\xc3\x92NIC funciona i cada parcial s'ajusta a la graella de l'AFINACI\xc3\x93 ACTIVA (la de la caixa Tuning), seguida en viu. Aix\xc3\xb2 GUANYA al Motor propi: mentre est\xc3\xa0 enc\xc3\xa8s, una escala pr\xc3\xb2pia carregada queda de banda."));
+        "The CUSTOM ENGINE's scale IS the spectrum, and the whole panel takes its colour: it REPLACES the harmonic engine, whose controls go inert (they are never reset). Needs a scale loaded or typed first, and *Temper to tuning* - inside that box - beats it.",
+        "L'escala del MOTOR PROPI \xc3\x89S l'espectre, i tot el panell n'agafa el color: SUBSTITUEIX el motor harm\xc3\xb2nic, els controls del qual queden inerts (mai no es reinicien). Cal tenir-hi una escala carregada o escrita, i *Tempera a l'afinaci\xc3\xb3* - dins d'aquella caixa - hi guanya."));
     intervalEdit.setTextToShowWhenEmpty (tr ("intervals: 3/2 2 700c ...", "intervals: 3/2 2 700c ..."),
                                          juce::Colour (0xff8f96a8));
     gSpecScale.setText     (tr ("Spectrum vs Tuning", "Espectre vs afinaci\xc3\xb3"));
@@ -3437,6 +3435,16 @@ void FractalAdditiveAudioProcessorEditor::openPartialAmpWindow()
         // are then on screen without scrolling at all.
         partialWindow->centreWithSize (860, 560);
         partialWindow->onHide = [this] { if (partialWindow != nullptr) partialWindow->setVisible (false); refocus(); };
+        // Play from the computer keyboard while this window is in front. The events go
+        // through the editor's OWN handlers, so there is one key map, one undo binding
+        // and one set of swallowed keys - not a second copy here to drift out of step.
+        // Everything the window itself uses keeps working: it is the FOCUSED component
+        // that gets first refusal (the close button, the On pill, the Reset button), the
+        // grid is driven entirely by the mouse (SHIFT+click ranges, knob drags), and the
+        // one keystroke the window documents - Ctrl+Z - is handled by keyPressed before
+        // any play key is looked at, so undo never also rings a note.
+        partialWindow->onKey      = [this] (const juce::KeyPress& k) { return keyPressed (k); };
+        partialWindow->onKeyState = [this] { return keyStateChanged (true); };
     }
     partialPanel.applyLanguage();
     partialPanel.resync();          // never open on a stale partial list
@@ -3539,6 +3547,90 @@ void FractalAdditiveAudioProcessorEditor::openTimbreChooser()
         });
 }
 
+//==============================================================================
+// One colour per interval in the Custom Engine's text box, so "3/2 2 700c" reads as
+// three values instead of one run of characters. Presentation only: the text, and
+// therefore what loadTimbreText() parses, is byte-for-byte what the user typed - the
+// token boundaries come from IntervalTokens.h, which copies the parser's own
+// separator set.
+//
+// HOW, given juce::TextEditor has no "colour this range" call: setText() and
+// insertTextAtCaret() bake the CURRENT textColourId into the run they insert, so the
+// text is rebuilt run by run with the colour switched between them. The caret is put
+// back where it was, or typing would jump to the end on every keystroke.
+//
+// The cost, stated plainly: rebuilding the text drops the BOX's own undo history, so
+// Ctrl+Z inside it no longer walks back through what was typed. Enter applies the list
+// and Escape leaves it, and a parameter undo (the processor's) is untouched.
+void FractalAdditiveAudioProcessorEditor::recolourIntervalTokens()
+{
+    const auto text = intervalEdit.getText();
+    if (text == lastColouredIntervals) return; // already painted from exactly this text
+    lastColouredIntervals = text;
+    if (text.isEmpty()) return;
+    // A line break would come back out as a SPACE: insertTextAtCaret flattens "\r\n" in a
+    // single-line editor, and rewriting what the user typed is the one thing this is not
+    // allowed to do. Nothing typed or pasted into this box can contain one (JUCE flattens
+    // those on the way in too), so this only ever fires on a programmatic value - and it
+    // drops the colour, never a character.
+    if (text.containsAnyOf ("\r\n")) return;
+
+    // Bright and far apart on the 0xff20202b background, and spread around the hue
+    // wheel so NEIGHBOURING tokens are never a near-miss of each other: consecutive
+    // entries are at least 60 degrees apart, including the wrap from the last back to
+    // the first (which is what a 6-token list does).
+    static const juce::Colour palette[] = { juce::Colour (0xff5cd6ff),   // cyan-blue 195
+                                            juce::Colour (0xffffc857),   // amber      40
+                                            juce::Colour (0xff8cf06a),   // green     105
+                                            juce::Colour (0xffff8fd2),   // pink      325
+                                            juce::Colour (0xffb79bff) }; // violet    258
+    constexpr int paletteSize = (int) (sizeof (palette) / sizeof (palette[0]));
+
+    // Character indices, not bytes: TextEditor ranges count characters, and a typed
+    // non-ASCII character (a stray accent from another keyboard layout) would put every
+    // range after it out by one if this walked the UTF-8 bytes.
+    std::vector<int> cps;
+    cps.reserve ((size_t) text.length());
+    for (auto p = text.getCharPointer(); ! p.isEmpty(); ++p)
+        cps.push_back ((int) *p);
+
+    const auto spans = intervaltokens::spans (cps, paletteSize);
+    if (spans.empty()) return;
+
+    const int caret = intervalEdit.getCaretPosition();
+    const juce::Colour gapCol (0xff8f96a8); // the whitespace between values: no colour to carry
+
+    intervalEdit.clear();
+    int pos = 0;
+    auto emit = [this, &text, &pos] (int end, juce::Colour col)
+    {
+        if (end <= pos) return;
+        intervalEdit.setColour (juce::TextEditor::textColourId, col);
+        intervalEdit.insertTextAtCaret (text.substring (pos, end));
+        pos = end;
+    };
+    for (const auto& s : spans)
+    {
+        emit (s.start, gapCol);                                  // separators
+        emit (s.start + s.length, palette[s.colour]);            // the value itself
+    }
+    emit ((int) cps.size(), gapCol);                             // trailing separators
+    intervalEdit.setCaretPosition (caret);
+}
+
+// setText() alone would paint the whole thing in whatever colour was current, so the
+// two always travel together - a scale loaded from a preset, an undo or the timer must
+// arrive coloured exactly like one that was typed.
+void FractalAdditiveAudioProcessorEditor::setIntervalText (const juce::String& text)
+{
+    intervalEdit.setText (text, false); // false: our own recolour follows, not a re-entry
+    // setText paints the lot in ONE colour, so the runs must be redone even when the
+    // string is the one we painted last (reloading the same spectrum, an undo back to
+    // it): clearing the record is what stops the guard above from skipping that.
+    lastColouredIntervals.clear();
+    recolourIntervalTokens();
+}
+
 // Dress the SPECTRUM panel for whichever engine is in force: light the right chip, grey
 // the box that is being overridden, and leave everything that still works alone.
 //
@@ -3581,10 +3673,12 @@ void FractalAdditiveAudioProcessorEditor::applyEngineState()
     lblTimbreRepeats.setAlpha (repsLive ? 1.0f : 0.4f);
 
     // The engine chips: exactly one lit, in its own colour, with black text (the
-    // envelope-tab treatment). CUSTOM is only clickable once a scale exists to switch to.
-    const int sel = st == E::Harmonic ? 0 : (st == E::CustomScale ? 1 : 2);
-    const juce::Colour chipCol[3] = { cHarmonic, cTimbre, cTuning };
-    for (int i = 0; i < 3; ++i)
+    // modulator-tab treatment). CUSTOM is only clickable once a scale exists to switch to.
+    // TEMPERED lights HARMONIC, because in temper mode the harmonic engine is the one
+    // generating every partial - the tuning only says where they may land.
+    const int sel = st == E::CustomScale ? 1 : 0;
+    const juce::Colour chipCol[2] = { cHarmonic, cTimbre };
+    for (int i = 0; i < 2; ++i)
     {
         const bool on = i == sel;
         engineChip[i].setColour (juce::TextButton::buttonColourId,
@@ -3593,6 +3687,10 @@ void FractalAdditiveAudioProcessorEditor::applyEngineState()
                                  on ? juce::Colours::black : juce::Colour (0xffb9c0d0));
     }
     engineChip[1].setEnabled (loaded);
+    // ...and the WHOLE panel wears that colour (frame + title chip + interior tint), the
+    // way the Modulators box wears its selected tab's. The old neutral steel said nothing
+    // and read as "white" beside the coloured panels around it.
+    spectrumPanelColour = chipCol[sel];
 
     // Repaint so the painted parts (both engines' interiors, the override note and the
     // badges) follow the state too - not just the child controls.
@@ -3609,9 +3707,8 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     p.bothEngines    = bothEnginesBounds;
     p.essentials     = essentialsBounds;
     p.tuning         = lFootBounds;
-    p.engineChips    = engineChip[0].getBounds()
-                          .getUnion (engineChip[1].getBounds())
-                          .getUnion (engineChip[2].getBounds());
+    p.engineChips    = engineChip[0].getBounds().getUnion (engineChip[1].getBounds());
+    p.panelColour    = spectrumPanelColour;
     // Invisible controls are left out on purpose: several are mode-dependent (the prime
     // whitelist vs the limit fader, the Off button, ...) and a hidden one has no geometry
     // worth asserting.
@@ -3620,7 +3717,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
 
     add ("harm.baseN",       baseNFader);      add ("harm.baseNLbl",  lblBaseN);
     add ("harm.basePitch",   basePitchBox);    add ("harm.pitchLbl",  lblBasePitch);
-    add ("harm.temper",      temperToggle);    add ("harm.harmonics", harmonicsFader);
+    add ("harm.harmonics",   harmonicsFader);
     add ("harm.primeMode",   primeModeBox);    add ("harm.primeLimit", primeLimitFader);
     add ("harm.primeLimitLbl", lblPrimeLimit);
     add ("harm.prime0",      primeToggle[0]);  add ("harm.prime8",    primeToggle[8]);
@@ -3629,6 +3726,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("cust.load",        loadTimbreButton); add ("cust.off",      clearTimbreButton);
     add ("cust.intervals",   intervalEdit);     add ("cust.status",   timbreStatusLabel);
     add ("cust.reps",        timbreRepeatsFader); add ("cust.repsLbl", lblTimbreRepeats);
+    add ("cust.temper",      temperToggle); // back inside the box whose scale it bypasses
 
     add ("both.slope",       slopeFader);      add ("both.pencil",    partialEditBtn);
     add ("both.manual",      partialManualT);  add ("both.fractal",   fractalFader);
@@ -4023,8 +4121,11 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     {
         using E = FractalAdditiveAudioProcessor::EngineInForce;
         const auto st = processorRef.engineInForce();
-        // The neutral container first, so the three coloured boxes sit inside it.
-        macroFrameTitle (spectrumBounds, cSpectrum, tr ("SPECTRUM", "ESPECTRE"), 1.0f);
+        // The container wears the SELECTED ENGINE's colour - frame, title chip and
+        // interior tint - exactly as the Modulators box wears its selected tab's. It was
+        // a neutral steel that read as white next to the coloured panels around it and
+        // said nothing about which engine was making the sound.
+        macroFrameTitle (spectrumBounds, spectrumPanelColour, tr ("SPECTRUM", "ESPECTRE"), 1.0f);
 
         // One line, right of the engine chips, that names the override in words. Only
         // when there IS one: with the plain harmonic series nothing is being overridden
@@ -4464,24 +4565,27 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // rows share their left and right lines.
         spectrumBounds = row.reduced (3, 0);
 
-        // Header: the three engine chips ride ON the panel's top line, immediately right
-        // of the PAINTED "SPECTRUM" title chip - measured with the same function that
-        // draws it, because a guessed offset would put the first chip on top of the title.
+        auto sp = spectrumBounds.reduced (5, 4);
+        sp.removeFromTop (16); // clear the panel's frame line + title-chip band
+
+        // The engine tab strip, directly UNDER the panel title - the same shape as the
+        // Modulators box's AMP/PITCH/FILTER/CUSTOM strip (title, then a chip row, then
+        // the contents). They used to ride ON the panel's top line beside the painted
+        // title, which made them read as decoration on the frame rather than as the
+        // panel's own selector. 18 px and not the Modulators' 19: this panel's rows are
+        // laid out to the pixel and the last one owes TEMPER a full 20 (see below).
         {
-            auto hdr = spectrumBounds.withHeight (17);
-            hdr.removeFromLeft ((int) std::ceil (titleChipWidth (tr ("SPECTRUM", "ESPECTRE"),
-                                                                 (float) spectrumBounds.getWidth())) + 8);
-            for (int i = 0; i < 3; ++i)
+            auto chips = sp.removeFromTop (18);
+            for (int i = 0; i < 2; ++i)
             {
-                engineChip[i].setBounds (hdr.removeFromLeft (82).reduced (1, 0));
-                hdr.removeFromLeft (3);
+                engineChip[i].setBounds (chips.removeFromLeft (104).reduced (1, 0));
+                chips.removeFromLeft (3);
             }
-            hdr.removeFromLeft (6);
-            engineNoteBounds = hdr; // paint() writes the override line here
+            chips.removeFromLeft (8);
+            engineNoteBounds = chips; // paint() writes the override line here
+            sp.removeFromTop (3);
         }
 
-        auto sp = spectrumBounds.reduced (5, 4);
-        sp.removeFromTop (16); // clear the panel's frame line + chip band
         const int pW = sp.getWidth();
         // Harmonic is the busiest box (Base + Harmonics + Prime), Custom the narrowest
         // (four stacked controls); the shared box takes what is left.
@@ -4510,12 +4614,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
             bi.removeFromLeft (5);
             lblBasePitch.setBounds (bi.removeFromTop (13));
             compact (basePitchBox, bi.removeFromTop (24));
-            bi.removeFromTop (8);
-            // TEMPER sits with the engine it changes (it snaps THESE partials onto the
-            // active tuning's grid), not - as before - inside the Custom Engine box whose
-            // scale it bypasses. It is also the way OUT of a custom-scale override, which
-            // is why applyEngineState() leaves it bright when this box dims.
-            temperToggle.setBounds (bi.removeFromTop (20));
         }
         {
             auto hi = hcHarm.reduced (5, 3); hi.removeFromTop (lblH);
@@ -4568,18 +4666,26 @@ void FractalAdditiveAudioProcessorEditor::resized()
             {
                 loadTimbreButton.setBounds (brow.reduced (2, 0));
             }
-            ci.removeFromTop (6);
+            // 5 px between rows, not 6: TEMPER came back into this box (see below) and
+            // the fifth row has to be a whole 20 px control, not the 16 that were left.
+            ci.removeFromTop (5);
             intervalEditHome = ci.removeFromTop (24).reduced (1, 0); // type intervals, Enter builds
             intervalEdit.setBounds (intervalEdit.hasKeyboardFocus (false)
                                         ? intervalEditHome.withRight (getWidth() - 10)
                                         : intervalEditHome);
-            ci.removeFromTop (6);
+            ci.removeFromTop (5);
             timbreStatusLabel.setBounds (ci.removeFromTop (16));
-            ci.removeFromTop (6);
+            ci.removeFromTop (5);
             auto fr = ci.removeFromTop (22);
             lblTimbreRepeats.setJustificationType (juce::Justification::centredLeft);
             lblTimbreRepeats.setBounds (fr.removeFromLeft (38));
             timbreRepeatsFader.setBounds (fr);
+            ci.removeFromTop (2);
+            // TEMPER, back where it is chosen from: inside the Custom Engine, because
+            // what it decides is whether THIS box's scale is the spectrum at all. Ticking
+            // it hands the spectrum to the harmonic engine and bypasses the scale above -
+            // which the box says in words (see the BYPASSED badge in paint()).
+            temperToggle.setBounds (ci.removeFromTop (20));
         }
 
         //-- BOTH ENGINES: SLOPE | FRACTAL | MORPH over RANGE --------------------
@@ -5054,6 +5160,21 @@ bool FractalAdditiveAudioProcessorEditor::keyStateChanged (bool)
     return hadHeld || mappedDown || ! heldKeys.empty();
 }
 
+// Which windows of ours count as "the player is here", for the QWERTY-as-MIDI mapping.
+//
+// The per-partial amplitude editor is a REAL top-level window, so opening it takes the
+// keyboard focus off the editor and playing simply stopped - you could not hear the
+// partial whose knob you were dragging, which is the one moment you most want to. Its
+// own window is added here (and forwards its key events to keyPressed /
+// keyStateChanged, see openPartialAmpWindow) so the same mapping keeps working there.
+// isActiveWindow() and not hasKeyboardFocus(): nothing inside that window has to want
+// focus for the window to be the one in front.
+bool FractalAdditiveAudioProcessorEditor::playKeysLive() const
+{
+    if (hasKeyboardFocus (true)) return true;
+    return partialWindow != nullptr && partialWindow->isVisible() && partialWindow->isActiveWindow();
+}
+
 // Reconcile the sounding computer-keyboard notes with the ACTUAL physical key
 // state (isKeyCurrentlyDown -> GetAsyncKeyState on Windows). Called both on key
 // events (low latency) and on the 30 Hz timer (safety net): a KEYUP missed while
@@ -5078,7 +5199,7 @@ void FractalAdditiveAudioProcessorEditor::pollComputerKeyboard()
     // releases once focus has been gone for >250 ms (you actually left the
     // plugin). Brief losses keep the notes sounding, so you can freely tweak any
     // parameter with a note held down.
-    const bool focusedNow = hasKeyboardFocus (true) && ! typing;
+    const bool focusedNow = playKeysLive() && ! typing;
     const juce::uint32 now = juce::Time::getMillisecondCounter();
     if (focusedNow)
         lastFocusedMs = now;
@@ -5135,7 +5256,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         if (src != lastSeenTimbreSource && ! intervalEdit.hasKeyboardFocus (false))
         {
             lastSeenTimbreSource = src;
-            intervalEdit.setText (src, false);
+            setIntervalText (src);
         }
     }
     refreshRefAText();       // keep the Reference-A box in sync with the parameter (automation)

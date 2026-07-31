@@ -10,11 +10,13 @@
 #include "dsp/Dissonance.h"
 #include "dsp/PartialGains.h"
 #include "PartialAmpEdit.h"
+#include "IntervalTokens.h"
 
 #include <algorithm>
 #include <chrono>
 #include <vector>
 #include <map>
+#include <string>
 #include <cstdio>
 #include <cmath>
 
@@ -1002,6 +1004,64 @@ int main()
             check (out.size() == 4 && sorted && hasHomeless && hasEdits,
                    "the written list keeps the homeless edits and stays sorted by key");
         }
+    }
+
+    //--------------------------------------------------------------------------
+    // The Custom Engine's interval box paints every value in its own colour, which
+    // means rebuilding its text run by run. A run whose range is one character out
+    // paints the wrong characters and NOTHING complains - the wrong colour is still
+    // legible text - so the ranges are checked here rather than by eye.
+    std::printf ("interval-token colouring:\n");
+    {
+        auto cps = [] (const char* s)
+        {
+            std::vector<int> v;
+            for (const char* p = s; *p != '\0'; ++p) v.push_back ((int) (unsigned char) *p);
+            return v;
+        };
+        auto piece = [&cps] (const char* s, const intervaltokens::Span& sp)
+        {
+            const auto v = cps (s);
+            std::string out;
+            for (int i = sp.start; i < sp.start + sp.length; ++i) out += (char) v[(size_t) i];
+            return out;
+        };
+
+        {
+            const char* t = "3/2 2 700c";
+            const auto s = intervaltokens::spans (cps (t), 5);
+            check (s.size() == 3, "three values are three spans");
+            check (s.size() == 3 && piece (t, s[0]) == "3/2" && piece (t, s[1]) == "2"
+                   && piece (t, s[2]) == "700c",
+                   "each span covers exactly its own value, separators excluded");
+            check (s.size() == 3 && s[0].colour != s[1].colour && s[1].colour != s[2].colour,
+                   "and no value shares a colour with the one before or after it");
+        }
+        // Every separator loadTimbreText() splits on, several in a row, plus leading and
+        // trailing ones: a run of spaces must not become an empty token wearing a colour.
+        {
+            const char* t = "  5/4,,9/8;\t2\r\n  ";
+            const auto s = intervaltokens::spans (cps (t), 5);
+            bool ok = s.size() == 3 && piece (t, s[0]) == "5/4" && piece (t, s[1]) == "9/8"
+                   && piece (t, s[2]) == "2";
+            for (const auto& sp : s) ok = ok && sp.length > 0;
+            check (ok, "commas, semicolons, tabs, newlines and runs of them separate but never colour");
+        }
+        // The palette must WRAP without ever repeating across a boundary.
+        {
+            const auto s = intervaltokens::spans (cps ("1 2 3 4 5 6 7 8 9"), 5);
+            bool ok = s.size() == 9;
+            for (size_t i = 1; i < s.size(); ++i) ok = ok && s[i].colour != s[i - 1].colour;
+            for (const auto& sp : s) ok = ok && sp.colour >= 0 && sp.colour < 5;
+            check (ok, "a list longer than the palette keeps cycling, adjacent values still differ");
+        }
+        // A one-colour palette would make the whole feature a no-op, so it is refused.
+        {
+            const auto s = intervaltokens::spans (cps ("3/2 2"), 1);
+            check (s.size() == 2 && s[0].colour != s[1].colour, "a degenerate palette is widened, not obeyed");
+        }
+        check (intervaltokens::spans ({}, 5).empty() && intervaltokens::spans (cps ("   "), 5).empty(),
+               "empty and all-separator text produce no spans at all");
     }
 
     //--------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 #include "PluginProcessor.h"
 #include "ScaleKeyboard.h"
 #include "PartialAmpEdit.h"
+#include "IntervalTokens.h"
 #include "dsp/Dissonance.h"
 #include <algorithm>
 #include <limits>
@@ -36,9 +37,19 @@ public:
     {
         juce::Rectangle<int> spectrum, harmonicEngine, customEngine, bothEngines,
                              essentials, tuning, engineChips;
+        // The colour the WHOLE SPECTRUM panel is wearing right now (the selected
+        // engine's). Probed because "it must not be the neutral steel again, and it
+        // must not collide with the panels around it" is a measurable claim about a
+        // hue, and nothing else in the build could check it.
+        juce::Colour panelColour;
         std::vector<std::pair<juce::String, juce::Rectangle<int>>> controls; // "harm.baseN" etc.
     };
     LayoutProbe layoutProbe() const;
+    // Test hook (RhythmVerify): re-read engineInForce() and redress the panel for it,
+    // exactly as the 30 Hz timer does. The verifier has no message loop, so without this
+    // the panel would still be wearing the colour it was constructed with and "selecting
+    // an engine recolours the whole panel" could not be measured at all.
+    void refreshEngineDressing() { applyEngineState(); }
 
 private:
     using SliderAttachment   = juce::AudioProcessorValueTreeState::SliderAttachment;
@@ -62,6 +73,17 @@ private:
     void refocus();
     void reclaimFocusUnlessTyping(); // regrab keyboard focus after a window switch (not while typing)
     void pollComputerKeyboard(); // reconcile held keys against the real key state
+    bool playKeysLive() const;   // may the QWERTY mapping ring notes right now?
+    // Repaint the Custom Engine's interval list with one colour per token (see
+    // IntervalTokens.h). Called on every edit and after every programmatic setText.
+    void recolourIntervalTokens();
+    void setIntervalText (const juce::String& text); // setText + recolour, never one without the other
+    // The text the box was last painted from. It is the re-entry guard, and it has to be
+    // the TEXT and not a bool: TextEditor::textChanged() POSTS the onTextChange callback
+    // instead of calling it, so a scoped flag is already down by the time our own inserts
+    // come back as messages - each of which would rebuild the text and post more, which
+    // multiplies rather than settles. Comparing the text ends it after one pass.
+    juce::String lastColouredIntervals;
     void openScalaChooser();
     void openPartialAmpWindow();   // the pencil in the SLOPE cell
     void refreshSlopeFreeze();     // shows that SLOPE is inert while manual mode is on
@@ -2216,6 +2238,11 @@ private:
             warnLbl.setColour (juce::Label::textColourId, juce::Colour (0xffffb020));
             view.setViewedComponent (&grid, false);
             view.setScrollBarsShown (true, false);
+            // The knob list takes the keyboard focus inside its window, so Up/Down/Page
+            // scroll it. That also puts it FIRST in the key-event chain, ahead of the
+            // window's forward-to-the-editor hook: a key this list uses is used here and
+            // never also rings a note.
+            view.setWantsKeyboardFocus (true);
             addAndMakeVisible (view);
         }
 
@@ -2447,14 +2474,35 @@ private:
     struct PartialAmpWindow : juce::DocumentWindow
     {
         std::function<void()> onHide;
+        // The computer keyboard has to go on playing while this window is in front.
+        // It is a separate DESKTOP window, so opening it moves the keyboard focus out
+        // of the editor and the QWERTY-as-MIDI mapping simply stopped: you could not
+        // hear the partial you were dragging. These two forward the key events to the
+        // editor's OWN handlers - one mapping, not a second copy that could drift -
+        // and returning true is also what stops a play key escaping to the host, where
+        // the DAW's own computer-MIDI keyboard would fire a second, differently tuned
+        // note (the "ghost note" the editor's keyPressed already guards against).
+        std::function<bool (const juce::KeyPress&)> onKey;
+        std::function<bool()>                       onKeyState;
         explicit PartialAmpWindow (const juce::String& name)
             : juce::DocumentWindow (name, juce::Colour (0xff0e1118), juce::DocumentWindow::closeButton)
         {
             setUsingNativeTitleBar (true);
             setResizable (true, false);
             setResizeLimits (320, 240, 6000, 4000);
+            // With nothing inside it wanting focus, key events reach this window itself
+            // (ComponentPeer::getTargetForKeyPress falls back to the peer's component).
+            setWantsKeyboardFocus (true);
         }
         void closeButtonPressed() override { if (onHide) onHide(); }
+        bool keyPressed (const juce::KeyPress& k) override
+        {
+            return (onKey != nullptr && onKey (k)) || juce::DocumentWindow::keyPressed (k);
+        }
+        bool keyStateChanged (bool isDown) override
+        {
+            return (onKeyState != nullptr && onKeyState()) || juce::DocumentWindow::keyStateChanged (isDown);
+        }
     };
 
     // Floating centre panel that explains WHY the current settings are silent.
@@ -2498,13 +2546,20 @@ private:
     void refreshPresetDirtyMark();
     juce::Rectangle<int> titleClickArea; // the title squares; clicking them plays the jingle
     juce::ToggleButton primeToggle[9], morphToggle;
-    juce::ToggleButton temperToggle; // HARMONIC engine mode: snap its partials to the active tuning
+    juce::ToggleButton temperToggle; // lives INSIDE the Custom Engine box (the scale it bypasses)
     std::unique_ptr<ButtonAttachment> temperAtt;
-    // SPECTRUM header: the three mutually exclusive engine states as chips (the same
-    // pattern as the envelope tabs), exactly one lit. They READ engineInForce() and
-    // WRITE the two parameters that decide it, so the override is one click to leave -
-    // and switching away never discards the loaded scale (only "timbreOn" goes down).
-    juce::TextButton engineChip[3];
+    // SPECTRUM panel: the two ENGINES as chips, directly under the panel title and
+    // built exactly like the modulator tab strip - exactly one lit, and the selected
+    // one's colour is worn by the whole panel. They READ engineInForce() and WRITE the
+    // parameters that decide it, so an override is one click to leave - and switching
+    // away never discards the loaded scale (only "timbreOn" goes down).
+    // TEMPERED is NOT one of them: it is a mode of the harmonic engine, a tick box in
+    // the Custom Engine box (see temperToggle), not a third engine.
+    juce::TextButton engineChip[2];
+    // What applyEngineState() dressed the panel in. Seeded with the harmonic engine's
+    // blue - the state a fresh instance opens in - so the very first paint (which can
+    // land before the first applyEngineState) is never a default black frame.
+    juce::Colour         spectrumPanelColour { 0xff5cb8ff };
     void applyEngineState(); // dim/enable + chip look + repaint, from engineInForce()
     std::unique_ptr<SliderAttachment> primeLimitFaderAtt;
     // SLOPE cell: the pencil that opens the per-partial amplitude window, and the ON/OFF

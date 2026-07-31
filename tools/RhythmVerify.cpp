@@ -2434,6 +2434,30 @@ int main()
         // the widest configuration there is - the 9 prime-whitelist toggles, plus a loaded
         // scale, which adds the Off button and the longest status line. Both live in the
         // narrowest boxes of the panel, so they are where a squeeze shows up first.
+        // The panel wears the SELECTED ENGINE's colour, and that can fail in two
+        // directions: back to the neutral steel that read as white (saturation 0.13), or
+        // onto a hue so close to a neighbouring panel's that the boxes stop being
+        // tellable apart. The neighbours are Essentials (green), Tuning (purple) and
+        // Spectrum-vs-Tuning (orange).
+        auto checkPanelColour = [] (juce::Colour panel, const char* who)
+        {
+            auto hueGap = [] (juce::Colour a, juce::Colour b)
+            {
+                const float d = std::abs (a.getHue() - b.getHue()) * 360.0f;
+                return std::min (d, 360.0f - d);
+            };
+            const juce::Colour neighbours[] = { juce::Colour (0xff4fe09a),   // Essentials
+                                                juce::Colour (0xffb27bff),   // Tuning
+                                                juce::Colour (0xffff9a3c) }; // Spectrum vs Tuning
+            float worst = 360.0f;
+            for (const auto& n : neighbours) worst = std::min (worst, hueGap (panel, n));
+            std::printf ("  panel colour %s (%s)  saturation %.2f  nearest neighbouring panel hue %.0f deg away\n",
+                         panel.toDisplayString (false).toRawUTF8(), who, panel.getSaturation(), worst);
+            check (panel.getSaturation() > 0.35f,
+                   "the panel is a real colour, not the old neutral steel");
+            check (worst > 40.0f, "and its hue is clear of every panel around it");
+        };
+
         for (int pass = 0; ed != nullptr && pass < 2; ++pass)
         {
             if (pass == 1)
@@ -2459,9 +2483,16 @@ int main()
                    && ! L.harmonicEngine.intersects (L.bothEngines)
                    && ! L.customEngine.intersects (L.bothEngines),
                    "the two engines and the shared box never overlap (they are separate spaces)");
+            // The engine chips are a TAB STRIP under the panel title, modelled on the
+            // Modulators box's: below the title band, above everything else, inside the
+            // panel. Riding on the panel's top line (where they used to be) fails the
+            // first of these.
             check (L.spectrum.contains (L.engineChips)
+                   && L.engineChips.getY() >= L.spectrum.getY() + 14
                    && L.engineChips.getBottom() <= L.harmonicEngine.getY(),
-                   "the engine chips ride in the panel's header, clear of the boxes below");
+                   "the engine chips sit under the SPECTRUM title, clear of the boxes below");
+
+            checkPanelColour (L.panelColour, "harmonic engine selected");
             std::printf ("  panel %d x %d   harmonic %d   custom %d   both %d   essentials %d\n",
                          L.spectrum.getWidth(), L.spectrum.getHeight(), L.harmonicEngine.getWidth(),
                          L.customEngine.getWidth(), L.bothEngines.getWidth(), L.essentials.getWidth());
@@ -2483,6 +2514,37 @@ int main()
                          outside > 0 ? (" (first: " + worstName + ")").toRawUTF8() : "");
             check (! L.controls.empty() && outside == 0, "no control spills out of its own box");
 
+            // "Inside its box" is not enough on its own: removeFromTop() on an exhausted
+            // rectangle hands back a SQUASHED one, which still sits inside the box and
+            // still overlaps nothing - so a control that ran out of room disappears
+            // without failing either check above. Adding a row to a hand-laid-out panel
+            // is exactly how that happens.
+            int squashed = 0;
+            juce::String squashedName;
+            for (const auto& c : L.controls)
+                if (c.second.getHeight() < 12 || c.second.getWidth() < 10)
+                {
+                    ++squashed;
+                    if (squashedName.isEmpty())
+                        squashedName = c.first + " (" + juce::String (c.second.getWidth()) + "x"
+                                     + juce::String (c.second.getHeight()) + ")";
+                }
+            std::printf ("  %d controls squeezed to nothing%s\n", squashed,
+                         squashed > 0 ? (" (first: " + squashedName + ")").toRawUTF8() : "");
+            check (squashed == 0, "and every one of them still has room to be used");
+
+            // The generic rule above only catches a total collapse. TEMPER is the row that
+            // came back into the Custom Engine box, at the BOTTOM of five stacked rows, so
+            // it is the one that silently absorbs any pixel the rows above take: it is
+            // asserted at its nominal 20 px, the height a tick box needs to be readable.
+            for (const auto& c : L.controls)
+                if (c.first == "cust.temper")
+                {
+                    std::printf ("  cust.temper %d x %d\n", c.second.getWidth(), c.second.getHeight());
+                    check (c.second.getHeight() >= 20 && c.second.getWidth() >= 100,
+                           "the temper tick box got its whole row inside the Custom Engine");
+                }
+
             // ...and no two of them may sit on top of each other.
             int clashes = 0;
             juce::String clashName;
@@ -2496,6 +2558,33 @@ int main()
             std::printf ("  %d overlapping control pairs%s\n", clashes,
                          clashes > 0 ? (" (first: " + clashName + ")").toRawUTF8() : "");
             check (clashes == 0, "and no two controls overlap");
+        }
+
+        // Selecting the other engine must recolour the WHOLE panel, not just light a
+        // chip - and the colour it lands on has to clear its neighbours too, which is
+        // the harder half (the Custom Engine's pink sits above the Tuning box's purple).
+        // Temper mode then hands the spectrum back to the harmonic engine, so the panel
+        // must go back to blue while the custom scale is bypassed.
+        if (ed != nullptr)
+        {
+            using E = FractalAdditiveAudioProcessor::EngineInForce;
+            const auto blue = ed->layoutProbe().panelColour;
+            p.setTimbreEnabled (true);
+            ed->refreshEngineDressing();
+            const auto pink = ed->layoutProbe().panelColour;
+            check (p.engineInForce() == E::CustomScale, "the CUSTOM engine is in force");
+            check (pink != blue, "selecting it recolours the whole panel, it does not just light a chip");
+            checkPanelColour (pink, "custom engine selected");
+
+            auto* tt = p.apvts.getParameter ("timbreTemper");
+            tt->setValueNotifyingHost (1.0f);
+            ed->refreshEngineDressing();
+            check (p.engineInForce() == E::Tempered, "ticking Temper (inside the Custom Engine box) takes over");
+            check (ed->layoutProbe().panelColour == blue,
+                   "and the panel goes back to the harmonic engine's colour, which is what is generating");
+            tt->setValueNotifyingHost (0.0f);
+            p.setTimbreEnabled (false);
+            ed->refreshEngineDressing();
         }
     }
 
