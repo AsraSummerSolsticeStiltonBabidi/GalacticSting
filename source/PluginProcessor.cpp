@@ -2246,7 +2246,9 @@ void FractalAdditiveAudioProcessor::setRealtimeLink (RtLink mode, const RtSettin
     rtSeenSpecGen  = spectrumEngine.getGeneration();
     rtSeenChordGen = chordGeneration.load();
     rtSeenAdaptGen = adaptGeneration.load();
-    rtHeldSig = rtTuneSig = -1.0;
+    rtHeldTarget.clear();
+    rtHeldF0  = 0.0;
+    rtTuneSig = -1.0;
     if (mode != RtLink::Off)
         takeRealtimeBaseline (mode);
 }
@@ -2337,15 +2339,49 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
     }
 
     // ...the two SPECTRUM-side links. Same throttle + coalesce, aimed at a different target.
+    //
+    // A finished adaptation is published FIRST, before anything below can decide there is
+    // nothing to do. A chord let go a moment before its search finished was still a chord
+    // the user played, and the result belongs to it: held back here, it would have been
+    // applied on some later tick against a completely different chord.
+    if (const int g = adaptGeneration.load(); g != rtSeenAdaptGen)
+    {
+        rtSeenAdaptGen = g;
+        juce::String aerr;
+        if (applySpectrumAdapt (/*undoable*/ false, aerr))
+            ++rtApplies;
+    }
+
     double f0 = 0.0;
     std::vector<double> alphas;
     if (rtLink == RtLink::SpectrumFromChord)
     {
+        // THE TRIGGER IS WHAT IS BEING PLAYED. The frequencies come from the rhythm
+        // engine's held-note bookkeeping, which is published from every processBlock
+        // whether or not the rhythm engine is switched on, so they are the pitches really
+        // sounding - the tuning's, per-note bend included.
         alphas = heldChordAsTargetAlphas (f0);
         if (alphas.size() < 2)
-            return;   // nothing (or one note) held: leave the spectrum exactly as it is
-        const double sig = ratioSetSig (alphas);
-        if (std::abs (sig - rtHeldSig) > 1.0e-9) { rtHeldSig = sig; rtPending = true; }
+        {
+            // Nothing (or one note) held: leave the spectrum exactly as it is, and DROP any
+            // pending adaptation. Without this, engaging the link with nothing down left
+            // rtPending true and the first chord to arrive was adapted to with whatever
+            // this tick happened to read - and, worse, a chord released mid-search came
+            // back as a re-adaptation to a chord that was no longer being played.
+            rtPending = false;
+            return;
+        }
+        // Has the chord actually MOVED? Compared note by note against the set the last
+        // adaptation aimed at, in cents, including the root's absolute pitch: Sethares'
+        // roughness is a frequency width, so the same chord an octave up is a different
+        // target and must re-adapt, while a bend jitter below a cent must not.
+        bool moved = alphas.size() != rtHeldTarget.size()
+                  || ! (rtHeldF0 > 0.0)
+                  || std::abs (1200.0 * std::log2 (f0 / rtHeldF0)) > kRtHeldMoveCents;
+        for (size_t i = 0; i < alphas.size() && ! moved; ++i)
+            if (std::abs (1200.0 * std::log2 (alphas[i] / rtHeldTarget[i])) > kRtHeldMoveCents)
+                moved = true;
+        if (moved) rtPending = true;
     }
     else
     {
@@ -2364,6 +2400,11 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
         if (startSpectrumAdapt (rtSet.adapt, alphas, f0, err))
         {
             ++rtStarts;
+            // Remember what this search is aimed at, not what merely passed by: the
+            // throttle can hold a launch for several ticks and the chord may have changed
+            // again in between, so the reference has to be the target actually used.
+            rtHeldTarget = alphas;
+            rtHeldF0     = f0;
         }
         else
         {
@@ -2372,13 +2413,6 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
             rtLink = RtLink::Off;
             return;
         }
-    }
-    if (const int g = adaptGeneration.load(); g != rtSeenAdaptGen)
-    {
-        rtSeenAdaptGen = g;
-        juce::String err;
-        if (applySpectrumAdapt (/*undoable*/ false, err))
-            ++rtApplies;
     }
 }
 

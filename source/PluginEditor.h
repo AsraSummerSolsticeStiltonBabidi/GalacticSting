@@ -51,6 +51,25 @@ public:
     // an engine recolours the whole panel" could not be measured at all.
     void refreshEngineDressing() { applyEngineState(); }
 
+    // Test hooks (RhythmVerify): drive the Spectrum-vs-Tuning panel the way a hand does -
+    // pick a mode, pick the adaptation's target, press REALTIME - and read back what the
+    // panel then says. The wiring these check ("REALTIME follows the notes you PLAY,
+    // whatever the target box was left on" and "each mode keeps its own Period") lives
+    // entirely inside these callbacks, and the verifier has neither a mouse nor a message
+    // loop to reach them with.
+    struct PanelProbe
+    {
+        int  mode = 0;                 // specModeBox
+        int  adaptTarget = 0;          // adaptTargetBox (1 = loaded tuning, 2 = held chord)
+        bool adaptTargetEnabled = true;
+        juce::String period;           // the shared Period field, as typed
+    };
+    PanelProbe panelProbeForTests() const;
+    void setSpecModeForTests (int mode);
+    void setAdaptTargetForTests (int id);
+    void setPeriodTextForTests (const juce::String& t);
+    void pressAdaptRealtimeForTests();
+
 private:
     using SliderAttachment   = juce::AudioProcessorValueTreeState::SliderAttachment;
     using ComboBoxAttachment = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
@@ -2670,6 +2689,16 @@ private:
     bool             lastNadRootOnly = true;
     juce::String     lastNadOpts;   // Min/Max + period + smallest interval, as typed
     double           lastNadSig = -1.0e30;
+    // ONE REMEMBERED PERIOD PER MODE. The search wants 2/1 and the adaptation wants 8/1 -
+    // eight partials spread over three octaves is the spectrum that mode exists to build,
+    // and 2/1 crammed them into one - so the field cannot have a single default. The rule:
+    // the text belongs to the mode it was typed in. Leaving a mode parks whatever the field
+    // says under that mode and the mode you arrive at shows its own value back; nothing a
+    // user typed is ever thrown away, it just stays where it was typed.
+    // [0] = "Find tunings based on beating", [1] = "Adapt spectrum to tuning based on beating".
+    juce::String     periodTextByMode[2] { "2", "8" };
+    int              lastSpecMode = 1;
+    void             switchPeriodTextForMode (int newMode);
     juce::TextButton chordGoBtn;
     ChordList        chordList;
     juce::Viewport   chordView;
@@ -2691,8 +2720,13 @@ private:
     //   processor what they should be doing (see syncRealtimeLink).
     juce::TextButton chordRtBtn, adaptRtBtn;
     bool             chordRtOn = false, adaptRtOn = false;
+    // The target the user chose by hand, parked while REALTIME forces the box to the held
+    // chord (the only target a follower can meaningfully have) and handed straight back
+    // when realtime goes off. 0 = nothing parked.
+    int              adaptTargetBeforeRt = 0;
     FractalAdditiveAudioProcessor::RtSettings realtimeSettingsFromPanel() const;
     void syncRealtimeLink();
+    void syncAdaptTargetLock();
     void paintRealtimeButtons();
     // Chord preview scheduling (messages sent into the processor's collector when due).
     struct PrevEv { juce::uint32 dueMs; juce::MidiMessage msg; };

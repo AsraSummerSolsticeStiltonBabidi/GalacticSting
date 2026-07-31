@@ -2586,6 +2586,45 @@ int main()
             p.setTimbreEnabled (false);
             ed->refreshEngineDressing();
         }
+
+        // THE PANEL'S OWN WIRING, through the same callbacks a click runs.
+        if (ed != nullptr)
+        {
+            using RtLink = FractalAdditiveAudioProcessor::RtLink;
+            // (1) Each mode brings its own Period. The search wants 2/1; the adaptation
+            //     wants room for its partials and starts at 8/1. A value the user types
+            //     stays with the mode it was typed in - it is parked, never destroyed.
+            ed->setSpecModeForTests (1);
+            check (ed->panelProbeForTests().period == "2", "the tuning search's Period starts at 2");
+            ed->setSpecModeForTests (2);
+            check (ed->panelProbeForTests().period == "8", "the spectrum adaptation's Period starts at 8");
+            ed->setPeriodTextForTests ("3");
+            ed->setSpecModeForTests (1);
+            check (ed->panelProbeForTests().period == "2",
+                   "typing 3 in the adaptation does not change the search's own Period");
+            ed->setSpecModeForTests (2);
+            check (ed->panelProbeForTests().period == "3",
+                   "and coming back finds the 3 that was typed there, not the default again");
+            ed->setPeriodTextForTests ("8");
+
+            // (2) REALTIME follows WHAT IS PLAYED. Deliberately left on "to the loaded
+            //     tuning" first: that is exactly the state the complaint came from, where
+            //     the follower kept re-applying the whole loaded scale as the spectrum.
+            ed->setAdaptTargetForTests (1);
+            check (p.getRealtimeLink() == RtLink::Off, "precondition: no link yet");
+            ed->pressAdaptRealtimeForTests();
+            const auto probe = ed->panelProbeForTests();
+            check (p.getRealtimeLink() == RtLink::SpectrumFromChord,
+                   "pressing REALTIME follows the HELD NOTES even with the target left on the loaded tuning");
+            check (probe.adaptTarget == 2 && ! probe.adaptTargetEnabled,
+                   "and the target box says so, and waits, instead of claiming a target the link is not using");
+            ed->pressAdaptRealtimeForTests();
+            const auto after = ed->panelProbeForTests();
+            check (p.getRealtimeLink() == RtLink::Off, "pressing it again ends the link");
+            check (after.adaptTarget == 1 && after.adaptTargetEnabled,
+                   "and hands the target box back with the choice the user had made");
+            ed->setSpecModeForTests (1);
+        }
     }
 
     // --- run 36: the SPECTRUM adapted to notes, and the two REALTIME links ------------
@@ -2744,8 +2783,10 @@ int main()
             // An ABSOLUTE bound, deliberately not derived from kRtTuneTicks: computing the
             // allowance from the very constant under test made the check pass at any
             // throttle setting at all, including none (200 changes -> 110 searches sailed
-            // through it). "A handful per 200 spectrum changes" is the behaviour promised.
-            constexpr int allowed = 8;
+            // through it). The promise is "at most a few searches a second"; the floor came
+            // down from one second to a third when the search itself got ~5x faster, so the
+            // number here follows it - and still fails an unthrottled follower by 9x.
+            constexpr int allowed = 12;
             std::printf ("  %d spectrum changes -> %d searches started, %d retunes applied "
                          "(throttle allows at most %d)\n", kTicks, starts, applies, allowed);
             check (starts >= 2, "the follower keeps searching as the spectrum keeps moving");
@@ -2764,6 +2805,75 @@ int main()
                          p.activeSclSource() != rtScale ? "yes" : "NO");
             check (p.activeSclSource() != rtScale,
                    "one Ctrl+Z after switching realtime off leaves the follower's tuning behind");
+        }
+
+        //-- (c2) REALTIME "the spectrum follows what you PLAY". The complaint this answers:
+        //   with the target left on the loaded tuning, the follower kept writing the loaded
+        //   scale into the spectrum for ever ("en 12ED2 me pone 12ED2 como espectro todo el
+        //   rato"). It has to watch the KEYS instead, and it has to sit still when they are
+        //   not moving - re-adapting to an unchanged chord is what made it feel stuck.
+        {
+            setP ("timbreTemper", 0.0f);
+            Proc::RtSettings rs;
+            rs.adapt.partials = 4;          // small: this measures WHEN it adapts, not how well
+            rs.adapt.periodRatio = 2.0; rs.adapt.minGapCents = 50.0; rs.adapt.rootOnly = true;
+            rs.adapt.goal = 0; rs.adapt.shapeAmps = false;
+
+            auto tick = [&p, &buf] (int n)
+            {
+                for (int i = 0; i < n; ++i)
+                {
+                    juce::MidiBuffer none;
+                    p.processBlock (buf, none);          // republishes the held chord
+                    p.pollParametersForTests();          // one 60 Hz link tick
+                    juce::Thread::sleep (1);
+                }
+            };
+            auto keys = [&p, &buf] (bool on, std::initializer_list<int> notes)
+            {
+                juce::MidiBuffer m;
+                for (const int k : notes)
+                    m.addEvent (on ? juce::MidiMessage::noteOn (1, k, (juce::uint8) 100)
+                                   : juce::MidiMessage::noteOff (1, k), 0);
+                p.processBlock (buf, m);
+            };
+            auto settle = [&p, &tick] { for (int i = 0; i < 400 && p.isSpectrumAdaptRunning(); ++i) tick (1); tick (3); };
+
+            p.setRealtimeLink (Proc::RtLink::SpectrumFromChord, rs);
+            tick (60);
+            const int idleStarts = p.getRealtimeStarts();
+            std::printf ("  nothing held, 60 ticks -> %d adaptations started\n", idleStarts);
+            check (idleStarts == 0, "with no keys down the follower does nothing at all");
+
+            keys (true, { 60, 64, 67 });
+            settle();
+            const int afterChord = p.getRealtimeStarts();
+            const int appliedOne = p.getRealtimeApplies();
+            std::printf ("  C-E-G held -> %d started, %d applied\n", afterChord, appliedOne);
+            check (afterChord >= 1, "holding a chord makes it adapt to THAT chord");
+            check (appliedOne >= 1, "and the result reaches the spectrum");
+
+            tick (120);
+            settle();
+            std::printf ("  same chord held for another 120 ticks -> %d started (was %d)\n",
+                         p.getRealtimeStarts(), afterChord);
+            check (p.getRealtimeStarts() == afterChord,
+                   "and holding it still re-adapts NOTHING - an unchanged chord is not a new target");
+
+            keys (false, { 64 });                    // C-E-G becomes C-G: a different chord
+            keys (true,  { 65 });                    // ...plus F
+            settle();
+            std::printf ("  chord changed -> %d started\n", p.getRealtimeStarts());
+            check (p.getRealtimeStarts() > afterChord, "changing the notes DOES start a new adaptation");
+
+            const int beforeRelease = p.getRealtimeStarts();
+            keys (false, { 60, 65, 67 });
+            tick (120);
+            std::printf ("  keys up, 120 ticks -> %d started (was %d)\n",
+                         p.getRealtimeStarts(), beforeRelease);
+            check (p.getRealtimeStarts() == beforeRelease,
+                   "and letting go stops it dead instead of re-adapting to an empty hand");
+            p.setRealtimeLink (Proc::RtLink::Off, rs);
         }
 
         //-- (d) THE FEEDBACK GUARD: temper mode makes the tuning build the spectrum, so a

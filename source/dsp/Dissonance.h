@@ -15,7 +15,9 @@
 // exact timbre - the basis of the "tune by dissonance curve" feature; its MAXIMA
 // are the roughest intervals (the "reverse" mode).
 //
-// Pure C++ (no JUCE), message-thread only, unit-tested in SpectrumTests.
+// Pure C++ (no JUCE), unit-tested in SpectrumTests. searchChords spawns short-lived
+// worker threads for its table build (see buildGridTables) and joins them before it
+// returns, so a caller still sees one plain blocking call.
 //==============================================================================
 
 #include <vector>
@@ -23,6 +25,9 @@
 #include <algorithm>
 #include <string>
 #include <functional>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 namespace dissonance
 {
@@ -224,6 +229,135 @@ namespace dissonance
 
     struct ChordResult { std::vector<double> alphas; double value; };
 
+    //==========================================================================
+    // THE GRID TABLES, and why they are the whole cost of a chord search.
+    //
+    // The enumeration below scores a combination from two exact tables - Dself per grid
+    // point and Dcross per pair of grid points. Building dCross is O(G^2) calls of
+    // crossDissonance, each O(P^2) partial pairs: at the 64-partial analysis cap, a 5-cent
+    // grid over 2/1 is ~28,700 pairs x 4,096 partial pairs x 2 exp = ~235 million exp
+    // calls, which measured 1.4 s single-threaded. The realtime "tuning follows the
+    // spectrum" link re-runs this on every spectrum change, so that number IS the
+    // feature's latency. Three things cut it without touching a single result:
+    //
+    //   1. BUILD ONLY WHAT IS READ. Every grid index in a legal combination sits at least
+    //      minGap cents from the root AND from the period, and every PAIR of them at least
+    //      minGap apart - so the band outside that, and every cell closer than minGap to
+    //      the diagonal, is never looked at. In "0 vs all" the enumeration only ever reads
+    //      row 0, so the other 99.6% of the matrix was pure waste.
+    //   2. SPREAD IT OVER THE CORES. The cells are independent; each worker claims whole
+    //      rows from one atomic counter (row i costs G-i pairs, so a static split would
+    //      leave half the cores idle). Every cell is written by exactly one thread and read
+    //      by none until the join, so the table is bit-identical to the serial one.
+    //   3. REUSE IT. The tables depend on the spectrum, the period and the grid, and on
+    //      nothing else - not on the note count, not on min/max, not on how many results
+    //      are wanted. Re-searching the same spectrum (a second Find, a note count changed,
+    //      Min flipped to Max) therefore costs the enumeration only.
+    struct GridTables
+    {
+        std::vector<Partial> spectrum;      // exactly what these were built from
+        double period = 0.0, step = 0.0, minGap = -1.0;
+        int    G = 0;
+        bool   full = false;                // every pair, not just the root row
+        std::vector<double> dSelf, dCross;
+        bool   valid = false;
+    };
+
+    inline std::mutex& gridCacheMutex() { static std::mutex m; return m; }
+    inline GridTables& gridCache()      { static GridTables c; return c; }
+
+    // Drop the cached tables (frees ~0.5 MB; the tests use it to prove a cold search and
+    // a cached one return the same thing).
+    inline void clearGridCache()
+    {
+        std::unique_lock<std::mutex> lk (gridCacheMutex());
+        gridCache() = GridTables {};
+    }
+
+    // Do these cached tables answer THIS question exactly? The spectrum is compared value
+    // by value (a spectrum that differs in the last bit is a different spectrum), and a
+    // table built for a SMALLER minimum interval is a superset of one built for a larger
+    // one - it has every cell this search can read, and then some.
+    inline bool gridTablesMatch (const GridTables& c, const std::vector<Partial>& sp,
+                                 double period, double step, int G, double minGap, bool needFull)
+    {
+        if (! c.valid || c.G != G || c.period != period || c.step != step
+            || (needFull && ! c.full) || c.minGap > minGap
+            || c.spectrum.size() != sp.size())
+            return false;
+        for (size_t i = 0; i < sp.size(); ++i)
+            if (c.spectrum[i].freq != sp[i].freq || c.spectrum[i].amp != sp[i].amp)
+                return false;
+        return true;
+    }
+
+    // Fill dSelf/dCross for the indices a legal combination can actually use. Returns
+    // false if `progress` asked to stop. `progress` is only ever called from THIS thread.
+    inline bool buildGridTables (const std::vector<Partial>& sp, const std::vector<double>& alpha,
+                                 int G, int iLo, int iHi, double step, double minGap, bool full,
+                                 std::vector<double>& dSelf, std::vector<double>& dCross,
+                                 const std::function<bool(float)>& progress, float p0, float p1)
+    {
+        const int stride = G + 1;
+        dSelf.assign ((size_t) stride, 0.0);
+        dCross.assign ((size_t) stride * (size_t) stride, 0.0);
+        dSelf[0] = selfDissonance (sp, alpha[0]);            // the root's own term
+        for (int i = iLo; i <= iHi; ++i)
+            dSelf[(size_t) i] = selfDissonance (sp, alpha[(size_t) i]);
+
+        // Row 0 is the beating against the ROOT - the one row "0 vs all" needs. The rest
+        // of the matrix is only built for "all vs all".
+        const int rows = full ? (iHi - iLo + 2) : 1;         // row 0, then iLo..iHi
+        std::atomic<int>  next { 0 };
+        std::atomic<int>  done { 0 };
+        std::atomic<bool> stop { false };
+        bool cancelled = false;
+
+        const auto worker = [&] (bool main)
+        {
+            for (;;)
+            {
+                if (stop.load (std::memory_order_relaxed)) return;
+                const int k = next.fetch_add (1, std::memory_order_relaxed);
+                if (k >= rows) return;
+                const int i = k == 0 ? 0 : iLo + k - 1;
+                for (int j = std::max (i + 1, iLo); j <= iHi; ++j)
+                {
+                    // The SAME comparison the enumeration's gap rule makes, so a cell is
+                    // skipped exactly when no combination can ever read it.
+                    if ((double) (j - i) * step < minGap) continue;
+                    const double v = crossDissonance (sp, alpha[(size_t) i], alpha[(size_t) j]);
+                    dCross[(size_t) i * (size_t) stride + (size_t) j] = v;
+                    dCross[(size_t) j * (size_t) stride + (size_t) i] = v;
+                }
+                const int d = done.fetch_add (1, std::memory_order_relaxed) + 1;
+                if (main && progress
+                    && ! progress (p0 + (p1 - p0) * (float) d / (float) std::max (1, rows)))
+                {
+                    stop.store (true, std::memory_order_relaxed);
+                    cancelled = true;
+                    return;
+                }
+            }
+        };
+
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 1;
+        const int helpers = std::max (0, std::min ((int) hw, rows) - 1);
+        std::vector<std::thread> pool;
+        pool.reserve ((size_t) helpers);
+        for (int t = 0; t < helpers; ++t)
+        {
+            // A machine that cannot spawn a thread must still finish the search: the
+            // calling thread already does the same work, so it just goes slower.
+            try { pool.emplace_back ([&worker] { worker (false); }); }
+            catch (...) { break; }
+        }
+        worker (true);
+        for (auto& t : pool) t.join();
+        return ! cancelled;
+    }
+
     // Ranked n-note chord search: the root is fixed at 1/1; the remaining notes-1
     // degrees sweep a cents grid inside (0, period); every combination's TOTAL
     // Sethares dissonance is evaluated EXACTLY at grid points via the pair
@@ -286,19 +420,37 @@ namespace dissonance
         for (int i = 1; i <= G; ++i) alpha[(size_t) i] = std::pow (2.0, (double) i * step / 1200.0);
 
         // Exact tables: Dself per grid point, Dcross per unordered pair (incl. root).
-        std::vector<double> dSelf ((size_t) G + 1);
-        for (int i = 0; i <= G; ++i) dSelf[(size_t) i] = selfDissonance (spectrum, alpha[(size_t) i]);
-        std::vector<double> dCross ((size_t) (G + 1) * (size_t) (G + 1), 0.0);
-        for (int i = 0; i <= G; ++i)
+        // Only the indices a legal combination can hold are built (see GridTables): every
+        // note sits at least minGap from the root and from the period, so the band outside
+        // [iLo, iHi] is unreachable and is never written NOR read.
+        const double minGap = std::max (0.0, minGapCents);
+        int iLo = 1, iHi = G;
+        while (iLo <= G && (double) iLo * step < minGap) ++iLo;
+        while (iHi >= 1 && totalCents - (double) iHi * step < minGap) --iHi;
+        if (iHi - iLo + 1 < m)
+            return out;                        // no room for m notes: the gap rule kills them all
+
+        std::vector<double> dSelf, dCross;
         {
-            for (int j = i + 1; j <= G; ++j)
+            std::unique_lock<std::mutex> lk (gridCacheMutex());
+            const auto& c = gridCache();
+            if (gridTablesMatch (c, spectrum, period, step, G, minGap, ! rootOnly))
             {
-                const double v = crossDissonance (spectrum, alpha[(size_t) i], alpha[(size_t) j]);
-                dCross[(size_t) i * (size_t) (G + 1) + (size_t) j] = v;
-                dCross[(size_t) j * (size_t) (G + 1) + (size_t) i] = v;
+                dSelf = c.dSelf;               // ~460 KB memcpy against ~1.4 s of exp calls
+                dCross = c.dCross;
             }
-            if (progress && ! progress (0.25f * (float) i / (float) std::max (1, G)))
-                return out;
+        }
+        if (dCross.empty())
+        {
+            if (! buildGridTables (spectrum, alpha, G, iLo, iHi, step, minGap, ! rootOnly,
+                                   dSelf, dCross, progress, 0.0f, 0.25f))
+                return out;                    // cancelled mid-build
+            std::unique_lock<std::mutex> lk (gridCacheMutex());
+            auto& c = gridCache();
+            c.spectrum = spectrum; c.period = period; c.step = step; c.G = G;
+            c.minGap = minGap;     c.full = ! rootOnly;
+            c.dSelf = dSelf;       c.dCross = dCross;
+            c.valid = true;
         }
 
         // Enumerate combinations of m strictly-increasing interior indices. Keep the
@@ -313,7 +465,18 @@ namespace dissonance
         for (int i = 0; i < m; ++i) c[i] = i + 1;
         long long done = 0;
         const double rootTerm = dSelf[0];
-        const double minGap = std::max (0.0, minGapCents);
+        // BRANCH AND BOUND. Every term of the decomposition is >= 0 - Sethares' pair term
+        // is min(ai,aj) * (C1*e^(A1 s d) + C2*e^(A2 s d)) with C1 = -C2 and A1 > A2, which
+        // is 0 at d = 0 and positive for every d > 0 - so the running sum over the first
+        // few notes is a LOWER BOUND on the whole combination, and on every combination
+        // that shares those notes as a prefix. Once the keep-list is full, a prefix already
+        // worse than its worst entry can be dropped WITH ITS ENTIRE SUBTREE: those
+        // combinations could only have been rejected anyway, so the results are identical
+        // and the work is not done. Only for minima (a maximum needs an upper bound, which
+        // a partial sum is not), and only if no amplitude is negative, which would break
+        // the sign argument.
+        bool canPrune = ! maxima;
+        for (const auto& p : spectrum) if (! (p.amp >= 0.0)) canPrune = false;
         while (true)
         {
             // Minimum-interval rule: every adjacent pair (incl. root->first and
@@ -336,13 +499,34 @@ namespace dissonance
             }
 
             // Total = union-of-copies dissmeasure, decomposed exactly into the tables.
+            // Accumulated as a PREFIX (each note against the root and against the notes
+            // already added) so the running value is a bound on the whole subtree.
+            const double cut = (int) best.size() >= keep ? best.back().value : 0.0;
+            const bool   prune = canPrune && (int) best.size() >= keep;
             double v = rootTerm;
+            int cutLevel = -1;
             for (int i = 0; i < m; ++i)
             {
                 v += dSelf[(size_t) c[i]] + dCross[(size_t) c[i]]; // cross with the root (index 0)
                 if (! rootOnly)                                    // "all vs all" only
-                    for (int j = i + 1; j < m; ++j)
-                        v += dCross[(size_t) c[i] * (size_t) (G + 1) + (size_t) c[j]];
+                    for (int j = 0; j < i; ++j)
+                        v += dCross[(size_t) c[j] * (size_t) (G + 1) + (size_t) c[i]];
+                if (prune && v > cut) { cutLevel = i; break; }
+            }
+            if (cutLevel >= 0)
+            {
+                // Skip every combination that starts with this prefix: index cutLevel
+                // moves on and everything after it is reset, instead of the usual
+                // last-index step.
+                if (++done % 65536 == 0 && progress
+                    && ! progress (0.25f + 0.65f * (float) done / (float) combosEst))
+                    return out;
+                int i = cutLevel;
+                while (i >= 0 && c[i] == G - (m - 1 - i)) --i;
+                if (i < 0) break;
+                ++c[i];
+                for (int j = i + 1; j < m; ++j) c[j] = c[j - 1] + 1;
+                continue;
             }
 
             if ((int) best.size() < keep || ! worseThan (v, best.back().value))

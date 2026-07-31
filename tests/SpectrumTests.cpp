@@ -551,6 +551,150 @@ int main()
     }
 
     //--------------------------------------------------------------------------
+    // THE REALTIME BUDGET. The tuning-follows-spectrum link re-runs this exact search
+    // every time the spectrum changes, so its cost is the feature's latency. Measured on
+    // this machine (12 cores) at the 64-partial analysis cap, before and after:
+    //     3 notes, all vs all   1374 ms -> ~300 ms cold, ~120 ms on the cached tables
+    //     3 notes, 0 vs all     2376 ms -> ~30 ms   (it was building a whole matrix to
+    //                                                read one row of it)
+    //     4 notes, all vs all   3045 ms -> ~320 ms with those tables already built
+    // The follower used to lag audibly behind the sound it was supposed to be following.
+    //
+    // Everything below the timings is a FENCE around the answer. The search was made
+    // parallel, table-cached and pruned; none of that is allowed to move a single
+    // result, so the top-4 chords and their dissonance values are pinned here to the
+    // values the single-threaded, uncached, unpruned version produced. A speedup that
+    // shifts a ranking is a bug, not an optimisation - this is what says so.
+    {
+        std::printf ("\nchord search: cost and an exact fence on its results\n");
+        std::vector<dissonance::Partial> big;          // the analysis cap, saw roll-off
+        for (int k = 1; k <= 64; ++k)
+            big.push_back ({ 261.6255653 * (double) k, 1.0 / (double) k });
+
+        const auto run = [&big] (int notes, int count, bool rootOnly, double& msOut)
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            auto r = dissonance::searchChords (big, 2.0, notes, count, false, 50.0, rootOnly);
+            msOut = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - t0).count();
+            return r;
+        };
+
+        double msAll = 0.0, msAll2 = 0.0, msRoot = 0.0, msQuad = 0.0;
+        const auto all  = run (3, 4, false, msAll);
+        const auto all2 = run (3, 4, false, msAll2);   // second run: the cached tables
+        const auto root = run (3, 4, true,  msRoot);
+        // FOUR notes: 2.2 million combinations, which is where the branch-and-bound does
+        // its work. It has to reach the same eight chords as the exhaustive scan did.
+        const auto quad = run (4, 8, false, msQuad);
+        std::printf ("  3 notes all vs all: %.0f ms (again, same spectrum: %.0f ms)   0 vs all: %.0f ms"
+                     "   4 notes all vs all: %.0f ms\n", msAll, msAll2, msRoot, msQuad);
+        const auto dump = [] (const char* tag, const std::vector<dissonance::ChordResult>& v)
+        {
+            for (const auto& r : v)
+            {
+                std::printf ("    %-10s value %.15g  alphas", tag, r.value);
+                for (const double a : r.alphas) std::printf (" %.15g", a);
+                std::printf ("\n");
+            }
+        };
+        dump ("all-vs-all", all);
+        dump ("0-vs-all", root);
+        dump ("4-note", quad);
+
+        // The fence. Values captured from the pre-optimisation build (single thread, no
+        // cache, no pruning) - they are what "unchanged" means from here on.
+        struct Fence { double value; double a1, a2, a3; };
+        static const Fence kAll[] = {
+            { 19.3419858948448, 1.50000056084297, 1.8750000170461,  0.0 },
+            { 19.4016229826057, 1.49999307729161, 1.94303671932295, 0.0 },
+            { 19.4063962706288, 1.49999307729161, 1.9285599852982,  0.0 },
+            { 19.5135834250506, 1.49999307729161, 1.91914459359882, 0.0 },
+        };
+        static const Fence kRoot[] = {
+            { 14.1229789745861, 1.66667375059104, 1.74999331540571, 0.0 },
+            { 14.1307750170015, 1.74999331540571, 1.83332750118558, 0.0 },
+            { 14.1320326277097, 1.75000870882375, 1.80131306216873, 0.0 },
+            { 14.1493449256536, 1.66667375059104, 1.83332750118558, 0.0 },
+        };
+        static const Fence kQuad[] = {
+            { 36.6296014709117, 1.29536498039975, 1.72715266142539, 1.94303671932295 },
+            { 36.6517883765966, 1.25047367501992, 1.66728415085272, 1.8757095314529  },
+            { 36.6794680166313, 1.29165651437782, 1.72221663410612, 1.9374854959832  },
+            { 36.6869045473911, 1.29536498039975, 1.66546706473225, 1.94303671932295 },
+            { 36.7141852821162, 1.2873018080426,  1.71640176896889, 1.93094206851233 },
+            { 36.785578435077,  1.2499995439951,  1.66666543550174, 1.94303671932295 },
+            { 36.796759806717,  1.29536498039975, 1.61920563480691, 1.94303671932295 },
+            { 36.8278914609482, 1.29162921688404, 1.66667375059104, 1.93743488375364 },
+        };
+        const auto fence = [] (const std::vector<dissonance::ChordResult>& got,
+                               const Fence* want, int n, int notes, const char* what)
+        {
+            bool ok = (int) got.size() == n;
+            for (int i = 0; i < n && ok; ++i)
+            {
+                if ((int) got[(size_t) i].alphas.size() != notes) { ok = false; break; }
+                const double* w = &want[i].a1;
+                ok = std::abs (got[(size_t) i].value - want[i].value) <= 1.0e-9 * std::abs (want[i].value);
+                for (int k = 1; k < notes && ok; ++k)
+                    ok = std::abs (1200.0 * std::log2 (got[(size_t) i].alphas[(size_t) k] / w[k - 1])) < 1.0e-6;
+            }
+            check (ok, what);
+        };
+        fence (all,  kAll,  (int) (sizeof (kAll)  / sizeof (Fence)), 3, "3-note all-vs-all top 4: same chords, same values as before the optimisation");
+        fence (root, kRoot, (int) (sizeof (kRoot) / sizeof (Fence)), 3, "3-note 0-vs-all top 4: same chords, same values as before the optimisation");
+        fence (quad, kQuad, (int) (sizeof (kQuad) / sizeof (Fence)), 4, "4-note top 8: the pruned search reaches the same chords as the exhaustive one");
+
+        // The cache must be an EXACT reuse, not an approximation: the same spectrum
+        // searched twice has to give bit-identical results, or a cached table is
+        // quietly answering a question it was not built for.
+        bool identical = all.size() == all2.size();
+        for (size_t i = 0; i < all.size() && identical; ++i)
+        {
+            if (all[i].value != all2[i].value || all[i].alphas.size() != all2[i].alphas.size())
+                identical = false;
+            for (size_t k = 0; k < all[i].alphas.size() && identical; ++k)
+                if (all[i].alphas[k] != all2[i].alphas[k]) identical = false;
+        }
+        check (identical, "the same search run twice is bit-identical (cached tables answer the same question)");
+
+        // ...and a DIFFERENT spectrum must never be answered out of the previous one's
+        // tables. That is the whole risk of caching them, and it takes TWO probes to close
+        // it, each the same SIZE as the cached spectrum so only the values can tell them
+        // apart: one that moves the frequencies (stretched partials - a stretched timbre
+        // wants a stretched scale, Sethares' own example) and one that moves only the
+        // amplitudes (a steeper roll-off). A cache that compared anything less than every
+        // value would hand one of them the other's chords.
+        for (const int probe : { 0, 1 })
+        {
+            std::vector<dissonance::Partial> other;
+            for (int k = 1; k <= 64; ++k)
+                other.push_back ({ 261.6255653 * (probe == 0 ? std::pow ((double) k, 1.2) : (double) k),
+                                   probe == 0 ? 1.0 / (double) k : (double) k / 64.0 });
+
+            dissonance::clearGridCache();
+            const auto cold = dissonance::searchChords (other, 2.0, 3, 4, false, 50.0, false);
+            dissonance::clearGridCache();
+            (void) dissonance::searchChords (big, 2.0, 3, 4, false, 50.0, false); // the cache now holds ANOTHER spectrum
+            const auto warm = dissonance::searchChords (other, 2.0, 3, 4, false, 50.0, false);
+
+            bool same = cold.size() == warm.size() && ! cold.empty();
+            for (size_t i = 0; i < cold.size() && same; ++i)
+            {
+                if (cold[i].value != warm[i].value || cold[i].alphas.size() != warm[i].alphas.size())
+                    same = false;
+                for (size_t k = 0; k < cold[i].alphas.size() && same; ++k)
+                    if (cold[i].alphas[k] != warm[i].alphas[k]) same = false;
+            }
+            std::printf ("  %-22s cold best %.9f   after another spectrum was searched %.9f\n",
+                         probe == 0 ? "stretched partials:" : "steeper roll-off:",
+                         cold.empty() ? 0.0 : cold[0].value, warm.empty() ? 0.0 : warm[0].value);
+            check (same, probe == 0
+                       ? "a spectrum whose partials MOVED gets its own tables, not the cached ones"
+                       : "and so does one where only the AMPLITUDES moved");
+        }
+    }
+
+    //--------------------------------------------------------------------------
     // THE INVERSE SEARCH: the notes are given and the PARTIALS move (adaptSpectrum).
     {
         std::printf ("\nadapting the spectrum to a fixed set of notes:\n");

@@ -1818,8 +1818,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     specModeBox.setSelectedId (processorRef.isSegmentModeActive() ? 3 : 1, juce::dontSendNotification); // restored state
     specModeBox.setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
     specModeBox.setMouseClickGrabsKeyboardFocus (false);
+    lastSpecMode = specModeBox.getSelectedId();
     specModeBox.onChange = [this]
     {
+        switchPeriodTextForMode (specModeBox.getSelectedId());
         const bool seg = specModeBox.getSelectedId() == 3;
         processorRef.setSegmentModeActive (seg);
         if (seg) processorRef.rebuildSegmentScale();
@@ -1889,7 +1891,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         addChildComponent (*b);
     }
     chordRtBtn.onClick = [this] { chordRtOn = ! chordRtOn; syncRealtimeLink(); resized(); refocus(); };
-    adaptRtBtn.onClick = [this] { adaptRtOn = ! adaptRtOn; syncRealtimeLink(); resized(); refocus(); };
+    adaptRtBtn.onClick = [this]
+    { adaptRtOn = ! adaptRtOn; syncAdaptTargetLock(); syncRealtimeLink(); resized(); refocus(); };
     // Two labelled view buttons: "Results" = the list of ALL found chords;
     // "Tuning info" = the LOADED chord's degrees ranked like any scale.
     for (auto* b : { &chordViewBack, &chordViewFwd })
@@ -1922,7 +1925,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     chordNotesLbl.setVisible (false);
     makeLabel (chordPerLbl, cSpecScale);
     chordPerLbl.setVisible (false);
-    chordPeriodEdit.setText ("2", juce::dontSendNotification);
+    chordPeriodEdit.setText (periodTextByMode[specModeBox.getSelectedId() == 2 ? 1 : 0],
+                             juce::dontSendNotification);
     chordPeriodEdit.setJustification (juce::Justification::centred);
     chordPeriodEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
     chordPeriodEdit.setColour (juce::TextEditor::outlineColourId, cSpecScale.withAlpha (0.7f));
@@ -2794,8 +2798,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Min = the most CONSONANT combinations with this exact timbre (Sethares sensory dissonance of all partial pairs). Max = the roughest.",
         "Min = les combinacions m\xc3\xa9s CONSONANTS amb aquest timbre exacte (disson\xc3\xa0ncia sensorial de Sethares de tots els parells de parcials). Max = les m\xc3\xa9s aspres."));
     chordPeriodEdit.setTooltip (tr (
-        "The *period* the search works in.\nWrite it as a whole number `3`, a fraction `3/2`, or cents `1200c` / `1200 cents` / just `1200`.",
-        "El *per\xc3\xado" "de* amb qu\xc3\xa8 treballa la cerca.\nEscriu-lo com a nombre enter `3`, fracci\xc3\xb3 `3/2`, o cents `1200c` / `1200 cents` / nom\xc3\xa9s `1200`."));
+        "The *period* the search works in.\nWrite it as a whole number `3`, a fraction `3/2`, or cents `1200c` / `1200 cents` / just `1200`.\n"
+        "Each mode keeps its own: the tuning search starts at `2`, the spectrum adaptation at `8` (its partials want room to spread). What you type stays with the mode you typed it in.",
+        "El *per\xc3\xado" "de* amb qu\xc3\xa8 treballa la cerca.\nEscriu-lo com a nombre enter `3`, fracci\xc3\xb3 `3/2`, o cents `1200c` / `1200 cents` / nom\xc3\xa9s `1200`.\n"
+        "Cada mode t\xc3\xa9 el seu: la cerca d'afinacions comen\xc3\xa7""a a `2`, l'adaptaci\xc3\xb3 de l'espectre a `8` (els parcials volen espai). El que escriguis es queda al mode on l'has escrit."));
     chordGoBtn.setTooltip (tr (
         "Rank all n-note combinations by their Sethares sensory dissonance against the CURRENT spectrum (grid search + exact refinement, on a background thread). Play previews a chord; double-click loads it as the active scale (.scl).",
         "Ordena totes les combinacions de n notes per la seva disson\xc3\xa0ncia sensorial de Sethares contra l'espectre ACTUAL (cerca en graella + refinament exacte, en segon pla). Play pre-escolta un acord; doble clic el carrega com a escala activa (.scl)."));
@@ -2813,8 +2819,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     chordRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
     adaptRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
     adaptTargetBox.setTooltip (tr (
-        "WHICH NOTES the spectrum is adapted to.\n*The loaded tuning* - its degrees.\n*The chord held now* - literally the notes under your fingers, at the pitch they are really sounding. Play a major chord in 31-EDO and the partials go where that chord beats least.",
-        "QUINES NOTES fan d'objectiu.\n*L'afinaci\xc3\xb3 carregada* - els seus graus.\n*L'acord que sona ara* - literalment les notes sota els dits, a l'al\xc3\xa7""ada real. Toca un acord major en 31-EDO i els parcials van on aquell acord bat menys."));
+        "WHICH NOTES the spectrum is adapted to.\n*The loaded tuning* - its degrees.\n*The chord held now* - literally the notes under your fingers, at the pitch they are really sounding. Play a major chord in 31-EDO and the partials go where that chord beats least.\nREALTIME always follows the held chord, so this box shows that and waits while the link is on.",
+        "QUINES NOTES fan d'objectiu.\n*L'afinaci\xc3\xb3 carregada* - els seus graus.\n*L'acord que sona ara* - literalment les notes sota els dits, a l'al\xc3\xa7""ada real. Toca un acord major en 31-EDO i els parcials van on aquell acord bat menys.\nTEMPS REAL sempre segueix l'acord que mantens, per aix\xc3\xb2 aquesta casella ho mostra i espera mentre el v\xc3\xadncle est\xc3\xa0 actiu."));
     adaptPartialsBox.setTooltip (tr (
         "How many partials the adapted spectrum has. They are all kept: the search MOVES them and never merges or removes one - each keeps at least the smallest interval below from its neighbours.",
         "Quants parcials t\xc3\xa9 l'espectre adaptat. Es conserven tots: la cerca els MOU i mai no en fusiona ni n'elimina cap - cada un guarda com a m\xc3\xadnim l'interval m\xc3\xa9s petit de sota respecte als ve\xc3\xafns."));
@@ -2828,11 +2834,11 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Adapt the spectrum once, now. It is written into the Custom Engine (partial ratios) plus the per-partial amplitudes, as ONE undo step.",
         "Adapta l'espectre un cop, ara. S'escriu al Motor Propi (raons dels parcials) m\xc3\xa9s les amplituds per parcial, com UN sol pas d'anul\xc2\xb7laci\xc3\xb3."));
     chordRtBtn.setTooltip (tr (
-        "REALTIME: the tuning follows the TOP result on its own, every time the spectrum changes (a knob, a modulator, a preset). At most one search a second, never two at once, and many changes while it is busy collapse into one - so a sweeping modulator cannot pile searches up. A full search takes a moment (about 1.5 s with a rich spectrum), so each retune lands as its own search finishes. Realtime updates do NOT fill the tuning bank: the tuning you had joins it ONCE when you switch this on, and switching it off leaves ONE Ctrl+Z back to it.",
-        "TEMPS REAL: l'afinaci\xc3\xb3 segueix sola el PRIMER resultat cada cop que canvia l'espectre (un potenci\xc3\xb2metre, un modulador, un preset). Com a m\xc3\xa0xim una cerca per segon, mai dues alhora, i molts canvis mentre treballa es fusionen en un - aix\xc3\xad un modulador escombrant no pot acumular cerques. Una cerca completa triga una estona (uns 1,5 s amb un espectre ric), per aix\xc3\xb2 cada reafinaci\xc3\xb3 arriba quan acaba la seva cerca. Les actualitzacions en temps real NO omplen el banc: l'afinaci\xc3\xb3 que tenies hi entra UN sol cop en activar-ho, i en desactivar-ho queda UN Ctrl+Z per recuperar-la."));
+        "REALTIME: the tuning follows the TOP result on its own, every time the spectrum changes (a knob, a modulator, a preset). At most three searches a second, never two at once, and many changes while it is busy collapse into one - so a sweeping modulator cannot pile searches up. A full search takes about 0.3 s with a rich spectrum (0.1 s when the spectrum's tables can be reused), so each retune lands as its own search finishes. Realtime updates do NOT fill the tuning bank: the tuning you had joins it ONCE when you switch this on, and switching it off leaves ONE Ctrl+Z back to it.",
+        "TEMPS REAL: l'afinaci\xc3\xb3 segueix sola el PRIMER resultat cada cop que canvia l'espectre (un potenci\xc3\xb2metre, un modulador, un preset). Com a m\xc3\xa0xim tres cerques per segon, mai dues alhora, i molts canvis mentre treballa es fusionen en un - aix\xc3\xad un modulador escombrant no pot acumular cerques. Una cerca completa triga uns 0,3 s amb un espectre ric (0,1 s quan es poden reaprofitar les taules de l'espectre), per aix\xc3\xb2 cada reafinaci\xc3\xb3 arriba quan acaba la seva cerca. Les actualitzacions en temps real NO omplen el banc: l'afinaci\xc3\xb3 que tenies hi entra UN sol cop en activar-ho, i en desactivar-ho queda UN Ctrl+Z per recuperar-la."));
     adaptRtBtn.setTooltip (tr (
-        "REALTIME: the spectrum re-adapts on its own - to the tuning, or to the chord you are holding, whichever the target above says. Throttled to about four adaptations a second and coalesced. Switching it off leaves ONE Ctrl+Z back to the spectrum you had before.",
-        "TEMPS REAL: l'espectre es torna a adaptar sol - a l'afinaci\xc3\xb3, o a l'acord que mantens, seg\xc3\xb3ns l'objectiu de dalt. Limitat a ~quatre adaptacions per segon i fusionat. En desactivar-ho queda UN Ctrl+Z per recuperar l'espectre anterior."));
+        "REALTIME: the spectrum follows WHAT YOU PLAY - it re-adapts to the chord under your fingers, at the pitch it is really sounding, every time that chord changes. Hold nothing and it does nothing; hold the same chord and it stays put instead of re-adapting to it over and over. Throttled to about four adaptations a second and coalesced. (The loaded tuning is a target for the Adapt button, not for a follower: it would just keep writing the same scale into the spectrum.) Switching it off leaves ONE Ctrl+Z back to the spectrum you had before.",
+        "TEMPS REAL: l'espectre segueix el QUE TOQUES - es torna a adaptar a l'acord que tens sota els dits, a l'al\xc3\xa7""ada real, cada cop que aquell acord canvia. Si no mantens res, no fa res; si mantens el mateix acord, es queda quiet en comptes de tornar-s'hi a adaptar un cop i un altre. Limitat a ~quatre adaptacions per segon i fusionat. (L'afinaci\xc3\xb3 carregada \xc3\xa9s un objectiu per al bot\xc3\xb3 Adapta, no per a un seguidor: nom\xc3\xa9s escriuria la mateixa escala a l'espectre.) En desactivar-ho queda UN Ctrl+Z per recuperar l'espectre anterior."));
     adaptList.tip = tr ("The adapted spectrum: every partial's interval from the played note, and the amplitude the search gave it. All of them are here - the search moves partials, it never drops them.",
                         "L'espectre adaptat: l'interval de cada parcial respecte a la nota tocada i l'amplitud que li ha donat la cerca. Hi s\xc3\xb3n tots - la cerca mou parcials, no en descarta cap.");
     adaptList.emptyText = tr ("Press Adapt to move the partials to where these notes beat least (or most).",
@@ -2992,6 +2998,75 @@ FractalAdditiveAudioProcessorEditor::realtimeSettingsFromPanel() const
     return s;
 }
 
+//==============================================================================
+// Test hooks - see PanelProbe in the header. Each one goes through the SAME callback a
+// click or a keystroke would, so what the verifier exercises is the shipping wiring.
+FractalAdditiveAudioProcessorEditor::PanelProbe
+FractalAdditiveAudioProcessorEditor::panelProbeForTests() const
+{
+    PanelProbe pr;
+    pr.mode               = specModeBox.getSelectedId();
+    pr.adaptTarget        = adaptTargetBox.getSelectedId();
+    pr.adaptTargetEnabled = adaptTargetBox.isEnabled();
+    pr.period             = chordPeriodEdit.getText();
+    return pr;
+}
+
+void FractalAdditiveAudioProcessorEditor::setSpecModeForTests (int mode)
+{
+    specModeBox.setSelectedId (mode, juce::sendNotificationSync);
+}
+
+void FractalAdditiveAudioProcessorEditor::setAdaptTargetForTests (int id)
+{
+    adaptTargetBox.setSelectedId (id, juce::sendNotificationSync);
+}
+
+void FractalAdditiveAudioProcessorEditor::setPeriodTextForTests (const juce::String& t)
+{
+    chordPeriodEdit.setText (t, juce::dontSendNotification);
+    syncRealtimeLink();                       // exactly what onFocusLost does
+}
+
+void FractalAdditiveAudioProcessorEditor::pressAdaptRealtimeForTests()
+{
+    if (adaptRtBtn.onClick) adaptRtBtn.onClick();
+}
+
+// Park the Period the user typed under the mode they typed it in, and show the mode being
+// entered its own value (see periodTextByMode). Only modes 1 and 2 own this field - the
+// segment picker has a period box of its own - so arriving at or leaving mode 3 changes
+// nothing except which value is waiting when the field comes back.
+void FractalAdditiveAudioProcessorEditor::switchPeriodTextForMode (int newMode)
+{
+    if (newMode == lastSpecMode) return;
+    if (lastSpecMode == 1 || lastSpecMode == 2)
+        periodTextByMode[lastSpecMode == 2 ? 1 : 0] = chordPeriodEdit.getText();
+    if (newMode == 1 || newMode == 2)
+        chordPeriodEdit.setText (periodTextByMode[newMode == 2 ? 1 : 0], juce::dontSendNotification);
+    lastSpecMode = newMode;
+}
+
+// The adaptation's target selector, kept honest about the realtime link. While the link
+// is on the box READS "to the chord held now" and cannot be changed, because that is the
+// only target the follower uses; when it goes off - by the button, by leaving the mode, or
+// because the processor refused the link - the user's own choice comes straight back, so
+// the hand-pressed Adapt still works on whichever target they picked.
+void FractalAdditiveAudioProcessorEditor::syncAdaptTargetLock()
+{
+    if (adaptRtOn)
+    {
+        if (adaptTargetBeforeRt == 0) adaptTargetBeforeRt = adaptTargetBox.getSelectedId();
+        adaptTargetBox.setSelectedId (2, juce::dontSendNotification);
+    }
+    else if (adaptTargetBeforeRt > 0)
+    {
+        adaptTargetBox.setSelectedId (adaptTargetBeforeRt, juce::dontSendNotification);
+        adaptTargetBeforeRt = 0;
+    }
+    adaptTargetBox.setEnabled (! adaptRtOn);
+}
+
 void FractalAdditiveAudioProcessorEditor::syncRealtimeLink()
 {
     using RtLink = FractalAdditiveAudioProcessor::RtLink;
@@ -3005,8 +3080,15 @@ void FractalAdditiveAudioProcessorEditor::syncRealtimeLink()
     if (mode == 1 && tuneSourceBox.getSelectedId() == 2 && chordRtOn)
         want = RtLink::TuningFromSpectrum;
     else if (mode == 2 && adaptRtOn)
-        want = adaptTargetBox.getSelectedId() == 2 ? RtLink::SpectrumFromChord
-                                                   : RtLink::SpectrumFromTuning;
+        // REALTIME MEANS "FOLLOW WHAT I PLAY". The other target - the loaded tuning - is a
+        // fixed set of notes that only changes when the user loads another scale, so a
+        // follower aimed at it re-applied the SAME adaptation for ever: in 12ED2 the panel
+        // simply put the twelve degrees of 12ED2 into the spectrum and kept putting them
+        // there. That is what the Adapt button is for (one press, one result); the realtime
+        // button is aimed at the chord under the fingers, always. The target selector is
+        // forced to say so while the link is lit (see adaptRtBtn.onClick), so the panel
+        // never claims a target the link is not using.
+        want = RtLink::SpectrumFromChord;
 
     if (want != processorRef.getRealtimeLink()) processorRef.setRealtimeLink (want, s);
     else                                       processorRef.updateRealtimeSettings (s);
@@ -3033,6 +3115,7 @@ void FractalAdditiveAudioProcessorEditor::paintRealtimeButtons()
             resized();
         }
     }
+    syncAdaptTargetLock();   // a link refused above releases the target box with it
     const juce::Colour lit (0xffd23b6b), dim (0xff44445e);
     chordRtBtn.setColour (juce::TextButton::buttonColourId,
                           live == RtLink::TuningFromSpectrum ? lit : dim);

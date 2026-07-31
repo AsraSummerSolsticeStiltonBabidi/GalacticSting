@@ -569,8 +569,16 @@ public:
     // REALTIME links between the spectrum and the tuning ("Spectrum vs Tuning").
     //   TuningFromSpectrum  - the tuning follows the top beating-search result whenever
     //                         the SPECTRUM changes.
-    //   SpectrumFromTuning  - the spectrum is adapted to the loaded tuning.
+    //   SpectrumFromTuning  - the spectrum is adapted to the loaded tuning. NOT what the
+    //                         panel's REALTIME button engages any more: a loaded tuning is
+    //                         a fixed set of notes, so a follower aimed at it re-applies
+    //                         the SAME adaptation for ever (in 12ED2 it simply kept writing
+    //                         12ED2 into the spectrum). One press of Adapt does that job
+    //                         better. Kept because the link itself is sound, and because a
+    //                         tuning that really is being edited live is a legitimate use.
     //   SpectrumFromChord   - the spectrum is adapted to the chord being held right now.
+    //                         This is what REALTIME means in the adapt panel: follow the
+    //                         notes actually being played.
     // Driven from timerCallback (60 Hz), so it works with the editor shut and is
     // exercisable offline through pollParametersForTests().
     enum class RtLink { Off = 0, TuningFromSpectrum = 1, SpectrumFromTuning = 2, SpectrumFromChord = 3 };
@@ -596,11 +604,14 @@ public:
     int getRealtimeApplies() const noexcept { return rtApplies; }
     // How many 60 Hz ticks the two links wait between launches, on top of never running two
     // at once. Measured on this machine: a 3-note grid+refine chord search over 2/1 with a
-    // rich spectrum (the 64-partial analysis cap) is ~1.7 s, while an 8-partial adaptation
-    // is 9 ms against a triad and ~100 ms against 31 scale degrees. Without a throttle a
-    // modulator sweeping the spectrum starts a new search on EVERY tick - 200 spectrum
-    // changes produced 138 searches - and the worker queue never drains.
-    static constexpr int kRtTuneTicks  = 60;  // ~1 s: the full grid+refine chord search
+    // rich spectrum (the 64-partial analysis cap) USED to be ~1.4 s and is now ~0.30 s cold
+    // and ~0.12 s when the grid tables can be reused ("0 vs all" is 0.03 s) - see the
+    // GridTables comment in Dissonance.h. The one-second floor was sized for the old cost
+    // and had become the slowest part of the link, so it comes down with it. An 8-partial
+    // adaptation is 9 ms against a triad and ~100 ms against 31 scale degrees. Without a
+    // throttle a modulator sweeping the spectrum starts a new search on EVERY tick - 200
+    // spectrum changes produced 138 searches - and the worker queue never drains.
+    static constexpr int kRtTuneTicks  = 20;  // ~0.33 s: the full grid+refine chord search
     static constexpr int kRtAdaptTicks = 15;  // ~250 ms: the (much cheaper) adaptation
 
     //==========================================================================
@@ -876,7 +887,14 @@ private:
     bool rtPending = false;
     unsigned int rtSeenSpecGen = 0;
     int  rtSeenChordGen = 0, rtSeenAdaptGen = 0;
-    double rtHeldSig = -1.0;            // the held chord the last adaptation was aimed at
+    // The held chord the last adaptation was actually AIMED AT - the ratios and the root's
+    // real pitch, not a hash. The follower re-adapts only when the notes under the fingers
+    // move away from these (see kRtHeldMoveCents): a per-note bend wobbling by a hundredth
+    // of a cent is not a new chord, and re-running the search for it produced a visually
+    // identical spectrum four times a second and made the link feel stuck.
+    std::vector<double> rtHeldTarget;
+    double rtHeldF0 = 0.0;
+    static constexpr double kRtHeldMoveCents = 1.0;
     double rtTuneSig = -1.0;            // the tuning shape the last adaptation was aimed at
 
     // WHAT A REALTIME LINK MUST NEVER DO: leave the patch somewhere the user cannot get
