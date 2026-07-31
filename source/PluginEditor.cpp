@@ -937,9 +937,9 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // ANY template change, from either engine, so it wears the shared (mint) colour and
     // lives in the BOTH ENGINES box - inside the Harmonic Engine it was dimmed whenever
     // a custom scale took over, while it went on morphing that scale's partials.
-    morphToggle.setColour (juce::ToggleButton::textColourId, cSlope);
-    morphToggle.setColour (juce::ToggleButton::tickColourId, cSlope);
-    morphToggle.setColour (juce::ToggleButton::tickDisabledColourId, cSlope.withAlpha (0.4f));
+    // An ON/OFF pill, not a tick box: the painted MORPH sub-label above it is already the
+    // name, so a checkbox ALSO labelled "Morph" read as a second, different control.
+    morphToggle.setName ("onled"); // green(on)/red(off) pill, drawn by GalacticLnF
     morphToggle.setMouseClickGrabsKeyboardFocus (false);
     morphToggle.onClick = [this] { refocus(); };
     addAndMakeVisible (morphToggle);
@@ -2568,8 +2568,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
 
     lblBaseN.setText     ("N", dontSendNotification);
     lblBasePitch.setText (tr ("Pitch", "To"), dontSendNotification);
-    lblFractal.setText   (tr ("Level", "Nivell"), dontSendNotification);
-    lblOctave.setText    (tr ("Transpose", "Transposa"), dontSendNotification);
+    lblFractal.setText   ({}, dontSendNotification);   // the FRACTAL sub-label already names it
+    lblOctave.setText    ({}, dontSendNotification);   // the OCTAVE cell label already names it
     lblRange.setText     (tr ("Spectrum", "Espectre"), dontSendNotification);
     lblPrimeLimit.setText(tr ("Limit", "L\xc3\xadmit"), dontSendNotification);
     lblCutoff.setText    (tr ("Cut", "Tall"), dontSendNotification);
@@ -2577,7 +2577,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblEnvAmt.setText    (tr ("Env", "Env"), dontSendNotification);
     lblPitchAmt.setText  (tr ("St", "St"), dontSendNotification);
     lblMorphTime.setText (tr ("Time", "Temps"), dontSendNotification);
-    morphToggle.setButtonText (tr ("Morph", "Morph"));
+    // No text: the painted MORPH sub-label above it is the name, and the toggle saying
+    // "Morph" under a heading that says MORPH read as two different controls.
+    morphToggle.setButtonText ({});
     lblTimbreRepeats.setText (tr ("Reps", "Reps"), dontSendNotification);
     lblBend.setText      (tr ("Pitch bend", "Pitch bend"), dontSendNotification);
     lblPeriod.setText    (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
@@ -3977,8 +3979,9 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     // GroupComponent can end up on top of the controls it is supposed to contain).
     // interiorAlpha < 1 greys just the fill (the frame + title stay bright), used for
     // whichever engine box is currently being overridden by the other.
-    auto macroFrameTitle = [&] (juce::Rectangle<int> boxI, juce::Colour col, const juce::String& ttl,
-                                float interiorAlpha)
+    // The frame alone, no title chip. Split out so a box whose contents already name
+    // themselves can have the same outline without a caption repeating the obvious.
+    auto macroFrame = [&] (juce::Rectangle<int> boxI, juce::Colour col, float interiorAlpha)
     {
         constexpr float titleH = 32.0f; // matches drawGroupComponentOutline
         auto box = boxI.toFloat();
@@ -3989,6 +3992,12 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         g.fillPath (shape);
         g.setColour (col.withAlpha (0.95f));
         g.strokePath (shape, juce::PathStrokeType (2.6f));
+        return box;
+    };
+    auto macroFrameTitle = [&] (juce::Rectangle<int> boxI, juce::Colour col, const juce::String& ttl,
+                                float interiorAlpha)
+    {
+        const auto box = macroFrame (boxI, col, interiorAlpha);
         drawTitleChip (g, box, col, ttl); // colour chip, bounded to the text
     };
     auto subLabel = [&] (const juce::Rectangle<int>& c, juce::Colour col, const juce::String& s, float al)
@@ -4081,7 +4090,9 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         if (! bothEnginesBounds.isEmpty())
         {
             // Never dimmed: every control in here shapes whatever spectrum is running.
-            macroFrameTitle (bothEnginesBounds, cSlope, tr ("BOTH ENGINES", "ELS DOS MOTORS"), 1.0f);
+            // No box title: the four sub-labels below already name themselves, and
+            // "BOTH ENGINES" only repeated what the SPECTRUM panel around them implies.
+            macroFrame (bothEnginesBounds, cSlope, 1.0f);
             g.setColour (cSlope.withAlpha (0.5f));
             const float top = (float) bothEnginesBounds.getY() + 17.5f;
             const float bot = (float) bothEnginesBounds.getBottom() - 3.0f;
@@ -4094,18 +4105,18 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
             // affecting the sound entirely - and nothing on screen used to admit it.
             if (processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f)
             {
-                subLabel (beSlope, juce::Colour (0xff8f96a8), tr ("SLOPE", "PENDENT"), 1.0f);
+                subLabel (beSlope, juce::Colour (0xff8f96a8), tr ("AMP SLOPE", "PENDENT AMP"), 1.0f);
                 g.setColour (cOverride);
                 g.setFont (juce::Font (juce::FontOptions (10.0f).withStyle ("Bold")));
-                g.drawText (tr ("FROZEN", "CONGELAT"),
-                            beSlope.withHeight (13).reduced (5, 0).withTrimmedLeft (44),
+                g.drawText (tr ("FROZEN - DRAWN BY HAND", "CONGELAT - DIBUIXAT A MA"),
+                            beSlope.withHeight (13).reduced (5, 0).withTrimmedLeft (72),
                             juce::Justification::centredLeft, false);
             }
             else
-                subLabel (beSlope, cSlope, tr ("SLOPE", "PENDENT"), 1.0f);
+                subLabel (beSlope, cSlope, tr ("AMP SLOPE", "PENDENT AMP"), 1.0f);
             subLabel (beFractal, cFractal, tr ("FRACTAL", "FRACTAL"), 1.0f);
             subLabel (beMorph,   cSlope,   tr ("MORPH", "MORPHING"), 1.0f);
-            subLabel (beRange.translated (0, 3), cSlope, tr ("RANGE", "ABAST"), 1.0f);
+            subLabel (beRange.translated (0, 3), cSlope, tr ("OCTAVE RANGE", "ABAST OCTAVES"), 1.0f);
         }
     }
 
@@ -4596,7 +4607,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
             {
                 auto fi = beFractal.reduced (6, 3); fi.removeFromTop (lblH);
-                lblFractal.setBounds (fi.removeFromTop (13));
+                lblFractal.setVisible (false); // named by the painted FRACTAL sub-label
                 fractalFader.setBounds (fi);
             }
             {
@@ -4667,8 +4678,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
             { auto c = ecOct.reduced (6, 1);   c.removeFromTop (13); c.removeFromBottom (4);
               // [label][white value][+ green][- red]: value first, then + before -.
               auto rr = c.removeFromTop (juce::jmin (22, juce::jmax (0, c.getHeight())));
-              lblOctave.setJustificationType (juce::Justification::centredLeft);
-              lblOctave.setBounds (rr.removeFromLeft (66));
+              // No "Transpose" caption: the cell's own OCTAVE label already says it, and
+              // the stepper only ever transposes. The freed width goes to the controls.
+              lblOctave.setVisible (false);
               octVal.setBounds (rr.removeFromLeft (40));
               octUp.setBounds  (rr.removeFromLeft (24).reduced (0, 1));
               rr.removeFromLeft (4);
