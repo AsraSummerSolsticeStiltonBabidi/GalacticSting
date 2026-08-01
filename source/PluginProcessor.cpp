@@ -437,16 +437,26 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "timbreRepeats", 1 }, "Timbre Period Repeats", 1, 8, 3));
 
+    //-- PRESET PLAYGROUND: the blend point, as two real parameters --------------
+    // The point in the rectangle IS these two numbers, which is what makes the whole
+    // feature automatable: dragging it writes them through a proper gesture so the host
+    // records the move, and playing that automation back moves the point (and everything
+    // it drives) with the window open OR shut - the window only ever draws them.
+    // (0,0) is the top-left corner, so a playground at rest sounds exactly like the
+    // preset the user dropped on corner A rather than some blend nobody chose.
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "pgX", 1 }, "Playground X",
+        NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.0f));
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "pgY", 1 }, "Playground Y",
+        NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.0f));
+
     return { params.begin(), params.end() };
 }
 
 //==============================================================================
 spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() const
 {
-    spectrum::SpectrumSettings s;
-    s.baseN         = (int) apvts.getRawParameterValue ("baseN")->load();
-    s.baseMode      = (spectrum::BaseMode) (int) apvts.getRawParameterValue ("baseMode")->load();
-    s.selection     = apvts.getRawParameterValue ("harmonics")->load();
     // Compile at the LOWEST slope the modulation can REACH, not at the knob's value.
     //
     // Each voice rescales the published amplitudes from the template's slope to its own,
@@ -457,42 +467,61 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
     // a shallower voice would need, and the fidelity rule is that nothing goes missing.
     // With nothing mapped the reachable minimum IS the knob value, so this costs exactly
     // nothing until a modulator is pointed at slope.
+    float slope;
     if (apvts.getRawParameterValue ("partialManual")->load() > 0.5f)
     {
         // MANUAL mode: the amplitudes belong to the user's per-partial edits, so slope
         // is frozen where it stood when manual was switched on. Freezing rather than
         // zeroing is what keeps the sound identical at the moment of switching - the
         // curve slope was drawing simply becomes the starting point of the drawing.
-        s.curveSlope = manualSlopeFrozen;
+        slope = manualSlopeFrozen;
     }
     else
     {
         auto* p = apvts.getParameter ("curveSlope");
         float lo = 0.0f, hi = 0.0f;
         modEngine.modulationSpan ("curveSlope", lo, hi);
-        s.curveSlope = p != nullptr
-                     ? p->convertFrom0to1 (juce::jlimit (0.0f, 1.0f, p->getValue() + lo))
-                     : apvts.getRawParameterValue ("curveSlope")->load();
+        slope = p != nullptr
+              ? p->convertFrom0to1 (juce::jlimit (0.0f, 1.0f, p->getValue() + lo))
+              : apvts.getRawParameterValue ("curveSlope")->load();
     }
+
+    return settingsFromValues ([this] (const char* id)
+                               { return apvts.getRawParameterValue (id)->load(); },
+                               timbreDegrees, timbrePeriod, slope);
+}
+
+// See the contract in PluginProcessor.h: the ONE place a set of parameter values plus a
+// custom scale becomes SpectrumSettings, shared by the live patch and by every preset
+// sitting on a playground corner.
+spectrum::SpectrumSettings FractalAdditiveAudioProcessor::settingsFromValues (
+    const std::function<float (const char*)>& get,
+    const std::vector<float>& degrees, float period, float slope) const
+{
+    spectrum::SpectrumSettings s;
+    s.baseN      = (int) get ("baseN");
+    s.baseMode   = (spectrum::BaseMode) (int) get ("baseMode");
+    s.selection  = get ("harmonics");
+    s.curveSlope = slope;
 
     // Prime limit is a CONTINUOUS position on the Off - 23 - 19 ... - 2 fader: the
     // whole value below is the limit in force, the one above is the next stop, and
     // the fraction between them fades out the harmonics that stop would remove.
-    const float plPos = juce::jlimit (0.0f, 9.0f, apvts.getRawParameterValue ("primeLimit")->load());
+    const float plPos = juce::jlimit (0.0f, 9.0f, get ("primeLimit"));
     const int plIdx   = juce::jlimit (0, 9, (int) std::floor (plPos));
     s.primeLimitPos  = plPos;
     s.primeLimit     = primeLimitValues[plIdx];
     s.primeLimitNext = primeLimitValues[juce::jmin (9, plIdx + 1)];
 
-    s.primeUseWhitelist = apvts.getRawParameterValue ("primeMode")->load() > 0.5f;
+    s.primeUseWhitelist = get ("primeMode") > 0.5f;
     unsigned mask = 0;
     for (int i = 0; i < spectrum::primeListSize; ++i)
-        if (apvts.getRawParameterValue ("primeWL" + juce::String (i))->load() > 0.5f)
+        if (get (("primeWL" + juce::String (i)).toRawUTF8()) > 0.5f)
             mask |= (1u << i);
     s.primeWhitelistMask = mask;
 
-    s.fractalLevel   = apvts.getRawParameterValue ("fractalLevel")->load();
-    s.spectrumRangeOct = (int) apvts.getRawParameterValue ("spectrumRange")->load();
+    s.fractalLevel   = get ("fractalLevel");
+    s.spectrumRangeOct = (int) get ("spectrumRange");
     s.ampFloorDb     = -120.0f;
     s.maxPartials    = spectrum::kMaxPartials;
 
@@ -500,33 +529,35 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::currentSettings() cons
     // grid of the ACTIVE TUNING (whatever is loaded in the Tuning box - .scl, MTS,
     // MPE...), read live every poll so tuning changes retune the spectrum in real
     // time. Independent of the Custom Engine's own loaded scale.
-    // The branch is engineInForce()'s, not a second copy of its rules: the UI names the
-    // engine from that helper, so a spectrum built here by other rules would be labelled
-    // wrongly on screen (that is how temper mode came to be invisible).
-    switch (engineInForce())
+    // The branch is engineInForce()'s rule, applied to whichever patch is being asked
+    // about: the UI names the engine from that helper, so a spectrum built here by other
+    // rules would be labelled wrongly on screen (that is how temper mode came to be
+    // invisible). Written out rather than calling engineInForce() because a playground
+    // corner's engine is decided by ITS values, not by the live ones.
+    const bool temper   = get ("timbreTemper") > 0.5f;
+    const bool customOn = ! degrees.empty() && get ("timbreOn") > 0.5f;
+    if (temper)
     {
-        case EngineInForce::Tempered:
-        {
-            s.source         = spectrum::Source::Harmonic;
-            s.temperToTimbre = true;
-            const int D = juce::jmax (1, tuning.degreesPerPeriod()); // no cap: every degree is a grid point
-            s.timbreDegrees.clear();
-            s.timbreDegrees.reserve ((size_t) D);
-            for (int d = 0; d < D; ++d)
-                s.timbreDegrees.push_back ((float) getDegreeRatio (d));
-            s.timbrePeriod = (float) tuning.periodRatio(); // the tuning's OWN period, not a key lookup
-            if (! (s.timbrePeriod > 1.0001f)) { s.timbrePeriod = 2.0f; }
-            break;
-        }
-        case EngineInForce::CustomScale:
-            s.source              = spectrum::Source::ScalaTimbre;
-            s.timbreDegrees       = timbreDegrees;
-            s.timbrePeriod        = timbrePeriod;
-            s.timbrePeriodRepeats = (int) apvts.getRawParameterValue ("timbreRepeats")->load();
-            break;
-        case EngineInForce::Harmonic:
-            s.source = spectrum::Source::Harmonic;
-            break;
+        s.source         = spectrum::Source::Harmonic;
+        s.temperToTimbre = true;
+        const int D = juce::jmax (1, tuning.degreesPerPeriod()); // no cap: every degree is a grid point
+        s.timbreDegrees.clear();
+        s.timbreDegrees.reserve ((size_t) D);
+        for (int d = 0; d < D; ++d)
+            s.timbreDegrees.push_back ((float) getDegreeRatio (d));
+        s.timbrePeriod = (float) tuning.periodRatio(); // the tuning's OWN period, not a key lookup
+        if (! (s.timbrePeriod > 1.0001f)) { s.timbrePeriod = 2.0f; }
+    }
+    else if (customOn)
+    {
+        s.source              = spectrum::Source::ScalaTimbre;
+        s.timbreDegrees       = degrees;
+        s.timbrePeriod        = period;
+        s.timbrePeriodRepeats = (int) get ("timbreRepeats");
+    }
+    else
+    {
+        s.source = spectrum::Source::Harmonic;
     }
     return s;
 }
@@ -552,10 +583,22 @@ void FractalAdditiveAudioProcessor::timerCallback()
         }
     }
 
+    // THE PRESET PLAYGROUND. Driven from here, not from the window, for the same reason
+    // every other automatable thing in this plugin is: pgX/pgY are parameters, and
+    // automation has to move the point (and everything it blends) with the editor shut.
+    // It runs BEFORE the ordinary rebuild test below, and leaves lastPushed describing
+    // the morphed parameters, so the two never publish over each other.
+    drivePlayground();
+
     const auto s = currentSettings();
     if (s != lastPushed)
     {
-        spectrumEngine.requestRebuild (s);
+        // While the playground is engaged the SPECTRUM comes from the blend of the
+        // corners' compiled partial lists, which is the only thing that means anything
+        // when two corners run different engines. Compiling the morphed parameters here
+        // as well would publish that over the blend a moment later.
+        if (! pgActive)
+            spectrumEngine.requestRebuild (s);
         lastPushed = s;
     }
 
@@ -905,7 +948,15 @@ bool FractalAdditiveAudioProcessor::loadTimbreFile (const juce::File& f, juce::S
     return true;
 }
 
-bool FractalAdditiveAudioProcessor::loadTimbreText (const juce::String& text, juce::String& errorOut)
+// The typed-intervals parser on its own, writing NOTHING. Split out of loadTimbreText
+// because a preset sitting on a playground corner has to be compiled from ITS intervals
+// without disturbing the live Custom Engine (assigning a corner must not change the
+// sound), and a second copy of this grammar would eventually accept a different language
+// than the box the user types into.
+bool FractalAdditiveAudioProcessor::parseTimbreIntervals (const juce::String& text,
+                                                          std::vector<float>& degOut,
+                                                          float& periodOut,
+                                                          juce::String& errorOut)
 {
     // Parse each token into a ratio. 'c' suffix or a decimal point = cents;
     // "a/b" = fraction; a bare integer = a/1.
@@ -964,8 +1015,20 @@ bool FractalAdditiveAudioProcessor::loadTimbreText (const juce::String& text, ju
     for (size_t i = 0; i + 1 < ratios.size(); ++i)
         deg.push_back ((float) ratios[i]);
 
+    degOut    = deg;
+    periodOut = (float) period;
+    return true;
+}
+
+bool FractalAdditiveAudioProcessor::loadTimbreText (const juce::String& text, juce::String& errorOut)
+{
+    std::vector<float> deg;
+    float period = 2.0f;
+    if (! parseTimbreIntervals (text, deg, period, errorOut))
+        return false;
+
     timbreDegrees = deg;
-    timbrePeriod  = (float) period;
+    timbrePeriod  = period;
     timbreName    = "typed";
     timbreSource  = text;
     setTimbreOnParam (true);
@@ -3146,7 +3209,75 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         sg.setProperty ("name", lastDissName, nullptr);
         state.appendChild (sg, nullptr);
     }
+
+    // THE ADAPTIVE / REALTIME SPECTRUM IS PART OF THE PATCH, not something outside it.
+    // A preset whose spectrum follows the chord under your fingers is a different
+    // instrument from the same preset with the follower off, so saving it saves that -
+    // and the settings it follows WITH (how many partials, the period, the goal, the
+    // register width), or reloading would arm a follower aimed somewhere else.
+    state.removeChild (state.getChildWithName ("REALTIME"), nullptr);
+    state.appendChild (realtimeSettingsToTree(), nullptr);
+
+    // THE PLAYGROUND: which preset is on which corner. Only the NAMES - the corners are
+    // presets in their own right and re-reading the files on load is what keeps a corner
+    // in step with the preset it points at (and stops a project file carrying four whole
+    // copies of other presets around). pgX/pgY are ordinary parameters and are already in
+    // the tree above.
+    state.removeChild (state.getChildWithName ("PLAYGROUND"), nullptr);
+    if (getPlaygroundAssignedCount() > 0)
+    {
+        juce::ValueTree pg ("PLAYGROUND");
+        for (int i = 0; i < kPlaygroundCorners; ++i)
+            if (pgCorner[(size_t) i].assigned())
+                pg.setProperty ("c" + juce::String (i), pgCorner[(size_t) i].name, nullptr);
+        state.appendChild (pg, nullptr);
+    }
     return state;
+}
+
+juce::ValueTree FractalAdditiveAudioProcessor::realtimeSettingsToTree() const
+{
+    juce::ValueTree rt ("REALTIME");
+    rt.setProperty ("link",    (int) effectiveRealtimeLink(), nullptr);
+    rt.setProperty ("notes",   rtSet.notes,       nullptr);
+    rt.setProperty ("period",  rtSet.periodRatio, nullptr);
+    rt.setProperty ("pline",   rtSet.periodLine,  nullptr);
+    rt.setProperty ("maxima",  rtSet.maxima,      nullptr);
+    rt.setProperty ("gap",     rtSet.minGapCents, nullptr);
+    rt.setProperty ("root",    rtSet.rootOnly,    nullptr);
+    rt.setProperty ("aPart",   rtSet.adapt.partials,    nullptr);
+    rt.setProperty ("aPeriod", rtSet.adapt.periodRatio, nullptr);
+    rt.setProperty ("aGap",    rtSet.adapt.minGapCents, nullptr);
+    rt.setProperty ("aRoot",   rtSet.adapt.rootOnly,    nullptr);
+    rt.setProperty ("aGoal",   rtSet.adapt.goal,        nullptr);
+    rt.setProperty ("aLo",     rtSet.adapt.rangeLo,     nullptr);
+    rt.setProperty ("aHi",     rtSet.adapt.rangeHi,     nullptr);
+    rt.setProperty ("aAmps",   rtSet.adapt.shapeAmps,   nullptr);
+    rt.setProperty ("aSteps",  rtSet.adapt.regSteps,    nullptr);
+    return rt;
+}
+
+FractalAdditiveAudioProcessor::RtSettings
+FractalAdditiveAudioProcessor::realtimeSettingsFromTree (const juce::ValueTree& rt) const
+{
+    RtSettings s = rtSet;   // anything the file predates keeps what is in force now
+    if (! rt.isValid()) return s;
+    s.notes       = (int)    rt.getProperty ("notes",  s.notes);
+    s.periodRatio = (double) rt.getProperty ("period", s.periodRatio);
+    s.periodLine  =          rt.getProperty ("pline",  s.periodLine).toString();
+    s.maxima      = (bool)   rt.getProperty ("maxima", s.maxima);
+    s.minGapCents = (double) rt.getProperty ("gap",    s.minGapCents);
+    s.rootOnly    = (bool)   rt.getProperty ("root",   s.rootOnly);
+    s.adapt.partials    = (int)    rt.getProperty ("aPart",   s.adapt.partials);
+    s.adapt.periodRatio = (double) rt.getProperty ("aPeriod", s.adapt.periodRatio);
+    s.adapt.minGapCents = (double) rt.getProperty ("aGap",    s.adapt.minGapCents);
+    s.adapt.rootOnly    = (bool)   rt.getProperty ("aRoot",   s.adapt.rootOnly);
+    s.adapt.goal        = (int)    rt.getProperty ("aGoal",   s.adapt.goal);
+    s.adapt.rangeLo     = (double) rt.getProperty ("aLo",     s.adapt.rangeLo);
+    s.adapt.rangeHi     = (double) rt.getProperty ("aHi",     s.adapt.rangeHi);
+    s.adapt.shapeAmps   = (bool)   rt.getProperty ("aAmps",   s.adapt.shapeAmps);
+    s.adapt.regSteps    = (int)    rt.getProperty ("aSteps",  s.adapt.regSteps);
+    return s;
 }
 
 void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
@@ -3335,6 +3466,49 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
         }
     }
 
+    // THE PLAYGROUND, restored BEFORE the realtime link below: engaging it stands the
+    // follower down, and doing it the other way round would arm a follower and then
+    // immediately suspend it, losing the arming the file actually carried.
+    //
+    // The corners are re-read from their .gsting files by name. A corner whose preset has
+    // been renamed or deleted comes back EMPTY rather than silently substituting
+    // something else - a playground quietly morphing towards a preset the user never
+    // chose is worse than one that visibly lost a corner.
+    for (int i = 0; i < kPlaygroundCorners; ++i)
+        pgCorner[(size_t) i] = PlaygroundCorner{};
+    pgActive = false; pgWinner = -1; pgRtSuspended = false; pgSuspendedRt = RtLink::Off;
+    pgLastX = pgLastY = -1.0; pgDirty = true;
+    if (auto pg = tree.getChildWithName ("PLAYGROUND"); pg.isValid())
+        for (int i = 0; i < kPlaygroundCorners; ++i)
+        {
+            const auto n = pg.getProperty ("c" + juce::String (i)).toString();
+            if (n.isNotEmpty()) { juce::String err; assignPlaygroundCorner (i, n, err); }
+        }
+    refreshPlaygroundActive();
+
+    // The realtime/adaptive link travels with the patch (see captureState). Restored
+    // through setRealtimeLink so it takes its own undo baseline exactly as pressing the
+    // button would - a follower armed by a preset must be as reversible as one armed by
+    // hand. An absent child means the state predates this and the follower stays off.
+    {
+        const auto rtTree = tree.getChildWithName ("REALTIME");
+        const auto s = realtimeSettingsFromTree (rtTree);
+        const auto want = (RtLink) (int) (rtTree.isValid() ? (int) rtTree.getProperty ("link", 0) : 0);
+        if (pgActive)
+        {
+            // The playground owns the spectrum: remember the arming, run nothing (see
+            // refreshPlaygroundActive for why the two cannot both write the spectrum).
+            rtSet = s;
+            pgSuspendedRt = want;
+            pgRtSuspended = true;
+            setRealtimeLink (RtLink::Off, s);
+        }
+        else
+        {
+            setRealtimeLink (want, s);
+        }
+    }
+
     // RE-BASELINE THE RANDOM TRIGGER against the level the project just restored, and
     // throw away any edge that restoring produced. replaceState() rewrites every
     // parameter, so a project saved with the trigger left at 1 (which is where a press
@@ -3490,6 +3664,391 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
         return true;
     }
     return false;
+}
+
+//==============================================================================
+// THE PRESET PLAYGROUND. The rules it obeys are in dsp/PresetMorph.h (weights, the
+// log-vs-linear choice per family, nearest-corner-with-hysteresis) and in
+// spectrum::blendTemplates (the partial-list crossfade); this is the wiring.
+//==============================================================================
+bool FractalAdditiveAudioProcessor::assignPlaygroundCorner (int corner, const juce::String& presetName,
+                                                            juce::String& errorOut)
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners))
+        return false;
+
+    auto& c = pgCorner[(size_t) corner];
+    c = PlaygroundCorner{};                    // clearing is just "assign nothing"
+
+    if (presetName.isNotEmpty())
+    {
+        auto file = getPresetFolder().getChildFile (presetName + ".gsting");
+        if (! file.existsAsFile())
+        { errorOut = "That preset no longer exists."; refreshPlaygroundActive(); return false; }
+
+        auto xml = juce::XmlDocument::parse (file);
+        if (xml == nullptr)
+        { errorOut = "That preset could not be read."; refreshPlaygroundActive(); return false; }
+
+        // Same gate loadPreset uses: .gsting files are user-editable, and a foreign tree
+        // would give every corner value a default and make the corner sound like an
+        // init patch while claiming to be the preset.
+        auto tree = juce::ValueTree::fromXml (*xml);
+        if (! tree.hasType (apvts.state.getType()))
+        { errorOut = "That file is not a Fibl\xc3\xb3 preset."; refreshPlaygroundActive(); return false; }
+
+        c.name = presetName;
+
+        // Parameter values, indexed by getParameters() order (see PlaygroundCorner).
+        const auto& all = getParameters();
+        c.params.assign ((size_t) all.size(), 0.0f);
+        c.hasParam.assign ((size_t) all.size(), 0);
+        for (int i = 0; i < all.size(); ++i)
+            if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]))
+                if (auto child = tree.getChildWithProperty ("id", p->paramID); child.isValid())
+                {
+                    c.params[(size_t) i]   = (float) (double) child.getProperty ("value");
+                    c.hasParam[(size_t) i] = 1;
+                }
+
+        // The Custom Engine's own scale, and the per-partial amplitude edits: both are
+        // state, not parameters, and both are part of what this corner SOUNDS like.
+        if (auto tim = tree.getChildWithName ("TIMBRE"); tim.isValid())
+        {
+            c.timbreName   = tim.getProperty ("name").toString();
+            c.timbreSource = tim.getProperty ("source").toString();
+        }
+        if (auto pg = tree.getChildWithName ("PGAINS"); pg.isValid())
+            for (const auto& tok : juce::StringArray::fromTokens (pg.getProperty ("v").toString(), " ", ""))
+            {
+                const int col = tok.indexOfChar (':');
+                if (col > 0)
+                    c.gains.push_back ({ tok.substring (0, col).getLargeIntValue(),
+                                         tok.substring (col + 1).getFloatValue() });
+            }
+        std::sort (c.gains.begin(), c.gains.end(),
+                   [] (const spectrum::PartialGain& a, const spectrum::PartialGain& b) { return a.key < b.key; });
+        {
+            double v = 0.0;
+            const int mi = paramIndexOf ("partialManual");
+            c.manual = c.value (mi, v) && v > 0.5;
+        }
+
+        // THE ADAPTIVE / REALTIME SPECTRUM IS PART OF THE PRESET, not something outside
+        // it: a corner remembers whether it was saved with the follower armed, and the
+        // nearest-corner rule carries that over like any other discrete setting.
+        if (auto rt = tree.getChildWithName ("REALTIME"); rt.isValid())
+        {
+            c.rtLink = (int) rt.getProperty ("link", 0);
+            c.rtSet  = realtimeSettingsFromTree (rt);
+        }
+
+        compileCornerTemplate (c);
+    }
+
+    refreshPlaygroundActive();
+    pgDirty = true;    // a corner moved: the next tick re-applies EVERYTHING, with a
+                       // generation bump, because this is a real discontinuity.
+    return true;
+}
+
+juce::String FractalAdditiveAudioProcessor::getPlaygroundCornerName (int corner) const
+{
+    return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].name
+                                                                 : juce::String();
+}
+
+int FractalAdditiveAudioProcessor::getPlaygroundAssignedCount() const
+{
+    int n = 0;
+    for (const auto& c : pgCorner) if (c.assigned()) ++n;
+    return n;
+}
+
+bool FractalAdditiveAudioProcessor::isPlaygroundActive() const { return pgActive; }
+
+bool FractalAdditiveAudioProcessor::isPlaygroundSuspendingRealtime() const noexcept
+{
+    return pgActive && pgRtSuspended && pgSuspendedRt != RtLink::Off;
+}
+
+void FractalAdditiveAudioProcessor::getPlaygroundWeights (double wOut[kPlaygroundCorners]) const
+{
+    bool assigned[kPlaygroundCorners];
+    for (int i = 0; i < kPlaygroundCorners; ++i) assigned[i] = pgCorner[(size_t) i].assigned();
+    presetmorph::bilinearWeights ((double) apvts.getRawParameterValue ("pgX")->load(),
+                                  (double) apvts.getRawParameterValue ("pgY")->load(),
+                                  assigned, wOut);
+}
+
+int FractalAdditiveAudioProcessor::paramIndexOf (const char* id) const
+{
+    const auto& all = getParameters();
+    for (int i = 0; i < all.size(); ++i)
+        if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]))
+            if (p->paramID == id) return i;
+    return -1;
+}
+
+void FractalAdditiveAudioProcessor::compileCornerTemplate (PlaygroundCorner& c)
+{
+    // The corner's Custom Engine scale as degree ratios, parsed exactly the way
+    // restoreState parses it - a corner has to compile to the same partials the preset
+    // would if it were simply loaded.
+    std::vector<float> degrees;
+    float period = 2.0f;
+    if (c.timbreSource.isNotEmpty())
+    {
+        std::vector<double> perDeg; double per = 2.0; juce::String err;
+        if (c.timbreName != "typed" && TuningManager::parseScalaScale (c.timbreSource, perDeg, per, err))
+        {
+            degrees.assign (perDeg.begin(), perDeg.end());
+            period = (float) per;
+        }
+        else
+        {
+            parseTimbreIntervals (c.timbreSource, degrees, period, err); // typed intervals
+        }
+    }
+
+    // A corner has no live modulators and no "manual slope frozen" history, so its
+    // compile slope is simply its own curveSlope - which is also what the morph writes
+    // to the slope parameter at that corner, so the voices' dS comes out at 0 there.
+    double slope = 1.0;
+    c.value (paramIndexOf ("curveSlope"), slope);
+
+    const auto s = settingsFromValues (
+        [&c, this] (const char* id)
+        {
+            double v = 0.0;
+            if (c.value (paramIndexOf (id), v)) return (float) v;
+            // A preset saved before this parameter existed: fall back to the parameter's
+            // DEFAULT, never to whatever the live patch happens to hold - a corner must
+            // sound the same whatever was loaded when it was assigned.
+            if (auto* p = apvts.getParameter (id)) return p->convertFrom0to1 (p->getDefaultValue());
+            return 0.0f;
+        },
+        degrees, period, (float) slope);
+
+    c.tmpl = std::make_shared<const spectrum::SpectrumTemplate> (spectrum::compileSpectrum (s));
+}
+
+void FractalAdditiveAudioProcessor::refreshPlaygroundActive()
+{
+    const bool was = pgActive;
+    pgActive = getPlaygroundAssignedCount() >= 2;
+    if (pgActive == was)
+        return;
+
+    if (pgActive)
+    {
+        // ENGAGING. The realtime/adaptive follower is stood down for the duration.
+        //
+        // Not because the two are incompatible in principle, but because they both write
+        // the SPECTRUM and only one can own it. SpectrumFromChord re-adapts the partials
+        // (and the per-partial amplitudes) up to ten times a second and publishes them
+        // directly; it would overwrite the blend within ~100 ms of every move, so the
+        // point in the rectangle would visibly do nothing and the feature would read as
+        // broken. TuningFromSpectrum is worse: the blend changes the spectrum sixty times
+        // a second, so it would retune the instrument continuously - and the tuning is
+        // exactly what the playground promises never to touch.
+        //
+        // The arming is REMEMBERED, not discarded, and handed straight back below.
+        pgSuspendedRt = rtLink;
+        pgRtSuspended = true;
+        if (rtLink != RtLink::Off)
+            setRealtimeLink (RtLink::Off, rtSet);
+        pgWinner = -1;   // no incumbent: the first apply adopts the highest weight outright
+    }
+    else
+    {
+        // LETTING GO. Put the follower back, then force ONE ordinary rebuild: the
+        // spectrum has been coming from the blend, so lastPushed no longer describes
+        // anything the compiler produced and the usual "settings changed?" test would
+        // leave the last blend sounding under un-morphed controls for ever.
+        if (pgRtSuspended && pgSuspendedRt != RtLink::Off)
+            setRealtimeLink (pgSuspendedRt, rtSet);
+        pgRtSuspended = false;
+        pgSuspendedRt = RtLink::Off;
+        lastPushed = currentSettings();
+        spectrumEngine.requestRebuild (lastPushed);
+    }
+    pgDirty = true;
+}
+
+void FractalAdditiveAudioProcessor::drivePlayground()
+{
+    refreshPlaygroundActive();
+    if (! pgActive)
+        return;
+
+    const double x = (double) apvts.getRawParameterValue ("pgX")->load();
+    const double y = (double) apvts.getRawParameterValue ("pgY")->load();
+
+    double w[kPlaygroundCorners];
+    bool assigned[kPlaygroundCorners];
+    for (int i = 0; i < kPlaygroundCorners; ++i) assigned[i] = pgCorner[(size_t) i].assigned();
+    presetmorph::bilinearWeights (x, y, assigned, w);
+
+    const int  prevWinner = pgWinner;
+    const int  winner = presetmorph::nearestCorner (w, pgWinner, presetmorph::kHysteresis);
+    const bool winnerChanged = winner != prevWinner;
+    pgWinner = winner;
+
+    // A JUMP, as opposed to a drag: automation cutting from one corner to another, the
+    // point being clicked somewhere else, a corner being (re)assigned, or a discrete
+    // setting flipping. Those are genuine spectrum CHANGES and the voices' own machinery
+    // (the per-voice morph, or the 50 ms template fade when Morph is off) is what should
+    // carry them. Anything smaller is a drag, and a drag must NOT bump the generation -
+    // see SpectrumEngine::BlendJob::bumpGeneration for why sixty morph restarts a second
+    // is the click machine this project spent days removing.
+    const double moved = (pgLastX < 0.0) ? 1.0 : std::abs (x - pgLastX) + std::abs (y - pgLastY);
+    const bool   jump  = pgDirty || winnerChanged || moved > 0.15;
+
+    const bool movedAny = pgDirty || winnerChanged || moved >= 1.0e-6;
+    if (movedAny) pgParamsPending = true;
+    if (! movedAny && ! pgParamsPending)
+        return;                                  // parked AND settled: nothing left to do
+
+    if (winnerChanged)
+        applyPlaygroundDiscreteState (winner);
+
+    // THE CONTROLS follow at ~30 Hz, not 60. Every write goes through the normal
+    // parameter path (so the sliders move, the host sees the value, and Ctrl+Z steps back
+    // through the drag in the usual ~1 s transactions), and that path records an undo
+    // action per changed property: at 60 Hz across ~200 parameters it is pure churn for a
+    // movement no eye can resolve at 33 ms anyway. THE SPECTRUM - the part that is
+    // actually being listened to - is republished on every tick regardless.
+    //
+    // pgParamsPending is what keeps the throttle honest. Without it, a drag that STOPS on
+    // a skipped tick leaves every control one frame short of the point - for ever, because
+    // the next tick sees no movement and returns early. The parked patch then quietly did
+    // not match the pad, by a hair that never closed.
+    if (pgDirty || winnerChanged || (++pgParamTick & 1) == 0)
+    {
+        applyPlaygroundContinuous (w);
+        pgParamsPending = false;
+    }
+
+    if (movedAny)
+        postPlaygroundBlend (w, jump);
+
+    // The playground owns the spectrum while it is engaged, so the ordinary
+    // "settings changed -> requestRebuild" test in timerCallback must not fire behind it
+    // (it would compile the morphed PARAMETERS and publish that over the blend, which is
+    // precisely the un-blended cross-engine nonsense the blend exists to avoid).
+    lastPushed = currentSettings();
+
+    pgLastX = x; pgLastY = y;
+    pgDirty = false;
+}
+
+// Everything that cannot be averaged comes from ONE corner (see PresetMorph.h). The
+// parameters themselves are written by applyPlaygroundContinuous, which skips nothing:
+// this is the non-parameter half - the Custom Engine's scale and the per-partial
+// amplitude edits, both of which belong to a specific spectrum and cannot be mixed.
+void FractalAdditiveAudioProcessor::applyPlaygroundDiscreteState (int corner)
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners)) return;
+    const auto& c = pgCorner[(size_t) corner];
+    if (! c.assigned()) return;
+
+    // The Custom Engine's scale. Loaded the same way restoreState loads it, and BEFORE
+    // the timbreOn parameter is written (loadTimbreText switches the engine on by
+    // itself, so a corner saved with it off has to be able to put it back off).
+    if (c.timbreSource.isEmpty())
+    {
+        clearTimbre();
+    }
+    else
+    {
+        std::vector<double> perDeg; double per = 2.0; juce::String err;
+        if (c.timbreName != "typed" && TuningManager::parseScalaScale (c.timbreSource, perDeg, per, err))
+        {
+            timbreDegrees.assign (perDeg.begin(), perDeg.end());
+            timbrePeriod = (float) per;
+            timbreName   = c.timbreName;
+            timbreSource = c.timbreSource;
+        }
+        else
+        {
+            loadTimbreText (c.timbreSource, err);
+        }
+    }
+
+    // The per-partial amplitude edits, STORED without republishing: the blend that
+    // follows in the same tick is the publish, and republishing here first would swap in
+    // the previous blend carrying gain keys computed for a different partial list - the
+    // same 7 ms amplitude thump the adaptation's apply path documents.
+    setPartialGains (c.gains, c.manual, false);
+}
+
+void FractalAdditiveAudioProcessor::applyPlaygroundContinuous (const double w[kPlaygroundCorners])
+{
+    const auto& all = getParameters();
+    for (int i = 0; i < all.size(); ++i)
+    {
+        auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]);
+        if (p == nullptr) continue;
+
+        const bool isDiscrete = dynamic_cast<juce::AudioParameterChoice*> (all[i]) != nullptr
+                             || dynamic_cast<juce::AudioParameterBool*>   (all[i]) != nullptr;
+        const auto space = presetmorph::morphSpaceFor (p->paramID.toStdString(), isDiscrete);
+        if (space == presetmorph::MorphSpace::Excluded)
+            continue;
+
+        double target = 0.0;
+        if (space == presetmorph::MorphSpace::Discrete)
+        {
+            // Nearest corner - one winner for every discrete setting at once, so the
+            // engine, the scale and the manual switch can never come from three
+            // different presets (see nearestCorner in PresetMorph.h).
+            if (pgWinner < 0 || ! pgCorner[(size_t) pgWinner].value (i, target))
+                continue;
+        }
+        else
+        {
+            double v[kPlaygroundCorners], ww[kPlaygroundCorners];
+            int n = 0;
+            for (int k = 0; k < kPlaygroundCorners; ++k)
+                if (w[k] > 0.0 && pgCorner[(size_t) k].value (i, v[n]))
+                    ww[n++] = w[k];
+            if (n == 0) continue;      // no assigned corner knows this parameter
+            target = presetmorph::blendScalar (v, ww, n, space);
+        }
+
+        const float norm = juce::jlimit (0.0f, 1.0f, p->convertTo0to1 ((float) target));
+        // Only write what actually moved. A parked point, or a parameter every corner
+        // agrees on, then costs nothing at all - no host notification, no undo action.
+        if (std::abs (p->getValue() - norm) > 1.0e-5f)
+            p->setValueNotifyingHost (norm);
+    }
+}
+
+void FractalAdditiveAudioProcessor::postPlaygroundBlend (const double w[kPlaygroundCorners],
+                                                          bool bumpGeneration)
+{
+    spectrum::SpectrumEngine::BlendJob job;
+    bool any = false;
+    for (int i = 0; i < kPlaygroundCorners; ++i)
+    {
+        job.w[i] = w[i];
+        if (w[i] > 0.0 && pgCorner[(size_t) i].tmpl != nullptr)
+        { job.corner[i] = pgCorner[(size_t) i].tmpl; any = true; }
+        else
+            job.w[i] = 0.0;
+    }
+    if (! any) return;
+
+    // Stamp the blend with the slope the voices will read off the slope PARAMETER, so an
+    // unmodulated voice computes dS = 0 and renders the blended amplitudes exactly as
+    // they are. Stamping the corners' own slopes instead would have every voice re-slope
+    // the whole crossfade by ratio^-(paramSlope - blendedSlope) - a tilt across the
+    // spectrum that grows and shrinks as the point moves, which is not a blend of
+    // anything.
+    job.curveSlope     = apvts.getRawParameterValue ("curveSlope")->load();
+    job.bumpGeneration = bumpGeneration;
+    spectrumEngine.requestBlend (std::move (job));
 }
 
 // The Tuning panel's "Load preset's tuning" button.

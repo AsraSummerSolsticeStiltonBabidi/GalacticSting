@@ -11,6 +11,7 @@
 #include "dsp/Dissonance.h"
 #include "dsp/ModEngine.h"
 #include "dsp/NoteGate.h"
+#include "dsp/PresetMorph.h"
 #include "dsp/RhythmEngine.h"
 #include "dsp/SpectrumEngine.h"
 #include "dsp/TuningManager.h"
@@ -377,6 +378,9 @@ public:
     // ratios "3/2", or integers "3"), space/comma/newline separated. The highest
     // interval becomes the period (the Reps repeat point).
     bool loadTimbreText (const juce::String& text, juce::String& errorOut);
+    // The same grammar, parsed WITHOUT touching the live Custom Engine - see the .cpp.
+    static bool parseTimbreIntervals (const juce::String& text, std::vector<float>& degOut,
+                                      float& periodOut, juce::String& errorOut);
     void clearTimbre();
     // The Custom Engine's on/off is a real PARAMETER, so it is automatable and -
     // the reason it moved here - Ctrl+Z undoes it like every other control. It only
@@ -483,6 +487,49 @@ public:
     // (see ModEngine.h), never the base value this compares against.
     bool presetHasDrifted() const;
     juce::String getLoadedPresetName() const { return loadedPresetName; }
+
+    //==========================================================================
+    // THE PRESET PLAYGROUND.
+    //
+    // Up to four presets sit on the corners of a rectangle and a draggable point
+    // inside it blends them. The point IS the two automatable parameters pgX/pgY, so
+    // the whole movement records and plays back in the host with the window open or
+    // shut - the window is only ever a view onto those two numbers.
+    //
+    // WHAT MOVES (and the rules live in dsp/PresetMorph.h, where they are unit-tested):
+    //   - continuous parameters: weighted average, in log space for times, frequencies,
+    //     Q and the base-harmonic index, linear for everything already perceptual;
+    //   - discrete settings (engine, phase, prime mode, manual amps, morph, realtime
+    //     arming...): ONE nearest corner for all of them, with hysteresis;
+    //   - the SPECTRUM: not through the parameters at all. Each corner's spectrum is
+    //     compiled once when it is assigned and the compiled partial LISTS are blended
+    //     (spectrum::blendTemplates), which is the only thing that means anything when
+    //     two corners are running different engines.
+    //
+    // WHAT NEVER MOVES: the tuning. Mode, loaded scale, reference A, octave shift, bend
+    // range, the bank and any absolute table are all excluded - the playground changes
+    // the SOUND, not what the keys mean. Same promise loadPreset() already makes.
+    static constexpr int kPlaygroundCorners = presetmorph::kCorners;
+
+    // Put a preset on a corner (empty name clears it). Compiles that preset's spectrum
+    // there and then - synchronously, on the message thread, exactly as prepareToPlay's
+    // buildNow does - because a corner has to have a template before the very first
+    // blend, and the alternative is a first drag that silently does nothing.
+    bool assignPlaygroundCorner (int corner, const juce::String& presetName, juce::String& errorOut);
+    juce::String getPlaygroundCornerName (int corner) const;
+    int  getPlaygroundAssignedCount() const;
+    // The morph only DRIVES anything with two or more corners assigned. One preset has
+    // nothing to blend with, and letting it apply would mean opening the window and
+    // dropping a single preset silently overwrote the patch the user was working on.
+    bool isPlaygroundActive() const;
+    void getPlaygroundWeights (double wOut[kPlaygroundCorners]) const;
+    // Which corner currently owns every discrete setting (-1 = none). The window marks
+    // it, because "why did the engine change?" has to have a visible answer.
+    int  getPlaygroundNearestCorner() const noexcept { return pgWinner; }
+    // The realtime/adaptive link is SUSPENDED while the playground drives the spectrum
+    // (see drivePlayground). True = the window should say so, instead of leaving a lit
+    // REALTIME button that is quietly doing nothing.
+    bool isPlaygroundSuspendingRealtime() const noexcept;
 
     //==========================================================================
     // The TWO inputs every Sethares feature shares. Their numbers are compared with
@@ -916,6 +963,20 @@ private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
     spectrum::SpectrumSettings currentSettings() const;
+    // The ONE place a set of parameter values plus a custom scale becomes
+    // SpectrumSettings. currentSettings() feeds it the live parameters; a playground
+    // corner feeds it the preset's own. Two copies of these rules would eventually
+    // disagree, and the symptom would be a corner that sounds different on the pad
+    // than it does when you simply load it.
+    //
+    // `get` returns a parameter's REAL (denormalised) value by id. `slope` is passed in
+    // because the live patch's slope is not simply the knob (manual mode freezes it, and
+    // a modulator mapped to it lowers what has to be compiled) while a corner's is.
+    // Temper mode reads the LIVE tuning in both cases - deliberately: the tuning is
+    // excluded from the morph, so a tempered corner tempers to whatever is loaded now.
+    spectrum::SpectrumSettings settingsFromValues (const std::function<float (const char*)>& get,
+                                                  const std::vector<float>& degrees,
+                                                  float period, float slope) const;
     void timerCallback() override;
     void addRecentScl (const juce::File&);
     // tuningMode param -> TuningManager mode + synth zone layout. Index 3 = "MPE
@@ -1080,6 +1141,71 @@ private:
     void applySpecSnapshot (const SpecSnapshot& s);
     SpecSnapshot captureSpecSnapshot() const;
     void driveRealtimeLink();
+
+    //== THE PRESET PLAYGROUND (see the public API above) =======================
+    // One corner. Everything a blend needs is extracted ONCE, when the preset is
+    // dropped here: the parameter values, the custom scale, the per-partial amplitude
+    // edits, and the compiled spectrum. Nothing is re-read from disk while dragging.
+    struct PlaygroundCorner
+    {
+        juce::String name;                                   // empty = this corner is unassigned
+        // The preset's REAL (denormalised) value for every parameter, indexed by the
+        // parameter's position in getParameters() - NOT a map keyed by id. A drag reads
+        // all four corners for every parameter, thirty times a second; an id lookup per
+        // read is 200x200 string compares per frame for no benefit, because the index
+        // order is identical for every corner by construction.
+        std::vector<float> params;
+        std::vector<char>  hasParam;   // 0 = this preset predates that parameter
+        std::vector<spectrum::PartialGain> gains;
+        bool manual = false;                                  // "partialManual"
+        juce::String timbreName, timbreSource;                // the Custom Engine's own scale
+        int  rtLink = 0;                                      // the realtime/adaptive link it was saved with
+        RtSettings rtSet;
+        // shared_ptr, and const: a drag posts a blend job every 16 ms and the worker may
+        // still be reading a corner the user has just replaced. Immutable + refcounted is
+        // what makes reassigning a corner mid-blend safe without a lock.
+        std::shared_ptr<const spectrum::SpectrumTemplate> tmpl;
+        bool assigned() const noexcept { return name.isNotEmpty(); }
+        // The preset's value for parameter #i, or false if this preset predates it.
+        bool value (int i, double& out) const noexcept
+        {
+            if (i < 0 || (size_t) i >= params.size() || ! hasParam[(size_t) i]) return false;
+            out = (double) params[(size_t) i];
+            return true;
+        }
+    };
+    std::array<PlaygroundCorner, kPlaygroundCorners> pgCorner;
+    bool  pgActive   = false;   // >= 2 corners assigned: the morph is driving
+    int   pgWinner   = -1;      // the corner every discrete setting comes from
+    double pgLastX = -1.0, pgLastY = -1.0;
+    bool  pgDirty    = true;    // force one full apply (a corner changed, or we just engaged)
+    int   pgParamTick = 0;      // throttles the CONTROL writes (see drivePlayground)
+    bool  pgParamsPending = false; // a throttled tick still owes the controls one write
+    // What the realtime link was doing when the playground took the spectrum over, so
+    // it can be handed back untouched when the playground lets go.
+    RtLink pgSuspendedRt = RtLink::Off;
+    bool   pgRtSuspended = false;
+    void drivePlayground();
+    void applyPlaygroundDiscreteState (int corner);
+    void applyPlaygroundContinuous (const double w[kPlaygroundCorners]);
+    void postPlaygroundBlend (const double w[kPlaygroundCorners], bool bumpGeneration);
+    void refreshPlaygroundActive();
+    // Where a parameter sits in getParameters(). -1 if there is no such parameter.
+    int  paramIndexOf (const char* id) const;
+    // The realtime/adaptive link as saved in a preset/project, and back again. It is
+    // PART OF THE PRESET (a patch that follows what you play is not the same patch with
+    // the follower off), so it travels in the state like everything else.
+    juce::ValueTree realtimeSettingsToTree() const;
+    RtSettings      realtimeSettingsFromTree (const juce::ValueTree&) const;
+    // What the user asked for, which is not always what is running: the playground
+    // stands the follower down while it owns the spectrum, and saving must record the
+    // arming the user chose rather than the suspension.
+    RtLink effectiveRealtimeLink() const noexcept
+    { return pgRtSuspended ? pgSuspendedRt : rtLink; }
+    // Build a corner's SpectrumSettings from ITS values (never the live ones), then
+    // compile it. Shares settingsFromValues with currentSettings(), so a corner and the
+    // live patch can never disagree about what a set of numbers means.
+    void compileCornerTemplate (PlaygroundCorner& c);
 
     // One transaction that carries the whole SPECTRUM (Custom-Engine text + per-partial
     // amplitudes + the manual switch) from one snapshot to another. The individual pieces

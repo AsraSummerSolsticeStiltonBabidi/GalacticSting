@@ -39,7 +39,8 @@ public:
         // chips are its title; the selected chip decides whose controls are inside).
         juce::Rectangle<int> spectrum, engineBox, bothEngines,
                              essentials, envelopes, tuning, engineChips,
-                             specColumn; // the full-height Spectrum-vs-Tuning box on the right
+                             specColumn, // the full-height Spectrum-vs-Tuning box on the right
+                             titleBar;   // the strip the preset cluster + playground button live in
         // THE TOP-RIGHT CORNER of every macro panel, as how far INSIDE its own corner the
         // drawn border passes: 0.5 px when that corner is square, 2.5 px for the 9 px
         // radius. Sampled off the very path paint() strokes (see macroFramePath).
@@ -271,6 +272,29 @@ private:
     juce::String lastColouredIntervals;
     void openScalaChooser();
     void openPartialAmpWindow();   // the pencil in the SLOPE cell
+    void openPlaygroundWindow();   // "Open Preset Playground", under the preset selector
+
+public:
+    // Test hooks (RhythmVerify): the playground panel is in a SEPARATE desktop window,
+    // so nothing the main layout probe measures ever touches it - and the verifier has
+    // no mouse to open it with. These lay it out at a given size, run its paint(), and
+    // drive the pad the way a drag does, so the component's own code (its layout, its
+    // pixel-to-parameter mapping and the gesture pair the host records from) is exercised
+    // by the build rather than only by someone opening the plugin and looking.
+    struct PlaygroundProbe
+    {
+        juce::Rectangle<int> panel, pad, padArea, box[4], clear[4], lbl[4];
+        juce::String status;
+    };
+    // Probes in the given language and RESTORES the one it found, exactly as
+    // layoutProbeInLanguage does - a probe that leaves the editor in Catalan would make
+    // every later check in the run measure the wrong strings.
+    PlaygroundProbe playgroundProbeForTests (int w, int h, bool useCatalan);
+    // Press, move to the normalised point, release - the whole gesture, through the very
+    // handlers a mouse reaches.
+    void playgroundDragForTests (float nx, float ny);
+
+private:
     void refreshSlopeFreeze();     // shows that SLOPE is inert while manual mode is on
     void openTimbreChooser();
     void openTuningBankChooser();
@@ -2656,6 +2680,395 @@ private:
         { grid.model.clearSelection(); grid.repaint(); }
     };
 
+    //==========================================================================
+    // THE PRESET PLAYGROUND.
+    //
+    // Four presets on the corners of a rectangle and a draggable point inside it. The
+    // point is nothing but a view onto the pgX / pgY PARAMETERS: dragging writes them
+    // through beginChangeGesture / setValueNotifyingHost / endChangeGesture so the host
+    // records the move, and automation played back moves the point here - or, with this
+    // window shut, moves everything it drives anyway, because the blending itself lives
+    // in the processor's 60 Hz poll and not in this component.
+    //
+    // The COLOURS are the feature's vocabulary: each corner owns one, the point is
+    // tinted by the weights it is currently made of, and the corner that owns every
+    // DISCRETE setting (engine, phase mode, manual amps, realtime arming - things that
+    // cannot be averaged) wears a ring. Without that ring "why did the engine change
+    // when I crossed the middle?" has no visible answer at all.
+    static juce::Colour playgroundCornerColour (int i)
+    {
+        static const juce::Colour c[4] { juce::Colour (0xff5cb8ff), juce::Colour (0xffffb020),
+                                         juce::Colour (0xff4ed08a), juce::Colour (0xffe07ad0) };
+        return c[i & 3];
+    }
+
+    struct PlaygroundPad : juce::Component, juce::SettableTooltipClient
+    {
+        FractalAdditiveAudioProcessor* proc = nullptr;
+        std::function<juce::String (const char*, const char*)> trF;
+        std::function<void()> onMoved;
+        bool dragging = false;
+
+        // The square the point actually travels in. Inset so a corner's dot and its
+        // percentage are drawn INSIDE the component and never clipped by its edge.
+        juce::Rectangle<float> padArea() const
+        { return getLocalBounds().toFloat().reduced (26.0f); }
+
+        void writePoint (juce::Point<float> p)
+        {
+            const auto a = padArea();
+            const float x = a.getWidth()  > 1.0f ? juce::jlimit (0.0f, 1.0f, (p.x - a.getX()) / a.getWidth())  : 0.0f;
+            const float y = a.getHeight() > 1.0f ? juce::jlimit (0.0f, 1.0f, (p.y - a.getY()) / a.getHeight()) : 0.0f;
+            if (proc == nullptr) return;
+            for (auto* id : { "pgX", "pgY" })
+                if (auto* q = proc->apvts.getParameter (id))
+                    q->setValueNotifyingHost (juce::String (id) == "pgX" ? x : y);
+            repaint();
+            if (onMoved) onMoved();
+        }
+
+        void mouseDown (const juce::MouseEvent& e) override
+        {
+            if (proc == nullptr) return;
+            // ONE gesture per drag, opened before the first value goes out: a host in
+            // touch/latch mode only starts writing automation when it sees the gesture,
+            // and only stops when it sees the end - so without this pair a recorded drag
+            // is either nothing at all or never stops recording.
+            dragging = true;
+            for (auto* id : { "pgX", "pgY" })
+                if (auto* q = proc->apvts.getParameter (id)) q->beginChangeGesture();
+            writePoint (e.position);
+        }
+        void mouseDrag (const juce::MouseEvent& e) override { if (dragging) writePoint (e.position); }
+        void mouseUp (const juce::MouseEvent&) override
+        {
+            if (! dragging || proc == nullptr) return;
+            dragging = false;
+            for (auto* id : { "pgX", "pgY" })
+                if (auto* q = proc->apvts.getParameter (id)) q->endChangeGesture();
+        }
+
+        juce::String getTooltip() override
+        {
+            if (trF == nullptr) return {};
+            return trF ("Drag the point. Each corner is a preset and the point is the blend of them - "
+                        "the SOUND only, never the tuning. Its position is the automatable pgX / pgY "
+                        "parameters, so a move recorded in the DAW plays back with this window shut.",
+                        "Arrossega el punt. Cada cantonada \xc3\xa9s un preset i el punt \xc3\xa9s la seva barreja - "
+                        "nom\xc3\xa9s el SO, mai l'afinaci\xc3\xb3. La seva posici\xc3\xb3 s\xc3\xb3n els par\xc3\xa0metres "
+                        "automatitzables pgX / pgY, o sigui que un moviment gravat al DAW es reprodueix amb "
+                        "aquesta finestra tancada.");
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            const auto a = padArea();
+            g.setColour (juce::Colour (0xff141a24));
+            g.fillRoundedRectangle (a, 6.0f);
+            g.setColour (juce::Colour (0xff55557a));
+            g.drawRoundedRectangle (a.reduced (0.5f), 6.0f, 1.0f);
+            // Quarter lines: the middle of each edge and the centre, so the eye can see
+            // where "half way" is without measuring.
+            g.setColour (juce::Colour (0xff2a3140));
+            g.drawLine (a.getCentreX(), a.getY(), a.getCentreX(), a.getBottom(), 1.0f);
+            g.drawLine (a.getX(), a.getCentreY(), a.getRight(), a.getCentreY(), 1.0f);
+
+            if (proc == nullptr) return;
+
+            double w[FractalAdditiveAudioProcessor::kPlaygroundCorners];
+            proc->getPlaygroundWeights (w);
+            const int winner = proc->getPlaygroundNearestCorner();
+            const bool active = proc->isPlaygroundActive();
+
+            for (int i = 0; i < 4; ++i)
+            {
+                const auto name = proc->getPlaygroundCornerName (i);
+                const juce::Point<float> c { (i & 1) ? a.getRight() : a.getX(),
+                                             (i & 2) ? a.getBottom() : a.getY() };
+                const auto col = playgroundCornerColour (i);
+                const float ww = (float) (active ? w[i] : (name.isNotEmpty() ? 0.0 : 0.0));
+                // Radius grows with the weight - the size of a corner's dot IS how much
+                // of it you are hearing. Empty corners stay a hollow outline.
+                const float rad = name.isEmpty() ? 7.0f : 7.0f + 13.0f * ww;
+                if (name.isEmpty())
+                {
+                    g.setColour (juce::Colour (0xff3a4152));
+                    g.drawEllipse (juce::Rectangle<float> (rad * 2.0f, rad * 2.0f).withCentre (c), 1.5f);
+                }
+                else
+                {
+                    g.setColour (col.withAlpha (0.30f + 0.70f * ww));
+                    g.fillEllipse (juce::Rectangle<float> (rad * 2.0f, rad * 2.0f).withCentre (c));
+                }
+                if (i == winner && active)
+                {
+                    // The corner every DISCRETE setting is coming from.
+                    g.setColour (juce::Colours::white.withAlpha (0.85f));
+                    g.drawEllipse (juce::Rectangle<float> (rad * 2.0f + 8.0f, rad * 2.0f + 8.0f).withCentre (c), 2.0f);
+                }
+
+                // Name + percentage, pushed OUTWARDS from the corner so it never sits
+                // under the point.
+                auto lab = juce::Rectangle<float> (150.0f, 15.0f)
+                               .withCentre ({ c.x + ((i & 1) ? -58.0f : 58.0f),
+                                              c.y + ((i & 2) ? 17.0f : -17.0f) });
+                g.setColour (name.isEmpty() ? juce::Colour (0xff6a7285) : col);
+                g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
+                juce::String t;
+                t << (char) ('A' + i) << "  ";
+                t << (name.isEmpty() ? (trF ? trF ("empty", "buida") : juce::String ("empty")) : name);
+                if (active && ! name.isEmpty()) t << "  " << juce::String (w[i] * 100.0, 0) << "%";
+                g.drawText (t, lab.toNearestInt(),
+                            (i & 1) ? juce::Justification::centredRight : juce::Justification::centredLeft, false);
+            }
+
+            // The point, tinted by what it is made of right now.
+            const float px = a.getX() + a.getWidth()  * proc->apvts.getRawParameterValue ("pgX")->load();
+            const float py = a.getY() + a.getHeight() * proc->apvts.getRawParameterValue ("pgY")->load();
+            float r = 0.0f, gg = 0.0f, b = 0.0f, sum = 0.0f;
+            for (int i = 0; i < 4; ++i)
+            {
+                const auto col = playgroundCornerColour (i);
+                r  += (float) w[i] * col.getFloatRed();
+                gg += (float) w[i] * col.getFloatGreen();
+                b  += (float) w[i] * col.getFloatBlue();
+                sum += (float) w[i];
+            }
+            const auto pc = sum > 0.001f ? juce::Colour::fromFloatRGBA (r / sum, gg / sum, b / sum, 1.0f)
+                                         : juce::Colour (0xff8f96a8);
+            g.setColour (juce::Colours::black.withAlpha (0.5f));
+            g.fillEllipse (juce::Rectangle<float> (20.0f, 20.0f).withCentre ({ px, py }));
+            g.setColour (pc);
+            g.fillEllipse (juce::Rectangle<float> (14.0f, 14.0f).withCentre ({ px, py }));
+            g.setColour (juce::Colours::white);
+            g.drawEllipse (juce::Rectangle<float> (14.0f, 14.0f).withCentre ({ px, py }), 2.0f);
+        }
+    };
+
+    struct PlaygroundPanel : juce::Component, private juce::Timer
+    {
+        FractalAdditiveAudioProcessor* proc = nullptr;
+        std::function<juce::String (const char*, const char*)> trF;
+
+        juce::Label        headLbl, statLbl;
+        juce::Label        cornerLbl[4];
+        RefreshingComboBox cornerBox[4];
+        juce::TextButton   cornerClear[4];
+        PlaygroundPad      pad;
+        // Its own TooltipWindow, parented HERE: the editor's serves only its own
+        // subtree, so in a separate desktop window every hover read-out is invisible
+        // without this (the same trap PartialAmpPanel documents).
+        juce::TooltipWindow tooltips { this, 350 };
+        float lastX = -1.0f, lastY = -1.0f;
+        int   lastAssigned = -1, lastWinner = -2;
+
+        PlaygroundPanel()
+        {
+            headLbl.setFont (juce::Font (juce::FontOptions (15.0f).withStyle ("Bold")));
+            headLbl.setColour (juce::Label::textColourId, juce::Colour (0xff5cb8ff));
+            headLbl.setInterceptsMouseClicks (false, false);
+            addAndMakeVisible (headLbl);
+
+            statLbl.setFont (juce::Font (juce::FontOptions (12.0f)));
+            statLbl.setColour (juce::Label::textColourId, juce::Colour (0xffb8c0d0));
+            statLbl.setJustificationType (juce::Justification::topLeft);
+            statLbl.setInterceptsMouseClicks (false, false);
+            addAndMakeVisible (statLbl);
+
+            for (int i = 0; i < 4; ++i)
+            {
+                cornerLbl[i].setText (juce::String::charToString ((juce::juce_wchar) ('A' + i)),
+                                      juce::dontSendNotification);
+                cornerLbl[i].setFont (juce::Font (juce::FontOptions (14.0f).withStyle ("Bold")));
+                cornerLbl[i].setColour (juce::Label::textColourId, playgroundCornerColour (i));
+                cornerLbl[i].setJustificationType (juce::Justification::centred);
+                cornerLbl[i].setInterceptsMouseClicks (false, false);
+                addAndMakeVisible (cornerLbl[i]);
+
+                cornerBox[i].setColour (juce::ComboBox::outlineColourId, playgroundCornerColour (i).withAlpha (0.6f));
+                cornerBox[i].setMouseClickGrabsKeyboardFocus (false);
+                cornerBox[i].onBeforePopup = [this, i] { refillCorner (i); };
+                cornerBox[i].onChange = [this, i]
+                {
+                    if (proc == nullptr) return;
+                    juce::String err;
+                    // Item 1 is "(empty)" - selecting it CLEARS the corner. Anything else
+                    // is a preset name read straight off the folder listing.
+                    const auto name = cornerBox[i].getSelectedId() <= 1 ? juce::String() : cornerBox[i].getText();
+                    proc->assignPlaygroundCorner (i, name, err);
+                    refresh (true);
+                };
+                addAndMakeVisible (cornerBox[i]);
+
+                cornerClear[i].setButtonText ("X");
+                cornerClear[i].setColour (juce::TextButton::buttonColourId, juce::Colour (0xffe0453f).withAlpha (0.5f));
+                cornerClear[i].setMouseClickGrabsKeyboardFocus (false);
+                cornerClear[i].onClick = [this, i]
+                {
+                    if (proc == nullptr) return;
+                    juce::String err;
+                    proc->assignPlaygroundCorner (i, {}, err);
+                    cornerBox[i].setSelectedId (1, juce::dontSendNotification);
+                    refresh (true);
+                };
+                addAndMakeVisible (cornerClear[i]);
+            }
+
+            pad.onMoved = [this] { refresh (false); };
+            addAndMakeVisible (pad);
+            startTimerHz (30);
+        }
+
+        void refillCorner (int i)
+        {
+            if (proc == nullptr) return;
+            const auto cur = proc->getPlaygroundCornerName (i);
+            cornerBox[i].clear (juce::dontSendNotification);
+            cornerBox[i].addItem (trF ? trF ("(empty)", "(buida)") : juce::String ("(empty)"), 1);
+            int id = 2;
+            for (const auto& n : proc->getPresetNames())
+                cornerBox[i].addItem (n, id++);
+            if (cur.isNotEmpty()) cornerBox[i].setText (cur, juce::dontSendNotification);
+            else                  cornerBox[i].setSelectedId (1, juce::dontSendNotification);
+        }
+
+        void applyLanguage()
+        {
+            headLbl.setText (trF ? trF ("PRESET PLAYGROUND", "LABORATORI DE PRESETS")
+                                 : juce::String ("PRESET PLAYGROUND"), juce::dontSendNotification);
+            for (int i = 0; i < 4; ++i)
+            {
+                refillCorner (i);
+                cornerBox[i].setTooltip (trF ? trF ("The preset on this corner. Drop up to four; two make a line, "
+                                                    "three a triangle, four the whole rectangle. An empty corner "
+                                                    "contributes nothing at all.",
+                                                    "El preset d'aquesta cantonada. Posa'n fins a quatre; dos fan una "
+                                                    "l\xc3\xadnia, tres un triangle, quatre tot el rectangle. Una "
+                                                    "cantonada buida no hi aporta res.")
+                                              : juce::String());
+                cornerClear[i].setTooltip (trF ? trF ("Take the preset off this corner.",
+                                                      "Treu el preset d'aquesta cantonada.")
+                                               : juce::String());
+            }
+            lastWinner = -2;   // force the status line to be rebuilt in the new language
+            refresh (true);
+        }
+
+        void resized() override
+        {
+            auto r = getLocalBounds().reduced (10);
+            headLbl.setBounds (r.removeFromTop (20));
+            r.removeFromTop (4);
+            statLbl.setBounds (r.removeFromBottom (58));
+            r.removeFromBottom (4);
+
+            const auto row = [this] (int lo, int hi, juce::Rectangle<int> band)
+            {
+                auto left  = band.removeFromLeft (band.getWidth() / 2).reduced (2, 0);
+                auto right = band.reduced (2, 0);
+                const auto lay = [this] (int i, juce::Rectangle<int> cell)
+                {
+                    cornerLbl[i].setBounds (cell.removeFromLeft (16));
+                    cornerClear[i].setBounds (cell.removeFromRight (24).reduced (1, 1));
+                    cell.removeFromRight (3);
+                    cornerBox[i].setBounds (cell);
+                };
+                lay (lo, left);
+                lay (hi, right);
+            };
+            row (0, 1, r.removeFromTop (24));
+            row (2, 3, r.removeFromBottom (24));
+            pad.setBounds (r.reduced (0, 4));
+        }
+
+        void paint (juce::Graphics& g) override { g.fillAll (juce::Colour (0xff0e1118)); }
+
+        // Automation moves the point with this window open, and a preset dropped on a
+        // corner changes what the pad has to draw. Both arrive from OUTSIDE this
+        // component, so it polls rather than waiting to be told.
+        void timerCallback() override { refresh (false); }
+
+        void refresh (bool force)
+        {
+            if (proc == nullptr) return;
+            const float x = proc->apvts.getRawParameterValue ("pgX")->load();
+            const float y = proc->apvts.getRawParameterValue ("pgY")->load();
+            const int   n = proc->getPlaygroundAssignedCount();
+            const int   wn = proc->getPlaygroundNearestCorner();
+            if (! force && x == lastX && y == lastY && n == lastAssigned && wn == lastWinner)
+                return;
+            lastX = x; lastY = y; lastAssigned = n; lastWinner = wn;
+
+            juce::String s;
+            if (n < 2)
+            {
+                s << (trF ? trF ("Drop a preset on at least TWO corners. With one there is nothing to blend "
+                                 "with, so the playground stays out of the way and leaves your patch alone.",
+                                 "Posa un preset a com a m\xc3\xadnim DUES cantonades. Amb una no hi ha res amb "
+                                 "qu\xc3\xa8 barrejar, aix\xc3\xad que el laboratori no toca res i et deixa el patch "
+                                 "tal com el tens.")
+                          : juce::String());
+            }
+            else
+            {
+                double w[FractalAdditiveAudioProcessor::kPlaygroundCorners];
+                proc->getPlaygroundWeights (w);
+                s << (trF ? trF ("Blend: ", "Barreja: ") : juce::String ("Blend: "));
+                bool first = true;
+                for (int i = 0; i < 4; ++i)
+                    if (proc->getPlaygroundCornerName (i).isNotEmpty())
+                    {
+                        if (! first) s << " + ";
+                        first = false;
+                        s << (char) ('A' + i) << " " << juce::String (w[i] * 100.0, 0) << "%";
+                    }
+                s << "\n";
+                if (wn >= 0)
+                    s << (trF ? trF ("Settings that cannot be averaged (engine, phase, prime mode, manual amps, "
+                                     "realtime) come from ", "Els ajustos que no es poden promitjar (motor, fase, mode "
+                                     "primer, amplituds manuals, temps real) venen de ")
+                              : juce::String ("From "))
+                      << (char) ('A' + wn) << ".\n";
+                s << (trF ? trF ("The tuning is never touched.", "L'afinaci\xc3\xb3 no es toca mai.")
+                          : juce::String());
+                if (proc->isPlaygroundSuspendingRealtime())
+                    s << (trF ? trF ("  REALTIME is paused while the playground drives the spectrum; it comes "
+                                     "back when a corner is cleared.",
+                                     "  TEMPS REAL est\xc3\xa0 en pausa mentre el laboratori porta l'espectre; torna "
+                                     "quan buidis una cantonada.")
+                              : juce::String());
+            }
+            statLbl.setText (s, juce::dontSendNotification);
+            pad.repaint();
+        }
+    };
+
+    // Its own desktop window, like the partial-amplitude editor: the pad wants to be as
+    // square and as large as the user cares to make it, which a panel clipped inside the
+    // plugin's fixed 1200x650 could not be.
+    struct PlaygroundWindow : juce::DocumentWindow
+    {
+        std::function<void()> onHide;
+        std::function<bool (const juce::KeyPress&)> onKey;
+        std::function<bool()>                       onKeyState;
+        explicit PlaygroundWindow (const juce::String& name)
+            : juce::DocumentWindow (name, juce::Colour (0xff0e1118), juce::DocumentWindow::closeButton)
+        {
+            setUsingNativeTitleBar (true);
+            setResizable (true, false);
+            setResizeLimits (420, 380, 3000, 3000);
+            setWantsKeyboardFocus (true);
+        }
+        void closeButtonPressed() override { if (onHide) onHide(); }
+        // The computer keyboard has to go on playing while this window is in front -
+        // the whole point of a morph pad is hearing it move (same forwarding, and the
+        // same "one key map, not a second copy", as PartialAmpWindow).
+        bool keyPressed (const juce::KeyPress& k) override
+        { return (onKey != nullptr && onKey (k)) || juce::DocumentWindow::keyPressed (k); }
+        bool keyStateChanged (bool isDown) override
+        { return (onKeyState != nullptr && onKeyState()) || juce::DocumentWindow::keyStateChanged (isDown); }
+    };
+
     // A REAL window, not an in-editor overlay: with up to 16384 knobs the useful size
     // is "as big as the screen", which a panel clipped to the plugin's own 1200x650
     // could never be. Resizable, and it keeps its size for the session.
@@ -2802,6 +3215,12 @@ private:
     // Declared AFTER the panel it shows, so it is torn down FIRST: the window holds the
     // panel as non-owned content and must not outlive it.
     std::unique_ptr<PartialAmpWindow> partialWindow;
+    // The preset playground: the button that lives with the preset selector, its panel,
+    // and its window. Same ordering rule - the window must be destroyed before the panel
+    // it points at.
+    juce::TextButton                 playgroundButton;
+    PlaygroundPanel                  playgroundPanel;
+    std::unique_ptr<PlaygroundWindow> playgroundWindow;
     // -1 = not applied yet, so the first timer tick (and every language switch, which
     // resets it) writes the slope fader's frozen/normal look and its bilingual tooltip.
     int   lastManualFrozenShown = -1;

@@ -9,6 +9,7 @@
 #include "dsp/Spectrum.h"
 #include "dsp/Dissonance.h"
 #include "dsp/PartialGains.h"
+#include "dsp/PresetMorph.h"
 #include "PartialAmpEdit.h"
 #include "IntervalTokens.h"
 
@@ -2125,6 +2126,300 @@ int main()
         }
         check (intervaltokens::spans ({}, 5).empty() && intervaltokens::spans (cps ("   "), 5).empty(),
                "empty and all-separator text produce no spans at all");
+    }
+
+    //--------------------------------------------------------------------------
+    // THE PRESET PLAYGROUND: the weights, the log-vs-linear choice, the exclusion
+    // list, the nearest-corner hysteresis and the spectrum crossfade. Everything here
+    // is checkable without a plugin, a window or a mouse - which is the point, because
+    // "does the middle of the pad sound like the middle" is a numeric claim.
+    {
+        using namespace presetmorph;
+        std::printf ("\npreset playground - weights:\n");
+
+        const bool all4[4]  = { true, true, true, true };
+        const bool topEdge[4] = { true, true, false, false };
+        const bool diag[4]  = { true, false, false, true };
+        const bool tri[4]   = { true, true, true, false };
+        double w[4];
+
+        {
+            bool ok = true;
+            const double corners[4][2] = { {0,0}, {1,0}, {0,1}, {1,1} };
+            for (int i = 0; i < 4; ++i)
+            {
+                bilinearWeights (corners[i][0], corners[i][1], all4, w);
+                for (int k = 0; k < 4; ++k)
+                    ok = ok && std::abs (w[k] - (k == i ? 1.0 : 0.0)) < 1e-12;
+            }
+            check (ok, "each corner of a full playground is exactly its own preset, nothing else");
+        }
+        bilinearWeights (0.5, 0.5, all4, w);
+        check (std::abs (w[0] - 0.25) < 1e-12 && std::abs (w[1] - 0.25) < 1e-12
+               && std::abs (w[2] - 0.25) < 1e-12 && std::abs (w[3] - 0.25) < 1e-12,
+               "the centre of a full playground is a quarter of each");
+        bilinearWeights (0.25, 0.0, all4, w);
+        check (std::abs (w[0] - 0.75) < 1e-12 && std::abs (w[1] - 0.25) < 1e-12
+               && w[2] == 0.0 && w[3] == 0.0,
+               "on an edge only that edge's two corners contribute, linearly");
+
+        // TWO presets = a LINE. The unused axis must do nothing at all, INCLUDING on the
+        // far edge where the raw bilinear weights all collapse to zero.
+        {
+            bool ok = true;
+            for (double y : { 0.0, 0.3, 1.0 })
+            {
+                bilinearWeights (0.3, y, topEdge, w);
+                ok = ok && std::abs (w[0] - 0.7) < 1e-6 && std::abs (w[1] - 0.3) < 1e-6
+                        && w[2] == 0.0 && w[3] == 0.0;
+            }
+            check (ok, "with two corners on one edge the OTHER axis is inert - even against the empty edge");
+        }
+        bilinearWeights (1.0, 0.0, diag, w);
+        check (std::abs (w[0] - 0.5) < 1e-6 && std::abs (w[3] - 0.5) < 1e-6,
+               "a diagonal pair reads 50/50 on the empty corner instead of dividing by zero");
+        bilinearWeights (1.0, 1.0, tri, w);
+        check (w[3] == 0.0 && std::abs (w[0] + w[1] + w[2] - 1.0) < 1e-9,
+               "an unassigned corner never contributes, and the rest still sum to one");
+        {
+            const bool none[4] = { false, false, false, false };
+            bilinearWeights (0.5, 0.5, none, w);
+            check (w[0] == 0.0 && w[1] == 0.0 && w[2] == 0.0 && w[3] == 0.0,
+                   "nothing assigned = no weight anywhere (the morph must not drive)");
+        }
+
+        std::printf ("preset playground - log vs linear:\n");
+        // The claim that makes the whole feature musical: halfway between a 20 ms decay
+        // and a 2 s decay is 200 ms, not 1.01 s.
+        {
+            const double v[2] = { 0.02, 2.0 }, ww[2] = { 0.5, 0.5 };
+            const double lg = blendScalar (v, ww, 2, MorphSpace::Log);
+            const double ln = blendScalar (v, ww, 2, MorphSpace::Linear);
+            std::printf ("  20 ms vs 2 s at the midpoint: log %.4f s, linear %.4f s\n", lg, ln);
+            check (std::abs (lg - 0.2) < 1e-9, "log space puts the middle of 20 ms..2 s at 200 ms");
+            check (std::abs (ln - 1.01) < 1e-9, "...and the linear answer really is the 1.01 s smear");
+        }
+        {
+            // Base Harmonic: the played pitch is -log2(N) octaves, so halfway from 1 to
+            // 16 must be 4 (two octaves), not 8.5.
+            const double v[2] = { 1.0, 16.0 }, ww[2] = { 0.5, 0.5 };
+            check (std::abs (blendScalar (v, ww, 2, MorphSpace::Log) - 4.0) < 1e-9,
+                   "Base Harmonic 1 -> 16 passes through 4, the two-octave midpoint");
+        }
+        check (blendScalar (nullptr, nullptr, 0, MorphSpace::Linear) == 0.0,
+               "no contributing corner is not a divide by zero");
+
+        check (morphSpaceFor ("ampDecay", false) == MorphSpace::Log
+               && morphSpaceFor ("filterAttack", false) == MorphSpace::Log
+               && morphSpaceFor ("pitchRelease", false) == MorphSpace::Log
+               && morphSpaceFor ("morphTime", false) == MorphSpace::Log
+               && morphSpaceFor ("modE2D", false) == MorphSpace::Log
+               && morphSpaceFor ("modL1Hz", false) == MorphSpace::Log
+               && morphSpaceFor ("filterResonance", false) == MorphSpace::Log
+               && morphSpaceFor ("baseN", false) == MorphSpace::Log
+               && morphSpaceFor ("rhythmDivX", false) == MorphSpace::Log,
+               "times, rates, Q, the harmonic index and the divider BASE average in log space");
+        check (morphSpaceFor ("rhythmFeedbackDecay", false) == MorphSpace::Linear,
+               "a FRACTION that merely ends in \"Decay\" is not a time");
+        check (morphSpaceFor ("ampCurveD", false) == MorphSpace::Linear
+               && morphSpaceFor ("modE1CurveR", false) == MorphSpace::Linear,
+               "envelope segment CURVES are shapes in -1..+1, not times");
+        check (morphSpaceFor ("modE1S", false) == MorphSpace::Linear,
+               "an envelope SUSTAIN is a level, not a time");
+        check (morphSpaceFor ("filterCutoff", false) == MorphSpace::Linear
+               && morphSpaceFor ("masterGain", false) == MorphSpace::Linear
+               && morphSpaceFor ("pitchEnvAmount", false) == MorphSpace::Linear
+               && morphSpaceFor ("filterEnvAmount", false) == MorphSpace::Linear
+               && morphSpaceFor ("curveSlope", false) == MorphSpace::Linear
+               && morphSpaceFor ("harmonics", false) == MorphSpace::Linear
+               && morphSpaceFor ("primeLimit", false) == MorphSpace::Linear
+               && morphSpaceFor ("fractalLevel", false) == MorphSpace::Linear
+               && morphSpaceFor ("rhythmDivN", false) == MorphSpace::Linear,
+               "cents, dB, semitones, octaves, exponents and the continuous selectors stay linear");
+        check (morphSpaceFor ("phaseMode", true) == MorphSpace::Discrete
+               && morphSpaceFor ("timbreOn", true) == MorphSpace::Discrete
+               && morphSpaceFor ("partialManual", true) == MorphSpace::Discrete
+               && morphSpaceFor ("morph", true) == MorphSpace::Discrete
+               && morphSpaceFor ("primeMode", true) == MorphSpace::Discrete,
+               "every choice/bool is discrete, decided by the parameter's TYPE not its name");
+        check (morphSpaceFor ("somethingInventedTomorrow", false) == MorphSpace::Linear
+               && morphSpaceFor ("somethingInventedTomorrow", true) == MorphSpace::Discrete,
+               "a parameter nobody has written yet morphs conservatively - it is never excluded by accident");
+
+        std::printf ("preset playground - the exclusion list (TUNING IS NOT MORPHED):\n");
+        {
+            bool ok = true;
+            for (const char* id : { "tuningMode", "bendRange", "refA", "octaveShift",
+                                    "tuningBankSlot", "specRandom", "pgX", "pgY" })
+                ok = ok && morphSpaceFor (id, false) == MorphSpace::Excluded
+                        && morphSpaceFor (id, true)  == MorphSpace::Excluded;
+            check (ok, "tuning mode, bend range, reference A, octave, bank slot, the random TRIGGER "
+                       "and the pad's own coordinates are excluded - discrete or not");
+        }
+
+        std::printf ("preset playground - nearest corner with hysteresis:\n");
+        {
+            // A two-corner line swept left to right and back. The flip must happen ONCE
+            // each way, at different places, and never chatter in the middle.
+            int cur = 0, flipsUp = 0, flipsDown = 0;
+            double upAt = -1.0, downAt = -1.0;
+            for (int i = 0; i <= 1000; ++i)
+            {
+                const double x = i / 1000.0;
+                bilinearWeights (x, 0.0, topEdge, w);
+                const int n = nearestCorner (w, cur, kHysteresis);
+                if (n != cur) { ++flipsUp; upAt = x; cur = n; }
+            }
+            for (int i = 1000; i >= 0; --i)
+            {
+                const double x = i / 1000.0;
+                bilinearWeights (x, 0.0, topEdge, w);
+                const int n = nearestCorner (w, cur, kHysteresis);
+                if (n != cur) { ++flipsDown; downAt = x; cur = n; }
+            }
+            std::printf ("  flips: %d going right (at x=%.3f), %d coming back (at x=%.3f)\n",
+                         flipsUp, upAt, flipsDown, downAt);
+            check (flipsUp == 1 && flipsDown == 1, "exactly one flip each way across the whole travel");
+            check (upAt > 0.53 && upAt < 0.56 && downAt > 0.44 && downAt < 0.47,
+                   "and the two thresholds are apart - that gap IS the hysteresis");
+            check (cur == 0, "sweeping there and back ends on the corner it started on");
+        }
+        {
+            // The boundary jitter that made this necessary: a point parked at dead centre
+            // while automation wobbles it by a hair must not flip anything.
+            int cur = 0, flips = 0;
+            for (int i = 0; i < 2000; ++i)
+            {
+                const double x = 0.5 + ((i & 1) ? 1e-7 : -1e-7);
+                bilinearWeights (x, 0.5, all4, w);
+                const int n = nearestCorner (w, cur, kHysteresis);
+                if (n != cur) { ++flips; cur = n; }
+            }
+            check (flips == 0, "a point resting on a boundary does not flap the engine 60 times a second");
+        }
+        {
+            // An incumbent whose corner has just been emptied must be dropped at once,
+            // or every discrete setting would keep pointing at a preset that is gone.
+            const bool only23[4] = { false, false, true, true };
+            bilinearWeights (0.0, 1.0, only23, w);
+            check (nearestCorner (w, 0, kHysteresis) == 2, "an un-assigned incumbent is abandoned immediately");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    std::printf ("\npreset playground - blending compiled spectra (across engines):\n");
+    {
+        SpectrumSettings a;                       // harmonic, base 1
+        a.reach = 16; a.curveSlope = 1.0f;
+        SpectrumSettings b = a;                   // a custom scale: nothing in common to average
+        b.source = Source::ScalaTimbre;
+        b.timbreDegrees = { 1.0f, 1.25f, 1.5f };
+        b.timbrePeriod = 2.0f; b.timbrePeriodRepeats = 2;
+        const auto tA = compileSpectrum (a);
+        const auto tB = compileSpectrum (b);
+        check (! tA.partials.empty() && ! tB.partials.empty(), "both corner spectra compile to something");
+
+        const auto same = [] (const SpectrumTemplate& x, const SpectrumTemplate& y)
+        {
+            if (x.partials.size() != y.partials.size()) return false;
+            for (size_t i = 0; i < x.partials.size(); ++i)
+                if (x.partials[i].ratio != y.partials[i].ratio || x.partials[i].amp != y.partials[i].amp)
+                    return false;
+            return true;
+        };
+        check (same (blendTemplates (tA, tB, 0.0), tA) && same (blendTemplates (tA, tB, 1.0), tB),
+               "AT A CORNER the blend is that corner's spectrum, partial for partial, bit for bit");
+
+        // The intermediate is REAL: it has to contain partials from both, and it must
+        // not be either end.
+        // 7.0 is harmonic 7, which the custom scale (1, 5/4, 3/2 over two octaves:
+        // 1, 1.25, 1.5, 2, 2.5, 3) does not contain; 1.25 is the 5/4 the harmonic engine
+        // does not contain. Both chosen because they belong to ONE side only - a ratio
+        // the two share is a blend of two amplitudes and says nothing about either.
+        const auto mid = blendTemplates (tA, tB, 0.5);
+        const bool hasA = hasRatio (mid, 7.0, 1e-3);
+        const bool hasB = hasRatio (mid, 1.25, 1e-3);
+        check (hasA && hasB, "the middle really contains partials from BOTH engines");
+        check (! same (mid, tA) && ! same (mid, tB), "...and is neither of them");
+
+        // The morph's fidelity promise: a partial that exists at either end is still
+        // there in between - nothing is dropped for being quiet.
+        {
+            int lost = 0;
+            for (const auto& p : tA.partials)
+                if (! hasRatio (mid, (double) p.ratio, 1e-3)) ++lost;
+            check (lost == 0, "no partial of the source spectrum goes missing half way across");
+        }
+
+        // MONOTONIC INTERMEDIATES: dragging must not jump. A partial present in A only
+        // fades DOWN all the way, one present in B only fades UP all the way, measured
+        // against the partial they are both being normalised with.
+        {
+            bool downOk = true, upOk = true;
+            double prevDown = 1e18, prevUp = -1.0;
+            for (int i = 0; i <= 20; ++i)
+            {
+                const double t = i / 20.0;
+                const auto bl = blendTemplates (tA, tB, t);
+                const double dA = (double) ampAtRatio (bl, 7.0, 1e-3);   // A only
+                const double dB = (double) ampAtRatio (bl, 1.25, 1e-3);  // B only
+                if (i > 0 && i < 20)
+                {
+                    if (dA > prevDown + 1e-9) downOk = false;
+                    if (dB < prevUp - 1e-9)   upOk = false;
+                }
+                if (dA >= 0.0) prevDown = dA;
+                if (dB >= 0.0) prevUp   = dB;
+            }
+            check (downOk, "a partial only the first preset has fades down monotonically across the drag");
+            check (upOk,   "a partial only the second preset has fades up monotonically across the drag");
+        }
+
+        // THE ENERGY-DUPLICATION TRAP, the one blendFractalTemplates was fixed for.
+        // Three partials of A share ONE ~1-cent bin with a single partial of B. Each of
+        // them must take its SHARE of the bin's blended energy, not the whole of B's.
+        {
+            SpectrumTemplate x, y;
+            x.partials = { { 1.0000f, 0.6f }, { 1.0002f, 0.8f }, { 1.0004f, 0.6f }, { 4.0f, 1.0f } };
+            y.partials = { { 1.0000f, 1.0f }, { 4.0f, 1.0f } };
+            const auto bl = blendTemplates (x, y, 0.5);
+            double lowSum = 0.0, high = 0.0;
+            for (const auto& p : bl.partials)
+                (p.ratio < 2.0f ? lowSum : high) += (double) p.amp;
+            // 1.0000 and 1.0002 land in the same ~1 c bin, 1.0004 in the next one up.
+            // Correct: (0.5*1.4 + 0.5*1.0) + 0.5*0.6 = 1.5 against the 4.0 partial's 1.0.
+            // Handing each of the shared bin's partials the whole of b's amplitude gives
+            // 0.8 + 0.9 + 0.3 = 2.0 - measured, and that is what this number catches.
+            std::printf ("  shared-bin energy vs the lone partial: %.4f (correct 1.5, duplicating 2.0)\n",
+                         lowSum / high);
+            check (std::abs (lowSum / high - 1.5) < 1e-4,
+                   "several partials sharing one bin split its energy - they do not each take all of it");
+            check (bl.partials.size() == 4,
+                   "and every one of them survives at its own ratio; nothing is merged away");
+        }
+
+        // Equal power through the middle. Two disjoint spectra blended linearly and then
+        // RMS-normalised come out at 1/sqrt(2) each, so the pad does not sag in the
+        // middle - and the normalisation is the identity at both ends.
+        {
+            SpectrumTemplate x, y;
+            x.partials = { { 1.0f, 1.0f } };
+            y.partials = { { 3.0f, 1.0f } };
+            const auto bl = blendTemplates (x, y, 0.5);
+            check (bl.partials.size() == 2
+                   && std::abs (bl.partials[0].amp - 0.70710678f) < 1e-5f
+                   && std::abs (bl.partials[1].amp - 0.70710678f) < 1e-5f,
+                   "two disjoint spectra cross at equal power, not at half amplitude each");
+        }
+
+        // Four corners the way the engine does it: two rows by x, then the rows by y.
+        // At a corner that chain must still collapse to exactly that corner.
+        {
+            const auto top    = blendTemplates (tA, tB, 0.0);
+            const auto bottom = blendTemplates (tB, tA, 0.0);
+            const auto out    = blendTemplates (top, bottom, 0.0);
+            check (same (out, tA), "the hierarchical four-corner chain is still exact at a corner");
+        }
     }
 
     //--------------------------------------------------------------------------

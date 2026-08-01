@@ -1816,6 +1816,19 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     savePresetButton.onClick = [this] { savePresetFlow(); };
     addAndMakeVisible (savePresetButton);
 
+    // The preset playground lives WITH the preset selector, because that is what it is
+    // made of: it takes presets off this same list and puts them on the corners of a
+    // morph pad.
+    playgroundButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff7a4fd0));
+    playgroundButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    playgroundButton.setMouseClickGrabsKeyboardFocus (false);
+    playgroundButton.onClick = [this] { openPlaygroundWindow(); };
+    addAndMakeVisible (playgroundButton);
+    playgroundPanel.proc = &processorRef;
+    playgroundPanel.pad.proc = &processorRef;
+    playgroundPanel.trF     = [this] (const char* en, const char* ca) { return tr (en, ca); };
+    playgroundPanel.pad.trF = [this] (const char* en, const char* ca) { return tr (en, ca); };
+
     // Pitch-bend range (inside the Tuning box).
     configCombo (bendBox, "bendRange", bendAtt, cTuning, {});
     makeLabel (lblBend, cTuning);
@@ -2802,6 +2815,13 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // tuning Load, so the pair reads as two destinations for one kind of file.
     refreshCustomEngineButtons();
     savePresetButton.setButtonText (tr ("Save", "Desa"));
+    playgroundButton.setButtonText (tr ("Open Preset Playground", "Obre el Laboratori de Presets"));
+    playgroundButton.setTooltip (tr (
+        "*Preset Playground.* Put up to four presets on the corners of a rectangle and drag a point between them: everything you hear morphs, including !across engines! (a custom scale on one corner and the harmonic engine on another blend their compiled PARTIALS, because their knobs have nothing in common to average).\nThe point is two automatable parameters, so a move recorded in the DAW plays back with the window shut.\n!The tuning is never touched! - mode, scale, reference A, octave and bend range all stay exactly as you left them.",
+        "*Laboratori de Presets.* Posa fins a quatre presets a les cantonades d'un rectangle i arrossega un punt entre ells: tot el que sents es transforma, !fins i tot entre motors! (una escala pr\xc3\xb2pia a una cantonada i el motor harm\xc3\xb2nic a una altra barregen els seus PARCIALS compilats, perqu\xc3\xa8 els seus controls no tenen res en com\xc3\xba per promitjar).\nEl punt s\xc3\xb3n dos par\xc3\xa0metres automatitzables, o sigui que un moviment gravat al DAW es reprodueix amb la finestra tancada.\n!L'afinaci\xc3\xb3 no es toca mai! - mode, escala, refer\xc3\xa8ncia A, octava i rang de bend queden exactament com els tenies."));
+    playgroundPanel.applyLanguage();
+    if (playgroundWindow != nullptr)
+        playgroundWindow->setName (tr ("Fibl\xc3\xb3 - preset playground", "Fibl\xc3\xb3 - laboratori de presets"));
     presetBox.setTextWhenNothingSelected (tr ("Presets...", "Presets..."));
     dissBtn.setButtonText          (tr ("Find", "Troba"));
     dissSaveBtn.setButtonText      (tr ("Save", "Desa"));
@@ -4073,6 +4093,79 @@ void FractalAdditiveAudioProcessorEditor::openPartialAmpWindow()
     partialWindow->toFront (true);
 }
 
+void FractalAdditiveAudioProcessorEditor::openPlaygroundWindow()
+{
+    if (playgroundWindow == nullptr)
+    {
+        playgroundWindow = std::make_unique<PlaygroundWindow> (
+            tr ("Fibl\xc3\xb3 - preset playground", "Fibl\xc3\xb3 - laboratori de presets"));
+        playgroundWindow->setLookAndFeel (lnf.get());
+        playgroundWindow->setContentNonOwned (&playgroundPanel, false);
+        // Square-ish by default: the pad is a rectangle whose two axes mean the same
+        // thing, so a wide, short window would make the same movement read as a bigger
+        // change horizontally than vertically.
+        playgroundWindow->centreWithSize (520, 480);
+        playgroundWindow->onHide = [this] { if (playgroundWindow != nullptr) playgroundWindow->setVisible (false); refocus(); };
+        // Keep playing from the computer keyboard while the pad is in front - hearing
+        // the morph move IS the feature. Through the editor's own handlers, so there is
+        // one key map and one set of swallowed keys (see openPartialAmpWindow).
+        playgroundWindow->onKey      = [this] (const juce::KeyPress& k) { return keyPressed (k); };
+        playgroundWindow->onKeyState = [this] { return keyStateChanged (true); };
+    }
+    playgroundPanel.applyLanguage();   // also refills the corner lists from the folder
+    playgroundWindow->setVisible (true);
+    playgroundWindow->toFront (true);
+}
+
+FractalAdditiveAudioProcessorEditor::PlaygroundProbe
+FractalAdditiveAudioProcessorEditor::playgroundProbeForTests (int w, int h, bool useCatalan)
+{
+    const bool was = catalan;
+    catalan = useCatalan;
+    playgroundPanel.applyLanguage();
+    playgroundPanel.setSize (w, h);
+    playgroundPanel.refresh (true);
+    // Run paint() for real. It draws four corner dots sized by weight, the blend-tinted
+    // point and every corner's name - all of it off live processor state, so a null or a
+    // stale index in there is a crash in a window nothing else in the build ever opens.
+    {
+        juce::Image img (juce::Image::ARGB, juce::jmax (1, w), juce::jmax (1, h), true);
+        juce::Graphics g (img);
+        playgroundPanel.paintEntireComponent (g, true);
+    }
+    PlaygroundProbe p;
+    p.panel   = playgroundPanel.getLocalBounds();
+    p.pad     = playgroundPanel.pad.getBounds();
+    p.padArea = playgroundPanel.pad.padArea().toNearestInt() + playgroundPanel.pad.getPosition();
+    for (int i = 0; i < 4; ++i)
+    {
+        p.box[i]   = playgroundPanel.cornerBox[i].getBounds();
+        p.clear[i] = playgroundPanel.cornerClear[i].getBounds();
+        p.lbl[i]   = playgroundPanel.cornerLbl[i].getBounds();
+    }
+    p.status = playgroundPanel.statLbl.getText();
+    catalan = was;
+    playgroundPanel.applyLanguage();
+    return p;
+}
+
+void FractalAdditiveAudioProcessorEditor::playgroundDragForTests (float nx, float ny)
+{
+    auto& pad = playgroundPanel.pad;
+    const auto a = pad.padArea();
+    const juce::Point<float> pt { a.getX() + a.getWidth() * nx, a.getY() + a.getHeight() * ny };
+    // Through mouseDown/mouseDrag/mouseUp, not writePoint: the begin/endChangeGesture
+    // pair lives in the first and the last of those, and a host in touch or latch mode
+    // records nothing at all without it.
+    const juce::MouseEvent e (juce::Desktop::getInstance().getMainMouseSource(),
+                              pt, juce::ModifierKeys::leftButtonModifier, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                              &pad, &pad, juce::Time::getCurrentTime(), pt,
+                              juce::Time::getCurrentTime(), 1, false);
+    pad.mouseDown (e);
+    pad.mouseDrag (e);
+    pad.mouseUp (e);
+}
+
 // SLOPE is frozen while manual per-partial amplitudes are on (the processor freezes it
 // at the value it had when manual came on, so switching is silent). A fader that quietly
 // does nothing is the worst of both worlds: grey it out, take its mouse away, and let
@@ -4550,6 +4643,9 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     p.tuning         = lFootBounds;
     p.engineChips    = engineChip[0].getBounds().getUnion (engineChip[1].getBounds());
     p.specColumn     = gSpecScale.getBounds();
+    // The 78 px title strip resized() carves off the top - the same number, so the probe
+    // cannot end up measuring against a height paint() has stopped using.
+    p.titleBar       = juce::Rectangle<int> (0, 0, getWidth(), 78);
     // Every macro panel's top-right corner, sampled off the path that is really stroked
     // there (see LayoutProbe::panelCorners). The two panels whose right edge IS the shared
     // wall must come back square; every corner facing open space must come back rounded.
@@ -4636,6 +4732,13 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("ess.refHz",        lblRefHz);
     add ("ess.octVal",       octVal);          add ("ess.octUp",      octUp);
     add ("ess.octDn",        octDn);
+
+    // The title-bar cluster. Probed because the playground button's WORD is the whole
+    // feature and Catalan is eight characters longer than English there: a TextButton
+    // does not condense, it CLIPS, so the only way a build can see it is by measuring
+    // the string against the cell in both languages.
+    add ("top.preset",       presetBox);       add ("top.save",       savePresetButton);
+    add ("top.playground",   playgroundButton);
 
     // The TUNING box and the Spectrum-vs-Tuning column. They were never probed, and
     // they are the two densest stacks in the window: TUNING piles up to six optional
@@ -4731,6 +4834,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     // The words that ARE the feature (see LayoutProbe::buttonTexts).
     p.buttonTexts.push_back ({ "cust.load",  loadTimbreButton.getButtonText() });
     p.buttonTexts.push_back ({ "tun.toBank", tuningBankAddBtn.getButtonText() });
+    p.buttonTexts.push_back ({ "top.playground", playgroundButton.getButtonText() });
 
     // The three border lines that must be one (see LayoutProbe::wall*). Derived from
     // kFrameLine, the same constant both frame painters use, so the probe can never be
@@ -5240,6 +5344,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
         presetDirtyMark.setBounds (presetBox.getRight() - 15, presetBox.getY() - 3, 14, 14);
         r2.removeFromLeft (4);
         savePresetButton.setBounds (r2.removeFromLeft (46));
+        // A third row, the full width of the cluster: the button's word is the whole
+        // feature and it is the longer language that decides how wide it has to be, so
+        // it gets the lot rather than a leftover slice (see the probe check in
+        // RhythmVerify - "Obre el Laboratori de Presets" is 8 characters longer than the
+        // English and clipped at 150 px).
+        playgroundButton.setBounds (lc.getX(), presetBox.getBottom() + 3, 200, 20);
     }
     // Spectrum-to-Rhythm: top right, high-contrast.
     rhythmBtn.setBounds (titleBar.removeFromRight (178).withSizeKeepingCentre (168, 26));

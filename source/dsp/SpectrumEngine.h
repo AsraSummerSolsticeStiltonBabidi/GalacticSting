@@ -19,6 +19,7 @@
 
 #include <array>
 #include <atomic>
+#include <memory>
 #include <mutex>
 
 namespace spectrum
@@ -147,6 +148,54 @@ namespace spectrum
             publish (std::move (t));
         }
 
+        //----------------------------------------------------------------------
+        // THE PRESET PLAYGROUND'S BLEND, run on this same worker.
+        //
+        // Corner templates are compiled ONCE when a preset is dropped on a corner and
+        // are immutable afterwards, so the job carries shared_ptrs to them: a drag
+        // posts a new job every 16 ms and copying four 16k-partial lists per frame
+        // would be half a megabyte of memcpy for nothing, while a raw pointer would be
+        // a lifetime bug the moment a corner is reassigned mid-blend.
+        struct BlendJob
+        {
+            std::shared_ptr<const SpectrumTemplate> corner[4];
+            double w[4] = { 0.0, 0.0, 0.0, 0.0 };  // bilinear weights, already renormalised
+            float  curveSlope = 1.0f;              // stamped on the result (see blendTemplates)
+            // WHETHER THE VOICES SHOULD TREAT THIS AS A SPECTRUM CHANGE.
+            //
+            // false is the normal case while the point is being dragged, and it is the
+            // SAME trick setOverrides uses: publishing without bumping the generation
+            // means no voice restarts its spectral morph. A drag moves every partial by
+            // a hair per frame, so the voices simply read the new ratios (phase-
+            // continuous - a small frequency move on a running phase is inaudible) and
+            // glide the amplitudes over the usual 7 ms. Bumping the generation 60 times
+            // a second would instead re-seed every voice's morph clock and phase
+            // reference on every frame: the staircase that produced the loud clicks.
+            //
+            // true is for a DISCONTINUITY - engaging the playground, a corner being
+            // (re)assigned, a discrete setting flipping, or automation jumping the point
+            // across the pad - where the spectrum really does change in one step and the
+            // existing machinery (the per-voice morph, or the 50 ms template fade when
+            // Morph is off) is exactly what should handle it.
+            bool   bumpGeneration = true;
+        };
+
+        void requestBlend (BlendJob job)
+        {
+            {
+                const std::lock_guard<std::mutex> lk (requestMutex);
+                // Supersede anything the worker was about to publish, for the same
+                // reason publishNow does: a rebuild queued from the pre-morph settings
+                // would otherwise land AFTER this blend and put the un-morphed spectrum
+                // back, with nothing left to correct it.
+                hasRequest = false;
+                blend      = std::move (job);
+                hasBlend   = true;
+                ++pubEpoch;
+            }
+            wakeUp.signal();
+        }
+
         // How many edits actually found a partial in the live spectrum. Surfaced so the
         // editor can SAY that an edit is currently homeless rather than pretend it applied.
         int getGainMatchedCount() const noexcept { return gainMatched.load(); }
@@ -166,11 +215,31 @@ namespace spectrum
                 if (threadShouldExit()) break;
 
                 SpectrumSettings s;
-                bool have = false;
+                BlendJob job;
+                bool have = false, haveBlend = false;
                 unsigned long long epoch = 0;
                 {
                     const std::lock_guard<std::mutex> lk (requestMutex);
-                    if (hasRequest) { s = requested; hasRequest = false; have = true; epoch = pubEpoch; }
+                    // A blend takes priority: while the playground owns the spectrum
+                    // there are no ordinary requests, and if one did race in it is by
+                    // definition from the settings the blend supersedes.
+                    if (hasBlend)        { job = blend;     hasBlend   = false; haveBlend = true; epoch = pubEpoch; }
+                    else if (hasRequest) { s   = requested; hasRequest = false; have      = true; epoch = pubEpoch; }
+                }
+
+                if (haveBlend)
+                {
+                    auto t = runBlend (job);
+                    bool superseded = false;
+                    {
+                        const std::lock_guard<std::mutex> lk (requestMutex);
+                        superseded = pubEpoch != epoch;   // the point moved again mid-blend
+                    }
+                    if (! abortBuild.load() && ! superseded)
+                    {
+                        if (job.bumpGeneration) publish (std::move (t));
+                        else                    publishKeepingGeneration (std::move (t));
+                    }
                 }
 
                 if (have)
@@ -197,6 +266,56 @@ namespace spectrum
             if (! overridesOn || overrides.empty())
             { t.gain.clear(); gainMatched.store (0); return; }
             gainMatched.store (resolveGains (t.partials, overrides, t.gain));
+        }
+
+        // The four-corner blend, hierarchically: the top pair by x, the bottom pair by
+        // y's counterpart x, then those two rows by y - which is exactly the bilinear
+        // weights the caller sent, re-expressed as three crossfades (bilinear IS
+        // separable, and a blend is linear in the amplitudes, so the two agree exactly).
+        // Corners with no weight are skipped entirely, so a two-preset line costs ONE
+        // blend and an unassigned corner never contributes a partial.
+        static SpectrumTemplate runBlend (const BlendJob& job)
+        {
+            const auto row = [&job] (int lo, int hi, SpectrumTemplate& out) -> double
+            {
+                const double a = job.corner[lo] != nullptr ? job.w[lo] : 0.0;
+                const double b = job.corner[hi] != nullptr ? job.w[hi] : 0.0;
+                if (a <= 0.0 && b <= 0.0) return 0.0;
+                if (b <= 0.0) { out = *job.corner[lo]; return a; }
+                if (a <= 0.0) { out = *job.corner[hi]; return b; }
+                out = blendTemplates (*job.corner[lo], *job.corner[hi], b / (a + b));
+                return a + b;
+            };
+
+            SpectrumTemplate top, bottom, result;
+            const double wTop = row (0, 1, top);
+            const double wBot = row (2, 3, bottom);
+            if (wTop <= 0.0 && wBot <= 0.0) return {};
+            if (wBot <= 0.0)      result = std::move (top);
+            else if (wTop <= 0.0) result = std::move (bottom);
+            else                  result = blendTemplates (top, bottom, wBot / (wTop + wBot));
+
+            // The caller's slope, not the blend of the corners' - see blendTemplates.
+            result.curveSlope = job.curveSlope;
+            return result;
+        }
+
+        // Publish WITHOUT advancing the generation: the live template is replaced, the
+        // voices pick up the new ratios and amplitudes on their next block, and not one
+        // of them starts a spectral morph. See BlendJob::bumpGeneration.
+        void publishKeepingGeneration (SpectrumTemplate t)
+        {
+            const std::lock_guard<std::mutex> lk (buildMutex);
+            const int cur = live.load();
+            const int w   = (cur + 1) % (int) pool.size();
+            t.generation = generation.load (std::memory_order_relaxed);
+            fillGains (t);
+            pool[(size_t) w] = std::move (t);
+            liveCount.store ((int) pool[(size_t) w].partials.size());
+            rawCount .store (pool[(size_t) w].rawCount);
+            truncated.store (pool[(size_t) w].truncated);
+            liveRev.fetch_add (1, std::memory_order_release);
+            live.store (w, std::memory_order_release);
         }
 
         // Serialised between worker and buildNow (never called on the audio thread).
@@ -239,6 +358,8 @@ namespace spectrum
         std::mutex        buildMutex;
         SpectrumSettings  requested;
         bool              hasRequest = false;
+        BlendJob          blend;                  // guarded by requestMutex
+        bool              hasBlend   = false;     // coalesced: the latest point wins
         // Guarded by requestMutex. Bumped by publishNow so a build that started earlier
         // cannot publish an older spectrum over a newer one (see publishNow).
         unsigned long long pubEpoch = 0;

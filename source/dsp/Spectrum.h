@@ -193,4 +193,39 @@ namespace spectrum
     // destroyed), the build bails out early and returns an empty template.
     SpectrumTemplate compileSpectrum (const SpectrumSettings&,
                                       const std::atomic<bool>* abort = nullptr);
+
+    //==========================================================================
+    // CROSSFADE TWO ALREADY-COMPILED TEMPLATES. `t` runs 0 (exactly `a`) to 1
+    // (exactly `b`); both ends are returned untouched, so a playground point parked
+    // on a corner sounds bit-for-bit like that corner's preset.
+    //
+    // This exists because the PRESET PLAYGROUND has to morph between corners that may
+    // be running DIFFERENT ENGINES. "Custom scale at Reps 3" and "harmonic at Base 7,
+    // Fractal 2.4" have no parameters in common to average, so their parameter sets
+    // cannot be interpolated at all - the partial LISTS can.
+    //
+    // Matching is by quantised cents (~1 c bins), and both templates are accumulated
+    // into ONE bin map so every bin is blended exactly once. That is the same shape as
+    // the fractional-fractality blend and for the same hard-won reason: walking one
+    // list and looking each partial up in a map of the other hands the other side's
+    // FULL amplitude to every one of several partials sharing a bin, which duplicates
+    // its energy once per collision. Here each partial keeps its own SHARE of its bin.
+    //
+    // Amplitudes are then RMS-renormalised, which turns the linear crossfade into an
+    // equal-power one: two disjoint spectra at t=0.5 come out at 0.707 each rather
+    // than 0.5 each, so the middle of the pad does not sag. It is the identity at
+    // either end (a compiled template is already RMS-normalised), so it cannot disturb
+    // the corner-exactness above.
+    //
+    // NOTHING IS DROPPED except partials whose blended amplitude is exactly zero -
+    // i.e. one side's partials while that side has no weight at all, which are not
+    // "hidden", they are absent from the sound by definition. The only cap is
+    // kMaxPartials (the voices' array size); if a union genuinely exceeds it the
+    // `truncated` flag is raised, which the meter already reports, exactly as an
+    // over-full compile does.
+    //
+    // Cost is O(nA + nB) hash operations. Four corners are done hierarchically - top
+    // pair by x, bottom pair by x, then those two by y - so a full four-preset move is
+    // three of these. Run it on the spectrum builder worker, never on the audio thread.
+    SpectrumTemplate blendTemplates (const SpectrumTemplate& a, const SpectrumTemplate& b, double t);
 }
