@@ -29,6 +29,16 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     synth.enableLegacyMode (48);
     synth.setVoiceStealingEnabled (true);
 
+    // Watch the RANDOM SPECTRUM trigger for rising edges (see RandomTrigListener).
+    // Baselined to the parameter's current level first, so merely attaching cannot
+    // manufacture an edge and randomise a spectrum nobody asked for.
+    if (auto* rp = apvts.getParameter ("specRandom"))
+    {
+        randomTrigLevel.store (rp->getValue() >= 0.5f, std::memory_order_release);
+        randomTrigListener.owner = this;
+        rp->addListener (&randomTrigListener);
+    }
+
     for (int i = 0; i < 32; ++i)
         synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning, modEngine));
 
@@ -75,6 +85,11 @@ void FractalAdditiveAudioProcessor::addRecentScl (const juce::File& f)
 FractalAdditiveAudioProcessor::~FractalAdditiveAudioProcessor()
 {
     stopTimer();
+    // Detach before anything else: the listener holds a raw back-pointer into this
+    // object, and a host automation write arriving mid-destruction would follow it.
+    if (auto* rp = apvts.getParameter ("specRandom"))
+        rp->removeListener (&randomTrigListener);
+    randomTrigListener.owner = nullptr;
     // Stop and reap the background workers before members are destroyed.
     chordCancel = true;
     nadCancel   = true;
@@ -409,6 +424,14 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     // Ctrl+Z undoes switching it, like every other control.
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "timbreOn", 1 }, "Custom Engine On", true));
+    // RANDOM SPECTRUM: a TRIGGER, not a state. Its RISING edge (0 -> 1) generates a
+    // fresh random custom spectrum; the level itself means nothing. A momentary button
+    // with no parameter behind it could not be automated at all, and a parameter whose
+    // VALUE was the spectrum would be a lie (there is no continuum from one random
+    // spectrum to the next) - so the host drives it the way it drives any other trigger:
+    // draw a 0->1 step wherever a new spectrum should land, and each step fires once.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "specRandom", 1 }, "Random Spectrum (trigger)", false));
 
     //-- Scala-as-timbre --------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterInt>(
@@ -535,6 +558,13 @@ void FractalAdditiveAudioProcessor::timerCallback()
         spectrumEngine.requestRebuild (s);
         lastPushed = s;
     }
+
+    // RANDOM SPECTRUM: the rising edge the listener caught (a click, or host
+    // automation stepping 0 -> 1) is spent HERE, on the message thread, because
+    // building the spectrum parses text and republishes the template. In the processor
+    // rather than the editor so an automated trigger fires with the window shut - a
+    // trigger that only worked while someone was looking would not be automatable.
+    pollRandomSpectrumTrigger();
 
     // Spectrum <-> tuning REALTIME links (throttled + coalesced; refuses to close a
     // feedback loop). Here, not in the editor, so they keep working with the window shut.
@@ -939,6 +969,99 @@ bool FractalAdditiveAudioProcessor::loadTimbreText (const juce::String& text, ju
     timbreName    = "typed";
     timbreSource  = text;
     setTimbreOnParam (true);
+    return true;
+}
+
+//==============================================================================
+// RANDOM SPECTRUM - the distribution, stated in full because a random generator with
+// an unexplained distribution is unusable: nobody can tell a bug from a draw.
+//
+//  * PARTIAL COUNT: uniform in [kRandMinPartials, kRandMaxPartials] = 5..12 partials
+//    per period. Below ~5 there is not enough of a spectrum to have a timbre at all;
+//    above ~12 the partials inside one period sit closer than a critical band over
+//    most of the range and the result stops being a chord of partials and starts being
+//    a band of noise. Reps (1..8) stacks the period, so what the ear gets is this many
+//    times Reps - a rich sound from a countable set.
+//
+//  * POSITION: uniform in LOG frequency (i.e. uniform in CENTS), which is the only
+//    uniform that sounds uniform: uniform in Hz would pile every draw into the top
+//    octave and leave the bottom of the spectrum empty every single time.
+//
+//  * REACH: the span comes from the two controls that already decide how far the
+//    spectrum reaches - the OCTAVE RANGE cut (spectrumRange, in octaves above the
+//    played pitch) divided by how many times Reps stacks the period - clamped to
+//    1..3 octaves. So a random spectrum lands inside the reach the user has set
+//    instead of overshooting it (partials above the cut are dropped by the range
+//    control, and a generator that aimed above it would be asking for that).
+//
+//  * MINIMUM SPACING: kRandMinGapCents (35c) between neighbours, built into the draw
+//    (a uniform draw over the span MINUS the gaps, with the gaps added back - which is
+//    still exactly uniform, just conditioned on the spacing). Two reasons, and the
+//    second is the important one: partials a few cents apart are one beating partial,
+//    not two; and loadTimbreText DEDUPES ratios within 1e-6, so an unconstrained draw
+//    could silently hand back fewer partials than it generated. This synth never drops
+//    a partial quietly, so the generator does not produce ones that would be dropped.
+//
+//  * THE TOP INTERVAL IS THE EXACT PERIOD (2^span). loadTimbreText reads the highest
+//    interval as the repeat point, so leaving it random would make Reps stack at a
+//    random, usually irrational period - the difference between an instrument and a
+//    smear. A clean octave-multiple period is what makes repeated draws sound like
+//    different instruments rather than different accidents.
+juce::String FractalAdditiveAudioProcessor::makeRandomSpectrumText()
+{
+    constexpr int    kRandMinPartials = 5;
+    constexpr int    kRandMaxPartials = 12;
+    constexpr double kRandMinGapCents = 35.0;
+
+    const int reps = juce::jlimit (1, 8, (int) apvts.getRawParameterValue ("timbreRepeats")->load());
+    const int cut  = juce::jlimit (1, 10, (int) apvts.getRawParameterValue ("spectrumRange")->load());
+    const int spanOct   = juce::jlimit (1, 3, cut / reps);
+    const double spanC  = 1200.0 * (double) spanOct;
+
+    juce::String text;
+    // Redraw on the astronomically unlikely event that a draw repeats the previous one
+    // exactly: "every press is a different spectrum" is a promise, not a probability.
+    for (int attempt = 0; attempt < 8; ++attempt)
+    {
+        // n partials INSIDE the period; the period itself is written as the last token.
+        int n = randomSpectrumRng.nextInt ({ kRandMinPartials, kRandMaxPartials + 1 });
+        // Never ask for more partials than the span can hold at the minimum spacing:
+        // the alternative is a draw that quietly violates its own spacing rule.
+        n = juce::jmin (n, (int) std::floor (spanC / kRandMinGapCents) - 1);
+        n = juce::jmax (1, n);
+
+        // Uniform-with-a-minimum-gap: draw n points uniformly over the span shrunk by
+        // the (n+1) gaps that must exist (n interior gaps + the one below the period),
+        // sort them, then push the i-th up by (i+1) gaps. Exactly uniform, exactly
+        // spaced - no rejection loop that could spin.
+        const double free = juce::jmax (0.0, spanC - (double) (n + 1) * kRandMinGapCents);
+        std::vector<double> cents;
+        cents.reserve ((size_t) n);
+        for (int i = 0; i < n; ++i) cents.push_back (randomSpectrumRng.nextDouble() * free);
+        std::sort (cents.begin(), cents.end());
+        for (int i = 0; i < n; ++i) cents[(size_t) i] += (double) (i + 1) * kRandMinGapCents;
+
+        juce::String t;
+        for (int i = 0; i < n; ++i)
+            t << juce::String (cents[(size_t) i], 2) << "c ";
+        t << juce::String (spanC, 2) << "c";   // the period, exact
+
+        if (t != lastRandomSpectrumText) { text = t; break; }
+        text = t; // last attempt wins rather than returning nothing
+    }
+    lastRandomSpectrumText = text;
+    return text;
+}
+
+bool FractalAdditiveAudioProcessor::pollRandomSpectrumTrigger()
+{
+    if (! randomTrigPending.exchange (false, std::memory_order_acq_rel)) return false;
+    juce::String err;
+    // Undoable, like every other control: one Ctrl+Z brings the previous spectrum back.
+    // A random button that overwrote a hand-typed scale with no way back would make the
+    // feature something you cannot risk pressing.
+    if (! loadTimbreTextUndoable (makeRandomSpectrumText(), err)) return false;
+    ++randomSpectrumCount;
     return true;
 }
 
@@ -1879,26 +2002,70 @@ double FractalAdditiveAudioProcessor::measureCurrentAgainstTarget (const std::ve
     return regs.mode == dissonance::Aggregate::Minimax ? rs.worst : rs.mean;
 }
 
+// THE ANCHOR the register range hangs off (see the header). Held beats last-played beats
+// key 60 - and the "held" part comes from the rhythm engine's own note bookkeeping, the
+// same one heldChordAsTargetAlphas reads, because a second note-tracker is a second answer
+// to "which note are we on" and they drift.
+int FractalAdditiveAudioProcessor::registerAnchorKey() const noexcept
+{
+    const int k = rhythm.getAnchorNote();
+    return k >= 0 ? juce::jlimit (0, 127, k) : 60;
+}
+
+// The default width in STEPS of the scale loaded right now: the same musical width in
+// every tuning (see dissonance::kAdaptRegisterDefaultPeriods, which was measured).
+int FractalAdditiveAudioProcessor::defaultRegisterSteps() const noexcept
+{
+    const int D = juce::jmax (1, getScaleDegrees());
+    return juce::jlimit (1, 127, (int) std::lround (dissonance::kAdaptRegisterDefaultPeriods * (double) D));
+}
+
 // THE REGISTER RANGE, resolved in ONE place. The panel prints what this returns and the
 // search runs on what this returns, so the two can never disagree about which registers a
 // spectrum was optimised for - and that answer genuinely differs (a spectrum optimised at
 // C1 is ~3.7x rougher at C6 than one optimised there; see SpectrumTests).
+//
+// ANCHOR + N STEPS, both resolved here rather than in the editor: the realtime follower
+// runs with the window shut, and a range the panel had baked into two frequencies would
+// have stayed pinned to whatever register happened to be played when the window closed -
+// which is the exact complaint (the same spectrum whatever octave you play in) this form
+// exists to answer.
 dissonance::Registers FractalAdditiveAudioProcessor::adaptRegistersFor (const SpectrumAdaptSettings& s,
-                                                                        double f0Hz, bool realtime)
+                                                                        double f0Hz, bool realtime) const
 {
     dissonance::Registers regs;
     regs.mode = s.aggregate == 1 ? dissonance::Aggregate::Minimax : dissonance::Aggregate::Mean;
-    double lo = s.regLoHz, hi = s.regHiHz;
-    // AUTO (0 Hz): an octave either side of the pitch the adaptation is anchored at. The
-    // follower runs with the editor shut, so the default cannot live in the editor - and a
-    // missing range must not collapse silently back to the single-pitch objective this
-    // whole change exists to replace.
-    if (! (lo > 0.0) || ! (hi > 0.0) || ! std::isfinite (lo) || ! std::isfinite (hi))
-    { lo = f0Hz * 0.5; hi = f0Hz * 2.0; }
+    const int steps  = juce::jlimit (0, 127, s.regSteps >= 0 ? s.regSteps : defaultRegisterSteps());
+    const int anchor = registerAnchorKey();
+    // The top is CLAMPED TO THE BOARD, never wrapped and never re-anchored lower: the user
+    // said "N steps above the note I am playing", and moving the anchor to make N fit would
+    // optimise for registers they never asked about. The panel prints the steps that really
+    // fit whenever this bites, so a shortened range is stated and not silent.
+    const int top = juce::jlimit (0, 127, anchor + steps);
+    double lo = getNoteFrequency (anchor), hi = getNoteFrequency (top);
+    // Both ends through the KEY LADDER, not through f0Hz: f0 carries per-note pitch bend,
+    // and a range whose bottom followed a bend wheel would resample the objective (and
+    // re-price the run) on every wheel message.
+    if (! (lo > 0.0) || ! std::isfinite (lo)) lo = f0Hz;
+    if (! (hi > 0.0) || ! std::isfinite (hi)) hi = lo;
     if (hi < lo) std::swap (lo, hi);
     const int cap = realtime ? dissonance::kAdaptRegisterCapRt : dissonance::kAdaptRegisterCap;
     regs.f0 = dissonance::registerPoints (lo, hi, dissonance::registerCountFor (lo, hi, cap));
     return regs;
+}
+
+// The price of one run, resolved from the SAME settings the run itself will use - the
+// partial count after its own clamp, and the register count adaptRegistersFor really
+// returns for this path. Reading either of those from anywhere else would let the number
+// on the button and the work the thread does drift apart.
+double FractalAdditiveAudioProcessor::estimateAdaptMs (const SpectrumAdaptSettings& s,
+                                                       int targetNotes, double f0Hz, bool realtime) const
+{
+    if (targetNotes <= 0) return 0.0;
+    const int N    = juce::jlimit (2, 24, s.partials);
+    const auto regs = adaptRegistersFor (s, f0Hz, realtime);
+    return dissonance::adaptEstimateMs (N, targetNotes, s.rootOnly,
+                                        (int) juce::jmax<size_t> (1, regs.f0.size()), s.shapeAmps);
 }
 
 bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSettings& s,
@@ -1938,14 +2105,33 @@ bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSetti
         return false;
     }
     const double topRatio = std::exp2 ((totalC - std::max (1.0, gap)) / 1200.0);
-    // "all vs all" sounds every target note at once, so the pair count grows with
-    // (notes x partials)^2 and a 31-note scale at 16 partials is half a million pairs per
-    // evaluation - minutes, not milliseconds. Say so instead of appearing to hang.
-    if (! s.rootOnly && (int) targetAlphas.size() * N > 480)
+
+    // COST IS A PRICE, NOT A VETO. This used to refuse outright: "all vs all over 31 notes
+    // x 16 partials is too heavy to search - switch the scope to 0 vs all". It is a ~45 s
+    // computation. Adapt is a one-shot, user-initiated calculation that already runs on a
+    // worker, reports progress and cancels on a second press, so 45 s is a decision the
+    // player is entitled to make - and refusing it removed the feature (a 31-note scale
+    // simply could not be adapted to in the scope that hears every note against every
+    // other). The estimate now goes on the button; only the genuinely absurd is stopped.
+    //
+    // The bound is kAdaptAbsurdMs = 10 minutes, and it exists because there IS a shape
+    // beyond argument: 24 partials against a 128-key absolute table in "all vs all" is
+    // ~44 minutes, minutes per single sweep, and it would be indistinguishable from a
+    // hang. The refusal states the number rather than a verdict.
+    const auto regs = adaptRegistersFor (s, f0Hz, realtime);
+    const double estMs = dissonance::adaptEstimateMs (N, (int) targetAlphas.size(), s.rootOnly,
+                                                      (int) std::max<size_t> (1, regs.f0.size()),
+                                                      s.shapeAmps);
+    if (estMs > dissonance::kAdaptAbsurdMs)
     {
-        errorOut = "\"all vs all\" over " + juce::String ((int) targetAlphas.size())
-                 + " notes x " + juce::String (N) + " partials is too heavy to search. "
-                   "Switch the scope to \"0 vs all\", or use fewer partials.";
+        errorOut = "This search is estimated at " + juce::String (estMs / 60000.0, 1)
+                 + " minutes (" + juce::String ((int) targetAlphas.size()) + " notes x "
+                 + juce::String (N) + " partials"
+                 + (s.rootOnly ? juce::String (", 0 vs all") : juce::String (", all vs all"))
+                 + ", " + juce::String ((int) regs.f0.size()) + " registers), past the "
+                 + juce::String ((int) (dissonance::kAdaptAbsurdMs / 60000.0))
+                 + "-minute limit. Fewer partials, fewer registers, or the \"0 vs all\" scope "
+                   "will bring it inside.";
         return false;
     }
 
@@ -1976,10 +2162,9 @@ bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSetti
     adaptProgress    = 0.0f;
     adaptRunning     = true;
 
-    // Resolved BEFORE the thread starts, from the same helper the panel reads, so the run
-    // and the read-out are the same registers by construction.
-    const auto regs = adaptRegistersFor (s, f0Hz, realtime);
-
+    // `regs` was resolved above, BEFORE the thread starts and before the cost bound was
+    // measured, from the same helper the panel reads - so the run, the read-out and the
+    // price on the button are the same registers by construction.
     adaptThread = std::make_unique<std::thread> (
         [this, seed = std::move (seed), alphas = targetAlphas, f0Hz, s, N, gap, topRatio, regs]()
         {
@@ -2072,6 +2257,20 @@ bool FractalAdditiveAudioProcessor::applySpectrumAdapt (bool undoable, juce::Str
 
     const auto before = captureSpecSnapshot();
 
+    // MANUAL AMPLITUDE MODE GOES ON FIRST, and exactly the way timerCallback would do it
+    // (freeze the slope, remember the mode). The per-partial edits below only apply while
+    // it is on, but currentSettings() reads a DIFFERENT slope in each mode - so building
+    // `ts` below in one mode and letting the next poll notice the other produced a second,
+    // pointless template a few milliseconds behind the first: a second amplitude fade for
+    // a spectrum that had not changed.
+    if (apvts.getRawParameterValue ("partialManual")->load() <= 0.5f)
+    {
+        manualSlopeFrozen = apvts.getRawParameterValue ("curveSlope")->load();
+        lastManualMode    = true;
+        if (auto* pm = apvts.getParameter ("partialManual"))
+            pm->setValueNotifyingHost (1.0f);
+    }
+
     // The typed text: every partial above 1/1 in cents, then the PERIOD as the highest
     // value (loadTimbreText's rule: the top interval is the repeat point). 1/1 is implicit.
     // centsText, not String(x, 5): this text lands in the Custom Engine's box for the
@@ -2101,7 +2300,7 @@ bool FractalAdditiveAudioProcessor::applySpectrumAdapt (bool undoable, juce::Str
     ts.timbreDegrees       = timbreDegrees;
     ts.timbrePeriod        = timbrePeriod;
     ts.timbrePeriodRepeats = (int) apvts.getRawParameterValue ("timbreRepeats")->load();
-    const auto tmpl = spectrum::compileSpectrum (ts);
+    auto tmpl = spectrum::compileSpectrum (ts);   // published below - not thrown away
     std::vector<spectrum::PartialGain> gains;
     if (! tmpl.partials.empty())
     {
@@ -2133,9 +2332,26 @@ bool FractalAdditiveAudioProcessor::applySpectrumAdapt (bool undoable, juce::Str
                 spectrum::setPartialGain (gains, spectrum::gainKey (info.ratios[i]), dB);
             }
     }
-    setPartialGains (gains, true);
-    if (auto* p = apvts.getParameter ("partialManual"))
-        p->setValueNotifyingHost (1.0f);   // the edits only apply while manual mode is on
+    // ONE EVENT, NOT THREE. An adaptation changes the partial RATIOS and their AMPLITUDES
+    // together, and until now they reached the voices apart:
+    //   1. setPartialGains republished the LIVE (still OLD) template with gain keys
+    //      computed for the new partials. Keys are log-frequencies (PartialGains.h), so
+    //      against the old list almost none of them bind - which also STRIPS the previous
+    //      adaptation's shaping off the partials that are still sounding. That republish
+    //      deliberately leaves the generation alone, so no morph starts and no 50 ms
+    //      template fade arms: the voices got the whole amplitude change over the bare
+    //      7 ms de-click slew. Measured (run 42): a one-hop short-term RMS step 4.6x the
+    //      note's own ripple - +57% then -24% inside 20 ms. That is the reported "golpe".
+    //   2. ~17-35 ms later the real template arrived, via the next timer poll and the
+    //      build worker - pure latency, since the template was compiled RIGHT HERE.
+    // So: hand the edits over WITHOUT republishing, then publish the template we already
+    // built. publish() resolves the stored edits against it (fillGains), stamps a new
+    // generation - which is what arms the fade and the morph - and swaps once.
+    setPartialGains (gains, true, /*republish*/ false);
+    spectrumEngine.publishNow (std::move (tmpl));
+    // ...and the poll must not build the identical thing again a tick later: `ts` IS what
+    // currentSettings() will return now that the Custom Engine holds these degrees.
+    lastPushed = ts;
 
     if (undoable)
     {
@@ -2329,28 +2545,58 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
     }
 
     // ...the two SPECTRUM-side links. Same throttle + coalesce, aimed at a different target.
-    //
+    double f0 = 0.0;
+    std::vector<double> alphas;
+    const bool fromChord = rtLink == RtLink::SpectrumFromChord;
+    // Read BEFORE anything is published: whether a finished result still belongs to the
+    // hands on the keys is the first thing that has to be decided about it.
+    if (fromChord) alphas = heldChordAsTargetAlphas (f0);
+
+    // Has the chord actually MOVED away from the set the last search was AIMED at?
+    // Compared note by note, in cents, including the root's absolute pitch: Sethares'
+    // roughness is a frequency width, so the same chord an octave up is a different target
+    // and must re-adapt, while a bend jitter below a cent must not.
+    bool moved = false;
+    if (fromChord && ! alphas.empty())
+    {
+        moved = alphas.size() != rtHeldTarget.size()
+             || ! (rtHeldF0 > 0.0)
+             || std::abs (1200.0 * std::log2 (f0 / rtHeldF0)) > kRtHeldMoveCents;
+        for (size_t i = 0; i < alphas.size() && ! moved; ++i)
+            if (std::abs (1200.0 * std::log2 (alphas[i] / rtHeldTarget[i])) > kRtHeldMoveCents)
+                moved = true;
+    }
+
     // A finished adaptation is published FIRST, before anything below can decide there is
     // nothing to do. A chord let go a moment before its search finished was still a chord
     // the user played, and the result belongs to it: held back here, it would have been
     // applied on some later tick against a completely different chord.
+    //
+    // ...but a result aimed at a chord the player has already MOVED OFF is a different
+    // thing entirely, and applying it is heard as a lurch: a full respectrum onto a
+    // spectrum nobody asked for, replaced by the right one a few tens of milliseconds
+    // later. Two spectrum changes where the music called for one. So it is dropped -
+    // and dropping it costs nothing, because `moved` has already set rtPending and the
+    // search for the chord that IS being held starts on the next allowed tick. "Let go"
+    // (alphas empty) is deliberately NOT stale: that case is the one above.
     if (const int g = adaptGeneration.load(); g != rtSeenAdaptGen)
     {
         rtSeenAdaptGen = g;
-        juce::String aerr;
-        if (applySpectrumAdapt (/*undoable*/ false, aerr))
-            ++rtApplies;
+        if (! (fromChord && ! alphas.empty() && moved))
+        {
+            juce::String aerr;
+            if (applySpectrumAdapt (/*undoable*/ false, aerr))
+                ++rtApplies;
+        }
     }
 
-    double f0 = 0.0;
-    std::vector<double> alphas;
-    if (rtLink == RtLink::SpectrumFromChord)
+    if (fromChord)
     {
         // THE TRIGGER IS WHAT IS BEING PLAYED. The frequencies come from the rhythm
         // engine's held-note bookkeeping, which is published from every processBlock
         // whether or not the rhythm engine is switched on, so they are the pitches really
-        // sounding - the tuning's, per-note bend included.
-        alphas = heldChordAsTargetAlphas (f0);
+        // sounding - the tuning's, per-note bend included. (Read at the top of this
+        // function, because the publish above has to know whether they still match.)
         if (alphas.empty())
         {
             // NOTHING held: leave the spectrum exactly as it is, and DROP any pending
@@ -2376,16 +2622,9 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
         // back f0 = the note's REAL sounding frequency, and Sethares' critical band is a
         // width in Hz, not in cents - the same partial set is a different roughness an
         // octave down, and the adaptation answers with different partial positions there.
-        // Has the chord actually MOVED? Compared note by note against the set the last
-        // adaptation aimed at, in cents, including the root's absolute pitch: Sethares'
-        // roughness is a frequency width, so the same chord an octave up is a different
-        // target and must re-adapt, while a bend jitter below a cent must not.
-        bool moved = alphas.size() != rtHeldTarget.size()
-                  || ! (rtHeldF0 > 0.0)
-                  || std::abs (1200.0 * std::log2 (f0 / rtHeldF0)) > kRtHeldMoveCents;
-        for (size_t i = 0; i < alphas.size() && ! moved; ++i)
-            if (std::abs (1200.0 * std::log2 (alphas[i] / rtHeldTarget[i])) > kRtHeldMoveCents)
-                moved = true;
+        // (`moved` - "is this still the chord the last search was aimed at?" - is computed
+        // at the top of this function; it decides BOTH whether to search again and whether
+        // an already-finished result is still worth applying.)
         if (moved) rtPending = true;
     }
     else
@@ -3096,6 +3335,15 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
             setTimbreOnParam ((bool) tim.getProperty ("on", true) && ! timbreDegrees.empty());
         }
     }
+
+    // RE-BASELINE THE RANDOM TRIGGER against the level the project just restored, and
+    // throw away any edge that restoring produced. replaceState() rewrites every
+    // parameter, so a project saved with the trigger left at 1 (which is where a press
+    // leaves it) arrived as a 0 -> 1 step and REGENERATED the spectrum on load: the user
+    // reopened yesterday's project and found a random timbre where their own had been.
+    randomTrigLevel.store (apvts.getRawParameterValue ("specRandom")->load() >= 0.5f,
+                           std::memory_order_release);
+    randomTrigPending.store (false, std::memory_order_release);
 }
 
 void FractalAdditiveAudioProcessor::getStateInformation (juce::MemoryBlock& destData)

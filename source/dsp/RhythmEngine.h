@@ -488,6 +488,20 @@ public:
         }
         return 0;   // contended beyond reason: report nothing rather than a torn chord
     }
+    // THE ANCHOR KEY: the lowest note being held, and - once every key is up - the last
+    // one that was. -1 until something has been played.
+    //
+    // The register range the spectrum adaptation optimises over hangs off this note ("N
+    // steps above the step you pressed"), and the hand-pressed Adapt button has to have an
+    // anchor without the user holding a key down while reaching for the mouse. That is the
+    // whole reason this outlives the note: getHeldChord goes empty the instant the keys
+    // come up, and a range that vanished with it would put the button back to guessing.
+    //
+    // It rides the SAME bookkeeping the held chord is published from (publishHeld, from
+    // every processBlock), not a second copy of the MIDI: two note-trackers drifting apart
+    // is exactly how the panel ends up naming one anchor while the search uses another.
+    // The KEY, not the frequency, because N is counted in scale STEPS.
+    int getAnchorNote() const noexcept { return anchorNote.load (std::memory_order_relaxed); }
     // True when at least one partial is routed - self-play only engages then, so the
     // synth still plays its held notes normally when no rhythm is set up.
     bool hasEnabledSlot() const noexcept
@@ -949,17 +963,27 @@ private:
     std::atomic<double>   heldPubHz[kMaxNotes] = {};
     std::atomic<int>      heldPubN { 0 };
     std::atomic<unsigned> heldSeq  { 0 };
+    // See getAnchorNote. Plain relaxed int, no seqlock: it is ONE value, so it cannot tear,
+    // and it is deliberately NOT cleared when the last key comes up.
+    std::atomic<int>      anchorNote { -1 };
 
     void publishHeld() noexcept
     {
         double f[kMaxNotes];
         int n = 0;
+        int lowestKey = -1;
         for (auto& h : heldCol)
             if (h.active)
             {
                 h.f0 = noteHz (h.note, h.ch); // picks up a tuning change with no MIDI event
+                if (lowestKey < 0 || h.note < lowestKey) lowestKey = h.note;
                 if (h.f0 > 0.0 && n < kMaxNotes) f[n++] = h.f0;
             }
+        // The lowest KEY of the held set, kept after release (see getAnchorNote). Lowest
+        // by key and not by frequency: the anchor is the step the range is counted from,
+        // and steps are the keyboard's, so an inverted or negative-step tuning must not
+        // make the anchor jump to a different key than the one under the lowest finger.
+        if (lowestKey >= 0) anchorNote.store (lowestKey, std::memory_order_relaxed);
         std::sort (f, f + n);
         heldSeq.fetch_add (1, std::memory_order_release);   // -> odd: readers retry
         for (int i = 0; i < n; ++i)

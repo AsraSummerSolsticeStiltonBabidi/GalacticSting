@@ -111,6 +111,117 @@ public:
     std::function<void(int)>        onEditKey;
     std::function<void(int,double)> onAddKey;
 
+    //==========================================================================
+    // PERIOD NUMBERS, and why octave names had to go.
+    //
+    // "C2", "C4" are 12-EDO's own invention: they name a pitch class that only exists
+    // because the octave is cut into twelve. In 31-EDO, in Bohlen-Pierce (period 3/1),
+    // in any .scl with its own period, they name nothing - and the adaptation's register
+    // range was expressed in them, so the one control that decides WHICH REGISTERS a
+    // spectrum is optimised for spoke a language most of this instrument's tunings do
+    // not have.
+    //
+    // What replaces them is the PERIOD number, counted exactly the way octaves are
+    // counted in 12-EDO: the reference key (60, degree 0) is period 3 - which is what
+    // the rest of the product already calls C3 - and every degree-0 key carries its own
+    // number, drawn small to the right of its "0". Those numbers ARE the units the
+    // register range is typed in, so the keyboard is where you read them off.
+    static constexpr int kRefPeriodNumber = 3;
+    static int periodNumberForNote (int note, int degrees)
+    {
+        const int D = juce::jmax (1, degrees);
+        const int rel = note - kRefKey;
+        // FLOOR division, not C's truncation: -1/12 is 0 in C++, which would put the whole
+        // period below the reference into the reference's own number and give two adjacent
+        // periods the same name.
+        const int p = rel >= 0 ? rel / D : -(((-rel) + D - 1) / D);
+        return p + kRefPeriodNumber;
+    }
+    // The MIDI key that STARTS period `p` under a tuning with `degrees` per period - the
+    // inverse of the above, and what the register fields resolve their typed number with.
+    // -1 when that period has no key on a 128-note keyboard.
+    static int noteForPeriodNumber (int p, int degrees)
+    {
+        const int D = juce::jmax (1, degrees);
+        const long long k = (long long) kRefKey + (long long) (p - kRefPeriodNumber) * D;
+        return (k >= 0 && k <= 127) ? (int) k : -1;
+    }
+
+    // The geometry of a degree-0 key's two numbers. ONE place: paint() draws from it and
+    // periodTagProbe() measures it, so a check can never be measuring a layout the screen
+    // has stopped using.
+    struct ZeroLayout { juce::Rectangle<float> zero, tag; float tagFont = 0.0f; };
+    static ZeroLayout layOutPeriodTag (juce::Rectangle<float> area, float cellW, int digits)
+    {
+        ZeroLayout z;
+        // "Much smaller", and sized to the DIGITS it has to hold, in a strip RESERVED on
+        // the right of the cell rather than whatever the centred "0" happens to leave.
+        // The leftover is about 8 px at this key width, and a two-digit period ("-1",
+        // "10") needs ten - it would have been silently shrunk into a smear, in exactly
+        // the tunings (period 1, huge periods) where the number matters most.
+        const int   n = juce::jmax (1, digits);
+        z.tagFont = juce::jlimit (7.0f, 10.5f, cellW * 0.27f);
+        // The strip may take up to 55% of the cell, and when even that is not enough the
+        // TAG FONT comes down - never the text. drawFittedText would have squashed a
+        // three-character period ("-10", which a one-degree-per-period tuning really has)
+        // into an illegible smear and nothing in the build could have seen it; 7 pt is the
+        // floor, and three characters fit inside 55% of a key at 7 pt with room to spare.
+        const float cap  = area.getWidth() * 0.55f;
+        float       need = z.tagFont * 0.62f * (float) n + 3.0f;
+        if (need > cap)
+        {
+            z.tagFont = juce::jmax (7.0f, (cap - 3.0f) / (0.62f * (float) n));
+            need = cap;
+        }
+        const float strip = juce::jmin (need, cap);
+        z.zero = area.withTrimmedRight (strip);
+        auto t = area.withLeft (area.getRight() - strip).reduced (1.0f, 0.0f);
+        // VERTICALLY CENTRED ON THE "0", not on the cell: with an interval label
+        // underneath, the cell's own centre sits well below the digit this annotates.
+        z.tag = t.withSizeKeepingCentre (t.getWidth(), juce::jmin (t.getHeight(), z.tagFont * 1.5f));
+        return z;
+    }
+
+    // Test hook (RhythmVerify): every degree-0 key on screen, with the exact rects and
+    // fonts paint() uses and the width the period number really needs in that font. A
+    // number drawn into too small a rect is shrunk by drawFittedText - legible-looking,
+    // wrong size, invisible to every bounds check - so the width is measured, not eyeballed.
+    struct PeriodTag
+    {
+        int note = 0, number = 0;
+        juce::Rectangle<float> zero, tag;
+        float zeroFont = 0.0f, tagFont = 0.0f;
+        float zeroTextWidth = 0.0f, tagTextWidth = 0.0f;
+    };
+    std::vector<PeriodTag> periodTagProbe() const
+    {
+        std::vector<PeriodTag> out;
+        const int D = juce::jmax (1, getDegrees ? getDegrees() : 12);
+        const int cells = numCells();
+        const float w = (float) keysWidth() / (float) juce::jmax (1, cells);
+        for (int i = 0; i < cells; ++i)
+        {
+            const int note = baseKey + i;
+            if (note > 127 || note >= rangeLo + rangeCount) break;
+            if (((note - kRefKey) % D + D) % D != 0) continue;
+            PeriodTag t;
+            t.note   = note;
+            t.number = periodNumberForNote (note, D);
+            const juce::String tag (t.number);
+            auto cell = cellRect (i);
+            const auto area = degreeArea (cell, getLabel ? getLabel (0) : juce::String(), w, t.zeroFont);
+            const auto z = layOutPeriodTag (area, w, tag.length());
+            t.zero = z.zero; t.tag = z.tag; t.tagFont = z.tagFont;
+            t.zeroFont = juce::jmin (t.zeroFont, z.zero.getWidth() * 0.9f);
+            t.zeroTextWidth = (float) juce::GlyphArrangement::getStringWidthInt (
+                juce::Font (juce::FontOptions (t.zeroFont).withStyle ("Bold")), "0");
+            t.tagTextWidth  = (float) juce::GlyphArrangement::getStringWidthInt (
+                juce::Font (juce::FontOptions (z.tagFont).withStyle ("Bold")), tag);
+            out.push_back (t);
+        }
+        return out;
+    }
+
     juce::String getTooltip() override
     {
         if (hoverArmed && hoverCell >= 0 && getHoverText != nullptr)
@@ -150,7 +261,7 @@ public:
             const float hue = 0.82f * (float) degree / (float) D;
             const bool held = state.isNoteOnForChannels (0xffff, note);
 
-            auto cell = juce::Rectangle<float> (aw + i * w, keysY, w, keysH).reduced (0.6f);
+            auto cell = cellRect (i);
             // The hovered key stretches a little into the strip - a clear "this one".
             if (note == hoveredNote && degree != 0)
                 cell = cell.withTop (cell.getY() - 7.0f);
@@ -160,20 +271,38 @@ public:
             if (held) { g.setColour (juce::Colours::white); g.drawRect (cell, 2.0f); }
 
             // Degree number (wide, but a touch smaller so it clears the key edges in
-            // dense scales) + the just-interval label below it.
+            // dense scales) + the just-interval label below it. On a degree-0 key the
+            // PERIOD NUMBER rides beside it - see periodNumberForNote.
             const juce::String label = getLabel ? getLabel (degree) : juce::String();
-            g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-            if (label.isNotEmpty())
+            const auto ink = col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white;
+            g.setColour (ink);
             {
-                auto top = cell.removeFromTop (cell.getHeight() * 0.52f);
-                g.setFont (juce::Font (juce::FontOptions (juce::jmin (top.getHeight() * 0.76f, w * 0.66f)).withStyle ("Bold")));
-                g.drawFittedText (juce::String (degree), top.reduced (1, 0).toNearestInt(), juce::Justification::centred, 1, 0.5f);
-                drawIntervalLabel (g, label, cell, w);
-            }
-            else
-            {
-                g.setFont (juce::Font (juce::FontOptions (juce::jmin (cell.getHeight() * 0.66f, w * 0.66f)).withStyle ("Bold")));
-                g.drawFittedText (juce::String (degree), cell.reduced (1, 0).toNearestInt(), juce::Justification::centred, 1, 0.5f);
+                float fontH = 0.0f;
+                auto rest = cell;
+                const auto area = degreeArea (rest, label, w, fontH);
+                if (degree == 0)
+                {
+                    const juce::String tag (periodNumberForNote (note, D));
+                    const auto z = layOutPeriodTag (area, w, tag.length());
+                    g.setFont (juce::Font (juce::FontOptions (juce::jmin (fontH, z.zero.getWidth() * 0.9f))
+                                               .withStyle ("Bold")));
+                    g.drawFittedText ("0", z.zero.reduced (1.0f, 0.0f).toNearestInt(),
+                                      juce::Justification::centred, 1, 0.5f);
+                    // Smaller AND quieter: it is a coordinate, not a degree, and at full
+                    // ink it read as a second scale degree sitting on the same key.
+                    g.setColour (ink.withMultipliedAlpha (0.72f));
+                    g.setFont (juce::Font (juce::FontOptions (z.tagFont).withStyle ("Bold")));
+                    g.drawFittedText (tag, z.tag.toNearestInt(), juce::Justification::centred, 1, 0.5f);
+                    g.setColour (ink);
+                }
+                else
+                {
+                    g.setFont (juce::Font (juce::FontOptions (fontH).withStyle ("Bold")));
+                    g.drawFittedText (juce::String (degree), area.reduced (1.0f, 0.0f).toNearestInt(),
+                                      juce::Justification::centred, 1, 0.5f);
+                }
+                if (label.isNotEmpty())
+                    drawIntervalLabel (g, label, rest, w);
             }
 
             // Strip cell (above the key): hover deltas; the hovered key itself gets an
@@ -389,6 +518,30 @@ private:
     {
         const int usable = juce::jmax (1, getWidth() - 2 * kArrowW);
         return juce::jmax (1, usable / kCellW);
+    }
+    // The resting key cell for view index `i`, exactly as paint() builds it (the hover
+    // stretch is left out on purpose: it is a transient, and the probe measures the layout
+    // the keyboard sits in). Shared so paint() and periodTagProbe() cannot disagree.
+    juce::Rectangle<float> cellRect (int i) const
+    {
+        const float w = (float) keysWidth() / (float) juce::jmax (1, numCells());
+        return juce::Rectangle<float> ((float) arrowW() + (float) i * w, (float) stripH,
+                                       w, (float) getHeight() - (float) stripH).reduced (0.6f);
+    }
+    // The band the DEGREE NUMBER is drawn in, and the font height it gets. `cell` is
+    // trimmed in place so the caller is left holding exactly the room the interval label
+    // may use - one call decides both, so a change to either can never orphan the other.
+    static juce::Rectangle<float> degreeArea (juce::Rectangle<float>& cell,
+                                              const juce::String& label, float w, float& fontOut)
+    {
+        if (label.isNotEmpty())
+        {
+            auto top = cell.removeFromTop (cell.getHeight() * 0.52f);
+            fontOut = juce::jmin (top.getHeight() * 0.76f, w * 0.66f);
+            return top;
+        }
+        fontOut = juce::jmin (cell.getHeight() * 0.66f, w * 0.66f);
+        return cell;
     }
     bool isScrollable() const { return rangeCount > numCells(); }
     int  arrowW()      const { return kArrowW; }

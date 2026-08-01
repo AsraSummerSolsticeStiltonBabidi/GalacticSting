@@ -228,6 +228,47 @@ public:
     }
     int  getTimbreNoteCount() const noexcept { return (int) timbreDegrees.size(); }
 
+    // Drop the loaded custom spectrum THROUGH the undo stack, so the Remove button is
+    // as undoable as everything else. clearTimbre() on its own is invisible to Ctrl+Z:
+    // the spectrum is not an APVTS parameter, so a plain clear destroyed a hand-typed
+    // scale with no way back. Reuses TimbreTextAction, whose empty text IS a clear.
+    void clearTimbreUndoable()
+    {
+        if (timbreSource.isEmpty() && timbreDegrees.empty()) return;
+        const auto before = timbreSource;
+        undoManager.beginNewTransaction();
+        undoManager.perform (new TimbreTextAction (*this, before, juce::String()));
+    }
+
+    //== RANDOM SPECTRUM (the "specRandom" trigger parameter) ====================
+    // Press it from the UI: a real 0 -> 1 parameter step, so the host records it as
+    // automation and replaying that automation fires exactly the same way a click does.
+    // The 0 is written first because the level may already BE 1 (the previous press
+    // left it there): without it a second click would be no edge at all, and the button
+    // would work exactly once per session.
+    void pressRandomSpectrum()
+    {
+        if (auto* p = apvts.getParameter ("specRandom"))
+        {
+            p->beginChangeGesture();
+            p->setValueNotifyingHost (0.0f);
+            p->setValueNotifyingHost (1.0f);
+            p->endChangeGesture();
+        }
+    }
+    // Consume a pending rising edge and build the spectrum. Called by the 60 Hz timer
+    // (message thread - loadTimbreText parses and republishes, neither of which may run
+    // on the audio thread), and directly by the verifier, which has no message loop.
+    // Returns true if a spectrum was actually generated.
+    bool pollRandomSpectrumTrigger();
+    // How many random spectra this instance has generated. The one thing a test can
+    // count to prove "the rising edge fired once, and a held level does not re-fire".
+    int  getRandomSpectrumCount() const noexcept { return randomSpectrumCount; }
+    // The interval text a random press would produce. Public so the generator's
+    // distribution can be measured directly (spacing, count, span) instead of inferred
+    // from the partials that survive compilation.
+    juce::String makeRandomSpectrumText();
+
     // Degrees per period of the active tuning (for the colour keyboard).
     int getScaleDegrees() const noexcept { return tuning.degreesPerPeriod(); }
 
@@ -351,15 +392,21 @@ public:
     // directly (atomics) and reads the live pulse rates for its panel.
     RhythmEngine& getRhythm() noexcept { return rhythm; }
     const spectrum::SpectrumTemplate* getLiveTemplate() const noexcept { return spectrumEngine.getLive(); }
+    // Every swap of the live template, gains-only republishes included (see
+    // SpectrumEngine::getLiveRevision). Read by run 42 to count what the ear gets.
+    juce::uint32 getSpectrumLiveRevision() const noexcept { return spectrumEngine.getLiveRevision(); }
 
     // Per-partial amplitude edits. The authoritative copy lives HERE, because it has to
     // be saved with the project; the spectrum engine only ever holds a resolved
     // index-aligned copy for the voices. Message thread.
-    void setPartialGains (std::vector<spectrum::PartialGain> ov, bool on)
+    // `republish == false` stores the edits without swapping the live template - only for
+    // a caller that publishes its own template in the same call (see
+    // SpectrumEngine::setOverrides and applySpectrumAdapt).
+    void setPartialGains (std::vector<spectrum::PartialGain> ov, bool on, bool republish = true)
     {
         partialGains = ov;
         ++partialGainsRev;
-        spectrumEngine.setOverrides (std::move (ov), on);
+        spectrumEngine.setOverrides (std::move (ov), on, republish);
     }
     const std::vector<spectrum::PartialGain>& getPartialGains() const noexcept { return partialGains; }
     // Bumped on every write. The editor window has to notice edits that did NOT come
@@ -546,16 +593,41 @@ public:
         // critical band is a width in Hz, so a spectrum optimised at ONE pitch is optimal
         // only there - and, worse, an optimiser working in the bass sees tight partial
         // clusters as nearly free and builds them, which is precisely the roughness that
-        // dominates two octaves up. 0 Hz means AUTO: an octave either side of the note the
-        // adaptation is anchored at (so a follower with the window shut still spans the
-        // register being played, instead of silently collapsing to one pitch).
-        double regLoHz = 0.0, regHiHz = 0.0;
+        // dominates two octaves up.
+        //
+        // ONE NUMBER, and it is a COUNT OF SCALE STEPS: the range runs from the anchor key
+        // (see registerAnchorKey) to `regSteps` degrees of the loaded tuning above it. Two
+        // absolute bounds could not do this - they were pinned to fixed pitches, so the
+        // adaptation answered with the same spectrum whichever register was actually being
+        // played, and they had to be re-read every time the tuning changed. A step count is
+        // the same musical width in any tuning (24 in 12-EDO, 62 in 31-EDO, 26 in
+        // Bohlen-Pierce are all two periods) and it FOLLOWS the hands.
+        //
+        // < 0 means "the default width", which is kAdaptRegisterDefaultPeriods periods of
+        // whatever scale is loaded - so a follower running with the window shut still spans
+        // the register being played instead of collapsing to one pitch.
+        int    regSteps  = -1;
         int    aggregate = 0;        // 0 = mean over the range, 1 = minimax (the worst register)
     };
+    // The KEY the register range hangs off: the lowest note being HELD, else the last one
+    // played, else 60. In that order and for that reason - the hand-pressed Adapt must have
+    // a defensible anchor without the user holding a key down while they reach for the
+    // mouse, and "middle C" is only ever the answer before a single note has been played.
+    int registerAnchorKey() const noexcept;
+    // How many steps the DEFAULT range spans under the scale loaded right now.
+    int defaultRegisterSteps() const noexcept;
     // The registers a run would use, resolved exactly as startSpectrumAdapt resolves them -
     // the panel prints these, so what it claims and what the search does cannot drift.
-    static dissonance::Registers adaptRegistersFor (const SpectrumAdaptSettings& s, double f0Hz,
-                                                    bool realtime);
+    // A member, not a static: the range is now anchor-relative and step-counted, so it can
+    // only be resolved by something that knows the anchor and the tuning's own frequencies.
+    dissonance::Registers adaptRegistersFor (const SpectrumAdaptSettings& s, double f0Hz,
+                                             bool realtime) const;
+    // WHAT ONE RUN WILL COST, in milliseconds, before it is started (see Dissonance.h).
+    // Same helper the panel prints and the same one startSpectrumAdapt's hard bound is
+    // measured against, so the price on the button and the only remaining refusal can
+    // never be two different numbers.
+    double estimateAdaptMs (const SpectrumAdaptSettings& s, int targetNotes,
+                            double f0Hz, bool realtime) const;
     // `targetAlphas` are the notes as ratios (alphas[0] is the root, normally 1.0);
     // `f0Hz` is the root's real frequency - Sethares roughness depends on register, so
     // the same chord an octave down wants a different spectrum.
@@ -661,7 +733,20 @@ public:
     // throttle a modulator sweeping the spectrum starts a new search on EVERY tick - 200
     // spectrum changes produced 138 searches - and the worker queue never drains.
     static constexpr int kRtTuneTicks  = 20;  // ~0.33 s: the full grid+refine chord search
-    static constexpr int kRtAdaptTicks = 15;  // ~250 ms: the (much cheaper) adaptation
+    // ~100 ms for the adaptation. It was 250 ms, and that was THE lag the player felt:
+    // a chord struck from rest is never throttled (the link has been idle for seconds),
+    // so the first move landed in ~50 ms and every move made while still playing waited
+    // out the floor - measured at 163 ms for a second move 130 ms after the first, i.e.
+    // most of it spent doing nothing. The floor was sized when one adaptation cost ~250 ms;
+    // an 8-partial triad is now ~30 ms, and "never two at once" (adaptRunning) is what
+    // actually keeps the worker from piling up. What is left here is a bound on how often
+    // the SPECTRUM may be rewritten, and 10 Hz is a rate the 50 ms template fade absorbs.
+    static constexpr int kRtAdaptTicks = 6;
+    // The same floor as a DURATION (the timer runs at 60 Hz). It is the budget one realtime
+    // adaptation has: a search that takes longer than this cannot land before the next one
+    // is due, so the follower's results arrive stale - which the panel warns about instead
+    // of silently degrading, and instead of refusing the settings outright.
+    static constexpr double kRtAdaptBudgetMs = kRtAdaptTicks * 1000.0 / 60.0;
 
     //==========================================================================
     // Scale EDITING on the keyboard. Works from ANY loaded tuning (the current
@@ -862,6 +947,34 @@ private:
     std::vector<float> timbreDegrees;
     float              timbrePeriod = 2.0f;
     juce::String       timbreName, timbreSource;
+
+    //== RANDOM SPECTRUM trigger ("specRandom") =================================
+    // Edge detection lives in a parameter LISTENER, not in the 60 Hz poll, because a
+    // press writes 0 then 1 back to back: a poll that only ever sees the LEVEL would
+    // read 1, then 1 again next tick, and every click after the first would do nothing.
+    // The listener is called synchronously by setValueNotifyingHost on whatever thread
+    // wrote (the audio thread, for host automation), so it does the minimum possible -
+    // raise an atomic flag - and the message-thread timer does the actual work.
+    struct RandomTrigListener : juce::AudioProcessorParameter::Listener
+    {
+        FractalAdditiveAudioProcessor* owner = nullptr;
+        void parameterValueChanged (int, float newValue) override
+        {
+            if (owner == nullptr) return;
+            const bool now = newValue >= 0.5f;
+            const bool was = owner->randomTrigLevel.exchange (now, std::memory_order_acq_rel);
+            if (now && ! was) owner->randomTrigPending.store (true, std::memory_order_release);
+        }
+        void parameterGestureChanged (int, bool) override {}
+    };
+    RandomTrigListener randomTrigListener;
+    std::atomic<bool>  randomTrigLevel   { false }; // last level the listener saw
+    std::atomic<bool>  randomTrigPending { false }; // a rising edge is waiting for the timer
+    int                randomSpectrumCount = 0;     // how many have been generated (tests count it)
+    // Seeded once from the clock, then advanced by every draw: two presses in the same
+    // millisecond still get different spectra, which a per-press time seed would not give.
+    juce::Random       randomSpectrumRng { (juce::int64) juce::Time::getHighResolutionTicks() };
+    juce::String       lastRandomSpectrumText; // redraw if a draw repeats the previous one
 
     // Persistent recent-.scl list (global app settings, shared across instances).
     std::unique_ptr<juce::PropertiesFile> appProps;

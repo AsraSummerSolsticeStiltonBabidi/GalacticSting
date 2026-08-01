@@ -62,6 +62,11 @@ public:
             juce::String name, text;
             juce::Rectangle<int> cell;  // the rect the text is drawn into
             float textWidth = 0.0f;     // measured in the very font paint() sets
+            // The INK. "The whole panel is one colour" is a claim about exactly this,
+            // and it is invisible to every geometric check in the build: the old
+            // mint/magenta scheme of the Fractal-Morph-Range compartment laid out
+            // perfectly and simply looked like a different box.
+            juce::Colour colour;
         };
         std::vector<PaintedLabel> paintedLabels;
         // The same measurement for every juce::Label COMPONENT laid out in those boxes,
@@ -69,11 +74,40 @@ public:
         // going unreadably condensed instead of disappearing, which no bounds check can
         // see either. Same struct: cell = the label's bounds, textWidth = what it needs.
         std::vector<PaintedLabel> componentLabels;
+        // The read-outs that WRAP. A juce::Label lays its text out in as many lines as its
+        // height allows, and modern JUCE will SHRINK THE FONT to make more of them fit - so
+        // a sentence that "fits" can be rendering two points smaller than the one beside
+        // it, and a single-line width check would reject every wrapping label out of hand.
+        // Measured the only way that answers the real question: word-wrap this text, in
+        // this font, at this width, and see how tall it comes out.
+        struct WrappedLabel
+        {
+            juce::String name, text;
+            juce::Rectangle<int> cell;   // the TEXT area - the Label's own border removed
+            float needWidth = 0.0f, needHeight = 0.0f;
+        };
+        std::vector<WrappedLabel> wrappedLabels;
+        // ...and every OTHER sentence the adaptation's read-out can print, measured against
+        // that same label's text area with the widest numbers each can hold. The label only
+        // ever shows one state; probing the live one would measure whichever state the
+        // verifier happened to reach, and the state that clips is always the other one.
+        std::vector<WrappedLabel> readoutVariants;
         // Every combo whose ITEM TEXTS are rewritten by applyLanguage(), as
         // name -> selected id. Probed because re-wording a ComboBox is the one operation
         // that can silently DESELECT it (getSelectedId() compares the visible label
         // against the item's text), and a mode box that reads 0 gates its whole panel off.
         std::vector<std::pair<juce::String, int>> comboIds;
+        // The BUTTONS whose word is the whole feature: the custom view's one button that
+        // is "Load" or "Remove" depending on what is loaded, and the tuning bank's add
+        // button. A wrong word on the first of those means a green Load that deletes the
+        // user's spectrum, and no bounds check in the build could ever see it.
+        std::vector<std::pair<juce::String, juce::String>> buttonTexts;
+        // THE SHARED WALL, as the x of the LINE each of the three boxes actually draws
+        // there - not the x of its rectangle. Every border is a stroke whose centre sits
+        // a fixed distance inside the box, so two rects that merely touch draw TWO lines
+        // back to back; comparing the rects would call that a shared wall while the
+        // screen shows a doubled border. These are what paint() puts on the glass.
+        float wallSpectrumRight = 0.0f, wallTuningRight = 0.0f, wallColumnLeft = 0.0f;
     };
     LayoutProbe layoutProbe() const;
     // Test hook (RhythmVerify): probe the layout in the OTHER language. Every painted
@@ -91,6 +125,12 @@ public:
     // clicking CUSTOM must still open that view (it is the only place the Load button
     // and the intervals editor live), while the sound honestly stays harmonic.
     void clickEngineChipForTests (int i) { if (engineChip[i & 1].onClick) engineChip[i & 1].onClick(); }
+    // Test hooks (RhythmVerify): the custom view's two buttons, through their own
+    // callbacks. The Load/Remove one is a SINGLE button with two opposite jobs, and
+    // which job it has depends on state the verifier can set - so "the green Load never
+    // deletes anything and the red Remove always does" is only checkable from here.
+    void clickCustomLoadRemoveForTests() { if (loadTimbreButton.onClick) loadTimbreButton.onClick(); }
+    void clickRandomSpectrumForTests()   { if (randomSpectrumBtn.onClick) randomSpectrumBtn.onClick(); }
 
     // Test hooks (RhythmVerify): drive the Spectrum-vs-Tuning panel the way a hand does -
     // pick a mode, pick the adaptation's target, press REALTIME - and read back what the
@@ -106,6 +146,28 @@ public:
         juce::String period;           // the shared Period field, as typed
     };
     PanelProbe panelProbeForTests() const;
+    // Test hook (RhythmVerify): the keyboard's degree-0 keys, with the period number each
+    // one prints and the rects and fonts paint() really uses (see ScaleKeyboard). Those
+    // numbers are how the register range's ANCHOR is named back to the user ("3:0"), so
+    // they have to be legible at the key width the keyboard actually uses, in every tuning -
+    // and there is no other way in this build to see a number that drawFittedText silently
+    // shrank to fit.
+    std::vector<ScaleKeyboard::PeriodTag> keyboardPeriodTagsForTests() const
+    { return keyboard.periodTagProbe(); }
+    // Test hooks (RhythmVerify): the adaptation's register range - the step count the field
+    // shows, the anchor it is counted from, the keys it resolves to and the Hz the search
+    // is really given. A range that reads one width and searches another is the bug this
+    // probe exists to catch, and it now has one more way to happen than it did: the anchor
+    // moves with the hands.
+    struct RegisterProbe { int steps = 0, fitting = 0, anchorKey = 0, keyLo = 0, keyHi = 0;
+                           double loHz = 0.0, hiHz = 0.0; juce::String stepsText, spanText; };
+    RegisterProbe registerProbeForTests() const;
+    void setAdaptRegisterStepsForTests (const juce::String& n);
+    // Test hook (RhythmVerify): what the panel would print on the Adapt button, and what
+    // one run / one realtime update is predicted to cost with the settings as they stand.
+    juce::String adaptButtonTextForTests() const { return adaptGoBtn.getButtonText(); }
+    double       adaptCostMsForTests (bool realtime) const { return adaptCostMs (realtime); }
+    juce::String adaptReadoutForTests() const { return adaptReadoutText(); }
     void setSpecModeForTests (int mode);
     void setAdaptTargetForTests (int id);
     // The two selectors that ADD rows to the right column (the free chord search's
@@ -2664,6 +2726,23 @@ private:
     // land before the first applyEngineState) is never a default black frame.
     juce::Colour         spectrumPanelColour { 0xff5cb8ff };
     void applyEngineState(); // dim/enable + chip look + repaint, from engineInForce()
+    // SELECTING A VIEW IS SELECTING AN ENGINE. One function, used by both chips and by
+    // every other route that changes which view is on screen (Remove, Random), so the
+    // two can never be wired differently: showing the custom view puts the custom engine
+    // in force and showing the harmonic view takes it out. Writes the PARAMETERS
+    // engineInForce() reads (never a member), so the choice is automatable, undoable,
+    // and identical whether it came from a click or from the host.
+    void selectEngineView (bool custom);
+    // The custom view's Load/Remove button wears whichever of its two jobs is live right
+    // now - word, colour and tooltip together. In ONE place because a button that says
+    // "Load" in green and DELETES the user's spectrum is the worst failure this panel
+    // could have, and three call sites setting two of the three properties is how that
+    // happens. Called by applyLanguage() and by the timer whenever the engine changes.
+    void refreshCustomEngineButtons();
+    // Repaint every control inside the SPECTRUM panel in the engine's colour. The panel
+    // is ONE box now, so a fader still wearing its old per-cell hue would be the only
+    // thing on screen still claiming the compartments are separate boxes.
+    void recolourSpectrumControls (juce::Colour col);
     std::unique_ptr<SliderAttachment> primeLimitFaderAtt;
     // SLOPE cell: the pencil that opens the per-partial amplitude window, and the ON/OFF
     // pill under it. The pill and the one INSIDE the window are two attachments to the
@@ -2732,9 +2811,19 @@ private:
     juce::TextButton recentOpenBtn;     // opens the floating Recent list
     juce::TextButton loadItsSpectrumBtn; // .scl written by this synth: restore its patch
     juce::TextButton loadPresetTuningBtn; // the loaded PRESET carries a different tuning
-    juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
+    // loadTimbreButton is ONE button with two jobs: "Load" while no custom spectrum
+    // exists, "Remove" once one does. The Custom-Engine On/Off pill that used to sit
+    // beside it is gone - with the engine chips deciding which engine is in force, an
+    // Off pill was a second, quieter switch for the same thing, and the pair could
+    // disagree on screen. Removing is the destructive half the pill never offered.
+    juce::TextButton loadSclButton, clearSclButton, loadTimbreButton,
                      langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3], tuningBankLoadBtn,
                      tuningBankClearBtn;
+    // RANDOM SPECTRUM: fires the automatable "specRandom" trigger (see the processor).
+    // The button does not build anything itself - it writes the parameter, and the
+    // processor's own poll builds - so a click and a host automation step take exactly
+    // the same path and cannot drift apart.
+    juce::TextButton randomSpectrumBtn;
     juce::Label          vibeLabel;   // "Vibe coded by" credit, left of the language button
     juce::HyperlinkButton vibeLink;   // "Asra3" -> Instagram
     juce::TextEditor periodEdit;
@@ -2796,20 +2885,47 @@ private:
     juce::ComboBox   adaptGoalBox;     // minimum / maximum / inside a range
     juce::TextEditor adaptLoEdit, adaptHiEdit;   // the range's two ends (goal = range)
     juce::Label      adaptPartialsLbl, adaptRangeLbl, adaptInfoLbl;
-    //== THE REGISTER RANGE the adaptation optimises over, as note names ("C2".."C4").
+    //== THE REGISTER RANGE the adaptation optimises over: ONE number, N, counted in STEPS
+    //   of the loaded tuning, running UPWARD from the note being played (see
+    //   FractalAdditiveAudioProcessor::registerAnchorKey for which note that is).
+    //
+    //   It was two absolute bounds before - "C2".."C4", then periods 2..4 - and both forms
+    //   had the same defect underneath the notation: they were pinned to fixed pitches, so
+    //   the adaptation handed back the same spectrum whichever register was actually being
+    //   played, which is the complaint this whole thread started from. Anchor + count
+    //   follows the hands, and a count of STEPS is the one unit every tuning has: 24 steps
+    //   is two octaves in 12-EDO, 62 steps is two periods in 31-EDO, 26 is two in
+    //   Bohlen-Pierce, and none of that needs an octave to be named.
+    //
     //   Sethares' critical band is a width in Hz, so the answer genuinely differs per
-    //   octave - which registers a spectrum was optimised for therefore has to be on
+    //   register - which registers a spectrum was optimised for therefore has to be on
     //   screen, not implied. `adaptAggBox` picks mean-over-the-range vs the worst register.
-    juce::TextEditor adaptRegLoEdit, adaptRegHiEdit;
+    juce::TextEditor adaptRegStepsEdit;
     juce::ComboBox   adaptAggBox;
-    juce::Label      adaptRegLbl, adaptRegInfoLbl;
-    // AUTO until the user types: the fields follow an octave either side of the lowest
-    // note being played. Typing in either one latches it off for good - a range the user
-    // set is never moved under them.
-    bool             adaptRegAuto = true;
-    int              adaptRegAutoLo = 48, adaptRegAutoHi = 72;
-    void             syncAdaptRegisterAuto();
-    void             commitAdaptRegisters();
+    // `adaptRegSpanLbl` is what stops N being a magic number: it names the ANCHOR the range
+    // hangs off and says what N amounts to in periods, so the width is readable without
+    // arithmetic and the user can see WHICH note is being counted from.
+    // `adaptAggInfoLbl` says in WORDS what the aggregate choice costs the player. It
+    // replaced a line of bare counts ("3 registers, realtime 3") that explained nothing
+    // to anyone who had not read the source; those counts are in its tooltip.
+    juce::Label      adaptRegLbl, adaptRegSpanLbl, adaptAggInfoLbl;
+    // N, in the user's own unit. < 0 means "not typed yet": until then the field shows -
+    // and the search uses - the default width for whatever scale is loaded, so swapping
+    // 12-EDO for 31-EDO on a fresh instance still gives two periods rather than two thirds
+    // of one. Once the user types, the NUMBER is theirs and is never reinterpreted: N is
+    // their statement of how wide in the tuning's own units, and re-deriving it on a scale
+    // change is precisely the silent rewrite this control is built to avoid.
+    int              adaptRegSteps = -1;
+    int              registerDegreesPerPeriod() const;
+    int              registerStepsEffective() const;       // N as typed, or the default width
+    int              registerStepsFitting() const;         // ...and how many of them the board has
+    juce::String     registerPeriodText (int key) const;   // key -> the period it starts
+    juce::String     registerKeyText (int key) const;      // key -> "period:degree", e.g. "3:0"
+    juce::String     adaptRegSpanText() const;             // the sentence under the N field
+    juce::String     adaptRegSpanLine (const juce::String& anchor, int steps, int fit,
+                                       const juce::String& periods) const;
+    void             syncAdaptRegisterSpan();
+    void             commitAdaptRegisterSteps();
     // The key whose ACTIVE-TUNING pitch is nearest `hz` - how a register in Hz is named
     // back to the user. Through the tuning, so a shifted or table-anchored instrument
     // names its own keys and not 12-EDO's.
@@ -2820,6 +2936,33 @@ private:
     juce::Viewport   adaptView;
     int              lastAdaptGen = 0;
     void runSpectrumAdapt();
+    //== THE ONE READ-OUT under the two buttons. There used to be two lines of numbers
+    //   there and neither said what it was for ("avg C2-C4: 769.9 -> 27.8 (96% less)" over
+    //   "sounding now: 31.4 (Reps/Fractal)"), the second one usually clipped. This has a
+    //   single job - WHAT IS HAPPENING, OR WHAT WILL HAPPEN IF YOU PRESS - and answers it
+    //   in one sentence, in priority order (see adaptReadoutText). Every number that was
+    //   on screen is still available, in the read-out's tooltip.
+    juce::String adaptReadoutText() const;
+    juce::String adaptReadoutTip() const;
+    // Its five states, each a function of its own numbers so nothing is written twice and
+    // the layout probe can measure every one of them at its widest (see readoutVariants).
+    juce::String adaptAggMeaning    (bool worstCase) const;
+    juce::String adaptLineWorking   (int pct) const;
+    juce::String adaptLineLag       (double ms) const;
+    juce::String adaptLineFollowing (int updates) const;
+    juce::String adaptLineCost      (double ms) const;
+    juce::String adaptLineResult    (int pct, bool less, const juce::String& span, bool drift) const;
+    // What ONE Adapt with the panel's current settings will cost, in ms, and the same
+    // figure for one REALTIME update (which uses fewer registers). Both come from the
+    // processor's estimator, so the price on the button is the number the guard uses.
+    double adaptCostMs (bool realtime) const;
+    // The result the last finished run reported, kept so the read-out can be rebuilt on
+    // any tick (a warning may replace it and then have to give it back). `adaptInfoTipBase`
+    // is the language's own explanation of what this line is for, set by applyLanguage and
+    // always the first paragraph of the tooltip.
+    juce::String adaptResultLine, adaptResultTip, adaptInfoTipBase;
+    juce::uint32 lastAdaptTipMs = 0;   // the tooltip is rebuilt at 4 Hz, not at timer rate
+    void refreshAdaptButtonText();
     //== REALTIME: one button per direction, and the one shared place that tells the
     //   processor what they should be doing (see syncRealtimeLink).
     juce::TextButton chordRtBtn, adaptRtBtn;

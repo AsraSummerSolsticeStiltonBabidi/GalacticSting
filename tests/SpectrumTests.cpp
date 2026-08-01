@@ -1444,6 +1444,313 @@ int main()
             check (miniRun.score < miniRun.seedScore && meanRun.score < meanRun.seedScore,
                    "and both aggregates really came down from the harmonic seed");
         }
+
+        //---------------------------------------------------------------------
+        // (8) HOW WIDE SHOULD THE RANGE BE? The panel asks for ONE number - N steps above
+        // the note being played - so the default N is a real decision and "two octaves"
+        // was a guess nobody had measured. This measures it.
+        //
+        // The same seed, the same anchor (the note under the fingers), optimised over
+        // widths of 0.5 .. 4 periods with the SHIPPING sampling rule, then judged on a
+        // dense sweep at three places that matter:
+        //   - AT THE ANCHOR      : the register actually being played - the one thing the
+        //                          player is guaranteed to hear;
+        //   - WORST INSIDE       : the ugliest register the range promised to cover;
+        //   - ONE PERIOD ABOVE   : the hole question. A narrow range says nothing about
+        //                          the register just outside it, and a player who moves up
+        //                          one octave lands exactly there.
+        // The reference for "above" is the spectrum optimised AT that register on its own:
+        // that is the best any spectrum could do there, so the ratio is how much the range
+        // choice costs somebody who steps outside it.
+        {
+            const double anch = atOct (kLowHz, 3.0);           // 261.6 Hz: the register a player sits in
+            const auto atOne = [&] (const std::vector<dissonance::Partial>& sp, double spF0, double f)
+            {
+                return dissonance::scoreOverRegisters (sp, spF0, { f }, oneNote, true,
+                                                       dissonance::Goal::Min, 0.0, 0.0,
+                                                       dissonance::Aggregate::Mean).perRegister[0];
+            };
+            // WIDTH 0 is the old single-pitch behaviour, kept in the table as the baseline
+            // every other row has to beat somewhere.
+            const double widths[] = { 0.0, 0.5, 1.0, 2.0, 3.0, 4.0 };
+            // The probes are FIXED absolute registers - the anchor and one, two, three,
+            // four and five periods above it - so a column means the same pitch in every
+            // row. (Judging each width "one period above ITS OWN top" compares a different
+            // register per row, which is exactly how a width can look good by being asked
+            // an easier question.) Each probe's reference is a spectrum optimised for that
+            // register ALONE: the best anything could do there, so a penalty of 1.00x is
+            // "as good as if you had adapted for this register on purpose".
+            const double probes[] = { 0.0, 1.0, 2.0, 3.0, 4.0, 5.0 };
+            double refAt[6] = {};
+            for (int i = 0; i < 6; ++i)
+            {
+                const double f = atOct (anch, probes[i]);
+                refAt[i] = atOne (adaptOver (anch, f, f, 1, dissonance::Aggregate::Mean).spectrum, anch, f);
+            }
+            for (const auto mode : { dissonance::Aggregate::Mean, dissonance::Aggregate::Minimax })
+            {
+                const bool mini = mode == dissonance::Aggregate::Minimax;
+                std::printf ("  range WIDTH, anchored at %.1f Hz, %s aggregate (dense-judged):\n",
+                             anch, mini ? "minimax" : "mean");
+                std::printf ("    width     pts   at anchor  worst inside  1 period above"
+                             "   | penalty vs a spectrum optimised for that register alone\n");
+                std::printf ("    %-56s|   +0     +1     +2     +3     +4     +5 periods\n", "");
+                double anchorAt[6] = {}, penAbove[6] = {}, meanPen04[6] = {};
+                int row = 0;
+                for (const double w : widths)
+                {
+                    const double top = atOct (anch, w);
+                    const int pts = dissonance::registerCountFor (anch, top, dissonance::kAdaptRegisterCap);
+                    const auto run = adaptOver (anch, anch, top, pts, mode);
+                    double m = 0, worst = 0, wHz = 0;
+                    judge (run.spectrum, anch, anch, top, m, worst, wHz);
+                    const double here = atOne (run.spectrum, anch, anch);
+                    const double out  = atOne (run.spectrum, anch, atOct (top, 1.0));
+                    const auto refAbove = adaptOver (anch, atOct (top, 1.0), atOct (top, 1.0), 1, mode);
+                    const double refOut = atOne (refAbove.spectrum, anch, atOct (top, 1.0));
+                    std::printf ("    %.1f per %4d  %10.3f  %12.3f  %8.3f %5.2fx |",
+                                 w, pts, here, worst, out, out / std::max (1.0e-9, refOut));
+                    double sum04 = 0.0;
+                    for (int i = 0; i < 6; ++i)
+                    {
+                        const double p = atOne (run.spectrum, anch, atOct (anch, probes[i]))
+                                       / std::max (1.0e-9, refAt[i]);
+                        std::printf (" %5.2fx", p);
+                        if (i <= 4) sum04 += p;
+                    }
+                    std::printf ("\n");
+                    anchorAt[row] = here; penAbove[row] = out / std::max (1.0e-9, refOut);
+                    meanPen04[row] = sum04 / 5.0;
+                    ++row;
+                }
+                std::printf ("    mean penalty over the anchor and four periods above it:");
+                for (int i = 0; i < row; ++i) std::printf ("  %.1f per %.2fx", widths[i], meanPen04[i]);
+                std::printf ("\n");
+                if (! mini)
+                {
+                    // (i) WIDENING COSTS THE PLAYED REGISTER, and the cost is real but
+                    // bounded. If it were not bounded the honest default would be "no
+                    // range at all", because the anchor is the one register the player is
+                    // certain to hear.
+                    std::printf ("    at the anchor: %.3f with no range -> %.3f at 2 periods"
+                                 " -> %.3f at 4 periods\n", anchorAt[0], anchorAt[3], anchorAt[5]);
+                    check (anchorAt[3] < anchorAt[0] * 1.35,
+                           "a two-period range costs the register being played less than 35% against no range at all");
+                    // (ii) THE HOLE IS REAL. Optimising at ONE pitch leaves the register a
+                    // period up measurably worse than a range does - that is what makes the
+                    // width a decision rather than a shrug.
+                    std::printf ("    one period above a ZERO-width range: %.2fx"
+                                 " vs %.2fx above a two-period range\n", penAbove[0], penAbove[3]);
+                    check (meanPen04[3] < meanPen04[0],
+                           "a two-period range really is better across the anchor and the four periods above it"
+                           " than optimising at the played pitch alone");
+                }
+                else
+                {
+                    // MINIMAX DEGENERATES under an anchor-and-up range, and the panel's own
+                    // wording has to survive that: the range starts AT the played note and
+                    // the played note is the worst register in it, so "only the worst
+                    // register counts" IS "only the anchor counts" - the width buys nothing.
+                    // Mean is the aggregate that makes N mean something.
+                    std::printf ("    minimax at the anchor across all widths: %.3f .. %.3f\n",
+                                 anchorAt[0], anchorAt[5]);
+                    check (std::abs (anchorAt[5] - anchorAt[0]) < 0.02 * anchorAt[0],
+                           "under an anchor-and-up range MINIMAX is the anchor alone - width changes nothing for it");
+                }
+            }
+            // ...and the same question asked from three different registers, because a
+            // default fitted to middle C would be a default fitted to one measurement. Only
+            // the summary is printed: the mean penalty over the anchor and the four periods
+            // above it, which is the number the choice turns on.
+            {
+                std::printf ("  the same sweep from three anchors (mean penalty over the anchor and +4 periods):\n");
+                const double anchors[] = { atOct (kLowHz, 1.0), atOct (kLowHz, 3.0), atOct (kLowHz, 5.0) };
+                int bestCount[6] = {};
+                for (const double a : anchors)
+                {
+                    double refs[5] = {};
+                    for (int i = 0; i < 5; ++i)
+                    {
+                        const double f = atOct (a, (double) i);
+                        refs[i] = atOne (adaptOver (a, f, f, 1, dissonance::Aggregate::Mean).spectrum, a, f);
+                    }
+                    std::printf ("    anchor %7.1f Hz:", a);
+                    int best = 0; double bestVal = 1.0e9;
+                    for (int r = 0; r < 6; ++r)
+                    {
+                        const double top = atOct (a, widths[r]);
+                        const auto run = adaptOver (a, a, top,
+                                                    dissonance::registerCountFor (a, top, dissonance::kAdaptRegisterCap),
+                                                    dissonance::Aggregate::Mean);
+                        double sum = 0.0;
+                        for (int i = 0; i < 5; ++i)
+                            sum += atOne (run.spectrum, a, atOct (a, (double) i)) / std::max (1.0e-9, refs[i]);
+                        const double pen = sum / 5.0;
+                        std::printf ("  %.1f per %.2fx", widths[r], pen);
+                        if (pen < bestVal) { bestVal = pen; best = r; }
+                    }
+                    std::printf ("   (best: %.1f periods)\n", widths[best]);
+                    ++bestCount[best];
+                }
+                // The DEFAULT is not simply the best cell of that table: the widest range
+                // always wins a coverage average, and it pays for it at the anchor - the
+                // one register the player is certain to hear - and in registers per run,
+                // which the realtime follower cannot afford (kAdaptRegisterCapRt = 3, i.e.
+                // exactly a two-period range at one register per octave). What the table has
+                // to show is that no NARROWER width wins outright, because that would make
+                // the default indefensible.
+                check (bestCount[0] + bestCount[1] + bestCount[2] == 0,
+                       "from every anchor, a range narrower than two periods is beaten - the default is not too wide");
+            }
+            // WHAT THE ANCHOR-AND-UP FORM COSTS IN TIME, which is not free and shows up in
+            // the realtime follower's landing latency (RhythmVerify times it end to end).
+            // Same width, same sampling, same seed - only the PLACEMENT changes: two periods
+            // ABOVE the played note, as the panel now asks for, against the octave-either-
+            // side band it used to use. The optimiser sweeps longer up there, and this is
+            // the number the follower's budget is derived from rather than guessed at.
+            {
+                // The follower's own shape: 8 partials, a triad under the fingers, 50 cents
+                // of air, amplitudes shaped, at the realtime register cap.
+                const int Nrt = 8;
+                const double gRt = 50.0, tRt = std::exp2 ((1200.0 - gRt) / 1200.0);
+                const std::vector<double> triad { 1.0, std::exp2 (4.0 / 12.0), std::exp2 (7.0 / 12.0) };
+                std::vector<dissonance::Partial> seed8;
+                for (int i = 0; i < Nrt; ++i)
+                {
+                    const double r = std::exp2 ((double) i / (double) Nrt);
+                    seed8.push_back ({ anch * r, std::pow (r, -1.0) });
+                }
+                const auto timeOne = [&] (const char* what, double lo, double hi)
+                {
+                    dissonance::Registers rg;
+                    rg.mode = dissonance::Aggregate::Mean;
+                    rg.f0 = dissonance::registerPoints (lo, hi,
+                                dissonance::registerCountFor (lo, hi, dissonance::kAdaptRegisterCapRt));
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const auto r = dissonance::adaptSpectrum (seed8, anch, triad, true,
+                                                              dissonance::Goal::Min, 0.0, 0.0, gRt, tRt,
+                                                              true, 24.0, 8, rg);
+                    const double ms = std::chrono::duration<double, std::milli> (
+                                          std::chrono::steady_clock::now() - t0).count();
+                    std::printf ("    %-28s %d points, %2d sweeps, %6.1f ms\n",
+                                 what, (int) rg.f0.size(), r.sweepsDone, ms);
+                    return ms;
+                };
+                std::printf ("  the SAME two-period width, placed two ways (the follower's own shape):\n");
+                const double straddle = timeOne ("octave either side (old)", anch * 0.5, anch * 2.0);
+                const double upward   = timeOne ("two periods up (now)",     anch, atOct (anch, 2.0));
+                std::printf ("    the anchor-and-up form costs %.2fx the time of the straddling one\n",
+                             upward / std::max (1.0e-9, straddle));
+            }
+            // ...and the DEFAULT the panel ships (kAdaptRegisterDefaultPeriods) has to be one
+            // of the widths this table measured, or the table is not about the product.
+            std::printf ("  the panel's default range is %.1f periods of the loaded tuning\n",
+                         dissonance::kAdaptRegisterDefaultPeriods);
+            bool measured = false;
+            for (const double w : widths)
+                if (std::abs (w - dissonance::kAdaptRegisterDefaultPeriods) < 1.0e-9) measured = true;
+            check (measured, "and that default is a width this table actually measured");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // THE ADAPTATION COST MODEL. The panel prints "Adapt ~14 s" on the button and only
+    // refuses genuinely absurd requests, so that number has to MEAN something - a
+    // made-up figure is worse than no figure, because a user plans around it.
+    //
+    // What is being checked is the SHAPE of dissonance::adaptTotalPairs, not the clock:
+    // one nanoseconds-per-pair constant is fitted across configurations that differ by
+    // more than 100x in work, in both scopes, with and without amplitude shaping, at 1
+    // and at 7 registers. If the pair count were wrong in any of its factors - registers,
+    // line searches, scope - no single constant could fit them all and the spread below
+    // would blow up. (The previous refusal claimed "31 notes x 16 partials is minutes,
+    // not milliseconds". Row 6 is exactly that shape and the table says what it is.)
+    {
+        std::printf ("\nadaptation cost model (predicted vs measured):\n");
+        struct Cfg { int N, A, R, sweeps; bool rootOnly, amps; const char* what; };
+        const Cfg cfgs[] = {
+            {  8,  1, 1, 6, true,  false, "8 partials, 1 note, 0-vs-all, 1 reg" },
+            {  8, 12, 3, 6, true,  true,  "8 partials, 12 notes, 0-vs-all, 3 reg, +amps" },
+            { 12,  4, 1, 6, false, false, "12 partials, 4 notes, all-vs-all, 1 reg" },
+            { 16,  7, 7, 2, true,  true,  "16 partials, 7 notes, 0-vs-all, 7 reg, +amps" },
+            { 12, 31, 1, 2, true,  false, "12 partials, 31 notes, 0-vs-all, 1 reg" },
+            { 16, 31, 1, 1, false, false, "16 partials, 31 notes, ALL-vs-all, 1 reg" } };
+
+        double worstRatio = 1.0, bestRatio = 1.0e9, sumPairs = 0.0, sumMs = 0.0;
+        for (const auto& c : cfgs)
+        {
+            const double f0 = 220.0;
+            const double totalC = 1200.0 * std::log2 (4.0);   // a 4/1 period: room for 16 partials
+            const double gap = 20.0;
+            const double top = std::exp2 ((totalC - gap) / 1200.0);
+            std::vector<dissonance::Partial> seed;
+            for (int i = 0; i < c.N; ++i)
+            {
+                const double r = std::exp2 (totalC * (double) i / (double) c.N / 1200.0);
+                seed.push_back ({ f0 * r, std::pow (r, -1.0) });
+            }
+            std::vector<double> alphas;
+            for (int i = 0; i < c.A; ++i) alphas.push_back (std::exp2 ((double) i / 31.0));
+            dissonance::Registers rg;
+            rg.f0 = dissonance::registerPoints (f0 * 0.5, f0 * 4.0, c.R);
+            rg.mode = dissonance::Aggregate::Mean;
+
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto res = dissonance::adaptSpectrum (seed, f0, alphas, c.rootOnly,
+                                                        dissonance::Goal::Min, 0.0, 0.0, gap, top,
+                                                        c.amps, 6.0, c.sweeps, rg);
+            const double ms = std::chrono::duration<double, std::milli> (
+                                  std::chrono::steady_clock::now() - t0).count();
+            // Predicted against the sweeps that REALLY ran: adaptSpectrum stops early when
+            // a sweep buys nothing, and charging the model for sweeps it never did would
+            // be fitting the constant to the optimiser's luck instead of to the machine.
+            const int    done = std::max (1, res.sweepsDone);
+            const double pairs = dissonance::adaptTotalPairs (c.N, c.A, c.rootOnly, c.R, c.amps, done);
+            const double pred  = dissonance::adaptEstimateMs (c.N, c.A, c.rootOnly, c.R, c.amps, done);
+            const double ratio = pred / std::max (0.001, ms);
+            sumPairs += pairs; sumMs += ms;
+            // Sub-millisecond runs are excluded from the BAND (never from the fit): at
+            // 0.5 ms the measurement is the allocator, the cold cache and the clock's own
+            // resolution, and it swings between x0.38 and x0.61 run to run on an idle
+            // machine. Holding the model to that would be testing the timer.
+            if (ms >= 2.0)
+            {
+                worstRatio = std::max (worstRatio, ratio);
+                bestRatio  = std::min (bestRatio, ratio);
+            }
+            std::printf ("    %-46s  %2d sweeps  %10.0f pairs   predicted %8.1f ms   measured %8.1f ms   x%.2f%s\n",
+                         c.what, done, pairs, pred, ms, ratio, ms < 2.0 ? "  (below the timing floor)" : "");
+            // Partials are never dropped, whatever the cost: the run that the old dialog
+            // called impossible still comes back with every partial it was given.
+            check ((int) res.spectrum.size() == c.N,
+                   (std::string ("  ...and it returned all ") + std::to_string (c.N) + " partials").c_str());
+        }
+        const double fitted = sumMs * 1.0e6 / std::max (1.0, sumPairs);
+        std::printf ("    fitted %.2f ns/pair (header says %.2f); prediction band x%.2f .. x%.2f\n",
+                     fitted, dissonance::kAdaptNsPerPair, bestRatio, worstRatio);
+        // A single constant has to cover every timeable row within a factor of two either
+        // way. That is loose enough for a cold cache and a busy machine and far too tight
+        // for a wrong exponent: dropping the register factor alone puts row 4 out by 7x.
+        check (bestRatio > 0.5 && worstRatio < 2.0,
+               "one ns/pair constant predicts every configuration within a factor of 2");
+        // ...and the constant shipped in the header is the one the machine actually shows.
+        check (fitted > dissonance::kAdaptNsPerPair * 0.5 && fitted < dissonance::kAdaptNsPerPair * 2.0,
+               "and kAdaptNsPerPair is within a factor of 2 of the measured fit");
+        // THE HARD BOUND is the only thing left that refuses, and it must refuse only the
+        // absurd: 16 partials against a 31-note scale in "all vs all" - the configuration
+        // the old dialog rejected outright - has to be OFFERED, and a 24-partial spectrum
+        // against a full 128-key table in the same scope has to be the thing that is not.
+        {
+            const double offered = dissonance::adaptEstimateMs (16, 31, false, 7, true, 6);
+            const double absurd  = dissonance::adaptEstimateMs (24, 128, false, 7, true, 6);
+            std::printf ("    31 notes x 16 partials all-vs-all, 7 reg, +amps: %.1f s (bound %.0f s)\n"
+                         "    128 notes x 24 partials all-vs-all, 7 reg, +amps: %.0f s\n",
+                         offered * 0.001, dissonance::kAdaptAbsurdMs * 0.001, absurd * 0.001);
+            check (offered < dissonance::kAdaptAbsurdMs,
+                   "the search the old dialog refused is under the hard bound - it is offered");
+            check (absurd > dissonance::kAdaptAbsurdMs,
+                   "and a 128-note table at 24 partials all-vs-all is over it - that one is refused");
+        }
     }
 
     //--------------------------------------------------------------------------

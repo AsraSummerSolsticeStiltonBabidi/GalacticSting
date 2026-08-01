@@ -2492,6 +2492,60 @@ int main()
             check (win.contains (L.essentials) && win.contains (L.tuning), "so are Essentials and Tuning");
             check (! L.spectrum.intersects (L.essentials) && ! L.spectrum.intersects (L.tuning),
                    "and it overlaps neither of them");
+
+            // THE SHARED WALL. SPECTRUM's right border, TUNING's right border and the
+            // Spectrum-vs-Tuning column's LEFT border must be ONE drawn line.
+            //
+            // Measured on the LINES, not the rectangles, and that distinction is the
+            // whole test. Removing the gutter so the two rects merely TOUCH still drew
+            // two strokes back to back - a 7 px pink-then-orange band, which is the
+            // doubled border this was supposed to remove - and a rect comparison called
+            // that a shared wall. Half a pixel of tolerance because the rects are
+            // integers and the stroke centres are not.
+            {
+                std::printf ("  wall lines: spectrum %.1f, tuning %.1f, column %.1f"
+                             "   (rects: %d / %d / %d)\n",
+                             L.wallSpectrumRight, L.wallTuningRight, L.wallColumnLeft,
+                             L.spectrum.getRight(), L.tuning.getRight(), L.specColumn.getX());
+                check (std::abs (L.wallSpectrumRight - L.wallColumnLeft) <= 0.5f,
+                       "the SPECTRUM panel's right border IS the Spectrum-vs-Tuning column's left border");
+                check (std::abs (L.wallTuningRight - L.wallColumnLeft) <= 0.5f,
+                       "and so is the TUNING box's - one line on the glass, not two side by side");
+                check (win.contains (L.specColumn),
+                       "and sharing it keeps the column inside the window");
+            }
+
+            // ONE BOX, ONE COLOUR. Every painted sub-label in SPECTRUM wears the selected
+            // ENGINE's hue - the Fractal / Morph / Octave Range compartment included,
+            // which used to keep a mint-and-magenta scheme of its own. That is invisible
+            // to every geometric check here: those labels laid out perfectly and simply
+            // looked like a separate box. The two INERTNESS marks are the stated
+            // exceptions (a greyed AMP DECAY and the amber FROZEN beside it say the
+            // control cannot affect the sound; painting them the panel hue would unify
+            // the panel by deleting its only warning).
+            {
+                int offHue = 0; juce::String offName;
+                for (const auto& s : L.paintedLabels)
+                {
+                    if (! s.name.startsWith ("eng.") && ! s.name.startsWith ("both.")) continue;
+                    if (s.name == "both.frozen" || s.name == "both.decay") continue;
+                    if (s.colour != L.panelColour)
+                    { ++offHue; if (offName.isEmpty()) offName = s.name + " " + s.colour.toDisplayString (false); }
+                }
+                std::printf ("  %d spectrum sub-labels off the panel colour%s\n", offHue,
+                             offHue > 0 ? (" (first: " + offName + ")").toRawUTF8() : "");
+                check (offHue == 0, "every compartment label in SPECTRUM is the selected engine's colour");
+            }
+
+            // The Custom-Engine ON/OFF pill is GONE. Probing by NAME, because the way
+            // this regresses is somebody re-adding "one small toggle" beside Load: the
+            // engine chips are the only engine switch now, and a second quieter one
+            // could sit there visibly disagreeing with them.
+            {
+                bool hasOff = false;
+                for (const auto& c : L.controls) if (c.first == "cust.off") hasOff = true;
+                check (! hasOff, "the custom-spectrum On/Off toggle is gone");
+            }
             check (L.spectrum.contains (L.engineBox) && L.spectrum.contains (L.bothEngines),
                    "the shared engine box and the both-engines box are inside the panel");
             check (! L.engineBox.intersects (L.bothEngines),
@@ -2540,6 +2594,15 @@ int main()
                             check (c.second.getWidth() >= 300 && c.second.getHeight() >= 56,
                                    "the intervals editor got the custom view's freed space");
                         }
+                // RANDOM is the one control that can CREATE a spectrum from nothing, so
+                // it must be in the custom view whatever the state of that view - it was
+                // the empty workspace that needed it most.
+                if (pass == 2)
+                {
+                    bool hasRandom = false;
+                    for (const auto& c : L.controls) if (c.first == "cust.random") hasRandom = true;
+                    check (hasRandom, "the RANDOM SPECTRUM button is in the custom view");
+                }
             }
 
             // Every control must be INSIDE the box whose name it carries.
@@ -2747,18 +2810,86 @@ int main()
 
                     // A COMBO IS NOT A LABEL and the condensing rule above cannot see it:
                     // a ComboBox given too little room draws its arrow and clips the word
-                    // silently. The adaptation's register row packs a caption, two note
-                    // fields and this box onto one 186 px line, and the Catalan words are
-                    // the longer ones ("Registres", "pitjor") - so the box that ends up
-                    // with whatever is left over is measured explicitly.
+                    // silently. This box used to be squeezed into whatever the register
+                    // row had left over - 49 px, an arrow with a clipped word beside it -
+                    // and it now has a row of its own precisely because it is the choice
+                    // the panel most needed to spell out. The bar is the WORD's own width
+                    // in both languages, plus the arrow, not a guessed number.
                     if (sh.mode == 2)
                         for (const auto& c : P.controls)
                             if (c.first == "spec.agg")
                             {
-                                std::printf ("    aggregate box: %d px wide (%s)\n",
-                                             c.second.getWidth(), lang == 1 ? "ca" : "en");
-                                check (c.second.getWidth() >= 50,
-                                       "the mean/minimax box keeps room for its word beside its arrow");
+                                // The REAL geometry: the custom LookAndFeel gives the text
+                                // label box.width - height/3 - height/2, the label's own
+                                // border eats 10 more, and getComboBoxFont is 15 pt at
+                                // this height. 28 px of furniture, not a guess.
+                                const juce::Font cf { juce::FontOptions (15.0f) };
+                                const int need = juce::jmax (
+                                    juce::GlyphArrangement::getStringWidthInt (cf, lang == 1 ? "pitjor" : "worst"),
+                                    juce::GlyphArrangement::getStringWidthInt (cf, lang == 1 ? "mitjana" : "average")) + 28;
+                                std::printf ("    aggregate box: %d px wide, needs %d (%s)\n",
+                                             c.second.getWidth(), need, lang == 1 ? "ca" : "en");
+                                check (c.second.getWidth() >= need,
+                                       "the average/worst-case box fits its longest word beside its arrow");
+                            }
+
+                    // THE WRAPPING READ-OUTS. A juce::Label lays out in as many lines as
+                    // its height allows and then CONDENSES - and modern JUCE shrinks the
+                    // font first - so a sentence that overflows still looks like text and
+                    // no bounds check in the build can see it. That is exactly how the old
+                    // "sounding now:" line shipped clipped. Every state of the read-out is
+                    // measured here, not just whichever one happens to be showing.
+                    {
+                        int over = 0; juce::String worst; float worstBy = 0.0f;
+                        const auto judge = [&] (const std::vector<FractalAdditiveAudioProcessorEditor::LayoutProbe::WrappedLabel>& v)
+                        {
+                            for (const auto& s : v)
+                            {
+                                const float dh = s.needHeight - (float) s.cell.getHeight();
+                                const float dw = s.needWidth  - (float) s.cell.getWidth();
+                                const float d  = juce::jmax (dh, dw);
+                                if (d > 0.5f)
+                                {
+                                    ++over;
+                                    if (d > worstBy) { worstBy = d; worst = s.name + " \"" + s.text + "\""; }
+                                }
+                            }
+                        };
+                        judge (P.wrappedLabels);
+                        judge (P.readoutVariants);
+                        if (sh.mode == 2)
+                        {
+                            std::printf ("    %d wrapping read-outs measured, %d overflow%s\n",
+                                         (int) (P.wrappedLabels.size() + P.readoutVariants.size()), over,
+                                         over > 0 ? (" (worst: " + worst + " by "
+                                                     + juce::String ((int) std::ceil (worstBy)) + " px)").toRawUTF8() : "");
+                            // The live labels can legitimately be empty here (the verifier
+                            // has no message loop, so the timer that writes them never
+                            // runs) - the VARIANTS are the ones that must always be there.
+                            check (! P.readoutVariants.empty(),
+                                   "the adaptation's sentences are probed at all");
+                            check (over == 0,
+                                   lang == 1 ? "every sentence the read-outs can print fits its box (Catalan)"
+                                             : "every sentence the read-outs can print fits its box (English)");
+                        }
+                    }
+
+                    // ...and the results list must SURVIVE those sentences. It is the
+                    // LEFTOVER of this column: every row added above it comes straight out
+                    // of its height, and a list squeezed to a sliver still sits inside its
+                    // box, overlaps nothing and passes every other check here. The bar is
+                    // AdaptList::kRowH = 18: three partial rows visible without scrolling
+                    // in the tightest shape the panel has (goal Range adds a whole row).
+                    // Before this pass it was 68 px in the Min shape and 43 in Range.
+                    if (sh.mode == 2)
+                        for (const auto& c : P.controls)
+                            if (c.first == "spec.adaptList")
+                            {
+                                std::printf ("    adapted-partial list: %d px tall = %d rows (%s)\n",
+                                             c.second.getHeight(), c.second.getHeight() / 18,
+                                             lang == 1 ? "ca" : "en");
+                                check (c.second.getHeight() >= 3 * 18,
+                                       "the adapted-partial list still shows several partials unscrolled");
                             }
                 }
             }
@@ -2895,6 +3026,219 @@ int main()
             ed->refreshEngineDressing();
         }
 
+        //== LOAD BECOMES REMOVE, AND THE SELECTOR FOLLOWS THE VIEW ==============
+        // One button with two opposite jobs is the most dangerous control in the
+        // window: if its WORD and its ACTION are set in different places they drift,
+        // and a green "Load" that silently deletes a hand-typed spectrum is the result.
+        // Both are exercised here through the button's own callback.
+        if (ed != nullptr)
+        {
+            using E = FractalAdditiveAudioProcessor::EngineInForce;
+            auto word = [&] (const char* which)
+            {
+                for (const auto& b : ed->layoutProbe().buttonTexts) if (b.first == which) return b.second;
+                return juce::String();
+            };
+            auto hasControl = [&] (const char* name)
+            {
+                for (const auto& c : ed->layoutProbe().controls) if (c.first == name) return true;
+                return false;
+            };
+
+            p.clearTimbre();
+            ed->clickEngineChipForTests (1);   // open the (empty) custom workspace
+            ed->refreshEngineDressing();
+            std::printf ("  nothing loaded: the button reads \"%s\"\n", word ("cust.load").toRawUTF8());
+            check (word ("cust.load") == "Load", "with no spectrum loaded the button loads");
+
+            juce::String terr;
+            p.loadTimbreText ("5/4 3/2 2", terr);
+            ed->refreshEngineDressing();
+            std::printf ("  spectrum loaded: the button reads \"%s\"\n", word ("cust.load").toRawUTF8());
+            check (word ("cust.load") == "Remove", "once one IS loaded, the same button removes it");
+
+            // ...and pressing it there really removes it, undoably. A Remove that were
+            // merely the old Off in a red coat would leave the scale loaded, and the
+            // button would then be lying about what it just did.
+            ed->clickCustomLoadRemoveForTests();
+            ed->refreshEngineDressing();
+            check (! p.timbreLoaded() && p.engineInForce() == E::Harmonic,
+                   "pressing Remove deletes the spectrum and hands the sound back to the harmonic engine");
+            check (hasControl ("cust.load") && hasControl ("cust.random"),
+                   "and leaves the workspace open, so loading or randomising another is one click");
+            p.undoManager.undo();
+            ed->refreshEngineDressing();
+            check (p.timbreLoaded() && word ("cust.load") == "Remove",
+                   "and one Ctrl+Z brings the removed spectrum back");
+
+            // THE SELECTOR IS THE ENGINE SWITCH. With the On/Off pill gone the chips are
+            // the only way between the engines, so showing a view must BE selecting it -
+            // in both directions, and without ever discarding the loaded spectrum (that
+            // is Remove's job, and only Remove's).
+            ed->clickEngineChipForTests (0);
+            ed->refreshEngineDressing();
+            check (p.engineInForce() == E::Harmonic && hasControl ("harm.baseN"),
+                   "showing the HARMONIC view puts the harmonic engine in force");
+            check (p.timbreLoaded(), "...while keeping the loaded spectrum - switching engines erases nothing");
+            ed->clickEngineChipForTests (1);
+            ed->refreshEngineDressing();
+            check (p.engineInForce() == E::CustomScale && hasControl ("cust.intervals"),
+                   "and showing the CUSTOM view puts the custom engine in force");
+            p.clearTimbre();
+            ed->refreshEngineDressing();
+        }
+
+        //== THE RANDOM SPECTRUM TRIGGER ========================================
+        // Automatable means a PARAMETER a host can draw, firing on its RISING edge.
+        // Everything below is about that edge behaving like an edge: it fires once per
+        // 0 -> 1, a held 1 never re-fires, and restoring a project that saved it at 1
+        // does not fire at all (which would replace the spectrum the user saved with a
+        // random one, every single time they reopened the session).
+        if (ed != nullptr)
+        {
+            auto* rp = p.apvts.getParameter ("specRandom");
+            check (rp != nullptr, "the random spectrum has an automatable parameter behind it");
+            if (rp != nullptr)
+            {
+                p.clearTimbre();
+                const int base = p.getRandomSpectrumCount();
+
+                rp->setValueNotifyingHost (1.0f);      // a host automation step
+                check (p.pollRandomSpectrumTrigger(), "a 0 -> 1 step fires it");
+                const auto first = p.getTimbreSource();
+                check (p.timbreLoaded() && p.engineInForce()
+                           == FractalAdditiveAudioProcessor::EngineInForce::CustomScale,
+                       "and the spectrum it built is the one in force");
+
+                // A HELD 1 is not a second edge. Without this, automation that simply
+                // parked the lane at 1 would rebuild the spectrum 60 times a second and
+                // the sound would never settle.
+                check (! p.pollRandomSpectrumTrigger() && p.getTimbreSource() == first,
+                       "holding it at 1 does not fire again");
+
+                rp->setValueNotifyingHost (0.0f);
+                check (! p.pollRandomSpectrumTrigger(), "and falling back to 0 does not fire either");
+                rp->setValueNotifyingHost (1.0f);
+                check (p.pollRandomSpectrumTrigger(), "the NEXT rising edge does");
+                const auto second = p.getTimbreSource();
+                check (second != first, "and it is a genuinely different spectrum");
+                check (p.getRandomSpectrumCount() == base + 2, "exactly two presses, exactly two spectra");
+
+                // The BUTTON must take the same path: it writes the parameter and the
+                // processor builds. A button that built directly would work while a
+                // recorded automation of the very same press did nothing.
+                ed->clickRandomSpectrumForTests();
+                check (p.pollRandomSpectrumTrigger(), "the button's own click fires the same edge");
+                const auto third = p.getTimbreSource();
+                check (third != second, "and presses in a row keep producing different spectra");
+
+                // UNDO MUST GO BACKWARDS, NOT SIDEWAYS. Ctrl+Z has to bring back the
+                // spectrum that was there before the press - and, walking the whole
+                // stack, must never re-fire the trigger on the way: a level that flips
+                // back up under undo is a rising edge like any other, and a Ctrl+Z that
+                // answers with a THIRD random spectrum is worse than one that does nothing.
+                {
+                    p.undoManager.undo();
+                    const bool reFired = p.pollRandomSpectrumTrigger();
+                    std::printf ("  one undo after a random press: re-fired = %d, spectrum now \"%s\"\n",
+                                 (int) reFired, p.getTimbreSource().toRawUTF8());
+                    check (! reFired, "undoing a random press does not fire another one");
+                    check (p.getTimbreSource() == second,
+                           "and it puts the spectrum that was there before the press back");
+                    // Walk the rest of the stack: every step back through the trigger's
+                    // own level changes has to stay silent too.
+                    int fires = 0;
+                    for (int i = 0; i < 6; ++i)
+                    { p.undoManager.undo(); if (p.pollRandomSpectrumTrigger()) ++fires; }
+                    check (fires == 0, "and neither does walking the whole undo stack back");
+                }
+
+                // REOPENING A PROJECT MUST NOT RANDOMISE ANYTHING. A press leaves the
+                // parameter at 1, so that is the value a saved project carries; restoring
+                // it rewrites every parameter and used to arrive as a fresh 0 -> 1 step.
+                {
+                    juce::String derr;
+                    p.loadTimbreText ("7/6 3/2 7/4 2", derr);  // the user's own spectrum
+                    const auto mine = p.getTimbreSource();
+                    juce::MemoryBlock st;
+                    p.getStateInformation (st);          // saved with the trigger left at 1
+                    check (rp->getValue() >= 0.5f, "precondition: a press does leave the trigger at 1");
+                    // A FRESH instance starts at the default 0 - that is what makes the
+                    // restore a genuine 0 -> 1 step, and it is the exact path the host
+                    // takes every time the project is reopened.
+                    rp->setValueNotifyingHost (0.0f);
+                    p.pollRandomSpectrumTrigger();
+                    p.setStateInformation (st.getData(), (int) st.getSize());
+                    const bool fired = p.pollRandomSpectrumTrigger();
+                    std::printf ("  reload from 0 with the trigger saved at %.0f: fired = %d\n",
+                                 rp->getValue(), (int) fired);
+                    check (! fired && p.getTimbreSource() == mine,
+                           "reopening a project with the trigger saved at 1 does NOT randomise the spectrum");
+                }
+
+                //-- THE DISTRIBUTION, measured. A random generator whose distribution is
+                //   not checked is one nobody can tell a bug from a draw in.
+                {
+                    int    worstN = 1000, bestN = 0;
+                    double worstGap = 1.0e9, worstTop = 0.0;
+                    int    badPeriod = 0, dupes = 0;
+                    std::vector<juce::String> seen;
+                    for (int i = 0; i < 200; ++i)
+                    {
+                        const auto txt = p.makeRandomSpectrumText();
+                        seen.push_back (txt);
+                        juce::StringArray tk;
+                        tk.addTokens (txt, " ", "");
+                        tk.removeEmptyStrings();
+                        std::vector<double> c;
+                        for (const auto& t : tk) c.push_back (t.dropLastCharacters (1).getDoubleValue());
+                        worstN = std::min (worstN, (int) c.size());
+                        bestN  = std::max (bestN,  (int) c.size());
+                        // Sorted, spaced, and inside the span - the three promises.
+                        for (size_t k = 1; k < c.size(); ++k) worstGap = std::min (worstGap, c[k] - c[k - 1]);
+                        worstGap = std::min (worstGap, c.empty() ? 1.0e9 : c[0]);
+                        worstTop = std::max (worstTop, c.empty() ? 0.0 : c.back());
+                        // The TOP token is the period and must be a whole octave: it is
+                        // what Reps stacks, and a random period smears instead of stacking.
+                        if (! c.empty() && std::abs (std::fmod (c.back(), 1200.0)) > 0.001) ++badPeriod;
+                    }
+                    std::sort (seen.begin(), seen.end());
+                    for (size_t i = 1; i < seen.size(); ++i) if (seen[i] == seen[i - 1]) ++dupes;
+                    std::printf ("  200 draws: %d..%d tokens, smallest gap %.2fc, highest partial %.0fc,"
+                                 " %d bad periods, %d repeats\n",
+                                 worstN, bestN, worstGap, worstTop, badPeriod, dupes);
+                    // 5..12 partials PLUS the period token = 6..13 tokens.
+                    check (worstN >= 6 && bestN <= 13, "every draw has a musical number of partials");
+                    check (worstN != bestN, "and the count really varies from draw to draw");
+                    check (worstGap >= 34.99,
+                           "no two partials land closer than the 35c minimum (none can be deduped away)");
+                    check (badPeriod == 0, "the period is always an exact whole number of octaves");
+                    check (dupes == 0, "and 200 draws produce 200 different spectra");
+                }
+                p.clearTimbre();
+                rp->setValueNotifyingHost (0.0f);
+                p.pollRandomSpectrumTrigger();
+                ed->refreshEngineDressing();
+            }
+        }
+
+        //== THE TUNING BANK BUTTON'S NAME ======================================
+        // "+" named neither what it adds nor where. Probed as a word because there is
+        // nothing geometric about it - and because the row it sits in is laid out FROM
+        // the button's own text width, so a longer name is exactly what pushes its
+        // neighbours out (which the sweep above measures, in both languages).
+        if (ed != nullptr)
+        {
+            for (int lang = 0; lang < 2; ++lang)
+            {
+                const auto P = ed->layoutProbeInLanguage (lang == 1);
+                juce::String w;
+                for (const auto& b : P.buttonTexts) if (b.first == "tun.toBank") w = b.second;
+                std::printf ("  bank add button (%s): \"%s\"\n", lang == 1 ? "ca" : "en", w.toRawUTF8());
+                check (w.length() > 1 && w != "+", "the tuning bank's add button says what it does");
+            }
+        }
+
         // THE PANEL'S OWN WIRING, through the same callbacks a click runs.
         if (ed != nullptr)
         {
@@ -2957,6 +3301,307 @@ int main()
                 ed->pressAdaptRealtimeForTests();
                 check (p.getRealtimeLink() == RtLink::Off,
                        "and ONE press of REALTIME stops it (it used to take two)");
+            }
+        }
+
+        //== PERIOD NUMBERS on the keys, and the register range that is counted in STEPS ==
+        //
+        // "C2".."C4" is 12-EDO's naming, and the register range - the one control that
+        // decides WHICH REGISTERS a spectrum is optimised for - was expressed in it. Under
+        // 31-EDO or Bohlen-Pierce those names denote nothing the tuning has. The keyboard
+        // prints a PERIOD number beside every degree-0 key instead, and that is how the
+        // range's anchor is named; the width itself is a count of STEPS above that anchor.
+        // Three things have to hold and none of them is visible to any other check here.
+        if (ed != nullptr)
+        {
+            std::printf ("period numbers on the keys, and as the register unit:\n");
+            ed->setSpecModeForTests (2);
+            ed->resized();
+
+            // (1) THE NUMBER ITSELF. Counted the way octaves are counted, with the
+            //     reference key (60) as period 3 - which is what the rest of the product
+            //     calls C3 - and by FLOOR division, so the period below the reference is 2
+            //     and not 3 again. In 12-EDO it must agree key for key with the note names
+            //     it replaced; in 31-EDO it must not.
+            {
+                bool ok12 = true;
+                for (int k = 0; k <= 127; k += 1)
+                    if (ScaleKeyboard::periodNumberForNote (k, 12) != k / 12 - 2) ok12 = false;
+                check (ok12, "in 12-EDO a period number is exactly the octave number it replaced");
+                check (ScaleKeyboard::periodNumberForNote (60, 31) == 3
+                       && ScaleKeyboard::periodNumberForNote (59, 31) == 2
+                       && ScaleKeyboard::periodNumberForNote (29, 31) == 2
+                       && ScaleKeyboard::periodNumberForNote (28, 31) == 1,
+                       "in 31-EDO it counts 31-key periods, and the key below a boundary is the period below");
+                check (ScaleKeyboard::noteForPeriodNumber (3, 31) == 60
+                       && ScaleKeyboard::noteForPeriodNumber (2, 31) == 29
+                       && ScaleKeyboard::noteForPeriodNumber (9, 31) == -1,
+                       "and the inverse lands on the period's own first key, or says the board has none");
+            }
+
+            // (2) IT HAS TO BE READABLE. drawFittedText does not clip a number that is too
+            //     big for its rect - it SHRINKS it - so an unreadable period tag looks like
+            //     a deliberate design choice and no bounds check in this build can see it.
+            //     Measured in the very font paint() sets, against the very rect it draws
+            //     into, at the key width the keyboard really uses.
+            {
+                const auto tags = ed->keyboardPeriodTagsForTests();
+                int tooNarrow = 0, overlaps = 0, offCentre = 0, tiny = 0;
+                juce::String firstBad;
+                for (const auto& t : tags)
+                {
+                    if (t.tagTextWidth > (float) t.tag.getWidth())
+                    { ++tooNarrow; if (firstBad.isEmpty()) firstBad = "period " + juce::String (t.number); }
+                    // The "0" and its period number share a cell; the tag's strip is
+                    // RESERVED out of it, so the two can never print on top of each other.
+                    if (t.tag.getX() < t.zero.getRight() - 0.01f) ++overlaps;
+                    // "vertically centred to its right" - the user's words, as a number.
+                    if (std::abs (t.tag.getCentreY() - t.zero.getCentreY()) > 1.0f) ++offCentre;
+                    if (t.tagFont < 7.0f) ++tiny;
+                }
+                std::printf ("  %d degree-0 keys on screen: %d tags too narrow%s, %d overlapping the 0,"
+                             " %d off-centre, %d below 7 pt\n",
+                             (int) tags.size(), tooNarrow,
+                             firstBad.isEmpty() ? "" : (" (" + firstBad + ")").toRawUTF8(),
+                             overlaps, offCentre, tiny);
+                if (! tags.empty())
+                    std::printf ("  first tag: period %d, \"0\" %.1f pt in %.0f px, number %.1f pt needing"
+                                 " %.1f px of %.0f\n",
+                                 tags.front().number, tags.front().zeroFont, tags.front().zero.getWidth(),
+                                 tags.front().tagFont, tags.front().tagTextWidth,
+                                 tags.front().tag.getWidth());
+                check (! tags.empty(), "every period boundary on screen carries its number");
+                check (tooNarrow == 0, "and every one of them fits its rect without being shrunk");
+                check (overlaps == 0, "and none of them prints over the \"0\" it belongs to");
+                check (offCentre == 0, "and each is vertically centred on that \"0\"");
+                check (tiny == 0, "and none of them is drawn below 7 pt");
+
+                // ...INCLUDING the numbers this tuning does not happen to show. A period
+                // number runs from one to three characters (a one-degree-per-period scale
+                // reaches "-10"), and the widest is the one nobody was looking at. Measured
+                // through the same layout call paint() uses, on the same cell geometry.
+                if (! tags.empty())
+                {
+                    const auto& t0 = tags.front();
+                    const float cellW = t0.zero.getWidth() + t0.tag.getWidth() + 2.0f;
+                    const auto  area  = t0.zero.getUnion (t0.tag);
+                    int narrow = 0, small = 0;
+                    for (const char* s : { "3", "-2", "-10" })
+                    {
+                        const juce::String txt (s);
+                        const auto z = ScaleKeyboard::layOutPeriodTag (area, cellW, txt.length());
+                        const float w = (float) juce::GlyphArrangement::getStringWidthInt (
+                            juce::Font (juce::FontOptions (z.tagFont).withStyle ("Bold")), txt);
+                        std::printf ("    \"%s\": %.1f pt, needs %.1f px of %.1f, \"0\" left with %.0f px\n",
+                                     s, z.tagFont, w, z.tag.getWidth(), z.zero.getWidth());
+                        if (w > z.tag.getWidth()) ++narrow;
+                        if (z.tagFont < 7.0f || z.zero.getWidth() < 10.0f) ++small;
+                    }
+                    check (narrow == 0, "a one-, two- or three-character period all fit their strip");
+                    check (small == 0, "and none of them costs the \"0\" its own legibility");
+                }
+            }
+
+            // (3) ONE NUMBER: N STEPS ABOVE THE NOTE BEING PLAYED. The range used to be two
+            //     absolute bounds (note names, then period numbers) and both forms were
+            //     pinned to fixed pitches - so the adaptation answered with the same
+            //     spectrum whichever register was actually played, which is the complaint
+            //     the whole feature came from. What has to hold now is different in kind:
+            //     the width is a COUNT in the tuning's own steps, and the range hangs off a
+            //     note that MOVES. Neither is visible to any other check in this build.
+            {
+                const int D = juce::jmax (1, p.getScaleDegrees());
+                juce::AudioBuffer<float> rbuf (2, blk);
+                const auto play = [&] (std::initializer_list<int> keys, bool on)
+                {
+                    juce::MidiBuffer m;
+                    for (const int k : keys)
+                        m.addEvent (on ? juce::MidiMessage::noteOn (1, k, (juce::uint8) 100)
+                                       : juce::MidiMessage::noteOff (1, k), 0);
+                    rbuf.clear();
+                    p.processBlock (rbuf, m);
+                };
+
+                // (3a) THE DEFAULT IS A WIDTH, NOT A NUMBER OF KEYS. Two periods of the
+                //      LOADED scale (see dissonance::kAdaptRegisterDefaultPeriods, which
+                //      SpectrumTests measures), so it is the same musical span in every
+                //      tuning instead of "24" meaning two periods here and two thirds of
+                //      one somewhere else.
+                const auto d0 = ed->registerProbeForTests();
+                std::printf ("  default width: %d steps of %d/period = %.1f periods; \"%s\"\n",
+                             d0.steps, D, d0.steps / (double) D, d0.spanText.toRawUTF8());
+                check (d0.steps == (int) std::lround (dissonance::kAdaptRegisterDefaultPeriods * D),
+                       "a fresh panel starts at the measured default width, in the loaded scale's own steps");
+                check (d0.stepsText == juce::String (d0.steps),
+                       "and the field shows that number rather than leaving the user to guess it");
+                check (d0.spanText.contains (juce::String (dissonance::kAdaptRegisterDefaultPeriods, 1))
+                       || d0.spanText.contains (juce::String (dissonance::kAdaptRegisterDefaultPeriods, 1)
+                                                    .replaceCharacter ('.', ',')),
+                       "and the line under it says what that comes to in PERIODS - N alone is a magic number");
+
+                // (3b) THE ANCHOR RULE, all three branches. Held (lowest), else last
+                //      played, else key 60. The middle branch is the one that makes the
+                //      hand-pressed Adapt usable at all: nobody can hold a chord and click
+                //      a button at the same time, and a range that vanished with the notes
+                //      would put that button back to guessing.
+                play ({ 55, 48 }, true);
+                const auto held = ed->registerProbeForTests();
+                play ({ 55, 48 }, false);
+                const auto letGo = ed->registerProbeForTests();
+                std::printf ("  anchor: holding 48+55 -> key %d (\"%s\"); after release -> key %d\n",
+                             held.anchorKey, held.spanText.toRawUTF8(), letGo.anchorKey);
+                check (held.anchorKey == 48,
+                       "the range hangs off the LOWEST note being held, not the last one pressed");
+                check (letGo.anchorKey == 48,
+                       "and it stays there when the keys come up - the Adapt button always has an anchor");
+                check (held.spanText.contains (":"),
+                       "and the panel NAMES that note (period:degree), so the user can see what the width is counted from");
+
+                // (3c) THE RANGE RESOLVES ANCHOR -> ANCHOR + N THROUGH THE TUNING, and it
+                //      MOVES with the hands. Playing an octave up must move both ends: the
+                //      original bug was that it did not.
+                play ({ 72 }, true);
+                const auto up = ed->registerProbeForTests();
+                play ({ 72 }, false);
+                std::printf ("  playing 72: keys %d..%d, %.1f..%.1f Hz (was %.1f..%.1f Hz from key 48)\n",
+                             up.keyLo, up.keyHi, up.loHz, up.hiHz, held.loHz, held.hiHz);
+                check (up.keyLo == 72 && up.keyHi == juce::jlimit (0, 127, 72 + up.steps),
+                       "the range runs from the played key to N steps above it");
+                check (std::abs (up.loHz - p.getNoteFrequency (72)) < 1.0e-9
+                       && std::abs (up.hiHz - p.getNoteFrequency (up.keyHi)) < 1.0e-9,
+                       "and both ends are the ACTIVE TUNING's own frequencies for those keys");
+                check (up.loHz > held.loHz * 1.5 && up.hiHz > held.hiHz * 1.5,
+                       "and moving up the keyboard really does move the registers being optimised for");
+
+                // (3d) WHAT THE PANEL SHOWS IS WHAT THE SEARCH GETS. The editor pushes the
+                //      step COUNT and the processor resolves it; if those two ever disagreed
+                //      the panel would be describing a run that never happened.
+                {
+                    FractalAdditiveAudioProcessor::SpectrumAdaptSettings st;
+                    st.regSteps = up.steps;
+                    const auto regs = p.adaptRegistersFor (st, p.getNoteFrequency (60), false);
+                    const auto now = ed->registerProbeForTests();
+                    check (! regs.f0.empty()
+                           && std::abs (regs.f0.front() - now.loHz) < 1.0e-9
+                           && std::abs (regs.f0.back()  - now.hiHz) < 1.0e-9,
+                           "the Hz the search is really given are the Hz the panel is showing");
+                }
+
+                // (3e) A TYPED N IS THE USER'S, AND IT IS IN STEPS. Loading a scale with a
+                //      different degree count must NOT re-derive it: N is their statement of
+                //      how wide in the tuning's own units, and rewriting it on a scale swap
+                //      is the silent change this control exists to prevent. An UNTYPED one
+                //      does follow the scale - that is the default, not a setting.
+                ed->setAdaptRegisterStepsForTests ("31");
+                const auto typed = ed->registerProbeForTests();
+                juce::String sclErr;
+                const bool loaded = p.loadScalaText (
+                    "! r.scl\n31-EDO\n 31\n!\n"
+                    + [] { juce::String s; for (int i = 1; i <= 31; ++i)
+                               s << " " << juce::String (1200.0 * i / 31.0, 5) << "\n"; return s; } (),
+                    "edo31", sclErr);
+                ed->resized();
+                const auto after = ed->registerProbeForTests();
+                std::printf ("  typed 31 steps, then loaded %d-EDO: still %d steps = %.1f periods (\"%s\")\n",
+                             p.getScaleDegrees(), after.steps, after.steps / (double) juce::jmax (1, p.getScaleDegrees()),
+                             after.spanText.toRawUTF8());
+                check (loaded, "the 31-EDO scale loads");
+                check (typed.steps == 31 && after.steps == 31,
+                       "a typed width survives a tuning change unchanged - N is the user's number, in steps");
+                check (after.spanText.contains ("1.0") || after.spanText.contains ("1,0"),
+                       "and the panel re-states what it now amounts to (31 steps of 31 = one period)");
+
+                // The clamps, both of them, and both stated in the field rather than behind
+                // it. 0 is legal - "just the register I am playing", the single-pitch
+                // objective chosen on purpose - and 127 is the whole board, which is a
+                // number of KEYS and so can never depend on the tuning.
+                ed->setAdaptRegisterStepsForTests ("999");
+                const auto big = ed->registerProbeForTests();
+                ed->setAdaptRegisterStepsForTests ("0");
+                const auto zero = ed->registerProbeForTests();
+                check (big.steps == 127 && big.stepsText == "127",
+                       "a width past the keyboard snaps to the board IN THE FIELD, not behind it");
+                check (zero.steps == 0 && zero.keyLo == zero.keyHi,
+                       "and 0 is legal: one register, the played one");
+                // Rubbish snaps back to the number in force rather than becoming "no width",
+                // which the processor would read as the default and quietly undo the typing.
+                ed->setAdaptRegisterStepsForTests ("");
+                const auto junk = ed->registerProbeForTests();
+                check (junk.steps == zero.steps && junk.stepsText.isNotEmpty(),
+                       "unreadable text snaps back to the width in force, never to \"no width\"");
+                // ...and the anchor at the very top of the board, where N genuinely does not
+                // fit. The shortened range must be SAID.
+                ed->setAdaptRegisterStepsForTests ("60");
+                play ({ 120 }, true);
+                const auto top = ed->registerProbeForTests();
+                play ({ 120 }, false);
+                std::printf ("  60 steps above key 120: %d fit, keys %d..%d, \"%s\"\n",
+                             top.fitting, top.keyLo, top.keyHi, top.spanText.toRawUTF8());
+                check (top.fitting == 7 && top.keyHi == 127,
+                       "at the top of the keyboard the range stops at the last key - the anchor is never moved to make N fit");
+                check (top.spanText.contains ("7"),
+                       "and the panel says how many steps really fit instead of showing a width it is not using");
+
+                // Back to a known state for everything downstream: 12-EDO, default width.
+                p.clearScala();
+                ed->setAdaptRegisterStepsForTests (juce::String (p.defaultRegisterSteps()));
+                play ({ 60 }, true); play ({ 60 }, false);
+                ed->resized();
+            }
+
+            //== THE PRICE OF A RUN, ON THE BUTTON =============================
+            // The panel used to REFUSE "all vs all over 31 notes x 16 partials" as "too
+            // heavy to search". It is a calculation of tens of seconds on a worker thread
+            // that already reports progress and already cancels. What a musician needs
+            // there is the number, not a veto - so the button wears it.
+            {
+                ed->setSpecModeForTests (2);
+                ed->resized();
+                const double ms = ed->adaptCostMsForTests (false);
+                const auto txt = ed->adaptButtonTextForTests();
+                std::printf ("  loaded tuning, %d degrees: one Adapt ~%.0f ms; button says \"%s\"\n",
+                             juce::jmax (1, p.getScaleDegrees()), ms, txt.toRawUTF8());
+                check (ms > 0.0, "the panel can price a run before starting it");
+                // Cheap runs must NOT shout a duration at the user; expensive ones must.
+                check (ms < 950.0 ? ! txt.containsChar ('~') : txt.containsChar ('~'),
+                       "the button carries a duration only when there is really a wait");
+                // With nothing held the follower has no target and no cost, so the read-out
+                // must NOT be warning about lag - a lag warning with no chord down would be
+                // a warning about a search that is not going to happen.
+                check (ed->adaptCostMsForTests (true) == 0.0,
+                       "an empty hand prices a realtime update at nothing, not at a warning");
+
+                // THE ESTIMATE'S SHAPE, through the processor's own estimator - the same
+                // call the ten-minute guard measures itself against, so the price on the
+                // button and the only refusal left cannot be two different numbers.
+                {
+                    FractalAdditiveAudioProcessor::SpectrumAdaptSettings s;
+                    s.partials = 16; s.periodRatio = 8.0; s.minGapCents = 20.0;
+                    // Six octaves of range, in the unit the setting is now in: 72 steps of
+                    // 12-EDO. The estimator has to price the registers that width really
+                    // produces, not a pair of frequencies nothing else uses any more.
+                    s.shapeAmps = true; s.regSteps = 72;
+                    const double f0 = 261.6;
+                    s.rootOnly = false;
+                    const double heavy = p.estimateAdaptMs (s, 31, f0, false);
+                    const double heavyRt = p.estimateAdaptMs (s, 31, f0, true);
+                    s.rootOnly = true;
+                    const double light = p.estimateAdaptMs (s, 31, f0, false);
+                    std::printf ("  31 notes x 16 partials over 6 octaves: all-vs-all %.1f s"
+                                 " (realtime cap %.1f s), 0-vs-all %.1f s; hard bound %.0f s\n",
+                                 heavy * 0.001, heavyRt * 0.001, light * 0.001,
+                                 dissonance::kAdaptAbsurdMs * 0.001);
+                    // The realtime path takes the smaller register cap (3 instead of 7) and
+                    // the cost is exactly linear in that count, so it is never dearer.
+                    check (heavyRt < heavy,
+                           "one realtime update never costs more than one hand-pressed Adapt");
+                    // The configuration the old dialog REFUSED outright. It is tens of
+                    // seconds - offered, priced, cancellable - not "too heavy to search".
+                    check (heavy > dissonance::kAdaptWarnMs && heavy < dissonance::kAdaptAbsurdMs,
+                           "the search the old dialog refused is warned about, and offered");
+                    check (light < heavy * 0.5,
+                           "and \"0 vs all\" is priced as the much cheaper scope it is");
+                }
             }
         }
     }
@@ -3032,7 +3677,7 @@ int main()
             // The registers this run will use, resolved by the processor's own helper -
             // "really sounding" has to be measured over the same ones the search optimised
             // or the two numbers printed side by side would be on different scales.
-            const auto regs = Proc::adaptRegistersFor (st, f0, /*realtime*/ false);
+            const auto regs = p.adaptRegistersFor (st, f0, /*realtime*/ false);
             const double beforeReal = p.measureCurrentAgainstTarget (alphas, f0, true, regs);
             juce::String err;
             check (p.startSpectrumAdapt (st, alphas, f0, err), "the adaptation starts");
@@ -3047,15 +3692,19 @@ int main()
             std::printf ("  12ED2 x 8 partials: model %.2f -> %.2f, really sounding %.2f -> %.2f\n",
                          info.before, info.after, beforeReal, afterReal);
             // THE REGISTER RANGE, end to end through the real processor. A settings block
-            // with no range set means AUTO - an octave either side of the anchor - and the
+            // with no width set means the DEFAULT width - two periods of the loaded scale,
+            // counted UP from the anchor key (test (a) above left that at key 60) - and the
             // result must SAY which registers it was optimised for, because with a
             // single-pitch objective (the bug this replaces) the answer is different.
-            std::printf ("  registers: %d points, %.2f..%.2f Hz (anchor %.2f), %s\n",
-                         info.regPoints, info.regLoHz, info.regHiHz, f0,
-                         info.aggregate == 1 ? "minimax" : "mean");
-            check (info.regPoints == 3 && std::abs (info.regLoHz - f0 * 0.5) < 1.0e-6
-                   && std::abs (info.regHiHz - f0 * 2.0) < 1.0e-6,
-                   "an unset range is an octave either side of the anchor, sampled at three registers");
+            const double anchorHz = p.getNoteFrequency (p.registerAnchorKey());
+            const double topHz    = p.getNoteFrequency (juce::jlimit (0, 127, p.registerAnchorKey()
+                                                                              + p.defaultRegisterSteps()));
+            std::printf ("  registers: %d points, %.2f..%.2f Hz (anchor key %d at %.2f Hz, target f0 %.2f), %s\n",
+                         info.regPoints, info.regLoHz, info.regHiHz, p.registerAnchorKey(),
+                         anchorHz, f0, info.aggregate == 1 ? "minimax" : "mean");
+            check (info.regPoints == 3 && std::abs (info.regLoHz - anchorHz) < 1.0e-6
+                   && std::abs (info.regHiHz - topHz) < 1.0e-6,
+                   "an unset width is two periods UP from the note played, sampled at three registers");
             check ((int) info.perRegister.size() == info.regPoints
                    && (int) info.registerF0.size() == info.regPoints,
                    "and the result carries one measured number per register");
@@ -3063,9 +3712,9 @@ int main()
                    "the aggregate read-outs are consistent (mean never above the worst register)");
             // The realtime follower's cap is a STATED difference, not a silent one: at this
             // two-octave range it samples exactly as densely as the Adapt button does.
-            const auto rtRegs = Proc::adaptRegistersFor (st, f0, /*realtime*/ true);
+            const auto rtRegs = p.adaptRegistersFor (st, f0, /*realtime*/ true);
             check (rtRegs.f0.size() == regs.f0.size(),
-                   "and at the default two-octave range realtime samples exactly as densely");
+                   "and at the default two-period width realtime samples exactly as densely");
             std::printf ("  compiled partials: %d (asked %d x %d periods)\n",
                          t != nullptr ? (int) t->partials.size() : -1, st.partials, reps);
             check (afterReal < beforeReal, "the spectrum the synth REALLY makes beats less against that tuning");
@@ -3992,6 +4641,417 @@ int main()
                 check (q->applySpectrumAdapt (false, e3),
                        "and it produces a spectrum (the range is read between the two numbers)");
             }
+        }
+    }
+
+    // --- run 42: the REALTIME adaptive link - how LATE it lands, and how hard ----------
+    // "sigue habiendo un trompicon al cambiar el espectro realtime, arregla ese retraso y
+    //  esa transicion que produce como un golpe al hacer el cambio, tiene que ser smooth."
+    // Two complaints, so two numbers, both measured on the REAL link (a held chord, the
+    // 60 Hz timer, the background search, the real apply path):
+    //   LATENCY      - from the chord moving to the new spectrum being audible;
+    //   DISCONTINUITY- how much of that spectral journey is spent in a single 2.5 ms hop,
+    //                  plus run 26's per-sample jump/peak so no fix can smuggle in a click.
+    //
+    // The harness is paced to WALL CLOCK. The search runs on its own thread, so an offline
+    // render that outruns realtime would credit the link with far more samples of lag than
+    // a player ever hears (and would compress the 60 Hz timer into nothing).
+    {
+        std::printf ("\nrealtime adaptive spectrum: how late it lands and how hard:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        constexpr int    eb  = 64;
+        constexpr double sr4 = 48000.0;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (sr4, eb);
+        auto setR = [&p] (const char* id, float v)
+        { auto* q = p->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v));
+          p->pollParametersForTests(); };
+        // Morph OFF: the reported case, and the one where a template change is a bare swap.
+        setR ("morph", 0.0f);
+        // Short envelope segments so the chord change itself is over within ~20 ms and the
+        // only event left in the analysis window is the spectrum landing.
+        setR ("ampAttack", 0.001f); setR ("ampDecay", 0.001f);
+        setR ("ampSustain", 1.0f);  setR ("ampRelease", 0.003f);
+        setR ("fractalLevel", 1.0f); setR ("curveSlope", 1.0f); setR ("baseN", 1.0f);
+
+        juce::AudioBuffer<float> b (2, eb);
+        std::vector<float> x;                  // the recorded stream
+        struct Mark { size_t at; long long clock; juce::uint32 gen, rev; int applies, starts; };
+        std::vector<Mark> marks;
+        bool recording = false;
+        long long clockS = 0, nextPoll = 0;
+        const long long tickS = (long long) (sr4 / 60.0);   // the real message timer's cadence
+        const double    t0ms  = juce::Time::getMillisecondCounterHiRes();
+
+        auto pumpFor = [&] (double seconds, juce::MidiBuffer firstBlockMidi)
+        {
+            const long long want = clockS + (long long) (seconds * sr4);
+            bool sent = false;
+            while (clockS < want)
+            {
+                juce::MidiBuffer m;
+                if (! sent) { m = firstBlockMidi; sent = true; }
+                b.clear();
+                p->processBlock (b, m);
+                if (recording)
+                    for (int k = 0; k < eb; ++k) x.push_back (b.getReadPointer (0)[k]);
+                clockS += eb;
+                if (clockS >= nextPoll)
+                {
+                    nextPoll += tickS;
+                    p->pollParametersForTests();
+                    const auto* t = p->getLiveTemplate();
+                    marks.push_back ({ x.size(), clockS, t != nullptr ? t->generation : 0u,
+                                       p->getSpectrumLiveRevision(),
+                                       p->getRealtimeApplies(), p->getRealtimeStarts() });
+                }
+                for (;;)   // pace: never let the render outrun the searcher's wall clock
+                {
+                    const double behind = (double) clockS * 1000.0 / sr4
+                                        - (juce::Time::getMillisecondCounterHiRes() - t0ms);
+                    if (behind <= 0.0) break;
+                    juce::Thread::sleep (behind > 2.0 ? 1 : 0);
+                }
+            }
+        };
+        auto keyMidi = [] (bool on, std::initializer_list<int> notes)
+        {
+            juce::MidiBuffer m;
+            for (const int k : notes)
+                m.addEvent (on ? juce::MidiMessage::noteOn (1, k, (juce::uint8) 100)
+                               : juce::MidiMessage::noteOff (1, k), 0);
+            return m;
+        };
+
+        Proc::RtSettings rs;
+        rs.adapt.partials = 8; rs.adapt.periodRatio = 2.0; rs.adapt.minGapCents = 50.0;
+        rs.adapt.rootOnly = true; rs.adapt.goal = 0; rs.adapt.shapeAmps = true;
+
+        pumpFor (0.10, {});
+        pumpFor (1.6, keyMidi (true, { 60, 64, 67 }));      // chord A, settled
+        p->setRealtimeLink (Proc::RtLink::SpectrumFromChord, rs);
+        pumpFor (2.2, {});                                  // the first adaptation lands + settles
+
+        recording = true;
+        pumpFor (0.30, {});
+        const size_t    T0 = x.size();                      // the chord MOVES here
+        const long long C0 = clockS;                        // ...on the free-running clock too
+        const auto genAt0 = [&]
+        { const auto* t = p->getLiveTemplate(); return t != nullptr ? t->generation : 0u; }();
+        const juce::uint32 revAt0 = p->getSpectrumLiveRevision();
+        // Chord B moves the QUALITY as well as the pitch. A pure transposition would not
+        // do: in an equal temperament the ratios above the root are then identical, and
+        // the adaptation can come back with the very same typed degrees - a "change" that
+        // legitimately produces no new spectrum at all, which is not what is being timed
+        // here. (That is exactly what a first cut of the throttle probe measured: two major
+        // triads two semitones apart, and a landing that never came because none was due.)
+        pumpFor (0.02, keyMidi (false, { 60, 64, 67 }));
+        pumpFor (1.6,  keyMidi (true,  { 62, 65, 69 }));    // C major -> D minor
+        const size_t    T1 = x.size();                      // ...and a settled tail to compare against
+        const long long C1 = clockS;
+        recording = false;
+
+        // ...and now the case a PLAYER actually meets: a second move only 130 ms after the
+        // first, so the throttle is still loaded. This is where "el retraso" lives - a move
+        // made from rest is never throttled at all, because the link had been idle.
+        const auto genOf = [&]
+        { const auto* t = p->getLiveTemplate(); return t != nullptr ? t->generation : 0u; };
+        pumpFor (0.02, keyMidi (false, { 62, 65, 69 }));
+        pumpFor (0.13, keyMidi (true,  { 57, 61, 64 }));    // A major
+        const size_t   T2     = clockS;
+        const auto     genAt2 = genOf();
+        pumpFor (0.02, keyMidi (false, { 57, 61, 64 }));
+        pumpFor (1.2,  keyMidi (true,  { 57, 60, 64 }));    // ...to A minor: a real new target
+
+        // ---- and a result aimed at a chord the player has ALREADY LEFT ----
+        // Press P, wait until the search for P is genuinely RUNNING, then move to Q while
+        // it runs - so P's answer is guaranteed to arrive for a chord nobody is holding.
+        // Both moves ADD a note: the chord never empties, so this cannot be confused with
+        // the "let go a moment before the search finished" rule, which is the opposite case
+        // (that result IS the chord the user played, and must still be applied).
+        pumpFor (0.02, keyMidi (false, { 57, 60, 64 }));
+        pumpFor (0.70, keyMidi (true,  { 60, 64, 67 }));    // settled; the throttle is clear
+        const bool idleBeforeP = ! p->isSpectrumAdaptRunning();
+        pumpFor (0.004, keyMidi (true, { 65 }));            // P = C E F G
+        bool sawRunning = false;
+        for (int i = 0; i < 600 && ! sawRunning; ++i)
+        { pumpFor (0.0015, {}); sawRunning = p->isSpectrumAdaptRunning(); }
+        const auto      genAtQ = genOf();
+        const long long C3     = clockS;
+        pumpFor (0.80, keyMidi (true, { 62 }));             // Q = C D E F G, mid-search
+        int pubAfterQ = 0;
+        for (const auto& mk : marks)
+            if ((long long) mk.clock > C3) pubAfterQ = (int) (mk.gen - genAtQ);
+
+        // ---- when did each new spectrum reach the voices? ----
+        // marks[].at is the RECORDED length, which stops advancing once recording ends, so
+        // the throttled probe is timed on the free-running sample clock instead.
+        auto firstAfter = [&] (size_t t, juce::uint32 gen0, bool wantGen) -> size_t
+        {
+            for (const auto& mk : marks)
+                if (mk.at > t && (wantGen ? mk.gen != gen0 : mk.rev != revAt0)) return mk.at;
+            return 0;
+        };
+        const size_t applyS0 = firstAfter (T0, genAt0, true);
+        const size_t swapS0  = firstAfter (T0, 0, false);       // the FIRST live-slot swap
+        size_t applyS2 = 0; int marksAfter2 = 0; int genAfter2 = 0, startsAfter2 = 0;
+        for (const auto& mk : marks)
+            if ((long long) mk.clock > (long long) T2)
+            {
+                ++marksAfter2;
+                genAfter2    = (int) (mk.gen - genAt2);
+                startsAfter2 = mk.starts;
+                if (applyS2 == 0 && mk.gen != genAt2) applyS2 = (size_t) mk.clock;
+            }
+        // Counted on the free-running clock, NOT on the recorded length: `at` stops
+        // advancing the moment recording ends, so every later mark would otherwise be
+        // filed at exactly T1 and the throttle probe's own changes would be counted here.
+        int publishes = 0, swaps = 0;
+        for (const auto& mk : marks)
+            if (mk.clock > C0 && mk.clock <= C1)
+            { publishes = (int) (mk.gen - genAt0); swaps = (int) (mk.rev - revAt0); }
+        const double applyMs0 = applyS0 > 0 ? (double) (applyS0 - T0) * 1000.0 / sr4 : -1.0;
+        const double swapMs0  = swapS0  > 0 ? (double) (swapS0  - T0) * 1000.0 / sr4 : -1.0;
+        const double applyMs2 = applyS2 > 0 ? (double) (applyS2 - T2) * 1000.0 / sr4 : -1.0;
+
+        // ---- the spectral trajectory across the first landing ----
+        constexpr int fo = 10, fftN = 1 << fo, hop = 120;   // 21.3 ms window, 2.5 ms hop
+        juce::dsp::FFT fft (fo);
+        std::vector<float> fbuf (2 * (size_t) fftN);
+        std::vector<std::vector<float>> mags;
+        std::vector<size_t> mid;                             // window CENTRE = the frame's time
+        for (size_t at = 0; at + (size_t) fftN <= x.size(); at += (size_t) hop)
+        {
+            std::fill (fbuf.begin(), fbuf.end(), 0.0f);
+            for (int i = 0; i < fftN; ++i)
+                fbuf[(size_t) i] = (0.5f - 0.5f * std::cos (2.0f * juce::MathConstants<float>::pi
+                                                             * (float) i / (float) (fftN - 1)))
+                                 * x[at + (size_t) i];
+            fft.performFrequencyOnlyForwardTransform (fbuf.data());
+            mags.emplace_back (fbuf.begin(), fbuf.begin() + fftN / 2);
+            mid.push_back (at + (size_t) fftN / 2);
+        }
+        auto dist = [] (const std::vector<float>& u, const std::vector<float>& v)
+        { double d = 0.0; for (size_t k = 0; k < u.size(); ++k) d += std::abs ((double) u[k] - (double) v[k]); return d; };
+        auto meanOf = [&] (size_t lo, size_t hi)
+        {
+            std::vector<float> a ((size_t) fftN / 2, 0.0f);
+            int c = 0;
+            for (size_t i = 0; i < mags.size(); ++i)
+                if (mid[i] >= lo && mid[i] < hi) { for (size_t k = 0; k < a.size(); ++k) a[k] += mags[i][k]; ++c; }
+            for (auto& v : a) v /= (float) std::max (1, c);
+            return a;
+        };
+        // REFERENCE = the sound after the new NOTES are steady but before ANY part of the
+        // new spectrum has moved (anchored on the first live-slot swap, whatever it was);
+        // FINAL = the settled end of the first landing.
+        const size_t lm = (size_t) fftN / 2;   // half a window: a frame centred here is clean
+        const size_t firstMove = swapS0 > 0 ? swapS0 : T0 + (size_t) (0.25 * sr4);
+        const size_t refLo = T0 + (size_t) (0.028 * sr4) + lm;
+        const size_t refHi = firstMove > lm ? firstMove - lm : refLo + 1;
+        const auto ref = meanOf (refLo, std::max (refHi, refLo + 1));
+        const auto fin = meanOf (T1 - (size_t) (0.30 * sr4), T1);
+        const double D0 = dist (ref, fin);
+        double meanMag = 0.0;
+        for (size_t i = 0; i < mags.size(); ++i)
+            if (mid[i] >= T0 && mid[i] < T1)
+            { double s2 = 0.0; for (const float v : mags[i]) s2 += v; meanMag += s2; }
+        meanMag /= (double) std::max<size_t> (1, (T1 - T0) / (size_t) hop);
+
+        // Progress along that journey. Smoothed over 5 hops (12.5 ms): three notes an equal
+        // temperament apart BEAT, so a single frame's distance ripples by tens of percent
+        // whatever the spectrum is doing, and an unsmoothed "largest one-hop step" would be
+        // measuring the beat, not the landing.
+        std::vector<double> prog, progT;
+        for (size_t i = 0; i < mags.size(); ++i)
+            if (mid[i] >= refLo && mid[i] < T1)
+            { prog.push_back (D0 > 0.0 ? 1.0 - dist (mags[i], fin) / D0 : 0.0);
+              progT.push_back ((double) ((long long) mid[i] - (long long) T0) * 1000.0 / sr4); }
+        std::vector<double> sm (prog.size(), 0.0);
+        for (size_t i = 0; i < prog.size(); ++i)
+        {
+            double a = 0.0; int c = 0;
+            for (size_t j = (i >= 2 ? i - 2 : 0); j <= std::min (prog.size() - 1, i + 2); ++j) { a += prog[j]; ++c; }
+            sm[i] = a / std::max (1, c);
+        }
+        double t10 = -1.0, t90 = -1.0, maxStep = 0.0; double stepAt = -1.0;
+        for (size_t i = 0; i < sm.size(); ++i)
+        {
+            if (t10 < 0.0 && sm[i] >= 0.10) t10 = progT[i];
+            if (t90 < 0.0 && sm[i] >= 0.90) t90 = progT[i];
+            if (i > 0 && sm[i - 1] < 0.90 && sm[i] - sm[i - 1] > maxStep)
+            { maxStep = sm[i] - sm[i - 1]; stepAt = progT[i]; }
+        }
+        // THE TWO METRICS THAT SURVIVE THE BEATING, AND HOW THEY ARE MADE FAIR.
+        // Three notes a tempered third apart beat, and so do the adapted partials
+        // themselves (the search is only asked to keep them 50 cents apart), so both the
+        // spectrum and the loudness ripple continuously whatever the link is doing - by
+        // over +/-30% of the mean, measured. Each event is therefore compared with that
+        // shimmer PEAK TO PEAK over windows of the SAME length in the SAME take: 150 ms
+        // straddling the landing, against the last settled 150 ms. A ratio near 1 means
+        // the change cannot be picked out of the note's own movement; the "golpe" is a
+        // number well above it. (Peak against a MEDIAN would have called the shimmer
+        // itself a thump, which is how a first cut of this metric read 3.6x with nothing
+        // happening at that instant at all.)
+        //   - SPECTRAL FLUX: L1 between consecutive magnitude frames (the timbre stepping);
+        //   - RMS STEP:      one-hop change in short-term loudness (the thump itself).
+        const size_t evLo = firstMove > (size_t) (0.015 * sr4) ? firstMove - (size_t) (0.015 * sr4) : T0;
+        const size_t evHi = evLo + (size_t) (0.150 * sr4);
+        const size_t caLo = T1 - (size_t) (0.165 * sr4), caHi = T1 - (size_t) (0.015 * sr4);
+        double fluxPeak = 0.0, fluxCalmPk = 0.0;
+        for (size_t i = 1; i < mags.size(); ++i)
+        {
+            const double f = dist (mags[i], mags[i - 1]) / std::max (1.0e-9, meanMag);
+            if (mid[i] >= evLo && mid[i] < evHi) fluxPeak   = std::max (fluxPeak, f);
+            if (mid[i] >= caLo && mid[i] < caHi) fluxCalmPk = std::max (fluxCalmPk, f);
+        }
+
+        // THE THUMP, MEASURED AS A LOUDNESS EXCURSION. Two choices make this sharp:
+        //   - a 20 ms RMS window, not a short one. In Aligned phase mode (the default) a
+        //     voice is a PULSE train, so a 5 ms window holds barely one period and its RMS
+        //     swings by tens of percent purely on where the window falls against the pulse
+        //     - noise that buried the event completely.
+        //   - peak-to-trough over a 30 ms span, not a one-hop difference. A step spends its
+        //     whole size inside such a span; the notes' own beating (a few Hz, so 200 ms
+        //     and up) can only contribute the small piece of its cycle that fits.
+        constexpr int rw = 960, rh = 120;    // 20 ms window, 2.5 ms hop
+        constexpr int exSpan = 12;           // 30 ms
+        std::vector<double> rms;
+        std::vector<size_t> rmsAt;
+        for (size_t at = T0; at + (size_t) rw <= T1; at += (size_t) rh)
+        {
+            double s2 = 0.0;
+            for (int i = 0; i < rw; ++i) { const double v = x[at + (size_t) i]; s2 += v * v; }
+            rms.push_back (std::sqrt (s2 / rw));
+            rmsAt.push_back (at + (size_t) rw / 2);   // the window's CENTRE is its time
+        }
+        double meanRms = 0.0; for (const double v : rms) meanRms += v;
+        meanRms /= std::max<size_t> (1, rms.size());
+        double thumpAt = -1.0, thump = 0.0, rmsCalmPk = 0.0;
+        for (size_t i = 0; i + (size_t) exSpan < rms.size(); ++i)
+        {
+            double lo = rms[i], hi = rms[i];
+            for (int k = 1; k <= exSpan; ++k) { lo = std::min (lo, rms[i + (size_t) k]);
+                                                hi = std::max (hi, rms[i + (size_t) k]); }
+            const double e = (hi - lo) / std::max (1.0e-12, meanRms);
+            const size_t at = rmsAt[i];
+            if (at >= evLo && at < evHi && e > thump)
+            { thump = e; thumpAt = (double) ((long long) at - (long long) T0) * 1000.0 / sr4; }
+            if (at >= caLo && at < caHi) rmsCalmPk = std::max (rmsCalmPk, e);
+        }
+
+        // Run 26's per-sample click metric, so no fix here can smuggle a click back in.
+        double maxJump = 0.0, peak = 0.0;
+        for (size_t i = T0 + (size_t) (0.030 * sr4); i < T1; ++i)
+        {
+            peak = std::max (peak, (double) std::abs (x[i]));
+            maxJump = std::max (maxJump, (double) std::abs (x[i] - x[i - 1]));
+        }
+
+        const double fluxRatio = fluxCalmPk > 0.0 ? fluxPeak / fluxCalmPk : 0.0;
+        const double rmsRatio  = rmsCalmPk  > 0.0 ? thump    / rmsCalmPk  : 0.0;
+        std::printf ("  chord moved -> first live swap %.0f ms, new TEMPLATE %.0f ms; %d publishes, %d live swaps\n",
+                     swapMs0, applyMs0, publishes, swaps);
+        std::printf ("  a second move 130 ms later (throttle loaded) -> new template after %.0f ms"
+                     " (%d ticks watched, %d publishes, %d searches, %d applies, link %s%s)\n",
+                     applyMs2, marksAfter2, genAfter2, startsAfter2, p->getRealtimeApplies(),
+                     p->getRealtimeLink() == Proc::RtLink::Off ? "OFF" : "on",
+                     p->getRealtimeRefusal().toRawUTF8());
+        std::printf ("  landing vs the note's own shimmer, 150 ms each: flux %.3f/%.3f = %.2fx   "
+                     "RMS excursion %.3f (at %.0f ms)/%.3f = %.2fx\n",
+                     fluxPeak, fluxCalmPk, fluxRatio, thump, thumpAt, rmsCalmPk, rmsRatio);
+        std::printf ("  jump/peak %.4f; 10%% of the change at %.0f ms (D0 %.1f, meanMag %.1f, meanRms %.4f)\n",
+                     peak > 0.0 ? maxJump / peak : 0.0, t10, D0, meanMag, meanRms);
+        std::printf ("  events after the move (ms:gen/rev/starts/applies):");
+        for (size_t i = 1; i < marks.size(); ++i)
+            if (marks[i].clock > C0 && marks[i].clock <= C1
+                && (marks[i].gen != marks[i - 1].gen || marks[i].rev != marks[i - 1].rev
+                    || marks[i].starts != marks[i - 1].starts))
+                std::printf (" %.0f:%u/%u/%d/%d", (double) (marks[i].clock - C0) * 1000.0 / sr4,
+                             marks[i].gen - genAt0, marks[i].rev - revAt0,
+                             marks[i].starts, marks[i].applies);
+        std::printf ("\n  RMS (ms:%%ofmean):");
+        for (size_t i = 0; i < rms.size(); i += 4)
+        {
+            const double ms = (double) ((long long) rmsAt[i] - (long long) T0) * 1000.0 / sr4;
+            if (ms >= 0.0 && ms <= 260.0)
+                std::printf (" %.0f:%.0f", ms, 100.0 * rms[i] / std::max (1.0e-12, meanRms));
+        }
+        std::printf ("\n");
+        check (applyS0 > 0, "the chord change really did reach the spectrum");
+        check (D0 > 0.0, "and the spectrum really did change");
+        check (swaps == 1 && publishes == 1,
+               "a chord move is ONE template swap - not a gains-only republish and then the real one");
+        // 70 ms, raised from 60 when the register range became "N steps ABOVE the note being
+        // played" instead of an octave either side of it, and raised on a measurement rather
+        // than to make a change fit. Both regimes were timed here against the same take: the
+        // adaptation lands on the SAME tick (33 ms, the apply is unchanged), and what moves
+        // is the search that follows it - one 16.7 ms poll interval, 51 ms -> 67 ms end to
+        // end. The cause is the objective, not the machinery: an upward band produces a
+        // different spectrum, and the next search sweeps from THAT one. (Measured on its own
+        // in SpectrumTests, the upward band is actually the cheaper of the two to search:
+        // 12.4 ms against 16.7 at the follower's own shape.) Both numbers are a quarter of
+        // the 250 ms throttle, so a player still hears the change as immediate.
+        check (applyMs0 > 0.0 && applyMs0 <= 70.0,
+               "the new spectrum is live within one search + two timer ticks of the chord moving");
+        check (applyMs2 > 0.0 && applyMs2 <= 100.0,
+               "and a move made 130 ms after another one is not held back by the throttle");
+        check (rmsRatio <= 1.4,
+               "the landing is no louder a step than the note's own beating (no thump)");
+        // A ceiling, not the thump detector: one clean 50 ms fade moves MORE spectrum in
+        // the landing window than two half-sized steps do, so this number is deliberately
+        // allowed to go up when the apply is fixed. What it forbids is a landing several
+        // times the note's own movement, i.e. a hard snap.
+        check (fluxRatio <= 2.0,
+               "and the spectrum is not snapped across in one hop either");
+        std::printf ("  P then Q mid-search: search was running = %d, publishes after Q = %d\n",
+                     (int) sawRunning, pubAfterQ);
+        check (idleBeforeP && sawRunning,
+               "the second move really did land while the first move's search was still running");
+        check (pubAfterQ == 1,
+               "a result aimed at the chord the player has already left is DROPPED, not applied late");
+
+        //-- A REBUILD ALREADY IN FLIGHT MUST NOT LAND ON TOP OF THE ADAPTATION.
+        // Publishing the adapted template directly is what removed the round trip, but it
+        // means the build WORKER may still be compiling a template from settings captured
+        // before the adaptation existed. If that one published afterwards it would put the
+        // old spectrum back - and because the apply also tells the poll "this state is
+        // pushed", nothing would ever notice: the adaptation would silently vanish, and the
+        // REALTIME button would look like it had stopped working. So: a deliberately heavy
+        // rebuild is queued, the adaptation is applied while it compiles, and the spectrum
+        // must still be the adapted one afterwards.
+        {
+            auto q = std::make_unique<Proc>();
+            q->prepareToPlay (sr4, 256);
+            auto sq = [&q] (const char* id, float v)
+            { auto* z = q->apvts.getParameter (id); z->setValueNotifyingHost (z->convertTo0to1 (v)); };
+            sq ("fractalLevel", 4.0f); sq ("spectrumRange", 10.0f); sq ("baseN", 1.0f);
+            q->pollParametersForTests();
+            juce::Thread::sleep (400);                  // the heavy template settles in
+
+            Proc::SpectrumAdaptSettings st;
+            st.partials = 8; st.periodRatio = 2.0; st.minGapCents = 50.0;
+            st.rootOnly = true; st.goal = 0; st.shapeAmps = true;
+            const std::vector<double> al { 1.0, std::pow (2.0, 4.0 / 12.0), std::pow (2.0, 7.0 / 12.0) };
+            juce::String e;
+            check (q->startSpectrumAdapt (st, al, 261.6255653, e), "the race probe's adaptation starts");
+            for (int i = 0; i < 3000 && q->isSpectrumAdaptRunning(); ++i) juce::Thread::sleep (2);
+
+            // Queue the heavy rebuild, then apply BEFORE the worker can finish it.
+            sq ("curveSlope", 3.0f);
+            q->pollParametersForTests();
+            check (q->applySpectrumAdapt (false, e), "...and applies while a rebuild is in flight");
+            const auto* ta = q->getLiveTemplate();
+            const size_t nAdapted = ta != nullptr ? ta->partials.size() : 0;
+            juce::Thread::sleep (3000);                 // any in-flight build has long finished
+            q->pollParametersForTests();
+            juce::Thread::sleep (300);
+            const auto* tb = q->getLiveTemplate();
+            const size_t nAfter = tb != nullptr ? tb->partials.size() : 0;
+            std::printf ("  in-flight rebuild vs the adaptation: %d partials at apply, %d three seconds later\n",
+                         (int) nAdapted, (int) nAfter);
+            check (nAdapted > 0 && nAfter == nAdapted,
+                   "a rebuild already in flight cannot publish the OLD spectrum over the adaptation");
         }
     }
 

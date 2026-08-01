@@ -866,9 +866,9 @@ namespace dissonance
         if (hiHz < loHz) std::swap (loHz, hiHz);
         const double octaves = std::log2 (hiHz / loHz);
         if (! (octaves > 0.02)) return 1;                    // a degenerate range IS one pitch
-        // The 1e-6 is not cosmetic: an "octave either side" range that lands on 2.0000001
-        // octaves through a stretched tuning's own frequencies would otherwise round UP to
-        // four points, and the panel would report a different count for two ranges the user
+        // The 1e-6 is not cosmetic: a two-period range that lands on 2.0000001 octaves
+        // through a stretched tuning's own frequencies would otherwise round UP to four
+        // points, and the panel would report a different count for two ranges the user
         // cannot tell apart.
         const int want = 1 + (int) std::ceil (octaves - 1.0e-6);
         return std::max (2, std::min (want, std::max (2, cap)));
@@ -877,9 +877,113 @@ namespace dissonance
     // The two caps. 7 covers C1..C7 at one octave a point; the realtime follower runs on a
     // ~250 ms throttle and an adaptation against 31 scale degrees is already ~100 ms at one
     // register, so it takes 3 - which is still EXACT sampling for the panel's default range
-    // (an octave either side of the played note is 2 octaves, i.e. one octave a point).
+    // (two periods above the played note is 2 octaves in 12-EDO, i.e. one octave a point).
     constexpr int kAdaptRegisterCap   = 7;
     constexpr int kAdaptRegisterCapRt = 3;
+
+    // HOW WIDE THE DEFAULT RANGE IS, in PERIODS of whatever tuning is loaded. The panel
+    // asks for it as a step count (N degrees above the note being played), so this number
+    // times the scale's degree count is the N a fresh instance starts with: 24 steps in
+    // 12-EDO, 62 in 31-EDO, 26 in Bohlen-Pierce - the same musical width in every tuning.
+    //
+    // MEASURED, not assumed - see SpectrumTests "(8) HOW WIDE SHOULD THE RANGE BE?", which
+    // optimises one seed over 0.5/1/2/3/4 periods and judges each answer densely at the
+    // anchor, at its own worst register, and one period ABOVE the range. Two periods is
+    // where those three stop trading against each other: it costs the played register
+    // almost nothing over a half-period range, and it is the narrowest width whose
+    // neighbour one period up is not left dramatically worse than a spectrum optimised
+    // there. Wider buys a little more insurance outside and pays for it at the anchor,
+    // which is the one register the player is certain to hear.
+    constexpr double kAdaptRegisterDefaultPeriods = 2.0;
+
+    //==========================================================================
+    // WHAT A RUN WILL COST, IN MILLISECONDS, BEFORE IT IS STARTED.
+    //
+    // Adapt is a ONE-SHOT, user-initiated calculation. It is allowed to take time, and
+    // REFUSING it because it looked big was the wrong answer: "all vs all over 31 notes x
+    // 16 partials is too heavy to search" turned a 45-second computation - on a worker
+    // thread, cancellable, with a progress bar already wired up - into a feature the user
+    // could not have at all. What a musician needs there is the NUMBER, so the decision is
+    // theirs to make.
+    //
+    // The cost of adaptSpectrum is completely determined by its arguments. There is no
+    // data-dependent branch in the inner loop: every objective evaluation walks the same
+    // fixed set of partial pairs, and every pair term is the same handful of flops plus two
+    // std::exp calls. So the work is
+    //
+    //     pairs per objective evaluation      (adaptPairsPerEval, below)
+    //   x registers                           (the objective is evaluated at every one)
+    //   x kAdaptLineSearchEvals               (one golden-section line search)
+    //   x line searches per sweep             (n-1 positions, plus n amplitudes if shaping)
+    //   x sweeps
+    //
+    // and the only machine-dependent quantity is nanoseconds per pair. That constant is
+    // MEASURED, not guessed (see SpectrumTests, "adaptation cost model"), and the test
+    // fails if prediction and measurement drift apart - so the estimate the panel prints
+    // cannot quietly become fiction.
+
+    // A golden-section lineSearch costs: 2 bracketing evaluations, then one per iteration
+    // (26 max, and the 1e-4 tolerance is never reached first for a cents window of hundreds
+    // of cents or a +-6 dB amplitude window), then one midpoint probe. 29 evaluations.
+    constexpr int kAdaptLineSearchEvals = 29;
+
+    // Partial pairs one targetScore() call walks, for `nNotes` target notes against an
+    // `nPartials` spectrum. These are the exact loop counts of selfDissonance /
+    // crossDissonance / chordDissonance above, not an approximation of them.
+    inline double adaptPairsPerEval (int nPartials, int nNotes, bool rootOnly)
+    {
+        const double n = (double) std::max (1, nPartials);
+        const double A = (double) std::max (1, nNotes);
+        if (rootOnly)
+            return A * n * (n - 1.0) * 0.5      // each note's own copy, dissmeasure: n(n-1)/2
+                 + (A - 1.0) * n * n;           // each note against the root, crossDissonance: n^2
+        const double u = A * n;                 // the whole union sounded at once
+        return u * (u - 1.0) * 0.5;
+    }
+
+    // Total partial-pair terms a whole adaptSpectrum() run walks.
+    inline double adaptTotalPairs (int nPartials, int nNotes, bool rootOnly, int registers,
+                                   bool shapeAmps, int sweeps)
+    {
+        const double n = (double) std::max (2, nPartials);
+        const double lineSearches = (n - 1.0) + (shapeAmps ? n : 0.0);
+        return (double) std::max (1, sweeps) * lineSearches * (double) kAdaptLineSearchEvals
+             * (double) std::max (1, registers)
+             * adaptPairsPerEval (nPartials, nNotes, rootOnly);
+    }
+
+    // Nanoseconds per pair term, MEASURED (see the calibration table printed by
+    // SpectrumTests). It is a property of the CPU - two std::exp calls, a divide and a
+    // handful of adds - so it does not depend on the size of the problem, and the test
+    // proves that by fitting this one number across configurations spanning 34 thousand to
+    // 53 million pair terms, both scopes, 1 and 7 registers, with and without amplitude
+    // shaping. Every one of them lands inside x0.6 .. x1.1 of its measurement.
+    constexpr double kAdaptNsPerPair = 9.8;
+
+    // The estimate the panel prints. `sweeps` is the ceiling adaptSpectrum is given (6):
+    // a run that converges early finishes SOONER than this, never later, so the number on
+    // screen is an honest upper bound and the progress bar catches up with it.
+    inline double adaptEstimateMs (int nPartials, int nNotes, bool rootOnly, int registers,
+                                   bool shapeAmps, int sweeps = 6)
+    {
+        return adaptTotalPairs (nPartials, nNotes, rootOnly, registers, shapeAmps, sweeps)
+             * kAdaptNsPerPair * 1.0e-6;
+    }
+
+    // THE ONE HARD BOUND, and why it is where it is.
+    //
+    // Ten minutes. Everything below it is offered with its price on the button and left to
+    // the user: the search runs on a worker, reports progress, and the Adapt button turns
+    // into Stop while it works, so a ten-minute run costs a musician one click to abandon.
+    // Above it the request is not a choice anybody is making on purpose - it is 24 partials
+    // against a 128-key absolute table in "all vs all", about 44 minutes, seven of them per
+    // SWEEP, and it would be indistinguishable from a hang. That is the only case refused,
+    // and the refusal states the number instead of pronouncing a verdict.
+    constexpr double kAdaptAbsurdMs = 600000.0;
+
+    // Above this, the Adapt button wears its price and the panel warns. 3 s is the point
+    // where a musician stops expecting an answer "now" and starts wondering if it worked.
+    constexpr double kAdaptWarnMs = 3000.0;
 
     struct RegisterScores
     {
