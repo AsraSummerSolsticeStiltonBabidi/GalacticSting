@@ -953,6 +953,44 @@ void FractalAdditiveAudioProcessor::clearTimbre()
 }
 
 //==============================================================================
+double FractalAdditiveAudioProcessor::analysisAnchorHz() const
+{
+    // The tonic that is REALLY sounding on key 60 under the active tuning - octave
+    // shift, reference-A and a .tun/@ABL table anchor included. The scale generator
+    // and the chord search used kRefFreq * referenceScale() instead, which loses the
+    // octave shift and any table anchor: with octave shift -2 they scored a register
+    // four times higher than the one being played, while the degree list right next
+    // to them scored the real one - two incomparable columns of numbers.
+    const double f0 = tuning.frequencyForNote (60);
+    if (f0 > 0.0 && std::isfinite (f0))
+        return f0;
+    return TuningManager::kRefFreq * tuning.referenceScale();
+}
+
+std::vector<dissonance::Partial> FractalAdditiveAudioProcessor::analysisSpectrumAt (double f0Hz) const
+{
+    // The PUBLISHED template first, never a routine recompile: this runs on the
+    // message thread and a compile at fractalLevel > 1 costs hundreds of
+    // milliseconds - the editor's timer re-running it starved the 60 Hz
+    // timerCallback (the only place a modulated Base is sampled into a rebuild
+    // request) and froze the spectrum at whatever Base value was caught last.
+    // Being at most one publish behind is invisible to a 64-partial analysis, and
+    // it keeps every readout scoring the SAME spectrum. The live template carries
+    // the user's per-partial gains already resolved (SpectrumEngine::fillGains).
+    if (const auto* live = spectrumEngine.getLive(); live != nullptr && ! live->partials.empty())
+        return dissonance::analysisSpectrum (live->partials, live->gain, f0Hz);
+
+    // Cold start (before the first publish): compile once, and resolve the manual
+    // edits against that list exactly as the engine would - a muted or boosted
+    // partial must weigh the same here as it will the moment the engine publishes.
+    const auto tmpl = spectrum::compileSpectrum (currentSettings());
+    std::vector<float> gain;
+    if (apvts.getRawParameterValue ("partialManual")->load() > 0.5f && ! partialGains.empty())
+        spectrum::resolveGains (tmpl.partials, partialGains, gain);
+    return dissonance::analysisSpectrum (tmpl.partials, gain, f0Hz);
+}
+
+//==============================================================================
 bool FractalAdditiveAudioProcessor::generateDissonanceScale (int count, bool useMaxima,
                                                              double periodRatio,
                                                              const juce::String& periodSclLine,
@@ -966,29 +1004,15 @@ bool FractalAdditiveAudioProcessor::generateDissonanceScale (int count, bool use
         return false;
     }
 
-    // Analyse the spectrum the synth is REALLY producing right now (pure recompute
-    // of the current settings; message thread, no audio-thread interaction).
-    const auto tmpl = spectrum::compileSpectrum (currentSettings());
-    if (tmpl.partials.empty())
+    // Analyse the spectrum the synth is REALLY producing (published template at its
+    // sounding amplitudes, per-partial edits included) at the register it is really
+    // played in - the same spectrum and the same anchor as the degree list that
+    // colours the result, because the two sets of heights sit side by side.
+    const auto spec = analysisSpectrumAt (analysisAnchorHz());
+    if (spec.empty())
     {
         errorOut = "The current settings produce no partials - nothing to analyse.";
         return false;
-    }
-
-    // Anchor at middle C times the A-reference, like the audible tuning itself.
-    const double f0 = TuningManager::kRefFreq * tuning.referenceScale();
-    std::vector<dissonance::Partial> spec;
-    spec.reserve (tmpl.partials.size());
-    for (const auto& p : tmpl.partials)
-        spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
-
-    // Analysis cap: the curve's shape is set by the strongest partials; capping
-    // keeps the 1-cent sweep instant. (Analysis only - the SOUND is never capped.)
-    if (spec.size() > 64)
-    {
-        std::sort (spec.begin(), spec.end(),
-                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
-        spec.resize (64);
     }
 
     const auto curve = dissonance::dissonanceCurve (spec, periodRatio, 1.0);
@@ -1078,53 +1102,15 @@ FractalAdditiveAudioProcessor::computeActiveScaleDissonance() const
 {
     std::vector<DissDegreeInfo> out;
 
-    // Read the template that is ALREADY PUBLISHED rather than compiling a fresh one.
-    //
-    // This used to call compileSpectrum() synchronously, on the message thread, with no
-    // abort flag - and the editor's 30 Hz timer re-runs it whenever the template
-    // generation changes. Put a modulator on any spectrum control and the generation
-    // changes on essentially every tick, so the message thread spent all its time
-    // compiling. At fractalLevel > 1 one compile is hundreds of milliseconds, and the
-    // processor's own 60 Hz timerCallback - the ONLY place a modulated Base is ever
-    // sampled into a rebuild request - was starved. The spectrum froze at whatever Base
-    // value was caught last and the fader's modulation marker stopped moving: exactly
-    // "Base no longer moves and the LFO doesn't move it", and it never recovered because
-    // the starvation persisted for as long as fractal stayed above 1.
-    //
-    // The analysis keeps only the 64 loudest partials anyway, so being at most one
-    // publish behind is invisible here. A fresh compile is kept only as the cold-start
-    // fallback, before the builder has published anything at all.
-    std::vector<dissonance::Partial> spec;
-
-    // Anchor the partials at the ACTUAL sounding tonic of the active tuning, so the
-    // absolute frequencies (which Sethares roughness depends on) are correct.
-    double f0 = tuning.frequencyForNote (60);
-    if (! (f0 > 0.0) || ! std::isfinite (f0))
-        f0 = TuningManager::kRefFreq * tuning.referenceScale();
-
-    if (const auto* live = spectrumEngine.getLive(); live != nullptr && ! live->partials.empty())
-    {
-        spec.reserve (live->partials.size());
-        for (const auto& p : live->partials)
-            spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
-    }
-    else
-    {
-        const auto tmpl = spectrum::compileSpectrum (currentSettings());
-        if (tmpl.partials.empty())
-            return out;
-        spec.reserve (tmpl.partials.size());
-        for (const auto& p : tmpl.partials)
-            spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
-    }
+    // The shared analysis spectrum (published template, sounding amplitudes, 64-cap)
+    // at the ACTUAL sounding tonic of the active tuning. Reading the PUBLISHED
+    // template rather than recompiling is what analysisSpectrumAt exists for: this
+    // is re-run from the editor's timer, and a synchronous compile here used to
+    // starve the 60 Hz timerCallback that samples a modulated Base (the spectrum
+    // froze at whatever Base value was caught last, for as long as fractal > 1).
+    const auto spec = analysisSpectrumAt (analysisAnchorHz());
     if (spec.empty())
         return out;
-    if (spec.size() > 64) // analysis cap only; the SOUND is never capped
-    {
-        std::sort (spec.begin(), spec.end(),
-                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
-        spec.resize (64);
-    }
 
     const int D = juce::jmax (1, getScaleDegrees());
     out.reserve ((size_t) D + 1);
@@ -1304,25 +1290,17 @@ bool FractalAdditiveAudioProcessor::startChordSearch (int notes, double periodRa
         chordThread->join();
     chordCancel = false;
 
-    // Analyse the spectrum the synth is REALLY producing right now (same prep as the
-    // dyad Transmute: absolute frequencies anchored at middle C x the A-reference,
-    // strongest-64 analysis cap - analysis only, never the sound).
-    const auto tmpl = spectrum::compileSpectrum (currentSettings());
-    if (tmpl.partials.empty())
+    // Analyse the spectrum the synth is REALLY producing (same prep as the scale
+    // generator and the degree list: published template, SOUNDING amplitudes with
+    // the user's per-partial edits, strongest-64 analysis cap, anchored at the
+    // active tuning's real key-60 tonic). The realtime follower re-runs this on
+    // every spectrum change, so reading the published template also spares it a
+    // full recompile per trigger.
+    std::vector<dissonance::Partial> spec = analysisSpectrumAt (analysisAnchorHz());
+    if (spec.empty())
     {
         errorOut = "The current settings produce no partials - nothing to analyse.";
         return false;
-    }
-    const double f0 = TuningManager::kRefFreq * tuning.referenceScale();
-    std::vector<dissonance::Partial> spec;
-    spec.reserve (tmpl.partials.size());
-    for (const auto& p : tmpl.partials)
-        spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
-    if (spec.size() > 64)
-    {
-        std::sort (spec.begin(), spec.end(),
-                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
-        spec.resize (64);
     }
 
     chordPeriodSclLine = periodSclLine;
@@ -1691,38 +1669,19 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
     nadUsedD  = D;
     std::vector<double> ratios ((size_t) D);
     for (int d = 0; d < D; ++d) ratios[(size_t) d] = getDegreeRatio (d);
-    // Take the PUBLISHED template, not a fresh compile. Two reasons: this runs on the
-    // message thread and a compile at fractalLevel > 1 costs hundreds of milliseconds
-    // (which starved the 60 Hz timer that samples a modulated Base - see
-    // computeActiveScaleDissonance); and the Degrees list now reads the published one, so
-    // recompiling here would let the two lists disagree, which the anchor comment below
-    // explicitly forbids. Copied, because the search continues on a worker thread and the
-    // engine's slot can be recycled under it.
-    spectrum::SpectrumTemplate tmpl;
-    if (const auto* live = spectrumEngine.getLive(); live != nullptr && ! live->partials.empty())
-        tmpl.partials = live->partials;
-    else
-        tmpl = spectrum::compileSpectrum (currentSettings());
     // The period the search reasons with: the tuning's own unless the user typed a
     // different one in the box (it decides what counts as an equal-step scale and
     // which intervals are just the same pitch class again).
     const double periodC = 1200.0 * std::log2 (std::max (1.0e-9,
                               periodOverride > 1.0 ? periodOverride : tuning.periodRatio()));
     const double minGap = juce::jlimit (0.0, 600.0, minGapCents);
-    // Same absolute anchor as the Degrees list (computeActiveScaleDissonance):
-    // Sethares roughness depends on register, so both lists must agree.
-    double f0 = tuning.frequencyForNote (60);
-    if (! (f0 > 0.0) || ! std::isfinite (f0))
-        f0 = TuningManager::kRefFreq * tuning.referenceScale();
-    std::vector<dissonance::Partial> spec;
-    spec.reserve (tmpl.partials.size());
-    for (const auto& p : tmpl.partials) spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
-    if (spec.size() > 64)
-    {
-        std::sort (spec.begin(), spec.end(),
-                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
-        spec.resize (64);
-    }
+    // The SAME analysis spectrum and absolute anchor as the Degrees list
+    // (computeActiveScaleDissonance): Sethares roughness depends on register and on
+    // amplitude, and the two lists sit side by side, so they must score the same
+    // spectrum from the same register or their numbers are incomparable. The vector
+    // is an owned copy, because the search continues on a worker thread and the
+    // engine's live slot can be recycled under it.
+    std::vector<dissonance::Partial> spec = analysisSpectrumAt (analysisAnchorHz());
 
     nadBusy = true;
     nadThread = std::make_unique<std::thread> ([this, notes, D, periodC, rootOnly, maxMode, minGap,
@@ -1881,9 +1840,7 @@ std::vector<double> FractalAdditiveAudioProcessor::tuningAsTargetAlphas (double&
         if (r > 0.0 && std::isfinite (r)) a.push_back (r);
     }
     // Same absolute anchor as the Degrees list and the n-ad search, so all three agree.
-    f0Out = tuning.frequencyForNote (60);
-    if (! (f0Out > 0.0) || ! std::isfinite (f0Out))
-        f0Out = TuningManager::kRefFreq * tuning.referenceScale();
+    f0Out = analysisAnchorHz();
     return a;
 }
 
@@ -1906,35 +1863,48 @@ std::vector<double> FractalAdditiveAudioProcessor::heldChordAsTargetAlphas (doub
 }
 
 double FractalAdditiveAudioProcessor::measureCurrentAgainstTarget (const std::vector<double>& alphas,
-                                                                  double f0Hz, bool rootOnly) const
+                                                                  double f0Hz, bool rootOnly,
+                                                                  const dissonance::Registers& regs) const
 {
     if (alphas.empty() || ! (f0Hz > 0.0)) return 0.0;
-    // The PUBLISHED template, not a fresh compile: this runs on the message thread and a
-    // compile at fractalLevel > 1 costs hundreds of milliseconds (the same reason
-    // startNadCompute reads the published one).
-    std::vector<dissonance::Partial> spec;
-    if (const auto* live = spectrumEngine.getLive(); live != nullptr && ! live->partials.empty())
-    {
-        spec.reserve (live->partials.size());
-        for (size_t i = 0; i < live->partials.size(); ++i)
-        {
-            const float g = i < live->gain.size() ? live->gain[i] : 1.0f;
-            spec.push_back ({ (double) live->partials[i].ratio * f0Hz, (double) live->partials[i].amp * g });
-        }
-    }
+    // The shared analysis spectrum: published template, SOUNDING amplitudes (this is
+    // the "really sounding" number, so the user's per-partial edits must weigh in),
+    // 64-cap. Anchored at the caller's f0 - the same anchor the adaptation itself
+    // used - so "sounding now" and the adaptation's before/after are one scale.
+    const auto spec = analysisSpectrumAt (f0Hz);
     if (spec.empty()) return 0.0;
-    if (spec.size() > 64)   // ANALYSIS ONLY - the sound keeps every partial it has
-    {
-        std::sort (spec.begin(), spec.end(),
-                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
-        spec.resize (64);
-    }
-    return dissonance::targetScore (spec, alphas, rootOnly);
+    // ...and aggregated over the SAME registers, the same way (see the header).
+    const auto rs = dissonance::scoreOverRegisters (spec, f0Hz, regs.f0, alphas, rootOnly,
+                                                    dissonance::Goal::Min, 0.0, 0.0, regs.mode);
+    return regs.mode == dissonance::Aggregate::Minimax ? rs.worst : rs.mean;
+}
+
+// THE REGISTER RANGE, resolved in ONE place. The panel prints what this returns and the
+// search runs on what this returns, so the two can never disagree about which registers a
+// spectrum was optimised for - and that answer genuinely differs (a spectrum optimised at
+// C1 is ~3.7x rougher at C6 than one optimised there; see SpectrumTests).
+dissonance::Registers FractalAdditiveAudioProcessor::adaptRegistersFor (const SpectrumAdaptSettings& s,
+                                                                        double f0Hz, bool realtime)
+{
+    dissonance::Registers regs;
+    regs.mode = s.aggregate == 1 ? dissonance::Aggregate::Minimax : dissonance::Aggregate::Mean;
+    double lo = s.regLoHz, hi = s.regHiHz;
+    // AUTO (0 Hz): an octave either side of the pitch the adaptation is anchored at. The
+    // follower runs with the editor shut, so the default cannot live in the editor - and a
+    // missing range must not collapse silently back to the single-pitch objective this
+    // whole change exists to replace.
+    if (! (lo > 0.0) || ! (hi > 0.0) || ! std::isfinite (lo) || ! std::isfinite (hi))
+    { lo = f0Hz * 0.5; hi = f0Hz * 2.0; }
+    if (hi < lo) std::swap (lo, hi);
+    const int cap = realtime ? dissonance::kAdaptRegisterCapRt : dissonance::kAdaptRegisterCap;
+    regs.f0 = dissonance::registerPoints (lo, hi, dissonance::registerCountFor (lo, hi, cap));
+    return regs;
 }
 
 bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSettings& s,
                                                         const std::vector<double>& targetAlphas,
-                                                        double f0Hz, juce::String& errorOut)
+                                                        double f0Hz, juce::String& errorOut,
+                                                        bool realtime)
 {
     const int N = juce::jlimit (2, 24, s.partials);
     if (targetAlphas.empty() || ! (f0Hz > 0.0) || ! std::isfinite (f0Hz))
@@ -2006,15 +1976,19 @@ bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSetti
     adaptProgress    = 0.0f;
     adaptRunning     = true;
 
+    // Resolved BEFORE the thread starts, from the same helper the panel reads, so the run
+    // and the read-out are the same registers by construction.
+    const auto regs = adaptRegistersFor (s, f0Hz, realtime);
+
     adaptThread = std::make_unique<std::thread> (
-        [this, seed = std::move (seed), alphas = targetAlphas, f0Hz, s, N, gap, topRatio]()
+        [this, seed = std::move (seed), alphas = targetAlphas, f0Hz, s, N, gap, topRatio, regs]()
         {
             const auto goal = s.goal == 1 ? dissonance::Goal::Max
                             : s.goal == 2 ? dissonance::Goal::Range
                                           : dissonance::Goal::Min;
             auto res = dissonance::adaptSpectrum (seed, f0Hz, alphas, s.rootOnly, goal,
                                                   s.rangeLo, s.rangeHi, gap, topRatio,
-                                                  s.shapeAmps, (double) spectrum::kGainMaxDb, 6,
+                                                  s.shapeAmps, (double) spectrum::kGainMaxDb, 6, regs,
                                                   [this] (float p) { adaptProgress.store (p); return ! adaptCancel.load(); });
             if (! adaptCancel.load() && ! res.spectrum.empty())
             {
@@ -2030,6 +2004,18 @@ bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSetti
                 info.after       = res.score;
                 info.targetNotes = (int) alphas.size();
                 info.valid       = (int) info.ratios.size() == N;
+                info.regLoHz     = regs.f0.empty() ? f0Hz : regs.f0.front();
+                info.regHiHz     = regs.f0.empty() ? f0Hz : regs.f0.back();
+                info.regPoints   = (int) std::max<size_t> (1, regs.f0.size());
+                info.aggregate   = regs.mode == dissonance::Aggregate::Minimax ? 1 : 0;
+                info.mean        = res.mean;
+                info.worst       = res.worst;
+                info.seedMean    = res.seedMean;
+                info.seedWorst   = res.seedWorst;
+                info.perRegister = res.perRegister;
+                info.registerF0  = res.registerF0;
+                info.worstHz     = juce::isPositiveAndBelow (res.worstIndex, (int) res.registerF0.size())
+                                       ? res.registerF0[(size_t) res.worstIndex] : f0Hz;
                 {
                     const juce::ScopedLock sl (adaptLock);
                     adaptResult = std::move (info);
@@ -2088,10 +2074,14 @@ bool FractalAdditiveAudioProcessor::applySpectrumAdapt (bool undoable, juce::Str
 
     // The typed text: every partial above 1/1 in cents, then the PERIOD as the highest
     // value (loadTimbreText's rule: the top interval is the repeat point). 1/1 is implicit.
+    // centsText, not String(x, 5): this text lands in the Custom Engine's box for the
+    // user to read and edit, and a fixed 5-decimal print filled it with "100.00000c
+    // 1200.00000c" noise. The 'c' suffix alone marks cents to the parser, so "100c"
+    // round-trips identically - only genuinely inexact values keep their decimals.
     juce::String txt;
     for (size_t i = 1; i < info.ratios.size(); ++i)
-        txt << juce::String (1200.0 * std::log2 (juce::jmax (1.0e-9, info.ratios[i])), 5) << "c ";
-    txt << juce::String (1200.0 * std::log2 (juce::jmax (1.0001, adaptPeriodRatio)), 5) << "c";
+        txt << dissonance::centsText (1200.0 * std::log2 (juce::jmax (1.0e-9, info.ratios[i]))).c_str() << "c ";
+    txt << dissonance::centsText (1200.0 * std::log2 (juce::jmax (1.0001, adaptPeriodRatio))).c_str() << "c";
 
     if (! loadTimbreText (txt, errorOut))
         return false;
@@ -2246,7 +2236,9 @@ void FractalAdditiveAudioProcessor::setRealtimeLink (RtLink mode, const RtSettin
     rtSeenSpecGen  = spectrumEngine.getGeneration();
     rtSeenChordGen = chordGeneration.load();
     rtSeenAdaptGen = adaptGeneration.load();
-    rtHeldSig = rtTuneSig = -1.0;
+    rtHeldTarget.clear();
+    rtHeldF0  = 0.0;
+    rtTuneSig = -1.0;
     if (mode != RtLink::Off)
         takeRealtimeBaseline (mode);
 }
@@ -2337,15 +2329,64 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
     }
 
     // ...the two SPECTRUM-side links. Same throttle + coalesce, aimed at a different target.
+    //
+    // A finished adaptation is published FIRST, before anything below can decide there is
+    // nothing to do. A chord let go a moment before its search finished was still a chord
+    // the user played, and the result belongs to it: held back here, it would have been
+    // applied on some later tick against a completely different chord.
+    if (const int g = adaptGeneration.load(); g != rtSeenAdaptGen)
+    {
+        rtSeenAdaptGen = g;
+        juce::String aerr;
+        if (applySpectrumAdapt (/*undoable*/ false, aerr))
+            ++rtApplies;
+    }
+
     double f0 = 0.0;
     std::vector<double> alphas;
     if (rtLink == RtLink::SpectrumFromChord)
     {
+        // THE TRIGGER IS WHAT IS BEING PLAYED. The frequencies come from the rhythm
+        // engine's held-note bookkeeping, which is published from every processBlock
+        // whether or not the rhythm engine is switched on, so they are the pitches really
+        // sounding - the tuning's, per-note bend included.
         alphas = heldChordAsTargetAlphas (f0);
-        if (alphas.size() < 2)
-            return;   // nothing (or one note) held: leave the spectrum exactly as it is
-        const double sig = ratioSetSig (alphas);
-        if (std::abs (sig - rtHeldSig) > 1.0e-9) { rtHeldSig = sig; rtPending = true; }
+        if (alphas.empty())
+        {
+            // NOTHING held: leave the spectrum exactly as it is, and DROP any pending
+            // adaptation. Without this, engaging the link with nothing down left rtPending
+            // true and the first chord to arrive was adapted to with whatever this tick
+            // happened to read - and, worse, a chord released mid-search came back as a
+            // re-adaptation to a chord that was no longer being played.
+            rtPending = false;
+            return;
+        }
+        // ONE NOTE IS A LEGAL TARGET. The bar here used to be two notes, so a monophonic
+        // line - a lead, a bass, one finger on the keyboard - lit the REALTIME button and
+        // then never adapted once, for ever: the guard returned before startSpectrumAdapt
+        // was ever reached. Nothing in the model needed that. With a single note alphas is
+        // {1.0} and dissonance::targetScore collapses, under BOTH scopes, to exactly
+        // dissonance::selfDissonance (spec, 1.0) - the spectrum's own INTERNAL roughness,
+        // the beating of the partials against each other with no chord involved. That is
+        // what the user asked to minimise and it is far from degenerate: sliding one
+        // partial of an 8-partial harmonic seed across 300 cents at C4 swings the measure
+        // from 6.50 to 7.25 (see SpectrumTests, "a SINGLE held note").
+        //
+        // The register comes along for free, and it has to: heldChordAsTargetAlphas hands
+        // back f0 = the note's REAL sounding frequency, and Sethares' critical band is a
+        // width in Hz, not in cents - the same partial set is a different roughness an
+        // octave down, and the adaptation answers with different partial positions there.
+        // Has the chord actually MOVED? Compared note by note against the set the last
+        // adaptation aimed at, in cents, including the root's absolute pitch: Sethares'
+        // roughness is a frequency width, so the same chord an octave up is a different
+        // target and must re-adapt, while a bend jitter below a cent must not.
+        bool moved = alphas.size() != rtHeldTarget.size()
+                  || ! (rtHeldF0 > 0.0)
+                  || std::abs (1200.0 * std::log2 (f0 / rtHeldF0)) > kRtHeldMoveCents;
+        for (size_t i = 0; i < alphas.size() && ! moved; ++i)
+            if (std::abs (1200.0 * std::log2 (alphas[i] / rtHeldTarget[i])) > kRtHeldMoveCents)
+                moved = true;
+        if (moved) rtPending = true;
     }
     else
     {
@@ -2361,9 +2402,18 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
         rtPending   = false;
         rtLastStart = rtTick;
         juce::String err;
-        if (startSpectrumAdapt (rtSet.adapt, alphas, f0, err))
+        // `realtime` = true: the follower takes the SMALLER register cap (3 instead of 7).
+        // The cost is exactly linear in the number of registers and this runs on a ~250 ms
+        // throttle, so seven of them would simply stop it keeping up with the fingers. The
+        // panel says so out loud (see the "registers" read-out) rather than degrading quietly.
+        if (startSpectrumAdapt (rtSet.adapt, alphas, f0, err, /*realtime*/ true))
         {
             ++rtStarts;
+            // Remember what this search is aimed at, not what merely passed by: the
+            // throttle can hold a launch for several ticks and the chord may have changed
+            // again in between, so the reference has to be the target actually used.
+            rtHeldTarget = alphas;
+            rtHeldF0     = f0;
         }
         else
         {
@@ -2372,13 +2422,6 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
             rtLink = RtLink::Off;
             return;
         }
-    }
-    if (const int g = adaptGeneration.load(); g != rtSeenAdaptGen)
-    {
-        rtSeenAdaptGen = g;
-        juce::String err;
-        if (applySpectrumAdapt (/*undoable*/ false, err))
-            ++rtApplies;
     }
 }
 

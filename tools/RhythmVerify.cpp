@@ -2430,20 +2430,60 @@ int main()
         std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
         auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
         check (ed != nullptr, "the editor builds");
-        // Measured TWICE: once as it opens (prime LIMIT fader, no scale loaded) and once in
-        // the widest configuration there is - the 9 prime-whitelist toggles, plus a loaded
-        // scale, which adds the Off button and the longest status line. Both live in the
-        // narrowest boxes of the panel, so they are where a squeeze shows up first.
-        for (int pass = 0; ed != nullptr && pass < 2; ++pass)
+        // Measured THREE times, because the engines share ONE box now and only the
+        // selected view's controls exist on screen: (0) as it opens - the HARMONIC view
+        // with the prime LIMIT fader; (1) the HARMONIC view at its widest - the 9
+        // prime-whitelist toggles; (2) the CUSTOM view - a loaded scale, whose whole
+        // point is that the freed box goes to the intervals editor (asserted below).
+        // The panel wears the SELECTED ENGINE's colour, and that can fail in two
+        // directions: back to the neutral steel that read as white (saturation 0.13), or
+        // onto a hue so close to a neighbouring panel's that the boxes stop being
+        // tellable apart. The neighbours are Essentials (green), Tuning (purple) and
+        // Spectrum-vs-Tuning (orange).
+        auto checkPanelColour = [] (juce::Colour panel, const char* who)
+        {
+            auto hueGap = [] (juce::Colour a, juce::Colour b)
+            {
+                const float d = std::abs (a.getHue() - b.getHue()) * 360.0f;
+                return std::min (d, 360.0f - d);
+            };
+            const juce::Colour neighbours[] = { juce::Colour (0xff4fe09a),   // Essentials
+                                                juce::Colour (0xffb27bff),   // Tuning
+                                                juce::Colour (0xffff9a3c) }; // Spectrum vs Tuning
+            float worst = 360.0f;
+            for (const auto& n : neighbours) worst = std::min (worst, hueGap (panel, n));
+            std::printf ("  panel colour %s (%s)  saturation %.2f  nearest neighbouring panel hue %.0f deg away\n",
+                         panel.toDisplayString (false).toRawUTF8(), who, panel.getSaturation(), worst);
+            check (panel.getSaturation() > 0.35f,
+                   "the panel is a real colour, not the old neutral steel");
+            check (worst > 40.0f, "and its hue is clear of every panel around it");
+        };
+
+        for (int pass = 0; ed != nullptr && pass < 4; ++pass)
         {
             if (pass == 1)
             {
-                juce::String err;
-                p.loadTimbreText ("5/4 3/2 2", err);
                 auto* pm = p.apvts.getParameter ("primeMode");
                 pm->setValueNotifyingHost (1.0f); // Whitelist
                 ed->resized();                    // no message loop here to do it for us
-                std::printf ("  (prime whitelist + a loaded custom scale)\n");
+                std::printf ("  (harmonic view, prime whitelist)\n");
+            }
+            if (pass == 2)
+            {
+                juce::String err;
+                p.loadTimbreText ("5/4 3/2 2", err); // switches the Custom Engine on
+                ed->refreshEngineDressing();         // chip + view follow, as the timer would
+                std::printf ("  (custom view: loaded scale)\n");
+            }
+            if (pass == 3)
+            {
+                // Back to the harmonic view with MANUAL per-partial amplitudes on: the one
+                // state that puts a SECOND painted label ("FROZEN") into a cell that
+                // already has one, which is the case the label checks below exist for.
+                p.setTimbreEnabled (false);
+                p.apvts.getParameter ("partialManual")->setValueNotifyingHost (1.0f);
+                ed->refreshEngineDressing();
+                std::printf ("  (harmonic view, manual per-partial amplitudes on)\n");
             }
             check (ed->getWidth() == 1200 && ed->getHeight() == 650, "at 1200 x 650");
             const auto L = ed->layoutProbe();
@@ -2452,28 +2492,66 @@ int main()
             check (win.contains (L.essentials) && win.contains (L.tuning), "so are Essentials and Tuning");
             check (! L.spectrum.intersects (L.essentials) && ! L.spectrum.intersects (L.tuning),
                    "and it overlaps neither of them");
-            check (L.spectrum.contains (L.harmonicEngine) && L.spectrum.contains (L.customEngine)
-                   && L.spectrum.contains (L.bothEngines),
-                   "all three nested boxes are inside the panel");
-            check (! L.harmonicEngine.intersects (L.customEngine)
-                   && ! L.harmonicEngine.intersects (L.bothEngines)
-                   && ! L.customEngine.intersects (L.bothEngines),
-                   "the two engines and the shared box never overlap (they are separate spaces)");
-            check (L.spectrum.contains (L.engineChips)
-                   && L.engineChips.getBottom() <= L.harmonicEngine.getY(),
-                   "the engine chips ride in the panel's header, clear of the boxes below");
-            std::printf ("  panel %d x %d   harmonic %d   custom %d   both %d   essentials %d\n",
-                         L.spectrum.getWidth(), L.spectrum.getHeight(), L.harmonicEngine.getWidth(),
-                         L.customEngine.getWidth(), L.bothEngines.getWidth(), L.essentials.getWidth());
+            check (L.spectrum.contains (L.engineBox) && L.spectrum.contains (L.bothEngines),
+                   "the shared engine box and the both-engines box are inside the panel");
+            check (! L.engineBox.intersects (L.bothEngines),
+                   "and they never overlap (they are separate spaces)");
+            // The engine chips are the shared box's TITLE now, modelled on the
+            // Modulators box's tab row: inside the box, at its top, under the panel's
+            // own title band. A strip floating outside the box would read as panel
+            // decoration again, which is exactly what this layout replaced.
+            check (L.engineBox.contains (L.engineChips)
+                   && L.engineChips.getY() >= L.spectrum.getY() + 14
+                   && L.engineChips.getBottom() <= L.engineBox.getY() + 24,
+                   "the engine chips are the engine box's own title row");
+
+            checkPanelColour (L.panelColour, pass == 2 ? "custom engine selected"
+                                                       : "harmonic engine selected");
+            std::printf ("  panel %d x %d   engine box %d   both %d   essentials %d\n",
+                         L.spectrum.getWidth(), L.spectrum.getHeight(), L.engineBox.getWidth(),
+                         L.bothEngines.getWidth(), L.essentials.getWidth());
+
+            // ONE box, ONE view: the probe only reports visible controls, so the
+            // selected engine's controls must be there and the other engine's must
+            // not - both present at once means the views leak into each other.
+            {
+                bool anyHarm = false, anyCustOnly = false, hasIntervals = false;
+                for (const auto& c : L.controls)
+                {
+                    if (c.first.startsWith ("harm.")) anyHarm = true;
+                    if (c.first == "cust.intervals") { hasIntervals = true; anyCustOnly = true; }
+                    if (c.first == "cust.load")       anyCustOnly = true;
+                }
+                if (pass != 2)
+                    check (anyHarm && ! anyCustOnly,
+                           "harmonic view: its controls are inside, the custom engine's are not");
+                else
+                    check (! anyHarm && anyCustOnly && hasIntervals,
+                           "custom view: its controls are inside, the harmonic engine's are not");
+                // The point of the merge: the intervals editor gets the freed space.
+                // It was a single 24 px line in a fifth of the panel; in the shared box
+                // it must be a real multi-line area.
+                if (pass == 2)
+                    for (const auto& c : L.controls)
+                        if (c.first == "cust.intervals")
+                        {
+                            std::printf ("  cust.intervals %d x %d\n",
+                                         c.second.getWidth(), c.second.getHeight());
+                            check (c.second.getWidth() >= 300 && c.second.getHeight() >= 56,
+                                   "the intervals editor got the custom view's freed space");
+                        }
+            }
 
             // Every control must be INSIDE the box whose name it carries.
             int outside = 0;
             juce::String worstName;
             for (const auto& c : L.controls)
             {
-                const auto* box = c.first.startsWith ("harm.") ? &L.harmonicEngine
-                                : c.first.startsWith ("cust.") ? &L.customEngine
+                const auto* box = c.first.startsWith ("harm.") ? &L.engineBox
+                                : c.first.startsWith ("cust.") ? &L.engineBox
                                 : c.first.startsWith ("both.") ? &L.bothEngines
+                                : c.first.startsWith ("tun.")  ? &L.tuning
+                                : c.first.startsWith ("spec.") ? &L.specColumn
                                                                : &L.essentials;
                 if (! box->contains (c.second))
                 { ++outside; if (worstName.isEmpty()) worstName = c.first; }
@@ -2482,6 +2560,37 @@ int main()
                          (int) L.controls.size(), outside,
                          outside > 0 ? (" (first: " + worstName + ")").toRawUTF8() : "");
             check (! L.controls.empty() && outside == 0, "no control spills out of its own box");
+
+            // "Inside its box" is not enough on its own: removeFromTop() on an exhausted
+            // rectangle hands back a SQUASHED one, which still sits inside the box and
+            // still overlaps nothing - so a control that ran out of room disappears
+            // without failing either check above. Adding a row to a hand-laid-out panel
+            // is exactly how that happens.
+            int squashed = 0;
+            juce::String squashedName;
+            for (const auto& c : L.controls)
+                if (c.second.getHeight() < 12 || c.second.getWidth() < 10)
+                {
+                    ++squashed;
+                    if (squashedName.isEmpty())
+                        squashedName = c.first + " (" + juce::String (c.second.getWidth()) + "x"
+                                     + juce::String (c.second.getHeight()) + ")";
+                }
+            std::printf ("  %d controls squeezed to nothing%s\n", squashed,
+                         squashed > 0 ? (" (first: " + squashedName + ")").toRawUTF8() : "");
+            check (squashed == 0, "and every one of them still has room to be used");
+
+            // The generic rule above only catches a total collapse. TEMPER is laid out
+            // in BOTH views (it must never vanish under the user's own click) and in
+            // each it is the row that silently absorbs any pixel its neighbours take:
+            // it is asserted at its nominal 20 px, the height a readable tick box needs.
+            for (const auto& c : L.controls)
+                if (c.first == "cust.temper")
+                {
+                    std::printf ("  cust.temper %d x %d\n", c.second.getWidth(), c.second.getHeight());
+                    check (c.second.getHeight() >= 20 && c.second.getWidth() >= 100,
+                           "the temper tick box got its whole row inside the Custom Engine");
+                }
 
             // ...and no two of them may sit on top of each other.
             int clashes = 0;
@@ -2496,6 +2605,359 @@ int main()
             std::printf ("  %d overlapping control pairs%s\n", clashes,
                          clashes > 0 ? (" (first: " + clashName + ")").toRawUTF8() : "");
             check (clashes == 0, "and no two controls overlap");
+
+            // THE SUB-CELLS. Every divider line and every inline sub-label is drawn from
+            // these rects, not from the controls, so a cell that grew past its box draws
+            // a line across its NEIGHBOUR's controls - which no check on the controls
+            // themselves can see. (The engine box's cells vanish in the custom view by
+            // design, so each cell is only judged against the box it belongs to.)
+            {
+                int bad = 0; juce::String badName;
+                for (const auto& c : L.cells)
+                {
+                    const auto* box = c.first.startsWith ("eng.")  ? &L.engineBox
+                                    : c.first.startsWith ("both.") ? &L.bothEngines
+                                                                   : &L.essentials;
+                    if (! box->contains (c.second)) { ++bad; if (badName.isEmpty()) badName = c.first; }
+                }
+                for (size_t i = 0; i < L.cells.size(); ++i)
+                    for (size_t j = i + 1; j < L.cells.size(); ++j)
+                        if (L.cells[i].second.intersects (L.cells[j].second))
+                        { ++bad; if (badName.isEmpty()) badName = L.cells[i].first + " / " + L.cells[j].first; }
+                std::printf ("  %d cells probed, %d escaped or overlap%s\n", (int) L.cells.size(), bad,
+                             bad > 0 ? (" (first: " + badName + ")").toRawUTF8() : "");
+                check (! L.cells.empty() && bad == 0,
+                       "every sub-cell stays inside its box and clear of its neighbours");
+            }
+
+            // THE PAINTED SUB-LABELS, in BOTH languages. A painted label has no component
+            // to squash: it fails by clipping, silently, and usually in the language the
+            // author does not read - which is exactly how "FROZEN - DRAWN BY HAND" shipped
+            // clipped at "DRA...". Measure the string in the very font paint() sets and
+            // require it to fit the very rect paint() draws it into.
+            for (int lang = 0; lang < 2; ++lang)
+            {
+                const auto P = ed->layoutProbeInLanguage (lang == 1);
+                int clipped = 0, over = 0;
+                juce::String worstL, overL;
+                float worstOverflow = 0.0f;
+                for (const auto& s : P.paintedLabels)
+                {
+                    const float slack = (float) s.cell.getWidth() - s.textWidth;
+                    if (slack < 0.0f)
+                    {
+                        ++clipped;
+                        if (-slack > worstOverflow)
+                        { worstOverflow = -slack; worstL = s.name + " \"" + s.text + "\""; }
+                    }
+                }
+                // ...and no two of them may print on top of each other. Two labels in one
+                // cell (AMP DECAY + FROZEN) is the case that bites: the second one's left
+                // edge has to clear the first one's TEXT, not a guessed offset.
+                for (size_t i = 0; i < P.paintedLabels.size(); ++i)
+                    for (size_t j = i + 1; j < P.paintedLabels.size(); ++j)
+                    {
+                        const auto& a = P.paintedLabels[i];
+                        const auto& b = P.paintedLabels[j];
+                        const auto ai = a.cell.withWidth (juce::jmax (1, (int) std::ceil (
+                                            std::min ((float) a.cell.getWidth(), a.textWidth))));
+                        const auto bi = b.cell.withWidth (juce::jmax (1, (int) std::ceil (
+                                            std::min ((float) b.cell.getWidth(), b.textWidth))));
+                        if (ai.intersects (bi))
+                        { ++over; if (overL.isEmpty()) overL = a.name + " / " + b.name; }
+                    }
+                std::printf ("  %s: %d painted labels, %d clipped%s, %d overprinting%s\n",
+                             lang == 1 ? "catalan" : "english", (int) P.paintedLabels.size(), clipped,
+                             clipped > 0 ? (" (worst: " + worstL + " by "
+                                            + juce::String ((int) worstOverflow) + " px)").toRawUTF8() : "",
+                             over, over > 0 ? (" (" + overL + ")").toRawUTF8() : "");
+                check (! P.paintedLabels.empty() && clipped == 0,
+                       lang == 1 ? "no painted sub-label clips in Catalan"
+                                 : "no painted sub-label clips in English");
+                check (over == 0, lang == 1 ? "and none of them overprints another (Catalan)"
+                                            : "and none of them overprints another (English)");
+
+                // ...and the same for the Label COMPONENTS. These squash to 70% instead
+                // of clipping, so an undersized cell shows a readable-but-condensed word
+                // that passes every bounds check in the build and still looks broken.
+                int squeezed = 0; juce::String worstC; float worstRatio = 1.0f;
+                for (const auto& s : P.componentLabels)
+                {
+                    const float need = s.textWidth + 2.0f; // Label's own 2 px text inset
+                    if (need > (float) s.cell.getWidth())
+                    {
+                        ++squeezed;
+                        const float r = (float) s.cell.getWidth() / juce::jmax (1.0f, need);
+                        if (r < worstRatio)
+                        { worstRatio = r; worstC = s.name + " \"" + s.text + "\""; }
+                    }
+                }
+                std::printf ("  %s: %d label components, %d condensed%s\n",
+                             lang == 1 ? "catalan" : "english", (int) P.componentLabels.size(), squeezed,
+                             squeezed > 0 ? (" (worst: " + worstC + " at "
+                                             + juce::String ((int) (worstRatio * 100.0f)) + "%)").toRawUTF8() : "");
+                check (squeezed == 0,
+                       lang == 1 ? "no label component is squashed to fit (Catalan)"
+                                 : "no label component is squashed to fit (English)");
+            }
+        }
+
+        // THE RIGHT COLUMN, MODE BY MODE. It re-lays itself completely for each of the
+        // four shapes it can take, and until now only the first was ever measured - so a
+        // row added to the adaptation (its "between lo hi" range) or to the free chord
+        // search (Find + REALTIME) could push the results list, or itself, out of the box
+        // with nothing to notice. Swept in BOTH languages, because the captions in there
+        // are the longest in the window.
+        if (ed != nullptr)
+        {
+            struct Shape { int mode, source, goal; const char* what; };
+            const Shape shapes[] = {
+                { 1, 1, 1, "search, from the current tuning" },
+                { 1, 2, 1, "search, from all possible tunings (Find + REALTIME)" },
+                { 2, 1, 1, "adapt, goal Min" },
+                { 2, 1, 3, "adapt, goal Range (the extra lo/hi row)" },
+                { 3, 1, 1, "from the spectrum's segment" } };
+            for (const auto& sh : shapes)
+            {
+                ed->setSpecModeForTests (sh.mode);
+                ed->setTuneSourceForTests (sh.source);
+                ed->setAdaptGoalForTests (sh.goal);
+                ed->resized();
+                for (int lang = 0; lang < 2; ++lang)
+                {
+                    const auto P = ed->layoutProbeInLanguage (lang == 1);
+                    int outside = 0, squashed = 0, condensed = 0;
+                    juce::String first;
+                    for (const auto& c : P.controls)
+                    {
+                        if (! c.first.startsWith ("spec.")) continue;
+                        if (! P.specColumn.contains (c.second))
+                        { ++outside; if (first.isEmpty()) first = c.first + " out"; }
+                        if (c.second.getHeight() < 12 || c.second.getWidth() < 10)
+                        { ++squashed; if (first.isEmpty()) first = c.first + " squashed"; }
+                    }
+                    for (const auto& s : P.componentLabels)
+                        if (s.name.startsWith ("spec.") && s.textWidth + 2.0f > (float) s.cell.getWidth())
+                        { ++condensed; if (first.isEmpty()) first = s.name + " \"" + s.text + "\" condensed"; }
+                    std::printf ("  %s [%s]: %d out, %d squashed, %d condensed%s\n",
+                                 lang == 1 ? "ca" : "en", sh.what, outside, squashed, condensed,
+                                 first.isEmpty() ? "" : (" (" + first + ")").toRawUTF8());
+                    check (outside + squashed + condensed == 0,
+                           "this mode's whole column fits, unsquashed and uncondensed");
+
+                    // A COMBO IS NOT A LABEL and the condensing rule above cannot see it:
+                    // a ComboBox given too little room draws its arrow and clips the word
+                    // silently. The adaptation's register row packs a caption, two note
+                    // fields and this box onto one 186 px line, and the Catalan words are
+                    // the longer ones ("Registres", "pitjor") - so the box that ends up
+                    // with whatever is left over is measured explicitly.
+                    if (sh.mode == 2)
+                        for (const auto& c : P.controls)
+                            if (c.first == "spec.agg")
+                            {
+                                std::printf ("    aggregate box: %d px wide (%s)\n",
+                                             c.second.getWidth(), lang == 1 ? "ca" : "en");
+                                check (c.second.getWidth() >= 50,
+                                       "the mean/minimax box keeps room for its word beside its arrow");
+                            }
+                }
+            }
+            ed->setSpecModeForTests (1);
+            ed->setTuneSourceForTests (1);
+            ed->setAdaptGoalForTests (1);
+        }
+
+        // SWITCHING LANGUAGE MUST NOT DESELECT ANYTHING. Re-wording a juce::ComboBox is
+        // the one operation that can silently clear it: getSelectedId() compares the
+        // VISIBLE label against the selected item's text, so it reads 0 for as long as
+        // the two disagree - which is exactly the window changeItemText() opens. Feeding
+        // that 0 back to setSelectedId() (the obvious "refresh the displayed text" line)
+        // cleared the selection for good, and a Spectrum-vs-Tuning mode of 0 gates that
+        // whole panel off: no Notes, no Period, no Find, no REALTIME, no results list,
+        // until the plugin was reopened. Two full round-trips, because the damage only
+        // showed on the SECOND switch.
+        if (ed != nullptr)
+        {
+            const auto base = ed->layoutProbe().comboIds;
+            for (int round = 0; round < 2; ++round)
+                for (int lang = 0; lang < 2; ++lang)
+                    ed->layoutProbeInLanguage (lang == 1); // leaves the language it found
+            const auto after = ed->layoutProbe().comboIds;
+            int lost = 0, changed = 0;
+            juce::String firstLost;
+            for (size_t i = 0; i < base.size() && i < after.size(); ++i)
+            {
+                if (after[i].second != base[i].second)
+                {
+                    ++changed;
+                    if (after[i].second == 0) { ++lost; if (firstLost.isEmpty()) firstLost = base[i].first; }
+                    else if (firstLost.isEmpty()) firstLost = base[i].first;
+                }
+            }
+            std::printf ("  %d localised combos, %d changed by 2 language round-trips (%d deselected)%s\n",
+                         (int) base.size(), changed, lost,
+                         firstLost.isEmpty() ? "" : (" (first: " + firstLost + ")").toRawUTF8());
+            check (! base.empty() && base.size() == after.size() && changed == 0,
+                   "switching language keeps every combo's selection (it never deselects one)");
+        }
+
+        // Selecting the other engine must recolour the WHOLE panel, not just light a
+        // chip - and the colour it lands on has to clear its neighbours too, which is
+        // the harder half (the Custom Engine's pink sits above the Tuning box's purple).
+        // Temper mode then hands the spectrum back to the harmonic engine, so the panel
+        // must go back to blue while the custom scale is bypassed.
+        if (ed != nullptr)
+        {
+            using E = FractalAdditiveAudioProcessor::EngineInForce;
+            // Pass 2 above left the Custom Engine ON (loading a scale switches it on),
+            // so step back to the harmonic engine first or "blue" would be pink.
+            p.setTimbreEnabled (false);
+            ed->refreshEngineDressing();
+            const auto blue = ed->layoutProbe().panelColour;
+            p.setTimbreEnabled (true);
+            ed->refreshEngineDressing();
+            const auto pink = ed->layoutProbe().panelColour;
+            check (p.engineInForce() == E::CustomScale, "the CUSTOM engine is in force");
+            check (pink != blue, "selecting it recolours the whole panel, it does not just light a chip");
+            checkPanelColour (pink, "custom engine selected");
+
+            auto* tt = p.apvts.getParameter ("timbreTemper");
+            tt->setValueNotifyingHost (1.0f);
+            ed->refreshEngineDressing();
+            check (p.engineInForce() == E::Tempered, "ticking Temper (inside the Custom Engine box) takes over");
+            check (ed->layoutProbe().panelColour == blue,
+                   "and the panel goes back to the harmonic engine's colour, which is what is generating");
+            tt->setValueNotifyingHost (0.0f);
+            p.setTimbreEnabled (false);
+            ed->refreshEngineDressing();
+        }
+
+        // The empty-workspace pin. With ONE shared box, the Load button and the
+        // intervals editor only exist inside the CUSTOM view - so with no scale loaded
+        // the CUSTOM chip must still open that view (sound honestly staying harmonic),
+        // or creating a custom spectrum is simply impossible. This is measured through
+        // the chips' own onClick, because engineInForce alone cannot see it.
+        if (ed != nullptr)
+        {
+            using E = FractalAdditiveAudioProcessor::EngineInForce;
+            p.clearTimbre();               // truly nothing loaded
+            ed->refreshEngineDressing();
+            auto hasControl = [&] (const char* name)
+            {
+                for (const auto& c : ed->layoutProbe().controls)
+                    if (c.first == name) return true;
+                return false;
+            };
+            check (hasControl ("harm.baseN") && ! hasControl ("cust.intervals"),
+                   "no scale loaded: the box opens on the harmonic view");
+            ed->clickEngineChipForTests (1);
+            check (hasControl ("cust.intervals") && hasControl ("cust.load")
+                   && ! hasControl ("harm.baseN"),
+                   "clicking CUSTOM with nothing loaded still opens its view (Load + intervals reachable)");
+            check (p.engineInForce() == E::Harmonic,
+                   "while the SOUND honestly stays harmonic (there is no scale to sound)");
+            ed->clickEngineChipForTests (0);
+            check (hasControl ("harm.baseN") && ! hasControl ("cust.intervals"),
+                   "and HARMONIC brings its view back");
+
+            // THE PIN vs AUTOMATION. The pin is editor-side state; engineInForce() is the
+            // processor's. A host writing the engine parameters while the pin is up is the
+            // one way the two could end up saying different things - a lit CUSTOM chip
+            // over a harmonic sound, with no click anywhere to blame. The pin may only
+            // ever hold an EMPTY workspace open, so any real non-harmonic engine state
+            // has to supersede it the moment it is observed.
+            ed->clickEngineChipForTests (1);            // pin the custom view (nothing loaded)
+            check (hasControl ("cust.intervals"), "precondition: the empty workspace is pinned open");
+            p.apvts.getParameter ("timbreTemper")->setValueNotifyingHost (1.0f); // automation
+            ed->refreshEngineDressing();                // what the 30 Hz timer does
+            check (p.engineInForce() == E::Tempered, "automation put the plugin in temper mode");
+            check (hasControl ("harm.baseN") && ! hasControl ("cust.intervals"),
+                   "and the pinned view gives way to it - the panel never contradicts the sound");
+            p.apvts.getParameter ("timbreTemper")->setValueNotifyingHost (0.0f);
+            ed->refreshEngineDressing();
+            check (hasControl ("harm.baseN") && ! hasControl ("cust.intervals"),
+                   "and the pin stays cleared afterwards, rather than springing back");
+
+            // ...and the same for a scale arriving from outside while the pin is up: the
+            // view it was holding open is now the real one, so nothing on screen moves,
+            // but the pin itself must be gone (the sound, not the click, owns the view).
+            ed->clickEngineChipForTests (1);
+            juce::String terr;
+            p.loadTimbreText ("5/4 3/2 2", terr);       // e.g. a preset or an undo
+            ed->refreshEngineDressing();
+            check (p.engineInForce() == E::CustomScale && hasControl ("cust.intervals"),
+                   "a scale arriving from outside makes the pinned view the REAL one");
+            p.setTimbreEnabled (false);
+            ed->refreshEngineDressing();
+            check (hasControl ("harm.baseN") && ! hasControl ("cust.intervals"),
+                   "and switching that engine off returns to harmonic - the stale pin does not hold it open");
+            p.clearTimbre();
+            ed->refreshEngineDressing();
+        }
+
+        // THE PANEL'S OWN WIRING, through the same callbacks a click runs.
+        if (ed != nullptr)
+        {
+            using RtLink = FractalAdditiveAudioProcessor::RtLink;
+            // (1) Each mode brings its own Period. The search wants 2/1; the adaptation
+            //     wants room for its partials and starts at 8/1. A value the user types
+            //     stays with the mode it was typed in - it is parked, never destroyed.
+            ed->setSpecModeForTests (1);
+            check (ed->panelProbeForTests().period == "2", "the tuning search's Period starts at 2");
+            ed->setSpecModeForTests (2);
+            check (ed->panelProbeForTests().period == "8", "the spectrum adaptation's Period starts at 8");
+            ed->setPeriodTextForTests ("3");
+            ed->setSpecModeForTests (1);
+            check (ed->panelProbeForTests().period == "2",
+                   "typing 3 in the adaptation does not change the search's own Period");
+            ed->setSpecModeForTests (2);
+            check (ed->panelProbeForTests().period == "3",
+                   "and coming back finds the 3 that was typed there, not the default again");
+            ed->setPeriodTextForTests ("8");
+
+            // (2) REALTIME follows WHAT IS PLAYED. Deliberately left on "to the loaded
+            //     tuning" first: that is exactly the state the complaint came from, where
+            //     the follower kept re-applying the whole loaded scale as the spectrum.
+            ed->setAdaptTargetForTests (1);
+            check (p.getRealtimeLink() == RtLink::Off, "precondition: no link yet");
+            ed->pressAdaptRealtimeForTests();
+            const auto probe = ed->panelProbeForTests();
+            check (p.getRealtimeLink() == RtLink::SpectrumFromChord,
+                   "pressing REALTIME follows the HELD NOTES even with the target left on the loaded tuning");
+            check (probe.adaptTarget == 2 && ! probe.adaptTargetEnabled,
+                   "and the target box says so, and waits, instead of claiming a target the link is not using");
+            ed->pressAdaptRealtimeForTests();
+            const auto after = ed->panelProbeForTests();
+            check (p.getRealtimeLink() == RtLink::Off, "pressing it again ends the link");
+            check (after.adaptTarget == 1 && after.adaptTargetEnabled,
+                   "and hands the target box back with the choice the user had made");
+            ed->setSpecModeForTests (1);
+
+            // (3) A REALTIME LINK SURVIVES THE WINDOW BEING CLOSED - so a REOPENED editor
+            //     has to adopt it. It used to open on "Find tunings" with both REALTIME
+            //     flags false while the processor went on adapting the spectrum to every
+            //     chord: nothing lit said so, the first press of REALTIME only caught the
+            //     button up with the link (two presses to stop it), and any unrelated
+            //     touch on the panel called syncRealtimeLink() and killed the user's
+            //     follower unasked.
+            ed->setSpecModeForTests (2);
+            ed->pressAdaptRealtimeForTests();
+            check (p.getRealtimeLink() == RtLink::SpectrumFromChord, "a link is running");
+            base.reset();                                   // close the window, link keeps running
+            check (p.getRealtimeLink() == RtLink::SpectrumFromChord,
+                   "closing the editor leaves it running (the follower lives in the processor)");
+            base.reset (p.createEditor());
+            ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+            check (ed != nullptr && ed->panelProbeForTests().mode == 2,
+                   "the reopened editor opens on the submenu that owns the running link");
+            if (ed != nullptr)
+            {
+                check (! ed->panelProbeForTests().adaptTargetEnabled,
+                       "with the target box locked to the held chord, exactly as while it was armed");
+                ed->pressAdaptRealtimeForTests();
+                check (p.getRealtimeLink() == RtLink::Off,
+                       "and ONE press of REALTIME stops it (it used to take two)");
+            }
         }
     }
 
@@ -2567,7 +3029,11 @@ int main()
             st.partials = 8; st.periodRatio = 2.0; st.minGapCents = 50.0;
             st.rootOnly = true; st.goal = 0; st.shapeAmps = true;
 
-            const double beforeReal = p.measureCurrentAgainstTarget (alphas, f0, true);
+            // The registers this run will use, resolved by the processor's own helper -
+            // "really sounding" has to be measured over the same ones the search optimised
+            // or the two numbers printed side by side would be on different scales.
+            const auto regs = Proc::adaptRegistersFor (st, f0, /*realtime*/ false);
+            const double beforeReal = p.measureCurrentAgainstTarget (alphas, f0, true, regs);
             juce::String err;
             check (p.startSpectrumAdapt (st, alphas, f0, err), "the adaptation starts");
             for (int i = 0; i < 2000 && p.isSpectrumAdaptRunning(); ++i) juce::Thread::sleep (5);
@@ -2577,9 +3043,29 @@ int main()
 
             const int reps = (int) p.apvts.getRawParameterValue ("timbreRepeats")->load();
             const int want = st.partials * juce::jmax (1, reps);
-            const double afterReal = p.measureCurrentAgainstTarget (alphas, f0, true);
+            const double afterReal = p.measureCurrentAgainstTarget (alphas, f0, true, regs);
             std::printf ("  12ED2 x 8 partials: model %.2f -> %.2f, really sounding %.2f -> %.2f\n",
                          info.before, info.after, beforeReal, afterReal);
+            // THE REGISTER RANGE, end to end through the real processor. A settings block
+            // with no range set means AUTO - an octave either side of the anchor - and the
+            // result must SAY which registers it was optimised for, because with a
+            // single-pitch objective (the bug this replaces) the answer is different.
+            std::printf ("  registers: %d points, %.2f..%.2f Hz (anchor %.2f), %s\n",
+                         info.regPoints, info.regLoHz, info.regHiHz, f0,
+                         info.aggregate == 1 ? "minimax" : "mean");
+            check (info.regPoints == 3 && std::abs (info.regLoHz - f0 * 0.5) < 1.0e-6
+                   && std::abs (info.regHiHz - f0 * 2.0) < 1.0e-6,
+                   "an unset range is an octave either side of the anchor, sampled at three registers");
+            check ((int) info.perRegister.size() == info.regPoints
+                   && (int) info.registerF0.size() == info.regPoints,
+                   "and the result carries one measured number per register");
+            check (info.mean <= info.worst + 1.0e-12 && info.after <= info.seedWorst,
+                   "the aggregate read-outs are consistent (mean never above the worst register)");
+            // The realtime follower's cap is a STATED difference, not a silent one: at this
+            // two-octave range it samples exactly as densely as the Adapt button does.
+            const auto rtRegs = Proc::adaptRegistersFor (st, f0, /*realtime*/ true);
+            check (rtRegs.f0.size() == regs.f0.size(),
+                   "and at the default two-octave range realtime samples exactly as densely");
             std::printf ("  compiled partials: %d (asked %d x %d periods)\n",
                          t != nullptr ? (int) t->partials.size() : -1, st.partials, reps);
             check (afterReal < beforeReal, "the spectrum the synth REALLY makes beats less against that tuning");
@@ -2655,8 +3141,10 @@ int main()
             // An ABSOLUTE bound, deliberately not derived from kRtTuneTicks: computing the
             // allowance from the very constant under test made the check pass at any
             // throttle setting at all, including none (200 changes -> 110 searches sailed
-            // through it). "A handful per 200 spectrum changes" is the behaviour promised.
-            constexpr int allowed = 8;
+            // through it). The promise is "at most a few searches a second"; the floor came
+            // down from one second to a third when the search itself got ~5x faster, so the
+            // number here follows it - and still fails an unthrottled follower by 9x.
+            constexpr int allowed = 12;
             std::printf ("  %d spectrum changes -> %d searches started, %d retunes applied "
                          "(throttle allows at most %d)\n", kTicks, starts, applies, allowed);
             check (starts >= 2, "the follower keeps searching as the spectrum keeps moving");
@@ -2677,6 +3165,111 @@ int main()
                    "one Ctrl+Z after switching realtime off leaves the follower's tuning behind");
         }
 
+        //-- (c2) REALTIME "the spectrum follows what you PLAY". The complaint this answers:
+        //   with the target left on the loaded tuning, the follower kept writing the loaded
+        //   scale into the spectrum for ever ("en 12ED2 me pone 12ED2 como espectro todo el
+        //   rato"). It has to watch the KEYS instead, and it has to sit still when they are
+        //   not moving - re-adapting to an unchanged chord is what made it feel stuck.
+        {
+            setP ("timbreTemper", 0.0f);
+            Proc::RtSettings rs;
+            rs.adapt.partials = 4;          // small: this measures WHEN it adapts, not how well
+            rs.adapt.periodRatio = 2.0; rs.adapt.minGapCents = 50.0; rs.adapt.rootOnly = true;
+            rs.adapt.goal = 0; rs.adapt.shapeAmps = false;
+
+            auto tick = [&p, &buf] (int n)
+            {
+                for (int i = 0; i < n; ++i)
+                {
+                    juce::MidiBuffer none;
+                    p.processBlock (buf, none);          // republishes the held chord
+                    p.pollParametersForTests();          // one 60 Hz link tick
+                    juce::Thread::sleep (1);
+                }
+            };
+            auto keys = [&p, &buf] (bool on, std::initializer_list<int> notes)
+            {
+                juce::MidiBuffer m;
+                for (const int k : notes)
+                    m.addEvent (on ? juce::MidiMessage::noteOn (1, k, (juce::uint8) 100)
+                                   : juce::MidiMessage::noteOff (1, k), 0);
+                p.processBlock (buf, m);
+            };
+            auto settle = [&p, &tick] { for (int i = 0; i < 400 && p.isSpectrumAdaptRunning(); ++i) tick (1); tick (3); };
+
+            p.setRealtimeLink (Proc::RtLink::SpectrumFromChord, rs);
+            tick (60);
+            const int idleStarts = p.getRealtimeStarts();
+            std::printf ("  nothing held, 60 ticks -> %d adaptations started\n", idleStarts);
+            check (idleStarts == 0, "with no keys down the follower does nothing at all");
+
+            keys (true, { 60, 64, 67 });
+            settle();
+            const int afterChord = p.getRealtimeStarts();
+            const int appliedOne = p.getRealtimeApplies();
+            std::printf ("  C-E-G held -> %d started, %d applied\n", afterChord, appliedOne);
+            check (afterChord >= 1, "holding a chord makes it adapt to THAT chord");
+            check (appliedOne >= 1, "and the result reaches the spectrum");
+
+            tick (120);
+            settle();
+            std::printf ("  same chord held for another 120 ticks -> %d started (was %d)\n",
+                         p.getRealtimeStarts(), afterChord);
+            check (p.getRealtimeStarts() == afterChord,
+                   "and holding it still re-adapts NOTHING - an unchanged chord is not a new target");
+
+            keys (false, { 64 });                    // C-E-G becomes C-G: a different chord
+            keys (true,  { 65 });                    // ...plus F
+            settle();
+            std::printf ("  chord changed -> %d started\n", p.getRealtimeStarts());
+            check (p.getRealtimeStarts() > afterChord, "changing the notes DOES start a new adaptation");
+
+            //-- ONE NOTE IS A TARGET, not a reason to sit still.
+            //   The follower used to require two notes ("if (alphas.size() < 2) return"), so a
+            //   lead line, a bass line or one finger on the keyboard lit REALTIME and then
+            //   never adapted once, for ever. With a single key down the target set is {1.0},
+            //   the cross-note terms are gone, and what is left is the spectrum's own INTERNAL
+            //   roughness at that key's REAL pitch (Dissonance.h::targetScore) - exactly "the
+            //   least beating between the partials themselves".
+            const int beforeSolo   = p.getRealtimeStarts();
+            const int beforeSoloAp = p.getRealtimeApplies();
+            keys (false, { 60, 65 });                // C-F-G becomes G alone
+            tick (60); settle();
+            std::printf ("  down to ONE held note -> %d started (was %d), %d applied (was %d)\n",
+                         p.getRealtimeStarts(), beforeSolo, p.getRealtimeApplies(), beforeSoloAp);
+            check (p.getRealtimeStarts() > beforeSolo,
+                   "a SINGLE held note still adapts (its partials beat least against each other)");
+            check (p.getRealtimeApplies() > beforeSoloAp,
+                   "and that single-note result really reaches the spectrum");
+
+            const int soloStarts = p.getRealtimeStarts();
+            tick (120);
+            settle();
+            check (p.getRealtimeStarts() == soloStarts,
+                   "holding that one note still re-adapts nothing - one note is a target, not a treadmill");
+
+            //   ...and the SAME note an octave down is a different target: Sethares' critical
+            //   band is a width in Hz, so the register changes which partials beat least. If
+            //   this did not re-adapt, the single-note target would be anchored somewhere
+            //   other than the note actually sounding.
+            keys (false, { 67 });
+            keys (true,  { 55 });
+            tick (60); settle();
+            std::printf ("  the same note an octave DOWN -> %d started (was %d)\n",
+                         p.getRealtimeStarts(), soloStarts);
+            check (p.getRealtimeStarts() > soloStarts,
+                   "one note moved to another register is a NEW target and re-adapts");
+
+            const int beforeRelease = p.getRealtimeStarts();
+            keys (false, { 55 });
+            tick (120);
+            std::printf ("  keys up, 120 ticks -> %d started (was %d)\n",
+                         p.getRealtimeStarts(), beforeRelease);
+            check (p.getRealtimeStarts() == beforeRelease,
+                   "and letting go stops it dead instead of re-adapting to an empty hand");
+            p.setRealtimeLink (Proc::RtLink::Off, rs);
+        }
+
         //-- (d) THE FEEDBACK GUARD: temper mode makes the tuning build the spectrum, so a
         //   link the other way would chase itself for ever. It must refuse, not oscillate.
         {
@@ -2692,6 +3285,713 @@ int main()
                    "a realtime link refuses to run into temper mode's own tuning -> spectrum loop");
             check (p.getRealtimeRefusal().isNotEmpty(), "and says why instead of going quiet");
             setP ("timbreTemper", 0.0f);
+        }
+    }
+
+    // --- run 37: with morph OFF, a spectrum change FADES - it does not step ---------
+    // "cuando cambia el spectrum se escucha una transicion subita y abrupta entre un
+    //  espectro y otro, haz que sea smooth... que eso no intervenga en el morphing."
+    // The amplitudes used to slew over the fixed 7 ms de-click constant, so a large
+    // timbre change read as a hard cut. Measured directly: the 10%->90% rise time of a
+    // partial that APPEARS with the new template. Widening Spectrum Range from 2 to 10
+    // octaves only APPENDS partials past the old count, so harmonic 6 starts from a
+    // true zero at an unchanged frequency (rank-mapped changes make an appearing
+    // harmonic INHERIT a neighbouring rank's amplitude, which hides most of the rise).
+    {
+        std::printf ("morph OFF: an appearing partial's rise time:\n");
+        constexpr int eb = 64; constexpr double sr = 48000.0;
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (sr, eb);
+        auto s = [&] (const char* id, float v)
+        { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+          p->pollParametersForTests(); };
+        s ("morph", 0.0f);
+        s ("ampAttack", 0.001f); s ("ampDecay", 0.001f); s ("ampSustain", 1.0f); s ("ampRelease", 0.005f);
+        s ("fractalLevel", 1.0f); s ("curveSlope", 1.0f); s ("baseN", 1.0f);
+        s ("spectrumRange", 2.0f);                // ratio <= 4: harmonics 1..4 only
+        juce::AudioBuffer<float> b (2, eb);
+        auto pump = [&] (int blocks, std::vector<float>* out)
+        {
+            for (int i = 0; i < blocks; ++i)
+            { juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+              if (out != nullptr) for (int k = 0; k < eb; ++k) out->push_back (b.getReadPointer (0)[k]); }
+        };
+        juce::Thread::sleep (40); pump (40, nullptr);   // twice: the builder thread must
+        juce::Thread::sleep (40); pump (40, nullptr);   // publish the Odd template first
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+          b.clear(); p->processBlock (b, m); }
+        pump ((int) (0.5 * sr / eb), nullptr);          // settle on the narrow spectrum
+
+        const double f2 = 6.0 * p->getNoteFrequency (60);   // the partial that will appear
+        // Hann-windowed magnitude of ONE exact frequency (a direct DFT bin: no FFT grid,
+        // any window length). 12.5 ms window = fast enough to time a 7 ms step honestly.
+        auto mag = [&] (const std::vector<float>& x, size_t at, int len)
+        {
+            double re = 0.0, im = 0.0;
+            for (int i = 0; i < len && at + (size_t) i < x.size(); ++i)
+            {
+                const double w  = 0.5 - 0.5 * std::cos (2.0 * juce::MathConstants<double>::pi * i / (len - 1));
+                const double ph = 2.0 * juce::MathConstants<double>::pi * f2 * (double) i / sr;
+                re += w * (double) x[at + (size_t) i] * std::cos (ph);
+                im += w * (double) x[at + (size_t) i] * std::sin (ph);
+            }
+            return std::sqrt (re * re + im * im);
+        };
+
+        s ("spectrumRange", 10.0f);               // full range: harmonic 6 fades IN from zero
+        juce::Thread::sleep (25);                 // let the builder publish the new template
+        std::vector<float> tr;
+        pump ((int) (1.2 * sr / eb), &tr);
+
+        constexpr int win = 600, hop = 120;       // 12.5 ms window, 2.5 ms hop
+        std::vector<double> env;
+        for (size_t at = 0; at + (size_t) win <= tr.size(); at += (size_t) hop)
+            env.push_back (mag (tr, at, win));
+        double fin = 0.0; int fc = 0;
+        for (size_t i = env.size() >= 40 ? env.size() - 40 : 0; i < env.size(); ++i) { fin += env[i]; ++fc; }
+        fin /= std::max (1, fc);
+        int i10 = -1, i90 = -1;
+        for (size_t i = 0; i < env.size(); ++i)
+        {
+            if (i10 < 0 && env[i] >= 0.10 * fin) i10 = (int) i;
+            if (env[i] >= 0.90 * fin) { i90 = (int) i; break; }
+        }
+        const double riseMs = (i10 >= 0 && i90 >= i10) ? (i90 - i10) * hop * 1000.0 / sr : -1.0;
+        std::printf ("  10%%->90%% rise = %.1f ms (final mag %.4f)\n", riseMs, fin);
+        check (fin > 1.0e-4, "the appearing partial does arrive");
+        check (riseMs >= 40.0,  "a spectrum change with morph OFF is a real fade (>= 40 ms), not a 7 ms step");
+        check (riseMs <= 300.0, "...and stays a de-click, not an effect (<= 300 ms)");
+
+        // The hard-won regression guard: a FRESH note still starts ON its target spectrum
+        // (snapAmps), with no fade-in inherited from the template glide.
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+          b.clear(); p->processBlock (b, m); }
+        pump ((int) (0.4 * sr / eb), nullptr);    // release tail dies; the voice goes idle
+        std::vector<float> att;
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+          b.clear(); p->processBlock (b, m);
+          for (int k = 0; k < eb; ++k) att.push_back (b.getReadPointer (0)[k]); }
+        pump ((int) (0.5 * sr / eb), &att);
+        const double early = mag (att, (size_t) (0.010 * sr), win);   // 10..22.5 ms after note-on
+        const double susta = mag (att, (size_t) (0.400 * sr), win);
+        std::printf ("  fresh note: mag@10ms=%.4f  sustain=%.4f (%.0f%%)\n",
+                     early, susta, susta > 0.0 ? 100.0 * early / susta : 0.0);
+        check (susta > 1.0e-4 && early >= 0.7 * susta,
+               "a cold note still SNAPS onto the template (no fade-in regression)");
+    }
+
+    // --- run 38: morph ON under a STREAM of templates (the realtime-adaptive cadence) --
+    // "el morphing... tiene como un trompicon parece a veces cuando se usa con el
+    //  adaptive tuning."
+    // The realtime link applies a REAL new template every ~250-300 ms; with a Morph Time
+    // longer than that the glide never completes before the next target lands. Three
+    // stumbles lived in that regime, none of them a click (run 26 stays green through
+    // all of them) - each is a sudden SPECTRAL step, so the metric here is spectral
+    // flux: the L1 distance between consecutive Hann-window magnitude spectra,
+    // normalised by the mean spectrum magnitude. A morph that really glides moves a few
+    // percent per 10 ms hop; a bank snapping to a new template moves in one hop.
+    //   - a template landing MID-crossfade snapped alignInc, stepping the audible
+    //     destination bank onto the new frequencies at full weight;
+    //   - a template landing at weight >= 0.999 adopted the aligned PHASES but re-seeded
+    //     the glide from curRatio, jumping the audible frequencies backwards;
+    //   - when the stream ENDS, the amp slew flipped from Morph Time to 7 ms with ~37%
+    //     of the amplitude move still pending - a knee right at the settle.
+    {
+        std::printf ("morph under an adaptive-cadence template stream (spectral flux):\n");
+        constexpr int eb = 64; constexpr double sr = 48000.0;
+        constexpr int stepBlocks = (int) (0.30 * 48000.0 / 64.0);   // 300 ms of audio per template
+        struct Res { double stream, settle, jump; };
+        auto run = [&] (bool morphOn, const char* label)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr, eb);
+            auto s = [&] (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            s ("ampAttack", 0.002f); s ("ampDecay", 0.002f); s ("ampSustain", 1.0f);
+            s ("fractalLevel", 1.0f); s ("curveSlope", 2.0f); s ("baseN", 1.0f);
+            // Morph Time far LONGER than the template cadence - the reported regime.
+            // The crossfade weight then climbs toward 1 across several template
+            // arrivals, which is exactly where the old alignInc snap was heard at
+            // nearly full strength.
+            s ("morph", morphOn ? 1.0f : 0.0f); s ("morphTime", 2.0f);
+            juce::AudioBuffer<float> b (2, eb);
+            for (int i = 0; i < 60; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+            { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+              b.clear(); p->processBlock (b, m); }
+            for (int i = 0; i < 120; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+
+            std::vector<float> x;
+            auto pump = [&] (int blocks)
+            {
+                for (int i = 0; i < blocks; ++i)
+                { juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                  for (int k = 0; k < eb; ++k) x.push_back (b.getReadPointer (0)[k]); }
+            };
+            // 8 template changes 300 ms of audio apart - far faster than the 2 s morph -
+            // between a COUNT-jumping pair (base 1 <-> 3 triples the sub-Nyquist count).
+            for (int stepIdx = 0; stepIdx < 8; ++stepIdx)
+            {
+                s ("baseN", (stepIdx & 1) != 0 ? 1.0f : 3.0f);
+                juce::Thread::sleep (25);          // let the builder thread publish
+                pump (stepBlocks);
+            }
+            const size_t streamEnd = x.size();
+            pump ((int) (2.2 * sr / eb));          // the stream stops; the morph completes at ~+1.7 s
+
+            // Per-sample click metric (run 26's) alongside the flux, so a fix for the
+            // stumble can never smuggle a click back in.
+            double maxJump = 0.0, peak = 0.0;
+            for (size_t i = 0; i < x.size(); ++i)
+            {
+                peak = std::max (peak, (double) std::abs (x[i]));
+                if (i > 0) maxJump = std::max (maxJump, (double) std::abs (x[i] - x[i - 1]));
+            }
+
+            constexpr int fo = 10, fftN = 1 << fo, hop = 240;   // 21.3 ms window, 5 ms hop
+            juce::dsp::FFT fft (fo);
+            std::vector<float> buf (2 * (size_t) fftN);
+            std::vector<float> prevMag, curMag ((size_t) fftN / 2);
+            std::vector<std::vector<float>> settleMags;   // frames after the last change
+            double meanMag = 0.0, maxStream = 0.0, maxSettle = 0.0;
+            std::vector<double> flux;
+            size_t frames = 0;
+            // A frame belongs to the settle once its window starts AFTER the last change.
+            const size_t settleFrom = streamEnd / (size_t) hop + 1;
+            for (size_t at = 0; at + (size_t) fftN <= x.size(); at += (size_t) hop, ++frames)
+            {
+                std::fill (buf.begin(), buf.end(), 0.0f);
+                for (int i = 0; i < fftN; ++i)
+                    buf[(size_t) i] = (0.5f - 0.5f * std::cos (2.0f * juce::MathConstants<float>::pi
+                                                               * (float) i / (float) (fftN - 1)))
+                                    * x[at + (size_t) i];
+                fft.performFrequencyOnlyForwardTransform (buf.data());
+                std::copy (buf.begin(), buf.begin() + fftN / 2, curMag.begin());
+                double sum = 0.0, d = 0.0;
+                for (size_t k = 0; k < curMag.size(); ++k)
+                {
+                    sum += curMag[k];
+                    if (! prevMag.empty()) d += std::abs (curMag[k] - prevMag[k]);
+                }
+                meanMag += sum;
+                flux.push_back (prevMag.empty() ? 0.0 : d);
+                prevMag = curMag;
+                if (frames >= settleFrom) settleMags.push_back (curMag);
+            }
+            meanMag /= std::max<size_t> (1, frames);
+            for (size_t fi = 0; fi < flux.size() && fi < settleFrom; ++fi)
+                maxStream = std::max (maxStream, flux[fi] / std::max (1.0e-9, meanMag));
+
+            // The settle metric is the trajectory of the DISTANCE TO THE FINAL SPECTRUM,
+            // D(t) - an integral quantity, immune to the per-hop ripple of a working
+            // glide. A smooth settle spends D gradually; the amp-slew knee spent the
+            // whole remaining distance in ~15 ms the moment the morph completed. So the
+            // reported number is the largest one-hop RELATIVE drop of D, gated to frames
+            // still meaningfully far away (> 5% of the settle's starting distance).
+            if (settleMags.size() > 50)
+            {
+                std::vector<float> fin ((size_t) fftN / 2, 0.0f);
+                const size_t finFrom = settleMags.size() - 40;      // last 200 ms = settled
+                for (size_t fi = finFrom; fi < settleMags.size(); ++fi)
+                    for (size_t k = 0; k < fin.size(); ++k)
+                        fin[k] += settleMags[fi][k] / 40.0f;
+                std::vector<double> D (settleMags.size(), 0.0);
+                for (size_t fi = 0; fi < settleMags.size(); ++fi)
+                    for (size_t k = 0; k < fin.size(); ++k)
+                        D[fi] += std::abs (settleMags[fi][k] - fin[k]);
+                // Gated to frames still meaningfully far from the final spectrum, in
+                // BOTH senses: relative to the journey this settle actually makes, and
+                // absolute against the signal level - otherwise a control run that is
+                // already settled measures ratios of pure noise.
+                for (size_t fi = 0; fi + 1 < finFrom; ++fi)
+                    if (D[fi] > 0.05 * D[0] && D[fi] > 0.02 * meanMag)
+                        maxSettle = std::max (maxSettle, (D[fi] - D[fi + 1]) / D[fi]);
+            }
+            const double jr = peak > 0.0 ? maxJump / peak : 0.0;
+            std::printf ("  %-22s stream maxFlux=%.3f  settle maxDrop=%.2f  jump/peak=%.3f\n",
+                         label, maxStream, maxSettle, jr);
+            return Res { maxStream, maxSettle, jr };
+        };
+
+        const auto off = run (false, "morph off (control)");
+        const auto on  = run (true,  "morph on, 2 s");
+        check (off.stream > 0.0, "the control case actually made sound");
+        // The control snaps the whole spectrum every 300 ms, so its stream flux IS the
+        // size of one full step; a morph that genuinely glides must sit well below it.
+        // (Before the aligned bank glided, this measured 0.76x the control: once the
+        // crossfade weight neared 1, each new template snapped the audible spectrum.)
+        check (on.stream <= 0.5 * off.stream,
+               "mid-stream: every new target GLIDES - no audible step while templates keep landing");
+        // The last glide spends its remaining distance-to-final gradually; the old
+        // amp-slew knee spent nearly ALL of it in one 5 ms hop at morph completion.
+        check (on.settle <= 0.30,
+               "stream end: the morph settles with no amp-slew knee (bounded per-hop drop)");
+        check (on.jump <= off.jump * 2.5 + 0.02,
+               "and the smoothing never re-introduces a per-sample click");
+    }
+
+    // --- run 39: the state round-trip, done TWICE, byte for byte ---------------------
+    // Run 12 restores once and only compares the SIZE of the two blobs. A latched flag
+    // that dies on the SECOND restore (restored from the tree, then cleared again by the
+    // very code that restores the next child) keeps the size identical and the value
+    // wrong, and a user only ever meets it by reopening a project twice - or by a host
+    // that calls setStateInformation twice, which many do (once on load, once when the
+    // preset name is applied). So: build a state that latches everything at once - manual
+    // per-partial amplitudes ON with real edits, an absolute 128-key .tun with a period
+    // the user overrode, a typed custom spectrum, the segment picker - save, restore,
+    // save, restore, save, and require the last two blobs to be IDENTICAL BYTES.
+    {
+        std::printf ("state round-trip, restored twice:\n");
+        auto tmp = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                       .getChildFile ("fiblo_rt2_table.tun");
+        {
+            juce::String s ("; stretched, non-repeating\n[Exact Tuning]\nbasefreq=32.7032\n");
+            for (int n = 0; n < 128; ++n)
+            {
+                const double d = (double) (n - 60);
+                s << "note " << n << "=" << juce::String ((n - 24) * 100.0 + 0.002 * d * std::abs (d), 6) << "\n";
+            }
+            tmp.replaceWithText (s);
+        }
+
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 64);
+        juce::String err;
+
+        auto setQ = [&] (const char* id, float plain)
+        {
+            auto* q = p->apvts.getParameter (id);
+            q->setValueNotifyingHost (q->convertTo0to1 (plain));
+            p->pollParametersForTests();
+        };
+
+        check (p->loadScalaFile (tmp, err), "an absolute 128-key .tun loads");
+        check (p->setTuningTablePeriod ("3/2", err), "and takes a period the user typed over it");
+        check (p->loadTimbreText ("1/1 5/4 3/2 7/4 2/1", err), "a typed custom spectrum loads");
+        setQ ("timbreOn", 1.0f);
+        // Per-partial edits + manual mode: the pair the amplitude window latches.
+        {
+            std::vector<spectrum::PartialGain> g;
+            for (int i = 1; i <= 6; ++i)
+                g.push_back ({ (long long) (i * 120000), -1.5f * (float) i });
+            setQ ("partialManual", 1.0f);
+            p->setPartialGains (g, true);
+        }
+        p->setSegmentModeActive (true);
+        p->setSegmentPeriodText ("3/2");
+        p->setSegmentUseTopPeriod (true);
+        // Arm the adaptive realtime follower, exactly as pressing REALTIME does.
+        {
+            FractalAdditiveAudioProcessor::RtSettings s;
+            s.adapt.partials = 6;
+            p->setRealtimeLink (FractalAdditiveAudioProcessor::RtLink::SpectrumFromChord, s);
+        }
+
+        // The three saves, with a full restore between each.
+        juce::MemoryBlock a, b, c;
+        p->getStateInformation (a);
+        p->setStateInformation (a.getData(), (int) a.getSize());
+        p->pollParametersForTests();
+        p->getStateInformation (b);
+        p->setStateInformation (b.getData(), (int) b.getSize());
+        p->pollParametersForTests();
+        p->getStateInformation (c);
+
+        std::printf ("  blob sizes %d / %d / %d bytes\n",
+                     (int) a.getSize(), (int) b.getSize(), (int) c.getSize());
+        check (b.getSize() == c.getSize() && b == c,
+               "restoring twice gives byte-identical state (no flag dies on the second pass)");
+
+        // ...and every latched thing is still what it was, after TWO restores.
+        check (p->tuningIsAbsoluteTable(), "still an absolute 128-key table");
+        check (p->tuningTablePeriodIsUserSet() && p->getScaleDegrees() == 7,
+               "the period the user typed over the table survived both restores");
+        std::printf ("  custom spectrum after 2 restores: loaded=%d degrees=%d active=%d\n",
+                     (int) p->timbreLoaded(), p->getTimbreNoteCount(), (int) p->isTimbreActive());
+        check (p->timbreLoaded() && p->getTimbreNoteCount() == 4,
+               "the typed custom spectrum survived both restores");
+        check (p->apvts.getRawParameterValue ("partialManual")->load() > 0.5f,
+               "manual per-partial amplitudes are still ON");
+        check ((int) p->getPartialGains().size() == 6,
+               "and all six per-partial edits came back");
+        check (p->isSegmentModeActive(), "the segment picker is still the active mode");
+    }
+
+    // --- run 40: the 50 ms fade against a FRESH note, and against MORPH ----------------
+    // Two claims about b347c02's template glide that run 37 does not reach.
+    //
+    // (a) It is armed PER VOICE and held for ~200 ms. Run 37's regression note is struck
+    //     on a plugin that has been idle for 400 ms; this one is struck 50 ms after the
+    //     spectrum changed under a sounding note, so the voice it lands on is carrying an
+    //     armed fade. snapAmps has to win there too, or turning a knob while playing puts
+    //     a 50 ms fade-in on the very next note.
+    //
+    // (b) With morph ON the fade must not STACK on the morph. The two are alternatives in
+    //     one `glideTarget`, never a sum - so with Morph Time at its minimum an appearing
+    //     partial has to arrive FASTER than the 50 ms morph-off fade, not slower.
+    //
+    // Measured with run 37's instrument (a Hann-windowed magnitude of ONE partial's exact
+    // frequency), because per-voice normalisation recomputes normGain from the amplitudes
+    // that are actually sounding: the total level therefore does NOT move while the
+    // partials glide, and an RMS or peak envelope of the output is blind to all of this.
+    {
+        std::printf ("the 50 ms fade vs a fresh note, and vs morph:\n");
+        constexpr int eb = 64; constexpr double sr4 = 48000.0;
+        constexpr int win = 600, hop = 120;   // 12.5 ms window, 2.5 ms hop (as run 37)
+
+        struct Rig
+        {
+            // A locally defined class can neither reach the enclosing constexpr nor hold a
+            // static data member of its own, so the block size is an ordinary field.
+            int eb = 64;
+            std::unique_ptr<FractalAdditiveAudioProcessor> p;
+            juce::AudioBuffer<float> b { 2, 64 };
+            void set (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); }
+            void pump (int blocks, std::vector<float>* out)
+            {
+                for (int i = 0; i < blocks; ++i)
+                { juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                  if (out != nullptr) for (int k = 0; k < eb; ++k) out->push_back (b.getReadPointer (0)[k]); }
+            }
+            void key (bool on, int n, std::vector<float>* out = nullptr)
+            {
+                juce::MidiBuffer m;
+                m.addEvent (on ? juce::MidiMessage::noteOn (1, n, (juce::uint8) 100)
+                               : juce::MidiMessage::noteOff (1, n), 0);
+                b.clear(); p->processBlock (b, m);
+                if (out != nullptr) for (int k = 0; k < eb; ++k) out->push_back (b.getReadPointer (0)[k]);
+            }
+        };
+        auto mag = [sr4] (const std::vector<float>& x, size_t at, int len, double f)
+        {
+            double re = 0.0, im = 0.0;
+            for (int i = 0; i < len && at + (size_t) i < x.size(); ++i)
+            {
+                const double w  = 0.5 - 0.5 * std::cos (2.0 * juce::MathConstants<double>::pi * i / (len - 1));
+                const double ph = 2.0 * juce::MathConstants<double>::pi * f * (double) i / sr4;
+                re += w * (double) x[at + (size_t) i] * std::cos (ph);
+                im += w * (double) x[at + (size_t) i] * std::sin (ph);
+            }
+            return std::sqrt (re * re + im * im);
+        };
+        // Exactly run 37's arrangement: Spectrum Range 2 -> 10 only APPENDS partials, so
+        // harmonic 6 rises from a true zero at an unchanged frequency.
+        auto build = [&] (bool morphOn, float morphTime)
+        {
+            auto r = std::make_unique<Rig>();
+            r->p = std::make_unique<FractalAdditiveAudioProcessor>();
+            r->p->prepareToPlay (sr4, eb);
+            r->set ("morph", morphOn ? 1.0f : 0.0f);
+            r->set ("morphTime", morphTime);
+            r->set ("ampAttack", 0.001f); r->set ("ampDecay", 0.001f);
+            r->set ("ampSustain", 1.0f);  r->set ("ampRelease", 0.005f);
+            r->set ("fractalLevel", 1.0f); r->set ("curveSlope", 1.0f); r->set ("baseN", 1.0f);
+            r->set ("spectrumRange", 2.0f);
+            juce::Thread::sleep (40); r->pump (40, nullptr);
+            juce::Thread::sleep (40); r->pump (40, nullptr);
+            return r;
+        };
+        auto riseMsOf = [&] (const std::vector<float>& tr, double f)
+        {
+            std::vector<double> env;
+            for (size_t at = 0; at + (size_t) win <= tr.size(); at += (size_t) hop)
+                env.push_back (mag (tr, at, win, f));
+            double fin = 0.0; int fc = 0;
+            for (size_t i = env.size() >= 40 ? env.size() - 40 : 0; i < env.size(); ++i) { fin += env[i]; ++fc; }
+            fin /= std::max (1, fc);
+            int i10 = -1, i90 = -1;
+            for (size_t i = 0; i < env.size(); ++i)
+            {
+                if (i10 < 0 && env[i] >= 0.10 * fin) i10 = (int) i;
+                if (env[i] >= 0.90 * fin) { i90 = (int) i; break; }
+            }
+            return std::pair<double, double> { (i10 >= 0 && i90 >= i10) ? (i90 - i10) * hop * 1000.0 / sr4 : -1.0,
+                                               fin };
+        };
+
+        //-- (a) a fresh note onto a voice whose fade is armed.
+        {
+            auto r = build (false, 0.3f);
+            r->key (true, 60);
+            r->pump ((int) (0.5 * sr4 / eb), nullptr);
+            const double f6 = 6.0 * r->p->getNoteFrequency (60);
+            r->set ("spectrumRange", 10.0f);          // arms the 50 ms fade on this voice
+            juce::Thread::sleep (25);                 // the builder publishes (no audio yet)
+            // Only 5 ms of the fade: harmonic 6 is still near ZERO on this voice, so a
+            // fresh note that inherited the fade instead of snapping would go on creeping
+            // up from there and read a fraction of its sustain at 10 ms.
+            r->pump ((int) (0.005 * sr4 / eb), nullptr);
+            // Release and re-strike the same key in one block: the fresh note lands on the
+            // voice that is carrying the armed fade.
+            {
+                juce::MidiBuffer m;
+                m.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+                m.addEvent (juce::MidiMessage::noteOn  (1, 60, (juce::uint8) 100), 0);
+                r->b.clear(); r->p->processBlock (r->b, m);
+            }
+            std::vector<float> att;
+            for (int k = 0; k < eb; ++k) att.push_back (r->b.getReadPointer (0)[k]);
+            r->pump ((int) (0.5 * sr4 / eb), &att);
+            const double early = mag (att, (size_t) (0.010 * sr4), win, f6);
+            const double susta = mag (att, (size_t) (0.400 * sr4), win, f6);
+            std::printf ("  fresh note onto an ARMED voice: mag@10ms=%.4f sustain=%.4f (%.0f%%)\n",
+                         early, susta, susta > 0.0 ? 100.0 * early / susta : 0.0);
+            // Note what this can and cannot see. A 50 ms fade would read 18-36% here, so
+            // the bar catches the leak this exists for. It cannot distinguish a snap from
+            // the ordinary 7 ms de-click slew, and it cannot be made to FAIL by breaking
+            // one mechanism alone: curAmp is not zeroed on note-off (the envelope is what
+            // silences a note), so a voice re-struck on the same spectrum has nothing left
+            // to glide even with snapAmps and the per-note reset both disabled. Three
+            // independent guards cover this - snapAmps on a cold note, and
+            // tmplGlideSamps/ampGlideCur reset on EVERY note-on, steal included.
+            check (susta > 1.0e-4 && early >= 0.7 * susta,
+                   "a note struck into an armed template fade still SNAPS onto its target");
+        }
+
+        //-- (b) morph ON at its shortest must not be SLOWER than the morph-off fade.
+        {
+            auto off = build (false, 0.3f);
+            off->key (true, 60);
+            off->pump ((int) (0.5 * sr4 / eb), nullptr);
+            const double f6 = 6.0 * off->p->getNoteFrequency (60);
+            off->set ("spectrumRange", 10.0f);
+            juce::Thread::sleep (25);
+            std::vector<float> a; off->pump ((int) (1.2 * sr4 / eb), &a);
+            const auto ro = riseMsOf (a, f6);
+
+            auto on = build (true, 0.0f);   // Morph Time at its minimum
+            on->key (true, 60);
+            on->pump ((int) (0.5 * sr4 / eb), nullptr);
+            on->set ("spectrumRange", 10.0f);
+            juce::Thread::sleep (25);
+            std::vector<float> c; on->pump ((int) (1.2 * sr4 / eb), &c);
+            const auto rn = riseMsOf (c, f6);
+
+            std::printf ("  appearing partial rise: morph OFF %.1f ms, morph ON at min Morph Time %.1f ms\n",
+                         ro.first, rn.first);
+            check (ro.second > 1.0e-4 && rn.second > 1.0e-4, "the partial arrives in both");
+            // Bounded on BOTH sides. `>= 40` is run 37's claim (it is a real fade, not a
+            // 7 ms step); the upper bound is what makes stacking visible - adding
+            // kTmplGlideSec to the morph term instead of choosing between them takes this
+            // number from 70 ms to 85 ms, and nothing else in the build would notice.
+            check (ro.first >= 40.0 && ro.first <= 78.0,
+                   "morph OFF is exactly ONE 50 ms fade - not a fade plus something else");
+            check (rn.first >= 0.0 && rn.first < ro.first,
+                   "morph ON at its minimum is FASTER - the fade and the morph are alternatives, never a sum");
+        }
+    }
+
+    // --- run 41: rapid sequences, lifecycle and parameter edges -----------------------
+    // Everything here is a state the panel can reach in a second of ordinary use and that
+    // no test drove before: a switch thrown mid-note, a file loaded while a worker runs,
+    // an undo across an engine change, and every parameter at both ends of its range.
+    // The bar is deliberately blunt - the plugin must keep making finite audio and must
+    // never lose the user's scale - because that is exactly what these sequences broke.
+    {
+        std::printf ("rapid sequences, lifecycle, parameter edges:\n");
+        constexpr double sr3 = 48000.0;
+        constexpr int    blk3 = 64;
+        juce::AudioBuffer<float> buf (2, blk3);
+
+        auto finite = [&buf] (const juce::AudioBuffer<float>& b)
+        {
+            for (int ch = 0; ch < b.getNumChannels(); ++ch)
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                {
+                    const float v = b.getSample (ch, i);
+                    if (! std::isfinite (v) || std::abs (v) > 8.0f) return false;
+                }
+            return true;
+        };
+
+        //-- (a) switches thrown WHILE notes sound: manual amps, the engine, morph, bend.
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr3, blk3);
+            juce::String err;
+            check (p->loadTimbreText ("5/4 3/2 7/4 2", err), "a custom spectrum is loaded");
+            auto setQ = [&p] (const char* id, float v)
+            { auto* q = p->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v)); };
+            setQ ("morph", 1.0f); setQ ("morphTime", 2.0f);
+            p->pollParametersForTests();
+
+            juce::MidiBuffer on;
+            for (const int k : { 55, 60, 64, 67, 71 })
+                on.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0);
+            p->processBlock (buf, on);
+
+            bool ok = true;
+            std::vector<spectrum::PartialGain> edits;
+            for (int i = 1; i <= 8; ++i) edits.push_back ({ (long long) (i * 90000), -2.0f * (float) i });
+            for (int t = 0; t < 240 && ok; ++t)
+            {
+                // Every second block: flip something that rebuilds the whole spectrum.
+                switch (t % 6)
+                {
+                    case 0: setQ ("partialManual", (t / 6) % 2 ? 1.0f : 0.0f);
+                            p->setPartialGains (edits, (t / 6) % 2 != 0); break;
+                    case 1: p->setTimbreEnabled ((t / 6) % 2 == 0); break;                 // engine chip
+                    case 2: setQ ("timbreTemper", (t / 6) % 3 == 0 ? 1.0f : 0.0f); break;  // temper
+                    case 3: setQ ("morphTime", (t / 6) % 2 ? 0.001f : 5.0f); break;         // both ends
+                    case 4: setQ ("baseN", (float) (1 + (t / 6) % 8)); break;
+                    default: break;
+                }
+                p->pollParametersForTests();
+                juce::MidiBuffer m;
+                if (t % 7 == 0) m.addEvent (juce::MidiMessage::pitchWheel (1, (t * 977) % 16384), 0);
+                p->processBlock (buf, m);
+                ok = finite (buf);
+            }
+            check (ok, "flipping manual amps / engine / temper / morph time under five held notes stays finite");
+            // ...and the user's scale is still there. Every one of those switches only
+            // ever flips a parameter; not one of them may be the thing that loses it.
+            std::printf ("  after the sequence: loaded=%d degrees=%d src=\"%s\"\n",
+                         (int) p->timbreLoaded(), p->getTimbreNoteCount(),
+                         p->getTimbreSource().substring (0, 40).toRawUTF8());
+            check (p->timbreLoaded() && p->getTimbreNoteCount() == 4,
+                   "and the loaded custom scale is untouched by all of it");
+        }
+
+        //-- (b) a .tun loaded while the adaptive search is RUNNING, and an undo across an
+        //   engine switch. Both cross a worker thread and the undo history at once.
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr3, blk3);
+            juce::String err;
+            auto edo = [] (int n)
+            {
+                juce::String s;
+                s << "! x.scl\n" << juce::String (n) << "-EDO\n " << juce::String (n) << "\n!\n";
+                for (int i = 1; i <= n; ++i) s << " " << juce::String (1200.0 * (double) i / (double) n, 6) << "\n";
+                return s;
+            };
+            check (p->loadScalaText (edo (19), "edo19", err), "a 19-EDO tuning loads");
+
+            FractalAdditiveAudioProcessor::RtSettings rs;
+            rs.adapt.partials = 12; rs.adapt.periodRatio = 4.0; rs.adapt.minGapCents = 40.0;
+            rs.adapt.rootOnly = true; rs.adapt.goal = 0; rs.adapt.shapeAmps = true;
+            juce::MidiBuffer on;
+            for (const int k : { 60, 63, 67 }) on.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0);
+            p->processBlock (buf, on);
+            p->setRealtimeLink (FractalAdditiveAudioProcessor::RtLink::SpectrumFromChord, rs);
+            for (int i = 0; i < 8; ++i) { juce::MidiBuffer none; p->processBlock (buf, none); p->pollParametersForTests(); }
+
+            // ...and NOW, mid-search, replace the tuning under it.
+            const bool wasRunning = p->isSpectrumAdaptRunning();
+            check (p->loadScalaText (edo (31), "edo31", err), "another tuning loads while the search runs");
+            for (int i = 0; i < 200; ++i)
+            { juce::MidiBuffer none; p->processBlock (buf, none); p->pollParametersForTests(); juce::Thread::sleep (1); }
+            std::printf ("  adaptive search was running when the tuning changed: %s\n",
+                         wasRunning ? "yes" : "no (it had already finished)");
+            check (p->getScaleDegrees() == 31,
+                   "the tuning the user asked for is the one in force - a worker never overwrites it");
+            check (finite (buf), "and the audio is still finite through it");
+            p->setRealtimeLink (FractalAdditiveAudioProcessor::RtLink::Off, rs);
+
+            // Undo ACROSS an engine switch: the custom engine goes on (undoable), then off.
+            check (p->loadTimbreTextUndoable ("3/2 2", err), "a typed spectrum is set undoably");
+            const int before = p->getTimbreNoteCount();
+            p->undoManager.undo();
+            const int afterUndo = p->getTimbreNoteCount();
+            p->undoManager.redo();
+            const int afterRedo = p->getTimbreNoteCount();
+            std::printf ("  typed spectrum degrees: %d -> undo %d -> redo %d\n", before, afterUndo, afterRedo);
+            check (afterRedo == before, "undo then redo across the engine switch lands back exactly");
+        }
+
+        //-- (c) LIFECYCLE: destroy the processor with every worker in flight. The three
+        //   threads capture `this` and publish into members, so a missed join is a write
+        //   into freed memory - which is silent until it is not.
+        {
+            for (int trial = 0; trial < 4; ++trial)
+            {
+                auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+                p->prepareToPlay (sr3, blk3);
+                juce::String err;
+                juce::String scl ("! y.scl\n24-EDO\n 24\n!\n");
+                for (int i = 1; i <= 24; ++i) scl << " " << juce::String (50.0 * (double) i, 6) << "\n";
+                p->loadScalaText (scl, "edo24", err);
+                // n-ad ranking (heavy), the chord search, and the spectrum adaptation, all
+                // started and NONE waited for.
+                p->startNadCompute (4, true, false, 2.0, 30.0);
+                p->startChordSearch (5, 2.0, "2/1", 16, false, 30.0, true, err);
+                FractalAdditiveAudioProcessor::RtSettings rs;
+                rs.adapt.partials = 16; rs.adapt.periodRatio = 8.0; rs.adapt.minGapCents = 20.0;
+                rs.adapt.rootOnly = true; rs.adapt.goal = 0; rs.adapt.shapeAmps = true;
+                juce::MidiBuffer on;
+                for (const int k : { 60, 64, 67, 71 }) on.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0);
+                p->processBlock (buf, on);
+                p->setRealtimeLink (FractalAdditiveAudioProcessor::RtLink::SpectrumFromChord, rs);
+                for (int i = 0; i < 3; ++i) { juce::MidiBuffer none; p->processBlock (buf, none); p->pollParametersForTests(); }
+                // ...and drop it on the floor, mid-flight.
+                p.reset();
+            }
+            check (true, "destroying the processor with the n-ad, chord and adapt workers in flight returns");
+        }
+
+        //-- (d) PARAMETER EDGES: every parameter at its minimum, then at its maximum, with
+        //   notes held and manual amplitudes on but NO edits stored (the "on with zero
+        //   edits" case). A range that only works in the middle is a range that ships.
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr3, blk3);
+            juce::String err;
+            p->loadTimbreText ("5/4 3/2 2", err);
+            auto* man = p->apvts.getParameter ("partialManual");
+            man->setValueNotifyingHost (1.0f);
+            p->setPartialGains ({}, true);   // ON with nothing stored
+            p->pollParametersForTests();
+
+            juce::MidiBuffer on;
+            for (const int k : { 36, 60, 96 }) on.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0);
+            p->processBlock (buf, on);
+            check (finite (buf), "manual per-partial amplitudes ON with zero edits still sounds");
+
+            int worst = -1;
+            juce::String worstId;
+            for (int end = 0; end < 2 && worst < 0; ++end)
+            {
+                for (auto* ap : p->getParameters())
+                    if (auto* rp = dynamic_cast<juce::RangedAudioParameter*> (ap))
+                        rp->setValueNotifyingHost (end == 0 ? 0.0f : 1.0f);
+                p->pollParametersForTests();
+                for (int i = 0; i < 120; ++i)
+                {
+                    juce::MidiBuffer none;
+                    p->processBlock (buf, none);
+                    p->pollParametersForTests();
+                    if (! finite (buf)) { worst = end; break; }
+                }
+            }
+            std::printf ("  every parameter at its %s: %s\n",
+                         worst < 0 ? "min AND max" : (worst == 0 ? "min" : "max"),
+                         worst < 0 ? "finite throughout" : "NOT FINITE");
+            check (worst < 0, "every parameter at both ends of its range keeps the output finite");
+
+            // An inverted adaptation range (lo > hi) is a thing a hand types. It must be
+            // read as the interval between them, not as an empty one.
+            {
+                auto q = std::make_unique<FractalAdditiveAudioProcessor>();
+                q->prepareToPlay (sr3, blk3);
+                q->loadScalaText ("! z.scl\n12-EDO\n 12\n!\n 100.0\n 200.0\n 300.0\n 400.0\n 500.0\n"
+                                  " 600.0\n 700.0\n 800.0\n 900.0\n 1000.0\n 1100.0\n 2/1\n", "edo12", err);
+                FractalAdditiveAudioProcessor::RtSettings rs;
+                rs.adapt.partials = 6; rs.adapt.periodRatio = 4.0; rs.adapt.minGapCents = 40.0;
+                rs.adapt.rootOnly = true; rs.adapt.goal = 2;  // Range
+                rs.adapt.shapeAmps = false;
+                rs.adapt.rangeLo = 900.0; rs.adapt.rangeHi = 100.0;   // deliberately inverted
+                juce::String e2;
+                std::vector<double> alphas { 1.0, std::pow (2.0, 4.0 / 12.0), std::pow (2.0, 7.0 / 12.0) };
+                const bool started = q->startSpectrumAdapt (rs.adapt, alphas, 261.6255653, e2);
+                for (int i = 0; i < 800 && q->isSpectrumAdaptRunning(); ++i) juce::Thread::sleep (2);
+                std::printf ("  inverted adapt range (lo 900 > hi 100): started=%d\n", (int) started);
+                check (started, "an inverted adaptation range is accepted, not refused");
+                juce::String e3;
+                check (q->applySpectrumAdapt (false, e3),
+                       "and it produces a spectrum (the range is read between the two numbers)");
+            }
         }
     }
 

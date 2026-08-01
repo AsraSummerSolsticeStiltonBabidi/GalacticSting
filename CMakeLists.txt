@@ -46,7 +46,13 @@ juce_add_plugin(FractalAdditive
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE          # required for computer-keyboard play
     VST3_CATEGORIES             "Instrument" "Synth"
     FORMATS                     Standalone VST3
-    PRODUCT_NAME                "Fibló Galàctic")
+    # ASCII on purpose. PRODUCT_NAME is what names the .vst3 file, the bundle folder and
+    # the standalone .exe, and a non-ASCII filename broke three separate things: the
+    # linker warned it may not load at all under a codepage other than 1252 (LNK4232),
+    # JUCE's moduleinfo.json helper wrote the accents through the console codepage so
+    # Ableton read mojibake, and the mangled PATH stopped any post-build repair from even
+    # finding the file. The DISPLAYED name keeps its accents - see JucePlugin_Name below.
+    PRODUCT_NAME                "Fiblo Galactic")
 
 # Embedded assets (title font + the one-shot startup jingle).
 juce_add_binary_data(GalacticAssets SOURCES assets/fonts/Kablammo.ttf assets/audio/jingle.wav)
@@ -74,6 +80,10 @@ target_link_libraries(FractalAdditive
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags)
+
+# (No moduleinfo.json repair step: with an ASCII PRODUCT_NAME, JUCE's helper has no
+# accents to mangle in the first place. The displayed name keeps its accents because
+# AudioProcessor::getName() returns them directly - see PluginProcessor.h.)
 
 #-------------------------------------------------------------------------------
 # Unit tests for the (JUCE-free) spectrum compiler.

@@ -10,11 +10,13 @@
 #include "dsp/Dissonance.h"
 #include "dsp/PartialGains.h"
 #include "PartialAmpEdit.h"
+#include "IntervalTokens.h"
 
 #include <algorithm>
 #include <chrono>
 #include <vector>
 #include <map>
+#include <string>
 #include <cstdio>
 #include <cmath>
 
@@ -457,6 +459,170 @@ int main()
     }
 
     //--------------------------------------------------------------------------
+    // The adapted-spectrum text used to print every value at a fixed 5 decimals
+    // ("100.00000c 1200.00000c"), pure noise the user then had to edit around.
+    // Precision must survive the trim: only REDUNDANT zeros go.
+    std::printf ("Cents text (trailing zeros trimmed, precision kept):\n");
+    {
+        using dissonance::centsText;
+        check (centsText (700.0)      == "700",       "700.00000 -> 700 (no redundant zeros)");
+        check (centsText (701.955)    == "701.955",   "701.955 keeps its real decimals");
+        check (centsText (200.00002)  == "200.00002", "200.00002 keeps ALL its 5 decimals");
+        check (centsText (100.000004) == "100",       "sub-precision dust rounds away, then trims");
+        check (centsText (1200.5)     == "1200.5",    "1200.50000 -> 1200.5");
+        check (centsText (0.0)        == "0",         "zero is plain 0");
+        check (centsText (-0.000001)  == "0",         "negative dust never prints as -0");
+        check (centsText (-386.31371) == "-386.31371","negative values keep sign and precision");
+    }
+
+    //--------------------------------------------------------------------------
+    // THE REFERENCE MODEL, PINNED. An independent brute-force dissmeasure, written
+    // straight from Sethares' appendix (no sorting, no pair decomposition, no
+    // tables, no cap): every optimised path in Dissonance.h is held to it at 1e-12,
+    // and one dyad is pinned to a hand-computed CONSTANT so a wrong constant in
+    // dissmeasure could not hide inside a reference that copied it.
+    std::printf ("\nSethares reference model (brute force + hand-computed fixture):\n");
+    {
+        const auto refPair = [] (double f1, double a1, double f2, double a2)
+        {
+            const double fmin = std::min (f1, f2), fdif = std::abs (f1 - f2);
+            const double s = 0.24 / (0.0207 * fmin + 18.96);
+            return std::min (a1, a2) * (5.0 * std::exp (-3.51 * s * fdif)
+                                        - 5.0 * std::exp (-5.75 * s * fdif));
+        };
+        const auto refDiss = [&refPair] (const std::vector<dissonance::Partial>& p)
+        {
+            double d = 0.0;
+            for (size_t i = 0; i < p.size(); ++i)
+                for (size_t j = i + 1; j < p.size(); ++j)
+                    d += refPair (p[i].freq, p[i].amp, p[j].freq, p[j].amp);
+            return d;
+        };
+
+        // FIXTURE, by hand: 440 + 450 Hz, unit amplitudes. s = 0.24/(0.0207*440 +
+        // 18.96) = 0.00855066267635742; d = 10; D = 5(e^(-3.51 s d) - e^(-5.75 s d))
+        // = 0.645574149314169. Pins Dstar, S1, S2, C1, C2, A1, A2 and the
+        // lower-frequency rule all at once.
+        {
+            const double got = dissonance::dissmeasure ({ { 440.0, 1.0 }, { 450.0, 1.0 } });
+            std::printf ("  440+450 Hz dyad: %.15f (hand value 0.645574149314169)\n", got);
+            check (std::abs (got - 0.64557414931416934) < 1.0e-12,
+                   "two sines 440+450 Hz, equal amps: matches the hand-computed roughness");
+        }
+        // s must come from the pair's LOWER frequency, not the global minimum: in
+        // {100, 400, 410} the 400/410 pair uses s(400). Checked against the
+        // reference, which applies the rule per pair by construction.
+        {
+            const std::vector<dissonance::Partial> tri { { 100.0, 1.0 }, { 400.0, 1.0 }, { 410.0, 1.0 } };
+            check (std::abs (dissonance::dissmeasure (tri) - refDiss (tri)) < 1.0e-12,
+                   "s is taken from each pair's own lower frequency (not the spectrum's minimum)");
+        }
+        // Edge cases the model must get exactly right.
+        check (dissonance::dissmeasure ({}) == 0.0, "empty spectrum -> 0");
+        check (dissonance::dissmeasure ({ { 440.0, 1.0 } }) == 0.0, "single partial -> 0 (nothing to beat)");
+        check (dissonance::dissmeasure ({ { 440.0, 1.0 }, { 440.0, 1.0 } }) == 0.0,
+               "unison pair (d = 0) -> exactly 0 (C1 = -C2)");
+        check (dissonance::dissmeasure ({ { 440.0, 0.0 }, { 450.0, 1.0 } }) == 0.0,
+               "a zero-amplitude partial contributes nothing (min-amplitude weighting)");
+
+        // UNION SEMANTICS at 1e-12 on three spectra: harmonic, stretched (Sethares'
+        // own example of a timbre wanting its own scale) and hand-reweighted (with a
+        // zero-amp partial and a duplicated frequency in it), at alphas below AND
+        // above 1 - dissonanceAt/chordDissonance/self+cross must all be exactly
+        // dissmeasure of the union, however the copies land.
+        {
+            std::vector<std::vector<dissonance::Partial>> specs (3);
+            for (int k = 1; k <= 7; ++k)
+                specs[0].push_back ({ 261.6255653 * k, 1.0 / k });
+            for (int k = 1; k <= 10; ++k)
+                specs[1].push_back ({ 261.6255653 * std::pow ((double) k, 1.2), 1.0 / k });
+            specs[2] = { { 220.0, 0.3 }, { 275.0, 1.0 }, { 275.0, 0.5 }, { 330.0, 0.0 }, { 495.0, 0.7 } };
+
+            bool unionOk = true, chordOk = true, decompOk = true, symOk = true;
+            for (const auto& sp : specs)
+            {
+                for (const double alpha : { 1.5, std::pow (2.0, 7.0 / 12.0), 0.75, 1.0 })
+                {
+                    std::vector<dissonance::Partial> u = sp;
+                    for (const auto& p : sp) u.push_back ({ p.freq * alpha, p.amp });
+                    const double want = refDiss (u);
+                    const double tol  = 1.0e-12 * std::max (1.0, std::abs (want));
+                    if (std::abs (dissonance::dissonanceAt (sp, alpha) - want) > tol) unionOk = false;
+                    // self+cross grouping of the same union (the tables' identity):
+                    const double dec = dissonance::selfDissonance (sp, 1.0)
+                                     + dissonance::selfDissonance (sp, alpha)
+                                     + dissonance::crossDissonance (sp, 1.0, alpha);
+                    if (std::abs (dec - want) > tol) decompOk = false;
+                    if (std::abs (dissonance::crossDissonance (sp, 1.0, alpha)
+                                  - dissonance::crossDissonance (sp, alpha, 1.0)) > tol) symOk = false;
+                }
+                const std::vector<double> chord { 1.0, 0.8, 1.25, 1.5 }; // includes a note BELOW the root
+                std::vector<dissonance::Partial> u;
+                for (const double a : chord)
+                    for (const auto& p : sp) u.push_back ({ p.freq * a, p.amp });
+                const double want = refDiss (u);
+                if (std::abs (dissonance::chordDissonance (sp, chord) - want)
+                    > 1.0e-12 * std::max (1.0, std::abs (want))) chordOk = false;
+            }
+            check (unionOk,  "dissonanceAt == brute-force dissmeasure of the union (1e-12; alpha < 1 included)");
+            check (decompOk, "self + self + cross == the same union, exactly (the grid tables' identity)");
+            check (symOk,    "crossDissonance is symmetric in its two transpositions");
+            check (chordOk,  "chordDissonance == brute-force union over all notes (1e-12, all three spectra)");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // THE ANALYSIS SPECTRUM: what every dissonance readout scores. The user's
+    // per-partial gain must multiply BEFORE the 64-cap sorts, or a muted partial
+    // holds a cap slot (beating in the analysis, silent to the ear) while a boosted
+    // one - the loudest thing sounding - is dropped from the analysis entirely.
+    std::printf ("\nanalysis spectrum (sounding amplitudes, gains BEFORE the cap):\n");
+    {
+        std::vector<spectrum::Partial> parts;
+        for (int k = 1; k <= 100; ++k)
+            parts.push_back ({ (float) k, 1.0f / (float) k });
+        const double f0 = 100.0;
+        const auto ampAt = [] (const std::vector<dissonance::Partial>& s, double freq) -> double
+        {
+            for (const auto& p : s)
+                if (std::abs (p.freq - freq) < 1.0e-6) return p.amp;
+            return -1.0;
+        };
+
+        // No edits: the 64 loudest COMPILED partials, anchored at f0.
+        {
+            const auto spec = dissonance::analysisSpectrum (parts, {}, f0);
+            check (spec.size() == 64, "no edits: exactly the 64-partial analysis cap");
+            check (std::abs (ampAt (spec, 100.0) - 1.0) < 1.0e-9, "partial 1 kept at freq ratio*f0, amp untouched");
+            check (ampAt (spec, 100.0 * 100.0) < 0.0, "the quietest compiled partial is the one dropped");
+        }
+
+        // Edits: mute the loudest (gain 0), boost the quietest 40 dB (x100 -> sounding amp 1.0).
+        std::vector<float> gain (100, 1.0f);
+        gain[0]  = 0.0f;
+        gain[99] = 100.0f;
+        const auto spec = dissonance::analysisSpectrum (parts, gain, f0);
+        check (spec.size() == 64, "with edits: still exactly 64 partials");
+        check (ampAt (spec, 100.0) < 0.0,
+               "a MUTED partial (the loudest compiled one) is not in the analysis");
+        check (std::abs (ampAt (spec, 100.0 * 100.0) - 1.0) < 1.0e-6,
+               "the BOOSTED quiet partial is analysed at its sounding amplitude (amp x gain)");
+        check (std::abs (ampAt (spec, 200.0) - 0.5) < 1.0e-6,
+               "an unedited partial keeps its compiled amplitude exactly");
+        // The cap keeps the loudest SOUNDING partials: kept minimum >= dropped maximum.
+        double keptMin = 1.0e30;
+        for (const auto& p : spec) keptMin = std::min (keptMin, p.amp);
+        double dropMax = 0.0;
+        for (int k = 1; k <= 100; ++k)
+        {
+            const double sound = (1.0 / (double) k) * (double) gain[(size_t) k - 1];
+            if (ampAt (spec, f0 * (double) k) < 0.0) dropMax = std::max (dropMax, sound);
+        }
+        std::printf ("  kept quietest %.6f   dropped loudest %.6f\n", keptMin, dropMax);
+        check (keptMin >= dropMax - 1.0e-9, "the cap keeps the loudest SOUNDING partials, none louder was dropped");
+    }
+
+    //--------------------------------------------------------------------------
     std::printf ("N-note chords (Sethares union measure, TTSS 6.8/App.E):\n");
     {
         // A harmonic timbre, 7 partials, saw-ish roll-off, anchored at middle C.
@@ -545,6 +711,150 @@ int main()
                     if (std::abs (1200.0 * std::log2 (all[i].alphas[k] / root[i].alphas[k])) > 1.0)
                         differs = true;
             check (differs, "0 vs all and all vs all do NOT return the same chords");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // THE REALTIME BUDGET. The tuning-follows-spectrum link re-runs this exact search
+    // every time the spectrum changes, so its cost is the feature's latency. Measured on
+    // this machine (12 cores) at the 64-partial analysis cap, before and after:
+    //     3 notes, all vs all   1374 ms -> ~300 ms cold, ~120 ms on the cached tables
+    //     3 notes, 0 vs all     2376 ms -> ~30 ms   (it was building a whole matrix to
+    //                                                read one row of it)
+    //     4 notes, all vs all   3045 ms -> ~320 ms with those tables already built
+    // The follower used to lag audibly behind the sound it was supposed to be following.
+    //
+    // Everything below the timings is a FENCE around the answer. The search was made
+    // parallel, table-cached and pruned; none of that is allowed to move a single
+    // result, so the top-4 chords and their dissonance values are pinned here to the
+    // values the single-threaded, uncached, unpruned version produced. A speedup that
+    // shifts a ranking is a bug, not an optimisation - this is what says so.
+    {
+        std::printf ("\nchord search: cost and an exact fence on its results\n");
+        std::vector<dissonance::Partial> big;          // the analysis cap, saw roll-off
+        for (int k = 1; k <= 64; ++k)
+            big.push_back ({ 261.6255653 * (double) k, 1.0 / (double) k });
+
+        const auto run = [&big] (int notes, int count, bool rootOnly, double& msOut)
+        {
+            const auto t0 = std::chrono::steady_clock::now();
+            auto r = dissonance::searchChords (big, 2.0, notes, count, false, 50.0, rootOnly);
+            msOut = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - t0).count();
+            return r;
+        };
+
+        double msAll = 0.0, msAll2 = 0.0, msRoot = 0.0, msQuad = 0.0;
+        const auto all  = run (3, 4, false, msAll);
+        const auto all2 = run (3, 4, false, msAll2);   // second run: the cached tables
+        const auto root = run (3, 4, true,  msRoot);
+        // FOUR notes: 2.2 million combinations, which is where the branch-and-bound does
+        // its work. It has to reach the same eight chords as the exhaustive scan did.
+        const auto quad = run (4, 8, false, msQuad);
+        std::printf ("  3 notes all vs all: %.0f ms (again, same spectrum: %.0f ms)   0 vs all: %.0f ms"
+                     "   4 notes all vs all: %.0f ms\n", msAll, msAll2, msRoot, msQuad);
+        const auto dump = [] (const char* tag, const std::vector<dissonance::ChordResult>& v)
+        {
+            for (const auto& r : v)
+            {
+                std::printf ("    %-10s value %.15g  alphas", tag, r.value);
+                for (const double a : r.alphas) std::printf (" %.15g", a);
+                std::printf ("\n");
+            }
+        };
+        dump ("all-vs-all", all);
+        dump ("0-vs-all", root);
+        dump ("4-note", quad);
+
+        // The fence. Values captured from the pre-optimisation build (single thread, no
+        // cache, no pruning) - they are what "unchanged" means from here on.
+        struct Fence { double value; double a1, a2, a3; };
+        static const Fence kAll[] = {
+            { 19.3419858948448, 1.50000056084297, 1.8750000170461,  0.0 },
+            { 19.4016229826057, 1.49999307729161, 1.94303671932295, 0.0 },
+            { 19.4063962706288, 1.49999307729161, 1.9285599852982,  0.0 },
+            { 19.5135834250506, 1.49999307729161, 1.91914459359882, 0.0 },
+        };
+        static const Fence kRoot[] = {
+            { 14.1229789745861, 1.66667375059104, 1.74999331540571, 0.0 },
+            { 14.1307750170015, 1.74999331540571, 1.83332750118558, 0.0 },
+            { 14.1320326277097, 1.75000870882375, 1.80131306216873, 0.0 },
+            { 14.1493449256536, 1.66667375059104, 1.83332750118558, 0.0 },
+        };
+        static const Fence kQuad[] = {
+            { 36.6296014709117, 1.29536498039975, 1.72715266142539, 1.94303671932295 },
+            { 36.6517883765966, 1.25047367501992, 1.66728415085272, 1.8757095314529  },
+            { 36.6794680166313, 1.29165651437782, 1.72221663410612, 1.9374854959832  },
+            { 36.6869045473911, 1.29536498039975, 1.66546706473225, 1.94303671932295 },
+            { 36.7141852821162, 1.2873018080426,  1.71640176896889, 1.93094206851233 },
+            { 36.785578435077,  1.2499995439951,  1.66666543550174, 1.94303671932295 },
+            { 36.796759806717,  1.29536498039975, 1.61920563480691, 1.94303671932295 },
+            { 36.8278914609482, 1.29162921688404, 1.66667375059104, 1.93743488375364 },
+        };
+        const auto fence = [] (const std::vector<dissonance::ChordResult>& got,
+                               const Fence* want, int n, int notes, const char* what)
+        {
+            bool ok = (int) got.size() == n;
+            for (int i = 0; i < n && ok; ++i)
+            {
+                if ((int) got[(size_t) i].alphas.size() != notes) { ok = false; break; }
+                const double* w = &want[i].a1;
+                ok = std::abs (got[(size_t) i].value - want[i].value) <= 1.0e-9 * std::abs (want[i].value);
+                for (int k = 1; k < notes && ok; ++k)
+                    ok = std::abs (1200.0 * std::log2 (got[(size_t) i].alphas[(size_t) k] / w[k - 1])) < 1.0e-6;
+            }
+            check (ok, what);
+        };
+        fence (all,  kAll,  (int) (sizeof (kAll)  / sizeof (Fence)), 3, "3-note all-vs-all top 4: same chords, same values as before the optimisation");
+        fence (root, kRoot, (int) (sizeof (kRoot) / sizeof (Fence)), 3, "3-note 0-vs-all top 4: same chords, same values as before the optimisation");
+        fence (quad, kQuad, (int) (sizeof (kQuad) / sizeof (Fence)), 4, "4-note top 8: the pruned search reaches the same chords as the exhaustive one");
+
+        // The cache must be an EXACT reuse, not an approximation: the same spectrum
+        // searched twice has to give bit-identical results, or a cached table is
+        // quietly answering a question it was not built for.
+        bool identical = all.size() == all2.size();
+        for (size_t i = 0; i < all.size() && identical; ++i)
+        {
+            if (all[i].value != all2[i].value || all[i].alphas.size() != all2[i].alphas.size())
+                identical = false;
+            for (size_t k = 0; k < all[i].alphas.size() && identical; ++k)
+                if (all[i].alphas[k] != all2[i].alphas[k]) identical = false;
+        }
+        check (identical, "the same search run twice is bit-identical (cached tables answer the same question)");
+
+        // ...and a DIFFERENT spectrum must never be answered out of the previous one's
+        // tables. That is the whole risk of caching them, and it takes TWO probes to close
+        // it, each the same SIZE as the cached spectrum so only the values can tell them
+        // apart: one that moves the frequencies (stretched partials - a stretched timbre
+        // wants a stretched scale, Sethares' own example) and one that moves only the
+        // amplitudes (a steeper roll-off). A cache that compared anything less than every
+        // value would hand one of them the other's chords.
+        for (const int probe : { 0, 1 })
+        {
+            std::vector<dissonance::Partial> other;
+            for (int k = 1; k <= 64; ++k)
+                other.push_back ({ 261.6255653 * (probe == 0 ? std::pow ((double) k, 1.2) : (double) k),
+                                   probe == 0 ? 1.0 / (double) k : (double) k / 64.0 });
+
+            dissonance::clearGridCache();
+            const auto cold = dissonance::searchChords (other, 2.0, 3, 4, false, 50.0, false);
+            dissonance::clearGridCache();
+            (void) dissonance::searchChords (big, 2.0, 3, 4, false, 50.0, false); // the cache now holds ANOTHER spectrum
+            const auto warm = dissonance::searchChords (other, 2.0, 3, 4, false, 50.0, false);
+
+            bool same = cold.size() == warm.size() && ! cold.empty();
+            for (size_t i = 0; i < cold.size() && same; ++i)
+            {
+                if (cold[i].value != warm[i].value || cold[i].alphas.size() != warm[i].alphas.size())
+                    same = false;
+                for (size_t k = 0; k < cold[i].alphas.size() && same; ++k)
+                    if (cold[i].alphas[k] != warm[i].alphas[k]) same = false;
+            }
+            std::printf ("  %-22s cold best %.9f   after another spectrum was searched %.9f\n",
+                         probe == 0 ? "stretched partials:" : "steeper roll-off:",
+                         cold.empty() ? 0.0 : cold[0].value, warm.empty() ? 0.0 : warm[0].value);
+            check (same, probe == 0
+                       ? "a spectrum whose partials MOVED gets its own tables, not the cached ones"
+                       : "and so does one where only the AMPLITUDES moved");
         }
     }
 
@@ -683,6 +993,457 @@ int main()
                && std::abs (dissonance::goalCost (5.0, dissonance::Goal::Range, 2.0, 4.0) - 1.0) < 1.0e-12
                && std::abs (dissonance::goalCost (1.0, dissonance::Goal::Range, 2.0, 4.0) - 1.0) < 1.0e-12,
                "goalCost: min, max, and zero cost anywhere inside the range");
+
+        //----------------------------------------------------------------------
+        // A SINGLE HELD NOTE.
+        //
+        // The realtime "spectrum follows what you play" link used to refuse anything under
+        // two notes: a monophonic line lit the REALTIME button and then never adapted once,
+        // for ever. Nothing in the model required that. With one note the target set is
+        // {1.0}, every cross-note term vanishes, and what is left is the spectrum's own
+        // INTERNAL roughness - the partials beating against EACH OTHER - which is precisely
+        // what "minimum beating between the partials" means. These checks fence that it is
+        // a real, register-dependent objective and not a constant the search can only shrug
+        // at, and that the number the panel prints is the number that was optimised.
+        {
+            std::printf ("\n  a SINGLE held note (target = {1.0}):\n");
+            const std::vector<double> one { 1.0 };
+
+            // (1) THE IDENTITY the whole single-note path rests on. Both scopes collapse to
+            // selfDissonance, so "0 vs all" and "all vs all" cannot disagree - which is what
+            // keeps the scope selector honest instead of silently meaning two things - and
+            // AdaptResult's seedScore/score (the panel's "beating: X -> Y") ARE the internal
+            // roughness they claim to be.
+            const double self = dissonance::selfDissonance (seed, 1.0);
+            check (std::abs (dissonance::targetScore (seed, one, false) - self) < 1.0e-12
+                   && std::abs (dissonance::targetScore (seed, one, true) - self) < 1.0e-12,
+                   "one note: BOTH scopes are exactly the spectrum's internal roughness");
+
+            // (2) NOT FLAT. A constant objective would leave coordinate descent nothing to
+            // descend and the partials would sit exactly where the seed put them - which is
+            // the failure mode this whole feature would have had if the measure were
+            // degenerate. Slide one partial across 300 cents and watch the measure move.
+            double vLo = 1.0e18, vHi = -1.0e18;
+            for (double c = 500.0; c <= 800.0; c += 50.0)
+            {
+                auto t = seed;
+                t[3].freq = f0 * std::exp2 (c / 1200.0);
+                const double v = dissonance::targetScore (t, one, false);
+                vLo = std::min (vLo, v); vHi = std::max (vHi, v);
+            }
+            std::printf ("    sliding partial 3 over 300 cents: %.4f .. %.4f\n", vLo, vHi);
+            check (vHi - vLo > 0.05 * vLo,
+                   "the single-note objective really depends on where the partials sit");
+
+            // (3) It ADAPTS, in two registers, on POSITIONS ALONE - amplitude shaping off, so
+            // the improvement cannot be credited to a reshaped envelope.
+            const double topRatio = std::exp2 ((1200.0 - minGap) / 1200.0); // the plugin's own cap
+            const auto seedAt = [&] (double base)
+            {
+                std::vector<dissonance::Partial> s;
+                for (int i = 0; i < N; ++i)
+                {
+                    const double r = std::exp2 (1200.0 * (double) i / (double) N / 1200.0);
+                    s.push_back ({ base * r, std::pow (r, -1.0) });
+                }
+                return s;
+            };
+            struct Reg { double f; dissonance::AdaptResult mn, mx; };
+            Reg regs[2] { { f0 }, { f0 * 0.25 } };            // C4, and C2 two octaves below
+            for (auto& R : regs)
+            {
+                const auto s = seedAt (R.f);
+                R.mn = dissonance::adaptSpectrum (s, R.f, one, false, dissonance::Goal::Min,
+                                                  0.0, 0.0, minGap, topRatio, false, 24.0, 6);
+                R.mx = dissonance::adaptSpectrum (s, R.f, one, false, dissonance::Goal::Max,
+                                                  0.0, 0.0, minGap, topRatio, false, 24.0, 6);
+                std::printf ("    %8.3f Hz: internal roughness  seed %.4f -> min %.4f / max %.4f\n",
+                             R.f, R.mn.seedScore, R.mn.score, R.mx.score);
+                std::printf ("      min lands at cents:");
+                for (const auto& p : R.mn.spectrum)
+                    std::printf (" %.1f", 1200.0 * std::log2 (p.freq / R.f));
+                std::printf ("\n");
+
+                check ((int) R.mn.spectrum.size() == N && (int) R.mx.spectrum.size() == N,
+                       "a single-note adaptation returns every partial it was given");
+                check (std::abs (R.mn.spectrum[0].freq - R.f) < 1.0e-9
+                       && std::abs (R.mx.spectrum[0].freq - R.f) < 1.0e-9,
+                       "anchored on the note ACTUALLY played - partial 0 sits exactly there");
+                check (R.mn.score < R.mn.seedScore * 0.9,
+                       "Min really lowers the internal roughness of one note (>10% under the harmonic seed)");
+                check (R.mx.score > R.mx.seedScore * 1.01,
+                       "Max really raises it, so the goal selector is live with one note too");
+                // The read-out cannot lie: what adaptSpectrum reports IS selfDissonance of
+                // the spectra it started from and ended with.
+                check (std::abs (R.mn.seedScore - dissonance::selfDissonance (seedAt (R.f), 1.0)) < 1.0e-12
+                       && std::abs (R.mn.score - dissonance::selfDissonance (R.mn.spectrum, 1.0)) < 1.0e-12,
+                       "and the before/after it reports IS that same internal roughness");
+                // Fidelity: moved, never merged.
+                double worstGap = 1.0e9;
+                for (const auto& r : { R.mn, R.mx })
+                    for (size_t i = 1; i < r.spectrum.size(); ++i)
+                        worstGap = std::min (worstGap, 1200.0 * std::log2 (r.spectrum[i].freq
+                                                                           / r.spectrum[i - 1].freq));
+                check (worstGap >= minGap - 0.05,
+                       "and no two of its partials come closer than the smallest interval");
+            }
+
+            // (4) THE REGISTER MATTERS, which is the reason the target is anchored at the
+            // note's REAL frequency and not at key 60. Sethares' critical band is a width in
+            // Hz, so the same partial set is a different roughness an octave down - if these
+            // two answers were equal, the anchoring would be doing nothing.
+            // Measured as each partial's interval above ITS OWN partial 0, so a whole
+            // spectrum shifted bodily to some other register cannot pass for two different
+            // answers - only genuinely different intervals can.
+            double worstMove = 0.0;
+            for (int i = 0; i < N; ++i)
+                worstMove = std::max (worstMove,
+                                      std::abs (1200.0 * std::log2 (regs[0].mn.spectrum[(size_t) i].freq / regs[0].mn.spectrum[0].freq)
+                                              - 1200.0 * std::log2 (regs[1].mn.spectrum[(size_t) i].freq / regs[1].mn.spectrum[0].freq)));
+            std::printf ("    biggest disagreement between the two registers' answers: %.1f cents\n", worstMove);
+            check (worstMove > minGap,
+                   "the two registers get genuinely DIFFERENT partial positions");
+
+            // Sharper still: each register's own answer must beat the other register's
+            // answer transplanted onto it. Equal positions could be a coincidence; this
+            // cannot be - it says the search is solving the problem it was actually given.
+            const auto transplantedTo = [] (const dissonance::AdaptResult& r, double from, double to)
+            {
+                std::vector<dissonance::Partial> t;
+                t.reserve (r.spectrum.size());
+                for (const auto& p : r.spectrum) t.push_back ({ p.freq / from * to, p.amp });
+                return dissonance::selfDissonance (t, 1.0);
+            };
+            const double guestAtLow  = transplantedTo (regs[0].mn, regs[0].f, regs[1].f);
+            const double guestAtHigh = transplantedTo (regs[1].mn, regs[1].f, regs[0].f);
+            std::printf ("    C2's own answer %.4f vs C4's answer moved down %.4f;"
+                         "  C4's own %.4f vs C2's moved up %.4f\n",
+                         regs[1].mn.score, guestAtLow, regs[0].mn.score, guestAtHigh);
+            check (regs[1].mn.score < guestAtLow && regs[0].mn.score < guestAtHigh,
+                   "each register's answer is better THERE than the other register's answer is");
+
+            // (5) Range is still a real third option with one note: aim at a band between the
+            // min and the max just measured, one the seed is not already sitting in.
+            {
+                const double span = regs[0].mx.score - regs[0].mn.score;
+                const double bLo  = regs[0].mn.score + 0.6 * span;
+                const double bHi  = regs[0].mn.score + 0.8 * span;
+                const auto rg = dissonance::adaptSpectrum (seedAt (f0), f0, one, false,
+                                                           dissonance::Goal::Range, bLo, bHi,
+                                                           minGap, topRatio, false, 24.0, 6);
+                std::printf ("    range [%.4f, %.4f] -> %.4f  (seed %.4f)\n",
+                             bLo, bHi, rg.score, rg.seedScore);
+                check (rg.seedScore < bLo || rg.seedScore > bHi,
+                       "the single-note range band starts out of reach of the seed (so the test can fail)");
+                check (rg.score >= bLo - 1.0e-6 && rg.score <= bHi + 1.0e-6,
+                       "Range lands INSIDE its band with a single held note too");
+            }
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // OPTIMISING FOR A REGISTER RANGE, not for one pitch.
+    //
+    // Sethares' s = Dstar/(S1*f_lower + S2) makes the critical band a width in HERTZ, so
+    // the roughness of a fixed set of ratios depends on where it is played. The whole
+    // section below is one argument in four parts: the arithmetic that says a single-pitch
+    // objective must misbehave, the misbehaviour measured, the range objective beating it,
+    // and the sampling rule earned rather than assumed.
+    {
+        std::printf ("\nadapting over a REGISTER RANGE:\n");
+        constexpr double kLowHz = 32.7031956625748;      // key 24 at A=440; the plugin names it C0
+        const auto atOct = [] (double base, double oct) { return base * std::exp2 (oct); };
+
+        //---------------------------------------------------------------------
+        // (1) THE ARITHMETIC, checked against dissmeasure itself rather than trusted.
+        // One pair of ratio r at lower frequency f1 contributes
+        //     x = s*d = 0.24 * f1 * (r-1) / (0.0207*f1 + 18.96)
+        // to Sethares' pair term, which peaks at x = ln(28.75/17.55)/2.24 = 0.2204.
+        {
+            const auto pairX = [] (double f1, double r)
+            { return 0.24 * f1 * (r - 1.0) / (0.0207 * f1 + 18.96); };
+            const auto pairD = [] (double f1, double r)
+            {
+                // dissmeasure of exactly that pair, both partials at amplitude 1.
+                return dissonance::dissmeasure ({ { f1, 1.0 }, { f1 * r, 1.0 } });
+            };
+            const double xPeak = std::log (28.75 / 17.55) / 2.24;
+            std::printf ("  Sethares' pair term peaks at x = %.4f\n", xPeak);
+            check (std::abs (xPeak - 0.2204) < 5.0e-4, "the roughness peak really is at x = 0.2204");
+
+            // The peak, found by brute force on the pair measure, must sit where x = xPeak.
+            double bestX = 0.0, bestV = -1.0;
+            for (double x = 0.001; x < 2.0; x += 0.0002)
+            {
+                const double v = 5.0 * (std::exp (-3.51 * x) - std::exp (-5.75 * x));
+                if (v > bestV) { bestV = v; bestX = x; }
+            }
+            check (std::abs (bestX - xPeak) < 1.0e-3, "and a brute-force sweep of the term agrees");
+
+            // The roughest INTERVAL therefore shrinks fast with register. Solve x = xPeak
+            // for r at three registers, and confirm the pair measure really peaks there.
+            for (const double oct : { 0.0, 2.0, 4.0 })
+            {
+                const double f1 = atOct (kLowHz, oct);
+                const double r  = 1.0 + xPeak * (0.0207 * f1 + 18.96) / (0.24 * f1);
+                const double c  = 1200.0 * std::log2 (r);
+                // Brute force: the widest-beating interval at this f1, to 1 cent.
+                double bc = 0.0, bv = -1.0;
+                for (double cc = 5.0; cc < 900.0; cc += 1.0)
+                {
+                    const double v = pairD (f1, std::exp2 (cc / 1200.0));
+                    if (v > bv) { bv = v; bc = cc; }
+                }
+                std::printf ("    %7.1f Hz: roughest interval %6.1f c (brute force %6.1f c)\n", f1, c, bc);
+                check (std::abs (c - bc) < 2.0, "the roughest interval at this register is where the algebra puts it");
+            }
+
+            // The 32.6-cent watershed: x -> 11.594*(r-1) as f1 -> infinity, so a pair
+            // reaches the peak on the way up only if 11.594*(r-1) > 0.2204.
+            const double watershed = 1200.0 * std::log2 (1.0 + 0.2204 * 0.0207 / 0.24);
+            std::printf ("  pairs wider than %.1f c cross the peak and then improve; narrower ones never do\n",
+                         watershed);
+            check (std::abs (watershed - 32.6) < 0.5, "the watershed is 32.6 cents");
+            // A FIFTH is far above it: nearly gone five octaves up. Twenty cents is far below it:
+            // six times worse five octaves up. This is the whole reason a bass-only
+            // optimiser is not merely incomplete but actively wrong.
+            const double fifthLo = pairD (kLowHz, 1.5),          fifthHi = pairD (atOct (kLowHz, 5.0), 1.5);
+            const double tightLo = pairD (kLowHz, std::exp2 (20.0 / 1200.0));
+            const double tightHi = pairD (atOct (kLowHz, 5.0), std::exp2 (20.0 / 1200.0));
+            std::printf ("    a fifth : %.4f at 33 Hz -> %.4f at 1047 Hz   (x %.3f -> %.3f)\n",
+                         fifthLo, fifthHi, pairX (kLowHz, 1.5), pairX (atOct (kLowHz, 5.0), 1.5));
+            std::printf ("    20 cents: %.4f at 33 Hz -> %.4f at 1047 Hz\n", tightLo, tightHi);
+            check (fifthHi < fifthLo * 0.05, "a fifth all but vanishes five octaves up");
+            check (tightHi > tightLo * 3.0,  "a 20-cent pair gets several times WORSE five octaves up");
+        }
+
+        //---------------------------------------------------------------------
+        // The shared setup for (2)-(4): one held note (the objective is then the
+        // spectrum's own internal roughness), 12 partials, 30 cents of air - deliberately
+        // just under the 32.6-cent watershed, so the optimiser is ALLOWED to build the
+        // clusters that only bite higher up.
+        const int    Nr      = 12;
+        const double gapR    = 30.0;
+        const double topR    = std::exp2 ((1200.0 - gapR) / 1200.0);
+        const std::vector<double> oneNote { 1.0 };
+        const auto seedR = [&] (double base)
+        {
+            std::vector<dissonance::Partial> s;
+            for (int i = 0; i < Nr; ++i)
+            {
+                const double r = std::exp2 (1200.0 * (double) i / (double) Nr / 1200.0);
+                s.push_back ({ base * r, std::pow (r, -1.0) });
+            }
+            return s;
+        };
+        const auto adaptOver = [&] (double anchor, double lo, double hi, int pts,
+                                    dissonance::Aggregate mode)
+        {
+            dissonance::Registers rg;
+            rg.f0 = dissonance::registerPoints (lo, hi, pts);
+            rg.mode = mode;
+            return dissonance::adaptSpectrum (seedR (anchor), anchor, oneNote, true,
+                                              dissonance::Goal::Min, 0.0, 0.0, gapR, topR,
+                                              false, 24.0, 8, rg);
+        };
+        // The TRUTH a candidate is judged by: a dense sweep, never the sampling it was
+        // optimised on (that would let a coarse sampling grade its own homework).
+        const auto judge = [&] (const std::vector<dissonance::Partial>& sp, double spF0,
+                                double lo, double hi, double& mean, double& worst, double& worstHz)
+        {
+            const auto pts = dissonance::registerPoints (lo, hi,
+                                 1 + (int) std::lround (12.0 * std::log2 (hi / lo)));
+            const auto rs = dissonance::scoreOverRegisters (sp, spF0, pts, oneNote, true,
+                                                            dissonance::Goal::Min, 0.0, 0.0,
+                                                            dissonance::Aggregate::Mean);
+            mean = rs.mean; worst = rs.worst;
+            worstHz = pts[(size_t) rs.worstIndex];
+        };
+        const double lo1 = kLowHz, hi7 = atOct (kLowHz, 6.0);   // 33..2093 Hz, the range being argued about
+
+        //---------------------------------------------------------------------
+        // (2) THE FAILURE MODE, demonstrated on the OLD objective. Optimise at one pitch
+        // in the bass (exactly what the search did before this change - the single-pitch
+        // overload is still that code path) and two things must show up: the answer is a
+        // stack of partials sitting ON the minimum gap, and it is far rougher up top than
+        // a spectrum optimised up there.
+        const auto bassOnly = dissonance::adaptSpectrum (seedR (lo1), lo1, oneNote, true,
+                                                         dissonance::Goal::Min, 0.0, 0.0,
+                                                         gapR, topR, false, 24.0, 8);
+        const auto trebleOnly = dissonance::adaptSpectrum (seedR (hi7), hi7, oneNote, true,
+                                                           dissonance::Goal::Min, 0.0, 0.0,
+                                                           gapR, topR, false, 24.0, 8);
+        {
+            std::printf ("  single-pitch answer at %.1f Hz, partial cents:", lo1);
+            for (const auto& p : bassOnly.spectrum)
+                std::printf (" %.0f", 1200.0 * std::log2 (p.freq / lo1));
+            std::printf ("\n");
+
+            // Tight clusters: how many neighbour gaps sit ON the 30-cent floor?
+            int atFloor = 0;
+            for (size_t i = 1; i < bassOnly.spectrum.size(); ++i)
+                if (1200.0 * std::log2 (bassOnly.spectrum[i].freq / bassOnly.spectrum[i - 1].freq)
+                    < gapR + 1.0) ++atFloor;
+            std::printf ("    %d of its %d neighbour gaps are pinned at the %.0f-cent floor\n",
+                         atFloor, Nr - 1, gapR);
+            check (atFloor >= (Nr - 1) / 2,
+                   "optimising in the BASS packs partials into clusters - they cost nearly nothing there");
+
+            // ...and those clusters are what dominates in the treble.
+            const auto atTopBass = dissonance::scoreOverRegisters (bassOnly.spectrum, lo1, { hi7 },
+                                                                   oneNote, true, dissonance::Goal::Min,
+                                                                   0.0, 0.0, dissonance::Aggregate::Mean);
+            const auto atTopTop  = dissonance::scoreOverRegisters (trebleOnly.spectrum, hi7, { hi7 },
+                                                                   oneNote, true, dissonance::Goal::Min,
+                                                                   0.0, 0.0, dissonance::Aggregate::Mean);
+            std::printf ("    judged at %.0f Hz: bass-optimised %.3f vs treble-optimised %.3f (%.2fx worse)\n",
+                         hi7, atTopBass.perRegister[0], atTopTop.perRegister[0],
+                         atTopBass.perRegister[0] / atTopTop.perRegister[0]);
+            check (atTopBass.perRegister[0] > atTopTop.perRegister[0] * 2.0,
+                   "and up in the treble that bass-optimised spectrum is more than TWICE as rough as one optimised there");
+        }
+
+        //---------------------------------------------------------------------
+        // (3) THE FIX BEATS IT. Same seed, same partials, same gap - only the objective
+        // changes. Both aggregation modes must improve the worst register of the range
+        // over what the single-pitch answer leaves there.
+        double bassM = 0, bassW = 0, bassWHz = 0;
+        judge (bassOnly.spectrum, lo1, lo1, hi7, bassM, bassW, bassWHz);
+        const auto meanRun = adaptOver (lo1, lo1, hi7, 7, dissonance::Aggregate::Mean);
+        const auto miniRun = adaptOver (lo1, lo1, hi7, 7, dissonance::Aggregate::Minimax);
+        double meanM = 0, meanW = 0, meanWHz = 0, miniM = 0, miniW = 0, miniWHz = 0;
+        judge (meanRun.spectrum, lo1, lo1, hi7, meanM, meanW, meanWHz);
+        judge (miniRun.spectrum, lo1, lo1, hi7, miniM, miniW, miniWHz);
+        {
+            std::printf ("  over 33..2093 Hz (dense sweep of the ANSWERS):\n");
+            std::printf ("    single pitch (33 Hz): mean %.3f   worst %.3f at %.0f Hz\n", bassM, bassW, bassWHz);
+            std::printf ("    MEAN aggregate   : mean %.3f   worst %.3f at %.0f Hz\n", meanM, meanW, meanWHz);
+            std::printf ("    MINIMAX aggregate: mean %.3f   worst %.3f at %.0f Hz\n", miniM, miniW, miniWHz);
+            check (miniW < bassW * 0.85,
+                   "MINIMAX cuts the worst register of the range by >15% against the single-pitch answer");
+            check (meanM < bassM * 0.98,
+                   "and MEAN lowers the average across the range against it too");
+
+            // THE TRADE, stated in numbers, because the panel offers both and the user has
+            // to choose: minimax buys its worst register with the average, and vice versa.
+            std::printf ("    minimax's worst register is %.1f%% better than mean's;"
+                         " mean's average is %.1f%% better than minimax's\n",
+                         100.0 * (meanW - miniW) / meanW, 100.0 * (miniM - meanM) / miniM);
+            check (miniW < meanW,  "minimax really does protect the worst register better than mean");
+            check (meanM < miniM,  "and mean really does reach a better average than minimax");
+        }
+
+        //---------------------------------------------------------------------
+        // (4) THE SAMPLING RULE, EARNED. One octave between points; two is not enough.
+        // The test that matters is not "does a coarse sampling estimate the aggregate" but
+        // "does a spectrum optimised on it hold up when judged densely" - and for minimax,
+        // which hunts a peak, points two octaves apart let the peak fall between them.
+        {
+            const auto ref = adaptOver (lo1, lo1, hi7, 25, dissonance::Aggregate::Minimax);
+            double refM = 0, refW = 0, refH = 0;
+            judge (ref.spectrum, lo1, lo1, hi7, refM, refW, refH);
+            std::printf ("  minimax sampling (6 octaves), judged densely against a 0.25-octave reference:\n");
+            double w4 = 0, w7 = 0, m4 = 0, m7 = 0, h = 0;
+            judge (adaptOver (lo1, lo1, hi7, 4, dissonance::Aggregate::Minimax).spectrum, lo1, lo1, hi7, m4, w4, h);
+            judge (miniRun.spectrum, lo1, lo1, hi7, m7, w7, h);
+            std::printf ("    reference (0.25 oct): worst %.3f\n", refW);
+            std::printf ("    4 points (2.00 oct) : worst %.3f (%+.1f%%)\n", w4, 100.0 * (w4 - refW) / refW);
+            std::printf ("    7 points (1.00 oct) : worst %.3f (%+.1f%%)\n", w7, 100.0 * (w7 - refW) / refW);
+            check (std::abs (w7 - refW) < 0.06 * refW,
+                   "one octave a point lands within 6% of a four-times-denser sampling");
+            check (w4 > w7 * 1.05,
+                   "two octaves a point is measurably worse - the rule is earned, not assumed");
+        }
+
+        //---------------------------------------------------------------------
+        // (5) THE POINT-COUNT RULE the panel prints, and the caps the two paths use.
+        {
+            check (dissonance::registerCountFor (kLowHz, kLowHz, 7) == 1,
+                   "a degenerate range is ONE register, not a division by zero");
+            check (dissonance::registerCountFor (kLowHz, atOct (kLowHz, 2.0), 7) == 3,
+                   "two octaves want three points (one octave a point)");
+            check (dissonance::registerCountFor (kLowHz, atOct (kLowHz, 6.0), 7) == 7,
+                   "six octaves want seven");
+            check (dissonance::registerCountFor (kLowHz, atOct (kLowHz, 10.0), 7) == 7
+                   && dissonance::registerCountFor (kLowHz, atOct (kLowHz, 10.0), 3) == 3,
+                   "and the cap binds - the realtime path takes 3 where the Adapt button takes 7");
+            // The realtime cap is NOT a degradation at the panel's default range: an octave
+            // either side of the played note is two octaves, which wants three points anyway.
+            check (dissonance::registerCountFor (kLowHz, atOct (kLowHz, 2.0), 3)
+                   == dissonance::registerCountFor (kLowHz, atOct (kLowHz, 2.0), 7),
+                   "at the default two-octave range the realtime follower samples EXACTLY as densely as Adapt");
+            const auto pts = dissonance::registerPoints (kLowHz, atOct (kLowHz, 4.0), 5);
+            bool geometric = pts.size() == 5;
+            for (size_t i = 1; i < pts.size() && geometric; ++i)
+                if (std::abs (pts[i] / pts[i - 1] - 2.0) > 1.0e-9) geometric = false;
+            check (geometric, "the sampling points are evenly spaced in LOG frequency");
+        }
+
+        //---------------------------------------------------------------------
+        // (6) NO REGRESSION, and no partial lost. The single-pitch overload must still be
+        // exactly the old objective (one register at the anchor), and a range run must
+        // return every partial it was given, ordered, with its air intact and audible.
+        {
+            dissonance::Registers oneReg;
+            oneReg.f0 = { lo1 };
+            const auto viaRange = dissonance::adaptSpectrum (seedR (lo1), lo1, oneNote, true,
+                                                             dissonance::Goal::Min, 0.0, 0.0,
+                                                             gapR, topR, false, 24.0, 8, oneReg);
+            bool identical = viaRange.spectrum.size() == bassOnly.spectrum.size()
+                          && std::abs (viaRange.score - bassOnly.score) < 1.0e-12;
+            for (size_t i = 0; i < viaRange.spectrum.size() && identical; ++i)
+                if (viaRange.spectrum[i].freq != bassOnly.spectrum[i].freq
+                    || viaRange.spectrum[i].amp != bassOnly.spectrum[i].amp) identical = false;
+            check (identical,
+                   "one register IS the old single-pitch objective, bit for bit - nothing else changed under it");
+            // And with one register the reported score is still exactly the score there.
+            check (std::abs (bassOnly.score - dissonance::selfDissonance (bassOnly.spectrum, 1.0)) < 1.0e-12,
+                   "and its read-out is still that register's own roughness");
+
+            double worstGap = 1.0e9, quietest = 1.0e9;
+            bool ordered = true;
+            for (const auto& r : { meanRun, miniRun })
+            {
+                if ((int) r.spectrum.size() != Nr) ordered = false;
+                for (size_t i = 0; i < r.spectrum.size(); ++i)
+                {
+                    quietest = std::min (quietest, r.spectrum[i].amp);
+                    if (i == 0) continue;
+                    const double g = 1200.0 * std::log2 (r.spectrum[i].freq / r.spectrum[i - 1].freq);
+                    worstGap = std::min (worstGap, g);
+                    if (! (g > 0.0)) ordered = false;
+                }
+            }
+            std::printf ("  range-optimised results: %d partials each, closest pair %.2f c, quietest %.5f\n",
+                         Nr, worstGap, quietest);
+            check (ordered && worstGap >= gapR - 0.05 && quietest > 0.0,
+                   "a range-optimised spectrum keeps every partial, its air and its amplitude - nothing merged, nothing muted");
+        }
+
+        //---------------------------------------------------------------------
+        // (7) THE READ-OUT CANNOT LIE. What adaptSpectrum reports as `score` is the
+        // aggregate it optimised, recomputed here from the spectrum it returned - the
+        // panel prints these two numbers as "before -> after" and they have to be the
+        // thing the search actually worked on, not middle C standing in for six octaves.
+        {
+            const auto rs = dissonance::scoreOverRegisters (miniRun.spectrum, lo1, miniRun.registerF0,
+                                                            oneNote, true, dissonance::Goal::Min,
+                                                            0.0, 0.0, dissonance::Aggregate::Minimax);
+            check (std::abs (miniRun.score - rs.worst) < 1.0e-12
+                   && std::abs (miniRun.worst - rs.worst) < 1.0e-12,
+                   "minimax reports the WORST register's own value");
+            const auto rm = dissonance::scoreOverRegisters (meanRun.spectrum, lo1, meanRun.registerF0,
+                                                            oneNote, true, dissonance::Goal::Min,
+                                                            0.0, 0.0, dissonance::Aggregate::Mean);
+            check (std::abs (meanRun.score - rm.mean) < 1.0e-12,
+                   "and mean reports the average over the range");
+            check ((int) miniRun.perRegister.size() == (int) miniRun.registerF0.size()
+                   && miniRun.registerF0.size() == 7,
+                   "with one number per register, for every register it was asked for");
+            // Both modes minimise: whatever each was told to optimise, it beat its seed.
+            check (miniRun.score < miniRun.seedScore && meanRun.score < meanRun.seedScore,
+                   "and both aggregates really came down from the harmonic seed");
+        }
     }
 
     //--------------------------------------------------------------------------
@@ -1002,6 +1763,64 @@ int main()
             check (out.size() == 4 && sorted && hasHomeless && hasEdits,
                    "the written list keeps the homeless edits and stays sorted by key");
         }
+    }
+
+    //--------------------------------------------------------------------------
+    // The Custom Engine's interval box paints every value in its own colour, which
+    // means rebuilding its text run by run. A run whose range is one character out
+    // paints the wrong characters and NOTHING complains - the wrong colour is still
+    // legible text - so the ranges are checked here rather than by eye.
+    std::printf ("interval-token colouring:\n");
+    {
+        auto cps = [] (const char* s)
+        {
+            std::vector<int> v;
+            for (const char* p = s; *p != '\0'; ++p) v.push_back ((int) (unsigned char) *p);
+            return v;
+        };
+        auto piece = [&cps] (const char* s, const intervaltokens::Span& sp)
+        {
+            const auto v = cps (s);
+            std::string out;
+            for (int i = sp.start; i < sp.start + sp.length; ++i) out += (char) v[(size_t) i];
+            return out;
+        };
+
+        {
+            const char* t = "3/2 2 700c";
+            const auto s = intervaltokens::spans (cps (t), 5);
+            check (s.size() == 3, "three values are three spans");
+            check (s.size() == 3 && piece (t, s[0]) == "3/2" && piece (t, s[1]) == "2"
+                   && piece (t, s[2]) == "700c",
+                   "each span covers exactly its own value, separators excluded");
+            check (s.size() == 3 && s[0].colour != s[1].colour && s[1].colour != s[2].colour,
+                   "and no value shares a colour with the one before or after it");
+        }
+        // Every separator loadTimbreText() splits on, several in a row, plus leading and
+        // trailing ones: a run of spaces must not become an empty token wearing a colour.
+        {
+            const char* t = "  5/4,,9/8;\t2\r\n  ";
+            const auto s = intervaltokens::spans (cps (t), 5);
+            bool ok = s.size() == 3 && piece (t, s[0]) == "5/4" && piece (t, s[1]) == "9/8"
+                   && piece (t, s[2]) == "2";
+            for (const auto& sp : s) ok = ok && sp.length > 0;
+            check (ok, "commas, semicolons, tabs, newlines and runs of them separate but never colour");
+        }
+        // The palette must WRAP without ever repeating across a boundary.
+        {
+            const auto s = intervaltokens::spans (cps ("1 2 3 4 5 6 7 8 9"), 5);
+            bool ok = s.size() == 9;
+            for (size_t i = 1; i < s.size(); ++i) ok = ok && s[i].colour != s[i - 1].colour;
+            for (const auto& sp : s) ok = ok && sp.colour >= 0 && sp.colour < 5;
+            check (ok, "a list longer than the palette keeps cycling, adjacent values still differ");
+        }
+        // A one-colour palette would make the whole feature a no-op, so it is refused.
+        {
+            const auto s = intervaltokens::spans (cps ("3/2 2"), 1);
+            check (s.size() == 2 && s[0].colour != s[1].colour, "a degenerate palette is widened, not obeyed");
+        }
+        check (intervaltokens::spans ({}, 5).empty() && intervaltokens::spans (cps ("   "), 5).empty(),
+               "empty and all-separator text produce no spans at all");
     }
 
     //--------------------------------------------------------------------------

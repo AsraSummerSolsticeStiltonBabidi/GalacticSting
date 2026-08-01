@@ -3,6 +3,7 @@
 #include "PluginProcessor.h"
 #include "ScaleKeyboard.h"
 #include "PartialAmpEdit.h"
+#include "IntervalTokens.h"
 #include "dsp/Dissonance.h"
 #include <algorithm>
 #include <limits>
@@ -34,16 +35,106 @@ public:
     // Nothing in the plugin itself calls this.
     struct LayoutProbe
     {
-        juce::Rectangle<int> spectrum, harmonicEngine, customEngine, bothEngines,
-                             essentials, tuning, engineChips;
+        // engineBox is the ONE shared box both engines live in (the HARMONIC / CUSTOM
+        // chips are its title; the selected chip decides whose controls are inside).
+        juce::Rectangle<int> spectrum, engineBox, bothEngines,
+                             essentials, tuning, engineChips,
+                             specColumn; // the full-height Spectrum-vs-Tuning box on the right
+        // The colour the WHOLE SPECTRUM panel is wearing right now (the selected
+        // engine's). Probed because "it must not be the neutral steel again, and it
+        // must not collide with the panels around it" is a measurable claim about a
+        // hue, and nothing else in the build could check it.
+        juce::Colour panelColour;
         std::vector<std::pair<juce::String, juce::Rectangle<int>>> controls; // "harm.baseN" etc.
+        // The SUB-CELLS the boxes are divided into. They are rectangles only - the
+        // dividers between them and their inline sub-labels are drawn in paint() from
+        // exactly these - so a cell that escaped its box, or two cells that grew into
+        // each other, draws a divider across a neighbour's controls and nothing in the
+        // build could see it. Named "eng.base", "both.slope", "ess.ref", ...
+        std::vector<std::pair<juce::String, juce::Rectangle<int>>> cells;
+        // Every PAINTED label: the exact rect paint() draws it into, and how wide the
+        // string actually is in the font paint() uses. A painted label has no component
+        // to squash, so it fails by CLIPPING - silently, in one language only ("FROZEN -
+        // DRAWN BY HAND" clipped at "DRA..."). Probing the measured width is the only way
+        // a build can tell.
+        struct PaintedLabel
+        {
+            juce::String name, text;
+            juce::Rectangle<int> cell;  // the rect the text is drawn into
+            float textWidth = 0.0f;     // measured in the very font paint() sets
+        };
+        std::vector<PaintedLabel> paintedLabels;
+        // The same measurement for every juce::Label COMPONENT laid out in those boxes,
+        // in its own font. A Label does not clip - it squashes to 70% - so it fails by
+        // going unreadably condensed instead of disappearing, which no bounds check can
+        // see either. Same struct: cell = the label's bounds, textWidth = what it needs.
+        std::vector<PaintedLabel> componentLabels;
+        // Every combo whose ITEM TEXTS are rewritten by applyLanguage(), as
+        // name -> selected id. Probed because re-wording a ComboBox is the one operation
+        // that can silently DESELECT it (getSelectedId() compares the visible label
+        // against the item's text), and a mode box that reads 0 gates its whole panel off.
+        std::vector<std::pair<juce::String, int>> comboIds;
     };
     LayoutProbe layoutProbe() const;
+    // Test hook (RhythmVerify): probe the layout in the OTHER language. Every painted
+    // sub-label is bilingual and Catalan is the longer language nearly everywhere, so a
+    // label that fits in English can still clip in Catalan - which is precisely how the
+    // "FROZEN - DRAWN BY HAND" clip survived review. Restores the language it found.
+    LayoutProbe layoutProbeInLanguage (bool useCatalan);
+    // Test hook (RhythmVerify): re-read engineInForce() and redress the panel for it,
+    // exactly as the 30 Hz timer does. The verifier has no message loop, so without this
+    // the panel would still be wearing the colour it was constructed with and "selecting
+    // an engine recolours the whole panel" could not be measured at all.
+    void refreshEngineDressing() { applyEngineState(); }
+    // Test hook (RhythmVerify): click an engine chip the way a hand does. Exists for
+    // the one behaviour a probe of engineInForce cannot reach: with NO scale loaded,
+    // clicking CUSTOM must still open that view (it is the only place the Load button
+    // and the intervals editor live), while the sound honestly stays harmonic.
+    void clickEngineChipForTests (int i) { if (engineChip[i & 1].onClick) engineChip[i & 1].onClick(); }
+
+    // Test hooks (RhythmVerify): drive the Spectrum-vs-Tuning panel the way a hand does -
+    // pick a mode, pick the adaptation's target, press REALTIME - and read back what the
+    // panel then says. The wiring these check ("REALTIME follows the notes you PLAY,
+    // whatever the target box was left on" and "each mode keeps its own Period") lives
+    // entirely inside these callbacks, and the verifier has neither a mouse nor a message
+    // loop to reach them with.
+    struct PanelProbe
+    {
+        int  mode = 0;                 // specModeBox
+        int  adaptTarget = 0;          // adaptTargetBox (1 = loaded tuning, 2 = held chord)
+        bool adaptTargetEnabled = true;
+        juce::String period;           // the shared Period field, as typed
+    };
+    PanelProbe panelProbeForTests() const;
+    void setSpecModeForTests (int mode);
+    void setAdaptTargetForTests (int id);
+    // The two selectors that ADD rows to the right column (the free chord search's
+    // Find/REALTIME pair, and the adaptation's "between lo hi" row). Both exist only in
+    // one branch of resized(), so a layout sweep cannot reach them any other way.
+    void setTuneSourceForTests (int id);
+    void setAdaptGoalForTests (int id);
+    void setPeriodTextForTests (const juce::String& t);
+    void pressAdaptRealtimeForTests();
 
 private:
     using SliderAttachment   = juce::AudioProcessorValueTreeState::SliderAttachment;
     using ComboBoxAttachment = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
     using ButtonAttachment   = juce::AudioProcessorValueTreeState::ButtonAttachment;
+
+    // Every inline sub-label the editor PAINTS (BASE / HARMONICS / AMP DECAY / FROZEN /
+    // PHASE / ...). Built in ONE place and used by both paint() (which draws them) and
+    // layoutProbe() (which measures them), because a painted label has no component to
+    // squash and fails only by clipping - so the drawn rect and the measured rect must
+    // be the SAME rect or the check is measuring a label that is not on screen.
+    struct PaintedSub
+    {
+        juce::String name, text;
+        juce::Rectangle<int> cell;
+        juce::Colour col;
+        float fontHeight = 11.5f;
+        bool  fitted = false;  // drawFittedText (shrinks to fit) vs drawText (clips)
+    };
+    std::vector<PaintedSub> paintedSubLabels() const;
 
     void configGroup (juce::GroupComponent&, juce::Colour);
     void configFader (juce::Slider&, const juce::String& paramID,
@@ -62,6 +153,17 @@ private:
     void refocus();
     void reclaimFocusUnlessTyping(); // regrab keyboard focus after a window switch (not while typing)
     void pollComputerKeyboard(); // reconcile held keys against the real key state
+    bool playKeysLive() const;   // may the QWERTY mapping ring notes right now?
+    // Repaint the Custom Engine's interval list with one colour per token (see
+    // IntervalTokens.h). Called on every edit and after every programmatic setText.
+    void recolourIntervalTokens();
+    void setIntervalText (const juce::String& text); // setText + recolour, never one without the other
+    // The text the box was last painted from. It is the re-entry guard, and it has to be
+    // the TEXT and not a bool: TextEditor::textChanged() POSTS the onTextChange callback
+    // instead of calling it, so a scoped flag is already down by the time our own inserts
+    // come back as messages - each of which would rebuild the text and post more, which
+    // multiplies rather than settles. Comparing the text ends it after one pass.
+    juce::String lastColouredIntervals;
     void openScalaChooser();
     void openPartialAmpWindow();   // the pencil in the SLOPE cell
     void refreshSlopeFreeze();     // shows that SLOPE is inert while manual mode is on
@@ -86,8 +188,11 @@ private:
         void showPopup() override { if (onBeforePopup) onBeforePopup(); juce::ComboBox::showPopup(); }
     };
 
-    // TextEditor that grows while being edited (the Custom-Engine intervals box
-    // stretches to the window edge while typing, then shrinks back on blur).
+    // TextEditor with a focus hook. It used to stretch to the window edge while
+    // typing (the intervals box was one 24 px line); now that box is a multi-line
+    // area filling most of the shared engine box, so the hook only resets the view
+    // to the text's start on blur - but the hook itself stays: without it a long
+    // list was left scrolled to its tail and read as if it began mid-way.
     struct ExpandingEditor : juce::TextEditor
     {
         std::function<void (bool)> onFocusChanged;
@@ -2216,6 +2321,11 @@ private:
             warnLbl.setColour (juce::Label::textColourId, juce::Colour (0xffffb020));
             view.setViewedComponent (&grid, false);
             view.setScrollBarsShown (true, false);
+            // The knob list takes the keyboard focus inside its window, so Up/Down/Page
+            // scroll it. That also puts it FIRST in the key-event chain, ahead of the
+            // window's forward-to-the-editor hook: a key this list uses is used here and
+            // never also rings a note.
+            view.setWantsKeyboardFocus (true);
             addAndMakeVisible (view);
         }
 
@@ -2447,14 +2557,35 @@ private:
     struct PartialAmpWindow : juce::DocumentWindow
     {
         std::function<void()> onHide;
+        // The computer keyboard has to go on playing while this window is in front.
+        // It is a separate DESKTOP window, so opening it moves the keyboard focus out
+        // of the editor and the QWERTY-as-MIDI mapping simply stopped: you could not
+        // hear the partial you were dragging. These two forward the key events to the
+        // editor's OWN handlers - one mapping, not a second copy that could drift -
+        // and returning true is also what stops a play key escaping to the host, where
+        // the DAW's own computer-MIDI keyboard would fire a second, differently tuned
+        // note (the "ghost note" the editor's keyPressed already guards against).
+        std::function<bool (const juce::KeyPress&)> onKey;
+        std::function<bool()>                       onKeyState;
         explicit PartialAmpWindow (const juce::String& name)
             : juce::DocumentWindow (name, juce::Colour (0xff0e1118), juce::DocumentWindow::closeButton)
         {
             setUsingNativeTitleBar (true);
             setResizable (true, false);
             setResizeLimits (320, 240, 6000, 4000);
+            // With nothing inside it wanting focus, key events reach this window itself
+            // (ComponentPeer::getTargetForKeyPress falls back to the peer's component).
+            setWantsKeyboardFocus (true);
         }
         void closeButtonPressed() override { if (onHide) onHide(); }
+        bool keyPressed (const juce::KeyPress& k) override
+        {
+            return (onKey != nullptr && onKey (k)) || juce::DocumentWindow::keyPressed (k);
+        }
+        bool keyStateChanged (bool isDown) override
+        {
+            return (onKeyState != nullptr && onKeyState()) || juce::DocumentWindow::keyStateChanged (isDown);
+        }
     };
 
     // Floating centre panel that explains WHY the current settings are silent.
@@ -2488,23 +2619,50 @@ private:
 
     SteppedSlider baseNFader, timbreRepeatsFader;
     MagneticSlider fractalFader, harmonicsFader, primeLimitFader; // magnetic whole-value detents
-    juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, octaveFader, pEnvAmtFader;
+    juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, pEnvAmtFader;
     juce::Slider  ampAdsr[4], filtAdsr[4], pitchAdsr[4];
     juce::ComboBox tuneSourceBox, tuneScopeBox; // beating mode: source + scope
-    juce::ComboBox basePitchBox, whitelistBox, phaseBox, primeModeBox, primeLimitBox, tuningBox, bendBox,
+    juce::ComboBox basePitchBox, phaseBox, primeModeBox, tuningBox, bendBox,
                    dissCountBox, dissModeBox, tuningBankBox;
     RefreshingComboBox presetBox;
     juce::Label presetDirtyMark; // "*" - some parameter drifted from the loaded preset
     void refreshPresetDirtyMark();
     juce::Rectangle<int> titleClickArea; // the title squares; clicking them plays the jingle
     juce::ToggleButton primeToggle[9], morphToggle;
-    juce::ToggleButton temperToggle; // HARMONIC engine mode: snap its partials to the active tuning
+    juce::ToggleButton temperToggle; // lives INSIDE the Custom Engine box (the scale it bypasses)
     std::unique_ptr<ButtonAttachment> temperAtt;
-    // SPECTRUM header: the three mutually exclusive engine states as chips (the same
-    // pattern as the envelope tabs), exactly one lit. They READ engineInForce() and
-    // WRITE the two parameters that decide it, so the override is one click to leave -
-    // and switching away never discards the loaded scale (only "timbreOn" goes down).
-    juce::TextButton engineChip[3];
+    // SPECTRUM panel: the two ENGINES as chips - the TITLE ROW of the one shared
+    // engine box, built exactly like the modulator tab strip. Exactly one lit, the
+    // selected one's colour worn by the whole panel, and the selected one's controls
+    // the only ones inside the box (resized() gates visibility from engineInForce).
+    // They READ engineInForce() and WRITE the parameters that decide it, so chip
+    // selection and which engine SOUNDS are one thing - and switching away never
+    // discards the loaded scale (only "timbreOn" goes down).
+    // TEMPERED is NOT one of them: it is a mode of the harmonic engine, a tick box
+    // laid out in BOTH views (see temperToggle), not a third engine.
+    juce::TextButton engineChip[2];
+    // Show the CUSTOM view while nothing sounds custom yet. The engines share ONE box,
+    // so with no scale loaded the Load button and the intervals editor only exist
+    // inside the custom view - if the CUSTOM chip refused the click until a scale
+    // existed (as it used to), the only ways to CREATE one would be unreachable.
+    // Cleared the moment any non-harmonic engine state is observed, and by the
+    // HARMONIC chip: it may only ever hold the box open as a workspace, never
+    // contradict a real engine change.
+    bool customViewPinned = false;
+    // ONE predicate for "which view is inside the shared engine box", used by
+    // resized() (visibility + layout), paint() (dividers/sub-labels) and
+    // applyEngineState() (chip lighting + panel colour) - three readers that must
+    // never disagree about what is on screen.
+    bool customViewShown() const
+    {
+        using E = FractalAdditiveAudioProcessor::EngineInForce;
+        const auto st = processorRef.engineInForce();
+        return st == E::CustomScale || (st == E::Harmonic && customViewPinned);
+    }
+    // What applyEngineState() dressed the panel in. Seeded with the harmonic engine's
+    // blue - the state a fresh instance opens in - so the very first paint (which can
+    // land before the first applyEngineState) is never a default black frame.
+    juce::Colour         spectrumPanelColour { 0xff5cb8ff };
     void applyEngineState(); // dim/enable + chip look + repaint, from engineInForce()
     std::unique_ptr<SliderAttachment> primeLimitFaderAtt;
     // SLOPE cell: the pencil that opens the per-partial amplitude window, and the ON/OFF
@@ -2585,8 +2743,8 @@ private:
     // in table mode - a scale's period comes from the scale and must not look editable.
     juce::TextEditor tablePeriodEdit;
     juce::TextButton tablePeriodResetBtn;
-    ExpandingEditor  intervalEdit; // Custom Engine: typed intervals -> partials (grows while editing)
-    juce::Rectangle<int> intervalEditHome; // its normal (collapsed) bounds
+    ExpandingEditor  intervalEdit; // Custom Engine: typed intervals -> partials (multi-line)
+    juce::Rectangle<int> intervalEditHome; // its laid-out bounds (kept for the focus hook)
     juce::TextEditor refAEdit;     // Reference A: type the Hz directly ("hz" shown to its right)
     WarningOverlay warningOverlay;
     NoticeOverlay  noticeOverlay;
@@ -2615,6 +2773,18 @@ private:
     bool             lastNadRootOnly = true;
     juce::String     lastNadOpts;   // Min/Max + period + smallest interval, as typed
     double           lastNadSig = -1.0e30;
+    juce::uint32     lastNadSpecMs = 0;      // rate limit for SPECTRUM-driven recomputes (see timer)
+    double           lastNadSpecSig = -1.0;  // last ACCEPTED spectrum signature (held between refreshes)
+    // ONE REMEMBERED PERIOD PER MODE. The search wants 2/1 and the adaptation wants 8/1 -
+    // eight partials spread over three octaves is the spectrum that mode exists to build,
+    // and 2/1 crammed them into one - so the field cannot have a single default. The rule:
+    // the text belongs to the mode it was typed in. Leaving a mode parks whatever the field
+    // says under that mode and the mode you arrive at shows its own value back; nothing a
+    // user typed is ever thrown away, it just stays where it was typed.
+    // [0] = "Find tunings based on beating", [1] = "Adapt spectrum to tuning based on beating".
+    juce::String     periodTextByMode[2] { "2", "8" };
+    int              lastSpecMode = 1;
+    void             switchPeriodTextForMode (int newMode);
     juce::TextButton chordGoBtn;
     ChordList        chordList;
     juce::Viewport   chordView;
@@ -2626,6 +2796,24 @@ private:
     juce::ComboBox   adaptGoalBox;     // minimum / maximum / inside a range
     juce::TextEditor adaptLoEdit, adaptHiEdit;   // the range's two ends (goal = range)
     juce::Label      adaptPartialsLbl, adaptRangeLbl, adaptInfoLbl;
+    //== THE REGISTER RANGE the adaptation optimises over, as note names ("C2".."C4").
+    //   Sethares' critical band is a width in Hz, so the answer genuinely differs per
+    //   octave - which registers a spectrum was optimised for therefore has to be on
+    //   screen, not implied. `adaptAggBox` picks mean-over-the-range vs the worst register.
+    juce::TextEditor adaptRegLoEdit, adaptRegHiEdit;
+    juce::ComboBox   adaptAggBox;
+    juce::Label      adaptRegLbl, adaptRegInfoLbl;
+    // AUTO until the user types: the fields follow an octave either side of the lowest
+    // note being played. Typing in either one latches it off for good - a range the user
+    // set is never moved under them.
+    bool             adaptRegAuto = true;
+    int              adaptRegAutoLo = 48, adaptRegAutoHi = 72;
+    void             syncAdaptRegisterAuto();
+    void             commitAdaptRegisters();
+    // The key whose ACTIVE-TUNING pitch is nearest `hz` - how a register in Hz is named
+    // back to the user. Through the tuning, so a shifted or table-anchored instrument
+    // names its own keys and not 12-EDO's.
+    int              nearestKeyForHz (double hz) const;
     juce::ToggleButton adaptAmpsToggle;          // shape AMPLITUDES as well as positions
     juce::TextButton adaptGoBtn;
     AdaptList        adaptList;
@@ -2636,8 +2824,13 @@ private:
     //   processor what they should be doing (see syncRealtimeLink).
     juce::TextButton chordRtBtn, adaptRtBtn;
     bool             chordRtOn = false, adaptRtOn = false;
+    // The target the user chose by hand, parked while REALTIME forces the box to the held
+    // chord (the only target a follower can meaningfully have) and handed straight back
+    // when realtime goes off. 0 = nothing parked.
+    int              adaptTargetBeforeRt = 0;
     FractalAdditiveAudioProcessor::RtSettings realtimeSettingsFromPanel() const;
     void syncRealtimeLink();
+    void syncAdaptTargetLock();
     void paintRealtimeButtons();
     // Chord preview scheduling (messages sent into the processor's collector when due).
     struct PrevEv { juce::uint32 dueMs; juce::MidiMessage msg; };
@@ -2680,18 +2873,18 @@ private:
     // opaque GroupComponent added after its children buries them (they keep their
     // tooltips, so the bug looks like "the control is there but dead").
     juce::GroupComponent gFilter, gAmpEnv, gPitchEnv, gTuning, gSpecScale, gScaleDiss;
-    juce::Label lblBaseN, lblBasePitch, lblRange, lblFractal, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
-                lblTimbreRepeats, lblBend, lblPeriod, lblSteps, lblRefA, lblRefHz, lblOctave, lblPitchAmt,
+    juce::Label lblBaseN, lblBasePitch, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
+                lblTimbreRepeats, lblBend, lblPeriod, lblSteps, lblRefA, lblRefHz, lblPitchAmt,
                 lblMorphTime, lblTuningBank, tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel,
                 tuningPeriodLbl;
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], pitchAdsrLbl[4], primeLbl[9];
 
     std::unique_ptr<SliderAttachment>   baseNAtt, slopeAtt, fractalAtt, gainAtt,
-                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, octaveAtt, pEnvAmtAtt,
+                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, pEnvAmtAtt,
                                         harmonicsAtt;
     std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4], pitchAdsrAtt[4];
-    std::unique_ptr<ComboBoxAttachment> basePitchAtt, whitelistAtt, phaseAtt,
-                                        primeModeAtt, primeLimitAtt, tuningAtt, bendAtt, tuningBankAtt;
+    std::unique_ptr<ComboBoxAttachment> basePitchAtt, phaseAtt,
+                                        primeModeAtt, tuningAtt, bendAtt, tuningBankAtt;
     std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], morphAtt;
     std::unique_ptr<SliderAttachment>   morphTimeAtt;
 
@@ -2703,9 +2896,9 @@ private:
     bool catalan = false;
     int  baseKey = 60; // MIDI note of the leftmost computer key; Z/X shift it by one period
     int  lastPrimeMode = -1;
-    // Packs engineInForce() with "is a custom scale loaded at all" - the CUSTOM chip is
-    // only clickable in the second case, and that can change without the first one
-    // moving (loading a scale while the engine is off). -1 = never applied yet.
+    // Packs engineInForce() with "is a custom scale loaded at all" - the second bit
+    // can change without the first one moving (loading a scale while the engine is
+    // off), and the custom view's Off button hangs on it. -1 = never applied yet.
     int  lastEngineShown = -1;
     int  lastResetOffState = -1; // packs Reset/Off visibility to detect changes for relayout
     int  lastDissGeneration = 0; // refresh the degree list / shortfall notice once per generation
@@ -2714,10 +2907,18 @@ private:
     // Everything here is a rect only - the frames, the title chips, the dividers, the
     // sub-labels and the override badges are all drawn in paint() from these.
     juce::Rectangle<int> spectrumBounds;       // the whole SPECTRUM panel
-    juce::Rectangle<int> engineNoteBounds;     // header strip right of the engine chips
-    juce::Rectangle<int> harmonicEngineBounds; // nested: HARMONIC ENGINE
-    juce::Rectangle<int> hcBase, hcHarm, hcPrime;  // its sub-cells
-    juce::Rectangle<int> customEngineBounds;   // nested: CUSTOM ENGINE (replaces the one above)
+    // ONE shared engine box: the HARMONIC / CUSTOM chips are its title row, and only
+    // the selected engine's controls are laid out inside it (the other's are hidden).
+    // Two separate framed boxes said "two independent things" about two engines that
+    // are mutually exclusive, and left the Custom Engine squeezed into a fifth of the
+    // panel while most of its box was air.
+    juce::Rectangle<int> engineBoxBounds;
+    juce::Rectangle<int> hcBase, hcHarm, hcPrime;  // harmonic view's sub-cells (empty in custom view)
+    // The CUSTOM view's two sub-cells, so it has the same shared divider every other box
+    // in the window has: which SCALE is loaded (Load / On-Off / Temper) above, the
+    // spectrum itself (typed intervals, what they built, Reps) below. Empty in the
+    // harmonic view. Without them this view was the one undivided box in the plugin.
+    juce::Rectangle<int> ccScale, ccBody;
     juce::Rectangle<int> bothEnginesBounds;    // nested: what applies to EITHER engine
     juce::Rectangle<int> beSlope, beFractal, beMorph, beRange; // its sub-cells
     juce::Rectangle<int> essentialsBounds;     // Essentials macro-group frame
