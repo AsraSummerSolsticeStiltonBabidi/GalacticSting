@@ -542,12 +542,27 @@ public:
         int    goal        = 0;      // 0 = minimum beating, 1 = maximum, 2 = inside a range
         double rangeLo = 0.0, rangeHi = 0.0;
         bool   shapeAmps   = true;   // also move per-partial AMPLITUDES, not only positions
+        // THE REGISTER RANGE the objective is aggregated over (see Dissonance.h). Sethares'
+        // critical band is a width in Hz, so a spectrum optimised at ONE pitch is optimal
+        // only there - and, worse, an optimiser working in the bass sees tight partial
+        // clusters as nearly free and builds them, which is precisely the roughness that
+        // dominates two octaves up. 0 Hz means AUTO: an octave either side of the note the
+        // adaptation is anchored at (so a follower with the window shut still spans the
+        // register being played, instead of silently collapsing to one pitch).
+        double regLoHz = 0.0, regHiHz = 0.0;
+        int    aggregate = 0;        // 0 = mean over the range, 1 = minimax (the worst register)
     };
+    // The registers a run would use, resolved exactly as startSpectrumAdapt resolves them -
+    // the panel prints these, so what it claims and what the search does cannot drift.
+    static dissonance::Registers adaptRegistersFor (const SpectrumAdaptSettings& s, double f0Hz,
+                                                    bool realtime);
     // `targetAlphas` are the notes as ratios (alphas[0] is the root, normally 1.0);
     // `f0Hz` is the root's real frequency - Sethares roughness depends on register, so
     // the same chord an octave down wants a different spectrum.
+    // `realtime` picks the SMALLER register cap (see Dissonance.h): the follower must keep
+    // up with the fingers, and the cost is exactly linear in the number of registers.
     bool startSpectrumAdapt (const SpectrumAdaptSettings& s, const std::vector<double>& targetAlphas,
-                             double f0Hz, juce::String& errorOut);
+                             double f0Hz, juce::String& errorOut, bool realtime = false);
     void cancelSpectrumAdapt() { adaptCancel = true; }
     bool  isSpectrumAdaptRunning() const noexcept { return adaptRunning.load(); }
     float getSpectrumAdaptProgress() const noexcept { return adaptProgress.load(); }
@@ -560,6 +575,17 @@ public:
         double after  = 0.0;          // what this one does
         int    targetNotes = 0;
         bool   valid = false;
+        // The register range this result was optimised over, and what it achieves across
+        // it. `before`/`after` are the AGGREGATE that was minimised (mean over the range,
+        // or the worst register's own value) - so the panel's one line reports the number
+        // the search actually worked on, never middle C's value standing in for six octaves.
+        double regLoHz = 0.0, regHiHz = 0.0;
+        int    regPoints = 1;
+        int    aggregate = 0;         // 0 = mean, 1 = minimax
+        double mean = 0.0,  worst = 0.0;       // both aggregates of the ADAPTED spectrum
+        double seedMean = 0.0, seedWorst = 0.0;
+        double worstHz = 0.0;         // the register that scores worst
+        std::vector<double> perRegister, registerF0;
     };
     AdaptInfo getSpectrumAdaptResult() const
     {
@@ -581,8 +607,12 @@ public:
     // What the CURRENT spectrum really beats against the current target, measured on the
     // compiled partials - so a fractal level or a Reps count the adaptation did not model
     // shows up as a number the user can see instead of a silent discrepancy.
+    // `regs` must be the SAME registers the adaptation ran on and aggregated the same way:
+    // "sounding now" sits next to "after" in one line, and a value measured at one pitch
+    // against an aggregate over six octaves would differ for reasons that have nothing to
+    // do with the patch, printing a discrepancy warning that was pure arithmetic.
     double measureCurrentAgainstTarget (const std::vector<double>& alphas, double f0Hz,
-                                        bool rootOnly) const;
+                                        bool rootOnly, const dissonance::Registers& regs) const;
 
     //==========================================================================
     // REALTIME links between the spectrum and the tuning ("Spectrum vs Tuning").

@@ -2796,6 +2796,24 @@ private:
     juce::ComboBox   adaptGoalBox;     // minimum / maximum / inside a range
     juce::TextEditor adaptLoEdit, adaptHiEdit;   // the range's two ends (goal = range)
     juce::Label      adaptPartialsLbl, adaptRangeLbl, adaptInfoLbl;
+    //== THE REGISTER RANGE the adaptation optimises over, as note names ("C2".."C4").
+    //   Sethares' critical band is a width in Hz, so the answer genuinely differs per
+    //   octave - which registers a spectrum was optimised for therefore has to be on
+    //   screen, not implied. `adaptAggBox` picks mean-over-the-range vs the worst register.
+    juce::TextEditor adaptRegLoEdit, adaptRegHiEdit;
+    juce::ComboBox   adaptAggBox;
+    juce::Label      adaptRegLbl, adaptRegInfoLbl;
+    // AUTO until the user types: the fields follow an octave either side of the lowest
+    // note being played. Typing in either one latches it off for good - a range the user
+    // set is never moved under them.
+    bool             adaptRegAuto = true;
+    int              adaptRegAutoLo = 48, adaptRegAutoHi = 72;
+    void             syncAdaptRegisterAuto();
+    void             commitAdaptRegisters();
+    // The key whose ACTIVE-TUNING pitch is nearest `hz` - how a register in Hz is named
+    // back to the user. Through the tuning, so a shifted or table-anchored instrument
+    // names its own keys and not 12-EDO's.
+    int              nearestKeyForHz (double hz) const;
     juce::ToggleButton adaptAmpsToggle;          // shape AMPLITUDES as well as positions
     juce::TextButton adaptGoBtn;
     AdaptList        adaptList;

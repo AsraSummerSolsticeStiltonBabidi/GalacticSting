@@ -2744,6 +2744,22 @@ int main()
                                  first.isEmpty() ? "" : (" (" + first + ")").toRawUTF8());
                     check (outside + squashed + condensed == 0,
                            "this mode's whole column fits, unsquashed and uncondensed");
+
+                    // A COMBO IS NOT A LABEL and the condensing rule above cannot see it:
+                    // a ComboBox given too little room draws its arrow and clips the word
+                    // silently. The adaptation's register row packs a caption, two note
+                    // fields and this box onto one 186 px line, and the Catalan words are
+                    // the longer ones ("Registres", "pitjor") - so the box that ends up
+                    // with whatever is left over is measured explicitly.
+                    if (sh.mode == 2)
+                        for (const auto& c : P.controls)
+                            if (c.first == "spec.agg")
+                            {
+                                std::printf ("    aggregate box: %d px wide (%s)\n",
+                                             c.second.getWidth(), lang == 1 ? "ca" : "en");
+                                check (c.second.getWidth() >= 50,
+                                       "the mean/minimax box keeps room for its word beside its arrow");
+                            }
                 }
             }
             ed->setSpecModeForTests (1);
@@ -3013,7 +3029,11 @@ int main()
             st.partials = 8; st.periodRatio = 2.0; st.minGapCents = 50.0;
             st.rootOnly = true; st.goal = 0; st.shapeAmps = true;
 
-            const double beforeReal = p.measureCurrentAgainstTarget (alphas, f0, true);
+            // The registers this run will use, resolved by the processor's own helper -
+            // "really sounding" has to be measured over the same ones the search optimised
+            // or the two numbers printed side by side would be on different scales.
+            const auto regs = Proc::adaptRegistersFor (st, f0, /*realtime*/ false);
+            const double beforeReal = p.measureCurrentAgainstTarget (alphas, f0, true, regs);
             juce::String err;
             check (p.startSpectrumAdapt (st, alphas, f0, err), "the adaptation starts");
             for (int i = 0; i < 2000 && p.isSpectrumAdaptRunning(); ++i) juce::Thread::sleep (5);
@@ -3023,9 +3043,29 @@ int main()
 
             const int reps = (int) p.apvts.getRawParameterValue ("timbreRepeats")->load();
             const int want = st.partials * juce::jmax (1, reps);
-            const double afterReal = p.measureCurrentAgainstTarget (alphas, f0, true);
+            const double afterReal = p.measureCurrentAgainstTarget (alphas, f0, true, regs);
             std::printf ("  12ED2 x 8 partials: model %.2f -> %.2f, really sounding %.2f -> %.2f\n",
                          info.before, info.after, beforeReal, afterReal);
+            // THE REGISTER RANGE, end to end through the real processor. A settings block
+            // with no range set means AUTO - an octave either side of the anchor - and the
+            // result must SAY which registers it was optimised for, because with a
+            // single-pitch objective (the bug this replaces) the answer is different.
+            std::printf ("  registers: %d points, %.2f..%.2f Hz (anchor %.2f), %s\n",
+                         info.regPoints, info.regLoHz, info.regHiHz, f0,
+                         info.aggregate == 1 ? "minimax" : "mean");
+            check (info.regPoints == 3 && std::abs (info.regLoHz - f0 * 0.5) < 1.0e-6
+                   && std::abs (info.regHiHz - f0 * 2.0) < 1.0e-6,
+                   "an unset range is an octave either side of the anchor, sampled at three registers");
+            check ((int) info.perRegister.size() == info.regPoints
+                   && (int) info.registerF0.size() == info.regPoints,
+                   "and the result carries one measured number per register");
+            check (info.mean <= info.worst + 1.0e-12 && info.after <= info.seedWorst,
+                   "the aggregate read-outs are consistent (mean never above the worst register)");
+            // The realtime follower's cap is a STATED difference, not a silent one: at this
+            // two-octave range it samples exactly as densely as the Adapt button does.
+            const auto rtRegs = Proc::adaptRegistersFor (st, f0, /*realtime*/ true);
+            check (rtRegs.f0.size() == regs.f0.size(),
+                   "and at the default two-octave range realtime samples exactly as densely");
             std::printf ("  compiled partials: %d (asked %d x %d periods)\n",
                          t != nullptr ? (int) t->partials.size() : -1, st.partials, reps);
             check (afterReal < beforeReal, "the spectrum the synth REALLY makes beats less against that tuning");

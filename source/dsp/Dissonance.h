@@ -780,22 +780,183 @@ namespace dissonance
         }
     }
 
+    //==========================================================================
+    // THE REGISTER RANGE, and why one pitch is the wrong objective.
+    //
+    // targetScore above is a function of ABSOLUTE frequencies: Sethares' s = Dstar /
+    // (S1*f_lower + S2) makes the critical band a width in Hz, not in cents. Write the
+    // roughness argument for one partial pair of ratio r sitting at lower frequency f1:
+    //
+    //     x = s*d = 0.24 * f1 * (r - 1) / (0.0207 * f1 + 18.96)
+    //
+    // and the pair term peaks at x = 0.2204 (5*(-3.51)e^(A1 x) + (-5)(-5.75)e^(A2 x) = 0
+    // gives e^(2.24 x) = 28.75/17.55, x = ln(1.63818)/2.24). x grows monotonically with f1
+    // toward the asymptote 11.594*(r-1), so:
+    //
+    //   - the roughest interval is ~434 c at 65 Hz, ~142 c at 262 Hz, ~61 c at 1047 Hz
+    //     (Hz, not note names: this header is UI-free, and the plugin calls key 60 "C3"
+    //     while the acoustics literature calls it C4 - naming it either way here would
+    //     read as wrong to half the people who open the file);
+    //   - a pair WIDER than 1200*log2(1 + 0.2204/11.594) = 32.6 cents crosses the peak on
+    //     the way up and then gets BETTER (a fifth: 0.746 at 65 Hz, 0.0001 at 1047 Hz);
+    //   - a pair NARROWER than 32.6 cents never reaches the peak, so it gets monotonically
+    //     WORSE going up (20 cents apart: 0.099 at 65 Hz, 0.577 at 1047 Hz).
+    //
+    // So an optimiser working only in the bass sees tight partial clusters as nearly free
+    // and will HAPPILY BUILD THEM - and those clusters are the dominant roughness two
+    // octaves up. Optimising at one pitch does not merely miss the rest of the keyboard;
+    // it actively produces spectra that are clean low and buzzy high (SpectrumTests
+    // measures exactly that). The objective therefore aggregates over a RANGE of f0.
+    enum class Aggregate
+    {
+        Mean = 0,     // the average register: best overall, free to sacrifice one octave
+        Minimax = 1   // the WORST register: nothing is allowed to be horrible anywhere
+    };
+
+    // The f0 values a range is sampled at: `n` points spread evenly in LOG frequency
+    // (roughness varies smoothly with log f0 - see the sampling test in SpectrumTests,
+    // which fences a handful of points against a dense sweep). n <= 1, or a degenerate
+    // range, collapses to a single point - which makes the single-pitch behaviour a
+    // special case of this one, not a separate code path.
+    inline std::vector<double> registerPoints (double loHz, double hiHz, int n)
+    {
+        std::vector<double> out;
+        if (! (loHz > 0.0) || ! std::isfinite (loHz)) return out;
+        if (! (hiHz > 0.0) || ! std::isfinite (hiHz)) hiHz = loHz;
+        if (hiHz < loHz) std::swap (loHz, hiHz);
+        if (n < 1) n = 1;
+        if (n == 1 || ! (hiHz > loHz * 1.0001))
+        {
+            out.push_back (std::sqrt (loHz * hiHz)); // the middle of the range, in log f
+            return out;
+        }
+        const double a = std::log2 (loHz), b = std::log2 (hiHz);
+        out.reserve ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            out.push_back (std::exp2 (a + (b - a) * (double) i / (double) (n - 1)));
+        return out;
+    }
+
+    struct Registers
+    {
+        std::vector<double> f0;               // the pitches the objective is evaluated at
+        Aggregate mode = Aggregate::Mean;
+    };
+
+    // HOW MANY POINTS A RANGE NEEDS - one octave of spacing, capped.
+    //
+    // Every pair term is a smooth bump in log f0 (it rises to Sethares' peak at x = 0.2204
+    // and decays), so the aggregate is smooth too and does not need dense sampling. It was
+    // measured rather than assumed: a 12-partial spectrum optimised over six octaves
+    // (33..2093 Hz) and then judged on a 0.08-octave sweep came out, against a
+    // 0.25-octave-spaced reference,
+    //
+    //     spacing   3.0 oct   2.0 oct   1.5 oct   1.0 oct   0.75 oct
+    //     mean       +3.3%     +2.8%     +2.2%     +0.5%     +0.5%
+    //     minimax   +29.8%    +20.6%     +3.4%     -4.3%      0.0%   (worst register)
+    //
+    // Mean is forgiving; MINIMAX is not - it hunts a peak, and with points two octaves
+    // apart the peak simply falls between them and the search never sees it. One octave is
+    // where both settle, so that is the rule. `cap` is the paths' one honest difference:
+    // the cost is exactly linear in the number of points, so the realtime follower takes a
+    // smaller cap and the panel SAYS how many registers each path uses.
+    inline int registerCountFor (double loHz, double hiHz, int cap)
+    {
+        if (! (loHz > 0.0) || ! (hiHz > 0.0)) return 1;
+        if (hiHz < loHz) std::swap (loHz, hiHz);
+        const double octaves = std::log2 (hiHz / loHz);
+        if (! (octaves > 0.02)) return 1;                    // a degenerate range IS one pitch
+        // The 1e-6 is not cosmetic: an "octave either side" range that lands on 2.0000001
+        // octaves through a stretched tuning's own frequencies would otherwise round UP to
+        // four points, and the panel would report a different count for two ranges the user
+        // cannot tell apart.
+        const int want = 1 + (int) std::ceil (octaves - 1.0e-6);
+        return std::max (2, std::min (want, std::max (2, cap)));
+    }
+
+    // The two caps. 7 covers C1..C7 at one octave a point; the realtime follower runs on a
+    // ~250 ms throttle and an adaptation against 31 scale degrees is already ~100 ms at one
+    // register, so it takes 3 - which is still EXACT sampling for the panel's default range
+    // (an octave either side of the played note is 2 octaves, i.e. one octave a point).
+    constexpr int kAdaptRegisterCap   = 7;
+    constexpr int kAdaptRegisterCapRt = 3;
+
+    struct RegisterScores
+    {
+        std::vector<double> perRegister;      // RAW target score at each register
+        double mean  = 0.0;                   // average raw score over the range
+        double worst = 0.0;                   // raw score of the register that scores WORST
+        int    worstIndex = 0;                // which register that is
+        double cost  = 0.0;                   // what the search minimises (mean/max of goalCost)
+    };
+
+    // Score `sp` - which is anchored at `spF0` - at every register in `regF0`, by
+    // transposing the WHOLE spectrum there (its ratios and the target intervals are the
+    // same everywhere; only the absolute frequencies, and therefore the critical band,
+    // move). "Worst" is defined by goalCost, not by raw dissonance, so it means the same
+    // thing under Min, Max and Range: the register furthest from what was asked for.
+    inline RegisterScores scoreOverRegisters (const std::vector<Partial>& sp, double spF0,
+                                              const std::vector<double>& regF0,
+                                              const std::vector<double>& alphas, bool rootOnly,
+                                              Goal goal, double rangeLo, double rangeHi,
+                                              Aggregate agg)
+    {
+        RegisterScores rs;
+        if (sp.empty() || alphas.empty() || ! (spF0 > 0.0))
+            return rs;
+        // No range given at all is the single-register case at the spectrum's own anchor -
+        // identical arithmetic to the pre-range objective, bit for bit.
+        std::vector<double> one;
+        const std::vector<double>& regs = regF0.empty() ? (one = { spF0 }) : regF0;
+
+        rs.perRegister.reserve (regs.size());
+        std::vector<Partial> t (sp.size());
+        double sumCost = 0.0, worstCost = -1.0e300;
+        for (size_t k = 0; k < regs.size(); ++k)
+        {
+            const double scale = regs[k] / spF0;
+            for (size_t i = 0; i < sp.size(); ++i)
+                t[i] = { sp[i].freq * scale, sp[i].amp };
+            const double d = targetScore (t, alphas, rootOnly);
+            const double c = goalCost (d, goal, rangeLo, rangeHi);
+            rs.perRegister.push_back (d);
+            rs.mean += d;
+            sumCost += c;
+            if (c > worstCost) { worstCost = c; rs.worst = d; rs.worstIndex = (int) k; }
+        }
+        rs.mean /= (double) regs.size();
+        rs.cost = agg == Aggregate::Minimax ? worstCost : sumCost / (double) regs.size();
+        return rs;
+    }
+
     struct AdaptResult
     {
         std::vector<Partial> spectrum;   // freq = ratio * f0, ascending; [0] is the played pitch
         double score = 0.0;              // the dissonance it achieves against the target
         double seedScore = 0.0;          // what the SEED spectrum scored, for honest before/after
         int    sweepsDone = 0;
+        // The range read-out. `score`/`seedScore` above report the AGGREGATE that was
+        // actually optimised (mean over the range, or the worst register's own value) -
+        // with one register they are exactly the old single-pitch numbers. These carry
+        // both aggregates plus the per-register detail, so a caller can say how much
+        // Mean's worst register costs against Minimax's without re-running anything.
+        std::vector<double> perRegister, seedPerRegister, registerF0;
+        double mean = 0.0,  worst = 0.0;
+        double seedMean = 0.0, seedWorst = 0.0;
+        int    worstIndex = 0;
     };
 
     // `seed` must be ascending by freq with seed[0].freq == f0 (the played pitch).
     // `maxRatio` is the highest ratio a partial may reach; `minGapCents` the air every
-    // pair of partials keeps. `progress` (0..1) returns false to abort.
+    // pair of partials keeps. `regs` is the REGISTER RANGE the objective aggregates over
+    // (empty f0 list = the single register f0, i.e. the pre-range behaviour exactly).
+    // `progress` (0..1) returns false to abort.
     inline AdaptResult adaptSpectrum (std::vector<Partial> seed, double f0,
                                       const std::vector<double>& alphas, bool rootOnly,
                                       Goal goal, double rangeLo, double rangeHi,
                                       double minGapCents, double maxRatio,
                                       bool shapeAmps, double ampRangeDb, int sweeps,
+                                      const Registers& regs,
                                       const std::function<bool(float)>& progress = {})
     {
         AdaptResult out;
@@ -837,15 +998,32 @@ namespace dissonance
             for (int i = 0; i < n; ++i)
                 work[(size_t) i] = { f0 * std::exp2 (cents[(size_t) i] / 1200.0), amp[(size_t) i] * g };
         };
+        // THE OBJECTIVE IS THE WHOLE RANGE. Every evaluation transposes the candidate to
+        // each register and aggregates - mean, or the worst register. The single-register
+        // case falls straight out of this (see scoreOverRegisters), so there is only ever
+        // one objective in the code and no second path to drift out of agreement.
+        const auto measure = [&] (const std::vector<Partial>& sp)
+        {
+            return scoreOverRegisters (sp, f0, regs.f0, alphas, rootOnly,
+                                       goal, rangeLo, rangeHi, regs.mode);
+        };
         const auto cost = [&]
         {
             build();
-            return goalCost (targetScore (work, alphas, rootOnly), goal, rangeLo, rangeHi);
+            return measure (work).cost;
         };
 
         build();
-        out.seedScore = targetScore (work, alphas, rootOnly);
-        double best = goalCost (out.seedScore, goal, rangeLo, rangeHi);
+        const auto seedScores = measure (work);
+        // The reported "before" is the aggregate that is being optimised: the mean over the
+        // range, or the worst register's own dissonance. The panel prints these two numbers
+        // as "beating: X -> Y", and a number optimised over five octaves that quoted only
+        // middle C's value would be a read-out of something nobody asked for.
+        out.seedScore       = regs.mode == Aggregate::Minimax ? seedScores.worst : seedScores.mean;
+        out.seedMean        = seedScores.mean;
+        out.seedWorst       = seedScores.worst;
+        out.seedPerRegister = seedScores.perRegister;
+        double best = seedScores.cost;
 
         constexpr double invPhi = 0.6180339887498949;
         // One golden-section line search on coordinate `set`, over [lo, hi]. `restore` is
@@ -888,7 +1066,19 @@ namespace dissonance
                 if (! (cents[(size_t) i] > cents[(size_t) i - 1] + gap * 0.999))
                     cents[(size_t) i] = keep;   // the window had no legal room: leave it put
                 if (progress && ! progress (0.05f + 0.9f * (float) (s * n + i) / (float) (nSweeps * n)))
-                { out.spectrum = work; out.score = targetScore (work, alphas, rootOnly); return out; }
+                {
+                    // Cancelled mid-sweep: report the spectrum reached so far, measured the
+                    // SAME way as a completed run (a cancelled result that quoted middle C
+                    // while a finished one quoted the range would be two scales in one field).
+                    build();
+                    const auto rs = measure (work);
+                    out.spectrum = work;
+                    out.score    = regs.mode == Aggregate::Minimax ? rs.worst : rs.mean;
+                    out.mean = rs.mean; out.worst = rs.worst; out.worstIndex = rs.worstIndex;
+                    out.perRegister = rs.perRegister;
+                    out.registerF0  = regs.f0.empty() ? std::vector<double> { f0 } : regs.f0;
+                    return out;
+                }
             }
             if (shapeAmps)
                 for (int i = 0; i < n; ++i)
@@ -905,9 +1095,30 @@ namespace dissonance
         }
 
         build();
-        out.spectrum = work;
-        out.score    = targetScore (work, alphas, rootOnly);
+        const auto rs = measure (work);
+        out.spectrum    = work;
+        out.score       = regs.mode == Aggregate::Minimax ? rs.worst : rs.mean;
+        out.mean        = rs.mean;
+        out.worst       = rs.worst;
+        out.worstIndex  = rs.worstIndex;
+        out.perRegister = rs.perRegister;
+        out.registerF0  = regs.f0.empty() ? std::vector<double> { f0 } : regs.f0;
         return out;
+    }
+
+    // The single-register call, kept because it is the honest name for what it does: adapt
+    // the spectrum for ONE pitch. Everything the range objective adds collapses to exactly
+    // this when the range holds one point, so this is a thin forward, not a second search.
+    inline AdaptResult adaptSpectrum (std::vector<Partial> seed, double f0,
+                                      const std::vector<double>& alphas, bool rootOnly,
+                                      Goal goal, double rangeLo, double rangeHi,
+                                      double minGapCents, double maxRatio,
+                                      bool shapeAmps, double ampRangeDb, int sweeps,
+                                      const std::function<bool(float)>& progress = {})
+    {
+        return adaptSpectrum (std::move (seed), f0, alphas, rootOnly, goal, rangeLo, rangeHi,
+                              minGapCents, maxRatio, shapeAmps, ampRangeDb, sweeps,
+                              Registers {}, progress);
     }
 
     struct ExtremeInfo { double ratio; double value; };

@@ -1863,7 +1863,8 @@ std::vector<double> FractalAdditiveAudioProcessor::heldChordAsTargetAlphas (doub
 }
 
 double FractalAdditiveAudioProcessor::measureCurrentAgainstTarget (const std::vector<double>& alphas,
-                                                                  double f0Hz, bool rootOnly) const
+                                                                  double f0Hz, bool rootOnly,
+                                                                  const dissonance::Registers& regs) const
 {
     if (alphas.empty() || ! (f0Hz > 0.0)) return 0.0;
     // The shared analysis spectrum: published template, SOUNDING amplitudes (this is
@@ -1872,12 +1873,38 @@ double FractalAdditiveAudioProcessor::measureCurrentAgainstTarget (const std::ve
     // used - so "sounding now" and the adaptation's before/after are one scale.
     const auto spec = analysisSpectrumAt (f0Hz);
     if (spec.empty()) return 0.0;
-    return dissonance::targetScore (spec, alphas, rootOnly);
+    // ...and aggregated over the SAME registers, the same way (see the header).
+    const auto rs = dissonance::scoreOverRegisters (spec, f0Hz, regs.f0, alphas, rootOnly,
+                                                    dissonance::Goal::Min, 0.0, 0.0, regs.mode);
+    return regs.mode == dissonance::Aggregate::Minimax ? rs.worst : rs.mean;
+}
+
+// THE REGISTER RANGE, resolved in ONE place. The panel prints what this returns and the
+// search runs on what this returns, so the two can never disagree about which registers a
+// spectrum was optimised for - and that answer genuinely differs (a spectrum optimised at
+// C1 is ~3.7x rougher at C6 than one optimised there; see SpectrumTests).
+dissonance::Registers FractalAdditiveAudioProcessor::adaptRegistersFor (const SpectrumAdaptSettings& s,
+                                                                        double f0Hz, bool realtime)
+{
+    dissonance::Registers regs;
+    regs.mode = s.aggregate == 1 ? dissonance::Aggregate::Minimax : dissonance::Aggregate::Mean;
+    double lo = s.regLoHz, hi = s.regHiHz;
+    // AUTO (0 Hz): an octave either side of the pitch the adaptation is anchored at. The
+    // follower runs with the editor shut, so the default cannot live in the editor - and a
+    // missing range must not collapse silently back to the single-pitch objective this
+    // whole change exists to replace.
+    if (! (lo > 0.0) || ! (hi > 0.0) || ! std::isfinite (lo) || ! std::isfinite (hi))
+    { lo = f0Hz * 0.5; hi = f0Hz * 2.0; }
+    if (hi < lo) std::swap (lo, hi);
+    const int cap = realtime ? dissonance::kAdaptRegisterCapRt : dissonance::kAdaptRegisterCap;
+    regs.f0 = dissonance::registerPoints (lo, hi, dissonance::registerCountFor (lo, hi, cap));
+    return regs;
 }
 
 bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSettings& s,
                                                         const std::vector<double>& targetAlphas,
-                                                        double f0Hz, juce::String& errorOut)
+                                                        double f0Hz, juce::String& errorOut,
+                                                        bool realtime)
 {
     const int N = juce::jlimit (2, 24, s.partials);
     if (targetAlphas.empty() || ! (f0Hz > 0.0) || ! std::isfinite (f0Hz))
@@ -1949,15 +1976,19 @@ bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSetti
     adaptProgress    = 0.0f;
     adaptRunning     = true;
 
+    // Resolved BEFORE the thread starts, from the same helper the panel reads, so the run
+    // and the read-out are the same registers by construction.
+    const auto regs = adaptRegistersFor (s, f0Hz, realtime);
+
     adaptThread = std::make_unique<std::thread> (
-        [this, seed = std::move (seed), alphas = targetAlphas, f0Hz, s, N, gap, topRatio]()
+        [this, seed = std::move (seed), alphas = targetAlphas, f0Hz, s, N, gap, topRatio, regs]()
         {
             const auto goal = s.goal == 1 ? dissonance::Goal::Max
                             : s.goal == 2 ? dissonance::Goal::Range
                                           : dissonance::Goal::Min;
             auto res = dissonance::adaptSpectrum (seed, f0Hz, alphas, s.rootOnly, goal,
                                                   s.rangeLo, s.rangeHi, gap, topRatio,
-                                                  s.shapeAmps, (double) spectrum::kGainMaxDb, 6,
+                                                  s.shapeAmps, (double) spectrum::kGainMaxDb, 6, regs,
                                                   [this] (float p) { adaptProgress.store (p); return ! adaptCancel.load(); });
             if (! adaptCancel.load() && ! res.spectrum.empty())
             {
@@ -1973,6 +2004,18 @@ bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSetti
                 info.after       = res.score;
                 info.targetNotes = (int) alphas.size();
                 info.valid       = (int) info.ratios.size() == N;
+                info.regLoHz     = regs.f0.empty() ? f0Hz : regs.f0.front();
+                info.regHiHz     = regs.f0.empty() ? f0Hz : regs.f0.back();
+                info.regPoints   = (int) std::max<size_t> (1, regs.f0.size());
+                info.aggregate   = regs.mode == dissonance::Aggregate::Minimax ? 1 : 0;
+                info.mean        = res.mean;
+                info.worst       = res.worst;
+                info.seedMean    = res.seedMean;
+                info.seedWorst   = res.seedWorst;
+                info.perRegister = res.perRegister;
+                info.registerF0  = res.registerF0;
+                info.worstHz     = juce::isPositiveAndBelow (res.worstIndex, (int) res.registerF0.size())
+                                       ? res.registerF0[(size_t) res.worstIndex] : f0Hz;
                 {
                     const juce::ScopedLock sl (adaptLock);
                     adaptResult = std::move (info);
@@ -2359,7 +2402,11 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
         rtPending   = false;
         rtLastStart = rtTick;
         juce::String err;
-        if (startSpectrumAdapt (rtSet.adapt, alphas, f0, err))
+        // `realtime` = true: the follower takes the SMALLER register cap (3 instead of 7).
+        // The cost is exactly linear in the number of registers and this runs on a ~250 ms
+        // throttle, so seven of them would simply stop it keeping up with the fingers. The
+        // panel says so out loud (see the "registers" read-out) rather than degrading quietly.
+        if (startSpectrumAdapt (rtSet.adapt, alphas, f0, err, /*realtime*/ true))
         {
             ++rtStarts;
             // Remember what this search is aimed at, not what merely passed by: the
