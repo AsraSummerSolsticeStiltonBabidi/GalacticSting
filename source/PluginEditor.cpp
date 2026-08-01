@@ -1027,7 +1027,6 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // running engine produced), so it has no GroupComponent of its own - its frame is
     // that box's, and its title is a painted sub-label like SLOPE and MORPH.
     configFader (fractalFader, "fractalLevel", fractalAtt, cFractal, "Fractal self-similarity level (1 = off)");
-    makeLabel (lblFractal, cFractal);
     // Essentials macro (Phase / Gain / Reference) - one framed box drawn
     // in paint() like the Harmonic Engine, so no per-cell GroupComponents here.
     configCombo (phaseBox, "phaseMode", phaseAtt, cEssentials, "Aligned: tonal pulse, never clips.  Scattered: louder, noisier.");
@@ -1040,8 +1039,6 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // into the SPECTRUM panel's BOTH ENGINES box, because that cut applies to either
     // engine and hiding it among the output essentials made a partial-remover easy to
     // miss. The value labels are refreshed by the timer.
-    makeLabel (lblOctave, cEssentials);
-    makeLabel (lblRange,  cSlope);
     auto stepParam = [this] (const char* id, int delta)
     {
         if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (processorRef.apvts.getParameter (id)))
@@ -2356,6 +2353,34 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     });
     addAndMakeVisible (keyboard);
 
+    // ADOPT A REALTIME LINK THAT IS ALREADY RUNNING.
+    //
+    // The link lives in the PROCESSOR and deliberately keeps following with this window
+    // shut - the throttle, the coalescing and the single undo step are all down there.
+    // But a reopened editor built its panel from scratch: mode box on "Find tunings",
+    // both REALTIME flags false. So the follower went on rewriting the spectrum under
+    // every chord with NOTHING lit to say so - the exact state syncRealtimeLink()'s rule
+    // ("a link may never run invisibly behind another panel") exists to forbid - and the
+    // first press of REALTIME only caught the button up with the link, so it took two
+    // presses to stop it. Worse, any unrelated touch on the panel (the scope box, the
+    // period field) called syncRealtimeLink() and switched the user's follower off
+    // without being asked. Adopting it here makes the panel tell the truth on open.
+    // Not while the segment picker is the active mode: the mode box belongs to it there,
+    // and the processor refuses a spectrum link in segment mode anyway.
+    {
+        using RtLink = FractalAdditiveAudioProcessor::RtLink;
+        const auto live = processorRef.getRealtimeLink();
+        if (live != RtLink::Off && ! processorRef.isSegmentModeActive())
+        {
+            const int mode = live == RtLink::SpectrumFromChord ? 2 : 1;
+            specModeBox.setSelectedId (mode, juce::dontSendNotification);
+            lastSpecMode = mode;
+            chordPeriodEdit.setText (periodTextByMode[mode == 2 ? 1 : 0], juce::dontSendNotification);
+            if (live == RtLink::SpectrumFromChord) { adaptRtOn = true; syncAdaptTargetLock(); }
+            else { chordRtOn = true; tuneSourceBox.setSelectedId (2, juce::dontSendNotification); }
+        }
+    }
+
     applyLanguage();
     applyEngineState(); // sets lastEngineShown, so the timer only re-does it on a change
 
@@ -2580,9 +2605,6 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
 
     lblBaseN.setText     ("N", dontSendNotification);
     lblBasePitch.setText (tr ("Pitch", "To"), dontSendNotification);
-    lblFractal.setText   ({}, dontSendNotification);   // the FRACTAL sub-label already names it
-    lblOctave.setText    ({}, dontSendNotification);   // the OCTAVE cell label already names it
-    lblRange.setText     (tr ("Spectrum", "Espectre"), dontSendNotification);
     lblPrimeLimit.setText(tr ("Limit", "L\xc3\xadmit"), dontSendNotification);
     lblCutoff.setText    (tr ("Cut", "Tall"), dontSendNotification);
     lblRes.setText       (tr ("Res", "Res"), dontSendNotification);
@@ -2747,14 +2769,21 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     refAEdit.setTooltip (tr (
         "Reference pitch: C3 (the tuning anchor key) = this many Hz. The default 261.6255653 is exactly C3 at A=440. Transposes the WHOLE instrument in every tuning mode. Type a value and press Enter.",
         "To de refer\xc3\xa8ncia: C3 (la tecla \xc3\xa0ncora de l'afinaci\xc3\xb3) = aquests Hz. El defecte 261.6255653 \xc3\xa9s exactament C3 amb La=440. Transposa TOT l'instrument en qualsevol mode d'afinaci\xc3\xb3. Escriu un valor i prem Enter."));
-    octaveFader.setTooltip (tr (
-        "Transpose the WHOLE synth by whole octaves (-5..+5), on top of the reference.",
-        "Transposa TOT el sintetitzador per octaves senceres (-5..+5), a sobre de la refer\xc3\xa8ncia."));
-
+    // Re-word a combo's items WITHOUT losing what is selected.
+    //
+    // The id has to be read BEFORE the texts change. juce::ComboBox::getSelectedId()
+    // returns 0 the moment the visible label stops matching the selected item's text
+    // (juce_ComboBox.cpp: `if (getText() == item->text) return item->itemID; return 0;`)
+    // - which is precisely what changeItemText() does to it. Reading it afterwards
+    // therefore handed setSelectedId a 0 and CLEARED the selection for good: one
+    // language switch emptied the Spectrum-vs-Tuning mode box, and with mode == 0 that
+    // panel's every gate (beat / adapt / segment) went false, so Notes, Period, Find,
+    // REALTIME and the results list all vanished until the plugin was reopened.
     auto localise = [] (juce::ComboBox& b, const juce::StringArray& items)
     {
+        const int keep = b.getSelectedId();
         for (int i = 0; i < items.size(); ++i) b.changeItemText (i + 1, items[i]);
-        b.setSelectedId (b.getSelectedId(), juce::dontSendNotification); // refresh displayed text
+        b.setSelectedId (keep, juce::dontSendNotification); // refresh displayed text
     };
     localise (basePitchBox, { tr ("Transposed down", "Transposada avall"), tr ("Original", "Original") });
     localise (phaseBox,     { tr ("Aligned", "Alineat"), tr ("Scattered", "Dispers") });
@@ -2787,11 +2816,14 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     adaptInfoLbl.setTooltip (tr (
         "How much the spectrum BEATS against the target notes (Sethares roughness), before the adaptation and after it - lower = smoother. A second line appears only if Reps or Fractal make the real sound differ from the adapted spectrum.",
         "Quant BAT l'espectre contra les notes objectiu (aspror de Sethares), abans de l'adaptaci\xc3\xb3 i despr\xc3\xa9s - m\xc3\xa9s baix = m\xc3\xa9s suau. Nom\xc3\xa9s apareix una segona l\xc3\xadnia si Reps o Fractal fan que el so real difereixi de l'espectre adaptat."));
-    specModeBox.changeItemText (1, tr ("Find tunings based on beating", "Troba afinacions pel batec"));
-    specModeBox.changeItemText (2, tr ("Adapt spectrum to tuning based on beating",
-                                       "Adapta l'espectre a l'afinaci\xc3\xb3 pel batec"));
-    specModeBox.changeItemText (3, tr ("From spectrum's segment", "Del segment de l'espectre"));
-    specModeBox.setSelectedId (specModeBox.getSelectedId(), juce::dontSendNotification);
+    {
+        const int keepMode = specModeBox.getSelectedId(); // BEFORE the texts move - see localise
+        specModeBox.changeItemText (1, tr ("Find tunings based on beating", "Troba afinacions pel batec"));
+        specModeBox.changeItemText (2, tr ("Adapt spectrum to tuning based on beating",
+                                           "Adapta l'espectre a l'afinaci\xc3\xb3 pel batec"));
+        specModeBox.changeItemText (3, tr ("From spectrum's segment", "Del segment de l'espectre"));
+        specModeBox.setSelectedId (keepMode, juce::dontSendNotification);
+    }
     localise (tuneSourceBox, { tr ("From current tuning", "De l'afinaci\xc3\xb3 actual"),
                                tr ("From all possible tunings", "De totes les afinacions possibles") });
     localise (tuneScopeBox,  { tr ("0 vs all", "0 vs tot"), tr ("all vs all", "tot vs tot") });
@@ -3044,6 +3076,16 @@ void FractalAdditiveAudioProcessorEditor::setSpecModeForTests (int mode)
 void FractalAdditiveAudioProcessorEditor::setAdaptTargetForTests (int id)
 {
     adaptTargetBox.setSelectedId (id, juce::sendNotificationSync);
+}
+
+void FractalAdditiveAudioProcessorEditor::setTuneSourceForTests (int id)
+{
+    tuneSourceBox.setSelectedId (id, juce::sendNotificationSync);
+}
+
+void FractalAdditiveAudioProcessorEditor::setAdaptGoalForTests (int id)
+{
+    adaptGoalBox.setSelectedId (id, juce::sendNotificationSync);
 }
 
 void FractalAdditiveAudioProcessorEditor::setPeriodTextForTests (const juce::String& t)
@@ -3791,6 +3833,92 @@ void FractalAdditiveAudioProcessorEditor::applyEngineState()
     repaint();
 }
 
+// The ONE list of inline sub-labels the editor paints. paint() draws it; layoutProbe()
+// measures it. Kept in one place because a painted label has no component to squash and
+// so fails only by CLIPPING - which is invisible to every other check in the build, and
+// is how "FROZEN - DRAWN BY HAND" shipped clipped at "DRA...".
+std::vector<FractalAdditiveAudioProcessorEditor::PaintedSub>
+FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
+{
+    std::vector<PaintedSub> v;
+    // The band every sub-label is drawn into: the top 13 px of its cell, 5 px in.
+    auto band = [] (juce::Rectangle<int> cell) { return cell.withHeight (13).reduced (5, 0); };
+    auto add  = [&v] (const char* nm, juce::String txt, juce::Rectangle<int> cell,
+                      juce::Colour col, float h = 11.5f, bool fitted = false)
+    { v.push_back ({ nm, std::move (txt), cell, col, h, fitted }); };
+
+    if (! spectrumBounds.isEmpty())
+    {
+        // Harmonic view only: the custom view's controls name themselves and resized()
+        // leaves the hc* cells empty.
+        if (! engineBoxBounds.isEmpty() && ! customViewShown() && ! hcBase.isEmpty())
+        {
+            add ("eng.base",  tr ("BASE", "BASE"),                     band (hcBase),  cHarmonic);
+            add ("eng.harm",  tr ("HARMONICS", "HARM\xc3\x92NICS"),    band (hcHarm),  cHarmonic);
+            // PRIME sits right under the shared divider -> nudge it down for air.
+            add ("eng.prime", tr ("PRIME", "PRIMERS"), band (hcPrime.translated (0, 5)), cHarmonic);
+        }
+        if (! bothEnginesBounds.isEmpty())
+        {
+            // AMP DECAY says so when it is inert: with manual per-partial amplitudes on
+            // the processor freezes the compile slope where it stood, so the fader stops
+            // affecting the sound entirely. ("DECAY", not "SLOPE": it is how fast the
+            // partials' amplitudes fall off, and "slope" read as maths, not sound.)
+            const bool man = processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+            const auto decay = tr ("AMP DECAY", "CAIGUDA AMP");
+            const auto slopeBand = band (beSlope);
+            add ("both.decay", decay, slopeBand, man ? juce::Colour (0xff8f96a8) : cSlope);
+            if (man)
+            {
+                // The FROZEN tag starts after the MEASURED width of the label beside it,
+                // not at a hard-coded 72 px: at 72 the Catalan "CAIGUDA AMP" (wider than
+                // the English "AMP DECAY") ran straight under "CONGELAT" and the two
+                // words overprinted each other. Measured, the gap is a gap in both.
+                const juce::Font f (juce::FontOptions (11.5f).withStyle ("Bold"));
+                const int used = juce::GlyphArrangement::getStringWidthInt (f, decay) + 8;
+                add ("both.frozen", tr ("FROZEN", "CONGELAT"),
+                     slopeBand.withTrimmedLeft (juce::jmin (used, juce::jmax (0, slopeBand.getWidth() - 46))),
+                     cOverride, 10.0f, true);
+            }
+            add ("both.fractal", tr ("FRACTAL", "FRACTAL"),                   band (beFractal), cFractal);
+            add ("both.morph",   tr ("MORPH", "MORPHING"),                    band (beMorph),   cSlope);
+            add ("both.range",   tr ("OCTAVE RANGE", "ABAST OCTAVES"), band (beRange.translated (0, 3)), cSlope);
+        }
+    }
+    if (! essentialsBounds.isEmpty())
+    {
+        // Essentials' labels sit LEFT of their control (vertically centred), in the same
+        // band resized() reserves for them (6 px in, 78 wide, minus a 2 px gap).
+        auto left = [] (juce::Rectangle<int> c) { return c.reduced (6, 0).withWidth (76); };
+        add ("ess.phase", tr ("PHASE", "FASE"),                    left (ecPhase), cEssentials);
+        add ("ess.gain",  tr ("GAIN", "GUANY"),                    left (ecGain),  cEssentials);
+        add ("ess.ref",   tr ("REFERENCE", "REFER\xc3\x88NCIA"),   left (ecRef),   cEssentials);
+        // OCTAVE reads like the three rows above it now: label LEFT of the stepper,
+        // not above it - it was the one cell in the box laid out the other way round.
+        add ("ess.oct",   tr ("OCTAVE", "OCTAVA"),                 left (ecOct),   cEssentials);
+    }
+    return v;
+}
+
+FractalAdditiveAudioProcessorEditor::LayoutProbe
+FractalAdditiveAudioProcessorEditor::layoutProbeInLanguage (bool useCatalan)
+{
+    const bool was = catalan;
+    catalan = useCatalan;
+    // applyLanguage(), not just the flag: the PAINTED labels come from tr() at probe
+    // time, but every Label COMPONENT's text was written once by applyLanguage - probing
+    // without re-running it would measure Catalan geometry against English strings and
+    // silently pass. resized() after it, because some rows only exist in one language's
+    // width (the tuning buttons are laid out from their own text width).
+    applyLanguage();
+    if (getWidth() > 0) resized();
+    auto p = layoutProbe();
+    catalan = was;
+    applyLanguage();
+    if (getWidth() > 0) resized();
+    return p;
+}
+
 FractalAdditiveAudioProcessorEditor::LayoutProbe
 FractalAdditiveAudioProcessorEditor::layoutProbe() const
 {
@@ -3801,12 +3929,22 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     p.essentials     = essentialsBounds;
     p.tuning         = lFootBounds;
     p.engineChips    = engineChip[0].getBounds().getUnion (engineChip[1].getBounds());
+    p.specColumn     = gSpecScale.getBounds();
     p.panelColour    = spectrumPanelColour;
     // Invisible controls are left out on purpose: several are mode-dependent (the prime
     // whitelist vs the limit fader, the Off button, ...) and a hidden one has no geometry
     // worth asserting.
     auto add = [&p] (const char* name, const juce::Component& c)
-    { if (c.isVisible()) p.controls.push_back ({ name, c.getBounds() }); };
+    {
+        if (! c.isVisible()) return;
+        p.controls.push_back ({ name, c.getBounds() });
+        // A Label carries TEXT that has to fit the cell it was given. Recorded here
+        // rather than in a separate list so it can never name a control the layout no
+        // longer produces.
+        if (const auto* l = dynamic_cast<const juce::Label*> (&c); l != nullptr && l->getText().isNotEmpty())
+            p.componentLabels.push_back ({ name, l->getText(), l->getBounds(),
+                (float) juce::GlyphArrangement::getStringWidthInt (l->getFont(), l->getText()) });
+    };
 
     add ("harm.baseN",       baseNFader);      add ("harm.baseNLbl",  lblBaseN);
     add ("harm.basePitch",   basePitchBox);    add ("harm.pitchLbl",  lblBasePitch);
@@ -3823,16 +3961,75 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
 
     add ("both.slope",       slopeFader);      add ("both.pencil",    partialEditBtn);
     add ("both.manual",      partialManualT);  add ("both.fractal",   fractalFader);
-    add ("both.fractalLbl",  lblFractal);      add ("both.morph",     morphToggle);
+    add ("both.morph",       morphToggle);
     add ("both.morphTime",   morphTimeFader);  add ("both.morphLbl",  lblMorphTime);
     add ("both.rangeVal",    sprVal);          add ("both.rangeUp",   sprUp);
     add ("both.rangeDn",     sprDn);
 
     add ("ess.phase",        phaseBox);        add ("ess.gain",       gainFader);
     add ("ess.refA",         refAEdit);        add ("ess.refALbl",    lblRefA);
-    add ("ess.refHz",        lblRefHz);        add ("ess.octLbl",     lblOctave);
+    add ("ess.refHz",        lblRefHz);
     add ("ess.octVal",       octVal);          add ("ess.octUp",      octUp);
     add ("ess.octDn",        octDn);
+
+    // The TUNING box and the Spectrum-vs-Tuning column. They were never probed, and
+    // they are the two densest stacks in the window: TUNING piles up to six optional
+    // rows inside a fixed height (a .scl with its own patch, a preset's tuning, bend,
+    // Recent, the bank) and the right column re-lays itself for every mode. Both are
+    // where a caption sized in English quietly condenses in Catalan.
+    add ("tun.mode",         tuningBox);       add ("tun.load",       loadSclButton);
+    add ("tun.save",         saveTuningBtn);   add ("tun.toBank",     tuningBankAddBtn);
+    add ("tun.name",         tuningNameLabel); add ("tun.period",     tuningPeriodLbl);
+    add ("tun.tablePeriod",  tablePeriodEdit); add ("tun.tableReset", tablePeriodResetBtn);
+    add ("tun.itsSpectrum",  loadItsSpectrumBtn);
+    add ("tun.presetTuning", loadPresetTuningBtn);
+    add ("tun.bendLbl",      lblBend);         add ("tun.bend",       bendBox);
+    add ("tun.recent",       recentOpenBtn);   add ("tun.bankLbl",    lblTuningBank);
+    add ("tun.bank",         tuningBankBox);   add ("tun.bankLoad",   tuningBankLoadBtn);
+    add ("tun.bankClear",    tuningBankClearBtn);
+
+    add ("spec.mode",        specModeBox);     add ("spec.source",    tuneSourceBox);
+    add ("spec.scope",       tuneScopeBox);    add ("spec.notesLbl",  chordNotesLbl);
+    add ("spec.notes",       chordNotesBox);   add ("spec.minMax",    chordMinMaxBox);
+    add ("spec.perLbl",      chordPerLbl);     add ("spec.period",    chordPeriodEdit);
+    add ("spec.minLbl",      chordMinLbl);     add ("spec.min",       chordMinEdit);
+    add ("spec.find",        chordGoBtn);      add ("spec.rt",        chordRtBtn);
+    add ("spec.adaptTarget", adaptTargetBox);  add ("spec.partialsLbl", adaptPartialsLbl);
+    add ("spec.partials",    adaptPartialsBox); add ("spec.goal",     adaptGoalBox);
+    add ("spec.amps",        adaptAmpsToggle); add ("spec.rangeLbl",  adaptRangeLbl);
+    add ("spec.rangeLo",     adaptLoEdit);     add ("spec.rangeHi",   adaptHiEdit);
+    add ("spec.adapt",       adaptGoBtn);      add ("spec.adaptRt",   adaptRtBtn);
+    add ("spec.segPerLbl",   segPeriodLbl);    add ("spec.segPeriod", segPeriodEdit);
+    add ("spec.segTop",      segTopToggle);
+
+    // The sub-CELLS. Empty ones are skipped: the harmonic cells are deliberately empty
+    // in the custom view (paint() reads that as "draw no harmonic dividers").
+    auto cell = [&p] (const char* name, const juce::Rectangle<int>& r)
+    { if (! r.isEmpty()) p.cells.push_back ({ name, r }); };
+    cell ("eng.base",    hcBase);    cell ("eng.harm",    hcHarm);   cell ("eng.prime", hcPrime);
+    cell ("eng.custScale", ccScale); cell ("eng.custBody", ccBody);
+    cell ("both.slope",  beSlope);   cell ("both.fractal", beFractal);
+    cell ("both.morph",  beMorph);   cell ("both.range",  beRange);
+    cell ("ess.phase",   ecPhase);   cell ("ess.gain",    ecGain);
+    cell ("ess.ref",     ecRef);     cell ("ess.oct",     ecOct);
+
+    // Every combo applyLanguage() re-words, and what it currently has selected.
+    auto combo = [&p] (const char* name, const juce::ComboBox& c)
+    { p.comboIds.push_back ({ name, c.getSelectedId() }); };
+    combo ("basePitch",   basePitchBox);   combo ("phase",       phaseBox);
+    combo ("primeMode",   primeModeBox);   combo ("bend",        bendBox);
+    combo ("modSel",      modSelBox);      combo ("lfoWave",     lfoWaveBox);
+    combo ("lfoRateMode", lfoRateModeBox); combo ("lfoPhaseMode", lfoPhaseModeBox);
+    combo ("specMode",    specModeBox);    combo ("tuneSource",  tuneSourceBox);
+    combo ("tuneScope",   tuneScopeBox);   combo ("adaptTarget", adaptTargetBox);
+    combo ("adaptGoal",   adaptGoalBox);
+
+    // The painted sub-labels, each with the width its text really needs in the font
+    // paint() sets for it.
+    for (const auto& s : paintedSubLabels())
+        p.paintedLabels.push_back ({ s.name, s.text, s.cell,
+            (float) juce::GlyphArrangement::getStringWidthInt (
+                juce::Font (juce::FontOptions (s.fontHeight).withStyle ("Bold")), s.text) });
     return p;
 }
 
@@ -4191,11 +4388,20 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         const auto box = macroFrame (boxI, col, interiorAlpha);
         drawTitleChip (g, box, col, ttl); // colour chip, bounded to the text
     };
-    auto subLabel = [&] (const juce::Rectangle<int>& c, juce::Colour col, const juce::String& s, float al)
+    // Every inline sub-label of every macro box, drawn from the ONE list layoutProbe()
+    // also measures (see paintedSubLabels): the rect that is drawn and the rect that is
+    // checked can then never drift apart.
+    auto drawSubLabels = [&]
     {
-        g.setColour (col.withMultipliedAlpha (al));
-        g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
-        g.drawText (s, c.withHeight (13).reduced (5, 0), juce::Justification::centredLeft, false);
+        for (const auto& s : paintedSubLabels())
+        {
+            g.setColour (s.col);
+            g.setFont (juce::Font (juce::FontOptions (s.fontHeight).withStyle ("Bold")));
+            if (s.fitted)
+                g.drawFittedText (s.text, s.cell, juce::Justification::centredLeft, 1, 0.8f);
+            else
+                g.drawText (s.text, s.cell, juce::Justification::centredLeft, false);
+        }
     };
 
     //== SPECTRUM: one panel holding both engines and everything that shapes either =====
@@ -4227,10 +4433,16 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
                 g.drawLine ((float) hcHarm.getX(), top, (float) hcHarm.getX(), bot, 1.0f);
                 g.drawLine ((float) hcHarm.getX(), (float) hcPrime.getY(),
                             (float) hcHarm.getRight(), (float) hcPrime.getY(), 1.0f);
-                subLabel (hcBase,  cHarmonic, tr ("BASE", "BASE"),           1.0f);
-                subLabel (hcHarm,  cHarmonic, tr ("HARMONICS", "HARM\xc3\x92NICS"), 1.0f);
-                // PRIME sits right under the shared divider -> nudge it down for air.
-                subLabel (hcPrime.translated (0, 5), cHarmonic, tr ("PRIME", "PRIMERS"), 1.0f);
+            }
+            // Custom view: the one shared divider between "which scale is loaded" and
+            // "the spectrum it makes". Drawn in the panel's own colour (the custom
+            // engine's) exactly as the harmonic view's are drawn in the harmonic
+            // engine's, so the two views of the shared box read the same way.
+            if (customViewShown() && ! ccBody.isEmpty())
+            {
+                g.setColour (spectrumPanelColour.withAlpha (0.5f));
+                g.drawLine ((float) ccBody.getX(), (float) ccBody.getY(),
+                            (float) ccBody.getRight(), (float) ccBody.getY(), 1.0f);
             }
         }
 
@@ -4248,28 +4460,6 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
             g.drawLine ((float) beMorph.getX(),   top, (float) beMorph.getX(),   bot, 1.0f);
             g.drawLine ((float) beRange.getX(), (float) beRange.getY(),
                         (float) beRange.getRight(), (float) beRange.getY(), 1.0f);
-            // AMP DECAY says so when it is inert. With manual per-partial amplitudes on,
-            // the processor freezes the compile slope where it stood, so this fader stops
-            // affecting the sound entirely - and nothing on screen used to admit it.
-            // ("DECAY", not "SLOPE": it is how fast the partials' amplitudes fall off,
-            // and "slope" read as maths, not sound.)
-            if (processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f)
-            {
-                subLabel (beSlope, juce::Colour (0xff8f96a8), tr ("AMP DECAY", "CAIGUDA AMP"), 1.0f);
-                g.setColour (cOverride);
-                g.setFont (juce::Font (juce::FontOptions (10.0f).withStyle ("Bold")));
-                // Short enough to FIT the cell ("FROZEN - DRAWN BY HAND" clipped at
-                // "DRA..."); the pencil beside it and the fader's frozen tooltip carry
-                // the why. drawFittedText, so the Catalan never clips either.
-                g.drawFittedText (tr ("FROZEN", "CONGELAT"),
-                                  beSlope.withHeight (13).reduced (5, 0).withTrimmedLeft (72),
-                                  juce::Justification::centredLeft, 1, 0.8f);
-            }
-            else
-                subLabel (beSlope, cSlope, tr ("AMP DECAY", "CAIGUDA AMP"), 1.0f);
-            subLabel (beFractal, cFractal, tr ("FRACTAL", "FRACTAL"), 1.0f);
-            subLabel (beMorph,   cSlope,   tr ("MORPH", "MORPHING"), 1.0f);
-            subLabel (beRange.translated (0, 3), cSlope, tr ("OCTAVE RANGE", "ABAST OCTAVES"), 1.0f);
         }
     }
 
@@ -4286,22 +4476,10 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         const float rx = (float) essentialsBounds.getRight() - 4.0f;
         for (auto* cell : { &ecGain, &ecRef, &ecOct })
             g.drawLine (lx, (float) cell->getY(), rx, (float) cell->getY(), 1.0f);
-        // Sub-labels sit LEFT of their control (vertically centred), not above it.
-        auto subLeft = [&] (const juce::Rectangle<int>& c, const juce::String& s)
-        {
-            g.setColour (cEssentials);
-            g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
-            // Same band resized() reserves for the label (6 px in + 78 wide, minus a
-            // 2 px gap to the control) so long labels ("REFERENCIA") don't clip.
-            g.drawText (s, c.reduced (6, 0).withWidth (76), juce::Justification::centredLeft, false);
-        };
-        subLeft (ecPhase, tr ("PHASE", "FASE"));
-        subLeft (ecGain,  tr ("GAIN", "GUANY"));
-        subLeft (ecRef,   tr ("REFERENCE", "REFER\xc3\x88NCIA"));
-        // OCTAVE reads like the three rows above it now: label LEFT of the stepper,
-        // not above it - it was the one cell in the box laid out the other way round.
-        subLeft (ecOct,   tr ("OCTAVE", "OCTAVA"));
     }
+
+    // Every inline sub-label of every macro box, from the one shared list.
+    drawSubLabels();
 
     // TUNING box: a plain macro-style box now (the result lists moved INTO the
     // Spectrum-to-Tuning column, so the old inverted-L is gone) - base aligned with
@@ -4367,6 +4545,20 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
     auto compact = [] (juce::Component& c, juce::Rectangle<int> r)
     { c.setBounds (r.withSizeKeepingCentre (r.getWidth(), juce::jmin (24, r.getHeight()))); };
+
+    // A left-hand caption sized to the WORDS in it, never to a pixel count that only
+    // ever fitted English. A juce::Label whose cell is too narrow does not clip and does
+    // not disappear - it CONDENSES to 70% - so it stays inside its bounds, overlaps
+    // nothing, and every geometric check in the build passes while the word on screen is
+    // visibly squashed ("Temps" in the Morph cell was at 91%). Never takes so much that
+    // the control beside it is left with nothing.
+    auto caption = [] (juce::Label& l, juce::Rectangle<int>& row, int nominal, int keepForControl = 24)
+    {
+        l.setJustificationType (juce::Justification::centredLeft);
+        const int need = juce::GlyphArrangement::getStringWidthInt (l.getFont(), l.getText()) + 4;
+        const int w    = juce::jmax (nominal, need);
+        l.setBounds (row.removeFromLeft (juce::jmin (w, juce::jmax (0, row.getWidth() - keepForControl))));
+    };
 
     //== Right column: ONE full-height Spectrum-to-Tuning box - mode controls on top,
     //   its result list (chords / dyad degrees / segment picker) INSIDE it below.
@@ -4506,9 +4698,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
             chordCountLbl.setVisible (false); chordCountBox.setVisible (false);
             si.removeFromTop (4);
             auto r3 = si.removeFromTop (22);
-            chordMinLbl.setJustificationType (juce::Justification::centredLeft);
-            chordMinLbl.setBounds (r3.removeFromLeft (112)); // "smallest interval (c)"
-            chordMinEdit.setBounds (r3.removeFromLeft (48).reduced (0, 1));
+            caption (chordMinLbl, r3, 112, 48); // "smallest interval (c)" / "interval mes petit (c)"
+            chordMinEdit.setBounds (r3.removeFromLeft (juce::jmin (48, r3.getWidth())).reduced (0, 1));
             if (adapt && adaptGoalBox.getSelectedId() == 3)
             {
                 si.removeFromTop (3);
@@ -4662,6 +4853,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         if (! customView)
         {
             //-- HARMONIC view: BASE | HARMONICS over PRIME, TEMPER along the bottom --
+            ccScale = ccBody = {}; // the custom view's cells: paint() draws no divider for them
             auto hb = engineBoxBounds.reduced (5, 0);
             hb.removeFromTop (chipH); hb.removeFromBottom (3);
             // TEMPER is reachable from BOTH views (see the ctor comment): here it spans
@@ -4724,6 +4916,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
             auto ci = engineBoxBounds.reduced (6, 0);
             ci.removeFromTop (chipH + 2); ci.removeFromBottom (4);
+            const auto ccAll = ci;   // everything below the chip strip
             auto brow = ci.removeFromTop (24);
             // TEMPER on the right of the top row (reachable from BOTH views).
             temperToggle.setBounds (brow.removeFromRight (juce::jmin (170, brow.getWidth() * 40 / 100)));
@@ -4751,9 +4944,17 @@ void FractalAdditiveAudioProcessorEditor::resized()
             intervalEditHome = ci.reduced (1, 0); // multi-line: type intervals, Enter builds
             intervalEdit.setBounds (intervalEditHome);
             timbreStatusLabel.setBounds (statusRow);
-            lblTimbreRepeats.setJustificationType (juce::Justification::centredLeft);
-            lblTimbreRepeats.setBounds (repsRow.removeFromLeft (38));
+            caption (lblTimbreRepeats, repsRow, 38, 60);
             timbreRepeatsFader.setBounds (repsRow.removeFromLeft (juce::jmin (220, repsRow.getWidth())));
+            // The custom view's own two cells, so it gets the SHARED DIVIDER every other
+            // box in the window has. The merge left this view as four rows of controls
+            // floating in one undivided rectangle - the only box in the plugin with no
+            // internal delimitation at all - while the harmonic view it shares the frame
+            // with has three cells and two dividers. Top = what SCALE is loaded (Load /
+            // On-Off / Temper); body = the spectrum itself (the typed intervals, what
+            // they built, and how many times it repeats).
+            ccScale = ccAll.withBottom (intervalEditHome.getY() - 3);
+            ccBody  = ccAll.withTop (ccScale.getBottom());
         }
 
         //-- BOTH ENGINES: SLOPE | FRACTAL | MORPH over RANGE --------------------
@@ -4781,23 +4982,22 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
             {
                 auto fi = beFractal.reduced (6, 3); fi.removeFromTop (lblH);
-                lblFractal.setVisible (false); // named by the painted FRACTAL sub-label
                 fractalFader.setBounds (fi);
             }
             {
                 auto mi = beMorph.reduced (6, 3); mi.removeFromTop (lblH);
                 morphToggle.setBounds (mi.removeFromTop (20));
                 mi.removeFromTop (2);
-                lblMorphTime.setJustificationType (juce::Justification::centredLeft);
                 auto mr = mi.removeFromTop (juce::jmin (19, juce::jmax (0, mi.getHeight())));
-                lblMorphTime.setBounds (mr.removeFromLeft (34));
+                caption (lblMorphTime, mr, 34, 60);
                 morphTimeFader.setBounds (mr);
             }
             {
                 // RANGE: the spectrum's octave span, as the same [value][+][-] stepper it
-                // had in Essentials. Its name is the painted RANGE sub-label now, so the
-                // row's own "Spectrum" label would only say it twice.
-                lblRange.setVisible (false);
+                // had in Essentials. Its name is the painted OCTAVE RANGE sub-label now,
+                // so the row's own "Spectrum" label was deleted rather than hidden - a
+                // member hidden on every single layout pass is a member nothing can ever
+                // show, and it kept a dead entry alive in the layout probe.
                 auto ri = beRange.reduced (6, 3); ri.removeFromTop (lblH + 3);
                 auto rr = ri.removeFromTop (juce::jmin (24, juce::jmax (0, ri.getHeight())));
                 sprVal.setBounds (rr.removeFromLeft (40));
@@ -4845,19 +5045,18 @@ void FractalAdditiveAudioProcessorEditor::resized()
             { auto c = ecRef.reduced (6, 1);   c.removeFromLeft (78);
               auto rr = c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))
                           .withWidth (juce::jmin (c.getWidth(), 158));
-              lblRefA.setJustificationType (juce::Justification::centredLeft);
-              lblRefA.setBounds (rr.removeFromLeft (34));
+              caption (lblRefA, rr, 34, 70);
               lblRefHz.setBounds (rr.removeFromRight (22));
               refAEdit.setBounds (rr); }
             { auto c = ecOct.reduced (6, 1);   c.removeFromLeft (78);
               // Same shape as PHASE / GAIN / REFERENCE: the stepper sits RIGHT of the
-              // painted OCTAVE label (subLeft in paint()), not below it - it was the
+              // painted OCTAVE label (see paintedSubLabels()), not below it - it was the
               // one cell in the box laid out the other way round.
               // [white value][+ green][- red]: value first, then + before -.
               auto rr = c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()));
-              // No "Transpose" caption: the cell's own OCTAVE label already says it, and
-              // the stepper only ever transposes. The freed width goes to the controls.
-              lblOctave.setVisible (false);
+              // No "Transpose" caption: the cell's own painted OCTAVE label already says
+              // it, and the stepper only ever transposes. The freed width goes to the
+              // controls (the caption member itself is gone, not merely hidden).
               octVal.setBounds (rr.removeFromLeft (40));
               octUp.setBounds  (rr.removeFromLeft (24).reduced (0, 1));
               rr.removeFromLeft (4);

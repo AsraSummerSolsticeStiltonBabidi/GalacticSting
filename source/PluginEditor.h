@@ -38,15 +38,49 @@ public:
         // engineBox is the ONE shared box both engines live in (the HARMONIC / CUSTOM
         // chips are its title; the selected chip decides whose controls are inside).
         juce::Rectangle<int> spectrum, engineBox, bothEngines,
-                             essentials, tuning, engineChips;
+                             essentials, tuning, engineChips,
+                             specColumn; // the full-height Spectrum-vs-Tuning box on the right
         // The colour the WHOLE SPECTRUM panel is wearing right now (the selected
         // engine's). Probed because "it must not be the neutral steel again, and it
         // must not collide with the panels around it" is a measurable claim about a
         // hue, and nothing else in the build could check it.
         juce::Colour panelColour;
         std::vector<std::pair<juce::String, juce::Rectangle<int>>> controls; // "harm.baseN" etc.
+        // The SUB-CELLS the boxes are divided into. They are rectangles only - the
+        // dividers between them and their inline sub-labels are drawn in paint() from
+        // exactly these - so a cell that escaped its box, or two cells that grew into
+        // each other, draws a divider across a neighbour's controls and nothing in the
+        // build could see it. Named "eng.base", "both.slope", "ess.ref", ...
+        std::vector<std::pair<juce::String, juce::Rectangle<int>>> cells;
+        // Every PAINTED label: the exact rect paint() draws it into, and how wide the
+        // string actually is in the font paint() uses. A painted label has no component
+        // to squash, so it fails by CLIPPING - silently, in one language only ("FROZEN -
+        // DRAWN BY HAND" clipped at "DRA..."). Probing the measured width is the only way
+        // a build can tell.
+        struct PaintedLabel
+        {
+            juce::String name, text;
+            juce::Rectangle<int> cell;  // the rect the text is drawn into
+            float textWidth = 0.0f;     // measured in the very font paint() sets
+        };
+        std::vector<PaintedLabel> paintedLabels;
+        // The same measurement for every juce::Label COMPONENT laid out in those boxes,
+        // in its own font. A Label does not clip - it squashes to 70% - so it fails by
+        // going unreadably condensed instead of disappearing, which no bounds check can
+        // see either. Same struct: cell = the label's bounds, textWidth = what it needs.
+        std::vector<PaintedLabel> componentLabels;
+        // Every combo whose ITEM TEXTS are rewritten by applyLanguage(), as
+        // name -> selected id. Probed because re-wording a ComboBox is the one operation
+        // that can silently DESELECT it (getSelectedId() compares the visible label
+        // against the item's text), and a mode box that reads 0 gates its whole panel off.
+        std::vector<std::pair<juce::String, int>> comboIds;
     };
     LayoutProbe layoutProbe() const;
+    // Test hook (RhythmVerify): probe the layout in the OTHER language. Every painted
+    // sub-label is bilingual and Catalan is the longer language nearly everywhere, so a
+    // label that fits in English can still clip in Catalan - which is precisely how the
+    // "FROZEN - DRAWN BY HAND" clip survived review. Restores the language it found.
+    LayoutProbe layoutProbeInLanguage (bool useCatalan);
     // Test hook (RhythmVerify): re-read engineInForce() and redress the panel for it,
     // exactly as the 30 Hz timer does. The verifier has no message loop, so without this
     // the panel would still be wearing the colour it was constructed with and "selecting
@@ -74,6 +108,11 @@ public:
     PanelProbe panelProbeForTests() const;
     void setSpecModeForTests (int mode);
     void setAdaptTargetForTests (int id);
+    // The two selectors that ADD rows to the right column (the free chord search's
+    // Find/REALTIME pair, and the adaptation's "between lo hi" row). Both exist only in
+    // one branch of resized(), so a layout sweep cannot reach them any other way.
+    void setTuneSourceForTests (int id);
+    void setAdaptGoalForTests (int id);
     void setPeriodTextForTests (const juce::String& t);
     void pressAdaptRealtimeForTests();
 
@@ -81,6 +120,21 @@ private:
     using SliderAttachment   = juce::AudioProcessorValueTreeState::SliderAttachment;
     using ComboBoxAttachment = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
     using ButtonAttachment   = juce::AudioProcessorValueTreeState::ButtonAttachment;
+
+    // Every inline sub-label the editor PAINTS (BASE / HARMONICS / AMP DECAY / FROZEN /
+    // PHASE / ...). Built in ONE place and used by both paint() (which draws them) and
+    // layoutProbe() (which measures them), because a painted label has no component to
+    // squash and fails only by clipping - so the drawn rect and the measured rect must
+    // be the SAME rect or the check is measuring a label that is not on screen.
+    struct PaintedSub
+    {
+        juce::String name, text;
+        juce::Rectangle<int> cell;
+        juce::Colour col;
+        float fontHeight = 11.5f;
+        bool  fitted = false;  // drawFittedText (shrinks to fit) vs drawText (clips)
+    };
+    std::vector<PaintedSub> paintedSubLabels() const;
 
     void configGroup (juce::GroupComponent&, juce::Colour);
     void configFader (juce::Slider&, const juce::String& paramID,
@@ -2565,10 +2619,10 @@ private:
 
     SteppedSlider baseNFader, timbreRepeatsFader;
     MagneticSlider fractalFader, harmonicsFader, primeLimitFader; // magnetic whole-value detents
-    juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, octaveFader, pEnvAmtFader;
+    juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, pEnvAmtFader;
     juce::Slider  ampAdsr[4], filtAdsr[4], pitchAdsr[4];
     juce::ComboBox tuneSourceBox, tuneScopeBox; // beating mode: source + scope
-    juce::ComboBox basePitchBox, whitelistBox, phaseBox, primeModeBox, primeLimitBox, tuningBox, bendBox,
+    juce::ComboBox basePitchBox, phaseBox, primeModeBox, tuningBox, bendBox,
                    dissCountBox, dissModeBox, tuningBankBox;
     RefreshingComboBox presetBox;
     juce::Label presetDirtyMark; // "*" - some parameter drifted from the loaded preset
@@ -2801,18 +2855,18 @@ private:
     // opaque GroupComponent added after its children buries them (they keep their
     // tooltips, so the bug looks like "the control is there but dead").
     juce::GroupComponent gFilter, gAmpEnv, gPitchEnv, gTuning, gSpecScale, gScaleDiss;
-    juce::Label lblBaseN, lblBasePitch, lblRange, lblFractal, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
-                lblTimbreRepeats, lblBend, lblPeriod, lblSteps, lblRefA, lblRefHz, lblOctave, lblPitchAmt,
+    juce::Label lblBaseN, lblBasePitch, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
+                lblTimbreRepeats, lblBend, lblPeriod, lblSteps, lblRefA, lblRefHz, lblPitchAmt,
                 lblMorphTime, lblTuningBank, tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel,
                 tuningPeriodLbl;
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], pitchAdsrLbl[4], primeLbl[9];
 
     std::unique_ptr<SliderAttachment>   baseNAtt, slopeAtt, fractalAtt, gainAtt,
-                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, octaveAtt, pEnvAmtAtt,
+                                        cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, pEnvAmtAtt,
                                         harmonicsAtt;
     std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4], pitchAdsrAtt[4];
-    std::unique_ptr<ComboBoxAttachment> basePitchAtt, whitelistAtt, phaseAtt,
-                                        primeModeAtt, primeLimitAtt, tuningAtt, bendAtt, tuningBankAtt;
+    std::unique_ptr<ComboBoxAttachment> basePitchAtt, phaseAtt,
+                                        primeModeAtt, tuningAtt, bendAtt, tuningBankAtt;
     std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], morphAtt;
     std::unique_ptr<SliderAttachment>   morphTimeAtt;
 
@@ -2842,6 +2896,11 @@ private:
     // panel while most of its box was air.
     juce::Rectangle<int> engineBoxBounds;
     juce::Rectangle<int> hcBase, hcHarm, hcPrime;  // harmonic view's sub-cells (empty in custom view)
+    // The CUSTOM view's two sub-cells, so it has the same shared divider every other box
+    // in the window has: which SCALE is loaded (Load / On-Off / Temper) above, the
+    // spectrum itself (typed intervals, what they built, Reps) below. Empty in the
+    // harmonic view. Without them this view was the one undivided box in the plugin.
+    juce::Rectangle<int> ccScale, ccBody;
     juce::Rectangle<int> bothEnginesBounds;    // nested: what applies to EITHER engine
     juce::Rectangle<int> beSlope, beFractal, beMorph, beRange; // its sub-cells
     juce::Rectangle<int> essentialsBounds;     // Essentials macro-group frame
