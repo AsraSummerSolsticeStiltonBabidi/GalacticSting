@@ -2072,6 +2072,20 @@ bool FractalAdditiveAudioProcessor::applySpectrumAdapt (bool undoable, juce::Str
 
     const auto before = captureSpecSnapshot();
 
+    // MANUAL AMPLITUDE MODE GOES ON FIRST, and exactly the way timerCallback would do it
+    // (freeze the slope, remember the mode). The per-partial edits below only apply while
+    // it is on, but currentSettings() reads a DIFFERENT slope in each mode - so building
+    // `ts` below in one mode and letting the next poll notice the other produced a second,
+    // pointless template a few milliseconds behind the first: a second amplitude fade for
+    // a spectrum that had not changed.
+    if (apvts.getRawParameterValue ("partialManual")->load() <= 0.5f)
+    {
+        manualSlopeFrozen = apvts.getRawParameterValue ("curveSlope")->load();
+        lastManualMode    = true;
+        if (auto* pm = apvts.getParameter ("partialManual"))
+            pm->setValueNotifyingHost (1.0f);
+    }
+
     // The typed text: every partial above 1/1 in cents, then the PERIOD as the highest
     // value (loadTimbreText's rule: the top interval is the repeat point). 1/1 is implicit.
     // centsText, not String(x, 5): this text lands in the Custom Engine's box for the
@@ -2101,7 +2115,7 @@ bool FractalAdditiveAudioProcessor::applySpectrumAdapt (bool undoable, juce::Str
     ts.timbreDegrees       = timbreDegrees;
     ts.timbrePeriod        = timbrePeriod;
     ts.timbrePeriodRepeats = (int) apvts.getRawParameterValue ("timbreRepeats")->load();
-    const auto tmpl = spectrum::compileSpectrum (ts);
+    auto tmpl = spectrum::compileSpectrum (ts);   // published below - not thrown away
     std::vector<spectrum::PartialGain> gains;
     if (! tmpl.partials.empty())
     {
@@ -2133,9 +2147,26 @@ bool FractalAdditiveAudioProcessor::applySpectrumAdapt (bool undoable, juce::Str
                 spectrum::setPartialGain (gains, spectrum::gainKey (info.ratios[i]), dB);
             }
     }
-    setPartialGains (gains, true);
-    if (auto* p = apvts.getParameter ("partialManual"))
-        p->setValueNotifyingHost (1.0f);   // the edits only apply while manual mode is on
+    // ONE EVENT, NOT THREE. An adaptation changes the partial RATIOS and their AMPLITUDES
+    // together, and until now they reached the voices apart:
+    //   1. setPartialGains republished the LIVE (still OLD) template with gain keys
+    //      computed for the new partials. Keys are log-frequencies (PartialGains.h), so
+    //      against the old list almost none of them bind - which also STRIPS the previous
+    //      adaptation's shaping off the partials that are still sounding. That republish
+    //      deliberately leaves the generation alone, so no morph starts and no 50 ms
+    //      template fade arms: the voices got the whole amplitude change over the bare
+    //      7 ms de-click slew. Measured (run 42): a one-hop short-term RMS step 4.6x the
+    //      note's own ripple - +57% then -24% inside 20 ms. That is the reported "golpe".
+    //   2. ~17-35 ms later the real template arrived, via the next timer poll and the
+    //      build worker - pure latency, since the template was compiled RIGHT HERE.
+    // So: hand the edits over WITHOUT republishing, then publish the template we already
+    // built. publish() resolves the stored edits against it (fillGains), stamps a new
+    // generation - which is what arms the fade and the morph - and swaps once.
+    setPartialGains (gains, true, /*republish*/ false);
+    spectrumEngine.publishNow (std::move (tmpl));
+    // ...and the poll must not build the identical thing again a tick later: `ts` IS what
+    // currentSettings() will return now that the Custom Engine holds these degrees.
+    lastPushed = ts;
 
     if (undoable)
     {
@@ -2329,28 +2360,58 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
     }
 
     // ...the two SPECTRUM-side links. Same throttle + coalesce, aimed at a different target.
-    //
+    double f0 = 0.0;
+    std::vector<double> alphas;
+    const bool fromChord = rtLink == RtLink::SpectrumFromChord;
+    // Read BEFORE anything is published: whether a finished result still belongs to the
+    // hands on the keys is the first thing that has to be decided about it.
+    if (fromChord) alphas = heldChordAsTargetAlphas (f0);
+
+    // Has the chord actually MOVED away from the set the last search was AIMED at?
+    // Compared note by note, in cents, including the root's absolute pitch: Sethares'
+    // roughness is a frequency width, so the same chord an octave up is a different target
+    // and must re-adapt, while a bend jitter below a cent must not.
+    bool moved = false;
+    if (fromChord && ! alphas.empty())
+    {
+        moved = alphas.size() != rtHeldTarget.size()
+             || ! (rtHeldF0 > 0.0)
+             || std::abs (1200.0 * std::log2 (f0 / rtHeldF0)) > kRtHeldMoveCents;
+        for (size_t i = 0; i < alphas.size() && ! moved; ++i)
+            if (std::abs (1200.0 * std::log2 (alphas[i] / rtHeldTarget[i])) > kRtHeldMoveCents)
+                moved = true;
+    }
+
     // A finished adaptation is published FIRST, before anything below can decide there is
     // nothing to do. A chord let go a moment before its search finished was still a chord
     // the user played, and the result belongs to it: held back here, it would have been
     // applied on some later tick against a completely different chord.
+    //
+    // ...but a result aimed at a chord the player has already MOVED OFF is a different
+    // thing entirely, and applying it is heard as a lurch: a full respectrum onto a
+    // spectrum nobody asked for, replaced by the right one a few tens of milliseconds
+    // later. Two spectrum changes where the music called for one. So it is dropped -
+    // and dropping it costs nothing, because `moved` has already set rtPending and the
+    // search for the chord that IS being held starts on the next allowed tick. "Let go"
+    // (alphas empty) is deliberately NOT stale: that case is the one above.
     if (const int g = adaptGeneration.load(); g != rtSeenAdaptGen)
     {
         rtSeenAdaptGen = g;
-        juce::String aerr;
-        if (applySpectrumAdapt (/*undoable*/ false, aerr))
-            ++rtApplies;
+        if (! (fromChord && ! alphas.empty() && moved))
+        {
+            juce::String aerr;
+            if (applySpectrumAdapt (/*undoable*/ false, aerr))
+                ++rtApplies;
+        }
     }
 
-    double f0 = 0.0;
-    std::vector<double> alphas;
-    if (rtLink == RtLink::SpectrumFromChord)
+    if (fromChord)
     {
         // THE TRIGGER IS WHAT IS BEING PLAYED. The frequencies come from the rhythm
         // engine's held-note bookkeeping, which is published from every processBlock
         // whether or not the rhythm engine is switched on, so they are the pitches really
-        // sounding - the tuning's, per-note bend included.
-        alphas = heldChordAsTargetAlphas (f0);
+        // sounding - the tuning's, per-note bend included. (Read at the top of this
+        // function, because the publish above has to know whether they still match.)
         if (alphas.empty())
         {
             // NOTHING held: leave the spectrum exactly as it is, and DROP any pending
@@ -2376,16 +2437,9 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
         // back f0 = the note's REAL sounding frequency, and Sethares' critical band is a
         // width in Hz, not in cents - the same partial set is a different roughness an
         // octave down, and the adaptation answers with different partial positions there.
-        // Has the chord actually MOVED? Compared note by note against the set the last
-        // adaptation aimed at, in cents, including the root's absolute pitch: Sethares'
-        // roughness is a frequency width, so the same chord an octave up is a different
-        // target and must re-adapt, while a bend jitter below a cent must not.
-        bool moved = alphas.size() != rtHeldTarget.size()
-                  || ! (rtHeldF0 > 0.0)
-                  || std::abs (1200.0 * std::log2 (f0 / rtHeldF0)) > kRtHeldMoveCents;
-        for (size_t i = 0; i < alphas.size() && ! moved; ++i)
-            if (std::abs (1200.0 * std::log2 (alphas[i] / rtHeldTarget[i])) > kRtHeldMoveCents)
-                moved = true;
+        // (`moved` - "is this still the chord the last search was aimed at?" - is computed
+        // at the top of this function; it decides BOTH whether to search again and whether
+        // an already-finished result is still worth applying.)
         if (moved) rtPending = true;
     }
     else

@@ -73,6 +73,14 @@ namespace spectrum
         // start a morph) rather than just re-reading it. Read on the audio thread.
         juce::uint32 getGeneration() const noexcept { return generation.load (std::memory_order_acquire); }
 
+        // Bumped on EVERY swap of the live slot - a full publish AND a gains-only
+        // republish, which deliberately leaves the generation alone. The two counters
+        // together are how a test can tell "one spectrum change" from "one spectrum
+        // change plus two invisible amplitude edits either side of it": the second kind
+        // never starts a morph and never arms the template fade, so it lands on the ear
+        // as a bare 7 ms amplitude step. See run 42.
+        juce::uint32 getLiveRevision() const noexcept { return liveRev.load (std::memory_order_acquire); }
+
         //----------------------------------------------------------------------
         // Message thread: hand over the user's per-partial amplitude edits and republish
         // the live template with them resolved.
@@ -84,20 +92,59 @@ namespace spectrum
         // amplitude targets from the template every block regardless, so a new gain array
         // is picked up immediately and glides in over the usual 7 ms: click-free, and no
         // morph in sight.
-        void setOverrides (std::vector<PartialGain> ov, bool on)
+        //
+        // `republish == false` STORES the edits and stops there. It exists for the one
+        // caller that is about to publish a template of its own in the same call (the
+        // spectrum adaptation, which changes the partial RATIOS and their AMPLITUDES
+        // together): republishing first would swap in the OLD partial list carrying gain
+        // keys that were computed for the NEW one, so every edit would miss, the previous
+        // adaptation's shaping would be stripped, and the ear would get that as a bare
+        // 7 ms amplitude step - a thump - milliseconds before the real change. The stored
+        // edits are resolved by the very next publish (see fillGains), so nothing is lost.
+        void setOverrides (std::vector<PartialGain> ov, bool on, bool republish = true)
         {
             {
                 const std::lock_guard<std::mutex> lk (overrideMutex);
                 overrides   = std::move (ov);
                 overridesOn = on;
             }
+            if (! republish) return;
             const std::lock_guard<std::mutex> lk (buildMutex);
             const int cur = live.load();
             if (cur < 0) return;                       // nothing published yet; the next publish picks them up
             const int w = (cur + 1) % (int) pool.size();
             pool[(size_t) w] = pool[(size_t) cur];     // message thread only - allocation is fine here
             fillGains (pool[(size_t) w]);
+            liveRev.fetch_add (1, std::memory_order_release);
             live.store (w, std::memory_order_release); // same generation: no morph restart
+        }
+
+        // Message thread: publish a template the CALLER already compiled, right now.
+        //
+        // The worker exists so a deep fractal never blocks anything, and the normal route
+        // (requestRebuild) is the right one for every knob and modulator. This is for the
+        // caller that has the finished template in its hand ALREADY - the adaptation
+        // compiles one to resolve its amplitudes against - and would otherwise throw it
+        // away, wait a whole 16.7 ms timer tick for currentSettings() to notice, and then
+        // wait again for the worker to build the identical thing. That round trip was pure
+        // latency between the player's hands and the spectrum they asked for.
+        //
+        // It also SUPERSEDES the worker. A rebuild queued or already running was compiled
+        // from settings captured BEFORE this template existed, so letting it publish
+        // afterwards would put the older spectrum back - and the caller has by then told
+        // the poll that this state is already pushed, so nothing would ever correct it:
+        // the adaptation would simply vanish. The queued request is dropped and an epoch is
+        // bumped, which the worker checks before publishing (see run()). Nothing is lost by
+        // it: the caller builds from currentSettings(), so its template already carries
+        // every parameter the discarded one did.
+        void publishNow (SpectrumTemplate t)
+        {
+            {
+                const std::lock_guard<std::mutex> lk (requestMutex);
+                hasRequest = false;
+                ++pubEpoch;
+            }
+            publish (std::move (t));
         }
 
         // How many edits actually found a partial in the live spectrum. Surfaced so the
@@ -120,15 +167,21 @@ namespace spectrum
 
                 SpectrumSettings s;
                 bool have = false;
+                unsigned long long epoch = 0;
                 {
                     const std::lock_guard<std::mutex> lk (requestMutex);
-                    if (hasRequest) { s = requested; hasRequest = false; have = true; }
+                    if (hasRequest) { s = requested; hasRequest = false; have = true; epoch = pubEpoch; }
                 }
 
                 if (have)
                 {
                     auto t = compileSpectrum (s, &abortBuild);
-                    if (! abortBuild.load())   // discard a build that was cancelled at teardown
+                    bool superseded = false;
+                    {
+                        const std::lock_guard<std::mutex> lk (requestMutex);
+                        superseded = pubEpoch != epoch;   // publishNow overtook this build
+                    }
+                    if (! abortBuild.load() && ! superseded)   // also discards a build cancelled at teardown
                         publish (std::move (t));
                 }
             }
@@ -161,6 +214,7 @@ namespace spectrum
             // Keep the standalone counter in sync (used by getGeneration()); the voices
             // read the template's own stamp so the pair is always consistent.
             generation.store (g, std::memory_order_release);
+            liveRev.fetch_add (1, std::memory_order_release);
             live.store (w, std::memory_order_release);
         }
 
@@ -174,6 +228,7 @@ namespace spectrum
 
         std::atomic<int>  live       { -1 };
         std::atomic<juce::uint32> generation { 0 };
+        std::atomic<juce::uint32> liveRev    { 0 };
         std::atomic<int>  liveCount  { 0 };
         std::atomic<int>  rawCount   { 0 };
         std::atomic<bool> truncated  { false };
@@ -184,6 +239,9 @@ namespace spectrum
         std::mutex        buildMutex;
         SpectrumSettings  requested;
         bool              hasRequest = false;
+        // Guarded by requestMutex. Bumped by publishNow so a build that started earlier
+        // cannot publish an older spectrum over a newer one (see publishNow).
+        unsigned long long pubEpoch = 0;
         juce::WaitableEvent wakeUp;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SpectrumEngine)

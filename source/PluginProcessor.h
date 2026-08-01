@@ -351,15 +351,21 @@ public:
     // directly (atomics) and reads the live pulse rates for its panel.
     RhythmEngine& getRhythm() noexcept { return rhythm; }
     const spectrum::SpectrumTemplate* getLiveTemplate() const noexcept { return spectrumEngine.getLive(); }
+    // Every swap of the live template, gains-only republishes included (see
+    // SpectrumEngine::getLiveRevision). Read by run 42 to count what the ear gets.
+    juce::uint32 getSpectrumLiveRevision() const noexcept { return spectrumEngine.getLiveRevision(); }
 
     // Per-partial amplitude edits. The authoritative copy lives HERE, because it has to
     // be saved with the project; the spectrum engine only ever holds a resolved
     // index-aligned copy for the voices. Message thread.
-    void setPartialGains (std::vector<spectrum::PartialGain> ov, bool on)
+    // `republish == false` stores the edits without swapping the live template - only for
+    // a caller that publishes its own template in the same call (see
+    // SpectrumEngine::setOverrides and applySpectrumAdapt).
+    void setPartialGains (std::vector<spectrum::PartialGain> ov, bool on, bool republish = true)
     {
         partialGains = ov;
         ++partialGainsRev;
-        spectrumEngine.setOverrides (std::move (ov), on);
+        spectrumEngine.setOverrides (std::move (ov), on, republish);
     }
     const std::vector<spectrum::PartialGain>& getPartialGains() const noexcept { return partialGains; }
     // Bumped on every write. The editor window has to notice edits that did NOT come
@@ -661,7 +667,15 @@ public:
     // throttle a modulator sweeping the spectrum starts a new search on EVERY tick - 200
     // spectrum changes produced 138 searches - and the worker queue never drains.
     static constexpr int kRtTuneTicks  = 20;  // ~0.33 s: the full grid+refine chord search
-    static constexpr int kRtAdaptTicks = 15;  // ~250 ms: the (much cheaper) adaptation
+    // ~100 ms for the adaptation. It was 250 ms, and that was THE lag the player felt:
+    // a chord struck from rest is never throttled (the link has been idle for seconds),
+    // so the first move landed in ~50 ms and every move made while still playing waited
+    // out the floor - measured at 163 ms for a second move 130 ms after the first, i.e.
+    // most of it spent doing nothing. The floor was sized when one adaptation cost ~250 ms;
+    // an 8-partial triad is now ~30 ms, and "never two at once" (adaptRunning) is what
+    // actually keeps the worker from piling up. What is left here is a bound on how often
+    // the SPECTRUM may be rewritten, and 10 Hz is a rate the 50 ms template fade absorbs.
+    static constexpr int kRtAdaptTicks = 6;
 
     //==========================================================================
     // Scale EDITING on the keyboard. Works from ANY loaded tuning (the current

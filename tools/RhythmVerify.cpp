@@ -3995,6 +3995,407 @@ int main()
         }
     }
 
+    // --- run 42: the REALTIME adaptive link - how LATE it lands, and how hard ----------
+    // "sigue habiendo un trompicon al cambiar el espectro realtime, arregla ese retraso y
+    //  esa transicion que produce como un golpe al hacer el cambio, tiene que ser smooth."
+    // Two complaints, so two numbers, both measured on the REAL link (a held chord, the
+    // 60 Hz timer, the background search, the real apply path):
+    //   LATENCY      - from the chord moving to the new spectrum being audible;
+    //   DISCONTINUITY- how much of that spectral journey is spent in a single 2.5 ms hop,
+    //                  plus run 26's per-sample jump/peak so no fix can smuggle in a click.
+    //
+    // The harness is paced to WALL CLOCK. The search runs on its own thread, so an offline
+    // render that outruns realtime would credit the link with far more samples of lag than
+    // a player ever hears (and would compress the 60 Hz timer into nothing).
+    {
+        std::printf ("\nrealtime adaptive spectrum: how late it lands and how hard:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        constexpr int    eb  = 64;
+        constexpr double sr4 = 48000.0;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (sr4, eb);
+        auto setR = [&p] (const char* id, float v)
+        { auto* q = p->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v));
+          p->pollParametersForTests(); };
+        // Morph OFF: the reported case, and the one where a template change is a bare swap.
+        setR ("morph", 0.0f);
+        // Short envelope segments so the chord change itself is over within ~20 ms and the
+        // only event left in the analysis window is the spectrum landing.
+        setR ("ampAttack", 0.001f); setR ("ampDecay", 0.001f);
+        setR ("ampSustain", 1.0f);  setR ("ampRelease", 0.003f);
+        setR ("fractalLevel", 1.0f); setR ("curveSlope", 1.0f); setR ("baseN", 1.0f);
+
+        juce::AudioBuffer<float> b (2, eb);
+        std::vector<float> x;                  // the recorded stream
+        struct Mark { size_t at; long long clock; juce::uint32 gen, rev; int applies, starts; };
+        std::vector<Mark> marks;
+        bool recording = false;
+        long long clockS = 0, nextPoll = 0;
+        const long long tickS = (long long) (sr4 / 60.0);   // the real message timer's cadence
+        const double    t0ms  = juce::Time::getMillisecondCounterHiRes();
+
+        auto pumpFor = [&] (double seconds, juce::MidiBuffer firstBlockMidi)
+        {
+            const long long want = clockS + (long long) (seconds * sr4);
+            bool sent = false;
+            while (clockS < want)
+            {
+                juce::MidiBuffer m;
+                if (! sent) { m = firstBlockMidi; sent = true; }
+                b.clear();
+                p->processBlock (b, m);
+                if (recording)
+                    for (int k = 0; k < eb; ++k) x.push_back (b.getReadPointer (0)[k]);
+                clockS += eb;
+                if (clockS >= nextPoll)
+                {
+                    nextPoll += tickS;
+                    p->pollParametersForTests();
+                    const auto* t = p->getLiveTemplate();
+                    marks.push_back ({ x.size(), clockS, t != nullptr ? t->generation : 0u,
+                                       p->getSpectrumLiveRevision(),
+                                       p->getRealtimeApplies(), p->getRealtimeStarts() });
+                }
+                for (;;)   // pace: never let the render outrun the searcher's wall clock
+                {
+                    const double behind = (double) clockS * 1000.0 / sr4
+                                        - (juce::Time::getMillisecondCounterHiRes() - t0ms);
+                    if (behind <= 0.0) break;
+                    juce::Thread::sleep (behind > 2.0 ? 1 : 0);
+                }
+            }
+        };
+        auto keyMidi = [] (bool on, std::initializer_list<int> notes)
+        {
+            juce::MidiBuffer m;
+            for (const int k : notes)
+                m.addEvent (on ? juce::MidiMessage::noteOn (1, k, (juce::uint8) 100)
+                               : juce::MidiMessage::noteOff (1, k), 0);
+            return m;
+        };
+
+        Proc::RtSettings rs;
+        rs.adapt.partials = 8; rs.adapt.periodRatio = 2.0; rs.adapt.minGapCents = 50.0;
+        rs.adapt.rootOnly = true; rs.adapt.goal = 0; rs.adapt.shapeAmps = true;
+
+        pumpFor (0.10, {});
+        pumpFor (1.6, keyMidi (true, { 60, 64, 67 }));      // chord A, settled
+        p->setRealtimeLink (Proc::RtLink::SpectrumFromChord, rs);
+        pumpFor (2.2, {});                                  // the first adaptation lands + settles
+
+        recording = true;
+        pumpFor (0.30, {});
+        const size_t    T0 = x.size();                      // the chord MOVES here
+        const long long C0 = clockS;                        // ...on the free-running clock too
+        const auto genAt0 = [&]
+        { const auto* t = p->getLiveTemplate(); return t != nullptr ? t->generation : 0u; }();
+        const juce::uint32 revAt0 = p->getSpectrumLiveRevision();
+        // Chord B moves the QUALITY as well as the pitch. A pure transposition would not
+        // do: in an equal temperament the ratios above the root are then identical, and
+        // the adaptation can come back with the very same typed degrees - a "change" that
+        // legitimately produces no new spectrum at all, which is not what is being timed
+        // here. (That is exactly what a first cut of the throttle probe measured: two major
+        // triads two semitones apart, and a landing that never came because none was due.)
+        pumpFor (0.02, keyMidi (false, { 60, 64, 67 }));
+        pumpFor (1.6,  keyMidi (true,  { 62, 65, 69 }));    // C major -> D minor
+        const size_t    T1 = x.size();                      // ...and a settled tail to compare against
+        const long long C1 = clockS;
+        recording = false;
+
+        // ...and now the case a PLAYER actually meets: a second move only 130 ms after the
+        // first, so the throttle is still loaded. This is where "el retraso" lives - a move
+        // made from rest is never throttled at all, because the link had been idle.
+        const auto genOf = [&]
+        { const auto* t = p->getLiveTemplate(); return t != nullptr ? t->generation : 0u; };
+        pumpFor (0.02, keyMidi (false, { 62, 65, 69 }));
+        pumpFor (0.13, keyMidi (true,  { 57, 61, 64 }));    // A major
+        const size_t   T2     = clockS;
+        const auto     genAt2 = genOf();
+        pumpFor (0.02, keyMidi (false, { 57, 61, 64 }));
+        pumpFor (1.2,  keyMidi (true,  { 57, 60, 64 }));    // ...to A minor: a real new target
+
+        // ---- and a result aimed at a chord the player has ALREADY LEFT ----
+        // Press P, wait until the search for P is genuinely RUNNING, then move to Q while
+        // it runs - so P's answer is guaranteed to arrive for a chord nobody is holding.
+        // Both moves ADD a note: the chord never empties, so this cannot be confused with
+        // the "let go a moment before the search finished" rule, which is the opposite case
+        // (that result IS the chord the user played, and must still be applied).
+        pumpFor (0.02, keyMidi (false, { 57, 60, 64 }));
+        pumpFor (0.70, keyMidi (true,  { 60, 64, 67 }));    // settled; the throttle is clear
+        const bool idleBeforeP = ! p->isSpectrumAdaptRunning();
+        pumpFor (0.004, keyMidi (true, { 65 }));            // P = C E F G
+        bool sawRunning = false;
+        for (int i = 0; i < 600 && ! sawRunning; ++i)
+        { pumpFor (0.0015, {}); sawRunning = p->isSpectrumAdaptRunning(); }
+        const auto      genAtQ = genOf();
+        const long long C3     = clockS;
+        pumpFor (0.80, keyMidi (true, { 62 }));             // Q = C D E F G, mid-search
+        int pubAfterQ = 0;
+        for (const auto& mk : marks)
+            if ((long long) mk.clock > C3) pubAfterQ = (int) (mk.gen - genAtQ);
+
+        // ---- when did each new spectrum reach the voices? ----
+        // marks[].at is the RECORDED length, which stops advancing once recording ends, so
+        // the throttled probe is timed on the free-running sample clock instead.
+        auto firstAfter = [&] (size_t t, juce::uint32 gen0, bool wantGen) -> size_t
+        {
+            for (const auto& mk : marks)
+                if (mk.at > t && (wantGen ? mk.gen != gen0 : mk.rev != revAt0)) return mk.at;
+            return 0;
+        };
+        const size_t applyS0 = firstAfter (T0, genAt0, true);
+        const size_t swapS0  = firstAfter (T0, 0, false);       // the FIRST live-slot swap
+        size_t applyS2 = 0; int marksAfter2 = 0; int genAfter2 = 0, startsAfter2 = 0;
+        for (const auto& mk : marks)
+            if ((long long) mk.clock > (long long) T2)
+            {
+                ++marksAfter2;
+                genAfter2    = (int) (mk.gen - genAt2);
+                startsAfter2 = mk.starts;
+                if (applyS2 == 0 && mk.gen != genAt2) applyS2 = (size_t) mk.clock;
+            }
+        // Counted on the free-running clock, NOT on the recorded length: `at` stops
+        // advancing the moment recording ends, so every later mark would otherwise be
+        // filed at exactly T1 and the throttle probe's own changes would be counted here.
+        int publishes = 0, swaps = 0;
+        for (const auto& mk : marks)
+            if (mk.clock > C0 && mk.clock <= C1)
+            { publishes = (int) (mk.gen - genAt0); swaps = (int) (mk.rev - revAt0); }
+        const double applyMs0 = applyS0 > 0 ? (double) (applyS0 - T0) * 1000.0 / sr4 : -1.0;
+        const double swapMs0  = swapS0  > 0 ? (double) (swapS0  - T0) * 1000.0 / sr4 : -1.0;
+        const double applyMs2 = applyS2 > 0 ? (double) (applyS2 - T2) * 1000.0 / sr4 : -1.0;
+
+        // ---- the spectral trajectory across the first landing ----
+        constexpr int fo = 10, fftN = 1 << fo, hop = 120;   // 21.3 ms window, 2.5 ms hop
+        juce::dsp::FFT fft (fo);
+        std::vector<float> fbuf (2 * (size_t) fftN);
+        std::vector<std::vector<float>> mags;
+        std::vector<size_t> mid;                             // window CENTRE = the frame's time
+        for (size_t at = 0; at + (size_t) fftN <= x.size(); at += (size_t) hop)
+        {
+            std::fill (fbuf.begin(), fbuf.end(), 0.0f);
+            for (int i = 0; i < fftN; ++i)
+                fbuf[(size_t) i] = (0.5f - 0.5f * std::cos (2.0f * juce::MathConstants<float>::pi
+                                                             * (float) i / (float) (fftN - 1)))
+                                 * x[at + (size_t) i];
+            fft.performFrequencyOnlyForwardTransform (fbuf.data());
+            mags.emplace_back (fbuf.begin(), fbuf.begin() + fftN / 2);
+            mid.push_back (at + (size_t) fftN / 2);
+        }
+        auto dist = [] (const std::vector<float>& u, const std::vector<float>& v)
+        { double d = 0.0; for (size_t k = 0; k < u.size(); ++k) d += std::abs ((double) u[k] - (double) v[k]); return d; };
+        auto meanOf = [&] (size_t lo, size_t hi)
+        {
+            std::vector<float> a ((size_t) fftN / 2, 0.0f);
+            int c = 0;
+            for (size_t i = 0; i < mags.size(); ++i)
+                if (mid[i] >= lo && mid[i] < hi) { for (size_t k = 0; k < a.size(); ++k) a[k] += mags[i][k]; ++c; }
+            for (auto& v : a) v /= (float) std::max (1, c);
+            return a;
+        };
+        // REFERENCE = the sound after the new NOTES are steady but before ANY part of the
+        // new spectrum has moved (anchored on the first live-slot swap, whatever it was);
+        // FINAL = the settled end of the first landing.
+        const size_t lm = (size_t) fftN / 2;   // half a window: a frame centred here is clean
+        const size_t firstMove = swapS0 > 0 ? swapS0 : T0 + (size_t) (0.25 * sr4);
+        const size_t refLo = T0 + (size_t) (0.028 * sr4) + lm;
+        const size_t refHi = firstMove > lm ? firstMove - lm : refLo + 1;
+        const auto ref = meanOf (refLo, std::max (refHi, refLo + 1));
+        const auto fin = meanOf (T1 - (size_t) (0.30 * sr4), T1);
+        const double D0 = dist (ref, fin);
+        double meanMag = 0.0;
+        for (size_t i = 0; i < mags.size(); ++i)
+            if (mid[i] >= T0 && mid[i] < T1)
+            { double s2 = 0.0; for (const float v : mags[i]) s2 += v; meanMag += s2; }
+        meanMag /= (double) std::max<size_t> (1, (T1 - T0) / (size_t) hop);
+
+        // Progress along that journey. Smoothed over 5 hops (12.5 ms): three notes an equal
+        // temperament apart BEAT, so a single frame's distance ripples by tens of percent
+        // whatever the spectrum is doing, and an unsmoothed "largest one-hop step" would be
+        // measuring the beat, not the landing.
+        std::vector<double> prog, progT;
+        for (size_t i = 0; i < mags.size(); ++i)
+            if (mid[i] >= refLo && mid[i] < T1)
+            { prog.push_back (D0 > 0.0 ? 1.0 - dist (mags[i], fin) / D0 : 0.0);
+              progT.push_back ((double) ((long long) mid[i] - (long long) T0) * 1000.0 / sr4); }
+        std::vector<double> sm (prog.size(), 0.0);
+        for (size_t i = 0; i < prog.size(); ++i)
+        {
+            double a = 0.0; int c = 0;
+            for (size_t j = (i >= 2 ? i - 2 : 0); j <= std::min (prog.size() - 1, i + 2); ++j) { a += prog[j]; ++c; }
+            sm[i] = a / std::max (1, c);
+        }
+        double t10 = -1.0, t90 = -1.0, maxStep = 0.0; double stepAt = -1.0;
+        for (size_t i = 0; i < sm.size(); ++i)
+        {
+            if (t10 < 0.0 && sm[i] >= 0.10) t10 = progT[i];
+            if (t90 < 0.0 && sm[i] >= 0.90) t90 = progT[i];
+            if (i > 0 && sm[i - 1] < 0.90 && sm[i] - sm[i - 1] > maxStep)
+            { maxStep = sm[i] - sm[i - 1]; stepAt = progT[i]; }
+        }
+        // THE TWO METRICS THAT SURVIVE THE BEATING, AND HOW THEY ARE MADE FAIR.
+        // Three notes a tempered third apart beat, and so do the adapted partials
+        // themselves (the search is only asked to keep them 50 cents apart), so both the
+        // spectrum and the loudness ripple continuously whatever the link is doing - by
+        // over +/-30% of the mean, measured. Each event is therefore compared with that
+        // shimmer PEAK TO PEAK over windows of the SAME length in the SAME take: 150 ms
+        // straddling the landing, against the last settled 150 ms. A ratio near 1 means
+        // the change cannot be picked out of the note's own movement; the "golpe" is a
+        // number well above it. (Peak against a MEDIAN would have called the shimmer
+        // itself a thump, which is how a first cut of this metric read 3.6x with nothing
+        // happening at that instant at all.)
+        //   - SPECTRAL FLUX: L1 between consecutive magnitude frames (the timbre stepping);
+        //   - RMS STEP:      one-hop change in short-term loudness (the thump itself).
+        const size_t evLo = firstMove > (size_t) (0.015 * sr4) ? firstMove - (size_t) (0.015 * sr4) : T0;
+        const size_t evHi = evLo + (size_t) (0.150 * sr4);
+        const size_t caLo = T1 - (size_t) (0.165 * sr4), caHi = T1 - (size_t) (0.015 * sr4);
+        double fluxPeak = 0.0, fluxCalmPk = 0.0;
+        for (size_t i = 1; i < mags.size(); ++i)
+        {
+            const double f = dist (mags[i], mags[i - 1]) / std::max (1.0e-9, meanMag);
+            if (mid[i] >= evLo && mid[i] < evHi) fluxPeak   = std::max (fluxPeak, f);
+            if (mid[i] >= caLo && mid[i] < caHi) fluxCalmPk = std::max (fluxCalmPk, f);
+        }
+
+        // THE THUMP, MEASURED AS A LOUDNESS EXCURSION. Two choices make this sharp:
+        //   - a 20 ms RMS window, not a short one. In Aligned phase mode (the default) a
+        //     voice is a PULSE train, so a 5 ms window holds barely one period and its RMS
+        //     swings by tens of percent purely on where the window falls against the pulse
+        //     - noise that buried the event completely.
+        //   - peak-to-trough over a 30 ms span, not a one-hop difference. A step spends its
+        //     whole size inside such a span; the notes' own beating (a few Hz, so 200 ms
+        //     and up) can only contribute the small piece of its cycle that fits.
+        constexpr int rw = 960, rh = 120;    // 20 ms window, 2.5 ms hop
+        constexpr int exSpan = 12;           // 30 ms
+        std::vector<double> rms;
+        std::vector<size_t> rmsAt;
+        for (size_t at = T0; at + (size_t) rw <= T1; at += (size_t) rh)
+        {
+            double s2 = 0.0;
+            for (int i = 0; i < rw; ++i) { const double v = x[at + (size_t) i]; s2 += v * v; }
+            rms.push_back (std::sqrt (s2 / rw));
+            rmsAt.push_back (at + (size_t) rw / 2);   // the window's CENTRE is its time
+        }
+        double meanRms = 0.0; for (const double v : rms) meanRms += v;
+        meanRms /= std::max<size_t> (1, rms.size());
+        double thumpAt = -1.0, thump = 0.0, rmsCalmPk = 0.0;
+        for (size_t i = 0; i + (size_t) exSpan < rms.size(); ++i)
+        {
+            double lo = rms[i], hi = rms[i];
+            for (int k = 1; k <= exSpan; ++k) { lo = std::min (lo, rms[i + (size_t) k]);
+                                                hi = std::max (hi, rms[i + (size_t) k]); }
+            const double e = (hi - lo) / std::max (1.0e-12, meanRms);
+            const size_t at = rmsAt[i];
+            if (at >= evLo && at < evHi && e > thump)
+            { thump = e; thumpAt = (double) ((long long) at - (long long) T0) * 1000.0 / sr4; }
+            if (at >= caLo && at < caHi) rmsCalmPk = std::max (rmsCalmPk, e);
+        }
+
+        // Run 26's per-sample click metric, so no fix here can smuggle a click back in.
+        double maxJump = 0.0, peak = 0.0;
+        for (size_t i = T0 + (size_t) (0.030 * sr4); i < T1; ++i)
+        {
+            peak = std::max (peak, (double) std::abs (x[i]));
+            maxJump = std::max (maxJump, (double) std::abs (x[i] - x[i - 1]));
+        }
+
+        const double fluxRatio = fluxCalmPk > 0.0 ? fluxPeak / fluxCalmPk : 0.0;
+        const double rmsRatio  = rmsCalmPk  > 0.0 ? thump    / rmsCalmPk  : 0.0;
+        std::printf ("  chord moved -> first live swap %.0f ms, new TEMPLATE %.0f ms; %d publishes, %d live swaps\n",
+                     swapMs0, applyMs0, publishes, swaps);
+        std::printf ("  a second move 130 ms later (throttle loaded) -> new template after %.0f ms"
+                     " (%d ticks watched, %d publishes, %d searches, %d applies, link %s%s)\n",
+                     applyMs2, marksAfter2, genAfter2, startsAfter2, p->getRealtimeApplies(),
+                     p->getRealtimeLink() == Proc::RtLink::Off ? "OFF" : "on",
+                     p->getRealtimeRefusal().toRawUTF8());
+        std::printf ("  landing vs the note's own shimmer, 150 ms each: flux %.3f/%.3f = %.2fx   "
+                     "RMS excursion %.3f (at %.0f ms)/%.3f = %.2fx\n",
+                     fluxPeak, fluxCalmPk, fluxRatio, thump, thumpAt, rmsCalmPk, rmsRatio);
+        std::printf ("  jump/peak %.4f; 10%% of the change at %.0f ms (D0 %.1f, meanMag %.1f, meanRms %.4f)\n",
+                     peak > 0.0 ? maxJump / peak : 0.0, t10, D0, meanMag, meanRms);
+        std::printf ("  events after the move (ms:gen/rev/starts/applies):");
+        for (size_t i = 1; i < marks.size(); ++i)
+            if (marks[i].clock > C0 && marks[i].clock <= C1
+                && (marks[i].gen != marks[i - 1].gen || marks[i].rev != marks[i - 1].rev
+                    || marks[i].starts != marks[i - 1].starts))
+                std::printf (" %.0f:%u/%u/%d/%d", (double) (marks[i].clock - C0) * 1000.0 / sr4,
+                             marks[i].gen - genAt0, marks[i].rev - revAt0,
+                             marks[i].starts, marks[i].applies);
+        std::printf ("\n  RMS (ms:%%ofmean):");
+        for (size_t i = 0; i < rms.size(); i += 4)
+        {
+            const double ms = (double) ((long long) rmsAt[i] - (long long) T0) * 1000.0 / sr4;
+            if (ms >= 0.0 && ms <= 260.0)
+                std::printf (" %.0f:%.0f", ms, 100.0 * rms[i] / std::max (1.0e-12, meanRms));
+        }
+        std::printf ("\n");
+        check (applyS0 > 0, "the chord change really did reach the spectrum");
+        check (D0 > 0.0, "and the spectrum really did change");
+        check (swaps == 1 && publishes == 1,
+               "a chord move is ONE template swap - not a gains-only republish and then the real one");
+        check (applyMs0 > 0.0 && applyMs0 <= 60.0,
+               "the new spectrum is live within one search + two timer ticks of the chord moving");
+        check (applyMs2 > 0.0 && applyMs2 <= 100.0,
+               "and a move made 130 ms after another one is not held back by the throttle");
+        check (rmsRatio <= 1.4,
+               "the landing is no louder a step than the note's own beating (no thump)");
+        // A ceiling, not the thump detector: one clean 50 ms fade moves MORE spectrum in
+        // the landing window than two half-sized steps do, so this number is deliberately
+        // allowed to go up when the apply is fixed. What it forbids is a landing several
+        // times the note's own movement, i.e. a hard snap.
+        check (fluxRatio <= 2.0,
+               "and the spectrum is not snapped across in one hop either");
+        std::printf ("  P then Q mid-search: search was running = %d, publishes after Q = %d\n",
+                     (int) sawRunning, pubAfterQ);
+        check (idleBeforeP && sawRunning,
+               "the second move really did land while the first move's search was still running");
+        check (pubAfterQ == 1,
+               "a result aimed at the chord the player has already left is DROPPED, not applied late");
+
+        //-- A REBUILD ALREADY IN FLIGHT MUST NOT LAND ON TOP OF THE ADAPTATION.
+        // Publishing the adapted template directly is what removed the round trip, but it
+        // means the build WORKER may still be compiling a template from settings captured
+        // before the adaptation existed. If that one published afterwards it would put the
+        // old spectrum back - and because the apply also tells the poll "this state is
+        // pushed", nothing would ever notice: the adaptation would silently vanish, and the
+        // REALTIME button would look like it had stopped working. So: a deliberately heavy
+        // rebuild is queued, the adaptation is applied while it compiles, and the spectrum
+        // must still be the adapted one afterwards.
+        {
+            auto q = std::make_unique<Proc>();
+            q->prepareToPlay (sr4, 256);
+            auto sq = [&q] (const char* id, float v)
+            { auto* z = q->apvts.getParameter (id); z->setValueNotifyingHost (z->convertTo0to1 (v)); };
+            sq ("fractalLevel", 4.0f); sq ("spectrumRange", 10.0f); sq ("baseN", 1.0f);
+            q->pollParametersForTests();
+            juce::Thread::sleep (400);                  // the heavy template settles in
+
+            Proc::SpectrumAdaptSettings st;
+            st.partials = 8; st.periodRatio = 2.0; st.minGapCents = 50.0;
+            st.rootOnly = true; st.goal = 0; st.shapeAmps = true;
+            const std::vector<double> al { 1.0, std::pow (2.0, 4.0 / 12.0), std::pow (2.0, 7.0 / 12.0) };
+            juce::String e;
+            check (q->startSpectrumAdapt (st, al, 261.6255653, e), "the race probe's adaptation starts");
+            for (int i = 0; i < 3000 && q->isSpectrumAdaptRunning(); ++i) juce::Thread::sleep (2);
+
+            // Queue the heavy rebuild, then apply BEFORE the worker can finish it.
+            sq ("curveSlope", 3.0f);
+            q->pollParametersForTests();
+            check (q->applySpectrumAdapt (false, e), "...and applies while a rebuild is in flight");
+            const auto* ta = q->getLiveTemplate();
+            const size_t nAdapted = ta != nullptr ? ta->partials.size() : 0;
+            juce::Thread::sleep (3000);                 // any in-flight build has long finished
+            q->pollParametersForTests();
+            juce::Thread::sleep (300);
+            const auto* tb = q->getLiveTemplate();
+            const size_t nAfter = tb != nullptr ? tb->partials.size() : 0;
+            std::printf ("  in-flight rebuild vs the adaptation: %d partials at apply, %d three seconds later\n",
+                         (int) nAdapted, (int) nAfter);
+            check (nAdapted > 0 && nAfter == nAdapted,
+                   "a rebuild already in flight cannot publish the OLD spectrum over the adaptation");
+        }
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }
