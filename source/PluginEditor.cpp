@@ -4057,16 +4057,35 @@ void FractalAdditiveAudioProcessorEditor::openPartialAmpWindow()
 // at the value it had when manual came on, so switching is silent). A fader that quietly
 // does nothing is the worst of both worlds: grey it out, take its mouse away, and let
 // paint() write FROZEN next to the SLOPE label.
+// THE ONE WRITER of the SLOPE (AMP DECAY) fader's colour, and why it has to be one.
+//
+// Two places used to set it and they disagreed. recolourSpectrumControls painted every
+// control in SPECTRUM the selected engine's hue - correct while the fader is live -
+// while refreshSlopeFreeze painted it grey when frozen and cSlope when not. cSlope is
+// the MINT this panel stopped using when the two engines merged into one box, so ONE
+// pencil (manual per-partial amplitudes) on/off cycle left the fader mint green in a
+// blue panel and nothing ever put it back. The mirror-image bug was there too: with
+// manual ON, any engine reselection repainted the frozen fader the panel hue and
+// deleted the "this control is inert" grey, which refreshSlopeFreeze then refused to
+// restore because its own before/after guard had not changed.
+//
+// So: grey while frozen, the PANEL's colour otherwise - decided here, from the live
+// parameter, by both callers.
+void FractalAdditiveAudioProcessorEditor::applySlopeFaderColour()
+{
+    const bool frozen = processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+    const auto col = frozen ? juce::Colour (0xff5a6070) : spectrumPanelColour;
+    slopeFader.setColour (juce::Slider::thumbColourId, col);
+    slopeFader.setColour (juce::Slider::trackColourId, col.withAlpha (0.55f));
+}
+
 void FractalAdditiveAudioProcessorEditor::refreshSlopeFreeze()
 {
     const bool frozen = processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
     if ((frozen ? 1 : 0) == lastManualFrozenShown) return;
     lastManualFrozenShown = frozen ? 1 : 0;
     slopeFader.setEnabled (! frozen);
-    slopeFader.setColour (juce::Slider::thumbColourId,
-                          frozen ? juce::Colour (0xff5a6070) : cSlope);
-    slopeFader.setColour (juce::Slider::trackColourId,
-                          (frozen ? juce::Colour (0xff5a6070) : cSlope).withAlpha (0.55f));
+    applySlopeFaderColour();
     slopeFader.setTooltip (frozen
         ? tr ("!Frozen!: *manual per-partial amplitudes* are on, so the amplitudes come from the pencil's knobs and this fader does nothing. It is kept exactly where it stood - switch manual off and it applies again.",
               "!Congelat!: les *amplituds manuals per parcial* estan actives, les amplituds venen dels controls del llapis i aquest fader no fa res. Es conserva tal com estava - apaga el manual i torna a aplicar-se.")
@@ -4287,9 +4306,12 @@ void FractalAdditiveAudioProcessorEditor::recolourSpectrumControls (juce::Colour
     // (stepped, magnetic, plain) and a deduced initializer-list has no common type.
     for (juce::Slider* s : { (juce::Slider*) &baseNFader, (juce::Slider*) &harmonicsFader,
                              (juce::Slider*) &primeLimitFader, (juce::Slider*) &timbreRepeatsFader,
-                             (juce::Slider*) &slopeFader, (juce::Slider*) &fractalFader,
-                             (juce::Slider*) &morphTimeFader })
+                             (juce::Slider*) &fractalFader, (juce::Slider*) &morphTimeFader })
         fader (*s);
+    // slopeFader is deliberately NOT in that list: it has a SECOND state (frozen by manual
+    // per-partial amplitudes) and exactly one function is allowed to write its colour.
+    // See applySlopeFaderColour - two writers is what turned it green.
+    applySlopeFaderColour();
     for (juce::ComboBox* b : { &basePitchBox, &primeModeBox }) combo (*b);
     for (auto* l : { &lblBaseN, &lblBasePitch, &lblPrimeLimit, &lblTimbreRepeats, &lblMorphTime })
         label (*l);
@@ -4499,6 +4521,8 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     p.engineChips    = engineChip[0].getBounds().getUnion (engineChip[1].getBounds());
     p.specColumn     = gSpecScale.getBounds();
     p.panelColour    = spectrumPanelColour;
+    p.slopeColour    = slopeFader.findColour (juce::Slider::thumbColourId);
+    p.slopeFrozen    = processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
     // Invisible controls are left out on purpose: several are mode-dependent (the prime
     // whitelist vs the limit fader, the Off button, ...) and a hidden one has no geometry
     // worth asserting.

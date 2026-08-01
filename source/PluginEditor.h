@@ -45,6 +45,13 @@ public:
         // must not collide with the panels around it" is a measurable claim about a
         // hue, and nothing else in the build could check it.
         juce::Colour panelColour;
+        // The SLOPE (AMP DECAY) fader's thumb colour, and whether it is frozen right now.
+        // Probed because that fader is the ONE control in the panel allowed to leave the
+        // panel colour, and only in one direction: the inert grey while manual per-partial
+        // amplitudes are on. It went MINT after a pencil on/off cycle - a colour this
+        // panel stopped using - and no geometric check in the build could see it.
+        juce::Colour slopeColour;
+        bool         slopeFrozen = false;
         std::vector<std::pair<juce::String, juce::Rectangle<int>>> controls; // "harm.baseN" etc.
         // The SUB-CELLS the boxes are divided into. They are rectangles only - the
         // dividers between them and their inline sub-labels are drawn in paint() from
@@ -120,6 +127,10 @@ public:
     // the panel would still be wearing the colour it was constructed with and "selecting
     // an engine recolours the whole panel" could not be measured at all.
     void refreshEngineDressing() { applyEngineState(); }
+    // Test hook (RhythmVerify): re-read "partialManual" and redress the SLOPE fader,
+    // exactly as the 30 Hz timer does. The verifier has no message loop, so a pencil
+    // on/off cycle is otherwise unreachable - and that cycle is the bug.
+    void refreshSlopeFreezeForTests() { refreshSlopeFreeze(); }
     // Test hook (RhythmVerify): click an engine chip the way a hand does. Exists for
     // the one behaviour a probe of engineInForce cannot reach: with NO scale loaded,
     // clicking CUSTOM must still open that view (it is the only place the Load button
@@ -2743,6 +2754,10 @@ private:
     // is ONE box now, so a fader still wearing its old per-cell hue would be the only
     // thing on screen still claiming the compartments are separate boxes.
     void recolourSpectrumControls (juce::Colour col);
+    // The SLOPE (AMP DECAY) fader's colour, decided in ONE place - it is the only control
+    // in the panel with a second, INERT state, and having two writers is what left it
+    // mint green after a pencil on/off cycle. See the definition.
+    void applySlopeFaderColour();
     std::unique_ptr<SliderAttachment> primeLimitFaderAtt;
     // SLOPE cell: the pencil that opens the per-partial amplitude window, and the ON/OFF
     // pill under it. The pill and the one INSIDE the window are two attachments to the

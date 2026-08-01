@@ -2963,6 +2963,46 @@ int main()
             ed->refreshEngineDressing();
         }
 
+        // THE AMP DECAY FADER AFTER A PENCIL ON/OFF CYCLE.
+        //
+        // Every control in SPECTRUM wears the panel colour, with ONE stated exception: the
+        // AMP DECAY (slope) fader goes grey while manual per-partial amplitudes are on,
+        // because it is then inert. Toggling that off has to give the panel colour BACK -
+        // and it did not: the un-freeze path restored `cSlope`, the mint this panel
+        // stopped using when the engines merged, so one pencil cycle left a green fader in
+        // a blue panel for the rest of the session. Colour, not geometry, so nothing else
+        // in this file could have seen it.
+        if (ed != nullptr)
+        {
+            auto* pm = p.apvts.getParameter ("partialManual");
+            auto slope = [&] { return ed->layoutProbe().slopeColour; };
+            const auto panel = ed->layoutProbe().panelColour;
+            pm->setValueNotifyingHost (0.0f); ed->refreshSlopeFreezeForTests();
+            const auto live0 = slope();
+            pm->setValueNotifyingHost (1.0f); ed->refreshSlopeFreezeForTests();
+            const auto frozen = slope();
+            // ...and an engine reselection while frozen must NOT repaint it live: that was
+            // the mirror-image half of the same bug (recolourSpectrumControls painted every
+            // fader the panel hue, deleting the panel's only inertness warning, and the
+            // freeze refresh then refused to restore it because its state had not changed).
+            ed->refreshEngineDressing();
+            const auto frozenAfterEngine = slope();
+            pm->setValueNotifyingHost (0.0f); ed->refreshSlopeFreezeForTests();
+            const auto live1 = slope();
+            std::printf ("  AMP DECAY fader: panel %s   live %s -> frozen %s -> engine redress %s -> live %s\n",
+                         panel.toDisplayString (false).toRawUTF8(),
+                         live0.toDisplayString (false).toRawUTF8(),
+                         frozen.toDisplayString (false).toRawUTF8(),
+                         frozenAfterEngine.toDisplayString (false).toRawUTF8(),
+                         live1.toDisplayString (false).toRawUTF8());
+            check (live0 == panel, "the AMP DECAY fader wears the panel colour while it is live");
+            check (frozen != panel, "and goes off it while manual amplitudes freeze it (it says it is inert)");
+            check (frozenAfterEngine == frozen,
+                   "and stays inert-grey when the engine is reselected under it");
+            check (live1 == panel,
+                   "and a pencil on/off cycle puts the panel colour BACK (it used to leave it mint green)");
+        }
+
         // The empty-workspace pin. With ONE shared box, the Load button and the
         // intervals editor only exist inside the CUSTOM view - so with no scale loaded
         // the CUSTOM chip must still open that view (sound honestly staying harmonic),
