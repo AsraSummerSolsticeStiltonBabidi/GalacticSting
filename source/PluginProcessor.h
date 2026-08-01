@@ -200,31 +200,51 @@ public:
     struct TimbreTextAction : public juce::UndoableAction
     {
         TimbreTextAction (FractalAdditiveAudioProcessor& p, juce::String prev, juce::String next)
-            : proc (p), after (std::move (next)), before (std::move (prev)) {}
-        bool perform() override { return applyOne (after); }
-        bool undo() override    { return applyOne (before); }
+            : proc (p), after (std::move (next)), before (std::move (prev)),
+              // The PREVIOUS spectrum's tuning provenance, captured here (construction
+              // happens before loadTimbreText wipes it): undoing a typed spectrum back
+              // to an adapted one must restore the "Load spectrum's tuning" button too,
+              // or Ctrl+Z would bring the spectrum back with its origin quietly gone.
+              beforeProvName (p.specProvName), beforeProvSource (p.specProvSource),
+              beforeProvPeriod (p.specProvPeriod) {}
+        bool perform() override { return applyOne (after, false); }
+        bool undo() override    { return applyOne (before, true); }
         int  getSizeInUnits() override { return (int) (after.length() + before.length()) * 2 + 32; }
-        bool applyOne (const juce::String& t)
+        bool applyOne (const juce::String& t, bool restoreProv)
         {
             juce::String e;
-            if (t.trim().isEmpty()) { proc.clearTimbre(); return true; }
-            return proc.loadTimbreText (t, e);
+            bool ok = true;
+            if (t.trim().isEmpty()) proc.clearTimbre();
+            else                    ok = proc.loadTimbreText (t, e);
+            // loadTimbreText/clearTimbre both clear provenance (typed text has none);
+            // going BACK re-attaches the origin the previous spectrum really had.
+            if (ok && restoreProv)
+            {
+                proc.specProvName   = beforeProvName;
+                proc.specProvSource = beforeProvSource;
+                proc.specProvPeriod = beforeProvPeriod;
+            }
+            return ok;
         }
         FractalAdditiveAudioProcessor& proc;
         juce::String after, before;
+        juce::String beforeProvName, beforeProvSource, beforeProvPeriod;
     };
 
     // Type a custom tuning THROUGH the undo stack. Returns false (with errorOut set) if
     // the text does not parse, in which case nothing is pushed.
     bool loadTimbreTextUndoable (const juce::String& text, juce::String& errorOut)
     {
-        // Capture the previous text BEFORE applying anything: loadTimbreText below
-        // already overwrites timbreSource, so asking for it afterwards would record the
-        // NEW value as the one to go back to - an undo that undid nothing.
-        const auto before = timbreSource;
+        // The ACTION is constructed BEFORE applying anything: its constructor captures
+        // the previous text's provenance, and loadTimbreText below clears that (typed
+        // text has none) - constructing afterwards recorded an empty origin as the one
+        // to go back to, so undoing a typed spectrum back to an adapted one silently
+        // lost its "Load spectrum's tuning" button (caught by RhythmVerify b2). The
+        // same order protects `before` = timbreSource, which the load overwrites too.
+        std::unique_ptr<TimbreTextAction> act (new TimbreTextAction (*this, timbreSource, text));
         if (! loadTimbreText (text, errorOut)) return false;   // rejected: nothing is pushed
         undoManager.beginNewTransaction();
-        undoManager.perform (new TimbreTextAction (*this, before, text));
+        undoManager.perform (act.release());
         return true;
     }
     int  getTimbreNoteCount() const noexcept { return (int) timbreDegrees.size(); }
@@ -532,6 +552,77 @@ public:
     bool isPlaygroundSuspendingRealtime() const noexcept;
 
     //==========================================================================
+    // THE PLAYGROUND'S SECOND MODE: MIX ("multi-Fibló", integrated).
+    //
+    // Morph produces ONE blended patch; MIX runs the four corner presets as four real
+    // sub-engines SIMULTANEOUSLY - each with its own voices, its own modulators and
+    // its own compiled spectrum, all fed the same incoming MIDI - and the point is a
+    // four-way volume balance: the bilinear weights become per-corner GAINS under the
+    // equal-power law (presetmorph::mixGains - sqrt(w), so total power is constant
+    // across the pad and a vertex is exactly that corner alone).
+    //
+    // SHARED, deliberately: the TUNING (the keys mean one thing - MIX changes the
+    // sound, never the pitch of a key), the master output gain (the corners' own saved
+    // masterGain values are NOT applied - the master is the master), the preview/MIDI
+    // plumbing, and the RHYTHM engine, which stays on the MAIN patch: four rhythm
+    // engines firing four pulse trains at once is chaos nobody asked for, and the
+    // main patch's rhythm is what the user had dialled in.
+    //
+    // PER CORNER: the voice/mod parameters (via a ParamBank filled from the corner's
+    // stored preset values - see ParamBank.h), the modulator ROUTING the preset was
+    // saved with (a corner with no routing simply has its modulators off), and the
+    // corner's compiled spectrum, republished into its own engine whenever an
+    // adaptive corner adapts (same rules as morph mode - the corner's voices morph or
+    // fade to it exactly as the live engine would).
+    //
+    // WHAT MIX NEVER DOES: touch the live patch. No parameter is written, no spectrum
+    // is published over the live one - the main engine keeps rendering the patch the
+    // user had (crossfaded out while MIX is engaged), so disengaging restores the
+    // ordinary single-engine state EXACTLY, and mid-note: voices in flight simply
+    // fade, they are never stolen by a state rewrite.
+    //
+    // One current, honest limit: a corner preset whose modulators drive SPECTRUM
+    // parameters (Base, Fractal, Prime...) does not re-compile that corner's spectrum
+    // per block - the corner's spectrum is its compiled template (updated by the
+    // adaptive follower when armed). The live engine's 60 Hz recompile loop exists
+    // for exactly that and stays with the live patch; per-voice targets (envelopes,
+    // filter, pitch, slope) modulate fully in every corner.
+    bool isPlaygroundMixMode() const noexcept
+    { return apvts.getRawParameterValue ("pgMode")->load() > 0.5f; }
+    // Is the mix actually sounding (engaged and past the message->audio handoff)?
+    bool isPlaygroundMixEngaged() const noexcept { return mixEngaged.load (std::memory_order_acquire); }
+
+    // ADAPTIVE CORNERS: a corner whose preset was saved with the SpectrumFromChord
+    // follower armed KEEPS ADAPTING while the playground is engaged - against its OWN
+    // settings, to the chord being held right now - and its corner template updates
+    // live, so the blend (and therefore the morphed result) moves with the playing.
+    // Half-morphed with a static preset the adaptation is diluted but PRESENT, which
+    // is the point: "morphs locos" between several presets, not from one.
+    //
+    // Only SpectrumFromChord qualifies. TuningFromSpectrum writes the TUNING, which
+    // the playground promises never to touch; SpectrumFromTuning aims at a fixed set
+    // of notes, so inside the playground it would re-derive the same spectrum for
+    // ever (the enum's own comment already documents that trap) - a corner saved with
+    // either stays exactly as compiled. The LIVE patch's follower stays suspended as
+    // before: the playground owns the live spectrum, and the corner adaptations reach
+    // it THROUGH the blend rather than around it.
+    //
+    // How many corners are adapting right now (assigned + armed + not refused).
+    int getPlaygroundAdaptiveCount() const noexcept;
+    // Counters for the offline verifier: searches launched for corners, results applied.
+    int getPlaygroundAdaptStarts()  const noexcept { return pgAdaptStarts; }
+    int getPlaygroundAdaptApplies() const noexcept { return pgAdaptApplies; }
+    // Non-empty when a corner's saved settings cannot run at all (bad period, absurd
+    // cost...). The corner stops retrying and this SAYS so - never a silent stop.
+    juce::String getPlaygroundAdaptRefusal() const { return pgAdaptRefusal; }
+    // The corner's compiled template, so a test can prove it CHANGES when the chord does.
+    std::shared_ptr<const spectrum::SpectrumTemplate> getPlaygroundCornerTemplateForTests (int corner) const
+    {
+        return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].tmpl
+                                                                     : nullptr;
+    }
+
+    //==========================================================================
     // The TWO inputs every Sethares feature shares. Their numbers are compared with
     // each other (the degree list next to the n-ad list, the generated scale's
     // heights against the degree colouring, "sounding now" against an adaptation),
@@ -679,8 +770,14 @@ public:
     // the same chord an octave down wants a different spectrum.
     // `realtime` picks the SMALLER register cap (see Dissonance.h): the follower must keep
     // up with the fingers, and the cost is exactly linear in the number of registers.
+    // `targetIsTuning` marks the runs whose alphas came from tuningAsTargetAlphas: only
+    // those record the active tuning as the result's provenance (see AdaptInfo). The
+    // CALLER states it because the alphas alone cannot say where they came from - a held
+    // chord can spell out the scale exactly, and guessing from values would pin a tuning
+    // onto a spectrum the user derived from their fingers.
     bool startSpectrumAdapt (const SpectrumAdaptSettings& s, const std::vector<double>& targetAlphas,
-                             double f0Hz, juce::String& errorOut, bool realtime = false);
+                             double f0Hz, juce::String& errorOut, bool realtime = false,
+                             bool targetIsTuning = false);
     void cancelSpectrumAdapt() { adaptCancel = true; }
     bool  isSpectrumAdaptRunning() const noexcept { return adaptRunning.load(); }
     float getSpectrumAdaptProgress() const noexcept { return adaptProgress.load(); }
@@ -703,6 +800,13 @@ public:
         double seedMean = 0.0, seedWorst = 0.0;
         double worstHz = 0.0;         // the register that scores worst
         std::vector<double> perRegister, registerF0;
+        // PROVENANCE: the tuning this result was adapted TO, captured when the search
+        // was STARTED (the user can load another tuning while the worker runs, and the
+        // result still belongs to the one it was aimed at). Empty when the target was
+        // the held chord, or the active tuning had no reloadable source (MTS/Equal).
+        // Travels inside the result - not in a member beside it - so a newer search's
+        // target can never be pinned onto an older search's spectrum.
+        juce::String provName, provSource, provPeriod;
     };
     AdaptInfo getSpectrumAdaptResult() const
     {
@@ -877,6 +981,46 @@ public:
     }
     juce::String getPendingPresetTuningName() const { return presetPendingSclName; }
     bool loadPendingPresetTuning (juce::String& errorOut);
+
+    //==========================================================================
+    // SPECTRUM PROVENANCE: the tuning the CURRENT custom spectrum was derived from.
+    //
+    // Recorded (as name + the FULL source text, like bankSource - a bank slot or a
+    // file may be gone later, so the scale text itself is what is stored) by every
+    // path that derives a spectrum FROM a tuning:
+    //   * Adapt with the TUNING as target (hand-pressed or the SpectrumFromTuning
+    //     realtime link) - e.g. the dissonance-minimum spectrum of a tuning;
+    //   * a .scl/.tun loaded as the Custom Engine's spectrum (the file IS a tuning,
+    //     so "the tuning this spectrum came from" is exactly that file).
+    // NOT recorded - the honest rule for each:
+    //   * typed intervals and the random generator (no tuning was involved);
+    //   * Adapt with the HELD CHORD as target (the notes under the fingers are the
+    //     origin, not the scale as a whole - and an MTS/equal-mode tuning could not
+    //     be re-loaded from text anyway);
+    //   * an adapt run while the active tuning cannot be captured as text
+    //     (MTS-ESP / Equal mode: there is no source to bring back later).
+    // Cleared whenever the spectrum is replaced by something with no tuning origin
+    // (typed text, random, clearTimbre), carried through undo/redo snapshots, the
+    // playground's winner corner, save/reload and presets.
+    //
+    // The Tuning panel shows a "Load spectrum's tuning" button while this exists
+    // (disabled when that tuning is already active), which loads it through the
+    // normal undoable tuning path - see loadSpectrumProvenanceTuning().
+    bool hasSpectrumProvenance() const noexcept
+    { return specProvSource.isNotEmpty() && timbreLoaded(); }
+    juce::String getSpectrumProvenanceName() const { return specProvName; }
+    // Is the provenance tuning the one ACTIVE now? Same text-equality rule as
+    // hasPendingPresetTuning, plus the mode: a matching .scl sitting behind
+    // MTS/Equal mode is loaded but not in force, so it does not count as active.
+    bool spectrumProvenanceIsActive() const
+    {
+        return specProvSource.isNotEmpty()
+            && specProvSource == tuning.getScalaSource()
+            && getTuningMode() == (int) TuningManager::Mode::Scala;
+    }
+    // Load the provenance tuning as the ACTIVE tuning, as one undo transaction
+    // (TuningSnapshotAction), so Ctrl+Z brings the displaced tuning straight back.
+    bool loadSpectrumProvenanceTuning (juce::String& errorOut);
     // ctrl+click: folded into the period, sorted. exactText, when given, is the
     // spec the user typed, kept verbatim so a ratio stays a ratio in the .scl.
     bool addNoteToTuning  (double ratioFromTonic, juce::String& errorOut,
@@ -1006,6 +1150,12 @@ private:
     std::vector<float> timbreDegrees;
     float              timbrePeriod = 2.0f;
     juce::String       timbreName, timbreSource;
+    // SPECTRUM PROVENANCE (see the public block above): the tuning the current custom
+    // spectrum was derived from - display name, the full reloadable source text, and a
+    // table's period spec (the same triple TuningManager::Snapshot restores from).
+    // Kept as text like bankSource, never as a slot/file reference: the slot can be
+    // cleared and the file deleted, and the button must still be able to deliver.
+    juce::String       specProvName, specProvSource, specProvPeriod;
 
     //== RANDOM SPECTRUM trigger ("specRandom") =================================
     // Edge detection lives in a parameter LISTENER, not in the 60 Hz poll, because a
@@ -1131,6 +1281,10 @@ private:
         bool manual = false;
         bool timbreOn = false;
         bool taken = false;
+        // The spectrum's tuning provenance travels WITH the spectrum it describes:
+        // undoing an adaptation back to a typed spectrum must also take the
+        // "Load spectrum's tuning" button away, and redoing must bring it back.
+        juce::String provName, provSource, provPeriod;
     };
     TuningManager::Snapshot rtTuneBase;
     int  rtTuneBaseMode = 0;
@@ -1159,8 +1313,29 @@ private:
         std::vector<spectrum::PartialGain> gains;
         bool manual = false;                                  // "partialManual"
         juce::String timbreName, timbreSource;                // the Custom Engine's own scale
+        // The corner spectrum's tuning provenance, read from the preset's TIMBRE child:
+        // when this corner WINS the discrete state, its spectrum arrives with the origin
+        // it was saved with - and a winner saved without one clears the button honestly.
+        juce::String provName, provSource, provPeriod;
         int  rtLink = 0;                                      // the realtime/adaptive link it was saved with
         RtSettings rtSet;
+        // The preset's MODULATOR ROUTING (the MODS child): target-id csv per modulator
+        // and the drawn LFO waves. Morph mode never reads these (routing is live-patch
+        // state there); MIX mode loads them into the corner's OWN ModEngine, because a
+        // preset whose filter breathes under an LFO is not the same preset with the
+        // routing stripped. Empty = that modulator drives nothing = it is simply off.
+        juce::String modTargets[ModEngine::kMods];
+        juce::String modWaves[ModEngine::kLfos];
+        // ADAPTIVE-CORNER bookkeeping (message thread; see the public block). The aim is
+        // the chord the last launched search was AIMED at - the same "has it moved?"
+        // reference the plain follower keeps, per corner because each corner searches
+        // with its own settings and on its own turn of the round-robin.
+        std::vector<double> rtAimAlphas;
+        double rtAimF0 = 0.0;
+        bool   rtPend  = false;   // the chord moved: this corner owes a search
+        bool   rtDead  = false;   // its settings REFUSED to run: stop retrying, say so
+        bool rtAdaptive() const noexcept
+        { return assigned() && rtLink == (int) RtLink::SpectrumFromChord && ! rtDead; }
         // shared_ptr, and const: a drag posts a blend job every 16 ms and the worker may
         // still be reading a corner the user has just replaced. Immutable + refcounted is
         // what makes reassigning a corner mid-blend safe without a lock.
@@ -1185,11 +1360,129 @@ private:
     // it can be handed back untouched when the playground lets go.
     RtLink pgSuspendedRt = RtLink::Off;
     bool   pgRtSuspended = false;
+
+    //== ADAPTIVE CORNERS (see the public block). Message thread except where noted. ==
+    // One finished corner search. It carries its OWN identity (corner + preset name) and
+    // the chord it was AIMED at, because by the time it is consumed the corner may have
+    // been reassigned and the chord may have moved - both of which make it stale, and a
+    // stale adaptation is DROPPED, never applied late (same rule as the plain follower).
+    struct CornerAdaptResult
+    {
+        int corner = -1;
+        juce::String cornerName;
+        std::vector<double> ratios, amps;   // ascending, ratios[0] == 1.0
+        double period = 2.0;
+        std::vector<double> aimAlphas;
+        double aimF0 = 0.0;
+        bool valid = false;
+    };
+    CornerAdaptResult pgAdaptResult;        // guarded by adaptLock (worker writes, timer reads)
+    std::atomic<int>  pgAdaptGeneration { 0 };
+    int  pgSeenAdaptGen = 0;
+    int  pgAdaptLastStart = -1000;          // in rtTick units: same launch floor as the follower
+    int  pgAdaptNext = 0;                   // round-robin cursor over the adaptive corners
+    int  pgAdaptInFlight = -1;              // corner whose search is running (-1 = none)
+    int  pgAdaptStarts = 0, pgAdaptApplies = 0;
+    juce::String pgAdaptRefusal;
+    // A corner preset's value for a parameter, falling back to the parameter's DEFAULT
+    // (never the live patch) when the preset predates it - shared by every corner
+    // compile so old presets always mean the same thing.
+    float cornerValueOr (const PlaygroundCorner& c, const char* id) const;
+    // Launch one corner's adaptation on the shared worker ("never two at once" is
+    // adaptRunning, exactly as the follower uses it).
+    bool startCornerAdapt (int corner, const std::vector<double>& alphas, double f0,
+                           juce::String& errorOut);
+    // Write a finished result into its corner: adapted intervals as the corner's typed
+    // spectrum, adapted amplitudes BAKED into the corner's compiled template.
+    void applyCornerAdaptResult (PlaygroundCorner& c, const CornerAdaptResult& r);
+    // Consume finished results, watch the held chord, launch what is owed. Called from
+    // drivePlayground while the playground is engaged.
+    void drivePlaygroundAdaptive();
+
     void drivePlayground();
     void applyPlaygroundDiscreteState (int corner);
     void applyPlaygroundContinuous (const double w[kPlaygroundCorners]);
     void postPlaygroundBlend (const double w[kPlaygroundCorners], bool bumpGeneration);
     void refreshPlaygroundActive();
+
+    //== PLAYGROUND MIX MODE (see the public block). ============================
+    // One corner's sub-engine. Declaration order IS destruction safety: the synth's
+    // AdditiveVoices hold references to `spectrum`, `mods` and `bank`, so the synth
+    // (declared last) must be destroyed first - same rule the processor's own members
+    // follow for the main engine.
+    struct MixCornerEngine
+    {
+        explicit MixCornerEngine (FractalAdditiveAudioProcessor& p)
+            : bank (p), mods (p.apvts, &bank)
+        {
+            synth.setVoiceStealingEnabled (true);
+            synth.enableLegacyMode (48);   // caller mirrors the live zone/bend right after
+        }
+        // Polyphony follows the VISIBLE "pgVoices" control (measured: five 32-voice
+        // engines are ~3x a 48 kHz/512 block on dense spectra, so a fixed 32 would be
+        // an inaudible-until-it-crackles trap and a fixed lower number a silent cap).
+        // Message thread; MPESynthesiser's own voice lock serialises this against the
+        // audio thread, and reduceNumVoices steals sounding voices properly.
+        void setVoices (FractalAdditiveAudioProcessor& p, int want)
+        {
+            want = juce::jlimit (1, 32, want);
+            while (synth.getNumVoices() < want)
+                synth.addVoice (new AdditiveVoice (p.apvts, spectrum, p.tuning, mods, &bank));
+            if (synth.getNumVoices() > want)
+                synth.reduceNumVoices (want);
+        }
+        ParamBank                 bank;      // the corner preset's values (see ParamBank.h)
+        spectrum::SpectrumEngine  spectrum;  // holds the corner's compiled template
+        ModEngine                 mods;      // the corner's own modulators, reading `bank`
+        juce::MPESynthesiser      synth;
+        juce::AudioBuffer<float>  buf;       // render scratch, sized on the message thread
+        // What the bank/routing/template currently describe, so a 60 Hz tick only
+        // refreshes when the corner actually changed (assign, or an adaptive apply).
+        std::shared_ptr<const spectrum::SpectrumTemplate> lastTmpl;
+        juce::String lastName;
+    };
+    // The message thread OWNS the engines (built on demand, kept for the processor's
+    // lifetime - never deleted mid-session, so the audio thread can hold a pointer
+    // across a block without a lock); the atomics are the audio thread's view,
+    // release-stored only once an engine is fully built.
+    std::array<std::unique_ptr<MixCornerEngine>, kPlaygroundCorners> mixEng;
+    std::array<std::atomic<MixCornerEngine*>, kPlaygroundCorners>    mixEngLive {};
+    std::atomic<bool>  mixEngaged { false };                     // message -> audio
+    std::atomic<float> mixGainTarget[kPlaygroundCorners] {};     // sqrt(w) per corner
+    bool pgMixDriving  = false;   // message thread: the mix path ran this tick
+    bool pgLastMixMode = false;   // detects morph<->mix flips (forces a full re-apply)
+    // Audio-thread-only mix state (touched in renderSynthMix and nowhere else).
+    float mixXfade = 0.0f;                       // 0 = main engine alone, 1 = corners alone
+    float mixGainCur[kPlaygroundCorners] {};     // smoothed per-corner gains
+    float mixApplied[kPlaygroundCorners] {};     // gain actually applied last block (ramp start)
+    float mixMainApplied = 1.0f;
+    bool  mixWasOn = false;                      // edge detect: engage re-injects held keys
+    bool  mixKilled = false;                     // corner voices killed after fade-out
+    int   mixTailBlocks = 0;                     // muted blocks so the 5 ms kill can finish
+    double curBpm = -1.0, curPpq = -1.0, curF0 = 0.0; // this block's transport (audio thread)
+    juce::AudioBuffer<float> mixScratch;         // the main engine's bus during a crossfade
+    juce::MidiBuffer         mixInject;          // reused: held keys re-struck on engage
+    int lastBlockSize = 512;
+
+    void drivePlaygroundMix (const double w[kPlaygroundCorners]);
+    void buildMixEngine (int corner);
+    void refreshMixEngine (int corner);
+    void renderSynthMix (juce::AudioBuffer<float>& out, const juce::MidiBuffer& midi, int nSamp);
+    // Mirror the live zone layout / bend range onto a sub-synth (corners follow the
+    // LIVE tuning plumbing - the tuning is global, exactly as the morph promises).
+    void applyZoneTo (juce::MPESynthesiser& s) const
+    {
+        if (lastZoneMpe)
+        {
+            juce::MPEZoneLayout zone;
+            zone.setLowerZone (15, 48, 48);   // same numbers as applyTuningMode, same reason
+            s.setZoneLayout (zone);
+        }
+        else
+        {
+            s.enableLegacyMode (lastBendApplied);
+        }
+    }
     // Where a parameter sits in getParameters(). -1 if there is no such parameter.
     int  paramIndexOf (const char* id) const;
     // The realtime/adaptive link as saved in a preset/project, and back again. It is

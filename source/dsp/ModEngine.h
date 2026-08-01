@@ -40,6 +40,8 @@
 #include <atomic>
 #include <cmath>
 
+#include "ParamBank.h"
+
 class ModEngine : private juce::AudioProcessorParameter::Listener
 {
 public:
@@ -149,17 +151,23 @@ public:
         }
     }
 
-    ModEngine (juce::AudioProcessorValueTreeState& s) : apvts (s)
+    // `bank` selects the value source (see ParamBank.h): nullptr is the live patch -
+    // behaviour identical to before the playground's MIX mode existed - and a corner's
+    // bank makes this engine read (and write its global targets into) that corner's
+    // own values, so a corner preset's modulators run against the preset, never
+    // against whatever the live knobs happen to say.
+    ModEngine (juce::AudioProcessorValueTreeState& s, ParamBank* bank = nullptr)
+        : src { &s, bank }
     {
         // Cache every modulator parameter's raw atomic once: processBlock then
         // runs with ZERO string building / map lookups on the audio thread.
         for (int i = 0; i < kMods; ++i)
         {
             const auto pre = ownPrefix (i);
-            const auto rv  = [this, &pre] (const char* suf) { return apvts.getRawParameterValue (pre + suf); };
+            const auto rv  = [this, &pre] (const char* suf) { return src.raw (pre + suf); };
             auto& q = prm[(size_t) i];
             q.on = rv ("On"); q.range = rv ("Range");
-            onParam[(size_t) i] = apvts.getParameter (pre + "On");
+            onParam[(size_t) i] = src.param (pre + "On");
             if (i < kEnvs) { q.a = rv ("A"); q.d = rv ("D"); q.s = rv ("S"); q.r = rv ("R");
                              q.cA = rv ("CurveA"); q.cD = rv ("CurveD"); q.cR = rv ("CurveR"); }
             else
@@ -196,8 +204,8 @@ public:
     void addTarget (int mod, const juce::String& pid)
     {
         if (! juce::isPositiveAndBelow (mod, kMods) || pid.startsWith (ownPrefix (mod))) return;
-        auto* p   = apvts.getParameter (pid);
-        auto* raw = apvts.getRawParameterValue (pid);
+        auto* p   = src.param (pid);       // shared object: ranges are one layout
+        auto* raw = src.raw (pid);         // THIS source's value store
         if (p == nullptr || raw == nullptr) return;
         const juce::ScopedLock sl (routingLock);
         auto& m = mods[(size_t) mod];
@@ -303,7 +311,7 @@ public:
             for (int t = 0; t < kMaxTargets && ! drives; ++t)
                 drives = mods[(size_t) i].tgtId[(size_t) t] == pid;
             if (! drives) continue;
-            const bool on = onParam[(size_t) i] != nullptr ? onParam[(size_t) i]->getValue() > 0.5f
+            const bool on = onParam[(size_t) i] != nullptr ? src.normOf (onParam[(size_t) i]) > 0.5f
                                                            : prm[(size_t) i].on->load() > 0.5f;
             if (! on) continue;
             const float rg = prm[(size_t) i].range->load();
@@ -339,7 +347,7 @@ public:
             // Gate on the USER's On setting, never on a modulated copy of it: two
             // modulators cross-mapped onto each other's On would otherwise form a
             // block-rate limit cycle (both off -> restored -> both on -> ...).
-            act[i] = (onParam[(size_t) i] != nullptr ? onParam[(size_t) i]->getValue() > 0.5f
+            act[i] = (onParam[(size_t) i] != nullptr ? src.normOf (onParam[(size_t) i]) > 0.5f
                                                      : q.on->load() > 0.5f) && anyTarget;
 
             if (i < kEnvs)
@@ -482,7 +490,7 @@ public:
         }
         for (int k = 0; k < nW; ++k)
         {
-            const float norm = juce::jlimit (0.0f, 1.0f, writes[k].p->getValue() + writes[k].sum);
+            const float norm = juce::jlimit (0.0f, 1.0f, src.normOf (writes[k].p) + writes[k].sum);
             writes[k].raw->store (writes[k].p->convertFrom0to1 (norm));
         }
         // Whatever was modulated LAST block but not this one returns to its own
@@ -493,7 +501,7 @@ public:
             bool still = false;
             for (int j = 0; j < nW; ++j) if (writes[j].raw == lastW[k].raw) { still = true; break; }
             if (! still && lastW[k].p != nullptr)
-                lastW[k].raw->store (lastW[k].p->convertFrom0to1 (lastW[k].p->getValue()));
+                lastW[k].raw->store (lastW[k].p->convertFrom0to1 (src.normOf (lastW[k].p)));
         }
         nLastW = nW;
         for (int k = 0; k < nW; ++k) lastW[k] = { writes[k].p, writes[k].raw };
@@ -555,8 +563,13 @@ private:
     }
 
     // index -> parameter cache for the listener above (message thread maintains it).
+    // Live source only: a corner engine's base values come from its BANK, which no
+    // gesture ever touches, so the whole hold dance has nothing to protect there - and
+    // registering four corner listeners on the LIVE parameters would make grabbing a
+    // live knob pause modulation inside presets that do not even contain that knob.
     void watchAdd (const juce::String& pid, juce::RangedAudioParameter* p)
     {
+        if (! src.isLive()) return;
         for (auto& w : watched)
             if (w.p.load() == nullptr)
             {
@@ -567,6 +580,7 @@ private:
     }
     void watchRemove (const juce::String& pid)
     {
+        if (! src.isLive()) return;   // never added (see watchAdd)
         for (auto& w : watched)
             if (w.p.load() != nullptr && w.id == pid)
             {
@@ -637,7 +651,7 @@ private:
         }
     }
 
-    juce::AudioProcessorValueTreeState& apvts;
+    ParamSource src;   // live APVTS or a corner's ParamBank (see ParamBank.h)
     mutable juce::CriticalSection routingLock; // message-thread routing edits/reads; never audio
     Mod  mods[kMods];
     Ptrs prm[kMods];

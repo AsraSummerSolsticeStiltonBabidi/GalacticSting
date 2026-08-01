@@ -1496,6 +1496,21 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         resized(); repaint(); refocus();
     };
     addChildComponent (loadPresetTuningBtn);
+    // The current custom spectrum was DERIVED FROM a tuning (adapted to it, or loaded
+    // from a scale file): offer that tuning here, same idiom as the preset's tuning
+    // above. Word/enabled/tooltip live in refreshSpectrumTuningButton().
+    loadSpectrumTuningBtn.setColour (juce::TextButton::buttonColourId, cLoad);
+    loadSpectrumTuningBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+    loadSpectrumTuningBtn.setMouseClickGrabsKeyboardFocus (false);
+    loadSpectrumTuningBtn.onClick = [this]
+    {
+        juce::String err;
+        if (! processorRef.loadSpectrumProvenanceTuning (err))
+            juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                tr ("Load spectrum's tuning", "Carrega l'afinaci\xc3\xb3 de l'espectre"), err, this);
+        resized(); repaint(); refocus();
+    };
+    addChildComponent (loadSpectrumTuningBtn);
     // Recent: one button that opens the floating list of everything ever loaded.
     recentOpenBtn.setColour (juce::TextButton::buttonColourId, cTuning.withAlpha (0.28f));
     recentOpenBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
@@ -1828,6 +1843,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     playgroundPanel.pad.proc = &processorRef;
     playgroundPanel.trF     = [this] (const char* en, const char* ca) { return tr (en, ca); };
     playgroundPanel.pad.trF = [this] (const char* en, const char* ca) { return tr (en, ca); };
+    playgroundPanel.attachVoices();   // needs proc: the pgVoices attachment
 
     // Pitch-bend range (inside the Tuning box).
     configCombo (bendBox, "bendRange", bendAtt, cTuning, {});
@@ -2802,6 +2818,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     loadPresetTuningBtn.setTooltip (tr (
         "The preset you just loaded was saved with a *different tuning*.\nLoading a preset only changes the *sound*, !never the scale!. Click to bring that tuning in too.",
         "El preset que acabes de carregar es va desar amb una *afinaci\xc3\xb3 diferent*.\nCarregar un preset nom\xc3\xa9s canvia el *so*, !mai l'escala!. Clica per portar tamb\xc3\xa9 aquella afinaci\xc3\xb3."));
+    refreshSpectrumTuningButton(); // its word/tooltip re-render in the new language (sig includes it)
     tuningBankLoadBtn.setButtonText (tr ("+ .scl", "+ .scl"));
     tablePeriodResetBtn.setButtonText (tr ("est.", "est."));
     tablePeriodResetBtn.setTooltip (tr ("Back to Fibló's own estimate of the period.",
@@ -3697,7 +3714,11 @@ void FractalAdditiveAudioProcessorEditor::runSpectrumAdapt()
         // No cost veto here any more: the price is on the button (see refreshAdaptButtonText)
         // and the only refusal left is the processor's ten-minute bound, which comes back
         // through `err` with the estimate in it rather than a verdict.
-        processorRef.startSpectrumAdapt (s.adapt, alphas, f0, err);
+        // `targetIsTuning` = the target selector, stated by the caller: a tuning-targeted
+        // result records the tuning as the spectrum's provenance, a chord-targeted one
+        // must not (see startSpectrumAdapt).
+        processorRef.startSpectrumAdapt (s.adapt, alphas, f0, err, /*realtime*/ false,
+                                         /*targetIsTuning*/ ! toChord);
     if (err.isNotEmpty())
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
             tr ("Adapt spectrum to tuning", "Adapta l'espectre a l'afinaci\xc3\xb3"), err, this);
@@ -4143,6 +4164,14 @@ FractalAdditiveAudioProcessorEditor::playgroundProbeForTests (int w, int h, bool
         p.clear[i] = playgroundPanel.cornerClear[i].getBounds();
         p.lbl[i]   = playgroundPanel.cornerLbl[i].getBounds();
     }
+    for (int m = 0; m < 2; ++m)
+    {
+        p.mode[m]     = playgroundPanel.modeBtn[m].getBounds();
+        p.modeText[m] = playgroundPanel.modeBtn[m].getButtonText();
+    }
+    p.voicesL    = playgroundPanel.voicesLbl.getBounds();
+    p.voicesC    = playgroundPanel.voicesSlider.getBounds();
+    p.voicesText = playgroundPanel.voicesLbl.getText();
     p.status = playgroundPanel.statLbl.getText();
     catalan = was;
     playgroundPanel.applyLanguage();
@@ -4384,6 +4413,36 @@ void FractalAdditiveAudioProcessorEditor::refreshCustomEngineButtons()
     randomSpectrumBtn.setTooltip (tr (
         "Build a brand-new random spectrum. Every press is a different one: 5 to 12 partials per period, spread evenly in PITCH (not in Hz) over the reach your Octave Range and Reps already set, never closer than 35 cents so no two of them collapse into one beating partial. The period stays a whole number of octaves, so Reps stacks it cleanly instead of smearing. Automatable: it is a trigger parameter, so a 0-to-1 step drawn in the host fires it exactly like this click, with the window shut. One Ctrl+Z brings the previous spectrum back.",
         "Construeix un espectre nou a l'atzar. Cada pulsaci\xc3\xb3 \xc3\xa9s diferent: de 5 a 12 parcials per per\xc3\xado" "de, repartits uniformement en TO (no en Hz) dins l'abast que ja fixen l'Abast d'octaves i les Reps, i mai a menys de 35 cents perqu\xc3\xa8 cap parell no es fongui en un sol parcial batent. El per\xc3\xado" "de es queda en un nombre enter d'octaves, aix\xc3\xad que les Reps l'apilen net en comptes d'esborronar-lo. Automatitzable: \xc3\xa9s un par\xc3\xa0metre disparador, aix\xc3\xad que un escal\xc3\xb3 de 0 a 1 dibuixat a l'amfitri\xc3\xb3 el dispara igual que aquest clic, amb la finestra tancada. Un Ctrl+Z recupera l'espectre anterior."));
+}
+
+// The "Load spectrum's tuning" button: the current custom spectrum was DERIVED from a
+// tuning (adapted to it, or loaded from a scale file), and this button loads that
+// tuning. Word, enabled state and tooltip in one function - when the provenance tuning
+// is already ACTIVE the button must say so and refuse, and a "Load" word over a click
+// that refuses (or a greyed button whose word still promises a load it never names)
+// is exactly the disagreement single-writer functions exist to prevent.
+void FractalAdditiveAudioProcessorEditor::refreshSpectrumTuningButton()
+{
+    const bool has    = processorRef.hasSpectrumProvenance();
+    const bool active = has && processorRef.spectrumProvenanceIsActive();
+    const auto name   = processorRef.getSpectrumProvenanceName();
+    // Cheap per-tick guard: language + the three inputs above are the whole output.
+    const juce::String sig = (catalan ? "c|" : "e|") + juce::String (has ? 1 : 0)
+                           + (active ? "1" : "0") + "|" + name;
+    if (sig == lastSpectrumTuningSig) return;
+    lastSpectrumTuningSig = sig;
+    if (! has) return; // invisible (resized() gates on hasSpectrumProvenance): nothing to word
+    loadSpectrumTuningBtn.setEnabled (! active);
+    loadSpectrumTuningBtn.setButtonText (active
+        ? tr ("Spectrum's tuning (active)", "Afinaci\xc3\xb3 de l'espectre (activa)")
+        : tr ("Load spectrum's tuning", "Carrega l'afinaci\xc3\xb3 de l'espectre"));
+    const auto shown = name.isNotEmpty() ? name : tr ("(unnamed)", "(sense nom)");
+    loadSpectrumTuningBtn.setTooltip (active
+        ? tr ("This custom spectrum was derived from the tuning !", "Aquest espectre propi es va derivar de l'afinaci\xc3\xb3 !")
+          + shown + tr ("!, which is already the active tuning.", "!, que ja \xc3\xa9s l'afinaci\xc3\xb3 activa.")
+        : tr ("This custom spectrum was derived from the tuning !", "Aquest espectre propi es va derivar de l'afinaci\xc3\xb3 !")
+          + shown + tr ("! (adapted to it, or loaded from its scale file). Click to make that tuning the ACTIVE one - the spectrum itself stays as it is, and Ctrl+Z brings the current tuning back.",
+                        "! (adaptat a ella, o carregat del seu fitxer d'escala). Clica per fer aquella afinaci\xc3\xb3 l'ACTIVA - l'espectre es queda com est\xc3\xa0, i Ctrl+Z recupera l'afinaci\xc3\xb3 actual."));
 }
 
 // ONE PANEL, ONE COLOUR. Every control inside SPECTRUM takes the selected engine's hue,
@@ -4751,6 +4810,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("tun.tablePeriod",  tablePeriodEdit); add ("tun.tableReset", tablePeriodResetBtn);
     add ("tun.itsSpectrum",  loadItsSpectrumBtn);
     add ("tun.presetTuning", loadPresetTuningBtn);
+    add ("tun.specTuning",   loadSpectrumTuningBtn);
     add ("tun.bendLbl",      lblBend);         add ("tun.bend",       bendBox);
     add ("tun.recent",       recentOpenBtn);   add ("tun.bankLbl",    lblTuningBank);
     add ("tun.bank",         tuningBankBox);   add ("tun.bankLoad",   tuningBankLoadBtn);
@@ -4835,6 +4895,10 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     p.buttonTexts.push_back ({ "cust.load",  loadTimbreButton.getButtonText() });
     p.buttonTexts.push_back ({ "tun.toBank", tuningBankAddBtn.getButtonText() });
     p.buttonTexts.push_back ({ "top.playground", playgroundButton.getButtonText() });
+    // Recorded only while it exists (its two words are state-dependent, and probing a
+    // hidden button would measure a word resized() never put on screen).
+    if (loadSpectrumTuningBtn.isVisible())
+        p.buttonTexts.push_back ({ "tun.specTuning", loadSpectrumTuningBtn.getButtonText() });
 
     // The three border lines that must be one (see LayoutProbe::wall*). Derived from
     // kFrameLine, the same constant both frame painters use, so the probe can never be
@@ -6209,6 +6273,19 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 ti.removeFromTop (3);
                 loadPresetTuningBtn.setBounds (ti.removeFromTop (22).reduced (2, 0));
             }
+            // The custom spectrum's own tuning, whenever it HAS one (derived by Adapt,
+            // or loaded from a scale file). Same idiom as the preset row above, but it
+            // stays VISIBLE when that tuning is already active - disabled and saying so
+            // (refreshSpectrumTuningButton) - because vanishing right after the click
+            // would read as the button failing rather than the job being done.
+            const bool hasProvTuning = processorRef.hasSpectrumProvenance();
+            loadSpectrumTuningBtn.setVisible (hasProvTuning);
+            if (hasProvTuning)
+            {
+                refreshSpectrumTuningButton();
+                ti.removeFromTop (3);
+                loadSpectrumTuningBtn.setBounds (ti.removeFromTop (22).reduced (2, 0));
+            }
             // Pitch bend ABOVE Recent; hidden in MPE-input mode (the MPE zone fixes
             // the per-note range at +-48, so the choice is irrelevant there).
             const bool bendVis = tmode != 3;
@@ -6964,10 +7041,17 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // The table-period field and its reset only exist in table mode, and the reset only
     // once the user has typed a period - both are laid out in resized(), so both belong in
     // this signature or the field appears only after some unrelated relayout.
+    // ...and the spectrum-provenance button's two states: whether it exists at all
+    // (a row appears/disappears in the TUNING stack, so it must relayout) and whether
+    // its tuning is the active one (word + enabled flip without any other bit moving -
+    // e.g. the user loads a different scale while an adapted spectrum sits loaded).
     const int  packed   = (resetVis ? 1 : 0) | (offVis ? 2 : 0) | (processorRef.getTuningMode() << 2)
                         | (processorRef.tuningIsAbsoluteTable()      ? 1 << 4 : 0)
-                        | (processorRef.tuningTablePeriodIsUserSet() ? 1 << 5 : 0);
+                        | (processorRef.tuningTablePeriodIsUserSet() ? 1 << 5 : 0)
+                        | (processorRef.hasSpectrumProvenance()      ? 1 << 6 : 0)
+                        | (processorRef.spectrumProvenanceIsActive() ? 1 << 7 : 0);
     if (packed != lastResetOffState) { lastResetOffState = packed; resized(); }
+    refreshSpectrumTuningButton(); // cheap (sig-guarded): keeps word/enabled honest per tick
 
     const int mode = (int) (processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f);
     if (mode != lastPrimeMode) { lastPrimeMode = mode; resized(); }

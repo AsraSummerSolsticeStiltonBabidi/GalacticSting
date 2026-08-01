@@ -123,6 +123,13 @@ namespace presetmorph
     //                   one random spectrum and the next to morph along anyway.
     //   pgX, pgY        the point itself. Morphing the coordinates from the corners
     //                   would make the playground drive its own input.
+    //   pgMode          morph vs mix - the playground's OWN mode. Left to the discrete
+    //                   rule it would be written from the winner corner's saved value,
+    //                   so dropping a preset that happened to be saved in mix mode
+    //                   would flip the playground the user is standing in.
+    //   pgVoices        the mix's per-corner voice budget - playground configuration,
+    //                   like pgMode: morphing it from the corners would let a preset
+    //                   quietly change how much CPU the pad the user is dragging costs.
     //
     // A FUTURE PARAMETER lands in Linear (or Discrete, if it is a choice/bool) by
     // default. That is deliberate: the default must be "morphs, in the most
@@ -145,7 +152,7 @@ namespace presetmorph
         if (id == "tuningMode" || id == "bendRange" || id == "refA"
             || id == "octaveShift" || id == "tuningBankSlot"
             || id == "specRandom"
-            || id == "pgX" || id == "pgY")
+            || id == "pgX" || id == "pgY" || id == "pgMode" || id == "pgVoices")
             return MorphSpace::Excluded;
 
         if (isDiscrete)
@@ -242,4 +249,30 @@ namespace presetmorph
     // tremor nor an automation curve's own quantisation can rattle it, narrow enough
     // that the flip still lands where a listener would put "the middle".
     inline constexpr double kHysteresis = 0.08;
+
+    //==========================================================================
+    // 4. MIX GAINS (the playground's second mode).
+    //
+    // In MIX mode the four corner presets sound SIMULTANEOUSLY - four independent
+    // engines summed in audio - and the point is a four-way volume balance. The
+    // bilinear weights become per-corner GAINS under the EQUAL-POWER law:
+    //
+    //     gain[i] = sqrt(w[i])
+    //
+    // Why sqrt and not the weight itself: the corners are four INDEPENDENT signals
+    // (different engines, different spectra, uncorrelated phases), so what the ear
+    // hears as "how much of it" is its POWER, gain^2. The weights sum to 1, so
+    // sum(gain^2) = 1 everywhere: constant total power across the whole pad. A
+    // linear gain (gain = w) would instead sag to half power in the middle of a
+    // two-corner edge (0.5^2 + 0.5^2 = 0.5, i.e. -3 dB) - the classic crossfade
+    // hole. The law is still exact at a vertex: w = 1 there, sqrt(1) = 1, so only
+    // that corner sounds and at full level.
+    //
+    // Weights <= 0 (unassigned corners, or the far corners at a vertex) give gain 0
+    // exactly: a corner with no weight contributes silence, not a hiss floor.
+    inline void mixGains (const double w[kCorners], double gOut[kCorners])
+    {
+        for (int i = 0; i < kCorners; ++i)
+            gOut[i] = w[i] > 0.0 ? std::sqrt (w[i]) : 0.0;
+    }
 }

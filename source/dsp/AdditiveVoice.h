@@ -36,45 +36,50 @@
 class AdditiveVoice : public juce::MPESynthesiserVoice
 {
 public:
+    // `bank` selects the value source (see ParamBank.h): nullptr - the live patch,
+    // identical behaviour to always; a corner's ParamBank - this voice belongs to one
+    // of the playground MIX mode's sub-engines and reads THAT preset's values. One
+    // voice class either way: forking it would let the two drift apart.
     AdditiveVoice (juce::AudioProcessorValueTreeState& state, const spectrum::SpectrumEngine& eng,
-                   const TuningManager& tuningManager, const ModEngine& modulators)
-        : apvts (state), engine (eng), tuning (tuningManager), mods (modulators),
+                   const TuningManager& tuningManager, const ModEngine& modulators,
+                   ParamBank* bank = nullptr)
+        : src { &state, bank }, engine (eng), tuning (tuningManager), mods (modulators),
           sine (spectrum::sineTable())
     {
-        attackParam  = apvts.getRawParameterValue ("ampAttack");
-        decayParam   = apvts.getRawParameterValue ("ampDecay");
-        sustainParam = apvts.getRawParameterValue ("ampSustain");
-        releaseParam = apvts.getRawParameterValue ("ampRelease");
-        phaseModeParam = apvts.getRawParameterValue ("phaseMode");
+        attackParam  = src.raw ("ampAttack");
+        decayParam   = src.raw ("ampDecay");
+        sustainParam = src.raw ("ampSustain");
+        releaseParam = src.raw ("ampRelease");
+        phaseModeParam = src.raw ("phaseMode");
 
-        fCutoffParam = apvts.getRawParameterValue ("filterCutoff");
-        fResParam    = apvts.getRawParameterValue ("filterResonance");
-        fEnvAmtParam = apvts.getRawParameterValue ("filterEnvAmount");
-        fAttackParam = apvts.getRawParameterValue ("filterAttack");
-        fDecayParam  = apvts.getRawParameterValue ("filterDecay");
-        fSustainParam= apvts.getRawParameterValue ("filterSustain");
-        fReleaseParam= apvts.getRawParameterValue ("filterRelease");
+        fCutoffParam = src.raw ("filterCutoff");
+        fResParam    = src.raw ("filterResonance");
+        fEnvAmtParam = src.raw ("filterEnvAmount");
+        fAttackParam = src.raw ("filterAttack");
+        fDecayParam  = src.raw ("filterDecay");
+        fSustainParam= src.raw ("filterSustain");
+        fReleaseParam= src.raw ("filterRelease");
 
-        pEnvAmtParam = apvts.getRawParameterValue ("pitchEnvAmount");
-        pAttackParam = apvts.getRawParameterValue ("pitchAttack");
-        pDecayParam  = apvts.getRawParameterValue ("pitchDecay");
-        pSustainParam= apvts.getRawParameterValue ("pitchSustain");
-        pReleaseParam= apvts.getRawParameterValue ("pitchRelease");
+        pEnvAmtParam = src.raw ("pitchEnvAmount");
+        pAttackParam = src.raw ("pitchAttack");
+        pDecayParam  = src.raw ("pitchDecay");
+        pSustainParam= src.raw ("pitchSustain");
+        pReleaseParam= src.raw ("pitchRelease");
 
-        curveSlopeParam = apvts.getRawParameterValue ("curveSlope");
-        manualParam     = apvts.getRawParameterValue ("partialManual");
-        ampCurveA = apvts.getRawParameterValue ("ampCurveA");
-        ampCurveD = apvts.getRawParameterValue ("ampCurveD");
-        ampCurveR = apvts.getRawParameterValue ("ampCurveR");
-        filtCurveA = apvts.getRawParameterValue ("filterCurveA");
-        filtCurveD = apvts.getRawParameterValue ("filterCurveD");
-        filtCurveR = apvts.getRawParameterValue ("filterCurveR");
-        pitchCurveA = apvts.getRawParameterValue ("pitchCurveA");
-        pitchCurveD = apvts.getRawParameterValue ("pitchCurveD");
-        pitchCurveR = apvts.getRawParameterValue ("pitchCurveR");
+        curveSlopeParam = src.raw ("curveSlope");
+        manualParam     = src.raw ("partialManual");
+        ampCurveA = src.raw ("ampCurveA");
+        ampCurveD = src.raw ("ampCurveD");
+        ampCurveR = src.raw ("ampCurveR");
+        filtCurveA = src.raw ("filterCurveA");
+        filtCurveD = src.raw ("filterCurveD");
+        filtCurveR = src.raw ("filterCurveR");
+        pitchCurveA = src.raw ("pitchCurveA");
+        pitchCurveD = src.raw ("pitchCurveD");
+        pitchCurveR = src.raw ("pitchCurveR");
 
-        morphParam     = apvts.getRawParameterValue ("morph");
-        morphTimeParam = apvts.getRawParameterValue ("morphTime");
+        morphParam     = src.raw ("morph");
+        morphTimeParam = src.raw ("morphTime");
 
         filter.setType (juce::dsp::StateVariableTPTFilterType::lowpass);
     }
@@ -892,7 +897,7 @@ private:
         clearCurrentNote();
     }
 
-    juce::AudioProcessorValueTreeState& apvts;
+    ParamSource                         src;   // live APVTS or a corner's ParamBank
     const spectrum::SpectrumEngine&     engine;
     const TuningManager&                tuning;
     const ModEngine&                    mods;
@@ -922,8 +927,10 @@ private:
     // identically whichever route it takes). Unmapped targets cost one atomic load.
     float modded (int t, const std::atomic<float>* fallback) const noexcept
     {
+        // The BASE comes from this voice's source (the live knob, or the corner's
+        // stored value); the parameter object supplies only the range conversion.
         if (auto* p = modOwner[(size_t) t])
-            return p->convertFrom0to1 (juce::jlimit (0.0f, 1.0f, p->getValue() + modOff[(size_t) t]));
+            return p->convertFrom0to1 (juce::jlimit (0.0f, 1.0f, src.normOf (p) + modOff[(size_t) t]));
         return fallback->load();
     }
     const spectrum::SineTable&          sine;
