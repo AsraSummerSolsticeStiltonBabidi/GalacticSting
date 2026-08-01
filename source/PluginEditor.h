@@ -62,6 +62,11 @@ public:
             juce::String name, text;
             juce::Rectangle<int> cell;  // the rect the text is drawn into
             float textWidth = 0.0f;     // measured in the very font paint() sets
+            // The INK. "The whole panel is one colour" is a claim about exactly this,
+            // and it is invisible to every geometric check in the build: the old
+            // mint/magenta scheme of the Fractal-Morph-Range compartment laid out
+            // perfectly and simply looked like a different box.
+            juce::Colour colour;
         };
         std::vector<PaintedLabel> paintedLabels;
         // The same measurement for every juce::Label COMPONENT laid out in those boxes,
@@ -74,6 +79,17 @@ public:
         // that can silently DESELECT it (getSelectedId() compares the visible label
         // against the item's text), and a mode box that reads 0 gates its whole panel off.
         std::vector<std::pair<juce::String, int>> comboIds;
+        // The BUTTONS whose word is the whole feature: the custom view's one button that
+        // is "Load" or "Remove" depending on what is loaded, and the tuning bank's add
+        // button. A wrong word on the first of those means a green Load that deletes the
+        // user's spectrum, and no bounds check in the build could ever see it.
+        std::vector<std::pair<juce::String, juce::String>> buttonTexts;
+        // THE SHARED WALL, as the x of the LINE each of the three boxes actually draws
+        // there - not the x of its rectangle. Every border is a stroke whose centre sits
+        // a fixed distance inside the box, so two rects that merely touch draw TWO lines
+        // back to back; comparing the rects would call that a shared wall while the
+        // screen shows a doubled border. These are what paint() puts on the glass.
+        float wallSpectrumRight = 0.0f, wallTuningRight = 0.0f, wallColumnLeft = 0.0f;
     };
     LayoutProbe layoutProbe() const;
     // Test hook (RhythmVerify): probe the layout in the OTHER language. Every painted
@@ -91,6 +107,12 @@ public:
     // clicking CUSTOM must still open that view (it is the only place the Load button
     // and the intervals editor live), while the sound honestly stays harmonic.
     void clickEngineChipForTests (int i) { if (engineChip[i & 1].onClick) engineChip[i & 1].onClick(); }
+    // Test hooks (RhythmVerify): the custom view's two buttons, through their own
+    // callbacks. The Load/Remove one is a SINGLE button with two opposite jobs, and
+    // which job it has depends on state the verifier can set - so "the green Load never
+    // deletes anything and the red Remove always does" is only checkable from here.
+    void clickCustomLoadRemoveForTests() { if (loadTimbreButton.onClick) loadTimbreButton.onClick(); }
+    void clickRandomSpectrumForTests()   { if (randomSpectrumBtn.onClick) randomSpectrumBtn.onClick(); }
 
     // Test hooks (RhythmVerify): drive the Spectrum-vs-Tuning panel the way a hand does -
     // pick a mode, pick the adaptation's target, press REALTIME - and read back what the
@@ -2664,6 +2686,23 @@ private:
     // land before the first applyEngineState) is never a default black frame.
     juce::Colour         spectrumPanelColour { 0xff5cb8ff };
     void applyEngineState(); // dim/enable + chip look + repaint, from engineInForce()
+    // SELECTING A VIEW IS SELECTING AN ENGINE. One function, used by both chips and by
+    // every other route that changes which view is on screen (Remove, Random), so the
+    // two can never be wired differently: showing the custom view puts the custom engine
+    // in force and showing the harmonic view takes it out. Writes the PARAMETERS
+    // engineInForce() reads (never a member), so the choice is automatable, undoable,
+    // and identical whether it came from a click or from the host.
+    void selectEngineView (bool custom);
+    // The custom view's Load/Remove button wears whichever of its two jobs is live right
+    // now - word, colour and tooltip together. In ONE place because a button that says
+    // "Load" in green and DELETES the user's spectrum is the worst failure this panel
+    // could have, and three call sites setting two of the three properties is how that
+    // happens. Called by applyLanguage() and by the timer whenever the engine changes.
+    void refreshCustomEngineButtons();
+    // Repaint every control inside the SPECTRUM panel in the engine's colour. The panel
+    // is ONE box now, so a fader still wearing its old per-cell hue would be the only
+    // thing on screen still claiming the compartments are separate boxes.
+    void recolourSpectrumControls (juce::Colour col);
     std::unique_ptr<SliderAttachment> primeLimitFaderAtt;
     // SLOPE cell: the pencil that opens the per-partial amplitude window, and the ON/OFF
     // pill under it. The pill and the one INSIDE the window are two attachments to the
@@ -2732,9 +2771,19 @@ private:
     juce::TextButton recentOpenBtn;     // opens the floating Recent list
     juce::TextButton loadItsSpectrumBtn; // .scl written by this synth: restore its patch
     juce::TextButton loadPresetTuningBtn; // the loaded PRESET carries a different tuning
-    juce::TextButton loadSclButton, clearSclButton, loadTimbreButton, clearTimbreButton,
+    // loadTimbreButton is ONE button with two jobs: "Load" while no custom spectrum
+    // exists, "Remove" once one does. The Custom-Engine On/Off pill that used to sit
+    // beside it is gone - with the engine chips deciding which engine is in force, an
+    // Off pill was a second, quieter switch for the same thing, and the pair could
+    // disagree on screen. Removing is the destructive half the pill never offered.
+    juce::TextButton loadSclButton, clearSclButton, loadTimbreButton,
                      langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3], tuningBankLoadBtn,
                      tuningBankClearBtn;
+    // RANDOM SPECTRUM: fires the automatable "specRandom" trigger (see the processor).
+    // The button does not build anything itself - it writes the parameter, and the
+    // processor's own poll builds - so a click and a host automation step take exactly
+    // the same path and cannot drift apart.
+    juce::TextButton randomSpectrumBtn;
     juce::Label          vibeLabel;   // "Vibe coded by" credit, left of the language button
     juce::HyperlinkButton vibeLink;   // "Asra3" -> Instagram
     juce::TextEditor periodEdit;

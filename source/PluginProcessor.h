@@ -228,6 +228,47 @@ public:
     }
     int  getTimbreNoteCount() const noexcept { return (int) timbreDegrees.size(); }
 
+    // Drop the loaded custom spectrum THROUGH the undo stack, so the Remove button is
+    // as undoable as everything else. clearTimbre() on its own is invisible to Ctrl+Z:
+    // the spectrum is not an APVTS parameter, so a plain clear destroyed a hand-typed
+    // scale with no way back. Reuses TimbreTextAction, whose empty text IS a clear.
+    void clearTimbreUndoable()
+    {
+        if (timbreSource.isEmpty() && timbreDegrees.empty()) return;
+        const auto before = timbreSource;
+        undoManager.beginNewTransaction();
+        undoManager.perform (new TimbreTextAction (*this, before, juce::String()));
+    }
+
+    //== RANDOM SPECTRUM (the "specRandom" trigger parameter) ====================
+    // Press it from the UI: a real 0 -> 1 parameter step, so the host records it as
+    // automation and replaying that automation fires exactly the same way a click does.
+    // The 0 is written first because the level may already BE 1 (the previous press
+    // left it there): without it a second click would be no edge at all, and the button
+    // would work exactly once per session.
+    void pressRandomSpectrum()
+    {
+        if (auto* p = apvts.getParameter ("specRandom"))
+        {
+            p->beginChangeGesture();
+            p->setValueNotifyingHost (0.0f);
+            p->setValueNotifyingHost (1.0f);
+            p->endChangeGesture();
+        }
+    }
+    // Consume a pending rising edge and build the spectrum. Called by the 60 Hz timer
+    // (message thread - loadTimbreText parses and republishes, neither of which may run
+    // on the audio thread), and directly by the verifier, which has no message loop.
+    // Returns true if a spectrum was actually generated.
+    bool pollRandomSpectrumTrigger();
+    // How many random spectra this instance has generated. The one thing a test can
+    // count to prove "the rising edge fired once, and a held level does not re-fire".
+    int  getRandomSpectrumCount() const noexcept { return randomSpectrumCount; }
+    // The interval text a random press would produce. Public so the generator's
+    // distribution can be measured directly (spacing, count, span) instead of inferred
+    // from the partials that survive compilation.
+    juce::String makeRandomSpectrumText();
+
     // Degrees per period of the active tuning (for the colour keyboard).
     int getScaleDegrees() const noexcept { return tuning.degreesPerPeriod(); }
 
@@ -876,6 +917,34 @@ private:
     std::vector<float> timbreDegrees;
     float              timbrePeriod = 2.0f;
     juce::String       timbreName, timbreSource;
+
+    //== RANDOM SPECTRUM trigger ("specRandom") =================================
+    // Edge detection lives in a parameter LISTENER, not in the 60 Hz poll, because a
+    // press writes 0 then 1 back to back: a poll that only ever sees the LEVEL would
+    // read 1, then 1 again next tick, and every click after the first would do nothing.
+    // The listener is called synchronously by setValueNotifyingHost on whatever thread
+    // wrote (the audio thread, for host automation), so it does the minimum possible -
+    // raise an atomic flag - and the message-thread timer does the actual work.
+    struct RandomTrigListener : juce::AudioProcessorParameter::Listener
+    {
+        FractalAdditiveAudioProcessor* owner = nullptr;
+        void parameterValueChanged (int, float newValue) override
+        {
+            if (owner == nullptr) return;
+            const bool now = newValue >= 0.5f;
+            const bool was = owner->randomTrigLevel.exchange (now, std::memory_order_acq_rel);
+            if (now && ! was) owner->randomTrigPending.store (true, std::memory_order_release);
+        }
+        void parameterGestureChanged (int, bool) override {}
+    };
+    RandomTrigListener randomTrigListener;
+    std::atomic<bool>  randomTrigLevel   { false }; // last level the listener saw
+    std::atomic<bool>  randomTrigPending { false }; // a rising edge is waiting for the timer
+    int                randomSpectrumCount = 0;     // how many have been generated (tests count it)
+    // Seeded once from the clock, then advanced by every draw: two presses in the same
+    // millisecond still get different spectra, which a per-press time seed would not give.
+    juce::Random       randomSpectrumRng { (juce::int64) juce::Time::getHighResolutionTicks() };
+    juce::String       lastRandomSpectrumText; // redraw if a draw repeats the previous one
 
     // Persistent recent-.scl list (global app settings, shared across instances).
     std::unique_ptr<juce::PropertiesFile> appProps;

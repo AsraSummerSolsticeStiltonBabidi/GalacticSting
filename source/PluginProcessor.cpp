@@ -29,6 +29,16 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     synth.enableLegacyMode (48);
     synth.setVoiceStealingEnabled (true);
 
+    // Watch the RANDOM SPECTRUM trigger for rising edges (see RandomTrigListener).
+    // Baselined to the parameter's current level first, so merely attaching cannot
+    // manufacture an edge and randomise a spectrum nobody asked for.
+    if (auto* rp = apvts.getParameter ("specRandom"))
+    {
+        randomTrigLevel.store (rp->getValue() >= 0.5f, std::memory_order_release);
+        randomTrigListener.owner = this;
+        rp->addListener (&randomTrigListener);
+    }
+
     for (int i = 0; i < 32; ++i)
         synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning, modEngine));
 
@@ -75,6 +85,11 @@ void FractalAdditiveAudioProcessor::addRecentScl (const juce::File& f)
 FractalAdditiveAudioProcessor::~FractalAdditiveAudioProcessor()
 {
     stopTimer();
+    // Detach before anything else: the listener holds a raw back-pointer into this
+    // object, and a host automation write arriving mid-destruction would follow it.
+    if (auto* rp = apvts.getParameter ("specRandom"))
+        rp->removeListener (&randomTrigListener);
+    randomTrigListener.owner = nullptr;
     // Stop and reap the background workers before members are destroyed.
     chordCancel = true;
     nadCancel   = true;
@@ -409,6 +424,14 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     // Ctrl+Z undoes switching it, like every other control.
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "timbreOn", 1 }, "Custom Engine On", true));
+    // RANDOM SPECTRUM: a TRIGGER, not a state. Its RISING edge (0 -> 1) generates a
+    // fresh random custom spectrum; the level itself means nothing. A momentary button
+    // with no parameter behind it could not be automated at all, and a parameter whose
+    // VALUE was the spectrum would be a lie (there is no continuum from one random
+    // spectrum to the next) - so the host drives it the way it drives any other trigger:
+    // draw a 0->1 step wherever a new spectrum should land, and each step fires once.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "specRandom", 1 }, "Random Spectrum (trigger)", false));
 
     //-- Scala-as-timbre --------------------------------------------------------
     params.push_back (std::make_unique<AudioParameterInt>(
@@ -535,6 +558,13 @@ void FractalAdditiveAudioProcessor::timerCallback()
         spectrumEngine.requestRebuild (s);
         lastPushed = s;
     }
+
+    // RANDOM SPECTRUM: the rising edge the listener caught (a click, or host
+    // automation stepping 0 -> 1) is spent HERE, on the message thread, because
+    // building the spectrum parses text and republishes the template. In the processor
+    // rather than the editor so an automated trigger fires with the window shut - a
+    // trigger that only worked while someone was looking would not be automatable.
+    pollRandomSpectrumTrigger();
 
     // Spectrum <-> tuning REALTIME links (throttled + coalesced; refuses to close a
     // feedback loop). Here, not in the editor, so they keep working with the window shut.
@@ -939,6 +969,99 @@ bool FractalAdditiveAudioProcessor::loadTimbreText (const juce::String& text, ju
     timbreName    = "typed";
     timbreSource  = text;
     setTimbreOnParam (true);
+    return true;
+}
+
+//==============================================================================
+// RANDOM SPECTRUM - the distribution, stated in full because a random generator with
+// an unexplained distribution is unusable: nobody can tell a bug from a draw.
+//
+//  * PARTIAL COUNT: uniform in [kRandMinPartials, kRandMaxPartials] = 5..12 partials
+//    per period. Below ~5 there is not enough of a spectrum to have a timbre at all;
+//    above ~12 the partials inside one period sit closer than a critical band over
+//    most of the range and the result stops being a chord of partials and starts being
+//    a band of noise. Reps (1..8) stacks the period, so what the ear gets is this many
+//    times Reps - a rich sound from a countable set.
+//
+//  * POSITION: uniform in LOG frequency (i.e. uniform in CENTS), which is the only
+//    uniform that sounds uniform: uniform in Hz would pile every draw into the top
+//    octave and leave the bottom of the spectrum empty every single time.
+//
+//  * REACH: the span comes from the two controls that already decide how far the
+//    spectrum reaches - the OCTAVE RANGE cut (spectrumRange, in octaves above the
+//    played pitch) divided by how many times Reps stacks the period - clamped to
+//    1..3 octaves. So a random spectrum lands inside the reach the user has set
+//    instead of overshooting it (partials above the cut are dropped by the range
+//    control, and a generator that aimed above it would be asking for that).
+//
+//  * MINIMUM SPACING: kRandMinGapCents (35c) between neighbours, built into the draw
+//    (a uniform draw over the span MINUS the gaps, with the gaps added back - which is
+//    still exactly uniform, just conditioned on the spacing). Two reasons, and the
+//    second is the important one: partials a few cents apart are one beating partial,
+//    not two; and loadTimbreText DEDUPES ratios within 1e-6, so an unconstrained draw
+//    could silently hand back fewer partials than it generated. This synth never drops
+//    a partial quietly, so the generator does not produce ones that would be dropped.
+//
+//  * THE TOP INTERVAL IS THE EXACT PERIOD (2^span). loadTimbreText reads the highest
+//    interval as the repeat point, so leaving it random would make Reps stack at a
+//    random, usually irrational period - the difference between an instrument and a
+//    smear. A clean octave-multiple period is what makes repeated draws sound like
+//    different instruments rather than different accidents.
+juce::String FractalAdditiveAudioProcessor::makeRandomSpectrumText()
+{
+    constexpr int    kRandMinPartials = 5;
+    constexpr int    kRandMaxPartials = 12;
+    constexpr double kRandMinGapCents = 35.0;
+
+    const int reps = juce::jlimit (1, 8, (int) apvts.getRawParameterValue ("timbreRepeats")->load());
+    const int cut  = juce::jlimit (1, 10, (int) apvts.getRawParameterValue ("spectrumRange")->load());
+    const int spanOct   = juce::jlimit (1, 3, cut / reps);
+    const double spanC  = 1200.0 * (double) spanOct;
+
+    juce::String text;
+    // Redraw on the astronomically unlikely event that a draw repeats the previous one
+    // exactly: "every press is a different spectrum" is a promise, not a probability.
+    for (int attempt = 0; attempt < 8; ++attempt)
+    {
+        // n partials INSIDE the period; the period itself is written as the last token.
+        int n = randomSpectrumRng.nextInt ({ kRandMinPartials, kRandMaxPartials + 1 });
+        // Never ask for more partials than the span can hold at the minimum spacing:
+        // the alternative is a draw that quietly violates its own spacing rule.
+        n = juce::jmin (n, (int) std::floor (spanC / kRandMinGapCents) - 1);
+        n = juce::jmax (1, n);
+
+        // Uniform-with-a-minimum-gap: draw n points uniformly over the span shrunk by
+        // the (n+1) gaps that must exist (n interior gaps + the one below the period),
+        // sort them, then push the i-th up by (i+1) gaps. Exactly uniform, exactly
+        // spaced - no rejection loop that could spin.
+        const double free = juce::jmax (0.0, spanC - (double) (n + 1) * kRandMinGapCents);
+        std::vector<double> cents;
+        cents.reserve ((size_t) n);
+        for (int i = 0; i < n; ++i) cents.push_back (randomSpectrumRng.nextDouble() * free);
+        std::sort (cents.begin(), cents.end());
+        for (int i = 0; i < n; ++i) cents[(size_t) i] += (double) (i + 1) * kRandMinGapCents;
+
+        juce::String t;
+        for (int i = 0; i < n; ++i)
+            t << juce::String (cents[(size_t) i], 2) << "c ";
+        t << juce::String (spanC, 2) << "c";   // the period, exact
+
+        if (t != lastRandomSpectrumText) { text = t; break; }
+        text = t; // last attempt wins rather than returning nothing
+    }
+    lastRandomSpectrumText = text;
+    return text;
+}
+
+bool FractalAdditiveAudioProcessor::pollRandomSpectrumTrigger()
+{
+    if (! randomTrigPending.exchange (false, std::memory_order_acq_rel)) return false;
+    juce::String err;
+    // Undoable, like every other control: one Ctrl+Z brings the previous spectrum back.
+    // A random button that overwrote a hand-typed scale with no way back would make the
+    // feature something you cannot risk pressing.
+    if (! loadTimbreTextUndoable (makeRandomSpectrumText(), err)) return false;
+    ++randomSpectrumCount;
     return true;
 }
 
@@ -3150,6 +3273,15 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
             setTimbreOnParam ((bool) tim.getProperty ("on", true) && ! timbreDegrees.empty());
         }
     }
+
+    // RE-BASELINE THE RANDOM TRIGGER against the level the project just restored, and
+    // throw away any edge that restoring produced. replaceState() rewrites every
+    // parameter, so a project saved with the trigger left at 1 (which is where a press
+    // leaves it) arrived as a 0 -> 1 step and REGENERATED the spectrum on load: the user
+    // reopened yesterday's project and found a random timbre where their own had been.
+    randomTrigLevel.store (apvts.getRawParameterValue ("specRandom")->load() >= 0.5f,
+                           std::memory_order_release);
+    randomTrigPending.store (false, std::memory_order_release);
 }
 
 void FractalAdditiveAudioProcessor::getStateInformation (juce::MemoryBlock& destData)

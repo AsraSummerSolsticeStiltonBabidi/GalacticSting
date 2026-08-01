@@ -52,6 +52,14 @@ namespace
     const juce::Colour cLoad      { 0xff2fb155 }; // green = Load buttons
     const juce::Colour cReset     { 0xffe0453f }; // red   = Reset / Off buttons
 
+    // Every macro box - the GroupComponent ones and the ones the editor paints by hand -
+    // draws its border as a 2.6 px stroke whose CENTRE line sits this far inside the
+    // box's own rectangle. Named once and used by all of them (drawGroupComponentOutline,
+    // macroFrame, and layoutProbe's wall read-out) because "these two boxes share a wall"
+    // is a claim about where those centre lines land, and a test that guessed the number
+    // would pass while the two lines sat side by side.
+    constexpr float kFrameLine = 1.3f;
+
     // UI wrapper over the (unit-tested, pure-C++) label logic in Dissonance.h.
     juce::String justName (double ratio)
     {
@@ -310,8 +318,9 @@ namespace
         {
             const auto col = group.findColour (juce::GroupComponent::outlineColourId);
             constexpr float titleH = 32.0f; // room ABOVE the frame for the title chip
-            auto frame = juce::Rectangle<float> (1.3f, titleH * 0.5f,
-                                                 (float) w - 2.6f, (float) h - titleH * 0.5f - 1.3f);
+            auto frame = juce::Rectangle<float> (kFrameLine, titleH * 0.5f,
+                                                 (float) w - 2.0f * kFrameLine,
+                                                 (float) h - titleH * 0.5f - kFrameLine);
 
             // Interior panel: lighter than the page (0xff0c0c12) and subtly tinted by the
             // section colour. Rounded TOP corners + angular bottom (like the chips).
@@ -902,36 +911,12 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             engineChip[i].setMouseClickGrabsKeyboardFocus (false);
             addAndMakeVisible (engineChip[i]);
         }
-        // Writing the parameter (with a gesture) rather than a member is what puts these
-        // clicks in the undo history and in host automation, like every other control.
-        auto setTemper = [this] (bool on)
-        {
-            if (auto* p = processorRef.apvts.getParameter ("timbreTemper"))
-            {
-                p->beginChangeGesture();
-                p->setValueNotifyingHost (on ? 1.0f : 0.0f);
-                p->endChangeGesture();
-            }
-        };
-        // HARMONIC: temper off + the Custom Engine off. setTimbreEnabled only flips the
-        // parameter, so the loaded scale is KEPT - clicking here must never be the thing
-        // that loses the user's scale.
-        engineChip[0].onClick = [this, setTemper]
-        {
-            customViewPinned = false;
-            setTemper (false); processorRef.setTimbreEnabled (false);
-            applyEngineState(); refocus();
-        };
-        // CUSTOM: switch the scale on when one exists; with none loaded the click still
-        // OPENS the custom view (pinned) - that view is the only place the Load button
-        // and the intervals editor live, so refusing the click (as the disabled chip
-        // used to) would make creating a custom spectrum impossible.
-        engineChip[1].onClick = [this, setTemper]
-        {
-            customViewPinned = true; // harmless when a scale exists: the engine takes over
-            setTemper (false); processorRef.setTimbreEnabled (true);
-            applyEngineState(); refocus();
-        };
+        // Both chips run the SAME function (see selectEngineView): picking a view IS
+        // picking the engine, in one place, so the two directions cannot be wired
+        // differently. With the Custom-Engine On/Off pill gone these chips are the only
+        // switch between the engines, which is exactly why there must be only one of them.
+        engineChip[0].onClick = [this] { selectEngineView (false); refocus(); };
+        engineChip[1].onClick = [this] { selectEngineView (true);  refocus(); };
         // Right-click still maps a modulator onto the parameter the CUSTOM chip owns.
         addMapListener (engineChip[1], "timbreOn");
     }
@@ -1502,22 +1487,58 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 
     // Custom Engine (.scl as spectrum) - the CUSTOM view of the shared engine box.
     // (Its bilingual tooltip is set in applyLanguage, which the ctor calls below.)
-    loadTimbreButton.setColour (juce::TextButton::buttonColourId, cLoad);
+    // ONE button, two jobs (see refreshCustomEngineButtons, which sets its word and its
+    // colour): "Load" while nothing is loaded, "Remove" once a spectrum exists. The
+    // Custom-Engine On/Off pill that used to sit beside it is gone: the engine chips
+    // already decide which engine is in force, so the pill was a second switch for the
+    // same thing that could visibly disagree with them. The non-destructive off it
+    // offered now lives on the HARMONIC chip (which keeps the loaded scale); this
+    // button is the destructive one, and calls itself Remove so it can never be mistaken
+    // for the other. Removal goes through the undo stack: one Ctrl+Z brings it back.
     loadTimbreButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
     loadTimbreButton.setMouseClickGrabsKeyboardFocus (false);
-    loadTimbreButton.onClick = [this] { openTimbreChooser(); };
-    addAndMakeVisible (loadTimbreButton);
-    // On/Off toggle: switching OFF keeps the loaded .scl (nothing is erased) - the
-    // engine just goes back to harmonic mode until switched on again.
-    clearTimbreButton.setColour (juce::TextButton::buttonColourId, cReset);
-    clearTimbreButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
-    clearTimbreButton.setMouseClickGrabsKeyboardFocus (false);
-    clearTimbreButton.onClick = [this]
+    loadTimbreButton.onClick = [this]
     {
-        processorRef.setTimbreEnabled (! processorRef.isTimbreActive());
-        resized(); refocus();
+        if (processorRef.timbreLoaded())
+        {
+            processorRef.clearTimbreUndoable();
+            // Stay in the custom view rather than snapping to harmonic: the user removed
+            // a spectrum inside this workspace, and being thrown out of it after every
+            // Remove would make "remove, then load another" a two-click hunt for the chip.
+            // The SOUND is honestly harmonic again (there is no spectrum), and the
+            // HARMONIC chip is right there to make the view agree.
+            customViewPinned = true;
+            applyEngineState();
+        }
+        else
+        {
+            openTimbreChooser();
+        }
+        refocus();
     };
-    addAndMakeVisible (clearTimbreButton);
+    addAndMakeVisible (loadTimbreButton);
+    // RANDOM: fires the automatable trigger, it does not build anything itself. A click
+    // and a host automation step therefore take the identical path through the processor
+    // - the one way to be sure the automated version does what the button does.
+    randomSpectrumBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::black);
+    randomSpectrumBtn.setMouseClickGrabsKeyboardFocus (false);
+    randomSpectrumBtn.onClick = [this]
+    {
+        // Pressing Random inside the pinned empty workspace has to leave the CUSTOM
+        // engine in force, not just draw a spectrum: loadTimbreText switches it on, and
+        // pinning keeps the view where the user is while the processor catches up on its
+        // next tick (the chips would otherwise flicker back to harmonic for one frame).
+        customViewPinned = true;
+        processorRef.pressRandomSpectrum();
+        refocus();
+    };
+    // NO right-click modulator routing on this one, deliberately. ModEngine writes the
+    // parameters' RAW ATOMICS on the audio thread and never calls setValueNotifyingHost
+    // (see ModEngine.h) - so an LFO mapped here would move the value and the trigger's
+    // listener would never see an edge. A routing menu that offers a mapping which
+    // silently does nothing is worse than no menu at all. The HOST's automation lane
+    // does go through setValueNotifyingHost, which is what makes it work there.
+    addAndMakeVisible (randomSpectrumBtn);
     // TEMPER is laid out in BOTH views of the shared engine box (resized() places it
     // per view): ticking it in the custom view switches the view to HARMONIC - the
     // engine that generates in temper mode - and if the toggle only existed in the
@@ -2688,7 +2709,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     loadSclButton.setButtonText    (tr ("Load", "Obrir"));
     loadSclButton.getProperties().set ("fork", true);
     clearSclButton.setButtonText   (tr ("Reset", "Reinicia"));
-    tuningBankAddBtn.setButtonText ("+");
+    // "Add to Bank", not "+". A lone plus beside Load and Save named neither the thing
+    // it adds nor where it adds it, and the two other + buttons on screen (the octave
+    // steppers, and the bank's own "+ .scl") add something else entirely.
+    tuningBankAddBtn.setButtonText (tr ("Add to Bank", "Afegeix al banc"));
     tuningBankAddBtn.getProperties().set ("fork", true);
     loadItsSpectrumBtn.setButtonText (tr ("Load its original spectrum", "Carrega el seu espectre original"));
     loadItsSpectrumBtn.setTooltip (tr (
@@ -2705,12 +2729,11 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     tablePeriodEdit.setTooltip (tr (
         "This tuning is a *128-key table* (a .tun whose mapping does not repeat), so its !pitches are the file's own! and are never touched by this field.\nThe period is only needed by the features that assume one: keyboard colours, the snapping grid, the chord search and the dissonance lists. Fibló estimates it (the readout says how far the file strays); type a ratio (\"2\", \"3/2\") or cents (\"1200c\") to set your own, Return to apply.",
         "Aquesta afinaci\xc3\xb3 \xc3\xa9s una *taula de 128 tecles* (un .tun que no es repeteix), aix\xc3\xad que les !seves altures s\xc3\xb3n les del fitxer! i aquest camp no en toca cap.\nEl per\xc3\xado" "de nom\xc3\xa9s el necessiten les funcions que en pressuposen un: colors del teclat, graella d'imantaci\xc3\xb3, cerca d'acords i llistes de dissonància. Fibl\xc3\xb3 l'estima (el r\xc3\xa8tol diu quant se'n desvia el fitxer); escriu una ra\xc3\xb3 (\"2\", \"3/2\") o cents (\"1200c\") per posar-hi el teu, i Retorn per aplicar-lo."));
-    // It loads a SCALE file, same as the tuning Load does - it just points the intervals
-    // at the timbre instead of at the keyboard. Same fork, same word, so the pair reads
-    // as two destinations for one kind of file rather than two unrelated buttons.
-    loadTimbreButton.setButtonText (tr ("Load", "Obrir"));
-    loadTimbreButton.getProperties().set ("fork", true);
-    clearTimbreButton.setButtonText (processorRef.isTimbreActive() ? tr ("On", "Actiu") : tr ("Off", "Apagat"));
+    // The custom view's Load/Remove and Random buttons: word, colour and tooltip in ONE
+    // place (see refreshCustomEngineButtons) so the word can never disagree with what the
+    // click does. While it loads, it loads a SCALE file - same fork, same word as the
+    // tuning Load, so the pair reads as two destinations for one kind of file.
+    refreshCustomEngineButtons();
     savePresetButton.setButtonText (tr ("Save", "Desa"));
     presetBox.setTextWhenNothingSelected (tr ("Presets...", "Presets..."));
     dissBtn.setButtonText          (tr ("Find", "Troba"));
@@ -2781,11 +2804,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     bendBox.setTooltip (tr (
         "Per-note pitch-bend range. +-48 st is the MPE standard and is REQUIRED for Ableton Live 12's tuning systems and the Microtuner device (enable MPE on this plugin in Live). Use +-2 for a classic keyboard pitch wheel.",
         "Rang del pitch bend per nota. +-48 st \xc3\xa9s l'est\xc3\xa0ndard MPE i \xc3\x89S NECESSARI per als sistemes d'afinaci\xc3\xb3 d'Ableton Live 12 i el Microtuner (activa MPE al plugin dins de Live). Fes servir +-2 per a la roda d'un teclat cl\xc3\xa0ssic."));
-    loadTimbreButton.setTooltip (tr (
-        "Load a .tun/.scl/.ascl whose intervals become the PARTIALS of the sound - the CUSTOM chip lights and this engine replaces the harmonic one. Decay, Fractal, Range and Reps still shape it.",
-        "Carrega un .tun/.scl/.ascl els intervals del qual passen a ser els PARCIALS del so - s'enc\xc3\xa9n el xip PROPI i aquest motor substitueix l'harm\xc3\xb2nic. Caiguda, Fractal, Abast i Reps encara hi actuen."));
-    clearTimbreButton.setTooltip (tr ("Custom engine ON/OFF. Off keeps the loaded scale - nothing is erased; switch it back on any time.",
-                                      "Motor propi ON/OFF. En apagar-lo NO s'esborra l'escala carregada; el pots tornar a encendre quan vulguis."));
+    // (loadTimbreButton's and randomSpectrumBtn's tooltips are set by
+    //  refreshCustomEngineButtons above: they depend on which job the button has.)
     timbreRepeatsFader.setTooltip (tr (
         "How many periods of the scale are stacked as partials. More repeats = the timbre reaches higher in the spectrum.",
         "Quants per\xc3\xado""des de l'escala s'apilen com a parcials. M\xc3\xa9s repeticions = el timbre arriba m\xc3\xa9s amunt de l'espectre."));
@@ -3947,6 +3967,108 @@ void FractalAdditiveAudioProcessorEditor::setIntervalText (const juce::String& t
     recolourIntervalTokens();
 }
 
+// The custom view's two buttons, dressed for what they do RIGHT NOW. Word, colour and
+// tooltip are set together here and nowhere else: a button reading "Load" in green while
+// its click deletes the loaded spectrum is the one mistake this panel must not make, and
+// that is exactly what happens when the word is set in one place and the action in another.
+void FractalAdditiveAudioProcessorEditor::refreshCustomEngineButtons()
+{
+    const bool loaded = processorRef.timbreLoaded();
+    loadTimbreButton.setButtonText (loaded ? tr ("Remove", "Treu") : tr ("Load", "Obrir"));
+    // The tuning fork is the "this loads a scale file" glyph; a Remove does not load one.
+    loadTimbreButton.getProperties().set ("fork", ! loaded);
+    loadTimbreButton.setColour (juce::TextButton::buttonColourId, loaded ? cReset : cLoad);
+    loadTimbreButton.setTooltip (loaded
+        ? tr ("Delete the loaded custom spectrum and hand the sound back to the harmonic engine. One Ctrl+Z brings it back. To keep the spectrum but stop it sounding, click the HARMONIC chip instead - that switches engines without erasing anything.",
+              "Esborra l'espectre propi carregat i torna el so al motor harm\xc3\xb2nic. Un Ctrl+Z el recupera. Si el vols conservar per\xc3\xb2 que no soni, clica el xip HARM\xc3\x92NIC: aix\xc3\xb2 canvia de motor sense esborrar res.")
+        : tr ("Load a .tun/.scl/.ascl whose intervals become the PARTIALS of the sound - the CUSTOM chip lights and this engine replaces the harmonic one. Decay, Fractal, Range and Reps still shape it.",
+              "Carrega un .tun/.scl/.ascl els intervals del qual passen a ser els PARCIALS del so - s'enc\xc3\xa9n el xip PROPI i aquest motor substitueix l'harm\xc3\xb2nic. Caiguda, Fractal, Abast i Reps encara hi actuen."));
+    randomSpectrumBtn.setButtonText (tr ("Random", "Atzar"));
+    randomSpectrumBtn.setTooltip (tr (
+        "Build a brand-new random spectrum. Every press is a different one: 5 to 12 partials per period, spread evenly in PITCH (not in Hz) over the reach your Octave Range and Reps already set, never closer than 35 cents so no two of them collapse into one beating partial. The period stays a whole number of octaves, so Reps stacks it cleanly instead of smearing. Automatable: it is a trigger parameter, so a 0-to-1 step drawn in the host fires it exactly like this click, with the window shut. One Ctrl+Z brings the previous spectrum back.",
+        "Construeix un espectre nou a l'atzar. Cada pulsaci\xc3\xb3 \xc3\xa9s diferent: de 5 a 12 parcials per per\xc3\xado" "de, repartits uniformement en TO (no en Hz) dins l'abast que ja fixen l'Abast d'octaves i les Reps, i mai a menys de 35 cents perqu\xc3\xa8 cap parell no es fongui en un sol parcial batent. El per\xc3\xado" "de es queda en un nombre enter d'octaves, aix\xc3\xad que les Reps l'apilen net en comptes d'esborronar-lo. Automatitzable: \xc3\xa9s un par\xc3\xa0metre disparador, aix\xc3\xad que un escal\xc3\xb3 de 0 a 1 dibuixat a l'amfitri\xc3\xb3 el dispara igual que aquest clic, amb la finestra tancada. Un Ctrl+Z recupera l'espectre anterior."));
+}
+
+// ONE PANEL, ONE COLOUR. Every control inside SPECTRUM takes the selected engine's hue,
+// so nothing on screen is left claiming the old nested boxes still exist: the panel used
+// to be three framed boxes in three different colours (blue harmonic / pink custom /
+// mint "both engines" with a magenta Fractal), and after the frames became plain divider
+// lines those leftover hues were the only thing still drawing the boundaries.
+//
+// Deliberately NOT recoloured: the +/- steppers (green = up, red = down, the same pair
+// as Essentials' OCTAVE) and the Load/Remove button (green loads, red deletes). Those
+// colours mean an ACTION, not a compartment, and washing them into the panel hue would
+// erase the one warning that says which of the two the button is about to do.
+void FractalAdditiveAudioProcessorEditor::recolourSpectrumControls (juce::Colour col)
+{
+    auto fader = [&col] (juce::Slider& s)
+    {
+        s.setColour (juce::Slider::thumbColourId, col);
+        s.setColour (juce::Slider::trackColourId, col.withAlpha (0.55f));
+    };
+    auto combo = [&col] (juce::ComboBox& b)
+    {
+        b.setColour (juce::ComboBox::outlineColourId, col.withAlpha (0.7f));
+        b.setColour (juce::ComboBox::arrowColourId, col);
+    };
+    auto label = [&col] (juce::Label& l) { l.setColour (juce::Label::textColourId, col.brighter (0.15f)); };
+    auto tick  = [&col] (juce::ToggleButton& t)
+    {
+        t.setColour (juce::ToggleButton::tickColourId, col);
+        t.setColour (juce::ToggleButton::tickDisabledColourId, col.withAlpha (0.4f));
+    };
+
+    // Spelled as juce::Slider* because these are four different Slider SUBCLASSES
+    // (stepped, magnetic, plain) and a deduced initializer-list has no common type.
+    for (juce::Slider* s : { (juce::Slider*) &baseNFader, (juce::Slider*) &harmonicsFader,
+                             (juce::Slider*) &primeLimitFader, (juce::Slider*) &timbreRepeatsFader,
+                             (juce::Slider*) &slopeFader, (juce::Slider*) &fractalFader,
+                             (juce::Slider*) &morphTimeFader })
+        fader (*s);
+    for (juce::ComboBox* b : { &basePitchBox, &primeModeBox }) combo (*b);
+    for (auto* l : { &lblBaseN, &lblBasePitch, &lblPrimeLimit, &lblTimbreRepeats, &lblMorphTime })
+        label (*l);
+    for (int i = 0; i < 9; ++i) { tick (primeToggle[i]); label (primeLbl[i]); }
+    // TEMPER's tick used to be forced to the harmonic blue "because that is the engine it
+    // hands the spectrum to" - which was the whole point when the two engines were two
+    // boxes, and is now just one control refusing to join the panel it lives in.
+    tick (temperToggle);
+    partialEditBtn.col = col;
+    randomSpectrumBtn.setColour (juce::TextButton::buttonColourId, col);
+}
+
+// SELECTING A VIEW IS SELECTING AN ENGINE.
+//
+// The view on screen and the engine making the sound are ONE choice, so there is one
+// function that makes it - called by both chips and by every other route that changes
+// the view. It writes the PARAMETERS engineInForce() reads, never a member, so the
+// choice lands in the undo history and in host automation exactly as a fader would.
+//
+// custom = true  : temper off, the Custom Engine on. With a scale loaded, that engine
+//                  is now the one generating and the custom view is the real view.
+//                  With NOTHING loaded there is no spectrum to sound, so the sound
+//                  honestly stays harmonic and the view is held open by the pin - that
+//                  view is the only place Load, Random and the intervals editor live,
+//                  and refusing the click (as the disabled chip once did) made creating
+//                  a custom spectrum flatly impossible.
+// custom = false : temper off, the Custom Engine off. setTimbreEnabled only flips the
+//                  parameter, so a loaded scale is KEPT - this is the way BACK to the
+//                  harmonic engine, and it must never be the thing that loses a scale.
+//                  (That non-destructive off-switch is what the deleted On/Off pill did;
+//                  the Remove button is the destructive one, and says so.)
+void FractalAdditiveAudioProcessorEditor::selectEngineView (bool custom)
+{
+    if (auto* p = processorRef.apvts.getParameter ("timbreTemper"))
+    {
+        p->beginChangeGesture();
+        p->setValueNotifyingHost (0.0f);
+        p->endChangeGesture();
+    }
+    customViewPinned = custom;
+    processorRef.setTimbreEnabled (custom);
+    applyEngineState();
+}
+
 // Dress the SPECTRUM panel for whichever engine is in force: light the right chip and
 // recolour the whole panel with it. There is no dimming any more: the engines share ONE
 // box and only the SELECTED engine's controls are inside it (resized() gates their
@@ -3986,6 +4108,13 @@ void FractalAdditiveAudioProcessorEditor::applyEngineState()
     // way the Modulators box wears its selected tab's. The old neutral steel said nothing
     // and read as "white" beside the coloured panels around it.
     spectrumPanelColour = chipCol[sel];
+    // Every control inside it too, not just the chrome. The panel is one box with
+    // divider lines now, so a fader still wearing a nested box's old hue would be the
+    // only thing left on screen drawing the boundaries the frames used to draw.
+    recolourSpectrumControls (spectrumPanelColour);
+    // And the Load/Remove button, whose word depends on whether a spectrum exists -
+    // which is precisely the thing that changes under this call.
+    refreshCustomEngineButtons();
 
     // Chip selection = VIEW switching: relayout so the selected engine's controls are
     // the ones inside the shared box. Guarded because the ctor calls this before
@@ -4014,14 +4143,19 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
 
     if (! spectrumBounds.isEmpty())
     {
+        // ONE PANEL, ONE COLOUR: every sub-label in SPECTRUM is the SELECTED ENGINE's
+        // hue, including the Amp Decay / Fractal / Morph / Octave Range compartment,
+        // which used to keep a mint-and-magenta scheme of its own. Those hues were the
+        // last thing on screen still drawing the nested boxes that are now dividers.
+        const auto cPanel = spectrumPanelColour;
         // Harmonic view only: the custom view's controls name themselves and resized()
         // leaves the hc* cells empty.
         if (! engineBoxBounds.isEmpty() && ! customViewShown() && ! hcBase.isEmpty())
         {
-            add ("eng.base",  tr ("BASE", "BASE"),                     band (hcBase),  cHarmonic);
-            add ("eng.harm",  tr ("HARMONICS", "HARM\xc3\x92NICS"),    band (hcHarm),  cHarmonic);
+            add ("eng.base",  tr ("BASE", "BASE"),                     band (hcBase),  cPanel);
+            add ("eng.harm",  tr ("HARMONICS", "HARM\xc3\x92NICS"),    band (hcHarm),  cPanel);
             // PRIME sits right under the shared divider -> nudge it down for air.
-            add ("eng.prime", tr ("PRIME", "PRIMERS"), band (hcPrime.translated (0, 5)), cHarmonic);
+            add ("eng.prime", tr ("PRIME", "PRIMERS"), band (hcPrime.translated (0, 5)), cPanel);
         }
         if (! bothEnginesBounds.isEmpty())
         {
@@ -4032,7 +4166,11 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
             const bool man = processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
             const auto decay = tr ("AMP DECAY", "CAIGUDA AMP");
             const auto slopeBand = band (beSlope);
-            add ("both.decay", decay, slopeBand, man ? juce::Colour (0xff8f96a8) : cSlope);
+            // The greyed AMP DECAY and the amber FROZEN are the two exceptions to "one
+            // colour": they are not compartment labels, they are the pair that says this
+            // control cannot affect the sound right now. Painting them the panel hue
+            // would unify the panel by deleting its only warning.
+            add ("both.decay", decay, slopeBand, man ? juce::Colour (0xff8f96a8) : cPanel);
             if (man)
             {
                 // The FROZEN tag starts after the MEASURED width of the label beside it,
@@ -4045,9 +4183,9 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
                      slopeBand.withTrimmedLeft (juce::jmin (used, juce::jmax (0, slopeBand.getWidth() - 46))),
                      cOverride, 10.0f, true);
             }
-            add ("both.fractal", tr ("FRACTAL", "FRACTAL"),                   band (beFractal), cFractal);
-            add ("both.morph",   tr ("MORPH", "MORPHING"),                    band (beMorph),   cSlope);
-            add ("both.range",   tr ("OCTAVE RANGE", "ABAST OCTAVES"), band (beRange.translated (0, 3)), cSlope);
+            add ("both.fractal", tr ("FRACTAL", "FRACTAL"),                   band (beFractal), cPanel);
+            add ("both.morph",   tr ("MORPH", "MORPHING"),                    band (beMorph),   cPanel);
+            add ("both.range",   tr ("OCTAVE RANGE", "ABAST OCTAVES"), band (beRange.translated (0, 3)), cPanel);
         }
     }
     if (! essentialsBounds.isEmpty())
@@ -4119,7 +4257,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("harm.prime0",      primeToggle[0]);  add ("harm.prime8",    primeToggle[8]);
     add ("harm.prime0Lbl",   primeLbl[0]);     add ("harm.prime8Lbl", primeLbl[8]);
 
-    add ("cust.load",        loadTimbreButton); add ("cust.off",      clearTimbreButton);
+    add ("cust.load",        loadTimbreButton); add ("cust.random",   randomSpectrumBtn);
     add ("cust.intervals",   intervalEdit);     add ("cust.status",   timbreStatusLabel);
     add ("cust.reps",        timbreRepeatsFader); add ("cust.repsLbl", lblTimbreRepeats);
     add ("cust.temper",      temperToggle); // laid out in BOTH views of the engine box
@@ -4197,7 +4335,19 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     for (const auto& s : paintedSubLabels())
         p.paintedLabels.push_back ({ s.name, s.text, s.cell,
             (float) juce::GlyphArrangement::getStringWidthInt (
-                juce::Font (juce::FontOptions (s.fontHeight).withStyle ("Bold")), s.text) });
+                juce::Font (juce::FontOptions (s.fontHeight).withStyle ("Bold")), s.text),
+            s.col });
+
+    // The words that ARE the feature (see LayoutProbe::buttonTexts).
+    p.buttonTexts.push_back ({ "cust.load",  loadTimbreButton.getButtonText() });
+    p.buttonTexts.push_back ({ "tun.toBank", tuningBankAddBtn.getButtonText() });
+
+    // The three border lines that must be one (see LayoutProbe::wall*). Derived from
+    // kFrameLine, the same constant both frame painters use, so the probe can never be
+    // measuring an offset paint() has stopped using.
+    p.wallSpectrumRight = (float) spectrumBounds.getRight() - kFrameLine;
+    p.wallTuningRight   = (float) lFootBounds.getRight()    - kFrameLine;
+    p.wallColumnLeft    = (float) gSpecScale.getX()         + kFrameLine;
     return p;
 }
 
@@ -4541,8 +4691,9 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     {
         constexpr float titleH = 32.0f; // matches drawGroupComponentOutline
         auto box = boxI.toFloat();
-        auto frame = juce::Rectangle<float> (box.getX() + 1.3f, box.getY() + titleH * 0.5f,
-                                             box.getWidth() - 2.6f, box.getHeight() - titleH * 0.5f - 1.3f);
+        auto frame = juce::Rectangle<float> (box.getX() + kFrameLine, box.getY() + titleH * 0.5f,
+                                             box.getWidth() - 2.0f * kFrameLine,
+                                             box.getHeight() - titleH * 0.5f - kFrameLine);
         const auto shape = topRoundedFrame (frame, 9.0f); // rounded top, angular bottom
         g.setColour (juce::Colour (0xff17171f).interpolatedWith (col, 0.05f * interiorAlpha));
         g.fillPath (shape);
@@ -4581,53 +4732,55 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         // said nothing about which engine was making the sound.
         macroFrameTitle (spectrumBounds, spectrumPanelColour, tr ("SPECTRUM", "ESPECTRE"), 1.0f);
 
-        //-- the shared ENGINE box: its title is the HARMONIC / CUSTOM chip strip -----
-        // One frame in the selected engine's colour, no painted title text: the lit
-        // chip IS the statement of which engine sounds, which is what retired the
-        // OVERRIDDEN / BYPASSED badges and the "controls are inert" banner - with one
-        // box and one lit chip there is nothing left on screen to be overridden.
-        if (! engineBoxBounds.isEmpty())
+        //-- ONE BOX, COMPARTMENTS, ONE COLOUR --------------------------------------
+        // The panel used to hold two more FRAMED boxes inside itself (the engine box and
+        // a "both engines" box), each with its own outline, its own interior fill and -
+        // worse - its own hue: mint for Decay/Morph/Range, magenta for Fractal, blue or
+        // pink for the engine. Three frames inside a frame said "three independent
+        // things"; they are three compartments of one spectrum. So: no inner frames at
+        // all, only DIVIDER LINES, and every one of them (like every sub-label and every
+        // control - see recolourSpectrumControls) in the SELECTED ENGINE's colour. There
+        // is now exactly one hue in the panel, and changing engine changes all of it.
+        //
+        // Lines are drawn INSIDE the outer frame: its top line sits at box.y + 16 with a
+        // 2.6 px stroke, so anything starting above ~17.5 pokes through the panel's edge.
         {
-            macroFrame (engineBoxBounds, spectrumPanelColour, 1.0f);
-            // Harmonic view only: the shared dividers + sub-labels of its three cells.
-            // (The custom view's controls name themselves; resized() leaves hc* empty.)
+            g.setColour (spectrumPanelColour.withAlpha (0.5f));
+            const float top = (float) spectrumBounds.getY() + 17.5f;
+            const float bot = (float) spectrumBounds.getBottom() - 4.0f;
+
+            // THE WALL between the engine compartment and the shared-controls
+            // compartment. It replaces two frame edges and the gutter between them, so
+            // the two compartments now share one line instead of facing each other
+            // across three.
+            if (! engineBoxBounds.isEmpty() && ! bothEnginesBounds.isEmpty())
+            {
+                const float wall = 0.5f * (float) (engineBoxBounds.getRight() + bothEnginesBounds.getX());
+                g.drawLine (wall, top, wall, bot, 1.0f);
+            }
+
+            // Harmonic view: the dividers of its three cells. (The custom view's controls
+            // name themselves; resized() leaves hc* empty, which reads as "draw none".)
             if (! customViewShown() && ! hcBase.isEmpty())
             {
-                g.setColour (cHarmonic.withAlpha (0.5f)); // shared internal dividers
-                // Inside the frame: its top line is at box.y + titleH*0.5 (16) and the
-                // stroke is 2.6 wide, so start just under it or they poke out of the box.
-                const float top = (float) engineBoxBounds.getY() + 17.5f;
-                const float bot = (float) hcPrime.getBottom();
-                g.drawLine ((float) hcHarm.getX(), top, (float) hcHarm.getX(), bot, 1.0f);
+                g.drawLine ((float) hcHarm.getX(), top, (float) hcHarm.getX(), (float) hcPrime.getBottom(), 1.0f);
                 g.drawLine ((float) hcHarm.getX(), (float) hcPrime.getY(),
                             (float) hcHarm.getRight(), (float) hcPrime.getY(), 1.0f);
             }
-            // Custom view: the one shared divider between "which scale is loaded" and
-            // "the spectrum it makes". Drawn in the panel's own colour (the custom
-            // engine's) exactly as the harmonic view's are drawn in the harmonic
-            // engine's, so the two views of the shared box read the same way.
+            // Custom view: the divider between "which spectrum is loaded" and the
+            // spectrum itself.
             if (customViewShown() && ! ccBody.isEmpty())
-            {
-                g.setColour (spectrumPanelColour.withAlpha (0.5f));
                 g.drawLine ((float) ccBody.getX(), (float) ccBody.getY(),
                             (float) ccBody.getRight(), (float) ccBody.getY(), 1.0f);
-            }
-        }
 
-        //-- nested box 3: what applies to EITHER engine ----------------------------
-        if (! bothEnginesBounds.isEmpty())
-        {
-            // Never dimmed: every control in here shapes whatever spectrum is running.
-            // No box title: the four sub-labels below already name themselves, and
-            // "BOTH ENGINES" only repeated what the SPECTRUM panel around them implies.
-            macroFrame (bothEnginesBounds, cSlope, 1.0f);
-            g.setColour (cSlope.withAlpha (0.5f));
-            const float top = (float) bothEnginesBounds.getY() + 17.5f;
-            const float bot = (float) bothEnginesBounds.getBottom() - 3.0f;
-            g.drawLine ((float) beFractal.getX(), top, (float) beFractal.getX(), bot, 1.0f);
-            g.drawLine ((float) beMorph.getX(),   top, (float) beMorph.getX(),   bot, 1.0f);
-            g.drawLine ((float) beRange.getX(), (float) beRange.getY(),
-                        (float) beRange.getRight(), (float) beRange.getY(), 1.0f);
+            // The shared-controls compartment: Amp Decay | Fractal | Morph over Range.
+            if (! bothEnginesBounds.isEmpty())
+            {
+                g.drawLine ((float) beFractal.getX(), top, (float) beFractal.getX(), bot, 1.0f);
+                g.drawLine ((float) beMorph.getX(),   top, (float) beMorph.getX(),   bot, 1.0f);
+                g.drawLine ((float) beRange.getX(), (float) beRange.getY(),
+                            (float) beRange.getRight(), (float) beRange.getY(), 1.0f);
+            }
         }
     }
 
@@ -4732,8 +4885,34 @@ void FractalAdditiveAudioProcessorEditor::resized()
     //   its result list (chords / dyad degrees / segment picker) INSIDE it below.
     //   The Tuning box is now a plain row-2 box (no more inverted L).
     {
-        auto sp = area.removeFromRight (208);
-        area.removeFromRight (6); // uniform gutter to Essentials/Filter
+        //== THE SHARED WALL ====================================================
+        // SPECTRUM's right border, TUNING's right border and the Spectrum-vs-Tuning
+        // column's LEFT border are ONE drawn line, not two lines side by side and not
+        // three lines with gutters between them.
+        //
+        // Every box's border is a stroke whose centre sits kFrameLine inside its own
+        // rectangle (see macroFrame / drawGroupComponentOutline), so "one line" means
+        // the box rects must OVERLAP by 2*kFrameLine: rows 1-2 end 3 px right of the
+        // wall, the column starts 3 px left of it, and both strokes then land on the
+        // same x. The column paints after the editor (it is a child component), so the
+        // single line that survives is its own - which is correct: the wall belongs to
+        // the box that runs the full height of the window.
+        //
+        // Merely ABUTTING the rects (which is what "no gutter" first produced) still
+        // drew two lines, pink then orange, back to back - a 7 px two-tone band that is
+        // exactly the doubled border this was meant to remove.
+        //
+        // The old layout had a 6 px gutter PLUS both insets = 12 px of dead space
+        // between two parallel lines. Reclaiming it widens rows 1-2 by 9 px and the
+        // right column by 6, so nothing had to shrink to pay for it - which is why
+        // nothing in either box needed re-fitting.
+        const int wallX = area.getRight() - 208;
+        // Box inset + the two stroke offsets. ROUNDED, not truncated: 2*1.3 truncates to
+        // 2 and leaves the two strokes 0.6 px apart, which is a visible pink sliver down
+        // the orange border - the doubled wall in miniature.
+        const int lap   = 3 + juce::roundToInt (2.0f * kFrameLine);
+        auto sp = area.withLeft (wallX - lap);
+        area.setRight (wallX + 3);
 
         // ONE beating mode now, with two selectors inside it:
         //   SOURCE - from the current tuning (combinations of its own degrees) or
@@ -5035,7 +5214,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // exactly the messaging this layout retires.
         juce::Component* harmView[] = { &baseNFader, &lblBaseN, &basePitchBox, &lblBasePitch,
                                         &harmonicsFader, &primeModeBox };
-        juce::Component* custView[] = { &loadTimbreButton, &clearTimbreButton, &intervalEdit,
+        juce::Component* custView[] = { &loadTimbreButton, &randomSpectrumBtn, &intervalEdit,
                                         &timbreStatusLabel, &timbreRepeatsFader, &lblTimbreRepeats };
         for (auto* c : harmView) c->setVisible (! customView);
         for (auto* c : custView) c->setVisible (customView);
@@ -5111,17 +5290,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // TEMPER on the right of the top row (reachable from BOTH views).
             temperToggle.setBounds (brow.removeFromRight (juce::jmin (170, brow.getWidth() * 40 / 100)));
             brow.removeFromRight (6);
-            const bool offVis = processorRef.timbreLoaded();
-            clearTimbreButton.setVisible (offVis);
-            if (offVis)
-            {
-                loadTimbreButton.setBounds (brow.removeFromLeft (brow.getWidth() * 6 / 10).reduced (2, 0));
-                clearTimbreButton.setBounds (brow.reduced (2, 0));
-            }
-            else
-            {
-                loadTimbreButton.setBounds (brow.reduced (2, 0));
-            }
+            // [Load / Remove][Random] - two buttons that never change in number, so the
+            // row does not re-shape under the user's hand the way it did when the Off
+            // pill appeared and disappeared with the loaded scale. RANDOM is always
+            // there because it is the one control that can CREATE a spectrum out of
+            // nothing, which is exactly the state where a workspace is emptiest.
+            loadTimbreButton.setBounds (brow.removeFromLeft (brow.getWidth() * 1 / 2).reduced (2, 0));
+            randomSpectrumBtn.setBounds (brow.reduced (2, 0));
             // The bottom rows first, then EVERYTHING left goes to the intervals box:
             // the custom view has far fewer controls than the harmonic one, and the
             // freed space is exactly what the typed spectrum needed - it was one 24 px
@@ -6220,7 +6395,10 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     using E = FractalAdditiveAudioProcessor::EngineInForce;
     const auto est = processorRef.engineInForce();
     juce::String tms;
-    juce::Colour tmsCol = cTimbre;
+    // The panel's own colour, not a fixed pink: with ONE box in ONE engine colour this
+    // line is the only thing left inside it that used to hold a hue of its own. The
+    // BYPASSED case keeps the amber below, because that is a warning, not a compartment.
+    juce::Colour tmsCol = spectrumPanelColour;
     if (est == E::Tempered && processorRef.isTimbreActive())
     {
         tms = tr ("Bypassed - ", "De banda - ") + processorRef.getTimbreName()
@@ -6320,7 +6498,9 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     if (lastEngineShown != (int) processorRef.engineInForce() * 2
                            + (processorRef.timbreLoaded() ? 1 : 0))
     {
+        // applyEngineState() re-dresses the Load/Remove button itself: "is a spectrum
+        // loaded" is half of the very state this comparison is watching, so the button's
+        // word arrives with the rest of the panel instead of one tick behind it.
         applyEngineState();
-        clearTimbreButton.setButtonText (processorRef.isTimbreActive() ? tr ("On", "Actiu") : tr ("Off", "Apagat"));
     }
 }

@@ -2492,6 +2492,60 @@ int main()
             check (win.contains (L.essentials) && win.contains (L.tuning), "so are Essentials and Tuning");
             check (! L.spectrum.intersects (L.essentials) && ! L.spectrum.intersects (L.tuning),
                    "and it overlaps neither of them");
+
+            // THE SHARED WALL. SPECTRUM's right border, TUNING's right border and the
+            // Spectrum-vs-Tuning column's LEFT border must be ONE drawn line.
+            //
+            // Measured on the LINES, not the rectangles, and that distinction is the
+            // whole test. Removing the gutter so the two rects merely TOUCH still drew
+            // two strokes back to back - a 7 px pink-then-orange band, which is the
+            // doubled border this was supposed to remove - and a rect comparison called
+            // that a shared wall. Half a pixel of tolerance because the rects are
+            // integers and the stroke centres are not.
+            {
+                std::printf ("  wall lines: spectrum %.1f, tuning %.1f, column %.1f"
+                             "   (rects: %d / %d / %d)\n",
+                             L.wallSpectrumRight, L.wallTuningRight, L.wallColumnLeft,
+                             L.spectrum.getRight(), L.tuning.getRight(), L.specColumn.getX());
+                check (std::abs (L.wallSpectrumRight - L.wallColumnLeft) <= 0.5f,
+                       "the SPECTRUM panel's right border IS the Spectrum-vs-Tuning column's left border");
+                check (std::abs (L.wallTuningRight - L.wallColumnLeft) <= 0.5f,
+                       "and so is the TUNING box's - one line on the glass, not two side by side");
+                check (win.contains (L.specColumn),
+                       "and sharing it keeps the column inside the window");
+            }
+
+            // ONE BOX, ONE COLOUR. Every painted sub-label in SPECTRUM wears the selected
+            // ENGINE's hue - the Fractal / Morph / Octave Range compartment included,
+            // which used to keep a mint-and-magenta scheme of its own. That is invisible
+            // to every geometric check here: those labels laid out perfectly and simply
+            // looked like a separate box. The two INERTNESS marks are the stated
+            // exceptions (a greyed AMP DECAY and the amber FROZEN beside it say the
+            // control cannot affect the sound; painting them the panel hue would unify
+            // the panel by deleting its only warning).
+            {
+                int offHue = 0; juce::String offName;
+                for (const auto& s : L.paintedLabels)
+                {
+                    if (! s.name.startsWith ("eng.") && ! s.name.startsWith ("both.")) continue;
+                    if (s.name == "both.frozen" || s.name == "both.decay") continue;
+                    if (s.colour != L.panelColour)
+                    { ++offHue; if (offName.isEmpty()) offName = s.name + " " + s.colour.toDisplayString (false); }
+                }
+                std::printf ("  %d spectrum sub-labels off the panel colour%s\n", offHue,
+                             offHue > 0 ? (" (first: " + offName + ")").toRawUTF8() : "");
+                check (offHue == 0, "every compartment label in SPECTRUM is the selected engine's colour");
+            }
+
+            // The Custom-Engine ON/OFF pill is GONE. Probing by NAME, because the way
+            // this regresses is somebody re-adding "one small toggle" beside Load: the
+            // engine chips are the only engine switch now, and a second quieter one
+            // could sit there visibly disagreeing with them.
+            {
+                bool hasOff = false;
+                for (const auto& c : L.controls) if (c.first == "cust.off") hasOff = true;
+                check (! hasOff, "the custom-spectrum On/Off toggle is gone");
+            }
             check (L.spectrum.contains (L.engineBox) && L.spectrum.contains (L.bothEngines),
                    "the shared engine box and the both-engines box are inside the panel");
             check (! L.engineBox.intersects (L.bothEngines),
@@ -2540,6 +2594,15 @@ int main()
                             check (c.second.getWidth() >= 300 && c.second.getHeight() >= 56,
                                    "the intervals editor got the custom view's freed space");
                         }
+                // RANDOM is the one control that can CREATE a spectrum from nothing, so
+                // it must be in the custom view whatever the state of that view - it was
+                // the empty workspace that needed it most.
+                if (pass == 2)
+                {
+                    bool hasRandom = false;
+                    for (const auto& c : L.controls) if (c.first == "cust.random") hasRandom = true;
+                    check (hasRandom, "the RANDOM SPECTRUM button is in the custom view");
+                }
             }
 
             // Every control must be INSIDE the box whose name it carries.
@@ -2893,6 +2956,219 @@ int main()
                    "and switching that engine off returns to harmonic - the stale pin does not hold it open");
             p.clearTimbre();
             ed->refreshEngineDressing();
+        }
+
+        //== LOAD BECOMES REMOVE, AND THE SELECTOR FOLLOWS THE VIEW ==============
+        // One button with two opposite jobs is the most dangerous control in the
+        // window: if its WORD and its ACTION are set in different places they drift,
+        // and a green "Load" that silently deletes a hand-typed spectrum is the result.
+        // Both are exercised here through the button's own callback.
+        if (ed != nullptr)
+        {
+            using E = FractalAdditiveAudioProcessor::EngineInForce;
+            auto word = [&] (const char* which)
+            {
+                for (const auto& b : ed->layoutProbe().buttonTexts) if (b.first == which) return b.second;
+                return juce::String();
+            };
+            auto hasControl = [&] (const char* name)
+            {
+                for (const auto& c : ed->layoutProbe().controls) if (c.first == name) return true;
+                return false;
+            };
+
+            p.clearTimbre();
+            ed->clickEngineChipForTests (1);   // open the (empty) custom workspace
+            ed->refreshEngineDressing();
+            std::printf ("  nothing loaded: the button reads \"%s\"\n", word ("cust.load").toRawUTF8());
+            check (word ("cust.load") == "Load", "with no spectrum loaded the button loads");
+
+            juce::String terr;
+            p.loadTimbreText ("5/4 3/2 2", terr);
+            ed->refreshEngineDressing();
+            std::printf ("  spectrum loaded: the button reads \"%s\"\n", word ("cust.load").toRawUTF8());
+            check (word ("cust.load") == "Remove", "once one IS loaded, the same button removes it");
+
+            // ...and pressing it there really removes it, undoably. A Remove that were
+            // merely the old Off in a red coat would leave the scale loaded, and the
+            // button would then be lying about what it just did.
+            ed->clickCustomLoadRemoveForTests();
+            ed->refreshEngineDressing();
+            check (! p.timbreLoaded() && p.engineInForce() == E::Harmonic,
+                   "pressing Remove deletes the spectrum and hands the sound back to the harmonic engine");
+            check (hasControl ("cust.load") && hasControl ("cust.random"),
+                   "and leaves the workspace open, so loading or randomising another is one click");
+            p.undoManager.undo();
+            ed->refreshEngineDressing();
+            check (p.timbreLoaded() && word ("cust.load") == "Remove",
+                   "and one Ctrl+Z brings the removed spectrum back");
+
+            // THE SELECTOR IS THE ENGINE SWITCH. With the On/Off pill gone the chips are
+            // the only way between the engines, so showing a view must BE selecting it -
+            // in both directions, and without ever discarding the loaded spectrum (that
+            // is Remove's job, and only Remove's).
+            ed->clickEngineChipForTests (0);
+            ed->refreshEngineDressing();
+            check (p.engineInForce() == E::Harmonic && hasControl ("harm.baseN"),
+                   "showing the HARMONIC view puts the harmonic engine in force");
+            check (p.timbreLoaded(), "...while keeping the loaded spectrum - switching engines erases nothing");
+            ed->clickEngineChipForTests (1);
+            ed->refreshEngineDressing();
+            check (p.engineInForce() == E::CustomScale && hasControl ("cust.intervals"),
+                   "and showing the CUSTOM view puts the custom engine in force");
+            p.clearTimbre();
+            ed->refreshEngineDressing();
+        }
+
+        //== THE RANDOM SPECTRUM TRIGGER ========================================
+        // Automatable means a PARAMETER a host can draw, firing on its RISING edge.
+        // Everything below is about that edge behaving like an edge: it fires once per
+        // 0 -> 1, a held 1 never re-fires, and restoring a project that saved it at 1
+        // does not fire at all (which would replace the spectrum the user saved with a
+        // random one, every single time they reopened the session).
+        if (ed != nullptr)
+        {
+            auto* rp = p.apvts.getParameter ("specRandom");
+            check (rp != nullptr, "the random spectrum has an automatable parameter behind it");
+            if (rp != nullptr)
+            {
+                p.clearTimbre();
+                const int base = p.getRandomSpectrumCount();
+
+                rp->setValueNotifyingHost (1.0f);      // a host automation step
+                check (p.pollRandomSpectrumTrigger(), "a 0 -> 1 step fires it");
+                const auto first = p.getTimbreSource();
+                check (p.timbreLoaded() && p.engineInForce()
+                           == FractalAdditiveAudioProcessor::EngineInForce::CustomScale,
+                       "and the spectrum it built is the one in force");
+
+                // A HELD 1 is not a second edge. Without this, automation that simply
+                // parked the lane at 1 would rebuild the spectrum 60 times a second and
+                // the sound would never settle.
+                check (! p.pollRandomSpectrumTrigger() && p.getTimbreSource() == first,
+                       "holding it at 1 does not fire again");
+
+                rp->setValueNotifyingHost (0.0f);
+                check (! p.pollRandomSpectrumTrigger(), "and falling back to 0 does not fire either");
+                rp->setValueNotifyingHost (1.0f);
+                check (p.pollRandomSpectrumTrigger(), "the NEXT rising edge does");
+                const auto second = p.getTimbreSource();
+                check (second != first, "and it is a genuinely different spectrum");
+                check (p.getRandomSpectrumCount() == base + 2, "exactly two presses, exactly two spectra");
+
+                // The BUTTON must take the same path: it writes the parameter and the
+                // processor builds. A button that built directly would work while a
+                // recorded automation of the very same press did nothing.
+                ed->clickRandomSpectrumForTests();
+                check (p.pollRandomSpectrumTrigger(), "the button's own click fires the same edge");
+                const auto third = p.getTimbreSource();
+                check (third != second, "and presses in a row keep producing different spectra");
+
+                // UNDO MUST GO BACKWARDS, NOT SIDEWAYS. Ctrl+Z has to bring back the
+                // spectrum that was there before the press - and, walking the whole
+                // stack, must never re-fire the trigger on the way: a level that flips
+                // back up under undo is a rising edge like any other, and a Ctrl+Z that
+                // answers with a THIRD random spectrum is worse than one that does nothing.
+                {
+                    p.undoManager.undo();
+                    const bool reFired = p.pollRandomSpectrumTrigger();
+                    std::printf ("  one undo after a random press: re-fired = %d, spectrum now \"%s\"\n",
+                                 (int) reFired, p.getTimbreSource().toRawUTF8());
+                    check (! reFired, "undoing a random press does not fire another one");
+                    check (p.getTimbreSource() == second,
+                           "and it puts the spectrum that was there before the press back");
+                    // Walk the rest of the stack: every step back through the trigger's
+                    // own level changes has to stay silent too.
+                    int fires = 0;
+                    for (int i = 0; i < 6; ++i)
+                    { p.undoManager.undo(); if (p.pollRandomSpectrumTrigger()) ++fires; }
+                    check (fires == 0, "and neither does walking the whole undo stack back");
+                }
+
+                // REOPENING A PROJECT MUST NOT RANDOMISE ANYTHING. A press leaves the
+                // parameter at 1, so that is the value a saved project carries; restoring
+                // it rewrites every parameter and used to arrive as a fresh 0 -> 1 step.
+                {
+                    juce::String derr;
+                    p.loadTimbreText ("7/6 3/2 7/4 2", derr);  // the user's own spectrum
+                    const auto mine = p.getTimbreSource();
+                    juce::MemoryBlock st;
+                    p.getStateInformation (st);          // saved with the trigger left at 1
+                    check (rp->getValue() >= 0.5f, "precondition: a press does leave the trigger at 1");
+                    // A FRESH instance starts at the default 0 - that is what makes the
+                    // restore a genuine 0 -> 1 step, and it is the exact path the host
+                    // takes every time the project is reopened.
+                    rp->setValueNotifyingHost (0.0f);
+                    p.pollRandomSpectrumTrigger();
+                    p.setStateInformation (st.getData(), (int) st.getSize());
+                    const bool fired = p.pollRandomSpectrumTrigger();
+                    std::printf ("  reload from 0 with the trigger saved at %.0f: fired = %d\n",
+                                 rp->getValue(), (int) fired);
+                    check (! fired && p.getTimbreSource() == mine,
+                           "reopening a project with the trigger saved at 1 does NOT randomise the spectrum");
+                }
+
+                //-- THE DISTRIBUTION, measured. A random generator whose distribution is
+                //   not checked is one nobody can tell a bug from a draw in.
+                {
+                    int    worstN = 1000, bestN = 0;
+                    double worstGap = 1.0e9, worstTop = 0.0;
+                    int    badPeriod = 0, dupes = 0;
+                    std::vector<juce::String> seen;
+                    for (int i = 0; i < 200; ++i)
+                    {
+                        const auto txt = p.makeRandomSpectrumText();
+                        seen.push_back (txt);
+                        juce::StringArray tk;
+                        tk.addTokens (txt, " ", "");
+                        tk.removeEmptyStrings();
+                        std::vector<double> c;
+                        for (const auto& t : tk) c.push_back (t.dropLastCharacters (1).getDoubleValue());
+                        worstN = std::min (worstN, (int) c.size());
+                        bestN  = std::max (bestN,  (int) c.size());
+                        // Sorted, spaced, and inside the span - the three promises.
+                        for (size_t k = 1; k < c.size(); ++k) worstGap = std::min (worstGap, c[k] - c[k - 1]);
+                        worstGap = std::min (worstGap, c.empty() ? 1.0e9 : c[0]);
+                        worstTop = std::max (worstTop, c.empty() ? 0.0 : c.back());
+                        // The TOP token is the period and must be a whole octave: it is
+                        // what Reps stacks, and a random period smears instead of stacking.
+                        if (! c.empty() && std::abs (std::fmod (c.back(), 1200.0)) > 0.001) ++badPeriod;
+                    }
+                    std::sort (seen.begin(), seen.end());
+                    for (size_t i = 1; i < seen.size(); ++i) if (seen[i] == seen[i - 1]) ++dupes;
+                    std::printf ("  200 draws: %d..%d tokens, smallest gap %.2fc, highest partial %.0fc,"
+                                 " %d bad periods, %d repeats\n",
+                                 worstN, bestN, worstGap, worstTop, badPeriod, dupes);
+                    // 5..12 partials PLUS the period token = 6..13 tokens.
+                    check (worstN >= 6 && bestN <= 13, "every draw has a musical number of partials");
+                    check (worstN != bestN, "and the count really varies from draw to draw");
+                    check (worstGap >= 34.99,
+                           "no two partials land closer than the 35c minimum (none can be deduped away)");
+                    check (badPeriod == 0, "the period is always an exact whole number of octaves");
+                    check (dupes == 0, "and 200 draws produce 200 different spectra");
+                }
+                p.clearTimbre();
+                rp->setValueNotifyingHost (0.0f);
+                p.pollRandomSpectrumTrigger();
+                ed->refreshEngineDressing();
+            }
+        }
+
+        //== THE TUNING BANK BUTTON'S NAME ======================================
+        // "+" named neither what it adds nor where. Probed as a word because there is
+        // nothing geometric about it - and because the row it sits in is laid out FROM
+        // the button's own text width, so a longer name is exactly what pushes its
+        // neighbours out (which the sweep above measures, in both languages).
+        if (ed != nullptr)
+        {
+            for (int lang = 0; lang < 2; ++lang)
+            {
+                const auto P = ed->layoutProbeInLanguage (lang == 1);
+                juce::String w;
+                for (const auto& b : P.buttonTexts) if (b.first == "tun.toBank") w = b.second;
+                std::printf ("  bank add button (%s): \"%s\"\n", lang == 1 ? "ca" : "en", w.toRawUTF8());
+                check (w.length() > 1 && w != "+", "the tuning bank's add button says what it does");
+            }
         }
 
         // THE PANEL'S OWN WIRING, through the same callbacks a click runs.
