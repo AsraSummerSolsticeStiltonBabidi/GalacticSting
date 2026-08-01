@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "dsp/AdditiveVoice.h"
+#include "dsp/Dissonance.h"
 #include "dsp/ModEngine.h"
 #include "dsp/NoteGate.h"
 #include "dsp/RhythmEngine.h"
@@ -435,6 +436,24 @@ public:
     // (see ModEngine.h), never the base value this compares against.
     bool presetHasDrifted() const;
     juce::String getLoadedPresetName() const { return loadedPresetName; }
+
+    //==========================================================================
+    // The TWO inputs every Sethares feature shares. Their numbers are compared with
+    // each other (the degree list next to the n-ad list, the generated scale's
+    // heights against the degree colouring, "sounding now" against an adaptation),
+    // and Sethares' roughness depends on absolute frequency AND on amplitude - so
+    // one anchor convention and one spectrum convention, or the columns are
+    // incomparable. Message thread.
+    //
+    // analysisAnchorHz: the frequency key 60 REALLY sounds at under the active
+    // tuning (reference-A, octave shift and a .tun/@ABL anchor included).
+    //
+    // analysisSpectrumAt: the published template at its SOUNDING amplitudes (the
+    // user's per-partial gain edits applied), anchored at f0Hz, analysis-capped to
+    // the 64 loudest sounding partials. Falls back to a fresh compile (with the
+    // same edits resolved) only before the first publish.
+    double analysisAnchorHz() const;
+    std::vector<dissonance::Partial> analysisSpectrumAt (double f0Hz) const;
 
     //==========================================================================
     // "Spectrum to Scale" (Sethares): analyses the CURRENT spectrum, builds a

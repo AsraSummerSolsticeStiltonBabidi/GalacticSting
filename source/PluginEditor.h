@@ -2719,6 +2719,8 @@ private:
     bool             lastNadRootOnly = true;
     juce::String     lastNadOpts;   // Min/Max + period + smallest interval, as typed
     double           lastNadSig = -1.0e30;
+    juce::uint32     lastNadSpecMs = 0;      // rate limit for SPECTRUM-driven recomputes (see timer)
+    double           lastNadSpecSig = -1.0;  // last ACCEPTED spectrum signature (held between refreshes)
     // ONE REMEMBERED PERIOD PER MODE. The search wants 2/1 and the adaptation wants 8/1 -
     // eight partials spread over three octaves is the spectrum that mode exists to build,
     // and 2/1 crammed them into one - so the field cannot have a single default. The rule:

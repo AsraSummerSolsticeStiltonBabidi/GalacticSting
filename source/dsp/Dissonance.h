@@ -143,6 +143,44 @@ namespace dissonance
         return d;
     }
 
+    // THE ANALYSIS SPECTRUM every Sethares readout starts from: a template's partials
+    // at their SOUNDING amplitudes (compiled amp x the user's per-partial gain edit,
+    // when one is bound - `gain` is index-aligned, empty = no edits), anchored in
+    // absolute Hz at `f0`, capped to the `cap` loudest partials. `PartialLike` is
+    // anything with .ratio and .amp (spectrum::Partial), kept generic so this header
+    // stays JUCE- and Spectrum-free for the unit tests.
+    //
+    // Two rules here are load-bearing:
+    //   - The gain multiplies BEFORE the cap sorts. The cap keeps the loudest
+    //     SOUNDING partials; every call site used to sort on the compiled amplitude
+    //     and ignore the gains, so a MUTED partial (gain 0) could hold a cap slot
+    //     and beat against everything in the analysis while contributing silence to
+    //     the ear, and a +24 dB-boosted quiet partial - possibly the loudest thing
+    //     actually sounding - could be dropped from the analysis entirely: the user
+    //     heard one spectrum and the search scored another.
+    //   - The cap is ANALYSIS-ONLY (the curve's shape is set by the strongest
+    //     partials and it keeps the sweeps instant). The SOUND is never capped.
+    template <typename PartialLike>
+    inline std::vector<Partial> analysisSpectrum (const std::vector<PartialLike>& partials,
+                                                  const std::vector<float>& gain,
+                                                  double f0, size_t cap = 64)
+    {
+        std::vector<Partial> spec;
+        spec.reserve (partials.size());
+        for (size_t i = 0; i < partials.size(); ++i)
+        {
+            const double g = i < gain.size() ? (double) gain[i] : 1.0;
+            spec.push_back ({ (double) partials[i].ratio * f0, (double) partials[i].amp * g });
+        }
+        if (spec.size() > cap)
+        {
+            std::sort (spec.begin(), spec.end(),
+                       [] (const Partial& a, const Partial& b) { return a.amp > b.amp; });
+            spec.resize (cap);
+        }
+        return spec;
+    }
+
     // Dissonance of the spectrum sounded together with itself transposed by `alpha`.
     inline double dissonanceAt (const std::vector<Partial>& spectrum, double alpha)
     {

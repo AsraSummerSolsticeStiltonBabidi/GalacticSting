@@ -476,6 +476,153 @@ int main()
     }
 
     //--------------------------------------------------------------------------
+    // THE REFERENCE MODEL, PINNED. An independent brute-force dissmeasure, written
+    // straight from Sethares' appendix (no sorting, no pair decomposition, no
+    // tables, no cap): every optimised path in Dissonance.h is held to it at 1e-12,
+    // and one dyad is pinned to a hand-computed CONSTANT so a wrong constant in
+    // dissmeasure could not hide inside a reference that copied it.
+    std::printf ("\nSethares reference model (brute force + hand-computed fixture):\n");
+    {
+        const auto refPair = [] (double f1, double a1, double f2, double a2)
+        {
+            const double fmin = std::min (f1, f2), fdif = std::abs (f1 - f2);
+            const double s = 0.24 / (0.0207 * fmin + 18.96);
+            return std::min (a1, a2) * (5.0 * std::exp (-3.51 * s * fdif)
+                                        - 5.0 * std::exp (-5.75 * s * fdif));
+        };
+        const auto refDiss = [&refPair] (const std::vector<dissonance::Partial>& p)
+        {
+            double d = 0.0;
+            for (size_t i = 0; i < p.size(); ++i)
+                for (size_t j = i + 1; j < p.size(); ++j)
+                    d += refPair (p[i].freq, p[i].amp, p[j].freq, p[j].amp);
+            return d;
+        };
+
+        // FIXTURE, by hand: 440 + 450 Hz, unit amplitudes. s = 0.24/(0.0207*440 +
+        // 18.96) = 0.00855066267635742; d = 10; D = 5(e^(-3.51 s d) - e^(-5.75 s d))
+        // = 0.645574149314169. Pins Dstar, S1, S2, C1, C2, A1, A2 and the
+        // lower-frequency rule all at once.
+        {
+            const double got = dissonance::dissmeasure ({ { 440.0, 1.0 }, { 450.0, 1.0 } });
+            std::printf ("  440+450 Hz dyad: %.15f (hand value 0.645574149314169)\n", got);
+            check (std::abs (got - 0.64557414931416934) < 1.0e-12,
+                   "two sines 440+450 Hz, equal amps: matches the hand-computed roughness");
+        }
+        // s must come from the pair's LOWER frequency, not the global minimum: in
+        // {100, 400, 410} the 400/410 pair uses s(400). Checked against the
+        // reference, which applies the rule per pair by construction.
+        {
+            const std::vector<dissonance::Partial> tri { { 100.0, 1.0 }, { 400.0, 1.0 }, { 410.0, 1.0 } };
+            check (std::abs (dissonance::dissmeasure (tri) - refDiss (tri)) < 1.0e-12,
+                   "s is taken from each pair's own lower frequency (not the spectrum's minimum)");
+        }
+        // Edge cases the model must get exactly right.
+        check (dissonance::dissmeasure ({}) == 0.0, "empty spectrum -> 0");
+        check (dissonance::dissmeasure ({ { 440.0, 1.0 } }) == 0.0, "single partial -> 0 (nothing to beat)");
+        check (dissonance::dissmeasure ({ { 440.0, 1.0 }, { 440.0, 1.0 } }) == 0.0,
+               "unison pair (d = 0) -> exactly 0 (C1 = -C2)");
+        check (dissonance::dissmeasure ({ { 440.0, 0.0 }, { 450.0, 1.0 } }) == 0.0,
+               "a zero-amplitude partial contributes nothing (min-amplitude weighting)");
+
+        // UNION SEMANTICS at 1e-12 on three spectra: harmonic, stretched (Sethares'
+        // own example of a timbre wanting its own scale) and hand-reweighted (with a
+        // zero-amp partial and a duplicated frequency in it), at alphas below AND
+        // above 1 - dissonanceAt/chordDissonance/self+cross must all be exactly
+        // dissmeasure of the union, however the copies land.
+        {
+            std::vector<std::vector<dissonance::Partial>> specs (3);
+            for (int k = 1; k <= 7; ++k)
+                specs[0].push_back ({ 261.6255653 * k, 1.0 / k });
+            for (int k = 1; k <= 10; ++k)
+                specs[1].push_back ({ 261.6255653 * std::pow ((double) k, 1.2), 1.0 / k });
+            specs[2] = { { 220.0, 0.3 }, { 275.0, 1.0 }, { 275.0, 0.5 }, { 330.0, 0.0 }, { 495.0, 0.7 } };
+
+            bool unionOk = true, chordOk = true, decompOk = true, symOk = true;
+            for (const auto& sp : specs)
+            {
+                for (const double alpha : { 1.5, std::pow (2.0, 7.0 / 12.0), 0.75, 1.0 })
+                {
+                    std::vector<dissonance::Partial> u = sp;
+                    for (const auto& p : sp) u.push_back ({ p.freq * alpha, p.amp });
+                    const double want = refDiss (u);
+                    const double tol  = 1.0e-12 * std::max (1.0, std::abs (want));
+                    if (std::abs (dissonance::dissonanceAt (sp, alpha) - want) > tol) unionOk = false;
+                    // self+cross grouping of the same union (the tables' identity):
+                    const double dec = dissonance::selfDissonance (sp, 1.0)
+                                     + dissonance::selfDissonance (sp, alpha)
+                                     + dissonance::crossDissonance (sp, 1.0, alpha);
+                    if (std::abs (dec - want) > tol) decompOk = false;
+                    if (std::abs (dissonance::crossDissonance (sp, 1.0, alpha)
+                                  - dissonance::crossDissonance (sp, alpha, 1.0)) > tol) symOk = false;
+                }
+                const std::vector<double> chord { 1.0, 0.8, 1.25, 1.5 }; // includes a note BELOW the root
+                std::vector<dissonance::Partial> u;
+                for (const double a : chord)
+                    for (const auto& p : sp) u.push_back ({ p.freq * a, p.amp });
+                const double want = refDiss (u);
+                if (std::abs (dissonance::chordDissonance (sp, chord) - want)
+                    > 1.0e-12 * std::max (1.0, std::abs (want))) chordOk = false;
+            }
+            check (unionOk,  "dissonanceAt == brute-force dissmeasure of the union (1e-12; alpha < 1 included)");
+            check (decompOk, "self + self + cross == the same union, exactly (the grid tables' identity)");
+            check (symOk,    "crossDissonance is symmetric in its two transpositions");
+            check (chordOk,  "chordDissonance == brute-force union over all notes (1e-12, all three spectra)");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // THE ANALYSIS SPECTRUM: what every dissonance readout scores. The user's
+    // per-partial gain must multiply BEFORE the 64-cap sorts, or a muted partial
+    // holds a cap slot (beating in the analysis, silent to the ear) while a boosted
+    // one - the loudest thing sounding - is dropped from the analysis entirely.
+    std::printf ("\nanalysis spectrum (sounding amplitudes, gains BEFORE the cap):\n");
+    {
+        std::vector<spectrum::Partial> parts;
+        for (int k = 1; k <= 100; ++k)
+            parts.push_back ({ (float) k, 1.0f / (float) k });
+        const double f0 = 100.0;
+        const auto ampAt = [] (const std::vector<dissonance::Partial>& s, double freq) -> double
+        {
+            for (const auto& p : s)
+                if (std::abs (p.freq - freq) < 1.0e-6) return p.amp;
+            return -1.0;
+        };
+
+        // No edits: the 64 loudest COMPILED partials, anchored at f0.
+        {
+            const auto spec = dissonance::analysisSpectrum (parts, {}, f0);
+            check (spec.size() == 64, "no edits: exactly the 64-partial analysis cap");
+            check (std::abs (ampAt (spec, 100.0) - 1.0) < 1.0e-9, "partial 1 kept at freq ratio*f0, amp untouched");
+            check (ampAt (spec, 100.0 * 100.0) < 0.0, "the quietest compiled partial is the one dropped");
+        }
+
+        // Edits: mute the loudest (gain 0), boost the quietest 40 dB (x100 -> sounding amp 1.0).
+        std::vector<float> gain (100, 1.0f);
+        gain[0]  = 0.0f;
+        gain[99] = 100.0f;
+        const auto spec = dissonance::analysisSpectrum (parts, gain, f0);
+        check (spec.size() == 64, "with edits: still exactly 64 partials");
+        check (ampAt (spec, 100.0) < 0.0,
+               "a MUTED partial (the loudest compiled one) is not in the analysis");
+        check (std::abs (ampAt (spec, 100.0 * 100.0) - 1.0) < 1.0e-6,
+               "the BOOSTED quiet partial is analysed at its sounding amplitude (amp x gain)");
+        check (std::abs (ampAt (spec, 200.0) - 0.5) < 1.0e-6,
+               "an unedited partial keeps its compiled amplitude exactly");
+        // The cap keeps the loudest SOUNDING partials: kept minimum >= dropped maximum.
+        double keptMin = 1.0e30;
+        for (const auto& p : spec) keptMin = std::min (keptMin, p.amp);
+        double dropMax = 0.0;
+        for (int k = 1; k <= 100; ++k)
+        {
+            const double sound = (1.0 / (double) k) * (double) gain[(size_t) k - 1];
+            if (ampAt (spec, f0 * (double) k) < 0.0) dropMax = std::max (dropMax, sound);
+        }
+        std::printf ("  kept quietest %.6f   dropped loudest %.6f\n", keptMin, dropMax);
+        check (keptMin >= dropMax - 1.0e-9, "the cap keeps the loudest SOUNDING partials, none louder was dropped");
+    }
+
+    //--------------------------------------------------------------------------
     std::printf ("N-note chords (Sethares union measure, TTSS 6.8/App.E):\n");
     {
         // A harmonic timbre, 7 partials, saw-ish roll-off, anchored at middle C.

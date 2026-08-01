@@ -3318,25 +3318,23 @@ void FractalAdditiveAudioProcessorEditor::updateHoverDissCache (int hoveredNote)
     if (! juce::isPositiveAndBelow (hoveredNote, 128)) return;
     const double f0 = processorRef.getNoteFrequency (hoveredNote);
     if (! (f0 > 0.0)) return;
-    const double sig = (double) processorRef.getTemplateGeneration() * 1.0e5 + f0;
+    // The gains revision is part of the signature because a per-partial amplitude
+    // edit deliberately does NOT bump the template generation (that would restart
+    // voice morphs ~60x a second while dragging) - yet it changes the sounding
+    // amplitudes this strip analyses, so the cache must refresh on it.
+    const double sig = (double) processorRef.getTemplateGeneration() * 1.0e5
+                     + (double) processorRef.getPartialGainsRevision() * 17.0 + f0;
     if (hoveredNote == hoverDissNote && std::abs (sig - hoverDissSig) < 1.0e-9) return;
 
     hoverDissNote = hoveredNote;
     hoverDissSig  = sig;
     hoverDissVal.fill (-1.0f);
 
-    const auto* t = processorRef.getLiveTemplate();
-    if (t == nullptr || t->partials.empty()) return;
-    std::vector<dissonance::Partial> spec;
-    spec.reserve (t->partials.size());
-    for (const auto& p : t->partials)
-        spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
-    if (spec.size() > 64)
-    {
-        std::sort (spec.begin(), spec.end(),
-                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
-        spec.resize (64);
-    }
+    // The shared analysis spectrum (sounding amplitudes, 64-cap), anchored at the
+    // HOVERED key's real pitch: this strip measures every key against that key, so
+    // the pair actually played is the pair analysed - same measure, honest anchor.
+    const auto spec = processorRef.analysisSpectrumAt (f0);
+    if (spec.empty()) return;
 
     // Values for every key, but the COLOUR SCALE is anchored to the PLAYABLE range
     // only (like the degree list anchors to its own rows) - extreme off-range keys
@@ -3363,6 +3361,10 @@ void FractalAdditiveAudioProcessorEditor::updateScaleDissonance()
     // degree ratios (captures a loaded/generated .scl or a tuning-bank switch).
     const int D = juce::jmax (1, processorRef.getScaleDegrees());
     double sig = (double) processorRef.getTemplateGeneration() * 101.0
+               // A per-partial amplitude edit changes the SOUNDING spectrum this
+               // analyses without bumping the template generation (see
+               // updateHoverDissCache) - it must refresh this list too.
+               + (double) processorRef.getPartialGainsRevision() * 19.0
                + (double) processorRef.getTuningMode() * 7.0
                + (double) D * 0.5
                + (double) processorRef.apvts.getRawParameterValue ("octaveShift")->load() * 13.0
@@ -5389,6 +5391,27 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         // The period is degree D itself, so it is covered by the loop below reaching it.
         for (int d = 1, n = juce::jmin (shapeD, 24); d <= n; ++d)
             shapeSig += processorRef.getDegreeRatio (d) * (double) (d + 3);
+        // The TIMBRE is part of the signature too: the list ranks combinations by the
+        // Sethares beating of the CURRENT spectrum, so a spectrum edit (a knob, a
+        // per-partial amplitude edit - which never bumps the template generation, hence
+        // the separate gains revision) must re-rank it, or it keeps showing the previous
+        // timbre's numbers next to a Degrees list that has already moved on. A modulated
+        // spectrum changes the generation on essentially every tick, so spectrum-driven
+        // recomputes are rate-limited to ~1 Hz (the worker joins its predecessor on
+        // every restart; timer-rate restarts would put a heavy cancel/join cycle on the
+        // message thread). Tuning/selector changes stay immediate.
+        double specSig = (double) processorRef.getTemplateGeneration() * 101.0
+                       + (double) processorRef.getPartialGainsRevision() * 19.0;
+        {
+            const juce::uint32 nowMs = juce::Time::getMillisecondCounter();
+            if (specSig != lastNadSpecSig && nowMs - lastNadSpecMs >= 1000)
+            {
+                lastNadSpecMs  = nowMs;
+                lastNadSpecSig = specSig;
+            }
+            specSig = lastNadSpecSig; // between refreshes the held value keeps the sig stable
+        }
+        shapeSig += specSig;
 
         if (std::abs (shapeSig - lastNadSig) > 1.0e-9 || chordNotesBox.getSelectedId() != lastNadSel
             || rootOnly != lastNadRootOnly || opts != lastNadOpts)

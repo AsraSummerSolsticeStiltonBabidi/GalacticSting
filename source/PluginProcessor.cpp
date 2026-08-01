@@ -953,6 +953,44 @@ void FractalAdditiveAudioProcessor::clearTimbre()
 }
 
 //==============================================================================
+double FractalAdditiveAudioProcessor::analysisAnchorHz() const
+{
+    // The tonic that is REALLY sounding on key 60 under the active tuning - octave
+    // shift, reference-A and a .tun/@ABL table anchor included. The scale generator
+    // and the chord search used kRefFreq * referenceScale() instead, which loses the
+    // octave shift and any table anchor: with octave shift -2 they scored a register
+    // four times higher than the one being played, while the degree list right next
+    // to them scored the real one - two incomparable columns of numbers.
+    const double f0 = tuning.frequencyForNote (60);
+    if (f0 > 0.0 && std::isfinite (f0))
+        return f0;
+    return TuningManager::kRefFreq * tuning.referenceScale();
+}
+
+std::vector<dissonance::Partial> FractalAdditiveAudioProcessor::analysisSpectrumAt (double f0Hz) const
+{
+    // The PUBLISHED template first, never a routine recompile: this runs on the
+    // message thread and a compile at fractalLevel > 1 costs hundreds of
+    // milliseconds - the editor's timer re-running it starved the 60 Hz
+    // timerCallback (the only place a modulated Base is sampled into a rebuild
+    // request) and froze the spectrum at whatever Base value was caught last.
+    // Being at most one publish behind is invisible to a 64-partial analysis, and
+    // it keeps every readout scoring the SAME spectrum. The live template carries
+    // the user's per-partial gains already resolved (SpectrumEngine::fillGains).
+    if (const auto* live = spectrumEngine.getLive(); live != nullptr && ! live->partials.empty())
+        return dissonance::analysisSpectrum (live->partials, live->gain, f0Hz);
+
+    // Cold start (before the first publish): compile once, and resolve the manual
+    // edits against that list exactly as the engine would - a muted or boosted
+    // partial must weigh the same here as it will the moment the engine publishes.
+    const auto tmpl = spectrum::compileSpectrum (currentSettings());
+    std::vector<float> gain;
+    if (apvts.getRawParameterValue ("partialManual")->load() > 0.5f && ! partialGains.empty())
+        spectrum::resolveGains (tmpl.partials, partialGains, gain);
+    return dissonance::analysisSpectrum (tmpl.partials, gain, f0Hz);
+}
+
+//==============================================================================
 bool FractalAdditiveAudioProcessor::generateDissonanceScale (int count, bool useMaxima,
                                                              double periodRatio,
                                                              const juce::String& periodSclLine,
@@ -966,29 +1004,15 @@ bool FractalAdditiveAudioProcessor::generateDissonanceScale (int count, bool use
         return false;
     }
 
-    // Analyse the spectrum the synth is REALLY producing right now (pure recompute
-    // of the current settings; message thread, no audio-thread interaction).
-    const auto tmpl = spectrum::compileSpectrum (currentSettings());
-    if (tmpl.partials.empty())
+    // Analyse the spectrum the synth is REALLY producing (published template at its
+    // sounding amplitudes, per-partial edits included) at the register it is really
+    // played in - the same spectrum and the same anchor as the degree list that
+    // colours the result, because the two sets of heights sit side by side.
+    const auto spec = analysisSpectrumAt (analysisAnchorHz());
+    if (spec.empty())
     {
         errorOut = "The current settings produce no partials - nothing to analyse.";
         return false;
-    }
-
-    // Anchor at middle C times the A-reference, like the audible tuning itself.
-    const double f0 = TuningManager::kRefFreq * tuning.referenceScale();
-    std::vector<dissonance::Partial> spec;
-    spec.reserve (tmpl.partials.size());
-    for (const auto& p : tmpl.partials)
-        spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
-
-    // Analysis cap: the curve's shape is set by the strongest partials; capping
-    // keeps the 1-cent sweep instant. (Analysis only - the SOUND is never capped.)
-    if (spec.size() > 64)
-    {
-        std::sort (spec.begin(), spec.end(),
-                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
-        spec.resize (64);
     }
 
     const auto curve = dissonance::dissonanceCurve (spec, periodRatio, 1.0);
@@ -1078,53 +1102,15 @@ FractalAdditiveAudioProcessor::computeActiveScaleDissonance() const
 {
     std::vector<DissDegreeInfo> out;
 
-    // Read the template that is ALREADY PUBLISHED rather than compiling a fresh one.
-    //
-    // This used to call compileSpectrum() synchronously, on the message thread, with no
-    // abort flag - and the editor's 30 Hz timer re-runs it whenever the template
-    // generation changes. Put a modulator on any spectrum control and the generation
-    // changes on essentially every tick, so the message thread spent all its time
-    // compiling. At fractalLevel > 1 one compile is hundreds of milliseconds, and the
-    // processor's own 60 Hz timerCallback - the ONLY place a modulated Base is ever
-    // sampled into a rebuild request - was starved. The spectrum froze at whatever Base
-    // value was caught last and the fader's modulation marker stopped moving: exactly
-    // "Base no longer moves and the LFO doesn't move it", and it never recovered because
-    // the starvation persisted for as long as fractal stayed above 1.
-    //
-    // The analysis keeps only the 64 loudest partials anyway, so being at most one
-    // publish behind is invisible here. A fresh compile is kept only as the cold-start
-    // fallback, before the builder has published anything at all.
-    std::vector<dissonance::Partial> spec;
-
-    // Anchor the partials at the ACTUAL sounding tonic of the active tuning, so the
-    // absolute frequencies (which Sethares roughness depends on) are correct.
-    double f0 = tuning.frequencyForNote (60);
-    if (! (f0 > 0.0) || ! std::isfinite (f0))
-        f0 = TuningManager::kRefFreq * tuning.referenceScale();
-
-    if (const auto* live = spectrumEngine.getLive(); live != nullptr && ! live->partials.empty())
-    {
-        spec.reserve (live->partials.size());
-        for (const auto& p : live->partials)
-            spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
-    }
-    else
-    {
-        const auto tmpl = spectrum::compileSpectrum (currentSettings());
-        if (tmpl.partials.empty())
-            return out;
-        spec.reserve (tmpl.partials.size());
-        for (const auto& p : tmpl.partials)
-            spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
-    }
+    // The shared analysis spectrum (published template, sounding amplitudes, 64-cap)
+    // at the ACTUAL sounding tonic of the active tuning. Reading the PUBLISHED
+    // template rather than recompiling is what analysisSpectrumAt exists for: this
+    // is re-run from the editor's timer, and a synchronous compile here used to
+    // starve the 60 Hz timerCallback that samples a modulated Base (the spectrum
+    // froze at whatever Base value was caught last, for as long as fractal > 1).
+    const auto spec = analysisSpectrumAt (analysisAnchorHz());
     if (spec.empty())
         return out;
-    if (spec.size() > 64) // analysis cap only; the SOUND is never capped
-    {
-        std::sort (spec.begin(), spec.end(),
-                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
-        spec.resize (64);
-    }
 
     const int D = juce::jmax (1, getScaleDegrees());
     out.reserve ((size_t) D + 1);
@@ -1304,25 +1290,17 @@ bool FractalAdditiveAudioProcessor::startChordSearch (int notes, double periodRa
         chordThread->join();
     chordCancel = false;
 
-    // Analyse the spectrum the synth is REALLY producing right now (same prep as the
-    // dyad Transmute: absolute frequencies anchored at middle C x the A-reference,
-    // strongest-64 analysis cap - analysis only, never the sound).
-    const auto tmpl = spectrum::compileSpectrum (currentSettings());
-    if (tmpl.partials.empty())
+    // Analyse the spectrum the synth is REALLY producing (same prep as the scale
+    // generator and the degree list: published template, SOUNDING amplitudes with
+    // the user's per-partial edits, strongest-64 analysis cap, anchored at the
+    // active tuning's real key-60 tonic). The realtime follower re-runs this on
+    // every spectrum change, so reading the published template also spares it a
+    // full recompile per trigger.
+    std::vector<dissonance::Partial> spec = analysisSpectrumAt (analysisAnchorHz());
+    if (spec.empty())
     {
         errorOut = "The current settings produce no partials - nothing to analyse.";
         return false;
-    }
-    const double f0 = TuningManager::kRefFreq * tuning.referenceScale();
-    std::vector<dissonance::Partial> spec;
-    spec.reserve (tmpl.partials.size());
-    for (const auto& p : tmpl.partials)
-        spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
-    if (spec.size() > 64)
-    {
-        std::sort (spec.begin(), spec.end(),
-                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
-        spec.resize (64);
     }
 
     chordPeriodSclLine = periodSclLine;
@@ -1691,38 +1669,19 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
     nadUsedD  = D;
     std::vector<double> ratios ((size_t) D);
     for (int d = 0; d < D; ++d) ratios[(size_t) d] = getDegreeRatio (d);
-    // Take the PUBLISHED template, not a fresh compile. Two reasons: this runs on the
-    // message thread and a compile at fractalLevel > 1 costs hundreds of milliseconds
-    // (which starved the 60 Hz timer that samples a modulated Base - see
-    // computeActiveScaleDissonance); and the Degrees list now reads the published one, so
-    // recompiling here would let the two lists disagree, which the anchor comment below
-    // explicitly forbids. Copied, because the search continues on a worker thread and the
-    // engine's slot can be recycled under it.
-    spectrum::SpectrumTemplate tmpl;
-    if (const auto* live = spectrumEngine.getLive(); live != nullptr && ! live->partials.empty())
-        tmpl.partials = live->partials;
-    else
-        tmpl = spectrum::compileSpectrum (currentSettings());
     // The period the search reasons with: the tuning's own unless the user typed a
     // different one in the box (it decides what counts as an equal-step scale and
     // which intervals are just the same pitch class again).
     const double periodC = 1200.0 * std::log2 (std::max (1.0e-9,
                               periodOverride > 1.0 ? periodOverride : tuning.periodRatio()));
     const double minGap = juce::jlimit (0.0, 600.0, minGapCents);
-    // Same absolute anchor as the Degrees list (computeActiveScaleDissonance):
-    // Sethares roughness depends on register, so both lists must agree.
-    double f0 = tuning.frequencyForNote (60);
-    if (! (f0 > 0.0) || ! std::isfinite (f0))
-        f0 = TuningManager::kRefFreq * tuning.referenceScale();
-    std::vector<dissonance::Partial> spec;
-    spec.reserve (tmpl.partials.size());
-    for (const auto& p : tmpl.partials) spec.push_back ({ (double) p.ratio * f0, (double) p.amp });
-    if (spec.size() > 64)
-    {
-        std::sort (spec.begin(), spec.end(),
-                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
-        spec.resize (64);
-    }
+    // The SAME analysis spectrum and absolute anchor as the Degrees list
+    // (computeActiveScaleDissonance): Sethares roughness depends on register and on
+    // amplitude, and the two lists sit side by side, so they must score the same
+    // spectrum from the same register or their numbers are incomparable. The vector
+    // is an owned copy, because the search continues on a worker thread and the
+    // engine's live slot can be recycled under it.
+    std::vector<dissonance::Partial> spec = analysisSpectrumAt (analysisAnchorHz());
 
     nadBusy = true;
     nadThread = std::make_unique<std::thread> ([this, notes, D, periodC, rootOnly, maxMode, minGap,
@@ -1881,9 +1840,7 @@ std::vector<double> FractalAdditiveAudioProcessor::tuningAsTargetAlphas (double&
         if (r > 0.0 && std::isfinite (r)) a.push_back (r);
     }
     // Same absolute anchor as the Degrees list and the n-ad search, so all three agree.
-    f0Out = tuning.frequencyForNote (60);
-    if (! (f0Out > 0.0) || ! std::isfinite (f0Out))
-        f0Out = TuningManager::kRefFreq * tuning.referenceScale();
+    f0Out = analysisAnchorHz();
     return a;
 }
 
@@ -1909,26 +1866,12 @@ double FractalAdditiveAudioProcessor::measureCurrentAgainstTarget (const std::ve
                                                                   double f0Hz, bool rootOnly) const
 {
     if (alphas.empty() || ! (f0Hz > 0.0)) return 0.0;
-    // The PUBLISHED template, not a fresh compile: this runs on the message thread and a
-    // compile at fractalLevel > 1 costs hundreds of milliseconds (the same reason
-    // startNadCompute reads the published one).
-    std::vector<dissonance::Partial> spec;
-    if (const auto* live = spectrumEngine.getLive(); live != nullptr && ! live->partials.empty())
-    {
-        spec.reserve (live->partials.size());
-        for (size_t i = 0; i < live->partials.size(); ++i)
-        {
-            const float g = i < live->gain.size() ? live->gain[i] : 1.0f;
-            spec.push_back ({ (double) live->partials[i].ratio * f0Hz, (double) live->partials[i].amp * g });
-        }
-    }
+    // The shared analysis spectrum: published template, SOUNDING amplitudes (this is
+    // the "really sounding" number, so the user's per-partial edits must weigh in),
+    // 64-cap. Anchored at the caller's f0 - the same anchor the adaptation itself
+    // used - so "sounding now" and the adaptation's before/after are one scale.
+    const auto spec = analysisSpectrumAt (f0Hz);
     if (spec.empty()) return 0.0;
-    if (spec.size() > 64)   // ANALYSIS ONLY - the sound keeps every partial it has
-    {
-        std::sort (spec.begin(), spec.end(),
-                   [] (const dissonance::Partial& a, const dissonance::Partial& b) { return a.amp > b.amp; });
-        spec.resize (64);
-    }
     return dissonance::targetScore (spec, alphas, rootOnly);
 }
 
