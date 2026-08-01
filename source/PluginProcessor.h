@@ -200,31 +200,51 @@ public:
     struct TimbreTextAction : public juce::UndoableAction
     {
         TimbreTextAction (FractalAdditiveAudioProcessor& p, juce::String prev, juce::String next)
-            : proc (p), after (std::move (next)), before (std::move (prev)) {}
-        bool perform() override { return applyOne (after); }
-        bool undo() override    { return applyOne (before); }
+            : proc (p), after (std::move (next)), before (std::move (prev)),
+              // The PREVIOUS spectrum's tuning provenance, captured here (construction
+              // happens before loadTimbreText wipes it): undoing a typed spectrum back
+              // to an adapted one must restore the "Load spectrum's tuning" button too,
+              // or Ctrl+Z would bring the spectrum back with its origin quietly gone.
+              beforeProvName (p.specProvName), beforeProvSource (p.specProvSource),
+              beforeProvPeriod (p.specProvPeriod) {}
+        bool perform() override { return applyOne (after, false); }
+        bool undo() override    { return applyOne (before, true); }
         int  getSizeInUnits() override { return (int) (after.length() + before.length()) * 2 + 32; }
-        bool applyOne (const juce::String& t)
+        bool applyOne (const juce::String& t, bool restoreProv)
         {
             juce::String e;
-            if (t.trim().isEmpty()) { proc.clearTimbre(); return true; }
-            return proc.loadTimbreText (t, e);
+            bool ok = true;
+            if (t.trim().isEmpty()) proc.clearTimbre();
+            else                    ok = proc.loadTimbreText (t, e);
+            // loadTimbreText/clearTimbre both clear provenance (typed text has none);
+            // going BACK re-attaches the origin the previous spectrum really had.
+            if (ok && restoreProv)
+            {
+                proc.specProvName   = beforeProvName;
+                proc.specProvSource = beforeProvSource;
+                proc.specProvPeriod = beforeProvPeriod;
+            }
+            return ok;
         }
         FractalAdditiveAudioProcessor& proc;
         juce::String after, before;
+        juce::String beforeProvName, beforeProvSource, beforeProvPeriod;
     };
 
     // Type a custom tuning THROUGH the undo stack. Returns false (with errorOut set) if
     // the text does not parse, in which case nothing is pushed.
     bool loadTimbreTextUndoable (const juce::String& text, juce::String& errorOut)
     {
-        // Capture the previous text BEFORE applying anything: loadTimbreText below
-        // already overwrites timbreSource, so asking for it afterwards would record the
-        // NEW value as the one to go back to - an undo that undid nothing.
-        const auto before = timbreSource;
+        // The ACTION is constructed BEFORE applying anything: its constructor captures
+        // the previous text's provenance, and loadTimbreText below clears that (typed
+        // text has none) - constructing afterwards recorded an empty origin as the one
+        // to go back to, so undoing a typed spectrum back to an adapted one silently
+        // lost its "Load spectrum's tuning" button (caught by RhythmVerify b2). The
+        // same order protects `before` = timbreSource, which the load overwrites too.
+        std::unique_ptr<TimbreTextAction> act (new TimbreTextAction (*this, timbreSource, text));
         if (! loadTimbreText (text, errorOut)) return false;   // rejected: nothing is pushed
         undoManager.beginNewTransaction();
-        undoManager.perform (new TimbreTextAction (*this, before, text));
+        undoManager.perform (act.release());
         return true;
     }
     int  getTimbreNoteCount() const noexcept { return (int) timbreDegrees.size(); }
@@ -679,8 +699,14 @@ public:
     // the same chord an octave down wants a different spectrum.
     // `realtime` picks the SMALLER register cap (see Dissonance.h): the follower must keep
     // up with the fingers, and the cost is exactly linear in the number of registers.
+    // `targetIsTuning` marks the runs whose alphas came from tuningAsTargetAlphas: only
+    // those record the active tuning as the result's provenance (see AdaptInfo). The
+    // CALLER states it because the alphas alone cannot say where they came from - a held
+    // chord can spell out the scale exactly, and guessing from values would pin a tuning
+    // onto a spectrum the user derived from their fingers.
     bool startSpectrumAdapt (const SpectrumAdaptSettings& s, const std::vector<double>& targetAlphas,
-                             double f0Hz, juce::String& errorOut, bool realtime = false);
+                             double f0Hz, juce::String& errorOut, bool realtime = false,
+                             bool targetIsTuning = false);
     void cancelSpectrumAdapt() { adaptCancel = true; }
     bool  isSpectrumAdaptRunning() const noexcept { return adaptRunning.load(); }
     float getSpectrumAdaptProgress() const noexcept { return adaptProgress.load(); }
@@ -703,6 +729,13 @@ public:
         double seedMean = 0.0, seedWorst = 0.0;
         double worstHz = 0.0;         // the register that scores worst
         std::vector<double> perRegister, registerF0;
+        // PROVENANCE: the tuning this result was adapted TO, captured when the search
+        // was STARTED (the user can load another tuning while the worker runs, and the
+        // result still belongs to the one it was aimed at). Empty when the target was
+        // the held chord, or the active tuning had no reloadable source (MTS/Equal).
+        // Travels inside the result - not in a member beside it - so a newer search's
+        // target can never be pinned onto an older search's spectrum.
+        juce::String provName, provSource, provPeriod;
     };
     AdaptInfo getSpectrumAdaptResult() const
     {
@@ -877,6 +910,46 @@ public:
     }
     juce::String getPendingPresetTuningName() const { return presetPendingSclName; }
     bool loadPendingPresetTuning (juce::String& errorOut);
+
+    //==========================================================================
+    // SPECTRUM PROVENANCE: the tuning the CURRENT custom spectrum was derived from.
+    //
+    // Recorded (as name + the FULL source text, like bankSource - a bank slot or a
+    // file may be gone later, so the scale text itself is what is stored) by every
+    // path that derives a spectrum FROM a tuning:
+    //   * Adapt with the TUNING as target (hand-pressed or the SpectrumFromTuning
+    //     realtime link) - e.g. the dissonance-minimum spectrum of a tuning;
+    //   * a .scl/.tun loaded as the Custom Engine's spectrum (the file IS a tuning,
+    //     so "the tuning this spectrum came from" is exactly that file).
+    // NOT recorded - the honest rule for each:
+    //   * typed intervals and the random generator (no tuning was involved);
+    //   * Adapt with the HELD CHORD as target (the notes under the fingers are the
+    //     origin, not the scale as a whole - and an MTS/equal-mode tuning could not
+    //     be re-loaded from text anyway);
+    //   * an adapt run while the active tuning cannot be captured as text
+    //     (MTS-ESP / Equal mode: there is no source to bring back later).
+    // Cleared whenever the spectrum is replaced by something with no tuning origin
+    // (typed text, random, clearTimbre), carried through undo/redo snapshots, the
+    // playground's winner corner, save/reload and presets.
+    //
+    // The Tuning panel shows a "Load spectrum's tuning" button while this exists
+    // (disabled when that tuning is already active), which loads it through the
+    // normal undoable tuning path - see loadSpectrumProvenanceTuning().
+    bool hasSpectrumProvenance() const noexcept
+    { return specProvSource.isNotEmpty() && timbreLoaded(); }
+    juce::String getSpectrumProvenanceName() const { return specProvName; }
+    // Is the provenance tuning the one ACTIVE now? Same text-equality rule as
+    // hasPendingPresetTuning, plus the mode: a matching .scl sitting behind
+    // MTS/Equal mode is loaded but not in force, so it does not count as active.
+    bool spectrumProvenanceIsActive() const
+    {
+        return specProvSource.isNotEmpty()
+            && specProvSource == tuning.getScalaSource()
+            && getTuningMode() == (int) TuningManager::Mode::Scala;
+    }
+    // Load the provenance tuning as the ACTIVE tuning, as one undo transaction
+    // (TuningSnapshotAction), so Ctrl+Z brings the displaced tuning straight back.
+    bool loadSpectrumProvenanceTuning (juce::String& errorOut);
     // ctrl+click: folded into the period, sorted. exactText, when given, is the
     // spec the user typed, kept verbatim so a ratio stays a ratio in the .scl.
     bool addNoteToTuning  (double ratioFromTonic, juce::String& errorOut,
@@ -1006,6 +1079,12 @@ private:
     std::vector<float> timbreDegrees;
     float              timbrePeriod = 2.0f;
     juce::String       timbreName, timbreSource;
+    // SPECTRUM PROVENANCE (see the public block above): the tuning the current custom
+    // spectrum was derived from - display name, the full reloadable source text, and a
+    // table's period spec (the same triple TuningManager::Snapshot restores from).
+    // Kept as text like bankSource, never as a slot/file reference: the slot can be
+    // cleared and the file deleted, and the button must still be able to deliver.
+    juce::String       specProvName, specProvSource, specProvPeriod;
 
     //== RANDOM SPECTRUM trigger ("specRandom") =================================
     // Edge detection lives in a parameter LISTENER, not in the 60 Hz poll, because a
@@ -1131,6 +1210,10 @@ private:
         bool manual = false;
         bool timbreOn = false;
         bool taken = false;
+        // The spectrum's tuning provenance travels WITH the spectrum it describes:
+        // undoing an adaptation back to a typed spectrum must also take the
+        // "Load spectrum's tuning" button away, and redoing must bring it back.
+        juce::String provName, provSource, provPeriod;
     };
     TuningManager::Snapshot rtTuneBase;
     int  rtTuneBaseMode = 0;
@@ -1159,6 +1242,10 @@ private:
         std::vector<spectrum::PartialGain> gains;
         bool manual = false;                                  // "partialManual"
         juce::String timbreName, timbreSource;                // the Custom Engine's own scale
+        // The corner spectrum's tuning provenance, read from the preset's TIMBRE child:
+        // when this corner WINS the discrete state, its spectrum arrives with the origin
+        // it was saved with - and a winner saved without one clears the button honestly.
+        juce::String provName, provSource, provPeriod;
         int  rtLink = 0;                                      // the realtime/adaptive link it was saved with
         RtSettings rtSet;
         // shared_ptr, and const: a drag posts a blend job every 16 ms and the worker may

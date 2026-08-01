@@ -912,6 +912,12 @@ bool FractalAdditiveAudioProcessor::loadTimbreFile (const juce::File& f, juce::S
     }
 
     auto text = f.loadFileAsString();
+    // PROVENANCE: a scale file loaded AS the spectrum is itself a tuning, so "the
+    // tuning this spectrum came from" is exactly this file. The ORIGINAL text is kept
+    // (captured here, before any .tun -> .scl conversion below rewrites `text`):
+    // loading it back as the tuning must give what loading the FILE as a tuning would
+    // have given, not Fibló's converted paraphrase of it.
+    const auto provText = text;
     // Same conversion as the tuning loader: a .tun's degrees are a perfectly good
     // spectrum, and timbreSource is re-parsed as .scl on state restore, so what gets
     // stored has to be the converted .scl and not the .tun.
@@ -943,6 +949,9 @@ bool FractalAdditiveAudioProcessor::loadTimbreFile (const juce::File& f, juce::S
     timbrePeriod = (float) period;
     timbreName   = f.getFileNameWithoutExtension();
     timbreSource = text;
+    specProvName   = timbreName;
+    specProvSource = provText;
+    specProvPeriod.clear(); // a repeating file needs no table period (tables are refused above)
     setTimbreOnParam (true);
     addRecentScl (f);
     return true;
@@ -1031,6 +1040,12 @@ bool FractalAdditiveAudioProcessor::loadTimbreText (const juce::String& text, ju
     timbrePeriod  = period;
     timbreName    = "typed";
     timbreSource  = text;
+    // Typed text (and the random generator, which comes through here) has no tuning
+    // origin, so any previous spectrum's provenance dies with that spectrum. The two
+    // paths that DO have one (applySpectrumAdapt, restoreState) re-set it right after
+    // this call - which is what keeps a stale "Load spectrum's tuning" button from
+    // offering the ORIGIN OF A SPECTRUM THAT IS NO LONGER LOADED.
+    specProvName.clear(); specProvSource.clear(); specProvPeriod.clear();
     setTimbreOnParam (true);
     return true;
 }
@@ -1136,6 +1151,9 @@ void FractalAdditiveAudioProcessor::clearTimbre()
     timbreDegrees.clear();
     timbreName.clear();
     timbreSource.clear();
+    // No spectrum, no origin: provenance describes the LOADED spectrum, and keeping it
+    // past a clear would offer a tuning "this spectrum" never came from (there is none).
+    specProvName.clear(); specProvSource.clear(); specProvPeriod.clear();
 }
 
 //==============================================================================
@@ -2134,7 +2152,7 @@ double FractalAdditiveAudioProcessor::estimateAdaptMs (const SpectrumAdaptSettin
 bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSettings& s,
                                                         const std::vector<double>& targetAlphas,
                                                         double f0Hz, juce::String& errorOut,
-                                                        bool realtime)
+                                                        bool realtime, bool targetIsTuning)
 {
     const int N = juce::jlimit (2, 24, s.partials);
     if (targetAlphas.empty() || ! (f0Hz > 0.0) || ! std::isfinite (f0Hz))
@@ -2225,11 +2243,22 @@ bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSetti
     adaptProgress    = 0.0f;
     adaptRunning     = true;
 
+    // PROVENANCE, captured NOW (message thread) and carried INSIDE the result: the user
+    // can load another tuning while the worker runs, and the finished spectrum still
+    // belongs to the tuning it was aimed at, not to whatever is active when it lands.
+    // Only a tuning-targeted run gets one, and only when the active tuning can actually
+    // be brought back from text (Scala mode with a source; MTS-ESP and Equal mode have
+    // no reloadable source, and recording a stale .scl that is NOT what the alphas came
+    // from would make the button load the wrong tuning while claiming this one).
+    TuningManager::Snapshot prov;
+    if (targetIsTuning && getTuningMode() == (int) TuningManager::Mode::Scala)
+        prov = tuning.captureTuning();
+
     // `regs` was resolved above, BEFORE the thread starts and before the cost bound was
     // measured, from the same helper the panel reads - so the run, the read-out and the
     // price on the button are the same registers by construction.
     adaptThread = std::make_unique<std::thread> (
-        [this, seed = std::move (seed), alphas = targetAlphas, f0Hz, s, N, gap, topRatio, regs]()
+        [this, seed = std::move (seed), alphas = targetAlphas, f0Hz, s, N, gap, topRatio, regs, prov]()
         {
             const auto goal = s.goal == 1 ? dissonance::Goal::Max
                             : s.goal == 2 ? dissonance::Goal::Range
@@ -2263,6 +2292,9 @@ bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSetti
                 info.registerF0  = res.registerF0;
                 info.worstHz     = juce::isPositiveAndBelow (res.worstIndex, (int) res.registerF0.size())
                                        ? res.registerF0[(size_t) res.worstIndex] : f0Hz;
+                info.provName    = prov.name;
+                info.provSource  = prov.source;
+                info.provPeriod  = prov.periodSpec;
                 {
                     const juce::ScopedLock sl (adaptLock);
                     adaptResult = std::move (info);
@@ -2346,6 +2378,12 @@ bool FractalAdditiveAudioProcessor::applySpectrumAdapt (bool undoable, juce::Str
 
     if (! loadTimbreText (txt, errorOut))
         return false;
+    // AFTER loadTimbreText (which clears it as "typed text"): this spectrum's origin is
+    // the tuning the search was aimed at, carried inside the result itself - empty when
+    // the target was a held chord, in which case the clear above is the truth.
+    specProvName   = info.provName;
+    specProvSource = info.provSource;
+    specProvPeriod = info.provPeriod;
 
     // Amplitudes, resolved against what the compiler ACTUALLY produced. The gain is a dB
     // OFFSET from the compiled amplitude, so it can only be computed once the compiled
@@ -2433,6 +2471,9 @@ FractalAdditiveAudioProcessor::SpecSnapshot FractalAdditiveAudioProcessor::captu
     s.manual     = apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
     s.timbreOn   = apvts.getRawParameterValue ("timbreOn")->load() > 0.5f;
     s.taken      = true;
+    s.provName   = specProvName;   // the origin is part of the spectrum being snapshot
+    s.provSource = specProvSource;
+    s.provPeriod = specProvPeriod;
     return s;
 }
 
@@ -2441,6 +2482,11 @@ void FractalAdditiveAudioProcessor::applySpecSnapshot (const SpecSnapshot& s)
     juce::String err;
     if (s.timbreText.trim().isEmpty()) clearTimbre();
     else                              loadTimbreText (s.timbreText, err);
+    // AFTER the load (loadTimbreText clears provenance): the snapshot's origin belongs
+    // to the snapshot's spectrum, so undo/redo moves the two together - see SpecSnapshot.
+    specProvName   = s.provName;
+    specProvSource = s.provSource;
+    specProvPeriod = s.provPeriod;
     setPartialGains (s.gains, s.manual);
     if (auto* p = apvts.getParameter ("partialManual"))
         p->setValueNotifyingHost (s.manual ? 1.0f : 0.0f);
@@ -2707,7 +2753,8 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
         // The cost is exactly linear in the number of registers and this runs on a ~250 ms
         // throttle, so seven of them would simply stop it keeping up with the fingers. The
         // panel says so out loud (see the "registers" read-out) rather than degrading quietly.
-        if (startSpectrumAdapt (rtSet.adapt, alphas, f0, err, /*realtime*/ true))
+        if (startSpectrumAdapt (rtSet.adapt, alphas, f0, err, /*realtime*/ true,
+                                /*targetIsTuning*/ ! fromChord))
         {
             ++rtStarts;
             // Remember what this search is aimed at, not what merely passed by: the
@@ -3106,6 +3153,17 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         tim.setProperty ("name",   timbreName,   nullptr);
         tim.setProperty ("source", timbreSource, nullptr);
         tim.setProperty ("on",     isTimbreActive(), nullptr);
+        // The spectrum's tuning provenance rides on the TIMBRE child because it IS a
+        // property of this spectrum: saved with it, gone with it. Full source text
+        // (like bankSource), so the button still delivers when the original bank
+        // slot/file no longer exists at reload time.
+        if (specProvSource.isNotEmpty())
+        {
+            tim.setProperty ("provName",   specProvName,   nullptr);
+            tim.setProperty ("provSource", specProvSource, nullptr);
+            if (specProvPeriod.isNotEmpty())
+                tim.setProperty ("provPeriod", specProvPeriod, nullptr);
+        }
         state.appendChild (tim, nullptr);
     }
 
@@ -3464,6 +3522,16 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
             loadTimbreText (src, err);
             setTimbreOnParam ((bool) tim.getProperty ("on", true) && ! timbreDegrees.empty());
         }
+        // Provenance LAST: both load paths above clear it (they cannot tell a saved
+        // adaptation from hand-typed text), and only the state knows the difference.
+        // Restored only when a spectrum really came back - provenance for a spectrum
+        // that failed to parse would offer the origin of nothing.
+        if (! timbreDegrees.empty())
+        {
+            specProvName   = tim.getProperty ("provName").toString();
+            specProvSource = tim.getProperty ("provSource").toString();
+            specProvPeriod = tim.getProperty ("provPeriod").toString();
+        }
     }
 
     // THE PLAYGROUND, restored BEFORE the realtime link below: engaging it stands the
@@ -3717,6 +3785,12 @@ bool FractalAdditiveAudioProcessor::assignPlaygroundCorner (int corner, const ju
         {
             c.timbreName   = tim.getProperty ("name").toString();
             c.timbreSource = tim.getProperty ("source").toString();
+            // Its spectrum's tuning provenance travels with it (see PlaygroundCorner):
+            // the winner corner must deliver its spectrum WITH the origin it was saved
+            // with, or morphing onto an adapted preset would silently drop the button.
+            c.provName   = tim.getProperty ("provName").toString();
+            c.provSource = tim.getProperty ("provSource").toString();
+            c.provPeriod = tim.getProperty ("provPeriod").toString();
         }
         if (auto pg = tree.getChildWithName ("PGAINS"); pg.isValid())
             for (const auto& tok : juce::StringArray::fromTokens (pg.getProperty ("v").toString(), " ", ""))
@@ -3974,6 +4048,12 @@ void FractalAdditiveAudioProcessor::applyPlaygroundDiscreteState (int corner)
         {
             loadTimbreText (c.timbreSource, err);
         }
+        // AFTER the loads (loadTimbreText clears provenance): the winner's spectrum
+        // arrives with the winner's own origin - which is empty when its preset had
+        // none, exactly the clear the button needs to disappear honestly.
+        specProvName   = c.provName;
+        specProvSource = c.provSource;
+        specProvPeriod = c.provPeriod;
     }
 
     // The per-partial amplitude edits, STORED without republishing: the blend that
@@ -4067,6 +4147,46 @@ bool FractalAdditiveAudioProcessor::loadPendingPresetTuning (juce::String& error
     applyTuningMode ((int) TuningManager::Mode::Scala);
     clearSegmentSource();
     syncBankSelector (bankAutoAdd (presetPendingSclName, presetPendingSclSource));
+    return true;
+}
+
+// The Tuning panel's "Load spectrum's tuning" button: bring back the tuning the current
+// custom spectrum was derived from (see the provenance block in the header).
+bool FractalAdditiveAudioProcessor::loadSpectrumProvenanceTuning (juce::String& errorOut)
+{
+    if (specProvSource.isEmpty())
+    {
+        errorOut = "This spectrum does not come from a tuning.";
+        return false;
+    }
+    if (spectrumProvenanceIsActive())
+    {
+        // The editor disables the button in this state; refusing here too keeps a host
+        // script (or a race with the 60 Hz poll) from pushing a do-nothing undo step.
+        errorOut = "That tuning is already the active one.";
+        return false;
+    }
+    // THROUGH THE UNDO STACK, unlike loadPendingPresetTuning: the displaced tuning must
+    // be one Ctrl+Z away. The snapshots are taken first, the tuning applied directly
+    // (exactly like loadPendingPresetTuning), and THEN the action is performed - whose
+    // perform() re-applies the same snapshot idempotently (the same pattern
+    // commitRealtimeBaseline relies on), so failure can be reported BEFORE anything is
+    // pushed: a failed load that still left an undo step would undo to a lie.
+    const auto before     = tuning.captureTuning();
+    const int  beforeMode = getTuningMode();
+    if (! tuning.restoreTuning ({ specProvName, specProvSource, specProvPeriod }, errorOut))
+        return false;
+    if (auto* p = apvts.getParameter ("tuningMode"))
+        p->setValueNotifyingHost (p->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
+    applyTuningMode ((int) TuningManager::Mode::Scala);
+    clearSegmentSource();
+    syncBankSelector (bankAutoAdd (specProvName.isNotEmpty() ? specProvName
+                                                             : juce::String ("spectrum's tuning"),
+                                   specProvSource));
+    undoManager.beginNewTransaction();
+    undoManager.perform (new TuningSnapshotAction (*this, before, beforeMode,
+                                                   tuning.captureTuning(),
+                                                   (int) TuningManager::Mode::Scala));
     return true;
 }
 

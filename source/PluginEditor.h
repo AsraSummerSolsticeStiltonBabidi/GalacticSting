@@ -3195,6 +3195,11 @@ private:
     // could have, and three call sites setting two of the three properties is how that
     // happens. Called by applyLanguage() and by the timer whenever the engine changes.
     void refreshCustomEngineButtons();
+    // The "Load spectrum's tuning" button's word, enabled state and tooltip, in ONE
+    // place for the same reason as refreshCustomEngineButtons: called by applyLanguage()
+    // and the timer, it must never say "load" while the click would refuse (already
+    // active), so the word and the enabled state have to move together.
+    void refreshSpectrumTuningButton();
     // Repaint every control inside the SPECTRUM panel in the engine's colour. The panel
     // is ONE box now, so a fader still wearing its old per-cell hue would be the only
     // thing on screen still claiming the compartments are separate boxes.
@@ -3277,6 +3282,12 @@ private:
     juce::TextButton recentOpenBtn;     // opens the floating Recent list
     juce::TextButton loadItsSpectrumBtn; // .scl written by this synth: restore its patch
     juce::TextButton loadPresetTuningBtn; // the loaded PRESET carries a different tuning
+    // The current CUSTOM SPECTRUM was derived from a tuning (adapted to it, or loaded
+    // from a scale file): this loads that tuning. Shown only while the provenance
+    // exists; DISABLED (word changes to say so) when that tuning is already active,
+    // because reloading what is active would only push a do-nothing undo step.
+    juce::TextButton loadSpectrumTuningBtn;
+    juce::String     lastSpectrumTuningSig; // skip the per-tick refresh when nothing moved
     // loadTimbreButton is ONE button with two jobs: "Load" while no custom spectrum
     // exists, "Remove" once one does. The Custom-Engine On/Off pill that used to sit
     // beside it is gone - with the engine chips deciding which engine is in force, an

@@ -15,6 +15,7 @@
 
 #include <juce_dsp/juce_dsp.h>
 
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -3908,6 +3909,125 @@ int main()
                          p.getTimbreSource().isEmpty() ? "empty (as it was)" : "back to its old value");
             check (p.getTimbreSource() != adapted, "one Ctrl+Z undoes the whole adaptation");
             p.undoManager.redo();
+        }
+
+        //-- (b2) SPECTRUM PROVENANCE: a spectrum derived FROM a tuning remembers which
+        //   tuning, as full source text; the Tuning panel's "Load spectrum's tuning"
+        //   brings it back note-for-note after the active tuning was replaced, a save
+        //   and a reload - and it is honestly ABSENT where no tuning was the origin.
+        {
+            std::printf ("\nspectrum provenance (\"load spectrum's tuning\"):\n");
+            juce::String err;
+            // What this block must hand back to the tests downstream (they assume the
+            // tuning and spectrum state (b) left): captured now, restored at the end.
+            const auto origSrc  = p.activeSclSource();
+            const auto origName = p.tuningScaleName();
+            // A distinctive origin: 7-EDO, nothing else in this file uses it.
+            juce::String edo7 ("! edo7.scl\nseven\n 7\n!\n");
+            for (int i = 1; i <= 7; ++i)
+                edo7 << " " << juce::String (1200.0 * i / 7.0, 5) << "\n";
+            check (p.loadScalaText (edo7, "edo7", err), "the origin tuning (7-EDO) loads");
+            std::array<double, 128> want {};
+            for (int n = 0; n < 128; ++n) want[(size_t) n] = p.getNoteFrequency (n);
+
+            // Derive the spectrum FROM that tuning (the dissonance-minimum spectrum of
+            // 7-EDO): the caller states the target is the tuning, exactly as the panel's
+            // Adapt with target = tuning does.
+            Proc::SpectrumAdaptSettings st;
+            st.partials = 4; st.periodRatio = 2.0; st.minGapCents = 50.0;
+            st.rootOnly = true; st.goal = 0; st.shapeAmps = false;
+            double f0 = 0.0;
+            const auto alphas = p.tuningAsTargetAlphas (f0);
+            check (p.startSpectrumAdapt (st, alphas, f0, err, false, /*targetIsTuning*/ true),
+                   "a tuning-targeted adaptation starts");
+            for (int i = 0; i < 2000 && p.isSpectrumAdaptRunning(); ++i) juce::Thread::sleep (5);
+            check (p.applySpectrumAdapt (true, err), "and applies");
+            check (p.hasSpectrumProvenance(), "the spectrum now knows the tuning it came from");
+            check (p.spectrumProvenanceIsActive(), "which right now IS the active tuning");
+            check (p.getSpectrumProvenanceName() == "edo7", "by name");
+            // Already active = the button refuses instead of pushing a do-nothing undo.
+            check (! p.loadSpectrumProvenanceTuning (err),
+                   "and loading it while it is already active refuses out loud");
+
+            // Replace the active tuning; the provenance must survive, no longer active.
+            juce::String edo5 ("! edo5.scl\nfive\n 5\n!\n");
+            for (int i = 1; i <= 5; ++i)
+                edo5 << " " << juce::String (1200.0 * i / 5.0, 5) << "\n";
+            check (p.loadScalaText (edo5, "edo5", err), "an unrelated tuning (5-EDO) replaces it");
+            check (p.hasSpectrumProvenance() && ! p.spectrumProvenanceIsActive(),
+                   "the origin is still remembered, and no longer claims to be active");
+
+            // SAVE the whole state, reload it into a FRESH instance (the origin's bank
+            // slot / file may be long gone by then - the state itself must carry it).
+            juce::MemoryBlock saved;
+            p.getStateInformation (saved);
+            {
+                auto q = std::make_unique<Proc>();
+                q->prepareToPlay (sr, blk);
+                q->setStateInformation (saved.getData(), (int) saved.getSize());
+                q->pollParametersForTests();
+                check (q->hasSpectrumProvenance() && ! q->spectrumProvenanceIsActive(),
+                       "after save + reload the reopened instance still offers the origin");
+                const auto displaced = q->activeSclSource();
+                // THE BUTTON: load the tuning the spectrum came from.
+                check (q->loadSpectrumProvenanceTuning (err), "pressing the button loads it");
+                double worstC = 0.0;
+                for (int n = 0; n < 128; ++n)
+                    worstC = std::max (worstC, std::abs (1200.0 * std::log2 (
+                                 q->getNoteFrequency (n) / want[(size_t) n])));
+                std::printf ("  reopened + button: worst deviation from the original 7-EDO"
+                             " = %.6f cents over all 128 keys\n", worstC);
+                check (worstC < 0.01, "the original tuning is back note-for-note");
+                check (q->spectrumProvenanceIsActive(), "and the button now reports it active");
+                // ...through the normal undoable path: one Ctrl+Z = the displaced tuning.
+                q->undoManager.undo();
+                q->pollParametersForTests();
+                check (q->activeSclSource() == displaced,
+                       "one Ctrl+Z brings the displaced tuning straight back");
+            }
+
+            // THE CLEARING RULES. Typed intervals have no tuning origin...
+            check (p.loadTimbreTextUndoable ("3/2 2", err), "typing intervals replaces the spectrum");
+            check (! p.hasSpectrumProvenance(), "a typed spectrum offers no tuning (it has none)");
+            // ...but undoing back to the adapted spectrum re-attaches its origin.
+            p.undoManager.undo();
+            check (p.hasSpectrumProvenance(),
+                   "undoing back to the adapted spectrum brings its origin back with it");
+            // A random spectrum is no one's tuning either.
+            p.pressRandomSpectrum();
+            check (p.pollRandomSpectrumTrigger(), "the random generator fires");
+            check (! p.hasSpectrumProvenance(), "a random spectrum offers no tuning");
+
+            // A CHORD-targeted adaptation: the origin is the fingers, not the scale, so
+            // no provenance - the button must not claim 5-EDO fathered it.
+            {
+                juce::MidiBuffer m;
+                for (const int k : { 60, 64, 67 })
+                    m.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0);
+                p.processBlock (buf, m);
+                double cf0 = 0.0;
+                const auto held = p.heldChordAsTargetAlphas (cf0);
+                check (p.startSpectrumAdapt (st, held, cf0, err, false, /*targetIsTuning*/ false),
+                       "a chord-targeted adaptation starts");
+                for (int i = 0; i < 2000 && p.isSpectrumAdaptRunning(); ++i) juce::Thread::sleep (5);
+                check (p.applySpectrumAdapt (true, err), "and applies");
+                check (! p.hasSpectrumProvenance(),
+                       "a spectrum adapted to the held chord names no tuning as its origin");
+                juce::MidiBuffer off;
+                for (const int k : { 60, 64, 67 })
+                    off.addEvent (juce::MidiMessage::noteOff (1, k), 0);
+                p.processBlock (buf, off);
+            }
+
+            // Back to the state (b) left, so the follower tests downstream measure their
+            // own preconditions and not this block's leftovers: unwind our three spectrum
+            // transactions (the chord adapt, the random draw, the 7-EDO adaptation - the
+            // typed-intervals one was already undone above), then put the tuning back.
+            p.undoManager.undo();
+            p.undoManager.undo();
+            p.undoManager.undo();
+            check (p.loadScalaText (origSrc, origName, err),
+                   "teardown: the original tuning returns for the tests downstream");
         }
 
         //-- (c) REALTIME "tuning follows the spectrum": throttled, coalesced, and it does
