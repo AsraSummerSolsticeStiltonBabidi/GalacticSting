@@ -6408,6 +6408,52 @@ int main()
         check (! fileA.existsAsFile() && ! fileB.existsAsFile(), "run 44's presets are cleaned up");
     }
 
+    //==========================================================================
+    // --- run 45: the floating windows are OS-OWNED by the editor's window --------------
+    // "al abrir la ventana del playground, a la que muevo el mouse se pone debajo de la
+    //  ventana principal del fiblo, arregla eso"
+    // Both floating tool windows were plain SIBLING top-level windows, so the first
+    // click on the main Fiblo window raised it over the one just opened. The fix is
+    // Win32 ownership (GWLP_HWNDPARENT): an owned window stays above its owner, and
+    // only its owner - never above other applications. Windows enforces the Z-order
+    // FROM this one recorded relationship, so what a build can honestly assert is the
+    // record itself, read BACK from the OS - the raise behaviour (click the editor,
+    // drag it, type into it, floating window stays visible) is confirmed by eye in
+    // the Standalone. Peers are created HIDDEN here: nothing flashes on screen.
+#if JUCE_WINDOWS
+    {
+        std::printf ("\nrun 45: floating windows owned by the editor's top-level window:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 256);
+        auto ed = std::unique_ptr<FractalAdditiveAudioProcessorEditor> (
+                      dynamic_cast<FractalAdditiveAudioProcessorEditor*> (p->createEditor()));
+        check (ed != nullptr, "the editor builds");
+        if (ed != nullptr)
+        {
+            // The mechanism needs a native editor window to own against. Hidden: the
+            // peer exists (that is all ownership needs) but never appears on screen.
+            ed->setVisible (false);
+            ed->addToDesktop (0);
+            for (const bool playground : { false, true })
+            {
+                const auto pr = ed->floatingOwnershipProbeForTests (playground);
+                std::printf ("  %s window: on desktop %d, OS owner == editor root %d\n",
+                             playground ? "playground " : "partial-amp", (int) pr.windowOnDesktop,
+                             (int) pr.ownerIsEditorRoot);
+                check (pr.windowOnDesktop,
+                       playground ? "the playground window gets a native peer"
+                                  : "the partial-amp window gets a native peer");
+                // Read back from the OS, not from our own bookkeeping: GetWindowLongPtr
+                // (GWLP_HWNDPARENT) must name the editor's GA_ROOT window.
+                check (pr.ownerIsEditorRoot,
+                       playground ? "the OS records the editor's window as the playground's OWNER"
+                                  : "the OS records the editor's window as the partial-amp OWNER");
+            }
+            ed->removeFromDesktop();
+        }
+    }
+#endif
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

@@ -273,6 +273,14 @@ private:
     void openScalaChooser();
     void openPartialAmpWindow();   // the pencil in the SLOPE cell
     void openPlaygroundWindow();   // "Open Preset Playground", under the preset selector
+    // Build-and-wire WITHOUT showing, split out of the two open functions so the
+    // ownership probe below exercises the exact construction a real click runs.
+    void ensurePartialWindow();
+    void ensurePlaygroundWindow();
+    // THE one mechanism both floating windows use to stay above the editor: OS-level
+    // ownership (see FloatingWindowOwner.h). Called on every open, not just the first,
+    // because a host may re-dock the editor under a different top-level window.
+    void attachFloatingWindow (juce::TopLevelWindow&);
 
 public:
     // Test hooks (RhythmVerify): the playground panel is in a SEPARATE desktop window,
@@ -300,6 +308,14 @@ public:
     // Press, move to the normalised point, release - the whole gesture, through the very
     // handlers a mouse reaches.
     void playgroundDragForTests (float nx, float ny);
+    // The floating windows' OS ownership, read BACK from the OS. The Z-order behaviour
+    // itself (clicking the editor no longer buries the floating window) is enforced by
+    // Windows from this one recorded relationship, so the honest automated check is
+    // "the OS has the editor's top-level root on record as the owner" - the raise
+    // behaviour can only be confirmed by eye. The caller must have put the editor on
+    // the desktop first (hidden is fine); peers are created hidden, nothing flashes.
+    struct FloatingOwnershipProbe { bool windowOnDesktop = false, ownerIsEditorRoot = false; };
+    FloatingOwnershipProbe floatingOwnershipProbeForTests (bool playground);
 
 private:
     void refreshSlopeFreeze();     // shows that SLOPE is inert while manual mode is on

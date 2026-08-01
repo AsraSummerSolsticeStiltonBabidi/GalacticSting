@@ -60,6 +60,7 @@ juce_add_binary_data(GalacticAssets SOURCES assets/fonts/Kablammo.ttf assets/aud
 target_sources(FractalAdditive PRIVATE
     source/PluginProcessor.cpp
     source/PluginEditor.cpp
+    source/FloatingWindowOwner.cpp
     source/dsp/Spectrum.cpp
     third_party/MTS-ESP/libMTSClient.cpp)
 
@@ -119,6 +120,7 @@ target_sources(RhythmVerify PRIVATE
     tools/RhythmVerify.cpp
     source/PluginProcessor.cpp
     source/PluginEditor.cpp
+    source/FloatingWindowOwner.cpp
     source/dsp/Spectrum.cpp
     third_party/MTS-ESP/libMTSClient.cpp)
 target_include_directories(RhythmVerify PRIVATE source third_party/MTS-ESP)
@@ -138,6 +140,7 @@ target_sources(FftVerify PRIVATE
     tools/FftVerify.cpp
     source/PluginProcessor.cpp
     source/PluginEditor.cpp
+    source/FloatingWindowOwner.cpp
     source/dsp/Spectrum.cpp
     third_party/MTS-ESP/libMTSClient.cpp)
 target_include_directories(FftVerify PRIVATE source third_party/MTS-ESP)

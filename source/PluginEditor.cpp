@@ -1,5 +1,6 @@
 #include "PluginEditor.h"
 #include "BinaryData.h"
+#include "FloatingWindowOwner.h" // keeps the floating windows above the editor (Win32 ownership)
 #include "dsp/Dissonance.h"
 
 namespace
@@ -4083,9 +4084,26 @@ void FractalAdditiveAudioProcessorEditor::updateWarning (int templatePartials)
 }
 
 //==============================================================================
+// Both floating tool windows stay ABOVE the editor through OS-level ownership - the
+// ONE mechanism shared by the partial-amplitude window and the playground. Without
+// it they are sibling top-level windows, and on Windows the first click on the main
+// Fiblo window raised it over the window the user had just opened: the pad or the
+// knob grid vanished mid-gesture. Ownership (unlike setAlwaysOnTop) keeps them above
+// the editor's top-level window ONLY - never above other applications - and follows
+// it on minimise. Re-applied on every open because a host can re-dock the editor
+// under a different top-level window without recreating it; attachToEditorRoot is
+// idempotent when nothing changed.
+void FractalAdditiveAudioProcessorEditor::attachFloatingWindow (juce::TopLevelWindow& w)
+{
+    if (auto* wp = w.getPeer())
+        if (auto* ep = getPeer())
+            floatwin::attachToEditorRoot (wp->getNativeHandle(), ep->getNativeHandle());
+}
+
+//==============================================================================
 // The pencil's window. Built on first use and then kept alive (hidden) for the rest of
 // the session, so reopening it lands on the size and scroll position you left it at.
-void FractalAdditiveAudioProcessorEditor::openPartialAmpWindow()
+void FractalAdditiveAudioProcessorEditor::ensurePartialWindow()
 {
     if (partialWindow == nullptr)
     {
@@ -4108,13 +4126,19 @@ void FractalAdditiveAudioProcessorEditor::openPartialAmpWindow()
         partialWindow->onKey      = [this] (const juce::KeyPress& k) { return keyPressed (k); };
         partialWindow->onKeyState = [this] { return keyStateChanged (true); };
     }
+}
+
+void FractalAdditiveAudioProcessorEditor::openPartialAmpWindow()
+{
+    ensurePartialWindow();
     partialPanel.applyLanguage();
     partialPanel.resync();          // never open on a stale partial list
     partialWindow->setVisible (true);
+    attachFloatingWindow (*partialWindow); // AFTER setVisible: that is what creates the peer
     partialWindow->toFront (true);
 }
 
-void FractalAdditiveAudioProcessorEditor::openPlaygroundWindow()
+void FractalAdditiveAudioProcessorEditor::ensurePlaygroundWindow()
 {
     if (playgroundWindow == nullptr)
     {
@@ -4133,9 +4157,41 @@ void FractalAdditiveAudioProcessorEditor::openPlaygroundWindow()
         playgroundWindow->onKey      = [this] (const juce::KeyPress& k) { return keyPressed (k); };
         playgroundWindow->onKeyState = [this] { return keyStateChanged (true); };
     }
+}
+
+void FractalAdditiveAudioProcessorEditor::openPlaygroundWindow()
+{
+    ensurePlaygroundWindow();
     playgroundPanel.applyLanguage();   // also refills the corner lists from the folder
     playgroundWindow->setVisible (true);
+    attachFloatingWindow (*playgroundWindow); // AFTER setVisible: that is what creates the peer
     playgroundWindow->toFront (true);
+}
+
+FractalAdditiveAudioProcessorEditor::FloatingOwnershipProbe
+FractalAdditiveAudioProcessorEditor::floatingOwnershipProbeForTests (bool playground)
+{
+    FloatingOwnershipProbe pr;
+    if (getPeer() == nullptr)   // the mechanism is defined relative to the editor's
+        return pr;              // native window; without one there is nothing to own
+    if (playground) ensurePlaygroundWindow(); else ensurePartialWindow();
+    auto& w = playground ? static_cast<juce::TopLevelWindow&> (*playgroundWindow)
+                         : static_cast<juce::TopLevelWindow&> (*partialWindow);
+    // addToDesktop() creates the peer while the component stays INVISIBLE, so the
+    // verifier never flashes windows on screen - openXxx does the same via
+    // setVisible(true), which is the only difference from the real click path.
+    if (w.getPeer() == nullptr)
+        w.addToDesktop();
+    attachFloatingWindow (w);
+    pr.windowOnDesktop = w.getPeer() != nullptr;
+    if (auto* wp = w.getPeer())
+        if (auto* ep = getPeer())
+        {
+            const auto owner = floatwin::ownerOf (wp->getNativeHandle());
+            pr.ownerIsEditorRoot = owner != nullptr
+                                && owner == floatwin::topLevelRootOf (ep->getNativeHandle());
+        }
+    return pr;
 }
 
 FractalAdditiveAudioProcessorEditor::PlaygroundProbe
@@ -6421,7 +6477,13 @@ bool FractalAdditiveAudioProcessorEditor::keyStateChanged (bool)
 bool FractalAdditiveAudioProcessorEditor::playKeysLive() const
 {
     if (hasKeyboardFocus (true)) return true;
-    return partialWindow != nullptr && partialWindow->isVisible() && partialWindow->isActiveWindow();
+    // BOTH floating windows count, or their key forwarding is a lie: the playground
+    // forwards its key events exactly like the partial window (hearing the morph move
+    // IS the feature), but while only partialWindow was listed here the poll decided
+    // "the player left" 250 ms after the pad took focus and released every held note.
+    const auto live = [] (const auto& w)
+        { return w != nullptr && w->isVisible() && w->isActiveWindow(); };
+    return live (partialWindow) || live (playgroundWindow);
 }
 
 // Reconcile the sounding computer-keyboard notes with the ACTUAL physical key
