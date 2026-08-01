@@ -2308,16 +2308,31 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
         // whether or not the rhythm engine is switched on, so they are the pitches really
         // sounding - the tuning's, per-note bend included.
         alphas = heldChordAsTargetAlphas (f0);
-        if (alphas.size() < 2)
+        if (alphas.empty())
         {
-            // Nothing (or one note) held: leave the spectrum exactly as it is, and DROP any
-            // pending adaptation. Without this, engaging the link with nothing down left
-            // rtPending true and the first chord to arrive was adapted to with whatever
-            // this tick happened to read - and, worse, a chord released mid-search came
-            // back as a re-adaptation to a chord that was no longer being played.
+            // NOTHING held: leave the spectrum exactly as it is, and DROP any pending
+            // adaptation. Without this, engaging the link with nothing down left rtPending
+            // true and the first chord to arrive was adapted to with whatever this tick
+            // happened to read - and, worse, a chord released mid-search came back as a
+            // re-adaptation to a chord that was no longer being played.
             rtPending = false;
             return;
         }
+        // ONE NOTE IS A LEGAL TARGET. The bar here used to be two notes, so a monophonic
+        // line - a lead, a bass, one finger on the keyboard - lit the REALTIME button and
+        // then never adapted once, for ever: the guard returned before startSpectrumAdapt
+        // was ever reached. Nothing in the model needed that. With a single note alphas is
+        // {1.0} and dissonance::targetScore collapses, under BOTH scopes, to exactly
+        // dissonance::selfDissonance (spec, 1.0) - the spectrum's own INTERNAL roughness,
+        // the beating of the partials against each other with no chord involved. That is
+        // what the user asked to minimise and it is far from degenerate: sliding one
+        // partial of an 8-partial harmonic seed across 300 cents at C4 swings the measure
+        // from 6.50 to 7.25 (see SpectrumTests, "a SINGLE held note").
+        //
+        // The register comes along for free, and it has to: heldChordAsTargetAlphas hands
+        // back f0 = the note's REAL sounding frequency, and Sethares' critical band is a
+        // width in Hz, not in cents - the same partial set is a different roughness an
+        // octave down, and the adaptation answers with different partial positions there.
         // Has the chord actually MOVED? Compared note by note against the set the last
         // adaptation aimed at, in cents, including the root's absolute pitch: Sethares'
         // roughness is a frequency width, so the same chord an octave up is a different

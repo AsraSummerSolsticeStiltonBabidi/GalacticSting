@@ -735,6 +735,15 @@ namespace dissonance
     //   rootOnly == false -> the whole union, every pair of notes ("all vs all").
     // The absolute frequencies in `sp` matter (Sethares' s depends on register), so the
     // caller anchors the spectrum at a real f0 before calling.
+    //
+    // ONE alpha is a first-class case, not an edge case to be rejected. `alphas` = {1.0} -
+    // a single note held - makes both branches collapse to the SAME thing: chordDissonance
+    // over one copy is dissmeasure of the spectrum, and the rootOnly sum has no cross term
+    // left, so both are exactly selfDissonance (sp, 1.0). That is the spectrum's INTERNAL
+    // roughness - the beating of its own partials against each other - which is the right
+    // objective for "make one note sound as smooth as possible" and the reason adaptSpectrum
+    // needs no separate single-note path. The scope selector therefore keeps working with
+    // one note: it simply has nothing left to disagree about.
     inline double targetScore (const std::vector<Partial>& sp, const std::vector<double>& alphas,
                                bool rootOnly)
     {

@@ -2875,8 +2875,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     chordRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
     adaptRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
     adaptTargetBox.setTooltip (tr (
-        "WHICH NOTES the spectrum is adapted to.\n*The loaded tuning* - its degrees.\n*The chord held now* - literally the notes under your fingers, at the pitch they are really sounding. Play a major chord in 31-EDO and the partials go where that chord beats least.\nREALTIME always follows the held chord, so this box shows that and waits while the link is on.",
-        "QUINES NOTES fan d'objectiu.\n*L'afinaci\xc3\xb3 carregada* - els seus graus.\n*L'acord que sona ara* - literalment les notes sota els dits, a l'al\xc3\xa7""ada real. Toca un acord major en 31-EDO i els parcials van on aquell acord bat menys.\nTEMPS REAL sempre segueix l'acord que mantens, per aix\xc3\xb2 aquesta casella ho mostra i espera mentre el v\xc3\xadncle est\xc3\xa0 actiu."));
+        "WHICH NOTES the spectrum is adapted to.\n*The loaded tuning* - its degrees.\n*The chord held now* - literally the notes under your fingers, at the pitch they are really sounding. Play a major chord in 31-EDO and the partials go where that chord beats least.\nONE note counts as a target too: with nothing else sounding, the thing being minimised is the beating of the partials against EACH OTHER, at that note's own pitch.\nREALTIME always follows the held chord, so this box shows that and waits while the link is on.",
+        "QUINES NOTES fan d'objectiu.\n*L'afinaci\xc3\xb3 carregada* - els seus graus.\n*L'acord que sona ara* - literalment les notes sota els dits, a l'al\xc3\xa7""ada real. Toca un acord major en 31-EDO i els parcials van on aquell acord bat menys.\nUNA sola nota tamb\xc3\xa9 val com a objectiu: si no sona res m\xc3\xa9s, el que es minimitza \xc3\xa9s el batec dels parcials ENTRE ELLS, a l'al\xc3\xa7""ada d'aquella nota.\nTEMPS REAL sempre segueix l'acord que mantens, per aix\xc3\xb2 aquesta casella ho mostra i espera mentre el v\xc3\xadncle est\xc3\xa0 actiu."));
     adaptPartialsBox.setTooltip (tr (
         "How many partials the adapted spectrum has. They are all kept: the search MOVES them and never merges or removes one - each keeps at least the smallest interval below from its neighbours.",
         "Quants parcials t\xc3\xa9 l'espectre adaptat. Es conserven tots: la cerca els MOU i mai no en fusiona ni n'elimina cap - cada un guarda com a m\xc3\xadnim l'interval m\xc3\xa9s petit de sota respecte als ve\xc3\xafns."));
@@ -2893,8 +2893,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "REALTIME: the tuning follows the TOP result on its own, every time the spectrum changes (a knob, a modulator, a preset). At most three searches a second, never two at once, and many changes while it is busy collapse into one - so a sweeping modulator cannot pile searches up. A full search takes about 0.3 s with a rich spectrum (0.1 s when the spectrum's tables can be reused), so each retune lands as its own search finishes. Realtime updates do NOT fill the tuning bank: the tuning you had joins it ONCE when you switch this on, and switching it off leaves ONE Ctrl+Z back to it.",
         "TEMPS REAL: l'afinaci\xc3\xb3 segueix sola el PRIMER resultat cada cop que canvia l'espectre (un potenci\xc3\xb2metre, un modulador, un preset). Com a m\xc3\xa0xim tres cerques per segon, mai dues alhora, i molts canvis mentre treballa es fusionen en un - aix\xc3\xad un modulador escombrant no pot acumular cerques. Una cerca completa triga uns 0,3 s amb un espectre ric (0,1 s quan es poden reaprofitar les taules de l'espectre), per aix\xc3\xb2 cada reafinaci\xc3\xb3 arriba quan acaba la seva cerca. Les actualitzacions en temps real NO omplen el banc: l'afinaci\xc3\xb3 que tenies hi entra UN sol cop en activar-ho, i en desactivar-ho queda UN Ctrl+Z per recuperar-la."));
     adaptRtBtn.setTooltip (tr (
-        "REALTIME: the spectrum follows WHAT YOU PLAY - it re-adapts to the chord under your fingers, at the pitch it is really sounding, every time that chord changes. Hold nothing and it does nothing; hold the same chord and it stays put instead of re-adapting to it over and over. Throttled to about four adaptations a second and coalesced. (The loaded tuning is a target for the Adapt button, not for a follower: it would just keep writing the same scale into the spectrum.) Switching it off leaves ONE Ctrl+Z back to the spectrum you had before.",
-        "TEMPS REAL: l'espectre segueix el QUE TOQUES - es torna a adaptar a l'acord que tens sota els dits, a l'al\xc3\xa7""ada real, cada cop que aquell acord canvia. Si no mantens res, no fa res; si mantens el mateix acord, es queda quiet en comptes de tornar-s'hi a adaptar un cop i un altre. Limitat a ~quatre adaptacions per segon i fusionat. (L'afinaci\xc3\xb3 carregada \xc3\xa9s un objectiu per al bot\xc3\xb3 Adapta, no per a un seguidor: nom\xc3\xa9s escriuria la mateixa escala a l'espectre.) En desactivar-ho queda UN Ctrl+Z per recuperar l'espectre anterior."));
+        "REALTIME: the spectrum follows WHAT YOU PLAY - it re-adapts to the chord under your fingers, at the pitch it is really sounding, every time that chord changes. A SINGLE note works: with nothing else sounding the target is the partials' beating against each other, so a lead or a bass line still gets its own smoothest (or roughest) timbre, and a different one in each register. Hold nothing and it does nothing; hold the same chord and it stays put instead of re-adapting to it over and over. Throttled to about four adaptations a second and coalesced. (The loaded tuning is a target for the Adapt button, not for a follower: it would just keep writing the same scale into the spectrum.) Switching it off leaves ONE Ctrl+Z back to the spectrum you had before.",
+        "TEMPS REAL: l'espectre segueix el QUE TOQUES - es torna a adaptar a l'acord que tens sota els dits, a l'al\xc3\xa7""ada real, cada cop que aquell acord canvia. UNA sola nota ja funciona: si no sona res m\xc3\xa9s, l'objectiu \xc3\xa9s el batec dels parcials entre ells, de manera que una melodia o un baix tamb\xc3\xa9 tenen el seu timbre m\xc3\xa9s llis (o m\xc3\xa9s aspre), i un de diferent a cada registre. Si no mantens res, no fa res; si mantens el mateix acord, es queda quiet en comptes de tornar-s'hi a adaptar un cop i un altre. Limitat a ~quatre adaptacions per segon i fusionat. (L'afinaci\xc3\xb3 carregada \xc3\xa9s un objectiu per al bot\xc3\xb3 Adapta, no per a un seguidor: nom\xc3\xa9s escriuria la mateixa escala a l'espectre.) En desactivar-ho queda UN Ctrl+Z per recuperar l'espectre anterior."));
     adaptList.tip = tr ("The adapted spectrum: every partial's interval from the played note, and the amplitude the search gave it. All of them are here - the search moves partials, it never drops them.",
                         "L'espectre adaptat: l'interval de cada parcial respecte a la nota tocada i l'amplitud que li ha donat la cerca. Hi s\xc3\xb3n tots - la cerca mou parcials, no en descarta cap.");
     adaptList.emptyText = tr ("Press Adapt to move the partials to where these notes beat least (or most).",
@@ -3200,10 +3200,14 @@ void FractalAdditiveAudioProcessorEditor::runSpectrumAdapt()
     const auto alphas = toChord ? processorRef.heldChordAsTargetAlphas (f0)
                                 : processorRef.tuningAsTargetAlphas (f0);
     juce::String err;
-    if (alphas.size() < 2)
-        err = toChord ? tr ("Hold a chord (two notes or more) and press Adapt again - this "
-                            "target IS the notes under your fingers.",
-                            "Mant\xc3\xa9n un acord (dues notes o m\xc3\xa9s) i torna a prémer Adapta - "
+    // ONE held note is a legal target, and refusing it was the bug: with a single note the
+    // score IS the spectrum's own internal roughness (dissonance::selfDissonance at that
+    // note's real pitch - see updateRealtimeLinks), so Adapt can still move the partials to
+    // where they beat least against EACH OTHER. Only "nothing held at all" has no target.
+    if (toChord ? alphas.empty() : alphas.size() < 2)
+        err = toChord ? tr ("Hold at least one note and press Adapt again - this target IS "
+                            "the notes under your fingers.",
+                            "Mant\xc3\xa9n com a m\xc3\xadnim una nota i torna a pr\xc3\xa9mer Adapta - "
                             "aquest objectiu S\xc3\x93N les notes que tens sota els dits.")
                       : tr ("The loaded tuning has no degrees to adapt to.",
                             "L'afinaci\xc3\xb3 carregada no t\xc3\xa9 graus als quals adaptar-se.");
@@ -5764,7 +5768,12 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             // The union of many notes at 64 analysis partials each is millions of pairs -
             // fine on a worker thread, not on this one. Above a chord's worth of notes the
             // "all vs all" measurement is left out rather than freezing the window for it.
-            const bool measurable = s.adapt.rootOnly || alphas.size() <= 8;
+            //
+            // `alphas` is re-read HERE, after the search finished, so the notes may already
+            // be released - and measureCurrentAgainstTarget answers 0.0 for an empty target.
+            // Printed, that 0.0 read as "sounding now: 0.0", i.e. the patch has become
+            // perfectly smooth, which is a lie about a measurement that was never taken.
+            const bool measurable = ! alphas.empty() && (s.adapt.rootOnly || alphas.size() <= 8);
             const double now = measurable
                                    ? processorRef.measureCurrentAgainstTarget (alphas, f0, s.adapt.rootOnly)
                                    : 0.0;

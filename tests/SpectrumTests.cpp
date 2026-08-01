@@ -993,6 +993,152 @@ int main()
                && std::abs (dissonance::goalCost (5.0, dissonance::Goal::Range, 2.0, 4.0) - 1.0) < 1.0e-12
                && std::abs (dissonance::goalCost (1.0, dissonance::Goal::Range, 2.0, 4.0) - 1.0) < 1.0e-12,
                "goalCost: min, max, and zero cost anywhere inside the range");
+
+        //----------------------------------------------------------------------
+        // A SINGLE HELD NOTE.
+        //
+        // The realtime "spectrum follows what you play" link used to refuse anything under
+        // two notes: a monophonic line lit the REALTIME button and then never adapted once,
+        // for ever. Nothing in the model required that. With one note the target set is
+        // {1.0}, every cross-note term vanishes, and what is left is the spectrum's own
+        // INTERNAL roughness - the partials beating against EACH OTHER - which is precisely
+        // what "minimum beating between the partials" means. These checks fence that it is
+        // a real, register-dependent objective and not a constant the search can only shrug
+        // at, and that the number the panel prints is the number that was optimised.
+        {
+            std::printf ("\n  a SINGLE held note (target = {1.0}):\n");
+            const std::vector<double> one { 1.0 };
+
+            // (1) THE IDENTITY the whole single-note path rests on. Both scopes collapse to
+            // selfDissonance, so "0 vs all" and "all vs all" cannot disagree - which is what
+            // keeps the scope selector honest instead of silently meaning two things - and
+            // AdaptResult's seedScore/score (the panel's "beating: X -> Y") ARE the internal
+            // roughness they claim to be.
+            const double self = dissonance::selfDissonance (seed, 1.0);
+            check (std::abs (dissonance::targetScore (seed, one, false) - self) < 1.0e-12
+                   && std::abs (dissonance::targetScore (seed, one, true) - self) < 1.0e-12,
+                   "one note: BOTH scopes are exactly the spectrum's internal roughness");
+
+            // (2) NOT FLAT. A constant objective would leave coordinate descent nothing to
+            // descend and the partials would sit exactly where the seed put them - which is
+            // the failure mode this whole feature would have had if the measure were
+            // degenerate. Slide one partial across 300 cents and watch the measure move.
+            double vLo = 1.0e18, vHi = -1.0e18;
+            for (double c = 500.0; c <= 800.0; c += 50.0)
+            {
+                auto t = seed;
+                t[3].freq = f0 * std::exp2 (c / 1200.0);
+                const double v = dissonance::targetScore (t, one, false);
+                vLo = std::min (vLo, v); vHi = std::max (vHi, v);
+            }
+            std::printf ("    sliding partial 3 over 300 cents: %.4f .. %.4f\n", vLo, vHi);
+            check (vHi - vLo > 0.05 * vLo,
+                   "the single-note objective really depends on where the partials sit");
+
+            // (3) It ADAPTS, in two registers, on POSITIONS ALONE - amplitude shaping off, so
+            // the improvement cannot be credited to a reshaped envelope.
+            const double topRatio = std::exp2 ((1200.0 - minGap) / 1200.0); // the plugin's own cap
+            const auto seedAt = [&] (double base)
+            {
+                std::vector<dissonance::Partial> s;
+                for (int i = 0; i < N; ++i)
+                {
+                    const double r = std::exp2 (1200.0 * (double) i / (double) N / 1200.0);
+                    s.push_back ({ base * r, std::pow (r, -1.0) });
+                }
+                return s;
+            };
+            struct Reg { double f; dissonance::AdaptResult mn, mx; };
+            Reg regs[2] { { f0 }, { f0 * 0.25 } };            // C4, and C2 two octaves below
+            for (auto& R : regs)
+            {
+                const auto s = seedAt (R.f);
+                R.mn = dissonance::adaptSpectrum (s, R.f, one, false, dissonance::Goal::Min,
+                                                  0.0, 0.0, minGap, topRatio, false, 24.0, 6);
+                R.mx = dissonance::adaptSpectrum (s, R.f, one, false, dissonance::Goal::Max,
+                                                  0.0, 0.0, minGap, topRatio, false, 24.0, 6);
+                std::printf ("    %8.3f Hz: internal roughness  seed %.4f -> min %.4f / max %.4f\n",
+                             R.f, R.mn.seedScore, R.mn.score, R.mx.score);
+                std::printf ("      min lands at cents:");
+                for (const auto& p : R.mn.spectrum)
+                    std::printf (" %.1f", 1200.0 * std::log2 (p.freq / R.f));
+                std::printf ("\n");
+
+                check ((int) R.mn.spectrum.size() == N && (int) R.mx.spectrum.size() == N,
+                       "a single-note adaptation returns every partial it was given");
+                check (std::abs (R.mn.spectrum[0].freq - R.f) < 1.0e-9
+                       && std::abs (R.mx.spectrum[0].freq - R.f) < 1.0e-9,
+                       "anchored on the note ACTUALLY played - partial 0 sits exactly there");
+                check (R.mn.score < R.mn.seedScore * 0.9,
+                       "Min really lowers the internal roughness of one note (>10% under the harmonic seed)");
+                check (R.mx.score > R.mx.seedScore * 1.01,
+                       "Max really raises it, so the goal selector is live with one note too");
+                // The read-out cannot lie: what adaptSpectrum reports IS selfDissonance of
+                // the spectra it started from and ended with.
+                check (std::abs (R.mn.seedScore - dissonance::selfDissonance (seedAt (R.f), 1.0)) < 1.0e-12
+                       && std::abs (R.mn.score - dissonance::selfDissonance (R.mn.spectrum, 1.0)) < 1.0e-12,
+                       "and the before/after it reports IS that same internal roughness");
+                // Fidelity: moved, never merged.
+                double worstGap = 1.0e9;
+                for (const auto& r : { R.mn, R.mx })
+                    for (size_t i = 1; i < r.spectrum.size(); ++i)
+                        worstGap = std::min (worstGap, 1200.0 * std::log2 (r.spectrum[i].freq
+                                                                           / r.spectrum[i - 1].freq));
+                check (worstGap >= minGap - 0.05,
+                       "and no two of its partials come closer than the smallest interval");
+            }
+
+            // (4) THE REGISTER MATTERS, which is the reason the target is anchored at the
+            // note's REAL frequency and not at key 60. Sethares' critical band is a width in
+            // Hz, so the same partial set is a different roughness an octave down - if these
+            // two answers were equal, the anchoring would be doing nothing.
+            // Measured as each partial's interval above ITS OWN partial 0, so a whole
+            // spectrum shifted bodily to some other register cannot pass for two different
+            // answers - only genuinely different intervals can.
+            double worstMove = 0.0;
+            for (int i = 0; i < N; ++i)
+                worstMove = std::max (worstMove,
+                                      std::abs (1200.0 * std::log2 (regs[0].mn.spectrum[(size_t) i].freq / regs[0].mn.spectrum[0].freq)
+                                              - 1200.0 * std::log2 (regs[1].mn.spectrum[(size_t) i].freq / regs[1].mn.spectrum[0].freq)));
+            std::printf ("    biggest disagreement between the two registers' answers: %.1f cents\n", worstMove);
+            check (worstMove > minGap,
+                   "the two registers get genuinely DIFFERENT partial positions");
+
+            // Sharper still: each register's own answer must beat the other register's
+            // answer transplanted onto it. Equal positions could be a coincidence; this
+            // cannot be - it says the search is solving the problem it was actually given.
+            const auto transplantedTo = [] (const dissonance::AdaptResult& r, double from, double to)
+            {
+                std::vector<dissonance::Partial> t;
+                t.reserve (r.spectrum.size());
+                for (const auto& p : r.spectrum) t.push_back ({ p.freq / from * to, p.amp });
+                return dissonance::selfDissonance (t, 1.0);
+            };
+            const double guestAtLow  = transplantedTo (regs[0].mn, regs[0].f, regs[1].f);
+            const double guestAtHigh = transplantedTo (regs[1].mn, regs[1].f, regs[0].f);
+            std::printf ("    C2's own answer %.4f vs C4's answer moved down %.4f;"
+                         "  C4's own %.4f vs C2's moved up %.4f\n",
+                         regs[1].mn.score, guestAtLow, regs[0].mn.score, guestAtHigh);
+            check (regs[1].mn.score < guestAtLow && regs[0].mn.score < guestAtHigh,
+                   "each register's answer is better THERE than the other register's answer is");
+
+            // (5) Range is still a real third option with one note: aim at a band between the
+            // min and the max just measured, one the seed is not already sitting in.
+            {
+                const double span = regs[0].mx.score - regs[0].mn.score;
+                const double bLo  = regs[0].mn.score + 0.6 * span;
+                const double bHi  = regs[0].mn.score + 0.8 * span;
+                const auto rg = dissonance::adaptSpectrum (seedAt (f0), f0, one, false,
+                                                           dissonance::Goal::Range, bLo, bHi,
+                                                           minGap, topRatio, false, 24.0, 6);
+                std::printf ("    range [%.4f, %.4f] -> %.4f  (seed %.4f)\n",
+                             bLo, bHi, rg.score, rg.seedScore);
+                check (rg.seedScore < bLo || rg.seedScore > bHi,
+                       "the single-note range band starts out of reach of the seed (so the test can fail)");
+                check (rg.score >= bLo - 1.0e-6 && rg.score <= bHi + 1.0e-6,
+                       "Range lands INSIDE its band with a single held note too");
+            }
+        }
     }
 
     //--------------------------------------------------------------------------

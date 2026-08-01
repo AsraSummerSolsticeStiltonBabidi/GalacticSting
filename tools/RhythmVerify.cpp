@@ -3184,8 +3184,44 @@ int main()
             std::printf ("  chord changed -> %d started\n", p.getRealtimeStarts());
             check (p.getRealtimeStarts() > afterChord, "changing the notes DOES start a new adaptation");
 
+            //-- ONE NOTE IS A TARGET, not a reason to sit still.
+            //   The follower used to require two notes ("if (alphas.size() < 2) return"), so a
+            //   lead line, a bass line or one finger on the keyboard lit REALTIME and then
+            //   never adapted once, for ever. With a single key down the target set is {1.0},
+            //   the cross-note terms are gone, and what is left is the spectrum's own INTERNAL
+            //   roughness at that key's REAL pitch (Dissonance.h::targetScore) - exactly "the
+            //   least beating between the partials themselves".
+            const int beforeSolo   = p.getRealtimeStarts();
+            const int beforeSoloAp = p.getRealtimeApplies();
+            keys (false, { 60, 65 });                // C-F-G becomes G alone
+            tick (60); settle();
+            std::printf ("  down to ONE held note -> %d started (was %d), %d applied (was %d)\n",
+                         p.getRealtimeStarts(), beforeSolo, p.getRealtimeApplies(), beforeSoloAp);
+            check (p.getRealtimeStarts() > beforeSolo,
+                   "a SINGLE held note still adapts (its partials beat least against each other)");
+            check (p.getRealtimeApplies() > beforeSoloAp,
+                   "and that single-note result really reaches the spectrum");
+
+            const int soloStarts = p.getRealtimeStarts();
+            tick (120);
+            settle();
+            check (p.getRealtimeStarts() == soloStarts,
+                   "holding that one note still re-adapts nothing - one note is a target, not a treadmill");
+
+            //   ...and the SAME note an octave down is a different target: Sethares' critical
+            //   band is a width in Hz, so the register changes which partials beat least. If
+            //   this did not re-adapt, the single-note target would be anchored somewhere
+            //   other than the note actually sounding.
+            keys (false, { 67 });
+            keys (true,  { 55 });
+            tick (60); settle();
+            std::printf ("  the same note an octave DOWN -> %d started (was %d)\n",
+                         p.getRealtimeStarts(), soloStarts);
+            check (p.getRealtimeStarts() > soloStarts,
+                   "one note moved to another register is a NEW target and re-adapts");
+
             const int beforeRelease = p.getRealtimeStarts();
-            keys (false, { 60, 65, 67 });
+            keys (false, { 55 });
             tick (120);
             std::printf ("  keys up, 120 ticks -> %d started (was %d)\n",
                          p.getRealtimeStarts(), beforeRelease);
