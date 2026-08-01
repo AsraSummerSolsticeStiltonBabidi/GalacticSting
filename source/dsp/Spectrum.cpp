@@ -283,6 +283,88 @@ namespace spectrum
         return out;
     }
 
+    //==========================================================================
+    // Crossfade two compiled templates (see the contract in Spectrum.h).
+    SpectrumTemplate blendTemplates (const SpectrumTemplate& a, const SpectrumTemplate& b, double t)
+    {
+        if (! (t > 0.0)) return a;   // also catches NaN -> "stay where you were"
+        if (! (t < 1.0)) return b;
+
+        const auto key = [] (float r)
+        { return (long long) std::llround (1200.0 * std::log2 (std::max (1.0e-9, (double) r))); };
+
+        // ONE bin map fed by BOTH sides - see the energy-duplication note in the header.
+        struct Bin { double aAmp = 0.0, bAmp = 0.0; };
+        std::unordered_map<long long, Bin> bins;
+        bins.reserve ((a.partials.size() + b.partials.size()) * 2);
+        for (const auto& p : a.partials) bins[key (p.ratio)].aAmp += (double) p.amp;
+        for (const auto& p : b.partials) bins[key (p.ratio)].bAmp += (double) p.amp;
+
+        std::vector<Partial> parts;
+        parts.reserve (a.partials.size() + b.partials.size());
+
+        // Every partial of `a` keeps its OWN ratio and takes its share of the bin's
+        // blended energy. A bin holding three of a's partials and one of b's splits b's
+        // contribution between the three in proportion instead of handing each the lot.
+        for (const auto& p : a.partials)
+        {
+            const auto it = bins.find (key (p.ratio));
+            const double aA = (it != bins.end()) ? it->second.aAmp : (double) p.amp;
+            const double bA = (it != bins.end()) ? it->second.bAmp : 0.0;
+            const double share = aA > 0.0 ? (double) p.amp / aA : 0.0;
+            const double amp = share * ((1.0 - t) * aA + t * bA);
+            if (amp > 0.0) parts.push_back ({ p.ratio, (float) amp });
+        }
+        // Partials `a` has no counterpart for are the genuinely new ones: they fade in
+        // from silence at t*amp rather than appearing at full height, which is what
+        // keeps a drag across the pad free of pops.
+        for (const auto& p : b.partials)
+        {
+            const auto it = bins.find (key (p.ratio));
+            if (it != bins.end() && it->second.aAmp > 0.0) continue;   // already carried above
+            const double amp = t * (double) p.amp;
+            if (amp > 0.0) parts.push_back ({ p.ratio, (float) amp });
+        }
+
+        std::sort (parts.begin(), parts.end(),
+                   [] (const Partial& x, const Partial& y) { return x.ratio < y.ratio; });
+
+        SpectrumTemplate out;
+        out.truncated = a.truncated || b.truncated;
+        out.rawCount  = (int) parts.size();
+        // The one honest limit: the voices' partial arrays are kMaxPartials long. Keep
+        // the loudest (and always the lowest ratio, so the played pitch survives) and
+        // SAY so through the flag the meter already reads.
+        if ((int) parts.size() > kMaxPartials)
+        {
+            auto lowestIt = std::min_element (parts.begin(), parts.end(),
+                                              [] (const Partial& x, const Partial& y) { return x.ratio < y.ratio; });
+            std::iter_swap (parts.begin(), lowestIt);
+            std::nth_element (parts.begin() + 1, parts.begin() + kMaxPartials, parts.end(),
+                              [] (const Partial& x, const Partial& y) { return x.amp > y.amp; });
+            parts.resize ((size_t) kMaxPartials);
+            std::sort (parts.begin(), parts.end(),
+                       [] (const Partial& x, const Partial& y) { return x.ratio < y.ratio; });
+            out.truncated = true;
+        }
+
+        double sumSq = 0.0;
+        for (const auto& p : parts) sumSq += (double) p.amp * (double) p.amp;
+        if (sumSq > 0.0)
+        {
+            const float inv = (float) (1.0 / std::sqrt (sumSq));
+            for (auto& p : parts) p.amp *= inv;
+        }
+
+        // A linear blend of the two compile-time slopes. The caller (the playground)
+        // overwrites this with the exact value it wrote to the curveSlope PARAMETER, so
+        // an unmodulated voice computes dS = 0 and renders the blended amplitudes as
+        // they are instead of re-sloping the whole crossfade.
+        out.curveSlope = (float) ((1.0 - t) * (double) a.curveSlope + t * (double) b.curveSlope);
+        out.partials   = std::move (parts);
+        return out;
+    }
+
     SpectrumTemplate compileSpectrum (const SpectrumSettings& s, const std::atomic<bool>* abort)
     {
         // Decimal fractal level -> compile the two neighbouring integer levels and blend.

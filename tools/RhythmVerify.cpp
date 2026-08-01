@@ -2513,6 +2513,59 @@ int main()
                        "and so is the TUNING box's - one line on the glass, not two side by side");
                 check (win.contains (L.specColumn),
                        "and sharing it keeps the column inside the window");
+
+                // ...AND THE CORNERS AT THAT END ARE SQUARE. Sharing the x was not enough:
+                // SPECTRUM and TUNING rounded their top-right corner with a 9 px radius, so
+                // each one's top edge curved away from the wall 9 px before reaching it and
+                // the "one line" was pinched by two arcs. Invisible to every check above -
+                // the arc leaves the border's x exactly where it was and both rects still
+                // end on the wall - so it is measured as how far INSIDE its own corner each
+                // panel's drawn border passes (see LayoutProbe::panelCorners).
+                {
+                    float sq = -1.0f, tu = -1.0f, es = -1.0f, en = -1.0f, co = -1.0f;
+                    for (const auto& c : L.panelCorners)
+                    {
+                        if (c.first == "spectrum")   sq = c.second;
+                        if (c.first == "tuning")     tu = c.second;
+                        if (c.first == "essentials") es = c.second;
+                        if (c.first == "envelopes")  en = c.second;
+                        if (c.first == "column")     co = c.second;
+                    }
+                    std::printf ("  top-right corner inset: spectrum %.1f  tuning %.1f"
+                                 " | essentials %.1f  envelopes %.1f  column %.1f px\n",
+                                 sq, tu, es, en, co);
+                    // A square corner reports 0.5 (the first sample is already inside the
+                    // path); the 9 px rounding reports 2.5 - the quadratic's own closest
+                    // approach to the corner is rad/4 in each axis, so the two cases are
+                    // five sampling steps apart and cannot be confused for one another.
+                    check (sq >= 0.0f && sq < 1.0f && tu >= 0.0f && tu < 1.0f,
+                           "the two panels that OWN the shared wall meet it square - one straight line, no arcs");
+                    check (es >= 2.0f && en >= 2.0f && co >= 2.0f,
+                           "and every corner facing open page keeps its radius - only the shared end is squared");
+                }
+            }
+
+            // AIR BETWEEN PANELS THAT SHARE NOTHING. The shared wall is one line by design;
+            // everywhere else the boxes are separate objects and were 6 px (4 vertically)
+            // apart, which at a 2.6 px stroke reads as two borders leaning on each other.
+            // Measured on the RECTS here and stated as the drawn-line distance, which is
+            // the rect gap plus the two stroke offsets (kFrameLine each side).
+            {
+                const int vGap  = L.essentials.getY()  - L.spectrum.getBottom();
+                const int hGap1 = L.envelopes.getX()   - L.essentials.getRight();
+                const int hGap2 = L.tuning.getX()      - L.envelopes.getRight();
+                const float line = 2.0f * 1.3f;   // kFrameLine, both strokes
+                std::printf ("  unshared gaps: spectrum->row2 %d px (%.1f between lines),"
+                             " essentials->envelopes %d (%.1f), envelopes->tuning %d (%.1f)\n",
+                             vGap, (float) vGap + line, hGap1, (float) hGap1 + line,
+                             hGap2, (float) hGap2 + line);
+                check (vGap >= 6, "rows 1 and 2 share no border, so they sit 6 px apart (they were 4)");
+                check (hGap1 >= 8 && hGap2 >= 8,
+                       "and the three row-2 boxes share none either - 8 px between each pair (they were 6)");
+                check (! L.essentials.intersects (L.envelopes)
+                       && ! L.envelopes.intersects (L.tuning)
+                       && win.contains (L.envelopes),
+                       "with nothing overlapping and nothing pushed out of the window to pay for it");
             }
 
             // ONE BOX, ONE COLOUR. Every painted sub-label in SPECTRUM wears the selected
@@ -2615,6 +2668,7 @@ int main()
                                 : c.first.startsWith ("both.") ? &L.bothEngines
                                 : c.first.startsWith ("tun.")  ? &L.tuning
                                 : c.first.startsWith ("spec.") ? &L.specColumn
+                                : c.first.startsWith ("top.")  ? &L.titleBar
                                                                : &L.essentials;
                 if (! box->contains (c.second))
                 { ++outside; if (worstName.isEmpty()) worstName = c.first; }
@@ -2808,30 +2862,32 @@ int main()
                     check (outside + squashed + condensed == 0,
                            "this mode's whole column fits, unsquashed and uncondensed");
 
-                    // A COMBO IS NOT A LABEL and the condensing rule above cannot see it:
-                    // a ComboBox given too little room draws its arrow and clips the word
-                    // silently. This box used to be squeezed into whatever the register
-                    // row had left over - 49 px, an arrow with a clipped word beside it -
-                    // and it now has a row of its own precisely because it is the choice
-                    // the panel most needed to spell out. The bar is the WORD's own width
-                    // in both languages, plus the arrow, not a guessed number.
+                    // THE AGGREGATE BOX IS GONE, and this is where a well-meaning hand puts
+                    // it back. It offered "average" vs "worst case"; with the range anchored
+                    // at the played note and running upward the worst register is always the
+                    // anchor, so minimax optimised one pitch and the Steps field beside it
+                    // stopped changing anything (10.742 at every width). Probing by NAME,
+                    // because a returning selector would sit there looking correct: nothing
+                    // else in this file measures a control that should not exist.
                     if (sh.mode == 2)
-                        for (const auto& c : P.controls)
-                            if (c.first == "spec.agg")
-                            {
-                                // The REAL geometry: the custom LookAndFeel gives the text
-                                // label box.width - height/3 - height/2, the label's own
-                                // border eats 10 more, and getComboBoxFont is 15 pt at
-                                // this height. 28 px of furniture, not a guess.
-                                const juce::Font cf { juce::FontOptions (15.0f) };
-                                const int need = juce::jmax (
-                                    juce::GlyphArrangement::getStringWidthInt (cf, lang == 1 ? "pitjor" : "worst"),
-                                    juce::GlyphArrangement::getStringWidthInt (cf, lang == 1 ? "mitjana" : "average")) + 28;
-                                std::printf ("    aggregate box: %d px wide, needs %d (%s)\n",
-                                             c.second.getWidth(), need, lang == 1 ? "ca" : "en");
-                                check (c.second.getWidth() >= need,
-                                       "the average/worst-case box fits its longest word beside its arrow");
-                            }
+                    {
+                        bool hasAgg = false;
+                        for (const auto& c : P.controls)      if (c.first == "spec.agg")    hasAgg = true;
+                        for (const auto& w : P.wrappedLabels) if (w.name == "spec.aggInfo") hasAgg = true;
+                        check (! hasAgg, "there is no average/worst-case selector, and no line explaining one");
+                        // ...and the explanation did not go with it. The user's ask was
+                        // explicitly "explain it in some hover", so the sentence has to be
+                        // IN the neighbouring control's tooltip, in the language on screen -
+                        // a tooltip no other check in this build can see.
+                        const auto& tip = P.regStepsTip;
+                        const bool says = lang == 1 ? tip.contains ("MITJANA")
+                                                    : tip.contains ("AVERAGE");
+                        std::printf ("    Steps hover: %d chars, says the aggregate is the average: %s (%s)\n",
+                                     tip.length(), says ? "yes" : "NO", lang == 1 ? "ca" : "en");
+                        check (says,
+                               "and the Steps field's hover says the spectrum is optimised as the AVERAGE"
+                               " across the register span");
+                    }
 
                     // THE WRAPPING READ-OUTS. A juce::Label lays out in as many lines as
                     // its height allows and then CONDENSES - and modern JUCE shrinks the
@@ -2961,6 +3017,46 @@ int main()
             tt->setValueNotifyingHost (0.0f);
             p.setTimbreEnabled (false);
             ed->refreshEngineDressing();
+        }
+
+        // THE AMP DECAY FADER AFTER A PENCIL ON/OFF CYCLE.
+        //
+        // Every control in SPECTRUM wears the panel colour, with ONE stated exception: the
+        // AMP DECAY (slope) fader goes grey while manual per-partial amplitudes are on,
+        // because it is then inert. Toggling that off has to give the panel colour BACK -
+        // and it did not: the un-freeze path restored `cSlope`, the mint this panel
+        // stopped using when the engines merged, so one pencil cycle left a green fader in
+        // a blue panel for the rest of the session. Colour, not geometry, so nothing else
+        // in this file could have seen it.
+        if (ed != nullptr)
+        {
+            auto* pm = p.apvts.getParameter ("partialManual");
+            auto slope = [&] { return ed->layoutProbe().slopeColour; };
+            const auto panel = ed->layoutProbe().panelColour;
+            pm->setValueNotifyingHost (0.0f); ed->refreshSlopeFreezeForTests();
+            const auto live0 = slope();
+            pm->setValueNotifyingHost (1.0f); ed->refreshSlopeFreezeForTests();
+            const auto frozen = slope();
+            // ...and an engine reselection while frozen must NOT repaint it live: that was
+            // the mirror-image half of the same bug (recolourSpectrumControls painted every
+            // fader the panel hue, deleting the panel's only inertness warning, and the
+            // freeze refresh then refused to restore it because its state had not changed).
+            ed->refreshEngineDressing();
+            const auto frozenAfterEngine = slope();
+            pm->setValueNotifyingHost (0.0f); ed->refreshSlopeFreezeForTests();
+            const auto live1 = slope();
+            std::printf ("  AMP DECAY fader: panel %s   live %s -> frozen %s -> engine redress %s -> live %s\n",
+                         panel.toDisplayString (false).toRawUTF8(),
+                         live0.toDisplayString (false).toRawUTF8(),
+                         frozen.toDisplayString (false).toRawUTF8(),
+                         frozenAfterEngine.toDisplayString (false).toRawUTF8(),
+                         live1.toDisplayString (false).toRawUTF8());
+            check (live0 == panel, "the AMP DECAY fader wears the panel colour while it is live");
+            check (frozen != panel, "and goes off it while manual amplitudes freeze it (it says it is inert)");
+            check (frozenAfterEngine == frozen,
+                   "and stays inert-grey when the engine is reselected under it");
+            check (live1 == panel,
+                   "and a pencil on/off cycle puts the panel colour BACK (it used to leave it mint green)");
         }
 
         // The empty-workspace pin. With ONE shared box, the Load button and the
@@ -3239,6 +3335,35 @@ int main()
             }
         }
 
+        //== THE PRESET PLAYGROUND BUTTON =======================================
+        // A TextButton does NOT condense the way a Label does - it CLIPS - and
+        // "Obre el Laboratori de Presets" is eight characters longer than the English.
+        // Measured in the very font drawButtonText uses (LookAndFeel_V4: the button's
+        // height, less 6 px of vertical padding, capped at 15), against the cell the
+        // layout really gives it.
+        if (ed != nullptr)
+        {
+            for (int lang = 0; lang < 2; ++lang)
+            {
+                const auto P = ed->layoutProbeInLanguage (lang == 1);
+                juce::String w;
+                for (const auto& b : P.buttonTexts) if (b.first == "top.playground") w = b.second;
+                juce::Rectangle<int> cell;
+                for (const auto& c : P.controls) if (c.first == "top.playground") cell = c.second;
+                const float fh = juce::jmin (15.0f, (float) cell.getHeight() * 0.6f);
+                const float need = (float) juce::GlyphArrangement::getStringWidthInt (
+                                       juce::Font (juce::FontOptions (fh)), w);
+                std::printf ("  playground button (%s): \"%s\" needs %.0f px in %d\n",
+                             lang == 1 ? "ca" : "en", w.toRawUTF8(), need, cell.getWidth());
+                check (w.containsIgnoreCase (lang == 1 ? "Laboratori" : "Playground"),
+                       "the playground button says what it opens, in this language");
+                check (! cell.isEmpty() && need <= (float) cell.getWidth() - 8.0f,
+                       "...and the word fits inside the cell the layout gives it, with margin");
+                check (cell.getRight() <= 1200 && cell.getBottom() <= 78,
+                       "...inside the title bar, not spilling over the panels below");
+            }
+        }
+
         // THE PANEL'S OWN WIRING, through the same callbacks a click runs.
         if (ed != nullptr)
         {
@@ -3348,8 +3473,27 @@ int main()
                 const auto tags = ed->keyboardPeriodTagsForTests();
                 int tooNarrow = 0, overlaps = 0, offCentre = 0, tiny = 0;
                 juce::String firstBad;
+                // THE GAP, measured INK TO INK, and why a rect check cannot see it. Both
+                // numbers are drawn CENTRED in their own rect, so two rects that merely do
+                // not overlap can still be six pixels of empty air apart - which is exactly
+                // what they were, and why the period number read as a second mark on the key
+                // instead of as an annotation of the "0" beside it. Recomputed here from the
+                // rects and text widths paint() really uses, then cross-checked against the
+                // layout's own `gap`, so neither side can drift into agreeing with itself.
+                float inkGap = -1.0f, gapDisagree = 0.0f;
+                int   tooFar = 0, tooSmall = 0;
                 for (const auto& t : tags)
                 {
+                    const float gg = (t.tag.getCentreX() - t.tagTextWidth * 0.5f)
+                                   - (t.zero.getCentreX() + t.zeroTextWidth * 0.5f);
+                    if (inkGap < 0.0f) inkGap = gg;
+                    gapDisagree = juce::jmax (gapDisagree, std::abs (gg - t.gap));
+                    // "bastante mas cerca del 0" - considerably closer. 6.19 px was the
+                    // shipped distance; anything above 3.5 is not "considerably closer",
+                    // and 1 px is the floor below which the two numbers touch.
+                    if (gg > 3.5f || gg < 1.0f) ++tooFar;
+                    // "un poco mas grandes" - the tag was 8.8 pt at the smallest key.
+                    if (t.tagFont < 9.5f) ++tooSmall;
                     if (t.tagTextWidth > (float) t.tag.getWidth())
                     { ++tooNarrow; if (firstBad.isEmpty()) firstBad = "period " + juce::String (t.number); }
                     // The "0" and its period number share a cell; the tag's strip is
@@ -3366,39 +3510,51 @@ int main()
                              overlaps, offCentre, tiny);
                 if (! tags.empty())
                     std::printf ("  first tag: period %d, \"0\" %.1f pt in %.0f px, number %.1f pt needing"
-                                 " %.1f px of %.0f\n",
+                                 " %.1f px of %.0f, ink gap %.2f px (was 6.19)\n",
                                  tags.front().number, tags.front().zeroFont, tags.front().zero.getWidth(),
                                  tags.front().tagFont, tags.front().tagTextWidth,
-                                 tags.front().tag.getWidth());
+                                 tags.front().tag.getWidth(), inkGap);
                 check (! tags.empty(), "every period boundary on screen carries its number");
                 check (tooNarrow == 0, "and every one of them fits its rect without being shrunk");
                 check (overlaps == 0, "and none of them prints over the \"0\" it belongs to");
                 check (offCentre == 0, "and each is vertically centred on that \"0\"");
                 check (tiny == 0, "and none of them is drawn below 7 pt");
+                check (gapDisagree < 0.01f,
+                       "the layout's own gap is the one the drawn rects and glyphs produce");
+                check (tooFar == 0, "the period number sits CLOSE to its \"0\" (1 .. 3.5 px of ink, was 6.19)");
+                check (tooSmall == 0, "and is drawn larger than the 8.8 pt it used to be");
 
-                // ...INCLUDING the numbers this tuning does not happen to show. A period
-                // number runs from one to three characters (a one-degree-per-period scale
-                // reaches "-10"), and the widest is the one nobody was looking at. Measured
-                // through the same layout call paint() uses, on the same cell geometry.
+                // ...INCLUDING the numbers this tuning does not happen to show, AT THE
+                // SMALLEST KEY THE KEYBOARD EVER DRAWS. A period number runs from one to
+                // three characters (a one-degree-per-period scale reaches "-10"), and the
+                // widest is the one nobody was looking at; keys have a fixed width, so
+                // kCellW - not the cell this window happened to open at - is the worst case.
+                // Measured through the same layout call paint() uses.
                 if (! tags.empty())
                 {
-                    const auto& t0 = tags.front();
-                    const float cellW = t0.zero.getWidth() + t0.tag.getWidth() + 2.0f;
-                    const auto  area  = t0.zero.getUnion (t0.tag);
-                    int narrow = 0, small = 0;
+                    const float cellW = (float) ScaleKeyboard::kCellW;
+                    const auto& t0    = tags.front();
+                    int narrow = 0, small = 0, far = 0;
                     for (const char* s : { "3", "-2", "-10" })
                     {
                         const juce::String txt (s);
-                        const auto z = ScaleKeyboard::layOutPeriodTag (area, cellW, txt.length());
-                        const float w = (float) juce::GlyphArrangement::getStringWidthInt (
-                            juce::Font (juce::FontOptions (z.tagFont).withStyle ("Bold")), txt);
-                        std::printf ("    \"%s\": %.1f pt, needs %.1f px of %.1f, \"0\" left with %.0f px\n",
-                                     s, z.tagFont, w, z.tag.getWidth(), z.zero.getWidth());
+                        const auto z = ScaleKeyboard::layOutPeriodTagForCell (cellW, t0.cellH,
+                                                                             t0.label, txt);
+                        const float w  = ScaleKeyboard::boldTextWidth (txt, z.tagFont);
+                        const float zw = ScaleKeyboard::boldTextWidth ("0", z.zeroFont);
+                        const float gg = (z.tag.getCentreX() - w * 0.5f)
+                                       - (z.zero.getCentreX() + zw * 0.5f);
+                        std::printf ("    \"%s\" at a %d px key: %.1f pt, needs %.1f px of %.1f,"
+                                     " \"0\" %.1f pt in %.1f px, ink gap %.2f\n",
+                                     s, ScaleKeyboard::kCellW, z.tagFont, w, z.tag.getWidth(),
+                                     z.zeroFont, z.zero.getWidth(), gg);
                         if (w > z.tag.getWidth()) ++narrow;
                         if (z.tagFont < 7.0f || z.zero.getWidth() < 10.0f) ++small;
+                        if (gg > 3.5f || gg < 1.0f) ++far;
                     }
                     check (narrow == 0, "a one-, two- or three-character period all fit their strip");
                     check (small == 0, "and none of them costs the \"0\" its own legibility");
+                    check (far == 0, "and every one of them stays tight against its \"0\"");
                 }
             }
 
@@ -3699,17 +3855,24 @@ int main()
             const double anchorHz = p.getNoteFrequency (p.registerAnchorKey());
             const double topHz    = p.getNoteFrequency (juce::jlimit (0, 127, p.registerAnchorKey()
                                                                               + p.defaultRegisterSteps()));
-            std::printf ("  registers: %d points, %.2f..%.2f Hz (anchor key %d at %.2f Hz, target f0 %.2f), %s\n",
+            std::printf ("  registers: %d points, %.2f..%.2f Hz (anchor key %d at %.2f Hz, target f0 %.2f),"
+                         " aggregated as the mean\n",
                          info.regPoints, info.regLoHz, info.regHiHz, p.registerAnchorKey(),
-                         anchorHz, f0, info.aggregate == 1 ? "minimax" : "mean");
+                         anchorHz, f0);
             check (info.regPoints == 3 && std::abs (info.regLoHz - anchorHz) < 1.0e-6
                    && std::abs (info.regHiHz - topHz) < 1.0e-6,
                    "an unset width is two periods UP from the note played, sampled at three registers");
             check ((int) info.perRegister.size() == info.regPoints
                    && (int) info.registerF0.size() == info.regPoints,
                    "and the result carries one measured number per register");
+            // The number the panel prints IS the aggregate the search minimised - the MEAN -
+            // and the worst register is carried beside it as a read-out only. If `after`
+            // ever came back as the worst register's own value again (which is what the
+            // deleted minimax path made it), this is where it would show.
+            check (std::abs (info.after - info.mean) < 1.0e-12,
+                   "what the panel prints as \"after\" is the MEAN over the registers, not one of them");
             check (info.mean <= info.worst + 1.0e-12 && info.after <= info.seedWorst,
-                   "the aggregate read-outs are consistent (mean never above the worst register)");
+                   "and the read-outs stay consistent (the mean is never above the worst register)");
             // The realtime follower's cap is a STATED difference, not a silent one: at this
             // two-octave range it samples exactly as densely as the Adapt button does.
             const auto rtRegs = p.adaptRegistersFor (st, f0, /*realtime*/ true);
@@ -5053,6 +5216,319 @@ int main()
             check (nAdapted > 0 && nAfter == nAdapted,
                    "a rebuild already in flight cannot publish the OLD spectrum over the adaptation");
         }
+    }
+
+    //==========================================================================
+    // THE PRESET PLAYGROUND, end to end on the real processor.
+    //
+    // The maths is checked offline in SpectrumTests (weights, log-vs-linear, hysteresis,
+    // the crossfade). What can only be checked HERE is the wiring: that dragging the two
+    // automatable parameters really moves ~200 controls, that it moves them the right
+    // way, that the SPECTRUM comes from the blend and not from the morphed knobs, that
+    // the TUNING is untouched, and that a corner arriving with the realtime follower
+    // armed does not immediately overwrite the blend.
+    {
+        std::printf ("\npreset playground (end to end):\n");
+        using Proc = FractalAdditiveAudioProcessor;
+
+        // Two presets on disk. Named so they cannot collide with a real one, and deleted
+        // at the end whatever happens.
+        auto folder = Proc::getPresetFolder();
+        auto fileA = folder.getChildFile ("zzz-verify-pg-A.gsting");
+        auto fileB = folder.getChildFile ("zzz-verify-pg-B.gsting");
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 64);
+        auto sp = [&] (const char* id, float plain)
+        {
+            if (auto* q = p->apvts.getParameter (id))
+                q->setValueNotifyingHost (q->convertTo0to1 (plain));
+        };
+        auto gp = [&] (const char* id) { return p->apvts.getRawParameterValue (id)->load(); };
+
+        // Corner A: the HARMONIC engine, short envelope, low base.
+        sp ("timbreOn", 0.0f); sp ("timbreTemper", 0.0f);
+        sp ("baseN", 1.0f); sp ("ampDecay", 0.02f); sp ("filterCutoff", 1200.0f);
+        sp ("curveSlope", 1.0f); sp ("phaseMode", 0.0f); sp ("masterGain", -6.0f);
+        sp ("refA", 440.0f); sp ("octaveShift", 0.0f); sp ("tuningMode", 2.0f);
+        p->pollParametersForTests();
+        check (p->savePreset ("zzz-verify-pg-A").isNotEmpty(), "corner preset A saved");
+
+        // Corner B: the CUSTOM SCALE engine - a different engine, so their parameter
+        // sets do not correspond and only the compiled partials can be blended.
+        {
+            juce::String err;
+            check (p->loadTimbreText ("5/4 3/2 2", err), "corner preset B gets a custom spectrum");
+        }
+        sp ("baseN", 16.0f); sp ("ampDecay", 2.0f); sp ("filterCutoff", 11000.0f);
+        sp ("curveSlope", 3.0f); sp ("phaseMode", 1.0f); sp ("masterGain", 6.0f);
+        sp ("timbreRepeats", 4.0f);
+        // ...and B is a preset whose ADAPTIVE/REALTIME spectrum is armed. That is part of
+        // the patch and has to survive the save.
+        {
+            Proc::RtSettings rs;
+            rs.adapt.partials = 6;
+            p->setRealtimeLink (Proc::RtLink::SpectrumFromChord, rs);
+        }
+        p->pollParametersForTests();
+        check (p->savePreset ("zzz-verify-pg-B").isNotEmpty(), "corner preset B saved");
+        p->setRealtimeLink (Proc::RtLink::Off, {});
+
+        // THE ADAPTIVE SPECTRUM IS PART OF A PRESET.
+        {
+            auto xml = juce::XmlDocument::parse (fileB);
+            const auto tree = xml != nullptr ? juce::ValueTree::fromXml (*xml) : juce::ValueTree();
+            const auto rt = tree.getChildWithName ("REALTIME");
+            check (rt.isValid() && (int) rt.getProperty ("link", 0) == (int) Proc::RtLink::SpectrumFromChord,
+                   "a preset saved with REALTIME on stores that it was on");
+            check (rt.isValid() && (int) rt.getProperty ("aPart", 0) == 6,
+                   "...and the settings the follower was aimed with, not just the switch");
+            check (p->loadPreset ("zzz-verify-pg-B")
+                   && p->getRealtimeLink() == Proc::RtLink::SpectrumFromChord,
+                   "loading it arms the follower again");
+            p->setRealtimeLink (Proc::RtLink::Off, {});
+        }
+
+        // A neutral starting patch, so "the morph moved it" cannot be confused with
+        // "it was already there".
+        p->loadPreset ("zzz-verify-pg-A");
+        sp ("ampDecay", 0.5f); sp ("filterCutoff", 5000.0f); sp ("baseN", 8.0f);
+        sp ("refA", 432.0f); sp ("octaveShift", 2.0f); sp ("bendRange", 0.0f);
+        sp ("tuningBankSlot", 0.0f);
+        p->pollParametersForTests();
+        const float refABefore = gp ("refA"), octBefore = gp ("octaveShift"),
+                    bendBefore = gp ("bendRange"), modeBefore = gp ("tuningMode");
+
+        juce::String err;
+        check (p->assignPlaygroundCorner (0, "zzz-verify-pg-A", err), "preset A dropped on corner A");
+        check (! p->isPlaygroundActive(), "ONE corner does not drive anything - the patch is left alone");
+        check (p->assignPlaygroundCorner (1, "zzz-verify-pg-B", err), "preset B dropped on corner B");
+        check (p->isPlaygroundActive(), "two corners engage the morph");
+
+        auto point = [&] (float x, float y)
+        {
+            sp ("pgX", x); sp ("pgY", y);
+            p->pollParametersForTests();
+            p->pollParametersForTests();   // the control writes are paced at ~30 Hz
+        };
+
+        point (0.0f, 0.0f);
+        check (std::abs (gp ("ampDecay") - 0.02f) < 1e-3f && std::abs (gp ("baseN") - 1.0f) < 0.01f
+               && std::abs (gp ("filterCutoff") - 1200.0f) < 1.0f && gp ("phaseMode") < 0.5f,
+               "at corner A every control reads preset A");
+        point (1.0f, 0.0f);
+        check (std::abs (gp ("ampDecay") - 2.0f) < 1e-2f && std::abs (gp ("baseN") - 16.0f) < 0.01f
+               && std::abs (gp ("filterCutoff") - 11000.0f) < 1.0f && gp ("phaseMode") > 0.5f,
+               "at corner B every control reads preset B");
+
+        // THE MIDDLE IS A REAL INTERMEDIATE, in the right space.
+        point (0.5f, 0.0f);
+        const float midDecay = gp ("ampDecay"), midBase = gp ("baseN"), midCut = gp ("filterCutoff");
+        std::printf ("  midpoint: ampDecay %.4f s (log %.4f, linear %.4f), baseN %.2f (log 4, linear 8.5), "
+                     "cutoff %.0f c\n",
+                     midDecay, std::sqrt (0.02 * 2.0), (0.02 + 2.0) / 2.0, midBase, midCut);
+        check (std::abs (midDecay - std::sqrt (0.02f * 2.0f)) < 0.01f,
+               "halfway between a 20 ms and a 2 s decay is 200 ms, not the 1.01 s linear smear");
+        check (std::abs (midBase - 4.0f) < 0.51f,
+               "halfway between Base 1 and Base 16 is Base 4 - two octaves, not three and a bit");
+        check (std::abs (midCut - 6100.0f) < 5.0f,
+               "cents are already logarithmic, so the cutoff averages LINEARLY");
+
+        // THE TUNING IS NOT MORPHED. Corner A and corner B were saved with the same
+        // tuning parameters, so this is checked against what the PATCH had when the
+        // playground engaged - which is different from both of them.
+        check (gp ("refA") == refABefore && gp ("octaveShift") == octBefore
+               && gp ("bendRange") == bendBefore && gp ("tuningMode") == modeBefore,
+               "reference A, octave, bend range and tuning mode are exactly where they were");
+
+        // A DRAG PRODUCES MONOTONIC INTERMEDIATES - no jumps, no overshoot.
+        {
+            bool mono = true;
+            float prev = -1.0f;
+            for (int i = 0; i <= 20; ++i)
+            {
+                point ((float) i / 20.0f, 0.0f);
+                const float d = gp ("ampDecay");
+                if (i > 0 && d < prev - 1e-4f) mono = false;
+                prev = d;
+            }
+            check (mono, "sweeping the point across writes a monotonically rising decay, never a jump");
+        }
+
+        // THE SPECTRUM IS THE BLEND, and at a corner it is EXACTLY that corner's.
+        {
+            point (1.0f, 0.0f);
+            juce::Thread::sleep (300);          // the blend runs on the spectrum worker
+            const auto* live = p->getLiveTemplate();
+            check (live != nullptr && ! live->partials.empty(), "the playground publishes a spectrum");
+            // Corner B is the custom scale 1, 5/4, 3/2 over 4 periods - the harmonic
+            // engine cannot produce 1.25, so finding it proves the blend followed the
+            // ENGINE across, not just the knobs.
+            bool has125 = false;
+            if (live != nullptr)
+                for (const auto& pp : live->partials)
+                    if (std::abs ((double) pp.ratio - 1.25) < 1e-3) has125 = true;
+            check (has125, "at corner B the sounding spectrum is the CUSTOM engine's, morphed across engines");
+
+            point (0.0f, 0.0f);
+            juce::Thread::sleep (300);
+            const auto* atA = p->getLiveTemplate();
+            bool stillHas125 = false;
+            if (atA != nullptr)
+                for (const auto& pp : atA->partials)
+                    if (std::abs ((double) pp.ratio - 1.25) < 1e-3) stillHas125 = true;
+            check (! stillHas125, "and back at corner A none of B's partials are left behind");
+
+            point (0.5f, 0.0f);
+            juce::Thread::sleep (300);
+            const auto* mid = p->getLiveTemplate();
+            bool bothPresent = false;
+            if (mid != nullptr)
+            {
+                bool a = false, b = false;
+                for (const auto& pp : mid->partials)
+                {
+                    if (std::abs ((double) pp.ratio - 1.25) < 1e-3) b = true;
+                    if (std::abs ((double) pp.ratio - 7.00) < 1e-2) a = true;
+                }
+                bothPresent = a && b;
+            }
+            check (bothPresent, "half way across, partials from BOTH engines are sounding at once");
+        }
+
+        // A DRAG MUST NOT RESTART EVERY VOICE'S MORPH. The generation is what starts one;
+        // it may move for the ENGAGE (a real spectrum change) but not for the frames of a
+        // drag, while the live revision must move on every one of them (that is the
+        // setPartialGains trick, applied here).
+        {
+            point (0.0f, 0.0f);
+            juce::Thread::sleep (250);
+            const auto gen0 = p->getTemplateGeneration();
+            const auto rev0 = p->getSpectrumLiveRevision();
+            for (int i = 1; i <= 20; ++i)      // a slow drag: 0.02 per frame, well under the jump threshold
+            {
+                sp ("pgX", (float) i * 0.02f);
+                p->pollParametersForTests();
+                juce::Thread::sleep (12);
+            }
+            juce::Thread::sleep (250);
+            const auto gen1 = p->getTemplateGeneration();
+            const auto rev1 = p->getSpectrumLiveRevision();
+            std::printf ("  20 drag frames: generation +%u, live revision +%u\n",
+                         gen1 - gen0, rev1 - rev0);
+            check (gen1 == gen0, "a drag does not bump the template generation even once - no morph restarts");
+            check (rev1 > rev0 + 5, "...while the live template really is being replaced on the way");
+        }
+
+        // A JUMP is different, and must be treated as one.
+        {
+            const auto gen0 = p->getTemplateGeneration();
+            point (1.0f, 0.0f);
+            juce::Thread::sleep (250);
+            check (p->getTemplateGeneration() > gen0,
+                   "automation cutting across the pad DOES bump the generation - the voices morph/fade it");
+        }
+
+        // A CORNER THAT ARRIVES WITH REALTIME ARMED must not overwrite the blend.
+        {
+            p->assignPlaygroundCorner (0, {}, err);
+            p->assignPlaygroundCorner (1, {}, err);
+            Proc::RtSettings rs;
+            p->setRealtimeLink (Proc::RtLink::SpectrumFromChord, rs);
+            check (p->getRealtimeLink() == Proc::RtLink::SpectrumFromChord, "realtime armed by hand");
+            p->assignPlaygroundCorner (0, "zzz-verify-pg-A", err);
+            p->assignPlaygroundCorner (1, "zzz-verify-pg-B", err);
+            p->pollParametersForTests();
+            check (p->getRealtimeLink() == Proc::RtLink::Off && p->isPlaygroundSuspendingRealtime(),
+                   "engaging the playground stands the follower down - one owner of the spectrum, and it SAYS so");
+            p->assignPlaygroundCorner (1, {}, err);
+            p->pollParametersForTests();
+            check (p->getRealtimeLink() == Proc::RtLink::SpectrumFromChord,
+                   "clearing a corner hands the follower straight back, exactly as armed");
+            p->setRealtimeLink (Proc::RtLink::Off, {});
+        }
+
+        // The playground survives a state round trip, and a corner whose preset has
+        // vanished comes back EMPTY rather than pointing at something else.
+        {
+            p->assignPlaygroundCorner (0, "zzz-verify-pg-A", err);
+            p->assignPlaygroundCorner (1, "zzz-verify-pg-B", err);
+            sp ("pgX", 0.37f); sp ("pgY", 0.62f);
+            p->pollParametersForTests();
+            juce::MemoryBlock blob;
+            p->getStateInformation (blob);
+
+            auto q = std::make_unique<Proc>();
+            q->prepareToPlay (48000.0, 64);
+            q->setStateInformation (blob.getData(), (int) blob.getSize());
+            q->pollParametersForTests();
+            check (q->getPlaygroundCornerName (0) == "zzz-verify-pg-A"
+                   && q->getPlaygroundCornerName (1) == "zzz-verify-pg-B"
+                   && q->isPlaygroundActive(),
+                   "the playground comes back from a project reload with its corners on");
+            check (std::abs (q->apvts.getRawParameterValue ("pgX")->load() - 0.37f) < 1e-3f
+                   && std::abs (q->apvts.getRawParameterValue ("pgY")->load() - 0.62f) < 1e-3f,
+                   "...and the point back where it was");
+
+            fileB.deleteFile();
+            auto r = std::make_unique<Proc>();
+            r->prepareToPlay (48000.0, 64);
+            r->setStateInformation (blob.getData(), (int) blob.getSize());
+            check (r->getPlaygroundCornerName (0) == "zzz-verify-pg-A"
+                   && r->getPlaygroundCornerName (1).isEmpty()
+                   && ! r->isPlaygroundActive(),
+                   "a corner whose preset is gone comes back EMPTY - it never substitutes another one");
+        }
+
+        // THE WINDOW ITSELF. It is a separate desktop window, so the main layout probe
+        // never sees it and no screenshot in this build can either - these lay it out at
+        // its smallest allowed size in BOTH languages, paint it, and drive the pad.
+        {
+            auto ed = std::unique_ptr<FractalAdditiveAudioProcessorEditor> (
+                          dynamic_cast<FractalAdditiveAudioProcessorEditor*> (p->createEditor()));
+            check (ed != nullptr, "the editor builds with the playground in it");
+            if (ed != nullptr)
+            {
+                ed->setSize (1200, 650);
+                for (int lang = 0; lang < 2; ++lang)
+                {
+                    // 420 x 380 is setResizeLimits' floor - the tightest the user can make it.
+                    const auto L = ed->playgroundProbeForTests (420, 380, lang == 1);
+                    int overlaps = 0, tiny = 0;
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        if (! L.panel.contains (L.box[i]) || ! L.panel.contains (L.clear[i])) ++overlaps;
+                        if (L.box[i].getWidth() < 60 || L.box[i].getHeight() < 14) ++tiny;
+                        if (L.box[i].intersects (L.clear[i]) || L.box[i].intersects (L.lbl[i])) ++overlaps;
+                        if (L.pad.intersects (L.box[i])) ++overlaps;
+                    }
+                    std::printf ("  playground panel (%s) at 420x380: pad %dx%d, combo %dx%d, "
+                                 "%d overlaps, %d squashed\n", lang == 1 ? "ca" : "en",
+                                 L.pad.getWidth(), L.pad.getHeight(),
+                                 L.box[0].getWidth(), L.box[0].getHeight(), overlaps, tiny);
+                    check (overlaps == 0 && tiny == 0,
+                           "at its smallest size nothing in the playground overlaps or is squashed away");
+                    check (L.pad.getWidth() > 200 && L.pad.getHeight() > 120,
+                           "...and the pad still gets most of the window");
+                    check (L.status.isNotEmpty(), "the panel says what the blend currently is");
+                }
+
+                // THE PAD'S MAPPING: a click at a fraction of the travel has to become
+                // exactly that value on the parameter, or the sound would never be where
+                // the point is drawn.
+                ed->playgroundProbeForTests (520, 480, false);
+                ed->playgroundDragForTests (0.25f, 0.75f);
+                std::printf ("  drag to (0.25, 0.75) -> pgX %.4f pgY %.4f\n", gp ("pgX"), gp ("pgY"));
+                check (std::abs (gp ("pgX") - 0.25f) < 0.02f && std::abs (gp ("pgY") - 0.75f) < 0.02f,
+                       "a drag lands the point exactly where it was dropped");
+                ed->playgroundDragForTests (0.0f, 0.0f);
+                check (gp ("pgX") == 0.0f && gp ("pgY") == 0.0f, "and a corner really is the corner");
+            }
+        }
+
+        fileA.deleteFile();
+        fileB.deleteFile();
+        check (! fileA.existsAsFile() && ! fileB.existsAsFile(), "the verifier's presets are cleaned up");
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
