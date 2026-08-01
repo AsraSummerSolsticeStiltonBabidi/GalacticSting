@@ -2861,6 +2861,10 @@ private:
         juce::TooltipWindow tooltips { this, 350 };
         float lastX = -1.0f, lastY = -1.0f;
         int   lastAssigned = -1, lastWinner = -2;
+        // Adaptive-corner state the status line reports: count + whether a refusal is
+        // showing. In the change detection because a corner can be SWAPPED without the
+        // assigned count moving, and a stale line would claim a follower that is gone.
+        int   lastAdaptSig = -1;
 
         PlaygroundPanel()
         {
@@ -2995,9 +2999,12 @@ private:
             const float y = proc->apvts.getRawParameterValue ("pgY")->load();
             const int   n = proc->getPlaygroundAssignedCount();
             const int   wn = proc->getPlaygroundNearestCorner();
-            if (! force && x == lastX && y == lastY && n == lastAssigned && wn == lastWinner)
+            const int   adSig = proc->getPlaygroundAdaptiveCount() * 2
+                              + (proc->getPlaygroundAdaptRefusal().isNotEmpty() ? 1 : 0);
+            if (! force && x == lastX && y == lastY && n == lastAssigned && wn == lastWinner
+                && adSig == lastAdaptSig)
                 return;
-            lastX = x; lastY = y; lastAssigned = n; lastWinner = wn;
+            lastX = x; lastY = y; lastAssigned = n; lastWinner = wn; lastAdaptSig = adSig;
 
             juce::String s;
             if (n < 2)
@@ -3037,6 +3044,17 @@ private:
                                      "  TEMPS REAL est\xc3\xa0 en pausa mentre el laboratori porta l'espectre; torna "
                                      "quan buidis una cantonada.")
                               : juce::String());
+                // Corners saved with the follower armed keep following INSIDE the blend -
+                // the one thing that would otherwise look broken ("my adaptive preset
+                // stopped adapting") or invisible ("why is the pad moving by itself?").
+                if (proc->getPlaygroundAdaptiveCount() > 0)
+                    s << (trF ? trF ("  Corners saved with REALTIME keep adapting to what you play, "
+                                     "inside the blend.",
+                                     "  Les cantonades desades amb TEMPS REAL segueixen adaptant-se al que "
+                                     "toques, dins la barreja.")
+                              : juce::String());
+                if (proc->getPlaygroundAdaptRefusal().isNotEmpty())
+                    s << "\n" << proc->getPlaygroundAdaptRefusal();
             }
             statLbl.setText (s, juce::dontSendNotification);
             pad.repaint();

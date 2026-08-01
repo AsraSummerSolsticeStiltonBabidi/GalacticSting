@@ -551,6 +551,36 @@ public:
     // REALTIME button that is quietly doing nothing.
     bool isPlaygroundSuspendingRealtime() const noexcept;
 
+    // ADAPTIVE CORNERS: a corner whose preset was saved with the SpectrumFromChord
+    // follower armed KEEPS ADAPTING while the playground is engaged - against its OWN
+    // settings, to the chord being held right now - and its corner template updates
+    // live, so the blend (and therefore the morphed result) moves with the playing.
+    // Half-morphed with a static preset the adaptation is diluted but PRESENT, which
+    // is the point: "morphs locos" between several presets, not from one.
+    //
+    // Only SpectrumFromChord qualifies. TuningFromSpectrum writes the TUNING, which
+    // the playground promises never to touch; SpectrumFromTuning aims at a fixed set
+    // of notes, so inside the playground it would re-derive the same spectrum for
+    // ever (the enum's own comment already documents that trap) - a corner saved with
+    // either stays exactly as compiled. The LIVE patch's follower stays suspended as
+    // before: the playground owns the live spectrum, and the corner adaptations reach
+    // it THROUGH the blend rather than around it.
+    //
+    // How many corners are adapting right now (assigned + armed + not refused).
+    int getPlaygroundAdaptiveCount() const noexcept;
+    // Counters for the offline verifier: searches launched for corners, results applied.
+    int getPlaygroundAdaptStarts()  const noexcept { return pgAdaptStarts; }
+    int getPlaygroundAdaptApplies() const noexcept { return pgAdaptApplies; }
+    // Non-empty when a corner's saved settings cannot run at all (bad period, absurd
+    // cost...). The corner stops retrying and this SAYS so - never a silent stop.
+    juce::String getPlaygroundAdaptRefusal() const { return pgAdaptRefusal; }
+    // The corner's compiled template, so a test can prove it CHANGES when the chord does.
+    std::shared_ptr<const spectrum::SpectrumTemplate> getPlaygroundCornerTemplateForTests (int corner) const
+    {
+        return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].tmpl
+                                                                     : nullptr;
+    }
+
     //==========================================================================
     // The TWO inputs every Sethares feature shares. Their numbers are compared with
     // each other (the degree list next to the n-ad list, the generated scale's
@@ -1248,6 +1278,16 @@ private:
         juce::String provName, provSource, provPeriod;
         int  rtLink = 0;                                      // the realtime/adaptive link it was saved with
         RtSettings rtSet;
+        // ADAPTIVE-CORNER bookkeeping (message thread; see the public block). The aim is
+        // the chord the last launched search was AIMED at - the same "has it moved?"
+        // reference the plain follower keeps, per corner because each corner searches
+        // with its own settings and on its own turn of the round-robin.
+        std::vector<double> rtAimAlphas;
+        double rtAimF0 = 0.0;
+        bool   rtPend  = false;   // the chord moved: this corner owes a search
+        bool   rtDead  = false;   // its settings REFUSED to run: stop retrying, say so
+        bool rtAdaptive() const noexcept
+        { return assigned() && rtLink == (int) RtLink::SpectrumFromChord && ! rtDead; }
         // shared_ptr, and const: a drag posts a blend job every 16 ms and the worker may
         // still be reading a corner the user has just replaced. Immutable + refcounted is
         // what makes reassigning a corner mid-blend safe without a lock.
@@ -1272,6 +1312,45 @@ private:
     // it can be handed back untouched when the playground lets go.
     RtLink pgSuspendedRt = RtLink::Off;
     bool   pgRtSuspended = false;
+
+    //== ADAPTIVE CORNERS (see the public block). Message thread except where noted. ==
+    // One finished corner search. It carries its OWN identity (corner + preset name) and
+    // the chord it was AIMED at, because by the time it is consumed the corner may have
+    // been reassigned and the chord may have moved - both of which make it stale, and a
+    // stale adaptation is DROPPED, never applied late (same rule as the plain follower).
+    struct CornerAdaptResult
+    {
+        int corner = -1;
+        juce::String cornerName;
+        std::vector<double> ratios, amps;   // ascending, ratios[0] == 1.0
+        double period = 2.0;
+        std::vector<double> aimAlphas;
+        double aimF0 = 0.0;
+        bool valid = false;
+    };
+    CornerAdaptResult pgAdaptResult;        // guarded by adaptLock (worker writes, timer reads)
+    std::atomic<int>  pgAdaptGeneration { 0 };
+    int  pgSeenAdaptGen = 0;
+    int  pgAdaptLastStart = -1000;          // in rtTick units: same launch floor as the follower
+    int  pgAdaptNext = 0;                   // round-robin cursor over the adaptive corners
+    int  pgAdaptInFlight = -1;              // corner whose search is running (-1 = none)
+    int  pgAdaptStarts = 0, pgAdaptApplies = 0;
+    juce::String pgAdaptRefusal;
+    // A corner preset's value for a parameter, falling back to the parameter's DEFAULT
+    // (never the live patch) when the preset predates it - shared by every corner
+    // compile so old presets always mean the same thing.
+    float cornerValueOr (const PlaygroundCorner& c, const char* id) const;
+    // Launch one corner's adaptation on the shared worker ("never two at once" is
+    // adaptRunning, exactly as the follower uses it).
+    bool startCornerAdapt (int corner, const std::vector<double>& alphas, double f0,
+                           juce::String& errorOut);
+    // Write a finished result into its corner: adapted intervals as the corner's typed
+    // spectrum, adapted amplitudes BAKED into the corner's compiled template.
+    void applyCornerAdaptResult (PlaygroundCorner& c, const CornerAdaptResult& r);
+    // Consume finished results, watch the held chord, launch what is owed. Called from
+    // drivePlayground while the playground is engaged.
+    void drivePlaygroundAdaptive();
+
     void drivePlayground();
     void applyPlaygroundDiscreteState (int corner);
     void applyPlaygroundContinuous (const double w[kPlaygroundCorners]);

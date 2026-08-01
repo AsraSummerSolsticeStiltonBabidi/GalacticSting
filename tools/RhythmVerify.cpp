@@ -5651,6 +5651,390 @@ int main()
         check (! fileA.existsAsFile() && ! fileB.existsAsFile(), "the verifier's presets are cleaned up");
     }
 
+    //==========================================================================
+    // --- run 43: ADAPTIVE CORNERS stay live inside the playground morph ---------------
+    // "quiero que los presets puedan tener espectro adaptativo y aun asi morphear entre
+    //  ellos en el preset playground... quiero que afecte, para dar pie a morphs locos,
+    //  como cuando cambias de espectro con el morph on."
+    // A corner whose preset was saved with the SpectrumFromChord follower armed must
+    // keep adapting INSIDE the playground: its corner template changes when the chord
+    // changes, the blended LIVE template moves with it (diluted, but present), each
+    // adaptive update publishes WITH a generation bump (the voices glide/fade it), a
+    // drag still bumps revision-not-generation, a stale result is dropped, a reload
+    // re-arms the corners - and none of it clicks or thumps, morph on OR off.
+    {
+        std::printf ("\nadaptive corners inside the playground:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        constexpr int    eb = 64;
+        constexpr double sr = 48000.0;
+
+        auto folder = Proc::getPresetFolder();
+        auto fileA = folder.getChildFile ("zzz-verify-pga-A.gsting");
+        auto fileB = folder.getChildFile ("zzz-verify-pga-B.gsting");
+        auto fileC = folder.getChildFile ("zzz-verify-pga-C.gsting");
+
+        // Three presets: A static, B the SAME sound saved with the follower armed, C the
+        // same sound with it off (the control corner - so the control take differs from
+        // the adaptive take by exactly one thing: whether the corner adapts).
+        {
+            auto m = std::make_unique<Proc>();
+            m->prepareToPlay (sr, eb);
+            auto sm = [&m] (const char* id, float v)
+            { if (auto* q = m->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
+            sm ("ampAttack", 0.001f); sm ("ampDecay", 0.001f); sm ("ampSustain", 1.0f);
+            sm ("ampRelease", 0.003f); sm ("baseN", 1.0f); sm ("curveSlope", 1.0f);
+            sm ("fractalLevel", 1.0f);
+            m->pollParametersForTests();
+            check (m->savePreset ("zzz-verify-pga-A").isNotEmpty(), "static corner preset saved");
+            Proc::RtSettings rs;
+            rs.adapt.partials = 6; rs.adapt.rootOnly = true; rs.adapt.shapeAmps = true;
+            m->setRealtimeLink (Proc::RtLink::SpectrumFromChord, rs);
+            m->pollParametersForTests();
+            check (m->savePreset ("zzz-verify-pga-B").isNotEmpty(),
+                   "adaptive corner preset saved (REALTIME armed)");
+            m->setRealtimeLink (Proc::RtLink::Off, {});
+            m->pollParametersForTests();
+            check (m->savePreset ("zzz-verify-pga-C").isNotEmpty(), "control corner preset saved");
+        }
+
+        const auto ratiosOf = [] (const std::shared_ptr<const spectrum::SpectrumTemplate>& t)
+        {
+            std::vector<float> r;
+            if (t != nullptr) for (const auto& p : t->partials) r.push_back (p.ratio);
+            return r;
+        };
+        const auto liveRatios = [] (Proc& p)
+        {
+            std::vector<float> r;
+            if (const auto* t = p.getLiveTemplate())
+                for (const auto& pp : t->partials) r.push_back (pp.ratio);
+            return r;
+        };
+        const auto differs = [] (const std::vector<float>& a, const std::vector<float>& b)
+        {
+            if (a.size() != b.size()) return true;
+            for (size_t i = 0; i < a.size(); ++i)
+                if (std::abs (a[i] - b[i]) > 1.0e-4f) return true;
+            return false;
+        };
+
+        // One wall-clock-paced take: corners A + (B|C) at the midpoint, chord A held and
+        // settled, then the chord MOVES while the recorder runs. Same rig as run 42, so
+        // the searches (real threads) and the 60 Hz poll keep their real cadence.
+        struct Take
+        {
+            std::vector<float> x;          // recorded audio across the chord move
+            size_t T0 = 0, T1 = 0;         // the move, and the settled end
+            juce::uint32 genBeforeMove = 0, genAfterSettle = 0;
+            int startsEnd = 0, appliesEnd = 0;
+            std::vector<float> cornerBefore, cornerAfter, liveBefore, liveAfter;
+            std::unique_ptr<Proc> p;       // handed back for the follow-on probes
+        };
+        auto take = [&] (bool adaptiveB, bool morphOn) -> Take
+        {
+            Take tk;
+            tk.p = std::make_unique<Proc>();
+            auto& p = *tk.p;
+            p.prepareToPlay (sr, eb);
+            auto sp = [&p] (const char* id, float v)
+            { if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
+            sp ("ampAttack", 0.001f); sp ("ampDecay", 0.001f); sp ("ampSustain", 1.0f);
+            sp ("ampRelease", 0.003f); sp ("morph", morphOn ? 1.0f : 0.0f); sp ("morphTime", 0.3f);
+            p.pollParametersForTests();
+
+            juce::String err;
+            p.assignPlaygroundCorner (0, "zzz-verify-pga-A", err);
+            p.assignPlaygroundCorner (1, adaptiveB ? "zzz-verify-pga-B" : "zzz-verify-pga-C", err);
+            sp ("pgX", 0.5f); sp ("pgY", 0.0f);
+            p.pollParametersForTests();
+
+            juce::AudioBuffer<float> b (2, eb);
+            long long clockS = 0, nextPoll = 0;
+            const long long tickS = (long long) (sr / 60.0);
+            const double t0ms = juce::Time::getMillisecondCounterHiRes();
+            bool recording = false;
+            auto pumpFor = [&] (double seconds, juce::MidiBuffer firstBlockMidi)
+            {
+                const long long want = clockS + (long long) (seconds * sr);
+                bool sent = false;
+                while (clockS < want)
+                {
+                    juce::MidiBuffer m;
+                    if (! sent) { m = firstBlockMidi; sent = true; }
+                    b.clear();
+                    p.processBlock (b, m);
+                    if (recording)
+                        for (int k = 0; k < eb; ++k) tk.x.push_back (b.getReadPointer (0)[k]);
+                    clockS += eb;
+                    if (clockS >= nextPoll) { nextPoll += tickS; p.pollParametersForTests(); }
+                    for (;;)   // never outrun the searcher's wall clock (as run 42)
+                    {
+                        const double behind = (double) clockS * 1000.0 / sr
+                                            - (juce::Time::getMillisecondCounterHiRes() - t0ms);
+                        if (behind <= 0.0) break;
+                        juce::Thread::sleep (behind > 2.0 ? 1 : 0);
+                    }
+                }
+            };
+            auto keyMidi = [] (bool on, std::initializer_list<int> notes)
+            {
+                juce::MidiBuffer m;
+                for (const int k : notes)
+                    m.addEvent (on ? juce::MidiMessage::noteOn (1, k, (juce::uint8) 100)
+                                   : juce::MidiMessage::noteOff (1, k), 0);
+                return m;
+            };
+
+            pumpFor (0.30, {});
+            pumpFor (1.40, keyMidi (true, { 60, 64, 67 }));      // chord A held + settled
+            tk.cornerBefore  = ratiosOf (p.getPlaygroundCornerTemplateForTests (1));
+            tk.liveBefore    = liveRatios (p);
+            tk.genBeforeMove = p.getTemplateGeneration();
+            recording = true;
+            pumpFor (0.10, {});
+            tk.T0 = tk.x.size();                                  // the chord MOVES here
+            pumpFor (0.02, keyMidi (false, { 60, 64, 67 }));
+            pumpFor (1.60, keyMidi (true,  { 62, 65, 69 }));      // C major -> D minor
+            tk.T1 = tk.x.size();
+            recording = false;
+            tk.cornerAfter    = ratiosOf (p.getPlaygroundCornerTemplateForTests (1));
+            tk.liveAfter      = liveRatios (p);
+            tk.genAfterSettle = p.getTemplateGeneration();
+            tk.startsEnd      = p.getPlaygroundAdaptStarts();
+            tk.appliesEnd     = p.getPlaygroundAdaptApplies();
+            return tk;
+        };
+
+        // Run-26-style per-sample click metric, plus run-42-style loudness excursion:
+        // the event window straddles the landing (which arrives search+throttle after
+        // T0), the calm window is the settled tail of the SAME take, so the note's own
+        // beating is the yardstick the landing is measured against.
+        const auto clickOf = [] (const Take& tk)
+        {
+            double maxJump = 0.0, peak = 0.0;
+            const size_t from = tk.T0 + (size_t) (0.030 * 48000.0);
+            for (size_t i = from + 1; i < tk.T1 && i < tk.x.size(); ++i)
+            {
+                peak    = std::max (peak, (double) std::abs (tk.x[i]));
+                maxJump = std::max (maxJump, (double) std::abs (tk.x[i] - tk.x[i - 1]));
+            }
+            return peak > 0.0 ? maxJump / peak : 0.0;
+        };
+        const auto thumpOf = [] (const Take& tk)
+        {
+            constexpr int rw = 960, rh = 120, exSpan = 12;       // 20 ms RMS, 30 ms excursion
+            std::vector<double> rms;
+            std::vector<size_t> at;
+            for (size_t a = tk.T0; a + (size_t) rw <= tk.T1; a += (size_t) rh)
+            {
+                double s2 = 0.0;
+                for (int i = 0; i < rw; ++i) { const double v = tk.x[a + (size_t) i]; s2 += v * v; }
+                rms.push_back (std::sqrt (s2 / rw));
+                at.push_back (a + (size_t) rw / 2);
+            }
+            double mean = 0.0;
+            for (const double v : rms) mean += v;
+            mean /= std::max<size_t> (1, rms.size());
+            // The event window opens AFTER the new chord's own 1 ms attack has fully
+            // left the 20 ms RMS windows (the landing cannot arrive before ~60 ms:
+            // detection tick + search + apply tick), so what this measures is the
+            // LANDING - with the attack inside the window the attack's step dominated
+            // and the metric could not see a landing thump at all.
+            const size_t evLo = tk.T0 + (size_t) (0.070 * 48000.0);
+            const size_t evHi = tk.T0 + (size_t) (0.500 * 48000.0);
+            const size_t caLo = tk.T1 - (size_t) (0.450 * 48000.0);
+            const size_t caHi = tk.T1 - (size_t) (0.030 * 48000.0);
+            double ev = 0.0, calm = 0.0;
+            for (size_t i = 0; i + (size_t) exSpan < rms.size(); ++i)
+            {
+                double lo = rms[i], hi = rms[i];
+                for (int k = 1; k <= exSpan; ++k)
+                { lo = std::min (lo, rms[i + (size_t) k]); hi = std::max (hi, rms[i + (size_t) k]); }
+                const double e = (hi - lo) / std::max (1.0e-12, mean);
+                if (at[i] >= evLo && at[i] < evHi) ev   = std::max (ev, e);
+                if (at[i] >= caLo && at[i] < caHi) calm = std::max (calm, e);
+            }
+            return calm > 0.0 ? ev / calm : 0.0;
+        };
+
+        // ---- morph OFF: the adaptation moves the corner, the blend, and the ear ----
+        auto ctlOff = take (false, false);
+        auto adpOff = take (true,  false);
+        std::printf ("  morph off: control starts/applies %d/%d, adaptive %d/%d; "
+                     "gen ctl +%u adp +%u\n",
+                     ctlOff.startsEnd, ctlOff.appliesEnd, adpOff.startsEnd, adpOff.appliesEnd,
+                     ctlOff.genAfterSettle - ctlOff.genBeforeMove,
+                     adpOff.genAfterSettle - adpOff.genBeforeMove);
+        check (adpOff.p->getPlaygroundAdaptiveCount() == 1,
+               "a corner saved with REALTIME armed counts as adaptive inside the playground");
+        check (ctlOff.p->getPlaygroundAdaptiveCount() == 0 && ctlOff.startsEnd == 0,
+               "a corner saved with it off never launches a search");
+        check (adpOff.startsEnd >= 1 && adpOff.appliesEnd >= 1,
+               "the adaptive corner really searched and really applied");
+        check (differs (adpOff.cornerBefore, adpOff.cornerAfter),
+               "the CORNER's template changes when the chord changes");
+        check (differs (adpOff.liveBefore, adpOff.liveAfter),
+               "...and the LIVE blended template moves with it - the point never moved");
+        check (! differs (ctlOff.liveBefore, ctlOff.liveAfter),
+               "the control take's live template does not move (the change IS the adaptation)");
+        check (adpOff.genAfterSettle > adpOff.genBeforeMove,
+               "an adaptive update publishes WITH a generation bump - the voices fade/morph it");
+        check (ctlOff.genAfterSettle == ctlOff.genBeforeMove,
+               "the control take's generation stands still across the same chord move");
+
+        const double jOffC = clickOf (ctlOff), jOffA = clickOf (adpOff);
+        const double tOffA = thumpOf (adpOff);
+        std::printf ("  morph off: jump/peak ctl %.3f adp %.3f; landing/calm RMS excursion %.2fx\n",
+                     jOffC, jOffA, tOffA);
+        check (jOffA <= jOffC * 2.5 + 0.02, "morph off: an adaptive landing does not click");
+        check (tOffA <= 1.6,
+               "morph off: the landing is no louder a step than the note's own movement (no thump)");
+
+        // ---- morph ON: same take, the voices GLIDE to each adaptive blend ----
+        auto ctlOn = take (false, true);
+        auto adpOn = take (true,  true);
+        const double jOnC = clickOf (ctlOn), jOnA = clickOf (adpOn);
+        const double tOnA = thumpOf (adpOn);
+        std::printf ("  morph on:  jump/peak ctl %.3f adp %.3f; landing/calm RMS excursion %.2fx; "
+                     "starts/applies %d/%d\n", jOnC, jOnA, tOnA, adpOn.startsEnd, adpOn.appliesEnd);
+        check (adpOn.appliesEnd >= 1 && adpOn.genAfterSettle > adpOn.genBeforeMove,
+               "morph on: the adaptation lands and bumps the generation (the morph glides to it)");
+        check (jOnA <= jOnC * 2.5 + 0.02, "morph on: an adaptive landing does not click either");
+        check (tOnA <= 1.6, "morph on: ...and does not thump");
+
+        // ---- the follow-on probes run on the settled morph-off adaptive rig ----
+        auto& p = *adpOff.p;
+        auto sp = [&p] (const char* id, float v)
+        { if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
+
+        // A DRAG under a held chord still bumps revision-not-generation: the chord is
+        // steady, so no adaptation is due, and the drag frames must not restart morphs.
+        {
+            for (int i = 0; i < 30; ++i) { p.pollParametersForTests(); juce::Thread::sleep (5); }
+            const auto gen0 = p.getTemplateGeneration();
+            const auto rev0 = p.getSpectrumLiveRevision();
+            // TOWARDS the incumbent winner (A, adopted at the midpoint engage): a drag
+            // the other way crosses the 0.08-hysteresis boundary, and a winner flip is a
+            // real discrete jump that bumps the generation BY DESIGN - it must not be
+            // mistaken for the drag itself doing it.
+            for (int i = 1; i <= 20; ++i)
+            {
+                sp ("pgX", 0.5f - (float) i * 0.01f);
+                p.pollParametersForTests();
+                juce::Thread::sleep (12);
+            }
+            juce::Thread::sleep (150);
+            p.pollParametersForTests();
+            std::printf ("  drag with an adaptive corner engaged: generation +%u, revision +%u\n",
+                         p.getTemplateGeneration() - gen0, p.getSpectrumLiveRevision() - rev0);
+            check (p.getTemplateGeneration() == gen0,
+                   "a drag still bumps revision-not-generation with an adaptive corner engaged");
+            check (p.getSpectrumLiveRevision() > rev0 + 5,
+                   "...while the live template really is being replaced along the way");
+        }
+
+        // A STALE RESULT IS DROPPED. Move to chord P, wait until P's search is genuinely
+        // RUNNING, move to Q mid-search: P's answer must be dropped (the chord it was
+        // aimed at is gone) and Q must get exactly one apply of its own.
+        {
+            juce::AudioBuffer<float> b (2, eb);
+            auto blockWith = [&] (juce::MidiBuffer m)
+            { b.clear(); p.processBlock (b, m); };
+            auto chord = [] (bool on, std::initializer_list<int> notes)
+            {
+                juce::MidiBuffer m;
+                for (const int k : notes)
+                    m.addEvent (on ? juce::MidiMessage::noteOn (1, k, (juce::uint8) 100)
+                                   : juce::MidiMessage::noteOff (1, k), 0);
+                return m;
+            };
+            auto settle = [&] (double seconds)
+            {
+                const int blocks = (int) (seconds * sr / eb);
+                for (int i = 0; i < blocks; ++i)
+                {
+                    blockWith ({});
+                    if ((i % 12) == 0) p.pollParametersForTests();
+                    juce::Thread::sleep (1);
+                }
+            };
+            blockWith (chord (false, { 62, 65, 69 }));
+            settle (0.6);
+            const int starts0 = p.getPlaygroundAdaptStarts(), applies0 = p.getPlaygroundAdaptApplies();
+            blockWith (chord (true, { 60, 64, 67, 65 }));        // P
+            bool sawRunning = false;
+            for (int i = 0; i < 4000 && ! sawRunning; ++i)
+            {
+                blockWith ({});
+                p.pollParametersForTests();
+                sawRunning = p.isSpectrumAdaptRunning();
+            }
+            blockWith (chord (true, { 62 }));                     // Q, mid-search
+            settle (1.0);
+            const int startsD = p.getPlaygroundAdaptStarts() - starts0;
+            const int appliesD = p.getPlaygroundAdaptApplies() - applies0;
+            std::printf ("  P then Q mid-search: running seen %d, starts +%d, applies +%d\n",
+                         (int) sawRunning, startsD, appliesD);
+            check (sawRunning, "Q really did land while P's search was still running");
+            check (startsD == 2 && appliesD == 1,
+                   "a result aimed at a chord the player has left is DROPPED, not applied late");
+        }
+
+        // WHEN THE ADAPTIVE CORNER IS THE WINNER, the live patch's spectrum state
+        // follows its adaptation - the Custom Engine box must describe what sounds.
+        {
+            sp ("pgX", 1.0f); sp ("pgY", 0.0f);                   // jump onto corner B
+            p.pollParametersForTests();
+            juce::AudioBuffer<float> b (2, eb);
+            juce::MidiBuffer off1;
+            for (const int k : { 60, 62, 64, 65, 67 }) off1.addEvent (juce::MidiMessage::noteOff (1, k), 0);
+            b.clear(); p.processBlock (b, off1);
+            juce::MidiBuffer on2;
+            for (const int k : { 57, 61, 64 }) on2.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0);
+            b.clear(); p.processBlock (b, on2);
+            for (int i = 0; i < 900; ++i)
+            {
+                juce::MidiBuffer m; b.clear(); p.processBlock (b, m);
+                if ((i % 12) == 0) p.pollParametersForTests();
+                juce::Thread::sleep (1);
+            }
+            std::printf ("  winner-corner adaptation: live custom spectrum '%s' (%d degrees)\n",
+                         p.getTimbreSource().substring (0, 40).toRawUTF8(), p.getTimbreNoteCount());
+            check (p.timbreLoaded() && p.getTimbreSource().contains ("c"),
+                   "with the adaptive corner as WINNER the live Custom Engine shows the adapted intervals");
+        }
+
+        // A RELOADED playground re-arms its adaptive corners.
+        {
+            juce::MemoryBlock blob;
+            p.getStateInformation (blob);
+            auto q = std::make_unique<Proc>();
+            q->prepareToPlay (sr, eb);
+            q->setStateInformation (blob.getData(), (int) blob.getSize());
+            q->pollParametersForTests();
+            check (q->isPlaygroundActive() && q->getPlaygroundAdaptiveCount() == 1,
+                   "a reloaded playground re-arms its adaptive corner");
+            juce::AudioBuffer<float> b (2, eb);
+            juce::MidiBuffer on;
+            for (const int k : { 60, 64, 67 }) on.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0);
+            b.clear(); q->processBlock (b, on);
+            for (int i = 0; i < 900 && q->getPlaygroundAdaptApplies() < 1; ++i)
+            {
+                juce::MidiBuffer m; b.clear(); q->processBlock (b, m);
+                if ((i % 12) == 0) q->pollParametersForTests();
+                juce::Thread::sleep (1);
+            }
+            std::printf ("  after reload: starts %d applies %d\n",
+                         q->getPlaygroundAdaptStarts(), q->getPlaygroundAdaptApplies());
+            check (q->getPlaygroundAdaptApplies() >= 1,
+                   "...and it genuinely adapts again after the reload");
+        }
+
+        fileA.deleteFile();
+        fileB.deleteFile();
+        fileC.deleteFile();
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

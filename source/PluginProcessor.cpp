@@ -3546,6 +3546,12 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
         pgCorner[(size_t) i] = PlaygroundCorner{};
     pgActive = false; pgWinner = -1; pgRtSuspended = false; pgSuspendedRt = RtLink::Off;
     pgLastX = pgLastY = -1.0; pgDirty = true;
+    // Adaptive-corner bookkeeping starts over with the corners themselves: a result in
+    // flight belongs to the OLD project's corners and must not land into this one.
+    pgSeenAdaptGen = pgAdaptGeneration.load();
+    pgAdaptInFlight = -1; pgAdaptNext = 0;
+    pgAdaptStarts = 0; pgAdaptApplies = 0;
+    pgAdaptRefusal.clear();
     if (auto pg = tree.getChildWithName ("PLAYGROUND"); pg.isValid())
         for (int i = 0; i < kPlaygroundCorners; ++i)
         {
@@ -3864,6 +3870,19 @@ int FractalAdditiveAudioProcessor::paramIndexOf (const char* id) const
     return -1;
 }
 
+// A corner preset's value for a parameter. The fallback is the parameter's DEFAULT,
+// never the live patch: a corner must sound the same whatever was loaded when it was
+// assigned. One helper, because the corner compile and the adaptive-corner compile
+// both need it and two copies would eventually disagree about what "the corner's
+// value" means.
+float FractalAdditiveAudioProcessor::cornerValueOr (const PlaygroundCorner& c, const char* id) const
+{
+    double v = 0.0;
+    if (c.value (paramIndexOf (id), v)) return (float) v;
+    if (auto* p = apvts.getParameter (id)) return p->convertFrom0to1 (p->getDefaultValue());
+    return 0.0f;
+}
+
 void FractalAdditiveAudioProcessor::compileCornerTemplate (PlaygroundCorner& c)
 {
     // The corner's Custom Engine scale as degree ratios, parsed exactly the way
@@ -3892,19 +3911,333 @@ void FractalAdditiveAudioProcessor::compileCornerTemplate (PlaygroundCorner& c)
     c.value (paramIndexOf ("curveSlope"), slope);
 
     const auto s = settingsFromValues (
-        [&c, this] (const char* id)
-        {
-            double v = 0.0;
-            if (c.value (paramIndexOf (id), v)) return (float) v;
-            // A preset saved before this parameter existed: fall back to the parameter's
-            // DEFAULT, never to whatever the live patch happens to hold - a corner must
-            // sound the same whatever was loaded when it was assigned.
-            if (auto* p = apvts.getParameter (id)) return p->convertFrom0to1 (p->getDefaultValue());
-            return 0.0f;
-        },
+        [&c, this] (const char* id) { return cornerValueOr (c, id); },
         degrees, period, (float) slope);
 
     c.tmpl = std::make_shared<const spectrum::SpectrumTemplate> (spectrum::compileSpectrum (s));
+}
+
+//==============================================================================
+// ADAPTIVE CORNERS: a corner saved with the SpectrumFromChord follower armed keeps
+// adapting INSIDE the playground - to the chord under the fingers, against its own
+// settings - and its template updates live so the blend moves with the playing.
+// The rules are the plain follower's, applied per corner; the publish is the blend.
+//==============================================================================
+int FractalAdditiveAudioProcessor::getPlaygroundAdaptiveCount() const noexcept
+{
+    int n = 0;
+    for (const auto& c : pgCorner) if (c.rtAdaptive()) ++n;
+    return n;
+}
+
+bool FractalAdditiveAudioProcessor::startCornerAdapt (int corner, const std::vector<double>& alphas,
+                                                      double f0, juce::String& errorOut)
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners)) return false;
+    auto& c = pgCorner[(size_t) corner];
+    const auto s = c.rtSet.adapt;            // BY VALUE: it travels into the worker thread
+    const int  N = juce::jlimit (2, 24, s.partials);
+    if (alphas.empty() || ! (f0 > 0.0) || ! std::isfinite (f0))
+    {
+        errorOut = "No target notes to adapt to.";
+        return false;
+    }
+    // The same refusal the plain follower makes: with the CORNER's temper switch on the
+    // adapted spectrum would be compiled from the tuning grid instead and never heard.
+    if (cornerValueOr (c, "timbreTemper") > 0.5f)
+    {
+        errorOut = "This preset was saved with temper mode on, which builds its spectrum "
+                   "from the tuning - an adapted spectrum would never be heard.";
+        return false;
+    }
+    const double period = s.periodRatio;
+    if (! (period > 1.02) || ! std::isfinite (period))
+    {
+        errorOut = "Invalid period.";
+        return false;
+    }
+    // The no-merge precondition, exactly as startSpectrumAdapt states it: N gaps must
+    // fit inside the period, the period's own copy of partial 0 included.
+    const double totalC = 1200.0 * std::log2 (period);
+    const double gap    = juce::jlimit (0.0, 600.0, s.minGapCents);
+    if (std::max (1.0, gap) * (double) N > totalC)
+    {
+        errorOut = "Those " + juce::String (N) + " partials cannot all keep "
+                 + juce::String (gap, 1) + " cents of air inside a "
+                 + juce::String (totalC, 1) + "-cent period.";
+        return false;
+    }
+    const double topRatio = std::exp2 ((totalC - std::max (1.0, gap)) / 1200.0);
+
+    // Priced with the realtime register cap (this IS a follower), and only the absurd is
+    // refused - same bound, same reason as startSpectrumAdapt.
+    const auto regs = adaptRegistersFor (s, f0, /*realtime*/ true);
+    const double estMs = dissonance::adaptEstimateMs (N, (int) alphas.size(), s.rootOnly,
+                                                      (int) std::max<size_t> (1, regs.f0.size()),
+                                                      s.shapeAmps);
+    if (estMs > dissonance::kAdaptAbsurdMs)
+    {
+        errorOut = "This corner's adaptation is estimated at " + juce::String (estMs / 60000.0, 1)
+                 + " minutes per search - it cannot follow anything at that price.";
+        return false;
+    }
+
+    adaptCancel = true;
+    if (adaptThread != nullptr && adaptThread->joinable())
+        adaptThread->join();
+    adaptCancel = false;
+
+    // Seed at the CORNER's slope, not the live patch's: the search belongs to the
+    // corner's preset, and the live slope is a morphed value that describes no preset.
+    const double slope = juce::jlimit (0.1, 6.0, (double) cornerValueOr (c, "curveSlope"));
+    std::vector<dissonance::Partial> seed;
+    seed.reserve ((size_t) N);
+    for (int i = 0; i < N; ++i)
+    {
+        const double cts = totalC * (double) i / (double) N;
+        const double r   = std::exp2 (cts / 1200.0);
+        seed.push_back ({ r * f0, std::pow (r, -slope) });
+    }
+
+    adaptProgress = 0.0f;
+    adaptRunning  = true;   // "never two at once", shared with the follower + the button
+
+    adaptThread = std::make_unique<std::thread> (
+        [this, seed = std::move (seed), alphas, f0, s, N, gap, topRatio, regs,
+         corner, name = c.name, period]()
+        {
+            const auto goal = s.goal == 1 ? dissonance::Goal::Max
+                            : s.goal == 2 ? dissonance::Goal::Range
+                                          : dissonance::Goal::Min;
+            auto res = dissonance::adaptSpectrum (seed, f0, alphas, s.rootOnly, goal,
+                                                  s.rangeLo, s.rangeHi, gap, topRatio,
+                                                  s.shapeAmps, (double) spectrum::kGainMaxDb, 6, regs,
+                                                  [this] (float p) { adaptProgress.store (p); return ! adaptCancel.load(); });
+            if (! adaptCancel.load() && ! res.spectrum.empty())
+            {
+                CornerAdaptResult r;
+                r.corner     = corner;
+                r.cornerName = name;    // identity travels WITH the result: the corner may
+                r.period     = period;  // be reassigned before this lands (see the consume)
+                r.aimAlphas  = alphas;
+                r.aimF0      = f0;
+                r.ratios.reserve (res.spectrum.size());
+                r.amps.reserve (res.spectrum.size());
+                for (const auto& p : res.spectrum)
+                {
+                    r.ratios.push_back (p.freq / f0);
+                    r.amps.push_back ((double) p.amp);
+                }
+                r.valid = (int) r.ratios.size() == N;
+                {
+                    const juce::ScopedLock sl (adaptLock);
+                    pgAdaptResult = std::move (r);
+                }
+                // Its OWN generation, never adaptGeneration: the Adapt panel's result -
+                // and its Apply button - must not be able to pick up a corner's run.
+                pgAdaptGeneration.fetch_add (1);
+            }
+            adaptProgress = 1.0f;
+            adaptRunning  = false;
+        });
+    return true;
+}
+
+void FractalAdditiveAudioProcessor::applyCornerAdaptResult (PlaygroundCorner& c,
+                                                            const CornerAdaptResult& r)
+{
+    // The adapted intervals become the corner's typed spectrum - the same text
+    // applySpectrumAdapt writes into the live patch, so the winner path (which loads
+    // c.timbreSource into the Custom Engine box) shows exactly what is sounding.
+    juce::String txt;
+    for (size_t i = 1; i < r.ratios.size(); ++i)
+        txt << dissonance::centsText (1200.0 * std::log2 (juce::jmax (1.0e-9, r.ratios[i]))).c_str() << "c ";
+    txt << dissonance::centsText (1200.0 * std::log2 (juce::jmax (1.0001, r.period))).c_str() << "c";
+    c.timbreName   = "typed";
+    c.timbreSource = txt;
+    // Adapted to the HANDS, not to a tuning: provenance is honestly nothing - the same
+    // rule applySpectrumAdapt applies to every chord-targeted run.
+    c.provName.clear(); c.provSource.clear(); c.provPeriod.clear();
+
+    // The amplitude shaping is BAKED into the template below, so it is in the BLEND at
+    // any weight - diluted but present, which is the whole feature. The manual-gain
+    // layer is cleared with the switch: fillGains resolves the winner's gains onto the
+    // published blend, so leaving them here would apply the shaping a SECOND time the
+    // moment this corner wins.
+    c.gains.clear();
+    c.manual = false;
+    const auto setParam = [this, &c] (const char* id, float v)
+    {
+        const int i = paramIndexOf (id);
+        if (juce::isPositiveAndBelow (i, (int) c.params.size()))
+        { c.params[(size_t) i] = v; c.hasParam[(size_t) i] = 1; }
+    };
+    setParam ("timbreOn", 1.0f);        // the adapted spectrum replaces the corner's
+    setParam ("partialManual", 0.0f);   // engine, exactly as the follower replaces the live one
+
+    // Compile at the CORNER's settings (fractal, reps, range... all its own), with the
+    // adapted degrees as the Custom Engine's scale - shared settingsFromValues, so this
+    // corner and a live patch holding the same adaptation can never disagree.
+    std::vector<float> degrees;
+    degrees.reserve (r.ratios.size());
+    for (const double v : r.ratios) degrees.push_back ((float) v);
+    auto s = settingsFromValues ([this, &c] (const char* id) { return cornerValueOr (c, id); },
+                                 degrees, (float) r.period,
+                                 juce::jlimit (0.1f, 6.0f, cornerValueOr (c, "curveSlope")));
+    // Stated explicitly rather than trusted to the getter (the same defence
+    // applySpectrumAdapt makes): this template must be the adapted spectrum, whatever
+    // the corner's stored switches were a moment ago.
+    s.source              = spectrum::Source::ScalaTimbre;
+    s.temperToTimbre      = false;
+    s.timbreDegrees       = degrees;
+    s.timbrePeriod        = (float) r.period;
+    s.timbrePeriodRepeats = (int) cornerValueOr (c, "timbreRepeats");
+    auto tmpl = spectrum::compileSpectrum (s);
+
+    // Bake the adapted amplitudes onto the compiled partials: same nearest-cents match
+    // and the same +/-24 dB bound as the follower's gain path, so a baked amp can never
+    // exceed what that path could have produced.
+    if (! tmpl.partials.empty() && ! r.amps.empty())
+    {
+        double aMax = 0.0, cMax = 0.0;
+        for (const double a : r.amps) aMax = juce::jmax (aMax, a);
+        for (const auto& p : tmpl.partials) cMax = juce::jmax (cMax, (double) p.amp);
+        if (aMax > 0.0 && cMax > 0.0)
+            for (size_t i = 0; i < r.ratios.size() && i < r.amps.size(); ++i)
+            {
+                int best = -1; double bestC = 1.0e9;
+                for (size_t q = 0; q < tmpl.partials.size(); ++q)
+                {
+                    const double d = std::abs (1200.0 * std::log2 (juce::jmax (1.0e-9,
+                                        (double) tmpl.partials[q].ratio / r.ratios[i])));
+                    if (d < bestC) { bestC = d; best = (int) q; }
+                }
+                if (best < 0 || bestC > 1.0) continue;   // a stacked copy: leave it alone
+                const double want = r.amps[i] / aMax * cMax;
+                const double have = (double) tmpl.partials[(size_t) best].amp;
+                if (! (want > 0.0) || ! (have > 0.0)) continue;
+                const double dB = juce::jlimit (-(double) spectrum::kGainMaxDb,
+                                                (double) spectrum::kGainMaxDb,
+                                                20.0 * std::log10 (want / have));
+                tmpl.partials[(size_t) best].amp = (float) (have * std::pow (10.0, dB / 20.0));
+            }
+    }
+    c.tmpl = std::make_shared<const spectrum::SpectrumTemplate> (std::move (tmpl));
+}
+
+void FractalAdditiveAudioProcessor::drivePlaygroundAdaptive()
+{
+    // The chord under the fingers RIGHT NOW - read once, because it answers three
+    // questions (is a finished result stale? has each corner's target moved? what does
+    // a new search aim at?) and they must all be answered about the same instant.
+    double f0 = 0.0;
+    const std::vector<double> held = heldChordAsTargetAlphas (f0);
+    const auto movedFrom = [&held, f0] (const std::vector<double>& aim, double aimF0)
+    {
+        // Per-note, in cents, root's absolute pitch included - the follower's own rule
+        // (kRtHeldMoveCents): a sub-cent bend wobble is not a new chord.
+        bool moved = held.size() != aim.size() || ! (aimF0 > 0.0)
+                  || std::abs (1200.0 * std::log2 (f0 / aimF0)) > kRtHeldMoveCents;
+        for (size_t i = 0; i < held.size() && ! moved; ++i)
+            if (std::abs (1200.0 * std::log2 (held[i] / aim[i])) > kRtHeldMoveCents)
+                moved = true;
+        return moved;
+    };
+
+    // 1. A FINISHED RESULT lands first (the follower's order: whether it still belongs
+    // to the hands on the keys is the first thing decided about it). Stale - the player
+    // has MOVED to a different chord - means dropped, never applied late; a RELEASED
+    // chord is not stale (that chord was played, and its result belongs to it).
+    if (const int g = pgAdaptGeneration.load(); g != pgSeenAdaptGen)
+    {
+        pgSeenAdaptGen  = g;
+        pgAdaptInFlight = -1;
+        CornerAdaptResult r;
+        {
+            const juce::ScopedLock sl (adaptLock);
+            r = pgAdaptResult;
+        }
+        const bool stale = ! held.empty() && movedFrom (r.aimAlphas, r.aimF0);
+        auto* c = juce::isPositiveAndBelow (r.corner, kPlaygroundCorners)
+                      ? &pgCorner[(size_t) r.corner] : nullptr;
+        // The name check is the identity check: the corner may have been reassigned (or
+        // cleared) while the search ran, and this result belongs to the preset it was
+        // started FOR, not to whichever one sits on that corner now.
+        if (r.valid && ! stale && c != nullptr && c->rtAdaptive() && c->name == r.cornerName)
+        {
+            applyCornerAdaptResult (*c, r);
+            ++pgAdaptApplies;
+            // When the adapting corner IS the winner, the live patch's spectrum state
+            // (Custom Engine text, gains, manual switch) is what the screen describes -
+            // it has to follow the adaptation or it would describe a spectrum that is
+            // no longer the one sounding.
+            if (pgWinner == r.corner)
+                applyPlaygroundDiscreteState (r.corner);
+            // A REAL spectrum change, not a drag: pgDirty makes the blend below publish
+            // WITH a generation bump, so the voices glide to it (morph on) or cross the
+            // 50 ms template fade (morph off) - "like changing spectrum with morph on".
+            // A bump-less publish would instead land every adaptation as a bare 7 ms
+            // amplitude step: run 42's documented thump.
+            pgDirty = true;
+        }
+    }
+    else if (pgAdaptInFlight >= 0 && ! adaptRunning.load())
+    {
+        // The search died with no result (cancelled by a hand-pressed Adapt, or torn
+        // down): that corner is still owed its adaptation, or it would sit stale on the
+        // current chord for ever.
+        if (pgCorner[(size_t) pgAdaptInFlight].rtAdaptive())
+            pgCorner[(size_t) pgAdaptInFlight].rtPend = true;
+        pgAdaptInFlight = -1;
+    }
+
+    // 2. HAS THE CHORD MOVED away from what each corner last aimed at? Nothing held
+    // clears every pending search - the follower's rule: engaging over silence must not
+    // adapt to whatever the next tick happens to read.
+    bool anyAdaptive = false;
+    for (auto& c : pgCorner)
+    {
+        if (! c.rtAdaptive()) continue;
+        anyAdaptive = true;
+        if (held.empty())                            c.rtPend = false;
+        else if (movedFrom (c.rtAimAlphas, c.rtAimF0)) c.rtPend = true;
+    }
+    if (! anyAdaptive || held.empty())
+        return;
+
+    // 3. LAUNCH what is owed: one search at a time (adaptRunning - shared with the
+    // follower and the Adapt button), the follower's own launch floor between starts,
+    // round-robin so two adaptive corners share the worker fairly.
+    if (adaptRunning.load() || rtTick - pgAdaptLastStart < kRtAdaptTicks)
+        return;
+    for (int k = 0; k < kPlaygroundCorners; ++k)
+    {
+        const int i = (pgAdaptNext + k) % kPlaygroundCorners;
+        auto& c = pgCorner[(size_t) i];
+        if (! c.rtAdaptive() || ! c.rtPend) continue;
+        juce::String err;
+        if (startCornerAdapt (i, held, f0, err))
+        {
+            ++pgAdaptStarts;
+            c.rtPend      = false;
+            // The target actually USED, not what merely passed by - the launch may have
+            // been held for several ticks (same reasoning as the follower's rtHeldTarget).
+            c.rtAimAlphas = held;
+            c.rtAimF0     = f0;
+            pgAdaptLastStart = rtTick;
+            pgAdaptInFlight  = i;
+            pgAdaptNext      = i + 1;
+        }
+        else
+        {
+            // These settings can never run. Stop asking (a refusal per tick is a flood)
+            // and SAY so where the window shows it - never a silent stop.
+            c.rtDead = true;
+            c.rtPend = false;
+            pgAdaptRefusal = juce::String::charToString ((juce::juce_wchar) ('A' + i)) + ": " + err;
+        }
+        break;
+    }
 }
 
 void FractalAdditiveAudioProcessor::refreshPlaygroundActive()
@@ -3933,6 +4266,13 @@ void FractalAdditiveAudioProcessor::refreshPlaygroundActive()
         if (rtLink != RtLink::Off)
             setRealtimeLink (RtLink::Off, rtSet);
         pgWinner = -1;   // no incumbent: the first apply adopts the highest weight outright
+        // Adaptive corners start FRESH: adopt the current result generation so nothing
+        // from a previous engagement can land into this one, and lift the launch floor
+        // so the first search is not throttled (the follower's own engage rule).
+        pgSeenAdaptGen   = pgAdaptGeneration.load();
+        pgAdaptLastStart = rtTick - 10000;
+        pgAdaptInFlight  = -1;
+        pgAdaptRefusal.clear();
     }
     else
     {
@@ -3955,6 +4295,11 @@ void FractalAdditiveAudioProcessor::drivePlayground()
     refreshPlaygroundActive();
     if (! pgActive)
         return;
+
+    // ADAPTIVE CORNERS first: a finished adaptation updates its corner's template and
+    // sets pgDirty, and the blend below is what publishes it - WITH the generation bump
+    // a real spectrum change deserves.
+    drivePlaygroundAdaptive();
 
     const double x = (double) apvts.getRawParameterValue ("pgX")->load();
     const double y = (double) apvts.getRawParameterValue ("pgY")->load();
