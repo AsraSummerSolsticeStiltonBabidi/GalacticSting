@@ -603,6 +603,12 @@ public:
     // the panel prints these, so what it claims and what the search does cannot drift.
     static dissonance::Registers adaptRegistersFor (const SpectrumAdaptSettings& s, double f0Hz,
                                                     bool realtime);
+    // WHAT ONE RUN WILL COST, in milliseconds, before it is started (see Dissonance.h).
+    // Same helper the panel prints and the same one startSpectrumAdapt's hard bound is
+    // measured against, so the price on the button and the only remaining refusal can
+    // never be two different numbers.
+    static double estimateAdaptMs (const SpectrumAdaptSettings& s, int targetNotes,
+                                   double f0Hz, bool realtime);
     // `targetAlphas` are the notes as ratios (alphas[0] is the root, normally 1.0);
     // `f0Hz` is the root's real frequency - Sethares roughness depends on register, so
     // the same chord an octave down wants a different spectrum.
@@ -717,6 +723,11 @@ public:
     // actually keeps the worker from piling up. What is left here is a bound on how often
     // the SPECTRUM may be rewritten, and 10 Hz is a rate the 50 ms template fade absorbs.
     static constexpr int kRtAdaptTicks = 6;
+    // The same floor as a DURATION (the timer runs at 60 Hz). It is the budget one realtime
+    // adaptation has: a search that takes longer than this cannot land before the next one
+    // is due, so the follower's results arrive stale - which the panel warns about instead
+    // of silently degrading, and instead of refusing the settings outright.
+    static constexpr double kRtAdaptBudgetMs = kRtAdaptTicks * 1000.0 / 60.0;
 
     //==========================================================================
     // Scale EDITING on the keyboard. Works from ANY loaded tuning (the current

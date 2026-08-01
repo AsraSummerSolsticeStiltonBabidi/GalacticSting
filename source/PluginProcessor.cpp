@@ -2024,6 +2024,20 @@ dissonance::Registers FractalAdditiveAudioProcessor::adaptRegistersFor (const Sp
     return regs;
 }
 
+// The price of one run, resolved from the SAME settings the run itself will use - the
+// partial count after its own clamp, and the register count adaptRegistersFor really
+// returns for this path. Reading either of those from anywhere else would let the number
+// on the button and the work the thread does drift apart.
+double FractalAdditiveAudioProcessor::estimateAdaptMs (const SpectrumAdaptSettings& s,
+                                                       int targetNotes, double f0Hz, bool realtime)
+{
+    if (targetNotes <= 0) return 0.0;
+    const int N    = juce::jlimit (2, 24, s.partials);
+    const auto regs = adaptRegistersFor (s, f0Hz, realtime);
+    return dissonance::adaptEstimateMs (N, targetNotes, s.rootOnly,
+                                        (int) juce::jmax<size_t> (1, regs.f0.size()), s.shapeAmps);
+}
+
 bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSettings& s,
                                                         const std::vector<double>& targetAlphas,
                                                         double f0Hz, juce::String& errorOut,
@@ -2061,14 +2075,33 @@ bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSetti
         return false;
     }
     const double topRatio = std::exp2 ((totalC - std::max (1.0, gap)) / 1200.0);
-    // "all vs all" sounds every target note at once, so the pair count grows with
-    // (notes x partials)^2 and a 31-note scale at 16 partials is half a million pairs per
-    // evaluation - minutes, not milliseconds. Say so instead of appearing to hang.
-    if (! s.rootOnly && (int) targetAlphas.size() * N > 480)
+
+    // COST IS A PRICE, NOT A VETO. This used to refuse outright: "all vs all over 31 notes
+    // x 16 partials is too heavy to search - switch the scope to 0 vs all". It is a ~45 s
+    // computation. Adapt is a one-shot, user-initiated calculation that already runs on a
+    // worker, reports progress and cancels on a second press, so 45 s is a decision the
+    // player is entitled to make - and refusing it removed the feature (a 31-note scale
+    // simply could not be adapted to in the scope that hears every note against every
+    // other). The estimate now goes on the button; only the genuinely absurd is stopped.
+    //
+    // The bound is kAdaptAbsurdMs = 10 minutes, and it exists because there IS a shape
+    // beyond argument: 24 partials against a 128-key absolute table in "all vs all" is
+    // ~44 minutes, minutes per single sweep, and it would be indistinguishable from a
+    // hang. The refusal states the number rather than a verdict.
+    const auto regs = adaptRegistersFor (s, f0Hz, realtime);
+    const double estMs = dissonance::adaptEstimateMs (N, (int) targetAlphas.size(), s.rootOnly,
+                                                      (int) std::max<size_t> (1, regs.f0.size()),
+                                                      s.shapeAmps);
+    if (estMs > dissonance::kAdaptAbsurdMs)
     {
-        errorOut = "\"all vs all\" over " + juce::String ((int) targetAlphas.size())
-                 + " notes x " + juce::String (N) + " partials is too heavy to search. "
-                   "Switch the scope to \"0 vs all\", or use fewer partials.";
+        errorOut = "This search is estimated at " + juce::String (estMs / 60000.0, 1)
+                 + " minutes (" + juce::String ((int) targetAlphas.size()) + " notes x "
+                 + juce::String (N) + " partials"
+                 + (s.rootOnly ? juce::String (", 0 vs all") : juce::String (", all vs all"))
+                 + ", " + juce::String ((int) regs.f0.size()) + " registers), past the "
+                 + juce::String ((int) (dissonance::kAdaptAbsurdMs / 60000.0))
+                 + "-minute limit. Fewer partials, fewer registers, or the \"0 vs all\" scope "
+                   "will bring it inside.";
         return false;
     }
 
@@ -2099,10 +2132,9 @@ bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSetti
     adaptProgress    = 0.0f;
     adaptRunning     = true;
 
-    // Resolved BEFORE the thread starts, from the same helper the panel reads, so the run
-    // and the read-out are the same registers by construction.
-    const auto regs = adaptRegistersFor (s, f0Hz, realtime);
-
+    // `regs` was resolved above, BEFORE the thread starts and before the cost bound was
+    // measured, from the same helper the panel reads - so the run, the read-out and the
+    // price on the button are the same registers by construction.
     adaptThread = std::make_unique<std::thread> (
         [this, seed = std::move (seed), alphas = targetAlphas, f0Hz, s, N, gap, topRatio, regs]()
         {

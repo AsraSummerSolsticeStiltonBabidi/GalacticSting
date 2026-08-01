@@ -74,6 +74,24 @@ public:
         // going unreadably condensed instead of disappearing, which no bounds check can
         // see either. Same struct: cell = the label's bounds, textWidth = what it needs.
         std::vector<PaintedLabel> componentLabels;
+        // The read-outs that WRAP. A juce::Label lays its text out in as many lines as its
+        // height allows, and modern JUCE will SHRINK THE FONT to make more of them fit - so
+        // a sentence that "fits" can be rendering two points smaller than the one beside
+        // it, and a single-line width check would reject every wrapping label out of hand.
+        // Measured the only way that answers the real question: word-wrap this text, in
+        // this font, at this width, and see how tall it comes out.
+        struct WrappedLabel
+        {
+            juce::String name, text;
+            juce::Rectangle<int> cell;   // the TEXT area - the Label's own border removed
+            float needWidth = 0.0f, needHeight = 0.0f;
+        };
+        std::vector<WrappedLabel> wrappedLabels;
+        // ...and every OTHER sentence the adaptation's read-out can print, measured against
+        // that same label's text area with the widest numbers each can hold. The label only
+        // ever shows one state; probing the live one would measure whichever state the
+        // verifier happened to reach, and the state that clips is always the other one.
+        std::vector<WrappedLabel> readoutVariants;
         // Every combo whose ITEM TEXTS are rewritten by applyLanguage(), as
         // name -> selected id. Probed because re-wording a ComboBox is the one operation
         // that can silently DESELECT it (getSelectedId() compares the visible label
@@ -128,6 +146,25 @@ public:
         juce::String period;           // the shared Period field, as typed
     };
     PanelProbe panelProbeForTests() const;
+    // Test hook (RhythmVerify): the keyboard's degree-0 keys, with the period number each
+    // one prints and the rects and fonts paint() really uses (see ScaleKeyboard). Those
+    // numbers are what the register range is typed in, so they have to be legible at the
+    // key width the keyboard actually uses, in every tuning - and there is no other way in
+    // this build to see a number that drawFittedText silently shrank to fit.
+    std::vector<ScaleKeyboard::PeriodTag> keyboardPeriodTagsForTests() const
+    { return keyboard.periodTagProbe(); }
+    // Test hooks (RhythmVerify): the adaptation's register range, in the periods the
+    // fields show and the Hz the search is really given. A range typed in one tuning and
+    // resolved in another is the bug this pair exists to catch.
+    struct RegisterProbe { int periodLo = 0, periodHi = 0, keyLo = 0, keyHi = 0;
+                           double loHz = 0.0, hiHz = 0.0; juce::String loText, hiText; };
+    RegisterProbe registerProbeForTests() const;
+    void setAdaptRegistersForTests (const juce::String& lo, const juce::String& hi);
+    // Test hook (RhythmVerify): what the panel would print on the Adapt button, and what
+    // one run / one realtime update is predicted to cost with the settings as they stand.
+    juce::String adaptButtonTextForTests() const { return adaptGoBtn.getButtonText(); }
+    double       adaptCostMsForTests (bool realtime) const { return adaptCostMs (realtime); }
+    juce::String adaptReadoutForTests() const { return adaptReadoutText(); }
     void setSpecModeForTests (int mode);
     void setAdaptTargetForTests (int id);
     // The two selectors that ADD rows to the right column (the free chord search's
@@ -2845,18 +2882,39 @@ private:
     juce::ComboBox   adaptGoalBox;     // minimum / maximum / inside a range
     juce::TextEditor adaptLoEdit, adaptHiEdit;   // the range's two ends (goal = range)
     juce::Label      adaptPartialsLbl, adaptRangeLbl, adaptInfoLbl;
-    //== THE REGISTER RANGE the adaptation optimises over, as note names ("C2".."C4").
+    //== THE REGISTER RANGE the adaptation optimises over, as PERIOD NUMBERS - the small
+    //   numbers the keyboard now prints beside every degree-0 key (see ScaleKeyboard).
+    //   It used to be note names, "C2".."C4", and those are 12-EDO's own invention: in
+    //   31-EDO or Bohlen-Pierce there is no C and no octave, so the one control that
+    //   decides WHICH REGISTERS a spectrum is optimised for spoke a language most of this
+    //   instrument's tunings do not have. A period is the same idea without the twelve,
+    //   and every tuning has one.
     //   Sethares' critical band is a width in Hz, so the answer genuinely differs per
-    //   octave - which registers a spectrum was optimised for therefore has to be on
+    //   register - which registers a spectrum was optimised for therefore has to be on
     //   screen, not implied. `adaptAggBox` picks mean-over-the-range vs the worst register.
     juce::TextEditor adaptRegLoEdit, adaptRegHiEdit;
     juce::ComboBox   adaptAggBox;
-    juce::Label      adaptRegLbl, adaptRegInfoLbl;
-    // AUTO until the user types: the fields follow an octave either side of the lowest
-    // note being played. Typing in either one latches it off for good - a range the user
+    // `adaptAggInfoLbl` says in WORDS what the aggregate choice costs the player. It
+    // replaced a line of bare counts ("3 registers, realtime 3") that explained nothing
+    // to anyone who had not read the source; those counts are in its tooltip.
+    juce::Label      adaptRegLbl, adaptAggInfoLbl;
+    // AUTO until the user types: the range follows one period either side of the lowest
+    // note being played. Typing in either field latches it off for good - a range the user
     // set is never moved under them.
     bool             adaptRegAuto = true;
-    int              adaptRegAutoLo = 48, adaptRegAutoHi = 72;
+    // The user's unit, kept in the user's unit. Storing MIDI keys here instead would make
+    // the same typed range mean a different span the moment a 31-note scale replaced a
+    // 12-note one - the range would silently shrink to two thirds of an octave without a
+    // single field changing on screen.
+    int              adaptRegPeriodLo = 2, adaptRegPeriodHi = 4;
+    int              registerDegreesPerPeriod() const;
+    juce::String     registerPeriodText (int key) const;   // key -> the period it starts
+    int              registerKeyForPeriod (int p) const;   // period -> its MIDI key, clamped
+    // The lowest and highest period the 128-key board really has under this tuning: 12-EDO
+    // has eleven of them, a 31-note scale four. Typing outside that snaps back to the edge.
+    int              registerPeriodMin() const;
+    int              registerPeriodMax() const;
+    void             clampAdaptRegisterPeriods();          // onto the periods the keyboard has
     void             syncAdaptRegisterAuto();
     void             commitAdaptRegisters();
     // The key whose ACTIVE-TUNING pitch is nearest `hz` - how a register in Hz is named
@@ -2869,6 +2927,33 @@ private:
     juce::Viewport   adaptView;
     int              lastAdaptGen = 0;
     void runSpectrumAdapt();
+    //== THE ONE READ-OUT under the two buttons. There used to be two lines of numbers
+    //   there and neither said what it was for ("avg C2-C4: 769.9 -> 27.8 (96% less)" over
+    //   "sounding now: 31.4 (Reps/Fractal)"), the second one usually clipped. This has a
+    //   single job - WHAT IS HAPPENING, OR WHAT WILL HAPPEN IF YOU PRESS - and answers it
+    //   in one sentence, in priority order (see adaptReadoutText). Every number that was
+    //   on screen is still available, in the read-out's tooltip.
+    juce::String adaptReadoutText() const;
+    juce::String adaptReadoutTip() const;
+    // Its five states, each a function of its own numbers so nothing is written twice and
+    // the layout probe can measure every one of them at its widest (see readoutVariants).
+    juce::String adaptAggMeaning    (bool worstCase) const;
+    juce::String adaptLineWorking   (int pct) const;
+    juce::String adaptLineLag       (double ms) const;
+    juce::String adaptLineFollowing (int updates) const;
+    juce::String adaptLineCost      (double ms) const;
+    juce::String adaptLineResult    (int pct, bool less, const juce::String& span, bool drift) const;
+    // What ONE Adapt with the panel's current settings will cost, in ms, and the same
+    // figure for one REALTIME update (which uses fewer registers). Both come from the
+    // processor's estimator, so the price on the button is the number the guard uses.
+    double adaptCostMs (bool realtime) const;
+    // The result the last finished run reported, kept so the read-out can be rebuilt on
+    // any tick (a warning may replace it and then have to give it back). `adaptInfoTipBase`
+    // is the language's own explanation of what this line is for, set by applyLanguage and
+    // always the first paragraph of the tooltip.
+    juce::String adaptResultLine, adaptResultTip, adaptInfoTipBase;
+    juce::uint32 lastAdaptTipMs = 0;   // the tooltip is rebuilt at 4 Hz, not at timer rate
+    void refreshAdaptButtonText();
     //== REALTIME: one button per direction, and the one shared place that tells the
     //   processor what they should be doing (see syncRealtimeLink).
     juce::TextButton chordRtBtn, adaptRtBtn;

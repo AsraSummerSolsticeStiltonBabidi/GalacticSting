@@ -870,11 +870,6 @@ namespace
     };
 }
 
-// The register range's note-name conversions (defined with the rest of that panel's code,
-// forward-declared here because the constructor seeds the two fields with them).
-static juce::String registerNoteName (int key);
-static int          registerKeyForName (const juce::String& text);
-
 //==============================================================================
 FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         FractalAdditiveAudioProcessor& p)
@@ -1900,11 +1895,12 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         addChildComponent (*ed);
     }
     // --- The REGISTER RANGE the adaptation is optimised over -------------------
-    // Note names, because that is what the player types into the keyboard: "C2" to "C4".
-    // They start on AUTO (an octave either side of what is being played) and stop moving
-    // the moment the user types in either field - see commitAdaptRegisters.
-    adaptAggBox.addItem ("avg", 1);      // mean over the range
-    adaptAggBox.addItem ("worst", 2);    // minimax: the worst register decides
+    // PERIOD NUMBERS, because that is what the keyboard prints beside every degree-0 key
+    // and the only unit every tuning this instrument loads really has (see the block
+    // comment at registerDegreesPerPeriod). They start on AUTO - one period either side of
+    // what is being played - and stop moving the moment the user types in either field.
+    adaptAggBox.addItem ("average", 1);   // mean over the range
+    adaptAggBox.addItem ("worst", 2);      // minimax: the worst register decides
     adaptAggBox.setSelectedId (1, juce::dontSendNotification);
     adaptAggBox.setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
     adaptAggBox.setMouseClickGrabsKeyboardFocus (false);
@@ -1916,7 +1912,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         ed->setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
         ed->setColour (juce::TextEditor::outlineColourId, cSpecScale.withAlpha (0.7f));
         ed->setIndents (4, 2);
-        ed->setInputRestrictions (4, "ABCDEFGabcdefg#b0123456789-");
+        // Period numbers: a sign and up to three digits. The old restriction admitted note
+        // letters, and a leftover "C2" typed into a field that now counts periods would
+        // have parsed as period 2 by accident in 12-EDO and as nothing anywhere else.
+        ed->setInputRestrictions (4, "-0123456789");
         ed->setSelectAllWhenFocused (true);
         ed->onReturnKey = [this] { commitAdaptRegisters(); refocus(); };
         ed->onFocusLost = [this] { commitAdaptRegisters(); };
@@ -1925,28 +1924,49 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     makeLabel (adaptPartialsLbl, cSpecScale); adaptPartialsLbl.setVisible (false);
     makeLabel (adaptRangeLbl,    cSpecScale); adaptRangeLbl.setVisible (false);
     makeLabel (adaptRegLbl,      cSpecScale); adaptRegLbl.setVisible (false);
-    adaptRegInfoLbl.setJustificationType (juce::Justification::centredLeft);
-    adaptRegInfoLbl.setColour (juce::Label::textColourId, cSpecScale.withAlpha (0.75f));
-    adaptRegInfoLbl.setFont (juce::Font (juce::FontOptions (10.0f)));
-    addChildComponent (adaptRegInfoLbl);
+    // A size smaller than the other captions, and deliberately: four controls share this
+    // row and the aggregate box beside it is the one that must not be squeezed again.
+    adaptRegLbl.setFont (juce::Font (juce::FontOptions (10.0f).withStyle ("Bold")));
+    // WHAT THE AGGREGATE MEANS, in a sentence. It wraps, so it gets a border of its own:
+    // juce::Label's default is 5 px left and right, which is 10 px of a 192 px column
+    // spent on nothing and enough to push the last word onto a line that does not exist.
+    adaptAggInfoLbl.setJustificationType (juce::Justification::topLeft);
+    adaptAggInfoLbl.setColour (juce::Label::textColourId, cSpecScale.withAlpha (0.8f));
+    adaptAggInfoLbl.setFont (juce::Font (juce::FontOptions (10.0f)));
+    adaptAggInfoLbl.setBorderSize (juce::BorderSize<int> (0, 1, 0, 1));
+    adaptAggInfoLbl.setMinimumHorizontalScale (1.0f); // it must FIT, not condense
+    addChildComponent (adaptAggInfoLbl);
     // The auto value, written DIRECTLY - not through syncAdaptRegisterAuto, which pushes
     // the panel's settings to the processor. Doing that here ran syncRealtimeLink() from
     // inside the constructor, before specModeBox and adaptRtOn had been restored, so
     // reopening the window while a REALTIME link was running computed "no link wanted" and
     // switched the user's running follower off. The timer picks the auto value up on its
     // first tick, when the panel really does know what it is showing.
-    adaptRegLoEdit.setText (registerNoteName (adaptRegAutoLo), juce::dontSendNotification);
-    adaptRegHiEdit.setText (registerNoteName (adaptRegAutoHi), juce::dontSendNotification);
+    adaptRegLoEdit.setText (juce::String (adaptRegPeriodLo), juce::dontSendNotification);
+    adaptRegHiEdit.setText (juce::String (adaptRegPeriodHi), juce::dontSendNotification);
     adaptInfoLbl.setJustificationType (juce::Justification::topLeft);
     adaptInfoLbl.setColour (juce::Label::textColourId, cSpecScale.brighter (0.2f));
     adaptInfoLbl.setFont (juce::Font (juce::FontOptions (10.5f)));
+    adaptInfoLbl.setBorderSize (juce::BorderSize<int> (0, 1, 0, 1));
+    adaptInfoLbl.setMinimumHorizontalScale (1.0f); // same rule: fit or say less
     addChildComponent (adaptInfoLbl); // its bilingual tooltip is set in applyLanguage
     adaptAmpsToggle.setToggleState (true, juce::dontSendNotification);
     adaptAmpsToggle.setMouseClickGrabsKeyboardFocus (false);
     adaptAmpsToggle.onClick = [this] { syncRealtimeLink(); refocus(); };
     addChildComponent (adaptAmpsToggle);
     adaptGoBtn.setColour (juce::TextButton::buttonColourId, cSpecScale.withAlpha (0.85f));
-    adaptGoBtn.onClick = [this] { runSpectrumAdapt(); };
+    // ONE button, two jobs, and the second one is what makes an expensive search safe to
+    // offer at all: while a run is going this STOPS it. Pressing it used to start another,
+    // and startSpectrumAdapt joins the running thread first - so a heavy search froze the
+    // window until it noticed the cancel flag. Cancelling only sets the flag; the worker
+    // sees it at its next progress callback and drops its own partial result.
+    adaptGoBtn.onClick = [this]
+    {
+        if (processorRef.isSpectrumAdaptRunning()) processorRef.cancelSpectrumAdapt();
+        else                                       runSpectrumAdapt();
+        refreshAdaptButtonText();
+        refocus();
+    };
     addChildComponent (adaptGoBtn);
     adaptView.setViewedComponent (&adaptList, false);
     adaptView.setScrollBarsShown (true, false);
@@ -2872,11 +2892,13 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.helpB.setButtonText (tr ("How to route", "Com encaminar"));
     chordList.emptyText = tr ("Press Find to search.\nhover a row to hear it\ndouble-click loads it as the scale",
                               "Prem Troba per cercar.\npassa-hi el cursor per escoltar-lo\ndoble clic el carrega com a escala");
-    // The adaptation's read-out is one plain sentence; the tooltip carries the
-    // definition so the label never has to (it used to overflow trying to).
-    adaptInfoLbl.setTooltip (tr (
-        "How much the spectrum BEATS against the target notes (Sethares roughness), before the adaptation and after it - lower = smoother. A second line appears only if Reps or Fractal make the real sound differ from the adapted spectrum.",
-        "Quant BAT l'espectre contra les notes objectiu (aspror de Sethares), abans de l'adaptaci\xc3\xb3 i despr\xc3\xa9s - m\xc3\xa9s baix = m\xc3\xa9s suau. Nom\xc3\xa9s apareix una segona l\xc3\xadnia si Reps o Fractal fan que el so real difereixi de l'espectre adaptat."));
+    // The adaptation's read-out is one plain sentence with ONE job at a time; every number
+    // it used to print is in its tooltip, which is rebuilt with each result (see
+    // adaptReadoutTip). This is the fallback text for before anything has happened.
+    adaptInfoTipBase = tr (
+        "What is happening, or what will happen if you press Adapt: how long the search will take, whether a REALTIME link can keep up, and how much beating the last adaptation removed. The raw Sethares numbers appear here once a run has finished.",
+        "Qu\xc3\xa8 est\xc3\xa0 passant, o qu\xc3\xa8 passar\xc3\xa0 si prems Adapta: quant trigar\xc3\xa0 la cerca, si un v\xc3\xadncle en TEMPS REAL hi pot seguir el ritme, i quant batec ha tret l'\xc3\xbaltima adaptaci\xc3\xb3. Els n\xc3\xbameros de Sethares en cru surten aqu\xc3\xad quan una cerca ha acabat.");
+    adaptInfoLbl.setTooltip (adaptInfoTipBase);
     {
         const int keepMode = specModeBox.getSelectedId(); // BEFORE the texts move - see localise
         specModeBox.changeItemText (1, tr ("Find tunings based on beating", "Troba afinacions pel batec"));
@@ -2931,9 +2953,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (adaptGoalBox,   { tr ("Min", "Min"), tr ("Max", "Max"), tr ("Range", "Rang") });
     adaptPartialsLbl.setText (tr ("Partials", "Parcials"), dontSendNotification);
     adaptRangeLbl.setText    (tr ("between", "entre"), dontSendNotification);
-    adaptRegLbl.setText      (tr ("Registers", "Registres"), dontSendNotification);
-    localise (adaptAggBox,   { tr ("avg", "mitj"), tr ("worst", "pitjor") });
-    adaptGoBtn.setButtonText (tr ("Adapt", "Adapta"));
+    adaptRegLbl.setText      (tr ("Periods", "Per\xc3\xado" "des"), dontSendNotification);
+    localise (adaptAggBox,   { tr ("average", "mitjana"), tr ("worst", "pitjor") });
+    refreshAdaptButtonText();
     adaptAmpsToggle.setButtonText (tr ("+ amps", "+ amplituds"));
     chordRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
     adaptRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
@@ -2947,21 +2969,21 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "The TARGET. Min = the partials go where these notes beat least. Max = where they beat most. Range = hit a beating value between the two numbers you type (the read-out below shows the scale those numbers are on).",
         "L'OBJECTIU. Min = els parcials van on aquestes notes baten menys. Max = on baten m\xc3\xa9s. Rang = arriba a un valor de batec entre els dos n\xc3\xbameros que escriguis (el marcador de sota mostra l'escala d'aquests n\xc3\xbameros)."));
     adaptRegLoEdit.setTooltip (tr (
-        "The LOWEST and HIGHEST register the spectrum is optimised for, as note names (C2, F#3, Eb-1). Sethares' critical band is a width in Hz, not in cents, so the answer really is different per octave: the interval that beats worst is about 434 cents at C1 but only 61 cents at C5, and a partial pair closer than 33 cents gets steadily WORSE the higher you play. A spectrum optimised at ONE pitch is optimal only there - and, optimised in the bass, it packs partials into tight clusters that cost almost nothing down there and dominate the roughness two octaves up. Until you type here these follow an octave either side of the lowest note you are holding; type once and they are yours.",
-        "El registre M\xc3\x89S GREU i el M\xc3\x89S AGUT per als quals s'optimitza l'espectre, com a noms de nota (C2, F#3, Eb-1). La banda cr\xc3\xadtica de Sethares \xc3\xa9s una amplada en Hz, no en cents, i per aix\xc3\xb2 la resposta \xc3\xa9s realment diferent a cada octava: l'interval que m\xc3\xa9s bat \xc3\xa9s d'uns 434 cents a C1 per\xc3\xb2 nom\xc3\xa9s 61 cents a C5, i una parella de parcials a menys de 33 cents empitjora com m\xc3\xa9s amunt toques. Un espectre optimitzat per a UNA sola al\xc3\xa7""ada nom\xc3\xa9s ho \xc3\xa9s all\xc3\xa0 - i optimitzat als greus, amuntega els parcials en grups atapa\xc3\xafts que all\xc3\xa0 baix no costen gaire i dues octaves m\xc3\xa9s amunt dominen l'aspresa. Fins que no hi escriguis, segueixen una octava a banda i banda de la nota m\xc3\xa9s greu que mantens; escriu-hi un cop i s\xc3\xb3n teus."));
+        "The LOWEST and HIGHEST register the spectrum is optimised for, as PERIOD NUMBERS - the small numbers printed beside every \"0\" key on the keyboard. They are counted the way octaves are counted in 12-EDO (the reference key is period 3), but a period is whatever THIS tuning repeats at, so they mean something in 31-EDO and in Bohlen-Pierce too, where \"C2\" means nothing at all.\nWhy a range and not one pitch: Sethares' critical band is a width in Hz, not in cents, so the answer really is different up and down the keyboard - the interval that beats worst is about 434 cents low and only 61 cents four octaves up, and a partial pair closer than 33 cents gets steadily WORSE the higher you play. A spectrum optimised at ONE pitch is optimal only there, and optimised in the bass it packs partials into tight clusters that cost almost nothing down there and dominate the roughness two periods up.\nUntil you type here these follow one period either side of the lowest note you are holding; type once and they are yours.",
+        "El registre M\xc3\x89S GREU i el M\xc3\x89S AGUT per als quals s'optimitza l'espectre, com a N\xc3\x9aMEROS DE PER\xc3\x8dODE - els nombres petits impresos al costat de cada tecla \"0\" del teclat. Es compten com es compten les octaves en 12-EDO (la tecla de refer\xc3\xa8ncia \xc3\xa9s el per\xc3\xado" "de 3), per\xc3\xb2 un per\xc3\xado" "de \xc3\xa9s all\xc3\xb2 que repeteix AQUESTA afinaci\xc3\xb3, i per aix\xc3\xb2 tenen sentit tamb\xc3\xa9 en 31-EDO i en Bohlen-Pierce, on \"C2\" no vol dir res.\nPer qu\xc3\xa8 un rang i no una sola al\xc3\xa7""ada: la banda cr\xc3\xadtica de Sethares \xc3\xa9s una amplada en Hz, no en cents, i per aix\xc3\xb2 la resposta \xc3\xa9s realment diferent amunt i avall del teclat - l'interval que m\xc3\xa9s bat \xc3\xa9s d'uns 434 cents als greus i nom\xc3\xa9s 61 quatre octaves m\xc3\xa9s amunt, i una parella de parcials a menys de 33 cents empitjora com m\xc3\xa9s amunt toques. Un espectre optimitzat per a UNA sola al\xc3\xa7""ada nom\xc3\xa9s ho \xc3\xa9s all\xc3\xa0, i optimitzat als greus amuntega els parcials en grups atapa\xc3\xafts que all\xc3\xa0 baix no costen gaire i dos per\xc3\xado" "des m\xc3\xa9s amunt dominen l'aspresa.\nFins que no hi escriguis, segueixen un per\xc3\xado" "de a banda i banda de la nota m\xc3\xa9s greu que mantens; escriu-hi un cop i s\xc3\xb3n teus."));
     adaptRegHiEdit.setTooltip (adaptRegLoEdit.getTooltip());
+    // The NUMBERS live here now. The box itself, and the sentence under it, say what the
+    // choice costs the player; this is for whoever wants the measurement behind it.
     adaptAggBox.setTooltip (tr (
-        "How the registers are COMBINED into one number to minimise.\n*avg* - the average over the range: the best spectrum overall, and free to sacrifice one octave to buy the others.\n*worst* - minimax: only the WORST register counts, so nothing is allowed to be horrible anywhere. Measured over C0-C6 on a 12-partial spectrum: avg reaches an average of 14.9 but leaves its worst register at 28.7, while worst reaches 18.7 with its worst register at 20.1 - avg's average is 20% better, worst's worst register is 30% better. That is the whole trade, and it is yours to make.",
-        "Com es COMBINEN els registres en un sol n\xc3\xbamero a minimitzar.\n*mitj* - la mitjana del rang: el millor espectre en conjunt, i lliure de sacrificar una octava per guanyar-ne d'altres.\n*pitjor* - minimax: nom\xc3\xa9s compta el PITJOR registre, aix\xc3\xad res no pot ser horrible enlloc. Mesurat de C0 a C6 amb un espectre de 12 parcials: *mitj* arriba a una mitjana de 14,9 per\xc3\xb2 deixa el pitjor registre a 28,7, i *pitjor* arriba a 18,7 amb el pitjor registre a 20,1 - la mitjana de *mitj* \xc3\xa9s un 20% millor, el pitjor registre de *pitjor* \xc3\xa9s un 30% millor. Aquest \xc3\xa9s tot el tracte, i \xc3\xa9s teu."));
-    adaptRegInfoLbl.setTooltip (tr (
-        "How many registers the objective is really evaluated at. One octave between points is enough - the roughness varies smoothly with log pitch, and at that spacing the answer is within 0.5% (avg) / 4% (worst) of a four-times-denser sweep; two octaves apart, minimax misses the peak entirely and comes out 21% worse. The cost is exactly linear in this number, so the REALTIME follower uses at most 3 (still exact for a two-octave range) while the Adapt button uses up to 7. Nothing is degraded silently: this line always says what each path will use.",
-        "A quants registres s'avalua realment l'objectiu. Amb una octava entre punts n'hi ha prou - l'aspresa varia suaument amb el logaritme de l'al\xc3\xa7""ada, i amb aquest espaiat la resposta queda a menys d'un 0,5% (mitj) / 4% (pitjor) d'un escombrat quatre vegades m\xc3\xa9s dens; amb dues octaves de separaci\xc3\xb3, el minimax es perd el pic i surt un 21% pitjor. El cost \xc3\xa9s exactament lineal amb aquest n\xc3\xbamero, aix\xc3\xad que el seguidor en TEMPS REAL en fa servir com a m\xc3\xa0xim 3 (encara exacte per a un rang de dues octaves) i el bot\xc3\xb3 Adapta fins a 7. No es degrada res en silenci: aquesta l\xc3\xadnia sempre diu qu\xc3\xa8 far\xc3\xa0 cada cam\xc3\xad."));
+        "How the registers are COMBINED into the one number the search minimises.\n*average* - the mean over the range. Best spectrum overall, and free to sacrifice one register to buy the others.\n*worst case* - minimax: only the WORST register counts, so nothing is allowed to be horrible anywhere.\nMeasured over six octaves on a 12-partial spectrum: average reaches a mean of 14.9 but leaves its worst register at 28.7, while worst case reaches 18.7 with its worst register at 20.1 - average's mean is 20% better, worst case's worst register is 30% better. That is the whole trade.\nThe objective is evaluated at one point per period, capped at 7 for the Adapt button and 3 for the REALTIME follower (the cost is exactly linear in that count, and 3 is still exact sampling for a two-period range). Nothing is degraded silently.",
+        "Com es COMBINEN els registres en l'\xc3\xbanic n\xc3\xbamero que la cerca minimitza.\n*mitjana* - la mitjana del rang. El millor espectre en conjunt, i lliure de sacrificar un registre per guanyar-ne d'altres.\n*pitjor cas* - minimax: nom\xc3\xa9s compta el PITJOR registre, aix\xc3\xad res no pot ser horrible enlloc.\nMesurat en sis octaves amb un espectre de 12 parcials: *mitjana* arriba a una mitjana de 14,9 per\xc3\xb2 deixa el pitjor registre a 28,7, i *pitjor cas* arriba a 18,7 amb el pitjor registre a 20,1 - la mitjana de *mitjana* \xc3\xa9s un 20% millor, el pitjor registre de *pitjor cas* \xc3\xa9s un 30% millor. Aquest \xc3\xa9s tot el tracte.\nL'objectiu s'avalua a un punt per per\xc3\xado" "de, amb un m\xc3\xa0xim de 7 per al bot\xc3\xb3 Adapta i de 3 per al seguidor en TEMPS REAL (el cost \xc3\xa9s exactament lineal amb aquest nombre, i 3 encara \xc3\xa9s mostreig exacte per a un rang de dos per\xc3\xado" "des). No es degrada res en silenci."));
+    adaptAggInfoLbl.setTooltip (adaptAggBox.getTooltip());
     adaptAmpsToggle.setTooltip (tr (
         "Also shape each partial's AMPLITUDE, not only where it sits. The amplitudes are written as per-partial edits (the pencil window's own values), bounded and never muted - a silenced partial would be a deleted one.",
         "Modela tamb\xc3\xa9 l'AMPLITUD de cada parcial, no nom\xc3\xa9s la posici\xc3\xb3. Les amplituds s'escriuen com a edicions per parcial (els mateixos valors de la finestra del llapis), acotades i mai silenciades - un parcial silenciat seria un parcial esborrat."));
     adaptGoBtn.setTooltip (tr (
-        "Adapt the spectrum once, now. It is written into the Custom Engine (partial ratios) plus the per-partial amplitudes, as ONE undo step.",
-        "Adapta l'espectre un cop, ara. S'escriu al Motor Propi (raons dels parcials) m\xc3\xa9s les amplituds per parcial, com UN sol pas d'anul\xc2\xb7laci\xc3\xb3."));
+        "Adapt the spectrum once, now. It is written into the Custom Engine (partial ratios) plus the per-partial amplitudes, as ONE undo step.\nThis is a ONE-SHOT calculation, so it is allowed to take time: when it will take more than a moment the button says roughly how long, and pressing it again while it runs STOPS it. Nothing is refused for being big except a request estimated past ten minutes, which is stated as a number rather than a verdict. The search runs on a background thread - you can keep playing while it works.",
+        "Adapta l'espectre un cop, ara. S'escriu al Motor Propi (raons dels parcials) m\xc3\xa9s les amplituds per parcial, com UN sol pas d'anul\xc2\xb7laci\xc3\xb3.\n\xc3\x89s un c\xc3\xa0lcul D'UN SOL COP, i per tant t\xc3\xa9 dret a trigar: quan trigui m\xc3\xa9s d'un instant, el bot\xc3\xb3 diu aproximadament quant, i tornar-lo a pr\xc3\xa9mer mentre treballa l'ATURA. No es rebutja res per ser gran, tret d'una petici\xc3\xb3 estimada en m\xc3\xa9s de deu minuts, i aix\xc3\xb2 es diu amb un n\xc3\xbamero, no amb un veredicte. La cerca va en un fil de fons - pots seguir tocant mentre treballa."));
     chordRtBtn.setTooltip (tr (
         "REALTIME: the tuning follows the TOP result on its own, every time the spectrum changes (a knob, a modulator, a preset). At most three searches a second, never two at once, and many changes while it is busy collapse into one - so a sweeping modulator cannot pile searches up. A full search takes about 0.3 s with a rich spectrum (0.1 s when the spectrum's tables can be reused), so each retune lands as its own search finishes. Realtime updates do NOT fill the tuning bank: the tuning you had joins it ONCE when you switch this on, and switching it off leaves ONE Ctrl+Z back to it.",
         "TEMPS REAL: l'afinaci\xc3\xb3 segueix sola el PRIMER resultat cada cop que canvia l'espectre (un potenci\xc3\xb2metre, un modulador, un preset). Com a m\xc3\xa0xim tres cerques per segon, mai dues alhora, i molts canvis mentre treballa es fusionen en un - aix\xc3\xad un modulador escombrant no pot acumular cerques. Una cerca completa triga uns 0,3 s amb un espectre ric (0,1 s quan es poden reaprofitar les taules de l'espectre), per aix\xc3\xb2 cada reafinaci\xc3\xb3 arriba quan acaba la seva cerca. Les actualitzacions en temps real NO omplen el banc: l'afinaci\xc3\xb3 que tenies hi entra UN sol cop en activar-ho, i en desactivar-ho queda UN Ctrl+Z per recuperar-la."));
@@ -3102,39 +3124,68 @@ void FractalAdditiveAudioProcessorEditor::runChordSearch()
 }
 
 //==============================================================================
-// NOTE NAMES for the register range. The product calls key 60 "C3" everywhere else (the
-// Reference cell takes and shows C3, not A), so these two must agree with it or the panel
-// would name the same key two different things in one window.
-static juce::String registerNoteName (int key)
+// PERIOD NUMBERS for the register range.
+//
+// This used to be note names ("C2".."C4"), and note names are 12-EDO's: they exist only
+// because that tuning cuts the octave into twelve and gives seven of the pieces letters.
+// In 31-EDO nothing is a C; in Bohlen-Pierce the period is 3/1 and "octave" is simply the
+// wrong word. So the range that decides WHICH REGISTERS a spectrum is optimised for is
+// typed in PERIODS - counted exactly the way octaves are counted, with the reference key
+// (60, degree 0) as period 3, which is what the rest of the product calls C3 - and the
+// keyboard prints those same numbers beside every degree-0 key so they can be read off
+// rather than guessed. In 12-EDO the two schemes coincide key for key.
+int FractalAdditiveAudioProcessorEditor::registerDegreesPerPeriod() const
 {
-    static const char* names[12] { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
-    const int k = juce::jlimit (0, 127, key);
-    return juce::String (names[k % 12]) + juce::String (k / 12 - 2);
+    return juce::jmax (1, processorRef.getScaleDegrees());
 }
 
-// "C3", "f#2", "Eb-1" -> a MIDI key; -1 when it is not a note name. Flats are accepted
-// because a microtonal player types them; they are shown back as their sharp spelling,
-// which is the same key and never a different pitch.
-static int registerKeyForName (const juce::String& text)
+juce::String FractalAdditiveAudioProcessorEditor::registerPeriodText (int key) const
 {
-    const auto t = text.trim();
-    if (t.isEmpty()) return -1;
-    static const int base[7] { 9, 11, 0, 2, 4, 5, 7 };   // A B C D E F G
-    const int letter = juce::CharacterFunctions::toUpperCase (t[0]) - 'A';
-    if (letter < 0 || letter > 6) return -1;
-    int semi = base[letter], i = 1;
-    while (i < t.length() && (t[i] == '#' || t[i] == 'b' || t[i] == 'B'))
-    { semi += (t[i] == '#') ? 1 : -1; ++i; }
-    const auto octText = t.substring (i).trim();
-    if (octText.isEmpty() || ! octText.containsOnly ("-0123456789")) return -1;
-    const int key = (octText.getIntValue() + 2) * 12 + semi;
-    return juce::isPositiveAndBelow (key, 128) ? key : -1;
+    return juce::String (ScaleKeyboard::periodNumberForNote (juce::jlimit (0, 127, key),
+                                                             registerDegreesPerPeriod()));
 }
 
-// AUTO: an octave either side of the lowest note being played (key 60 when nothing is
-// down). Written with dontSendNotification and only when the pair actually changes, so a
-// field the user is typing in is never yanked out from under the caret - and the moment
-// they DO type, adaptRegAuto latches off and this stops touching them for good.
+// The periods the 128-key board really has under this tuning. Key 0 may sit in the MIDDLE
+// of a period whose first key is below the board - that period is not one this instrument
+// can name a register with, so it is not offered.
+int FractalAdditiveAudioProcessorEditor::registerPeriodMin() const
+{
+    const int D = registerDegreesPerPeriod();
+    const int p = ScaleKeyboard::periodNumberForNote (0, D);
+    return ScaleKeyboard::noteForPeriodNumber (p, D) >= 0 ? p : p + 1;
+}
+
+int FractalAdditiveAudioProcessorEditor::registerPeriodMax() const
+{
+    return ScaleKeyboard::periodNumberForNote (127, registerDegreesPerPeriod());
+}
+
+// A period number -> the MIDI key it starts on. The clamp is by WHOLE PERIODS, never by
+// key: half a period below the bottom of the keyboard is not a register, and a range whose
+// ends were pinned to keys 0 and 127 would silently stop being the range the user typed.
+int FractalAdditiveAudioProcessorEditor::registerKeyForPeriod (int p) const
+{
+    const int D = registerDegreesPerPeriod();
+    const int k = ScaleKeyboard::noteForPeriodNumber (
+                      juce::jlimit (registerPeriodMin(), registerPeriodMax(), p), D);
+    return k >= 0 ? k : 60;
+}
+
+// Typing outside the board snaps back to the edge, visibly, in the field - the same rule
+// the old note-name parser used for an unreadable name. Also run when the TUNING changes:
+// a range typed for 12-EDO ("2 to 4") has to stay inside a 31-note scale's four periods
+// rather than resolve to a key that does not exist.
+void FractalAdditiveAudioProcessorEditor::clampAdaptRegisterPeriods()
+{
+    const int pMin = registerPeriodMin(), pMax = registerPeriodMax();
+    adaptRegPeriodLo = juce::jlimit (pMin, pMax, adaptRegPeriodLo);
+    adaptRegPeriodHi = juce::jlimit (pMin, pMax, adaptRegPeriodHi);
+    if (adaptRegPeriodHi < adaptRegPeriodLo) std::swap (adaptRegPeriodLo, adaptRegPeriodHi);
+}
+
+// The key whose ACTIVE-TUNING pitch is nearest `hz`. Through the tuning, never through
+// 12-EDO arithmetic: an octave shift, a reference-A change and a .tun table anchor all
+// move what a key sounds at, and this is how a frequency is named back to the user.
 int FractalAdditiveAudioProcessorEditor::nearestKeyForHz (double hz) const
 {
     if (! (hz > 0.0) || ! std::isfinite (hz)) return 60;
@@ -3149,45 +3200,74 @@ int FractalAdditiveAudioProcessorEditor::nearestKeyForHz (double hz) const
     return best;
 }
 
+// AUTO: one period either side of the lowest note being played (key 60 when nothing is
+// down). Written with dontSendNotification and only when the pair actually changes, so a
+// field the user is typing in is never yanked out from under the caret - and the moment
+// they DO type, adaptRegAuto latches off and this stops touching them for good.
 void FractalAdditiveAudioProcessorEditor::syncAdaptRegisterAuto()
 {
-    if (! adaptRegAuto) return;
-    // The lowest note REALLY sounding (the same held-chord bookkeeping the adaptation's
-    // target comes from), mapped back to the nearest KEY under this tuning - the fields
-    // speak in note names, so the auto value has to be one. Nothing held: key 60.
-    double lowHz = 0.0;
-    const int centre = (! processorRef.heldChordAsTargetAlphas (lowHz).empty() && lowHz > 0.0)
-                           ? nearestKeyForHz (lowHz) : 60;
-    const int lo = juce::jlimit (0, 127, centre - 12), hi = juce::jlimit (0, 127, centre + 12);
-    if (lo == adaptRegAutoLo && hi == adaptRegAutoHi && adaptRegLoEdit.getText().isNotEmpty())
-        return;
-    adaptRegAutoLo = lo; adaptRegAutoHi = hi;
-    adaptRegLoEdit.setText (registerNoteName (lo), juce::dontSendNotification);
-    adaptRegHiEdit.setText (registerNoteName (hi), juce::dontSendNotification);
+    // The CLAMP runs whether or not AUTO is on: loading a 31-note scale under a range that
+    // was typed for 12-EDO leaves the user's numbers pointing at periods that scale does
+    // not have. Snapping them to the edge - in the field, where it can be seen - is the
+    // honest answer; resolving them to a key that does not exist is not.
+    const int keepLo = adaptRegPeriodLo, keepHi = adaptRegPeriodHi;
+    clampAdaptRegisterPeriods();
+    bool changed = keepLo != adaptRegPeriodLo || keepHi != adaptRegPeriodHi;
+
+    if (adaptRegAuto)
+    {
+        // The lowest note REALLY sounding (the same held-chord bookkeeping the adaptation's
+        // target comes from), mapped back to the PERIOD it falls in. One period either side
+        // of it - which in 12-EDO is exactly the octave either side this used to do, and in
+        // 31-EDO is the span that tuning actually repeats over. Nothing held: key 60.
+        double lowHz = 0.0;
+        const int centre = (! processorRef.heldChordAsTargetAlphas (lowHz).empty() && lowHz > 0.0)
+                               ? nearestKeyForHz (lowHz) : 60;
+        const int p = ScaleKeyboard::periodNumberForNote (centre, registerDegreesPerPeriod());
+        const int lo = juce::jlimit (registerPeriodMin(), registerPeriodMax(), p - 1);
+        const int hi = juce::jlimit (registerPeriodMin(), registerPeriodMax(), p + 1);
+        if (lo != adaptRegPeriodLo || hi != adaptRegPeriodHi) changed = true;
+        adaptRegPeriodLo = lo; adaptRegPeriodHi = hi;
+    }
+    // Written only when something really moved, and always with dontSendNotification, so a
+    // field the user is typing in is never yanked out from under the caret.
+    if (! changed && adaptRegLoEdit.getText().isNotEmpty()) return;
+    adaptRegLoEdit.setText (juce::String (adaptRegPeriodLo), juce::dontSendNotification);
+    adaptRegHiEdit.setText (juce::String (adaptRegPeriodHi), juce::dontSendNotification);
     syncRealtimeLink();   // the follower's settings carry the range, so it must hear this
 }
 
 // The user typed a range. Two things happen and both matter: AUTO latches off (a range
-// somebody set is theirs), and unreadable text snaps back to the last good name instead of
-// being taken as "no range" - which would silently drop the whole objective back to one pitch.
+// somebody set is theirs), and unreadable text snaps back to the last good number instead
+// of being taken as "no range" - which would silently drop the whole objective back to one
+// pitch, the single-register behaviour this feature exists to replace.
 void FractalAdditiveAudioProcessorEditor::commitAdaptRegisters()
 {
-    const int lo = registerKeyForName (adaptRegLoEdit.getText());
-    const int hi = registerKeyForName (adaptRegHiEdit.getText());
-    if (lo < 0 || hi < 0)
+    const auto parse = [] (const juce::String& t, int& out)
     {
-        adaptRegLoEdit.setText (registerNoteName (adaptRegAutoLo), juce::dontSendNotification);
-        adaptRegHiEdit.setText (registerNoteName (adaptRegAutoHi), juce::dontSendNotification);
+        const auto s = t.trim();
+        if (s.isEmpty() || ! s.containsOnly ("-+0123456789")
+            || ! s.containsAnyOf ("0123456789")) return false;
+        out = s.getIntValue();
+        return true;
+    };
+    int lo = 0, hi = 0;
+    if (! parse (adaptRegLoEdit.getText(), lo) || ! parse (adaptRegHiEdit.getText(), hi))
+    {
+        adaptRegLoEdit.setText (juce::String (adaptRegPeriodLo), juce::dontSendNotification);
+        adaptRegHiEdit.setText (juce::String (adaptRegPeriodHi), juce::dontSendNotification);
     }
     else
     {
         adaptRegAuto = false;
-        // Lowest first, and always at least one key of span: a range typed backwards is a
-        // typo, not an instruction to optimise nothing.
-        adaptRegAutoLo = juce::jmin (lo, hi);
-        adaptRegAutoHi = juce::jmax (lo, hi);
-        adaptRegLoEdit.setText (registerNoteName (adaptRegAutoLo), juce::dontSendNotification);
-        adaptRegHiEdit.setText (registerNoteName (adaptRegAutoHi), juce::dontSendNotification);
+        // Lowest first: a range typed backwards is a typo, not an instruction to optimise
+        // nothing. (One period of span is legal and means one register - clampAdaptRegister
+        // Periods keeps both ends on the board.)
+        adaptRegPeriodLo = juce::jmin (lo, hi);
+        adaptRegPeriodHi = juce::jmax (lo, hi);
+        clampAdaptRegisterPeriods();
+        adaptRegLoEdit.setText (juce::String (adaptRegPeriodLo), juce::dontSendNotification);
+        adaptRegHiEdit.setText (juce::String (adaptRegPeriodHi), juce::dontSendNotification);
     }
     syncRealtimeLink();
     resized();
@@ -3216,20 +3296,18 @@ FractalAdditiveAudioProcessorEditor::realtimeSettingsFromPanel() const
     s.adapt.rangeLo     = adaptLoEdit.getText().getDoubleValue();
     s.adapt.rangeHi     = adaptHiEdit.getText().getDoubleValue();
     s.adapt.shapeAmps   = adaptAmpsToggle.getToggleState();
-    // THE REGISTER RANGE, in Hz, through the ACTIVE TUNING: the fields name keys, and what
-    // "C2" really sounds at is the tuning's business (octave shift, reference A and a .tun
-    // table anchor all move it). Reading them as 12-EDO here would optimise for registers
-    // the instrument does not play. An unreadable key leaves 0 Hz, which the processor
-    // reads as AUTO - never as "no range".
+    // THE REGISTER RANGE, in Hz, through the ACTIVE TUNING: the fields name PERIODS, the
+    // period's first key comes from the tuning's own degree count, and what that key really
+    // sounds at is the tuning's business again (octave shift, reference A and a .tun table
+    // anchor all move it). Resolving any of that as 12-EDO here would optimise for
+    // registers the instrument does not play. A key with no frequency leaves 0 Hz, which
+    // the processor reads as AUTO - never as "no range".
     {
-        const int lo = registerKeyForName (adaptRegLoEdit.getText());
-        const int hi = registerKeyForName (adaptRegHiEdit.getText());
-        if (lo >= 0 && hi >= 0)
-        {
-            const double a = processorRef.getNoteFrequency (juce::jmin (lo, hi));
-            const double b = processorRef.getNoteFrequency (juce::jmax (lo, hi));
-            if (a > 0.0 && b > 0.0) { s.adapt.regLoHz = a; s.adapt.regHiHz = b; }
-        }
+        const int lo = registerKeyForPeriod (juce::jmin (adaptRegPeriodLo, adaptRegPeriodHi));
+        const int hi = registerKeyForPeriod (juce::jmax (adaptRegPeriodLo, adaptRegPeriodHi));
+        const double a = processorRef.getNoteFrequency (lo);
+        const double b = processorRef.getNoteFrequency (hi);
+        if (a > 0.0 && b > 0.0) { s.adapt.regLoHz = juce::jmin (a, b); s.adapt.regHiHz = juce::jmax (a, b); }
     }
     s.adapt.aggregate = adaptAggBox.getSelectedId() == 2 ? 1 : 0;
     return s;
@@ -3247,6 +3325,27 @@ FractalAdditiveAudioProcessorEditor::panelProbeForTests() const
     pr.adaptTargetEnabled = adaptTargetBox.isEnabled();
     pr.period             = chordPeriodEdit.getText();
     return pr;
+}
+
+FractalAdditiveAudioProcessorEditor::RegisterProbe
+FractalAdditiveAudioProcessorEditor::registerProbeForTests() const
+{
+    RegisterProbe r;
+    r.periodLo = adaptRegPeriodLo; r.periodHi = adaptRegPeriodHi;
+    r.keyLo = registerKeyForPeriod (adaptRegPeriodLo);
+    r.keyHi = registerKeyForPeriod (adaptRegPeriodHi);
+    r.loHz  = processorRef.getNoteFrequency (r.keyLo);
+    r.hiHz  = processorRef.getNoteFrequency (r.keyHi);
+    r.loText = adaptRegLoEdit.getText(); r.hiText = adaptRegHiEdit.getText();
+    return r;
+}
+
+void FractalAdditiveAudioProcessorEditor::setAdaptRegistersForTests (const juce::String& lo,
+                                                                     const juce::String& hi)
+{
+    adaptRegLoEdit.setText (lo, juce::dontSendNotification);
+    adaptRegHiEdit.setText (hi, juce::dontSendNotification);
+    commitAdaptRegisters();   // exactly what Return and focus-lost do
 }
 
 void FractalAdditiveAudioProcessorEditor::setSpecModeForTests (int mode)
@@ -3341,6 +3440,160 @@ void FractalAdditiveAudioProcessorEditor::syncRealtimeLink()
     else                                       processorRef.updateRealtimeSettings (s);
 }
 
+//==============================================================================
+// THE COST OF A RUN, AND THE ONE LINE THAT SAYS WHAT IS GOING ON.
+//
+// A duration a musician reads at a glance. "45231 ms" is a number; "45 s" is an answer.
+// The units are the same word in both languages, so this needs no tr().
+static juce::String durationText (double ms, bool compact)
+{
+    if (ms < 950.0)   return juce::String (ms * 0.001, 1) + (compact ? "s" : " s");
+    if (ms < 60000.0) return juce::String ((int) std::lround (ms * 0.001)) + (compact ? "s" : " s");
+    return juce::String (ms / 60000.0, 1) + (compact ? "min" : " min");
+}
+
+// What ONE run costs with the panel's settings as they stand. The target's note count is
+// what makes this big or small, so it is read from the same two calls the run itself would
+// use - not from the degree box, which is the SEARCH's control and says nothing here.
+double FractalAdditiveAudioProcessorEditor::adaptCostMs (bool realtime) const
+{
+    const auto s = realtimeSettingsFromPanel();
+    double f0 = 0.0;
+    // REALTIME always aims at the held chord (see syncRealtimeLink), so its price is the
+    // held chord's price even while the target box shows something else.
+    const auto alphas = (realtime || adaptTargetBox.getSelectedId() == 2)
+                            ? processorRef.heldChordAsTargetAlphas (f0)
+                            : processorRef.tuningAsTargetAlphas (f0);
+    if (alphas.empty()) return 0.0;
+    if (! (f0 > 0.0)) f0 = processorRef.analysisAnchorHz();
+    return FractalAdditiveAudioProcessor::estimateAdaptMs (s.adapt, (int) alphas.size(), f0, realtime);
+}
+
+// The button carries its own price. Under a second it says nothing extra - that is not a
+// wait anybody plans around - and while a run is going it becomes the way to stop it,
+// which is the whole reason an expensive search can be offered instead of refused.
+void FractalAdditiveAudioProcessorEditor::refreshAdaptButtonText()
+{
+    if (processorRef.isSpectrumAdaptRunning())
+    {
+        adaptGoBtn.setButtonText (tr ("Stop", "Atura"));
+        return;
+    }
+    const double ms = adaptCostMs (false);
+    adaptGoBtn.setButtonText (ms >= 950.0
+        ? tr ("Adapt ~", "Adapta ~") + durationText (ms, true)
+        : tr ("Adapt", "Adapta"));
+}
+
+// ONE READ-OUT, ONE JOB: what is happening, or what will happen if you press. In priority
+// order, because only one of these is ever the thing the player needs to know:
+//   1. a run is going          -> how far along it is
+//   2. REALTIME cannot keep up -> say the results will LAG, and let it run anyway
+//   3. REALTIME is running     -> that it is following, and that it is alive
+//   4. the next press is heavy -> how long, and that it can be stopped
+//   5. something was adapted   -> how much beating it removed, in percent
+// The numbers this replaced ("avg C2-C4: 769.9 -> 27.8", "sounding now: 31.4") are in the
+// tooltip. They were two lines of raw Sethares roughness with no scale attached to them,
+// and the second line was the one that clipped.
+// The five sentences, each in ONE place. Built as functions of their numbers rather than
+// written where they are used, so the layout probe can measure every one of them with its
+// widest possible content - only one is on screen at a time, and the state that clips is
+// always the one nobody happened to be looking at.
+// WHAT THE AGGREGATE COSTS YOU, in a sentence. The choice used to be two abbreviations,
+// "avg" and "worst", with a line of register counts under them - true, and no help at all
+// to somebody deciding which one their piece wants.
+juce::String FractalAdditiveAudioProcessorEditor::adaptAggMeaning (bool worstCase) const
+{
+    return worstCase
+        ? tr ("Never bad anywhere, at the price of slightly less good everywhere.",
+              "Mai dolent enlloc, a canvi de ser una mica menys bo arreu.")
+        : tr ("Best on average; one part of the range may still be rough.",
+              "El millor de mitjana; una part del rang pot ser aspra.");
+}
+
+juce::String FractalAdditiveAudioProcessorEditor::adaptLineWorking (int pct) const
+{
+    return tr ("Working... ", "Treballant... ") + juce::String (pct)
+         + tr ("% - press Stop to cancel.", "% - prem Atura per cancel\xc2\xb7lar.");
+}
+
+// NOT a refusal. A follower whose search outlasts its own update slot still works - it
+// simply answers the chord you played a moment ago. Saying so is the honest thing;
+// switching the link off, or quietly refusing the settings, is not.
+juce::String FractalAdditiveAudioProcessorEditor::adaptLineLag (double ms) const
+{
+    return tr ("Realtime: ~", "Temps real: ~") + durationText (ms, false)
+         + tr (" per update - results lag behind your playing.",
+               " per canvi - els resultats van endarrerits.");
+}
+
+juce::String FractalAdditiveAudioProcessorEditor::adaptLineFollowing (int updates) const
+{
+    return tr ("Realtime: following what you play - ", "Temps real: segueix el que toques - ")
+         + juce::String (updates) + tr (" updates.", " canvis.");
+}
+
+juce::String FractalAdditiveAudioProcessorEditor::adaptLineCost (double ms) const
+{
+    return tr ("Adapt takes about ", "Adapta triga uns ") + durationText (ms, false)
+         + tr (". Keep playing; Stop cancels it.", ". Segueix tocant; Atura la cancel\xc2\xb7la.");
+}
+
+juce::String FractalAdditiveAudioProcessorEditor::adaptLineResult (int pct, bool less,
+                                                                   const juce::String& span,
+                                                                   bool drift) const
+{
+    juce::String t;
+    if (pct >= 0)
+        t << juce::String (pct)
+          << (less ? tr ("% less beating over periods ", "% menys batec als per\xc3\xado" "des ")
+                   : tr ("% more beating over periods ", "% m\xc3\xa9s batec als per\xc3\xado" "des "))
+          << span << ".";
+    else
+        t << tr ("Adapted over periods ", "Adaptat als per\xc3\xado" "des ") << span << ".";
+    // The caveat is a TAG, not a sentence: the read-out has two lines and the full
+    // explanation ("Reps stacks the adapted set again one period up and a fractal level
+    // self-convolves it, so what sounds has partials the search never saw") lives in the
+    // tooltip. What has to be on screen is that the two are not the same spectrum.
+    if (drift)
+        t << tr (" (+ Reps/Fractal partials)", " (+ parcials de Reps/Fractal)");
+    return t;
+}
+
+juce::String FractalAdditiveAudioProcessorEditor::adaptReadoutText() const
+{
+    if (processorRef.isSpectrumAdaptRunning())
+        return adaptLineWorking ((int) std::lround (processorRef.getSpectrumAdaptProgress() * 100.0f));
+
+    if (processorRef.getRealtimeLink() == FractalAdditiveAudioProcessor::RtLink::SpectrumFromChord)
+    {
+        const double live = adaptCostMs (true);
+        return live > FractalAdditiveAudioProcessor::kRtAdaptBudgetMs
+                   ? adaptLineLag (live)
+                   : adaptLineFollowing (processorRef.getRealtimeApplies());
+    }
+
+    const double ms = adaptCostMs (false);
+    if (ms > dissonance::kAdaptWarnMs) return adaptLineCost (ms);
+    return adaptResultLine;
+}
+
+// Everything the read-out no longer prints. Rebuilt with each result so the raw numbers
+// are always the LAST run's, never a stale set left over from the one before it.
+juce::String FractalAdditiveAudioProcessorEditor::adaptReadoutTip() const
+{
+    juce::String t = adaptInfoTipBase;
+    if (adaptResultTip.isNotEmpty()) t << "\n\n" << adaptResultTip;
+    const double ms = adaptCostMs (false), live = adaptCostMs (true);
+    if (ms > 0.0)
+        t << "\n\n" << tr ("Next Adapt: about ", "Propera Adapta: uns ") << durationText (ms, false)
+          << tr (" (one realtime update: ", " (una actualitzaci\xc3\xb3 en temps real: ")
+          << durationText (live, false) << ", "
+          << tr ("budget ", "pressupost ")
+          << durationText (FractalAdditiveAudioProcessor::kRtAdaptBudgetMs, false) << ").";
+    return t;
+}
+
 // The two REALTIME buttons' look, plus the one case they must OWN UP to: the processor
 // refused the link (a feedback loop) and switched it off under us. The button has to stop
 // claiming to be on, and the reason has to be said out loud, not swallowed.
@@ -3393,10 +3646,14 @@ void FractalAdditiveAudioProcessorEditor::runSpectrumAdapt()
                       : tr ("The loaded tuning has no degrees to adapt to.",
                             "L'afinaci\xc3\xb3 carregada no t\xc3\xa9 graus als quals adaptar-se.");
     else
+        // No cost veto here any more: the price is on the button (see refreshAdaptButtonText)
+        // and the only refusal left is the processor's ten-minute bound, which comes back
+        // through `err` with the estimate in it rather than a verdict.
         processorRef.startSpectrumAdapt (s.adapt, alphas, f0, err);
     if (err.isNotEmpty())
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
             tr ("Adapt spectrum to tuning", "Adapta l'espectre a l'afinaci\xc3\xb3"), err, this);
+    refreshAdaptButtonText();
     refocus();
 }
 
@@ -4248,6 +4505,30 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
             p.componentLabels.push_back ({ name, l->getText(), l->getBounds(),
                 (float) juce::GlyphArrangement::getStringWidthInt (l->getFont(), l->getText()) });
     };
+    // A read-out that is MEANT to wrap. Its cell is the text area drawLabel really uses
+    // (the Label's own border removed - JUCE's default is 5 px each side, which is 10 px
+    // of a 192 px column and enough on its own to push the last word off the bottom), and
+    // what it needs is the height the same text takes when word-wrapped at that width in
+    // that font. Registered in `controls` too, so the bounds and overlap rules still see it.
+    auto measureWrapped = [] (const char* name, const juce::Label& l, const juce::String& text)
+    {
+        const auto area = l.getBorderSize().subtractedFrom (l.getLocalBounds());
+        juce::AttributedString as;
+        as.setText (text);
+        as.setFont (l.getFont());
+        as.setJustification (l.getJustificationType());
+        as.setWordWrap (juce::AttributedString::byWord);
+        juce::TextLayout tl;
+        tl.createLayout (as, (float) area.getWidth());
+        return LayoutProbe::WrappedLabel { name, text, area + l.getBounds().getPosition(),
+                                           tl.getWidth(), tl.getHeight() };
+    };
+    auto addWrapped = [&p, &measureWrapped] (const char* name, const juce::Label& l)
+    {
+        if (! l.isVisible() || l.getText().isEmpty()) return;
+        p.controls.push_back ({ name, l.getBounds() });
+        p.wrappedLabels.push_back (measureWrapped (name, l, l.getText()));
+    };
 
     add ("harm.baseN",       baseNFader);      add ("harm.baseNLbl",  lblBaseN);
     add ("harm.basePitch",   basePitchBox);    add ("harm.pitchLbl",  lblBasePitch);
@@ -4304,7 +4585,31 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("spec.adapt",       adaptGoBtn);      add ("spec.adaptRt",   adaptRtBtn);
     add ("spec.regLbl",      adaptRegLbl);     add ("spec.regLo",     adaptRegLoEdit);
     add ("spec.regHi",       adaptRegHiEdit);  add ("spec.agg",       adaptAggBox);
-    add ("spec.regInfo",     adaptRegInfoLbl);
+    // The result list, never probed before, and the first thing a new row starves.
+    add ("spec.adaptList",   adaptView);       add ("spec.prog",      chordProgLbl);
+    // ...and the two WRAPPING read-outs, measured by the rule that fits them (see
+    // LayoutProbe::WrappedLabel). They carry the sentences this panel's whole clarity
+    // rework rests on, so "it fits" has to be a measurement, not a glance.
+    addWrapped ("spec.aggInfo", adaptAggInfoLbl);
+    addWrapped ("spec.info",    adaptInfoLbl);
+    // The OTHER four states of that read-out, at their widest: 100% progress, a run priced
+    // in minutes, a five-figure update count, a lagging follower, and a result line
+    // carrying both its percentage and the Reps/Fractal caveat. One of them is on screen;
+    // the rest have to be measured here or not at all.
+    if (adaptInfoLbl.isVisible())
+    {
+        const juce::String widestSpan ("-2" + juce::String::fromUTF8 ("\xe2\x80\x93") + "10");
+        p.readoutVariants.push_back (measureWrapped ("readout.working",   adaptInfoLbl, adaptLineWorking (100)));
+        p.readoutVariants.push_back (measureWrapped ("readout.lag",       adaptInfoLbl, adaptLineLag (44.4 * 60000.0)));
+        p.readoutVariants.push_back (measureWrapped ("readout.following", adaptInfoLbl, adaptLineFollowing (99999)));
+        p.readoutVariants.push_back (measureWrapped ("readout.cost",      adaptInfoLbl, adaptLineCost (44.4 * 60000.0)));
+        p.readoutVariants.push_back (measureWrapped ("readout.result",    adaptInfoLbl,
+                                                     adaptLineResult (100, false, widestSpan, true)));
+        // ...and the aggregate's OTHER meaning, for the same reason: only the selected
+        // one is on screen, and the longer of the two is the one that has to fit.
+        p.readoutVariants.push_back (measureWrapped ("agg.average",   adaptAggInfoLbl, adaptAggMeaning (false)));
+        p.readoutVariants.push_back (measureWrapped ("agg.worstCase", adaptAggInfoLbl, adaptAggMeaning (true)));
+    }
     add ("spec.segPerLbl",   segPeriodLbl);    add ("spec.segPeriod", segPeriodEdit);
     add ("spec.segTop",      segTopToggle);
 
@@ -4947,7 +5252,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
         }
         if (beat || adapt)
         {
-            tuneScopeBox.setBounds (si.removeFromTop (30)); // two lines: the long scope names
+            // 24, not 30. It was sized for two lines of a name it no longer has ("0 vs all"
+            // and "all vs all" are one short line in both languages), and in the adaptation
+            // those six pixels are the difference between four adapted partials on screen
+            // and five - the list is the leftover of this column and pays for every row.
+            tuneScopeBox.setBounds (si.removeFromTop (24));
             si.removeFromTop (3);
         }
         si.removeFromTop (1);
@@ -4965,7 +5274,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                                       &adaptGoalBox, &adaptAmpsToggle, &adaptGoBtn, &adaptRtBtn,
                                       &adaptInfoLbl, &adaptView,
                                       &adaptRegLbl, &adaptRegLoEdit, &adaptRegHiEdit,
-                                      &adaptAggBox, &adaptRegInfoLbl };
+                                      &adaptAggBox, &adaptAggInfoLbl };
         for (auto* c : sethC)  c->setVisible (false);
         for (auto* c : segC)   c->setVisible (seg);
         for (auto* c : beatC)  c->setVisible (beat || adapt); // Period + smallest interval are shared
@@ -4981,7 +5290,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // "From current tuning" updates live: no Find button, and Save makes no sense.
         chordGoBtn.setVisible   (chord);
         chordRtBtn.setVisible   (chord);
-        chordProgLbl.setVisible (chord || adapt);
+        chordProgLbl.setVisible (chord);   // the adaptation's progress lives in its read-out
         nadBox.setVisible (false); // the note count is the shared "Notes" box now
 
         const bool fromChord = processorRef.getGeneratedSclName().startsWith ("chord-");
@@ -5016,7 +5325,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                                              juce::dontSendNotification);
             }
 
-            auto r1 = si.removeFromTop (24);
+            auto r1 = si.removeFromTop (22);
             if (beat)
             {
                 chordNotesLbl.setJustificationType (juce::Justification::centredLeft);
@@ -5033,8 +5342,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 r1.removeFromLeft (6);
                 compact (adaptGoalBox, r1);
             }
-            si.removeFromTop (4);
-            auto r2 = si.removeFromTop (24);
+            si.removeFromTop (3);
+            auto r2 = si.removeFromTop (22);
             chordPerLbl.setJustificationType (juce::Justification::centredLeft);
             chordPerLbl.setBounds (r2.removeFromLeft (44));
             chordPeriodEdit.setBounds (r2.removeFromLeft (44).reduced (0, 1));
@@ -5045,7 +5354,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
             // The result count is fixed at 16 - one control less to think about.
             chordCountLbl.setVisible (false); chordCountBox.setVisible (false);
-            si.removeFromTop (4);
+            si.removeFromTop (3);
             auto r3 = si.removeFromTop (22);
             caption (chordMinLbl, r3, 112, 48); // "smallest interval (c)" / "interval mes petit (c)"
             chordMinEdit.setBounds (r3.removeFromLeft (juce::jmin (48, r3.getWidth())).reduced (0, 1));
@@ -5062,22 +5371,29 @@ void FractalAdditiveAudioProcessorEditor::resized()
             if (adapt)
             {
                 // WHICH REGISTERS. On its own row because the answer genuinely differs per
-                // octave and the user must be able to see - and change - what was optimised
-                // for, not infer it from the note they happened to be holding.
+                // register and the user must be able to see - and change - what was
+                // optimised for, not infer it from the note they happened to be holding.
+                // Two small fields now (a period number is at most "-2"), so the caption
+                // gets the room the longer Catalan word needs instead of paying for note
+                // names that no longer exist.
                 si.removeFromTop (3);
                 auto rg = si.removeFromTop (22);
-                // Four controls on one 186 px row, so the caption is sized to the WORD and
-                // told to leave 130 px behind it: "Registres" is wider than "Registers",
-                // and a fixed English-sized cell would have squeezed the Catalan aggregate
-                // box ("pitjor") down to an arrow with nothing readable beside it.
-                caption (adaptRegLbl, rg, 52, 130);
-                adaptRegLoEdit.setBounds (rg.removeFromLeft (34).reduced (0, 1));
-                rg.removeFromLeft (2);
-                adaptRegHiEdit.setBounds (rg.removeFromLeft (34).reduced (0, 1));
+                // A period number is at most three characters, where a note name was five
+                // ("Eb-1"), so the two fields give back 18 px - and the aggregate box, which
+                // used to end up with 49 px of leftover and clip its own word inside its
+                // arrow, gets ~86. The caption is sized to the WORD and told to leave that
+                // room behind it, because "Per\xc3\xado" "des" is the longer of the two.
+                caption (adaptRegLbl, rg, 50, 142);
+                adaptRegLoEdit.setBounds (rg.removeFromLeft (25).reduced (0, 1));
+                rg.removeFromLeft (3);
+                adaptRegHiEdit.setBounds (rg.removeFromLeft (25).reduced (0, 1));
                 rg.removeFromLeft (3);
                 compact (adaptAggBox, rg);
+                // ...and WHAT THAT CHOICE COSTS, in a sentence, directly under it. This
+                // row replaced a line of bare counts ("3 registers, realtime 3"): true,
+                // and no help at all to somebody deciding which one their piece wants.
                 si.removeFromTop (1);
-                adaptRegInfoLbl.setBounds (si.removeFromTop (13)); // "3 registers (realtime: 3)"
+                adaptAggInfoLbl.setBounds (si.removeFromTop (24)); // two lines at 10 pt
             }
             if (chord)
             {
@@ -5095,7 +5411,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 adaptGoBtn.setBounds (r4.removeFromLeft (r4.getWidth() * 3 / 5).reduced (1, 0));
                 adaptRtBtn.setBounds (r4.reduced (1, 0));
                 si.removeFromTop (2);
-                adaptInfoLbl.setBounds (si.removeFromTop (32));   // before -> after, honestly
+                // THE one read-out (see adaptReadoutText). 28 px is two lines at 10.5 pt,
+                // and every sentence it can print is written to fit two - RhythmVerify
+                // measures all five of them, in both languages, because only one is ever on
+                // screen and the state that overflows is always the other one. There is no
+                // second line of numbers under it any more and no separate progress row:
+                // while a run is going, the progress IS this line.
+                adaptInfoLbl.setBounds (si.removeFromTop (28));
             }
             if (chord && fromChord) // labelled view switch: all results vs the loaded chord's degrees
             {
@@ -5108,8 +5430,15 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 chordViewBack.setBounds (r5.removeFromLeft (r5.getWidth() / 2).reduced (1, 0));
                 chordViewFwd.setBounds  (r5.reduced (1, 0));
             }
-            si.removeFromTop (2);
-            chordProgLbl.setBounds (si.removeFromTop (14)); // search progress only
+            // The chord search keeps its own progress line. The adaptation does NOT: its
+            // read-out above carries the progress, and a second line that was blank most
+            // of the time and said "realtime: 37 updates" the rest of it was one of the
+            // two lines nobody could explain.
+            if (! adapt)
+            {
+                si.removeFromTop (2);
+                chordProgLbl.setBounds (si.removeFromTop (14)); // search progress only
+            }
         }
 
         // The result list fills the REST of this same box.
@@ -6080,31 +6409,27 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     if (specModeBox.getSelectedId() == 2)
     {
         const bool rt = processorRef.getRealtimeLink() != FractalAdditiveAudioProcessor::RtLink::Off;
-        // The register fields follow what is being played until the user types in them,
-        // and the line under them says how many registers each path really evaluates -
-        // the realtime follower's smaller count is stated, never applied behind the back.
+        // The register fields follow what is being played until the user types in them.
         syncAdaptRegisterAuto();
+        // WHAT THE AGGREGATE MEANS, in words, for whichever one is selected. This replaced
+        // a line of counts ("3 registers, realtime 3") that was true, useless on its own,
+        // and the reason the choice above it read as two arbitrary abbreviations. The
+        // counts are in the tooltip, where somebody who wants them will look.
+        adaptAggInfoLbl.setText (adaptAggMeaning (adaptAggBox.getSelectedId() == 2),
+                                 juce::dontSendNotification);
+        // The button carries the price of the next press, and becomes Stop while a run is
+        // going; the read-out under it says which of those is true right now.
+        refreshAdaptButtonText();
+        adaptInfoLbl.setText (adaptReadoutText(), juce::dontSendNotification);
+        // The TOOLTIP at 4 Hz, not 30. It carries the raw numbers and the cost estimate,
+        // so it has to follow the controls - but rebuilding a paragraph thirty times a
+        // second to hand it to a component nobody is hovering is pure allocation, and this
+        // timer already runs the whole window.
+        if (const auto now = juce::Time::getMillisecondCounter(); now - lastAdaptTipMs > 250)
         {
-            const auto rs = realtimeSettingsFromPanel();
-            double f0 = 0.0;
-            (void) processorRef.heldChordAsTargetAlphas (f0);
-            if (! (f0 > 0.0)) f0 = processorRef.analysisAnchorHz();
-            const auto hand = FractalAdditiveAudioProcessor::adaptRegistersFor (rs.adapt, f0, false);
-            const auto live = FractalAdditiveAudioProcessor::adaptRegistersFor (rs.adapt, f0, true);
-            juce::String rl;
-            rl << (int) hand.f0.size() << tr (" registers", " registres");
-            if (live.f0.size() != hand.f0.size())
-                rl << tr (", realtime ", ", temps real ") << (int) live.f0.size();
-            adaptRegInfoLbl.setText (rl, juce::dontSendNotification);
+            lastAdaptTipMs = now;
+            adaptInfoLbl.setTooltip (adaptReadoutTip());
         }
-        chordProgLbl.setText (processorRef.isSpectrumAdaptRunning()
-                                  ? tr ("Adapting... ", "Adaptant... ")
-                                    + juce::String ((int) std::lround (processorRef.getSpectrumAdaptProgress() * 100.0f)) + "%"
-                                  : rt ? tr ("realtime: ", "temps real: ")
-                                         + juce::String (processorRef.getRealtimeApplies())
-                                         + tr (" updates", " actualitzacions")
-                                       : juce::String(),
-                              juce::dontSendNotification);
 
         if (processorRef.getSpectrumAdaptGeneration() != lastAdaptGen)
         {
@@ -6164,44 +6489,48 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                                    ? processorRef.measureCurrentAgainstTarget (alphas, f0, s.adapt.rootOnly,
                                                                                doneRegs)
                                    : 0.0;
-            // ONE line a musician can read: the beating before the adaptation, after
-            // it, and the change in percent. The old read-out ("beating  seed 769.91
-            // ->  adapted 27.78" + a "really sounding" line with the note count, Reps
-            // and fractal appended) overflowed the label and explained nothing.
-            juce::String t;
-            // WHICH REGISTERS, on the same line as the number. `before`/`after` are the
-            // aggregate over the range that was actually minimised - printing them bare
-            // would let a mean over six octaves pass for one pitch's reading, which is
-            // exactly the confusion this whole change exists to end.
-            // The names come from the RESULT's own registers, not from the fields: the
-            // user may have retyped the range while the search was running, and a line
-            // that claimed C1-C7 for a run made over C2-C4 would be a plain lie.
-            t << (info.aggregate == 1 ? tr ("worst reg. ", "pitjor reg. ")
-                                      : tr ("avg ", "mitj "))
-              << registerNoteName (nearestKeyForHz (info.regLoHz)) << "-"
-              << registerNoteName (nearestKeyForHz (info.regHiHz)) << ": "
-              << juce::String (info.before, 1)
-              << " -> " << juce::String (info.after, 1);
-            if (info.before > 1.0e-12)
-            {
-                const int pct = (int) std::lround ((1.0 - info.after / info.before) * 100.0);
-                t << " (" << juce::String (std::abs (pct))
-                  << (pct >= 0 ? tr ("% less)", "% menys)") : tr ("% more)", "% m\xc3\xa9s)"));
-            }
-            // Second line ONLY when what is REALLY sounding differs from the search's
-            // own model - Reps stacks the whole adapted set again one period up and a
-            // fractal level self-convolves it, neither of which the search carries.
-            // When the numbers agree (the usual case) the line is pure noise, and it
-            // was the line that always got clipped.
+            // ONE SENTENCE, no raw Sethares numbers. "avg C2-C4: 769.9 -> 27.8 (96% less)"
+            // is four quantities and a scale nobody was told: 769.9 of what? The only part
+            // of it a musician can act on is the PERCENT, and the periods it was measured
+            // over. Everything else moved into the tooltip below.
+            //
+            // The periods come from the RESULT's own registers, not from the fields: the
+            // user may have retyped the range while the search was running, and a line that
+            // claimed periods 1-7 for a run made over 2-4 would be a plain lie.
+            const int D = registerDegreesPerPeriod();
+            const juce::String span = juce::String (ScaleKeyboard::periodNumberForNote (
+                                          nearestKeyForHz (info.regLoHz), D))
+                                    + juce::String::fromUTF8 ("\xe2\x80\x93")
+                                    + juce::String (ScaleKeyboard::periodNumberForNote (
+                                          nearestKeyForHz (info.regHiHz), D));
+            // The one caveat that changes what you HEAR: Reps stacks the whole adapted set
+            // again one period up and a fractal level self-convolves it, and the search
+            // saw neither. It used to be a bare second number ("sounding now: 31.4") that
+            // meant nothing without the first, and it was the line that always clipped.
             const int   reps = (int) processorRef.apvts.getRawParameterValue ("timbreRepeats")->load();
             const float frac = processorRef.apvts.getRawParameterValue ("fractalLevel")->load();
-            if (measurable && info.after > 1.0e-12 && std::abs (now - info.after) > 0.05 * info.after)
-            {
-                t << "\n" << tr ("sounding now: ", "sonant ara: ") << juce::String (now, 1);
-                if (reps > 1 || frac > 1.001f)
-                    t << " (Reps/Fractal)"; // the two controls that add partials the search never saw
-            }
-            adaptInfoLbl.setText (t, juce::dontSendNotification);
+            const bool  drift = measurable && info.after > 1.0e-12
+                             && std::abs (now - info.after) > 0.05 * info.after;
+            const int   pct = info.before > 1.0e-12
+                                  ? (int) std::lround ((1.0 - info.after / info.before) * 100.0) : 0;
+            adaptResultLine = adaptLineResult (info.before > 1.0e-12 ? std::abs (pct) : -1,
+                                               pct >= 0, span,
+                                               drift && (reps > 1 || frac > 1.001f));
+            // ...and every number that used to be on screen, kept where it can be read on
+            // demand instead of competing for a 192 px line.
+            adaptResultTip = tr ("Last run: ", "\xc3\x9altima cerca: ")
+                           + (info.aggregate == 1 ? tr ("worst register", "pitjor registre")
+                                                  : tr ("average", "mitjana"))
+                           + " " + span + ", "
+                           + tr ("beating ", "batec ") + juce::String (info.before, 1)
+                           + " -> " + juce::String (info.after, 1)
+                           + tr (" (Sethares roughness; lower = smoother).",
+                                 " (aspror de Sethares; m\xc3\xa9s baix = m\xc3\xa9s suau).")
+                           + (drift ? tr (" Really sounding now: ", " Sonant ara de veritat: ")
+                                      + juce::String (now, 1) + "."
+                                    : juce::String());
+            adaptInfoLbl.setText (adaptReadoutText(), juce::dontSendNotification);
+            adaptInfoLbl.setTooltip (adaptReadoutTip());
             resized();
             adaptList.repaint();
         }

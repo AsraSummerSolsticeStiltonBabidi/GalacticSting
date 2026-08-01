@@ -2810,18 +2810,86 @@ int main()
 
                     // A COMBO IS NOT A LABEL and the condensing rule above cannot see it:
                     // a ComboBox given too little room draws its arrow and clips the word
-                    // silently. The adaptation's register row packs a caption, two note
-                    // fields and this box onto one 186 px line, and the Catalan words are
-                    // the longer ones ("Registres", "pitjor") - so the box that ends up
-                    // with whatever is left over is measured explicitly.
+                    // silently. This box used to be squeezed into whatever the register
+                    // row had left over - 49 px, an arrow with a clipped word beside it -
+                    // and it now has a row of its own precisely because it is the choice
+                    // the panel most needed to spell out. The bar is the WORD's own width
+                    // in both languages, plus the arrow, not a guessed number.
                     if (sh.mode == 2)
                         for (const auto& c : P.controls)
                             if (c.first == "spec.agg")
                             {
-                                std::printf ("    aggregate box: %d px wide (%s)\n",
-                                             c.second.getWidth(), lang == 1 ? "ca" : "en");
-                                check (c.second.getWidth() >= 50,
-                                       "the mean/minimax box keeps room for its word beside its arrow");
+                                // The REAL geometry: the custom LookAndFeel gives the text
+                                // label box.width - height/3 - height/2, the label's own
+                                // border eats 10 more, and getComboBoxFont is 15 pt at
+                                // this height. 28 px of furniture, not a guess.
+                                const juce::Font cf { juce::FontOptions (15.0f) };
+                                const int need = juce::jmax (
+                                    juce::GlyphArrangement::getStringWidthInt (cf, lang == 1 ? "pitjor" : "worst"),
+                                    juce::GlyphArrangement::getStringWidthInt (cf, lang == 1 ? "mitjana" : "average")) + 28;
+                                std::printf ("    aggregate box: %d px wide, needs %d (%s)\n",
+                                             c.second.getWidth(), need, lang == 1 ? "ca" : "en");
+                                check (c.second.getWidth() >= need,
+                                       "the average/worst-case box fits its longest word beside its arrow");
+                            }
+
+                    // THE WRAPPING READ-OUTS. A juce::Label lays out in as many lines as
+                    // its height allows and then CONDENSES - and modern JUCE shrinks the
+                    // font first - so a sentence that overflows still looks like text and
+                    // no bounds check in the build can see it. That is exactly how the old
+                    // "sounding now:" line shipped clipped. Every state of the read-out is
+                    // measured here, not just whichever one happens to be showing.
+                    {
+                        int over = 0; juce::String worst; float worstBy = 0.0f;
+                        const auto judge = [&] (const std::vector<FractalAdditiveAudioProcessorEditor::LayoutProbe::WrappedLabel>& v)
+                        {
+                            for (const auto& s : v)
+                            {
+                                const float dh = s.needHeight - (float) s.cell.getHeight();
+                                const float dw = s.needWidth  - (float) s.cell.getWidth();
+                                const float d  = juce::jmax (dh, dw);
+                                if (d > 0.5f)
+                                {
+                                    ++over;
+                                    if (d > worstBy) { worstBy = d; worst = s.name + " \"" + s.text + "\""; }
+                                }
+                            }
+                        };
+                        judge (P.wrappedLabels);
+                        judge (P.readoutVariants);
+                        if (sh.mode == 2)
+                        {
+                            std::printf ("    %d wrapping read-outs measured, %d overflow%s\n",
+                                         (int) (P.wrappedLabels.size() + P.readoutVariants.size()), over,
+                                         over > 0 ? (" (worst: " + worst + " by "
+                                                     + juce::String ((int) std::ceil (worstBy)) + " px)").toRawUTF8() : "");
+                            // The live labels can legitimately be empty here (the verifier
+                            // has no message loop, so the timer that writes them never
+                            // runs) - the VARIANTS are the ones that must always be there.
+                            check (! P.readoutVariants.empty(),
+                                   "the adaptation's sentences are probed at all");
+                            check (over == 0,
+                                   lang == 1 ? "every sentence the read-outs can print fits its box (Catalan)"
+                                             : "every sentence the read-outs can print fits its box (English)");
+                        }
+                    }
+
+                    // ...and the results list must SURVIVE those sentences. It is the
+                    // LEFTOVER of this column: every row added above it comes straight out
+                    // of its height, and a list squeezed to a sliver still sits inside its
+                    // box, overlaps nothing and passes every other check here. The bar is
+                    // AdaptList::kRowH = 18: three partial rows visible without scrolling
+                    // in the tightest shape the panel has (goal Range adds a whole row).
+                    // Before this pass it was 68 px in the Min shape and 43 in Range.
+                    if (sh.mode == 2)
+                        for (const auto& c : P.controls)
+                            if (c.first == "spec.adaptList")
+                            {
+                                std::printf ("    adapted-partial list: %d px tall = %d rows (%s)\n",
+                                             c.second.getHeight(), c.second.getHeight() / 18,
+                                             lang == 1 ? "ca" : "en");
+                                check (c.second.getHeight() >= 3 * 18,
+                                       "the adapted-partial list still shows several partials unscrolled");
                             }
                 }
             }
@@ -3233,6 +3301,210 @@ int main()
                 ed->pressAdaptRealtimeForTests();
                 check (p.getRealtimeLink() == RtLink::Off,
                        "and ONE press of REALTIME stops it (it used to take two)");
+            }
+        }
+
+        //== PERIOD NUMBERS: on the keys, and as the unit the register range is typed in ==
+        //
+        // "C2".."C4" is 12-EDO's naming, and the register range - the one control that
+        // decides WHICH REGISTERS a spectrum is optimised for - was expressed in it. Under
+        // 31-EDO or Bohlen-Pierce those names denote nothing the tuning has. What replaced
+        // them is the PERIOD number, printed beside every degree-0 key and typed straight
+        // into the two fields. Three things have to hold and none of them is visible to any
+        // other check in this build.
+        if (ed != nullptr)
+        {
+            std::printf ("period numbers on the keys, and as the register unit:\n");
+            ed->setSpecModeForTests (2);
+            ed->resized();
+
+            // (1) THE NUMBER ITSELF. Counted the way octaves are counted, with the
+            //     reference key (60) as period 3 - which is what the rest of the product
+            //     calls C3 - and by FLOOR division, so the period below the reference is 2
+            //     and not 3 again. In 12-EDO it must agree key for key with the note names
+            //     it replaced; in 31-EDO it must not.
+            {
+                bool ok12 = true;
+                for (int k = 0; k <= 127; k += 1)
+                    if (ScaleKeyboard::periodNumberForNote (k, 12) != k / 12 - 2) ok12 = false;
+                check (ok12, "in 12-EDO a period number is exactly the octave number it replaced");
+                check (ScaleKeyboard::periodNumberForNote (60, 31) == 3
+                       && ScaleKeyboard::periodNumberForNote (59, 31) == 2
+                       && ScaleKeyboard::periodNumberForNote (29, 31) == 2
+                       && ScaleKeyboard::periodNumberForNote (28, 31) == 1,
+                       "in 31-EDO it counts 31-key periods, and the key below a boundary is the period below");
+                check (ScaleKeyboard::noteForPeriodNumber (3, 31) == 60
+                       && ScaleKeyboard::noteForPeriodNumber (2, 31) == 29
+                       && ScaleKeyboard::noteForPeriodNumber (9, 31) == -1,
+                       "and the inverse lands on the period's own first key, or says the board has none");
+            }
+
+            // (2) IT HAS TO BE READABLE. drawFittedText does not clip a number that is too
+            //     big for its rect - it SHRINKS it - so an unreadable period tag looks like
+            //     a deliberate design choice and no bounds check in this build can see it.
+            //     Measured in the very font paint() sets, against the very rect it draws
+            //     into, at the key width the keyboard really uses.
+            {
+                const auto tags = ed->keyboardPeriodTagsForTests();
+                int tooNarrow = 0, overlaps = 0, offCentre = 0, tiny = 0;
+                juce::String firstBad;
+                for (const auto& t : tags)
+                {
+                    if (t.tagTextWidth > (float) t.tag.getWidth())
+                    { ++tooNarrow; if (firstBad.isEmpty()) firstBad = "period " + juce::String (t.number); }
+                    // The "0" and its period number share a cell; the tag's strip is
+                    // RESERVED out of it, so the two can never print on top of each other.
+                    if (t.tag.getX() < t.zero.getRight() - 0.01f) ++overlaps;
+                    // "vertically centred to its right" - the user's words, as a number.
+                    if (std::abs (t.tag.getCentreY() - t.zero.getCentreY()) > 1.0f) ++offCentre;
+                    if (t.tagFont < 7.0f) ++tiny;
+                }
+                std::printf ("  %d degree-0 keys on screen: %d tags too narrow%s, %d overlapping the 0,"
+                             " %d off-centre, %d below 7 pt\n",
+                             (int) tags.size(), tooNarrow,
+                             firstBad.isEmpty() ? "" : (" (" + firstBad + ")").toRawUTF8(),
+                             overlaps, offCentre, tiny);
+                if (! tags.empty())
+                    std::printf ("  first tag: period %d, \"0\" %.1f pt in %.0f px, number %.1f pt needing"
+                                 " %.1f px of %.0f\n",
+                                 tags.front().number, tags.front().zeroFont, tags.front().zero.getWidth(),
+                                 tags.front().tagFont, tags.front().tagTextWidth,
+                                 tags.front().tag.getWidth());
+                check (! tags.empty(), "every period boundary on screen carries its number");
+                check (tooNarrow == 0, "and every one of them fits its rect without being shrunk");
+                check (overlaps == 0, "and none of them prints over the \"0\" it belongs to");
+                check (offCentre == 0, "and each is vertically centred on that \"0\"");
+                check (tiny == 0, "and none of them is drawn below 7 pt");
+
+                // ...INCLUDING the numbers this tuning does not happen to show. A period
+                // number runs from one to three characters (a one-degree-per-period scale
+                // reaches "-10"), and the widest is the one nobody was looking at. Measured
+                // through the same layout call paint() uses, on the same cell geometry.
+                if (! tags.empty())
+                {
+                    const auto& t0 = tags.front();
+                    const float cellW = t0.zero.getWidth() + t0.tag.getWidth() + 2.0f;
+                    const auto  area  = t0.zero.getUnion (t0.tag);
+                    int narrow = 0, small = 0;
+                    for (const char* s : { "3", "-2", "-10" })
+                    {
+                        const juce::String txt (s);
+                        const auto z = ScaleKeyboard::layOutPeriodTag (area, cellW, txt.length());
+                        const float w = (float) juce::GlyphArrangement::getStringWidthInt (
+                            juce::Font (juce::FontOptions (z.tagFont).withStyle ("Bold")), txt);
+                        std::printf ("    \"%s\": %.1f pt, needs %.1f px of %.1f, \"0\" left with %.0f px\n",
+                                     s, z.tagFont, w, z.tag.getWidth(), z.zero.getWidth());
+                        if (w > z.tag.getWidth()) ++narrow;
+                        if (z.tagFont < 7.0f || z.zero.getWidth() < 10.0f) ++small;
+                    }
+                    check (narrow == 0, "a one-, two- or three-character period all fit their strip");
+                    check (small == 0, "and none of them costs the \"0\" its own legibility");
+                }
+            }
+
+            // (3) THE FIELDS TAKE PERIODS AND RESOLVE THROUGH THE TUNING. What the search
+            //     is really given is Hz, and the key those Hz come from is the period's own
+            //     first key under the CURRENT degree count - so the same typed range spans
+            //     a genuinely different number of keys in a 31-note scale than in 12-EDO,
+            //     which is the whole point. Storing MIDI keys instead would have silently
+            //     shrunk a two-period range to two thirds of an octave.
+            {
+                ed->setAdaptRegistersForTests ("2", "4");
+                const auto r = ed->registerProbeForTests();
+                std::printf ("  typed 2..4 -> periods %d..%d, keys %d..%d, %.1f..%.1f Hz (%d degrees/period)\n",
+                             r.periodLo, r.periodHi, r.keyLo, r.keyHi, r.loHz, r.hiHz,
+                             juce::jmax (1, p.getScaleDegrees()));
+                check (r.periodLo == 2 && r.periodHi == 4 && r.loText == "2" && r.hiText == "4",
+                       "the register fields take a period number and show it back");
+                check (r.keyLo == ScaleKeyboard::noteForPeriodNumber (2, juce::jmax (1, p.getScaleDegrees()))
+                       && r.keyHi == ScaleKeyboard::noteForPeriodNumber (4, juce::jmax (1, p.getScaleDegrees())),
+                       "and each end resolves to that period's own first key under the LOADED tuning");
+                check (r.hiHz > r.loHz * 1.5 && r.loHz > 0.0,
+                       "and the two ends are real, ordered frequencies from the active tuning");
+                // A range typed backwards is a typo, not an instruction to optimise nothing.
+                ed->setAdaptRegistersForTests ("5", "1");
+                const auto sw = ed->registerProbeForTests();
+                check (sw.periodLo < sw.periodHi, "a range typed backwards is put the right way round");
+                // Rubbish snaps back to the last good pair rather than becoming "no range" -
+                // which the processor reads as AUTO and would collapse to a single pitch.
+                const auto before = ed->registerProbeForTests();
+                ed->setAdaptRegistersForTests ("", "-");
+                const auto junk = ed->registerProbeForTests();
+                check (junk.periodLo == before.periodLo && junk.periodHi == before.periodHi
+                       && junk.loText.isNotEmpty(),
+                       "unreadable text snaps back to the last good range, never to \"no range\"");
+                // ...and a period the keyboard does not have snaps to the edge, visibly.
+                ed->setAdaptRegistersForTests ("-99", "99");
+                const auto clamped = ed->registerProbeForTests();
+                std::printf ("  typed -99..99 -> %s..%s (keys %d..%d)\n",
+                             clamped.loText.toRawUTF8(), clamped.hiText.toRawUTF8(),
+                             clamped.keyLo, clamped.keyHi);
+                // The point is not merely that the KEY is legal - registerKeyForPeriod
+                // clamps that on its own. It is that the FIELD says the period the search
+                // is really given. Without the clamp the field read "-99" while the run
+                // used period -2, which is the panel lying about its own settings.
+                {
+                    const int D = juce::jmax (1, p.getScaleDegrees());
+                    check (clamped.keyLo >= 0 && clamped.keyHi <= 127
+                           && clamped.periodLo == ScaleKeyboard::periodNumberForNote (clamped.keyLo, D)
+                           && clamped.periodHi == ScaleKeyboard::periodNumberForNote (clamped.keyHi, D)
+                           && clamped.loText == juce::String (clamped.periodLo)
+                           && clamped.hiText == juce::String (clamped.periodHi),
+                           "a period off the keyboard snaps to the edge IN THE FIELD, not behind it");
+                }
+                ed->setAdaptRegistersForTests ("2", "4");
+            }
+
+            //== THE PRICE OF A RUN, ON THE BUTTON =============================
+            // The panel used to REFUSE "all vs all over 31 notes x 16 partials" as "too
+            // heavy to search". It is a calculation of tens of seconds on a worker thread
+            // that already reports progress and already cancels. What a musician needs
+            // there is the number, not a veto - so the button wears it.
+            {
+                ed->setSpecModeForTests (2);
+                ed->resized();
+                const double ms = ed->adaptCostMsForTests (false);
+                const auto txt = ed->adaptButtonTextForTests();
+                std::printf ("  loaded tuning, %d degrees: one Adapt ~%.0f ms; button says \"%s\"\n",
+                             juce::jmax (1, p.getScaleDegrees()), ms, txt.toRawUTF8());
+                check (ms > 0.0, "the panel can price a run before starting it");
+                // Cheap runs must NOT shout a duration at the user; expensive ones must.
+                check (ms < 950.0 ? ! txt.containsChar ('~') : txt.containsChar ('~'),
+                       "the button carries a duration only when there is really a wait");
+                // With nothing held the follower has no target and no cost, so the read-out
+                // must NOT be warning about lag - a lag warning with no chord down would be
+                // a warning about a search that is not going to happen.
+                check (ed->adaptCostMsForTests (true) == 0.0,
+                       "an empty hand prices a realtime update at nothing, not at a warning");
+
+                // THE ESTIMATE'S SHAPE, through the processor's own estimator - the same
+                // call the ten-minute guard measures itself against, so the price on the
+                // button and the only refusal left cannot be two different numbers.
+                {
+                    FractalAdditiveAudioProcessor::SpectrumAdaptSettings s;
+                    s.partials = 16; s.periodRatio = 8.0; s.minGapCents = 20.0;
+                    s.shapeAmps = true; s.regLoHz = 65.0; s.regHiHz = 4186.0;
+                    const double f0 = 261.6;
+                    s.rootOnly = false;
+                    const double heavy = FractalAdditiveAudioProcessor::estimateAdaptMs (s, 31, f0, false);
+                    const double heavyRt = FractalAdditiveAudioProcessor::estimateAdaptMs (s, 31, f0, true);
+                    s.rootOnly = true;
+                    const double light = FractalAdditiveAudioProcessor::estimateAdaptMs (s, 31, f0, false);
+                    std::printf ("  31 notes x 16 partials over 6 octaves: all-vs-all %.1f s"
+                                 " (realtime cap %.1f s), 0-vs-all %.1f s; hard bound %.0f s\n",
+                                 heavy * 0.001, heavyRt * 0.001, light * 0.001,
+                                 dissonance::kAdaptAbsurdMs * 0.001);
+                    // The realtime path takes the smaller register cap (3 instead of 7) and
+                    // the cost is exactly linear in that count, so it is never dearer.
+                    check (heavyRt < heavy,
+                           "one realtime update never costs more than one hand-pressed Adapt");
+                    // The configuration the old dialog REFUSED outright. It is tens of
+                    // seconds - offered, priced, cancellable - not "too heavy to search".
+                    check (heavy > dissonance::kAdaptWarnMs && heavy < dissonance::kAdaptAbsurdMs,
+                           "the search the old dialog refused is warned about, and offered");
+                    check (light < heavy * 0.5,
+                           "and \"0 vs all\" is priced as the much cheaper scope it is");
+                }
             }
         }
     }

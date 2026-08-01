@@ -1447,6 +1447,106 @@ int main()
     }
 
     //--------------------------------------------------------------------------
+    // THE ADAPTATION COST MODEL. The panel prints "Adapt ~14 s" on the button and only
+    // refuses genuinely absurd requests, so that number has to MEAN something - a
+    // made-up figure is worse than no figure, because a user plans around it.
+    //
+    // What is being checked is the SHAPE of dissonance::adaptTotalPairs, not the clock:
+    // one nanoseconds-per-pair constant is fitted across configurations that differ by
+    // more than 100x in work, in both scopes, with and without amplitude shaping, at 1
+    // and at 7 registers. If the pair count were wrong in any of its factors - registers,
+    // line searches, scope - no single constant could fit them all and the spread below
+    // would blow up. (The previous refusal claimed "31 notes x 16 partials is minutes,
+    // not milliseconds". Row 6 is exactly that shape and the table says what it is.)
+    {
+        std::printf ("\nadaptation cost model (predicted vs measured):\n");
+        struct Cfg { int N, A, R, sweeps; bool rootOnly, amps; const char* what; };
+        const Cfg cfgs[] = {
+            {  8,  1, 1, 6, true,  false, "8 partials, 1 note, 0-vs-all, 1 reg" },
+            {  8, 12, 3, 6, true,  true,  "8 partials, 12 notes, 0-vs-all, 3 reg, +amps" },
+            { 12,  4, 1, 6, false, false, "12 partials, 4 notes, all-vs-all, 1 reg" },
+            { 16,  7, 7, 2, true,  true,  "16 partials, 7 notes, 0-vs-all, 7 reg, +amps" },
+            { 12, 31, 1, 2, true,  false, "12 partials, 31 notes, 0-vs-all, 1 reg" },
+            { 16, 31, 1, 1, false, false, "16 partials, 31 notes, ALL-vs-all, 1 reg" } };
+
+        double worstRatio = 1.0, bestRatio = 1.0e9, sumPairs = 0.0, sumMs = 0.0;
+        for (const auto& c : cfgs)
+        {
+            const double f0 = 220.0;
+            const double totalC = 1200.0 * std::log2 (4.0);   // a 4/1 period: room for 16 partials
+            const double gap = 20.0;
+            const double top = std::exp2 ((totalC - gap) / 1200.0);
+            std::vector<dissonance::Partial> seed;
+            for (int i = 0; i < c.N; ++i)
+            {
+                const double r = std::exp2 (totalC * (double) i / (double) c.N / 1200.0);
+                seed.push_back ({ f0 * r, std::pow (r, -1.0) });
+            }
+            std::vector<double> alphas;
+            for (int i = 0; i < c.A; ++i) alphas.push_back (std::exp2 ((double) i / 31.0));
+            dissonance::Registers rg;
+            rg.f0 = dissonance::registerPoints (f0 * 0.5, f0 * 4.0, c.R);
+            rg.mode = dissonance::Aggregate::Mean;
+
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto res = dissonance::adaptSpectrum (seed, f0, alphas, c.rootOnly,
+                                                        dissonance::Goal::Min, 0.0, 0.0, gap, top,
+                                                        c.amps, 6.0, c.sweeps, rg);
+            const double ms = std::chrono::duration<double, std::milli> (
+                                  std::chrono::steady_clock::now() - t0).count();
+            // Predicted against the sweeps that REALLY ran: adaptSpectrum stops early when
+            // a sweep buys nothing, and charging the model for sweeps it never did would
+            // be fitting the constant to the optimiser's luck instead of to the machine.
+            const int    done = std::max (1, res.sweepsDone);
+            const double pairs = dissonance::adaptTotalPairs (c.N, c.A, c.rootOnly, c.R, c.amps, done);
+            const double pred  = dissonance::adaptEstimateMs (c.N, c.A, c.rootOnly, c.R, c.amps, done);
+            const double ratio = pred / std::max (0.001, ms);
+            sumPairs += pairs; sumMs += ms;
+            // Sub-millisecond runs are excluded from the BAND (never from the fit): at
+            // 0.5 ms the measurement is the allocator, the cold cache and the clock's own
+            // resolution, and it swings between x0.38 and x0.61 run to run on an idle
+            // machine. Holding the model to that would be testing the timer.
+            if (ms >= 2.0)
+            {
+                worstRatio = std::max (worstRatio, ratio);
+                bestRatio  = std::min (bestRatio, ratio);
+            }
+            std::printf ("    %-46s  %2d sweeps  %10.0f pairs   predicted %8.1f ms   measured %8.1f ms   x%.2f%s\n",
+                         c.what, done, pairs, pred, ms, ratio, ms < 2.0 ? "  (below the timing floor)" : "");
+            // Partials are never dropped, whatever the cost: the run that the old dialog
+            // called impossible still comes back with every partial it was given.
+            check ((int) res.spectrum.size() == c.N,
+                   (std::string ("  ...and it returned all ") + std::to_string (c.N) + " partials").c_str());
+        }
+        const double fitted = sumMs * 1.0e6 / std::max (1.0, sumPairs);
+        std::printf ("    fitted %.2f ns/pair (header says %.2f); prediction band x%.2f .. x%.2f\n",
+                     fitted, dissonance::kAdaptNsPerPair, bestRatio, worstRatio);
+        // A single constant has to cover every timeable row within a factor of two either
+        // way. That is loose enough for a cold cache and a busy machine and far too tight
+        // for a wrong exponent: dropping the register factor alone puts row 4 out by 7x.
+        check (bestRatio > 0.5 && worstRatio < 2.0,
+               "one ns/pair constant predicts every configuration within a factor of 2");
+        // ...and the constant shipped in the header is the one the machine actually shows.
+        check (fitted > dissonance::kAdaptNsPerPair * 0.5 && fitted < dissonance::kAdaptNsPerPair * 2.0,
+               "and kAdaptNsPerPair is within a factor of 2 of the measured fit");
+        // THE HARD BOUND is the only thing left that refuses, and it must refuse only the
+        // absurd: 16 partials against a 31-note scale in "all vs all" - the configuration
+        // the old dialog rejected outright - has to be OFFERED, and a 24-partial spectrum
+        // against a full 128-key table in the same scope has to be the thing that is not.
+        {
+            const double offered = dissonance::adaptEstimateMs (16, 31, false, 7, true, 6);
+            const double absurd  = dissonance::adaptEstimateMs (24, 128, false, 7, true, 6);
+            std::printf ("    31 notes x 16 partials all-vs-all, 7 reg, +amps: %.1f s (bound %.0f s)\n"
+                         "    128 notes x 24 partials all-vs-all, 7 reg, +amps: %.0f s\n",
+                         offered * 0.001, dissonance::kAdaptAbsurdMs * 0.001, absurd * 0.001);
+            check (offered < dissonance::kAdaptAbsurdMs,
+                   "the search the old dialog refused is under the hard bound - it is offered");
+            check (absurd > dissonance::kAdaptAbsurdMs,
+                   "and a 128-note table at 24 partials all-vs-all is over it - that one is refused");
+        }
+    }
+
+    //--------------------------------------------------------------------------
     // Fractal must be CONTINUOUS: nudging it off "off" is a nudge, not a new timbre.
     // "Raising fractal from 0 to a little more changed the sound irreversibly."
     // The fader quantises to 0.01, so 1.01 is the smallest move a user can make; it
