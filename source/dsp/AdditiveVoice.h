@@ -172,6 +172,10 @@ public:
         // snap with continuous phase = click-free) instead of gliding from a stale ratio.
         morphActive = false; morphPos = 1.0; prevN = 0; morphWeight = 0.0;
         morphWPos = 0.0; morphFadeOut = false;
+        // The amp glide starts a note at the 7 ms de-click minimum, steal included: a
+        // stolen voice's amplitudes must hand over to the NEW note in milliseconds, not
+        // inherit a seconds-long constant from the old note's in-flight morph.
+        ampGlideCur = 0.007; tmplGlideSamps = 0;
 
         // Retrigger this voice's modulators. A stolen voice retriggers too: it is a new
         // note, and its envelopes must start from the beginning like any other.
@@ -329,6 +333,52 @@ public:
                 {
                     const int lo = std::min (prevN, newN);
                     const int hi = std::max (prevN, newN);
+
+                    // THE invariant that makes a morph restart click-free:
+                    //   alignPhase[] is only ever WRITTEN while the crossfade weight is 0,
+                    //   phase[]      is only ever WRITTEN while that weight is 1.
+                    // At those two points the two oscillator banks are respectively
+                    // inaudible and numerically identical, so neither assignment can step
+                    // the output. Anything in between is left strictly alone.
+                    //
+                    // The old code wrote both arrays at an arbitrary weight - re-seeding
+                    // alignPhase whenever the weight was <= 0.5 and adopting it whenever it
+                    // was > 0.5 - so EVERY template change stepped every partial at once,
+                    // coherently. In Aligned mode alignPhase is the same constant 0.25 for
+                    // all of them, which makes that step a maximal impulse rather than a
+                    // smear, and two voices seeded identically stepped in phase and added.
+                    // With an LFO on Base (a new template ~60x a second) that was a
+                    // continuous train of near-full-scale clicks.
+                    //
+                    // This adoption runs BEFORE the glide below is re-aimed: the mappings
+                    // must start from the ratios the listener is actually hearing.
+                    const bool wasMorphing = morphActive;
+                    const int  seedSpan    = std::max (hi, activeCount); // every slot the render loop touches
+                    if (wasMorphing && morphWeight >= 0.999)
+                    {
+                        // Fully crossfaded: the output already IS the aligned bank, so hand
+                        // BOTH its phases AND its (possibly still gliding) ratios back to the
+                        // running bank and release the weight. Copying the phases alone and
+                        // re-seeding the glide from curRatio - a ratio the listener stopped
+                        // hearing when the weight reached 1 - jumped the audible frequencies
+                        // BACKWARDS mid-glide on every adoption: one of the "trompicon"
+                        // stumbles under the realtime-adaptive template stream, where
+                        // templates land faster than the morph completes.
+                        for (int j = 0; j < seedSpan; ++j)
+                        {
+                            phase[(size_t) j] = alignPhase[(size_t) j];
+                            if (alignRatio[(size_t) j] > 1.0e-12) // a slot the aligned bank never held keeps its own ratio
+                                curRatio[(size_t) j] = alignRatio[(size_t) j];
+                        }
+                        morphWeight = 0.0; morphWPos = 0.0;
+                    }
+                    else if (! wasMorphing)
+                    {
+                        // A morph that ENDED already adopted its phases (see the tail of
+                        // renderNextBlock), so the weight can be released here without a step.
+                        morphWeight = 0.0; morphWPos = 0.0;
+                    }
+
                     for (int j = 0; j < lo; ++j) // shared ranks: straight old[j] -> new[j]
                     {
                         morphStartLog[(size_t) j] = std::log2 (std::max (1.0e-12, curRatio[(size_t) j]));
@@ -361,39 +411,6 @@ public:
                     for (int j = 0; j < hi; ++j)
                         curRatio[(size_t) j] = std::exp2 (morphStartLog[(size_t) j]);
 
-                    // THE invariant that makes a morph restart click-free:
-                    //   alignPhase[] is only ever WRITTEN while the crossfade weight is 0,
-                    //   phase[]      is only ever WRITTEN while that weight is 1.
-                    // At those two points the two oscillator banks are respectively
-                    // inaudible and numerically identical, so neither assignment can step
-                    // the output. Anything in between is left strictly alone: a template
-                    // arriving mid-crossfade only re-aims alignInc (the DESTINATION
-                    // frequencies), and a frequency move with continuous phase cannot click.
-                    //
-                    // The old code wrote both arrays at an arbitrary weight - re-seeding
-                    // alignPhase whenever the weight was <= 0.5 and adopting it whenever it
-                    // was > 0.5 - so EVERY template change stepped every partial at once,
-                    // coherently. In Aligned mode alignPhase is the same constant 0.25 for
-                    // all of them, which makes that step a maximal impulse rather than a
-                    // smear, and two voices seeded identically stepped in phase and added.
-                    // With an LFO on Base (a new template ~60x a second) that was a
-                    // continuous train of near-full-scale clicks.
-                    const bool wasMorphing = morphActive;
-                    const int  seedSpan    = std::max (hi, activeCount); // every slot the render loop touches
-                    if (wasMorphing && morphWeight >= 0.999)
-                    {
-                        // Fully crossfaded: the output already IS alignPhase, so handing it
-                        // back to the running bank and releasing the weight costs nothing,
-                        // and it lets the next crossfade start from a real 0 again.
-                        for (int j = 0; j < seedSpan; ++j) phase[(size_t) j] = alignPhase[(size_t) j];
-                        morphWeight = 0.0; morphWPos = 0.0;
-                    }
-                    else if (! wasMorphing)
-                    {
-                        // A morph that ENDED already adopted its phases (see the tail of
-                        // renderNextBlock), so the weight can be released here without a step.
-                        morphWeight = 0.0; morphWPos = 0.0;
-                    }
                     morphN = hi; morphActive = true; morphFadeOut = false;
                     // EVERY new target restarts the glide clock. Keeping the old
                     // morphPos was what made a continuous move (a knob drag, or a
@@ -421,6 +438,24 @@ public:
                             else { const double h = std::sin ((double) j * 12.9898) * 43758.5453;
                                    alignPhase[(size_t) j] = h - std::floor (h); }
                         }
+                        // A fresh crossfade: the aligned bank is inaudible, so it can sit
+                        // directly AT the destination frequencies for the whole glide
+                        // (unchanged behaviour when templates come slower than the morph).
+                        for (int j = 0; j < hi; ++j)
+                            alignStartLog[(size_t) j] = morphTgtLog[(size_t) j];
+                    }
+                    else
+                    {
+                        // Mid-crossfade: the aligned bank is AUDIBLE at the current weight,
+                        // so its frequencies must GLIDE to the new destination just like the
+                        // running bank's. Snapping alignInc here (the old behaviour) was the
+                        // loudest of the adaptive-stream stumbles: once the weight neared 1,
+                        // the entire audible spectrum stepped onto each new template
+                        // instantly - morph on, yet audibly not morphing.
+                        for (int j = 0; j < hi; ++j)
+                            alignStartLog[(size_t) j] = alignRatio[(size_t) j] > 1.0e-12
+                                ? std::log2 (alignRatio[(size_t) j])
+                                : morphTgtLog[(size_t) j]; // a slot the bank never held starts at target
                     }
                 }
                 else if (morphActive && morphWeight > 1.0e-6)
@@ -430,11 +465,20 @@ public:
                     // morphWeight * (aligned - running) from every partial in one sample,
                     // which is the same coherent step as above. Ramp it out instead.
                     morphFadeOut = true;
+                    if (! snapAmps) tmplGlideSamps = (int) (kTmplGlideHold * currentSampleRate);
                 }
                 else
                 {
                     morphActive = false; morphFadeOut = false;
                     morphWeight = 0.0; morphWPos = 0.0;
+                    // Morph OFF: the ratios snap below (phase-continuous, no click), but the
+                    // AMPLITUDES get a real fade-out/fade-in of kTmplGlideSec instead of the
+                    // bare 7 ms de-click slew. 7 ms is right for hiding a step; over a large
+                    // timbre change it still READS as a hard cut ("una transicion subita y
+                    // abrupta"). This is deliberately NOT the morph machinery - the user
+                    // wants the two decoupled - just a longer target for the same amp slew.
+                    // snapAmps (a cold note) is excluded: a fresh note starts ON its target.
+                    if (! snapAmps) tmplGlideSamps = (int) (kTmplGlideHold * currentSampleRate);
                 }
                 lastGen = gen;
             }
@@ -527,19 +571,30 @@ public:
             for (int j = 0; j < n; ++j) // clamp guards a partial pushed past Nyquist by pitch bend
                 inc[(size_t) j] = std::min (curRatio[(size_t) j] * f0 / currentSampleRate, 0.4999);
 
-            // Increment for the coherent reference: the DESTINATION frequency (not the
-            // gliding one), so alignPhase converges to a proper pulse for the new spectrum.
+            // Increment for the coherent reference. The aligned bank GLIDES to the
+            // destination on the same clock as the running bank (alignStartLog is the
+            // destination itself when the crossfade began at weight 0, so a lone morph
+            // still advances at the true destination frequency throughout). It must not
+            // simply SIT on ps[j].ratio: a template landing mid-crossfade would snap the
+            // whole bank onto the new frequencies while it is audible at the current
+            // weight - the audible stumble under the realtime-adaptive stream.
             // Bounded by the SAME span the render loop crossfades over, not by n: the
             // fading tails in [n, activeCount) are mixed in at weight morphW too, and
             // leaving their alignInc stale advanced them at a frequency belonging to an
-            // older template - audible as a detuned ghost during every glide.
+            // older template - audible as a detuned ghost during every glide. Slots
+            // outside the glide (appeared mid-glide, old static tails, or any fade-out)
+            // follow the running ratio, which is exactly where the old code left them.
             if (morphActive)
             {
-                const int incSpan = std::max (n, activeCount);
+                const double tA     = std::min (1.0, morphPos);
+                const int    incSpan = std::max (n, activeCount);
                 for (int j = 0; j < incSpan; ++j)
                 {
-                    const double dr = (j < newN) ? (double) ps[(size_t) j].ratio : curRatio[(size_t) j];
-                    alignInc[(size_t) j] = std::min (dr * f0 / currentSampleRate, 0.4999);
+                    alignRatio[(size_t) j] = (! morphFadeOut && j < morphN)
+                        ? std::exp2 (alignStartLog[(size_t) j]
+                                     + (morphTgtLog[(size_t) j] - alignStartLog[(size_t) j]) * tA)
+                        : curRatio[(size_t) j];
+                    alignInc[(size_t) j] = std::min (alignRatio[(size_t) j] * f0 / currentSampleRate, 0.4999);
                 }
             }
 
@@ -572,16 +627,35 @@ public:
         // tracked with two scalar multiplies per sample - no O(n) re-sum, no lag, no clip.
         const int    span = std::max (n, activeCount);
         const double sr   = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
-        // AMPLITUDES glide over the Morph Time too. This used to be a hardcoded 7 ms
-        // whatever Morph said, so only the partial FREQUENCIES ever glided: the whole
-        // loudness/timbre profile still arrived in 7 ms and a big Base jump read as a
-        // step followed by a sweep. With Morph off, the 7 ms stays - it is the
-        // click-free minimum, not a glide.
-        const double ampGlideSec = (morphActive && morphTimeParam != nullptr)
-                                 ? std::max (0.007, (double) morphTimeParam->load())
-                                 : 0.007;
-        const double slew         = 1.0 - std::exp (-1.0 / (ampGlideSec * sr));
+        // AMPLITUDES glide over the Morph Time while a morph runs (a hardcoded 7 ms here
+        // once meant only the FREQUENCIES ever glided), over the kTmplGlideSec fade for
+        // a short window after a template change with Morph off (7 ms hides a step but
+        // reads as a hard cut over a big timbre change), and at the 7 ms click-free
+        // minimum the rest of the time.
+        double glideTarget = 0.007;
+        if (morphActive && morphTimeParam != nullptr)
+            glideTarget = std::max (0.007, (double) morphTimeParam->load());
+        else if (tmplGlideSamps > 0)
+            glideTarget = kTmplGlideSec;
+        if (tmplGlideSamps > 0) tmplGlideSamps = std::max (0, tmplGlideSamps - numSamples);
+        // The glide CONSTANT itself must never jump FASTER while the amplitudes are still
+        // moving: flipping from Morph Time straight to 7 ms the moment a morph completes
+        // swept the remaining ~1/e of the amplitude move in a few milliseconds - an
+        // audible knee ("trompicon") right as every realtime-adaptive stream settled.
+        // Slower is adopted at once (the pending delta was just re-aimed anyway, and a
+        // slowdown only softens); faster is approached over ~100 ms, so the knee becomes
+        // a gradual accelerando. Constant WITHIN the block, as normGain's closed-form
+        // sums require.
+        if (glideTarget >= ampGlideCur) ampGlideCur = glideTarget;
+        else ampGlideCur += (glideTarget - ampGlideCur)
+                          * (1.0 - std::exp (-(double) numSamples / (0.100 * sr)));
+        const double slew         = 1.0 - std::exp (-1.0 / (ampGlideCur * sr));
         const double oneMinusSlew = 1.0 - slew;
+        // Velocity / pressure / the fast-kill recovery keep their own FIXED ~7 ms glide:
+        // they are gain terms whose slew exists to hide steal hand-over steps, and tying
+        // them to the amplitude glide made a stolen note's velocity swell in over an
+        // entire Morph Time (seconds) instead of milliseconds.
+        const float gainSlew = (float) (1.0 - std::exp (-1.0 / (0.007 * sr)));
         double sumCur0 = 0.0, sumTarget = 0.0, sumTargetSq = 0.0, coefA = 0.0, coefB = 0.0;
         for (int i = 0; i < span; ++i)
         {
@@ -669,12 +743,13 @@ public:
                 acc += curAmp[(size_t) i] * s;
             }
 
-            // Velocity / pressure / the fast-kill recovery glide with the same ~7 ms
-            // constant as the amplitudes, so a stolen voice hands over without a step.
-            velocityLevel += (velTarget      - velocityLevel) * (float) slew;
-            pressure      += (pressureTarget - pressure)      * (float) slew;
+            // Velocity / pressure / the fast-kill recovery glide with their own fixed
+            // ~7 ms constant (gainSlew), so a stolen voice hands over without a step
+            // whatever the amplitude glide is currently doing.
+            velocityLevel += (velTarget      - velocityLevel) * gainSlew;
+            pressure      += (pressureTarget - pressure)      * gainSlew;
             if (! fastKill && fastKillGain < 1.0f)
-                fastKillGain += (1.0f - fastKillGain) * (float) slew;
+                fastKillGain += (1.0f - fastKillGain) * gainSlew;
 
             const float env    = adsr.getNextSample();
             const float killG  = fastKillGain; // 1 normally; fading out, or ramping back after a steal
@@ -894,7 +969,12 @@ private:
     std::array<double, spectrum::kMaxPartials> morphTgtLog   {}; // log2 target ratio during a morph
     double morphWeight = 0.0; // see the reference bound to it in renderNextBlock
     std::array<double, spectrum::kMaxPartials> alignPhase    {}; // coherent destination phase (morph crossfade)
-    std::array<double, spectrum::kMaxPartials> alignInc      {}; // destination-frequency increment for alignPhase
+    std::array<double, spectrum::kMaxPartials> alignInc      {}; // increment for alignPhase (from alignRatio)
+    // The aligned bank's own gliding ratio + its glide start (log2). It cannot simply
+    // sit on the destination: a template landing mid-crossfade would snap the audible
+    // aligned bank onto the new frequencies in one sample's time (see renderNextBlock).
+    std::array<double, spectrum::kMaxPartials> alignRatio    {};
+    std::array<double, spectrum::kMaxPartials> alignStartLog {};
 
     double        morphPos    = 1.0;   // 0..1 glide progress (>= 1 -> done)
     // Separate clock for the phase-crossfade WEIGHT, advanced per sample. It is NOT reset
@@ -914,6 +994,16 @@ private:
     int   activeCount = 0;     // slots to process (includes fading-out tails)
     bool  snapAmps    = true;  // snap amps to target this block (cold note start)
     float normGain    = 1.0f;  // per-voice normalisation gain (recomputed per sample)
+
+    // Spectral de-click for template changes with Morph OFF: the amp slew's target
+    // constant while the countdown runs, and how long it stays armed (~4 time constants,
+    // so the fade completes to ~2% before the constant relaxes back to 7 ms). This is
+    // NOT the morph machinery - the user explicitly wants the two decoupled - and it is
+    // constant and modest by design: de-clicking, not an effect.
+    static constexpr double kTmplGlideSec  = 0.050;
+    static constexpr double kTmplGlideHold = 0.200;
+    int    tmplGlideSamps = 0;     // samples the template glide stays armed for
+    double ampGlideCur    = 0.007; // CURRENT amp glide constant (only ever relaxes faster; see renderNextBlock)
 
     float velocityLevel = 0.0f, velTarget = 0.0f;
     float pressure = 0.0f, pressureTarget = 0.0f;

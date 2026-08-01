@@ -2894,6 +2894,248 @@ int main()
         }
     }
 
+    // --- run 37: with morph OFF, a spectrum change FADES - it does not step ---------
+    // "cuando cambia el spectrum se escucha una transicion subita y abrupta entre un
+    //  espectro y otro, haz que sea smooth... que eso no intervenga en el morphing."
+    // The amplitudes used to slew over the fixed 7 ms de-click constant, so a large
+    // timbre change read as a hard cut. Measured directly: the 10%->90% rise time of a
+    // partial that APPEARS with the new template. Widening Spectrum Range from 2 to 10
+    // octaves only APPENDS partials past the old count, so harmonic 6 starts from a
+    // true zero at an unchanged frequency (rank-mapped changes make an appearing
+    // harmonic INHERIT a neighbouring rank's amplitude, which hides most of the rise).
+    {
+        std::printf ("morph OFF: an appearing partial's rise time:\n");
+        constexpr int eb = 64; constexpr double sr = 48000.0;
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (sr, eb);
+        auto s = [&] (const char* id, float v)
+        { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+          p->pollParametersForTests(); };
+        s ("morph", 0.0f);
+        s ("ampAttack", 0.001f); s ("ampDecay", 0.001f); s ("ampSustain", 1.0f); s ("ampRelease", 0.005f);
+        s ("fractalLevel", 1.0f); s ("curveSlope", 1.0f); s ("baseN", 1.0f);
+        s ("spectrumRange", 2.0f);                // ratio <= 4: harmonics 1..4 only
+        juce::AudioBuffer<float> b (2, eb);
+        auto pump = [&] (int blocks, std::vector<float>* out)
+        {
+            for (int i = 0; i < blocks; ++i)
+            { juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+              if (out != nullptr) for (int k = 0; k < eb; ++k) out->push_back (b.getReadPointer (0)[k]); }
+        };
+        juce::Thread::sleep (40); pump (40, nullptr);   // twice: the builder thread must
+        juce::Thread::sleep (40); pump (40, nullptr);   // publish the Odd template first
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+          b.clear(); p->processBlock (b, m); }
+        pump ((int) (0.5 * sr / eb), nullptr);          // settle on the narrow spectrum
+
+        const double f2 = 6.0 * p->getNoteFrequency (60);   // the partial that will appear
+        // Hann-windowed magnitude of ONE exact frequency (a direct DFT bin: no FFT grid,
+        // any window length). 12.5 ms window = fast enough to time a 7 ms step honestly.
+        auto mag = [&] (const std::vector<float>& x, size_t at, int len)
+        {
+            double re = 0.0, im = 0.0;
+            for (int i = 0; i < len && at + (size_t) i < x.size(); ++i)
+            {
+                const double w  = 0.5 - 0.5 * std::cos (2.0 * juce::MathConstants<double>::pi * i / (len - 1));
+                const double ph = 2.0 * juce::MathConstants<double>::pi * f2 * (double) i / sr;
+                re += w * (double) x[at + (size_t) i] * std::cos (ph);
+                im += w * (double) x[at + (size_t) i] * std::sin (ph);
+            }
+            return std::sqrt (re * re + im * im);
+        };
+
+        s ("spectrumRange", 10.0f);               // full range: harmonic 6 fades IN from zero
+        juce::Thread::sleep (25);                 // let the builder publish the new template
+        std::vector<float> tr;
+        pump ((int) (1.2 * sr / eb), &tr);
+
+        constexpr int win = 600, hop = 120;       // 12.5 ms window, 2.5 ms hop
+        std::vector<double> env;
+        for (size_t at = 0; at + (size_t) win <= tr.size(); at += (size_t) hop)
+            env.push_back (mag (tr, at, win));
+        double fin = 0.0; int fc = 0;
+        for (size_t i = env.size() >= 40 ? env.size() - 40 : 0; i < env.size(); ++i) { fin += env[i]; ++fc; }
+        fin /= std::max (1, fc);
+        int i10 = -1, i90 = -1;
+        for (size_t i = 0; i < env.size(); ++i)
+        {
+            if (i10 < 0 && env[i] >= 0.10 * fin) i10 = (int) i;
+            if (env[i] >= 0.90 * fin) { i90 = (int) i; break; }
+        }
+        const double riseMs = (i10 >= 0 && i90 >= i10) ? (i90 - i10) * hop * 1000.0 / sr : -1.0;
+        std::printf ("  10%%->90%% rise = %.1f ms (final mag %.4f)\n", riseMs, fin);
+        check (fin > 1.0e-4, "the appearing partial does arrive");
+        check (riseMs >= 40.0,  "a spectrum change with morph OFF is a real fade (>= 40 ms), not a 7 ms step");
+        check (riseMs <= 300.0, "...and stays a de-click, not an effect (<= 300 ms)");
+
+        // The hard-won regression guard: a FRESH note still starts ON its target spectrum
+        // (snapAmps), with no fade-in inherited from the template glide.
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+          b.clear(); p->processBlock (b, m); }
+        pump ((int) (0.4 * sr / eb), nullptr);    // release tail dies; the voice goes idle
+        std::vector<float> att;
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+          b.clear(); p->processBlock (b, m);
+          for (int k = 0; k < eb; ++k) att.push_back (b.getReadPointer (0)[k]); }
+        pump ((int) (0.5 * sr / eb), &att);
+        const double early = mag (att, (size_t) (0.010 * sr), win);   // 10..22.5 ms after note-on
+        const double susta = mag (att, (size_t) (0.400 * sr), win);
+        std::printf ("  fresh note: mag@10ms=%.4f  sustain=%.4f (%.0f%%)\n",
+                     early, susta, susta > 0.0 ? 100.0 * early / susta : 0.0);
+        check (susta > 1.0e-4 && early >= 0.7 * susta,
+               "a cold note still SNAPS onto the template (no fade-in regression)");
+    }
+
+    // --- run 38: morph ON under a STREAM of templates (the realtime-adaptive cadence) --
+    // "el morphing... tiene como un trompicon parece a veces cuando se usa con el
+    //  adaptive tuning."
+    // The realtime link applies a REAL new template every ~250-300 ms; with a Morph Time
+    // longer than that the glide never completes before the next target lands. Three
+    // stumbles lived in that regime, none of them a click (run 26 stays green through
+    // all of them) - each is a sudden SPECTRAL step, so the metric here is spectral
+    // flux: the L1 distance between consecutive Hann-window magnitude spectra,
+    // normalised by the mean spectrum magnitude. A morph that really glides moves a few
+    // percent per 10 ms hop; a bank snapping to a new template moves in one hop.
+    //   - a template landing MID-crossfade snapped alignInc, stepping the audible
+    //     destination bank onto the new frequencies at full weight;
+    //   - a template landing at weight >= 0.999 adopted the aligned PHASES but re-seeded
+    //     the glide from curRatio, jumping the audible frequencies backwards;
+    //   - when the stream ENDS, the amp slew flipped from Morph Time to 7 ms with ~37%
+    //     of the amplitude move still pending - a knee right at the settle.
+    {
+        std::printf ("morph under an adaptive-cadence template stream (spectral flux):\n");
+        constexpr int eb = 64; constexpr double sr = 48000.0;
+        constexpr int stepBlocks = (int) (0.30 * 48000.0 / 64.0);   // 300 ms of audio per template
+        struct Res { double stream, settle, jump; };
+        auto run = [&] (bool morphOn, const char* label)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr, eb);
+            auto s = [&] (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            s ("ampAttack", 0.002f); s ("ampDecay", 0.002f); s ("ampSustain", 1.0f);
+            s ("fractalLevel", 1.0f); s ("curveSlope", 2.0f); s ("baseN", 1.0f);
+            // Morph Time far LONGER than the template cadence - the reported regime.
+            // The crossfade weight then climbs toward 1 across several template
+            // arrivals, which is exactly where the old alignInc snap was heard at
+            // nearly full strength.
+            s ("morph", morphOn ? 1.0f : 0.0f); s ("morphTime", 2.0f);
+            juce::AudioBuffer<float> b (2, eb);
+            for (int i = 0; i < 60; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+            { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+              b.clear(); p->processBlock (b, m); }
+            for (int i = 0; i < 120; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+
+            std::vector<float> x;
+            auto pump = [&] (int blocks)
+            {
+                for (int i = 0; i < blocks; ++i)
+                { juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                  for (int k = 0; k < eb; ++k) x.push_back (b.getReadPointer (0)[k]); }
+            };
+            // 8 template changes 300 ms of audio apart - far faster than the 2 s morph -
+            // between a COUNT-jumping pair (base 1 <-> 3 triples the sub-Nyquist count).
+            for (int stepIdx = 0; stepIdx < 8; ++stepIdx)
+            {
+                s ("baseN", (stepIdx & 1) != 0 ? 1.0f : 3.0f);
+                juce::Thread::sleep (25);          // let the builder thread publish
+                pump (stepBlocks);
+            }
+            const size_t streamEnd = x.size();
+            pump ((int) (2.2 * sr / eb));          // the stream stops; the morph completes at ~+1.7 s
+
+            // Per-sample click metric (run 26's) alongside the flux, so a fix for the
+            // stumble can never smuggle a click back in.
+            double maxJump = 0.0, peak = 0.0;
+            for (size_t i = 0; i < x.size(); ++i)
+            {
+                peak = std::max (peak, (double) std::abs (x[i]));
+                if (i > 0) maxJump = std::max (maxJump, (double) std::abs (x[i] - x[i - 1]));
+            }
+
+            constexpr int fo = 10, fftN = 1 << fo, hop = 240;   // 21.3 ms window, 5 ms hop
+            juce::dsp::FFT fft (fo);
+            std::vector<float> buf (2 * (size_t) fftN);
+            std::vector<float> prevMag, curMag ((size_t) fftN / 2);
+            std::vector<std::vector<float>> settleMags;   // frames after the last change
+            double meanMag = 0.0, maxStream = 0.0, maxSettle = 0.0;
+            std::vector<double> flux;
+            size_t frames = 0;
+            // A frame belongs to the settle once its window starts AFTER the last change.
+            const size_t settleFrom = streamEnd / (size_t) hop + 1;
+            for (size_t at = 0; at + (size_t) fftN <= x.size(); at += (size_t) hop, ++frames)
+            {
+                std::fill (buf.begin(), buf.end(), 0.0f);
+                for (int i = 0; i < fftN; ++i)
+                    buf[(size_t) i] = (0.5f - 0.5f * std::cos (2.0f * juce::MathConstants<float>::pi
+                                                               * (float) i / (float) (fftN - 1)))
+                                    * x[at + (size_t) i];
+                fft.performFrequencyOnlyForwardTransform (buf.data());
+                std::copy (buf.begin(), buf.begin() + fftN / 2, curMag.begin());
+                double sum = 0.0, d = 0.0;
+                for (size_t k = 0; k < curMag.size(); ++k)
+                {
+                    sum += curMag[k];
+                    if (! prevMag.empty()) d += std::abs (curMag[k] - prevMag[k]);
+                }
+                meanMag += sum;
+                flux.push_back (prevMag.empty() ? 0.0 : d);
+                prevMag = curMag;
+                if (frames >= settleFrom) settleMags.push_back (curMag);
+            }
+            meanMag /= std::max<size_t> (1, frames);
+            for (size_t fi = 0; fi < flux.size() && fi < settleFrom; ++fi)
+                maxStream = std::max (maxStream, flux[fi] / std::max (1.0e-9, meanMag));
+
+            // The settle metric is the trajectory of the DISTANCE TO THE FINAL SPECTRUM,
+            // D(t) - an integral quantity, immune to the per-hop ripple of a working
+            // glide. A smooth settle spends D gradually; the amp-slew knee spent the
+            // whole remaining distance in ~15 ms the moment the morph completed. So the
+            // reported number is the largest one-hop RELATIVE drop of D, gated to frames
+            // still meaningfully far away (> 5% of the settle's starting distance).
+            if (settleMags.size() > 50)
+            {
+                std::vector<float> fin ((size_t) fftN / 2, 0.0f);
+                const size_t finFrom = settleMags.size() - 40;      // last 200 ms = settled
+                for (size_t fi = finFrom; fi < settleMags.size(); ++fi)
+                    for (size_t k = 0; k < fin.size(); ++k)
+                        fin[k] += settleMags[fi][k] / 40.0f;
+                std::vector<double> D (settleMags.size(), 0.0);
+                for (size_t fi = 0; fi < settleMags.size(); ++fi)
+                    for (size_t k = 0; k < fin.size(); ++k)
+                        D[fi] += std::abs (settleMags[fi][k] - fin[k]);
+                // Gated to frames still meaningfully far from the final spectrum, in
+                // BOTH senses: relative to the journey this settle actually makes, and
+                // absolute against the signal level - otherwise a control run that is
+                // already settled measures ratios of pure noise.
+                for (size_t fi = 0; fi + 1 < finFrom; ++fi)
+                    if (D[fi] > 0.05 * D[0] && D[fi] > 0.02 * meanMag)
+                        maxSettle = std::max (maxSettle, (D[fi] - D[fi + 1]) / D[fi]);
+            }
+            const double jr = peak > 0.0 ? maxJump / peak : 0.0;
+            std::printf ("  %-22s stream maxFlux=%.3f  settle maxDrop=%.2f  jump/peak=%.3f\n",
+                         label, maxStream, maxSettle, jr);
+            return Res { maxStream, maxSettle, jr };
+        };
+
+        const auto off = run (false, "morph off (control)");
+        const auto on  = run (true,  "morph on, 2 s");
+        check (off.stream > 0.0, "the control case actually made sound");
+        // The control snaps the whole spectrum every 300 ms, so its stream flux IS the
+        // size of one full step; a morph that genuinely glides must sit well below it.
+        // (Before the aligned bank glided, this measured 0.76x the control: once the
+        // crossfade weight neared 1, each new template snapped the audible spectrum.)
+        check (on.stream <= 0.5 * off.stream,
+               "mid-stream: every new target GLIDES - no audible step while templates keep landing");
+        // The last glide spends its remaining distance-to-final gradually; the old
+        // amp-slew knee spent nearly ALL of it in one 5 ms hop at morph completion.
+        check (on.settle <= 0.30,
+               "stream end: the morph settles with no amp-slew knee (bounded per-hop drop)");
+        check (on.jump <= off.jump * 2.5 + 0.02,
+               "and the smoothing never re-introduces a per-sample click");
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }
