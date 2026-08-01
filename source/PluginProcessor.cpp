@@ -2002,22 +2002,52 @@ double FractalAdditiveAudioProcessor::measureCurrentAgainstTarget (const std::ve
     return regs.mode == dissonance::Aggregate::Minimax ? rs.worst : rs.mean;
 }
 
+// THE ANCHOR the register range hangs off (see the header). Held beats last-played beats
+// key 60 - and the "held" part comes from the rhythm engine's own note bookkeeping, the
+// same one heldChordAsTargetAlphas reads, because a second note-tracker is a second answer
+// to "which note are we on" and they drift.
+int FractalAdditiveAudioProcessor::registerAnchorKey() const noexcept
+{
+    const int k = rhythm.getAnchorNote();
+    return k >= 0 ? juce::jlimit (0, 127, k) : 60;
+}
+
+// The default width in STEPS of the scale loaded right now: the same musical width in
+// every tuning (see dissonance::kAdaptRegisterDefaultPeriods, which was measured).
+int FractalAdditiveAudioProcessor::defaultRegisterSteps() const noexcept
+{
+    const int D = juce::jmax (1, getScaleDegrees());
+    return juce::jlimit (1, 127, (int) std::lround (dissonance::kAdaptRegisterDefaultPeriods * (double) D));
+}
+
 // THE REGISTER RANGE, resolved in ONE place. The panel prints what this returns and the
 // search runs on what this returns, so the two can never disagree about which registers a
 // spectrum was optimised for - and that answer genuinely differs (a spectrum optimised at
 // C1 is ~3.7x rougher at C6 than one optimised there; see SpectrumTests).
+//
+// ANCHOR + N STEPS, both resolved here rather than in the editor: the realtime follower
+// runs with the window shut, and a range the panel had baked into two frequencies would
+// have stayed pinned to whatever register happened to be played when the window closed -
+// which is the exact complaint (the same spectrum whatever octave you play in) this form
+// exists to answer.
 dissonance::Registers FractalAdditiveAudioProcessor::adaptRegistersFor (const SpectrumAdaptSettings& s,
-                                                                        double f0Hz, bool realtime)
+                                                                        double f0Hz, bool realtime) const
 {
     dissonance::Registers regs;
     regs.mode = s.aggregate == 1 ? dissonance::Aggregate::Minimax : dissonance::Aggregate::Mean;
-    double lo = s.regLoHz, hi = s.regHiHz;
-    // AUTO (0 Hz): an octave either side of the pitch the adaptation is anchored at. The
-    // follower runs with the editor shut, so the default cannot live in the editor - and a
-    // missing range must not collapse silently back to the single-pitch objective this
-    // whole change exists to replace.
-    if (! (lo > 0.0) || ! (hi > 0.0) || ! std::isfinite (lo) || ! std::isfinite (hi))
-    { lo = f0Hz * 0.5; hi = f0Hz * 2.0; }
+    const int steps  = juce::jlimit (0, 127, s.regSteps >= 0 ? s.regSteps : defaultRegisterSteps());
+    const int anchor = registerAnchorKey();
+    // The top is CLAMPED TO THE BOARD, never wrapped and never re-anchored lower: the user
+    // said "N steps above the note I am playing", and moving the anchor to make N fit would
+    // optimise for registers they never asked about. The panel prints the steps that really
+    // fit whenever this bites, so a shortened range is stated and not silent.
+    const int top = juce::jlimit (0, 127, anchor + steps);
+    double lo = getNoteFrequency (anchor), hi = getNoteFrequency (top);
+    // Both ends through the KEY LADDER, not through f0Hz: f0 carries per-note pitch bend,
+    // and a range whose bottom followed a bend wheel would resample the objective (and
+    // re-price the run) on every wheel message.
+    if (! (lo > 0.0) || ! std::isfinite (lo)) lo = f0Hz;
+    if (! (hi > 0.0) || ! std::isfinite (hi)) hi = lo;
     if (hi < lo) std::swap (lo, hi);
     const int cap = realtime ? dissonance::kAdaptRegisterCapRt : dissonance::kAdaptRegisterCap;
     regs.f0 = dissonance::registerPoints (lo, hi, dissonance::registerCountFor (lo, hi, cap));
@@ -2029,7 +2059,7 @@ dissonance::Registers FractalAdditiveAudioProcessor::adaptRegistersFor (const Sp
 // returns for this path. Reading either of those from anywhere else would let the number
 // on the button and the work the thread does drift apart.
 double FractalAdditiveAudioProcessor::estimateAdaptMs (const SpectrumAdaptSettings& s,
-                                                       int targetNotes, double f0Hz, bool realtime)
+                                                       int targetNotes, double f0Hz, bool realtime) const
 {
     if (targetNotes <= 0) return 0.0;
     const int N    = juce::jlimit (2, 24, s.partials);

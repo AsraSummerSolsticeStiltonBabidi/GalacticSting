@@ -866,9 +866,9 @@ namespace dissonance
         if (hiHz < loHz) std::swap (loHz, hiHz);
         const double octaves = std::log2 (hiHz / loHz);
         if (! (octaves > 0.02)) return 1;                    // a degenerate range IS one pitch
-        // The 1e-6 is not cosmetic: an "octave either side" range that lands on 2.0000001
-        // octaves through a stretched tuning's own frequencies would otherwise round UP to
-        // four points, and the panel would report a different count for two ranges the user
+        // The 1e-6 is not cosmetic: a two-period range that lands on 2.0000001 octaves
+        // through a stretched tuning's own frequencies would otherwise round UP to four
+        // points, and the panel would report a different count for two ranges the user
         // cannot tell apart.
         const int want = 1 + (int) std::ceil (octaves - 1.0e-6);
         return std::max (2, std::min (want, std::max (2, cap)));
@@ -877,9 +877,24 @@ namespace dissonance
     // The two caps. 7 covers C1..C7 at one octave a point; the realtime follower runs on a
     // ~250 ms throttle and an adaptation against 31 scale degrees is already ~100 ms at one
     // register, so it takes 3 - which is still EXACT sampling for the panel's default range
-    // (an octave either side of the played note is 2 octaves, i.e. one octave a point).
+    // (two periods above the played note is 2 octaves in 12-EDO, i.e. one octave a point).
     constexpr int kAdaptRegisterCap   = 7;
     constexpr int kAdaptRegisterCapRt = 3;
+
+    // HOW WIDE THE DEFAULT RANGE IS, in PERIODS of whatever tuning is loaded. The panel
+    // asks for it as a step count (N degrees above the note being played), so this number
+    // times the scale's degree count is the N a fresh instance starts with: 24 steps in
+    // 12-EDO, 62 in 31-EDO, 26 in Bohlen-Pierce - the same musical width in every tuning.
+    //
+    // MEASURED, not assumed - see SpectrumTests "(8) HOW WIDE SHOULD THE RANGE BE?", which
+    // optimises one seed over 0.5/1/2/3/4 periods and judges each answer densely at the
+    // anchor, at its own worst register, and one period ABOVE the range. Two periods is
+    // where those three stop trading against each other: it costs the played register
+    // almost nothing over a half-period range, and it is the narrowest width whose
+    // neighbour one period up is not left dramatically worse than a spectrum optimised
+    // there. Wider buys a little more insurance outside and pays for it at the anchor,
+    // which is the one register the player is certain to hear.
+    constexpr double kAdaptRegisterDefaultPeriods = 2.0;
 
     //==========================================================================
     // WHAT A RUN WILL COST, IN MILLISECONDS, BEFORE IT IS STARTED.

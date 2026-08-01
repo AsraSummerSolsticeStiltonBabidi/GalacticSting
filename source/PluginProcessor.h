@@ -593,22 +593,41 @@ public:
         // critical band is a width in Hz, so a spectrum optimised at ONE pitch is optimal
         // only there - and, worse, an optimiser working in the bass sees tight partial
         // clusters as nearly free and builds them, which is precisely the roughness that
-        // dominates two octaves up. 0 Hz means AUTO: an octave either side of the note the
-        // adaptation is anchored at (so a follower with the window shut still spans the
-        // register being played, instead of silently collapsing to one pitch).
-        double regLoHz = 0.0, regHiHz = 0.0;
+        // dominates two octaves up.
+        //
+        // ONE NUMBER, and it is a COUNT OF SCALE STEPS: the range runs from the anchor key
+        // (see registerAnchorKey) to `regSteps` degrees of the loaded tuning above it. Two
+        // absolute bounds could not do this - they were pinned to fixed pitches, so the
+        // adaptation answered with the same spectrum whichever register was actually being
+        // played, and they had to be re-read every time the tuning changed. A step count is
+        // the same musical width in any tuning (24 in 12-EDO, 62 in 31-EDO, 26 in
+        // Bohlen-Pierce are all two periods) and it FOLLOWS the hands.
+        //
+        // < 0 means "the default width", which is kAdaptRegisterDefaultPeriods periods of
+        // whatever scale is loaded - so a follower running with the window shut still spans
+        // the register being played instead of collapsing to one pitch.
+        int    regSteps  = -1;
         int    aggregate = 0;        // 0 = mean over the range, 1 = minimax (the worst register)
     };
+    // The KEY the register range hangs off: the lowest note being HELD, else the last one
+    // played, else 60. In that order and for that reason - the hand-pressed Adapt must have
+    // a defensible anchor without the user holding a key down while they reach for the
+    // mouse, and "middle C" is only ever the answer before a single note has been played.
+    int registerAnchorKey() const noexcept;
+    // How many steps the DEFAULT range spans under the scale loaded right now.
+    int defaultRegisterSteps() const noexcept;
     // The registers a run would use, resolved exactly as startSpectrumAdapt resolves them -
     // the panel prints these, so what it claims and what the search does cannot drift.
-    static dissonance::Registers adaptRegistersFor (const SpectrumAdaptSettings& s, double f0Hz,
-                                                    bool realtime);
+    // A member, not a static: the range is now anchor-relative and step-counted, so it can
+    // only be resolved by something that knows the anchor and the tuning's own frequencies.
+    dissonance::Registers adaptRegistersFor (const SpectrumAdaptSettings& s, double f0Hz,
+                                             bool realtime) const;
     // WHAT ONE RUN WILL COST, in milliseconds, before it is started (see Dissonance.h).
     // Same helper the panel prints and the same one startSpectrumAdapt's hard bound is
     // measured against, so the price on the button and the only remaining refusal can
     // never be two different numbers.
-    static double estimateAdaptMs (const SpectrumAdaptSettings& s, int targetNotes,
-                                   double f0Hz, bool realtime);
+    double estimateAdaptMs (const SpectrumAdaptSettings& s, int targetNotes,
+                            double f0Hz, bool realtime) const;
     // `targetAlphas` are the notes as ratios (alphas[0] is the root, normally 1.0);
     // `f0Hz` is the root's real frequency - Sethares roughness depends on register, so
     // the same chord an octave down wants a different spectrum.

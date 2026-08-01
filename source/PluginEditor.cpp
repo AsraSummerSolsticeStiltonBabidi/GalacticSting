@@ -1895,10 +1895,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         addChildComponent (*ed);
     }
     // --- The REGISTER RANGE the adaptation is optimised over -------------------
-    // PERIOD NUMBERS, because that is what the keyboard prints beside every degree-0 key
-    // and the only unit every tuning this instrument loads really has (see the block
-    // comment at registerDegreesPerPeriod). They start on AUTO - one period either side of
-    // what is being played - and stop moving the moment the user types in either field.
+    // ONE number: N STEPS of the loaded tuning, counted UP from the note being played (see
+    // the block comment at registerDegreesPerPeriod). A step is the only unit every tuning
+    // this instrument loads really has, and an anchor the hands move makes the range follow
+    // the register actually being played instead of a pair of fixed pitches.
     adaptAggBox.addItem ("average", 1);   // mean over the range
     adaptAggBox.addItem ("worst", 2);      // minimax: the worst register decides
     adaptAggBox.setSelectedId (1, juce::dontSendNotification);
@@ -1906,27 +1906,40 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     adaptAggBox.setMouseClickGrabsKeyboardFocus (false);
     adaptAggBox.onChange = [this] { syncRealtimeLink(); resized(); repaint(); refocus(); };
     addChildComponent (adaptAggBox);
-    for (auto* ed : { &adaptRegLoEdit, &adaptRegHiEdit })
     {
+        auto* ed = &adaptRegStepsEdit;
         ed->setJustification (juce::Justification::centred);
         ed->setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
         ed->setColour (juce::TextEditor::outlineColourId, cSpecScale.withAlpha (0.7f));
         ed->setIndents (4, 2);
-        // Period numbers: a sign and up to three digits. The old restriction admitted note
-        // letters, and a leftover "C2" typed into a field that now counts periods would
-        // have parsed as period 2 by accident in 12-EDO and as nothing anywhere else.
-        ed->setInputRestrictions (4, "-0123456789");
+        // A COUNT: up to three digits, no sign. The range runs upward from the note being
+        // played, so a negative width is not a direction, it is a typo - and the old field
+        // admitted "-" only because a period NUMBER could legitimately be negative.
+        ed->setInputRestrictions (3, "0123456789");
         ed->setSelectAllWhenFocused (true);
-        ed->onReturnKey = [this] { commitAdaptRegisters(); refocus(); };
-        ed->onFocusLost = [this] { commitAdaptRegisters(); };
+        ed->onReturnKey = [this] { commitAdaptRegisterSteps(); refocus(); };
+        ed->onFocusLost = [this] { commitAdaptRegisterSteps(); };
         addChildComponent (*ed);
     }
     makeLabel (adaptPartialsLbl, cSpecScale); adaptPartialsLbl.setVisible (false);
     makeLabel (adaptRangeLbl,    cSpecScale); adaptRangeLbl.setVisible (false);
     makeLabel (adaptRegLbl,      cSpecScale); adaptRegLbl.setVisible (false);
-    // A size smaller than the other captions, and deliberately: four controls share this
+    // A size smaller than the other captions, and deliberately: three controls share this
     // row and the aggregate box beside it is the one that must not be squeezed again.
     adaptRegLbl.setFont (juce::Font (juce::FontOptions (10.0f).withStyle ("Bold")));
+    // WHAT N AMOUNTS TO, and WHICH NOTE it is counted from - one line, under the field.
+    // Without it N is a magic number: "62" says nothing about being two periods, and a
+    // range that hangs off a note nobody named is a control the user cannot aim.
+    adaptRegSpanLbl.setJustificationType (juce::Justification::topLeft);
+    adaptRegSpanLbl.setColour (juce::Label::textColourId, cSpecScale.withAlpha (0.8f));
+    // 9.5 pt, half a point under its neighbours: this line carries the widest numbers the
+    // panel can produce (a one-degree-per-period scale reaches anchor "-10:0" and 127
+    // steps), and at 10 pt the Catalan form of that overflowed its single line by 8 px.
+    // A Label answers that by condensing to 70%, which is unreadable and looks intentional.
+    adaptRegSpanLbl.setFont (juce::Font (juce::FontOptions (9.5f)));
+    adaptRegSpanLbl.setBorderSize (juce::BorderSize<int> (0, 1, 0, 1));
+    adaptRegSpanLbl.setMinimumHorizontalScale (1.0f); // it must FIT, not condense
+    addChildComponent (adaptRegSpanLbl);
     // WHAT THE AGGREGATE MEANS, in a sentence. It wraps, so it gets a border of its own:
     // juce::Label's default is 5 px left and right, which is 10 px of a 192 px column
     // spent on nothing and enough to push the last word onto a line that does not exist.
@@ -1936,14 +1949,13 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     adaptAggInfoLbl.setBorderSize (juce::BorderSize<int> (0, 1, 0, 1));
     adaptAggInfoLbl.setMinimumHorizontalScale (1.0f); // it must FIT, not condense
     addChildComponent (adaptAggInfoLbl);
-    // The auto value, written DIRECTLY - not through syncAdaptRegisterAuto, which pushes
+    // The default width, written DIRECTLY - not through syncAdaptRegisterSpan, which pushes
     // the panel's settings to the processor. Doing that here ran syncRealtimeLink() from
     // inside the constructor, before specModeBox and adaptRtOn had been restored, so
     // reopening the window while a REALTIME link was running computed "no link wanted" and
-    // switched the user's running follower off. The timer picks the auto value up on its
-    // first tick, when the panel really does know what it is showing.
-    adaptRegLoEdit.setText (juce::String (adaptRegPeriodLo), juce::dontSendNotification);
-    adaptRegHiEdit.setText (juce::String (adaptRegPeriodHi), juce::dontSendNotification);
+    // switched the user's running follower off. The timer picks it up on its first tick,
+    // when the panel really does know what it is showing.
+    adaptRegStepsEdit.setText (juce::String (registerStepsEffective()), juce::dontSendNotification);
     adaptInfoLbl.setJustificationType (juce::Justification::topLeft);
     adaptInfoLbl.setColour (juce::Label::textColourId, cSpecScale.brighter (0.2f));
     adaptInfoLbl.setFont (juce::Font (juce::FontOptions (10.5f)));
@@ -2953,7 +2965,12 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (adaptGoalBox,   { tr ("Min", "Min"), tr ("Max", "Max"), tr ("Range", "Rang") });
     adaptPartialsLbl.setText (tr ("Partials", "Parcials"), dontSendNotification);
     adaptRangeLbl.setText    (tr ("between", "entre"), dontSendNotification);
-    adaptRegLbl.setText      (tr ("Periods", "Per\xc3\xado" "des"), dontSendNotification);
+    // "Steps", not "Steps up": at 10 pt bold the Catalan "Passos amunt" needs more than the
+    // 66 px this row can spare beside the aggregate box and juce::Label answers that by
+    // CONDENSING to 70% rather than by clipping, which looks deliberate and reads as a
+    // different font (RhythmVerify measured it). The direction is in the line underneath,
+    // which says it in words - "24 steps above 3:0" - where there is room for it.
+    adaptRegLbl.setText      (tr ("Steps", "Passos"), dontSendNotification);
     localise (adaptAggBox,   { tr ("average", "mitjana"), tr ("worst", "pitjor") });
     refreshAdaptButtonText();
     adaptAmpsToggle.setButtonText (tr ("+ amps", "+ amplituds"));
@@ -2968,10 +2985,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     adaptGoalBox.setTooltip (tr (
         "The TARGET. Min = the partials go where these notes beat least. Max = where they beat most. Range = hit a beating value between the two numbers you type (the read-out below shows the scale those numbers are on).",
         "L'OBJECTIU. Min = els parcials van on aquestes notes baten menys. Max = on baten m\xc3\xa9s. Rang = arriba a un valor de batec entre els dos n\xc3\xbameros que escriguis (el marcador de sota mostra l'escala d'aquests n\xc3\xbameros)."));
-    adaptRegLoEdit.setTooltip (tr (
-        "The LOWEST and HIGHEST register the spectrum is optimised for, as PERIOD NUMBERS - the small numbers printed beside every \"0\" key on the keyboard. They are counted the way octaves are counted in 12-EDO (the reference key is period 3), but a period is whatever THIS tuning repeats at, so they mean something in 31-EDO and in Bohlen-Pierce too, where \"C2\" means nothing at all.\nWhy a range and not one pitch: Sethares' critical band is a width in Hz, not in cents, so the answer really is different up and down the keyboard - the interval that beats worst is about 434 cents low and only 61 cents four octaves up, and a partial pair closer than 33 cents gets steadily WORSE the higher you play. A spectrum optimised at ONE pitch is optimal only there, and optimised in the bass it packs partials into tight clusters that cost almost nothing down there and dominate the roughness two periods up.\nUntil you type here these follow one period either side of the lowest note you are holding; type once and they are yours.",
-        "El registre M\xc3\x89S GREU i el M\xc3\x89S AGUT per als quals s'optimitza l'espectre, com a N\xc3\x9aMEROS DE PER\xc3\x8dODE - els nombres petits impresos al costat de cada tecla \"0\" del teclat. Es compten com es compten les octaves en 12-EDO (la tecla de refer\xc3\xa8ncia \xc3\xa9s el per\xc3\xado" "de 3), per\xc3\xb2 un per\xc3\xado" "de \xc3\xa9s all\xc3\xb2 que repeteix AQUESTA afinaci\xc3\xb3, i per aix\xc3\xb2 tenen sentit tamb\xc3\xa9 en 31-EDO i en Bohlen-Pierce, on \"C2\" no vol dir res.\nPer qu\xc3\xa8 un rang i no una sola al\xc3\xa7""ada: la banda cr\xc3\xadtica de Sethares \xc3\xa9s una amplada en Hz, no en cents, i per aix\xc3\xb2 la resposta \xc3\xa9s realment diferent amunt i avall del teclat - l'interval que m\xc3\xa9s bat \xc3\xa9s d'uns 434 cents als greus i nom\xc3\xa9s 61 quatre octaves m\xc3\xa9s amunt, i una parella de parcials a menys de 33 cents empitjora com m\xc3\xa9s amunt toques. Un espectre optimitzat per a UNA sola al\xc3\xa7""ada nom\xc3\xa9s ho \xc3\xa9s all\xc3\xa0, i optimitzat als greus amuntega els parcials en grups atapa\xc3\xafts que all\xc3\xa0 baix no costen gaire i dos per\xc3\xado" "des m\xc3\xa9s amunt dominen l'aspresa.\nFins que no hi escriguis, segueixen un per\xc3\xado" "de a banda i banda de la nota m\xc3\xa9s greu que mantens; escriu-hi un cop i s\xc3\xb3n teus."));
-    adaptRegHiEdit.setTooltip (adaptRegLoEdit.getTooltip());
+    adaptRegStepsEdit.setTooltip (tr (
+        "HOW WIDE a band of registers the spectrum is optimised for, counted in STEPS of the loaded tuning and running UPWARD from the note you are playing.\nThe anchor is the lowest note you are HOLDING; with nothing down it is the last note you played, and before you have played anything it is the reference key. The line below names it as period:degree - \"3:0\" is that reference key - and says what your number comes to in periods, because a step count is exact in every tuning and unreadable as a width: 24 steps is two octaves in 12-EDO, 62 steps is the same two periods in 31-EDO, 26 in Bohlen-Pierce. That is why this is not typed in octaves - most of this instrument's tunings do not have one.\nWhy a band and not one pitch: Sethares' critical band is a width in Hz, not in cents, so the answer really is different up and down the keyboard - the interval that beats worst is about 434 cents low and only 61 cents four octaves up, and a partial pair closer than 33 cents gets steadily WORSE the higher you play. A spectrum optimised at ONE pitch is optimal only there, and optimised in the bass it packs partials into tight clusters that cost almost nothing down there and dominate the roughness two periods up.\nThe default is two periods, and that is measured rather than guessed: across three anchors, nothing narrower wins, while three periods and more buy a little insurance high up and pay for it at the register you are actually playing (11.9 -> 13.7 on the search's own scale). 0 is legal and means the played register alone. Your number stays YOUR number when the tuning changes; until you type, it follows the loaded scale's own two periods.",
+        "L'AMPLADA de la banda de registres per als quals s'optimitza l'espectre, comptada en PASSOS de l'afinaci\xc3\xb3 carregada i cap AMUNT des de la nota que toques.\nL'\xc3\xa0ncora \xc3\xa9s la nota m\xc3\xa9s greu que MANTENS; si no en mantens cap, l'\xc3\xbaltima que has tocat, i abans de tocar res, la tecla de refer\xc3\xa8ncia. La l\xc3\xadnia de sota l'anomena com a per\xc3\xado" "de:grau - \"3:0\" \xc3\xa9s aquella tecla de refer\xc3\xa8ncia - i diu a quants per\xc3\xado" "des equival el teu n\xc3\xbamero, perqu\xc3\xa8 un compte de passos \xc3\xa9s exacte en qualsevol afinaci\xc3\xb3 i illegible com a amplada: 24 passos s\xc3\xb3n dues octaves en 12-EDO, 62 passos s\xc3\xb3n els mateixos dos per\xc3\xado" "des en 31-EDO, 26 en Bohlen-Pierce. Per aix\xc3\xb2 no s'escriu en octaves - la majoria d'afinacions d'aquest instrument no en tenen.\nPer qu\xc3\xa8 una banda i no una sola al\xc3\xa7""ada: la banda cr\xc3\xadtica de Sethares \xc3\xa9s una amplada en Hz, no en cents, i per aix\xc3\xb2 la resposta \xc3\xa9s realment diferent amunt i avall del teclat - l'interval que m\xc3\xa9s bat \xc3\xa9s d'uns 434 cents als greus i nom\xc3\xa9s 61 quatre octaves m\xc3\xa9s amunt, i una parella de parcials a menys de 33 cents empitjora com m\xc3\xa9s amunt toques. Un espectre optimitzat per a UNA sola al\xc3\xa7""ada nom\xc3\xa9s ho \xc3\xa9s all\xc3\xa0, i optimitzat als greus amuntega els parcials en grups atapa\xc3\xafts que all\xc3\xa0 baix no costen gaire i dos per\xc3\xado" "des m\xc3\xa9s amunt dominen l'aspresa.\nPer defecte s\xc3\xb3n dos per\xc3\xado" "des, i aix\xc3\xb2 est\xc3\xa0 mesurat, no suposat: des de tres \xc3\xa0ncores, res m\xc3\xa9s estret no guanya, mentre que tres per\xc3\xado" "des o m\xc3\xa9s compren una mica d'asseguran\xc3\xa7""a amunt i la paguen al registre que realment toques (11,9 -> 13,7 a l'escala de la mateixa cerca). 0 \xc3\xa9s legal i vol dir nom\xc3\xa9s el registre tocat. El teu n\xc3\xbamero segueix sent EL TEU quan canvia l'afinaci\xc3\xb3; fins que no escriguis, segueix els dos per\xc3\xado" "des de l'escala carregada."));
+    adaptRegSpanLbl.setTooltip (adaptRegStepsEdit.getTooltip());
     // The NUMBERS live here now. The box itself, and the sentence under it, say what the
     // choice costs the player; this is for whoever wants the measurement behind it.
     adaptAggBox.setTooltip (tr (
@@ -3124,16 +3141,21 @@ void FractalAdditiveAudioProcessorEditor::runChordSearch()
 }
 
 //==============================================================================
-// PERIOD NUMBERS for the register range.
+// STEPS AND PERIODS for the register range.
 //
-// This used to be note names ("C2".."C4"), and note names are 12-EDO's: they exist only
-// because that tuning cuts the octave into twelve and gives seven of the pieces letters.
-// In 31-EDO nothing is a C; in Bohlen-Pierce the period is 3/1 and "octave" is simply the
-// wrong word. So the range that decides WHICH REGISTERS a spectrum is optimised for is
-// typed in PERIODS - counted exactly the way octaves are counted, with the reference key
-// (60, degree 0) as period 3, which is what the rest of the product calls C3 - and the
-// keyboard prints those same numbers beside every degree-0 key so they can be read off
-// rather than guessed. In 12-EDO the two schemes coincide key for key.
+// The range that decides WHICH REGISTERS a spectrum is optimised for is ONE number: N
+// STEPS - degrees of the loaded scale - counted upward from the note being played. It was
+// note names once ("C2".."C4"), then period numbers, and the notation was never the real
+// problem: both named ABSOLUTE pitches, so the adaptation answered with the same spectrum
+// whichever register was under the fingers. A count anchored on the played note follows
+// the hands, and a step is the one unit every tuning here really has - in 31-EDO nothing
+// is a C and in Bohlen-Pierce "octave" is simply the wrong word, but both have steps.
+//
+// PERIODS are still how the width is READ BACK (N steps / degrees per period), and the
+// anchor is named the way the keyboard names it: the period number printed beside every
+// degree-0 key, counted as octaves are counted with the reference key (60, degree 0) as
+// period 3 - what the rest of the product calls C3 - plus the degree inside it. So "3:0"
+// can be read straight off the instrument. In 12-EDO periods and octaves coincide.
 int FractalAdditiveAudioProcessorEditor::registerDegreesPerPeriod() const
 {
     return juce::jmax (1, processorRef.getScaleDegrees());
@@ -3145,42 +3167,33 @@ juce::String FractalAdditiveAudioProcessorEditor::registerPeriodText (int key) c
                                                              registerDegreesPerPeriod()));
 }
 
-// The periods the 128-key board really has under this tuning. Key 0 may sit in the MIDDLE
-// of a period whose first key is below the board - that period is not one this instrument
-// can name a register with, so it is not offered.
-int FractalAdditiveAudioProcessorEditor::registerPeriodMin() const
+// A key, named the way the keyboard names it: the PERIOD it falls in and its DEGREE inside
+// that period ("3:0" is the reference key). This is how the anchor is shown, and it has to
+// be readable off the instrument - the period number is printed beside every degree-0 key,
+// and the degree is what the user counts up from there.
+juce::String FractalAdditiveAudioProcessorEditor::registerKeyText (int key) const
 {
     const int D = registerDegreesPerPeriod();
-    const int p = ScaleKeyboard::periodNumberForNote (0, D);
-    return ScaleKeyboard::noteForPeriodNumber (p, D) >= 0 ? p : p + 1;
+    const int k = juce::jlimit (0, 127, key);
+    const int p = ScaleKeyboard::periodNumberForNote (k, D);
+    const int first = ScaleKeyboard::noteForPeriodNumber (p, D);
+    return registerPeriodText (k) + ":" + juce::String (first >= 0 ? k - first : 0);
 }
 
-int FractalAdditiveAudioProcessorEditor::registerPeriodMax() const
+// N as it stands: what the user typed, or - until they type - the default width for the
+// scale loaded right now (see adaptRegSteps and kAdaptRegisterDefaultPeriods).
+int FractalAdditiveAudioProcessorEditor::registerStepsEffective() const
 {
-    return ScaleKeyboard::periodNumberForNote (127, registerDegreesPerPeriod());
+    return adaptRegSteps >= 0 ? adaptRegSteps : processorRef.defaultRegisterSteps();
 }
 
-// A period number -> the MIDI key it starts on. The clamp is by WHOLE PERIODS, never by
-// key: half a period below the bottom of the keyboard is not a register, and a range whose
-// ends were pinned to keys 0 and 127 would silently stop being the range the user typed.
-int FractalAdditiveAudioProcessorEditor::registerKeyForPeriod (int p) const
+// ...and how many of those steps the 128-key board really has above the anchor. They differ
+// only near the top of the keyboard, and when they do the panel SAYS the shorter number:
+// the alternative - quietly moving the anchor down so N fits - would optimise for registers
+// the user never asked about, and nothing on screen would show it.
+int FractalAdditiveAudioProcessorEditor::registerStepsFitting() const
 {
-    const int D = registerDegreesPerPeriod();
-    const int k = ScaleKeyboard::noteForPeriodNumber (
-                      juce::jlimit (registerPeriodMin(), registerPeriodMax(), p), D);
-    return k >= 0 ? k : 60;
-}
-
-// Typing outside the board snaps back to the edge, visibly, in the field - the same rule
-// the old note-name parser used for an unreadable name. Also run when the TUNING changes:
-// a range typed for 12-EDO ("2 to 4") has to stay inside a 31-note scale's four periods
-// rather than resolve to a key that does not exist.
-void FractalAdditiveAudioProcessorEditor::clampAdaptRegisterPeriods()
-{
-    const int pMin = registerPeriodMin(), pMax = registerPeriodMax();
-    adaptRegPeriodLo = juce::jlimit (pMin, pMax, adaptRegPeriodLo);
-    adaptRegPeriodHi = juce::jlimit (pMin, pMax, adaptRegPeriodHi);
-    if (adaptRegPeriodHi < adaptRegPeriodLo) std::swap (adaptRegPeriodLo, adaptRegPeriodHi);
+    return juce::jlimit (0, 127 - processorRef.registerAnchorKey(), registerStepsEffective());
 }
 
 // The key whose ACTIVE-TUNING pitch is nearest `hz`. Through the tuning, never through
@@ -3200,75 +3213,75 @@ int FractalAdditiveAudioProcessorEditor::nearestKeyForHz (double hz) const
     return best;
 }
 
-// AUTO: one period either side of the lowest note being played (key 60 when nothing is
-// down). Written with dontSendNotification and only when the pair actually changes, so a
-// field the user is typing in is never yanked out from under the caret - and the moment
-// they DO type, adaptRegAuto latches off and this stops touching them for good.
-void FractalAdditiveAudioProcessorEditor::syncAdaptRegisterAuto()
+// WHAT N MEANS RIGHT NOW, in one line: the note the range is counted from, the count
+// itself, and the width that comes to in periods. A step count is exact in every tuning and
+// unreadable as a musical width - "62" is two periods in 31-EDO and nobody should have to
+// do that division - so the panel does the arithmetic out loud.
+//
+// The steps that really FIT are said whenever they differ from the steps asked for: at the
+// top of the keyboard the range is genuinely shorter than N, and a control that showed N
+// while the search used seven steps would be the panel lying about its own settings.
+// ...as a function of its own numbers, so the layout probe can measure BOTH of its forms at
+// their widest. Only one is ever on screen, and the one that overflows is always the other.
+juce::String FractalAdditiveAudioProcessorEditor::adaptRegSpanLine (const juce::String& anchor,
+                                                                    int steps, int fit,
+                                                                    const juce::String& per) const
 {
-    // The CLAMP runs whether or not AUTO is on: loading a 31-note scale under a range that
-    // was typed for 12-EDO leaves the user's numbers pointing at periods that scale does
-    // not have. Snapping them to the edge - in the field, where it can be seen - is the
-    // honest answer; resolving them to a key that does not exist is not.
-    const int keepLo = adaptRegPeriodLo, keepHi = adaptRegPeriodHi;
-    clampAdaptRegisterPeriods();
-    bool changed = keepLo != adaptRegPeriodLo || keepHi != adaptRegPeriodHi;
+    // Built by hand rather than through tr(): the numbers are runtime values, so this is
+    // the one place where the two languages are assembled instead of chosen. Both forms
+    // still exist in both languages - the layout probe measures all four.
+    // "126 of 127" rather than a sentence about the keyboard running out: the long form
+    // ("only 126 steps fit") overflowed this one line in Catalan by 7 px at the widest
+    // numbers a one-degree-per-period scale can produce, and RhythmVerify measures exactly
+    // that case because it is the one nobody sees until the day they play up there.
+    const juce::String count = fit == steps ? juce::String (steps)
+                                            : juce::String (fit) + "/" + juce::String (steps);
+    if (! catalan)
+        return count + " steps above " + anchor + " = " + per + " periods";
+    return count + " passos sobre " + anchor + " = " + per.replaceCharacter ('.', ',')
+         + juce::String::fromUTF8 (" per\xc3\xado" "des");
+}
 
-    if (adaptRegAuto)
-    {
-        // The lowest note REALLY sounding (the same held-chord bookkeeping the adaptation's
-        // target comes from), mapped back to the PERIOD it falls in. One period either side
-        // of it - which in 12-EDO is exactly the octave either side this used to do, and in
-        // 31-EDO is the span that tuning actually repeats over. Nothing held: key 60.
-        double lowHz = 0.0;
-        const int centre = (! processorRef.heldChordAsTargetAlphas (lowHz).empty() && lowHz > 0.0)
-                               ? nearestKeyForHz (lowHz) : 60;
-        const int p = ScaleKeyboard::periodNumberForNote (centre, registerDegreesPerPeriod());
-        const int lo = juce::jlimit (registerPeriodMin(), registerPeriodMax(), p - 1);
-        const int hi = juce::jlimit (registerPeriodMin(), registerPeriodMax(), p + 1);
-        if (lo != adaptRegPeriodLo || hi != adaptRegPeriodHi) changed = true;
-        adaptRegPeriodLo = lo; adaptRegPeriodHi = hi;
-    }
-    // Written only when something really moved, and always with dontSendNotification, so a
-    // field the user is typing in is never yanked out from under the caret.
-    if (! changed && adaptRegLoEdit.getText().isNotEmpty()) return;
-    adaptRegLoEdit.setText (juce::String (adaptRegPeriodLo), juce::dontSendNotification);
-    adaptRegHiEdit.setText (juce::String (adaptRegPeriodHi), juce::dontSendNotification);
+juce::String FractalAdditiveAudioProcessorEditor::adaptRegSpanText() const
+{
+    const int steps = registerStepsEffective(), fit = registerStepsFitting();
+    return adaptRegSpanLine (registerKeyText (processorRef.registerAnchorKey()), steps, fit,
+                             juce::String (fit / (double) registerDegreesPerPeriod(), 1));
+}
+
+// The anchor MOVES - it is the note being played - so the line under the field has to be
+// rebuilt as the hands move, and the follower has to hear about it. Written only when the
+// text really changed: this runs at timer rate, and re-setting a Label's text repaints it.
+void FractalAdditiveAudioProcessorEditor::syncAdaptRegisterSpan()
+{
+    const auto want = adaptRegSpanText();
+    const auto n = juce::String (registerStepsEffective());
+    // The FIELD only follows the tuning while N is untyped (adaptRegSteps < 0). Never with
+    // sendNotification and never when it already reads that, so a field the user is typing
+    // in is not yanked out from under the caret.
+    if (adaptRegStepsEdit.getText() != n && ! adaptRegStepsEdit.hasKeyboardFocus (true))
+        adaptRegStepsEdit.setText (n, juce::dontSendNotification);
+    if (want == adaptRegSpanLbl.getText()) return;
+    adaptRegSpanLbl.setText (want, juce::dontSendNotification);
     syncRealtimeLink();   // the follower's settings carry the range, so it must hear this
 }
 
-// The user typed a range. Two things happen and both matter: AUTO latches off (a range
-// somebody set is theirs), and unreadable text snaps back to the last good number instead
-// of being taken as "no range" - which would silently drop the whole objective back to one
-// pitch, the single-register behaviour this feature exists to replace.
-void FractalAdditiveAudioProcessorEditor::commitAdaptRegisters()
+// The user typed a width. Unreadable text snaps back to the number in force instead of
+// being taken as "no range" - which the processor would read as the default and quietly
+// undo what they were trying to type. A typed number is theirs from then on: it survives
+// every tuning change, because N is a statement about the tuning's own units and
+// re-deriving it on a scale swap is the silent rewrite this control exists to prevent.
+void FractalAdditiveAudioProcessorEditor::commitAdaptRegisterSteps()
 {
-    const auto parse = [] (const juce::String& t, int& out)
-    {
-        const auto s = t.trim();
-        if (s.isEmpty() || ! s.containsOnly ("-+0123456789")
-            || ! s.containsAnyOf ("0123456789")) return false;
-        out = s.getIntValue();
-        return true;
-    };
-    int lo = 0, hi = 0;
-    if (! parse (adaptRegLoEdit.getText(), lo) || ! parse (adaptRegHiEdit.getText(), hi))
-    {
-        adaptRegLoEdit.setText (juce::String (adaptRegPeriodLo), juce::dontSendNotification);
-        adaptRegHiEdit.setText (juce::String (adaptRegPeriodHi), juce::dontSendNotification);
-    }
-    else
-    {
-        adaptRegAuto = false;
-        // Lowest first: a range typed backwards is a typo, not an instruction to optimise
-        // nothing. (One period of span is legal and means one register - clampAdaptRegister
-        // Periods keeps both ends on the board.)
-        adaptRegPeriodLo = juce::jmin (lo, hi);
-        adaptRegPeriodHi = juce::jmax (lo, hi);
-        clampAdaptRegisterPeriods();
-        adaptRegLoEdit.setText (juce::String (adaptRegPeriodLo), juce::dontSendNotification);
-        adaptRegHiEdit.setText (juce::String (adaptRegPeriodHi), juce::dontSendNotification);
-    }
+    const auto s = adaptRegStepsEdit.getText().trim();
+    if (s.isNotEmpty() && s.containsOnly ("0123456789"))
+        // 0 IS legal and means "just the note I am playing" - one register, the old
+        // single-pitch objective, chosen on purpose rather than arrived at by accident.
+        // 127 is the whole board and cannot depend on the tuning, so this clamp can never
+        // reinterpret a width the way a clamp in periods would.
+        adaptRegSteps = juce::jlimit (0, 127, s.getIntValue());
+    adaptRegStepsEdit.setText (juce::String (registerStepsEffective()), juce::dontSendNotification);
+    adaptRegSpanLbl.setText (adaptRegSpanText(), juce::dontSendNotification);
     syncRealtimeLink();
     resized();
 }
@@ -3296,19 +3309,13 @@ FractalAdditiveAudioProcessorEditor::realtimeSettingsFromPanel() const
     s.adapt.rangeLo     = adaptLoEdit.getText().getDoubleValue();
     s.adapt.rangeHi     = adaptHiEdit.getText().getDoubleValue();
     s.adapt.shapeAmps   = adaptAmpsToggle.getToggleState();
-    // THE REGISTER RANGE, in Hz, through the ACTIVE TUNING: the fields name PERIODS, the
-    // period's first key comes from the tuning's own degree count, and what that key really
-    // sounds at is the tuning's business again (octave shift, reference A and a .tun table
-    // anchor all move it). Resolving any of that as 12-EDO here would optimise for
-    // registers the instrument does not play. A key with no frequency leaves 0 Hz, which
-    // the processor reads as AUTO - never as "no range".
-    {
-        const int lo = registerKeyForPeriod (juce::jmin (adaptRegPeriodLo, adaptRegPeriodHi));
-        const int hi = registerKeyForPeriod (juce::jmax (adaptRegPeriodLo, adaptRegPeriodHi));
-        const double a = processorRef.getNoteFrequency (lo);
-        const double b = processorRef.getNoteFrequency (hi);
-        if (a > 0.0 && b > 0.0) { s.adapt.regLoHz = juce::jmin (a, b); s.adapt.regHiHz = juce::jmax (a, b); }
-    }
+    // THE REGISTER RANGE, as the STEP COUNT the field shows. Not as two frequencies: the
+    // range hangs off the note being played, and Hz resolved here would freeze the anchor
+    // at whatever was under the fingers when this ran - which, with the window shut, is for
+    // ever. The processor turns anchor + N into Hz through the active tuning (see
+    // adaptRegistersFor), which is also where the octave shift, the reference A and a .tun
+    // table's anchor live, so nothing here has to know about any of them.
+    s.adapt.regSteps = registerStepsEffective();
     s.adapt.aggregate = adaptAggBox.getSelectedId() == 2 ? 1 : 0;
     return s;
 }
@@ -3331,21 +3338,22 @@ FractalAdditiveAudioProcessorEditor::RegisterProbe
 FractalAdditiveAudioProcessorEditor::registerProbeForTests() const
 {
     RegisterProbe r;
-    r.periodLo = adaptRegPeriodLo; r.periodHi = adaptRegPeriodHi;
-    r.keyLo = registerKeyForPeriod (adaptRegPeriodLo);
-    r.keyHi = registerKeyForPeriod (adaptRegPeriodHi);
-    r.loHz  = processorRef.getNoteFrequency (r.keyLo);
-    r.hiHz  = processorRef.getNoteFrequency (r.keyHi);
-    r.loText = adaptRegLoEdit.getText(); r.hiText = adaptRegHiEdit.getText();
+    r.steps     = registerStepsEffective();
+    r.fitting   = registerStepsFitting();
+    r.anchorKey = processorRef.registerAnchorKey();
+    r.keyLo     = r.anchorKey;
+    r.keyHi     = juce::jlimit (0, 127, r.anchorKey + r.fitting);
+    r.loHz      = processorRef.getNoteFrequency (r.keyLo);
+    r.hiHz      = processorRef.getNoteFrequency (r.keyHi);
+    r.stepsText = adaptRegStepsEdit.getText();
+    r.spanText  = adaptRegSpanText();
     return r;
 }
 
-void FractalAdditiveAudioProcessorEditor::setAdaptRegistersForTests (const juce::String& lo,
-                                                                     const juce::String& hi)
+void FractalAdditiveAudioProcessorEditor::setAdaptRegisterStepsForTests (const juce::String& n)
 {
-    adaptRegLoEdit.setText (lo, juce::dontSendNotification);
-    adaptRegHiEdit.setText (hi, juce::dontSendNotification);
-    commitAdaptRegisters();   // exactly what Return and focus-lost do
+    adaptRegStepsEdit.setText (n, juce::dontSendNotification);
+    commitAdaptRegisterSteps();   // exactly what Return and focus-lost do
 }
 
 void FractalAdditiveAudioProcessorEditor::setSpecModeForTests (int mode)
@@ -3466,7 +3474,7 @@ double FractalAdditiveAudioProcessorEditor::adaptCostMs (bool realtime) const
                             : processorRef.tuningAsTargetAlphas (f0);
     if (alphas.empty()) return 0.0;
     if (! (f0 > 0.0)) f0 = processorRef.analysisAnchorHz();
-    return FractalAdditiveAudioProcessor::estimateAdaptMs (s.adapt, (int) alphas.size(), f0, realtime);
+    return processorRef.estimateAdaptMs (s.adapt, (int) alphas.size(), f0, realtime);
 }
 
 // The button carries its own price. Under a second it says nothing extra - that is not a
@@ -4583,8 +4591,8 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("spec.amps",        adaptAmpsToggle); add ("spec.rangeLbl",  adaptRangeLbl);
     add ("spec.rangeLo",     adaptLoEdit);     add ("spec.rangeHi",   adaptHiEdit);
     add ("spec.adapt",       adaptGoBtn);      add ("spec.adaptRt",   adaptRtBtn);
-    add ("spec.regLbl",      adaptRegLbl);     add ("spec.regLo",     adaptRegLoEdit);
-    add ("spec.regHi",       adaptRegHiEdit);  add ("spec.agg",       adaptAggBox);
+    add ("spec.regLbl",      adaptRegLbl);     add ("spec.regSteps",  adaptRegStepsEdit);
+    add ("spec.agg",         adaptAggBox);
     // The result list, never probed before, and the first thing a new row starves.
     add ("spec.adaptList",   adaptView);       add ("spec.prog",      chordProgLbl);
     // ...and the two WRAPPING read-outs, measured by the rule that fits them (see
@@ -4592,6 +4600,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     // rework rests on, so "it fits" has to be a measurement, not a glance.
     addWrapped ("spec.aggInfo", adaptAggInfoLbl);
     addWrapped ("spec.info",    adaptInfoLbl);
+    addWrapped ("spec.regSpan", adaptRegSpanLbl);
     // The OTHER four states of that read-out, at their widest: 100% progress, a run priced
     // in minutes, a five-figure update count, a lagging follower, and a result line
     // carrying both its percentage and the Reps/Fractal caveat. One of them is on screen;
@@ -4609,6 +4618,15 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
         // one is on screen, and the longer of the two is the one that has to fit.
         p.readoutVariants.push_back (measureWrapped ("agg.average",   adaptAggInfoLbl, adaptAggMeaning (false)));
         p.readoutVariants.push_back (measureWrapped ("agg.worstCase", adaptAggInfoLbl, adaptAggMeaning (true)));
+        // ...and the register line in BOTH forms, at their widest numbers: the anchor a
+        // one-degree-per-period scale can reach ("-10:0"), a three-digit step count, and the
+        // "only N fit" wording that only appears at the top of the keyboard. That second
+        // form is the longer one and it is precisely the one a player never sees until the
+        // day they play up there.
+        p.readoutVariants.push_back (measureWrapped ("regSpan.plain",   adaptRegSpanLbl,
+                                                     adaptRegSpanLine ("-10:0", 127, 127, "10.6")));
+        p.readoutVariants.push_back (measureWrapped ("regSpan.clamped", adaptRegSpanLbl,
+                                                     adaptRegSpanLine ("-10:0", 127, 127 - 1, "10.5")));
     }
     add ("spec.segPerLbl",   segPeriodLbl);    add ("spec.segPeriod", segPeriodEdit);
     add ("spec.segTop",      segTopToggle);
@@ -5273,7 +5291,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         juce::Component* adaptC[] = { &adaptTargetBox, &adaptPartialsBox, &adaptPartialsLbl,
                                       &adaptGoalBox, &adaptAmpsToggle, &adaptGoBtn, &adaptRtBtn,
                                       &adaptInfoLbl, &adaptView,
-                                      &adaptRegLbl, &adaptRegLoEdit, &adaptRegHiEdit,
+                                      &adaptRegLbl, &adaptRegStepsEdit, &adaptRegSpanLbl,
                                       &adaptAggBox, &adaptAggInfoLbl };
         for (auto* c : sethC)  c->setVisible (false);
         for (auto* c : segC)   c->setVisible (seg);
@@ -5370,29 +5388,28 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
             if (adapt)
             {
-                // WHICH REGISTERS. On its own row because the answer genuinely differs per
-                // register and the user must be able to see - and change - what was
-                // optimised for, not infer it from the note they happened to be holding.
-                // Two small fields now (a period number is at most "-2"), so the caption
-                // gets the room the longer Catalan word needs instead of paying for note
-                // names that no longer exist.
-                si.removeFromTop (3);
+                // HOW WIDE, and - on the line under it - FROM WHERE. On its own row because
+                // the answer genuinely differs per register and the user must be able to
+                // see, and change, what was optimised for rather than infer it from the
+                // note they happened to be holding.
+                si.removeFromTop (2);
                 auto rg = si.removeFromTop (22);
-                // A period number is at most three characters, where a note name was five
-                // ("Eb-1"), so the two fields give back 18 px - and the aggregate box, which
-                // used to end up with 49 px of leftover and clip its own word inside its
-                // arrow, gets ~86. The caption is sized to the WORD and told to leave that
-                // room behind it, because "Per\xc3\xado" "des" is the longer of the two.
-                caption (adaptRegLbl, rg, 50, 142);
-                adaptRegLoEdit.setBounds (rg.removeFromLeft (25).reduced (0, 1));
-                rg.removeFromLeft (3);
-                adaptRegHiEdit.setBounds (rg.removeFromLeft (25).reduced (0, 1));
+                // ONE field now, where there were two, and a three-digit count needs 32 px
+                // where a period number needed 25. The aggregate box still clears the ~86 px
+                // it was given when the note names went - it is the control that clipped its
+                // own word inside its arrow at 49 px.
+                caption (adaptRegLbl, rg, 46, 132);
+                adaptRegStepsEdit.setBounds (rg.removeFromLeft (32).reduced (0, 1));
                 rg.removeFromLeft (3);
                 compact (adaptAggBox, rg);
+                // WHAT N COMES TO, and WHICH NOTE it hangs off. One line at 10 pt, and it is
+                // paid for out of the gaps around it rather than out of the result list:
+                // without this line N is a magic number and the anchor is invisible, which
+                // is the whole failure mode of a range that follows the hands.
+                adaptRegSpanLbl.setBounds (si.removeFromTop (12));
                 // ...and WHAT THAT CHOICE COSTS, in a sentence, directly under it. This
                 // row replaced a line of bare counts ("3 registers, realtime 3"): true,
                 // and no help at all to somebody deciding which one their piece wants.
-                si.removeFromTop (1);
                 adaptAggInfoLbl.setBounds (si.removeFromTop (24)); // two lines at 10 pt
             }
             if (chord)
@@ -5406,11 +5423,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
             if (adapt)
             {
-                si.removeFromTop (4);
+                si.removeFromTop (3);
                 auto r4 = si.removeFromTop (24);
                 adaptGoBtn.setBounds (r4.removeFromLeft (r4.getWidth() * 3 / 5).reduced (1, 0));
                 adaptRtBtn.setBounds (r4.reduced (1, 0));
-                si.removeFromTop (2);
+                si.removeFromTop (1);
                 // THE one read-out (see adaptReadoutText). 28 px is two lines at 10.5 pt,
                 // and every sentence it can print is written to fit two - RhythmVerify
                 // measures all five of them, in both languages, because only one is ever on
@@ -6409,8 +6426,9 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     if (specModeBox.getSelectedId() == 2)
     {
         const bool rt = processorRef.getRealtimeLink() != FractalAdditiveAudioProcessor::RtLink::Off;
-        // The register fields follow what is being played until the user types in them.
-        syncAdaptRegisterAuto();
+        // The range hangs off the note being played, so the line that names the anchor has
+        // to follow the hands - and the follower has to be told when it moves.
+        syncAdaptRegisterSpan();
         // WHAT THE AGGREGATE MEANS, in words, for whichever one is selected. This replaced
         // a line of counts ("3 registers, realtime 3") that was true, useless on its own,
         // and the reason the choice above it read as two arbitrary abbreviations. The
