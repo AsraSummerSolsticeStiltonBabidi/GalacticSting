@@ -551,6 +551,47 @@ public:
     // REALTIME button that is quietly doing nothing.
     bool isPlaygroundSuspendingRealtime() const noexcept;
 
+    //==========================================================================
+    // THE PLAYGROUND'S SECOND MODE: MIX ("multi-Fibló", integrated).
+    //
+    // Morph produces ONE blended patch; MIX runs the four corner presets as four real
+    // sub-engines SIMULTANEOUSLY - each with its own voices, its own modulators and
+    // its own compiled spectrum, all fed the same incoming MIDI - and the point is a
+    // four-way volume balance: the bilinear weights become per-corner GAINS under the
+    // equal-power law (presetmorph::mixGains - sqrt(w), so total power is constant
+    // across the pad and a vertex is exactly that corner alone).
+    //
+    // SHARED, deliberately: the TUNING (the keys mean one thing - MIX changes the
+    // sound, never the pitch of a key), the master output gain (the corners' own saved
+    // masterGain values are NOT applied - the master is the master), the preview/MIDI
+    // plumbing, and the RHYTHM engine, which stays on the MAIN patch: four rhythm
+    // engines firing four pulse trains at once is chaos nobody asked for, and the
+    // main patch's rhythm is what the user had dialled in.
+    //
+    // PER CORNER: the voice/mod parameters (via a ParamBank filled from the corner's
+    // stored preset values - see ParamBank.h), the modulator ROUTING the preset was
+    // saved with (a corner with no routing simply has its modulators off), and the
+    // corner's compiled spectrum, republished into its own engine whenever an
+    // adaptive corner adapts (same rules as morph mode - the corner's voices morph or
+    // fade to it exactly as the live engine would).
+    //
+    // WHAT MIX NEVER DOES: touch the live patch. No parameter is written, no spectrum
+    // is published over the live one - the main engine keeps rendering the patch the
+    // user had (crossfaded out while MIX is engaged), so disengaging restores the
+    // ordinary single-engine state EXACTLY, and mid-note: voices in flight simply
+    // fade, they are never stolen by a state rewrite.
+    //
+    // One current, honest limit: a corner preset whose modulators drive SPECTRUM
+    // parameters (Base, Fractal, Prime...) does not re-compile that corner's spectrum
+    // per block - the corner's spectrum is its compiled template (updated by the
+    // adaptive follower when armed). The live engine's 60 Hz recompile loop exists
+    // for exactly that and stays with the live patch; per-voice targets (envelopes,
+    // filter, pitch, slope) modulate fully in every corner.
+    bool isPlaygroundMixMode() const noexcept
+    { return apvts.getRawParameterValue ("pgMode")->load() > 0.5f; }
+    // Is the mix actually sounding (engaged and past the message->audio handoff)?
+    bool isPlaygroundMixEngaged() const noexcept { return mixEngaged.load (std::memory_order_acquire); }
+
     // ADAPTIVE CORNERS: a corner whose preset was saved with the SpectrumFromChord
     // follower armed KEEPS ADAPTING while the playground is engaged - against its OWN
     // settings, to the chord being held right now - and its corner template updates
@@ -1278,6 +1319,13 @@ private:
         juce::String provName, provSource, provPeriod;
         int  rtLink = 0;                                      // the realtime/adaptive link it was saved with
         RtSettings rtSet;
+        // The preset's MODULATOR ROUTING (the MODS child): target-id csv per modulator
+        // and the drawn LFO waves. Morph mode never reads these (routing is live-patch
+        // state there); MIX mode loads them into the corner's OWN ModEngine, because a
+        // preset whose filter breathes under an LFO is not the same preset with the
+        // routing stripped. Empty = that modulator drives nothing = it is simply off.
+        juce::String modTargets[ModEngine::kMods];
+        juce::String modWaves[ModEngine::kLfos];
         // ADAPTIVE-CORNER bookkeeping (message thread; see the public block). The aim is
         // the chord the last launched search was AIMED at - the same "has it moved?"
         // reference the plain follower keeps, per corner because each corner searches
@@ -1356,6 +1404,85 @@ private:
     void applyPlaygroundContinuous (const double w[kPlaygroundCorners]);
     void postPlaygroundBlend (const double w[kPlaygroundCorners], bool bumpGeneration);
     void refreshPlaygroundActive();
+
+    //== PLAYGROUND MIX MODE (see the public block). ============================
+    // One corner's sub-engine. Declaration order IS destruction safety: the synth's
+    // AdditiveVoices hold references to `spectrum`, `mods` and `bank`, so the synth
+    // (declared last) must be destroyed first - same rule the processor's own members
+    // follow for the main engine.
+    struct MixCornerEngine
+    {
+        explicit MixCornerEngine (FractalAdditiveAudioProcessor& p)
+            : bank (p), mods (p.apvts, &bank)
+        {
+            synth.setVoiceStealingEnabled (true);
+            synth.enableLegacyMode (48);   // caller mirrors the live zone/bend right after
+        }
+        // Polyphony follows the VISIBLE "pgVoices" control (measured: five 32-voice
+        // engines are ~3x a 48 kHz/512 block on dense spectra, so a fixed 32 would be
+        // an inaudible-until-it-crackles trap and a fixed lower number a silent cap).
+        // Message thread; MPESynthesiser's own voice lock serialises this against the
+        // audio thread, and reduceNumVoices steals sounding voices properly.
+        void setVoices (FractalAdditiveAudioProcessor& p, int want)
+        {
+            want = juce::jlimit (1, 32, want);
+            while (synth.getNumVoices() < want)
+                synth.addVoice (new AdditiveVoice (p.apvts, spectrum, p.tuning, mods, &bank));
+            if (synth.getNumVoices() > want)
+                synth.reduceNumVoices (want);
+        }
+        ParamBank                 bank;      // the corner preset's values (see ParamBank.h)
+        spectrum::SpectrumEngine  spectrum;  // holds the corner's compiled template
+        ModEngine                 mods;      // the corner's own modulators, reading `bank`
+        juce::MPESynthesiser      synth;
+        juce::AudioBuffer<float>  buf;       // render scratch, sized on the message thread
+        // What the bank/routing/template currently describe, so a 60 Hz tick only
+        // refreshes when the corner actually changed (assign, or an adaptive apply).
+        std::shared_ptr<const spectrum::SpectrumTemplate> lastTmpl;
+        juce::String lastName;
+    };
+    // The message thread OWNS the engines (built on demand, kept for the processor's
+    // lifetime - never deleted mid-session, so the audio thread can hold a pointer
+    // across a block without a lock); the atomics are the audio thread's view,
+    // release-stored only once an engine is fully built.
+    std::array<std::unique_ptr<MixCornerEngine>, kPlaygroundCorners> mixEng;
+    std::array<std::atomic<MixCornerEngine*>, kPlaygroundCorners>    mixEngLive {};
+    std::atomic<bool>  mixEngaged { false };                     // message -> audio
+    std::atomic<float> mixGainTarget[kPlaygroundCorners] {};     // sqrt(w) per corner
+    bool pgMixDriving  = false;   // message thread: the mix path ran this tick
+    bool pgLastMixMode = false;   // detects morph<->mix flips (forces a full re-apply)
+    // Audio-thread-only mix state (touched in renderSynthMix and nowhere else).
+    float mixXfade = 0.0f;                       // 0 = main engine alone, 1 = corners alone
+    float mixGainCur[kPlaygroundCorners] {};     // smoothed per-corner gains
+    float mixApplied[kPlaygroundCorners] {};     // gain actually applied last block (ramp start)
+    float mixMainApplied = 1.0f;
+    bool  mixWasOn = false;                      // edge detect: engage re-injects held keys
+    bool  mixKilled = false;                     // corner voices killed after fade-out
+    int   mixTailBlocks = 0;                     // muted blocks so the 5 ms kill can finish
+    double curBpm = -1.0, curPpq = -1.0, curF0 = 0.0; // this block's transport (audio thread)
+    juce::AudioBuffer<float> mixScratch;         // the main engine's bus during a crossfade
+    juce::MidiBuffer         mixInject;          // reused: held keys re-struck on engage
+    int lastBlockSize = 512;
+
+    void drivePlaygroundMix (const double w[kPlaygroundCorners]);
+    void buildMixEngine (int corner);
+    void refreshMixEngine (int corner);
+    void renderSynthMix (juce::AudioBuffer<float>& out, const juce::MidiBuffer& midi, int nSamp);
+    // Mirror the live zone layout / bend range onto a sub-synth (corners follow the
+    // LIVE tuning plumbing - the tuning is global, exactly as the morph promises).
+    void applyZoneTo (juce::MPESynthesiser& s) const
+    {
+        if (lastZoneMpe)
+        {
+            juce::MPEZoneLayout zone;
+            zone.setLowerZone (15, 48, 48);   // same numbers as applyTuningMode, same reason
+            s.setZoneLayout (zone);
+        }
+        else
+        {
+            s.enableLegacyMode (lastBendApplied);
+        }
+    }
     // Where a parameter sits in getParameters(). -1 if there is no such parameter.
     int  paramIndexOf (const char* id) const;
     // The realtime/adaptive link as saved in a preset/project, and back again. It is

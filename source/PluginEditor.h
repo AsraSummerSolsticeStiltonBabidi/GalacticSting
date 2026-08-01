@@ -284,6 +284,13 @@ public:
     struct PlaygroundProbe
     {
         juce::Rectangle<int> panel, pad, padArea, box[4], clear[4], lbl[4];
+        // The MORPH/MIX mode pair: bounds and the REAL (localised) label on each, so
+        // the verifier can assert the Catalan "MESCLA" fits the button it is drawn in.
+        juce::Rectangle<int> mode[2];
+        juce::String modeText[2];
+        // The MIX voice-budget row (label + control) and the label's real text.
+        juce::Rectangle<int> voicesL, voicesC;
+        juce::String voicesText;
         juce::String status;
     };
     // Probes in the given language and RESTORES the one it found, exactly as
@@ -2800,9 +2807,11 @@ private:
                     g.setColour (col.withAlpha (0.30f + 0.70f * ww));
                     g.fillEllipse (juce::Rectangle<float> (rad * 2.0f, rad * 2.0f).withCentre (c));
                 }
-                if (i == winner && active)
+                // The corner every DISCRETE setting is coming from - a MORPH-mode
+                // concept only. In MIX mode every corner is its own engine and no
+                // setting comes "from" anywhere, so the ring would be a lie there.
+                if (i == winner && active && ! proc->isPlaygroundMixMode())
                 {
-                    // The corner every DISCRETE setting is coming from.
                     g.setColour (juce::Colours::white.withAlpha (0.85f));
                     g.drawEllipse (juce::Rectangle<float> (rad * 2.0f + 8.0f, rad * 2.0f + 8.0f).withCentre (c), 2.0f);
                 }
@@ -2854,13 +2863,33 @@ private:
         juce::Label        cornerLbl[4];
         RefreshingComboBox cornerBox[4];
         juce::TextButton   cornerClear[4];
+        // The playground's two modes, as a radio pair driving the pgMode PARAMETER
+        // (host-automatable; the buttons are only a view onto it, like the pad onto
+        // pgX/pgY): MORPH blends one patch, MIX sounds all four corners at once and
+        // the point becomes their volume balance.
+        juce::TextButton   modeBtn[2];
+        // MIX's per-corner polyphony (the "pgVoices" parameter). VISIBLE by design:
+        // five engines at 32 voices each measured ~3x a 48 kHz/512 block on dense
+        // spectra, and the fidelity rule is that a CPU limit is a control the user
+        // holds, never a cap the code hides.
+        juce::Label        voicesLbl;
+        juce::Slider       voicesSlider { juce::Slider::IncDecButtons, juce::Slider::TextBoxLeft };
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> voicesAtt;
         PlaygroundPad      pad;
+
+        // Called once the processor pointer is set (attachments need the APVTS).
+        void attachVoices()
+        {
+            if (proc == nullptr || voicesAtt != nullptr) return;
+            voicesAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+                            proc->apvts, "pgVoices", voicesSlider);
+        }
         // Its own TooltipWindow, parented HERE: the editor's serves only its own
         // subtree, so in a separate desktop window every hover read-out is invisible
         // without this (the same trap PartialAmpPanel documents).
         juce::TooltipWindow tooltips { this, 350 };
         float lastX = -1.0f, lastY = -1.0f;
-        int   lastAssigned = -1, lastWinner = -2;
+        int   lastAssigned = -1, lastWinner = -2, lastMode = -1;
         // Adaptive-corner state the status line reports: count + whether a refusal is
         // showing. In the change detection because a corner can be SWAPPED without the
         // assigned count moving, and a stale line would claim a follower that is gone.
@@ -2918,6 +2947,33 @@ private:
                 addAndMakeVisible (cornerClear[i]);
             }
 
+            for (int m = 0; m < 2; ++m)
+            {
+                modeBtn[m].setMouseClickGrabsKeyboardFocus (false);
+                modeBtn[m].onClick = [this, m]
+                {
+                    if (proc == nullptr) return;
+                    // Through the parameter, with a gesture, so the host records the
+                    // switch and Ctrl+Z steps back over it like any other control.
+                    if (auto* p = proc->apvts.getParameter ("pgMode"))
+                    {
+                        p->beginChangeGesture();
+                        p->setValueNotifyingHost (p->convertTo0to1 ((float) m));
+                        p->endChangeGesture();
+                    }
+                    refresh (true);
+                };
+                addAndMakeVisible (modeBtn[m]);
+            }
+
+            voicesLbl.setFont (juce::Font (juce::FontOptions (12.0f)));
+            voicesLbl.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
+            voicesLbl.setInterceptsMouseClicks (false, false);
+            addAndMakeVisible (voicesLbl);
+            voicesSlider.setTextBoxStyle (juce::Slider::TextBoxLeft, false, 34, 18);
+            voicesSlider.setMouseClickGrabsKeyboardFocus (false);
+            addAndMakeVisible (voicesSlider);
+
             pad.onMoved = [this] { refresh (false); };
             addAndMakeVisible (pad);
             startTimerHz (30);
@@ -2940,6 +2996,32 @@ private:
         {
             headLbl.setText (trF ? trF ("PRESET PLAYGROUND", "LABORATORI DE PRESETS")
                                  : juce::String ("PRESET PLAYGROUND"), juce::dontSendNotification);
+            modeBtn[0].setButtonText (trF ? trF ("MORPH", "MORPH") : juce::String ("MORPH"));
+            modeBtn[1].setButtonText (trF ? trF ("MIX", "MESCLA") : juce::String ("MIX"));
+            modeBtn[0].setTooltip (trF ? trF ("Morph mode: the corners blend into ONE patch - every control and "
+                                              "the spectrum move to the point.",
+                                              "Mode morph: les cantonades es fonen en UN sol patch - cada control "
+                                              "i l'espectre segueixen el punt.")
+                                       : juce::String());
+            modeBtn[1].setTooltip (trF ? trF ("Mix mode: the four presets SOUND AT ONCE, each as its own full "
+                                              "engine, and the point balances their volumes (equal power). Your "
+                                              "own patch is untouched and comes back when you leave.",
+                                              "Mode mescla: els quatre presets SONEN ALHORA, cadascun amb el seu "
+                                              "propi motor complet, i el punt equilibra els seus volums (pot\xc3\xa8ncia "
+                                              "constant). El teu patch no es toca i torna quan en surts.")
+                                       : juce::String());
+            voicesLbl.setText (trF ? trF ("Mix voices per corner", "Veus de mescla per cantonada")
+                                   : juce::String ("Mix voices per corner"), juce::dontSendNotification);
+            voicesSlider.setTooltip (trF ? trF ("Polyphony of EACH corner engine in mix mode. Mix runs up to five "
+                                                "engines at once (four corners plus your patch tracking "
+                                                "underneath), so this is the CPU trade-off - a visible one, never "
+                                                "a hidden cap. 8 covers normal playing; raise it if your CPU can.",
+                                                "Polifonia de CADA motor de cantonada en mode mescla. La mescla fa "
+                                                "anar fins a cinc motors alhora (quatre cantonades m\xc3\xa9s el teu "
+                                                "patch seguint per sota), o sigui que aix\xc3\xb2 \xc3\xa9s l'equilibri "
+                                                "de CPU - visible, mai un l\xc3\xadmit amagat. 8 cobreix el joc "
+                                                "normal; puja-ho si la teva CPU pot.")
+                                         : juce::String());
             for (int i = 0; i < 4; ++i)
             {
                 refillCorner (i);
@@ -2961,10 +3043,24 @@ private:
         void resized() override
         {
             auto r = getLocalBounds().reduced (10);
-            headLbl.setBounds (r.removeFromTop (20));
+            // The mode pair shares the header row, so the pad loses no height to it.
+            auto head = r.removeFromTop (20);
+            modeBtn[1].setBounds (head.removeFromRight (64).reduced (0, 1));
+            head.removeFromRight (3);
+            modeBtn[0].setBounds (head.removeFromRight (64).reduced (0, 1));
+            head.removeFromRight (6);
+            headLbl.setBounds (head);
             r.removeFromTop (4);
             statLbl.setBounds (r.removeFromBottom (58));
             r.removeFromBottom (4);
+            // MIX's voice budget rides just above the status text; the pad keeps the rest.
+            {
+                auto vr = r.removeFromBottom (20);
+                voicesSlider.setBounds (vr.removeFromRight (96).reduced (0, 1));
+                vr.removeFromRight (4);
+                voicesLbl.setBounds (vr);
+                r.removeFromBottom (2);
+            }
 
             const auto row = [this] (int lo, int hi, juce::Rectangle<int> band)
             {
@@ -3001,10 +3097,25 @@ private:
             const int   wn = proc->getPlaygroundNearestCorner();
             const int   adSig = proc->getPlaygroundAdaptiveCount() * 2
                               + (proc->getPlaygroundAdaptRefusal().isNotEmpty() ? 1 : 0);
+            const int   mode  = proc->isPlaygroundMixMode() ? 1 : 0;
             if (! force && x == lastX && y == lastY && n == lastAssigned && wn == lastWinner
-                && adSig == lastAdaptSig)
+                && adSig == lastAdaptSig && mode == lastMode)
                 return;
             lastX = x; lastY = y; lastAssigned = n; lastWinner = wn; lastAdaptSig = adSig;
+            lastMode = mode;
+
+            // The mode pair reads like a radio group: the mode in force is lit.
+            for (int m = 0; m < 2; ++m)
+            {
+                modeBtn[m].setColour (juce::TextButton::buttonColourId,
+                                      m == mode ? juce::Colour (0xff2d6da8) : juce::Colour (0xff1a2130));
+                modeBtn[m].setColour (juce::TextButton::textColourOffId,
+                                      m == mode ? juce::Colours::white : juce::Colour (0xff8f96a8));
+            }
+            // The voice budget only means anything in mix mode; a control that quietly
+            // does nothing is the trap this project keeps refusing, so it greys out.
+            voicesSlider.setEnabled (mode == 1);
+            voicesLbl.setAlpha (mode == 1 ? 1.0f : 0.45f);
 
             juce::String s;
             if (n < 2)
@@ -3020,7 +3131,8 @@ private:
             {
                 double w[FractalAdditiveAudioProcessor::kPlaygroundCorners];
                 proc->getPlaygroundWeights (w);
-                s << (trF ? trF ("Blend: ", "Barreja: ") : juce::String ("Blend: "));
+                s << (mode == 1 ? (trF ? trF ("Mix: ", "Mescla: ") : juce::String ("Mix: "))
+                                : (trF ? trF ("Blend: ", "Barreja: ") : juce::String ("Blend: ")));
                 bool first = true;
                 for (int i = 0; i < 4; ++i)
                     if (proc->getPlaygroundCornerName (i).isNotEmpty())
@@ -3030,7 +3142,20 @@ private:
                         s << (char) ('A' + i) << " " << juce::String (w[i] * 100.0, 0) << "%";
                     }
                 s << "\n";
-                if (wn >= 0)
+                if (mode == 1)
+                {
+                    // MIX: no winner corner, no morphed controls - four whole engines
+                    // and a balance. Say exactly that, and that the user's patch waits
+                    // untouched underneath.
+                    s << (trF ? trF ("All four corners SOUND AT ONCE (equal-power balance). Your own "
+                                     "patch is silent but untouched - it comes back exactly as it was.",
+                                     "Totes les cantonades SONEN ALHORA (balan\xc3\xa7 de pot\xc3\xa8ncia "
+                                     "constant). El teu patch calla per\xc3\xb2 no es toca - torna "
+                                     "exactament com era.")
+                              : juce::String());
+                    s << "\n";
+                }
+                else if (wn >= 0)
                     s << (trF ? trF ("Settings that cannot be averaged (engine, phase, prime mode, manual amps, "
                                      "realtime) come from ", "Els ajustos que no es poden promitjar (motor, fase, mode "
                                      "primer, amplituds manuals, temps real) venen de ")

@@ -450,6 +450,21 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "pgY", 1 }, "Playground Y",
         NormalisableRange<float> (0.0f, 1.0f, 0.0001f), 0.0f));
+    // The playground's MODE is a parameter too, so a DAW can switch morph <-> mix
+    // under automation (and the choice survives save/reload like everything else).
+    // Excluded from the morph itself - see PresetMorph.h - or dropping a preset saved
+    // in mix mode onto a corner would flip the playground under the user's feet.
+    params.push_back (std::make_unique<AudioParameterChoice>(
+        ParameterID { "pgMode", 1 }, "Playground Mode",
+        StringArray { "Morph", "Mix" }, 0));
+    // MIX runs up to FIVE engines at once (four corners + the main patch tracking
+    // underneath), and the measured worst case (32 voices each, dense spectra) is ~3x
+    // a 48 kHz / 512 block - so the per-corner polyphony is a VISIBLE control, never a
+    // silent cap. 8 is the honest default: normal playing never steals under it, and
+    // the measured realistic cost fits the block budget; anyone with the CPU can push
+    // it to the main engine's own 32.
+    params.push_back (std::make_unique<AudioParameterInt>(
+        ParameterID { "pgVoices", 1 }, "Mix Voices per Corner", 1, 32, 8));
 
     return { params.begin(), params.end() };
 }
@@ -593,11 +608,14 @@ void FractalAdditiveAudioProcessor::timerCallback()
     const auto s = currentSettings();
     if (s != lastPushed)
     {
-        // While the playground is engaged the SPECTRUM comes from the blend of the
-        // corners' compiled partial lists, which is the only thing that means anything
-        // when two corners run different engines. Compiling the morphed parameters here
-        // as well would publish that over the blend a moment later.
-        if (! pgActive)
+        // While the playground is engaged IN MORPH MODE the SPECTRUM comes from the
+        // blend of the corners' compiled partial lists, which is the only thing that
+        // means anything when two corners run different engines. Compiling the morphed
+        // parameters here as well would publish that over the blend a moment later.
+        // MIX mode is different: the live spectrum still belongs to the live patch
+        // (the corners sound through their own engines), so an edit made while the
+        // mix plays must keep rebuilding it - it is what comes back on disengage.
+        if (! pgActive || pgMixDriving)
             spectrumEngine.requestRebuild (s);
         lastPushed = s;
     }
@@ -741,6 +759,11 @@ void FractalAdditiveAudioProcessor::timerCallback()
     {
         lastBendApplied = bendValues[bendIdx];
         synth.setLegacyModePitchbendRange (lastBendApplied);
+        // The MIX sub-engines bend by the same range - one MIDI-to-pitch mapping for
+        // the whole instrument (in MPE zone mode the zone already fixes it at +-48).
+        for (auto& e : mixEng)
+            if (e != nullptr && ! lastZoneMpe)
+                e->synth.setLegacyModePitchbendRange (lastBendApplied);
     }
 }
 
@@ -841,6 +864,11 @@ void FractalAdditiveAudioProcessor::applyTuningMode (int paramIndex)
         {
             synth.enableLegacyMode (lastBendApplied);
         }
+        // The MIX sub-engines follow the SAME zone plumbing: the tuning - and how MIDI
+        // maps to pitch - is global, exactly what the playground promises never to
+        // split per corner.
+        for (auto& e : mixEng)
+            if (e != nullptr) applyZoneTo (e->synth);
     }
 }
 
@@ -2798,7 +2826,6 @@ bool FractalAdditiveAudioProcessor::saveCurrentTuningScl (const juce::File& f, j
 //==============================================================================
 void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
-    juce::ignoreUnused (samplesPerBlock);
     synth.setCurrentPlaybackSampleRate (sampleRate);
     previewCollector.reset (sampleRate);
     noteGate.prepare (sampleRate);
@@ -2807,6 +2834,20 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     modHeld = 0;
     for (auto& row : modKeyHeld) row.fill (false);
     lastSr = sampleRate;
+
+    // MIX mode's scratch buses are sized HERE, on the prepare call, because the audio
+    // thread must never allocate: a block larger than this falls back to the plain
+    // single-engine render (defensive - hosts honour their own samplesPerBlock).
+    lastBlockSize = juce::jmax (16, samplesPerBlock);
+    mixScratch.setSize (2, juce::jmax (512, lastBlockSize));
+    mixInject.ensureSize (512);
+    for (auto& e : mixEng)
+        if (e != nullptr)
+        {
+            e->synth.setCurrentPlaybackSampleRate (sampleRate);
+            e->mods.prepare (sampleRate);
+            e->buf.setSize (2, juce::jmax (512, lastBlockSize));
+        }
     lastGain = juce::Decibels::decibelsToGain (apvts.getRawParameterValue ("masterGain")->load());
 
     // Build once synchronously so a template exists before the first note.
@@ -2916,6 +2957,13 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
     {
         keyboardState.allNotesOff (0);  // any physically-held key gets its note-off THIS block
         synth.turnOffAllVoices (false);        // backstop: instant silence regardless of the cause
+        // The MIX sub-engines too: a project swap must not leave a corner voice
+        // sounding a preset the new project does not even contain. Idle voices finish
+        // instantly; sounding ones fast-kill and are drained by renderSynthMix's own
+        // fade-out path (the mix is still rendered while its crossfade is non-zero).
+        for (auto& pe : mixEngLive)
+            if (auto* ce = pe.load (std::memory_order_acquire))
+                ce->synth.turnOffAllVoices (false);
         noteGate.prepare (lastSr > 0.0 ? lastSr : getSampleRate());
         modHeld = 0; modNoteOns = 0;
         for (auto& row : modKeyHeld) row.fill (false);
@@ -3019,6 +3067,10 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         for (int v = 0; v < synth.getNumVoices(); ++v)
             if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
                 av->setTransportForMod (bpm, ppq);
+        // Kept for the MIX sub-engines, whose modulators run inside renderSynthMix
+        // with exactly these numbers - a corner's transport-locked LFO must read the
+        // same clock the main engine's does.
+        curBpm = bpm; curPpq = ppq; curF0 = f0;
     }
     const bool midiOut  = apvts.getRawParameterValue ("rhythmOn")->load()       > 0.5f;
     const bool selfWant = apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f;
@@ -3076,7 +3128,7 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         synthMidi.addEvents (midiMessages, 0, nSamp, 0);   // synth plays the pulses...
         synthMidi.addEvents (held, 0, nSamp, 0);           // ...and the drone channel (ch 16)
         synthMidi.addEvents (previewMidi, 0, nSamp, 0);    // chord preview always audible AS a chord
-        synth.renderNextBlock (buffer, synthMidi, 0, nSamp);
+        renderSynthMix (buffer, synthMidi, nSamp);
 
         if (! midiOut) midiMessages.clear();               // internal-only: don't leak pulses to the DAW
     }
@@ -3087,12 +3139,12 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         juce::MidiBuffer synthMidi;
         synthMidi.addEvents (midiMessages, 0, nSamp, 0);
         synthMidi.addEvents (previewMidi, 0, nSamp, 0);
-        synth.renderNextBlock (buffer, synthMidi, 0, nSamp);
+        renderSynthMix (buffer, synthMidi, nSamp);
         rhythm.process (midiMessages, nSamp);
     }
     else
     {
-        synth.renderNextBlock (buffer, midiMessages, 0, nSamp); // held notes sound normally
+        renderSynthMix (buffer, midiMessages, nSamp);      // held notes sound normally
         // Timbre -> rhythm MIDI out: generated in this very block with exact sample
         // stamps, from the same f0/tuning maths as the voices -> sample-locked to the
         // audio. Consumes the input events; only the pulse MIDI leaves the plugin.
@@ -3103,6 +3155,143 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         apvts.getRawParameterValue ("masterGain")->load());
     buffer.applyGainRamp (0, nSamp, lastGain, gain);
     lastGain = gain;
+}
+
+//==============================================================================
+// THE MIX RENDER (the audio-thread half of playground MIX mode).
+//
+// With the mix disengaged and fully faded this is a tail call into the ordinary
+// single-engine render - bit-for-bit the old behaviour, zero overhead. Otherwise:
+//
+//   out = main * sqrt(1 - x)  +  sum_i corner_i * g_i * sqrt(x)
+//
+// where x is the engage crossfade (50 ms one-pole) and g_i the per-corner
+// equal-power gains (7 ms one-pole towards sqrt(w_i)). EVERY gain is applied as a
+// per-sample linear ramp from the value the previous block ended on
+// (applyGainRamp), so neither a drag, an automation jump across the pad, nor the
+// engage/disengage switch can ever step the waveform - the mixer equivalent of the
+// voices' 7 ms de-click slew.
+//
+// The MAIN engine keeps rendering the whole time, fed the ordinary MIDI; only its
+// OUTPUT is faded. Its voices, envelopes and note bookkeeping therefore stay
+// exactly what they would be with mix off - a note released while it was inaudible
+// still received its note-off - so disengaging is a pure fade with nothing to
+// rebuild and no voice ever orphaned. The corners are the opposite: they are COLD
+// on engage, so the keys held at that moment are re-struck into them (the tally
+// knows which keys, not their velocities - a fixed healthy velocity is used and the
+// corner's own envelope shapes the rest), and once a disengage fade completes their
+// voices are fast-killed and given a few muted blocks to actually finish -
+// stopping cold would leave fastKill armed on voices nothing ever renders again,
+// the exact trap beginFastKill documents.
+void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& out,
+                                                    const juce::MidiBuffer& midi, int nSamp)
+{
+    const bool   on = mixEngaged.load (std::memory_order_acquire);
+    const double sr = lastSr > 0.0 ? lastSr : 44100.0;
+
+    const float xTgt = on ? 1.0f : 0.0f;
+    const float aX   = 1.0f - (float) std::exp (-(double) nSamp / (0.050 * sr));
+    float xNow = mixXfade + (xTgt - mixXfade) * aX;
+    if (std::abs (xNow - xTgt) < 1.0e-4f) xNow = xTgt;
+
+    const bool anyMixWork = on || mixXfade > 0.0f || mixTailBlocks > 0;
+    mixXfade = xNow;
+    if (! anyMixWork)
+    {
+        mixWasOn       = on;
+        mixMainApplied = 1.0f;
+        for (auto& a : mixApplied) a = 0.0f;   // the next engage ramps in from silence
+        synth.renderNextBlock (out, midi, 0, nSamp);
+        return;
+    }
+
+    // ENGAGE edge: re-strike the held keys into the cold corner engines (see above).
+    const juce::MidiBuffer* cornerFeed = &midi;
+    if (on && ! mixWasOn)
+    {
+        mixInject.clear();
+        mixInject.addEvents (midi, 0, nSamp, 0);
+        for (int ch = 0; ch < 16; ++ch)
+            for (int k = 0; k < 128; ++k)
+                if (modKeyHeld[(size_t) ch][(size_t) k])
+                    mixInject.addEvent (juce::MidiMessage::noteOn (ch + 1, k, (juce::uint8) 100), 0);
+        cornerFeed = &mixInject;
+    }
+    mixWasOn = on;
+
+    // The main engine's bus. sqrt(1-x) against the corners' sqrt(x): equal-power, so
+    // the hand-over neither sags nor bumps.
+    const float mainNow = std::sqrt (juce::jmax (0.0f, 1.0f - xNow));
+    if (mixScratch.getNumSamples() >= nSamp && mixScratch.getNumChannels() > 0)
+    {
+        mixScratch.clear();
+        synth.renderNextBlock (mixScratch, midi, 0, nSamp);
+        mixScratch.applyGainRamp (0, nSamp, mixMainApplied, mainNow);
+        const int srcCh = mixScratch.getNumChannels();
+        for (int ch = 0; ch < out.getNumChannels(); ++ch)
+            out.addFrom (ch, 0, mixScratch, juce::jmin (ch, srcCh - 1), 0, nSamp);
+    }
+    else
+    {
+        // Defensive: a block larger than prepareToPlay promised. The main engine must
+        // sound whatever happens; the mix sits this block out.
+        synth.renderNextBlock (out, midi, 0, nSamp);
+    }
+    mixMainApplied = mainNow;
+
+    // The corners.
+    const float aG   = 1.0f - (float) std::exp (-(double) nSamp / (0.007 * sr));
+    const float xAmp = std::sqrt (juce::jmax (0.0f, xNow));
+    bool anyCorner = false;
+    for (int i = 0; i < kPlaygroundCorners; ++i)
+    {
+        auto* e = mixEngLive[(size_t) i].load (std::memory_order_acquire);
+        if (e == nullptr) continue;
+        anyCorner = true;
+
+        // This corner's OWN modulators (reading its bank), and the transport push its
+        // voices' per-voice LFOs need - the same clock the main engine's voices got.
+        e->mods.processBlock (nSamp, modNoteOns, modHeld > 0, curF0, curBpm, curPpq);
+        for (int v = 0; v < e->synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (e->synth.getVoice (v)))
+                av->setTransportForMod (curBpm, curPpq);
+
+        mixGainCur[i] += (mixGainTarget[i].load (std::memory_order_relaxed) - mixGainCur[i]) * aG;
+        const float now = mixGainCur[i] * xAmp;
+        if (e->buf.getNumSamples() < nSamp) { mixApplied[i] = now; continue; }  // defensive, as above
+        e->buf.clear();
+        e->synth.renderNextBlock (e->buf, *cornerFeed, 0, nSamp);
+        e->buf.applyGainRamp (0, nSamp, mixApplied[i], now);
+        mixApplied[i] = now;
+        const int srcCh = e->buf.getNumChannels();
+        for (int ch = 0; ch < out.getNumChannels(); ++ch)
+            out.addFrom (ch, 0, e->buf, juce::jmin (ch, srcCh - 1), 0, nSamp);
+    }
+
+    // Disengage fade COMPLETED: kill the corner voices and drain them (see above).
+    if (! on && xNow <= 0.0f && anyCorner)
+    {
+        if (! mixKilled)
+        {
+            mixKilled = true;
+            // Enough muted blocks for the 5 ms fast-kill to reach finishNote at ANY
+            // block size (10 ms of samples, plus slack) - a fixed block count was too
+            // short at small blocks, which is precisely the stuck-fastKill trap.
+            mixTailBlocks = (int) std::ceil (0.010 * sr / (double) juce::jmax (1, nSamp)) + 2;
+            for (auto& pe : mixEngLive)
+                if (auto* ce = pe.load (std::memory_order_acquire))
+                    ce->synth.turnOffAllVoices (false);
+        }
+        else if (mixTailBlocks > 0)
+        {
+            --mixTailBlocks;
+        }
+    }
+    else if (on)
+    {
+        mixKilled     = false;
+        mixTailBlocks = 0;
+    }
 }
 
 //==============================================================================
@@ -3823,6 +4012,17 @@ bool FractalAdditiveAudioProcessor::assignPlaygroundCorner (int corner, const ju
             c.rtSet  = realtimeSettingsFromTree (rt);
         }
 
+        // The preset's MODULATOR ROUTING, for MIX mode's per-corner ModEngine (see
+        // PlaygroundCorner). Kept as the saved text and parsed only when a sub-engine
+        // is refreshed - morph mode never pays for it.
+        if (auto ms = tree.getChildWithName ("MODS"); ms.isValid())
+        {
+            for (int m = 0; m < ModEngine::kMods; ++m)
+                c.modTargets[m] = ms.getProperty ("t" + juce::String (m)).toString();
+            for (int l = 0; l < ModEngine::kLfos; ++l)
+                c.modWaves[l] = ms.getProperty ("w" + juce::String (l)).toString();
+        }
+
         compileCornerTemplate (c);
     }
 
@@ -4170,8 +4370,10 @@ void FractalAdditiveAudioProcessor::drivePlaygroundAdaptive()
             // When the adapting corner IS the winner, the live patch's spectrum state
             // (Custom Engine text, gains, manual switch) is what the screen describes -
             // it has to follow the adaptation or it would describe a spectrum that is
-            // no longer the one sounding.
-            if (pgWinner == r.corner)
+            // no longer the one sounding. MORPH mode only: MIX never writes the live
+            // patch (its corners sound through their own engines - the replaced c.tmpl
+            // reaches the ear via refreshMixEngine's republish, generation bump and all).
+            if (pgWinner == r.corner && ! isPlaygroundMixMode())
                 applyPlaygroundDiscreteState (r.corner);
             // A REAL spectrum change, not a drag: pgDirty makes the blend below publish
             // WITH a generation bump, so the voices glide to it (morph on) or cross the
@@ -4294,11 +4496,29 @@ void FractalAdditiveAudioProcessor::drivePlayground()
 {
     refreshPlaygroundActive();
     if (! pgActive)
+    {
+        // The playground let go (or never engaged): the mix must let go with it, or
+        // four sub-engines would keep sounding under a pad that no longer exists.
+        pgMixDriving  = false;
+        pgLastMixMode = false;
+        mixEngaged.store (false, std::memory_order_release);
         return;
+    }
 
-    // ADAPTIVE CORNERS first: a finished adaptation updates its corner's template and
-    // sets pgDirty, and the blend below is what publishes it - WITH the generation bump
-    // a real spectrum change deserves.
+    const bool mixMode = isPlaygroundMixMode();
+    if (mixMode != pgLastMixMode)
+    {
+        pgLastMixMode = mixMode;
+        // Returning to MORPH: the live spectrum has not been the blend while MIX owned
+        // the sound, so the next morph tick must re-apply EVERYTHING - with the
+        // generation bump a real spectrum change deserves (the voices morph/fade it,
+        // which is also what makes the mode switch itself click-free on this side).
+        if (! mixMode) pgDirty = true;
+    }
+
+    // ADAPTIVE CORNERS first: a finished adaptation updates its corner's template.
+    // Morph mode publishes it through the blend below (with a generation bump); mix
+    // mode republishes it into that corner's own sub-engine (see refreshMixEngine).
     drivePlaygroundAdaptive();
 
     const double x = (double) apvts.getRawParameterValue ("pgX")->load();
@@ -4308,6 +4528,18 @@ void FractalAdditiveAudioProcessor::drivePlayground()
     bool assigned[kPlaygroundCorners];
     for (int i = 0; i < kPlaygroundCorners; ++i) assigned[i] = pgCorner[(size_t) i].assigned();
     presetmorph::bilinearWeights (x, y, assigned, w);
+
+    if (mixMode)
+    {
+        // MIX drives the sub-engines and NOTHING else: no parameter writes, no live
+        // spectrum publish - the live patch stays exactly as the user left it, which
+        // is what makes disengaging restore the single-engine state bit-for-bit.
+        drivePlaygroundMix (w);
+        pgMixDriving = true;
+        return;
+    }
+    pgMixDriving = false;
+    mixEngaged.store (false, std::memory_order_release);
 
     const int  prevWinner = pgWinner;
     const int  winner = presetmorph::nearestCorner (w, pgWinner, presetmorph::kHysteresis);
@@ -4360,6 +4592,100 @@ void FractalAdditiveAudioProcessor::drivePlayground()
 
     pgLastX = x; pgLastY = y;
     pgDirty = false;
+}
+
+//==============================================================================
+// PLAYGROUND MIX MODE - the message-thread half (the audio half is renderSynthMix).
+// Runs at 60 Hz while the playground is engaged in mix mode: keeps a sub-engine
+// alive and current for every assigned corner, and turns the bilinear weights into
+// per-corner gain TARGETS (equal-power - see presetmorph::mixGains). The audio
+// thread slews towards those targets; nothing here touches the live patch.
+//==============================================================================
+void FractalAdditiveAudioProcessor::drivePlaygroundMix (const double w[kPlaygroundCorners])
+{
+    const int wantVoices = (int) apvts.getRawParameterValue ("pgVoices")->load();
+    for (int i = 0; i < kPlaygroundCorners; ++i)
+    {
+        if (! pgCorner[(size_t) i].assigned()) continue;
+        if (mixEng[(size_t) i] == nullptr) buildMixEngine (i);
+        mixEng[(size_t) i]->setVoices (*this, wantVoices);  // the VISIBLE polyphony control
+        refreshMixEngine (i);
+    }
+
+    double g[kPlaygroundCorners];
+    presetmorph::mixGains (w, g);
+    for (int i = 0; i < kPlaygroundCorners; ++i)
+        mixGainTarget[i].store (pgCorner[(size_t) i].assigned()
+                                    && mixEngLive[(size_t) i].load (std::memory_order_relaxed) != nullptr
+                                ? (float) g[i] : 0.0f,
+                                std::memory_order_relaxed);
+    // Engaged LAST, after every assigned corner has a live engine: the audio thread
+    // must never fade in a mix whose engines it cannot find.
+    mixEngaged.store (true, std::memory_order_release);
+}
+
+// Build corner `corner`'s sub-engine. Message thread; the audio thread only learns of
+// it through the release-store at the end, by which time it is fully prepared.
+void FractalAdditiveAudioProcessor::buildMixEngine (int corner)
+{
+    auto e = std::make_unique<MixCornerEngine> (*this);
+    const double sr = lastSr > 0.0 ? lastSr : 48000.0;
+    e->synth.setCurrentPlaybackSampleRate (sr);
+    e->mods.prepare (sr);
+    applyZoneTo (e->synth);   // the LIVE zone/bend: tuning plumbing is global
+    e->buf.setSize (2, juce::jmax (512, lastBlockSize));
+    mixEng[(size_t) corner] = std::move (e);
+    mixEngLive[(size_t) corner].store (mixEng[(size_t) corner].get(), std::memory_order_release);
+}
+
+// Bring corner `corner`'s sub-engine in step with the corner: the preset's values into
+// the bank, its modulator routing into its ModEngine, its compiled template into its
+// SpectrumEngine. Cheap when nothing changed (one pointer + one string compare), so
+// calling it every tick is fine; a real change is an assign or an adaptive apply.
+void FractalAdditiveAudioProcessor::refreshMixEngine (int corner)
+{
+    auto* e = mixEng[(size_t) corner].get();
+    auto& c = pgCorner[(size_t) corner];
+    if (e == nullptr || ! c.assigned()) return;
+    if (e->lastTmpl == c.tmpl && e->lastName == c.name) return;
+    e->lastTmpl = c.tmpl;
+    e->lastName = c.name;
+
+    // The preset's values (defaults where it predates a parameter - cornerValueOr's
+    // rule, applied by the bank so voices and modulators read the same numbers).
+    e->bank.fill ([&c] (int i, double& out) { return c.value (i, out); });
+
+    // The preset's modulator routing + drawn LFO waves. An empty routing means the
+    // corner's modulators drive nothing - i.e. they are off, exactly as saved.
+    for (int m = 0; m < ModEngine::kMods; ++m)
+    {
+        e->mods.unmapAll (m);
+        juce::StringArray ids;
+        ids.addTokens (c.modTargets[m], ",", "");
+        for (const auto& id : ids)
+            if (id.isNotEmpty()) e->mods.addTarget (m, id);
+    }
+    for (int l = 0; l < ModEngine::kLfos; ++l)
+    {
+        juce::StringArray vals;
+        vals.addTokens (c.modWaves[l], ",", "");
+        if (vals.size() == ModEngine::kWaveN)
+        {
+            float wv[ModEngine::kWaveN];
+            for (int i = 0; i < ModEngine::kWaveN; ++i) wv[i] = vals[i].getFloatValue();
+            e->mods.setCustomWave (l, wv);
+        }
+    }
+
+    // The corner's per-partial edits are STORED first and the template published
+    // second, so the publish resolves the edits against exactly this partial list
+    // (the same store-then-publish order applyPlaygroundDiscreteState documents).
+    // publishNow bumps the sub-engine's generation: on an adaptive corner's update
+    // the corner's OWN voices morph (its morph on) or cross the 50 ms fade (off) -
+    // the same treatment a live spectrum change gets, which is the whole point.
+    e->spectrum.setOverrides (c.gains, c.manual, false);
+    if (c.tmpl != nullptr)
+        e->spectrum.publishNow (*c.tmpl);
 }
 
 // Everything that cannot be averaged comes from ONE corner (see PresetMorph.h). The

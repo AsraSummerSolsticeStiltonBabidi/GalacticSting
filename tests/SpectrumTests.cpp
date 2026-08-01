@@ -2250,11 +2250,47 @@ int main()
         {
             bool ok = true;
             for (const char* id : { "tuningMode", "bendRange", "refA", "octaveShift",
-                                    "tuningBankSlot", "specRandom", "pgX", "pgY" })
+                                    "tuningBankSlot", "specRandom", "pgX", "pgY", "pgMode", "pgVoices" })
                 ok = ok && morphSpaceFor (id, false) == MorphSpace::Excluded
                         && morphSpaceFor (id, true)  == MorphSpace::Excluded;
-            check (ok, "tuning mode, bend range, reference A, octave, bank slot, the random TRIGGER "
-                       "and the pad's own coordinates are excluded - discrete or not");
+            check (ok, "tuning mode, bend range, reference A, octave, bank slot, the random TRIGGER, "
+                       "the pad's own coordinates AND the playground's own mode + voice budget are "
+                       "excluded - discrete or not (a corner saved in mix mode must not flip the pad)");
+        }
+
+        std::printf ("preset playground - MIX gains (equal power):\n");
+        {
+            // The law itself: gains are sqrt(weights), so total POWER (sum of gain^2)
+            // is 1 wherever any corner has weight - no crossfade hole in the middle of
+            // an edge, no bump at a corner.
+            double g[4];
+            bool okPower = true, okZero = true;
+            for (int xi = 0; xi <= 10 && okPower; ++xi)
+                for (int yi = 0; yi <= 10 && okPower; ++yi)
+                {
+                    bilinearWeights (xi / 10.0, yi / 10.0, all4, w);
+                    mixGains (w, g);
+                    double p = 0.0;
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        p += g[i] * g[i];
+                        if (w[i] <= 0.0 && g[i] != 0.0) okZero = false;
+                    }
+                    if (std::abs (p - 1.0) > 1e-9) okPower = false;
+                }
+            check (okPower, "sum of squared gains is 1 across the whole pad - constant total power");
+            check (okZero,  "a corner with no weight gets gain 0 exactly - it contributes silence");
+
+            bilinearWeights (0.0, 0.0, all4, w);
+            mixGains (w, g);
+            check (g[0] == 1.0 && g[1] == 0.0 && g[2] == 0.0 && g[3] == 0.0,
+                   "at a vertex only that corner sounds, at exactly full level");
+
+            bilinearWeights (0.5, 0.0, topEdge, w);
+            mixGains (w, g);
+            check (std::abs (g[0] - std::sqrt (0.5)) < 1e-12
+                   && std::abs (g[1] - std::sqrt (0.5)) < 1e-12,
+                   "the middle of a two-corner edge is 0.707 each (-3 dB), not the 0.5 sag");
         }
 
         std::printf ("preset playground - nearest corner with hysteresis:\n");

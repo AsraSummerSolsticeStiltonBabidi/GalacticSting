@@ -1843,6 +1843,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     playgroundPanel.pad.proc = &processorRef;
     playgroundPanel.trF     = [this] (const char* en, const char* ca) { return tr (en, ca); };
     playgroundPanel.pad.trF = [this] (const char* en, const char* ca) { return tr (en, ca); };
+    playgroundPanel.attachVoices();   // needs proc: the pgVoices attachment
 
     // Pitch-bend range (inside the Tuning box).
     configCombo (bendBox, "bendRange", bendAtt, cTuning, {});
@@ -4163,6 +4164,14 @@ FractalAdditiveAudioProcessorEditor::playgroundProbeForTests (int w, int h, bool
         p.clear[i] = playgroundPanel.cornerClear[i].getBounds();
         p.lbl[i]   = playgroundPanel.cornerLbl[i].getBounds();
     }
+    for (int m = 0; m < 2; ++m)
+    {
+        p.mode[m]     = playgroundPanel.modeBtn[m].getBounds();
+        p.modeText[m] = playgroundPanel.modeBtn[m].getButtonText();
+    }
+    p.voicesL    = playgroundPanel.voicesLbl.getBounds();
+    p.voicesC    = playgroundPanel.voicesSlider.getBounds();
+    p.voicesText = playgroundPanel.voicesLbl.getText();
     p.status = playgroundPanel.statLbl.getText();
     catalan = was;
     playgroundPanel.applyLanguage();

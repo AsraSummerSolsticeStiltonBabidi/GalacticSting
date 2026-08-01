@@ -5631,6 +5631,29 @@ int main()
                     check (L.pad.getWidth() > 200 && L.pad.getHeight() > 120,
                            "...and the pad still gets most of the window");
                     check (L.status.isNotEmpty(), "the panel says what the blend currently is");
+                    // The MORPH/MIX mode pair: present, non-overlapping, and each REAL
+                    // (localised) label fits its button - "MESCLA" is wider than "MIX".
+                    bool modeOk = ! L.mode[0].isEmpty() && ! L.mode[1].isEmpty()
+                               && L.panel.contains (L.mode[0]) && L.panel.contains (L.mode[1])
+                               && ! L.mode[0].intersects (L.mode[1])
+                               && ! L.mode[0].intersects (L.pad) && ! L.mode[1].intersects (L.pad);
+                    for (int m = 0; m < 2; ++m)
+                    {
+                        const auto tw = juce::GlyphArrangement::getStringWidth (
+                                            juce::Font (juce::FontOptions (12.0f)), L.modeText[m]);
+                        if (tw > (float) L.mode[m].getWidth() - 4.0f) modeOk = false;
+                    }
+                    check (modeOk, "the MORPH/MIX mode pair fits, in this language, without covering anything");
+                    // The MIX voice-budget row: present, clear of the pad and status,
+                    // and its REAL (localised) label fits the space it is given.
+                    const bool vOk = ! L.voicesL.isEmpty() && ! L.voicesC.isEmpty()
+                                  && L.panel.contains (L.voicesL) && L.panel.contains (L.voicesC)
+                                  && ! L.voicesL.intersects (L.voicesC)
+                                  && ! L.voicesC.intersects (L.pad)
+                                  && juce::GlyphArrangement::getStringWidth (
+                                         juce::Font (juce::FontOptions (12.0f)), L.voicesText)
+                                       <= (float) L.voicesL.getWidth() - 2.0f;
+                    check (vOk, "the mix voice-budget control fits, label and all, in this language");
                 }
 
                 // THE PAD'S MAPPING: a click at a fraction of the travel has to become
@@ -6033,6 +6056,356 @@ int main()
         fileA.deleteFile();
         fileB.deleteFile();
         fileC.deleteFile();
+    }
+
+    //==========================================================================
+    // --- run 44: playground MIX mode - the integrated "multi-Fibló" -------------------
+    // "haz que el playground tenga un modo morph y otro modo que sea mix en que los 4
+    //  presets pueden sonar superpuestos a la vez, osea mover de un lado a otro equivale
+    //  a subir/bajar volumen de uno u otro."
+    // Verified on the REAL processor, by ear-equivalent measurement: each corner is
+    // rendered by its own engine, the point is an equal-power volume balance, the live
+    // patch is untouched and comes back exactly, and none of it clicks.
+    {
+        std::printf ("\nrun 44: playground MIX mode (multi-engine, end to end):\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        constexpr double msr = 48000.0;
+        constexpr int    meb = 64;
+
+        auto folder = Proc::getPresetFolder();
+        auto fileA  = folder.getChildFile ("zzz-verify-mix-A.gsting");
+        auto fileB  = folder.getChildFile ("zzz-verify-mix-B.gsting");
+
+        // Windowed Goertzel magnitude of one partial in a captured stretch of output.
+        // Hann-windowed so the strong neighbours of a dense harmonic spectrum do not
+        // leak into the bin being asked about.
+        const auto toneAmp = [] (const std::vector<float>& x, double sr, double hz)
+        {
+            const size_t n = x.size();
+            if (n < 16) return 0.0;
+            const double w = 2.0 * juce::MathConstants<double>::pi * hz / sr;
+            const double c = 2.0 * std::cos (w);
+            double s1 = 0.0, s2 = 0.0;
+            for (size_t i = 0; i < n; ++i)
+            {
+                const double win = 0.5 - 0.5 * std::cos (2.0 * juce::MathConstants<double>::pi
+                                                         * (double) i / (double) (n - 1));
+                const double s0 = (double) x[i] * win + c * s1 - s2;
+                s2 = s1; s1 = s0;
+            }
+            const double re = s1 - s2 * std::cos (w), im = s2 * std::sin (w);
+            return std::sqrt (re * re + im * im) / (0.25 * (double) n); // /(N/2 * hann gain)
+        };
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (msr, meb);
+        auto sp = [&] (const char* id, float plain)
+        {
+            if (auto* q = p->apvts.getParameter (id))
+                q->setValueNotifyingHost (q->convertTo0to1 (plain));
+        };
+        auto poll = [&] (int times = 3)
+        { for (int i = 0; i < times; ++i) { p->pollParametersForTests(); juce::Thread::sleep (2); } };
+        juce::AudioBuffer<float> buf (2, meb);
+        auto renderSec = [&] (double seconds, std::vector<float>* capture = nullptr)
+        {
+            const int blocks = (int) (seconds * msr / meb);
+            for (int i = 0; i < blocks; ++i)
+            {
+                juce::MidiBuffer m; buf.clear(); p->processBlock (buf, m);
+                if (capture != nullptr)
+                {
+                    const float* L = buf.getReadPointer (0);
+                    capture->insert (capture->end(), L, L + meb);
+                }
+                if ((i % 12) == 0) poll (1);
+            }
+        };
+        const double f0 = 261.6255653; // key 60 under the default tuning
+
+        // THREE DISTINGUISHABLE SPECTRA. Corner A: the harmonic engine (has 7.00,
+        // cannot have 1.25). Corner B: the custom scale 5/4 3/2 2 (has 1.25, cannot
+        // have 7.00). The LIVE patch: 11/8 2 (has 1.375 and neither of the others), so
+        // "the main engine is silent under the mix, and comes back after" is a
+        // measurement, not a hope.
+        {
+            juce::String err;
+            p->clearTimbre();
+            sp ("timbreOn", 0.0f); sp ("timbreTemper", 0.0f);
+            sp ("ampAttack", 0.005f); sp ("ampSustain", 1.0f); sp ("ampDecay", 0.2f);
+            sp ("baseN", 1.0f); sp ("curveSlope", 1.0f); sp ("masterGain", 0.0f);
+            poll();
+            check (p->savePreset ("zzz-verify-mix-A").isNotEmpty(), "mix corner preset A saved (harmonic)");
+            check (p->loadTimbreText ("5/4 3/2 2", err), "corner B gets the custom scale");
+            sp ("timbreRepeats", 4.0f);
+            poll();
+            check (p->savePreset ("zzz-verify-mix-B").isNotEmpty(), "mix corner preset B saved (custom)");
+            check (p->loadTimbreText ("11/8 2", err), "the LIVE patch gets its own signature spectrum");
+            poll();
+        }
+
+        // MIX MODE FIRST, corners after: from here on the playground must never write a
+        // live parameter, which is exactly what the round-trip check at the end proves.
+        sp ("pgMode", 1.0f); sp ("pgX", 0.0f); sp ("pgY", 0.0f);
+        poll();
+        std::vector<std::pair<juce::String, float>> snap;
+        for (auto* ap : p->getParameters())
+            if (auto* rp = dynamic_cast<juce::RangedAudioParameter*> (ap))
+                snap.push_back ({ rp->paramID, rp->getValue() });
+
+        // Hold the note BEFORE engaging, so the engage path has to re-strike it into
+        // the cold corner engines - a held chord must survive the hand-over.
+        {
+            juce::MidiBuffer on;
+            on.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+            buf.clear(); p->processBlock (buf, on);
+        }
+        renderSec (0.2);
+
+        juce::String err;
+        check (p->assignPlaygroundCorner (0, "zzz-verify-mix-A", err), "A on corner 0");
+        check (p->assignPlaygroundCorner (1, "zzz-verify-mix-B", err), "B on corner 1");
+        poll();
+        renderSec (0.1);
+        check (p->isPlaygroundMixMode() && p->isPlaygroundMixEngaged(),
+               "two corners + mix mode = the mix is engaged and sounding");
+
+        // VERTEX A: only corner A's engine, at full level - the note that was already
+        // held sounds because engage re-struck it.
+        std::vector<float> cap;
+        renderSec (0.8);                       // engage fade + gain slew fully settled
+        cap.clear(); renderSec (0.4, &cap);
+        const double a7A = toneAmp (cap, msr, 7.0 * f0), a125A = toneAmp (cap, msr, 1.25 * f0),
+                     a1375A = toneAmp (cap, msr, 1.375 * f0);
+        std::printf ("  vertex A: harmonic7 %.5f, custom1.25 %.5f, live1.375 %.5f\n", a7A, a125A, a1375A);
+        check (a7A > 1.0e-4, "at vertex A the held note sounds through corner A's engine (re-struck on engage)");
+        check (a125A < a7A * 0.1, "corner B at gain 0 contributes silence");
+        check (a1375A < a7A * 0.1, "the LIVE patch is silent under the mix (it is not corner 0's slot)");
+
+        // VERTEX B: only corner B's engine - a different ENGINE, not a blended patch.
+        sp ("pgX", 1.0f); poll();
+        renderSec (0.5);
+        cap.clear(); renderSec (0.4, &cap);
+        const double a7B = toneAmp (cap, msr, 7.0 * f0), a125B = toneAmp (cap, msr, 1.25 * f0);
+        std::printf ("  vertex B: harmonic7 %.5f, custom1.25 %.5f\n", a7B, a125B);
+        check (a125B > 1.0e-4, "at vertex B corner B's custom engine sounds");
+        check (a7B < a125B * 0.1, "and corner A is gone - the point really is a volume balance");
+
+        // THE MIDDLE: both engines AT ONCE (the thing morph mode cannot do is two
+        // envelopes/two mod banks - spectrally the proof is both signatures together),
+        // each at sqrt(0.5) of its vertex level: the equal-power law, measured.
+        sp ("pgX", 0.5f); poll();
+        renderSec (0.5);
+        cap.clear(); renderSec (0.4, &cap);
+        const double a7M = toneAmp (cap, msr, 7.0 * f0), a125M = toneAmp (cap, msr, 1.25 * f0);
+        const double ratioB = a125B > 0.0 ? a125M / a125B : 0.0;
+        const double ratioA = a7A > 0.0 ? a7M / a7A : 0.0;
+        std::printf ("  middle: harmonic7 %.5f (%.3f of its vertex), custom1.25 %.5f (%.3f of its vertex; "
+                     "equal-power predicts 0.707)\n", a7M, ratioA, a125M, ratioB);
+        check (a7M > 1.0e-4 && a125M > 1.0e-4, "half way across BOTH presets sound simultaneously");
+        check (ratioB > 0.55 && ratioB < 0.87 && ratioA > 0.55 && ratioA < 0.87,
+               "each corner sits at ~0.707 of its vertex level - the equal-power law, not a linear sag");
+
+        // DISENGAGE (clear the corners): the live patch comes back sounding, exactly
+        // as it was - no parameter moved, no spectrum overwritten.
+        p->assignPlaygroundCorner (0, {}, err);
+        p->assignPlaygroundCorner (1, {}, err);
+        poll();
+        renderSec (0.6);
+        cap.clear(); renderSec (0.4, &cap);
+        const double a1375D = toneAmp (cap, msr, 1.375 * f0), a125D = toneAmp (cap, msr, 1.25 * f0);
+        std::printf ("  disengaged: live1.375 %.5f, custom1.25 %.5f\n", a1375D, a125D);
+        check (! p->isPlaygroundMixEngaged(), "clearing the corners disengages the mix");
+        check (a1375D > 1.0e-4, "the live patch comes BACK SOUNDING mid-note (it was never killed, only faded)");
+        check (a125D < a1375D * 0.1, "no corner engine is left sounding behind it");
+        {
+            int moved = 0;
+            juce::String movedId;
+            for (auto* ap : p->getParameters())
+                if (auto* rp = dynamic_cast<juce::RangedAudioParameter*> (ap))
+                    for (const auto& s : snap)
+                        if (s.first == rp->paramID
+                            && s.first != "pgX" && s.first != "pgY"   // the pad itself, moved on purpose
+                            && std::abs (s.second - rp->getValue()) > 1.0e-6f)
+                        { ++moved; if (movedId.isEmpty()) movedId = s.first; }
+            std::printf ("  parameters moved by the whole mix session: %d%s%s\n",
+                         moved, moved > 0 ? " first: " : "", movedId.toRawUTF8());
+            check (moved == 0,
+                   "MIX never wrote a single live parameter - disengaging restores the patch EXACTLY");
+        }
+
+        // RELOADING MID-MIX comes back sounding.
+        {
+            check (p->assignPlaygroundCorner (0, "zzz-verify-mix-A", err)
+                   && p->assignPlaygroundCorner (1, "zzz-verify-mix-B", err), "corners back on");
+            sp ("pgX", 1.0f); poll();
+            juce::MemoryBlock blob;
+            p->getStateInformation (blob);
+
+            auto q = std::make_unique<Proc>();
+            q->prepareToPlay (msr, meb);
+            q->setStateInformation (blob.getData(), (int) blob.getSize());
+            for (int i = 0; i < 5; ++i) { q->pollParametersForTests(); juce::Thread::sleep (2); }
+            check (q->isPlaygroundMixMode() && q->isPlaygroundMixEngaged(),
+                   "a project saved mid-MIX reloads with the mix engaged");
+            juce::MidiBuffer on;
+            on.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+            juce::AudioBuffer<float> qb (2, meb);
+            qb.clear(); q->processBlock (qb, on);
+            std::vector<float> qcap;
+            for (int i = 0; i < (int) (1.0 * msr / meb); ++i)
+            {
+                juce::MidiBuffer m; qb.clear(); q->processBlock (qb, m);
+                if ((i % 12) == 0) q->pollParametersForTests();
+                if (i > (int) (0.6 * msr / meb))
+                {
+                    const float* L = qb.getReadPointer (0);
+                    qcap.insert (qcap.end(), L, L + meb);
+                }
+            }
+            const double q125 = toneAmp (qcap, msr, 1.25 * f0), q7 = toneAmp (qcap, msr, 7.0 * f0);
+            std::printf ("  after reload at vertex B: custom1.25 %.5f, harmonic7 %.5f\n", q125, q7);
+            check (q125 > 1.0e-4 && q7 < q125 * 0.1,
+                   "...and it SOUNDS: corner B's own engine, at its vertex, straight off the reload");
+        }
+
+        // CLICK-FREENESS, by run 26's own metric (largest sample-to-sample jump over
+        // peak). Control: the mix parked. Test 1: the balance jumped corner-to-corner
+        // by automation every few blocks (gains must ramp, never step). Test 2: the
+        // MODE flipped morph<->mix repeatedly (the engage/disengage crossfade).
+        //
+        // The corners here are NEAR-SINE presets (slope 6: the second partial sits
+        // -36 dB down), deliberately: a sine's own per-sample slope is ~2*pi*f/sr of
+        // its peak (~0.05 here), so the metric's floor is LOW and a stepped gain
+        // (jump/peak ~ 0.7 at the equal-power vertex level) cannot hide inside the
+        // signal's natural movement - which it could inside the dense-spectrum
+        // presets above, whose honest slope is ~0.36 of peak.
+        {
+            juce::String e0;
+            p->clearTimbre();
+            sp ("curveSlope", 6.0f); sp ("ampAttack", 0.005f); sp ("ampSustain", 1.0f);
+            poll();
+            check (p->savePreset ("zzz-verify-mix-S1").isNotEmpty(), "near-sine corner S1 saved");
+            check (p->loadTimbreText ("3/2 2", e0), "S2's custom scale loads");
+            poll();
+            check (p->savePreset ("zzz-verify-mix-S2").isNotEmpty(), "near-sine corner S2 saved");
+
+            auto clickRun = [&] (int mode, const char* label)
+            {
+                auto r = std::make_unique<Proc>();
+                r->prepareToPlay (msr, meb);
+                auto rs = [&] (const char* id, float v)
+                { if (auto* q = r->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
+                rs ("pgMode", 1.0f); rs ("ampAttack", 0.005f); rs ("ampSustain", 1.0f);
+                r->pollParametersForTests();
+                juce::String e2;
+                r->assignPlaygroundCorner (0, "zzz-verify-mix-S1", e2);
+                r->assignPlaygroundCorner (1, "zzz-verify-mix-S2", e2);
+                r->pollParametersForTests();
+                juce::AudioBuffer<float> b (2, meb);
+                {
+                    juce::MidiBuffer m;
+                    m.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+                    m.addEvent (juce::MidiMessage::noteOn (1, 67, 0.8f), 1);
+                    b.clear(); r->processBlock (b, m);
+                }
+                for (int i = 0; i < 120; ++i)   // engage fade + attack fully done
+                { juce::MidiBuffer m; b.clear(); r->processBlock (b, m);
+                  if ((i % 12) == 0) r->pollParametersForTests(); }
+
+                float maxJump = 0.0f, peak = 0.0f, prev = 0.0f;
+                bool have = false;
+                for (int step = 0; step < 240; ++step)
+                {
+                    if (mode == 1 && (step % 6) == 0)   // ~8 ms cadence: a hostile LFO on the balance
+                        rs ("pgX", (step / 6) & 1 ? 1.0f : 0.0f);
+                    if (mode == 2 && (step % 45) == 0)  // flip morph<->mix every ~60 ms
+                        rs ("pgMode", (step / 45) & 1 ? 0.0f : 1.0f);
+                    if ((step % 3) == 0) r->pollParametersForTests();
+                    juce::MidiBuffer m; b.clear(); r->processBlock (b, m);
+                    const float* L = b.getReadPointer (0);
+                    for (int k = 0; k < meb; ++k)
+                    {
+                        const float x = L[k];
+                        peak = std::max (peak, std::abs (x));
+                        if (have) maxJump = std::max (maxJump, std::abs (x - prev));
+                        prev = x; have = true;
+                    }
+                }
+                const float ratio = peak > 0.0f ? maxJump / peak : 0.0f;
+                std::printf ("  %-28s peak=%.4f maxJump=%.4f jump/peak=%.3f\n", label, peak, maxJump, ratio);
+                return ratio;
+            };
+            const float ctl  = clickRun (0, "mix parked (control)");
+            const float bal  = clickRun (1, "balance jumped 0<->1");
+            const float flip = clickRun (2, "mode flipped morph<->mix");
+            check (ctl > 0.0f, "the control case actually made sound");
+            check (bal  <= ctl * 2.5f + 0.02f, "slamming the balance corner-to-corner does not click");
+            check (flip <= ctl * 2.5f + 0.02f, "switching morph<->mix mid-note does not click");
+            folder.getChildFile ("zzz-verify-mix-S1.gsting").deleteFile();
+            folder.getChildFile ("zzz-verify-mix-S2.gsting").deleteFile();
+        }
+
+        // CPU, measured not guessed: ms per 512-sample block at 48 kHz (budget 10.67 ms),
+        // main engine alone vs the mix (main still tracking underneath - that cost is
+        // the no-orphaned-notes guarantee and is REPORTED, not hidden). The EXTREME
+        // case - 32 dense-spectrum notes, every engine at 32 voices - shows why the
+        // per-corner polyphony is a VISIBLE control (the main engine ALONE is near the
+        // whole budget there); the REALISTIC case - a four-note chord at the default
+        // voice budget of 8 - is what must actually fit.
+        {
+            auto bench = [&] (int corners, int voicesPerCorner, int notes, const char* label)
+            {
+                auto r = std::make_unique<Proc>();
+                r->prepareToPlay (48000.0, 512);
+                auto rs = [&] (const char* id, float v)
+                { if (auto* q = r->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
+                rs ("ampSustain", 1.0f);
+                if (corners > 0)
+                {
+                    rs ("pgMode", 1.0f);
+                    rs ("pgVoices", (float) voicesPerCorner);
+                    juce::String e2;
+                    static const char* names[4] = { "zzz-verify-mix-A", "zzz-verify-mix-B",
+                                                    "zzz-verify-mix-A", "zzz-verify-mix-B" };
+                    for (int i = 0; i < corners; ++i) r->assignPlaygroundCorner (i, names[i], e2);
+                }
+                for (int i = 0; i < 6; ++i) { r->pollParametersForTests(); juce::Thread::sleep (2); }
+                juce::AudioBuffer<float> b (2, 512);
+                {
+                    juce::MidiBuffer m;
+                    for (int k = 0; k < notes; ++k)
+                        m.addEvent (juce::MidiMessage::noteOn (1, notes >= 32 ? 40 + k : 60 + 4 * k,
+                                                               (juce::uint8) 100), 0);
+                    b.clear(); r->processBlock (b, m);
+                }
+                for (int i = 0; i < 60; ++i)   // fades settled, all voices sounding
+                { juce::MidiBuffer m; b.clear(); r->processBlock (b, m);
+                  if ((i % 12) == 0) r->pollParametersForTests(); }
+                const auto t0 = juce::Time::getHighResolutionTicks();
+                constexpr int N = 200;
+                for (int i = 0; i < N; ++i)
+                { juce::MidiBuffer m; b.clear(); r->processBlock (b, m); }
+                const double ms = juce::Time::highResolutionTicksToSeconds (
+                                      juce::Time::getHighResolutionTicks() - t0) * 1000.0 / N;
+                std::printf ("  %-40s %.3f ms/block (%.0f%% of budget)\n", label, ms, ms / 10.667 * 100.0);
+                return ms;
+            };
+            const double e0 = bench (0, 0, 32, "extreme 32 notes: main alone");
+            const double e4 = bench (4, 32, 32, "extreme 32 notes: 4 corners @32 voices");
+            const double d4 = bench (4, 8, 32, "extreme 32 notes: 4 corners @default 8");
+            const double r0 = bench (0, 0, 4, "realistic chord:  main alone");
+            const double r4 = bench (4, 8, 4, "realistic chord:  4 corners @default 8");
+            juce::ignoreUnused (e0, r0);
+            check (d4 < e4 * 0.75,
+                   "the VISIBLE voice control genuinely buys back CPU (default 8 well under 32)");
+            check (r4 < 10.0,
+                   "a realistic mix - 4 corners + main, default voice budget - fits the 10.67 ms block budget");
+        }
+
+        fileA.deleteFile();
+        fileB.deleteFile();
+        check (! fileA.existsAsFile() && ! fileB.existsAsFile(), "run 44's presets are cleaned up");
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
