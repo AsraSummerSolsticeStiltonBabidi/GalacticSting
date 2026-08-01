@@ -807,11 +807,18 @@ namespace dissonance
     // octaves up. Optimising at one pitch does not merely miss the rest of the keyboard;
     // it actively produces spectra that are clean low and buzzy high (SpectrumTests
     // measures exactly that). The objective therefore aggregates over a RANGE of f0.
-    enum class Aggregate
-    {
-        Mean = 0,     // the average register: best overall, free to sacrifice one octave
-        Minimax = 1   // the WORST register: nothing is allowed to be horrible anywhere
-    };
+    //
+    // THE AGGREGATE IS THE MEAN, ALWAYS, and there is no longer a choice about it.
+    //
+    // There used to be a second mode, minimax: score only the WORST register, so nothing is
+    // allowed to be horrible anywhere. It was a real trade while the range was two ABSOLUTE
+    // pitches. It stopped being one the moment the range was re-anchored at the note being
+    // played and made to run UPWARD from it - because the worst register of an upward range
+    // is then essentially always the lowest one, i.e. the anchor itself. Minimax therefore
+    // collapsed to "optimise the played note alone", and the whole point of the Steps width
+    // - how far up the objective looks - stopped changing anything: measured 10.742 at every
+    // width, identical to five decimals. A control that cannot change the result is worse
+    // than no control, so it is gone, and with it the aggregate selector it lived in.
 
     // The f0 values a range is sampled at: `n` points spread evenly in LOG frequency
     // (roughness varies smoothly with log f0 - see the sampling test in SpectrumTests,
@@ -840,7 +847,6 @@ namespace dissonance
     struct Registers
     {
         std::vector<double> f0;               // the pitches the objective is evaluated at
-        Aggregate mode = Aggregate::Mean;
     };
 
     // HOW MANY POINTS A RANGE NEEDS - one octave of spacing, capped.
@@ -853,13 +859,16 @@ namespace dissonance
     //
     //     spacing   3.0 oct   2.0 oct   1.5 oct   1.0 oct   0.75 oct
     //     mean       +3.3%     +2.8%     +2.2%     +0.5%     +0.5%
-    //     minimax   +29.8%    +20.6%     +3.4%     -4.3%      0.0%   (worst register)
     //
-    // Mean is forgiving; MINIMAX is not - it hunts a peak, and with points two octaves
-    // apart the peak simply falls between them and the search never sees it. One octave is
-    // where both settle, so that is the rule. `cap` is the paths' one honest difference:
-    // the cost is exactly linear in the number of points, so the realtime follower takes a
-    // smaller cap and the panel SAYS how many registers each path uses.
+    // i.e. the mean is forgiving all the way out to three octaves a point. One octave is
+    // kept anyway: it is where the curve has flattened, it costs a two-period range exactly
+    // three evaluations, and a sampling rule that only just holds is the kind that stops
+    // holding when the objective changes. (The same table for the old minimax aggregate ran
+    // +29.8% at three octaves - it hunted a peak that fell between the points - which is why
+    // the rule was one octave in the first place; minimax is gone, the rule stays.)
+    // `cap` is the paths' one honest difference: the cost is exactly linear in the number of
+    // points, so the realtime follower takes a smaller cap and the panel SAYS how many
+    // registers each path uses.
     inline int registerCountFor (double loHz, double hiHz, int cap)
     {
         if (! (loHz > 0.0) || ! (hiHz > 0.0)) return 1;
@@ -989,9 +998,12 @@ namespace dissonance
     {
         std::vector<double> perRegister;      // RAW target score at each register
         double mean  = 0.0;                   // average raw score over the range
+        // READ-OUTS, not objectives. `worst` is still reported (the panel's tooltip quotes
+        // the range the result really spans), but nothing optimises it any more - see the
+        // "THE AGGREGATE IS THE MEAN" block above for why minimax stopped being a choice.
         double worst = 0.0;                   // raw score of the register that scores WORST
         int    worstIndex = 0;                // which register that is
-        double cost  = 0.0;                   // what the search minimises (mean/max of goalCost)
+        double cost  = 0.0;                   // what the search minimises: the MEAN goalCost
     };
 
     // Score `sp` - which is anchored at `spF0` - at every register in `regF0`, by
@@ -1002,8 +1014,7 @@ namespace dissonance
     inline RegisterScores scoreOverRegisters (const std::vector<Partial>& sp, double spF0,
                                               const std::vector<double>& regF0,
                                               const std::vector<double>& alphas, bool rootOnly,
-                                              Goal goal, double rangeLo, double rangeHi,
-                                              Aggregate agg)
+                                              Goal goal, double rangeLo, double rangeHi)
     {
         RegisterScores rs;
         if (sp.empty() || alphas.empty() || ! (spF0 > 0.0))
@@ -1029,7 +1040,7 @@ namespace dissonance
             if (c > worstCost) { worstCost = c; rs.worst = d; rs.worstIndex = (int) k; }
         }
         rs.mean /= (double) regs.size();
-        rs.cost = agg == Aggregate::Minimax ? worstCost : sumCost / (double) regs.size();
+        rs.cost = sumCost / (double) regs.size();
         return rs;
     }
 
@@ -1039,11 +1050,11 @@ namespace dissonance
         double score = 0.0;              // the dissonance it achieves against the target
         double seedScore = 0.0;          // what the SEED spectrum scored, for honest before/after
         int    sweepsDone = 0;
-        // The range read-out. `score`/`seedScore` above report the AGGREGATE that was
-        // actually optimised (mean over the range, or the worst register's own value) -
-        // with one register they are exactly the old single-pitch numbers. These carry
-        // both aggregates plus the per-register detail, so a caller can say how much
-        // Mean's worst register costs against Minimax's without re-running anything.
+        // The range read-out. `score`/`seedScore` above report the aggregate that was
+        // actually optimised - the MEAN over the range - and with one register they are
+        // exactly the old single-pitch numbers. `worst` and `worstIndex` are carried
+        // alongside as pure read-outs, so a caller can say which register the mean was
+        // kindest to without re-running anything.
         std::vector<double> perRegister, seedPerRegister, registerF0;
         double mean = 0.0,  worst = 0.0;
         double seedMean = 0.0, seedWorst = 0.0;
@@ -1102,14 +1113,14 @@ namespace dissonance
             for (int i = 0; i < n; ++i)
                 work[(size_t) i] = { f0 * std::exp2 (cents[(size_t) i] / 1200.0), amp[(size_t) i] * g };
         };
-        // THE OBJECTIVE IS THE WHOLE RANGE. Every evaluation transposes the candidate to
-        // each register and aggregates - mean, or the worst register. The single-register
-        // case falls straight out of this (see scoreOverRegisters), so there is only ever
-        // one objective in the code and no second path to drift out of agreement.
+        // THE OBJECTIVE IS THE WHOLE RANGE: every evaluation transposes the candidate to
+        // each register and takes the MEAN. The single-register case falls straight out of
+        // this (see scoreOverRegisters), so there is only ever one objective in the code and
+        // no second path to drift out of agreement.
         const auto measure = [&] (const std::vector<Partial>& sp)
         {
             return scoreOverRegisters (sp, f0, regs.f0, alphas, rootOnly,
-                                       goal, rangeLo, rangeHi, regs.mode);
+                                       goal, rangeLo, rangeHi);
         };
         const auto cost = [&]
         {
@@ -1120,10 +1131,10 @@ namespace dissonance
         build();
         const auto seedScores = measure (work);
         // The reported "before" is the aggregate that is being optimised: the mean over the
-        // range, or the worst register's own dissonance. The panel prints these two numbers
-        // as "beating: X -> Y", and a number optimised over five octaves that quoted only
-        // middle C's value would be a read-out of something nobody asked for.
-        out.seedScore       = regs.mode == Aggregate::Minimax ? seedScores.worst : seedScores.mean;
+        // range. The panel prints these two numbers as "beating: X -> Y", and a number
+        // optimised over five octaves that quoted only middle C's value would be a read-out
+        // of something nobody asked for.
+        out.seedScore       = seedScores.mean;
         out.seedMean        = seedScores.mean;
         out.seedWorst       = seedScores.worst;
         out.seedPerRegister = seedScores.perRegister;
@@ -1177,7 +1188,7 @@ namespace dissonance
                     build();
                     const auto rs = measure (work);
                     out.spectrum = work;
-                    out.score    = regs.mode == Aggregate::Minimax ? rs.worst : rs.mean;
+                    out.score    = rs.mean;
                     out.mean = rs.mean; out.worst = rs.worst; out.worstIndex = rs.worstIndex;
                     out.perRegister = rs.perRegister;
                     out.registerF0  = regs.f0.empty() ? std::vector<double> { f0 } : regs.f0;
@@ -1201,7 +1212,7 @@ namespace dissonance
         build();
         const auto rs = measure (work);
         out.spectrum    = work;
-        out.score       = regs.mode == Aggregate::Minimax ? rs.worst : rs.mean;
+        out.score       = rs.mean;
         out.mean        = rs.mean;
         out.worst       = rs.worst;
         out.worstIndex  = rs.worstIndex;

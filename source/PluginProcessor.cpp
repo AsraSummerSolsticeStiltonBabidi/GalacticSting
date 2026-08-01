@@ -1996,10 +1996,11 @@ double FractalAdditiveAudioProcessor::measureCurrentAgainstTarget (const std::ve
     // used - so "sounding now" and the adaptation's before/after are one scale.
     const auto spec = analysisSpectrumAt (f0Hz);
     if (spec.empty()) return 0.0;
-    // ...and aggregated over the SAME registers, the same way (see the header).
+    // ...and aggregated over the SAME registers, the same way (see the header): the MEAN,
+    // which is what the search minimises and therefore the only scale "after" sits on.
     const auto rs = dissonance::scoreOverRegisters (spec, f0Hz, regs.f0, alphas, rootOnly,
-                                                    dissonance::Goal::Min, 0.0, 0.0, regs.mode);
-    return regs.mode == dissonance::Aggregate::Minimax ? rs.worst : rs.mean;
+                                                    dissonance::Goal::Min, 0.0, 0.0);
+    return rs.mean;
 }
 
 // THE ANCHOR the register range hangs off (see the header). Held beats last-played beats
@@ -2034,7 +2035,6 @@ dissonance::Registers FractalAdditiveAudioProcessor::adaptRegistersFor (const Sp
                                                                         double f0Hz, bool realtime) const
 {
     dissonance::Registers regs;
-    regs.mode = s.aggregate == 1 ? dissonance::Aggregate::Minimax : dissonance::Aggregate::Mean;
     const int steps  = juce::jlimit (0, 127, s.regSteps >= 0 ? s.regSteps : defaultRegisterSteps());
     const int anchor = registerAnchorKey();
     // The top is CLAMPED TO THE BOARD, never wrapped and never re-anchored lower: the user
@@ -2192,7 +2192,6 @@ bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSetti
                 info.regLoHz     = regs.f0.empty() ? f0Hz : regs.f0.front();
                 info.regHiHz     = regs.f0.empty() ? f0Hz : regs.f0.back();
                 info.regPoints   = (int) std::max<size_t> (1, regs.f0.size());
-                info.aggregate   = regs.mode == dissonance::Aggregate::Minimax ? 1 : 0;
                 info.mean        = res.mean;
                 info.worst       = res.worst;
                 info.seedMean    = res.seedMean;

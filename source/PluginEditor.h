@@ -38,8 +38,18 @@ public:
         // engineBox is the ONE shared box both engines live in (the HARMONIC / CUSTOM
         // chips are its title; the selected chip decides whose controls are inside).
         juce::Rectangle<int> spectrum, engineBox, bothEngines,
-                             essentials, tuning, engineChips,
+                             essentials, envelopes, tuning, engineChips,
                              specColumn; // the full-height Spectrum-vs-Tuning box on the right
+        // THE TOP-RIGHT CORNER of every macro panel, as how far INSIDE its own corner the
+        // drawn border passes: 0.5 px when that corner is square, 2.5 px for the 9 px
+        // radius. Sampled off the very path paint() strokes (see macroFramePath).
+        //
+        // Measured this way because nothing else in the probe can see it. The wall lines
+        // already agree (an arc leaves the border's x exactly where it was, it just stops
+        // short of the top), the rects already touch, and every bounds check passes - while
+        // on the glass two arcs pinch the shared wall at its top end and it reads as a seam
+        // instead of one line.
+        std::vector<std::pair<juce::String, float>> panelCorners;
         // The colour the WHOLE SPECTRUM panel is wearing right now (the selected
         // engine's). Probed because "it must not be the neutral steel again, and it
         // must not collide with the panels around it" is a measurable claim about a
@@ -115,8 +125,30 @@ public:
         // back to back; comparing the rects would call that a shared wall while the
         // screen shows a doubled border. These are what paint() puts on the glass.
         float wallSpectrumRight = 0.0f, wallTuningRight = 0.0f, wallColumnLeft = 0.0f;
+        // The Steps field's HOVER, in the language this probe was taken in. The average /
+        // worst-case selector and the sentence under it are gone (minimax could not change
+        // the result - see adaptRegStepsEdit), and the one thing that must not go with them
+        // is the answer to "so how ARE those registers combined?". It lives in this tooltip
+        // now, and a tooltip is invisible to every other check in this build - including to
+        // the bilingual sweep, which restores the language before it returns, so it has to
+        // be read HERE or not at all.
+        juce::String regStepsTip;
     };
     LayoutProbe layoutProbe() const;
+    // THE OUTLINE A MACRO PANEL IS DRAWN WITH, from its box rect - fill and stroke both.
+    // paint() strokes exactly what this returns and layoutProbe() measures exactly what
+    // this returns; there is no second place deciding which corners are round.
+    //
+    // That is not tidiness, it is what makes the corner check bite. The probe used to
+    // rebuild the path from its own copy of the rule, so sabotaging paint() into rounding
+    // the shared corner again left every check passing - the probe was measuring its own
+    // assumption. With one function, a hand that squares or rounds the wrong end changes
+    // the number the probe reads.
+    //
+    // The SHARED-WALL panels are SPECTRUM and TUNING: their right border is the same drawn
+    // line as the Spectrum-vs-Tuning column's left border (see the wall block in resized()),
+    // so that end is square and every corner facing open page keeps its radius.
+    juce::Path macroFramePath (const juce::Rectangle<int>& box) const;
     // Test hook (RhythmVerify): probe the layout in the OTHER language. Every painted
     // sub-label is bilingual and Catalan is the longer language nearly everywhere, so a
     // label that fits in English can still clip in Catalan - which is precisely how the
@@ -2914,16 +2946,19 @@ private:
     //
     //   Sethares' critical band is a width in Hz, so the answer genuinely differs per
     //   register - which registers a spectrum was optimised for therefore has to be on
-    //   screen, not implied. `adaptAggBox` picks mean-over-the-range vs the worst register.
+    //   screen, not implied.
+    //
+    //   There is no aggregate selector beside it any more. `adaptAggBox` offered mean over
+    //   the range vs minimax (the worst register), and minimax stopped being a choice the
+    //   day the range was anchored at the played note and made to run UPWARD: the worst
+    //   register of an upward range is the anchor itself, so minimax optimised the anchor
+    //   alone and THIS field stopped changing the result - 10.742 at every width. The
+    //   aggregate is the mean, always; the tooltip on this field says so.
     juce::TextEditor adaptRegStepsEdit;
-    juce::ComboBox   adaptAggBox;
     // `adaptRegSpanLbl` is what stops N being a magic number: it names the ANCHOR the range
     // hangs off and says what N amounts to in periods, so the width is readable without
     // arithmetic and the user can see WHICH note is being counted from.
-    // `adaptAggInfoLbl` says in WORDS what the aggregate choice costs the player. It
-    // replaced a line of bare counts ("3 registers, realtime 3") that explained nothing
-    // to anyone who had not read the source; those counts are in its tooltip.
-    juce::Label      adaptRegLbl, adaptRegSpanLbl, adaptAggInfoLbl;
+    juce::Label      adaptRegLbl, adaptRegSpanLbl;
     // N, in the user's own unit. < 0 means "not typed yet": until then the field shows -
     // and the search uses - the default width for whatever scale is loaded, so swapping
     // 12-EDO for 31-EDO on a fresh instance still gives two periods rather than two thirds
@@ -2961,7 +2996,6 @@ private:
     juce::String adaptReadoutTip() const;
     // Its five states, each a function of its own numbers so nothing is written twice and
     // the layout probe can measure every one of them at its widest (see readoutVariants).
-    juce::String adaptAggMeaning    (bool worstCase) const;
     juce::String adaptLineWorking   (int pct) const;
     juce::String adaptLineLag       (double ms) const;
     juce::String adaptLineFollowing (int updates) const;

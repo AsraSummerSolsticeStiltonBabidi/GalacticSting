@@ -607,7 +607,6 @@ public:
         // whatever scale is loaded - so a follower running with the window shut still spans
         // the register being played instead of collapsing to one pitch.
         int    regSteps  = -1;
-        int    aggregate = 0;        // 0 = mean over the range, 1 = minimax (the worst register)
     };
     // The KEY the register range hangs off: the lowest note being HELD, else the last one
     // played, else 60. In that order and for that reason - the hand-pressed Adapt must have
@@ -648,13 +647,12 @@ public:
         int    targetNotes = 0;
         bool   valid = false;
         // The register range this result was optimised over, and what it achieves across
-        // it. `before`/`after` are the AGGREGATE that was minimised (mean over the range,
-        // or the worst register's own value) - so the panel's one line reports the number
-        // the search actually worked on, never middle C's value standing in for six octaves.
+        // it. `before`/`after` are the aggregate that was minimised - the MEAN over the
+        // range - so the panel's one line reports the number the search actually worked on,
+        // never middle C's value standing in for six octaves.
         double regLoHz = 0.0, regHiHz = 0.0;
         int    regPoints = 1;
-        int    aggregate = 0;         // 0 = mean, 1 = minimax
-        double mean = 0.0,  worst = 0.0;       // both aggregates of the ADAPTED spectrum
+        double mean = 0.0,  worst = 0.0;       // the mean, and the register that scores worst
         double seedMean = 0.0, seedWorst = 0.0;
         double worstHz = 0.0;         // the register that scores worst
         std::vector<double> perRegister, registerF0;
@@ -679,10 +677,10 @@ public:
     // What the CURRENT spectrum really beats against the current target, measured on the
     // compiled partials - so a fractal level or a Reps count the adaptation did not model
     // shows up as a number the user can see instead of a silent discrepancy.
-    // `regs` must be the SAME registers the adaptation ran on and aggregated the same way:
-    // "sounding now" sits next to "after" in one line, and a value measured at one pitch
-    // against an aggregate over six octaves would differ for reasons that have nothing to
-    // do with the patch, printing a discrepancy warning that was pure arithmetic.
+    // `regs` must be the SAME registers the adaptation ran on: "sounding now" sits next to
+    // "after" in one line, and a value measured at one pitch against a mean over six
+    // octaves would differ for reasons that have nothing to do with the patch, printing a
+    // discrepancy warning that was pure arithmetic.
     double measureCurrentAgainstTarget (const std::vector<double>& alphas, double f0Hz,
                                         bool rootOnly, const dissonance::Registers& regs) const;
 

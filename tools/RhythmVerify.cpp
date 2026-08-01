@@ -2513,6 +2513,59 @@ int main()
                        "and so is the TUNING box's - one line on the glass, not two side by side");
                 check (win.contains (L.specColumn),
                        "and sharing it keeps the column inside the window");
+
+                // ...AND THE CORNERS AT THAT END ARE SQUARE. Sharing the x was not enough:
+                // SPECTRUM and TUNING rounded their top-right corner with a 9 px radius, so
+                // each one's top edge curved away from the wall 9 px before reaching it and
+                // the "one line" was pinched by two arcs. Invisible to every check above -
+                // the arc leaves the border's x exactly where it was and both rects still
+                // end on the wall - so it is measured as how far INSIDE its own corner each
+                // panel's drawn border passes (see LayoutProbe::panelCorners).
+                {
+                    float sq = -1.0f, tu = -1.0f, es = -1.0f, en = -1.0f, co = -1.0f;
+                    for (const auto& c : L.panelCorners)
+                    {
+                        if (c.first == "spectrum")   sq = c.second;
+                        if (c.first == "tuning")     tu = c.second;
+                        if (c.first == "essentials") es = c.second;
+                        if (c.first == "envelopes")  en = c.second;
+                        if (c.first == "column")     co = c.second;
+                    }
+                    std::printf ("  top-right corner inset: spectrum %.1f  tuning %.1f"
+                                 " | essentials %.1f  envelopes %.1f  column %.1f px\n",
+                                 sq, tu, es, en, co);
+                    // A square corner reports 0.5 (the first sample is already inside the
+                    // path); the 9 px rounding reports 2.5 - the quadratic's own closest
+                    // approach to the corner is rad/4 in each axis, so the two cases are
+                    // five sampling steps apart and cannot be confused for one another.
+                    check (sq >= 0.0f && sq < 1.0f && tu >= 0.0f && tu < 1.0f,
+                           "the two panels that OWN the shared wall meet it square - one straight line, no arcs");
+                    check (es >= 2.0f && en >= 2.0f && co >= 2.0f,
+                           "and every corner facing open page keeps its radius - only the shared end is squared");
+                }
+            }
+
+            // AIR BETWEEN PANELS THAT SHARE NOTHING. The shared wall is one line by design;
+            // everywhere else the boxes are separate objects and were 6 px (4 vertically)
+            // apart, which at a 2.6 px stroke reads as two borders leaning on each other.
+            // Measured on the RECTS here and stated as the drawn-line distance, which is
+            // the rect gap plus the two stroke offsets (kFrameLine each side).
+            {
+                const int vGap  = L.essentials.getY()  - L.spectrum.getBottom();
+                const int hGap1 = L.envelopes.getX()   - L.essentials.getRight();
+                const int hGap2 = L.tuning.getX()      - L.envelopes.getRight();
+                const float line = 2.0f * 1.3f;   // kFrameLine, both strokes
+                std::printf ("  unshared gaps: spectrum->row2 %d px (%.1f between lines),"
+                             " essentials->envelopes %d (%.1f), envelopes->tuning %d (%.1f)\n",
+                             vGap, (float) vGap + line, hGap1, (float) hGap1 + line,
+                             hGap2, (float) hGap2 + line);
+                check (vGap >= 6, "rows 1 and 2 share no border, so they sit 6 px apart (they were 4)");
+                check (hGap1 >= 8 && hGap2 >= 8,
+                       "and the three row-2 boxes share none either - 8 px between each pair (they were 6)");
+                check (! L.essentials.intersects (L.envelopes)
+                       && ! L.envelopes.intersects (L.tuning)
+                       && win.contains (L.envelopes),
+                       "with nothing overlapping and nothing pushed out of the window to pay for it");
             }
 
             // ONE BOX, ONE COLOUR. Every painted sub-label in SPECTRUM wears the selected
@@ -2808,30 +2861,32 @@ int main()
                     check (outside + squashed + condensed == 0,
                            "this mode's whole column fits, unsquashed and uncondensed");
 
-                    // A COMBO IS NOT A LABEL and the condensing rule above cannot see it:
-                    // a ComboBox given too little room draws its arrow and clips the word
-                    // silently. This box used to be squeezed into whatever the register
-                    // row had left over - 49 px, an arrow with a clipped word beside it -
-                    // and it now has a row of its own precisely because it is the choice
-                    // the panel most needed to spell out. The bar is the WORD's own width
-                    // in both languages, plus the arrow, not a guessed number.
+                    // THE AGGREGATE BOX IS GONE, and this is where a well-meaning hand puts
+                    // it back. It offered "average" vs "worst case"; with the range anchored
+                    // at the played note and running upward the worst register is always the
+                    // anchor, so minimax optimised one pitch and the Steps field beside it
+                    // stopped changing anything (10.742 at every width). Probing by NAME,
+                    // because a returning selector would sit there looking correct: nothing
+                    // else in this file measures a control that should not exist.
                     if (sh.mode == 2)
-                        for (const auto& c : P.controls)
-                            if (c.first == "spec.agg")
-                            {
-                                // The REAL geometry: the custom LookAndFeel gives the text
-                                // label box.width - height/3 - height/2, the label's own
-                                // border eats 10 more, and getComboBoxFont is 15 pt at
-                                // this height. 28 px of furniture, not a guess.
-                                const juce::Font cf { juce::FontOptions (15.0f) };
-                                const int need = juce::jmax (
-                                    juce::GlyphArrangement::getStringWidthInt (cf, lang == 1 ? "pitjor" : "worst"),
-                                    juce::GlyphArrangement::getStringWidthInt (cf, lang == 1 ? "mitjana" : "average")) + 28;
-                                std::printf ("    aggregate box: %d px wide, needs %d (%s)\n",
-                                             c.second.getWidth(), need, lang == 1 ? "ca" : "en");
-                                check (c.second.getWidth() >= need,
-                                       "the average/worst-case box fits its longest word beside its arrow");
-                            }
+                    {
+                        bool hasAgg = false;
+                        for (const auto& c : P.controls)      if (c.first == "spec.agg")    hasAgg = true;
+                        for (const auto& w : P.wrappedLabels) if (w.name == "spec.aggInfo") hasAgg = true;
+                        check (! hasAgg, "there is no average/worst-case selector, and no line explaining one");
+                        // ...and the explanation did not go with it. The user's ask was
+                        // explicitly "explain it in some hover", so the sentence has to be
+                        // IN the neighbouring control's tooltip, in the language on screen -
+                        // a tooltip no other check in this build can see.
+                        const auto& tip = P.regStepsTip;
+                        const bool says = lang == 1 ? tip.contains ("MITJANA")
+                                                    : tip.contains ("AVERAGE");
+                        std::printf ("    Steps hover: %d chars, says the aggregate is the average: %s (%s)\n",
+                                     tip.length(), says ? "yes" : "NO", lang == 1 ? "ca" : "en");
+                        check (says,
+                               "and the Steps field's hover says the spectrum is optimised as the AVERAGE"
+                               " across the register span");
+                    }
 
                     // THE WRAPPING READ-OUTS. A juce::Label lays out in as many lines as
                     // its height allows and then CONDENSES - and modern JUCE shrinks the
@@ -3388,8 +3443,27 @@ int main()
                 const auto tags = ed->keyboardPeriodTagsForTests();
                 int tooNarrow = 0, overlaps = 0, offCentre = 0, tiny = 0;
                 juce::String firstBad;
+                // THE GAP, measured INK TO INK, and why a rect check cannot see it. Both
+                // numbers are drawn CENTRED in their own rect, so two rects that merely do
+                // not overlap can still be six pixels of empty air apart - which is exactly
+                // what they were, and why the period number read as a second mark on the key
+                // instead of as an annotation of the "0" beside it. Recomputed here from the
+                // rects and text widths paint() really uses, then cross-checked against the
+                // layout's own `gap`, so neither side can drift into agreeing with itself.
+                float inkGap = -1.0f, gapDisagree = 0.0f;
+                int   tooFar = 0, tooSmall = 0;
                 for (const auto& t : tags)
                 {
+                    const float gg = (t.tag.getCentreX() - t.tagTextWidth * 0.5f)
+                                   - (t.zero.getCentreX() + t.zeroTextWidth * 0.5f);
+                    if (inkGap < 0.0f) inkGap = gg;
+                    gapDisagree = juce::jmax (gapDisagree, std::abs (gg - t.gap));
+                    // "bastante mas cerca del 0" - considerably closer. 6.19 px was the
+                    // shipped distance; anything above 3.5 is not "considerably closer",
+                    // and 1 px is the floor below which the two numbers touch.
+                    if (gg > 3.5f || gg < 1.0f) ++tooFar;
+                    // "un poco mas grandes" - the tag was 8.8 pt at the smallest key.
+                    if (t.tagFont < 9.5f) ++tooSmall;
                     if (t.tagTextWidth > (float) t.tag.getWidth())
                     { ++tooNarrow; if (firstBad.isEmpty()) firstBad = "period " + juce::String (t.number); }
                     // The "0" and its period number share a cell; the tag's strip is
@@ -3406,39 +3480,51 @@ int main()
                              overlaps, offCentre, tiny);
                 if (! tags.empty())
                     std::printf ("  first tag: period %d, \"0\" %.1f pt in %.0f px, number %.1f pt needing"
-                                 " %.1f px of %.0f\n",
+                                 " %.1f px of %.0f, ink gap %.2f px (was 6.19)\n",
                                  tags.front().number, tags.front().zeroFont, tags.front().zero.getWidth(),
                                  tags.front().tagFont, tags.front().tagTextWidth,
-                                 tags.front().tag.getWidth());
+                                 tags.front().tag.getWidth(), inkGap);
                 check (! tags.empty(), "every period boundary on screen carries its number");
                 check (tooNarrow == 0, "and every one of them fits its rect without being shrunk");
                 check (overlaps == 0, "and none of them prints over the \"0\" it belongs to");
                 check (offCentre == 0, "and each is vertically centred on that \"0\"");
                 check (tiny == 0, "and none of them is drawn below 7 pt");
+                check (gapDisagree < 0.01f,
+                       "the layout's own gap is the one the drawn rects and glyphs produce");
+                check (tooFar == 0, "the period number sits CLOSE to its \"0\" (1 .. 3.5 px of ink, was 6.19)");
+                check (tooSmall == 0, "and is drawn larger than the 8.8 pt it used to be");
 
-                // ...INCLUDING the numbers this tuning does not happen to show. A period
-                // number runs from one to three characters (a one-degree-per-period scale
-                // reaches "-10"), and the widest is the one nobody was looking at. Measured
-                // through the same layout call paint() uses, on the same cell geometry.
+                // ...INCLUDING the numbers this tuning does not happen to show, AT THE
+                // SMALLEST KEY THE KEYBOARD EVER DRAWS. A period number runs from one to
+                // three characters (a one-degree-per-period scale reaches "-10"), and the
+                // widest is the one nobody was looking at; keys have a fixed width, so
+                // kCellW - not the cell this window happened to open at - is the worst case.
+                // Measured through the same layout call paint() uses.
                 if (! tags.empty())
                 {
-                    const auto& t0 = tags.front();
-                    const float cellW = t0.zero.getWidth() + t0.tag.getWidth() + 2.0f;
-                    const auto  area  = t0.zero.getUnion (t0.tag);
-                    int narrow = 0, small = 0;
+                    const float cellW = (float) ScaleKeyboard::kCellW;
+                    const auto& t0    = tags.front();
+                    int narrow = 0, small = 0, far = 0;
                     for (const char* s : { "3", "-2", "-10" })
                     {
                         const juce::String txt (s);
-                        const auto z = ScaleKeyboard::layOutPeriodTag (area, cellW, txt.length());
-                        const float w = (float) juce::GlyphArrangement::getStringWidthInt (
-                            juce::Font (juce::FontOptions (z.tagFont).withStyle ("Bold")), txt);
-                        std::printf ("    \"%s\": %.1f pt, needs %.1f px of %.1f, \"0\" left with %.0f px\n",
-                                     s, z.tagFont, w, z.tag.getWidth(), z.zero.getWidth());
+                        const auto z = ScaleKeyboard::layOutPeriodTagForCell (cellW, t0.cellH,
+                                                                             t0.label, txt);
+                        const float w  = ScaleKeyboard::boldTextWidth (txt, z.tagFont);
+                        const float zw = ScaleKeyboard::boldTextWidth ("0", z.zeroFont);
+                        const float gg = (z.tag.getCentreX() - w * 0.5f)
+                                       - (z.zero.getCentreX() + zw * 0.5f);
+                        std::printf ("    \"%s\" at a %d px key: %.1f pt, needs %.1f px of %.1f,"
+                                     " \"0\" %.1f pt in %.1f px, ink gap %.2f\n",
+                                     s, ScaleKeyboard::kCellW, z.tagFont, w, z.tag.getWidth(),
+                                     z.zeroFont, z.zero.getWidth(), gg);
                         if (w > z.tag.getWidth()) ++narrow;
                         if (z.tagFont < 7.0f || z.zero.getWidth() < 10.0f) ++small;
+                        if (gg > 3.5f || gg < 1.0f) ++far;
                     }
                     check (narrow == 0, "a one-, two- or three-character period all fit their strip");
                     check (small == 0, "and none of them costs the \"0\" its own legibility");
+                    check (far == 0, "and every one of them stays tight against its \"0\"");
                 }
             }
 
@@ -3739,17 +3825,24 @@ int main()
             const double anchorHz = p.getNoteFrequency (p.registerAnchorKey());
             const double topHz    = p.getNoteFrequency (juce::jlimit (0, 127, p.registerAnchorKey()
                                                                               + p.defaultRegisterSteps()));
-            std::printf ("  registers: %d points, %.2f..%.2f Hz (anchor key %d at %.2f Hz, target f0 %.2f), %s\n",
+            std::printf ("  registers: %d points, %.2f..%.2f Hz (anchor key %d at %.2f Hz, target f0 %.2f),"
+                         " aggregated as the mean\n",
                          info.regPoints, info.regLoHz, info.regHiHz, p.registerAnchorKey(),
-                         anchorHz, f0, info.aggregate == 1 ? "minimax" : "mean");
+                         anchorHz, f0);
             check (info.regPoints == 3 && std::abs (info.regLoHz - anchorHz) < 1.0e-6
                    && std::abs (info.regHiHz - topHz) < 1.0e-6,
                    "an unset width is two periods UP from the note played, sampled at three registers");
             check ((int) info.perRegister.size() == info.regPoints
                    && (int) info.registerF0.size() == info.regPoints,
                    "and the result carries one measured number per register");
+            // The number the panel prints IS the aggregate the search minimised - the MEAN -
+            // and the worst register is carried beside it as a read-out only. If `after`
+            // ever came back as the worst register's own value again (which is what the
+            // deleted minimax path made it), this is where it would show.
+            check (std::abs (info.after - info.mean) < 1.0e-12,
+                   "what the panel prints as \"after\" is the MEAN over the registers, not one of them");
             check (info.mean <= info.worst + 1.0e-12 && info.after <= info.seedWorst,
-                   "the aggregate read-outs are consistent (mean never above the worst register)");
+                   "and the read-outs stay consistent (the mean is never above the worst register)");
             // The realtime follower's cap is a STATED difference, not a silent one: at this
             // two-octave range it samples exactly as densely as the Adapt button does.
             const auto rtRegs = p.adaptRegistersFor (st, f0, /*realtime*/ true);

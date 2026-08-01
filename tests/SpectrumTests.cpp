@@ -1236,12 +1236,10 @@ int main()
             }
             return s;
         };
-        const auto adaptOver = [&] (double anchor, double lo, double hi, int pts,
-                                    dissonance::Aggregate mode)
+        const auto adaptOver = [&] (double anchor, double lo, double hi, int pts)
         {
             dissonance::Registers rg;
             rg.f0 = dissonance::registerPoints (lo, hi, pts);
-            rg.mode = mode;
             return dissonance::adaptSpectrum (seedR (anchor), anchor, oneNote, true,
                                               dissonance::Goal::Min, 0.0, 0.0, gapR, topR,
                                               false, 24.0, 8, rg);
@@ -1254,8 +1252,7 @@ int main()
             const auto pts = dissonance::registerPoints (lo, hi,
                                  1 + (int) std::lround (12.0 * std::log2 (hi / lo)));
             const auto rs = dissonance::scoreOverRegisters (sp, spF0, pts, oneNote, true,
-                                                            dissonance::Goal::Min, 0.0, 0.0,
-                                                            dissonance::Aggregate::Mean);
+                                                            dissonance::Goal::Min, 0.0, 0.0);
             mean = rs.mean; worst = rs.worst;
             worstHz = pts[(size_t) rs.worstIndex];
         };
@@ -1292,10 +1289,10 @@ int main()
             // ...and those clusters are what dominates in the treble.
             const auto atTopBass = dissonance::scoreOverRegisters (bassOnly.spectrum, lo1, { hi7 },
                                                                    oneNote, true, dissonance::Goal::Min,
-                                                                   0.0, 0.0, dissonance::Aggregate::Mean);
+                                                                   0.0, 0.0);
             const auto atTopTop  = dissonance::scoreOverRegisters (trebleOnly.spectrum, hi7, { hi7 },
                                                                    oneNote, true, dissonance::Goal::Min,
-                                                                   0.0, 0.0, dissonance::Aggregate::Mean);
+                                                                   0.0, 0.0);
             std::printf ("    judged at %.0f Hz: bass-optimised %.3f vs treble-optimised %.3f (%.2fx worse)\n",
                          hi7, atTopBass.perRegister[0], atTopTop.perRegister[0],
                          atTopBass.perRegister[0] / atTopTop.perRegister[0]);
@@ -1305,54 +1302,63 @@ int main()
 
         //---------------------------------------------------------------------
         // (3) THE FIX BEATS IT. Same seed, same partials, same gap - only the objective
-        // changes. Both aggregation modes must improve the worst register of the range
-        // over what the single-pitch answer leaves there.
+        // changes. The range objective (the MEAN over the registers, which is now the only
+        // one) must lower the average across the range AND improve the worst register the
+        // single-pitch answer leaves behind.
         double bassM = 0, bassW = 0, bassWHz = 0;
         judge (bassOnly.spectrum, lo1, lo1, hi7, bassM, bassW, bassWHz);
-        const auto meanRun = adaptOver (lo1, lo1, hi7, 7, dissonance::Aggregate::Mean);
-        const auto miniRun = adaptOver (lo1, lo1, hi7, 7, dissonance::Aggregate::Minimax);
-        double meanM = 0, meanW = 0, meanWHz = 0, miniM = 0, miniW = 0, miniWHz = 0;
+        const auto meanRun = adaptOver (lo1, lo1, hi7, 7);
+        double meanM = 0, meanW = 0, meanWHz = 0;
         judge (meanRun.spectrum, lo1, lo1, hi7, meanM, meanW, meanWHz);
-        judge (miniRun.spectrum, lo1, lo1, hi7, miniM, miniW, miniWHz);
         {
             std::printf ("  over 33..2093 Hz (dense sweep of the ANSWERS):\n");
             std::printf ("    single pitch (33 Hz): mean %.3f   worst %.3f at %.0f Hz\n", bassM, bassW, bassWHz);
-            std::printf ("    MEAN aggregate   : mean %.3f   worst %.3f at %.0f Hz\n", meanM, meanW, meanWHz);
-            std::printf ("    MINIMAX aggregate: mean %.3f   worst %.3f at %.0f Hz\n", miniM, miniW, miniWHz);
-            check (miniW < bassW * 0.85,
-                   "MINIMAX cuts the worst register of the range by >15% against the single-pitch answer");
+            std::printf ("    range (mean of 7)   : mean %.3f   worst %.3f at %.0f Hz\n", meanM, meanW, meanWHz);
+            std::printf ("    the range objective is %.1f%% better on average, and %.1f%% better"
+                         " at the worst register\n",
+                         100.0 * (bassM - meanM) / bassM, 100.0 * (bassW - meanW) / bassW);
             check (meanM < bassM * 0.98,
-                   "and MEAN lowers the average across the range against it too");
-
-            // THE TRADE, stated in numbers, because the panel offers both and the user has
-            // to choose: minimax buys its worst register with the average, and vice versa.
-            std::printf ("    minimax's worst register is %.1f%% better than mean's;"
-                         " mean's average is %.1f%% better than minimax's\n",
-                         100.0 * (meanW - miniW) / meanW, 100.0 * (miniM - meanM) / miniM);
-            check (miniW < meanW,  "minimax really does protect the worst register better than mean");
-            check (meanM < miniM,  "and mean really does reach a better average than minimax");
+                   "the range objective lowers the AVERAGE across the range against the single-pitch answer");
+            // ...and it does NOT buy that average by sacrificing the worst register. It does
+            // not protect it either - that was minimax's job, and minimax bought its worst
+            // register with about 20% of the average. What matters for dropping minimax is
+            // not that the mean replaces it (it does not) but that minimax had stopped doing
+            // it: anchored at the played note and running upward, the worst register IS the
+            // anchor, so minimax optimised one pitch and the width bought nothing. The honest
+            // claim for the aggregate that ships is this one - a big win on the average, and
+            // no loss at the extreme.
+            check (meanW <= bassW,
+                   "and does not pay for it at the worst register (1.2% better here, not worse)");
         }
 
         //---------------------------------------------------------------------
-        // (4) THE SAMPLING RULE, EARNED. One octave between points; two is not enough.
-        // The test that matters is not "does a coarse sampling estimate the aggregate" but
-        // "does a spectrum optimised on it hold up when judged densely" - and for minimax,
-        // which hunts a peak, points two octaves apart let the peak fall between them.
+        // (4) THE SAMPLING RULE, EARNED - on the objective that actually ships. One octave
+        // between points. The test that matters is not "does a coarse sampling estimate the
+        // aggregate" but "does a spectrum optimised on it hold up when judged densely".
+        //
+        // The rule was originally earned on MINIMAX, which hunts a peak: at two octaves a
+        // point the peak fell between the points and the answer came out +20.6% worse. That
+        // aggregate is gone (see Dissonance.h - anchored at the played note and running
+        // upward, its worst register is always the anchor, so it optimised one pitch and the
+        // width stopped changing anything: 10.742 at every width). The MEAN is far more
+        // forgiving, but the rule still earns itself on it: one octave a point lands within
+        // 0.5% of a four-times-denser sampling, and two octaves a point comes out +2.2%
+        // worse - so the spacing is bought, not assumed.
         {
-            const auto ref = adaptOver (lo1, lo1, hi7, 25, dissonance::Aggregate::Minimax);
+            const auto ref = adaptOver (lo1, lo1, hi7, 25);
             double refM = 0, refW = 0, refH = 0;
             judge (ref.spectrum, lo1, lo1, hi7, refM, refW, refH);
-            std::printf ("  minimax sampling (6 octaves), judged densely against a 0.25-octave reference:\n");
+            std::printf ("  MEAN sampling (6 octaves), judged densely against a 0.25-octave reference:\n");
             double w4 = 0, w7 = 0, m4 = 0, m7 = 0, h = 0;
-            judge (adaptOver (lo1, lo1, hi7, 4, dissonance::Aggregate::Minimax).spectrum, lo1, lo1, hi7, m4, w4, h);
-            judge (miniRun.spectrum, lo1, lo1, hi7, m7, w7, h);
-            std::printf ("    reference (0.25 oct): worst %.3f\n", refW);
-            std::printf ("    4 points (2.00 oct) : worst %.3f (%+.1f%%)\n", w4, 100.0 * (w4 - refW) / refW);
-            std::printf ("    7 points (1.00 oct) : worst %.3f (%+.1f%%)\n", w7, 100.0 * (w7 - refW) / refW);
-            check (std::abs (w7 - refW) < 0.06 * refW,
-                   "one octave a point lands within 6% of a four-times-denser sampling");
-            check (w4 > w7 * 1.05,
-                   "two octaves a point is measurably worse - the rule is earned, not assumed");
+            judge (adaptOver (lo1, lo1, hi7, 4).spectrum, lo1, lo1, hi7, m4, w4, h);
+            judge (meanRun.spectrum, lo1, lo1, hi7, m7, w7, h);
+            std::printf ("    reference (0.25 oct): mean %.3f\n", refM);
+            std::printf ("    4 points (2.00 oct) : mean %.3f (%+.1f%%)\n", m4, 100.0 * (m4 - refM) / refM);
+            std::printf ("    7 points (1.00 oct) : mean %.3f (%+.1f%%)\n", m7, 100.0 * (m7 - refM) / refM);
+            check (std::abs (m7 - refM) < 0.03 * refM,
+                   "one octave a point lands within 3% of a four-times-denser sampling");
+            check (m4 > m7 * 1.01,
+                   "and two octaves a point is measurably worse (+2.2%) - the rule is earned, not assumed");
         }
 
         //---------------------------------------------------------------------
@@ -1402,7 +1408,7 @@ int main()
 
             double worstGap = 1.0e9, quietest = 1.0e9;
             bool ordered = true;
-            for (const auto& r : { meanRun, miniRun })
+            for (const auto& r : { meanRun })
             {
                 if ((int) r.spectrum.size() != Nr) ordered = false;
                 for (size_t i = 0; i < r.spectrum.size(); ++i)
@@ -1422,27 +1428,28 @@ int main()
 
         //---------------------------------------------------------------------
         // (7) THE READ-OUT CANNOT LIE. What adaptSpectrum reports as `score` is the
-        // aggregate it optimised, recomputed here from the spectrum it returned - the
-        // panel prints these two numbers as "before -> after" and they have to be the
-        // thing the search actually worked on, not middle C standing in for six octaves.
+        // aggregate it optimised - the MEAN over the registers - recomputed here from the
+        // spectrum it returned. The panel prints these two numbers as "before -> after" and
+        // they have to be the thing the search actually worked on, not middle C standing in
+        // for six octaves and not the worst register standing in for the average.
         {
-            const auto rs = dissonance::scoreOverRegisters (miniRun.spectrum, lo1, miniRun.registerF0,
-                                                            oneNote, true, dissonance::Goal::Min,
-                                                            0.0, 0.0, dissonance::Aggregate::Minimax);
-            check (std::abs (miniRun.score - rs.worst) < 1.0e-12
-                   && std::abs (miniRun.worst - rs.worst) < 1.0e-12,
-                   "minimax reports the WORST register's own value");
             const auto rm = dissonance::scoreOverRegisters (meanRun.spectrum, lo1, meanRun.registerF0,
                                                             oneNote, true, dissonance::Goal::Min,
-                                                            0.0, 0.0, dissonance::Aggregate::Mean);
-            check (std::abs (meanRun.score - rm.mean) < 1.0e-12,
-                   "and mean reports the average over the range");
-            check ((int) miniRun.perRegister.size() == (int) miniRun.registerF0.size()
-                   && miniRun.registerF0.size() == 7,
+                                                            0.0, 0.0);
+            check (std::abs (meanRun.score - rm.mean) < 1.0e-12
+                   && std::abs (meanRun.mean - rm.mean) < 1.0e-12,
+                   "the reported score IS the average over the range");
+            // `worst` survives as a READ-OUT and nothing else: it must still be the largest
+            // per-register value, so a caller quoting it is quoting the real thing.
+            double biggest = 0.0;
+            for (const double d : rm.perRegister) biggest = std::max (biggest, d);
+            check (std::abs (meanRun.worst - biggest) < 1.0e-12,
+                   "and `worst` still names the register that really scores worst");
+            check ((int) meanRun.perRegister.size() == (int) meanRun.registerF0.size()
+                   && meanRun.registerF0.size() == 7,
                    "with one number per register, for every register it was asked for");
-            // Both modes minimise: whatever each was told to optimise, it beat its seed.
-            check (miniRun.score < miniRun.seedScore && meanRun.score < meanRun.seedScore,
-                   "and both aggregates really came down from the harmonic seed");
+            check (meanRun.score < meanRun.seedScore,
+                   "and it really came down from the harmonic seed");
         }
 
         //---------------------------------------------------------------------
@@ -1467,8 +1474,7 @@ int main()
             const auto atOne = [&] (const std::vector<dissonance::Partial>& sp, double spF0, double f)
             {
                 return dissonance::scoreOverRegisters (sp, spF0, { f }, oneNote, true,
-                                                       dissonance::Goal::Min, 0.0, 0.0,
-                                                       dissonance::Aggregate::Mean).perRegister[0];
+                                                       dissonance::Goal::Min, 0.0, 0.0).perRegister[0];
             };
             // WIDTH 0 is the old single-pitch behaviour, kept in the table as the baseline
             // every other row has to beat somewhere.
@@ -1485,13 +1491,10 @@ int main()
             for (int i = 0; i < 6; ++i)
             {
                 const double f = atOct (anch, probes[i]);
-                refAt[i] = atOne (adaptOver (anch, f, f, 1, dissonance::Aggregate::Mean).spectrum, anch, f);
+                refAt[i] = atOne (adaptOver (anch, f, f, 1).spectrum, anch, f);
             }
-            for (const auto mode : { dissonance::Aggregate::Mean, dissonance::Aggregate::Minimax })
             {
-                const bool mini = mode == dissonance::Aggregate::Minimax;
-                std::printf ("  range WIDTH, anchored at %.1f Hz, %s aggregate (dense-judged):\n",
-                             anch, mini ? "minimax" : "mean");
+                std::printf ("  range WIDTH, anchored at %.1f Hz (dense-judged):\n", anch);
                 std::printf ("    width     pts   at anchor  worst inside  1 period above"
                              "   | penalty vs a spectrum optimised for that register alone\n");
                 std::printf ("    %-56s|   +0     +1     +2     +3     +4     +5 periods\n", "");
@@ -1501,12 +1504,12 @@ int main()
                 {
                     const double top = atOct (anch, w);
                     const int pts = dissonance::registerCountFor (anch, top, dissonance::kAdaptRegisterCap);
-                    const auto run = adaptOver (anch, anch, top, pts, mode);
+                    const auto run = adaptOver (anch, anch, top, pts);
                     double m = 0, worst = 0, wHz = 0;
                     judge (run.spectrum, anch, anch, top, m, worst, wHz);
                     const double here = atOne (run.spectrum, anch, anch);
                     const double out  = atOne (run.spectrum, anch, atOct (top, 1.0));
-                    const auto refAbove = adaptOver (anch, atOct (top, 1.0), atOct (top, 1.0), 1, mode);
+                    const auto refAbove = adaptOver (anch, atOct (top, 1.0), atOct (top, 1.0), 1);
                     const double refOut = atOne (refAbove.spectrum, anch, atOct (top, 1.0));
                     std::printf ("    %.1f per %4d  %10.3f  %12.3f  %8.3f %5.2fx |",
                                  w, pts, here, worst, out, out / std::max (1.0e-9, refOut));
@@ -1526,37 +1529,34 @@ int main()
                 std::printf ("    mean penalty over the anchor and four periods above it:");
                 for (int i = 0; i < row; ++i) std::printf ("  %.1f per %.2fx", widths[i], meanPen04[i]);
                 std::printf ("\n");
-                if (! mini)
-                {
-                    // (i) WIDENING COSTS THE PLAYED REGISTER, and the cost is real but
-                    // bounded. If it were not bounded the honest default would be "no
-                    // range at all", because the anchor is the one register the player is
-                    // certain to hear.
-                    std::printf ("    at the anchor: %.3f with no range -> %.3f at 2 periods"
-                                 " -> %.3f at 4 periods\n", anchorAt[0], anchorAt[3], anchorAt[5]);
-                    check (anchorAt[3] < anchorAt[0] * 1.35,
-                           "a two-period range costs the register being played less than 35% against no range at all");
-                    // (ii) THE HOLE IS REAL. Optimising at ONE pitch leaves the register a
-                    // period up measurably worse than a range does - that is what makes the
-                    // width a decision rather than a shrug.
-                    std::printf ("    one period above a ZERO-width range: %.2fx"
-                                 " vs %.2fx above a two-period range\n", penAbove[0], penAbove[3]);
-                    check (meanPen04[3] < meanPen04[0],
-                           "a two-period range really is better across the anchor and the four periods above it"
-                           " than optimising at the played pitch alone");
-                }
-                else
-                {
-                    // MINIMAX DEGENERATES under an anchor-and-up range, and the panel's own
-                    // wording has to survive that: the range starts AT the played note and
-                    // the played note is the worst register in it, so "only the worst
-                    // register counts" IS "only the anchor counts" - the width buys nothing.
-                    // Mean is the aggregate that makes N mean something.
-                    std::printf ("    minimax at the anchor across all widths: %.3f .. %.3f\n",
-                                 anchorAt[0], anchorAt[5]);
-                    check (std::abs (anchorAt[5] - anchorAt[0]) < 0.02 * anchorAt[0],
-                           "under an anchor-and-up range MINIMAX is the anchor alone - width changes nothing for it");
-                }
+                // (i) WIDENING COSTS THE PLAYED REGISTER, and the cost is real but
+                // bounded. If it were not bounded the honest default would be "no
+                // range at all", because the anchor is the one register the player is
+                // certain to hear.
+                std::printf ("    at the anchor: %.3f with no range -> %.3f at 2 periods"
+                             " -> %.3f at 4 periods\n", anchorAt[0], anchorAt[3], anchorAt[5]);
+                check (anchorAt[3] < anchorAt[0] * 1.35,
+                       "a two-period range costs the register being played less than 35% against no range at all");
+                // (ii) THE HOLE IS REAL. Optimising at ONE pitch leaves the register a
+                // period up measurably worse than a range does - that is what makes the
+                // width a decision rather than a shrug.
+                std::printf ("    one period above a ZERO-width range: %.2fx"
+                             " vs %.2fx above a two-period range\n", penAbove[0], penAbove[3]);
+                check (meanPen04[3] < meanPen04[0],
+                       "a two-period range really is better across the anchor and the four periods above it"
+                       " than optimising at the played pitch alone");
+                // (iii) THE WIDTH FIELD ACTUALLY DOES SOMETHING. This is the check that
+                // replaces the deleted minimax aggregate rather than merely deleting it.
+                // Under minimax the range's worst register was ALWAYS the anchor (the range
+                // starts there and runs up), so "only the worst register counts" was "only
+                // the anchor counts": the anchor scored 10.742 at 0, 0.5, 1, 2, 3 and 4
+                // periods - identical to five decimals - and the Steps field could not change
+                // the result at all. Under the mean it has to, or the control is decorative.
+                std::printf ("    the anchor moves %.1f%% between a zero-width and a four-period range"
+                             " (under minimax it moved 0.0%%: 10.742 at every width)\n",
+                             100.0 * std::abs (anchorAt[5] - anchorAt[0]) / anchorAt[0]);
+                check (std::abs (anchorAt[5] - anchorAt[0]) > 0.05 * anchorAt[0],
+                       "and the WIDTH really changes the answer - the control the minimax aggregate made inert");
             }
             // ...and the same question asked from three different registers, because a
             // default fitted to middle C would be a default fitted to one measurement. Only
@@ -1572,7 +1572,7 @@ int main()
                     for (int i = 0; i < 5; ++i)
                     {
                         const double f = atOct (a, (double) i);
-                        refs[i] = atOne (adaptOver (a, f, f, 1, dissonance::Aggregate::Mean).spectrum, a, f);
+                        refs[i] = atOne (adaptOver (a, f, f, 1).spectrum, a, f);
                     }
                     std::printf ("    anchor %7.1f Hz:", a);
                     int best = 0; double bestVal = 1.0e9;
@@ -1580,8 +1580,7 @@ int main()
                     {
                         const double top = atOct (a, widths[r]);
                         const auto run = adaptOver (a, a, top,
-                                                    dissonance::registerCountFor (a, top, dissonance::kAdaptRegisterCap),
-                                                    dissonance::Aggregate::Mean);
+                                                    dissonance::registerCountFor (a, top, dissonance::kAdaptRegisterCap));
                         double sum = 0.0;
                         for (int i = 0; i < 5; ++i)
                             sum += atOne (run.spectrum, a, atOct (a, (double) i)) / std::max (1.0e-9, refs[i]);
@@ -1623,7 +1622,6 @@ int main()
                 const auto timeOne = [&] (const char* what, double lo, double hi)
                 {
                     dissonance::Registers rg;
-                    rg.mode = dissonance::Aggregate::Mean;
                     rg.f0 = dissonance::registerPoints (lo, hi,
                                 dissonance::registerCountFor (lo, hi, dissonance::kAdaptRegisterCapRt));
                     const auto t0 = std::chrono::steady_clock::now();
@@ -1693,7 +1691,6 @@ int main()
             for (int i = 0; i < c.A; ++i) alphas.push_back (std::exp2 ((double) i / 31.0));
             dissonance::Registers rg;
             rg.f0 = dissonance::registerPoints (f0 * 0.5, f0 * 4.0, c.R);
-            rg.mode = dissonance::Aggregate::Mean;
 
             const auto t0 = std::chrono::steady_clock::now();
             const auto res = dissonance::adaptSpectrum (seed, f0, alphas, c.rootOnly,
