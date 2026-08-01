@@ -459,6 +459,23 @@ int main()
     }
 
     //--------------------------------------------------------------------------
+    // The adapted-spectrum text used to print every value at a fixed 5 decimals
+    // ("100.00000c 1200.00000c"), pure noise the user then had to edit around.
+    // Precision must survive the trim: only REDUNDANT zeros go.
+    std::printf ("Cents text (trailing zeros trimmed, precision kept):\n");
+    {
+        using dissonance::centsText;
+        check (centsText (700.0)      == "700",       "700.00000 -> 700 (no redundant zeros)");
+        check (centsText (701.955)    == "701.955",   "701.955 keeps its real decimals");
+        check (centsText (200.00002)  == "200.00002", "200.00002 keeps ALL its 5 decimals");
+        check (centsText (100.000004) == "100",       "sub-precision dust rounds away, then trims");
+        check (centsText (1200.5)     == "1200.5",    "1200.50000 -> 1200.5");
+        check (centsText (0.0)        == "0",         "zero is plain 0");
+        check (centsText (-0.000001)  == "0",         "negative dust never prints as -0");
+        check (centsText (-386.31371) == "-386.31371","negative values keep sign and precision");
+    }
+
+    //--------------------------------------------------------------------------
     std::printf ("N-note chords (Sethares union measure, TTSS 6.8/App.E):\n");
     {
         // A harmonic timbre, 7 partials, saw-ish roll-off, anchored at middle C.

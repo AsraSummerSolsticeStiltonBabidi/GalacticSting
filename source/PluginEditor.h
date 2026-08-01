@@ -35,7 +35,9 @@ public:
     // Nothing in the plugin itself calls this.
     struct LayoutProbe
     {
-        juce::Rectangle<int> spectrum, harmonicEngine, customEngine, bothEngines,
+        // engineBox is the ONE shared box both engines live in (the HARMONIC / CUSTOM
+        // chips are its title; the selected chip decides whose controls are inside).
+        juce::Rectangle<int> spectrum, engineBox, bothEngines,
                              essentials, tuning, engineChips;
         // The colour the WHOLE SPECTRUM panel is wearing right now (the selected
         // engine's). Probed because "it must not be the neutral steel again, and it
@@ -50,6 +52,11 @@ public:
     // the panel would still be wearing the colour it was constructed with and "selecting
     // an engine recolours the whole panel" could not be measured at all.
     void refreshEngineDressing() { applyEngineState(); }
+    // Test hook (RhythmVerify): click an engine chip the way a hand does. Exists for
+    // the one behaviour a probe of engineInForce cannot reach: with NO scale loaded,
+    // clicking CUSTOM must still open that view (it is the only place the Load button
+    // and the intervals editor live), while the sound honestly stays harmonic.
+    void clickEngineChipForTests (int i) { if (engineChip[i & 1].onClick) engineChip[i & 1].onClick(); }
 
     // Test hooks (RhythmVerify): drive the Spectrum-vs-Tuning panel the way a hand does -
     // pick a mode, pick the adaptation's target, press REALTIME - and read back what the
@@ -127,8 +134,11 @@ private:
         void showPopup() override { if (onBeforePopup) onBeforePopup(); juce::ComboBox::showPopup(); }
     };
 
-    // TextEditor that grows while being edited (the Custom-Engine intervals box
-    // stretches to the window edge while typing, then shrinks back on blur).
+    // TextEditor with a focus hook. It used to stretch to the window edge while
+    // typing (the intervals box was one 24 px line); now that box is a multi-line
+    // area filling most of the shared engine box, so the hook only resets the view
+    // to the text's start on blur - but the hook itself stays: without it a long
+    // list was left scrolled to its tail and read as if it began mid-way.
     struct ExpandingEditor : juce::TextEditor
     {
         std::function<void (bool)> onFocusChanged;
@@ -2567,14 +2577,34 @@ private:
     juce::ToggleButton primeToggle[9], morphToggle;
     juce::ToggleButton temperToggle; // lives INSIDE the Custom Engine box (the scale it bypasses)
     std::unique_ptr<ButtonAttachment> temperAtt;
-    // SPECTRUM panel: the two ENGINES as chips, directly under the panel title and
-    // built exactly like the modulator tab strip - exactly one lit, and the selected
-    // one's colour is worn by the whole panel. They READ engineInForce() and WRITE the
-    // parameters that decide it, so an override is one click to leave - and switching
-    // away never discards the loaded scale (only "timbreOn" goes down).
-    // TEMPERED is NOT one of them: it is a mode of the harmonic engine, a tick box in
-    // the Custom Engine box (see temperToggle), not a third engine.
+    // SPECTRUM panel: the two ENGINES as chips - the TITLE ROW of the one shared
+    // engine box, built exactly like the modulator tab strip. Exactly one lit, the
+    // selected one's colour worn by the whole panel, and the selected one's controls
+    // the only ones inside the box (resized() gates visibility from engineInForce).
+    // They READ engineInForce() and WRITE the parameters that decide it, so chip
+    // selection and which engine SOUNDS are one thing - and switching away never
+    // discards the loaded scale (only "timbreOn" goes down).
+    // TEMPERED is NOT one of them: it is a mode of the harmonic engine, a tick box
+    // laid out in BOTH views (see temperToggle), not a third engine.
     juce::TextButton engineChip[2];
+    // Show the CUSTOM view while nothing sounds custom yet. The engines share ONE box,
+    // so with no scale loaded the Load button and the intervals editor only exist
+    // inside the custom view - if the CUSTOM chip refused the click until a scale
+    // existed (as it used to), the only ways to CREATE one would be unreachable.
+    // Cleared the moment any non-harmonic engine state is observed, and by the
+    // HARMONIC chip: it may only ever hold the box open as a workspace, never
+    // contradict a real engine change.
+    bool customViewPinned = false;
+    // ONE predicate for "which view is inside the shared engine box", used by
+    // resized() (visibility + layout), paint() (dividers/sub-labels) and
+    // applyEngineState() (chip lighting + panel colour) - three readers that must
+    // never disagree about what is on screen.
+    bool customViewShown() const
+    {
+        using E = FractalAdditiveAudioProcessor::EngineInForce;
+        const auto st = processorRef.engineInForce();
+        return st == E::CustomScale || (st == E::Harmonic && customViewPinned);
+    }
     // What applyEngineState() dressed the panel in. Seeded with the harmonic engine's
     // blue - the state a fresh instance opens in - so the very first paint (which can
     // land before the first applyEngineState) is never a default black frame.
@@ -2659,8 +2689,8 @@ private:
     // in table mode - a scale's period comes from the scale and must not look editable.
     juce::TextEditor tablePeriodEdit;
     juce::TextButton tablePeriodResetBtn;
-    ExpandingEditor  intervalEdit; // Custom Engine: typed intervals -> partials (grows while editing)
-    juce::Rectangle<int> intervalEditHome; // its normal (collapsed) bounds
+    ExpandingEditor  intervalEdit; // Custom Engine: typed intervals -> partials (multi-line)
+    juce::Rectangle<int> intervalEditHome; // its laid-out bounds (kept for the focus hook)
     juce::TextEditor refAEdit;     // Reference A: type the Hz directly ("hz" shown to its right)
     WarningOverlay warningOverlay;
     NoticeOverlay  noticeOverlay;
@@ -2792,9 +2822,9 @@ private:
     bool catalan = false;
     int  baseKey = 60; // MIDI note of the leftmost computer key; Z/X shift it by one period
     int  lastPrimeMode = -1;
-    // Packs engineInForce() with "is a custom scale loaded at all" - the CUSTOM chip is
-    // only clickable in the second case, and that can change without the first one
-    // moving (loading a scale while the engine is off). -1 = never applied yet.
+    // Packs engineInForce() with "is a custom scale loaded at all" - the second bit
+    // can change without the first one moving (loading a scale while the engine is
+    // off), and the custom view's Off button hangs on it. -1 = never applied yet.
     int  lastEngineShown = -1;
     int  lastResetOffState = -1; // packs Reset/Off visibility to detect changes for relayout
     int  lastDissGeneration = 0; // refresh the degree list / shortfall notice once per generation
@@ -2803,10 +2833,13 @@ private:
     // Everything here is a rect only - the frames, the title chips, the dividers, the
     // sub-labels and the override badges are all drawn in paint() from these.
     juce::Rectangle<int> spectrumBounds;       // the whole SPECTRUM panel
-    juce::Rectangle<int> engineNoteBounds;     // header strip right of the engine chips
-    juce::Rectangle<int> harmonicEngineBounds; // nested: HARMONIC ENGINE
-    juce::Rectangle<int> hcBase, hcHarm, hcPrime;  // its sub-cells
-    juce::Rectangle<int> customEngineBounds;   // nested: CUSTOM ENGINE (replaces the one above)
+    // ONE shared engine box: the HARMONIC / CUSTOM chips are its title row, and only
+    // the selected engine's controls are laid out inside it (the other's are hidden).
+    // Two separate framed boxes said "two independent things" about two engines that
+    // are mutually exclusive, and left the Custom Engine squeezed into a fifth of the
+    // panel while most of its box was air.
+    juce::Rectangle<int> engineBoxBounds;
+    juce::Rectangle<int> hcBase, hcHarm, hcPrime;  // harmonic view's sub-cells (empty in custom view)
     juce::Rectangle<int> bothEnginesBounds;    // nested: what applies to EITHER engine
     juce::Rectangle<int> beSlope, beFractal, beMorph, beRange; // its sub-cells
     juce::Rectangle<int> essentialsBounds;     // Essentials macro-group frame

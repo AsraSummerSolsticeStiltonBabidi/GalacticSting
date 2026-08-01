@@ -28,6 +28,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <cstdio>
 
 namespace dissonance
 {
@@ -93,6 +94,28 @@ namespace dissonance
         auto s = justIntervalName (ratio, exactTolCents);
         if (s.size() > 2 && s.compare (s.size() - 2, 2, "/1") == 0)
             s.erase (s.size() - 2);
+        return s;
+    }
+
+    // A cents VALUE as display/round-trip text, without redundant zeros: "700",
+    // "701.955", "200.00002" - never "700.00000". Fixed maxDecimals first (5 keeps
+    // the full precision the adapted-spectrum text always carried), then the trailing
+    // zeros (and a bare trailing dot) go. FOR TEXT THE USER READS ONLY - .scl writers
+    // must NOT use it: the Scala format reads a line as cents only when it contains a
+    // decimal point, so "700" in a .scl would silently become the ratio 700/1. The
+    // interval-text parser is untouched and needs no decimals: its 'c' suffix alone
+    // marks cents ("700c" parses identically before and after). Unit-tested.
+    inline std::string centsText (double cents, int maxDecimals = 5)
+    {
+        char buf[64];
+        std::snprintf (buf, sizeof (buf), "%.*f", maxDecimals, cents);
+        std::string s (buf);
+        if (s.find ('.') != std::string::npos)
+        {
+            while (! s.empty() && s.back() == '0') s.pop_back();
+            if (! s.empty() && s.back() == '.') s.pop_back();
+        }
+        if (s == "-0") s = "0"; // -0.000001 rounds to "-0", which is not a value
         return s;
     }
 

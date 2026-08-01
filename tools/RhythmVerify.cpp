@@ -2430,10 +2430,11 @@ int main()
         std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
         auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
         check (ed != nullptr, "the editor builds");
-        // Measured TWICE: once as it opens (prime LIMIT fader, no scale loaded) and once in
-        // the widest configuration there is - the 9 prime-whitelist toggles, plus a loaded
-        // scale, which adds the Off button and the longest status line. Both live in the
-        // narrowest boxes of the panel, so they are where a squeeze shows up first.
+        // Measured THREE times, because the engines share ONE box now and only the
+        // selected view's controls exist on screen: (0) as it opens - the HARMONIC view
+        // with the prime LIMIT fader; (1) the HARMONIC view at its widest - the 9
+        // prime-whitelist toggles; (2) the CUSTOM view - a loaded scale, whose whole
+        // point is that the freed box goes to the intervals editor (asserted below).
         // The panel wears the SELECTED ENGINE's colour, and that can fail in two
         // directions: back to the neutral steel that read as white (saturation 0.13), or
         // onto a hue so close to a neighbouring panel's that the boxes stop being
@@ -2458,16 +2459,21 @@ int main()
             check (worst > 40.0f, "and its hue is clear of every panel around it");
         };
 
-        for (int pass = 0; ed != nullptr && pass < 2; ++pass)
+        for (int pass = 0; ed != nullptr && pass < 3; ++pass)
         {
             if (pass == 1)
             {
-                juce::String err;
-                p.loadTimbreText ("5/4 3/2 2", err);
                 auto* pm = p.apvts.getParameter ("primeMode");
                 pm->setValueNotifyingHost (1.0f); // Whitelist
                 ed->resized();                    // no message loop here to do it for us
-                std::printf ("  (prime whitelist + a loaded custom scale)\n");
+                std::printf ("  (harmonic view, prime whitelist)\n");
+            }
+            if (pass == 2)
+            {
+                juce::String err;
+                p.loadTimbreText ("5/4 3/2 2", err); // switches the Custom Engine on
+                ed->refreshEngineDressing();         // chip + view follow, as the timer would
+                std::printf ("  (custom view: loaded scale)\n");
             }
             check (ed->getWidth() == 1200 && ed->getHeight() == 650, "at 1200 x 650");
             const auto L = ed->layoutProbe();
@@ -2476,34 +2482,63 @@ int main()
             check (win.contains (L.essentials) && win.contains (L.tuning), "so are Essentials and Tuning");
             check (! L.spectrum.intersects (L.essentials) && ! L.spectrum.intersects (L.tuning),
                    "and it overlaps neither of them");
-            check (L.spectrum.contains (L.harmonicEngine) && L.spectrum.contains (L.customEngine)
-                   && L.spectrum.contains (L.bothEngines),
-                   "all three nested boxes are inside the panel");
-            check (! L.harmonicEngine.intersects (L.customEngine)
-                   && ! L.harmonicEngine.intersects (L.bothEngines)
-                   && ! L.customEngine.intersects (L.bothEngines),
-                   "the two engines and the shared box never overlap (they are separate spaces)");
-            // The engine chips are a TAB STRIP under the panel title, modelled on the
-            // Modulators box's: below the title band, above everything else, inside the
-            // panel. Riding on the panel's top line (where they used to be) fails the
-            // first of these.
-            check (L.spectrum.contains (L.engineChips)
+            check (L.spectrum.contains (L.engineBox) && L.spectrum.contains (L.bothEngines),
+                   "the shared engine box and the both-engines box are inside the panel");
+            check (! L.engineBox.intersects (L.bothEngines),
+                   "and they never overlap (they are separate spaces)");
+            // The engine chips are the shared box's TITLE now, modelled on the
+            // Modulators box's tab row: inside the box, at its top, under the panel's
+            // own title band. A strip floating outside the box would read as panel
+            // decoration again, which is exactly what this layout replaced.
+            check (L.engineBox.contains (L.engineChips)
                    && L.engineChips.getY() >= L.spectrum.getY() + 14
-                   && L.engineChips.getBottom() <= L.harmonicEngine.getY(),
-                   "the engine chips sit under the SPECTRUM title, clear of the boxes below");
+                   && L.engineChips.getBottom() <= L.engineBox.getY() + 24,
+                   "the engine chips are the engine box's own title row");
 
-            checkPanelColour (L.panelColour, "harmonic engine selected");
-            std::printf ("  panel %d x %d   harmonic %d   custom %d   both %d   essentials %d\n",
-                         L.spectrum.getWidth(), L.spectrum.getHeight(), L.harmonicEngine.getWidth(),
-                         L.customEngine.getWidth(), L.bothEngines.getWidth(), L.essentials.getWidth());
+            checkPanelColour (L.panelColour, pass == 2 ? "custom engine selected"
+                                                       : "harmonic engine selected");
+            std::printf ("  panel %d x %d   engine box %d   both %d   essentials %d\n",
+                         L.spectrum.getWidth(), L.spectrum.getHeight(), L.engineBox.getWidth(),
+                         L.bothEngines.getWidth(), L.essentials.getWidth());
+
+            // ONE box, ONE view: the probe only reports visible controls, so the
+            // selected engine's controls must be there and the other engine's must
+            // not - both present at once means the views leak into each other.
+            {
+                bool anyHarm = false, anyCustOnly = false, hasIntervals = false;
+                for (const auto& c : L.controls)
+                {
+                    if (c.first.startsWith ("harm.")) anyHarm = true;
+                    if (c.first == "cust.intervals") { hasIntervals = true; anyCustOnly = true; }
+                    if (c.first == "cust.load")       anyCustOnly = true;
+                }
+                if (pass < 2)
+                    check (anyHarm && ! anyCustOnly,
+                           "harmonic view: its controls are inside, the custom engine's are not");
+                else
+                    check (! anyHarm && anyCustOnly && hasIntervals,
+                           "custom view: its controls are inside, the harmonic engine's are not");
+                // The point of the merge: the intervals editor gets the freed space.
+                // It was a single 24 px line in a fifth of the panel; in the shared box
+                // it must be a real multi-line area.
+                if (pass == 2)
+                    for (const auto& c : L.controls)
+                        if (c.first == "cust.intervals")
+                        {
+                            std::printf ("  cust.intervals %d x %d\n",
+                                         c.second.getWidth(), c.second.getHeight());
+                            check (c.second.getWidth() >= 300 && c.second.getHeight() >= 56,
+                                   "the intervals editor got the custom view's freed space");
+                        }
+            }
 
             // Every control must be INSIDE the box whose name it carries.
             int outside = 0;
             juce::String worstName;
             for (const auto& c : L.controls)
             {
-                const auto* box = c.first.startsWith ("harm.") ? &L.harmonicEngine
-                                : c.first.startsWith ("cust.") ? &L.customEngine
+                const auto* box = c.first.startsWith ("harm.") ? &L.engineBox
+                                : c.first.startsWith ("cust.") ? &L.engineBox
                                 : c.first.startsWith ("both.") ? &L.bothEngines
                                                                : &L.essentials;
                 if (! box->contains (c.second))
@@ -2533,10 +2568,10 @@ int main()
                          squashed > 0 ? (" (first: " + squashedName + ")").toRawUTF8() : "");
             check (squashed == 0, "and every one of them still has room to be used");
 
-            // The generic rule above only catches a total collapse. TEMPER is the row that
-            // came back into the Custom Engine box, at the BOTTOM of five stacked rows, so
-            // it is the one that silently absorbs any pixel the rows above take: it is
-            // asserted at its nominal 20 px, the height a tick box needs to be readable.
+            // The generic rule above only catches a total collapse. TEMPER is laid out
+            // in BOTH views (it must never vanish under the user's own click) and in
+            // each it is the row that silently absorbs any pixel its neighbours take:
+            // it is asserted at its nominal 20 px, the height a readable tick box needs.
             for (const auto& c : L.controls)
                 if (c.first == "cust.temper")
                 {
@@ -2568,6 +2603,10 @@ int main()
         if (ed != nullptr)
         {
             using E = FractalAdditiveAudioProcessor::EngineInForce;
+            // Pass 2 above left the Custom Engine ON (loading a scale switches it on),
+            // so step back to the harmonic engine first or "blue" would be pink.
+            p.setTimbreEnabled (false);
+            ed->refreshEngineDressing();
             const auto blue = ed->layoutProbe().panelColour;
             p.setTimbreEnabled (true);
             ed->refreshEngineDressing();
@@ -2585,6 +2624,35 @@ int main()
             tt->setValueNotifyingHost (0.0f);
             p.setTimbreEnabled (false);
             ed->refreshEngineDressing();
+        }
+
+        // The empty-workspace pin. With ONE shared box, the Load button and the
+        // intervals editor only exist inside the CUSTOM view - so with no scale loaded
+        // the CUSTOM chip must still open that view (sound honestly staying harmonic),
+        // or creating a custom spectrum is simply impossible. This is measured through
+        // the chips' own onClick, because engineInForce alone cannot see it.
+        if (ed != nullptr)
+        {
+            using E = FractalAdditiveAudioProcessor::EngineInForce;
+            p.clearTimbre();               // truly nothing loaded
+            ed->refreshEngineDressing();
+            auto hasControl = [&] (const char* name)
+            {
+                for (const auto& c : ed->layoutProbe().controls)
+                    if (c.first == name) return true;
+                return false;
+            };
+            check (hasControl ("harm.baseN") && ! hasControl ("cust.intervals"),
+                   "no scale loaded: the box opens on the harmonic view");
+            ed->clickEngineChipForTests (1);
+            check (hasControl ("cust.intervals") && hasControl ("cust.load")
+                   && ! hasControl ("harm.baseN"),
+                   "clicking CUSTOM with nothing loaded still opens its view (Load + intervals reachable)");
+            check (p.engineInForce() == E::Harmonic,
+                   "while the SOUND honestly stays harmonic (there is no scale to sound)");
+            ed->clickEngineChipForTests (0);
+            check (hasControl ("harm.baseN") && ! hasControl ("cust.intervals"),
+                   "and HARMONIC brings its view back");
         }
 
         // THE PANEL'S OWN WIRING, through the same callbacks a click runs.

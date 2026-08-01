@@ -2088,10 +2088,14 @@ bool FractalAdditiveAudioProcessor::applySpectrumAdapt (bool undoable, juce::Str
 
     // The typed text: every partial above 1/1 in cents, then the PERIOD as the highest
     // value (loadTimbreText's rule: the top interval is the repeat point). 1/1 is implicit.
+    // centsText, not String(x, 5): this text lands in the Custom Engine's box for the
+    // user to read and edit, and a fixed 5-decimal print filled it with "100.00000c
+    // 1200.00000c" noise. The 'c' suffix alone marks cents to the parser, so "100c"
+    // round-trips identically - only genuinely inexact values keep their decimals.
     juce::String txt;
     for (size_t i = 1; i < info.ratios.size(); ++i)
-        txt << juce::String (1200.0 * std::log2 (juce::jmax (1.0e-9, info.ratios[i])), 5) << "c ";
-    txt << juce::String (1200.0 * std::log2 (juce::jmax (1.0001, adaptPeriodRatio)), 5) << "c";
+        txt << dissonance::centsText (1200.0 * std::log2 (juce::jmax (1.0e-9, info.ratios[i]))).c_str() << "c ";
+    txt << dissonance::centsText (1200.0 * std::log2 (juce::jmax (1.0001, adaptPeriodRatio))).c_str() << "c";
 
     if (! loadTimbreText (txt, errorOut))
         return false;
