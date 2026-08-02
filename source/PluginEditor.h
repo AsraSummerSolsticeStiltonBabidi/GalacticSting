@@ -273,6 +273,14 @@ private:
     void openScalaChooser();
     void openPartialAmpWindow();   // the pencil in the SLOPE cell
     void openPlaygroundWindow();   // "Open Preset Playground", under the preset selector
+    // Build-and-wire WITHOUT showing, split out of the two open functions so the
+    // ownership probe below exercises the exact construction a real click runs.
+    void ensurePartialWindow();
+    void ensurePlaygroundWindow();
+    // THE one mechanism both floating windows use to stay above the editor: OS-level
+    // ownership (see FloatingWindowOwner.h). Called on every open, not just the first,
+    // because a host may re-dock the editor under a different top-level window.
+    void attachFloatingWindow (juce::TopLevelWindow&);
 
 public:
     // Test hooks (RhythmVerify): the playground panel is in a SEPARATE desktop window,
@@ -300,6 +308,14 @@ public:
     // Press, move to the normalised point, release - the whole gesture, through the very
     // handlers a mouse reaches.
     void playgroundDragForTests (float nx, float ny);
+    // The floating windows' OS ownership, read BACK from the OS. The Z-order behaviour
+    // itself (clicking the editor no longer buries the floating window) is enforced by
+    // Windows from this one recorded relationship, so the honest automated check is
+    // "the OS has the editor's top-level root on record as the owner" - the raise
+    // behaviour can only be confirmed by eye. The caller must have put the editor on
+    // the desktop first (hidden is fine); peers are created hidden, nothing flashes.
+    struct FloatingOwnershipProbe { bool windowOnDesktop = false, ownerIsEditorRoot = false; };
+    FloatingOwnershipProbe floatingOwnershipProbeForTests (bool playground);
 
 private:
     void refreshSlopeFreeze();     // shows that SLOPE is inert while manual mode is on
@@ -3343,6 +3359,11 @@ private:
     // and the timer, it must never say "load" while the click would refuse (already
     // active), so the word and the enabled state have to move together.
     void refreshSpectrumTuningButton();
+    // The Shepard beats box's honesty dress: while Sync is chosen but the host has no
+    // BPM, the FREE ms value is what actually runs - the box turns amber and its
+    // tooltip says so. Colour and tooltip move together, in ONE place, called by the
+    // timer and by applyLanguage() (which resets lastShepNoBpm so the words re-render).
+    void refreshShepardSyncState();
     // Repaint every control inside the SPECTRUM panel in the engine's colour. The panel
     // is ONE box now, so a fader still wearing its old per-cell hue would be the only
     // thing on screen still claiming the compartments are separate boxes.
@@ -3652,6 +3673,21 @@ private:
                                         primeModeAtt, tuningAtt, bendAtt, tuningBankAtt;
     std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], morphAtt;
     std::unique_ptr<SliderAttachment>   morphTimeAtt;
+
+    // Shepard tone generator (bottom row of the Tuning box): on/off, the ONE rate
+    // control in its two dresses (the ms fader in Free mode, the beats box in Sync
+    // mode - resized() shows exactly one of them), and the level. All parameters.
+    juce::ToggleButton shepOnT;
+    juce::ComboBox     shepModeBox, shepDivBox;
+    juce::Slider       shepTimeFader, shepLevelFader;
+    std::unique_ptr<ButtonAttachment>   shepOnAtt;
+    std::unique_ptr<ComboBoxAttachment> shepModeAtt, shepDivAtt;
+    std::unique_ptr<SliderAttachment>   shepTimeAtt, shepLevelAtt;
+    // Last "Sync chosen but the host offers no BPM" state shown (-1 = not yet):
+    // the timer redresses the beats box amber and says in its tooltip that the
+    // free ms value is in force, instead of letting it claim a sync that is not
+    // happening. See shepardSyncHasNoBpm().
+    int lastShepNoBpm = -1;
 
     std::unique_ptr<juce::FileChooser>  fileChooser;
     juce::Component::SafePointer<juce::AlertWindow> activePrompt; // open save-preset dialog, if any
