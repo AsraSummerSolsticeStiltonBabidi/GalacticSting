@@ -13,6 +13,7 @@
 #include "dsp/NoteGate.h"
 #include "dsp/PresetMorph.h"
 #include "dsp/RhythmEngine.h"
+#include "dsp/ShepardEngine.h"
 #include "dsp/SpectrumEngine.h"
 #include "dsp/TuningManager.h"
 
@@ -415,6 +416,17 @@ public:
     // Timbre -> rhythm MIDI out (see RhythmEngine.h). The editor edits the slots
     // directly (atomics) and reads the live pulse rates for its panel.
     RhythmEngine& getRhythm() noexcept { return rhythm; }
+
+    //==========================================================================
+    // Shepard tone generator (Tuning panel). The engine itself is stateless about
+    // the transport: processBlock resolves the quantized mode's beats against the
+    // host BPM and hands the engine plain seconds. Exposed for the verifiers
+    // (probe of the live components) and the editor (the honesty flag below).
+    ShepardEngine& getShepard() noexcept { return shepard; }
+    // TRUE while the rate control is in Sync mode but the host offers no BPM, so
+    // the FREE (ms) value is what actually drives the rise. The editor shows this
+    // state instead of letting the beats box claim a sync that is not happening.
+    bool shepardSyncHasNoBpm() const noexcept { return shepSyncNoBpm.load (std::memory_order_relaxed); }
     const spectrum::SpectrumTemplate* getLiveTemplate() const noexcept { return spectrumEngine.getLive(); }
     // Every swap of the live template, gains-only republishes included (see
     // SpectrumEngine::getLiveRevision). Read by run 42 to count what the ear gets.
@@ -1141,6 +1153,10 @@ private:
     spectrum::SpectrumSettings  lastPushed;
     RhythmEngine                rhythm { apvts, spectrumEngine, tuning };
     NoteGate                    noteGate; // quantize-to-tempo / mono / quantize-to-pulse
+    // The Shepard tone (Tuning panel). Runs after the synth mix, before master gain,
+    // so the master fader still scales it with everything else.
+    ShepardEngine               shepard;
+    std::atomic<bool>           shepSyncNoBpm { false }; // see shepardSyncHasNoBpm()
     // Set by restoreState() (any thread); consumed at the top of the next processBlock
     // (audio thread) - see there for why. A preset/project load must never leave a
     // note stuck sounding.

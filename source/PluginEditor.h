@@ -3359,6 +3359,11 @@ private:
     // and the timer, it must never say "load" while the click would refuse (already
     // active), so the word and the enabled state have to move together.
     void refreshSpectrumTuningButton();
+    // The Shepard beats box's honesty dress: while Sync is chosen but the host has no
+    // BPM, the FREE ms value is what actually runs - the box turns amber and its
+    // tooltip says so. Colour and tooltip move together, in ONE place, called by the
+    // timer and by applyLanguage() (which resets lastShepNoBpm so the words re-render).
+    void refreshShepardSyncState();
     // Repaint every control inside the SPECTRUM panel in the engine's colour. The panel
     // is ONE box now, so a fader still wearing its old per-cell hue would be the only
     // thing on screen still claiming the compartments are separate boxes.
@@ -3668,6 +3673,21 @@ private:
                                         primeModeAtt, tuningAtt, bendAtt, tuningBankAtt;
     std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], morphAtt;
     std::unique_ptr<SliderAttachment>   morphTimeAtt;
+
+    // Shepard tone generator (bottom row of the Tuning box): on/off, the ONE rate
+    // control in its two dresses (the ms fader in Free mode, the beats box in Sync
+    // mode - resized() shows exactly one of them), and the level. All parameters.
+    juce::ToggleButton shepOnT;
+    juce::ComboBox     shepModeBox, shepDivBox;
+    juce::Slider       shepTimeFader, shepLevelFader;
+    std::unique_ptr<ButtonAttachment>   shepOnAtt;
+    std::unique_ptr<ComboBoxAttachment> shepModeAtt, shepDivAtt;
+    std::unique_ptr<SliderAttachment>   shepTimeAtt, shepLevelAtt;
+    // Last "Sync chosen but the host offers no BPM" state shown (-1 = not yet):
+    // the timer redresses the beats box amber and says in its tooltip that the
+    // free ms value is in force, instead of letting it claim a sync that is not
+    // happening. See shepardSyncHasNoBpm().
+    int lastShepNoBpm = -1;
 
     std::unique_ptr<juce::FileChooser>  fileChooser;
     juce::Component::SafePointer<juce::AlertWindow> activePrompt; // open save-preset dialog, if any

@@ -1850,6 +1850,31 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     configCombo (bendBox, "bendRange", bendAtt, cTuning, {});
     makeLabel (lblBend, cTuning);
 
+    // SHEPARD TONE GENERATOR (the Tuning box's bottom row). The tone's component
+    // spacing is the ACTIVE tuning's period, which is why it lives in this panel.
+    // Words and tooltips are written by applyLanguage(); which of the two rate
+    // dresses (ms fader / beats box) is on screen is decided by resized().
+    shepOnT.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
+    shepOnT.setColour (juce::ToggleButton::tickColourId, cTuning);
+    shepOnT.setMouseClickGrabsKeyboardFocus (false);
+    addAndMakeVisible (shepOnT);
+    shepOnAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "shepOn", shepOnT);
+    configCombo (shepModeBox, "shepMode", shepModeAtt, cTuning, {});
+    // Switching mode swaps which rate control is on screen, so it must re-lay the
+    // row NOW - the attachment only moves the parameter, never the layout.
+    shepModeBox.onChange = [this] { resized(); repaint(); refocus(); };
+    configCombo (shepDivBox, "shepDiv", shepDivAtt, cTuning, {});
+    // configFader dresses them as the standard vertical fader; these two live in a
+    // 22 px row, so they are re-dressed horizontal with a value box at their right.
+    configFader (shepTimeFader, "shepTime", shepTimeAtt, cTuning, {});
+    shepTimeFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    shepTimeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 15);
+    shepTimeFader.setNumDecimalPlacesToDisplay (0);
+    configFader (shepLevelFader, "shepLevel", shepLevelAtt, cTuning, {});
+    shepLevelFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    shepLevelFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 44, 15);
+    shepLevelFader.setNumDecimalPlacesToDisplay (0);
+
     // "Spectrum to Scale" (Sethares): generate + count + reverse + period + save,
     // plus the sorted degree/height list.
     configGroup (gSpecScale, cSpecScale);
@@ -2909,6 +2934,22 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     bendBox.setTooltip (tr (
         "Per-note pitch-bend range. +-48 st is the MPE standard and is REQUIRED for Ableton Live 12's tuning systems and the Microtuner device (enable MPE on this plugin in Live). Use +-2 for a classic keyboard pitch wheel.",
         "Rang del pitch bend per nota. +-48 st \xc3\xa9s l'est\xc3\xa0ndard MPE i \xc3\x89S NECESSARI per als sistemes d'afinaci\xc3\xb3 d'Ableton Live 12 i el Microtuner (activa MPE al plugin dins de Live). Fes servir +-2 per a la roda d'un teclat cl\xc3\xa0ssic."));
+    //-- Shepard tone generator (bottom row of the Tuning box) ------------------
+    shepOnT.setButtonText ("Shepard");
+    shepOnT.setTooltip (tr (
+        "An endlessly rising Shepard tone, mixed under the synth's output. Its components are spaced exactly ONE PERIOD of the *active tuning* apart - 2/1 here means it rises one octave; load Bohlen-Pierce and the spacing (and the rise) becomes 3/1 - and the stack is anchored on C3's own sounding pitch, so it stays consonant with the keyboard. Up to 64 sine components under a fixed spectral envelope whose edges reach zero: the component that wraps re-enters SILENT, so there are no clicks and no audible reset. With a period under ~187 cents the covered band narrows rather than any component being dropped. Off by default.",
+        "Un to de Shepard que puja sense fi, mesclat sota el so del sinte. Els components van separats exactament UN PER\xc3\x8dODE de l'*afinaci\xc3\xb3 activa* - amb 2/1 puja una octava; carrega Bohlen-Pierce i la separaci\xc3\xb3 (i la pujada) passa a ser 3/1 - i la pila queda ancorada al to real de Do3, per aix\xc3\xb2 \xc3\xa9s consonant amb el teclat. Fins a 64 components sinuso\xc3\xaf" "dals sota una envolupant espectral fixa amb vores a zero: el component que d\xc3\xb3na la volta hi torna a entrar EN SILENCI, o sigui sense clics ni reinici audible. Amb un per\xc3\xado" "de per sota d'uns 187 cents la banda coberta s'estreny en comptes de perdre cap component. Apagat per defecte."));
+    shepModeBox.setTooltip (tr (
+        "How the rise time is set. *Free*: the fader beside gives the time to rise one period, in ms. *Sync*: rising one period lasts the chosen number of host beats. Switching mode (or moving the rate) GLIDES the speed - the tone never jumps.",
+        "Com es fixa el temps de pujada. *Lliure*: el fader del costat d\xc3\xb3na el temps de pujar un per\xc3\xado" "de, en ms. *Sinc*: pujar un per\xc3\xado" "de dura els beats triats del tempo del DAW. Canviar de mode (o moure la velocitat) fa LLISCAR la marxa - el to mai salta."));
+    shepTimeFader.setTooltip (tr (
+        "Time to rise ONE period of the active tuning, 100 ms to 60 s (log fader). Changes glide - the tone never jumps.",
+        "Temps de pujar UN per\xc3\xado" "de de l'afinaci\xc3\xb3 activa, de 100 ms a 60 s (fader logar\xc3\xadtmic). Els canvis llisquen - el to mai salta."));
+    shepLevelFader.setTooltip (tr ("Shepard tone level, in dB.", "Nivell del to de Shepard, en dB."));
+    // The beats box's tooltip carries the no-BPM state and is written by
+    // refreshShepardSyncState(); resetting the memo makes it re-render in this language.
+    lastShepNoBpm = -1;
+    refreshShepardSyncState();
     // (loadTimbreButton's and randomSpectrumBtn's tooltips are set by
     //  refreshCustomEngineButtons above: they depend on which job the button has.)
     timbreRepeatsFader.setTooltip (tr (
@@ -2955,6 +2996,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (phaseBox,     { tr ("Aligned", "Alineat"), tr ("Scattered", "Dispers") });
     localise (primeModeBox, { tr ("Limit", "L\xc3\xadmit"), tr ("Whitelist", "Llista") });
     localise (bendBox,      { "\xc2\xb1""2 st", "\xc2\xb1""12 st", "\xc2\xb1""48 st (MPE)" });
+    localise (shepModeBox,  { tr ("Free (ms)", "Lliure (ms)"), tr ("Sync (beats)", "Sinc (beats)") });
     voiceEnv.tip = tr (
         "This envelope, drawn as a line with nodes. Drag a node for the attack time, the decay time + sustain level, or the release time; drag the LINE between nodes to bend it concave or convex; double-click a segment to straighten it.",
         "Aquesta envolupant, dibuixada com una línia amb nodes. Arrossega un node per al temps d'""atac, el de caï""da + nivell de sosteniment, o el d'""alliberament; arrossega la LÍNIA entre nodes per corbar-la; doble clic en un tram per aplanar-lo.");
@@ -4501,6 +4543,28 @@ void FractalAdditiveAudioProcessorEditor::refreshSpectrumTuningButton()
                         "! (adaptat a ella, o carregat del seu fitxer d'escala). Clica per fer aquella afinaci\xc3\xb3 l'ACTIVA - l'espectre es queda com est\xc3\xa0, i Ctrl+Z recupera l'afinaci\xc3\xb3 actual."));
 }
 
+// The Shepard beats box's HONESTY dress. Sync mode with no host BPM means the free
+// ms value is what actually runs; a beats box sitting there in its normal colour
+// would be claiming a sync that is not happening. Colour and tooltip are decided
+// together HERE - two writers is how a box ends up amber with a tooltip that still
+// promises beats. Cheap per-tick: one atomic read and an int compare.
+void FractalAdditiveAudioProcessorEditor::refreshShepardSyncState()
+{
+    const bool noBpm = shepModeBox.getSelectedId() == 2 && processorRef.shepardSyncHasNoBpm();
+    if ((int) noBpm == lastShepNoBpm) return;
+    lastShepNoBpm = (int) noBpm;
+    const juce::Colour amber (0xffffb020); // cOverride: the "this is being overridden" colour
+    shepDivBox.setColour (juce::ComboBox::outlineColourId, noBpm ? amber : cTuning.withAlpha (0.7f));
+    shepDivBox.setColour (juce::ComboBox::arrowColourId,   noBpm ? amber : cTuning);
+    shepDivBox.setTooltip (tr (
+        "Rise of one period as host beats: 1/4 = a quarter of a beat, 4 = four beats; 1/3 and 2/3 are the triplet-friendly ones.",
+        "La pujada d'un per\xc3\xado" "de en beats del DAW: 1/4 = un quart de beat, 4 = quatre beats; 1/3 i 2/3 s\xc3\xb3n els de treset.")
+        + (noBpm ? tr ("\n!NO BPM from the host right now!, so the FREE time (ms) is what is running - the beats take over the moment the host offers a tempo.",
+                       "\n!ARA MATEIX el DAW no d\xc3\xb3na cap BPM!, o sigui que mana el temps LLIURE (ms) - els beats prendran el control quan el DAW ofereixi un tempo.")
+                 : juce::String()));
+    shepDivBox.repaint();
+}
+
 // ONE PANEL, ONE COLOUR. Every control inside SPECTRUM takes the selected engine's hue,
 // so nothing on screen is left claiming the old nested boxes still exist: the panel used
 // to be three framed boxes in three different colours (blue harmonic / pink custom /
@@ -4871,6 +4935,11 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("tun.recent",       recentOpenBtn);   add ("tun.bankLbl",    lblTuningBank);
     add ("tun.bank",         tuningBankBox);   add ("tun.bankLoad",   tuningBankLoadBtn);
     add ("tun.bankClear",    tuningBankClearBtn);
+    // The Shepard row. Exactly ONE of shepTime/shepDiv is visible (the mode's own
+    // dress), so `add`'s visibility gate records the one really on screen.
+    add ("tun.shepOn",       shepOnT);         add ("tun.shepMode",   shepModeBox);
+    add ("tun.shepTime",     shepTimeFader);   add ("tun.shepDiv",    shepDivBox);
+    add ("tun.shepLvl",      shepLevelFader);
 
     add ("spec.mode",        specModeBox);     add ("spec.source",    tuneSourceBox);
     add ("spec.scope",       tuneScopeBox);    add ("spec.notesLbl",  chordNotesLbl);
@@ -4937,7 +5006,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     combo ("lfoRateMode", lfoRateModeBox); combo ("lfoPhaseMode", lfoPhaseModeBox);
     combo ("specMode",    specModeBox);    combo ("tuneSource",  tuneSourceBox);
     combo ("tuneScope",   tuneScopeBox);   combo ("adaptTarget", adaptTargetBox);
-    combo ("adaptGoal",   adaptGoalBox);
+    combo ("adaptGoal",   adaptGoalBox);   combo ("shepMode",    shepModeBox);
 
     // The painted sub-labels, each with the width its text really needs in the font
     // paint() sets for it.
@@ -6248,6 +6317,14 @@ void FractalAdditiveAudioProcessorEditor::resized()
         {
             lFootBounds = row.reduced (3, 0); // frame painted in paint()
             auto ti = row.reduced (3).reduced (8, 4); ti.removeFromTop (20); // clear the TUNING title band
+            // SHEPARD generator: the panel's bottom row, reserved FIRST so the pile of
+            // optional rows above (its-spectrum / preset-tuning / spectrum-tuning) can
+            // never squeeze it out - reserved last it would inherit the zero-height
+            // leftovers exactly in the states with the most buttons showing. Its height
+            // is PAID FOR by merging the old bend and Recent rows into one below, so
+            // the bank row keeps the same worst case it had.
+            auto shepRow = ti.removeFromBottom (22);
+            ti.removeFromBottom (3);
             auto mrow = ti.removeFromTop (24);
             compact (tuningBox, mrow.removeFromLeft (mrow.getWidth() * 34 / 100));
             mrow.removeFromLeft (5);
@@ -6342,23 +6419,30 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 ti.removeFromTop (3);
                 loadSpectrumTuningBtn.setBounds (ti.removeFromTop (22).reduced (2, 0));
             }
-            // Pitch bend ABOVE Recent; hidden in MPE-input mode (the MPE zone fixes
-            // the per-note range at +-48, so the choice is irrelevant there).
+            // Pitch bend and Recent share ONE row now (bend left, Recent right): the
+            // Shepard row at the bottom is paid for with exactly the row this merge
+            // frees, so the bank underneath keeps the height it had. Bend is hidden
+            // in MPE-input mode (the MPE zone fixes the per-note range at +-48, so
+            // the choice is irrelevant there) - Recent then takes the whole row.
             const bool bendVis = tmode != 3;
             lblBend.setVisible (bendVis); bendBox.setVisible (bendVis);
-            if (bendVis)
             {
                 ti.removeFromTop (3);
                 auto bendRow = ti.removeFromTop (22);
-                lblBend.setJustificationType (juce::Justification::centredLeft);
-                lblBend.setBounds (bendRow.removeFromLeft (74));
-                compact (bendBox, bendRow.removeFromLeft (juce::jmin (120, bendRow.getWidth())));
+                if (bendVis)
+                {
+                    lblBend.setJustificationType (juce::Justification::centredLeft);
+                    lblBend.setBounds (bendRow.removeFromLeft (74));
+                    compact (bendBox, bendRow.removeFromLeft (juce::jmin (120, bendRow.getWidth())));
+                    bendRow.removeFromLeft (6);
+                }
+                // Recent is ONE button that opens a floating list of every file loaded;
+                // the bank stays inline. Both stay reachable in every mode - picking one
+                // of them IS how you get into Scala mode, so gating them on already
+                // being there was a dead end. It also keeps "+ to bank" from ever
+                // feeding a list you cannot see.
+                recentOpenBtn.setBounds (bendRow.reduced (2, 0));
             }
-            // Recent is ONE button that opens a floating list of every file loaded;
-            // the bank stays inline. Both stay reachable in every mode, for the same
-            // reason as "Load tuning" above - picking one of them IS how you get into
-            // Scala mode, so gating them on already being there was a dead end. It
-            // also keeps "+ to bank" from ever feeding a list you cannot see.
             recentLabel.setVisible (false);
             for (int i = 0; i < 3; ++i) recentBtn[i].setVisible (false);
             const bool bankUi = true;
@@ -6368,8 +6452,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
             tuningBankClearBtn.setVisible (bankUi);
             if (bankUi)
             {
-                ti.removeFromTop (3);
-                recentOpenBtn.setBounds (ti.removeFromTop (22).reduced (2, 0));
                 ti.removeFromTop (3);
                 // Bank row: the label rides on the LEFT of the row (a separate label
                 // row no longer fits) - [BANK][combo (flex)][+ .scl][X remove].
@@ -6386,6 +6468,26 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 const bool fits = bkrow.getHeight() >= 14;
                 lblTuningBank.setVisible (fits); tuningBankBox.setVisible (fits);
                 tuningBankLoadBtn.setVisible (fits); tuningBankClearBtn.setVisible (fits);
+            }
+            // SHEPARD generator (the row reserved off the bottom above):
+            // [Shepard][Free-or-Sync][the rate control in that mode's dress][level].
+            // ONE rate control, two dresses: the ms fader (Free) and the beats box
+            // (Sync) occupy the same slot and exactly one is on screen - a knob that
+            // does nothing in the current mode is worse than no knob at all (the
+            // same rule as the LFO Div/Hz pair).
+            {
+                auto sh = shepRow;
+                shepOnT.setBounds (sh.removeFromLeft (86));
+                sh.removeFromLeft (4);
+                compact (shepModeBox, sh.removeFromLeft (juce::jmin (94, sh.getWidth())));
+                sh.removeFromLeft (6);
+                shepLevelFader.setBounds (sh.removeFromRight (juce::jmin (120, sh.getWidth())));
+                sh.removeFromRight (6);
+                const bool sync = shepModeBox.getSelectedId() == 2;
+                shepTimeFader.setVisible (! sync);
+                shepDivBox.setVisible (sync);
+                if (sync) compact (shepDivBox, sh.removeFromLeft (juce::jmin (86, sh.getWidth())));
+                else      shepTimeFader.setBounds (sh);
             }
         }
     }
@@ -6551,6 +6653,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
 
     refreshModWatch(); // live-modulation marker on every watched fader (see the header)
     refreshSlopeFreeze(); // SLOPE goes grey + "FROZEN" while manual amplitudes are on
+    refreshShepardSyncState(); // beats box goes amber while Sync has no BPM to sync to
     // The amplitude window follows the spectrum: the template is rebuilt on a background
     // thread whenever Base/Fractal/primes/tuning move, and the stored edits can change
     // with no rebuild at all (an undo, a preset, a reload). Both are polled here rather
