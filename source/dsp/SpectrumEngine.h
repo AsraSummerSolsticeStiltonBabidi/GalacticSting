@@ -163,20 +163,21 @@ namespace spectrum
             float  curveSlope = 1.0f;              // stamped on the result (see blendTemplates)
             // WHETHER THE VOICES SHOULD TREAT THIS AS A SPECTRUM CHANGE.
             //
-            // false is the normal case while the point is being dragged, and it is the
-            // SAME trick setOverrides uses: publishing without bumping the generation
-            // means no voice restarts its spectral morph. A drag moves every partial by
-            // a hair per frame, so the voices simply read the new ratios (phase-
-            // continuous - a small frequency move on a running phase is inaudible) and
-            // glide the amplitudes over the usual 7 ms. Bumping the generation 60 times
-            // a second would instead re-seed every voice's morph clock and phase
-            // reference on every frame: the staircase that produced the loud clicks.
+            // false is most frames of a drag, and it is the SAME trick setOverrides
+            // uses: publishing without bumping the generation means no voice restarts
+            // its spectral morph - the amplitudes track the moving blend at 60 Hz over
+            // the usual 7 ms slew. Bumping all sixty frames a second would re-seed
+            // every voice's morph clock and phase reference per frame: the staircase
+            // that produced the loud clicks.
             //
             // true is for a DISCONTINUITY - engaging the playground, a corner being
             // (re)assigned, a discrete setting flipping, or automation jumping the point
-            // across the pad - where the spectrum really does change in one step and the
-            // existing machinery (the per-voice morph, or the 50 ms template fade when
-            // Morph is off) is exactly what should handle it.
+            // across the pad - and, THROTTLED to 10 Hz, for the frames of a drag itself
+            // (drivePlayground's glide block): each bumped publish is what makes the
+            // voices BEND their partial frequencies to the blend (Morph on) or cross
+            // the 50 ms template fade (Morph off). Without any bumps a drag could only
+            // ever crossfade bin amplitudes in place - the reported "morph does not
+            // pitch-bend the partials".
             bool   bumpGeneration = true;
         };
 

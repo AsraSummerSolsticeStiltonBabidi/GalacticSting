@@ -633,6 +633,16 @@ public:
         return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].tmpl
                                                                      : nullptr;
     }
+    // TESTS ONLY: the gliding ratios of the first ACTIVE main-engine voice (see
+    // AdditiveVoice::curRatiosForTests). How run 47 proves a drag BENDS frequencies.
+    int voiceCurRatiosForTests (double* out, int maxN)
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive())
+                    return av->curRatiosForTests (out, maxN);
+        return 0;
+    }
 
     //==========================================================================
     // The TWO inputs every Sethares feature shares. Their numbers are compared with
@@ -1372,6 +1382,20 @@ private:
     bool  pgDirty    = true;    // force one full apply (a corner changed, or we just engaged)
     int   pgParamTick = 0;      // throttles the CONTROL writes (see drivePlayground)
     bool  pgParamsPending = false; // a throttled tick still owes the controls one write
+    // THE DRAG'S FREQUENCY GLIDE. A drag posts a blend every tick, and every
+    // kPgGlideTicks-th of them is published WITH a generation bump so the voices treat
+    // it as a real spectrum change: with Morph on the partials BEND to the new blend
+    // (the pitch glide morph does everywhere else in this app - the user's request),
+    // with Morph off they cross the 50 ms template fade. 10 Hz, the same cadence the
+    // adaptive corners already republish at ("a rate the 50 ms fade absorbs" -
+    // kRtAdaptTicks); the frames in between still publish bump-less so the AMPLITUDES
+    // track at the full 60 Hz. Bumping every frame instead is the documented click
+    // machine (sixty morph restarts a second); bumping never is what the user reported:
+    // ratios that only ever crossfade in place, "no pitch bend en los parciales".
+    int   pgBlendTick = 0;         // frames since engage, clocks the glide throttle
+    int   pgLastBump  = -1000000;  // pgBlendTick of the last bumped publish
+    bool  pgGlidePending = false;  // a bump-less blend went out after the last bump
+    static constexpr int kPgGlideTicks = kRtAdaptTicks;
     // What the realtime link was doing when the playground took the spectrum over, so
     // it can be handed back untouched when the playground lets go.
     RtLink pgSuspendedRt = RtLink::Off;

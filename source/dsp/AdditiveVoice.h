@@ -84,6 +84,18 @@ public:
         filter.setType (juce::dsp::StateVariableTPTFilterType::lowpass);
     }
 
+    // TESTS ONLY (message thread, voice idle between blocks): the ratios the
+    // oscillators are rendering RIGHT NOW - curRatio, the gliding values, not the
+    // template's targets. It exists so an offline probe can assert that a playground
+    // drag really BENDS the partial frequencies through intermediate values instead of
+    // snapping them (the run-47 glide check); nothing but the verifiers may call it.
+    int curRatiosForTests (double* out, int maxN) const noexcept
+    {
+        const int n = std::min (maxN, activeCount);
+        for (int i = 0; i < n; ++i) out[i] = curRatio[(size_t) i];
+        return n;
+    }
+
     //==========================================================================
     void noteStarted() override
     {

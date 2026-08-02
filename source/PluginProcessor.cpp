@@ -4526,6 +4526,7 @@ void FractalAdditiveAudioProcessor::refreshPlaygroundActive()
         if (rtLink != RtLink::Off)
             setRealtimeLink (RtLink::Off, rtSet);
         pgWinner = -1;   // no incumbent: the first apply adopts the highest weight outright
+        pgBlendTick = 0; pgLastBump = -1000000; pgGlidePending = false;
         // Adaptive corners start FRESH: adopt the current result generation so nothing
         // from a previous engagement can land into this one, and lift the launch floor
         // so the first search is not throttled (the follower's own engage rule).
@@ -4608,15 +4609,17 @@ void FractalAdditiveAudioProcessor::drivePlayground()
     // point being clicked somewhere else, a corner being (re)assigned, or a discrete
     // setting flipping. Those are genuine spectrum CHANGES and the voices' own machinery
     // (the per-voice morph, or the 50 ms template fade when Morph is off) is what should
-    // carry them. Anything smaller is a drag, and a drag must NOT bump the generation -
-    // see SpectrumEngine::BlendJob::bumpGeneration for why sixty morph restarts a second
-    // is the click machine this project spent days removing.
+    // carry them, immediately. A drag is smaller than that, and its generation bumps are
+    // THROTTLED to 10 Hz instead (see the glide block below) - bumping all sixty frames
+    // a second is the click machine this project spent days removing, bumping none of
+    // them is "no pitch bend en los parciales".
     const double moved = (pgLastX < 0.0) ? 1.0 : std::abs (x - pgLastX) + std::abs (y - pgLastY);
     const bool   jump  = pgDirty || winnerChanged || moved > 0.15;
 
     const bool movedAny = pgDirty || winnerChanged || moved >= 1.0e-6;
     if (movedAny) pgParamsPending = true;
-    if (! movedAny && ! pgParamsPending)
+    ++pgBlendTick;
+    if (! movedAny && ! pgParamsPending && ! pgGlidePending)
         return;                                  // parked AND settled: nothing left to do
 
     if (winnerChanged)
@@ -4640,7 +4643,29 @@ void FractalAdditiveAudioProcessor::drivePlayground()
     }
 
     if (movedAny)
-        postPlaygroundBlend (w, jump);
+    {
+        // THE FREQUENCY GLIDE (see kPgGlideTicks in the header): every ~6th frame of a
+        // drag publishes WITH a generation bump - 10 Hz, the adaptive corners' own
+        // republish rate - so with Morph on the voices BEND their partials to the
+        // moving blend, and with Morph off they cross the 50 ms fade. The frames in
+        // between publish bump-less: amplitudes keep tracking at 60 Hz without
+        // restarting anyone's morph clock.
+        const bool bump = jump || pgBlendTick - pgLastBump >= kPgGlideTicks;
+        postPlaygroundBlend (w, bump);
+        if (bump) { pgLastBump = pgBlendTick; pgGlidePending = false; }
+        else        pgGlidePending = true;
+    }
+    else if (pgGlidePending)
+    {
+        // The drag STOPPED between two glide ticks: the last bumped publish aimed the
+        // voices at a blend up to 100 ms behind the point. One final bumped publish
+        // lands them EXACTLY on the parked position - without it a parked pad would
+        // keep sounding a hair short of its own point for ever (the same one-frame-
+        // short trap pgParamsPending closes for the controls).
+        postPlaygroundBlend (w, true);
+        pgLastBump      = pgBlendTick;
+        pgGlidePending  = false;
+    }
 
     // The playground owns the spectrum while it is engaged, so the ordinary
     // "settings changed -> requestRebuild" test in timerCallback must not fire behind it
