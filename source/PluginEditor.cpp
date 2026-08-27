@@ -899,10 +899,23 @@ namespace
         }
 
         // Keep the selected-item text clear of the rounded left end.
+        //
+        // The usable text width is stated ONCE, here, because three places need to agree
+        // on it: this function, resized() (which sizes the Shepard row's boxes to the
+        // words they hold) and layoutProbe() (which measures whether the word fits). A
+        // combo neither clips visibly nor resizes - it just draws as much as the cell
+        // holds - so a formula copied out by hand would let "Sync Project Tempo" appear
+        // on screen as "Sync Project Te" with every check in the build still green.
+        static int comboTextWidth (int boxWidth, int boxHeight) noexcept
+        { return boxWidth - boxHeight / 3 - boxHeight / 2; }
+        // ...and the inverse: the box width a word of `textWidth` needs.
+        static int comboWidthForText (int textWidth, int boxHeight) noexcept
+        { return textWidth + boxHeight / 3 + boxHeight / 2 + 2; } // +2: the label's own rounding
+
         void positionComboBoxText (juce::ComboBox& box, juce::Label& label) override
         {
             const int inset = box.getHeight() / 3;
-            label.setBounds (inset, 1, box.getWidth() - inset - box.getHeight() / 2, box.getHeight() - 2);
+            label.setBounds (inset, 1, comboTextWidth (box.getWidth(), box.getHeight()), box.getHeight() - 2);
             label.setFont (getComboBoxFont (box));
         }
 
@@ -1866,10 +1879,11 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     configCombo (bendBox, "bendRange", bendAtt, cTuning, {});
     makeLabel (lblBend, cTuning);
 
-    // SHEPARD TONE GENERATOR (the Tuning box's bottom row). The tone's component
-    // spacing is the ACTIVE tuning's period, which is why it lives in this panel.
-    // Words and tooltips are written by applyLanguage(); which of the two rate
-    // dresses (ms fader / beats box) is on screen is decided by resized().
+    // SHEPARD MODE (the Tuning box's bottom row). It lives in this panel because the
+    // one tuning-dependent choice it offers - rise by an octave or by the tuning's own
+    // period - only exists here. Words and tooltips are written by applyLanguage();
+    // which of the two rate dresses (ms fader / beats box) is on screen, and whether
+    // the rise-interval box exists at all, is decided by resized().
     shepOnT.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
     shepOnT.setColour (juce::ToggleButton::tickColourId, cTuning);
     shepOnT.setMouseClickGrabsKeyboardFocus (false);
@@ -1886,10 +1900,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     shepTimeFader.setSliderStyle (juce::Slider::LinearHorizontal);
     shepTimeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 15);
     shepTimeFader.setNumDecimalPlacesToDisplay (0);
-    configFader (shepLevelFader, "shepLevel", shepLevelAtt, cTuning, {});
-    shepLevelFader.setSliderStyle (juce::Slider::LinearHorizontal);
-    shepLevelFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 44, 15);
-    shepLevelFader.setNumDecimalPlacesToDisplay (0);
+    configCombo (shepRiseBox, "shepRise", shepRiseAtt, cTuning, {});
 
     // "Spectrum to Scale" (Sethares): generate + count + reverse + period + save,
     // plus the sorted degree/height list.
@@ -2950,18 +2961,20 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     bendBox.setTooltip (tr (
         "Per-note pitch-bend range. +-48 st is the MPE standard and is REQUIRED for Ableton Live 12's tuning systems and the Microtuner device (enable MPE on this plugin in Live). Use +-2 for a classic keyboard pitch wheel.",
         "Rang del pitch bend per nota. +-48 st \xc3\xa9s l'est\xc3\xa0ndard MPE i \xc3\x89S NECESSARI per als sistemes d'afinaci\xc3\xb3 d'Ableton Live 12 i el Microtuner (activa MPE al plugin dins de Live). Fes servir +-2 per a la roda d'un teclat cl\xc3\xa0ssic."));
-    //-- Shepard tone generator (bottom row of the Tuning box) ------------------
+    //-- SHEPARD MODE (bottom row of the Tuning box) ---------------------------
     shepOnT.setButtonText ("Shepard");
     shepOnT.setTooltip (tr (
-        "An endlessly rising Shepard tone, mixed under the synth's output. Its components are spaced exactly ONE PERIOD of the *active tuning* apart - 2/1 here means it rises one octave; load Bohlen-Pierce and the spacing (and the rise) becomes 3/1 - and the stack is anchored on C3's own sounding pitch, so it stays consonant with the keyboard. Up to 64 sine components under a fixed spectral envelope whose edges reach zero: the component that wraps re-enters SILENT, so there are no clicks and no audible reset. With a period under ~187 cents the covered band narrows rather than any component being dropped. Off by default.",
-        "Un to de Shepard que puja sense fi, mesclat sota el so del sinte. Els components van separats exactament UN PER\xc3\x8dODE de l'*afinaci\xc3\xb3 activa* - amb 2/1 puja una octava; carrega Bohlen-Pierce i la separaci\xc3\xb3 (i la pujada) passa a ser 3/1 - i la pila queda ancorada al to real de Do3, per aix\xc3\xb2 \xc3\xa9s consonant amb el teclat. Fins a 64 components sinuso\xc3\xaf" "dals sota una envolupant espectral fixa amb vores a zero: el component que d\xc3\xb3na la volta hi torna a entrar EN SILENCI, o sigui sense clics ni reinici audible. Amb un per\xc3\xado" "de per sota d'uns 187 cents la banda coberta s'estreny en comptes de perdre cap component. Apagat per defecte."));
+        "SHEPARD MODE. The key you press becomes the root of a tone that rises for ever without ever getting higher - and it is built from THIS synth's spectrum, not from sine waves. The voice sounds its whole spectrum at up to 8 transpositions AT ONCE, one rise interval apart, anchored on the pressed key's own tuned pitch, all climbing together under a FIXED spectral window whose edges reach exactly zero: the copy leaving the top leaves silent and the one entering underneath enters silent, so there is no click and no reset to hide. Everything else about the note is untouched - the three envelopes, the filter, the modulators, morph, manual amplitudes - and letting go of the key releases it like any other note. Latched PER NOTE: flipping this changes the notes you play NEXT, never the ones already sounding. The bounds are stated, never silent: at most 8 copies (the band narrows, centred, rather than losing one) and up to 1638 partials each; a spectrum dense enough to need more lifts the window's bottom edge instead of dropping a single partial.",
+        "MODE SHEPARD. La tecla que prems es converteix en l'arrel d'un to que puja sense parar sense arribar mai m\xc3\xa9s amunt - i est\xc3\xa0 fet amb l'espectre D'AQUEST sinte, no amb sinusoides. La veu fa sonar tot el seu espectre en fins a 8 transposicions ALHORA, separades un interval de pujada, ancorades al to real de la tecla premuda i pujant totes juntes sota una finestra espectral FIXA amb vores que arriben exactament a zero: la c\xc3\xb2pia que surt per dalt surt en silenci i la que entra per sota entra en silenci, o sigui sense clics ni cap reinici a amagar. La resta de la nota no canvia gens - les tres envolupants, el filtre, els moduladors, el morph, les amplituds manuals - i deixar anar la tecla l'allibera com qualsevol nota. Es fixa PER NOTA: canviar-ho afecta les notes que toquis DESPR\xc3\x88S, mai les que ja sonen. Els l\xc3\xadmits es diuen, mai s'amaguen: com a molt 8 c\xc3\xb2pies (la banda s'estreny, centrada, en comptes de perdre'n cap) i fins a 1638 parcials cadascuna; un espectre prou dens puja la vora inferior de la finestra en comptes de perdre ni un sol parcial."));
     shepModeBox.setTooltip (tr (
-        "How the rise time is set. *Free*: the fader beside gives the time to rise one period, in ms. *Sync*: rising one period lasts the chosen number of host beats. Switching mode (or moving the rate) GLIDES the speed - the tone never jumps.",
-        "Com es fixa el temps de pujada. *Lliure*: el fader del costat d\xc3\xb3na el temps de pujar un per\xc3\xado" "de, en ms. *Sinc*: pujar un per\xc3\xado" "de dura els beats triats del tempo del DAW. Canviar de mode (o moure la velocitat) fa LLISCAR la marxa - el to mai salta."));
+        "How the rise time is set. *Free*: the fader beside gives the time to rise one interval, in ms. *Sync* (the default): rising one interval lasts the chosen number of host beats. Switching mode (or moving the rate) GLIDES the speed - a sounding Shepard never jumps.",
+        "Com es fixa el temps de pujada. *Lliure*: el fader del costat d\xc3\xb3na el temps de pujar un interval, en ms. *Sinc* (per defecte): pujar un interval dura els beats triats del tempo del DAW. Canviar de mode (o moure la velocitat) fa LLISCAR la marxa - un Shepard que sona mai salta."));
     shepTimeFader.setTooltip (tr (
-        "Time to rise ONE period of the active tuning, 100 ms to 60 s (log fader). Changes glide - the tone never jumps.",
-        "Temps de pujar UN per\xc3\xado" "de de l'afinaci\xc3\xb3 activa, de 100 ms a 60 s (fader logar\xc3\xadtmic). Els canvis llisquen - el to mai salta."));
-    shepLevelFader.setTooltip (tr ("Shepard tone level, in dB.", "Nivell del to de Shepard, en dB."));
+        "Time to rise ONE interval, 100 ms to 60 s (log fader). Changes glide - a sounding Shepard never jumps.",
+        "Temps de pujar UN interval, de 100 ms a 60 s (fader logar\xc3\xadtmic). Els canvis llisquen - un Shepard que sona mai salta."));
+    shepRiseBox.setTooltip (tr (
+        "What ONE rise step is. *Octave*: 2/1, the default in every tuning - an octave is what the ear hears as the same note again, so the illusion works whatever scale is loaded. *Period*: the active tuning's own repeat interval (3/1 under Bohlen-Pierce), which makes the rise land on the scale's own steps instead. This control only appears when the two differ; with an octave-period tuning there is nothing to choose.",
+        "Qu\xc3\xa8 \xc3\xa9s UN pas de pujada. *Octava*: 2/1, el valor per defecte en qualsevol afinaci\xc3\xb3 - una octava \xc3\xa9s el que l'orella sent com la mateixa nota un altre cop, aix\xc3\xad la il\xc2\xb7lusi\xc3\xb3 funciona amb l'escala que sigui. *Per\xc3\xad" "ode*: l'interval de repetici\xc3\xb3 de l'afinaci\xc3\xb3 activa (3/1 amb Bohlen-Pierce), que fa que la pujada caigui sobre els graus de l'escala. Aquest control nom\xc3\xa9s apareix quan els dos difereixen; amb una afinaci\xc3\xb3 d'octava no hi ha res a triar."));
     // The beats box's tooltip carries the no-BPM state and is written by
     // refreshShepardSyncState(); resetting the memo makes it re-render in this language.
     lastShepNoBpm = -1;
@@ -3019,7 +3032,14 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (phaseBox,     { tr ("Aligned", "Alineat"), tr ("Scattered", "Dispers") });
     localise (primeModeBox, { tr ("Limit", "L\xc3\xadmit"), tr ("Whitelist", "Llista") });
     localise (bendBox,      { "\xc2\xb1""2 st", "\xc2\xb1""12 st", "\xc2\xb1""48 st (MPE)" });
-    localise (shepModeBox,  { tr ("Free (ms)", "Lliure (ms)"), tr ("Sync (beats)", "Sinc (beats)") });
+    // "Sync (beats)" said nothing about WHOSE beats: the user read it as a beat
+    // subdivision of the rise rather than a lock to the host clock. Name the thing it
+    // actually locks to. (Only the TEXT changes - changeItemText keeps the item's
+    // POSITION, which is the whole contract with the ComboBoxAttachment.)
+    localise (shepModeBox,  { tr ("Free (ms)", "Lliure (ms)"),
+                              tr ("Sync Project Tempo", "Sinc tempo projecte") });
+    localise (shepRiseBox,  { tr ("Octave pitch bend", "Bend d'octava"),
+                              tr ("Period pitch bend", "Bend de per\xc3\xad" "ode") });
     voiceEnv.tip = tr (
         "This envelope, drawn as a line with nodes. Drag a node for the attack time, the decay time + sustain level, or the release time; drag the LINE between nodes to bend it concave or convex; double-click a segment to straighten it.",
         "Aquesta envolupant, dibuixada com una línia amb nodes. Arrossega un node per al temps d'""atac, el de caï""da + nivell de sosteniment, o el d'""alliberament; arrossega la LÍNIA entre nodes per corbar-la; doble clic en un tram per aplanar-lo.");
@@ -5138,10 +5158,11 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("tun.bank",         tuningBankBox);   add ("tun.bankLoad",   tuningBankLoadBtn);
     add ("tun.bankClear",    tuningBankClearBtn);
     // The Shepard row. Exactly ONE of shepTime/shepDiv is visible (the mode's own
-    // dress), so `add`'s visibility gate records the one really on screen.
+    // dress), and the rise-interval box only exists under a non-octave tuning, so
+    // `add`'s visibility gate records exactly what is really on screen.
     add ("tun.shepOn",       shepOnT);         add ("tun.shepMode",   shepModeBox);
     add ("tun.shepTime",     shepTimeFader);   add ("tun.shepDiv",    shepDivBox);
-    add ("tun.shepLvl",      shepLevelFader);
+    add ("tun.shepRise",     shepRiseBox);
 
     add ("spec.mode",        specModeBox);     add ("spec.source",    tuneSourceBox);
     add ("spec.scope",       tuneScopeBox);    add ("spec.notesLbl",  chordNotesLbl);
@@ -5201,7 +5222,29 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
 
     // Every combo applyLanguage() re-words, and what it currently has selected.
     auto combo = [&p] (const char* name, const juce::ComboBox& c)
-    { p.comboIds.push_back ({ name, c.getSelectedId() }); };
+    {
+        p.comboIds.push_back ({ name, c.getSelectedId() });
+        // The WIDEST item this box can show, against the room it has. The widest one,
+        // not the selected one: the box does not resize when the user changes modes, so
+        // a slot that only fits the current choice clips the other one the moment it is
+        // picked - and a probe that measured the selection would have to catch the box
+        // in that state to see it. The room is GalacticLnF's own comboTextWidth, the
+        // same function positionComboBoxText lays the label out with, so this check can
+        // never drift from what is actually drawn. Measured in the box's live font.
+        if (c.isVisible())
+        {
+            const auto f = c.getLookAndFeel().getComboBoxFont (const_cast<juce::ComboBox&> (c));
+            juce::String widest; float need = 0.0f;
+            for (int i = 0; i < c.getNumItems(); ++i)
+            {
+                const auto t = c.getItemText (i);
+                const auto w = (float) juce::GlyphArrangement::getStringWidthInt (f, t);
+                if (w > need) { need = w; widest = t; }
+            }
+            p.comboTexts.push_back ({ name, widest, need,
+                                      GalacticLnF::comboTextWidth (c.getWidth(), c.getHeight()) });
+        }
+    };
     combo ("basePitch",   basePitchBox);   combo ("phase",       phaseBox);
     combo ("primeMode",   primeModeBox);   combo ("bend",        bendBox);
     combo ("modSel",      modSelBox);      combo ("lfoWave",     lfoWaveBox);
@@ -5209,6 +5252,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     combo ("specMode",    specModeBox);    combo ("tuneSource",  tuneSourceBox);
     combo ("tuneScope",   tuneScopeBox);   combo ("adaptTarget", adaptTargetBox);
     combo ("adaptGoal",   adaptGoalBox);   combo ("shepMode",    shepModeBox);
+    combo ("shepRise",    shepRiseBox);
 
     // The painted sub-labels, each with the width its text really needs in the font
     // paint() sets for it.
@@ -6671,24 +6715,53 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 lblTuningBank.setVisible (fits); tuningBankBox.setVisible (fits);
                 tuningBankLoadBtn.setVisible (fits); tuningBankClearBtn.setVisible (fits);
             }
-            // SHEPARD generator (the row reserved off the bottom above):
-            // [Shepard][Free-or-Sync][the rate control in that mode's dress][level].
+            // SHEPARD MODE (the row reserved off the bottom above):
+            // [Shepard][Free-or-Sync][the rate control in that mode's dress][rise
+            // interval, only when the tuning's period is not an octave].
             // ONE rate control, two dresses: the ms fader (Free) and the beats box
             // (Sync) occupy the same slot and exactly one is on screen - a knob that
             // does nothing in the current mode is worse than no knob at all (the
-            // same rule as the LFO Div/Hz pair).
+            // same rule as the LFO Div/Hz pair). The rise-interval box follows the
+            // same rule one step further: with an octave-period tuning the two
+            // choices are the SAME interval, so the box is not there at all.
             {
+                // Each box is sized to the WORDS IT HOLDS, in the language actually on
+                // screen - never to a pixel count that only ever fitted English. A
+                // ComboBox does not clip visibly and does not resize: it draws as much
+                // of the item as the cell holds, so a fixed 94 px slot showed the
+                // renamed "Sync Project Tempo" as "Sync Project Te" while every bounds
+                // and overlap check in the build stayed green. The widest ITEM is what
+                // is measured, not the selected one, or the box would resize under the
+                // user as they change modes.
+                const int shepH = juce::jmin (24, shepRow.getHeight());
+                auto needFor = [shepH] (const juce::ComboBox& c, int nominal)
+                {
+                    auto& lf = c.getLookAndFeel();
+                    const auto f = lf.getComboBoxFont (const_cast<juce::ComboBox&> (c));
+                    int w = 0;
+                    for (int i = 0; i < c.getNumItems(); ++i)
+                        w = juce::jmax (w, juce::GlyphArrangement::getStringWidthInt (f, c.getItemText (i)));
+                    return juce::jmax (nominal, GalacticLnF::comboWidthForText (w, shepH));
+                };
+
                 auto sh = shepRow;
                 shepOnT.setBounds (sh.removeFromLeft (86));
                 sh.removeFromLeft (4);
-                compact (shepModeBox, sh.removeFromLeft (juce::jmin (94, sh.getWidth())));
+                compact (shepModeBox, sh.removeFromLeft (juce::jmin (needFor (shepModeBox, 94), sh.getWidth())));
                 sh.removeFromLeft (6);
-                shepLevelFader.setBounds (sh.removeFromRight (juce::jmin (120, sh.getWidth())));
-                sh.removeFromRight (6);
+                const bool riseChoice = shepard::periodDiffersFromOctave (processorRef.getTuningPeriodRatio());
+                shepRiseBox.setVisible (riseChoice);
+                if (riseChoice)
+                {
+                    compact (shepRiseBox, sh.removeFromRight (juce::jmin (needFor (shepRiseBox, 108), sh.getWidth())));
+                    sh.removeFromRight (6);
+                }
                 const bool sync = shepModeBox.getSelectedId() == 2;
                 shepTimeFader.setVisible (! sync);
                 shepDivBox.setVisible (sync);
-                if (sync) compact (shepDivBox, sh.removeFromLeft (juce::jmin (86, sh.getWidth())));
+                // The beats box holds "1/16".."16": it never needed 86 px, and the room
+                // it was hoarding is what pays for the rate mode's longer name.
+                if (sync) compact (shepDivBox, sh.removeFromLeft (juce::jmin (needFor (shepDivBox, 60), sh.getWidth())));
                 else      shepTimeFader.setBounds (sh);
             }
         }
@@ -7420,7 +7493,14 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                         | (processorRef.tuningIsAbsoluteTable()      ? 1 << 4 : 0)
                         | (processorRef.tuningTablePeriodIsUserSet() ? 1 << 5 : 0)
                         | (processorRef.hasSpectrumProvenance()      ? 1 << 6 : 0)
-                        | (processorRef.spectrumProvenanceIsActive() ? 1 << 7 : 0);
+                        | (processorRef.spectrumProvenanceIsActive() ? 1 << 7 : 0)
+                        // ...and whether the Shepard's rise-interval box is a real
+                        // choice at all. It exists only while the active tuning's
+                        // period is not an octave, and resized() is what puts it on
+                        // screen - so it belongs HERE or the box would appear only at
+                        // the next unrelated relayout after a Bohlen-Pierce load.
+                        | (shepard::periodDiffersFromOctave (
+                               processorRef.getTuningPeriodRatio())  ? 1 << 8 : 0);
     if (packed != lastResetOffState) { lastResetOffState = packed; resized(); }
     refreshSpectrumTuningButton(); // cheap (sig-guarded): keeps word/enabled honest per tick
 

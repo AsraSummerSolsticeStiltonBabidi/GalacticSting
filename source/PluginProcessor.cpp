@@ -334,34 +334,43 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "tuningBankSlot", 1 }, "Tuning Bank Slot", 0, kBankSlots, 0));
 
-    //-- Shepard tone generator (Tuning panel) ---------------------------------
-    // An endlessly rising tone whose component spacing is the ACTIVE TUNING's
-    // period (see ShepardEngine.h). Default OFF and at a modest level, so nothing
-    // sounds until it is asked for. All five are automatable.
+    //-- SHEPARD MODE (Tuning panel) -------------------------------------------
+    // A PLAYED mode, not a generator: the key you press becomes the root of an
+    // endlessly rising tone built from THIS synth's spectrum (see ShepardEngine.h
+    // and AdditiveVoice). Default OFF, so nothing changes until it is asked for.
+    // All four are automatable, and all four are read per VOICE - so a playground
+    // corner whose preset is a Shepard patch really sounds like one.
     params.push_back (std::make_unique<AudioParameterBool>(
-        ParameterID { "shepOn", 1 }, "Shepard On", false));
-    params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "shepLevel", 1 }, "Shepard Level",
-        NormalisableRange<float> (-60.0f, 0.0f, 0.1f), -18.0f));
-    // ONE rate control, two modes: FREE = the ms fader below; SYNC = a musical
-    // duration against the host BPM (the beats list). With no transport BPM the
-    // free value takes over and the editor says so (see shepardSyncHasNoBpm).
+        ParameterID { "shepOn", 1 }, "Shepard Mode", false));
+    // ONE rate control, two dresses: FREE = the ms fader below; SYNC = a musical
+    // duration against the host BPM (the beats list). SYNC IS THE DEFAULT: a rise
+    // that drifts against the track is the thing people fix first, and with no
+    // transport BPM the free value takes over anyway and the editor says so (see
+    // shepardSyncHasNoBpm).
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "shepMode", 1 }, "Shepard Rate Mode",
-        StringArray { "Free (ms)", "Sync (beats)" }, 0));
-    // Time to rise ONE period of the tuning, log-mapped over 100 ms .. 60 s.
+        StringArray { "Free (ms)", "Sync Project Tempo" }, 1));
+    // Time to rise ONE interval, log-mapped over 100 ms .. 60 s.
     {
         NormalisableRange<float> r (100.0f, 60000.0f, 1.0f);
         r.setSkewForCentre (2449.5f); // sqrt(100*60000): log-shaped travel
         params.push_back (std::make_unique<AudioParameterFloat>(
             ParameterID { "shepTime", 1 }, "Shepard Rise Time (ms)", r, 8000.0f));
     }
-    // The beats list mirrors ShepardEngine::kDivBeats ENTRY FOR ENTRY - the index
-    // is the contract between this choice and beatsForDiv(), and a list edited on
-    // one side only would silently re-time every saved project.
+    // The beats list mirrors shepard::kDivBeats ENTRY FOR ENTRY - the index is the
+    // contract between this choice and beatsForDiv(), and a list edited on one side
+    // only would silently re-time every saved project.
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "shepDiv", 1 }, "Shepard Rise Beats",
         StringArray { "1/16", "1/8", "1/4", "1/3", "1/2", "2/3", "1", "2", "3", "4", "8", "16" }, 9));
+    // WHAT ONE RISE STEP IS. An OCTAVE by default in every tuning - that is what a
+    // listener hears as "the same note again", and silently rising by 3/1 because a
+    // Bohlen-Pierce scale happens to be loaded would be a tuning decision nobody
+    // asked for. The tuning's own period is offered instead only when it differs
+    // from 2/1, and the editor hides the control entirely when it does not.
+    params.push_back (std::make_unique<AudioParameterChoice>(
+        ParameterID { "shepRise", 1 }, "Shepard Rise Interval",
+        StringArray { "Octave pitch bend", "Period pitch bend" }, 0));
 
     //-- Spectrum -> rhythm MIDI out --------------------------------------------
     // Each selected partial pulses at f0 * ratio / x^n; all of these are automatable.
@@ -2885,7 +2894,6 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
 
     applyTuningMode ((int) apvts.getRawParameterValue ("tuningMode")->load());
     rhythm.prepare (sampleRate);
-    shepard.prepare (sampleRate);
 
     // Poll the spectrum parameters and rebuild off the audio thread. 60 Hz (not 30):
     // a modulator driving a parameter that REBUILDS the spectrum (Base N, Harmonics,
@@ -3181,33 +3189,16 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         rhythm.process (midiMessages, nSamp);
     }
 
-    // SHEPARD TONE (Tuning panel): mixed in AFTER the synth render and BEFORE the
-    // master gain, so the master fader scales it with everything else. The engine
-    // gets plain seconds: the quantized mode's beats are resolved against the host
-    // BPM here, where the transport lives - and when Sync is chosen with no BPM on
-    // offer, the FREE value takes over and the flag says so, instead of the beats
-    // box silently meaning milliseconds.
-    {
-        const bool  shepOn = apvts.getRawParameterValue ("shepOn")->load() > 0.5f;
-        const int   mode   = (int) apvts.getRawParameterValue ("shepMode")->load();
-        double riseSec     = (double) apvts.getRawParameterValue ("shepTime")->load() * 0.001;
-        bool   noBpm       = false;
-        if (mode == 1)
-        {
-            // curBpm was read from the playhead earlier this block (the same clock
-            // the BPM-rate LFOs use). Hosts report BPM with the transport stopped
-            // too, so Sync works without pressing play.
-            if (curBpm > 1.0)
-                riseSec = ShepardEngine::beatsForDiv ((int) apvts.getRawParameterValue ("shepDiv")->load())
-                        * 60.0 / curBpm;
-            else
-                noBpm = true;
-        }
-        shepSyncNoBpm.store (mode == 1 && noBpm, std::memory_order_relaxed);
-        shepard.render (buffer, nSamp, shepOn,
-                        apvts.getRawParameterValue ("shepLevel")->load(),
-                        riseSec, tuning.periodRatio(), tuning.frequencyForNote (60));
-    }
+    // SHEPARD MODE is rendered INSIDE the voices now (see AdditiveVoice) - there is
+    // no separate engine to mix in any more, and nothing here touches the buffer.
+    // What still belongs here is the one fact only the transport knows: Sync was
+    // chosen but the host offers no BPM, so the FREE ms value is what actually drives
+    // the rise. The voices reach the same conclusion from the same curBpm; this flag
+    // is purely so the editor can SAY it instead of letting the beats box claim a
+    // sync that is not happening.
+    shepSyncNoBpm.store ((int) apvts.getRawParameterValue ("shepMode")->load() == 1
+                             && curBpm <= 1.0,
+                         std::memory_order_relaxed);
 
     const auto gain = juce::Decibels::decibelsToGain (
         apvts.getRawParameterValue ("masterGain")->load());

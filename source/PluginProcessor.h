@@ -334,6 +334,11 @@ public:
         numKeys = hi - lo + 1;
     }
 
+    // The ACTIVE tuning's repeat interval (2/1 in octave tunings, 3/1 under
+    // Bohlen-Pierce). The editor asks so the Shepard's rise-interval choice can exist
+    // only when it is really a choice - see shepard::periodDiffersFromOctave.
+    double getTuningPeriodRatio() const noexcept { return tuning.periodRatio(); }
+
     // Frequency ratio of scale degree `d` relative to degree 0 (the tonic on
     // key 60), for the keyboard's just-interval labels. Degree d is mapped to an
     // IN-RANGE key of the same degree class (walking down whole periods) rather
@@ -418,11 +423,32 @@ public:
     RhythmEngine& getRhythm() noexcept { return rhythm; }
 
     //==========================================================================
-    // Shepard tone generator (Tuning panel). The engine itself is stateless about
-    // the transport: processBlock resolves the quantized mode's beats against the
-    // host BPM and hands the engine plain seconds. Exposed for the verifiers
-    // (probe of the live components) and the editor (the honesty flag below).
-    ShepardEngine& getShepard() noexcept { return shepard; }
+    // SHEPARD MODE (Tuning panel). There is no separate engine any more: the mode is
+    // rendered inside the VOICES, from the key that was pressed and from the synth's
+    // own spectrum (see AdditiveVoice::planShepard). Only one fact still belongs to
+    // the processor - the transport's, below.
+    //
+    // TESTS ONLY: the Shepard copies of the first SOUNDING main-engine voice - grid
+    // index, ROOT frequency (the transposed played pitch each copy's spectrum is
+    // built on), window amplitude and partial count. Any pointer may be null. This is
+    // how run 46 proves the stack is anchored on the key that was pressed.
+    int voiceShepardForTests (long long* ms, double* roots, double* wins, int* counts, int maxN)
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive())
+                    return av->shepProbeForTests (ms, roots, wins, counts, maxN);
+        return 0;
+    }
+    // The rise interval the first sounding voice is ACTUALLY using, as a ratio.
+    double voiceShepardRiseRatioForTests()
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive())
+                    return av->shepRiseRatioForTests();
+        return 0.0;
+    }
     // TRUE while the rate control is in Sync mode but the host offers no BPM, so
     // the FREE (ms) value is what actually drives the rise. The editor shows this
     // state instead of letting the beats box claim a sync that is not happening.
@@ -1197,9 +1223,6 @@ private:
     spectrum::SpectrumSettings  lastPushed;
     RhythmEngine                rhythm { apvts, spectrumEngine, tuning };
     NoteGate                    noteGate; // quantize-to-tempo / mono / quantize-to-pulse
-    // The Shepard tone (Tuning panel). Runs after the synth mix, before master gain,
-    // so the master fader still scales it with everything else.
-    ShepardEngine               shepard;
     std::atomic<bool>           shepSyncNoBpm { false }; // see shepardSyncHasNoBpm()
     // Set by restoreState() (any thread); consumed at the top of the next processBlock
     // (audio thread) - see there for why. A preset/project load must never leave a

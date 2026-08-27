@@ -6833,280 +6833,580 @@ int main()
     }
 #endif
 
-    // --- run 46: the SHEPARD TONE generator (TUNING panel) -----------------------------
-    // "asegurate de que el shepards tone que produce es smooth y no tiene clicks ni
-    //  reseteo notable" - so every claim here is a measurement of the rendered thing:
-    //   1. NO CLICKS: the largest per-sample step never exceeds what a smooth render of
-    //      the probed components can produce (an analytic bound from the engine's own
-    //      state - run 26's metric, with a self-calibrating threshold);
-    //   2. SILENT WRAP: a component may only appear or disappear with window amplitude
-    //      below -80 dB (the raised cosine's edges reach exactly zero, so the wrap from
-    //      top to bottom is inaudible BY CONSTRUCTION - this check bites if the window
-    //      ever stops reaching zero);
-    //   3. STATIONARY CENTROID: the tone rises forever but goes nowhere - a drifting
-    //      centroid means the window moves with the stack, the classic mistake;
-    //   4. QUANTIZED RATE: 4 beats at 120 BPM = 2.000 s per period, measured from the
-    //      component frequencies through the REAL processor and a host playhead;
-    //   5. THE TUNING'S PERIOD: load a 3/1 scale (Bohlen-Pierce's period) and the
-    //      component spacing GLIDES to exactly 3/1, anchored on the sounding C3.
+    // --- run 46: SHEPARD MODE - PLAYED, and built from the synth's own spectrum --------
+    // v2, a redesign of run 46's original subject. The brief: "quiero que el creador de
+    // shepard tones no sea un motor de audio totalmente aparte e incontrolable por midi
+    // ... el shepards tone parte del tono pulsado en el teclado y construye un shepards
+    // tone usando el espectro del sinte en vez de un sine". The free-running sine drone
+    // is gone; the mode now lives inside the voice. So every claim below is measured
+    // through the REAL processor, with real MIDI, on the voice that is really sounding:
+    //   1. ROOT FOLLOWS THE KEY: every copy sits a whole number of rise intervals from
+    //      the PRESSED key's own tuned pitch, and the stack's phase is exactly where the
+    //      elapsed time says it should be (the old C3-anchored drone fails this by the
+    //      interval between the two keys);
+    //   2. SPECTRUM FOLLOWS THE PATCH: a copy carries a whole spectrum, not one sine,
+    //      and editing the spectrum changes what the Shepard sounds like;
+    //   3. SILENT WRAP: a copy may only appear or disappear with window amplitude below
+    //      -80 dB (the raised cosine's edges reach exactly zero);
+    //   4. STATIONARY CENTROID: it rises for ever and goes nowhere;
+    //   5. NO CLICKS: the largest per-sample step never exceeds what a smooth render of
+    //      the partials really sounding can produce (the analytic bound, calibrated from
+    //      the block's own RMS);
+    //   6. SYNC TIMING: 4 beats at 120 BPM = 2.000 s per rise interval, measured from
+    //      the copy roots through a host playhead;
+    //   7. THE ENVELOPE APPLIES: releasing the key fades the Shepard out to silence;
+    //   8. THE RISE INTERVAL: an OCTAVE by default even under Bohlen-Pierce, and the
+    //      tuning's 3/1 period only when the new dropdown asks for it;
+    //   9. CPU: the render cost with the mode on against the same note with it off;
+    //  10. the TUNING panel still fits, in both languages, and the new dropdown is on
+    //      screen exactly when it is a real choice.
     {
-        std::printf ("\nrun 46: Shepard tone generator (TUNING panel):\n");
+        std::printf ("\nrun 46: Shepard MODE - played, from the synth's own spectrum:\n");
         constexpr double ssr  = 48000.0;
         constexpr int    sblk = 256;
 
-        long long pm[ShepardEngine::kSlots];
-        double    pf[ShepardEngine::kSlots], pa[ShepardEngine::kSlots];
+        long long pm [shepard::kSlots];
+        double    pr [shepard::kSlots], pw[shepard::kSlots];
+        int       pcn[shepard::kSlots];
 
-        // -- engine level: octave period, 1 s per period, ~6.5 periods -------------
+        struct TestPlayHead : juce::AudioPlayHead
         {
-            ShepardEngine eng;
-            eng.prepare (ssr);
-            juce::AudioBuffer<float> b (2, sblk);
+            double bpm = 120.0;
+            juce::Optional<juce::AudioPlayHead::PositionInfo> getPosition() const override
+            {
+                juce::AudioPlayHead::PositionInfo pi;
+                pi.setBpm (bpm);
+                pi.setIsPlaying (false); // BPM is offered without the transport rolling
+                return pi;
+            }
+        };
+        TestPlayHead ph;
 
-            std::map<long long, double> lastAmp;   // last probed window amp per grid index
-            std::map<long long, double> firstAmp;  // first probed window amp per grid index
-            std::map<long long, bool>   inFirst;   // part of the initial stack (fade-in, not a wrap)
-            std::vector<double> centroids;         // per-block log2 amplitude centroid
-            float  maxJump = 0.0f, peak = 0.0f, prev = 0.0f;
-            double worstBound = 0.0;               // the analytic per-sample bound, worst block
-            double worstExcess = 0.0;              // measured jump / bound, worst block
-            bool   have = false;
-            const int totalBlocks = (int) (6.5 * ssr / sblk);
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (ssr, sblk);
+        p->setPlayHead (&ph);
+        juce::AudioBuffer<float> b (2, sblk);
+        auto set = [&] (const char* id, float plain)
+        {
+            auto* q = p->apvts.getParameter (id);
+            q->setValueNotifyingHost (q->convertTo0to1 (plain));
+            // The verifier has no message loop, so the 60 Hz poll that notices a
+            // spectrum parameter and asks the builder for a new template has to be
+            // pumped by hand - otherwise "editing the spectrum edits the Shepard"
+            // would be measuring a template nobody ever rebuilt.
+            p->pollParametersForTests();
+        };
+        juce::MidiBuffer pending;
+        auto pump = [&] (double seconds)
+        {
+            const int nB = juce::jmax (1, (int) std::lround (seconds * ssr / sblk));
+            for (int i = 0; i < nB; ++i)
+            {
+                juce::MidiBuffer m;
+                if (i == 0) m.swapWith (pending);
+                b.clear();
+                p->processBlock (b, m);
+            }
+            return nB;
+        };
+        auto keyDown = [&] (int note) { pending.addEvent (juce::MidiMessage::noteOn  (1, note, 0.9f), 0); };
+        auto keyUp   = [&] (int note) { pending.addEvent (juce::MidiMessage::noteOff (1, note), 0); };
+        auto probe   = [&] { return p->voiceShepardForTests (pm, pr, pw, pcn, shepard::kSlots); };
+
+        // -- the defaults --------------------------------------------------------
+        check ((int) p->apvts.getRawParameterValue ("shepMode")->load() == 1,
+               "the rate control defaults to SYNC (v1 defaulted to Free)");
+        check ((int) p->apvts.getRawParameterValue ("shepRise")->load() == 0,
+               "and one rise step defaults to the OCTAVE");
+        check (p->apvts.getParameter ("shepLevel") == nullptr,
+               "the v1 LEVEL fader is gone (the Shepard IS the voice now - it was a second master volume)");
+
+        // "QUE ESE SEA SU UNICO MODO." There is no free-running path left to reach: with
+        // the mode switched ON and NOTHING held, the plugin is silent. v1 would be
+        // droning here - that was the entire complaint - so this is the check that says
+        // the old engine was removed rather than merely hidden behind the new one.
+        {
+            p->apvts.getParameter ("shepOn")->setValueNotifyingHost (1.0f);
+            pump (2.0);                                  // long past v1's ~30 ms fade-in
+            float loudest = 0.0f;
+            for (int i = 0; i < 40; ++i)
+            {
+                juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                loudest = std::max (loudest, b.getMagnitude (0, sblk));
+            }
+            std::printf ("  Shepard ON, no key held: loudest sample %.2e over %d blocks\n", loudest, 40);
+            check (loudest < 1.0e-6f,
+                   "with the mode ON and no key down the plugin is SILENT - no drone survives anywhere");
+            p->apvts.getParameter ("shepOn")->setValueNotifyingHost (0.0f);
+            pump (0.3);
+        }
+
+        keyDown (60);
+        pump (0.3);
+        check (probe() == 0, "mode OFF by default: a played note is an ordinary note, no copies at all");
+        check (b.getMagnitude (0, sblk) > 1.0e-4f, "...and that ordinary note sounds");
+        keyUp (60); pump (1.5);
+
+        // -- 1. THE ROOT IS THE KEY YOU PRESSED ----------------------------------
+        set ("shepOn", 1.0f);
+        set ("shepDiv", 9.0f);   // "4" beats -> 2.0000 s per rise interval at 120 BPM
+        set ("phaseMode", 0.0f); // Aligned: a note-on is bit-for-bit repeatable
+        double bandCentroid[2] = { 0.0, 0.0 };
+        for (int ki = 0; ki < 2; ++ki)
+        {
+            const int key = ki == 0 ? 60 : 67;
+            keyDown (key);
+            const int nB = pump (0.5);
+            const double f0 = p->getNoteFrequency (key);
+            const int n = probe();
+            // The stack's WEIGHTED CENTRE, in absolute log2 Hz. Recorded per key because
+            // "the root is the key you pressed" is only half the rule: the copies sit on
+            // the KEY's grid, but the WINDOW that decides which of them sound - and how
+            // loudly - is a fixed band of ABSOLUTE frequency that must not move with the
+            // key at all. Checked below, across the two keys.
+            {
+                double sw = 0.0, sx = 0.0;
+                for (int k = 0; k < n; ++k) { sw += pw[k]; sx += pw[k] * std::log2 (pr[k]); }
+                bandCentroid[ki] = sw > 1.0e-12 ? sx / sw : 0.0;
+            }
+            // Where the rise really is: the probe reports each block's MIDPOINT, so
+            // after nB blocks the grid phase is (nB - 0.5) block-times into a 2 s rise.
+            const double gExp  = ((double) nB - 0.5) * ((double) sblk / ssr) / 2.0;
+            const double gFrac = gExp - std::floor (gExp);
+            double worst = 0.0, worstSp = 0.0;
+            std::vector<double> steps;
+            for (int k = 0; k < n; ++k)
+            {
+                const double st = std::log2 (pr[k] / f0);
+                steps.push_back (st);
+                const double d = std::abs ((st - std::floor (st)) - gFrac);
+                worst = std::max (worst, std::min (d, 1.0 - d));
+            }
+            std::sort (steps.begin(), steps.end());
+            for (size_t i = 1; i < steps.size(); ++i)
+                worstSp = std::max (worstSp, std::abs (steps[i] - steps[i - 1] - 1.0));
+            std::printf ("  key %d (%.4f Hz): %d copies, worst distance off THAT key's grid %.2e intervals,"
+                         " worst |spacing - 1 oct| %.2e\n", key, f0, n, worst, worstSp);
+            check (n >= 5 && worst < 1.0e-6,
+                   "every copy is a whole number of rise intervals from the PRESSED key's tuned pitch");
+            check (worstSp < 1.0e-9, "and neighbouring copies are exactly one rise interval apart");
+            keyUp (key); pump (1.5);
+        }
+        // ...and the BAND stayed put. The two keys are a fifth apart and were held for
+        // exactly the same time, so a key-anchored stack under a fixed window puts its
+        // weighted centre in the same place to the last bit; a stack whose window was
+        // built from some OTHER anchor - v1's C3, say - transposes the whole audible
+        // band by the interval between the two keys instead. The grid check above cannot
+        // see that: it measures each copy against the key it was built from, which is
+        // true by construction whatever the window is doing. This is the check that
+        // failed when the anchor was put back to C3 (0.585 octaves of drift, a fifth).
+        std::printf ("  the sounding BAND across the two keys: %.6f vs %.6f log2 Hz (drift %.2e oct)\n",
+                     bandCentroid[0], bandCentroid[1], std::abs (bandCentroid[0] - bandCentroid[1]));
+        check (std::abs (bandCentroid[0] - bandCentroid[1]) < 0.02,
+               "and the WINDOW did not move with the key - the same absolute band sounds either way");
+
+        // -- 2. THE BUILDING BLOCK IS THE SPECTRUM, NOT A SINE -------------------
+        // A copy carries the whole partial list, and editing the spectrum edits the
+        // Shepard: same key, same rise, but a different sound - and putting the patch
+        // back puts the sound back.
+        auto capture = [&] (float baseN, std::vector<float>& out)
+        {
+            set ("baseN", baseN);
+            juce::Thread::sleep (120);        // the builder thread compiles the new template
+            pump (0.8);                       // ...and publishes it; nothing is sounding
+            out.clear();
+            keyDown (60);
+            for (int i = 0; i < 60; ++i)      // ~0.32 s
+            {
+                juce::MidiBuffer m;
+                if (i == 0) m.swapWith (pending);
+                b.clear();
+                p->processBlock (b, m);
+                const float* L = b.getReadPointer (0);
+                for (int s2 = 0; s2 < sblk; ++s2) out.push_back (L[s2]);
+            }
+            const int n = probe();
+            int loudest = 0;
+            for (int k = 1; k < n; ++k) if (pw[k] > pw[loudest]) loudest = k;
+            const int partials = n > 0 ? pcn[loudest] : 0;
+            keyUp (60); pump (1.5);
+            return partials;
+        };
+        {
+            std::vector<float> a1, a2, a3;
+            const int part1 = capture (1.0f, a1);
+            (void)             capture (7.0f, a2);
+            const int part3 = capture (1.0f, a3);
+            double d12 = 0.0, d13 = 0.0, e1 = 0.0;
+            const size_t nS = std::min (a1.size(), std::min (a2.size(), a3.size()));
+            for (size_t i = 0; i < nS; ++i)
+            {
+                d12 += (double) (a1[i] - a2[i]) * (a1[i] - a2[i]);
+                d13 += (double) (a1[i] - a3[i]) * (a1[i] - a3[i]);
+                e1  += (double) a1[i] * a1[i];
+            }
+            const double r12 = std::sqrt (d12 / std::max (1.0e-15, e1));
+            const double r13 = std::sqrt (d13 / std::max (1.0e-15, e1));
+            std::printf ("  loudest copy carries %d partials; Base 1 vs Base 7 differs by %.3f of its own"
+                         " energy, Base 1 vs Base 1 again by %.5f\n", part1, r12, r13);
+            check (part1 > 4, "a copy is a whole SPECTRUM (a sine-based Shepard would report 1)");
+            check (r12 > 0.25, "editing the spectrum edits the Shepard - it is built from the patch");
+            check (r13 < 0.05, "and putting the patch back gives the same Shepard again");
+        }
+
+        // -- 3/4/5. SILENT WRAP, STATIONARY CENTROID, NO CLICKS ------------------
+        // A fast rise (400 ms per octave) so several wraps really happen inside a few
+        // seconds of audio, and Scattered phases so the click bound below is calibrated
+        // against an incoherent sum rather than the coherent note-on pulse.
+        set ("shepMode",  0.0f);      // Free (ms)
+        set ("shepTime",  400.0f);
+        set ("phaseMode", 1.0f);      // Scattered
+        set ("baseN",     1.0f);
+        set ("ampSustain", 1.0f);
+        pump (0.8);
+        {
+            keyDown (60);
+            pump (0.3);               // past the attack: the envelope is at sustain
+
+            std::map<long long, double> firstW, lastW;
+            std::map<long long, bool>   inFirst;
+            std::vector<double>         centroids;
+            float  prev = 0.0f; bool have = false;
+            double worstExcess = 0.0, worstBound = 0.0;
+            float  maxJump = 0.0f;
+            const int totalBlocks = (int) (3.0 * ssr / sblk);
             for (int blk2 = 0; blk2 < totalBlocks; ++blk2)
             {
-                const double scale0 = eng.probeOutScale();
+                juce::MidiBuffer m;
                 b.clear();
-                eng.render (b, sblk, true, 0.0f, 1.0, 2.0, 261.6255653);
-                const double scale1 = eng.probeOutScale();
-                const int n = eng.probe (pm, pf, pa, ShepardEngine::kSlots);
+                p->processBlock (b, m);
+                const int n = probe();
+                if (n == 0) continue;
 
-                // Analytic ceiling for a smooth render of exactly these components:
-                // |x[k]-x[k-1]| <= sum_i amp_i * 2 sin(pi f_i / sr), plus a small
-                // allowance for the amplitude/gain ramps themselves.
-                double bound = 1.0e-3;
-                double num = 0.0, den = 0.0;
-                for (int k = 0; k < n; ++k)
-                {
-                    bound += pa[k] * 2.0 * std::sin (juce::MathConstants<double>::pi * pf[k] / ssr);
-                    num   += pa[k] * std::log2 (pf[k]);
-                    den   += pa[k];
-                }
-                bound *= juce::jmax (scale0, scale1) * 1.35;
+                // The analytic ceiling for a SMOOTH render of exactly the partials that
+                // are sounding: |x[k]-x[k-1]| <= sum_j a_j * 2 sin(pi f_j / sr). The
+                // overall gain (normalisation x envelope x velocity) is unknown here, so
+                // it is calibrated from this block's own RMS, which for an incoherent
+                // sum is G * sqrt(sum a_j^2 / 2).
+                const auto* T = p->getLiveTemplate();
+                double sumA2 = 0.0, sumB = 0.0, num = 0.0, den = 0.0;
+                if (T != nullptr)
+                    for (int k = 0; k < n; ++k)
+                    {
+                        const double w  = pw[k];
+                        const int    nc = std::min (pcn[k], (int) T->partials.size());
+                        for (int i = 0; i < nc; ++i)
+                        {
+                            const double a = (double) T->partials[(size_t) i].amp * w;
+                            const double f = std::min ((double) T->partials[(size_t) i].ratio * pr[k],
+                                                       0.4999 * ssr);
+                            sumA2 += a * a;
+                            sumB  += a * 2.0 * std::sin (juce::MathConstants<double>::pi * f / ssr);
+                        }
+                        num += w * std::log2 (pr[k]);
+                        den += w;
+                    }
                 const float* L = b.getReadPointer (0);
-                float blockJump = 0.0f;
+                double energy = 0.0; float blockJump = 0.0f;
                 for (int i = 0; i < sblk; ++i)
                 {
                     const float x = L[i];
-                    peak = std::max (peak, std::abs (x));
+                    energy += (double) x * x;
                     if (have) blockJump = std::max (blockJump, std::abs (x - prev));
                     prev = x; have = true;
                 }
+                const double rms = std::sqrt (energy / (double) sblk);
+                const double G   = sumA2 > 1.0e-18 ? rms / std::sqrt (0.5 * sumA2) : 0.0;
+                const double bound = G * sumB * 1.35 + 1.0e-4;
                 maxJump = std::max (maxJump, blockJump);
-                if (bound > 0.0) worstExcess = std::max (worstExcess, (double) blockJump / bound);
                 worstBound = std::max (worstBound, bound);
+                if (bound > 0.0) worstExcess = std::max (worstExcess, (double) blockJump / bound);
 
                 for (int k = 0; k < n; ++k)
                 {
-                    if (firstAmp.find (pm[k]) == firstAmp.end())
+                    if (firstW.find (pm[k]) == firstW.end())
                     {
-                        firstAmp[pm[k]] = pa[k];
-                        inFirst[pm[k]]  = blk2 == 0; // the initial stack is a fade-in, not a wrap
+                        firstW[pm[k]]  = pw[k];
+                        inFirst[pm[k]] = blk2 == 0;   // the initial stack is not a wrap
                     }
-                    lastAmp[pm[k]] = pa[k];
+                    lastW[pm[k]] = pw[k];
                 }
-                if (den > 0.0 && blk2 >= (int) (1.0 * ssr / sblk))
-                    centroids.push_back (num / den);
+                if (den > 0.0) centroids.push_back (num / den);
             }
 
-            check (peak > 0.01f, "the tone actually sounds");
-            std::printf ("  click metric: max per-sample jump %.5f, smooth-render bound %.5f (worst jump/bound %.2f)\n",
-                         maxJump, worstBound, worstExcess);
+            std::printf ("  click metric: max per-sample jump %.5f, smooth-render bound %.5f"
+                         " (worst jump/bound %.2f)\n", maxJump, worstBound, worstExcess);
             check (worstExcess <= 1.0,
-                   "no per-sample step ever exceeds what these components can smoothly produce (no clicks)");
+                   "no per-sample step exceeds what these partials can smoothly produce (no clicks)");
 
-            // Every component that ENTERED after the start, and every one that LEFT,
-            // did so below -80 dB of window amplitude: the silent wrap.
-            double worstEntry = 0.0, worstExit = 0.0;
-            int wraps = 0;
-            const int lastN = eng.probe (pm, pf, pa, ShepardEngine::kSlots);
+            const int lastN = probe();
             std::map<long long, bool> stillHere;
             for (int k = 0; k < lastN; ++k) stillHere[pm[k]] = true;
-            for (const auto& e : firstAmp)
+            double worstEntry = 0.0, worstExit = 0.0; int wraps = 0;
+            for (const auto& e : firstW)
                 if (! inFirst[e.first]) { ++wraps; worstEntry = std::max (worstEntry, e.second); }
-            for (const auto& e : lastAmp)
+            for (const auto& e : lastW)
                 if (stillHere.find (e.first) == stillHere.end())
                 { ++wraps; worstExit = std::max (worstExit, e.second); }
-            std::printf ("  %d wrap events; worst entry amp %.2e (%.1f dB), worst exit amp %.2e (%.1f dB)\n",
-                         wraps,
-                         worstEntry, 20.0 * std::log10 (juce::jmax (1.0e-12, worstEntry)),
+            std::printf ("  %d wrap events; worst entry window %.2e (%.1f dB), worst exit %.2e (%.1f dB)\n",
+                         wraps, worstEntry, 20.0 * std::log10 (juce::jmax (1.0e-12, worstEntry)),
                          worstExit,  20.0 * std::log10 (juce::jmax (1.0e-12, worstExit)));
-            check (wraps >= 5, "several components wrapped during the render (the test saw the event)");
+            check (wraps >= 5, "several copies wrapped during the render (the test saw the event)");
             check (worstEntry < 1.0e-4 && worstExit < 1.0e-4,
-                   "every wrap happens below -80 dB: the re-entering component is SILENT (no reset)");
+                   "every wrap happens below -80 dB: the copy re-entering underneath is SILENT");
 
-            // The spectral centroid is STATIONARY: the illusion rises forever but goes
-            // nowhere. Peak-to-peak wobble within a period is the sampling ripple of
-            // the fixed window; a window that moved with the stack drifts a whole
-            // octave per period and fails this by miles.
             double cLo = 1.0e9, cHi = -1.0e9;
             for (const double c : centroids) { cLo = std::min (cLo, c); cHi = std::max (cHi, c); }
             const size_t nC = centroids.size();
             double headMean = 0.0, tailMean = 0.0;
             const size_t seg = juce::jmax ((size_t) 1, nC / 5);
-            for (size_t i = 0; i < seg; ++i)                { headMean += centroids[i]; tailMean += centroids[nC - 1 - i]; }
+            for (size_t i = 0; i < seg; ++i) { headMean += centroids[i]; tailMean += centroids[nC - 1 - i]; }
             headMean /= (double) seg; tailMean /= (double) seg;
-            std::printf ("  centroid (log2): %.4f .. %.4f (p-p %.4f oct), first fifth %.4f vs last fifth %.4f (drift %.4f)\n",
+            std::printf ("  copy centroid (log2 Hz): %.4f .. %.4f (p-p %.4f oct), first fifth %.4f vs"
+                         " last fifth %.4f (drift %.4f)\n",
                          cLo, cHi, cHi - cLo, headMean, tailMean, std::abs (tailMean - headMean));
             check (nC > 100 && cHi - cLo < 0.15,
-                   "the amplitude centroid only ripples - the tone rises but goes NOWHERE");
+                   "the window's centroid only ripples - the tone rises but goes NOWHERE");
             check (std::abs (tailMean - headMean) < 0.05,
-                   "and it does not drift across 5+ periods (the window never moves with the stack)");
+                   "and it does not drift over 7+ intervals (the window never travels with the stack)");
 
-            // Component spacing is the period: adjacent frequencies are exactly 2/1.
-            double worstSp = 0.0;
-            std::vector<double> fs (pf, pf + lastN);
-            std::sort (fs.begin(), fs.end());
-            for (size_t i = 1; i < fs.size(); ++i)
-                worstSp = std::max (worstSp, std::abs (fs[i] / fs[i - 1] - 2.0));
-            std::printf ("  spacing: %d components, worst |ratio - 2| = %.2e\n", lastN, worstSp);
-            check (lastN >= 8 && worstSp < 1.0e-6, "components sit exactly one 2/1 period apart");
+            // -- 7. THE ENVELOPE APPLIES ----------------------------------------
+            set ("ampRelease", 0.30f);
+            const float held = b.getMagnitude (0, sblk);
+            keyUp (60);
+            pump (0.12);
+            const float mid = b.getMagnitude (0, sblk);
+            pump (2.0);
+            const float after = b.getMagnitude (0, sblk);
+            std::printf ("  release: held %.4f -> 0.12 s after key-up %.4f -> settled %.2e\n",
+                         held, mid, after);
+            check (held > 1.0e-3f && mid < held * 0.85f,
+                   "letting go of the key RELEASES the Shepard through the amp envelope");
+            check (after < 1.0e-5f, "and it ends in silence, like any other note");
         }
 
-        // -- the REAL processor: quantized rate, tuning period, honesty, on/off ----
+        // -- 6. SYNC TIMING ------------------------------------------------------
+        set ("shepMode", 1.0f);   // Sync (beats)
+        set ("shepDiv",  9.0f);   // 4 beats -> 2.0000 s per interval at 120 BPM
+        check (! p->shepardSyncHasNoBpm(), "with a host BPM on offer, Sync is really syncing");
         {
-            struct TestPlayHead : juce::AudioPlayHead
+            keyDown (60);
+            pump (0.5);
+            const int n1 = probe();
+            std::map<long long, double> r1;
+            for (int k = 0; k < n1; ++k) r1[pm[k]] = pr[k];
+            const int nB = pump (1.0);
+            const double dt = (double) nB * sblk / ssr;
+            const int n2 = probe();
+            const double R = p->voiceShepardRiseRatioForTests();
+            double measured = -1.0;
+            for (int k = 0; k < n2 && measured < 0.0; ++k)
             {
-                double bpm = 120.0;
-                juce::Optional<juce::AudioPlayHead::PositionInfo> getPosition() const override
-                {
-                    juce::AudioPlayHead::PositionInfo pi;
-                    pi.setBpm (bpm);
-                    pi.setIsPlaying (false); // BPM is offered without the transport rolling
-                    return pi;
-                }
-            };
-            TestPlayHead ph;
+                const auto it = r1.find (pm[k]);
+                if (it == r1.end()) continue;
+                const double ratio = pr[k] / it->second;
+                if (ratio > 1.0000001) measured = dt * std::log2 (R) / std::log2 (ratio);
+            }
+            std::printf ("  sync 4 beats @ 120 BPM: measured %.4f s per rise interval (expected 2.0000)\n",
+                         measured);
+            check (std::abs (measured - 2.0) < 0.005,
+                   "quantized mode: 4 beats at 120 BPM = 2.000 s per rise interval");
 
-            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
-            p->prepareToPlay (ssr, sblk);
-            p->setPlayHead (&ph);
-            auto set = [&] (const char* id, float plain)
-            {
-                auto* q = p->apvts.getParameter (id);
-                q->setValueNotifyingHost (q->convertTo0to1 (plain));
-            };
-            juce::AudioBuffer<float> b (2, sblk);
-            auto pump = [&] (double seconds)
-            {
-                const int nB = (int) std::lround (seconds * ssr / sblk);
-                for (int i = 0; i < nB; ++i) { juce::MidiBuffer m; p->processBlock (b, m); }
-                return (double) nB * sblk / ssr; // the EXACT time that elapsed
-            };
-
-            // Default OFF: the tone must not exist until asked for.
+            // ...and the honesty flag when the host stops offering a BPM.
+            p->setPlayHead (nullptr);
             pump (0.2);
-            check (b.getMagnitude (0, sblk) == 0.0f, "the Shepard tone is OFF by default (exact silence)");
+            check (p->shepardSyncHasNoBpm(),
+                   "no host BPM: the processor still reports the free-value fallback honestly");
+            p->setPlayHead (&ph);
+            keyUp (60); pump (2.0);
+        }
 
-            set ("shepOn", 1.0f);
-            set ("shepMode", 1.0f);   // Sync (beats)
-            set ("shepDiv", 9.0f);    // "4" beats -> 2.000 s per period at 120 BPM
-            pump (2.0);
-            check (b.getMagnitude (0, sblk) > 1.0e-4f, "switched on, it sounds through processBlock");
-            check (! p->shepardSyncHasNoBpm(), "with a host BPM on offer, Sync is really syncing");
-
-            // Measure the rise time from one component's frequency trajectory:
-            //   f2/f1 = period^(dt/T)  ->  T = dt * log2 (period) / log2 (f2/f1).
-            auto measureT = [&] (double dtWanted)
-            {
-                const int n1 = p->getShepard().probe (pm, pf, pa, ShepardEngine::kSlots);
-                std::map<long long, double> f1;
-                for (int k = 0; k < n1; ++k) f1[pm[k]] = pf[k];
-                const double dt = pump (dtWanted);
-                const int n2 = p->getShepard().probe (pm, pf, pa, ShepardEngine::kSlots);
-                const double period = p->getShepard().currentSpacing();
-                for (int k = 0; k < n2; ++k)
-                {
-                    const auto it = f1.find (pm[k]);
-                    if (it == f1.end()) continue;
-                    const double r = pf[k] / it->second;
-                    if (r > 1.0000001)
-                        return dt * std::log2 (period) / std::log2 (r);
-                }
-                return -1.0;
-            };
-            const double tSync = measureT (2.0);
-            std::printf ("  sync 4 beats @ 120 BPM: measured %.4f s per period (expected 2.0000)\n", tSync);
-            check (std::abs (tSync - 2.0) < 0.002, "quantized mode: 4 beats at 120 BPM = 2.000 s per period");
-
-            // THE TUNING-PERIOD RULE: load a Bohlen-Pierce-period scale (3/1) and the
-            // spacing GLIDES to 3/1 - and the whole stack stays anchored on the pitch
-            // key 60 really sounds at (whole periods from the sounding tonic).
+        // -- 8. THE RISE INTERVAL: an octave unless the user says otherwise ------
+        {
             juce::String err;
             check (p->loadScalaText ("! bp\nBohlen-Pierce period test\n 1\n 3/1\n", "bp-period", err),
                    "a 3/1-period scale loads as the active tuning");
-            pump (3.0); // the 150 ms spacing glide is long settled after 3 s
+            check (shepard::periodDiffersFromOctave (p->getTuningPeriodRatio()),
+                   "and the processor agrees its period is not an octave (so the dropdown exists)");
+
+            auto spacingNow = [&]
             {
-                const int n = p->getShepard().probe (pm, pf, pa, ShepardEngine::kSlots);
-                std::vector<double> fs (pf, pf + n);
+                const int n = probe();
+                std::vector<double> fs (pr, pr + n);
                 std::sort (fs.begin(), fs.end());
-                double worstSp = 0.0;
+                double worst = 0.0, first = fs.size() > 1 ? fs[1] / fs[0] : 0.0;
                 for (size_t i = 1; i < fs.size(); ++i)
-                    worstSp = std::max (worstSp, std::abs (fs[i] / fs[i - 1] - 3.0));
-                std::printf ("  Bohlen-Pierce: %d components, worst |ratio - 3| = %.2e\n", n, worstSp);
-                check (n >= 5 && worstSp < 1.0e-3,
-                       "the spacing follows the TUNING's period: 3/1 under Bohlen-Pierce, not a hard-coded octave");
-            }
-            // THE ANCHOR: restart the tone (off -> fully idle -> on) and probe the very
-            // first block. A newborn stack has grid phase g0 = one block's fraction of a
-            // period, so every component must sit exactly g0 periods above the grid
-            // anchor*3^m through the pitch key 60 REALLY sounds at (analysisAnchorHz) -
-            // that whole-period relationship to the sounding tonic is what keeps the
-            // tone consonant with the keyboard in any tuning.
-            set ("shepOn", 0.0f);
-            pump (1.0); // fade out and return to cold idle
-            set ("shepOn", 1.0f);
-            { juce::MidiBuffer m; p->processBlock (b, m); }
-            {
-                const int n = p->getShepard().probe (pm, pf, pa, ShepardEngine::kSlots);
-                const double anchor = p->analysisAnchorHz();
-                const double g0 = (double) sblk / ssr / 2.0; // 4 beats @ 120 BPM = 2 s / period
-                double worstAnchor = 0.0;
-                for (int k = 0; k < n; ++k)
-                {
-                    const double steps = std::log (pf[k] / anchor) / std::log (3.0) - g0;
-                    worstAnchor = std::max (worstAnchor, std::abs (steps - std::round (steps)));
-                }
-                std::printf ("  restart: %d components, worst distance off the anchored grid %.2e periods\n",
-                             n, worstAnchor);
-                check (n >= 5 && worstAnchor < 1.0e-6,
-                       "the stack is anchored whole periods from the sounding C3 (consonant with the keyboard)");
-            }
+                    worst = std::max (worst, std::abs (fs[i] / fs[i - 1] - first));
+                return std::pair<double, double> { first, worst };
+            };
 
-            // HONESTY: Sync chosen, BPM taken away -> the FREE value drives the rise
-            // and the processor SAYS so (the editor turns the beats box amber from
-            // this very flag).
-            p->setPlayHead (nullptr);
-            set ("shepTime", 500.0f);
-            pump (2.5); // let the rate glide settle on the fallback value
-            check (p->shepardSyncHasNoBpm(), "no host BPM: the processor reports the fallback honestly");
-            const double tFree = measureT (1.0);
-            std::printf ("  sync with NO BPM: measured %.4f s per period (free fallback set to 0.5000)\n", tFree);
-            check (std::abs (tFree - 0.5) < 0.005, "and the free ms value is what actually drives the rise");
+            keyDown (60); pump (0.5);
+            auto oct = spacingNow();
+            std::printf ("  Bohlen-Pierce loaded, dropdown left at OCTAVE: copy spacing %.6f"
+                         " (worst deviation %.2e)\n", oct.first, oct.second);
+            check (std::abs (oct.first - 2.0) < 1.0e-9 && oct.second < 1.0e-9,
+                   "the DEFAULT rise is an octave even under a 3/1 tuning (no silent tuning decision)");
+            keyUp (60); pump (2.0);
 
-            // OFF fades to real, exact silence (the engine idles - no denormal tail).
-            set ("shepOn", 0.0f);
-            pump (1.0);
-            check (b.getMagnitude (0, sblk) == 0.0f, "switched off, it fades out and returns to exact silence");
+            set ("shepRise", 1.0f);   // "Period pitch bend"
+            keyDown (60); pump (0.5);
+            auto per = spacingNow();
+            std::printf ("  dropdown set to PERIOD: copy spacing %.6f (worst deviation %.2e)\n",
+                         per.first, per.second);
+            check (std::abs (per.first - 3.0) < 1.0e-6 && per.second < 1.0e-6,
+                   "choosing 'period pitch bend' rises by the TUNING's own 3/1 instead");
+            keyUp (60); pump (2.0);
+            set ("shepRise", 0.0f);
+            check (p->loadScalaText ("! oct\noctave test\n 1\n 2/1\n", "oct-period", err),
+                   "and an octave-period scale loads back");
+            check (! shepard::periodDiffersFromOctave (p->getTuningPeriodRatio()),
+                   "...where there is nothing to choose, so the dropdown has no reason to exist");
         }
 
-        // -- the TUNING panel with its new row, in its DENSEST reachable shape ------
-        // The Shepard row was paid for by merging the bend and Recent rows, so the
-        // bank row's worst case is unchanged - but that is an argument, and this is
-        // the measurement: an absolute-table tuning (the period row grows its edit
-        // field AND the reset button), both rate modes, both languages. The generic
-        // run-35 rules are applied to every control in the box: inside it, usable
-        // size, no overlaps - and the bank must still be on screen, because "honest
-        // failure" hides it the moment a new row starves it.
+        // -- 9. CPU: what the mode actually costs -------------------------------
+        {
+            // The key MATTERS to this measurement. The fractal levels of a harmonic base
+            // are integer ratios, so at C4 only the ~91 integers under Nyquist ever
+            // sound however deep the fractal goes: measuring "dense" at C4 would report
+            // the cheap patch twice and call it a range. The dense case is therefore
+            // played LOW, where the same template really does put thousands of partials
+            // under Nyquist - which is the case a user hits and has to be told about.
+            auto timeBlocks = [&] (bool on, int key)
+            {
+                set ("shepOn", on ? 1.0f : 0.0f);
+                pump (0.3);
+                keyDown (key);
+                pump (0.2);                       // steady state before the clock starts
+                const int nB = 400;
+                const double t0 = juce::Time::getMillisecondCounterHiRes();
+                for (int i = 0; i < nB; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+                const double ms = (juce::Time::getMillisecondCounterHiRes() - t0) / (double) nB;
+                // The oscillator count the meter reports - the copies' partials added
+                // up with the mode on, the plain sub-Nyquist count with it off.
+                const int osc = p->getPartialCount();
+                keyUp (key); pump (2.0);
+                return std::pair<double, int> { ms, osc };
+            };
+            const double blockMs = 1000.0 * sblk / ssr;
+            auto report = [&] (const char* what, int key)
+            {
+                const auto off = timeBlocks (false, key);
+                const auto onv = timeBlocks (true,  key);
+                std::printf ("  CPU at %s (key %d), ONE held note, %d-sample blocks (%.2f ms of audio):\n"
+                             "    Shepard OFF %.4f ms/block (%6.1f%% of realtime), %5d oscillators\n"
+                             "    Shepard ON  %.4f ms/block (%6.1f%% of realtime), %5d oscillators  ->  x%.1f\n",
+                             what, key, sblk, blockMs,
+                             off.first, 100.0 * off.first / blockMs, off.second,
+                             onv.first, 100.0 * onv.first / blockMs, onv.second,
+                             onv.first / std::max (1.0e-6, off.first));
+                return std::pair<std::pair<double, int>, std::pair<double, int>> { off, onv };
+            };
+
+            const auto dflt = report ("the DEFAULT spectrum", 60);
+            check (dflt.second.second > dflt.first.second * 2,
+                   "Shepard mode really multiplies the partial set (the copies are all sounding)");
+            check (dflt.second.first < 0.5 * blockMs,
+                   "and at the default spectrum one Shepard voice renders in well under realtime");
+
+            // ...and at a DENSE one, which is where the honest ceiling is. The mode
+            // multiplies the partial count by however many copies are inside the window,
+            // so a patch that is already expensive becomes several times as expensive:
+            // the number below is what a user has to be told, not a number measured on
+            // the cheapest possible patch and quoted as if it were the cost.
+            set ("fractalLevel", 4.0f);
+            juce::Thread::sleep (400);          // let the off-thread rebuild land
+            pump (0.6);
+            const auto dense = report ("a DENSE spectrum (fractal level 4), played LOW", 24);
+
+            // WHAT THAT SECOND ROW ACTUALLY SAYS, and it is not what you would guess.
+            // An ordinary low note pays for every partial the template has under its own
+            // Nyquist - 1024 of them at key 24. A SHEPARD note does not: its copies live
+            // in a FIXED band of absolute frequency, so the total is
+            //     sum over copies of (Nyquist / that copy's root)
+            // which for octave spacing converges to about twice the LOWEST copy's count,
+            // and the lowest copy sits near 40 Hz whatever key is held. The cost of the
+            // mode is therefore bounded by the BAND, not by the patch - which is why a
+            // dense low note can cost the SAME with the mode on as without it, and why
+            // the multiplication seen at C4 (x6) is the expensive end, not the cheap one.
+            // Nothing is being culled to achieve that: every copy is culled at its own
+            // Nyquist exactly as an ordinary voice at that pitch would be.
+            const double perVoice = std::max (dflt.second.first, dense.second.first);
+            std::printf ("    -> the honest ceiling: the copies live in a FIXED band, so ONE Shepard voice\n"
+                         "       costs at most ~%.0f%% of one core's realtime budget (%d oscillators at C4,\n"
+                         "       %d on the dense low note) - roughly %d simultaneous Shepard voices per core,\n"
+                         "       against %d for the same patch played normally.\n",
+                         100.0 * perVoice / blockMs, dflt.second.second, dense.second.second,
+                         (int) (blockMs / std::max (1.0e-6, perVoice)),
+                         (int) (blockMs / std::max (1.0e-6, std::max (dflt.first.first, dense.first.first))));
+
+            // Deliberately NOT a "the mode multiplies" assertion here: at this key it
+            // truthfully does not (see above), and an assertion written to the guess
+            // instead of to the mechanism would have to be faked to stay green.
+            // What MUST hold is the invariant the arrays depend on - no copy may ever
+            // carry more than one kStride slot - measured on the copies themselves.
+            {
+                set ("shepOn", 1.0f);
+                keyDown (24); pump (0.4);
+                const int n = probe();
+                int worstCopy = 0, tot = 0;
+                for (int k = 0; k < n; ++k) { worstCopy = std::max (worstCopy, pcn[k]); tot += pcn[k]; }
+                std::printf ("    dense low Shepard: %d copies, biggest carries %d partials (slot holds %d),"
+                             " %d in total\n", n, worstCopy, shepard::kStride, tot);
+                check (n >= 2 && worstCopy > 40,
+                       "a dense low note really is several copies, each a whole spectrum");
+                check (worstCopy <= shepard::kStride,
+                       "...and no copy ever overruns its own oscillator slot");
+                check (tot <= spectrum::kMaxPartials,
+                       "...nor the voice's arrays in total (the meter's number is a real one)");
+                keyUp (24); pump (2.0);
+            }
+            set ("fractalLevel", 1.0f);
+            juce::Thread::sleep (250);
+            pump (0.6);
+        }
+
+        // -- the nastiest hand-over there is: a DENSE ordinary note, STOLEN by a
+        //    Shepard one. The ordinary voice can be carrying thousands of fading
+        //    partials; a Shepard copy's bank is one kStride slot wide, so every loop
+        //    that walks a copy has to stop there - a stride further is the next copy's
+        //    phases, and from the top slot it is past the end of the array entirely.
+        {
+            set ("shepOn", 0.0f);
+            set ("fractalLevel", 3.0f);      // a few thousand partials in the template
+            set ("ampRelease", 3.0f);        // the tails are still alive when the steal lands
+            juce::Thread::sleep (250);
+            pump (0.6);
+            for (int k = 0; k < 24; ++k) keyDown (12 + k), pump (0.02);  // ~16 Hz up: huge partial counts
+            pump (0.3);
+            set ("shepOn", 1.0f);
+            float worst = 0.0f; bool finite = true;
+            for (int k = 0; k < 40; ++k)     // 40 more notes onto a 32-voice pool: real steals
+            {
+                keyDown (48 + (k % 24));
+                pump (0.03);
+                const float mag = b.getMagnitude (0, sblk);
+                worst = std::max (worst, mag);
+                if (! std::isfinite (mag)) finite = false;
+            }
+            for (int k = 0; k < 24; ++k) { keyUp (12 + k); keyUp (48 + k); }
+            pump (4.0);
+            std::printf ("  dense-note steals into Shepard mode: worst block magnitude %.3f, finite %s\n",
+                         worst, finite ? "yes" : "NO");
+            check (finite && worst < 4.0f,
+                   "a Shepard note stealing a dense ordinary voice stays bounded and finite");
+            check (b.getMagnitude (0, sblk) < 1.0e-4f, "and everything still releases to silence afterwards");
+            set ("fractalLevel", 1.0f);
+            set ("ampRelease", 0.30f);
+            set ("shepOn", 0.0f);
+            juce::Thread::sleep (250);
+            pump (0.6);
+        }
+
+        // -- 10. the TUNING panel with the new row, in its DENSEST reachable shape --
+        // The Shepard row is unchanged in height, but its right-hand slot now holds the
+        // rise-interval dropdown - and only when the tuning's period is not an octave.
+        // The generic run-35 rules are applied to every control in the box: inside it,
+        // usable size, no overlaps - and the bank must still be on screen.
         {
             auto tmp2 = juce::File::getSpecialLocation (juce::File::tempDirectory)
                             .getChildFile ("fiblo_shep_layout.tun");
@@ -7138,7 +7438,7 @@ int main()
                 {
                     const auto P = ed->layoutProbeInLanguage (lang == 1);
                     int outside = 0, squashed = 0, clashes = 0;
-                    bool hasOn = false, hasMode = false, hasLvl = false,
+                    bool hasOn = false, hasMode = false, hasRise = false,
                          hasRate = false, hasBank = false;
                     juce::String first;
                     std::vector<std::pair<juce::String, juce::Rectangle<int>>> tun;
@@ -7151,7 +7451,7 @@ int main()
                         { ++squashed; if (first.isEmpty()) first = c.first + " squashed"; }
                         if (c.first == "tun.shepOn")   hasOn   = true;
                         if (c.first == "tun.shepMode") hasMode = true;
-                        if (c.first == "tun.shepLvl")  hasLvl  = true;
+                        if (c.first == "tun.shepRise") hasRise = true;
                         if (c.first == (sync == 1 ? "tun.shepDiv" : "tun.shepTime")) hasRate = true;
                         if (c.first == "tun.bank")     hasBank = true;
                     }
@@ -7163,13 +7463,57 @@ int main()
                                  sync == 1 ? "sync" : "free", lang == 1 ? "ca" : "en",
                                  (int) tun.size(), outside, squashed, clashes,
                                  first.isEmpty() ? "" : (" (" + first + ")").toRawUTF8());
+                    {   // the Shepard row's real geometry, so a width that has to change
+                        // is a number here rather than a guess in the layout code
+                        int rl = 0, rr = 0;
+                        for (const auto& c : tun)
+                        {
+                            if (c.first == "tun.shepOn")   rl = c.second.getX();
+                            if (c.first == "tun.shepRise") rr = c.second.getRight();
+                        }
+                        std::printf ("    shepard row: x %d .. %d (%d px wide)\n", rl, rr, rr - rl);
+                    }
                     check (outside + squashed + clashes == 0,
                            "the whole TUNING stack fits, usable and clash-free, table period row included");
-                    check (hasOn && hasMode && hasLvl && hasRate,
-                           sync == 1 ? "the Shepard row shows on/off, mode, the BEATS box and level"
-                                     : "the Shepard row shows on/off, mode, the MS fader and level");
+                    check (hasOn && hasMode && hasRate,
+                           sync == 1 ? "the Shepard row shows the mode toggle, Free/Sync and the BEATS box"
+                                     : "the Shepard row shows the mode toggle, Free/Sync and the MS fader");
+                    check (hasRise, "and the rise-interval dropdown, because this tuning's period is 3/2");
                     check (hasBank, "and the tuning bank did not pay for it (still on screen)");
+
+                    // ...and the WORDS in that row are readable, not merely inside their
+                    // rectangles. Renaming the rate mode from "Sync (beats)" to "Sync
+                    // Project Tempo" (and its longer Catalan) makes the label say what it
+                    // locks to - but only if the box is wide enough to print it. A
+                    // ComboBox neither clips visibly nor resizes: it draws as much as the
+                    // cell holds, so every bounds/overlap check above stays green while
+                    // the screen reads "Sync Project Te". This is the one check that sees
+                    // that, and it sees it in BOTH languages.
+                    for (const auto& t : P.comboTexts)
+                        if (t.name == "shepMode" || t.name == "shepRise")
+                        {
+                            const bool fits = t.need <= (float) t.avail;
+                            if (! fits || lang == 1)
+                                std::printf ("    combo %-9s [%s] \"%s\": needs %.0f px, has %d\n",
+                                             t.name.toRawUTF8(), lang == 1 ? "ca" : "en",
+                                             t.text.toRawUTF8(), t.need, t.avail);
+                            check (fits, t.name == "shepMode"
+                                             ? "the rate mode's word fits its box (it is not drawn cut off)"
+                                             : "the rise interval's word fits its box too");
+                        }
                 }
+            }
+            // ...and it VANISHES the moment the period is an octave again: the timer's
+            // layout signature carries the tuning period for exactly this reason.
+            if (ed != nullptr)
+            {
+                check (p2->setTuningTablePeriod ("2/1", err), "the table period is set back to an octave");
+                ed->tickTimerForTests();
+                bool stillThere = false;
+                for (const auto& c : ed->layoutProbeInLanguage (false).controls)
+                    if (c.first == "tun.shepRise") stillThere = true;
+                check (! stillThere,
+                       "with an octave period the rise-interval dropdown is GONE (nothing to choose)");
             }
             tmp2.deleteFile();
         }

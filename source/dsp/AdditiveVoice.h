@@ -18,6 +18,16 @@
 //
 // Fidelity: the ONLY partials skipped are those above Nyquist at the current pitch
 // (they would alias). No audible partial is dropped here.
+//
+// SHEPARD MODE (see ShepardEngine.h for the rules and the bounds). When it is on,
+// the voice renders its spectrum at several rise-interval-spaced transpositions of
+// the played pitch AT ONCE, under a fixed raised-cosine window in absolute
+// log-frequency, all rising together. Everything else about the voice - the three
+// envelopes, the filter, the per-voice modulators, the morph, the manual amps - is
+// untouched: the copies MULTIPLY the partial set, they do not bypass the voice.
+// The copies reuse this voice's own oscillator arrays (slot * kStride offsets), so
+// Shepard mode costs no extra memory and can never exceed the oscillator budget the
+// voice already had.
 //==============================================================================
 
 #include <juce_audio_utils/juce_audio_utils.h>
@@ -29,6 +39,7 @@
 #include "SineTable.h"
 #include "TuningManager.h"
 #include "ModEngine.h"
+#include "ShepardEngine.h"
 
 #include <array>
 #include <cmath>
@@ -81,6 +92,15 @@ public:
         morphParam     = src.raw ("morph");
         morphTimeParam = src.raw ("morphTime");
 
+        // SHEPARD MODE. Read from THIS voice's source like every other control, so a
+        // playground corner whose preset is a Shepard patch really is one - the mode
+        // is part of what a preset sounds like, not a global switch bolted on top.
+        shepOnParam   = src.raw ("shepOn");
+        shepModeParam = src.raw ("shepMode");
+        shepTimeParam = src.raw ("shepTime");
+        shepDivParam  = src.raw ("shepDiv");
+        shepRiseParam = src.raw ("shepRise");
+
         filter.setType (juce::dsp::StateVariableTPTFilterType::lowpass);
     }
 
@@ -123,6 +143,26 @@ public:
         // amplitudes toward the new note: a click-free hand-off.
         const bool reuse = adsr.isActive() || fastKill;
 
+        // SHEPARD MODE IS LATCHED PER NOTE. It is a PLAYED mode: the note you press
+        // either is a Shepard or is not, and it stays what it was struck as for its
+        // whole life. Reading the switch every block instead would mean flipping it
+        // under a held chord had to add or remove seven transpositions between two
+        // samples - a step in every partial at once, i.e. the loudest click the whole
+        // design exists to avoid. Automation therefore takes effect on the NEXT note,
+        // which is exactly how the mode reads to a player, and the tooltip says so.
+        const bool wantShep = shepOnParam != nullptr && shepOnParam->load() > 0.5f;
+        if (! reuse || wantShep != shepActive)
+        {
+            // A cold note, or a STEAL that changes the mode: start the rise from the
+            // pressed pitch (g = 0 means the m = 0 copy IS the key's own tuned pitch)
+            // and let the band/rate be adopted instantly instead of glided up from a
+            // stale value, which would be an audible swoop out of nothing.
+            shepG = 0.0;
+            shepFresh = true;
+            for (auto& u : shepUsed) u = false;
+        }
+        shepActive = wantShep;
+
         // Deterministic note-on (same note twice = identical). Two phase modes:
         //   Aligned  - every partial starts at its peak (cosine), so they form a coherent
         //              pulse at the difference-tone rate -> a defined tone, not noise.
@@ -130,17 +170,12 @@ public:
         // Skipped on reuse (keeping the running phases avoids a discontinuity).
         if (! reuse)
         {
+            // The WHOLE array, every Shepard slot included (slot s lives at
+            // s * kStride): a copy claimed later in the note starts from a phase this
+            // note chose, not from whatever the previous note left in that slot.
             const bool aligned = phaseModeParam->load() < 0.5f;
             for (int i = 0; i < spectrum::kMaxPartials; ++i)
-            {
-                if (aligned)
-                    phase[(size_t) i] = 0.25; // sin(2*pi*0.25) = 1 -> all partials at their peak
-                else
-                {
-                    const double h = std::sin ((double) i * 12.9898) * 43758.5453;
-                    phase[(size_t) i] = h - std::floor (h);
-                }
-            }
+                seedPhase (phase, i, aligned);
         }
 
         // Velocity and pressure are GAIN terms, so on a steal they must glide like the
@@ -265,6 +300,13 @@ public:
     {
         if (! adsr.isActive() && ! fastKill)
             return;
+        // A ZERO-LENGTH render is not a block. JUCE's MPESynthesiser calls one on every
+        // sounding voice when a MIDI event lands on sample 0, and letting it through
+        // consumed this voice's note-on flag against no samples at all - and, since the
+        // Shepard layout is rebuilt per block, blanked the copy list a real block had
+        // just published.
+        if (numSamples <= 0)
+            return;
 
         // THIS VOICE's modulators, advanced by one block. Its own envelopes, its own LFO
         // phases, retriggered by its own note-on - so a chord is six independent
@@ -308,6 +350,15 @@ public:
         const double f0 = baseFreq * std::pow (2.0,
             ((double) currentlyPlayingNote.totalPitchbendInSemitones + pitchEnvSemis) / 12.0);
 
+        // THE SHEPARD LAYOUT, planned BEFORE anything else touches the partials: the
+        // base partial COUNT depends on the lowest copy's root (a copy below the played
+        // pitch has MORE partials under Nyquist than the played pitch does), and the
+        // morph's phase-seeding loops below have to walk every copy's oscillators, not
+        // just the first bank. With the mode off this is one copy at unity gain and the
+        // whole file behaves exactly as it did.
+        ShepLayout sl;
+        planShepard (sl, tmpl, f0, numSamples);
+
         // No infrasound gate: a very low fundamental (wide-period tunings can map a
         // key to a few Hz) is not silenced, because its HARMONICS - at 2x, 3x, ...
         // the fundamental - are audible even when the fundamental itself is not, so
@@ -317,9 +368,14 @@ public:
         // keys are not normally offered in the first place.)
         if (tmpl != nullptr && currentSampleRate > 0.0 && f0 > 0.0)
         {
-            const double maxRatio = (0.5 * currentSampleRate) / f0; // Nyquist / f0
+            // Nyquist / the LOWEST sounding root. Without Shepard that root is f0 and
+            // this is the old line unchanged; with it, the deepest copy sits
+            // sl.lowestRootMul below (or above) the key, and its partials are the ones
+            // that decide how long the shared base list has to be.
+            const double maxRatio = (0.5 * currentSampleRate) / (f0 * sl.lowestRootMul);
             const auto&  ps       = tmpl->partials;
-            const int    count    = std::min ((int) ps.size(), spectrum::kMaxPartials);
+            const int    count    = std::min ((int) ps.size(),
+                                              sl.windowed ? shepard::kStride : spectrum::kMaxPartials);
 
             // Sub-Nyquist partial count of the CURRENT template.
             int newN = 0;
@@ -370,7 +426,12 @@ public:
                     // This adoption runs BEFORE the glide below is re-aimed: the mappings
                     // must start from the ratios the listener is actually hearing.
                     const bool wasMorphing = morphActive;
-                    const int  seedSpan    = std::max (hi, activeCount); // every slot the render loop touches
+                    // Every slot the render loop touches - but never past ONE COPY's
+                    // width. A voice STOLEN from a dense ordinary note arrives here with
+                    // activeCount far beyond kStride, and one stride further is the next
+                    // copy's phases (or, from the top slot, PAST THE END of the array:
+                    // slot 9's base is 9*1638 and 9*1638 + 16384 is a wild write).
+                    const int  seedSpan    = std::min (std::max (hi, activeCount), sl.oscCap());
                     if (wasMorphing && morphWeight >= 0.999)
                     {
                         // Fully crossfaded: the output already IS the aligned bank, so hand
@@ -381,12 +442,16 @@ public:
                         // BACKWARDS mid-glide on every adoption: one of the "trompicon"
                         // stumbles under the realtime-adaptive template stream, where
                         // templates land faster than the morph completes.
+                        // Per COPY: with Shepard on, every transposition has its own
+                        // oscillators, and handing only the first bank's phases over
+                        // would leave the other seven stepping onto a reference they
+                        // never crossfaded to.
+                        for (int c = 0; c < sl.numCopies; ++c)
+                            for (int j = 0; j < seedSpan; ++j)
+                                phase[(size_t) (sl.off[c] + j)] = alignPhase[(size_t) (sl.off[c] + j)];
                         for (int j = 0; j < seedSpan; ++j)
-                        {
-                            phase[(size_t) j] = alignPhase[(size_t) j];
                             if (alignRatio[(size_t) j] > 1.0e-12) // a slot the aligned bank never held keeps its own ratio
                                 curRatio[(size_t) j] = alignRatio[(size_t) j];
-                        }
                         morphWeight = 0.0; morphWPos = 0.0;
                     }
                     else if (! wasMorphing)
@@ -449,12 +514,9 @@ public:
                     if (morphWeight <= 0.0)
                     {
                         const bool alg = phaseModeParam->load() < 0.5f;
-                        for (int j = 0; j < seedSpan; ++j)
-                        {
-                            if (alg) alignPhase[(size_t) j] = 0.25;
-                            else { const double h = std::sin ((double) j * 12.9898) * 43758.5453;
-                                   alignPhase[(size_t) j] = h - std::floor (h); }
-                        }
+                        for (int c = 0; c < sl.numCopies; ++c)
+                            for (int j = 0; j < seedSpan; ++j)
+                                seedPhase (alignPhase, sl.off[c] + j, alg);
                         // A fresh crossfade: the aligned bank is inaudible, so it can sit
                         // directly AT the destination frequencies for the whole glide
                         // (unchanged behaviour when templates come slower than the morph).
@@ -585,10 +647,13 @@ public:
                     tgtAmp[(size_t) j] *= (double) tmpl->gain[(size_t) j];
             }
 
-            for (int j = 0; j < n; ++j) // clamp guards a partial pushed past Nyquist by pitch bend
-                inc[(size_t) j] = std::min (curRatio[(size_t) j] * f0 / currentSampleRate, 0.4999);
+            // The oscillator INCREMENTS (this bank's and the aligned reference's) are
+            // filled per COPY by fillShepardCopies below, once `span` is known: each
+            // transposition multiplies these ratios by its own root and has its own
+            // Nyquist edge to cull at. With Shepard off that is the one line this used
+            // to be, for the one copy at unity.
 
-            // Increment for the coherent reference. The aligned bank GLIDES to the
+            // Ratio for the coherent reference. The aligned bank GLIDES to the
             // destination on the same clock as the running bank (alignStartLog is the
             // destination itself when the crossfade began at weight 0, so a lone morph
             // still advances at the true destination frequency throughout). It must not
@@ -611,12 +676,10 @@ public:
                         ? std::exp2 (alignStartLog[(size_t) j]
                                      + (morphTgtLog[(size_t) j] - alignStartLog[(size_t) j]) * tA)
                         : curRatio[(size_t) j];
-                    alignInc[(size_t) j] = std::min (alignRatio[(size_t) j] * f0 / currentSampleRate, 0.4999);
                 }
             }
 
             prevN = n;
-            engine.reportRendered (newN); // meter: the true (target) partial count
 
             // A cold note starts ON its target amplitudes - no fade-in. This MUST sit
             // inside the block that fills tgtAmp: outside it, a first block with no
@@ -644,6 +707,14 @@ public:
         // tracked with two scalar multiplies per sample - no O(n) re-sum, no lag, no clip.
         const int    span = std::max (n, activeCount);
         const double sr   = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
+
+        // Each copy's own partial count, increments and near-Nyquist taper. This is
+        // also where the meter's number comes from: with Shepard on it reports the
+        // partials REALLY sounding across every transposition, because that is the
+        // load the machine is carrying and hiding it would be the one dishonest
+        // number on the panel.
+        fillShepardCopies (sl, span, n, f0, sr);
+        engine.reportRendered (sl.total);
         // AMPLITUDES glide over the Morph Time while a morph runs (a hardcoded 7 ms here
         // once meant only the FREQUENCIES ever glided), over the kTmplGlideSec fade for
         // a short window after a template change with Morph off (7 ms hides a step but
@@ -713,9 +784,57 @@ public:
 
         const int    numChannels = output.getNumChannels();
 
+        // THE SHEPARD WINDOW, per sample. Each copy's window position u advances by the
+        // same tiny increment (du does not depend on which copy it is), so one complex
+        // rotation constant drives all of them: cos/sin are seeded exactly at the block
+        // start and rotated per sample, which is smooth to machine precision. Updating
+        // the window once per block instead would put a ~5% amplitude kink on every
+        // buffer boundary at the fastest rise rate - a 94 Hz buzz, not a Shepard.
+        double wc[shepard::kSlots], cx[shepard::kSlots], sx[shepard::kSlots], uu[shepard::kSlots];
+        double cd = 1.0, sd = 0.0;
+        if (sl.windowed)
+        {
+            const double d = juce::MathConstants<double>::twoPi * sl.du;
+            cd = std::cos (d); sd = std::sin (d);
+            for (int c = 0; c < sl.numCopies; ++c)
+            {
+                const double th = juce::MathConstants<double>::twoPi * sl.u0[(size_t) c];
+                cx[c] = std::cos (th); sx[c] = std::sin (th); uu[c] = sl.u0[(size_t) c];
+            }
+        }
+        else { wc[0] = 1.0; }
+
         while (--numSamples >= 0)
         {
             if (--sinceCutoff <= 0) { refreshCutoff(); sinceCutoff = kCutoffChunk; }
+
+            // Window values for this sample, and the two sums the normalisation needs.
+            // Both scale EXACTLY: every oscillator of copy c carries the same factor
+            // w_c, so sum(amp) over the whole stack is sum(w) * sum(amp) over the base
+            // list and sum(amp^2) is sum(w^2) * sum(amp^2). The closed-form running
+            // sums below therefore stay exact - a Shepard voice is normalised as
+            // honestly as a plain one, and its loudness does not breathe with how many
+            // copies happen to be inside the window.
+            double Sw = 1.0, Sw2 = 1.0;
+            if (sl.windowed)
+            {
+                Sw = 0.0; Sw2 = 0.0;
+                for (int c = 0; c < sl.numCopies; ++c)
+                {
+                    const double nc = cx[c] * cd - sx[c] * sd;
+                    const double ns = sx[c] * cd + cx[c] * sd;
+                    cx[c] = nc; sx[c] = ns;
+                    uu[c] += sl.du;
+                    // ONE definition of the window's shape (ShepardEngine.h). Outside
+                    // the band it is EXACTLY zero, and so is its slope there, so the
+                    // gate can never introduce a step - which is what makes a copy
+                    // leave the top and re-enter the bottom silent. Writing the formula
+                    // out a second time here is how a sabotage of the rule would leave
+                    // every test green.
+                    const double w = shepard::windowFromCos (uu[c], nc);
+                    wc[c] = w; Sw += w; Sw2 += w * w;
+                }
+            }
             // Crossfade weight, advanced PER SAMPLE. Doing this once per block meant that
             // for any Morph Time below one buffer the weight went 0 -> 1 between two
             // samples, switching every partial onto the coherent reference simultaneously:
@@ -733,31 +852,59 @@ public:
             }
             // Exact per-sample normalisation from the closed-form running sums (no lag).
             rk *= oneMinusSlew;
-            const double sumCur = sumTarget   + (sumCur0 - sumTarget) * rk;
-            const double sumSq  = sumTargetSq + (2.0 * coefA + coefB * rk) * rk;
+            const double sumCur = (sumTarget   + (sumCur0 - sumTarget) * rk)      * Sw;
+            const double sumSq  = (sumTargetSq + (2.0 * coefA + coefB * rk) * rk) * Sw2;
             const double rmsN   = sumSq  > 1.0e-12 ? 0.25 / std::sqrt (sumSq) : 0.0;
             const double peakN  = sumCur > 1.0e-9  ? 0.5  / sumCur            : 0.0;
             normGain = (float) (aligned ? std::min (rmsN, peakN) : rmsN);
 
-            double acc = 0.0;
+            // The amplitude slew is its own pass now: every copy reads the SAME base
+            // amplitudes (only the window factor differs), so slewing them once and
+            // reusing them is both cheaper and the only way the closed-form sums above
+            // can stay exact. With one copy at unity this is bit-for-bit the loop it
+            // replaced.
             for (int i = 0; i < span; ++i)
             {
                 const double target = (i < n) ? tgtAmp[(size_t) i] : 0.0;
                 curAmp[(size_t) i] += (target - curAmp[(size_t) i]) * slew;
+            }
 
-                double p = phase[(size_t) i] + inc[(size_t) i];
+            // One oscillator bank per copy, at slot * kStride. The advance is identical
+            // for all of them - only the increments (this copy's root) and the window
+            // factor differ.
+            const auto advance = [&] (int j) -> double
+            {
+                double p = phase[(size_t) j] + inc[(size_t) j];
                 if (p >= 1.0) p -= 1.0;
-                phase[(size_t) i] = p;
-
+                phase[(size_t) j] = p;
                 double s = (double) sine.lookup (p);
                 if (morphActive) // crossfade the running phase -> the coherent destination phase
                 {
-                    double pa = alignPhase[(size_t) i] + alignInc[(size_t) i]; // advances at the DEST freq
+                    double pa = alignPhase[(size_t) j] + alignInc[(size_t) j]; // advances at the DEST freq
                     if (pa >= 1.0) pa -= 1.0;
-                    alignPhase[(size_t) i] = pa;
+                    alignPhase[(size_t) j] = pa;
                     s += morphW * ((double) sine.lookup (pa) - s);
                 }
-                acc += curAmp[(size_t) i] * s;
+                return s;
+            };
+
+            double acc = 0.0;
+            for (int c = 0; c < sl.numCopies; ++c)
+            {
+                const double w = wc[c];
+                if (w <= 0.0) continue;   // a copy sitting on a window zero costs nothing
+                const int off = sl.off[(size_t) c];
+                const int nf  = sl.tapFrom[(size_t) c];
+                const int nc  = sl.count[(size_t) c];
+                double accC = 0.0;
+                for (int i = 0; i < nf; ++i)
+                    accC += curAmp[(size_t) i] * advance (off + i);
+                // The copy's own near-Nyquist taper (see fillShepardCopies): partials
+                // leave a rising copy by FADING through it, never by disappearing
+                // between two blocks.
+                for (int i = nf; i < nc; ++i)
+                    accC += curAmp[(size_t) i] * sl.tap[(size_t) c][(size_t) (i - nf)] * advance (off + i);
+                acc += w * accC;
             }
 
             // Velocity / pressure / the fast-kill recovery glide with their own fixed
@@ -808,7 +955,14 @@ public:
         // leaving them un-adopted stepped them back onto their old phase.
         if (morphActive && ! morphFadeOut && morphPos >= 1.0 && morphWeight >= 0.999)
         {
-            for (int i = 0; i < span; ++i) phase[(size_t) i] = alignPhase[(size_t) i];
+            // Clamped to ONE copy's bank: with Shepard on, slot 9's base is
+            // 9 * kStride and a span inherited from a dense ordinary note (activeCount
+            // near kMaxPartials, before this note's first Shepard block trimmed it)
+            // would write thousands of doubles past the end of the array.
+            const int adoptSpan = std::min (span, sl.oscCap());
+            for (int c = 0; c < sl.numCopies; ++c)
+                for (int i = 0; i < adoptSpan; ++i)
+                    phase[(size_t) (sl.off[c] + i)] = alignPhase[(size_t) (sl.off[c] + i)];
             morphActive = false;
             morphWeight = 0.0; morphWPos = 0.0; // safe here: the two banks are identical
         }
@@ -825,7 +979,40 @@ public:
             if (curAmp[(size_t) i] > 1.0e-5)
                 newActive = i + 1;
         activeCount = newActive;
+
+        // Snapshot for the verifiers (see shepProbeForTests): the copies as they stood
+        // at the END of this block, which is the state the next block continues from.
+        shepProbeCount = sl.windowed ? sl.numCopies : 0;
+        for (int c = 0; c < shepProbeCount; ++c)
+        {
+            shepProbeM   [(size_t) c] = sl.m[(size_t) c];
+            shepProbeRoot[(size_t) c] = f0 * sl.rootMul[(size_t) c];
+            shepProbeW   [(size_t) c] = wc[c];
+            shepProbeN   [(size_t) c] = sl.count[(size_t) c];
+        }
     }
+
+    //== Test probe (single-threaded verifiers only) ===========================
+    // The Shepard copies this voice rendered last block: grid index, ROOT frequency
+    // (the transposed played pitch this copy's whole spectrum is built on), the
+    // WINDOW amplitude at the end of the block, and how many partials it carried.
+    // The window value is the number the silent-wrap rule is stated in.
+    int shepProbeForTests (long long* ms, double* roots, double* wins, int* counts, int maxN) const noexcept
+    {
+        const int k = std::min (maxN, shepProbeCount);
+        for (int c = 0; c < k; ++c)
+        {
+            if (ms     != nullptr) ms    [c] = shepProbeM   [(size_t) c];
+            if (roots  != nullptr) roots [c] = shepProbeRoot[(size_t) c];
+            if (wins   != nullptr) wins  [c] = shepProbeW   [(size_t) c];
+            if (counts != nullptr) counts[c] = shepProbeN   [(size_t) c];
+        }
+        return k;
+    }
+    // The rise interval this voice is ACTUALLY using (the glided value), as a ratio:
+    // 2.0 for the octave default, the tuning's period when the user chose it.
+    double shepRiseRatioForTests() const noexcept { return std::exp2 (smShepP); }
+    bool   shepActiveForTests()    const noexcept { return shepActive; }
 
 private:
     //==========================================================================
@@ -907,6 +1094,253 @@ private:
         fastKillGain = 1.0f;
         releasing    = false;
         clearCurrentNote();
+    }
+
+    // The two phase modes, in ONE place so the note-on seeding and the morph's
+    // coherent reference cannot drift apart. `j` is the GLOBAL oscillator index, so
+    // in Scattered mode two Shepard copies of the same partial are decorrelated
+    // rather than stacked on identical phases.
+    void seedPhase (std::array<double, spectrum::kMaxPartials>& arr, int j, bool aligned) const noexcept
+    {
+        if (! juce::isPositiveAndBelow (j, spectrum::kMaxPartials)) return;
+        if (aligned) { arr[(size_t) j] = 0.25; return; } // sin(2*pi*0.25)=1: every partial at its peak
+        const double h = std::sin ((double) j * 12.9898) * 43758.5453;
+        arr[(size_t) j] = h - std::floor (h);
+    }
+
+    //==========================================================================
+    // SHEPARD MODE. The rules, the bounds and the pure maths live in
+    // ShepardEngine.h; these two functions are the per-block bookkeeping.
+    //
+    // The whole layout is one struct filled at the top of every block, because the
+    // rest of renderNextBlock needs it: the base partial count depends on the LOWEST
+    // copy's root, and every loop that writes phases has to walk all of them.
+    struct ShepLayout
+    {
+        bool   windowed  = false;   // false = one copy at unity gain: the ordinary voice
+        int    numCopies = 1;
+        int    total     = 0;       // oscillators rendered across every copy (the meter's number)
+        double du        = 0.0;     // window position advance per SAMPLE (same for every copy)
+        double lowestRootMul = 1.0; // lowest copy root / f0 anywhere in this block
+        double blockLogMove  = 0.0; // how far (log2) a root travels during this block
+        int       off    [shepard::kSlots] = {};   // oscillator base index (slot * kStride)
+        long long m      [shepard::kSlots] = {};   // grid index
+        double    rootMul[shepard::kSlots] = {};   // copy root / f0 at the block midpoint
+        double    u0     [shepard::kSlots] = {};   // window position at the block start
+        int       count  [shepard::kSlots] = {};   // partials this copy renders (its own Nyquist)
+        int       tapFrom[shepard::kSlots] = {};   // first index carrying the near-Nyquist taper
+        bool      fresh  [shepard::kSlots] = {};   // slot (re)claimed this block -> re-seed its phases
+        double    tap    [shepard::kSlots][shepard::kTaperMax]; // deliberately NOT zeroed: 5 kB a block
+        // How far into ONE copy's bank any loop may walk. With the mode off the whole
+        // array is one bank; with it on, a slot is kStride wide and a step further is
+        // the next copy's phases.
+        int oscCap() const noexcept { return windowed ? shepard::kStride : spectrum::kMaxPartials; }
+    };
+
+    // Where the copies are this block. With the mode off (or before any template
+    // exists) this leaves ONE copy at unity gain and offset 0, which is bit-for-bit
+    // the voice this file always was.
+    void planShepard (ShepLayout& sl, const spectrum::SpectrumTemplate* tmpl,
+                      double f0, int numSamples) noexcept
+    {
+        sl.windowed = false; sl.numCopies = 1; sl.total = 0;
+        sl.off[0] = 0; sl.m[0] = 0; sl.rootMul[0] = 1.0; sl.u0[0] = 0.5;
+        sl.count[0] = 0; sl.tapFrom[0] = 0; sl.fresh[0] = false;
+        sl.du = 0.0; sl.lowestRootMul = 1.0; sl.blockLogMove = 0.0;
+        if (! shepActive || tmpl == nullptr || tmpl->partials.empty()
+            || currentSampleRate <= 0.0 || f0 <= 0.0 || numSamples <= 0)
+            return;
+
+        const double sr  = currentSampleRate;
+        const double nyq = 0.5 * sr;
+        const double dt  = (double) numSamples / sr;
+
+        // THE RISE INTERVAL: ONE OCTAVE by default in every tuning; the tuning's own
+        // period only when the user explicitly picks it (see shepard::riseRatio).
+        const double R = shepard::riseRatio (
+            (shepRiseParam != nullptr && shepRiseParam->load() > 0.5f) ? shepard::RisePeriod
+                                                                      : shepard::RiseOctave,
+            tuning.periodRatio());
+        const double pTarget = std::log2 (R);
+
+        // THE RATE. Sync resolves against the host clock this voice was handed
+        // (setTransportForMod - the same number its LFOs lock to), so the rise is
+        // sample-locked to the transport without any new plumbing. No BPM on offer and
+        // the free ms value takes over; the panel says so from the processor's flag.
+        const bool sync = shepModeParam != nullptr && shepModeParam->load() > 0.5f;
+        const double riseSec = shepard::riseSeconds (sync,
+            shepTimeParam != nullptr ? (double) shepTimeParam->load() : 8000.0,
+            shepDivParam  != nullptr ? (int)    shepDivParam->load()  : 9,
+            modBpm);
+        const double rateTarget = 1.0 / juce::jmax (0.05, riseSec);
+
+        // THE DENSITY FLOOR. A copy below the played pitch has MORE partials under
+        // Nyquist than the key does, and each copy's oscillators live in one kStride
+        // slot. Rather than cut a partial, the window's BOTTOM EDGE lifts until the
+        // deepest copy fits: the band narrows (glided, so copies leave through a zero)
+        // exactly as it narrows for a very small rise interval.
+        const auto& ps = tmpl->partials;
+        const int   np = (int) ps.size();
+        const auto floorFor = [&] (int idx) -> double
+        {
+            if (np <= idx) return -1.0e9;                       // never binds
+            const double r = (double) ps[(size_t) idx].ratio;
+            return r > 1.0e-9 ? std::log2 (nyq / r) : -1.0e9;
+        };
+        const auto band = shepard::bandFor (sr, pTarget, floorFor (shepard::kDensityGuard));
+
+        if (shepFresh)
+        {
+            // Cold note: adopt the targets INSTANTLY. The glides exist to bend a
+            // RUNNING Shepard; a new note gliding up from the last note's band would
+            // be a swoop nobody played.
+            smShepP = pTarget; smShepLo = band.lo; smShepSpan = band.span; smShepRate = rateTarget;
+            shepFresh = false;
+        }
+        else
+        {
+            const double a = 1.0 - std::exp (-dt / 0.15);   // ~150 ms, as v1 used
+            smShepP    += a * (pTarget    - smShepP);
+            smShepLo   += a * (band.lo    - smShepLo);
+            smShepSpan += a * (band.span  - smShepSpan);
+            smShepRate += a * (rateTarget - smShepRate);
+        }
+        // The HARD floor is applied AFTER the glide rather than glided towards: a
+        // template that suddenly turns dense must not spend 150 ms with a bottom copy
+        // that needs more partials than its slot can hold.
+        smShepLo = juce::jmax (smShepLo, floorFor (shepard::kDensityHard));
+
+        const double P      = juce::jmax (1.0e-6, smShepP);
+        const double W      = juce::jmax (1.0e-6, smShepSpan);
+        const double A      = std::log2 (f0);
+        const double gStart = shepG;
+        const double gEnd   = shepG + smShepRate * dt;
+
+        // Which grid indices are inside the window at ANY moment of this block: the
+        // bottom bound taken at the END of the block (a copy entering underneath), the
+        // top bound at the START (one still on its way out). Both bounds slide down as
+        // g rises, so the union is at most kMaxCopies + 2 == kSlots wide - which is
+        // exactly why hashing the grid index by kSlots can never collide.
+        long long mLo = (long long) std::ceil  ((smShepLo     - A) / P - gEnd);
+        long long mHi = (long long) std::floor ((smShepLo + W - A) / P - gStart);
+        if (mHi < mLo) mHi = mLo;                                   // always at least the root copy
+        if (mHi - mLo + 1 > shepard::kSlots) mHi = mLo + shepard::kSlots - 1; // defensive; never fires
+
+        // Deactivate BEFORE claiming: with the union exactly kSlots wide, the slot a
+        // copy just vacated at one edge is the one the copy entering the other edge
+        // needs, and claiming first would orphan a live slot.
+        for (int s = 0; s < shepard::kSlots; ++s)
+            if (shepUsed[(size_t) s] && (shepM[(size_t) s] < mLo || shepM[(size_t) s] > mHi))
+                shepUsed[(size_t) s] = false;
+
+        const double gMid = 0.5 * (gStart + gEnd);
+        int c = 0;
+        for (long long mm = mLo; mm <= mHi && c < shepard::kSlots; ++mm, ++c)
+        {
+            const long long S = (long long) shepard::kSlots;
+            const int slot = (int) (((mm % S) + S) % S);
+            sl.m[c]       = mm;
+            sl.off[c]     = slot * shepard::kStride;
+            sl.rootMul[c] = std::exp2 ((gMid + (double) mm) * P);
+            sl.u0[c]      = ((A + (gStart + (double) mm) * P) - smShepLo) / W;
+            // A slot claimed for a NEW grid index is claimed at a window edge, where
+            // the window is ~0: the copy re-entering at the bottom starts SILENT. That
+            // is the no-reset guarantee, and it is what makes re-seeding it inaudible.
+            sl.fresh[c] = ! shepUsed[(size_t) slot] || shepM[(size_t) slot] != mm;
+            shepUsed[(size_t) slot] = true;
+            shepM[(size_t) slot]    = mm;
+        }
+        sl.numCopies     = c;
+        sl.windowed      = true;
+        sl.du            = smShepRate * P / W / sr;
+        sl.blockLogMove  = smShepRate * P * dt;
+        sl.lowestRootMul = std::exp2 ((gStart + (double) mLo) * P);
+
+        // Advance the rise. Whole steps are renumbered away in multiples of kSlots so
+        // the slot hash is untouched (the same trick v1 used on its sine grid).
+        shepG = gEnd;
+        if (shepG >= 4096.0)
+        {
+            const long long d = (long long) shepard::kSlots
+                              * (long long) (shepG / (double) shepard::kSlots);
+            shepG -= (double) d;
+            for (int s = 0; s < shepard::kSlots; ++s) shepM[(size_t) s] += d;
+        }
+    }
+
+    // Each copy's partial count, oscillator increments and near-Nyquist taper.
+    // Called once `span` (the base list including fading tails) is known.
+    void fillShepardCopies (ShepLayout& sl, int span, int n, double f0, double sr) noexcept
+    {
+        const double nyq = 0.5 * sr;
+        const bool   alg = phaseModeParam != nullptr && phaseModeParam->load() < 0.5f;
+        const double T   = shepard::taperWidth (sl.blockLogMove);
+        const int    cap = sl.oscCap();      // one copy's bank; see ShepLayout::oscCap
+        sl.total = 0;
+        int prevCount = std::min (span, cap);
+
+        for (int c = 0; c < sl.numCopies; ++c)
+        {
+            const int    off  = sl.off[(size_t) c];
+            const double root = f0 * sl.rootMul[(size_t) c];
+            const double maxR = root > 1.0e-9 ? nyq / root : 0.0;
+
+            int cnt = span;
+            if (sl.windowed)
+            {
+                // The copies are handed over in ascending root order, so their counts
+                // DESCEND: walking down from the previous copy's count costs O(1) per
+                // copy instead of rescanning the whole partial list eight times.
+                const int hiN = std::min (span, cap);
+                cnt = std::min (prevCount, hiN);
+                while (cnt > 0   && curRatio[(size_t) (cnt - 1)] > maxR) --cnt;
+                while (cnt < hiN && curRatio[(size_t) cnt]      <= maxR) ++cnt;
+            }
+            sl.count[(size_t) c] = cnt;
+            sl.total += cnt;
+
+            // A freshly claimed slot may hold another grid index's phases and
+            // increments, so it is filled and seeded over the WHOLE base span - the
+            // fading tails included, or a tail would sound at a stale frequency.
+            const double k      = root / sr;
+            const int    fillTo = sl.fresh[(size_t) c] ? cnt : std::min (cnt, n);
+            for (int i = 0; i < fillTo; ++i) // clamp guards a partial pushed past Nyquist by bend
+                inc[(size_t) (off + i)] = std::min (curRatio[(size_t) i] * k, 0.4999);
+            if (morphActive)
+                for (int i = 0; i < cnt; ++i)
+                    alignInc[(size_t) (off + i)] = std::min (alignRatio[(size_t) i] * k, 0.4999);
+            // ...but never past this slot's own width: `span` can still carry a dense
+            // ordinary note's activeCount on the first Shepard block after a steal, and
+            // one step past `cap` is the NEXT copy's phases (which are audible).
+            if (sl.fresh[(size_t) c])
+                for (int i = 0, e = std::min (span, cap); i < e; ++i)
+                {
+                    seedPhase (phase, off + i, alg);
+                    seedPhase (alignPhase, off + i, alg);
+                }
+
+            // THE NEAR-NYQUIST TAPER. A rising copy loses its top partials one by one;
+            // dropping them outright is a step of that partial's whole amplitude, and
+            // at seconds-per-octave that is several faint ticks a second. Instead each
+            // partial fades over the top T octaves of the copy's usable range, and
+            // because T is a distance in FREQUENCY the weights move continuously with
+            // the root - nothing ever appears or vanishes between two blocks. The zone
+            // is capped at kTaperMax partials so it stays a short tail loop; a spectrum
+            // dense enough to hit the cap simply gets a narrower (still smooth) taper.
+            int tf = cnt;
+            if (sl.windowed && cnt > 0)
+            {
+                const double thresh = maxR * std::exp2 (-T);
+                while (tf > 0 && curRatio[(size_t) (tf - 1)] > thresh
+                       && (cnt - tf) < shepard::kTaperMax) --tf;
+                const double lMax = std::log2 (std::max (1.0e-12, maxR));
+                for (int i = tf; i < cnt; ++i)
+                    sl.tap[(size_t) c][(size_t) (i - tf)] = juce::jlimit (0.0, 1.0,
+                        (lMax - std::log2 (std::max (1.0e-12, curRatio[(size_t) i]))) / T);
+            }
+            sl.tapFrom[(size_t) c] = tf;
+            prevCount = cnt;
+        }
     }
 
     ParamSource                         src;   // live APVTS or a corner's ParamBank
@@ -1032,4 +1466,24 @@ private:
     float fastKillGain = 1.0f;
     float fastKillDelta = 0.0f;
     bool  releasing = false; // in the note-off release tail: freeze ADSR params (see updateAdsrParameters)
+
+    //== SHEPARD MODE state (see ShepardEngine.h and planShepard) ==============
+    std::atomic<float>* shepOnParam   = nullptr, * shepModeParam = nullptr;
+    std::atomic<float>* shepTimeParam = nullptr, * shepDivParam  = nullptr;
+    std::atomic<float>* shepRiseParam = nullptr;
+    bool   shepActive = false;   // LATCHED at note-on: this note either is a Shepard or is not
+    bool   shepFresh  = true;    // adopt band/rate instantly (a cold note, not a glide)
+    double shepG      = 0.0;     // the rising grid phase, in rise intervals
+    double smShepP    = 1.0;     // smoothed log2(rise ratio)
+    double smShepLo   = 5.0;     // smoothed window bottom edge (log2 Hz)
+    double smShepSpan = 8.0;     // smoothed window span (log2)
+    double smShepRate = 0.125;   // smoothed rise rate (intervals per second)
+    std::array<long long, shepard::kSlots> shepM    {};  // grid index held by each slot
+    std::array<bool,      shepard::kSlots> shepUsed {};
+    // Last block's copies, for the verifiers only (see shepProbeForTests).
+    int shepProbeCount = 0;
+    std::array<long long, shepard::kSlots> shepProbeM    {};
+    std::array<double,    shepard::kSlots> shepProbeRoot {};
+    std::array<double,    shepard::kSlots> shepProbeW    {};
+    std::array<int,       shepard::kSlots> shepProbeN    {};
 };

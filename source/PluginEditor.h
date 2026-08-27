@@ -115,6 +115,20 @@ public:
         // that can silently DESELECT it (getSelectedId() compares the visible label
         // against the item's text), and a mode box that reads 0 gates its whole panel off.
         std::vector<std::pair<juce::String, int>> comboIds;
+        // ...and, for the combos whose WORDS are the feature, whether the selected item
+        // really FITS the box it was given. A ComboBox does not clip visibly and does not
+        // resize: it just draws as much of the word as the cell holds, so every geometric
+        // check in the build passes while the screen reads "Sync Project Te". `avail` is
+        // the text area LookAndFeel_V4 leaves after the arrow; `need` is what the word
+        // measures in the box's own font. This is the check that bites when a label is
+        // renamed to something longer than its slot - the Shepard rate box was.
+        struct ComboText
+        {
+            juce::String name, text;
+            float need = 0.0f;
+            int   avail = 0;
+        };
+        std::vector<ComboText> comboTexts;
         // The BUTTONS whose word is the whole feature: the custom view's one button that
         // is "Load" or "Remove" depending on what is loaded, and the tuning bank's add
         // button. A wrong word on the first of those means a green Load that deletes the
@@ -160,6 +174,13 @@ public:
     // the panel would still be wearing the colour it was constructed with and "selecting
     // an engine recolours the whole panel" could not be measured at all.
     void refreshEngineDressing() { applyEngineState(); }
+    // Test hook (RhythmVerify): run ONE tick of the panel timer. The verifier has no
+    // message loop, so anything that only appears because the timer noticed a change -
+    // the Shepard's rise-interval dropdown when the tuning's period stops being an
+    // octave, say - is otherwise unreachable, and "it appears when the tuning changes"
+    // could not be measured at all. It is the timer's own layout signature that is
+    // under test, so calling resized() directly here would test nothing.
+    void tickTimerForTests() { timerCallback(); }
     // Test hook (RhythmVerify): re-read "partialManual" and redress the SLOPE fader,
     // exactly as the 30 Hz timer does. The verifier has no message loop, so a pencil
     // on/off cycle is otherwise unreachable - and that cycle is the bug.
@@ -4008,15 +4029,22 @@ private:
     std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], morphAtt;
     std::unique_ptr<SliderAttachment>   morphTimeAtt;
 
-    // Shepard tone generator (bottom row of the Tuning box): on/off, the ONE rate
-    // control in its two dresses (the ms fader in Free mode, the beats box in Sync
-    // mode - resized() shows exactly one of them), and the level. All parameters.
+    // SHEPARD MODE (bottom row of the Tuning box): the mode toggle, the ONE rate
+    // control in its two dresses (the ms fader in Free mode, the beats box in Sync -
+    // resized() shows exactly one of them), and the rise-interval choice, which is on
+    // screen ONLY while the active tuning's period is not an octave (nothing to
+    // choose otherwise). The v1 LEVEL fader is gone: the Shepard is the voice now,
+    // so its level was a second master volume, and the only other thing a depth
+    // control could do - stop the window reaching zero at its edges - would break the
+    // silent wrap that makes the whole illusion click-free.
     juce::ToggleButton shepOnT;
-    juce::ComboBox     shepModeBox, shepDivBox;
-    juce::Slider       shepTimeFader, shepLevelFader;
+    juce::ComboBox     shepModeBox, shepDivBox, shepRiseBox;
+    juce::Slider       shepTimeFader;
     std::unique_ptr<ButtonAttachment>   shepOnAtt;
-    std::unique_ptr<ComboBoxAttachment> shepModeAtt, shepDivAtt;
-    std::unique_ptr<SliderAttachment>   shepTimeAtt, shepLevelAtt;
+    std::unique_ptr<ComboBoxAttachment> shepModeAtt, shepDivAtt, shepRiseAtt;
+    std::unique_ptr<SliderAttachment>   shepTimeAtt;
+    // (Whether the rise-interval box is on screen rides in the timer's `packed`
+    //  layout signature - see the tuning-period bit there.)
     // Last "Sync chosen but the host offers no BPM" state shown (-1 = not yet):
     // the timer redresses the beats box amber and says in its tooltip that the
     // free ms value is in force, instead of letting it claim a sync that is not
