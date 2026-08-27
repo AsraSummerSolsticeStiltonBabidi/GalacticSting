@@ -179,10 +179,60 @@ int main()
         s.fractalLevel = 1.2f; auto ta = compileSpectrum (s);
         s.fractalLevel = 1.5f; auto tb = compileSpectrum (s);
         s.fractalLevel = 1.9f; auto tc = compileSpectrum (s);
-        check (hasRatio (ta, 4.0) && ! hasRatio (ta, 9.0),
-               "at 1.2 the LOWEST new partial (4) is in, the highest (9) is not");
-        check (hasRatio (tb, 4.0) && hasRatio (tb, 6.0) && ! hasRatio (tb, 9.0),
-               "at 1.5 partials 4 and 6 are in, 9 still out (low->high)");
+        // Low->high entry is now measured as REVEAL PROGRESS, not as presence. Each new
+        // partial fades in along its own dB ramp, and the ramps start in ascending-ratio
+        // order and overlap, so a higher new partial can be on the list while still 60 dB
+        // down. Presence stopped being the right question the moment the reveal stopped
+        // switching partials on at full height (which is exactly what made the first
+        // hundredth of a crossing carry half of it). What must hold at every fader
+        // position is that a LOWER new partial is always further along its ramp.
+        auto revealed = [&t2] (const SpectrumTemplate& blend, double ratio)
+        {
+            const float now = ampAtRatio (blend, ratio), full = ampAtRatio (t2, ratio);
+            if (full <= 0.0f) return -1.0;
+            return now < 0.0f ? 0.0 : (double) now / (double) full;
+        };
+        bool orderOk = true, growsOk = true;
+        double prev4 = -1.0, prev6 = -1.0, prev9 = -1.0;
+        for (int k = 1; k <= 99; ++k)
+        {
+            s.fractalLevel = 1.0f + 0.01f * (float) k;
+            const auto bl = compileSpectrum (s);
+            // ORDER: compare each new partial against its own level-2 amplitude. Both
+            // templates are RMS-normalised by a factor common to all three, so the
+            // factor cancels in the comparison BETWEEN them and what is left is pure
+            // reveal progress.
+            const double r4 = revealed (bl, 4.0), r6 = revealed (bl, 6.0), r9 = revealed (bl, 9.0);
+            if (! (r4 >= r6 - 1e-6 && r6 >= r9 - 1e-6)) orderOk = false;
+            // GROWTH: measured against the loudest partial of the SAME template, i.e.
+            // how loud the new partial actually sounds. Reveal progress on its own is
+            // NOT monotone and must not be asserted to be: the whole template is
+            // RMS-renormalised as new energy arrives, so a new partial momentarily
+            // overshoots its level-2 amplitude by ~3% around mid-crossing and settles
+            // back. Its level relative to the fundamental never falls - measured, 0
+            // violations across the sweep.
+            const double a1 = std::max (1.0e-12, (double) ampAtRatio (bl, 1.0));
+            const double n4 = std::max (0.0f, ampAtRatio (bl, 4.0)) / a1;
+            const double n6 = std::max (0.0f, ampAtRatio (bl, 6.0)) / a1;
+            const double n9 = std::max (0.0f, ampAtRatio (bl, 9.0)) / a1;
+            if (n4 < prev4 - 1e-9 || n6 < prev6 - 1e-9 || n9 < prev9 - 1e-9) growsOk = false;
+            prev4 = n4; prev6 = n6; prev9 = n9;
+        }
+        check (orderOk, "at every fader position the lower new partial is further in than the higher (low->high)");
+        check (growsOk, "and every new partial only ever grows against the fundamental as the level rises");
+        // ...and they are genuinely STAGGERED, not merely ordered: half way across the
+        // crossing the three are decades apart, measured 1.035 / 0.065 / 0.0015 of their
+        // final amplitudes. Without the stagger every new partial would fade in together
+        // and the fader would be an ordinary crossfade of the two levels - uniform, but
+        // with the low-to-high growth that gives the control its meaning thrown away.
+        {
+            s.fractalLevel = 1.5f;
+            const auto mid = compileSpectrum (s);
+            const double m4 = revealed (mid, 4.0), m6 = revealed (mid, 6.0), m9 = revealed (mid, 9.0);
+            std::printf ("  mid-crossing reveal: partial 4 %.4f, partial 6 %.4f, partial 9 %.4f of final\n", m4, m6, m9);
+            check (m4 > 2.0 * m6 && m6 > 2.0 * m9,
+                   "the new partials arrive STAGGERED low to high, not all at once");
+        }
         check (hasRatio (tc, 4.0) && hasRatio (tc, 6.0) && hasRatio (tc, 9.0),
                "at 1.9 all three new partials are in");
         check (ta.partials.size() <= tb.partials.size() && tb.partials.size() <= tc.partials.size(),
@@ -193,6 +243,291 @@ int main()
         // The blended amplitudes must stay RMS-normalised like every other template.
         double sq = 0.0; for (const auto& p : tb.partials) sq += (double) p.amp * (double) p.amp;
         check (std::abs (sq - 1.0) < 1e-3, "blended template is RMS-normalised");
+    }
+
+    //--------------------------------------------------------------------------
+    // THE FRACTAL FADER MUST SPEND ITS CHANGE EVENLY.
+    //
+    // The report: "solo subir un poco el lvl por encima de uno de los escalones da un
+    // cambio brusco, nada que ver con subirlo si ya esta entremedio". Measured, the
+    // first hundredth of the 1->2 crossing in Prime mode moved the spectrum 10.157 dB
+    // and the whole crossing 20.736 dB - 49% of the journey in one click, 70x what the
+    // same click costs in the middle of the crossing. At 2->3 it was 67%, at 3->4 73%.
+    //
+    // The yardstick below is per-band energy in dB over 1/12-octave bands from ratio 1
+    // to 1024, floored at -80 dB re the (unit) total energy of an RMS-normalised
+    // template. Equal weight per band = log-frequency weighting, and the dB floor is
+    // what makes "a band lit up from silence" the large event it is to an ear. Every
+    // template compared is finalised the same way - range cut, keep-loudest cap,
+    // ascending sort, RMS normalisation - by whichever path built it, so the numbers are
+    // directly comparable and nothing has to be undone before comparing.
+    std::printf ("fractal fader uniformity:\n");
+    {
+        constexpr int kBands = 120;   // 10 octaves at 1/12 octave = ratio 1 .. 1024
+        auto bandsDb = [kBands] (const SpectrumTemplate& t)
+        {
+            std::vector<double> e ((size_t) kBands, 0.0);
+            for (const auto& p : t.partials)
+            {
+                const int b = (int) std::floor (std::log2 (std::max (1.0e-9, (double) p.ratio)) * 12.0);
+                if (b >= 0 && b < kBands) e[(size_t) b] += (double) p.amp * (double) p.amp;
+            }
+            std::vector<double> d ((size_t) kBands);
+            for (int i = 0; i < kBands; ++i)
+                d[(size_t) i] = 10.0 * std::log10 (std::max (e[(size_t) i], 1.0e-8)); // -80 dB floor
+            return d;
+        };
+        auto dist = [] (const std::vector<double>& a, const std::vector<double>& b)
+        {
+            double s = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) { const double x = a[i] - b[i]; s += x * x; }
+            return std::sqrt (s / (double) a.size());
+        };
+        auto centroidOct = [] (const SpectrumTemplate& t)
+        {
+            double num = 0.0, den = 0.0;
+            for (const auto& p : t.partials)
+            {
+                const double e = (double) p.amp * (double) p.amp;
+                num += e * std::log2 (std::max (1.0e-9, (double) p.ratio));
+                den += e;
+            }
+            return den > 0.0 ? num / den : 0.0;
+        };
+
+        // One crossing, walked on the fader's OWN grid: NormalisableRange(1, 4, 0.01)
+        // snaps the slider, so 1.00, 1.01 ... 2.00 are exactly the values a user can dial.
+        struct Walk
+        {
+            double maxStep = 0.0, meanStep = 0.0, firstStep = 0.0, total = 0.0, worstBackward = 0.0;
+            int    argMax = 0;
+            bool   centroidRises = true;
+            double centroidLo = 0.0, centroidHi = 0.0;
+        };
+        auto walk = [&] (SpectrumSettings s, int Llo)
+        {
+            std::vector<std::vector<double>> B;
+            std::vector<double> C;
+            for (int k = 0; k <= 100; ++k)
+            {
+                s.fractalLevel = (float) Llo + 0.01f * (float) k;
+                const auto x = compileSpectrum (s);
+                B.push_back (bandsDb (x));
+                C.push_back (centroidOct (x));
+            }
+            Walk w;
+            for (int k = 1; k <= 100; ++k)
+            {
+                const double d = dist (B[(size_t) k - 1], B[(size_t) k]);
+                if (d > w.maxStep) { w.maxStep = d; w.argMax = k; }
+                w.meanStep += d;
+                if (k == 1) w.firstStep = d;
+            }
+            w.meanStep /= 100.0;
+            w.total = dist (B[0], B[100]);
+            double prev = 0.0;
+            for (int k = 1; k <= 100; ++k)
+            {
+                const double d = dist (B[0], B[(size_t) k]);
+                w.worstBackward = std::max (w.worstBackward, prev - d);
+                prev = d;
+            }
+            for (int k = 1; k <= 100; ++k)
+                if (C[(size_t) k] < C[(size_t) k - 1] - 1.0e-9) w.centroidRises = false;
+            w.centroidLo = C.front(); w.centroidHi = C.back();
+            return w;
+        };
+
+        // Harmonics = Prime is the worst case and the mode the report names, because
+        // {1} u {primes} is the least multiplicatively closed of the four sets: 4, 6 and
+        // 9 are all NEW at level 2, so there is a large fresh set to reveal. With
+        // Harmonics = All/Odd/Even, or a pure prime LIMIT, the set is closed, there is
+        // nothing fresh, and the fader was always smooth - which is why the user hears
+        // this in prime mode and nowhere else.
+        SpectrumSettings prime; prime.baseN = 1; prime.selection = (float) Selection::Prime;
+        prime.curveSlope = 1.0f;
+
+        // K: the worst single click, as a multiple of the average click. Measured on the
+        // shipping code this was 14.4 / 27.6 / 40.2 for 1->2 / 2->3 / 3->4; with the dB
+        // reveal ramp it is 1.8 / 1.8 / 2.0. 4 sits with 2x headroom over the fix and a
+        // factor of 3.6 below the smallest failure the old code produced.
+        constexpr double kMaxStepRatio = 4.0;
+        // The first click of a crossing must not carry vastly more than its 1% share.
+        // Measured: 0.15% / 0.34% / 0.63% now, 49% / 67% / 73% before.
+        constexpr double kMaxFirstShare = 0.04;
+
+        for (int Llo = 1; Llo <= 3; ++Llo)
+        {
+            const auto w = walk (prime, Llo);
+            const double K = w.meanStep > 0.0 ? w.maxStep / w.meanStep : 0.0;
+            std::printf ("  Prime %d->%d  worst click %.3f dB @%d, mean %.4f dB, K=%.1f;"
+                         " first click %.2f%% of the crossing (%.3f dB total); centroid %.2f -> %.2f oct\n",
+                         Llo, Llo + 1, w.maxStep, w.argMax, w.meanStep, K,
+                         100.0 * w.firstStep / std::max (1.0e-12, w.total), w.total,
+                         w.centroidLo, w.centroidHi);
+
+            check (K <= kMaxStepRatio,
+                   "UNIFORMITY: no single fader click costs more than 4x the average click");
+            check (w.firstStep <= kMaxFirstShare * w.total,
+                   "NO EARLY CLIFF: the first 1% of a crossing delivers at most 4% of it");
+            // Measured worst backward wobble with the fix in place: 0.0101 dB, and it
+            // comes from the RMS renormalisation, not from the reveal. 0.05 dB is a
+            // twentieth of the smallest step the fader can produce.
+            check (w.worstBackward < 0.05,
+                   "MONOTONICITY: the spectrum only ever moves further from where the crossing started");
+            check (w.centroidRises && w.centroidHi > w.centroidLo + 0.2,
+                   "CHARACTER: the spectral centroid still climbs across the crossing - detail grows upward");
+        }
+
+        // Not just prime mode. The closed-set configs never stepped, and they must not
+        // start; the open ones must all come into line. This sweep walks the crossing
+        // INTERIOR (1.00 ... 1.99) only: the last click, from x.99 onto the integer
+        // level, is governed by a separate and OLDER effect - several upper-level
+        // partials inside one ~1-cent bin collapse onto the surviving lower-level
+        // partial, so blend(t->1) carries their summed amplitude on one ratio instead of
+        // three. That is why Base 4 measures a 0.797 dB last click against a 0.186 dB
+        // average (it was 0.820 dB before this change, i.e. untouched by it) while Prime,
+        // whose bins hold one partial each, measures 0.030 dB.
+        auto walkInterior = [&] (SpectrumSettings s, int Llo)
+        {
+            std::vector<std::vector<double>> B;
+            for (int k = 0; k <= 99; ++k)
+            {
+                s.fractalLevel = (float) Llo + 0.01f * (float) k;
+                B.push_back (bandsDb (compileSpectrum (s)));
+            }
+            double mx = 0.0, mean = 0.0;
+            for (int k = 1; k <= 99; ++k)
+            { const double d = dist (B[(size_t) k - 1], B[(size_t) k]); mx = std::max (mx, d); mean += d; }
+            mean /= 99.0;
+            return mean > 0.0 ? mx / mean : 0.0;
+        };
+        {
+            struct Cfg { const char* name; SpectrumSettings s; };
+            std::vector<Cfg> cfgs;
+            { SpectrumSettings s; s.selection = (float) Selection::Prime; s.reach = 256; cfgs.push_back ({ "Prime", s }); }
+            { SpectrumSettings s; s.selection = (float) Selection::All;   s.reach = 256; cfgs.push_back ({ "All (closed set)", s }); }
+            { SpectrumSettings s; s.selection = (float) Selection::Odd;   s.reach = 256; cfgs.push_back ({ "Odd (closed set)", s }); }
+            { SpectrumSettings s; s.selection = 2.5f;                     s.reach = 256; cfgs.push_back ({ "Harmonics 2.5", s }); }
+            { SpectrumSettings s; s.selection = (float) Selection::Prime; s.reach = 256;
+              s.primeLimit = 13; s.primeLimitPos = 1.0f; cfgs.push_back ({ "Prime + 13-limit", s }); }
+            { SpectrumSettings s; s.selection = (float) Selection::Prime; s.reach = 256;
+              s.curveSlope = 2.5f; cfgs.push_back ({ "Prime, slope 2.5", s }); }
+            { SpectrumSettings s; s.selection = (float) Selection::Prime; s.reach = 256;
+              s.curveSlope = 0.3f; cfgs.push_back ({ "Prime, slope 0.3", s }); }
+            { SpectrumSettings s; s.baseN = 3; s.selection = (float) Selection::Prime; s.reach = 256;
+              cfgs.push_back ({ "Base 3, Prime", s }); }
+            bool allEven = true;
+            double worst = 0.0; const char* worstAt = "";
+            for (const auto& c : cfgs)
+                for (int Llo = 1; Llo <= 3; ++Llo)
+                {
+                    const double K = walkInterior (c.s, Llo);
+                    if (K > worst) { worst = K; worstAt = c.name; }
+                    if (K > 4.0) { allEven = false; std::printf ("    %s %d->%d K=%.1f\n", c.name, Llo, Llo + 1, K); }
+                }
+            std::printf ("  worst max/mean click over 8 configs x 3 crossings: %.1f (%s)\n", worst, worstAt);
+            check (allEven, "UNIFORMITY holds across harmonics/prime/slope/base settings, not just prime mode");
+        }
+
+        // THE CLOSED-SET CASE, which is what the geometric survivor is for. When the base
+        // harmonic set is closed under multiplication - Harmonics = All or Odd, or a
+        // prime whitelist that keeps a closed set - the upper level introduces NO new
+        // ratios at all, there is nothing to reveal, and the only thing the fader does is
+        // rescale the partials both levels share. Linearly in amplitude that front-loads:
+        // measured max/mean click 1.8 (All), 1.7 (Odd), 2.4 (whitelist) with the worst
+        // click always the FIRST one. On a straight line in dB it is 1.1 / 1.0 / 1.0 and
+        // the worst click is no longer at the start.
+        //
+        // At the PLUGIN's reach (kSpectrumReach), not a cut-down one: the two levels of a
+        // closed set differ only in how far the products reach, so shortening the reach
+        // shrinks the difference until neither form of the fade is distinguishable
+        // (measured at reach 256: 1.55 linear against 1.58 geometric, a wash).
+        {
+            struct Cfg { const char* name; SpectrumSettings s; };
+            std::vector<Cfg> closed;
+            { SpectrumSettings s; s.selection = (float) Selection::All; closed.push_back ({ "All", s }); }
+            { SpectrumSettings s; s.selection = (float) Selection::Odd; closed.push_back ({ "Odd", s }); }
+            { SpectrumSettings s; s.primeUseWhitelist = true;
+              s.primeWhitelistMask = 0x1FCu; closed.push_back ({ "whitelist without 2 and 3", s }); }
+            bool flat = true;
+            for (const auto& c : closed)
+            {
+                const double K = walkInterior (c.s, 1);
+                std::printf ("  closed set, %-26s max/mean click %.2f\n", c.name, K);
+                if (K > 1.4) flat = false;
+            }
+            check (flat, "with nothing new to reveal the fader is FLAT - the shared partials fade in dB, not in amplitude");
+        }
+
+        // ENDPOINT EXACTNESS, bottom. compileSpectrum takes the single-level path for a
+        // fraction of 1e-3 or less, so the blend at t=0 itself is not reachable through
+        // the public API; what IS reachable, and what matters, is that the blend
+        // CONVERGES on the integer level as the fraction vanishes. Before the fix the
+        // first blended value the automation lane could reach was 4.881 dB away from the
+        // integer level in this config.
+        {
+            SpectrumSettings s = prime;
+            s.fractalLevel = 1.0f;     const auto atL   = compileSpectrum (s);
+            s.fractalLevel = 1.0011f;  const auto justAbove = compileSpectrum (s);
+            const double d = dist (bandsDb (atL), bandsDb (justAbove));
+            std::printf ("  crossing the 1e-3 blend threshold costs %.4f dB (was 4.881)\n", d);
+            check (d < 0.02, "ENDPOINT: entering the blend is not a cliff - below the fader's own smallest step");
+            // Every partial of the integer level is still there, at its own amplitude.
+            bool same = justAbove.partials.size() >= atL.partials.size();
+            double worstAmp = 0.0;
+            for (const auto& p : atL.partials)
+            {
+                const float a = ampAtRatio (justAbove, (double) p.ratio, 1.0e-4 * (double) p.ratio);
+                if (a < 0.0f) { same = false; break; }
+                worstAmp = std::max (worstAmp, std::abs ((double) a - (double) p.amp));
+            }
+            check (same && worstAmp < 1.0e-3,
+                   "ENDPOINT: and every partial of the integer level survives it unchanged");
+        }
+
+        // ENDPOINT EXACTNESS, top. At a fraction of 0.99 the reveal is complete (the
+        // last ramp starts at 0.5 at the latest and is a half-crossing wide) and every
+        // survivor carries the upper level's bin energy, so the template IS the upper
+        // level - partial set included. It cannot be bit-identical, because 1.99 is
+        // genuinely one hundredth short of 2.00 and the survivors are still that far
+        // along their fade; what has to be true is that the remaining gap shrinks in
+        // proportion to the remaining fraction rather than sitting there as an offset,
+        // which is what a blend that did NOT converge on the upper level would show.
+        //
+        // Prime is used because its ~1-cent bins hold exactly one partial each; where
+        // they do not (Base 4) the bin collapse described above applies and the partial
+        // COUNT at the top of a crossing differs from the upper level's. That is older
+        // than this change and untouched by it.
+        {
+            SpectrumSettings s = prime;
+            s.fractalLevel = 2.0f;    const auto exact  = compileSpectrum (s);
+            s.fractalLevel = 1.99f;   const auto near1  = compileSpectrum (s);
+            s.fractalLevel = 1.999f;  const auto near2  = compileSpectrum (s);
+            auto gap = [&exact] (const SpectrumTemplate& n, bool& sameSet)
+            {
+                sameSet = exact.partials.size() == n.partials.size();
+                double worst = 0.0;
+                if (sameSet)
+                    for (size_t i = 0; i < exact.partials.size(); ++i)
+                    {
+                        if (std::abs ((double) exact.partials[i].ratio - (double) n.partials[i].ratio)
+                            > 1.0e-4 * (double) exact.partials[i].ratio) { sameSet = false; break; }
+                        worst = std::max (worst, std::abs ((double) exact.partials[i].amp
+                                                           - (double) n.partials[i].amp));
+                    }
+                return worst;
+            };
+            bool set1 = false, set2 = false;
+            const double g1 = gap (near1, set1), g2 = gap (near2, set2);
+            std::printf ("  level 2 has %d partials; 1.99 is %d partials and %.2e away, 1.999 is %d and %.2e\n",
+                         (int) exact.partials.size(), (int) near1.partials.size(), g1,
+                         (int) near2.partials.size(), g2);
+            check (set1 && set2 && g1 < 5.0e-3,
+                   "ENDPOINT: the top of a crossing is the upper integer level, partial for partial");
+            check (g2 < 0.2 * g1,
+                   "ENDPOINT: and the last of the gap closes with the fraction, so t=1 is the upper level exactly");
+        }
     }
 
     //--------------------------------------------------------------------------
