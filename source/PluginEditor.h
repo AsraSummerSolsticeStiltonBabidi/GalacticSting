@@ -292,6 +292,16 @@ public:
     struct PlaygroundProbe
     {
         juce::Rectangle<int> panel, pad, padArea, box[4], clear[4], lbl[4];
+        // The per-corner EDIT button, its real (localised) label, and whether it is
+        // enabled - an Edit button on an empty corner has nothing to edit and must not
+        // be clickable. Bounds so the verifier can prove the new button did not shove
+        // the corner's name box under its neighbours.
+        juce::Rectangle<int> edit[4];
+        juce::String editText[4];
+        bool editEnabled[4] = { false, false, false, false };
+        // The corner names AS DRAWN, so a check can see the "*" a modified corner must
+        // carry (and, just as importantly, see it disappear when the corner is saved).
+        juce::String cornerName[4];
         // The MORPH/MIX mode pair: bounds and the REAL (localised) label on each, so
         // the verifier can assert the Catalan "MESCLA" fits the button it is drawn in.
         juce::Rectangle<int> mode[2];
@@ -317,6 +327,33 @@ public:
     struct FloatingOwnershipProbe { bool windowOnDesktop = false, ownerIsEditorRoot = false; };
     FloatingOwnershipProbe floatingOwnershipProbeForTests (bool playground);
 
+    // TESTS: what the preset drop-down's list REALLY shows for a typed query. Builds the
+    // actual panel and types into its actual field, so a check can never pass against a
+    // second copy of the filter that the drop-down itself has stopped using.
+    static juce::StringArray presetSearchProbeForTests (const juce::StringArray& names,
+                                                        const juce::String& typed);
+    // TESTS: what the MAIN window says about whose patch its controls are. The preset
+    // field is frozen (and disabled) while a playground corner is being edited; nothing
+    // else in the build can see that, and getting it wrong is how a user loads a preset
+    // onto somebody's corner.
+    struct CornerEditUiProbe
+    {
+        int  corner = -1;
+        juce::String presetText, saveText;
+        bool presetEnabled = true, dirtyMarkVisible = false;
+    };
+    CornerEditUiProbe cornerEditUiProbeForTests()
+    {
+        refreshCornerEditUi();
+        CornerEditUiProbe pr;
+        pr.corner           = processorRef.getPlaygroundEditCorner();
+        pr.presetText       = presetBox.getText();
+        pr.saveText         = savePresetButton.getButtonText();
+        pr.presetEnabled    = presetBox.isEnabled();
+        pr.dirtyMarkVisible = presetDirtyMark.isVisible();
+        return pr;
+    }
+
 private:
     void refreshSlopeFreeze();     // shows that SLOPE is inert while manual mode is on
     void openTimbreChooser();
@@ -326,6 +363,16 @@ private:
     void applyLanguage();
     void refreshPresetList();
     void savePresetFlow();
+    // The presets box's own drop-down: a search field over a live-filtered list (see
+    // PresetSearchPanel). Returns false when there is nothing to show, so the ordinary
+    // ComboBox popup still gets its turn and an empty folder is not an empty mystery box.
+    bool openPresetSearch();
+    // Ask for a name and save the playground corner currently in edit mode under it.
+    void saveCornerFlow (int corner);
+    // Keep the preset field / Save button honest about WHOSE patch the controls are.
+    // Called whenever edit mode may have changed, and once per UI tick (automation and
+    // the processor itself can end it - a corner cleared, the playground disengaging).
+    void refreshCornerEditUi();
     void updateWarning (int templatePartials);
     void runDissonanceTune();
     void saveDissonanceScl();
@@ -337,7 +384,167 @@ private:
     struct RefreshingComboBox : juce::ComboBox
     {
         std::function<void()> onBeforePopup;
-        void showPopup() override { if (onBeforePopup) onBeforePopup(); juce::ComboBox::showPopup(); }
+        // Optional: take the drop-down over entirely (the presets box does - it opens a
+        // SEARCHABLE list instead of a plain menu). Returning true means "handled".
+        std::function<bool()> onShowPopup;
+        void showPopup() override
+        {
+            if (onBeforePopup) onBeforePopup();
+            if (onShowPopup && onShowPopup()) return;
+            juce::ComboBox::showPopup();
+        }
+    };
+
+    //==========================================================================
+    // CASE- AND DIACRITIC-INSENSITIVE FOLDING, for the preset search box.
+    //
+    // Preset names are the user's own words in the user's own language, and this is a
+    // bilingual product: "Can\xc3\xa7\xc3\xb3 llunyana", "Melod\xc3\xada", "R\xc3\xa0dio"
+    // are exactly the names it invites. A search that only matched byte-for-byte would
+    // be a trap for those names specifically - you would have to know which accent you
+    // typed a year ago to find your own preset. juce::String has no folding of its own,
+    // so the Latin letters this project's two languages (and their neighbours) use are
+    // mapped here BY CODE POINT - never by a literal accented character, which would
+    // depend on how this file happens to be encoded.
+    //
+    // Anything not in the table falls through unchanged, so a Cyrillic or CJK name still
+    // matches itself exactly. U+00B7 (Catalan's l\xc2\xb7l) folds to NOTHING, so
+    // "col\xc2\xb7legi" is found by typing "collegi".
+    // ORDER MATTERS: the accent fold happens FIRST, on the raw code point, and covers
+    // BOTH cases of every letter. Lowercasing first would not work - JUCE's toLowerCase
+    // goes through towlower, which is locale-dependent and in the "C" locale a plugin
+    // starts in leaves U+00C7 ('\xc3\x87') exactly where it was. Folding after that would
+    // silently miss every CAPITALISED accented name, which is most of the names people
+    // actually give presets. Only once nothing matched does toLowerCase get its turn, on
+    // ASCII, where it is reliable.
+    static juce::juce_wchar foldSearchChar (juce::juce_wchar cIn)
+    {
+        const int  c  = (int) cIn;
+        const auto in = [c] (int lo, int hi) { return c >= lo && c <= hi; };
+        if (c == 0xb7) return 0;   // U+00B7, Catalan's l-geminada: punctuation, not a letter
+        if (in (0xc0, 0xc5) || in (0xe0, 0xe5) || in (0x100, 0x105))            return 'a';
+        if (c == 0xc7 || c == 0xe7 || in (0x106, 0x10d))                        return 'c';
+        if (in (0x10e, 0x111))                                                  return 'd';
+        if (in (0xc8, 0xcb) || in (0xe8, 0xeb) || in (0x112, 0x11b))            return 'e';
+        if (in (0x11c, 0x123))                                                  return 'g';
+        if (in (0x124, 0x127))                                                  return 'h';
+        if (in (0xcc, 0xcf) || in (0xec, 0xef) || in (0x128, 0x131))            return 'i';
+        // 0x13F/0x140 are Catalan's PRECOMPOSED L-with-middle-dot, so both spellings of
+        // "col-legi" - the two-character one and the one-character one - fold to "collegi".
+        if (in (0x139, 0x142))                                                  return 'l';
+        if (c == 0xd1 || c == 0xf1 || in (0x143, 0x148))                        return 'n';
+        if (in (0xd2, 0xd6) || c == 0xd8 || in (0xf2, 0xf6) || c == 0xf8
+            || in (0x14c, 0x151))                                               return 'o';
+        if (in (0x154, 0x159))                                                  return 'r';
+        if (c == 0xdf || in (0x15a, 0x161))                                     return 's';
+        if (in (0x162, 0x167))                                                  return 't';
+        if (in (0xd9, 0xdc) || in (0xf9, 0xfc) || in (0x168, 0x173))            return 'u';
+        if (c == 0xdd || c == 0xfd || c == 0xff || in (0x176, 0x178))           return 'y';
+        if (in (0x179, 0x17e))                                                  return 'z';
+        return juce::CharacterFunctions::toLowerCase (cIn);
+    }
+    static juce::String foldForSearch (const juce::String& s)
+    {
+        juce::String out;
+        out.preallocateBytes ((size_t) s.getNumBytesAsUTF8() + 1);
+        for (auto p = s.getCharPointer(); ! p.isEmpty();)
+            if (const auto f = foldSearchChar (p.getAndAdvance()); f != 0)
+                out += juce::String::charToString (f);
+        return out;
+    }
+
+    //==========================================================================
+    // THE PRESET DROP-DOWN, WITH A SEARCH BOX ("haz que el desplegable de presets tenga
+    // un buscador"). A plain ComboBox popup is a PopupMenu, and a PopupMenu owns the
+    // keyboard for its own navigation - a text field inside one cannot reliably be typed
+    // into. So the presets box opens THIS instead: a search field over a live-filtered
+    // list, in a CallOutBox (which handles click-outside and Escape by itself).
+    //
+    // The one thing it must not break is PLAYING. The editor's computer-keyboard mapping
+    // is disabled whenever a juce::TextEditor holds focus (see pollComputerKeyboard), so
+    // letters typed here can never fire notes - and the instant this closes, focus goes
+    // back to the editor and the same letters play again. That is why the search field is
+    // a real TextEditor and not a hand-rolled key handler.
+    struct PresetSearchPanel : juce::Component,
+                               juce::ListBoxModel
+    {
+        juce::TextEditor search;
+        juce::ListBox    list { "presets", this };
+        juce::StringArray all, shown;
+        juce::String      current;
+        std::function<void (const juce::String&)> onPick;
+        std::function<void()> onDismissed;
+
+        PresetSearchPanel (juce::StringArray items, juce::String cur, juce::String placeholder)
+            : all (std::move (items)), current (std::move (cur))
+        {
+            search.setTextToShowWhenEmpty (placeholder, juce::Colour (0xff6a7285));
+            search.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff141a24));
+            search.setColour (juce::TextEditor::outlineColourId,    juce::Colour (0xff55557a));
+            search.setColour (juce::TextEditor::textColourId,       juce::Colours::white);
+            search.setFont (juce::Font (juce::FontOptions (14.0f)));
+            search.onTextChange = [this] { refilter(); };
+            // Enter takes the highlighted row (the first match when nothing is selected),
+            // so a name can be found and loaded without the mouse ever moving.
+            search.onReturnKey  = [this] { pick (juce::jmax (0, list.getSelectedRow())); };
+            search.onEscapeKey  = [this] { dismiss(); };
+            addAndMakeVisible (search);
+
+            list.setRowHeight (20);
+            list.setColour (juce::ListBox::backgroundColourId, juce::Colour (0xff0e1118));
+            list.setOutlineThickness (0);
+            addAndMakeVisible (list);
+            refilter();
+        }
+        ~PresetSearchPanel() override { if (onDismissed) onDismissed(); }
+
+        void refilter()
+        {
+            const auto q = foldForSearch (search.getText().trim());
+            shown.clear();
+            for (const auto& n : all)
+                if (q.isEmpty() || foldForSearch (n).contains (q))
+                    shown.add (n);
+            list.updateContent();
+            // Select the loaded preset when it is still on screen, otherwise the first
+            // match - so Enter always has an obvious meaning and never nothing.
+            const int cur = shown.indexOf (current);
+            list.selectRow (cur >= 0 ? cur : (shown.isEmpty() ? -1 : 0), true, true);
+            list.repaint();
+        }
+        void pick (int row)
+        {
+            if (! juce::isPositiveAndBelow (row, shown.size())) return;
+            const auto name = shown[row];
+            dismiss();
+            if (onPick) onPick (name);
+        }
+        void dismiss()
+        {
+            if (auto* box = findParentComponentOfClass<juce::CallOutBox>()) box->dismiss();
+            else                                                            setVisible (false);
+        }
+
+        int getNumRows() override { return shown.size(); }
+        void paintListBoxItem (int row, juce::Graphics& g, int w, int h, bool selected) override
+        {
+            if (! juce::isPositiveAndBelow (row, shown.size())) return;
+            if (selected) { g.setColour (juce::Colour (0xff2d6da8)); g.fillRect (0, 0, w, h); }
+            g.setColour (shown[row] == current ? juce::Colour (0xffffc95c) : juce::Colours::white);
+            g.setFont (juce::Font (juce::FontOptions (13.0f)));
+            g.drawText (shown[row], 6, 0, w - 10, h, juce::Justification::centredLeft, true);
+        }
+        void listBoxItemClicked (int row, const juce::MouseEvent&) override { pick (row); }
+        void returnKeyPressed (int row) override { pick (row); }
+
+        void resized() override
+        {
+            auto r = getLocalBounds().reduced (4);
+            search.setBounds (r.removeFromTop (22));
+            r.removeFromTop (4);
+            list.setBounds (r);
+        }
+        void paint (juce::Graphics& g) override { g.fillAll (juce::Colour (0xff0e1118)); }
     };
 
     // TextEditor with a focus hook. It used to stretch to the window edge while
@@ -2803,9 +3010,12 @@ private:
             const int winner = proc->getPlaygroundNearestCorner();
             const bool active = proc->isPlaygroundActive();
 
+            const int editing = proc->getPlaygroundEditCorner();
             for (int i = 0; i < 4; ++i)
             {
-                const auto name = proc->getPlaygroundCornerName (i);
+                // The DISPLAY name: a corner carrying unsaved edits reads "name*" here,
+                // which is the one place the user is looking while dragging the point.
+                const auto name = proc->getPlaygroundCornerDisplayName (i);
                 const juce::Point<float> c { (i & 1) ? a.getRight() : a.getX(),
                                              (i & 2) ? a.getBottom() : a.getY() };
                 const auto col = playgroundCornerColour (i);
@@ -2830,6 +3040,14 @@ private:
                 {
                     g.setColour (juce::Colours::white.withAlpha (0.85f));
                     g.drawEllipse (juce::Rectangle<float> (rad * 2.0f + 8.0f, rad * 2.0f + 8.0f).withCentre (c), 2.0f);
+                }
+                // The corner the main window's controls are standing in for: an amber
+                // ring, the same colour the Edit button turns, so "where am I typing?"
+                // has an answer on the pad itself and not only in the status text.
+                if (i == editing)
+                {
+                    g.setColour (juce::Colour (0xffffc95c));
+                    g.drawEllipse (juce::Rectangle<float> (rad * 2.0f + 14.0f, rad * 2.0f + 14.0f).withCentre (c), 2.5f);
                 }
 
                 // Name + percentage, pushed OUTWARDS from the corner so it never sits
@@ -2879,6 +3097,15 @@ private:
         juce::Label        cornerLbl[4];
         RefreshingComboBox cornerBox[4];
         juce::TextButton   cornerClear[4];
+        // EDIT: hands the MAIN editor's controls to this corner (see
+        // FractalAdditiveAudioProcessor::beginPlaygroundCornerEdit for the ownership
+        // rules). One corner at a time; the button of the corner being edited reads
+        // "OK" and lights up, because "how do I get my own patch back" must be visible
+        // from the same place the trip started.
+        juce::TextButton   cornerEdit[4];
+        // Set by the editor: edit mode began or ended - the main window's preset field
+        // and Save button have to change with it.
+        std::function<void()> onEditModeChanged;
         // The playground's two modes, as a radio pair driving the pgMode PARAMETER
         // (host-automatable; the buttons are only a view onto it, like the pad onto
         // pgX/pgY): MORPH blends one patch, MIX sounds all four corners at once and
@@ -2910,6 +3137,8 @@ private:
         // showing. In the change detection because a corner can be SWAPPED without the
         // assigned count moving, and a stale line would claim a follower that is gone.
         int   lastAdaptSig = -1;
+        // Which corner is being edited + which carry a "*", as one number (see refresh).
+        int   lastEditSig = -1;
 
         PlaygroundPanel()
         {
@@ -2944,10 +3173,27 @@ private:
                     // Item 1 is "(empty)" - selecting it CLEARS the corner. Anything else
                     // is a preset name read straight off the folder listing.
                     const auto name = cornerBox[i].getSelectedId() <= 1 ? juce::String() : cornerBox[i].getText();
+                    // Dropping a different preset here REPLACES the corner from disk, so
+                    // it ends any edit of it (and throws the unsaved edits away - the one
+                    // explicit act that does, see rule 4). Tell the main window.
+                    const bool wasEditing = proc->getPlaygroundEditCorner() == i;
                     proc->assignPlaygroundCorner (i, name, err);
                     refresh (true);
+                    if (wasEditing && onEditModeChanged) onEditModeChanged();
                 };
                 addAndMakeVisible (cornerBox[i]);
+
+                cornerEdit[i].setButtonText ("E");
+                cornerEdit[i].setMouseClickGrabsKeyboardFocus (false);
+                cornerEdit[i].onClick = [this, i]
+                {
+                    if (proc == nullptr) return;
+                    if (proc->getPlaygroundEditCorner() == i) proc->endPlaygroundCornerEdit();
+                    else                                      proc->beginPlaygroundCornerEdit (i);
+                    refresh (true);
+                    if (onEditModeChanged) onEditModeChanged();
+                };
+                addAndMakeVisible (cornerEdit[i]);
 
                 cornerClear[i].setButtonText ("X");
                 cornerClear[i].setColour (juce::TextButton::buttonColourId, juce::Colour (0xffe0453f).withAlpha (0.5f));
@@ -2956,9 +3202,15 @@ private:
                 {
                     if (proc == nullptr) return;
                     juce::String err;
+                    // assignPlaygroundCorner ends edit mode on this corner by itself (it
+                    // is what discards unsaved edits), but the MAIN window still has to
+                    // be told, or it would keep showing a frozen preset field for a
+                    // corner that no longer exists.
+                    const bool wasEditing = proc->getPlaygroundEditCorner() == i;
                     proc->assignPlaygroundCorner (i, {}, err);
                     cornerBox[i].setSelectedId (1, juce::dontSendNotification);
                     refresh (true);
+                    if (wasEditing && onEditModeChanged) onEditModeChanged();
                 };
                 addAndMakeVisible (cornerClear[i]);
             }
@@ -2998,7 +3250,10 @@ private:
         void refillCorner (int i)
         {
             if (proc == nullptr) return;
-            const auto cur = proc->getPlaygroundCornerName (i);
+            // The DISPLAY name, so a corner carrying unsaved edits shows its "*" here
+            // too. The box's ITEMS stay the plain folder listing - the "*" is a state of
+            // this corner, not the name of a preset anyone could pick.
+            const auto cur = proc->getPlaygroundCornerDisplayName (i);
             cornerBox[i].clear (juce::dontSendNotification);
             cornerBox[i].addItem (trF ? trF ("(empty)", "(buida)") : juce::String ("(empty)"), 1);
             int id = 2;
@@ -3051,6 +3306,20 @@ private:
                 cornerClear[i].setTooltip (trF ? trF ("Take the preset off this corner.",
                                                       "Treu el preset d'aquesta cantonada.")
                                                : juce::String());
+                cornerEdit[i].setTooltip (trF ? trF ("Edit this corner. The MAIN window's controls become this "
+                                                     "corner's, live: what you change is heard in the blend "
+                                                     "straight away and the corner's name gets a * to say it no "
+                                                     "longer matches the preset it came from. Your own patch is "
+                                                     "kept aside and comes back untouched when you press OK. "
+                                                     "Save (main window) stores the corner under a new name.",
+                                                     "Edita aquesta cantonada. Els controls de la finestra "
+                                                     "PRINCIPAL passen a ser els d'aquesta cantonada, en directe: "
+                                                     "el que canvi\xc3\xafs se sent a la barreja de seguida i el nom "
+                                                     "de la cantonada rep un * per dir que ja no coincideix amb el "
+                                                     "preset d'on ve. El teu patch es guarda a part i torna intacte "
+                                                     "quan prems OK. Desar (finestra principal) guarda la cantonada "
+                                                     "amb un nom nou.")
+                                              : juce::String());
             }
             lastWinner = -2;   // force the status line to be rebuilt in the new language
             refresh (true);
@@ -3085,7 +3354,13 @@ private:
                 const auto lay = [this] (int i, juce::Rectangle<int> cell)
                 {
                     cornerLbl[i].setBounds (cell.removeFromLeft (16));
+                    // Right to left: X (take the preset off), then E (edit it), then the
+                    // name box gets everything left. The two buttons are sized from the
+                    // RIGHT so adding E could only ever cost the box width - never push a
+                    // control off the end of the row.
                     cornerClear[i].setBounds (cell.removeFromRight (24).reduced (1, 1));
+                    cell.removeFromRight (3);
+                    cornerEdit[i].setBounds (cell.removeFromRight (26).reduced (1, 1));
                     cell.removeFromRight (3);
                     cornerBox[i].setBounds (cell);
                 };
@@ -3114,11 +3389,45 @@ private:
             const int   adSig = proc->getPlaygroundAdaptiveCount() * 2
                               + (proc->getPlaygroundAdaptRefusal().isNotEmpty() ? 1 : 0);
             const int   mode  = proc->isPlaygroundMixMode() ? 1 : 0;
+            // WHICH corner is being edited, and which corners carry unsaved edits. In the
+            // change detector because the "*" can appear with nothing else moving at all
+            // (a knob turned in the main window is invisible to every other signal here),
+            // and a status line that only redraws on a drag would deny the edit exists.
+            int editSig = proc->getPlaygroundEditCorner() + 1;
+            for (int i = 0; i < 4; ++i)
+                if (proc->isPlaygroundCornerEdited (i)) editSig += 16 << i;
             if (! force && x == lastX && y == lastY && n == lastAssigned && wn == lastWinner
-                && adSig == lastAdaptSig && mode == lastMode)
+                && adSig == lastAdaptSig && mode == lastMode && editSig == lastEditSig)
                 return;
             lastX = x; lastY = y; lastAssigned = n; lastWinner = wn; lastAdaptSig = adSig;
             lastMode = mode;
+            const bool editChanged = editSig != lastEditSig;
+            lastEditSig = editSig;
+
+            // The corner rows: only an ASSIGNED corner has anything to edit, and only
+            // while the playground is really driving (two corners) does editing one mean
+            // anything - the blend is what you hear the edit in.
+            {
+                const int ed = proc->getPlaygroundEditCorner();
+                for (int i = 0; i < 4; ++i)
+                {
+                    const bool can = proc->getPlaygroundCornerName (i).isNotEmpty() && n >= 2;
+                    cornerEdit[i].setEnabled (can);
+                    cornerEdit[i].setButtonText (i == ed ? juce::String ("OK") : juce::String ("E"));
+                    cornerEdit[i].setColour (juce::TextButton::buttonColourId,
+                                             i == ed ? juce::Colour (0xffffc95c) : juce::Colour (0xff2d6da8).withAlpha (0.55f));
+                    cornerEdit[i].setColour (juce::TextButton::textColourOffId,
+                                             i == ed ? juce::Colours::black : juce::Colours::white);
+                    // The "*" lives on the name, so the box has to be re-read whenever the
+                    // edit signature moved - not only when a corner is (re)assigned.
+                    if (editChanged)
+                    {
+                        const auto disp = proc->getPlaygroundCornerDisplayName (i);
+                        if (disp.isNotEmpty() && cornerBox[i].getText() != disp)
+                            cornerBox[i].setText (disp, juce::dontSendNotification);
+                    }
+                }
+            }
 
             // The mode pair reads like a radio group: the mode in force is lit.
             for (int m = 0; m < 2; ++m)
@@ -3196,6 +3505,24 @@ private:
                               : juce::String());
                 if (proc->getPlaygroundAdaptRefusal().isNotEmpty())
                     s << "\n" << proc->getPlaygroundAdaptRefusal();
+                // EDIT MODE is the loudest thing this line can say: the main window's
+                // controls are somebody else's patch right now, and a user who does not
+                // know that will "fix" a corner thinking it is their own sound.
+                if (const int ed = proc->getPlaygroundEditCorner(); ed >= 0)
+                {
+                    s << "\n";
+                    s << (trF ? trF ("EDITING ", "EDITANT ") : juce::String ("EDITING "))
+                      << (char) ('A' + ed) << ": "
+                      << proc->getPlaygroundCornerDisplayName (ed) << ". ";
+                    s << (trF ? trF ("The main window's controls are THIS CORNER now - your own patch is "
+                                     "kept and comes back with OK. Save stores the corner under a new name; "
+                                     "unsaved edits stay on the corner (the *) until you replace it.",
+                                     "Els controls de la finestra principal s\xc3\xb3n ARA AQUESTA CANTONADA - "
+                                     "el teu patch es guarda i torna amb OK. Desar guarda la cantonada amb un "
+                                     "nom nou; els canvis no desats es queden a la cantonada (l'*) fins que "
+                                     "la substitueixis.")
+                              : juce::String());
+                }
             }
             statLbl.setText (s, juce::dontSendNotification);
             pad.repaint();
@@ -3304,6 +3631,13 @@ private:
     RefreshingComboBox presetBox;
     juce::Label presetDirtyMark; // "*" - some parameter drifted from the loaded preset
     void refreshPresetDirtyMark();
+    // The corner the main window's controls were standing in for last time the UI was
+    // refreshed, and the live patch's own preset name parked while that is true. The
+    // preset field is FROZEN during a corner edit (it is not the loaded preset any more),
+    // and this is what puts the real name back afterwards.
+    int          lastEditCornerSeen = -1;
+    bool         cornerEditUiActive = false;   // the TRANSITION guard, not a repeat of the above
+    juce::String presetTextBeforeCornerEdit;
     juce::Rectangle<int> titleClickArea; // the title squares; clicking them plays the jingle
     juce::ToggleButton primeToggle[9], morphToggle;
     juce::ToggleButton temperToggle; // lives INSIDE the Custom Engine box (the scale it bypasses)

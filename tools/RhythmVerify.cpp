@@ -3472,57 +3472,60 @@ int main()
             //     into, at the key width the keyboard really uses.
             {
                 const auto tags = ed->keyboardPeriodTagsForTests();
-                int tooNarrow = 0, overlaps = 0, offCentre = 0, tiny = 0;
+                int tooNarrow = 0, sideBySide = 0, offColumn = 0, tiny = 0;
                 juce::String firstBad;
-                // THE GAP, measured INK TO INK, and why a rect check cannot see it. Both
-                // numbers are drawn CENTRED in their own rect, so two rects that merely do
-                // not overlap can still be six pixels of empty air apart - which is exactly
-                // what they were, and why the period number read as a second mark on the key
-                // instead of as an annotation of the "0" beside it. Recomputed here from the
-                // rects and text widths paint() really uses, then cross-checked against the
-                // layout's own `gap`, so neither side can drift into agreeing with itself.
-                float inkGap = -1.0f, gapDisagree = 0.0f;
-                int   tooFar = 0, tooSmall = 0;
+                // THE STACK. The period number is ABOVE the "0" now, and the "0" is back on
+                // the column every other degree number stands in - the user's complaint was
+                // that the tag beside it DISPLACED it left. Neither is visible to an overlap
+                // check: a tag parked to the right of the digit overlaps nothing at all, and
+                // that was the shipped bug.
+                float worstEdge = 1e9f, gapDisagree = 0.0f, worstColumn = 0.0f;
+                int   tooFar = 0, tooSmall = 0, touchesBorder = 0;
                 for (const auto& t : tags)
                 {
-                    const float gg = (t.tag.getCentreX() - t.tagTextWidth * 0.5f)
-                                   - (t.zero.getCentreX() + t.zeroTextWidth * 0.5f);
-                    if (inkGap < 0.0f) inkGap = gg;
+                    const float gg = t.zero.getY() - t.tag.getBottom();
                     gapDisagree = juce::jmax (gapDisagree, std::abs (gg - t.gap));
-                    // "bastante mas cerca del 0" - considerably closer. 6.19 px was the
-                    // shipped distance; anything above 3.5 is not "considerably closer",
-                    // and 1 px is the floor below which the two numbers touch.
-                    if (gg > 3.5f || gg < 1.0f) ++tooFar;
+                    // Close enough to read as an annotation of that "0" (it was 6.19 px of
+                    // air side by side), never so close the two numbers' ink touches.
+                    if (gg > 3.5f || gg < 0.5f) ++tooFar;
                     // "un poco mas grandes" - the tag was 8.8 pt at the smallest key.
                     if (t.tagFont < 9.5f) ++tooSmall;
-                    if (t.tagTextWidth > (float) t.tag.getWidth())
+                    if (t.tagTextWidth > (float) t.tag.getWidth()
+                        || t.zeroTextWidth > (float) t.zero.getWidth())
                     { ++tooNarrow; if (firstBad.isEmpty()) firstBad = "period " + juce::String (t.number); }
-                    // The "0" and its period number share a cell; the tag's strip is
-                    // RESERVED out of it, so the two can never print on top of each other.
-                    if (t.tag.getX() < t.zero.getRight() - 0.01f) ++overlaps;
-                    // "vertically centred to its right" - the user's words, as a number.
-                    if (std::abs (t.tag.getCentreY() - t.zero.getCentreY()) > 1.0f) ++offCentre;
+                    // STACKED, not beside: the tag's whole rect is above the "0"'s.
+                    if (t.tag.getBottom() > t.zero.getY() + 0.01f) ++sideBySide;
+                    // CENTRED: the "0" stands exactly where the "1" on the next key does.
+                    worstColumn = juce::jmax (worstColumn, std::abs (t.zeroCentreX - t.degreeCentreX));
+                    if (std::abs (t.zeroCentreX - t.degreeCentreX) > 0.51f) ++offColumn;
+                    // "que no toque el borde" - the user's words, as a number. Measured on
+                    // the integer rects paint() draws into, on all four sides of the key.
+                    worstEdge = juce::jmin (worstEdge, t.edge);
+                    if (t.edge < 1.0f) ++touchesBorder;
                     if (t.tagFont < 7.0f) ++tiny;
                 }
-                std::printf ("  %d degree-0 keys on screen: %d tags too narrow%s, %d overlapping the 0,"
-                             " %d off-centre, %d below 7 pt\n",
+                std::printf ("  %d degree-0 keys on screen: %d shrunk to fit%s, %d not stacked,"
+                             " %d off the degree column, %d below 7 pt, %d touching the key border\n",
                              (int) tags.size(), tooNarrow,
                              firstBad.isEmpty() ? "" : (" (" + firstBad + ")").toRawUTF8(),
-                             overlaps, offCentre, tiny);
+                             sideBySide, offColumn, tiny, touchesBorder);
                 if (! tags.empty())
-                    std::printf ("  first tag: period %d, \"0\" %.1f pt in %.0f px, number %.1f pt needing"
-                                 " %.1f px of %.0f, ink gap %.2f px (was 6.19)\n",
-                                 tags.front().number, tags.front().zeroFont, tags.front().zero.getWidth(),
-                                 tags.front().tagFont, tags.front().tagTextWidth,
-                                 tags.front().tag.getWidth(), inkGap);
+                    std::printf ("  first tag: period %d, number %.1f pt needing %.1f px of %.0f ABOVE"
+                                 " a %.1f pt \"0\" in %.0f px; column error %.3f px, border clearance"
+                                 " %.2f px, vertical gap %.2f\n",
+                                 tags.front().number, tags.front().tagFont, tags.front().tagTextWidth,
+                                 tags.front().tag.getWidth(), tags.front().zeroFont,
+                                 tags.front().zero.getWidth(), worstColumn, worstEdge,
+                                 tags.front().gap);
                 check (! tags.empty(), "every period boundary on screen carries its number");
-                check (tooNarrow == 0, "and every one of them fits its rect without being shrunk");
-                check (overlaps == 0, "and none of them prints over the \"0\" it belongs to");
-                check (offCentre == 0, "and each is vertically centred on that \"0\"");
+                check (tooNarrow == 0, "and every one of them fits its rect without being squeezed");
+                check (sideBySide == 0, "the period number sits ABOVE the \"0\", never beside it");
+                check (offColumn == 0, "and the \"0\" is centred on the very column the other degrees use");
+                check (touchesBorder == 0, "and neither number touches the key's border");
                 check (tiny == 0, "and none of them is drawn below 7 pt");
                 check (gapDisagree < 0.01f,
-                       "the layout's own gap is the one the drawn rects and glyphs produce");
-                check (tooFar == 0, "the period number sits CLOSE to its \"0\" (1 .. 3.5 px of ink, was 6.19)");
+                       "the layout's own gap is the one the drawn rects produce");
+                check (tooFar == 0, "the period number sits CLOSE above its \"0\" (0.5 .. 3.5 px)");
                 check (tooSmall == 0, "and is drawn larger than the 8.8 pt it used to be");
 
                 // ...INCLUDING the numbers this tuning does not happen to show, AT THE
@@ -3530,12 +3533,16 @@ int main()
                 // three characters (a one-degree-per-period scale reaches "-10"), and the
                 // widest is the one nobody was looking at; keys have a fixed width, so
                 // kCellW - not the cell this window happened to open at - is the worst case.
-                // Measured through the same layout call paint() uses.
+                // Measured through the same layout call paint() uses. This is where a stack
+                // fails: two numbers where there was one, in a band that starts at the key's
+                // own top edge.
                 if (! tags.empty())
                 {
                     const float cellW = (float) ScaleKeyboard::kCellW;
                     const auto& t0    = tags.front();
-                    int narrow = 0, small = 0, far = 0;
+                    const auto  key   = ScaleKeyboard::cellRectForTests (cellW, t0.cellH);
+                    const float col   = ScaleKeyboard::degreeCentreXForTests (cellW, t0.cellH, t0.label);
+                    int narrow = 0, small = 0, far = 0, border = 0, offCol = 0;
                     for (const char* s : { "3", "-2", "-10" })
                     {
                         const juce::String txt (s);
@@ -3543,19 +3550,35 @@ int main()
                                                                              t0.label, txt);
                         const float w  = ScaleKeyboard::boldTextWidth (txt, z.tagFont);
                         const float zw = ScaleKeyboard::boldTextWidth ("0", z.zeroFont);
-                        const float gg = (z.tag.getCentreX() - w * 0.5f)
-                                       - (z.zero.getCentreX() + zw * 0.5f);
-                        std::printf ("    \"%s\" at a %d px key: %.1f pt, needs %.1f px of %.1f,"
-                                     " \"0\" %.1f pt in %.1f px, ink gap %.2f\n",
+                        const float gg = z.zero.getY() - z.tag.getBottom();
+                        const auto ti = z.tag.getSmallestIntegerContainer().toFloat();
+                        const auto zi = z.zero.getSmallestIntegerContainer().toFloat();
+                        const float e = juce::jmin (juce::jmin (ti.getY() - key.getY(),
+                                                                key.getBottom() - zi.getBottom()),
+                                                    juce::jmin (juce::jmin (ti.getX() - key.getX(),
+                                                                            key.getRight() - ti.getRight()),
+                                                                juce::jmin (zi.getX() - key.getX(),
+                                                                            key.getRight() - zi.getRight())));
+                        std::printf ("    \"%s\" at a %d px key: %.1f pt, needs %.1f px of %.1f, above a"
+                                     " %.1f pt \"0\" (%.1f px of %.1f); gap %.2f, border clearance %.2f,"
+                                     " column error %.3f\n",
                                      s, ScaleKeyboard::kCellW, z.tagFont, w, z.tag.getWidth(),
-                                     z.zeroFont, z.zero.getWidth(), gg);
-                        if (w > z.tag.getWidth()) ++narrow;
-                        if (z.tagFont < 7.0f || z.zero.getWidth() < 10.0f) ++small;
-                        if (gg > 3.5f || gg < 1.0f) ++far;
+                                     z.zeroFont, zw, z.zero.getWidth(), gg, e,
+                                     std::abs (z.zero.getCentreX() - col));
+                        if (w > z.tag.getWidth() || zw > z.zero.getWidth()) ++narrow;
+                        // The "0" is the scale degree: a stack that pays for itself by
+                        // shrinking the digit it annotates has solved nothing. 18 pt is the
+                        // side-by-side layout's own "0" at this key size.
+                        if (z.tagFont < 7.0f || z.zeroFont < 18.0f) ++small;
+                        if (gg > 3.5f || gg < 0.5f) ++far;
+                        if (e < 1.0f) ++border;
+                        if (std::abs (z.zero.getCentreX() - col) > 0.51f) ++offCol;
                     }
-                    check (narrow == 0, "a one-, two- or three-character period all fit their strip");
-                    check (small == 0, "and none of them costs the \"0\" its own legibility");
-                    check (far == 0, "and every one of them stays tight against its \"0\"");
+                    check (narrow == 0, "a one-, two- or three-character period all fit their rect");
+                    check (small == 0, "and none of them costs the \"0\" its own size");
+                    check (far == 0, "and every one of them stays tight above its \"0\"");
+                    check (border == 0, "and none of them touches the key border at the smallest key drawn");
+                    check (offCol == 0, "and the \"0\" stays on the degree column whatever the period is");
                 }
             }
 
@@ -5624,13 +5647,38 @@ int main()
                     // 420 x 380 is setResizeLimits' floor - the tightest the user can make it.
                     const auto L = ed->playgroundProbeForTests (420, 380, lang == 1);
                     int overlaps = 0, tiny = 0;
+                    int editBad = 0;
                     for (int i = 0; i < 4; ++i)
                     {
                         if (! L.panel.contains (L.box[i]) || ! L.panel.contains (L.clear[i])) ++overlaps;
                         if (L.box[i].getWidth() < 60 || L.box[i].getHeight() < 14) ++tiny;
                         if (L.box[i].intersects (L.clear[i]) || L.box[i].intersects (L.lbl[i])) ++overlaps;
                         if (L.pad.intersects (L.box[i])) ++overlaps;
+                        // THE EDIT BUTTON, added to a row that was already full. It has to
+                        // be inside the panel, clear of the name box and the X either side
+                        // of it, big enough to hit, and its REAL label has to fit - "OK"
+                        // is wider than "E" and it is the one the button wears while a
+                        // corner is being edited, i.e. exactly when it is being looked at.
+                        if (! L.panel.contains (L.edit[i])) ++editBad;
+                        if (L.edit[i].intersects (L.box[i]) || L.edit[i].intersects (L.clear[i])
+                            || L.edit[i].intersects (L.lbl[i]) || L.edit[i].intersects (L.pad)) ++editBad;
+                        if (L.edit[i].getWidth() < 18 || L.edit[i].getHeight() < 14) ++editBad;
+                        for (const char* s : { "E", "OK" })
+                            if (juce::GlyphArrangement::getStringWidth (
+                                    juce::Font (juce::FontOptions (13.0f)), s)
+                                > (float) L.edit[i].getWidth() - 4.0f) ++editBad;
+                        // An EMPTY corner has nothing to edit: the button must be dead,
+                        // not a click that silently does nothing (this run has corners A
+                        // and B assigned and C, D empty).
+                        const bool assigned = L.cornerName[i].isNotEmpty();
+                        if (L.editEnabled[i] != assigned) ++editBad;
                     }
+                    std::printf ("  edit buttons (%s): %dx%d each, \"%s\", enabled %d%d%d%d\n",
+                                 lang == 1 ? "ca" : "en", L.edit[0].getWidth(), L.edit[0].getHeight(),
+                                 L.editText[0].toRawUTF8(), (int) L.editEnabled[0], (int) L.editEnabled[1],
+                                 (int) L.editEnabled[2], (int) L.editEnabled[3]);
+                    check (editBad == 0,
+                           "every corner's EDIT button fits its row, clears its neighbours, and is dead on an empty corner");
                     std::printf ("  playground panel (%s) at 420x380: pad %dx%d, combo %dx%d, "
                                  "%d overlaps, %d squashed\n", lang == 1 ? "ca" : "en",
                                  L.pad.getWidth(), L.pad.getHeight(),
@@ -5681,6 +5729,324 @@ int main()
         fileA.deleteFile();
         fileB.deleteFile();
         check (! fileA.existsAsFile() && ! fileB.existsAsFile(), "the verifier's presets are cleaned up");
+    }
+
+    //--- EDITING A PLAYGROUND CORNER IN PLACE ---------------------------------------
+    // "cuando esta el playground haz que cada preset tenga un boton de edit y al clicarlo
+    //  puedas editarlo a tiempo real y entonces el nombre del preset aparece con un * para
+    //  avisar que fue editado, y que dandole a save se pueda guardar luego con otro nombre"
+    //
+    // Easy to demo, catastrophic to get wrong: the main editor's controls ARE the live
+    // patch, and pointing them at a corner without an ownership contract loses the sound
+    // the user was working on. Every check below is a clause of that contract (the rules
+    // are written out above beginPlaygroundCornerEdit) and not one of them is visible to
+    // any other check in this build.
+    {
+        std::printf ("\nediting a playground corner in place:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto folder = Proc::getPresetFolder();
+        auto fA = folder.getChildFile ("zzz-verify-ce-A.gsting");
+        auto fB = folder.getChildFile ("zzz-verify-ce-B.gsting");
+        auto fS = folder.getChildFile ("zzz-verify-ce-B2.gsting");
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 64);
+        auto sp = [&] (const char* id, float v)
+        { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
+        auto gp   = [&] (const char* id) { return p->apvts.getRawParameterValue (id)->load(); };
+        auto tick = [&] (int n) { for (int i = 0; i < n; ++i) p->pollParametersForTests(); };
+        // Every parameter's normalised value, so "the live patch came back" can be checked
+        // as ALL OF IT rather than as the three knobs the test happened to think of.
+        auto snapAll = [&]
+        {
+            std::vector<float> v;
+            for (auto* ap : p->getParameters())
+                if (auto* q = dynamic_cast<juce::RangedAudioParameter*> (ap)) v.push_back (q->getValue());
+            return v;
+        };
+        auto ratiosOf = [] (const std::shared_ptr<const spectrum::SpectrumTemplate>& t)
+        {
+            std::vector<double> r;
+            if (t != nullptr) for (const auto& pa : t->partials) r.push_back (pa.ratio);
+            return r;
+        };
+
+        sp ("timbreOn", 0.0f); sp ("baseN", 1.0f); sp ("ampDecay", 0.05f);
+        sp ("filterCutoff", 1000.0f); sp ("masterGain", -6.0f);
+        tick (2);
+        check (p->savePreset ("zzz-verify-ce-A").isNotEmpty(), "corner preset A saved");
+        sp ("baseN", 8.0f); sp ("ampDecay", 1.5f); sp ("filterCutoff", 9000.0f);
+        tick (2);
+        check (p->savePreset ("zzz-verify-ce-B").isNotEmpty(), "corner preset B saved");
+
+        juce::String err;
+        p->assignPlaygroundCorner (0, "zzz-verify-ce-A", err);
+        p->assignPlaygroundCorner (1, "zzz-verify-ce-B", err);
+        check (p->isPlaygroundActive(), "two corners engage the playground");
+        check (! p->beginPlaygroundCornerEdit (2), "an EMPTY corner cannot be edited - there is nothing there");
+
+        // MIX MODE FIRST, because it is the mode where the promise is testable: the
+        // playground writes nothing to the live patch there, so a live patch that comes
+        // back changed came back changed because edit mode broke it.
+        sp ("pgMode", 1.0f); sp ("pgX", 0.35f); sp ("pgY", 0.65f);
+        tick (4);
+        // The user's own sound: unlike either corner, with a tuning of its own.
+        sp ("baseN", 5.0f); sp ("ampDecay", 0.4f); sp ("filterCutoff", 4000.0f);
+        sp ("refA", 428.0f); sp ("octaveShift", 1.0f);
+        tick (4);
+        const auto  liveBefore   = snapAll();
+        const float pgxBefore    = gp ("pgX"), pgyBefore = gp ("pgY");
+        const bool  driftBefore  = p->presetHasDrifted();
+        const auto  loadedBefore = p->getLoadedPresetName();
+
+        check (p->beginPlaygroundCornerEdit (1), "Edit on an assigned corner enters edit mode");
+        check (p->getPlaygroundEditCorner() == 1, "...and the processor says WHICH corner it is");
+        tick (3);
+        std::printf ("  entering edit: ampDecay %.3f (corner B saved 1.500, live patch 0.400),"
+                     " baseN %.1f, refA %.0f, point (%.2f, %.2f)\n",
+                     gp ("ampDecay"), gp ("baseN"), gp ("refA"), gp ("pgX"), gp ("pgY"));
+        check (std::abs (gp ("ampDecay") - 1.5f) < 0.01f && std::abs (gp ("baseN") - 8.0f) < 0.01f
+               && std::abs (gp ("filterCutoff") - 9000.0f) < 1.0f,
+               "the main window's controls now READ that corner's stored values");
+        check (gp ("refA") == 428.0f && gp ("octaveShift") == 1.0f,
+               "...and the tuning is not part of a corner: reference and transpose never moved");
+        check (gp ("pgX") == pgxBefore && gp ("pgY") == pgyBefore,
+               "mix mode does not pin the point - the corner is its own engine, heard in the balance");
+        check (! p->isPlaygroundCornerEdited (1),
+               "and an UNTOUCHED corner carries no * - the warning has to mean something");
+
+        // RULE 2: THE HOST NEVER SEES THE SCRATCH SURFACE.
+        {
+            juce::MemoryBlock blob;
+            p->getStateInformation (blob);
+            auto q = std::make_unique<Proc>();
+            q->prepareToPlay (48000.0, 64);
+            q->setStateInformation (blob.getData(), (int) blob.getSize());
+            const float qd = q->apvts.getRawParameterValue ("ampDecay")->load();
+            std::printf ("  project saved MID-EDIT reopens with ampDecay %.3f (live 0.400, corner 1.500)\n", qd);
+            check (std::abs (qd - 0.4f) < 0.02f,
+                   "a project saved mid-edit reopens as the USER'S patch, never as somebody's corner");
+            check (q->getPlaygroundCornerName (1) == "zzz-verify-ce-B",
+                   "...with the corner assignments still on it");
+        }
+
+        // TURNING A CONTROL EDITS THE CORNER - and reaches the SOUND, not just the store.
+        const int  rev0   = p->getPlaygroundCornerRevForTests (1);
+        const auto tmpl0  = ratiosOf (p->getPlaygroundCornerTemplateForTests (1));
+        sp ("ampDecay", 0.11f);
+        sp ("baseN", 3.0f);            // a SPECTRUM parameter: it must reach the template
+        tick (20);                     // the recompile is throttled to the ~10 Hz glide cadence
+        const auto tmpl1 = ratiosOf (p->getPlaygroundCornerTemplateForTests (1));
+        std::printf ("  after editing: corner rev %d -> %d, template partials %d -> %d,"
+                     " first ratios %.4f -> %.4f, name \"%s\"\n",
+                     rev0, p->getPlaygroundCornerRevForTests (1), (int) tmpl0.size(), (int) tmpl1.size(),
+                     tmpl0.empty() ? 0.0 : tmpl0[0], tmpl1.empty() ? 0.0 : tmpl1[0],
+                     p->getPlaygroundCornerDisplayName (1).toRawUTF8());
+        check (p->getPlaygroundCornerRevForTests (1) > rev0,
+               "moving a control while editing writes THAT CORNER's store");
+        check (p->isPlaygroundCornerEdited (1) && p->getPlaygroundCornerDisplayName (1).endsWith ("*"),
+               "...and the corner's name gains the * that warns it no longer matches its preset");
+        check (! tmpl1.empty() && tmpl1 != tmpl0,
+               "...and the corner's SPECTRUM is recompiled, so the edit is HEARD and not merely stored");
+
+        // RULE 1: LEAVING HANDS THE LIVE PATCH BACK, ALL OF IT.
+        p->endPlaygroundCornerEdit();
+        tick (4);
+        check (p->getPlaygroundEditCorner() < 0, "OK leaves edit mode");
+        {
+            const auto liveAfter = snapAll();
+            int moved = 0;
+            float worst = 0.0f;
+            for (size_t i = 0; i < liveAfter.size() && i < liveBefore.size(); ++i)
+                if (const float d = std::abs (liveAfter[i] - liveBefore[i]); d > 1.0e-4f)
+                { ++moved; worst = juce::jmax (worst, d); }
+            std::printf ("  live patch on the way out: %d of %d parameters moved (worst %.5f)\n",
+                         moved, (int) liveBefore.size(), worst);
+            check (moved == 0, "and the live patch comes back EXACTLY as it was left - every parameter of it");
+        }
+        check (p->getLoadedPresetName() == loadedBefore && p->presetHasDrifted() == driftBefore,
+               "...including WHICH preset it is and whether it had drifted from it");
+        check (p->isPlaygroundCornerEdited (1),
+               "the unsaved edits stay ON THE CORNER for this session - the * is what warns about them");
+
+        // SAVE UNDER ANOTHER NAME.
+        check (p->savePlaygroundCornerAs (1, "zzz-verify-ce-B2").isEmpty(),
+               "a corner that is NOT in edit mode refuses to be saved - its full state is nowhere to save from");
+        p->beginPlaygroundCornerEdit (1);
+        tick (3);
+        const auto stored = p->savePlaygroundCornerAs (1, "zzz-verify-ce-B2");
+        check (stored == "zzz-verify-ce-B2" && fS.existsAsFile(),
+               "Save writes the edited corner as a preset of its own, under a new name");
+        check (p->getPlaygroundCornerName (1) == stored && ! p->isPlaygroundCornerEdited (1),
+               "...the corner takes that name and loses its *");
+        check (p->getLoadedPresetName() == loadedBefore,
+               "...and the LIVE patch's own preset identity is not touched by it");
+        check (fB.existsAsFile(),
+               "...and the preset the corner came FROM is never written by editing it");
+        p->endPlaygroundCornerEdit();
+        tick (2);
+        {
+            auto q = std::make_unique<Proc>();
+            q->prepareToPlay (48000.0, 64);
+            check (q->loadPreset ("zzz-verify-ce-B2"), "the saved corner loads like any other preset");
+            std::printf ("  saved corner reloads with ampDecay %.3f baseN %.1f (edited 0.110 / 3.0)\n",
+                         q->apvts.getRawParameterValue ("ampDecay")->load(),
+                         q->apvts.getRawParameterValue ("baseN")->load());
+            check (std::abs (q->apvts.getRawParameterValue ("ampDecay")->load() - 0.11f) < 0.005f
+                   && std::abs (q->apvts.getRawParameterValue ("baseN")->load() - 3.0f) < 0.01f,
+                   "...and the file really carries the edit, not the preset it started from");
+        }
+
+        // RULE 6: MORPH MODE PINS THE POINT, and the blend stops fighting the user.
+        sp ("pgMode", 0.0f); sp ("pgX", 0.5f); sp ("pgY", 0.0f);
+        tick (6);
+        p->beginPlaygroundCornerEdit (1);
+        tick (3);
+        std::printf ("  morph mode: editing corner B pinned the point to (%.2f, %.2f)\n", gp ("pgX"), gp ("pgY"));
+        check (gp ("pgX") == 1.0f && gp ("pgY") == 0.0f,
+               "in MORPH the point moves ONTO the corner being edited - what you hear IS what you edit");
+        sp ("filterCutoff", 2222.0f);
+        tick (10);
+        std::printf ("  a control set to 2222 while editing reads %.0f ten ticks later\n", gp ("filterCutoff"));
+        check (std::abs (gp ("filterCutoff") - 2222.0f) < 1.0f,
+               "and the blend's 30 Hz write-back is suspended - a knob turned in edit mode does not snap back");
+        // ...AND DRAGGING THE PAD AWAY MUST NOT DRAG THE CORNER WITH IT. This is the one
+        // that bites: at a pinned corner the blend writes back exactly what the pull just
+        // captured, so the suspension looks harmless. Move the point off the corner and it
+        // is a FEEDBACK LOOP - the blend rewrites every control from the mixture, the next
+        // pull captures that mixture into the corner, and the preset being edited walks
+        // towards the average of its neighbours one frame at a time until nothing of it is
+        // left. Corner A's cutoff is 1000; thirty frames of that would be most of the way.
+        sp ("pgX", 0.5f);
+        tick (30);
+        std::printf ("  pad dragged to the middle while editing corner B: cutoff %.0f"
+                     " (corner A is 1000, the edit was 2222)\n", gp ("filterCutoff"));
+        check (std::abs (gp ("filterCutoff") - 2222.0f) < 1.0f,
+               "and dragging the pad away while editing never drags the corner's own values towards the others");
+        p->endPlaygroundCornerEdit();
+        tick (6);
+        check (std::abs (gp ("pgX") - 0.5f) < 1.0e-3f && gp ("pgY") == 0.0f,
+               "leaving puts the point back exactly where the user had it");
+
+        // RULE 4: re-assigning the corner is the ONE act that throws unsaved edits away.
+        p->beginPlaygroundCornerEdit (0);
+        tick (3);
+        sp ("ampDecay", 0.9f);
+        tick (20);
+        check (p->isPlaygroundCornerEdited (0), "corner A now carries unsaved edits");
+        p->assignPlaygroundCorner (0, "zzz-verify-ce-A", err);
+        tick (3);
+        check (p->getPlaygroundEditCorner() < 0 && ! p->isPlaygroundCornerEdited (0),
+               "dropping a preset on the corner being edited ends the edit and re-reads it from disk");
+        // ...and so is the playground letting go entirely.
+        p->beginPlaygroundCornerEdit (1);
+        tick (3);
+        check (p->getPlaygroundEditCorner() == 1, "editing corner B again");
+        p->assignPlaygroundCorner (0, {}, err);
+        tick (3);
+        check (p->getPlaygroundEditCorner() < 0,
+               "and clearing a corner until the playground disengages ends edit mode too - never a"
+               " scratch surface left standing in for a blend that stopped");
+
+        // THE MAIN WINDOW SAYS WHOSE PATCH IT IS SHOWING (rule 3).
+        {
+            p->assignPlaygroundCorner (0, "zzz-verify-ce-A", err);
+            tick (3);
+            auto ed = std::unique_ptr<FractalAdditiveAudioProcessorEditor> (
+                          dynamic_cast<FractalAdditiveAudioProcessorEditor*> (p->createEditor()));
+            check (ed != nullptr, "the editor builds with corner edit in it");
+            if (ed != nullptr)
+            {
+                ed->setSize (1200, 650);
+                const auto before = ed->cornerEditUiProbeForTests();
+                p->beginPlaygroundCornerEdit (1);
+                tick (3);
+                const auto during = ed->cornerEditUiProbeForTests();
+                p->endPlaygroundCornerEdit();
+                tick (3);
+                const auto after = ed->cornerEditUiProbeForTests();
+                std::printf ("  preset field: \"%s\" -> \"%s\" -> \"%s\"; Save: \"%s\" -> \"%s\"\n",
+                             before.presetText.toRawUTF8(), during.presetText.toRawUTF8(),
+                             after.presetText.toRawUTF8(), before.saveText.toRawUTF8(),
+                             during.saveText.toRawUTF8());
+                check (during.presetText.startsWith ("B:")
+                       && during.presetText.contains (p->getPlaygroundCornerName (1)),
+                       "while editing, the preset field NAMES the corner instead of the loaded preset");
+                check (! during.presetEnabled && ! during.dirtyMarkVisible,
+                       "...and is dead: a corner is not something you load a preset over");
+                check (during.saveText != before.saveText && during.saveText.contains ("B"),
+                       "...and Save says which corner it would write");
+                check (after.presetText == before.presetText && after.presetEnabled,
+                       "and leaving edit mode puts the live patch's own preset name back, live again");
+            }
+        }
+
+        fA.deleteFile(); fB.deleteFile(); fS.deleteFile();
+        check (! fA.existsAsFile() && ! fB.existsAsFile() && ! fS.existsAsFile(),
+               "the corner-edit verifier's presets are cleaned up");
+    }
+
+    //--- A SEARCH BOX ON THE PRESETS DROP-DOWN ---------------------------------------
+    // "haz que el desplegable de presets tenga un buscador"
+    //
+    // The trap is not the filtering, it is WHAT COUNTS AS A MATCH. This product is
+    // bilingual and its presets are named in the user's own words, so a byte-exact match
+    // is a search box that cannot find "Can\xc3\xa7\xc3\xb3" unless you remember which
+    // accent you typed a year ago. Measured through the REAL panel (it is the component
+    // the drop-down builds), so the filter cannot drift away from the one that ships.
+    {
+        std::printf ("\nthe presets drop-down's search box:\n");
+        // CharPointer_UTF8, NOT a bare const char*, and this matters more than it looks:
+        // juce::String (const char*) reads each BYTE as its own code point, so
+        // "Can\xc3\xa7\xc3\xb3" built that way is a six-character Latin-1 smear and a test
+        // written with it would be checking the fold against mojibake instead of against
+        // the name. Real preset names arrive from getFileNameWithoutExtension - properly
+        // decoded by the OS - so these have to be built the same way to mean anything.
+        const auto U = [] (const char* s) { return juce::String (juce::CharPointer_UTF8 (s)); };
+        juce::StringArray names;
+        names.add (U ("Can\xc3\xa7\xc3\xb3 llunyana"));   // ca: cedilla + acute
+        names.add (U ("Melod\xc3\xad" "a nocturna"));     // es: acute (split, or \xad eats the 'a')
+        names.add (U ("R\xc3\xa0" "dio C\xc3\xb2smica")); // ca: graves
+        names.add (U ("Col\xc2\xb7legi de sons"));        // ca: l-geminada (a MIDDLE DOT, not a letter)
+        names.add ("BRASS stack");
+        names.add ("brass soft");
+        names.add ("Drone");
+        const auto E = [&] (const char* q) { return FractalAdditiveAudioProcessorEditor::presetSearchProbeForTests (names, q); };
+
+        check (E ("").size() == names.size(), "an empty box shows everything - it filters, it does not hide");
+        {
+            const auto r = E ("canco");
+            std::printf ("  typing \"canco\" -> %d match(es): %s\n", r.size(), r.joinIntoString (", ").toRawUTF8());
+            check (r.size() == 1 && r[0] == names[0],
+                   "\"canco\" finds \"Can\xc3\xa7\xc3\xb3 llunyana\" - accents typed or not, it is the same word");
+        }
+        {
+            const auto r = E ("MELODIA");
+            check (r.size() == 1 && r[0] == names[1],
+                   "and shouting it in ASCII finds \"Melod\xc3\xad" "a\" too - case and accents both ignored");
+        }
+        {
+            const auto r = E ("radio cosmica");
+            check (r.size() == 1 && r[0] == names[2], "graves fold as well, across a space");
+        }
+        {
+            const auto r = E ("collegi");
+            check (r.size() == 1 && r[0] == names[3],
+                   "and Catalan's l-geminada folds to nothing, so \"collegi\" finds \"col\xc2\xb7legi\"");
+        }
+        {
+            const auto r = E ("brass");
+            std::printf ("  typing \"brass\" -> %d match(es): %s\n", r.size(), r.joinIntoString (", ").toRawUTF8());
+            check (r.size() == 2, "a substring matches anywhere in the name, in either case");
+        }
+        {
+            const auto r = E ("zzzz");
+            check (r.isEmpty(), "and a query nothing matches shows an EMPTY list, not the whole folder");
+        }
+        // The accented names must still come back with their accents INTACT: the folding
+        // is a comparison, never a rewrite of the user's own file names.
+        check (E ("canco")[0] == names[0] && E ("radio")[0] == names[2],
+               "the names the list shows are the real ones - folding compares, it never renames");
     }
 
     //==========================================================================

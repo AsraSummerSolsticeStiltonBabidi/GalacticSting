@@ -3842,6 +3842,27 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
 
 void FractalAdditiveAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
+    // CORNER EDIT, rule 2: while the controls are standing in for a playground corner,
+    // captureState() describes THAT CORNER, not this instrument's patch. Saving it here
+    // would make a project reopened mid-edit come back as somebody's corner, with the
+    // user's own sound gone - so the frozen live patch is what the host is handed. The
+    // corner assignments are re-stamped onto it because those CAN change while editing.
+    if (pgEditCorner >= 0 && pgEditLiveState.isValid())
+    {
+        auto live = pgEditLiveState.createCopy();
+        live.removeChild (live.getChildWithName ("PLAYGROUND"), nullptr);
+        if (getPlaygroundAssignedCount() > 0)
+        {
+            juce::ValueTree pg ("PLAYGROUND");
+            for (int i = 0; i < kPlaygroundCorners; ++i)
+                if (pgCorner[(size_t) i].assigned())
+                    pg.setProperty ("c" + juce::String (i), pgCorner[(size_t) i].name, nullptr);
+            live.appendChild (pg, nullptr);
+        }
+        if (auto xml = live.createXml())
+            copyXmlToBinary (*xml, destData);
+        return;
+    }
     if (auto xml = captureState().createXml())
         copyXmlToBinary (*xml, destData);
 }
@@ -3998,6 +4019,13 @@ bool FractalAdditiveAudioProcessor::assignPlaygroundCorner (int corner, const ju
     if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners))
         return false;
 
+    // Re-assigning the corner being EDITED replaces its contents from disk, which is
+    // exactly what discards unsaved edits (rule 4) - so edit mode has to end first, or
+    // the frozen live patch would be handed back later from a corner that no longer
+    // exists and the scratch surface would be left standing as if it were the patch.
+    if (corner == pgEditCorner)
+        endPlaygroundCornerEdit();
+
     auto& c = pgCorner[(size_t) corner];
     c = PlaygroundCorner{};                    // clearing is just "assign nothing"
 
@@ -4094,6 +4122,320 @@ juce::String FractalAdditiveAudioProcessor::getPlaygroundCornerName (int corner)
 {
     return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].name
                                                                  : juce::String();
+}
+
+juce::String FractalAdditiveAudioProcessor::getPlaygroundCornerDisplayName (int corner) const
+{
+    const auto n = getPlaygroundCornerName (corner);
+    return (n.isNotEmpty() && isPlaygroundCornerEdited (corner)) ? n + "*" : n;
+}
+
+//==============================================================================
+// EDITING A CORNER IN PLACE - and THE OWNERSHIP RULES, which are the whole feature.
+//
+// The complaint this answers is simple: a corner is a preset you are listening to, and
+// there was no way to change it without leaving, loading it, editing it, saving it and
+// dropping it back. Now the corner's Edit button turns the main editor into that
+// corner's editor.
+//
+// The trap is equally simple, and it is a data-loss one: this instrument already has a
+// LIVE PATCH with its own identity (a preset name, a drift mark, an undo history, the
+// host's project state), and the main editor's controls are that patch. Pointing them
+// at a corner without saying who owns what is how a user loses the sound they were
+// working on. So:
+//
+//  1. THE LIVE PATCH IS FROZEN, NOT REPLACED. Entering edit mode captures the whole
+//     live patch (captureState) plus its preset identity and drift reference, and
+//     leaving writes them back. The controls in between are a SCRATCH SURFACE.
+//  2. THE HOST NEVER SEES THE SCRATCH SURFACE. getStateInformation saves the frozen
+//     live patch while edit mode is on - a project saved mid-edit reopens as the patch
+//     the user had, never as somebody's corner.
+//  3. THE PRESETS COMBO IS NOT THE CORNER. The editor freezes and disables it (and
+//     hides the drift mark) for the duration: a corner is not "the loaded preset", and
+//     letting the combo load one would drop a whole preset onto the scratch surface.
+//  4. THE EDITS LIVE IN THE CORNER, IN MEMORY, FOR THIS SESSION. The .gsting file the
+//     corner points at is NEVER written by editing. Unsaved edits stay on the corner
+//     when edit mode ends (they are what you were just listening to - discarding them
+//     silently would be the worse surprise) and the trailing "*" says so, in the pad,
+//     in the corner's box and in the frozen preset field. Re-assigning that corner, or
+//     reopening the project - both of which re-read the preset from disk - is what
+//     discards them, and both are explicit acts.
+//  5. THE TUNING IS NOT PART OF A CORNER. Push and pull both go through
+//     presetmorph::morphSpaceFor and skip everything it excludes, so tuningMode, refA,
+//     octaveShift, bendRange, the bank slot and the playground's own point cannot be
+//     carried into a corner or out of one - the same promise the morph itself makes.
+//  6. MORPH MODE PINS THE POINT TO THE CORNER. In morph mode the blend WRITES every
+//     continuous parameter sixty times a second, so there is no surface left to type
+//     into unless the blend is that corner: the point moves onto the corner on entry
+//     (and back off on exit). Then what you see, what you hear and what you are
+//     editing are the same thing. In MIX mode nothing is pinned and nothing needs to
+//     be - the corner is its own engine, so you hear the edit against the other three
+//     at whatever balance the point is sitting at. That is the "in context" case.
+//==============================================================================
+bool FractalAdditiveAudioProcessor::beginPlaygroundCornerEdit (int corner)
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners)) return false;
+    if (! pgCorner[(size_t) corner].assigned() || ! pgActive)     return false;
+    if (pgEditCorner == corner) return true;
+    // One corner at a time: two scratch surfaces would need two frozen live patches,
+    // and the second entry would freeze the FIRST corner as if it were the live one.
+    if (pgEditCorner >= 0) endPlaygroundCornerEdit();
+
+    pgEditLiveState       = captureState();
+    pgEditLiveX           = apvts.getRawParameterValue ("pgX")->load();
+    pgEditLiveY           = apvts.getRawParameterValue ("pgY")->load();
+    pgEditLivePresetName  = loadedPresetName;
+    pgEditLivePresetSnap  = loadedPresetSnapshot;
+    pgEditCorner          = corner;
+    pgEditCompilePending  = false;
+    pgEditPrimed          = false;   // the next pull is the baseline, not an edit
+
+    // Rule 6: morph mode pins the point onto the corner being edited.
+    if (! isPlaygroundMixMode())
+        for (const char* id : { "pgX", "pgY" })
+        {
+            const bool isX = juce::String (id) == "pgX";
+            const float v  = (isX ? (corner & 1) : (corner & 2)) ? 1.0f : 0.0f;
+            if (auto* p = apvts.getParameter (id))
+                p->setValueNotifyingHost (v);
+        }
+
+    pushCornerToLiveSurface (corner);
+    pgDirty = true;   // the next tick republishes with a generation bump
+    return true;
+}
+
+void FractalAdditiveAudioProcessor::endPlaygroundCornerEdit()
+{
+    if (pgEditCorner < 0) return;
+    pgEditCorner = -1;
+
+    // Hand the LIVE PATCH back. Deliberately NOT restoreState(): that would re-read
+    // every corner's .gsting from disk (its PLAYGROUND child re-assigns them), which
+    // would throw away the very edits this session was making - including the ones on
+    // the corner just left. Only what entering edit mode touched is put back.
+    if (pgEditLiveState.isValid())
+    {
+        const auto& all = getParameters();
+        for (int i = 0; i < all.size(); ++i)
+            if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]))
+            {
+                const bool isDiscrete = dynamic_cast<juce::AudioParameterChoice*> (all[i]) != nullptr
+                                     || dynamic_cast<juce::AudioParameterBool*>   (all[i]) != nullptr;
+                if (presetmorph::morphSpaceFor (p->paramID.toStdString(), isDiscrete)
+                        == presetmorph::MorphSpace::Excluded)
+                    continue;   // never written on the way in, so never written on the way out
+                if (auto ch = pgEditLiveState.getChildWithProperty ("id", p->paramID); ch.isValid())
+                {
+                    const float norm = juce::jlimit (0.0f, 1.0f,
+                                        p->convertTo0to1 ((float) (double) ch.getProperty ("value")));
+                    if (std::abs (p->getValue() - norm) > 1.0e-6f)
+                        p->setValueNotifyingHost (norm);
+                }
+            }
+
+        // The non-parameter half of the live patch: its Custom Engine scale (with the
+        // spectrum's provenance) and its per-partial amplitude edits.
+        if (auto tim = pgEditLiveState.getChildWithName ("TIMBRE"); tim.isValid())
+        {
+            juce::String err;
+            const auto src = tim.getProperty ("source").toString();
+            const auto nm  = tim.getProperty ("name").toString();
+            if (src.isEmpty()) clearTimbre();
+            else
+            {
+                std::vector<double> perDeg; double per = 2.0;
+                if (nm != "typed" && TuningManager::parseScalaScale (src, perDeg, per, err))
+                {
+                    timbreDegrees.assign (perDeg.begin(), perDeg.end());
+                    timbrePeriod = (float) per;
+                    timbreName   = nm;
+                    timbreSource = src;
+                }
+                else
+                    loadTimbreText (src, err);
+                specProvName   = tim.getProperty ("provName").toString();
+                specProvSource = tim.getProperty ("provSource").toString();
+                specProvPeriod = tim.getProperty ("provPeriod").toString();
+            }
+        }
+        else
+            clearTimbre();
+
+        {
+            std::vector<spectrum::PartialGain> g;
+            if (auto pg = pgEditLiveState.getChildWithName ("PGAINS"); pg.isValid())
+                for (const auto& tok : juce::StringArray::fromTokens (pg.getProperty ("v").toString(), " ", ""))
+                {
+                    const int col = tok.indexOfChar (':');
+                    if (col > 0)
+                        g.push_back ({ tok.substring (0, col).getLargeIntValue(),
+                                       tok.substring (col + 1).getFloatValue() });
+                }
+            bool man = false;
+            if (auto ch = pgEditLiveState.getChildWithProperty ("id", "partialManual"); ch.isValid())
+                man = (double) ch.getProperty ("value") > 0.5;
+            setPartialGains (g, man, false);   // the next blend publish resolves them
+        }
+
+        // The point goes back where the user left it (morph mode pinned it - rule 6).
+        for (const char* id : { "pgX", "pgY" })
+            if (auto* p = apvts.getParameter (id))
+                p->setValueNotifyingHost (juce::String (id) == "pgX" ? pgEditLiveX : pgEditLiveY);
+
+        // ...and so does the live patch's IDENTITY: which preset it came from and what
+        // "drifted" is measured against. Without this the editor's dirty mark would be
+        // reporting how far the LIVE patch has drifted from the corner it just showed.
+        loadedPresetName     = pgEditLivePresetName;
+        loadedPresetSnapshot = pgEditLivePresetSnap;
+    }
+
+    pgEditLiveState = {};
+    pgEditLivePresetSnap.clear();
+    pgDirty = true;   // the morph owns the controls again: re-apply EVERYTHING
+}
+
+// Corner -> the live control surface. Only what a corner actually owns (rule 5).
+void FractalAdditiveAudioProcessor::pushCornerToLiveSurface (int corner)
+{
+    const auto& c = pgCorner[(size_t) corner];
+    const auto& all = getParameters();
+    for (int i = 0; i < all.size(); ++i)
+    {
+        auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]);
+        if (p == nullptr) continue;
+        const bool isDiscrete = dynamic_cast<juce::AudioParameterChoice*> (all[i]) != nullptr
+                             || dynamic_cast<juce::AudioParameterBool*>   (all[i]) != nullptr;
+        if (presetmorph::morphSpaceFor (p->paramID.toStdString(), isDiscrete)
+                == presetmorph::MorphSpace::Excluded)
+            continue;
+        double v = 0.0;
+        if (! c.value (i, v)) continue;   // the corner's preset predates this parameter
+        const float norm = juce::jlimit (0.0f, 1.0f, p->convertTo0to1 ((float) v));
+        if (std::abs (p->getValue() - norm) > 1.0e-6f)
+            p->setValueNotifyingHost (norm);
+    }
+    // The Custom Engine scale, the provenance and the per-partial edits - the same
+    // non-parameter half the winner-corner rule already knows how to apply.
+    applyPlaygroundDiscreteState (corner);
+}
+
+// The live control surface -> the corner, once per 60 Hz tick while edit mode is on.
+// This is where "the controls edit THAT corner" actually happens.
+void FractalAdditiveAudioProcessor::pullPlaygroundCornerEdit()
+{
+    auto& c = pgCorner[(size_t) pgEditCorner];
+    if (! c.assigned()) { endPlaygroundCornerEdit(); return; }
+
+    bool changed = false;
+    const auto& all = getParameters();
+    if (c.params.size() != (size_t) all.size())
+    {
+        c.params.assign ((size_t) all.size(), 0.0f);
+        c.hasParam.assign ((size_t) all.size(), 0);
+    }
+    for (int i = 0; i < all.size(); ++i)
+    {
+        auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]);
+        if (p == nullptr) continue;
+        const bool isDiscrete = dynamic_cast<juce::AudioParameterChoice*> (all[i]) != nullptr
+                             || dynamic_cast<juce::AudioParameterBool*>   (all[i]) != nullptr;
+        if (presetmorph::morphSpaceFor (p->paramID.toStdString(), isDiscrete)
+                == presetmorph::MorphSpace::Excluded)
+            continue;
+        // The parameter object's own value is the USER'S BASE - modulation never goes
+        // through setValue (captureState relies on the same fact), so a corner cannot
+        // absorb an LFO's momentary displacement and freeze it as a value.
+        const float v = p->convertFrom0to1 (p->getValue());
+        if (! c.hasParam[(size_t) i] || std::abs (c.params[(size_t) i] - v) > 1.0e-7f)
+        {
+            c.params[(size_t) i]   = v;
+            c.hasParam[(size_t) i] = 1;
+            changed = true;
+        }
+    }
+
+    // ...and the non-parameter half, so editing the Custom Engine's scale or dragging a
+    // partial's amplitude lands in the corner too rather than being silently dropped.
+    if (c.timbreName != timbreName || c.timbreSource != timbreSource
+        || c.provName != specProvName || c.provSource != specProvSource
+        || c.provPeriod != specProvPeriod)
+    {
+        c.timbreName = timbreName; c.timbreSource = timbreSource;
+        c.provName = specProvName; c.provSource = specProvSource; c.provPeriod = specProvPeriod;
+        changed = true;
+    }
+    {
+        const auto& live = getPartialGains();
+        const bool man = apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+        if (man != c.manual || live.size() != c.gains.size()
+            || ! std::equal (live.begin(), live.end(), c.gains.begin(),
+                             [] (const spectrum::PartialGain& a, const spectrum::PartialGain& b)
+                             { return a.key == b.key && std::abs (a.dB - b.dB) < 1.0e-6f; }))
+        {
+            c.gains  = live;
+            c.manual = man;
+            changed  = true;
+        }
+    }
+
+    if (changed && ! pgEditPrimed)
+    {
+        // The baseline pull (see pgEditPrimed): the corner has taken the surface's view
+        // of itself, which is not something the user did.
+        ++c.rev;                         // the sub-engine still has to see the values
+        changed = false;
+    }
+    pgEditPrimed = true;
+    if (changed)
+    {
+        c.edited = true;                 // the "*"
+        ++c.rev;                         // the mix sub-engine's refill trigger
+        pgEditCompilePending = true;
+    }
+    // THE RECOMPILE, throttled to the glide cadence and never skipped for good: a full
+    // compileSpectrum every frame of a knob drag stalls the message thread, and dropping
+    // the last one would leave the corner's SPECTRUM permanently one edit behind the
+    // controls that produced it (pgParamsPending's lesson, on this side of the fence).
+    if (pgEditCompilePending && (++pgEditTick % kPgGlideTicks) == 0)
+    {
+        compileCornerTemplate (c);
+        pgEditCompilePending = false;
+        pgDirty = true;                  // republish the blend WITH a generation bump
+    }
+}
+
+juce::String FractalAdditiveAudioProcessor::savePlaygroundCornerAs (int corner, const juce::String& name)
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners)) return {};
+    auto& c = pgCorner[(size_t) corner];
+    if (! c.assigned()) return {};
+    // ONLY the corner in edit mode can be saved, and that is not a limitation - it is
+    // the only corner whose FULL state exists anywhere. A corner's store keeps what a
+    // BLEND needs (parameter values, scale, partial edits, routing); a .gsting also
+    // carries the rhythm slots, the tuning bank, the segment picker and the preset's own
+    // tuning. Writing a corner from its store would produce a preset that quietly lost
+    // all of those while claiming to be the same sound.
+    if (corner != pgEditCorner) return {};
+
+    const auto safe = juce::File::createLegalFileName (name).trim();
+    if (safe.isEmpty()) return {};
+
+    // The edited corner is standing ON the live control surface, so captureState()
+    // describes it exactly - the very tree savePreset would write for it.
+    auto file = getPresetFolder().getChildFile (safe + ".gsting");
+    auto xml  = captureState().createXml();
+    if (xml == nullptr || ! xml->writeTo (file))
+        return {};
+
+    // The corner now IS that file: renamed, and the "*" goes away because the edits it
+    // warned about are on disk. snapshotLoadedPreset is deliberately NOT called - the
+    // LIVE patch's identity is frozen while a corner is being edited (rule 1), and
+    // saving a corner must not quietly claim the user's own patch is now this preset.
+    c.name   = safe;
+    c.edited = false;
+    ++c.rev;
+    return safe;
 }
 
 int FractalAdditiveAudioProcessor::getPlaygroundAssignedCount() const
@@ -4558,11 +4900,20 @@ void FractalAdditiveAudioProcessor::drivePlayground()
     {
         // The playground let go (or never engaged): the mix must let go with it, or
         // four sub-engines would keep sounding under a pad that no longer exists.
+        // Corner edit goes with it for the same reason - a scratch surface standing in
+        // for a corner nobody is blending is just the user's patch, silently replaced.
+        endPlaygroundCornerEdit();
         pgMixDriving  = false;
         pgLastMixMode = false;
         mixEngaged.store (false, std::memory_order_release);
         return;
     }
+
+    // CORNER EDIT: the controls belong to a corner this tick, so read them INTO it
+    // before anything else looks at either. Done first so the mix refresh and the blend
+    // below both see the edit in the same frame it was made.
+    if (pgEditCorner >= 0) pullPlaygroundCornerEdit();
+    const bool editing = pgEditCorner >= 0;   // the pull can end edit mode (corner gone)
 
     const bool mixMode = isPlaygroundMixMode();
     if (mixMode != pgLastMixMode)
@@ -4622,7 +4973,11 @@ void FractalAdditiveAudioProcessor::drivePlayground()
     if (! movedAny && ! pgParamsPending && ! pgGlidePending)
         return;                                  // parked AND settled: nothing left to do
 
-    if (winnerChanged)
+    // Both writes below are SKIPPED while a corner is being edited: they exist to drive
+    // the controls FROM the blend, and the controls are the user's hands right now. Left
+    // running, every edit would be overwritten within 33 ms and the feature would read as
+    // a knob that snaps back.
+    if (winnerChanged && ! editing)
         applyPlaygroundDiscreteState (winner);
 
     // THE CONTROLS follow at ~30 Hz, not 60. Every write goes through the normal
@@ -4636,7 +4991,7 @@ void FractalAdditiveAudioProcessor::drivePlayground()
     // a skipped tick leaves every control one frame short of the point - for ever, because
     // the next tick sees no movement and returns early. The parked patch then quietly did
     // not match the pad, by a hair that never closed.
-    if (pgDirty || winnerChanged || (++pgParamTick & 1) == 0)
+    if (! editing && (pgDirty || winnerChanged || (++pgParamTick & 1) == 0))
     {
         applyPlaygroundContinuous (w);
         pgParamsPending = false;
@@ -4730,9 +5085,17 @@ void FractalAdditiveAudioProcessor::refreshMixEngine (int corner)
     auto* e = mixEng[(size_t) corner].get();
     auto& c = pgCorner[(size_t) corner];
     if (e == nullptr || ! c.assigned()) return;
-    if (e->lastTmpl == c.tmpl && e->lastName == c.name) return;
+    if (e->lastTmpl == c.tmpl && e->lastName == c.name && e->lastRev == c.rev) return;
+    // A CORNER EDIT that moved only voice parameters leaves the template pointer alone,
+    // so the template publish below is gated on the pointer really changing: the bank and
+    // the routing refresh at the full tick rate (they are cheap and the user is turning
+    // the knob NOW), while publishNow - which bumps the sub-engine's generation and
+    // restarts every voice's morph - stays at the ~10 Hz the recompile itself runs at.
+    // Publishing every frame is the click machine this project keeps documenting.
+    const bool tmplChanged = (e->lastTmpl != c.tmpl);
     e->lastTmpl = c.tmpl;
     e->lastName = c.name;
+    e->lastRev  = c.rev;
 
     // The preset's values (defaults where it predates a parameter - cornerValueOr's
     // rule, applied by the bank so voices and modulators read the same numbers).
@@ -4767,7 +5130,7 @@ void FractalAdditiveAudioProcessor::refreshMixEngine (int corner)
     // the corner's OWN voices morph (its morph on) or cross the 50 ms fade (off) -
     // the same treatment a live spectrum change gets, which is the whole point.
     e->spectrum.setOverrides (c.gains, c.manual, false);
-    if (c.tmpl != nullptr)
+    if (tmplChanged && c.tmpl != nullptr)
         e->spectrum.publishNow (*c.tmpl);
 }
 

@@ -627,6 +627,40 @@ public:
     // Non-empty when a corner's saved settings cannot run at all (bad period, absurd
     // cost...). The corner stops retrying and this SAYS so - never a silent stop.
     juce::String getPlaygroundAdaptRefusal() const { return pgAdaptRefusal; }
+    //==========================================================================
+    // EDITING A CORNER IN PLACE. Full rules (and the ownership contract this obeys) are
+    // in the big comment above beginPlaygroundCornerEdit in PluginProcessor.cpp. The
+    // short version, because getting it wrong is a data-loss bug:
+    //
+    //   * While a corner is being edited the main editor's controls are a SCRATCH
+    //     SURFACE showing that corner - they are NOT the live patch. The live patch is
+    //     frozen (parameters, timbre, per-partial edits, its preset identity and its
+    //     drift mark) and handed back byte-for-byte when edit mode ends.
+    //   * The edits live in the CORNER, in memory, for this session only. Nothing is
+    //     written to the .gsting the corner points at - ever. The trailing "*" on the
+    //     corner's name is the warning, and it survives leaving edit mode.
+    //   * Saving from edit mode writes the corner under a NAME OF ITS OWN and renames
+    //     the corner to it; the live patch's own preset identity is not touched.
+    //
+    // Returns false if the corner holds no preset, or the playground is not engaged.
+    bool beginPlaygroundCornerEdit (int corner);
+    // Hand the live patch back. Safe to call when nothing is being edited.
+    void endPlaygroundCornerEdit();
+    int  getPlaygroundEditCorner() const noexcept { return pgEditCorner; }
+    bool isPlaygroundCornerEdited (int corner) const noexcept
+    { return juce::isPositiveAndBelow (corner, kPlaygroundCorners) && pgCorner[(size_t) corner].edited; }
+    // The corner's name as the UI must show it: with the "*" when it carries unsaved
+    // edits. ONE place, so the pad, the corner box and the frozen preset field cannot
+    // disagree about whether a corner has been touched.
+    juce::String getPlaygroundCornerDisplayName (int corner) const;
+    // Save the corner (edited or not) as a preset file of its own and rename the corner
+    // to it. Returns the name actually stored (sanitised) or empty on failure.
+    juce::String savePlaygroundCornerAs (int corner, const juce::String& name);
+    // TESTS: how many times the edited corner's spectrum has been recompiled, so a check
+    // can prove an edit reaches the SOUND and not merely the store.
+    int getPlaygroundCornerRevForTests (int corner) const noexcept
+    { return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].rev : -1; }
+
     // The corner's compiled template, so a test can prove it CHANGES when the chord does.
     std::shared_ptr<const spectrum::SpectrumTemplate> getPlaygroundCornerTemplateForTests (int corner) const
     {
@@ -1366,6 +1400,13 @@ private:
         // still be reading a corner the user has just replaced. Immutable + refcounted is
         // what makes reassigning a corner mid-blend safe without a lock.
         std::shared_ptr<const spectrum::SpectrumTemplate> tmpl;
+        // CORNER EDIT (see beginPlaygroundCornerEdit). `edited` is the "*": this corner
+        // no longer matches the .gsting it was loaded from. `rev` counts every change to
+        // the corner's stored VALUES - the mix sub-engine keys its bank refill on it,
+        // because a filter tweak changes no template pointer and would otherwise be
+        // inaudible until something else happened to recompile the spectrum.
+        bool edited = false;
+        int  rev    = 0;
         bool assigned() const noexcept { return name.isNotEmpty(); }
         // The preset's value for parameter #i, or false if this preset predates it.
         bool value (int i, double& out) const noexcept
@@ -1400,6 +1441,36 @@ private:
     // it can be handed back untouched when the playground lets go.
     RtLink pgSuspendedRt = RtLink::Off;
     bool   pgRtSuspended = false;
+
+    //== CORNER EDIT (see the ownership block in the .cpp) ======================
+    // The corner whose values the main editor's controls are currently standing in
+    // for, or -1. Everything below exists so that leaving edit mode can hand the LIVE
+    // patch back exactly as it was found - it is the frozen live patch, not the corner.
+    int             pgEditCorner = -1;
+    juce::ValueTree pgEditLiveState;                  // captureState() at entry
+    float           pgEditLiveX = 0.0f, pgEditLiveY = 0.0f;   // the point, before pinning
+    juce::String    pgEditLivePresetName;             // the live patch's preset identity
+    std::vector<std::pair<juce::String, float>> pgEditLivePresetSnap;  // ...and its drift reference
+    // The corner recompile is THROTTLED to the glide cadence (kPgGlideTicks, 10 Hz): a
+    // full compileSpectrum per 60 Hz frame of a knob drag is the message thread's own
+    // click machine. `pending` is the pgParamsPending lesson applied here - a drag that
+    // STOPS on a skipped tick must still get its final compile, or the corner would be
+    // left permanently one edit short of what the controls show.
+    int  pgEditTick = 0;
+    bool pgEditCompilePending = false;
+    // THE FIRST PULL IS A BASELINE, NOT AN EDIT. Push writes only the parameters the
+    // corner's preset actually HAS; pull reads every parameter a corner may own. So the
+    // first pull always finds differences - the ones the preset predates, plus whatever
+    // a normalise/denormalise round trip costs a skewed range - and without this the "*"
+    // would appear the instant Edit was pressed, on a corner nobody had touched. That
+    // makes the warning meaningless, which is worse than not having it.
+    bool pgEditPrimed = false;
+    // Write corner `corner`'s stored values onto the live control surface, and read the
+    // surface back into the corner. Both skip every parameter presetmorph excludes -
+    // the tuning, the reference, the transpose and the playground's own point are NOT
+    // part of a corner and must survive a round trip untouched.
+    void pushCornerToLiveSurface (int corner);
+    void pullPlaygroundCornerEdit();
 
     //== ADAPTIVE CORNERS (see the public block). Message thread except where noted. ==
     // One finished corner search. It carries its OWN identity (corner + preset name) and
@@ -1480,6 +1551,11 @@ private:
         // refreshes when the corner actually changed (assign, or an adaptive apply).
         std::shared_ptr<const spectrum::SpectrumTemplate> lastTmpl;
         juce::String lastName;
+        // ...and which REVISION of the corner's stored values. A corner edit that moves
+        // only voice parameters leaves the template pointer alone, so without this the
+        // sub-engine would keep the values it was built with and the user would hear
+        // nothing move (the exact "the store changed but the sound did not" trap).
+        int lastRev = -1;
     };
     // The message thread OWNS the engines (built on demand, kept for the processor's
     // lifetime - never deleted mid-session, so the audio thread can hold a pointer

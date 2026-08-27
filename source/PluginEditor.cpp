@@ -1804,8 +1804,15 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     presetBox.setColour (juce::ComboBox::outlineColourId, juce::Colour (0xff55557a));
     presetBox.setMouseClickGrabsKeyboardFocus (false);
     presetBox.onBeforePopup = [this] { refreshPresetList(); };
+    // The drop-down is a SEARCHABLE list, not a plain menu (see PresetSearchPanel).
+    presetBox.onShowPopup   = [this] { return openPresetSearch(); };
     presetBox.onChange = [this]
     {
+        // The field is frozen while a playground corner is being edited: its text is a
+        // corner's name, not a preset's, and loading from it would drop a whole preset
+        // onto the corner's scratch surface. It is disabled there, so this is belt and
+        // braces for a programmatic setText that forgot dontSendNotification.
+        if (processorRef.getPlaygroundEditCorner() >= 0) return;
         const auto name = presetBox.getText();
         if (name.isNotEmpty() && processorRef.loadPreset (name))
             applyEngineState();
@@ -1845,6 +1852,15 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     playgroundPanel.trF     = [this] (const char* en, const char* ca) { return tr (en, ca); };
     playgroundPanel.pad.trF = [this] (const char* en, const char* ca) { return tr (en, ca); };
     playgroundPanel.attachVoices();   // needs proc: the pgVoices attachment
+    // CORNER EDIT: the panel owns the Edit buttons, the MAIN window owns the preset field
+    // and the Save flow they redirect (savePresetFlow reroutes itself), so the two are
+    // wired here rather than the panel reaching into the editor.
+    playgroundPanel.onEditModeChanged = [this]
+    {
+        refreshCornerEditUi();
+        applyEngineState();   // the corner's engine/scale are on the controls now
+        resized(); repaint();
+    };
 
     // Pitch-bend range (inside the Tuning box).
     configCombo (bendBox, "bendRange", bendAtt, cTuning, {});
@@ -2955,9 +2971,16 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     timbreRepeatsFader.setTooltip (tr (
         "How many periods of the scale are stacked as partials. More repeats = the timbre reaches higher in the spectrum.",
         "Quants per\xc3\xado""des de l'escala s'apilen com a parcials. M\xc3\xa9s repeticions = el timbre arriba m\xc3\xa9s amunt de l'espectre."));
-    presetBox.setTooltip (tr ("Load a saved preset.", "Carrega un preset desat."));
+    presetBox.setTooltip (tr ("Load a saved preset. The drop-down has a search box: type to filter the list "
+                              "(accents and capitals are ignored).",
+                              "Carrega un preset desat. El desplegable t\xc3\xa9 un cercador: escriu per filtrar "
+                              "la llista (els accents i les maj\xc3\xbascules s'ignoren)."));
     savePresetButton.setTooltip (tr ("Save the current sound as a preset (stored in Documents/Galactic Sting/Presets).",
                                      "Desa el so actual com a preset (a Documents/Galactic Sting/Presets)."));
+    // Corner-edit mode gives both of these a different meaning - re-apply it, or a
+    // language switch mid-edit would put the live patch's tooltips back on a frozen field.
+    lastEditCornerSeen = -12345;   // a value no corner index can be: force one rebuild
+    refreshCornerEditUi();
     dissBtn.setTooltip (tr (
         "Computes the Sethares sensory-dissonance curve of the CURRENT timbre and builds a scale from its most consonant points (the curve's minima), then loads it as the active tuning. With Max ticked it uses the roughest points (maxima) instead.",
         "Calcula la corba de dissonancia sensorial de Sethares del timbre ACTUAL i construeix una escala amb els seus punts m\xc3\xa9s consonants (els m\xc3\xadnims de la corba), i la carrega com a afinaci\xc3\xb3 activa. Amb Max marcat fa servir els punts m\xc3\xa9s aspres (m\xc3\xa0xims)."));
@@ -3142,8 +3165,183 @@ void FractalAdditiveAudioProcessorEditor::refreshPresetList()
         presetBox.setText (current, juce::dontSendNotification);
 }
 
+juce::StringArray FractalAdditiveAudioProcessorEditor::presetSearchProbeForTests (
+    const juce::StringArray& names, const juce::String& typed)
+{
+    PresetSearchPanel panel (names, {}, {});
+    panel.search.setText (typed, false);
+    // ...then the very function onTextChange calls. NOT setText's own notification:
+    // TextEditor::textChanged POSTS the callback (postCommandMessage), so with no
+    // message loop running it never arrives and a probe that trusted it would report
+    // "everything matches" for every query - which is a filter that is not being tested
+    // at all rather than one that works.
+    panel.refilter();
+    return panel.shown;
+}
+
+bool FractalAdditiveAudioProcessorEditor::openPresetSearch()
+{
+    const auto names = processorRef.getPresetNames();
+    if (names.isEmpty())
+        return false;   // nothing to filter: let the ordinary popup say "empty" its own way
+
+    auto panel = std::make_unique<PresetSearchPanel> (
+        names, presetBox.getText(),
+        tr ("Search presets...", "Cerca presets..."));
+    // Tall enough for ~12 rows, short enough that the callout still fits inside the
+    // editor above a box sitting near the top - CallOutBox flips it below/above by itself.
+    panel->setSize (juce::jmax (200, presetBox.getWidth() + 90),
+                    30 + juce::jlimit (60, 240, names.size() * 20 + 8));
+    panel->onPick = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
+                    (const juce::String& n)
+    {
+        if (safe == nullptr) return;
+        // Straight through the combo, so the ONE onChange handler loads it - a second
+        // load path here is how a preset ends up applied without the dirty mark, the
+        // tuning offer and the relayout that go with it.
+        safe->presetBox.setText (n, juce::sendNotificationSync);
+    };
+    // Whatever closes it - a pick, Escape, a click outside - the editor takes the
+    // keyboard back, or the computer-keyboard play the search field suspended would
+    // stay suspended (pollComputerKeyboard only re-arms once no TextEditor has focus).
+    panel->onDismissed = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
+    { if (safe != nullptr) safe->refocus(); };
+
+    auto* raw = panel.get();
+    juce::CallOutBox::launchAsynchronously (std::move (panel),
+                                            getLocalArea (&presetBox, presetBox.getLocalBounds()), this);
+    raw->search.grabKeyboardFocus();
+    return true;
+}
+
+void FractalAdditiveAudioProcessorEditor::saveCornerFlow (int corner)
+{
+    const auto base = processorRef.getPlaygroundCornerName (corner);
+    // Suggest a name that is NOT the corner's own, for the same reason savePresetFlow
+    // does: a reflex Enter must not overwrite the preset the corner was loaded FROM,
+    // which is very probably still on another corner or in somebody's project.
+    const auto existing = processorRef.getPresetNames();
+    juce::String suggested = base + " 2";
+    for (int n = 3; existing.contains (suggested); ++n) suggested = base + " " + juce::String (n);
+
+    auto* aw = new juce::AlertWindow (
+        tr ("Save corner ", "Desar cantonada ") + juce::String::charToString ((juce::juce_wchar) ('A' + corner)),
+        tr ("Name for this edited corner (it is saved as a normal preset, and the corner "
+            "takes the new name):",
+            "Nom per a aquesta cantonada editada (es desa com un preset normal, i la "
+            "cantonada passa a dir-se aix\xc3\xad):"),
+        juce::MessageBoxIconType::NoIcon, this);
+    aw->addTextEditor ("name", suggested, {});
+    aw->addButton (tr ("Save", "Desa"), 1, juce::KeyPress (juce::KeyPress::returnKey));
+    aw->addButton (tr ("Cancel", "Cancel\xc2\xb7la"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    activePrompt = aw;
+
+    aw->enterModalState (true, juce::ModalCallbackFunction::create (
+        [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this), aw, corner] (int result)
+        {
+            if (safe == nullptr) return;
+            const auto name = aw->getTextEditorContents ("name").trim();
+            if (result == 1 && name.isNotEmpty())
+            {
+                const auto stored = safe->processorRef.savePlaygroundCornerAs (corner, name);
+                if (stored.isEmpty())
+                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                        safe->tr ("Save corner", "Desar cantonada"),
+                        safe->tr ("Could not save the corner. Try a different name.",
+                                  "No s'ha pogut desar la cantonada. Prova un altre nom."),
+                        safe.getComponent());
+                else
+                {
+                    safe->refreshPresetList();            // the new file is a preset like any other
+                    safe->playgroundPanel.refresh (true); // the corner's "*" is gone
+                    safe->refreshCornerEditUi();
+                }
+            }
+            safe->refocus();
+        }), true);
+}
+
+// WHOSE PATCH ARE THESE CONTROLS? While a playground corner is being edited the answer
+// is "not yours", and the preset field is the only place the main window ever said
+// whose it was - so it says THAT instead, and stops being a way to load anything.
+// See FractalAdditiveAudioProcessor::beginPlaygroundCornerEdit, rules 1 and 3.
+void FractalAdditiveAudioProcessorEditor::refreshCornerEditUi()
+{
+    const int  ed   = processorRef.getPlaygroundEditCorner();
+    const auto disp = ed >= 0 ? juce::String::charToString ((juce::juce_wchar) ('A' + ed)) + ": "
+                                  + processorRef.getPlaygroundCornerDisplayName (ed)
+                              : juce::String();
+    // The FIELD's text, not just the mode, is the change detector: a "*" appears the
+    // moment any control moves - with the corner, the mode and everything else unchanged.
+    if (ed == lastEditCornerSeen && (ed < 0 || presetBox.getText() == disp))
+        return;
+    lastEditCornerSeen = ed;
+
+    if (ed >= 0)
+    {
+        // Park the LIVE patch's own name on the way in - once, on the transition, or a
+        // later refresh would "park" the corner's name over it and the real one is gone.
+        if (! cornerEditUiActive)
+        {
+            cornerEditUiActive         = true;
+            presetTextBeforeCornerEdit = presetBox.getText();
+        }
+        presetBox.setText (disp, juce::dontSendNotification);
+        presetBox.setEnabled (false);   // a corner is not "the loaded preset" (rule 3)
+        presetDirtyMark.setVisible (false);
+        presetBox.setTooltip (tr ("These controls are a PLAYGROUND CORNER right now, not your patch. "
+                                  "Your own sound is kept and comes back when you press OK in the "
+                                  "playground window. A * means this corner no longer matches the preset "
+                                  "it was loaded from.",
+                                  "Aquests controls s\xc3\xb3n ARA una CANTONADA del laboratori, no el teu "
+                                  "patch. El teu so es guarda i torna quan prems OK a la finestra del "
+                                  "laboratori. Un * vol dir que aquesta cantonada ja no coincideix amb el "
+                                  "preset d'on ve."));
+        savePresetButton.setButtonText (tr ("Save ", "Desa ")
+                                        + juce::String::charToString ((juce::juce_wchar) ('A' + ed)));
+        savePresetButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xffffc95c));
+        savePresetButton.setColour (juce::TextButton::textColourOffId, juce::Colours::black);
+        savePresetButton.setTooltip (tr ("Save this edited corner as a preset of its own, under a new name. "
+                                         "The corner then takes that name and loses its *. Your own patch is "
+                                         "not written anywhere.",
+                                         "Desa aquesta cantonada editada com un preset propi, amb un nom nou. "
+                                         "La cantonada passa a dir-se aix\xc3\xad i perd l'*. El teu patch no "
+                                         "s'escriu enlloc."));
+    }
+    else
+    {
+        // Only put the parked name back if we were REALLY in edit mode. A plain refresh
+        // (a language switch, a first paint) must never overwrite the field with a name
+        // from an edit session that never happened.
+        if (cornerEditUiActive)
+        {
+            cornerEditUiActive = false;
+            presetBox.setText (presetTextBeforeCornerEdit, juce::dontSendNotification);
+        }
+        presetBox.setEnabled (true);
+        presetBox.setTooltip (tr ("Load a saved preset. The drop-down has a search box: type to filter the "
+                                  "list (accents and capitals are ignored).",
+                                  "Carrega un preset desat. El desplegable t\xc3\xa9 un cercador: escriu per "
+                                  "filtrar la llista (els accents i les maj\xc3\xbascules s'ignoren)."));
+        savePresetButton.setButtonText (tr ("Save", "Desa"));
+        savePresetButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2d6da8));
+        savePresetButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+        savePresetButton.setTooltip (tr ("Save the current sound as a preset (stored in Documents/Galactic "
+                                         "Sting/Presets).",
+                                         "Desa el so actual com a preset (a Documents/Galactic Sting/Presets)."));
+        refreshPresetDirtyMark();
+    }
+}
+
 void FractalAdditiveAudioProcessorEditor::savePresetFlow()
 {
+    // In corner-edit mode Save belongs to the CORNER: the controls are its values, so
+    // saving "the current sound" would otherwise write somebody's corner into the user's
+    // own preset name. The corner flow asks for a name of its own (the user's words:
+    // "que dandole a save se pueda guardar luego con otro nombre").
+    if (const int ed = processorRef.getPlaygroundEditCorner(); ed >= 0)
+    { saveCornerFlow (ed); return; }
+
     // Drifted (some parameter no longer matches what THIS preset was saved with):
     // suggest a name that is NOT the original, so a reflex Save/Enter creates a
     // separate preset instead of silently overwriting the one that still sounds
@@ -4261,6 +4459,10 @@ FractalAdditiveAudioProcessorEditor::playgroundProbeForTests (int w, int h, bool
         p.box[i]   = playgroundPanel.cornerBox[i].getBounds();
         p.clear[i] = playgroundPanel.cornerClear[i].getBounds();
         p.lbl[i]   = playgroundPanel.cornerLbl[i].getBounds();
+        p.edit[i]       = playgroundPanel.cornerEdit[i].getBounds();
+        p.editText[i]   = playgroundPanel.cornerEdit[i].getButtonText();
+        p.editEnabled[i]= playgroundPanel.cornerEdit[i].isEnabled();
+        p.cornerName[i] = processorRef.getPlaygroundCornerDisplayName (i);
     }
     for (int m = 0; m < 2; ++m)
     {
@@ -6661,6 +6863,10 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     if (partialWindow != nullptr && partialWindow->isVisible())
         partialPanel.syncIfNeeded();
     refreshPresetDirtyMark();
+    // ...and WHOSE patch the controls are. Polled, not only pushed: the processor can end
+    // a corner edit on its own (the playground disengaging, a corner cleared by
+    // automation), and the "*" appears the moment any control moves.
+    refreshCornerEditUi();
     // Keep the Spectrum-Builder box showing the typed spectrum that is actually
     // loaded - it can change under us (a preset, an undo, "load its original
     // spectrum"). Never while it has focus: that would overwrite what is being typed.

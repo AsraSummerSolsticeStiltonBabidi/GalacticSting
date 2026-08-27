@@ -160,6 +160,9 @@ public:
     struct ZeroLayout
     {
         juce::Rectangle<float> zero, tag;
+        // The band the PAIR was laid out in: the degree band every other key uses, plus
+        // whatever it had to borrow from the interval label below it (see layOutZeroStack).
+        juce::Rectangle<float> band;
         float tagFont = 0.0f, zeroFont = 0.0f;
     };
     // The width a string really takes in the bold font both numbers are drawn in. MEASURED,
@@ -171,79 +174,125 @@ public:
         return (float) juce::GlyphArrangement::getStringWidthInt (
             juce::Font (juce::FontOptions (fontHeight).withStyle ("Bold")), s);
     }
-    // THE "0" AND ITS PERIOD NUMBER, AS ONE PAIR.
+    // THE "0" AND ITS PERIOD NUMBER, STACKED.
     //
-    // They used to be two halves of the cell: a strip RESERVED on the right for the tag and
-    // the "0" centred in everything left over. That protection was right and is kept - the
-    // tag's own room is decided before the "0" gets any, so a three-character period ("-10",
-    // which a one-degree-per-period tuning really has) can never be handed a rect too small
-    // and silently shrunk by drawFittedText into a smear no bounds check can see. What was
-    // wrong was the SPACING it produced: the tag sat flush against the key's right edge and
-    // the "0" floated in the middle of the rest, ~7 px of empty air apart, so the number
-    // read as a mark on the key rather than as an annotation of that "0".
+    // They used to sit SIDE BY SIDE: the tag took its width first and the "0" was centred
+    // in whatever was left. That is the bug the user hit - the number to the right of the
+    // "0" DISPLACED it to the left, so on every period boundary the one degree the whole
+    // keyboard is coloured and numbered for was the only number not standing in the same
+    // column as the "1", "2", "3"... on the keys either side of it.
     //
-    // Now both rects are sized to their own MEASURED glyphs and the pair is centred in the
-    // cell with a 2 px gap. The tag is also bigger (0.34 of the key width, floor 8, ceiling
-    // 12 - it was 0.27 / 7..10.5), and the "0" got bigger too as a side effect: it is no
-    // longer capped by "the cell minus a fat strip", only by what the pair really needs.
+    // Now the period number rides ABOVE the "0" and BOTH are centred on the key's own
+    // centre line, which is exactly where degreeArea centres every other degree number.
+    // Three things this has to get right, and none of them is visible to an overlap check:
     //
-    // Order matters: the TAG is sized first (it is the one that can be illegible), the "0"
-    // takes what is left, and if either overflows its FONT comes down - never its text.
-    static ZeroLayout layOutPeriodTag (juce::Rectangle<float> area, float cellW,
-                                       const juce::String& tag, float zeroFontIn)
+    //  * IT MUST FIT. drawFittedText with maximumLines = 1 does NOT reduce the font when
+    //    the text is too wide - it squeezes the glyphs horizontally down to the minimum
+    //    scale it was passed and then ellipsises, which looks like a design choice rather
+    //    than a bug. So every rect here is sized from the string's MEASURED width in its
+    //    own font, and when the room is not there the FONT comes down, never the text.
+    //    The widest period string is three characters ("-10", which a one-degree-per-period
+    //    scale really reaches) and it is the one nobody is looking at.
+    //  * IT MUST NOT TOUCH THE KEY BORDER. The degree band starts at the key's top edge, so
+    //    stacking a second number into it puts ink exactly where the key ends. kEdge is held
+    //    clear on all four sides, measured on the INTEGER rects paint() really draws into
+    //    (getSmallestIntegerContainer rounds outwards and can eat a pixel of margin).
+    //  * IT MUST NOT COST THE "0" ITS SIZE. Stacked, the pair needs ~37 px and the degree
+    //    band is ~34 at the smallest key the keyboard ever draws, so the band BORROWS the
+    //    difference from the interval label underneath - capped at a quarter of it, because
+    //    a stacked fraction has far less slack than these two numbers do. Only if that is
+    //    still not enough does the "0"'s own font come down.
+    //
+    // `cell` is trimmed in place to exactly the room the interval label may use - the same
+    // contract degreeArea has, so ONE call decides both and a change to either can never
+    // orphan the other.
+    static ZeroLayout layOutZeroStack (juce::Rectangle<float>& cell,
+                                       const juce::String& label,
+                                       float cellW, const juce::String& tagIn)
     {
+        constexpr float kEdge = 2.0f;   // clear space between the pair and the key's border
+        constexpr float kVGap = 1.0f;   // between the period number and the "0" it annotates
+
         ZeroLayout z;
-        const juce::String t = tag.isEmpty() ? juce::String ("0") : tag;
-        constexpr float gap = 2.0f;   // the ink-to-ink distance the user asked to shrink
-        z.tagFont = juce::jlimit (8.0f, 12.0f, cellW * 0.34f);
-        // The tag may take at most 45% of the cell: it is an annotation, and the "0" is the
-        // scale degree - the thing the whole keyboard is coloured and numbered for. Past
-        // that the FONT comes down (7 pt floor), so a wide period stays legible instead of
-        // eating the degree it annotates.
-        const float cap = area.getWidth() * 0.45f;
+        const juce::String t = tagIn.isEmpty() ? juce::String ("0") : tagIn;
+
+        // The band, and the font a NON-zero degree would get on this key: the stack has to
+        // line up with its neighbours, so it starts from their geometry rather than its own.
+        float zeroFont = 0.0f;
+        auto band = degreeArea (cell, label, cellW, zeroFont);
+        // Widest glyph either number may have. The rects are the glyph plus 1 px either
+        // side, so subtracting that 2 px here is what keeps kEdge clear of the key edge.
+        const float maxW = juce::jmax (4.0f, band.getWidth() - 2.0f * kEdge - 2.0f);
+
+        // 1. The period number's font: 0.34 of the key width, clamped 8..12, brought down
+        //    (7 pt floor) only if even that overruns the key.
+        z.tagFont  = juce::jlimit (8.0f, 12.0f, cellW * 0.34f);
         float tagW = boldTextWidth (t, z.tagFont);
-        if (tagW > cap)
+        if (tagW > maxW)
         {
-            z.tagFont = juce::jmax (7.0f, z.tagFont * cap / juce::jmax (1.0f, tagW));
+            z.tagFont = juce::jmax (7.0f, z.tagFont * maxW / juce::jmax (1.0f, tagW));
             tagW      = boldTextWidth (t, z.tagFont);
         }
-        // ...and the "0" takes the rest. Same rule: if its own glyph does not fit what is
-        // left, the font comes down rather than drawFittedText squashing the digit.
-        const float avail = juce::jmax (4.0f, area.getWidth() - tagW - gap);
-        z.zeroFont = juce::jmax (7.0f, zeroFontIn);
-        float zeroW = boldTextWidth ("0", z.zeroFont);
-        if (zeroW > avail)
+
+        // 2. Make room for the pair by borrowing downwards, NOT by shrinking the degree.
+        const float need   = 2.0f * kEdge + z.tagFont + kVGap + zeroFont;
+        const float borrow = juce::jlimit (0.0f, juce::jmax (0.0f, cell.getHeight() * 0.25f),
+                                           need - band.getHeight());
+        if (borrow > 0.0f)
         {
-            z.zeroFont = juce::jmax (7.0f, z.zeroFont * avail / juce::jmax (1.0f, zeroW));
+            band = band.withHeight (band.getHeight() + borrow);
+            cell.removeFromTop (borrow);   // the label keeps the rest - and only the rest
+        }
+
+        // 3. Only now, if the pair still does not fit, does the "0" get smaller.
+        const float room = band.getHeight() - 2.0f * kEdge - z.tagFont - kVGap;
+        z.zeroFont  = juce::jmax (7.0f, juce::jmin (zeroFont, room));
+        float zeroW = boldTextWidth ("0", z.zeroFont);
+        if (zeroW > maxW)
+        {
+            z.zeroFont = juce::jmax (7.0f, z.zeroFont * maxW / juce::jmax (1.0f, zeroW));
             zeroW      = boldTextWidth ("0", z.zeroFont);
         }
-        // The pair, centred in the cell. Each rect is its glyph plus 1 px either side, so
-        // drawFittedText has room to place the text without ever scaling it down.
-        const float pairW = zeroW + gap + tagW;
-        const float x0    = juce::jlimit (area.getX(), juce::jmax (area.getX(), area.getRight() - pairW),
-                                          area.getCentreX() - pairW * 0.5f);
-        z.zero = juce::Rectangle<float> (x0 - 1.0f, area.getY(), zeroW + 2.0f, area.getHeight());
-        auto t2 = juce::Rectangle<float> (x0 + zeroW + gap, area.getY(), tagW + 2.0f, area.getHeight());
-        // VERTICALLY CENTRED ON THE "0", not on the cell: with an interval label
-        // underneath, the cell's own centre sits well below the digit this annotates.
-        z.tag = t2.withSizeKeepingCentre (t2.getWidth(), juce::jmin (t2.getHeight(), z.tagFont * 1.5f));
+
+        // The stack, centred in the band on the key's own centre line. Each rect is its
+        // glyph plus 1 px either side so drawFittedText has room to place the text without
+        // ever scaling it, and each is exactly one line tall so the glyph cannot spill out
+        // of the rect the margin was measured on.
+        const float stackH = z.tagFont + kVGap + z.zeroFont;
+        const float top    = band.getY() + juce::jmax (kEdge, (band.getHeight() - stackH) * 0.5f);
+        const float cx     = band.getCentreX();
+        z.tag  = { cx - (tagW  + 2.0f) * 0.5f, top,                     tagW  + 2.0f, z.tagFont  };
+        z.zero = { cx - (zeroW + 2.0f) * 0.5f, top + z.tagFont + kVGap, zeroW + 2.0f, z.zeroFont };
+        z.band = band;
         return z;
     }
 
     // The two numbers as they would be drawn on a key `cellW` x `cellH` px, through the very
-    // pair of calls paint() makes (degreeArea decides the band and the "0"'s font;
-    // layOutPeriodTag divides it). Exists so a check can measure the SMALLEST key the
-    // keyboard ever draws - kCellW - instead of whichever cell the test window happened to
-    // produce. Keys have a FIXED width, so the tight case is by construction never the one
-    // on screen, and it is exactly where a period number would be shrunk unnoticed.
+    // call paint() makes. Exists so a check can measure the SMALLEST key the keyboard ever
+    // draws - kCellW - instead of whichever cell the test window happened to produce. Keys
+    // have a FIXED width, so the tight case is by construction never the one on screen, and
+    // it is exactly where a period number would be squeezed unnoticed.
     static ZeroLayout layOutPeriodTagForCell (float cellW, float cellH,
                                               const juce::String& degreeLabel,
                                               const juce::String& tag)
     {
         auto cell = juce::Rectangle<float> (0.0f, 0.0f, cellW, cellH).reduced (0.6f);
-        float degreeFont = 0.0f;
-        const auto area = degreeArea (cell, degreeLabel, cellW, degreeFont);
-        return layOutPeriodTag (area, cellW, tag, degreeFont);
+        return layOutZeroStack (cell, degreeLabel, cellW, tag);
+    }
+    // The key rect layOutPeriodTagForCell lays out in - the border nothing may touch. Same
+    // construction, one place, so a margin check cannot be measuring a different key.
+    static juce::Rectangle<float> cellRectForTests (float cellW, float cellH)
+    {
+        return juce::Rectangle<float> (0.0f, 0.0f, cellW, cellH).reduced (0.6f);
+    }
+    // Where a NON-zero degree number is centred on that same key. The whole point of the
+    // stack is that the "0" shares this column; measured through the very call paint()
+    // makes for the other degrees, so the two cannot drift apart silently.
+    static float degreeCentreXForTests (float cellW, float cellH, const juce::String& degreeLabel)
+    {
+        auto cell = cellRectForTests (cellW, cellH);
+        float f = 0.0f;
+        return degreeArea (cell, degreeLabel, cellW, f).reduced (1.0f, 0.0f).getCentreX();
     }
 
     // Test hook (RhythmVerify): every degree-0 key on screen, with the exact rects and
@@ -264,10 +313,20 @@ public:
         float cellW = 0.0f, cellH = 0.0f;
         juce::String label;
         juce::Rectangle<float> area;
-        // The INK-TO-INK distance between the "0" and its period number. The whole point
-        // of the pair layout, and invisible to a rect check: two rects that do not overlap
-        // can still be seven pixels of empty air apart.
-        float gap = 0.0f;
+        // The KEY as painted. The border the stack must not touch - and the only rect a
+        // "does it fit" check may be measured against.
+        juce::Rectangle<float> cell;
+        // The VERTICAL distance from the period number down to the "0" it annotates, and
+        // the SMALLEST clearance from either number to any of the key's four edges. Both
+        // are invisible to an overlap check: two rects that do not overlap can still be a
+        // mile apart, and a rect entirely inside another can still have ink hard against
+        // its edge. `edge` is measured on the INTEGER rects paint() really draws into,
+        // because getSmallestIntegerContainer rounds outwards and eats up to a pixel.
+        float gap = 0.0f, edge = 0.0f;
+        // Where the "0" sits ACROSS the key, against where a non-zero degree number is
+        // drawn on that same key. The bug was exactly this: a number beside the "0" pushed
+        // it off the column every other degree stands in.
+        float zeroCentreX = 0.0f, degreeCentreX = 0.0f;
     };
     std::vector<PeriodTag> periodTagProbe() const
     {
@@ -284,19 +343,25 @@ public:
             t.note   = note;
             t.number = periodNumberForNote (note, D);
             const juce::String tag (t.number);
-            auto cell = cellRect (i);
+            const auto cell = cellRect (i);
+            t.cell  = cell;
             t.label = getLabel ? getLabel (0) : juce::String();
-            float degreeFont = 0.0f;
-            const auto area = degreeArea (cell, t.label, w, degreeFont);
-            const auto z = layOutPeriodTag (area, w, tag, degreeFont);
+            auto rest = cell;                                  // trimmed to the label's room
+            const auto z = layOutZeroStack (rest, t.label, w, tag);
             t.zero = z.zero; t.tag = z.tag; t.tagFont = z.tagFont; t.zeroFont = z.zeroFont;
-            t.cellW = w; t.cellH = (float) getHeight() - (float) stripH; t.area = area;
+            t.cellW = w; t.cellH = (float) getHeight() - (float) stripH; t.area = z.band;
             t.zeroTextWidth = boldTextWidth ("0", z.zeroFont);
             t.tagTextWidth  = boldTextWidth (tag, z.tagFont);
-            // Both strings are drawn CENTRED in their rect, so the ink gap is the rect gap
-            // plus whatever slack each rect has around its own glyph.
-            t.gap = (z.tag.getCentreX() - t.tagTextWidth * 0.5f)
-                  - (z.zero.getCentreX() + t.zeroTextWidth * 0.5f);
+            t.gap = z.zero.getY() - z.tag.getBottom();
+            // The rects paint() actually hands drawFittedText, not the float ones.
+            const auto ti = z.tag.getSmallestIntegerContainer().toFloat();
+            const auto zi = z.zero.getSmallestIntegerContainer().toFloat();
+            t.edge = juce::jmin (juce::jmin (ti.getY() - cell.getY(), cell.getBottom() - zi.getBottom()),
+                                 juce::jmin (juce::jmin (ti.getX() - cell.getX(), cell.getRight() - ti.getRight()),
+                                             juce::jmin (zi.getX() - cell.getX(), cell.getRight() - zi.getRight())));
+            t.zeroCentreX   = z.zero.getCentreX();
+            t.degreeCentreX = degreeCentreXForTests (w, t.cellH, t.label)
+                            + cell.getX() - cellRectForTests (w, t.cellH).getX();
             out.push_back (t);
         }
         return out;
@@ -357,30 +422,34 @@ public:
             const auto ink = col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white;
             g.setColour (ink);
             {
-                float fontH = 0.0f;
                 auto rest = cell;
-                const auto area = degreeArea (rest, label, w, fontH);
                 if (degree == 0)
                 {
                     const juce::String tag (periodNumberForNote (note, D));
-                    const auto z = layOutPeriodTag (area, w, tag, fontH);
-                    // Both rects are already sized to their own measured glyph, so they are
-                    // drawn WHOLE (getSmallestIntegerContainer, never a rounded-down
-                    // toNearestInt) - rounding a rect one pixel narrower than the text is
-                    // precisely what makes drawFittedText shrink a number nobody can see.
-                    g.setFont (juce::Font (juce::FontOptions (z.zeroFont).withStyle ("Bold")));
-                    g.drawFittedText ("0", z.zero.getSmallestIntegerContainer(),
-                                      juce::Justification::centred, 1, 0.5f);
-                    // Smaller AND quieter: it is a coordinate, not a degree, and at full
-                    // ink it read as a second scale degree sitting on the same key.
+                    // ONE call decides the pair AND what is left for the interval label -
+                    // the stack borrows height downwards, so a label laid out from an
+                    // untrimmed cell would print straight through the "0".
+                    const auto z = layOutZeroStack (rest, label, w, tag);
+                    // The period number goes ON TOP, smaller AND quieter: it is a
+                    // coordinate, not a degree, and at full ink it read as a second scale
+                    // degree sitting on the same key.
                     g.setColour (ink.withMultipliedAlpha (0.72f));
                     g.setFont (juce::Font (juce::FontOptions (z.tagFont).withStyle ("Bold")));
                     g.drawFittedText (tag, z.tag.getSmallestIntegerContainer(),
                                       juce::Justification::centred, 1, 0.5f);
                     g.setColour (ink);
+                    // Both rects are already sized to their own measured glyph, so they are
+                    // drawn WHOLE (getSmallestIntegerContainer, never a rounded-down
+                    // toNearestInt) - rounding a rect one pixel narrower than the text is
+                    // precisely what makes drawFittedText squeeze a number nobody can see.
+                    g.setFont (juce::Font (juce::FontOptions (z.zeroFont).withStyle ("Bold")));
+                    g.drawFittedText ("0", z.zero.getSmallestIntegerContainer(),
+                                      juce::Justification::centred, 1, 0.5f);
                 }
                 else
                 {
+                    float fontH = 0.0f;
+                    const auto area = degreeArea (rest, label, w, fontH);
                     g.setFont (juce::Font (juce::FontOptions (fontH).withStyle ("Bold")));
                     g.drawFittedText (juce::String (degree), area.reduced (1.0f, 0.0f).toNearestInt(),
                                       juce::Justification::centred, 1, 0.5f);
