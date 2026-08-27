@@ -7954,6 +7954,699 @@ int main()
         check (! fileA.existsAsFile() && ! fileB.existsAsFile(), "run 47's presets are cleaned up");
     }
 
+    // --- run 48: MONOPHONIC GLIDE - one voice, and a real bend between two tuned pitches -
+    // "al activarlo el sinte no puede producir acordes pero al pulsar una nota y luego
+    //  otra se hace pitchbend de una a la otra en un tiempo especificado manualmente en ms"
+    //
+    // Everything here is measured on the RENDERED AUDIO wherever it can be, because the
+    // claim is about what is heard: the fundamental is estimated by autocorrelation over
+    // a 30 ms window (robust with a harmonic spectrum, where a zero-crossing count reads
+    // the brightest partial instead of the pitch), and the voice's own probe is printed
+    // beside it so a failure names WHICH half disagrees.
+    {
+        std::printf ("\nmonophonic glide: one voice, and a bend between two tuned pitches:\n");
+        constexpr double sr8 = 48000.0;
+        constexpr int    b8  = 256;
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (sr8, b8);
+        auto sp = [&p] (const char* id, float v)
+        { auto* q = p->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v));
+          p->pollParametersForTests(); };
+
+        // A patch whose pitch is easy to read and whose ENVELOPE is easy to catch
+        // retriggering: 1 ms attack, 30 ms decay to a 0.2 sustain, so a re-attack is a
+        // five-fold RMS bump that no smoothing can hide.
+        sp ("morph", 0.0f);
+        sp ("ampAttack", 0.001f); sp ("ampDecay", 0.030f);
+        sp ("ampSustain", 0.2f);  sp ("ampRelease", 0.010f);
+        sp ("phaseMode", 0.0f);
+        sp ("filterCutoff", 9600.0f);   // wide open in cents: the filter must not colour f0
+        sp ("pitchEnvAmount", 0.0f);
+
+        juce::AudioBuffer<float> ab (2, b8);
+        std::vector<float> x;
+        int clk = 0;
+        // Runs `blocks` blocks, optionally with MIDI on the first one, recording the mix.
+        auto pump = [&] (int blocks, const juce::MidiBuffer& first)
+        {
+            for (int i = 0; i < blocks; ++i)
+            {
+                juce::MidiBuffer m;
+                if (i == 0) m = first;
+                ab.clear();
+                p->processBlock (ab, m);
+                const float* r = ab.getReadPointer (0);
+                for (int k = 0; k < b8; ++k) x.push_back (r[k]);
+                clk += b8;
+            }
+        };
+        auto on  = [] (int k) { juce::MidiBuffer m;
+                                m.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0); return m; };
+        auto off = [] (int k) { juce::MidiBuffer m;
+                                m.addEvent (juce::MidiMessage::noteOff (1, k), 0); return m; };
+
+        // f0 by NORMALISED autocorrelation over `win` samples, lags from 2 kHz down to
+        // 50 Hz, with the octave rule that makes it usable on a harmonic spectrum at all:
+        // a periodic signal correlates just as well at TWICE its period, and a plain
+        // "largest correlation wins" therefore reports f0/2 about half the time (it did,
+        // for every reading here, until this was added). So the answer is the FIRST local
+        // peak that reaches 85% of the global one - the shortest period that explains the
+        // waveform - refined by a parabolic fit through its two neighbours.
+        std::vector<double> ac;
+        auto f0At = [&] (size_t at, int win) -> double
+        {
+            const int loLag = (int) (sr8 / 2000.0), hiLag = (int) (sr8 / 50.0);
+            if (at + (size_t) (win + hiLag) + 2 >= x.size()) return 0.0;
+            ac.assign ((size_t) hiLag + 2, 0.0);
+            double best = 0.0;
+            for (int lag = loLag; lag <= hiLag; ++lag)
+            {
+                double s = 0.0, e0 = 0.0, e1 = 0.0;
+                for (int i = 0; i < win; ++i)
+                {
+                    const double a = x[at + (size_t) i], c = x[at + (size_t) (i + lag)];
+                    s += a * c; e0 += a * a; e1 += c * c;
+                }
+                const double n = std::sqrt (e0 * e1);
+                ac[(size_t) lag] = n > 1.0e-12 ? s / n : 0.0;
+                best = std::max (best, ac[(size_t) lag]);
+            }
+            if (best <= 0.2) return 0.0;                    // nothing periodic here
+            int pick = 0;
+            for (int lag = loLag + 1; lag < hiLag; ++lag)
+                if (ac[(size_t) lag] >= 0.85 * best
+                    && ac[(size_t) lag] >= ac[(size_t) (lag - 1)]
+                    && ac[(size_t) lag] >= ac[(size_t) (lag + 1)])
+                { pick = lag; break; }
+            if (pick <= loLag || pick >= hiLag) return 0.0;
+            const double ym = ac[(size_t) (pick - 1)], y0 = ac[(size_t) pick], yp = ac[(size_t) (pick + 1)];
+            const double den = ym - 2.0 * y0 + yp;
+            const double d   = std::abs (den) > 1.0e-12 ? 0.5 * (ym - yp) / den : 0.0;
+            return sr8 / ((double) pick + juce::jlimit (-1.0, 1.0, d));
+        };
+        auto rmsAt = [&] (size_t at, int win) -> double
+        {
+            if (at + (size_t) win >= x.size()) return 0.0;
+            double s2 = 0.0;
+            for (int i = 0; i < win; ++i) { const double v = x[at + (size_t) i]; s2 += v * v; }
+            return std::sqrt (s2 / (double) win);
+        };
+
+        const double fLo = p->getNoteFrequency (60);
+        const double fHi = p->getNoteFrequency (67);   // a fifth: two clearly separate pitches
+        constexpr double glideMs = 200.0;
+
+        //-- (a) the CONTROL: mono OFF is a jump, and a second key adds a voice ----------
+        sp ("monoGlide", 0.0f);
+        sp ("glideTime", (float) glideMs);
+        check (p->synthVoiceCountForTests() == 32, "with the mode off the pool is the full 32 voices");
+        x.clear(); clk = 0;
+        pump (40, on (60));
+        const size_t polyA = x.size();
+        pump (40, on (67));
+        const int polyActive = p->activeVoiceCountForTests();
+        pump (10, {});
+        const double polyF0 = f0At (polyA + (size_t) (0.010 * sr8), 1440);
+        pump (4, off (67)); pump (4, off (60)); pump (40, {});
+        std::printf ("  poly control: %d voices sounding after the second key, f0 10 ms after it %.1f Hz\n",
+                     polyActive, polyF0);
+        check (polyActive == 2, "polyphonic: a second key really does add a second voice");
+
+        //-- (b) MONO ON: one voice, and the pitch BENDS ---------------------------------
+        sp ("monoGlide", 1.0f);
+        check (p->synthVoiceCountForTests() == 1,
+               "switching Monophonic glide on drops the pool to ONE voice (no chords possible)");
+
+        x.clear(); clk = 0;
+        pump (60, on (60));                     // settle on the low note
+        const size_t T = x.size();              // the takeover happens on the next block
+        pump (2, on (67));
+        const int monoActive = p->activeVoiceCountForTests();
+        pump (160, {});                         // ~850 ms: the glide plus a settled tail
+        const size_t T2 = x.size();
+        pump (2, off (67));                     // ...and back to the key still held
+        pump (120, {});
+        const size_t T3 = x.size();
+        pump (2, off (60)); pump (60, {});
+
+        check (monoActive == 1, "mono: a second simultaneous key adds NO voice - it takes the one over");
+
+        const int    win  = (int) (0.030 * sr8);      // 30 ms analysis window
+        const double fBefore = f0At (T - (size_t) (0.040 * sr8), win);
+        const double fAfter  = f0At (T + (size_t) ((glideMs + 120.0) * 0.001 * sr8), win);
+        // Linear in log2 -> the halfway sample sits on the GEOMETRIC mean. The window is
+        // centred on it, so the reading is the pitch at the midpoint and not an average
+        // of one side.
+        const double fMidT   = f0At (T + (size_t) ((0.5 * glideMs) * 0.001 * sr8) - (size_t) (win / 2), win);
+        const double fMidExp = std::sqrt (fLo * fHi);
+        std::printf ("  keys 60 -> 67: before %.2f Hz (tuned %.2f), after %.2f Hz (tuned %.2f), "
+                     "midpoint %.2f Hz (geometric mean %.2f)\n",
+                     fBefore, fLo, fAfter, fHi, fMidT, fMidExp);
+        check (std::abs (1200.0 * std::log2 (fBefore / fLo)) < 12.0,
+               "the held note sounds at its own tuned frequency before the takeover");
+        check (std::abs (1200.0 * std::log2 (fAfter / fHi)) < 12.0,
+               "and at the NEW note's tuned frequency once the glide time has passed");
+        check (std::abs (1200.0 * std::log2 (fMidT / fMidExp)) < 60.0,
+               "halfway through the glide the pitch is halfway between them (log2-linear portamento)");
+
+        // THE SWEEP IS CONTINUOUS, and this is the assertion a jump has to fail. Sampled
+        // every 10 ms across the glide: every reading must be inside the interval, the
+        // sequence must climb, and no single 10 ms step may carry more than a quarter of
+        // the whole interval (a snap carries all of it in one step).
+        std::vector<double> sweep;
+        for (double t = 0.0; t <= glideMs; t += 10.0)
+            sweep.push_back (f0At (T + (size_t) (t * 0.001 * sr8), win));
+        // THE COUNT THAT MATTERS IS "strictly between", not "small steps". A restrike
+        // reaches the new pitch BEFORE the first 10 ms sample, so every step it takes
+        // afterwards is zero and every reading is (just) inside the closed interval: a
+        // sabotage that removed the glide entirely passed "inside", "non-falling" AND
+        // "biggest step" and was caught by one assertion out of four. Readings strictly
+        // between the endpoints are what a jump cannot fake - it has none at all.
+        int    rising = 0, between = 0;
+        double biggestStep = 0.0;
+        const double totalC = 1200.0 * std::log2 (fHi / fLo);
+        for (size_t i = 0; i < sweep.size(); ++i)
+        {
+            if (sweep[i] > fLo * 1.01 && sweep[i] < fHi * 0.99) ++between;
+            if (i > 0)
+            {
+                if (sweep[i] >= sweep[i - 1] * 0.995) ++rising;
+                biggestStep = std::max (biggestStep, 1200.0 * std::log2 (std::max (1.0e-9, sweep[i] / sweep[i - 1])));
+            }
+        }
+        std::printf ("  sweep (10 ms apart, Hz):");
+        for (const double v : sweep) std::printf (" %.0f", v);
+        std::printf ("\n  strictly between the two pitches %d/%d, non-falling %d/%d, "
+                     "biggest 10 ms step %.0f c of %.0f c, starts %.0f c above the old note\n",
+                     between, (int) sweep.size(), rising, (int) sweep.size() - 1, biggestStep, totalC,
+                     sweep.empty() ? -1.0 : 1200.0 * std::log2 (std::max (1.0e-9, sweep[0] / fLo)));
+        check (between >= (int) sweep.size() - 3,
+               "the glide really TRAVELS: all but the endpoints lie strictly between the two tuned frequencies");
+        check (! sweep.empty() && std::abs (1200.0 * std::log2 (std::max (1.0e-9, sweep[0] / fLo))) < 150.0,
+               "and it starts from the OLD note's pitch - it has not already arrived when the key goes down");
+        check (rising == (int) sweep.size() - 1, "and the sweep never goes backwards");
+        check (biggestStep < 0.25 * totalC,
+               "no single 10 ms step carries a quarter of the interval - it is a bend, not a jump");
+
+        //-- (c) the legato RETURN: release the top key, glide back to the one held ------
+        const double fBack = f0At (T3 - (size_t) (0.050 * sr8), win);
+        std::printf ("  released the new key with the old one still down: %.2f Hz (tuned %.2f)\n",
+                     fBack, fLo);
+        check (std::abs (1200.0 * std::log2 (fBack / fLo)) < 12.0,
+               "releasing the key you are on returns the pitch to the key still held");
+
+        //-- (d) LEGATO DOES NOT RETRIGGER, but a note from silence DOES ------------------
+        // The patch decays to a 0.2 sustain in 30 ms, so a re-attack is a large, brief
+        // RMS bump. Measured as the loudest 5 ms window in the 40 ms after the event
+        // against the settled level just before it.
+        auto bumpAround = [&] (size_t at) -> double
+        {
+            const int w = (int) (0.005 * sr8);
+            const double before = rmsAt (at - (size_t) (0.020 * sr8), w);
+            double peak = 0.0;
+            for (size_t s = at; s < at + (size_t) (0.040 * sr8); s += (size_t) (0.001 * sr8))
+                peak = std::max (peak, rmsAt (s, w));
+            return before > 1.0e-9 ? peak / before : 0.0;
+        };
+        const double legatoBump = bumpAround (T);
+        const double returnBump = bumpAround (T2);
+        // ...and the same measurement on a note struck from SILENCE, which must retrigger.
+        x.clear(); clk = 0;
+        pump (40, on (60));
+        pump (4, off (60));
+        pump (60, {});                       // the release finishes: nothing is held
+        const size_t coldAt = x.size();
+        pump (60, on (64));
+        pump (4, off (64)); pump (40, {});
+        const double coldPeak = [&]
+        {
+            double pk = 0.0;
+            for (size_t s = coldAt; s < coldAt + (size_t) (0.040 * sr8); s += (size_t) (0.001 * sr8))
+                pk = std::max (pk, rmsAt (s, (int) (0.005 * sr8)));
+            return pk;
+        }();
+        const double coldSettled = rmsAt (coldAt + (size_t) (0.200 * sr8), (int) (0.005 * sr8));
+        const double coldBump = coldSettled > 1.0e-9 ? coldPeak / coldSettled : 0.0;
+        std::printf ("  envelope bump: legato takeover x%.2f, legato return x%.2f, "
+                     "cold note from silence x%.2f (attack/sustain = x%.1f)\n",
+                     legatoBump, returnBump, coldBump, 1.0 / 0.2);
+        check (legatoBump < 1.6, "a legato takeover does NOT retrigger the amplitude envelope");
+        check (returnBump < 1.6, "and neither does the legato return to a still-held key");
+        check (coldBump > 2.5,
+               "...while a note struck after every key came up DOES retrigger it (and starts at its own pitch)");
+
+        //-- (e) switching the mode off gives the polyphony back --------------------------
+        sp ("monoGlide", 0.0f);
+        check (p->synthVoiceCountForTests() == 32, "switching it off restores the full voice pool");
+        x.clear(); clk = 0;
+        pump (30, on (60));
+        pump (30, on (64));
+        const int backActive = p->activeVoiceCountForTests();
+        pump (2, off (60)); pump (2, off (64)); pump (40, {});
+        std::printf ("  after switching off: %d voices sounding on a two-key chord\n", backActive);
+        check (backActive == 2, "...and a chord really is polyphonic again");
+
+        //-- (f) MIX MODE: the rule reaches every sub-engine, or nothing here means anything
+        {
+            const auto dir = FractalAdditiveAudioProcessor::getPresetFolder();
+            dir.createDirectory();
+            juce::String err;
+            sp ("baseN", 2.0f);  const auto nameA = p->savePreset ("run48-A");
+            sp ("baseN", 5.0f);  const auto nameB = p->savePreset ("run48-B");
+            juce::File fA = dir.getChildFile (nameA + ".fibpreset");
+            juce::File fB = dir.getChildFile (nameB + ".fibpreset");
+            p->assignPlaygroundCorner (0, nameA, err);
+            p->assignPlaygroundCorner (1, nameB, err);
+            sp ("pgMode", 1.0f);            // MIX
+            sp ("pgVoices", 8.0f);
+            for (int i = 0; i < 20; ++i) { p->pollParametersForTests(); juce::Thread::sleep (10); }
+            const int polyMix0 = p->mixVoiceCountForTests (0), polyMix1 = p->mixVoiceCountForTests (1);
+            sp ("monoGlide", 1.0f);
+            for (int i = 0; i < 20; ++i) { p->pollParametersForTests(); juce::Thread::sleep (10); }
+            const int monoMix0 = p->mixVoiceCountForTests (0), monoMix1 = p->mixVoiceCountForTests (1);
+            sp ("monoGlide", 0.0f);
+            for (int i = 0; i < 20; ++i) { p->pollParametersForTests(); juce::Thread::sleep (10); }
+            const int backMix0 = p->mixVoiceCountForTests (0);
+            std::printf ("  MIX corner voices: poly %d/%d, mono %d/%d, back to poly %d\n",
+                         polyMix0, polyMix1, monoMix0, monoMix1, backMix0);
+            check (polyMix0 == 8 && polyMix1 == 8, "MIX corners follow the visible voice control when mono is off");
+            check (monoMix0 == 1 && monoMix1 == 1,
+                   "mono glide makes EVERY mix sub-engine mono too - never one engine mono and another not");
+            check (backMix0 == 8, "...and switching it off hands the corners their polyphony back");
+            sp ("pgMode", 0.0f);
+            p->assignPlaygroundCorner (0, {}, err);
+            p->assignPlaygroundCorner (1, {}, err);
+            fA.deleteFile(); fB.deleteFile();
+            // Base N is put BACK. The two corner presets above were saved by moving it, and
+            // leaving it on 5 left the spectrum's lowest partial at the 5th harmonic - so
+            // the f0 probe in (g) below read a pitch two octaves adrift and failed a claim
+            // about the glide that the glide was keeping perfectly.
+            sp ("baseN", 1.0f);
+        }
+
+        // Does the pitch actually TRAVEL from one note to the other? Sample the rendered f0
+        // every 10 ms across the glide and count the readings that lie STRICTLY between the
+        // two pitches. A restrike has none - it is already at the new pitch before the first
+        // sample - so this is the one metric a jump cannot pass. (A "biggest step" metric
+        // cannot: a jump's steps are all zero. That was measured, not assumed.)
+        auto glideTravel = [&] (int k1, int ch1, int k2, int ch2, double ms) -> double
+        {
+            x.clear(); clk = 0;
+            juce::MidiBuffer m1; m1.addEvent (juce::MidiMessage::noteOn (ch1, k1, (juce::uint8) 100), 0);
+            juce::MidiBuffer m2; m2.addEvent (juce::MidiMessage::noteOn (ch2, k2, (juce::uint8) 100), 0);
+            pump (60, m1);
+            const size_t at = x.size();
+            pump (2, m2);
+            pump (160, {});
+            const int w = (int) (0.030 * sr8);
+            const double f1 = p->getNoteFrequency (k1), f2 = p->getNoteFrequency (k2);
+            int between = 0, total = 0;
+            for (double t = 0.0; t <= ms; t += 10.0)
+            {
+                const double f = f0At (at + (size_t) (t * 0.001 * sr8), w);
+                ++total;
+                // A reading the estimator could not make counts AGAINST travelling. Skipping
+                // it silently would let a restrike - which is loud and messy exactly where
+                // the jump happens - hide inside the gap it created.
+                if (f > std::min (f1, f2) * 1.01 && f < std::max (f1, f2) * 0.99) ++between;
+            }
+            juce::MidiBuffer o1; o1.addEvent (juce::MidiMessage::noteOff (ch2, k2), 0);
+            juce::MidiBuffer o2; o2.addEvent (juce::MidiMessage::noteOff (ch1, k1), 0);
+            pump (2, o1); pump (2, o2); pump (60, {});
+            return total > 0 ? (double) between / (double) total : 0.0;
+        };
+
+        //-- (g) MPE: one note stream, whatever channel it arrives on ---------------------
+        // The mono rule is a rule about the INSTRUMENT, not about a channel. Under an MPE
+        // zone every note has its own channel, so a per-channel reading of "mono" would
+        // let an MPE controller play chords with the switch on - and the glide would never
+        // fire, because nothing would ever be taken over. Both notes here are on DIFFERENT
+        // member channels, and the first carries a per-note BEND: the glide has to start
+        // from the pitch that note is really sounding at, bend included, not from its key.
+        {
+            sp ("monoGlide", 1.0f);
+            sp ("tuningMode", 3.0f);      // MPE zone: +-48 semitones per note, tuning = Equal
+            const double fBent = p->getNoteFrequency (60) * std::exp2 (2.0 / 12.0);  // +2 semitones
+            const double fPlain = p->getNoteFrequency (67);
+            x.clear(); clk = 0;
+            juce::MidiBuffer mpeOn;
+            mpeOn.addEvent (juce::MidiMessage::pitchWheel (2, 8192 + (int) std::lround (8192.0 * 2.0 / 48.0)), 0);
+            mpeOn.addEvent (juce::MidiMessage::noteOn (2, 60, (juce::uint8) 100), 1);
+            pump (60, mpeOn);
+            const size_t mT = x.size();
+            juce::MidiBuffer mpeOn2; mpeOn2.addEvent (juce::MidiMessage::noteOn (3, 67, (juce::uint8) 100), 0);
+            pump (2, mpeOn2);
+            const int mpeActive = p->activeVoiceCountForTests();
+            pump (200, {});
+            const int  wM = (int) (0.030 * sr8);
+            const double mBefore = f0At (mT - (size_t) (0.040 * sr8), wM);
+            const double mAfter  = f0At (mT + (size_t) ((glideMs + 150.0) * 0.001 * sr8), wM);
+            juce::MidiBuffer mOff; mOff.addEvent (juce::MidiMessage::noteOff (3, 67), 0);
+            juce::MidiBuffer mOff2; mOff2.addEvent (juce::MidiMessage::noteOff (2, 60), 0);
+            pump (2, mOff); pump (2, mOff2); pump (60, {});
+            std::printf ("  MPE (ch2 bent +2 st -> ch3): %d voices, %.2f Hz (bent key = %.2f) -> "
+                         "%.2f Hz (target %.2f)\n", mpeActive, mBefore, fBent, mAfter, fPlain);
+            check (mpeActive == 1,
+                   "MPE: a second note on ANOTHER channel takes the voice over too - mono is per instrument");
+            check (std::abs (1200.0 * std::log2 (mBefore / fBent)) < 15.0,
+                   "...and the glide starts from the BENT pitch that note was really sounding, not from its key");
+            check (std::abs (1200.0 * std::log2 (mAfter / fPlain)) < 15.0,
+                   "...and still arrives on the new note's own frequency");
+            sp ("tuningMode", 0.0f);
+        }
+
+        //-- (h) SHEPARD MODE survives the takeover ---------------------------------------
+        // A Shepard note is a PLAYED mode latched for the life of the note (ShepardEngine.h),
+        // and a legato takeover IS that same note being bent. So the stack must keep rising
+        // through it: re-latching would reset the rise phase to zero, which is the swoop out
+        // of nothing that latch exists to prevent.
+        {
+            sp ("shepOn", 1.0f);
+            sp ("shepMode", 0.0f);        // Free (ms), so no host tempo is needed
+            sp ("shepTime", 4000.0f);
+            x.clear(); clk = 0;
+            pump (60, on (60));
+            const bool shepBefore = p->voiceShepardActiveForTests();
+            pump (2, on (67));
+            const int  shepVoices = p->activeVoiceCountForTests();
+            const bool shepDuring = p->voiceShepardActiveForTests();
+            const bool gliding    = p->voiceGlidingForTests();
+            pump (10, {});
+            const double shepMid = p->voiceSoundingHzForTests();
+            pump (160, {});
+            const double shepEnd = p->voiceSoundingHzForTests();
+            pump (2, off (67)); pump (2, off (60)); pump (60, {});
+            std::printf ("  Shepard + takeover: %d voice(s), shepard before/after %d/%d, gliding %d, "
+                         "voice pitch %.2f -> %.2f Hz (targets %.2f / %.2f)\n",
+                         shepVoices, (int) shepBefore, (int) shepDuring, (int) gliding,
+                         shepMid, shepEnd, fLo, fHi);
+            check (shepBefore && shepDuring,
+                   "a Shepard note taken over by the next key is STILL a Shepard note (the latch survives)");
+            check (shepVoices == 1, "...and it is still one voice");
+            check (shepMid > fLo * 1.005 && shepMid < fHi * 0.995,
+                   "...with the portamento genuinely under way 10 ms in, not snapped and not stalled");
+            check (std::abs (1200.0 * std::log2 (shepEnd / fHi)) < 5.0,
+                   "...and arriving on the new key's tuned pitch");
+            sp ("shepOn", 0.0f);
+        }
+
+        //-- (i) THE NOTE GATE'S OWN "Mono" STANDS DOWN -----------------------------------
+        // The gate's Mono emits a note-OFF for the sounding key at the same sample as the
+        // new note-on and BEFORE it, which puts the single voice into its release tail: the
+        // takeover then sees `releasing`, correctly refuses to call itself legato, and
+        // restrikes. Two mono switches, and the older one silently won. The processor now
+        // stands the gate's Mono down while glide is on; this is the measurement that says
+        // so, and it is the one that fails if that line is removed.
+        {
+            const double freeTravel  = glideTravel (60, 1, 67, 1, glideMs);
+            sp ("rhythmMono", 1.0f);
+            const double gatedTravel = glideTravel (60, 1, 67, 1, glideMs);
+            sp ("rhythmMono", 0.0f);
+            std::printf ("  note-gate Mono: %.0f%% of the readings lie between the two pitches with the "
+                         "gate off, %.0f%% with it ON\n", freeTravel * 100.0, gatedTravel * 100.0);
+            check (freeTravel > 0.7, "the control glide really travels (as run 48 already asserted)");
+            check (gatedTravel > 0.7,
+                   "and the note gate's own Mono no longer turns the glide back into a jump");
+        }
+
+        sp ("monoGlide", 0.0f);
+    }
+
+    // --- run 49: ADAPTIVE LOOKAHEAD - the spectrum is ready BEFORE the note sounds -----
+    // "habria alguna manera de hacer que el modo realtime se anticipara al midi que viene
+    //  y preparara el spectrum de antemano para tener 0 latencia en el cambio de parciales
+    //  cuando se usa compositivamente en el daw?"
+    //
+    // Three claims, three separate measurements, because they fail for different reasons:
+    //   1. the plugin really delays itself by exactly what it REPORTS as latency;
+    //   2. the adapted spectrum is published AT OR BEFORE the delayed note's first
+    //      audible sample - against the follower's own ~50-100 ms without it;
+    //   3. a transport jump flushes what is in flight, so a loop cannot replay it.
+    {
+        std::printf ("\nadaptive lookahead: the spectrum is ready before the note sounds:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        constexpr double sr9 = 48000.0;
+        constexpr int    b9  = 64;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (sr9, b9);
+        auto sp = [&p] (const char* id, float v)
+        { auto* q = p->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v));
+          p->pollParametersForTests(); };
+        sp ("morph", 0.0f);
+        sp ("ampAttack", 0.001f); sp ("ampDecay", 0.001f);
+        sp ("ampSustain", 1.0f);  sp ("ampRelease", 0.003f);
+        // Quantize-to-pulse is ON by default and would hold a note back for reasons that
+        // have nothing to do with this feature; the onset measured below has to be the
+        // lookahead's delay and nothing else's.
+        sp ("rhythmQPulse", 0.0f);
+
+        // A host timeline this harness owns, so the transport jump can be a real one.
+        struct FakeHead : juce::AudioPlayHead
+        {
+            juce::AudioPlayHead::PositionInfo pos;
+            juce::Optional<juce::AudioPlayHead::PositionInfo> getPosition() const override { return pos; }
+        };
+        FakeHead head;
+        head.pos.setBpm (120.0);
+        head.pos.setIsPlaying (false);
+        head.pos.setPpqPosition (0.0);
+        p->setPlayHead (&head);
+
+        Proc::RtSettings rs;
+        rs.adapt.partials = 8; rs.adapt.periodRatio = 2.0; rs.adapt.minGapCents = 50.0;
+        rs.adapt.rootOnly = true; rs.adapt.goal = 0; rs.adapt.shapeAmps = true;
+
+        //-- (1) THE REPORTED LATENCY, and the three states it has ----------------------
+        rs.lookahead = false;
+        p->setRealtimeLink (Proc::RtLink::Off, rs);
+        const int latOff = p->getLatencySamples();
+        rs.lookahead = true;                       // armed, but no follower to feed
+        p->updateRealtimeSettings (rs);
+        const int latArmedIdle = p->getLatencySamples();
+        p->setRealtimeLink (Proc::RtLink::SpectrumFromChord, rs);
+        const int latOn = p->getLatencySamples();
+        const int budget = p->getLookaheadSamples();
+        const int wantRaw = (int) std::ceil (Proc::kLookaheadMs * 0.001 * sr9);
+        const int wantBlk = ((wantRaw + b9 - 1) / b9) * b9;
+        std::printf ("  latency: off %d, armed-but-idle %d, running %d samples (%.1f ms)"
+                     " - budget %d, %d ms rounded up to whole %d-sample blocks = %d\n",
+                     latOff, latArmedIdle, latOn, (double) latOn * 1000.0 / sr9, budget,
+                     (int) Proc::kLookaheadMs, b9, wantBlk);
+        check (latOff == 0, "with lookahead off the plugin reports no latency at all");
+        check (latArmedIdle == 0,
+               "armed with no realtime follower running it still reports none - latency nobody uses is not paid");
+        check (latOn == wantBlk && budget == wantBlk,
+               "with the follower running the reported latency is the budget, rounded up to whole blocks");
+
+        //-- (2) THE REPORTED LATENCY IS THE BUFFER DEPTH -------------------------------
+        // Not "about right": the first audible sample of a note fed at sample 0 must land
+        // exactly `budget` samples later, because that is the number the host's delay
+        // compensation is going to shift everything back by.
+        juce::AudioBuffer<float> ab (2, b9);
+        head.pos.setIsPlaying (false);
+        {
+            juce::MidiBuffer m;
+            m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+            long long onset = -1, at = 0;
+            for (int i = 0; i < 400 && onset < 0; ++i)
+            {
+                juce::MidiBuffer mm;
+                if (i == 0) mm = m;
+                ab.clear();
+                p->processBlock (ab, mm);
+                const float* r = ab.getReadPointer (0);
+                for (int k = 0; k < b9; ++k)
+                    if (onset < 0 && std::abs (r[k]) > 1.0e-7f) onset = at + k;
+                at += b9;
+            }
+            std::printf ("  a note fed at sample 0 first sounds at sample %lld (reported latency %d)\n",
+                         onset, latOn);
+            check (onset == (long long) latOn,
+                   "the note is delayed by EXACTLY the reported latency - the host's compensation lands it on time");
+            juce::MidiBuffer off; off.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+            for (int i = 0; i < 400; ++i)
+            { juce::MidiBuffer mm; if (i == 0) mm = off; ab.clear(); p->processBlock (ab, mm); }
+        }
+
+        //-- (3) A TRANSPORT JUMP FLUSHES WHAT IS IN FLIGHT ------------------------------
+        // The control and the jump are the SAME take apart from the jump itself, so a
+        // difference can only be the flush.
+        auto playFrom = [&] (double ppq0, bool jumpAfterTwoBlocks) -> long long
+        {
+            head.pos.setIsPlaying (false);
+            head.pos.setPpqPosition (ppq0);
+            for (int i = 0; i < 4; ++i) { juce::MidiBuffer mm; ab.clear(); p->processBlock (ab, mm); }
+            head.pos.setIsPlaying (true);
+            double ppq = ppq0;
+            const double dPpq = (double) b9 * 120.0 / (60.0 * sr9);
+            long long onset = -1, at = 0;
+            for (int i = 0; i < 600 && onset < 0; ++i)
+            {
+                juce::MidiBuffer mm;
+                if (i == 2) mm.addEvent (juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100), 0);
+                if (jumpAfterTwoBlocks && i == 5) ppq = ppq0;      // the loop point
+                head.pos.setPpqPosition (ppq);
+                ppq += dPpq;
+                ab.clear();
+                p->processBlock (ab, mm);
+                const float* r = ab.getReadPointer (0);
+                for (int k = 0; k < b9; ++k)
+                    if (onset < 0 && std::abs (r[k]) > 1.0e-7f) onset = at + k;
+                at += b9;
+            }
+            juce::MidiBuffer offm; offm.addEvent (juce::MidiMessage::noteOff (1, 64), 0);
+            for (int i = 0; i < 300; ++i)
+            { juce::MidiBuffer mm; if (i == 0) mm = offm; ab.clear(); p->processBlock (ab, mm); }
+            head.pos.setIsPlaying (false);
+            return onset;
+        };
+        const long long plainOnset = playFrom (0.0, false);
+        const long long jumpOnset  = playFrom (8.0, true);
+        std::printf ("  playback: note buffered then heard at sample %lld (2 blocks + %d budget = %lld);"
+                     " with a loop jump 3 blocks later: %lld (-1 = never sounded)\n",
+                     plainOnset, latOn, (long long) (2 * b9 + latOn), jumpOnset);
+        check (plainOnset == (long long) (2 * b9 + latOn),
+               "during playback a buffered note still sounds exactly one budget after it arrived");
+        check (jumpOnset < 0,
+               "a transport jump FLUSHES the buffered note - a loop restart cannot replay it");
+        check (p->activeVoiceCountForTests() == 0,
+               "...and nothing is left holding after the flush (no stranded voice)");
+
+        //-- (4) THE ALIGNMENT: the spectrum is live before the note is audible ----------
+        // Paced to WALL CLOCK, exactly as run 42 is and for the same reason: the search
+        // runs on its own thread and the 60 Hz timer is a real timer, so an offline render
+        // that outran realtime would hand the follower a head start no player ever gets.
+        //
+        // Measured TWICE with everything else identical - lookahead on, then off - because
+        // the number that matters is the DIFFERENCE, and only the difference can be
+        // attributed to this feature.
+        // Filled by every `landing` call with the number the PLUGIN says it took, so the
+        // read-out on the button can be checked against the one measured from outside.
+        double selfReportMs = -1.0;
+        auto landing = [&] (bool lookahead) -> double
+        {
+            rs.lookahead = lookahead;
+            p->setRealtimeLink (Proc::RtLink::Off, rs);
+            p->setRealtimeLink (Proc::RtLink::SpectrumFromChord, rs);
+            const int bud = p->getLookaheadSamples();
+
+            long long clk = 0, nextPoll = 0;
+            const long long tick = (long long) (sr9 / 60.0);
+            const double    t0   = juce::Time::getMillisecondCounterHiRes();
+            juce::uint32 gen0 = 0;
+            long long feedAt = -1, landAt = -1;
+            long long startAt = -1, doneAt = -1; int startsSeen = 0;
+            long long appliedAt = -1; int appliesSeen = 0;
+            double wStart = -1.0, wDone = -1.0, wLand = -1.0, wApply = -1.0, wFeed = 0.0;
+
+            auto genNow = [&] { const auto* t = p->getLiveTemplate(); return t != nullptr ? t->generation : 0u; };
+            auto pumpFor = [&] (double seconds, juce::MidiBuffer first)
+            {
+                const long long want = clk + (long long) (seconds * sr9);
+                bool sent = false;
+                while (clk < want)
+                {
+                    juce::MidiBuffer m;
+                    if (! sent) { m = first; sent = true; }
+                    ab.clear();
+                    p->processBlock (ab, m);
+                    clk += b9;
+                    if (clk >= nextPoll)
+                    {
+                        nextPoll += tick;
+                        p->pollParametersForTests();
+                        if (feedAt >= 0 && landAt < 0 && genNow() != gen0) { landAt = clk; wLand = juce::Time::getMillisecondCounterHiRes() - t0; }
+                        if (feedAt >= 0 && startAt < 0 && p->getRealtimeStarts() != startsSeen) { startAt = clk; wStart = juce::Time::getMillisecondCounterHiRes() - t0; }
+                        if (feedAt >= 0 && doneAt  < 0 && ! p->isSpectrumAdaptRunning() && startAt >= 0) { doneAt = clk; wDone = juce::Time::getMillisecondCounterHiRes() - t0; }
+                        if (feedAt >= 0 && appliedAt < 0 && p->getRealtimeApplies() != appliesSeen) { appliedAt = clk; wApply = juce::Time::getMillisecondCounterHiRes() - t0; }
+                    }
+                    for (;;)   // never let the render outrun the searcher's wall clock
+                    {
+                        const double behind = (double) clk * 1000.0 / sr9
+                                            - (juce::Time::getMillisecondCounterHiRes() - t0);
+                        if (behind <= 0.0) break;
+                        juce::Thread::sleep (behind > 2.0 ? 1 : 0);
+                    }
+                }
+            };
+            auto keys = [] (bool down, std::initializer_list<int> ks)
+            {
+                juce::MidiBuffer m;
+                for (const int k : ks)
+                    m.addEvent (down ? juce::MidiMessage::noteOn (1, k, (juce::uint8) 100)
+                                     : juce::MidiMessage::noteOff (1, k), 0);
+                return m;
+            };
+
+            pumpFor (0.10, {});
+            pumpFor (2.4, keys (true, { 60, 64, 67 }));     // chord A, adapted and settled
+            pumpFor (0.02, keys (false, { 60, 64, 67 }));
+            // C major -> D minor: the QUALITY moves, not just the root, so the adaptation
+            // has a genuinely different answer to give (run 42 documents why a pure
+            // transposition would produce no new spectrum at all in an equal temperament).
+            const int startsBefore = p->getRealtimeStarts(), appliesBefore = p->getRealtimeApplies();
+            startsSeen = startsBefore;
+            appliesSeen = appliesBefore;
+            gen0   = genNow();
+            feedAt = clk;
+            wFeed  = juce::Time::getMillisecondCounterHiRes() - t0;
+            pumpFor (2.0, keys (true, { 62, 65, 69 }));
+            std::printf ("     WALL: launched %.1f, worker idle %.1f, applied %.1f, live %.1f (ms after feed)\n",
+                         wStart - wFeed, wDone - wFeed, wApply - wFeed, wLand - wFeed);
+            // The delayed note's first audible sample, by construction: the buffer depth
+            // asserted in (2) above. In ms from the moment the note ARRIVED.
+            const double audibleMs = (double) bud * 1000.0 / sr9;
+            const double landMs    = landAt >= 0 ? (double) (landAt - feedAt) * 1000.0 / sr9 : -1.0;
+            std::printf ("  lookahead %s: budget %.1f ms, the new spectrum went live %.1f ms "
+                         "after the notes arrived (margin %.1f ms; %d searches / %d applies during it)\n",
+                         lookahead ? "ON " : "OFF", audibleMs, landMs, audibleMs - landMs,
+                         p->getRealtimeStarts() - startsBefore, p->getRealtimeApplies() - appliesBefore);
+            std::printf ("     search launched at %.1f ms, worker idle again at %.1f ms\n",
+                         startAt >= 0 ? (double) (startAt - feedAt) * 1000.0 / sr9 : -1.0,
+                         doneAt  >= 0 ? (double) (doneAt  - feedAt) * 1000.0 / sr9 : -1.0);
+            // THE PLUGIN'S OWN READ-OUT of the same interval, checked against the one this
+            // harness measured from outside. It is what the LOOKAHEAD button prints and it
+            // is the only thing telling a user whose settings outgrow the budget that they
+            // have - so a read-out that quietly drifted from the truth would be worse than
+            // none. Both are wall-clock and the plugin starts its stopwatch one poll
+            // earlier (at the tick that SAW the chord move), so they agree to a tick.
+            selfReportMs = p->getLastRealtimeLandingMs();
+            std::printf ("     the plugin reports the same landing as %.1f ms (measured here: %.1f ms)\n",
+                         selfReportMs, wLand - wFeed);
+            return landMs;
+        };
+        double selfOn = 0.0, selfOff = 0.0;
+        const double onMs  = landing (true);  selfOn  = selfReportMs;
+        // The ON take is run TWICE and the WORST is asserted on. The first take of a fresh
+        // link was measured at 80 ms on an idle machine and at 213 ms on the same binary
+        // with a compiler running beside it, so a single fast take would let a budget that
+        // does not really fit pass. The worst of two is the honest reading.
+        const double onMs2 = landing (true);  selfOn  = std::max (selfOn, selfReportMs);
+        const double offMs = landing (false); selfOff = selfReportMs;
+        const double onWorst   = std::max (onMs, onMs2);
+        const double audibleMs = (double) latOn * 1000.0 / sr9;
+        check (onMs > 0.0 && offMs > 0.0, "both takes really did produce a new spectrum");
+        check (onWorst <= audibleMs,
+               "WITH lookahead the adapted spectrum is live AT OR BEFORE the delayed note's first sample");
+        check (offMs > audibleMs * 0.25,
+               "WITHOUT it the same move lands far later - which is the delay this exists to remove");
+        std::printf ("  the note sounds %.1f ms after it arrives with lookahead on; the spectrum needs "
+                     "%.1f / %.1f ms (on) / %.1f ms (off) - so the change is %s\n", audibleMs, onMs, onMs2,
+                     offMs, onWorst <= audibleMs ? "sample-aligned with the note" : "STILL LATE");
+        // The plugin's own number has to be the same number. 40 ms of tolerance is two 60 Hz
+        // ticks plus slack: the harness only samples at poll boundaries, the plugin stamps
+        // its stopwatch inside the poll that saw the move.
+        std::printf ("  the plugin's own read-out: %.1f ms (on) / %.1f ms (off); the button calls it %s\n",
+                     selfOn, selfOff, selfOn <= audibleMs ? "on time" : "LATE");
+        check (selfOn > 0.0 && std::abs (selfOn - onWorst) < 40.0,
+               "the landing the LOOKAHEAD button prints is the landing that really happened");
+        check (selfOn <= audibleMs,
+               "...and at these settings it reports a landing INSIDE the budget, so it does not say LATE");
+
+        p->setRealtimeLink (Proc::RtLink::Off, rs);
+        p->setPlayHead (nullptr);
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

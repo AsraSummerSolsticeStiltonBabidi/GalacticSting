@@ -3460,8 +3460,15 @@ private:
             }
             // The voice budget only means anything in mix mode; a control that quietly
             // does nothing is the trap this project keeps refusing, so it greys out.
-            voicesSlider.setEnabled (mode == 1);
-            voicesLbl.setAlpha (mode == 1 ? 1.0f : 0.45f);
+            // MONOPHONIC GLIDE takes it away for the same reason and SAYS SO: while mono
+            // is on every corner engine runs one voice, and a control still showing 8
+            // would be claiming a polyphony that is not happening.
+            // (The status line below says it in words - a label rewritten to carry the
+            // reason would have had to grow, and this row has no width to give.)
+            const bool monoNow = proc != nullptr
+                              && proc->apvts.getRawParameterValue ("monoGlide")->load() > 0.5f;
+            voicesSlider.setEnabled (mode == 1 && ! monoNow);
+            voicesLbl.setAlpha (mode == 1 && ! monoNow ? 1.0f : 0.45f);
 
             juce::String s;
             if (n < 2)
@@ -3499,6 +3506,17 @@ private:
                                      "constant). El teu patch calla per\xc3\xb2 no es toca - torna "
                                      "exactament com era.")
                               : juce::String());
+                    // MONOPHONIC GLIDE reaches every corner engine, because there is ONE
+                    // note stream and they all hear it. Said here rather than left for
+                    // the user to notice: the polyphony control they can see is disabled
+                    // and a silent override is exactly what this panel refuses to do.
+                    if (monoNow)
+                        s << (trF ? trF (" Monophonic glide is ON, so EVERY corner engine runs one voice "
+                                         "and glides the same way - \"Mix voices per corner\" waits.",
+                                         " El glide monof\xc3\xb2nic \xc3\xa9s actiu, aix\xc3\xad que CADA motor de "
+                                         "cantonada porta una sola veu i llisca igual - \"Veus de mescla "
+                                         "per cantonada\" espera.")
+                                  : juce::String());
                     s << "\n";
                 }
                 else if (wn >= 0)
@@ -3965,6 +3983,11 @@ private:
     //   processor what they should be doing (see syncRealtimeLink).
     juce::TextButton chordRtBtn, adaptRtBtn;
     bool             chordRtOn = false, adaptRtOn = false;
+    // ADAPTIVE LOOKAHEAD: the follower's own latency trade, on the follower's own row.
+    // Not a parameter (see RtSettings::lookahead) - it travels in the realtime settings
+    // like the rest of the link, and the panel adopts the live value when it opens.
+    juce::TextButton lookaheadBtn;
+    bool             lookaheadOn = false;
     // The target the user chose by hand, parked while REALTIME forces the box to the held
     // chord (the only target a follower can meaningfully have) and handed straight back
     // when realtime goes off. 0 = nothing parked.
@@ -4028,6 +4051,17 @@ private:
                                         primeModeAtt, tuningAtt, bendAtt, tuningBankAtt;
     std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], morphAtt;
     std::unique_ptr<SliderAttachment>   morphTimeAtt;
+
+    //== MONOPHONIC GLIDE (the PITCH tab of the shared envelope box) ============
+    // The toggle sits on the PITCH tab because that is where the user asked for it, and
+    // because that is where it belongs: it is a pitch behaviour, not an envelope. The
+    // time fader stands beside the pitch-envelope amount as a second "extra" column;
+    // both are visible only while that tab is showing.
+    juce::ToggleButton                monoGlideT;
+    juce::Slider                      glideFader;
+    juce::Label                       lblGlide;
+    std::unique_ptr<ButtonAttachment> monoGlideAtt;
+    std::unique_ptr<SliderAttachment> glideAtt;
 
     // SHEPARD MODE (bottom row of the Tuning box): the mode toggle, the ONE rate
     // control in its two dresses (the ms fader in Free mode, the beats box in Sync -

@@ -334,6 +334,28 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "tuningBankSlot", 1 }, "Tuning Bank Slot", 0, kBankSlots, 0));
 
+    //-- MONOPHONIC GLIDE (Pitch tab) ------------------------------------------
+    // "al activarlo el sinte no puede producir acordes pero al pulsar una nota y luego
+    //  otra se hace pitchbend de una a la otra en un tiempo especificado en ms".
+    // ON drops the synth - and every playground MIX sub-engine - to ONE voice, so a new
+    // note-on TAKES OVER the sounding one instead of adding to it, and the voice bends
+    // its pitch from the previous note's tuned frequency to the new one's. Last-note
+    // priority, no envelope retrigger while a key is held, and a release returns to the
+    // most recent key still down (see MonoGlide.h and AdditiveVoice::noteStarted).
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "monoGlide", 1 }, "Monophonic Glide", false));
+    // The portamento's DURATION, log-mapped over 1 ms .. 5 s. 1 ms rather than 0 because
+    // the mapping is logarithmic and because "the shortest glide there is" is a more
+    // useful bottom than a dead zone: at 1 ms the takeover is already indistinguishable
+    // from a jump, so no value is wasted. The centre sits at 100 ms, which is where the
+    // musically useful range lives - the fader spends half its travel between 1 and 100.
+    {
+        NormalisableRange<float> r (1.0f, 5000.0f, 0.1f);
+        r.setSkewForCentre (100.0f);
+        params.push_back (std::make_unique<AudioParameterFloat>(
+            ParameterID { "glideTime", 1 }, "Glide Time (ms)", r, 120.0f));
+    }
+
     //-- SHEPARD MODE (Tuning panel) -------------------------------------------
     // A PLAYED mode, not a generator: the key you press becomes the root of an
     // endlessly rising tone built from THIS synth's spectrum (see ShepardEngine.h
@@ -665,9 +687,26 @@ void FractalAdditiveAudioProcessor::timerCallback()
     // trigger that only worked while someone was looking would not be automatable.
     pollRandomSpectrumTrigger();
 
+    // MONOPHONIC GLIDE: the voice pool follows the switch. Here rather than in the
+    // editor because it is an automatable parameter and a project can arrive with it
+    // already on - the pool has to be one voice before the first note is played, not
+    // once somebody opens the window.
+    {
+        const bool mg = apvts.getRawParameterValue ("monoGlide")->load() > 0.5f;
+        if (mg != lastMonoGlide)
+        {
+            lastMonoGlide = mg;
+            applyMonoVoiceCount (mg);
+        }
+    }
+
     // Spectrum <-> tuning REALTIME links (throttled + coalesced; refuses to close a
     // feedback loop). Here, not in the editor, so they keep working with the window shut.
     driveRealtimeLink();
+    // ...and the lookahead budget, which the link above can have just switched off by
+    // refusing itself (a feedback-loop refusal ends the link, so the latency must go
+    // with it instead of being paid for a follower that is no longer running).
+    applyLookahead();
 
     // Segment scale tracks the timbre live: whenever the spectrum template changes
     // (Base N, fractal, a completing morph...) OR after a project reload, rebuild it
@@ -2132,6 +2171,37 @@ std::vector<double> FractalAdditiveAudioProcessor::heldChordAsTargetAlphas (doub
     return a;
 }
 
+// The lookahead's early view of the same chord. The pitch formula is the one
+// RhythmEngine::noteHz uses - the tuning's frequency for the key times its channel's
+// bend - and the bend-range table is the same three values the rhythm engine and the
+// MPE zone share, read from the same parameter, so "the notes about to sound" and "the
+// notes sounding" can only ever differ by the budget, never by their tuning.
+std::vector<double> FractalAdditiveAudioProcessor::heldChordEarlyAsTargetAlphas (double& f0Out) const
+{
+    f0Out = 0.0;
+    int keys[LookaheadPeek::kMaxHeld], chans[LookaheadPeek::kMaxHeld];
+    const int n = laPeek.getHeld (keys, chans, LookaheadPeek::kMaxHeld);
+    if (n <= 0) return {};
+
+    static constexpr double bendValues[] = { 2.0, 12.0, 48.0 };
+    const double range = bendValues[juce::jlimit (0, 2,
+        (int) apvts.getRawParameterValue ("bendRange")->load())];
+
+    std::vector<double> hz;
+    hz.reserve ((size_t) n);
+    for (int i = 0; i < n; ++i)
+    {
+        const double semis = (double) laPeek.wheelFor (chans[i]) / 8192.0 * range;
+        const double f = tuning.frequencyForNote (keys[i]) * std::exp2 (semis / 12.0);
+        if (f > 0.0 && std::isfinite (f)) hz.push_back (f);
+    }
+    if (hz.empty()) return {};
+    std::sort (hz.begin(), hz.end());
+    f0Out = hz.front();
+    for (auto& v : hz) v /= f0Out;
+    return hz;
+}
+
 double FractalAdditiveAudioProcessor::measureCurrentAgainstTarget (const std::vector<double>& alphas,
                                                                   double f0Hz, bool rootOnly,
                                                                   const dissonance::Registers& regs) const
@@ -2156,7 +2226,10 @@ double FractalAdditiveAudioProcessor::measureCurrentAgainstTarget (const std::ve
 // to "which note are we on" and they drift.
 int FractalAdditiveAudioProcessor::registerAnchorKey() const noexcept
 {
-    const int k = rhythm.getAnchorNote();
+    // With lookahead active the anchor comes from the early view for the same reason the
+    // target does: the register band the search optimises for has to belong to the note
+    // it is preparing, not to the one still sounding a budget behind it.
+    const int k = isLookaheadActive() ? laPeek.getAnchorNote() : rhythm.getAnchorNote();
     return k >= 0 ? juce::jlimit (0, 127, k) : 60;
 }
 
@@ -2629,8 +2702,16 @@ void FractalAdditiveAudioProcessor::setRealtimeLink (RtLink mode, const RtSettin
     rtHeldTarget.clear();
     rtHeldF0  = 0.0;
     rtTuneSig = -1.0;
+    // A landing measured by a link that is no longer running is not this link's answer.
+    // Cleared rather than kept, so the button reads "-" until this link has produced a
+    // real one instead of showing the previous mode's timing under the new mode's name.
+    rtMovedAtMs = -1.0;
+    rtLandingMs = -1.0;
     if (mode != RtLink::Off)
         takeRealtimeBaseline (mode);
+    // The budget is only armed while a spectrum-side follower is running, so the link
+    // changing is exactly when it has to be re-decided (and the host re-told).
+    applyLookahead();
 }
 
 // Signature of a set of ratios: changes iff the set does (and cheap enough for 60 Hz).
@@ -2639,6 +2720,87 @@ static double ratioSetSig (const std::vector<double>& r)
     double s = (double) r.size() * 1.7;
     for (size_t i = 0; i < r.size(); ++i) s += r[i] * (double) (i + 3);
     return s;
+}
+
+int FractalAdditiveAudioProcessor::mixVoiceCountForTests (int corner) const noexcept
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners)) return -1;
+    auto* e = mixEng[(size_t) corner].get();
+    return e != nullptr ? e->synth.getNumVoices() : -1;
+}
+
+//==============================================================================
+// MONOPHONIC GLIDE: the voice pool. Message thread only.
+//
+// ONE voice is the whole mechanism. With no free voice left, MPESynthesiser starts a
+// new note by calling noteStarted() on the voice that is already sounding, which is
+// precisely the takeover AdditiveVoice bends through; and a pool of one is also, by
+// construction, the promise that the synth "cannot produce chords". Nothing is
+// filtered out of the MIDI to achieve it - every note-on and note-off still arrives
+// (see MonoGlide.h), so the modulator gate and the rhythm engine still see the real
+// keyboard.
+//
+// reduceNumVoices() steals sounding voices properly (fast-kill, no click), and
+// MPESynthesiser's own voice lock serialises this against the audio thread - the same
+// contract MixCornerEngine::setVoices already relies on.
+void FractalAdditiveAudioProcessor::applyMonoVoiceCount (bool mono)
+{
+    const int want = mono ? 1 : kPolyVoices;
+    while (synth.getNumVoices() < want)
+        synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning, modEngine));
+    if (synth.getNumVoices() > want)
+        synth.reduceNumVoices (want);
+}
+
+//==============================================================================
+// ADAPTIVE LOOKAHEAD: arm or disarm the budget. Message thread only, because
+// setLatencySamples() must not run on the audio thread.
+//
+// THE JUCE MECHANICS THIS RELIES ON, named so a future reader does not have to guess
+// why a toggle is enough:
+//   AudioProcessor::setLatencySamples(n) stores n and calls updateHostDisplay() with
+//   ChangeDetails().withLatencyChanged(true). The VST3 wrapper turns that into the
+//   Vst::kLatencyChanged flag and hands it to its ComponentRestarter (an AsyncUpdater),
+//   which calls IComponentHandler::restartComponent on the MESSAGE thread; the host then
+//   re-queries getLatencySamples() and re-runs its delay compensation. setLatencySamples
+//   is a no-op when the value has not changed, so calling this every 60 Hz tick costs
+//   nothing and cannot spam the host.
+//
+// THE BUDGET IS ROUNDED UP TO WHOLE BLOCKS. A host's compensation is exact in samples
+// either way, but a whole number of blocks means the delayed copy of an event lands at
+// the same offset WITHIN a block as the original, so nothing downstream that reasons in
+// block-relative positions (the note gate's beat grid, the rhythm engine's pattern
+// anchor) has to deal with an event that changed its place in the buffer.
+//
+// It is only armed while a SPECTRUM-side realtime link is running. Latency with no
+// follower to feed would be a cost with nothing bought - and the tuning-side link
+// (TuningFromSpectrum) is triggered by the spectrum, not by notes, so a head start on
+// the keyboard would give it nothing either.
+void FractalAdditiveAudioProcessor::applyLookahead()
+{
+    const bool want = rtSet.lookahead
+                   && (rtLink == RtLink::SpectrumFromChord || rtLink == RtLink::SpectrumFromTuning);
+    const int  sr   = (int) juce::jmax (1.0, lastSr > 0.0 ? lastSr : getSampleRate());
+    const int  blk  = juce::jmax (16, lastBlockSize);
+
+    int budget = 0;
+    if (want)
+    {
+        const int raw = (int) std::ceil (kLookaheadMs * 0.001 * (double) sr);
+        budget = ((raw + blk - 1) / blk) * blk;      // whole blocks, always >= the ms asked for
+    }
+
+    if (want == laLastOn && sr == laLastSr && blk == laLastBlk && budget == laSamples.load())
+        return;
+
+    laLastOn = want; laLastSr = sr; laLastBlk = blk;
+    laSamples.store (budget, std::memory_order_relaxed);
+    // Events already in flight were stamped for the OLD budget: leaving them would put
+    // them at the wrong distance from everything around them. The audio thread does the
+    // flush (and the all-notes-off that goes with it) so no MIDI state is touched from
+    // two threads at once.
+    laFlush.store (true, std::memory_order_release);
+    setLatencySamples (budget);
 }
 
 void FractalAdditiveAudioProcessor::driveRealtimeLink()
@@ -2724,7 +2886,11 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
     const bool fromChord = rtLink == RtLink::SpectrumFromChord;
     // Read BEFORE anything is published: whether a finished result still belongs to the
     // hands on the keys is the first thing that has to be decided about it.
-    if (fromChord) alphas = heldChordAsTargetAlphas (f0);
+    // WITH LOOKAHEAD ON the follower reads the notes that have ARRIVED, not the ones
+    // that are sounding: they are the same notes one budget apart, and that budget is
+    // exactly the head start the search is being given (see LookaheadDelay.h).
+    if (fromChord) alphas = isLookaheadActive() ? heldChordEarlyAsTargetAlphas (f0)
+                                                : heldChordAsTargetAlphas (f0);
 
     // Has the chord actually MOVED away from the set the last search was AIMED at?
     // Compared note by note, in cents, including the root's absolute pitch: Sethares'
@@ -2740,6 +2906,13 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
             if (std::abs (1200.0 * std::log2 (alphas[i] / rtHeldTarget[i])) > kRtHeldMoveCents)
                 moved = true;
     }
+
+    // START THE STOPWATCH the lookahead budget is racing (see getLastRealtimeLandingMs).
+    // Here, not at the launch below: the interval that matters to the user is from the
+    // chord MOVING to the spectrum landing, and the throttle's wait before the search is
+    // even allowed to start is the largest part of it.
+    if (moved && rtMovedAtMs < 0.0)
+        rtMovedAtMs = juce::Time::getMillisecondCounterHiRes();
 
     // A finished adaptation is published FIRST, before anything below can decide there is
     // nothing to do. A chord let go a moment before its search finished was still a chord
@@ -2760,7 +2933,16 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
         {
             juce::String aerr;
             if (applySpectrumAdapt (/*undoable*/ false, aerr))
+            {
                 ++rtApplies;
+                // STOP THE STOPWATCH. This is the number the lookahead button prints and
+                // the only honest answer to "did the budget fit?" - measured on the user's
+                // machine with the user's settings, rather than estimated from a constant
+                // that is known wrong here (see kLookaheadMs).
+                if (rtMovedAtMs > 0.0)
+                    rtLandingMs = juce::Time::getMillisecondCounterHiRes() - rtMovedAtMs;
+                rtMovedAtMs = -1.0;
+            }
         }
     }
 
@@ -2867,6 +3049,9 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     synth.setCurrentPlaybackSampleRate (sampleRate);
     previewCollector.reset (sampleRate);
     noteGate.prepare (sampleRate);
+    monoGate.prepare();
+    laDelay.prepare();
+    laPeek.reset();
     modEngine.prepare (sampleRate);
     modNoteOns = 0; // in step with ModEngine::prepare - the first note-on must retrigger
     modHeld = 0;
@@ -2893,6 +3078,11 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     spectrumEngine.buildNow (lastPushed);
 
     applyTuningMode ((int) apvts.getRawParameterValue ("tuningMode")->load());
+    // The voice pool and the latency budget both depend on things prepareToPlay is the
+    // first to know (a restored monoGlide value; the rate and block the budget rounds to).
+    lastMonoGlide = apvts.getRawParameterValue ("monoGlide")->load() > 0.5f;
+    applyMonoVoiceCount (lastMonoGlide);
+    applyLookahead();
     rhythm.prepare (sampleRate);
 
     // Poll the spectrum parameters and rebuild off the audio thread. 60 Hz (not 30):
@@ -3003,12 +3193,65 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
             if (auto* ce = pe.load (std::memory_order_acquire))
                 ce->synth.turnOffAllVoices (false);
         noteGate.prepare (lastSr > 0.0 ? lastSr : getSampleRate());
+        monoGate.reset();
+        laDelay.flush(); laPeek.reset();
         modHeld = 0; modNoteOns = 0;
         for (auto& row : modKeyHeld) row.fill (false);
     }
 
     // Merge on-screen / computer-keyboard notes into the incoming MIDI stream.
     keyboardState.processNextMidiBuffer (midiMessages, 0, nSamp, true);
+
+    //== ADAPTIVE LOOKAHEAD (see LookaheadDelay.h) =============================
+    // The order here IS the feature: the follower's early view is taken from the stream
+    // at its ORIGINAL time, and only then is the stream re-stamped one budget later for
+    // everything that sounds. Both halves read the same buffer one statement apart.
+    {
+        const int budget = laSamples.load (std::memory_order_relaxed);
+
+        // A TRANSPORT DISCONTINUITY - a loop jumping back, a locator jump, playback
+        // starting or stopping - invalidates everything still in flight: those events
+        // belong to bars the transport has left, and replaying them at the loop point
+        // is a ghost note the user never wrote. Detected as a ppq position that did not
+        // advance by roughly this block's own length.
+        bool jumped = false;
+        if (auto* ph = getPlayHead())
+            if (auto pos = ph->getPosition())
+            {
+                const bool playing = pos->getIsPlaying();
+                double ppq = -1.0e30;
+                if (pos->getPpqPosition().hasValue()) ppq = *pos->getPpqPosition();
+                if (playing != laWasPlaying) jumped = true;
+                else if (playing && ppq > -1.0e29 && laLastPpq > -1.0e29 && lastSr > 0.0)
+                {
+                    double bpm = 120.0;
+                    if (pos->getBpm().hasValue() && *pos->getBpm() > 1.0) bpm = *pos->getBpm();
+                    const double expect = (double) nSamp * bpm / (60.0 * lastSr);
+                    // Half a block of tolerance either way: hosts round their ppq, and a
+                    // tempo ramp inside one buffer moves it slightly off the prediction.
+                    if (std::abs (ppq - laLastPpq - expect) > expect * 0.5 + 1.0e-6) jumped = true;
+                }
+                laWasPlaying = playing;
+                laLastPpq    = playing ? ppq : -1.0e30;
+            }
+
+        if (jumped || laFlush.exchange (false, std::memory_order_acq_rel))
+        {
+            // Dropping buffered note-ons is the point; dropping a buffered note-OFF
+            // would strand whatever it was going to close, so every voice is silenced
+            // with it. (Silence at a loop point is what the host asked for anyway.)
+            laDelay.flush();
+            laPeek.reset();
+            monoGate.reset();
+            synth.turnOffAllVoices (false);
+            for (auto& pe : mixEngLive)
+                if (auto* ce = pe.load (std::memory_order_acquire))
+                    ce->synth.turnOffAllVoices (false);
+        }
+
+        if (budget > 0) laPeek.observe (midiMessages);   // ...the notes that HAVE arrived
+        laDelay.process (midiMessages, nSamp, budget);   // ...and the stream that will sound
+    }
     // Chord-preview MIDI (editor play buttons): kept SEPARATE - it feeds only the
     // synth, never the rhythm engine (a preview must not trigger pulse trains or
     // leak to the DAW's MIDI out).
@@ -3019,8 +3262,22 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
     // grid, mono behaviour, and/or quantize to the running pattern's reset.
     {
         const bool qTempo = apvts.getRawParameterValue ("rhythmQTempo")->load() > 0.5f;
-        const bool mono   = apvts.getRawParameterValue ("rhythmMono")->load()   > 0.5f;
         const bool qPulse = apvts.getRawParameterValue ("rhythmQPulse")->load() > 0.5f;
+        // THE GATE'S OWN "Mono" STANDS DOWN WHILE MONOPHONIC GLIDE IS ON, and this is not
+        // a nicety - the two are different answers to the same question and the gate's one
+        // wins by arriving first. Its Mono emits a note-OFF for the sounding key at the
+        // SAME sample as the new note-on and BEFORE it, so the single voice is already in
+        // its release tail when the new note lands: AdditiveVoice::noteStarted then sees
+        // `releasing` and correctly refuses to call it a legato takeover, and the note
+        // restrikes at its own pitch. The result was a glide switch that silently did
+        // nothing whenever this older toggle happened to be on.
+        // Monophonic glide is already mono (the pool is ONE voice), so nothing is lost by
+        // standing the gate down - the notes it would have cut are cut by the takeover
+        // instead, with a bend where it had a restrike. The editor disables the gate's
+        // toggle and says so rather than leaving it lit over a mode it is not driving.
+        const bool monoGlideOn = apvts.getRawParameterValue ("monoGlide")->load() > 0.5f;
+        const bool mono   = ! monoGlideOn
+                         && apvts.getRawParameterValue ("rhythmMono")->load() > 0.5f;
         double beatOff = -1.0, beatPer = -1.0;
         if (qTempo)
             if (auto* ph = getPlayHead())
@@ -3039,6 +3296,13 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                           beatOff, beatPer, qPulse ? rhythm.samplesToNextReset() : -1.0,
                           qPulse ? rhythm.samplesSinceAnchor()  : -1.0);
     }
+
+    // MONOPHONIC GLIDE's note-stream half, AFTER the gate (a note held back by the beat
+    // grid has not been played yet, so it cannot take anything over) and before anything
+    // that sounds. It adds the legato return to a still-held key and nothing else; the
+    // mono-ness itself comes from the one-voice pool (see applyMonoVoiceCount).
+    monoGate.process (midiMessages, nSamp,
+                      apvts.getRawParameterValue ("monoGlide")->load() > 0.5f);
 
     // MODULATORS (3 envelopes + 3 LFOs): stepped once per block, writing straight
     // into the target parameters' raw atomics (base value + modulation) - smooth,
@@ -3138,6 +3402,7 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         rhythm.flushOpenGates();
         rhythm.flushEchoes();
         noteGate.prepare (lastSr > 0.0 ? lastSr : getSampleRate());
+        monoGate.reset();
         modHeld = 0;
         for (auto& row : modKeyHeld) row.fill (false);
     }
@@ -3550,6 +3815,7 @@ juce::ValueTree FractalAdditiveAudioProcessor::realtimeSettingsToTree() const
     rt.setProperty ("aHi",     rtSet.adapt.rangeHi,     nullptr);
     rt.setProperty ("aAmps",   rtSet.adapt.shapeAmps,   nullptr);
     rt.setProperty ("aSteps",  rtSet.adapt.regSteps,    nullptr);
+    rt.setProperty ("look",    rtSet.lookahead,         nullptr);
     return rt;
 }
 
@@ -3573,6 +3839,7 @@ FractalAdditiveAudioProcessor::realtimeSettingsFromTree (const juce::ValueTree& 
     s.adapt.rangeHi     = (double) rt.getProperty ("aHi",     s.adapt.rangeHi);
     s.adapt.shapeAmps   = (bool)   rt.getProperty ("aAmps",   s.adapt.shapeAmps);
     s.adapt.regSteps    = (int)    rt.getProperty ("aSteps",  s.adapt.regSteps);
+    s.lookahead         = (bool)   rt.getProperty ("look",    s.lookahead);
     return s;
 }
 
@@ -5032,7 +5299,17 @@ void FractalAdditiveAudioProcessor::drivePlayground()
 //==============================================================================
 void FractalAdditiveAudioProcessor::drivePlaygroundMix (const double w[kPlaygroundCorners])
 {
-    const int wantVoices = (int) apvts.getRawParameterValue ("pgVoices")->load();
+    // MONOPHONIC GLIDE IN MIX MODE: the rule applies to EVERY sub-engine, identically,
+    // and it is not refused here. It could not sensibly be: there is ONE note stream and
+    // the corners all hear it, so a mix that was mono in one engine and polyphonic in
+    // another would answer a single held chord with four different articulations. Each
+    // corner therefore drops to one voice exactly as the main engine does, and the
+    // takeover glides in each of them (the voices read the LIVE mono parameters, never
+    // the corner preset's - see AdditiveVoice's constructor for why).
+    //
+    // "Mix Voices per Corner" is not silently overridden: while mono is on the control
+    // is disabled and reads 1, so the panel states what is in force (see the editor).
+    const int wantVoices = lastMonoGlide ? 1 : (int) apvts.getRawParameterValue ("pgVoices")->load();
     for (int i = 0; i < kPlaygroundCorners; ++i)
     {
         if (! pgCorner[(size_t) i].assigned()) continue;

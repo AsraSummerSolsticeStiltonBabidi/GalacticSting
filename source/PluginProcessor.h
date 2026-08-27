@@ -9,7 +9,9 @@
 
 #include "dsp/AdditiveVoice.h"
 #include "dsp/Dissonance.h"
+#include "dsp/LookaheadDelay.h"
 #include "dsp/ModEngine.h"
+#include "dsp/MonoGlide.h"
 #include "dsp/NoteGate.h"
 #include "dsp/PresetMorph.h"
 #include "dsp/RhythmEngine.h"
@@ -454,6 +456,48 @@ public:
     // state instead of letting the beats box claim a sync that is not happening.
     bool shepardSyncHasNoBpm() const noexcept { return shepSyncNoBpm.load (std::memory_order_relaxed); }
     const spectrum::SpectrumTemplate* getLiveTemplate() const noexcept { return spectrumEngine.getLive(); }
+
+    //== MONOPHONIC GLIDE probes (verifiers only, single-threaded harnesses) ====
+    // The size of the pool, how many of it are sounding, and the pitch the sounding
+    // voice ended its last block on. Run 48 checks all three: the pool being ONE is
+    // the "no chords" promise, the active count is what a second simultaneous key must
+    // not increase, and the pitch is the internal counterpart of the audio's own f0
+    // probe (a disagreement between them names which half broke).
+    int synthVoiceCountForTests() const noexcept { return synth.getNumVoices(); }
+    int activeVoiceCountForTests() const noexcept
+    {
+        int c = 0;
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (synth.getVoice (v)->isActive()) ++c;
+        return c;
+    }
+    double voiceSoundingHzForTests() const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) return av->soundingHzForTests();
+        return 0.0;
+    }
+    // Is the sounding voice still in Shepard mode, and is a portamento still running on
+    // it? Run 48 uses the pair to prove a takeover does not interrupt a rising Shepard:
+    // its stack is a played mode latched per NOTE, and a legato takeover is one note.
+    bool voiceShepardActiveForTests() const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) return av->shepActiveForTests();
+        return false;
+    }
+    bool voiceGlidingForTests() const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) return av->glidingForTests();
+        return false;
+    }
+    // Voices in one playground MIX sub-engine (-1 when that corner has no engine).
+    // Declared here, defined after kPlaygroundCorners exists.
+    int mixVoiceCountForTests (int corner) const noexcept;
     // Every swap of the live template, gains-only republishes included (see
     // SpectrumEngine::getLiveRevision). Read by run 42 to count what the ear gets.
     juce::uint32 getSpectrumLiveRevision() const noexcept { return spectrumEngine.getLiveRevision(); }
@@ -901,6 +945,11 @@ public:
     // The chord being HELD right now, as ratios above its lowest note (empty if nothing
     // is down). f0Out is that lowest note's exact sounding frequency.
     std::vector<double> heldChordAsTargetAlphas (double& f0Out) const;
+    // The same chord read one lookahead budget EARLIER - the notes that have arrived but
+    // have not sounded yet (see LookaheadPeek). Only ever called while lookahead is
+    // active; with it off the rhythm engine's own bookkeeping is the single answer, as
+    // heldChordAsTargetAlphas' comment insists.
+    std::vector<double> heldChordEarlyAsTargetAlphas (double& f0Out) const;
 
     // Write the adapted spectrum into the Custom Engine: the partial RATIOS become its
     // scale and the per-partial AMPLITUDES become manual gain edits. `undoable` wraps it
@@ -944,9 +993,16 @@ public:
         double       minGapCents = 50.0;
         bool         rootOnly = false;
         SpectrumAdaptSettings adapt;   // the other two links
+        // ADAPTIVE LOOKAHEAD. Deliberately NOT an automatable parameter: it changes the
+        // plugin's reported latency, and a host re-running its delay compensation
+        // because a knob moved in a clip is not a thing anyone wants automated. It is
+        // part of the saved state like the rest of the link (see realtimeSettingsToTree).
+        bool lookahead = false;
     };
     void setRealtimeLink (RtLink mode, const RtSettings& s);
-    void updateRealtimeSettings (const RtSettings& s) { rtSet = s; }
+    // The panel pushes its settings here on every touch, so this is also where a change
+    // to the LOOKAHEAD toggle is noticed. applyLookahead() is a no-op when nothing moved.
+    void updateRealtimeSettings (const RtSettings& s) { rtSet = s; applyLookahead(); }
     RtLink getRealtimeLink() const noexcept { return rtLink; }
     // Non-empty when a link REFUSED to run (and switched itself off). Never silent.
     juce::String getRealtimeRefusal() const { return rtRefusal; }
@@ -954,6 +1010,64 @@ public:
     // follower actually launched, and how many results it actually applied.
     int getRealtimeStarts()  const noexcept { return rtStarts; }
     int getRealtimeApplies() const noexcept { return rtApplies; }
+
+    //== ADAPTIVE LOOKAHEAD ====================================================
+    // THE BUDGET, and where the number comes from. Every figure below was MEASURED on
+    // this machine while this feature was being written, not inherited.
+    //
+    // The budget has to cover everything between a note ARRIVING and the adapted spectrum
+    // being live in the voices. Broken into its four parts, each measured separately:
+    //
+    //   THE THROTTLE, up to kRtAdaptTicks = 6 ticks = 100 ms. This is the biggest term
+    //     and the one a "how long does the search take" reading misses entirely: a chord
+    //     change that arrives while the previous one's search is still fresh waits for the
+    //     throttle before it even starts. Run 49 measures it directly - its lookahead-OFF
+    //     take launched 97.3 ms after the notes arrived, against 12-13 ms when the
+    //     throttle was already clear.
+    //   ONE 60 Hz POLL to notice the notes at all: 16.7 ms.
+    //   THE SEARCH on its worker. Timed with no other load, realtime register cap, over
+    //     the whole settings range (RhythmVerify's probe, and Dissonance.h's model):
+    //     4 partials 2.6 ms, 8 partials 10.5 ms, 12 partials 33 ms, 16 partials 104 ms,
+    //     24 partials 84 ms against a 3-note chord in root-only scope (137 ms at 16
+    //     partials in all-vs-all). In situ, with the audio rendering beside it, the
+    //     default 8-partial follower measured 17-33 ms.
+    //   ONE MORE POLL to apply the finished result (16.7 ms) and the 50 ms template
+    //     de-click fade, so the spectrum is not merely published but SETTLED when the
+    //     note sounds.
+    //
+    // 100 + 16.7 + 33 + 16.7 + 50 = 216 ms at the DEFAULT follower settings, and 250 is
+    // that rounded up with the slack a loaded machine needs (the same run measured 200 ms
+    // for a search that takes 33 ms idle, once, while a compiler was running beside it).
+    //
+    // IT DOES NOT COVER EVERY SETTING, AND THE PANEL SAYS SO RATHER THAN PRETENDING.
+    // 16 or 24 partials against a wide chord outgrow it, and the honest answer is not a
+    // latency that silently moves under the user: getLastRealtimeLandingMs() reports how
+    // long the LAST spectrum change really took, the lookahead button prints it beside
+    // the budget, and it says LATE when it did not fit. A measured read-out beats an
+    // estimate - especially here, where the estimator's calibration constant is known
+    // wrong on this machine (SpectrumTests fits 14.67 ns/pair against the header's 9.8)
+    // and phase 3 re-fits it.
+    //
+    // The budget stays a CONSTANT rather than a function of the adapt settings so the
+    // reported latency only ever moves when the user works the LOOKAHEAD toggle itself.
+    // A latency that changed with a partial count would have the host re-run its delay
+    // compensation in the middle of a session, and the search cost also depends on how
+    // many keys are down - which no reported latency may ever depend on.
+    static constexpr double kLookaheadMs = 250.0;
+    // Is the user asking for it, and is it actually running? The second is not always the
+    // first: the budget is only armed while a spectrum-side realtime link is on, because
+    // with no follower to give a head start to, latency would buy nothing at all.
+    bool isLookaheadArmed()  const noexcept { return rtSet.lookahead; }
+    bool isLookaheadActive() const noexcept { return laSamples.load (std::memory_order_relaxed) > 0; }
+    int  getLookaheadSamples() const noexcept { return laSamples.load (std::memory_order_relaxed); }
+    void setLookaheadForTests (bool on) { rtSet.lookahead = on; applyLookahead(); }
+    // HOW LONG THE LAST SPECTRUM CHANGE REALLY TOOK, in milliseconds from the moment the
+    // chord moved to the moment the adapted spectrum was written. < 0 = nothing measured
+    // yet. Wall clock, message thread only, and it is the whole reason the budget above is
+    // allowed to be a constant: the number the user is shown is the one their own machine
+    // produced with their own settings, so a budget that does not fit says so out loud
+    // instead of quietly delivering a late spectrum. Read by the editor and by run 49.
+    double getLastRealtimeLandingMs() const noexcept { return rtLandingMs; }
     // How many 60 Hz ticks the two links wait between launches, on top of never running two
     // at once. Measured on this machine: a 3-note grid+refine chord search over 2/1 with a
     // rich spectrum (the 64-partial analysis cap) USED to be ~1.4 s and is now ~0.30 s cold
@@ -1223,6 +1337,28 @@ private:
     spectrum::SpectrumSettings  lastPushed;
     RhythmEngine                rhythm { apvts, spectrumEngine, tuning };
     NoteGate                    noteGate; // quantize-to-tempo / mono / quantize-to-pulse
+    MonoGlide                   monoGate; // MONOPHONIC GLIDE's note-stream half (MonoGlide.h)
+    // Voices the pool holds when mono glide is OFF. Mono forces it to 1 - which is what
+    // makes chords impossible AND what makes every new note a steal, i.e. a takeover the
+    // voice can bend through. Tracked here so switching back restores the real number.
+    static constexpr int kPolyVoices = 32;
+    bool lastMonoGlide = false;           // message thread: last value the voice pool follows
+    void applyMonoVoiceCount (bool mono); // message thread; see the definition
+    //== ADAPTIVE LOOKAHEAD (see LookaheadDelay.h) =============================
+    LookaheadDelay laDelay;   // the MIDI is re-stamped `laSamples` later
+    LookaheadPeek  laPeek;    // ...and the follower reads it at its ORIGINAL time
+    // How many samples of latency the plugin is CURRENTLY reporting and delaying by.
+    // Written on the message thread (setLatencySamples must not run on the audio one),
+    // read on the audio thread through the atomic.
+    std::atomic<int> laSamples { 0 };
+    bool  laLastOn   = false;  // last value applyLookahead() acted on
+    int   laLastSr   = 0;      // ...and the block/rate the budget was rounded for
+    int   laLastBlk  = 0;
+    std::atomic<bool> laFlush { false };   // message -> audio: drop what is in flight
+    void applyLookahead();     // message thread; see the definition
+    // Transport-jump detection, audio thread only. -1e30 = nothing seen yet.
+    double laLastPpq = -1.0e30;
+    bool   laWasPlaying = false;
     std::atomic<bool>           shepSyncNoBpm { false }; // see shepardSyncHasNoBpm()
     // Set by restoreState() (any thread); consumed at the top of the next processBlock
     // (audio thread) - see there for why. A preset/project load must never leave a
@@ -1339,6 +1475,13 @@ private:
     juce::String rtRefusal;
     int  rtTick = 0, rtLastStart = -1000, rtStarts = 0, rtApplies = 0;
     bool rtPending = false;
+    // THE MEASURED LANDING (see getLastRealtimeLandingMs). `rtMovedAtMs` is stamped the
+    // first time the chord is seen to have MOVED since the last landing - the moment the
+    // clock the lookahead budget is racing starts - and is cleared when the result lands,
+    // so a chord that moves twice during one search is timed from its FIRST move (the
+    // pessimistic, and honest, end of the interval). Wall clock, message thread only.
+    double rtMovedAtMs = -1.0;
+    double rtLandingMs = -1.0;
     unsigned int rtSeenSpecGen = 0;
     int  rtSeenChordGen = 0, rtSeenAdaptGen = 0;
     // The held chord the last adaptation was actually AIMED AT - the ratios and the root's

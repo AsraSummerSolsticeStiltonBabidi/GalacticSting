@@ -1179,6 +1179,21 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 
     configFader (pEnvAmtFader, "pitchEnvAmount", pEnvAmtAtt, cPitch, "How far the pitch envelope bends the pitch (semitones, +/-).");
     makeLabel (lblPitchAmt, cPitch);
+
+    // MONOPHONIC GLIDE. Both controls live on the PITCH tab and are shown only while it
+    // is the tab on screen (see resized()). They are ordinary parameter attachments -
+    // everything that makes the mode work (the one-voice pool, the legato takeover, the
+    // portamento itself) is in the processor and the voice, so it works with this window
+    // shut and under host automation.
+    monoGlideT.setMouseClickGrabsKeyboardFocus (false);
+    monoGlideT.onClick = [this] { refocus(); };
+    addChildComponent (monoGlideT);
+    monoGlideAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "monoGlide", monoGlideT);
+    addMapListener (monoGlideT, "monoGlide");
+    configFader (glideFader, "glideTime", glideAtt, cPitch,
+                 "How long the pitch takes to travel from the previous note to the new one (ms).");
+    glideFader.setTextValueSuffix (" ms");
+    makeLabel (lblGlide, cPitch);
     const char* ampIds[]   = { "ampAttack","ampDecay","ampSustain","ampRelease" };
     const char* fltIds[]   = { "filterAttack","filterDecay","filterSustain","filterRelease" };
     const char* pitchIds[] = { "pitchAttack","pitchDecay","pitchSustain","pitchRelease" };
@@ -2104,7 +2119,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // The two REALTIME buttons. They are plain toggles in the editor; everything that
     // makes them safe - the throttle, the coalescing, the feedback-loop refusal and the
     // single undo step - lives in the processor, so it also works with this window shut.
-    for (auto* b : { &chordRtBtn, &adaptRtBtn })
+    for (auto* b : { &chordRtBtn, &adaptRtBtn, &lookaheadBtn })
     {
         b->setMouseClickGrabsKeyboardFocus (false);
         addChildComponent (*b);
@@ -2112,6 +2127,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     chordRtBtn.onClick = [this] { chordRtOn = ! chordRtOn; syncRealtimeLink(); resized(); refocus(); };
     adaptRtBtn.onClick = [this]
     { adaptRtOn = ! adaptRtOn; syncAdaptTargetLock(); syncRealtimeLink(); resized(); refocus(); };
+    // LOOKAHEAD rides on the same syncRealtimeLink path as everything else on this panel,
+    // so the processor learns about it through the settings it already receives on every
+    // touch - and re-reports its latency from there (see applyLookahead).
+    lookaheadBtn.onClick = [this] { lookaheadOn = ! lookaheadOn; syncRealtimeLink(); resized(); refocus(); };
     // Two labelled view buttons: "Results" = the list of ALL found chords;
     // "Tuning info" = the LOADED chord's degrees ranked like any scale.
     for (auto* b : { &chordViewBack, &chordViewFwd })
@@ -2590,6 +2609,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             if (live == RtLink::SpectrumFromChord) { adaptRtOn = true; syncAdaptTargetLock(); }
             else { chordRtOn = true; tuneSourceBox.setSelectedId (2, juce::dontSendNotification); }
         }
+        // The LOOKAHEAD toggle is adopted whether or not a link is running: it is part of
+        // the saved realtime settings, and a reopened panel showing it OFF while the
+        // processor is reporting latency would be the same lie the block above fixes.
+        lookaheadOn = processorRef.isLookaheadArmed();
     }
 
     applyLanguage();
@@ -2703,8 +2726,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Una nota nom\xc3\xa9s pot COMEN\xc3\x87""AR en un beat del BPM del projecte: premuda a mig beat queda en sil\xc3\xa8nci i entra exactament al beat seg\xc3\xbc" "ent. Cal que el DAW reprodueixi; si la deixes anar abans, es cancel\xc2\xb7la en sil\xc3\xa8nci. Desactivat per defecte."));
     rhythmPanel.monoT.setButtonText (tr ("Mono", "Mono"));
     rhythmPanel.monoT.setTooltip (tr (
-        "Monophonic: when a new note starts, the note currently sounding stops. Off = polyphonic.",
-        "Monof\xc3\xb2nic: quan comen\xc3\xa7""a una nota nova, la que sonava s'atura. Desactivat = polif\xc3\xb2nic."));
+        "Monophonic: when a new note starts, the note currently sounding stops. Off = polyphonic.\nThis one CUTS the old note (a restrike at the new pitch). \"Monophonic glide\" on the PITCH tab is the other kind - it BENDS the old note to the new one - and while that is on this greys out, because cutting the note first is exactly what stops it gliding.",
+        "Monof\xc3\xb2nic: quan comen\xc3\xa7""a una nota nova, la que sonava s'atura. Desactivat = polif\xc3\xb2nic.\nAquest TALLA la nota antiga (un atac nou a la nova al\xc3\xa7""ada). El \"Glide monof\xc3\xb2nic\" de la pestanya PITCH \xc3\xa9s l'altra mena - DOBLEGA la nota antiga fins a la nova - i mentre aquell estigui actiu aquest queda desactivat, perqu\xc3\xa8 tallar la nota primer \xc3\xa9s justament el que impedeix que llisqui."));
     rhythmPanel.qPulseT.setButtonText (tr ("Quantize to pulse", "Quantitza al pols"));
     rhythmPanel.qPulseT.setTooltip (tr (
         "A new note waits for the moment the RUNNING pulse pattern resets - when all its polyrhythm subdivisions coincide on the 1 - and joins exactly there. With no pattern running it starts normally.",
@@ -2821,6 +2844,14 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblRes.setText       (tr ("Res", "Res"), dontSendNotification);
     lblEnvAmt.setText    (tr ("Env", "Env"), dontSendNotification);
     lblPitchAmt.setText  (tr ("St", "St"), dontSendNotification);
+    lblGlide.setText     (tr ("Glide", "Glide"), dontSendNotification);
+    monoGlideT.setButtonText (tr ("Monophonic glide", "Glide monof\xc3\xb2nic"));
+    monoGlideT.setTooltip (tr (
+        "MONOPHONIC GLIDE. ON, the synth plays ONE note at a time - it cannot make chords - and a new key does not start a new voice: it TAKES OVER the sounding one and BENDS its pitch there over the Glide time, through the tuning's own frequencies (per-note bend included), never through 12-TET semitones.\nLAST-NOTE priority: the newest key always wins, so pressing a second note always moves the pitch.\nLegato does NOT retrigger: while a key is held, the takeover keeps the envelopes, the modulators and a running Shepard exactly where they are - the glide IS the articulation. Lift every key and the next note starts fresh, at its own pitch, with everything retriggered.\nRelease the key you are on while another is still down and the pitch glides BACK to the most recently pressed key still held.\nIn playground MIX mode every corner engine is mono too, on the same note stream - \"Mix Voices per Corner\" reads 1 and waits while this is on.",
+        "GLIDE MONOF\xc3\x92NIC. Actiu, el sinte toca UNA nota alhora - no pot fer acords - i una tecla nova no engega cap veu nova: PREN la que sona i li DOBLEGA l'al\xc3\xa7""ada fins all\xc3\xa0 en el temps de Glide, per les freq\xc3\xbc\xc3\xa8ncies de la mateixa afinaci\xc3\xb3 (amb el bend per nota inclos), mai per semitons de 12-TET.\nPrioritat a l'\xc3\x9aLTIMA nota: la tecla m\xc3\xa9s nova sempre guanya, o sigui que prement-ne una segona l'al\xc3\xa7""ada sempre es mou.\nEl legato NO redispara: mentre mantens una tecla, la presa de rel\xc3\xa8u deixa les envolupants, els moduladors i un Shepard en marxa exactament on eren - el glide \xc3\x89S l'articulaci\xc3\xb3. Deixa anar totes les tecles i la nota seg\xc3\xbc" "ent comen\xc3\xa7""a de nou, a la seva al\xc3\xa7""ada i amb tot redisparat.\nDeixa anar la tecla on ets mentre en mantens una altra i l'al\xc3\xa7""ada torna lliscant a la darrera tecla premuda que encara mantens.\nEn mode MIX del playground cada motor de cantonada tamb\xc3\xa9 \xc3\xa9s mono, sobre el mateix flux de notes - \"Veus per cantonada\" marca 1 i espera mentre aix\xc3\xb2 estigui actiu."));
+    glideFader.setTooltip (tr (
+        "How long the pitch takes to travel from the previous note to the new one, in milliseconds. It is a TIME, not a rate: two octaves take exactly as long as a semitone. The fader is logarithmic (1 ms to 5 s, half its travel below 100 ms). Only does anything while Monophonic glide is on.",
+        "Quant triga l'al\xc3\xa7""ada a anar de la nota anterior a la nova, en millisegons. \xc3\x89s un TEMPS, no una velocitat: dues octaves triguen exactament el mateix que un semit\xc3\xb2. El fader \xc3\xa9s logar\xc3\xadtmic (1 ms a 5 s, mitja cursa per sota de 100 ms). Nom\xc3\xa9s fa res amb el Glide monof\xc3\xb2nic actiu."));
     lblMorphTime.setText (tr ("Time", "Temps"), dontSendNotification);
     // No text: the painted MORPH sub-label above it is the name, and the toggle saying
     // "Morph" under a heading that says MORPH read as two different controls.
@@ -3163,6 +3194,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     adaptRtBtn.setTooltip (tr (
         "REALTIME: the spectrum follows WHAT YOU PLAY - it re-adapts to the chord under your fingers, at the pitch it is really sounding, every time that chord changes. A SINGLE note works: with nothing else sounding the target is the partials' beating against each other, so a lead or a bass line still gets its own smoothest (or roughest) timbre, and a different one in each register. Hold nothing and it does nothing; hold the same chord and it stays put instead of re-adapting to it over and over. Throttled to about four adaptations a second and coalesced. (The loaded tuning is a target for the Adapt button, not for a follower: it would just keep writing the same scale into the spectrum.) Switching it off leaves ONE Ctrl+Z back to the spectrum you had before.",
         "TEMPS REAL: l'espectre segueix el QUE TOQUES - es torna a adaptar a l'acord que tens sota els dits, a l'al\xc3\xa7""ada real, cada cop que aquell acord canvia. UNA sola nota ja funciona: si no sona res m\xc3\xa9s, l'objectiu \xc3\xa9s el batec dels parcials entre ells, de manera que una melodia o un baix tamb\xc3\xa9 tenen el seu timbre m\xc3\xa9s llis (o m\xc3\xa9s aspre), i un de diferent a cada registre. Si no mantens res, no fa res; si mantens el mateix acord, es queda quiet en comptes de tornar-s'hi a adaptar un cop i un altre. Limitat a ~quatre adaptacions per segon i fusionat. (L'afinaci\xc3\xb3 carregada \xc3\xa9s un objectiu per al bot\xc3\xb3 Adapta, no per a un seguidor: nom\xc3\xa9s escriuria la mateixa escala a l'espectre.) En desactivar-ho queda UN Ctrl+Z per recuperar l'espectre anterior."));
+    lookaheadBtn.setTooltip (tr (
+        "LOOKAHEAD: the spectrum is ready BEFORE the note sounds, for written MIDI played back by the DAW.\nA plugin cannot see future MIDI - so this makes the plugin ARRIVE LATE on purpose. It reports 250 ms of latency, the host's delay compensation shifts everything back into place, and the incoming MIDI is buffered here by exactly that much. The adaptive search runs on each note the moment it ARRIVES, and the adapted spectrum is live by the time that note actually sounds: on playback the partials change sample-aligned with the note instead of ~50-200 ms into it.\nWHERE 250 ms COMES FROM (all measured): up to 100 ms of the follower's own throttle before the search may start, one 60 Hz poll to notice the notes, the search itself (11 ms at 8 partials, 33 at 12, ~104-137 at 16), one more poll to apply it and the 50 ms de-click fade.\nSO IT DOES NOT FIT EVERY SETTING, and the button SAYS SO instead of pretending: beside the budget it prints how long the LAST chord change really took on your machine, and marks it LATE when it did not fit. If you see LATE, use fewer partials.\nTHE TRADE, honestly: PLAYING LIVE FEELS THOSE 250 ms. This is for composing, not for performing. The plugin's rhythm MIDI OUT is delayed by the same amount (it is generated from the same shifted stream, which is what keeps the pulses locked to the audio) and hosts differ in whether they compensate a plugin's MIDI output.\nIt only costs latency while a REALTIME spectrum follower is actually running; otherwise it waits and reports zero. A loop or a locator jump flushes what is in flight, so no stale note is replayed.",
+        "ANTICIPACI\xc3\x93: l'espectre est\xc3\xa0 llest ABANS que soni la nota, per a MIDI escrit i reprodu\xc3\xaft pel DAW.\nUn plugin no pot veure el MIDI futur - o sigui que aix\xc3\xb2 fa que el plugin ARRIBI TARD expressament. Declara 250 ms de lat\xc3\xa8ncia, la compensaci\xc3\xb3 de retard de l'amfitri\xc3\xb3 ho torna tot al seu lloc, i el MIDI d'entrada es reserva aqu\xc3\xad exactament aquest temps. La cerca adaptativa s'executa sobre cada nota quan ARRIBA, i l'espectre adaptat ja \xc3\xa9s viu quan la nota sona de debo: en reproducci\xc3\xb3 els parcials canvien clavats a la mostra amb la nota, en comptes de ~50-200 ms m\xc3\xa9s tard.\nD'ON SURTEN ELS 250 ms (tot mesurat): fins a 100 ms del limitador del seguidor abans que la cerca pugui comen\xc3\xa7""ar, un sondeig de 60 Hz per adonar-se'n, la cerca mateixa (11 ms amb 8 parcials, 33 amb 12, ~104-137 amb 16), un altre sondeig per aplicar-la i els 50 ms d'esvaniment anti-clic.\nAIX\xc3\x92 VOL DIR QUE NO ENCAIXA A TOTES LES CONFIGURACIONS, i el bot\xc3\xb3 HO DIU en comptes de dissimular: al costat del pressupost escriu quant ha trigat de debo el darrer canvi d'acord a la teva m\xc3\xa0quina, i el marca TARD quan no hi ha cabut. Si veus TARD, fes servir menys parcials.\nEL PREU, sense enganys: TOCAR EN VIU NOTA aquests 250 ms. Aix\xc3\xb2 \xc3\xa9s per compondre, no per tocar. La sortida MIDI de ritme del plugin es retarda igual (es genera del mateix flux despla\xc3\xa7""at, que \xc3\xa9s el que mant\xc3\xa9 els polsos clavats a l'\xc3\xa0udio) i els amfitrions difereixen en si compensen la sortida MIDI d'un plugin.\nNom\xc3\xa9s costa lat\xc3\xa8ncia mentre un seguidor d'espectre en TEMPS REAL est\xc3\xa0 realment en marxa; si no, espera i declara zero. Un bucle o un salt de localitzador buida el que hi ha en vol, o sigui que no es repeteix cap nota vella."));
     adaptList.tip = tr ("The adapted spectrum: every partial's interval from the played note, and the amplitude the search gave it. All of them are here - the search moves partials, it never drops them.",
                         "L'espectre adaptat: l'interval de cada parcial respecte a la nota tocada i l'amplitud que li ha donat la cerca. Hi s\xc3\xb3n tots - la cerca mou parcials, no en descarta cap.");
     adaptList.emptyText = tr ("Press Adapt to move the partials to where these notes beat least (or most).",
@@ -3647,6 +3681,7 @@ FractalAdditiveAudioProcessorEditor::realtimeSettingsFromPanel() const
     // adaptRegistersFor), which is also where the octave shift, the reference A and a .tun
     // table's anchor live, so nothing here has to know about any of them.
     s.adapt.regSteps = registerStepsEffective();
+    s.lookahead      = lookaheadOn;
     return s;
 }
 
@@ -3948,6 +3983,36 @@ void FractalAdditiveAudioProcessorEditor::paintRealtimeButtons()
     adaptRtBtn.setColour (juce::TextButton::buttonColourId,
                           (live == RtLink::SpectrumFromTuning || live == RtLink::SpectrumFromChord)
                               ? lit : dim);
+    // LOOKAHEAD has THREE states and the colour says which: off; armed but idle (the
+    // follower is not running, so no latency is being paid and none would help); and
+    // actually delaying. A single lit/dim pair would have let "armed" look like "working"
+    // while the plugin reported zero latency.
+    const bool armed  = lookaheadOn;
+    const bool active = processorRef.isLookaheadActive();
+    lookaheadBtn.setColour (juce::TextButton::buttonColourId,
+                            active ? lit : (armed ? lit.withAlpha (0.45f) : dim));
+    // The button STATES ITS PRICE while it is paying it: a latency you cannot see the
+    // size of is the thing people distrust about lookahead in any plugin.
+    //
+    // ...and, once there is one, THE MEASURED LANDING beside it: how long the last chord
+    // change really took to reach the spectrum, on this machine, at these settings. The
+    // budget is a fixed 250 ms and heavy adapt settings (16 or 24 partials against a wide
+    // chord) can outgrow it - so the alternative to printing this number was a lookahead
+    // that quietly stopped being early and never said so. "LATE" is the whole point of
+    // the read-out; it is not decoration.
+    juce::String txt;
+    if (active)
+    {
+        const double budMs = (double) processorRef.getLookaheadSamples() * 1000.0
+                           / juce::jmax (1.0, processorRef.getSampleRate());
+        txt = tr ("LOOKAHEAD ", "ANTICIPACI\xc3\x93 ") + juce::String ((int) std::lround (budMs)) + " ms";
+        if (const double land = processorRef.getLastRealtimeLandingMs(); land >= 0.0)
+            txt << tr (" | last ", " | darrer ") << juce::String ((int) std::lround (land)) << " ms"
+                << (land <= budMs ? juce::String() : tr (" LATE", " TARD"));
+    }
+    else if (armed) txt = tr ("LOOKAHEAD (idle)", "ANTICIPACI\xc3\x93 (en espera)");
+    else            txt = tr ("LOOKAHEAD", "ANTICIPACI\xc3\x93");
+    lookaheadBtn.setButtonText (txt);
 }
 
 // The hand-pressed Adapt: one run against the selected target, then apply it as ONE undo
@@ -5905,7 +5970,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                                       &chordPerLbl, &chordPeriodEdit, &chordMinEdit, &chordMinLbl };
         juce::Component* adaptC[] = { &adaptTargetBox, &adaptPartialsBox, &adaptPartialsLbl,
                                       &adaptGoalBox, &adaptAmpsToggle, &adaptGoBtn, &adaptRtBtn,
-                                      &adaptInfoLbl, &adaptView,
+                                      &lookaheadBtn, &adaptInfoLbl, &adaptView,
                                       &adaptRegLbl, &adaptRegStepsEdit, &adaptRegSpanLbl };
         for (auto* c : sethC)  c->setVisible (false);
         for (auto* c : segC)   c->setVisible (seg);
@@ -6038,6 +6103,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 auto r4 = si.removeFromTop (24);
                 adaptGoBtn.setBounds (r4.removeFromLeft (r4.getWidth() * 3 / 5).reduced (1, 0));
                 adaptRtBtn.setBounds (r4.reduced (1, 0));
+                // LOOKAHEAD on its own row UNDER the follower it belongs to: it is the
+                // follower's latency trade and means nothing without it, so it must not
+                // sit where it could be mistaken for a third action.
+                si.removeFromTop (2);
+                lookaheadBtn.setBounds (si.removeFromTop (22).reduced (1, 0));
                 si.removeFromTop (1);
                 // THE one read-out (see adaptReadoutText). 28 px is two lines at 10.5 pt,
                 // and every sentence it can print is written to fit two - RhythmVerify
@@ -6429,8 +6499,20 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
             juce::Slider* setV[] = { &ampAdsr[0], &ampAdsr[1], &ampAdsr[2], &ampAdsr[3] };
             juce::Label*  labV[] = { &ampAdsrLbl[0], &ampAdsrLbl[1], &ampAdsrLbl[2], &ampAdsrLbl[3] };
-            juce::Slider* setP[] = { &pEnvAmtFader, &pitchAdsr[0], &pitchAdsr[1], &pitchAdsr[2], &pitchAdsr[3] };
-            juce::Label*  labP[] = { &lblPitchAmt, &pitchAdsrLbl[0], &pitchAdsrLbl[1], &pitchAdsrLbl[2], &pitchAdsrLbl[3] };
+            // MONOPHONIC GLIDE: the toggle takes a strip off the BOTTOM of the tab's body
+            // before anything else is laid out (the three tabs each copy `in`, so trimming
+            // it here trims it for all of them - which is why it is done only on PITCH),
+            // and the glide-time fader joins the pitch amount as a second extra column.
+            const bool pitchTab = envTab == 1;
+            monoGlideT.setVisible (pitchTab);
+            if (pitchTab)
+            {
+                auto strip = in.removeFromBottom (18);
+                monoGlideT.setBounds (strip);
+                in.removeFromBottom (2);
+            }
+            juce::Slider* setP[] = { &pEnvAmtFader, &glideFader, &pitchAdsr[0], &pitchAdsr[1], &pitchAdsr[2], &pitchAdsr[3] };
+            juce::Label*  labP[] = { &lblPitchAmt, &lblGlide, &pitchAdsrLbl[0], &pitchAdsrLbl[1], &pitchAdsrLbl[2], &pitchAdsrLbl[3] };
             juce::Slider* setF[] = { &cutoffFader, &resFader, &fEnvAmtFader, &filtAdsr[0], &filtAdsr[1], &filtAdsr[2], &filtAdsr[3] };
             juce::Label*  labF[] = { &lblCutoff, &lblRes, &lblEnvAmt, &filtAdsrLbl[0], &filtAdsrLbl[1], &filtAdsrLbl[2], &filtAdsrLbl[3] };
             // The four A/D/S/R faders of each voice envelope are replaced by the same
@@ -6438,8 +6520,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // cutoff, resonance, filter-env amount) keep their faders beside it.
             juce::Slider** sets[] = { setV, setP, setF };
             juce::Label**  labs[] = { labV, labP, labF };
-            const int counts[]    = { 4, 5, 7 };
-            const int extras[]    = { 0, 1, 3 };   // leading faders that are NOT the ADSR
+            const int counts[]    = { 4, 6, 7 };
+            const int extras[]    = { 0, 2, 3 };   // leading faders that are NOT the ADSR
             for (int t = 0; t < 3; ++t)
             {
                 const bool on = t == envTab;
@@ -7132,6 +7214,20 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // The two REALTIME buttons: their lit state, and the refusal notice when a link
     // switched itself off rather than close a feedback loop.
     paintRealtimeButtons();
+
+    // MONOPHONIC GLIDE stands the note gate's own "Mono" down (see the processor's
+    // noteGate.process call for why: the gate cuts the sounding note BEFORE the new one,
+    // which turned every takeover back into a restrike and killed the glide silently).
+    // The toggle greys out so the panel is not showing a lit switch that is not driving
+    // anything; its tooltip carries the reason permanently.
+    {
+        const bool mg = processorRef.apvts.getRawParameterValue ("monoGlide")->load() > 0.5f;
+        if (rhythmPanel.monoT.isEnabled() == mg)            // only on a real change
+        {
+            rhythmPanel.monoT.setEnabled (! mg);
+            rhythmPanel.monoT.setAlpha (mg ? 0.45f : 1.0f);
+        }
+    }
 
     // Spectrum adaptation (mode 2): progress, the adapted partial list, and the honest
     // before/after read-out.

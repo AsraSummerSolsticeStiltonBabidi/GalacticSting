@@ -101,6 +101,16 @@ public:
         shepDivParam  = src.raw ("shepDiv");
         shepRiseParam = src.raw ("shepRise");
 
+        // MONOPHONIC GLIDE. These two are read from the LIVE state, NOT through `src`,
+        // and that is deliberate: mono is a rule about the NOTE STREAM, and there is
+        // exactly one note stream feeding the main engine and every playground MIX
+        // sub-engine at once. If a corner's stored preset were allowed to disagree,
+        // the same run of note-ons would be a legato takeover in one engine and a
+        // restrike in another - the mix would be silently non-mono for that corner,
+        // which is the one outcome this feature is not allowed to have.
+        monoGlideParam = state.getRawParameterValue ("monoGlide");
+        glideMsParam   = state.getRawParameterValue ("glideTime");
+
         filter.setType (juce::dsp::StateVariableTPTFilterType::lowpass);
     }
 
@@ -142,6 +152,54 @@ public:
         // the envelope, phases and filter CONTINUOUS and just re-attack + slew the
         // amplitudes toward the new note: a click-free hand-off.
         const bool reuse = adsr.isActive() || fastKill;
+
+        //== MONOPHONIC GLIDE: is this note-on a LEGATO TAKEOVER? ==================
+        // Three things have to be true at once, and each one rules out a case that
+        // would otherwise glide when it must not:
+        //   - the mode is on (otherwise a plain voice steal from a full 32-voice pool
+        //     would start bending the pitch of unrelated notes);
+        //   - this note-on arrived as a STEAL of a voice that is still sounding
+        //     (`reuse`) - in mono the pool is one voice, so every steal is a takeover;
+        //   - that voice was still SUSTAINING, not in its release tail (`releasing`,
+        //     read here before the fresh note clears it). A note pressed after every
+        //     key came up is a new phrase, not a legato move: it starts AT its pitch
+        //     and retriggers everything, which is what every mono synth does and what
+        //     a player means by lifting their hand.
+        //
+        // THE RETRIGGER RULE, stated once: a legato takeover retriggers NOTHING - not
+        // the three voice envelopes, not this voice's modulators. Legato IS the glide;
+        // re-attacking the amplitude in the middle of a portamento is a second
+        // articulation nobody played, and the pitch envelope restarting mid-bend would
+        // fight the bend itself. Velocity still follows the new note (it glides over
+        // the usual 7 ms), and a note struck from silence retriggers normally.
+        // (`fastKill` excluded on top of `releasing`: a voice being hard-silenced -
+        // turnOffAllVoices from a preset load or a self-play routing change - is not a
+        // note anybody is holding, and gliding out of its corpse would be a swoop from
+        // whatever the project used to be playing.)
+        const bool monoGlide = monoGlideParam != nullptr && monoGlideParam->load() > 0.5f;
+        const bool legato    = monoGlide && reuse && ! releasing && ! fastKill && pitchLogValid;
+        {
+            // The glide is carried as a log2 OFFSET on this voice's base pitch, which
+            // is why it survives everything riding on top: a per-note bend arriving
+            // mid-glide, a tuning change, the pitch envelope - each still applies
+            // exactly as it always did, and the portamento is the distance between the
+            // two TUNED frequencies, never a walk through 12-ET semitones.
+            double off = 0.0;
+            int    len = 0;
+            if (legato)
+            {
+                const double tgt = std::log2 (std::max (1.0e-9,
+                                       tuning.frequencyForNote ((int) currentlyPlayingNote.initialNote)))
+                                 + (double) currentlyPlayingNote.totalPitchbendInSemitones / 12.0;
+                off = lastPitchLog - tgt;      // where we ARE, relative to where we are going
+                const double sr0 = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
+                const double ms  = glideMsParam != nullptr ? (double) glideMsParam->load() : 0.0;
+                len = (int) std::lround (std::max (0.0, ms) * 0.001 * sr0);
+            }
+            if (len > 0 && std::abs (off) > 1.0e-9) { glideOff = off; glideStep = -off / (double) len; glideLeft = len; }
+            else                                    { glideOff = 0.0; glideStep = 0.0;                 glideLeft = 0;   }
+            glideBaked = glideOff;
+        }
 
         // SHEPARD MODE IS LATCHED PER NOTE. It is a PLAYED mode: the note you press
         // either is a Shepard or is not, and it stays what it was struck as for its
@@ -230,8 +288,10 @@ public:
         ampGlideCur = 0.007; tmplGlideSamps = 0;
 
         // Retrigger this voice's modulators. A stolen voice retriggers too: it is a new
-        // note, and its envelopes must start from the beginning like any other.
-        modNewNote = true;
+        // note, and its envelopes must start from the beginning like any other - EXCEPT
+        // a mono legato takeover, which is one continuous note being bent (see the
+        // retrigger rule above). modHeld stays true either way: the key is down.
+        if (! legato) modNewNote = true;
         modHeld    = true;
 
         const double sr = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
@@ -244,17 +304,20 @@ public:
         // avoid. Only the AMP envelope does this: handing `reuse` to the filter
         // envelope would let a stolen voice inherit filterEnvValue ~1 (its sustain
         // defaults to 1.0) and skip its sweep entirely.
-        adsr.noteOn (reuse);
+        // A legato takeover does not re-attack: the envelope simply carries on where it
+        // was (sustain, or wherever the attack/decay had got to), which is the whole
+        // point of playing legato.
+        if (! legato) adsr.noteOn (reuse);
 
         updateFilterAdsrParameters();
         filterAdsr.setSampleRate (sr);
         if (! reuse) { filterAdsr.reset(); filter.reset(); filterEnvValue = 0.0f; }
-        filterAdsr.noteOn();
+        if (! legato) filterAdsr.noteOn();
 
         updatePitchAdsrParameters();
         pitchAdsr.setSampleRate (sr);
         if (! reuse) { pitchAdsr.reset(); pitchEnvValue = 0.0f; }
-        pitchAdsr.noteOn();
+        if (! legato) pitchAdsr.noteOn();
     }
 
     void noteStopped (bool allowTailOff) override
@@ -347,8 +410,16 @@ public:
         const double baseFreq = tuning.frequencyForNote ((int) currentlyPlayingNote.initialNote);
         const double pitchEnvSemis = (double) modded (ModEngine::PvPEnvAmt, pEnvAmtParam)
                                    * (double) pitchEnvValue;
-        const double f0 = baseFreq * std::pow (2.0,
-            ((double) currentlyPlayingNote.totalPitchbendInSemitones + pitchEnvSemis) / 12.0);
+        // ...times the MONOPHONIC GLIDE offset, which is a factor on the whole pitch and
+        // therefore carries the partials, the Shepard copies, the filter's key tracking
+        // and the rhythm-engine-free parts of this voice with it. NOT const any more: the
+        // glide advances INSIDE the render loop (see advanceGlide) so a portamento is a
+        // continuous bend rather than one step per audio buffer - at a 256-sample block a
+        // 100 ms octave glide updated per block would be a 19-step chromatic staircase.
+        double f0 = baseFreq * std::pow (2.0,
+            ((double) currentlyPlayingNote.totalPitchbendInSemitones + pitchEnvSemis) / 12.0)
+                  * std::exp2 (glideOff);
+        glideBaked = glideOff;   // the offset the increments below are about to be built at
 
         // THE SHEPARD LAYOUT, planned BEFORE anything else touches the partials: the
         // base partial COUNT depends on the lowest copy's root (a copy below the played
@@ -806,7 +877,14 @@ public:
 
         while (--numSamples >= 0)
         {
-            if (--sinceCutoff <= 0) { refreshCutoff(); sinceCutoff = kCutoffChunk; }
+            if (--sinceCutoff <= 0)
+            {
+                // The portamento moves first, so the cutoff's key tracking reads the
+                // pitch this chunk is actually about to sound at.
+                if (glideLeft > 0) advanceGlide (kCutoffChunk, sl, span, f0);
+                refreshCutoff();
+                sinceCutoff = kCutoffChunk;
+            }
 
             // Window values for this sample, and the two sums the normalisation needs.
             // Both scale EXACTLY: every oscillator of copy c carries the same factor
@@ -943,6 +1021,19 @@ public:
         // gesture during the note, so it glides rather than snapping.
         pressureSnap = false;
 
+        // WHERE THIS VOICE IS SOUNDING, for the next mono takeover to glide FROM. It is
+        // the tuned pitch plus its per-note bend plus whatever is left of the current
+        // glide - i.e. the real frequency - and deliberately NOT the pitch envelope: the
+        // envelope is per-note articulation that rides on top, and folding it in would
+        // make a takeover start from wherever the previous note's envelope happened to
+        // be and then have the new note's envelope apply on top of that a second time.
+        // Written at the END of the block, which is exactly the state a note-on landing
+        // on the next block (or on the next split of this one) takes over from.
+        lastPitchLog = std::log2 (std::max (1.0e-9, baseFreq))
+                     + (double) currentlyPlayingNote.totalPitchbendInSemitones / 12.0
+                     + glideOff;
+        pitchLogValid = true;
+
         // Morph finished this block: adopt the coherent destination phases (the
         // crossfade already reached them) so the sustained note carries on exactly
         // like a freshly-played new spectrum, not a phase-drifted version.
@@ -1011,6 +1102,14 @@ public:
     }
     // The rise interval this voice is ACTUALLY using (the glided value), as a ratio:
     // 2.0 for the octave default, the tuning's period when the user chose it.
+    // The pitch this voice ended its last block on, in Hz (tuned + bend + glide), and
+    // whether a portamento is still running. Verifiers only - the audible check is a
+    // zero-crossing f0 probe on the rendered stream, and this exists so a failure can
+    // say WHICH of the two disagrees.
+    double soundingHzForTests() const noexcept
+    { return pitchLogValid ? std::exp2 (lastPitchLog) : 0.0; }
+    bool   glidingForTests() const noexcept { return glideLeft > 0; }
+
     double shepRiseRatioForTests() const noexcept { return std::exp2 (smShepP); }
     bool   shepActiveForTests()    const noexcept { return shepActive; }
 
@@ -1106,6 +1205,54 @@ private:
         if (aligned) { arr[(size_t) j] = 0.25; return; } // sin(2*pi*0.25)=1: every partial at its peak
         const double h = std::sin ((double) j * 12.9898) * 43758.5453;
         arr[(size_t) j] = h - std::floor (h);
+    }
+
+    // Declared here so advanceGlide below can take it by reference; defined with the
+    // rest of the Shepard bookkeeping a few dozen lines down.
+    struct ShepLayout;
+
+    //==========================================================================
+    // MONOPHONIC GLIDE: advance the portamento by `ns` samples, INSIDE the render loop.
+    //
+    // The glide is linear in log2 frequency, so it spends the same number of cents per
+    // millisecond wherever it is - "a fixed TIME between the two notes", which is what
+    // was asked for, rather than a fixed rate that would take four times as long for
+    // two octaves as for one.
+    //
+    // The oscillator increments were built once at the top of the block from the pitch
+    // at glideBaked; rescaling them by the ratio between then and now is exact and
+    // costs one exp2 plus one multiply per oscillator per chunk (~3% of the inner loop
+    // at kCutoffChunk = 32, and only while a glide is actually running). Rebuilding
+    // them from curRatio instead would repeat the per-copy Nyquist walk eight times a
+    // block for no gain.
+    //
+    // The 0.4999 ceiling is the SAME clamp fillShepardCopies applies for a partial
+    // pushed past Nyquist by bend: a partial that crosses Nyquist part-way through a
+    // rising glide is pinned there for at most the rest of the block, and the next
+    // block's own count (rebuilt from the new pitch) drops it properly with the taper.
+    // Nothing accumulates, because inc[] is refilled from curRatio every block.
+    void advanceGlide (int ns, const ShepLayout& sl, int span, double& f0) noexcept
+    {
+        const int k = std::min (ns, glideLeft);
+        glideLeft -= k;
+        // Landing EXACTLY on zero rather than on the accumulated sum: a residue of a
+        // few thousandths of a cent would sit on the note for its whole life and would
+        // be inherited by the next takeover.
+        glideOff = (glideLeft == 0) ? 0.0 : glideOff + glideStep * (double) k;
+        const double ratio = std::exp2 (glideOff - glideBaked);
+        glideBaked = glideOff;
+        f0 *= ratio;
+
+        const int e = std::min (span, sl.oscCap());
+        for (int c = 0; c < sl.numCopies; ++c)
+        {
+            const int off = sl.off[(size_t) c];
+            for (int i = 0; i < e; ++i)
+                inc[(size_t) (off + i)] = std::min (inc[(size_t) (off + i)] * ratio, 0.4999);
+            if (morphActive)
+                for (int i = 0; i < e; ++i)
+                    alignInc[(size_t) (off + i)] = std::min (alignInc[(size_t) (off + i)] * ratio, 0.4999);
+        }
     }
 
     //==========================================================================
@@ -1466,6 +1613,22 @@ private:
     float fastKillGain = 1.0f;
     float fastKillDelta = 0.0f;
     bool  releasing = false; // in the note-off release tail: freeze ADSR params (see updateAdsrParameters)
+
+    //== MONOPHONIC GLIDE state (see noteStarted and advanceGlide) =============
+    // Both parameters come from the LIVE state, never from a corner's ParamBank -
+    // see the constructor for why the mono rule cannot be per-preset.
+    std::atomic<float>* monoGlideParam = nullptr;
+    std::atomic<float>* glideMsParam   = nullptr;
+    double glideOff   = 0.0;   // log2 offset still riding on this voice's pitch (octaves)
+    double glideStep  = 0.0;   // per-sample change of glideOff (linear in log2 = constant cents/s)
+    int    glideLeft  = 0;     // samples of portamento left to travel
+    double glideBaked = 0.0;   // the offset the oscillator increments were last built at
+    // log2 of the frequency this voice SOUNDED at, at the end of its last block: tuned
+    // pitch + per-note bend + the live glide, pitch envelope deliberately excluded.
+    // It is what the next takeover glides FROM, and it is only valid once a block has
+    // actually rendered (a voice that has never sounded has no pitch to leave from).
+    double lastPitchLog  = 0.0;
+    bool   pitchLogValid = false;
 
     //== SHEPARD MODE state (see ShepardEngine.h and planShepard) ==============
     std::atomic<float>* shepOnParam   = nullptr, * shepModeParam = nullptr;
