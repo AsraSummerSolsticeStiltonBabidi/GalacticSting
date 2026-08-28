@@ -74,11 +74,26 @@ public:
     juce::Point<int> getHoverAnchorScreen() const
     {
         if (hoverCell < 0) return {};
-        const int aw = arrowW();
-        const float w = (float) keysWidth() / (float) juce::jmax (1, numCells());
-        return localPointToGlobal (juce::Point<int> (aw + (int) (((float) hoverCell + 0.5f) * w), 0));
+        // Off cellRect, the one function that knows where the keys start (see
+        // keysOriginX): with the keys centred in a wider window, an anchor built from
+        // arrowW alone parks the hover callout over a different key than the one hovered.
+        return localPointToGlobal (juce::Point<int> ((int) cellRect (hoverCell).getCentreX(), 0));
     }
     bool isHoverActive() const noexcept { return hoverArmed && hoverCell >= 0; }
+
+    // Test hook: the span the keys REALLY occupy, in this component's own coordinates,
+    // built from cellRect - the very function paint() fills from. Not a reconstruction:
+    // a probe with its own copy of the rule would go on passing after paint() changed,
+    // which is the whole reason "the keyboard is centred" was never checkable before.
+    // Empty when the tuning has no playable key in the window at all.
+    juce::Rectangle<float> drawnKeysSpan() const
+    {
+        const int n = liveCells();
+        if (n <= 0) return {};
+        return cellRect (0).getUnion (cellRect (n - 1));
+    }
+    int drawnKeyCount() const { return liveCells(); }
+    int windowKeyCount() const { return numCells(); }
 
     // Optional: a short just-intonation label per degree (e.g. "3/2"), drawn
     // under the degree number - the interval each Sethares minimum lands on.
@@ -462,7 +477,7 @@ public:
             // EYE whose pupil takes the key's colour (a "you are looking here" marker
             // that covers nothing - the strip is empty space). No hover: period Hz.
             const bool infoActive  = hoveredNote >= 0;
-            auto sc = juce::Rectangle<float> (aw + i * w, 0.0f, w, (float) stripH).reduced (1.5f, 3.0f);
+            auto sc = juce::Rectangle<float> (keysOriginX() + (float) i * w, 0.0f, w, (float) stripH).reduced (1.5f, 3.0f);
             if (hoveredNote >= 0 && note == hoveredNote)
             {
                 auto eyeArea = sc.withTrimmedBottom (8.0f); // clear of the stretched key top
@@ -618,7 +633,10 @@ public:
                 const int n = noteAt (e.x);
                 if (n >= 0)
                 {
-                    const double pos = (double) (e.x - aw) * (double) numCells() / (double) keysWidth();
+                    // Where inside the key the click landed - measured from where the
+                    // keys really start (keysOriginX), not from the arrow zone.
+                    const double cw  = (double) keysWidth() / (double) juce::jmax (1, numCells());
+                    const double pos = ((double) e.x - (double) keysOriginX()) / juce::jmax (1.0, cw);
                     onAddKey (n, juce::jlimit (0.0, 0.999, pos - std::floor (pos)));
                 }
             }
@@ -671,13 +689,39 @@ private:
         const int usable = juce::jmax (1, getWidth() - 2 * kArrowW);
         return juce::jmax (1, usable / kCellW);
     }
+    // How many of those cells actually CARRY A KEY.
+    //
+    // "el teclado ahora mismo no aparece centrado en el sinte, haz que asi sea"
+    //
+    // paint()'s loop stops at the tuning's last playable note (and at 127), so under a
+    // tuning whose period is wide - a Bohlen-Pierce, a stretched table, anything where
+    // 40 Hz .. 4186 Hz spans only a handful of keys - the window has 35 cells and the
+    // scale has 8. Those 8 were drawn from the left edge and the rest of the keyboard
+    // was empty page: the keyboard sat in the left third of a full-width component,
+    // which is exactly "not centred". Stated ONCE, here, because the drawn keys, the
+    // hover anchor and the note-under-the-mouse all have to agree about where key 0
+    // starts - an offset applied to the painter alone would move the keys away from
+    // the notes they play.
+    int liveCells() const
+    {
+        const int last = juce::jmin (128, rangeLo + rangeCount); // one past the last playable note
+        return juce::jlimit (0, numCells(), last - baseKey);
+    }
+    // The x the FIRST key starts at: the arrow zone, plus half of whatever the live keys
+    // left over. When they fill the window (the ordinary case) this is arrowW() exactly.
+    float keysOriginX() const
+    {
+        const int cells = juce::jmax (1, numCells());
+        const float w = (float) keysWidth() / (float) cells;
+        return (float) arrowW() + (float) (cells - liveCells()) * w * 0.5f;
+    }
     // The resting key cell for view index `i`, exactly as paint() builds it (the hover
     // stretch is left out on purpose: it is a transient, and the probe measures the layout
     // the keyboard sits in). Shared so paint() and periodTagProbe() cannot disagree.
     juce::Rectangle<float> cellRect (int i) const
     {
         const float w = (float) keysWidth() / (float) juce::jmax (1, numCells());
-        return juce::Rectangle<float> ((float) arrowW() + (float) i * w, (float) stripH,
+        return juce::Rectangle<float> (keysOriginX() + (float) i * w, (float) stripH,
                                        w, (float) getHeight() - (float) stripH).reduced (0.6f);
     }
     // The band the DEGREE NUMBER is drawn in, and the font height it gets. `cell` is
@@ -710,7 +754,13 @@ private:
         const int cells = numCells();
         const int aw = arrowW();
         if (cells <= 0 || x < aw || x >= getWidth() - aw) return -1;
-        const int i = juce::jlimit (0, cells - 1, (x - aw) * cells / keysWidth());
+        // Off keysOriginX, not off the arrow zone: when the live keys are centred in a
+        // wider window (see liveCells) the two differ, and a hand-rolled x -> index that
+        // ignored the offset would play the key several cells to the left of the one
+        // under the pointer.
+        const float w = (float) keysWidth() / (float) cells;
+        const int i = (int) std::floor (((float) x - keysOriginX()) / juce::jmax (1.0f, w));
+        if (i < 0 || i >= liveCells()) return -1;   // the blank margin plays nothing
         const int note = baseKey + i;
         // Past the tuning's range the cells are blank - they must not play either.
         return (note <= 127 && note < rangeLo + rangeCount) ? note : -1;

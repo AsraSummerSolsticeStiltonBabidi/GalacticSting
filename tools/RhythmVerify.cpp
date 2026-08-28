@@ -3561,6 +3561,75 @@ int main()
             }
         }
 
+        //== THE KEYBOARD IS CENTRED ============================================
+        // "el teclado ahora mismo no aparece centrado en el sinte, haz que asi sea"
+        //
+        // Two claims, and only the first was ever true by construction:
+        //   (1) the COMPONENT is centred in the editor - resized() takes it off the
+        //       bottom of an evenly inset area, so this holds at every width and the
+        //       check exists to keep a future panel change from quietly nudging it;
+        //   (2) the KEYS DRAWN ON IT are centred inside the component - which is a
+        //       different rectangle, and was NOT centred. paint()'s loop stops at the
+        //       tuning's last playable note, so a wide-period tuning (only a handful of
+        //       keys between 40 Hz and 4186 Hz) filled the left third of the strip and
+        //       left the rest blank page. Nothing in this build could see it: the
+        //       component's own bounds were, and still are, perfectly centred.
+        //
+        // Swept at several widths on purpose. One width proves nothing about a layout
+        // whose panels are percentages: the leftover the keys are centred in changes
+        // with every one of them.
+        if (ed != nullptr)
+        {
+            auto centring = [] (const FractalAdditiveAudioProcessorEditor::LayoutProbe& P,
+                                int edW, const char* what)
+            {
+                const int compOff = P.keyboardBox.getX() - (edW - P.keyboardBox.getRight());
+                const int keysOff = (P.keysDrawn.getX() - P.keyboardBox.getX())
+                                  - (P.keyboardBox.getRight() - P.keysDrawn.getRight());
+                std::printf ("  %-22s editor %d: component %d..%d (off centre by %d), "
+                             "keys %d..%d of %d cells for %d playable (off centre by %d)\n",
+                             what, edW, P.keyboardBox.getX(), P.keyboardBox.getRight(), compOff,
+                             P.keysDrawn.getX(), P.keysDrawn.getRight(),
+                             P.keysInWindow, P.keysPlayable, keysOff);
+                check (! P.keyboardBox.isEmpty() && ! P.keysDrawn.isEmpty(),
+                       "the keyboard and its keys are on screen");
+                check (std::abs (compOff) <= 1,
+                       "the keyboard component is centred in the editor");
+                // 2 px: the cells are floats and the span is rounded outwards at both ends.
+                check (std::abs (keysOff) <= 2,
+                       "and the keys drawn on it are centred inside it");
+            };
+
+            const int widths[] = { 1200, 1000, 1400, 1320 };
+            for (const int w : widths)
+            {
+                ed->setSize (w, 650);
+                centring (ed->layoutProbe(), w, "12-TET");
+            }
+
+            // ...and the case that was actually broken: a tuning whose period is three
+            // octaves, so 40 Hz .. 4186 Hz holds a handful of keys and the window has
+            // room for thirty-five. Before this, those keys started at the left edge.
+            {
+                juce::String err;
+                const bool wide = p.loadScalaText ("! wide.scl\nthree-octave period\n 1\n!\n 3600.0\n",
+                                                   "wide-period", err);
+                check (wide, "a three-octave-period scale loads (the off-centre case)");
+                ed->resized();
+                for (const int w : widths)
+                {
+                    ed->setSize (w, 650);
+                    const auto P = ed->layoutProbe();
+                    centring (P, w, "three-octave period");
+                    check (P.keysPlayable < P.keysInWindow,
+                           "precondition: this tuning really does leave the window part empty");
+                }
+                p.clearScala();        // back to 12-TET for everything after this
+                ed->resized();
+            }
+            ed->setSize (1200, 650);
+        }
+
         //== THE PRESET PLAYGROUND BUTTON =======================================
         // A TextButton does NOT condense the way a Label does - it CLIPS - and
         // "Obre el Laboratori de Presets" is eight characters longer than the English.

@@ -332,6 +332,19 @@ public:
         // invisible to every rect check in the build - which is how the prime column's
         // left wall shipped with a 23 px hole under it.
         std::vector<std::pair<juce::String, juce::Line<float>>> dividers;
+        // THE KEYBOARD, as two rectangles that are not the same claim.
+        //
+        // "el teclado ahora mismo no aparece centrado en el sinte, haz que asi sea"
+        //
+        // `keyboardBox` is the component's own bounds in the editor. `keysDrawn` is the
+        // span the KEYS really occupy inside it, taken from ScaleKeyboard::cellRect -
+        // the function paint() fills from. The two differ whenever the tuning has fewer
+        // playable keys than the window has cells (a wide period puts only a handful
+        // between 40 Hz and 4186 Hz), and that is the case that was off centre: the
+        // component filled the editor while its keys hugged the left edge. Checking the
+        // component alone would have called that centred.
+        juce::Rectangle<int> keyboardBox, keysDrawn;
+        int keysInWindow = 0, keysPlayable = 0;   // cells available vs cells with a key
     };
     LayoutProbe layoutProbe() const;
     // THE DIVIDER LINES INSIDE THE SPECTRUM PANEL, from the cell rects. paint() strokes

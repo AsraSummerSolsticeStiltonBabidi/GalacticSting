@@ -5873,6 +5873,12 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     // the real tooltip has been reworded.
     p.regStepsTip       = const_cast<juce::TextEditor&> (adaptRegStepsEdit).getTooltip();
     p.dividers          = spectrumDividers(); // the very lines paint() strokes
+    // The keyboard, and the keys really on it (see LayoutProbe::keyboardBox).
+    p.keyboardBox  = keyboard.getBounds();
+    p.keysDrawn    = keyboard.drawnKeysSpan().getSmallestIntegerContainer()
+                       + keyboard.getBounds().getPosition();
+    p.keysInWindow = keyboard.windowKeyCount();
+    p.keysPlayable = keyboard.drawnKeyCount();
     return p;
 }
 
