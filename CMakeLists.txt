@@ -87,6 +87,17 @@ target_link_libraries(FractalAdditive
 # AudioProcessor::getName() returns them directly - see PluginProcessor.h.)
 
 #-------------------------------------------------------------------------------
+# The search that CHOSE the palette (JUCE-free, like the palette itself). Committed
+# because the colours in GalacticPalette.h are a RESULT: without the derivation in the
+# tree they are eleven magic hexes nobody can re-derive or extend.
+#-------------------------------------------------------------------------------
+add_executable(PaletteSearch tools/PaletteSearch.cpp)
+target_include_directories(PaletteSearch PRIVATE source)
+set_target_properties(PaletteSearch PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON)
+
+#-------------------------------------------------------------------------------
 # Unit tests for the (JUCE-free) spectrum compiler.
 #-------------------------------------------------------------------------------
 add_executable(SpectrumTests

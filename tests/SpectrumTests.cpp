@@ -12,6 +12,7 @@
 #include "dsp/PresetMorph.h"
 #include "PartialAmpEdit.h"
 #include "IntervalTokens.h"
+#include "GalacticPalette.h"
 
 #include <algorithm>
 #include <chrono>
@@ -3152,6 +3153,100 @@ int main()
             const auto bottom = blendTemplates (tB, tA, 0.0);
             const auto out    = blendTemplates (top, bottom, 0.0);
             check (same (out, tA), "the hierarchical four-corner chain is still exact at a corner");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // THE COLOUR SYSTEM.
+    //
+    // "haz que el color de spectrum vs tuning sea una mezcla del color de spectrum y del
+    //  color de tuning. haz que todas las demas relaciones de colores incluidas la que
+    //  hay entre spectrum y tuning sean lo mas contrastadas y diferentes posibles."
+    //
+    // The palette is the answer to a maximin problem (tools/PaletteSearch.cpp), which
+    // means it is exactly the kind of thing that decays: every future colour added by
+    // hand lands somewhere, and "somewhere" is on average right next to something.
+    // That is not a hypothetical - it is the history of this palette, which shipped with
+    // the TUNING panel and the CUSTOM modulator tab 3.8 units apart and a panel at
+    // 6.2:1 against the page. These checks live here rather than in RhythmVerify
+    // because the palette is JUCE-free and so is this file: nothing has to build an
+    // editor to ask whether two colours are the same colour.
+    {
+        std::printf ("\nThe colour system:\n");
+        using namespace galactic;
+
+        // (b) EVERY PAIR, AS FAR APART AS POSSIBLE. 15 is what the search reached under
+        // the constraints; asserting it is what stops the next colour landing at 4.
+        {
+            const auto w = palette::worstPair();
+            std::printf ("  closest pair: %s vs %s at %.1f (was 3.8: Tuning vs Custom modulator)\n",
+                         w.a, w.b, w.distance);
+            check (w.distance >= 15.0,
+                   "no two identity colours are closer than 15 units of OKLab");
+        }
+
+        // ...and every one of them is legible on the page, and is a COLOUR - the two
+        // ways an "optimal" separation cheats: park it on white, or park it on grey.
+        {
+            const auto c = palette::worstContrast();
+            std::printf ("  least legible: %s at %.1f:1 against the page (was 6.2:1)\n",
+                         c.a, c.distance);
+            check (c.distance >= 7.0,
+                   "every identity colour is WCAG AAA legible against the page");
+            double leastChroma = 1.0e9; const char* greyest = "";
+            for (const auto& e : palette::identitySet())
+            {
+                const double ch = colour::chroma (colour::toOklab (e.rgb));
+                if (ch < leastChroma) { leastChroma = ch; greyest = e.name; }
+            }
+            std::printf ("  least chromatic: %s at %.3f\n", greyest, leastChroma);
+            check (leastChroma >= 0.10,
+                   "and none of them has drifted back towards the neutral steel");
+        }
+
+        // (a) SPECTRUM VS TUNING IS THE MIXTURE OF ITS PARENTS.
+        //
+        // Asserted as a property, not as a hex: recompute the mixture here and require
+        // the palette to agree, then require it to actually LIE BETWEEN them. The second
+        // half is the one that bites, because rule (b) is pushing the parents apart and
+        // a mixture that has been quietly replaced by a hand-picked third colour would
+        // still "agree" with nothing at all if only the first half were checked.
+        {
+            const auto blend = palette::specScale();
+            check (blend == colour::mixOklch (palette::kHarmonic, palette::kTuning, 0.5),
+                   "Spectrum vs Tuning IS the mixture of Spectrum and Tuning - not a third hex");
+
+            const double toS = colour::deltaE (blend, palette::kHarmonic);
+            const double toT = colour::deltaE (blend, palette::kTuning);
+            const double parents = colour::deltaE (palette::kHarmonic, palette::kTuning);
+            std::printf ("  blend #%06x: %.1f from Spectrum, %.1f from Tuning, parents %.1f apart\n",
+                         blend, toS, toT, parents);
+            check (toS < parents && toT < parents,
+                   "and it sits BETWEEN them - closer to each parent than they are to each other");
+            // Rule (b) serving rule (a): far-apart parents are what give the mixture room
+            // to be its own colour. If they ever close up, the blend collapses onto both.
+            check (toS >= 12.0 && toT >= 12.0,
+                   "...and far enough from both to be a colour of its own, not a shade of either");
+            // The hue is genuinely between them, which is what "a mixture" looks like.
+            // Mixed on the straight line in (a,b) instead of round the arc, a saturated
+            // pair averages through the neutral axis and comes out grey.
+            check (colour::chroma (colour::toOklab (blend)) >= 0.10,
+                   "...and the mixture kept its chroma (it is not a grey wash of the two)");
+        }
+
+        // COLOUR BLINDNESS. Reported unconditionally and asserted at a lower bar than
+        // normal vision, because it is a lower bar honestly: dichromacy collapses most
+        // of the hue circle onto one axis, so twelve colours cannot be as separable as
+        // they are for a trichromat. The bar that matters is that no two of them become
+        // THE SAME COLOUR, which is where this palette was (0.7 apart under deuteranopia
+        // - literally indistinguishable).
+        {
+            const auto d = palette::worstPair (colour::Vision::deuteranopia);
+            const auto p = palette::worstPair (colour::Vision::protanopia);
+            std::printf ("  deuteranopia: closest %s vs %s at %.1f (was 0.7)\n", d.a, d.b, d.distance);
+            std::printf ("  protanopia:   closest %s vs %s at %.1f (was 1.2)\n", p.a, p.b, p.distance);
+            check (d.distance >= 5.0, "no two identity colours collapse onto each other under deuteranopia");
+            check (p.distance >= 5.0, "nor under protanopia");
         }
     }
 

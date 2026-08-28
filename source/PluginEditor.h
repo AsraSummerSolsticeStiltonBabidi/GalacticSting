@@ -4,6 +4,7 @@
 #include "ScaleKeyboard.h"
 #include "PartialAmpEdit.h"
 #include "IntervalTokens.h"
+#include "GalacticPalette.h"
 #include "dsp/Dissonance.h"
 #include <algorithm>
 #include <limits>
@@ -2364,7 +2365,7 @@ private:
         // them from the parameters; a drag updates them immediately so the node
         // follows the mouse without waiting for a repaint from elsewhere.
         float a = 0.1f, d = 0.3f, s = 0.7f, r = 0.4f, cA = 0.0f, cD = 0.55f, cR = 0.55f;
-        juce::Colour col { 0xff9a7bff };
+        juce::Colour col { 0xff000000u | galactic::palette::kCustomMod }; // the CUSTOM modulator identity
         juce::String tip;
         std::function<void (const juce::String&, float)> onEdit;    // suffix, plain value
         std::function<void (const juce::String&, bool)>  onGesture; // suffix, starting
@@ -2643,7 +2644,7 @@ private:
         {
             g.setColour (juce::Colour (0xf2101018));
             g.fillRoundedRectangle (getLocalBounds().toFloat(), 10.0f);
-            g.setColour (juce::Colour (0xff9a7bff));
+            g.setColour (juce::Colour (0xff000000u | galactic::palette::kCustomMod));
             g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (1.5f), 10.0f, 3.0f);
             g.setFont (juce::Font (juce::FontOptions (14.0f).withStyle ("Bold")));
             g.drawText ("LFO wave  -  drag points, double-click adds, right-click deletes, drag a line's middle to curve it",
@@ -2665,7 +2666,7 @@ private:
                                                     r.getBottom() - valueAt (x) * r.getHeight());
                 i == 0 ? curve.startNewSubPath (p) : curve.lineTo (p);
             }
-            g.setColour (juce::Colour (0xff9a7bff));
+            g.setColour (juce::Colour (0xff000000u | galactic::palette::kCustomMod));
             g.strokePath (curve, juce::PathStrokeType (2.2f));
             for (const auto& p : pts)
             {

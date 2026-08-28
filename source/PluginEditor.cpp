@@ -1,6 +1,7 @@
 #include "PluginEditor.h"
 #include "BinaryData.h"
 #include "FloatingWindowOwner.h" // keeps the floating windows above the editor (Win32 ownership)
+#include "GalacticPalette.h"
 #include "dsp/Dissonance.h"
 
 namespace
@@ -13,39 +14,40 @@ namespace
         return tf;
     }
 
-    // Section colours, deliberately spread around the hue wheel so that NO two
-    // neighbouring panels (horizontally OR vertically) share a similar hue - in
-    // particular no two near-identical blues sit side by side. Reading the two
-    // rows left-to-right the hue hops far each step:
-    //   Row 1: Harmonic(blue) | Range(yellow) | Fractal(vermilion) | Phase(green)
-    //   Row 2: Filter(orange) | Volume(purple) | Pitch(teal) | Tuning(gold) | Custom(pink)
-    // and every vertical pair contrasts too (blue over orange, yellow over purple,
-    // vermilion over teal, green over gold...).
-    // Layout (so the adjacency reasoning is legible):
-    //   Row 1: SPECTRUM = [Harmonic Engine(blue) | Custom Engine(pink) | Both engines(mint)]
-    //   Row 2: Essentials(green) | Modulators(tab colour) | Tuning(purple)
-    //   Right: Spectrum-to-Scale (full height, orange)
-    // The SPECTRUM container itself is deliberately NEUTRAL steel: it holds three
-    // coloured boxes and must not compete with them for the eye.
-    // Colours are placed around the hue wheel so every ADJACENT pair (horizontal
-    // AND vertical) is a clearly different colour - no two near-identical neighbours.
-    const juce::Colour cBase      { 0xff5cb8ff }; // Harmonic Engine is one blue
-    const juce::Colour cHarmonic  { 0xff5cb8ff }; // blue   210
-    const juce::Colour cWhitelist { 0xff5ff2b0 };
-    const juce::Colour cSpectrum  { 0xffc3ccdf }; // steel  - the neutral SPECTRUM container
-    const juce::Colour cSlope     { 0xff8ef0c4 }; // mint   - Slope/Fractal/Morph/Range (BOTH engines)
-    const juce::Colour cOverride  { 0xffffb020 }; // amber  - "this is being overridden" (as FROZEN)
-    const juce::Colour cRange     { 0xffffce3d }; // yellow 50
-    const juce::Colour cFractal   { 0xfff062cf }; // magenta 318
-    const juce::Colour cEssentials{ 0xff4fe09a }; // green  148  (Phase/Gain/Reference/Octave macro)
-    const juce::Colour cPrime     { 0xffffd84d };
-    const juce::Colour cFilter    { 0xff3fd0e6 }; // cyan   190
-    const juce::Colour cEnv       { 0xff3ad9b0 }; // teal-green 165 (Volume envelope)
-    const juce::Colour cPitch     { 0xffff5b52 }; // red    5
-    const juce::Colour cTuning    { 0xffb27bff }; // purple 275
-    const juce::Colour cTimbre    { 0xffff77c8 }; // pink   332  (Custom Engine)
-    const juce::Colour cSpecScale { 0xffff9a3c }; // orange 32   (its own colour now, not a yellow twin of Range)
-    const juce::Colour cScaleDiss { 0xff32c8be }; // teal        (live scale-dissonance list, under Tuning)
+    // SECTION COLOURS - every one of them from galactic::palette (source/GalacticPalette.h),
+    // which is where they are DECIDED and where a test can read them.
+    //
+    // They used to be hand-picked hues right here, in an anonymous namespace nothing
+    // could measure, "deliberately spread around the hue wheel" by eye. Spread by eye is
+    // how the TUNING panel (0xb27bff) and the CUSTOM modulator tab (0xff9a7bff) ended up
+    // 3.8 units of OKLab apart - two panels no one can tell apart, with every check in
+    // the build green - and how the least legible of them sat at 6.2:1 against the page.
+    //
+    // The set is now the answer to a maximin problem (tools/PaletteSearch.cpp): the
+    // SMALLEST perceptual distance between any two of them is as large as it can be
+    // while each stays legible, in gamut, and a real colour rather than a near-white.
+    // The worst pair is 15.2 apart instead of 3.8, and nothing here is a free choice any
+    // more - to change one, change it in the palette and re-run the search.
+    const juce::Colour cHarmonic  { 0xff000000u | galactic::palette::kHarmonic };
+    const juce::Colour cSlope     { 0xff000000u | galactic::palette::kSlope };
+    const juce::Colour cFractal   { 0xff000000u | galactic::palette::kFractal };
+    const juce::Colour cEssentials{ 0xff000000u | galactic::palette::kEssentials };
+    const juce::Colour cFilter    { 0xff000000u | galactic::palette::kFilter };
+    const juce::Colour cEnv       { 0xff000000u | galactic::palette::kEnv };
+    const juce::Colour cPitch     { 0xff000000u | galactic::palette::kPitch };
+    const juce::Colour cTuning    { 0xff000000u | galactic::palette::kTuning };
+    const juce::Colour cTimbre    { 0xff000000u | galactic::palette::kTimbre };
+    const juce::Colour cCustomMod { 0xff000000u | galactic::palette::kCustomMod };
+    const juce::Colour cScaleDiss { 0xff000000u | galactic::palette::kScaleDiss };
+    // ...and the one that is NOT chosen: Spectrum-vs-Tuning is the MIXTURE of the two
+    // panels it sits between, computed from them (rule (a) - see GalacticPalette.h). It
+    // was a hard-coded orange, which said nothing about what that column is for; now it
+    // cannot stop being a mixture, because there is no hex to edit.
+    const juce::Colour cSpecScale { 0xff000000u | galactic::palette::specScale() };
+    // SEMANTIC colours, deliberately outside the separation rule: these mean go, stop
+    // and "something else is driving this", and a colour chosen to win a distance
+    // contest would stop meaning it.
+    const juce::Colour cOverride  { 0xffffb020 }; // amber - "this is being overridden" (as FROZEN)
     // Phase/Gain/Reference now share the Essentials colour (one macro, one colour).
     const juce::Colour cPhase     = cEssentials;
     const juce::Colour cGain      = cEssentials;
@@ -1240,7 +1242,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // CUSTOM tab: 6 modulators (3 envelopes + 3 LFOs). The controls below re-attach
     // to whichever modulator the selector shows; map any fader via right-click.
     {
-        const juce::Colour cCustom (0xff9a7bff);
+        const juce::Colour & cCustom = cCustomMod; // the CUSTOM modulator identity, from the palette
         // The envelope is EDITED as a curve with nodes (the faders below stay as the
         // automation targets, but are no longer shown).
         envEditor.col = cCustom;
@@ -7040,7 +7042,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         {
             auto eb = row.removeFromLeft (juce::jmin (262, W * 24 / 100));
             row.removeFromLeft (2);   // the same unshared-border air, Envelopes -> Tuning
-            const juce::Colour tabCols[4] = { cEnv, cPitch, cFilter, juce::Colour (0xff9a7bff) };
+            const juce::Colour tabCols[4] = { cEnv, cPitch, cFilter, cCustomMod };
             gAmpEnv.setColour (juce::GroupComponent::outlineColourId, tabCols[envTab]);
             gAmpEnv.setColour (juce::GroupComponent::textColourId,    tabCols[envTab]);
             gAmpEnv.setBounds (eb.reduced (3, 0)); // title = "Envelopes" (set in applyLanguage)

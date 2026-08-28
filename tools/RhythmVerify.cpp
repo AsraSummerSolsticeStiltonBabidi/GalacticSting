@@ -2437,27 +2437,34 @@ int main()
         // prime-whitelist toggles; (2) the CUSTOM view - a loaded scale, whose whole
         // point is that the freed box goes to the intervals editor (asserted below).
         // The panel wears the SELECTED ENGINE's colour, and that can fail in two
-        // directions: back to the neutral steel that read as white (saturation 0.13), or
-        // onto a hue so close to a neighbouring panel's that the boxes stop being
-        // tellable apart. The neighbours are Essentials (green), Tuning (purple) and
-        // Spectrum-vs-Tuning (orange).
+        // directions: back to the neutral steel that read as white, or onto a colour so
+        // close to a neighbouring panel's that the boxes stop being tellable apart.
+        //
+        // Measured in OKLab against galactic::palette itself - the very set the palette
+        // search produced - not against three colours copied in here by hand. Those
+        // copies were three panels' hexes from an older palette, compared by HSV hue
+        // gap and HSV saturation, and BOTH proxies were wrong: they passed a pink at
+        // 0.33 "saturation" as steel and called a 15-unit separation a collision. A
+        // check with its own copy of the palette measures the palette it remembers.
         auto checkPanelColour = [] (juce::Colour panel, const char* who)
         {
-            auto hueGap = [] (juce::Colour a, juce::Colour b)
+            using namespace galactic;
+            const std::uint32_t rgb = panel.getARGB() & 0xffffffu;
+            double worst = 1.0e9; const char* nearest = "";
+            for (const auto& e : palette::identitySet())
             {
-                const float d = std::abs (a.getHue() - b.getHue()) * 360.0f;
-                return std::min (d, 360.0f - d);
-            };
-            const juce::Colour neighbours[] = { juce::Colour (0xff4fe09a),   // Essentials
-                                                juce::Colour (0xffb27bff),   // Tuning
-                                                juce::Colour (0xffff9a3c) }; // Spectrum vs Tuning
-            float worst = 360.0f;
-            for (const auto& n : neighbours) worst = std::min (worst, hueGap (panel, n));
-            std::printf ("  panel colour %s (%s)  saturation %.2f  nearest neighbouring panel hue %.0f deg away\n",
-                         panel.toDisplayString (false).toRawUTF8(), who, panel.getSaturation(), worst);
-            check (panel.getSaturation() > 0.35f,
-                   "the panel is a real colour, not the old neutral steel");
-            check (worst > 40.0f, "and its hue is clear of every panel around it");
+                if (e.rgb == rgb) continue;                 // itself
+                const double d = colour::deltaE (e.rgb, rgb);
+                if (d < worst) { worst = d; nearest = e.name; }
+            }
+            const double chroma = colour::chroma (colour::toOklab (rgb));
+            std::printf ("  panel colour %s (%s)  chroma %.3f  nearest other identity: %s at %.1f\n",
+                         panel.toDisplayString (false).toRawUTF8(), who, chroma, nearest, worst);
+            check (chroma > 0.10, "the panel is a real colour, not the old neutral steel");
+            // The guarantee the palette itself is held to (see SpectrumTests): if the
+            // panel is further than that from everything else, it is as distinct as any
+            // colour in this window is.
+            check (worst >= 15.0, "and it is clear of every other identity in the window");
         };
 
         for (int pass = 0; ed != nullptr && pass < 4; ++pass)
