@@ -2237,12 +2237,53 @@ int FractalAdditiveAudioProcessor::registerAnchorKey() const noexcept
     return k >= 0 ? juce::jlimit (0, 127, k) : 60;
 }
 
-// The default width in STEPS of the scale loaded right now: the same musical width in
-// every tuning (see dissonance::kAdaptRegisterDefaultPeriods, which was measured).
-int FractalAdditiveAudioProcessor::defaultRegisterSteps() const noexcept
+// PERIODS -> THE TWO FREQUENCIES, in ONE place (see the header for why it is not keys).
+// The anchor's pitch comes from the KEY LADDER, not from a sounding f0: f0 carries per-note
+// pitch bend, and a band whose ends followed a bend wheel would resample the objective -
+// and re-price the run - on every wheel message.
+void FractalAdditiveAudioProcessor::registerBandHz (double periods,
+                                                    double& loHz, double& hiHz) const noexcept
 {
-    const int D = juce::jmax (1, getScaleDegrees());
-    return juce::jlimit (1, 127, (int) std::lround (dissonance::kAdaptRegisterDefaultPeriods * (double) D));
+    const int anchor = registerAnchorKey();
+    double a = getNoteFrequency (anchor);
+    if (! (a > 0.0) || ! std::isfinite (a)) a = 261.6255653005986;   // no tuning yet: middle C
+    loHz = hiHz = a;
+    const double p = juce::jlimit (0.0, dissonance::kAdaptRegisterMaxPeriods,
+                                   std::isfinite (periods) ? periods : 0.0);
+    if (p <= 0.0) return;                       // a zero width IS the played register alone
+    const double ratio = std::pow (tuning.periodRatio(), p);
+    if (! (ratio > 1.0) || ! std::isfinite (ratio)) return;
+    // CLAMPED TO THE BOARD at both ends, never wrapped and never re-anchored: the user said
+    // "N periods either side of the note I am playing", and sliding the anchor to make N fit
+    // would optimise for registers they never asked about. The panel prints the periods that
+    // really fit at each end whenever this bites, so a shortened band is stated and not
+    // silent - and it is now asymmetric near either edge, which is why the read-out has a
+    // two-sided form at all.
+    const double bottom = getNoteFrequency (0), top = getNoteFrequency (127);
+    loHz = a / ratio;
+    hiHz = a * ratio;
+    if (bottom > 0.0 && std::isfinite (bottom)) loHz = std::max (loHz, std::min (a, bottom));
+    if (top    > 0.0 && std::isfinite (top))    hiHz = std::min (hiHz, std::max (a, top));
+}
+
+// WHICH PERIOD the band is being built on, and how much of a fact it is (see the header).
+// Message thread: the table estimate is not an atomic.
+FractalAdditiveAudioProcessor::RegisterPeriodInfo
+FractalAdditiveAudioProcessor::registerPeriodInfo() const
+{
+    RegisterPeriodInfo i;
+    i.ratio = tuning.periodRatio();
+    i.keys  = juce::jmax (1, getScaleDegrees());
+    if (! tuning.usesAbsoluteTable())
+        return i;                      // a scale (or MTS master) states its own period
+    i.devCents = tuning.tablePeriodDevCents();
+    // `found` is false when the file has nothing ascending to measure at all. periodRatio()
+    // then answers the 2/1-over-12-keys fallback, which is neither the file's nor the
+    // user's - the one case where the band is standing on a number nobody supplied.
+    i.source = (tuning.getTablePeriodEstimate().found || tuning.tablePeriodIsUserSet())
+                 ? RegisterPeriodSource::TableEstimate
+                 : RegisterPeriodSource::TableFallback;
+    return i;
 }
 
 // THE REGISTER RANGE, resolved in ONE place. The panel prints what this returns and the
@@ -2250,26 +2291,24 @@ int FractalAdditiveAudioProcessor::defaultRegisterSteps() const noexcept
 // spectrum was optimised for - and that answer genuinely differs (a spectrum optimised at
 // C1 is ~3.7x rougher at C6 than one optimised there; see SpectrumTests).
 //
-// ANCHOR + N STEPS, both resolved here rather than in the editor: the realtime follower
+// ANCHOR +- N PERIODS, all resolved here rather than in the editor: the realtime follower
 // runs with the window shut, and a range the panel had baked into two frequencies would
 // have stayed pinned to whatever register happened to be played when the window closed -
 // which is the exact complaint (the same spectrum whatever octave you play in) this form
 // exists to answer.
+//
+// BOTH DIRECTIONS. The band used to start AT the anchor and run up, so the spectrum was
+// never asked what it does below the note under the fingers - and Sethares' critical band
+// is a width in Hz, so that half of the keyboard is a different question, not a mirror of
+// this one (SpectrumTests (8) measures it: one period below the played note costs 1.46x
+// under the upward band and 1.27x under the symmetric one).
 dissonance::Registers FractalAdditiveAudioProcessor::adaptRegistersFor (const SpectrumAdaptSettings& s,
                                                                         double f0Hz, bool realtime) const
 {
     dissonance::Registers regs;
-    const int steps  = juce::jlimit (0, 127, s.regSteps >= 0 ? s.regSteps : defaultRegisterSteps());
-    const int anchor = registerAnchorKey();
-    // The top is CLAMPED TO THE BOARD, never wrapped and never re-anchored lower: the user
-    // said "N steps above the note I am playing", and moving the anchor to make N fit would
-    // optimise for registers they never asked about. The panel prints the steps that really
-    // fit whenever this bites, so a shortened range is stated and not silent.
-    const int top = juce::jlimit (0, 127, anchor + steps);
-    double lo = getNoteFrequency (anchor), hi = getNoteFrequency (top);
-    // Both ends through the KEY LADDER, not through f0Hz: f0 carries per-note pitch bend,
-    // and a range whose bottom followed a bend wheel would resample the objective (and
-    // re-price the run) on every wheel message.
+    const double per = s.regPeriods >= 0.0 ? s.regPeriods : dissonance::kAdaptRegisterDefaultPeriods;
+    double lo = 0.0, hi = 0.0;
+    registerBandHz (per, lo, hi);
     if (! (lo > 0.0) || ! std::isfinite (lo)) lo = f0Hz;
     if (! (hi > 0.0) || ! std::isfinite (hi)) hi = lo;
     if (hi < lo) std::swap (lo, hi);
@@ -3825,7 +3864,7 @@ juce::ValueTree FractalAdditiveAudioProcessor::realtimeSettingsToTree() const
     rt.setProperty ("aLo",     rtSet.adapt.rangeLo,     nullptr);
     rt.setProperty ("aHi",     rtSet.adapt.rangeHi,     nullptr);
     rt.setProperty ("aAmps",   rtSet.adapt.shapeAmps,   nullptr);
-    rt.setProperty ("aSteps",  rtSet.adapt.regSteps,    nullptr);
+    rt.setProperty ("aPer",    rtSet.adapt.regPeriods,  nullptr);
     rt.setProperty ("look",    rtSet.lookahead,         nullptr);
     return rt;
 }
@@ -3849,7 +3888,21 @@ FractalAdditiveAudioProcessor::realtimeSettingsFromTree (const juce::ValueTree& 
     s.adapt.rangeLo     = (double) rt.getProperty ("aLo",     s.adapt.rangeLo);
     s.adapt.rangeHi     = (double) rt.getProperty ("aHi",     s.adapt.rangeHi);
     s.adapt.shapeAmps   = (bool)   rt.getProperty ("aAmps",   s.adapt.shapeAmps);
-    s.adapt.regSteps    = (int)    rt.getProperty ("aSteps",  s.adapt.regSteps);
+    // THE WIDTH, and the one property in this tree that changed UNIT. Projects saved
+    // before the band became symmetric carry "aSteps": N degrees of the loaded tuning,
+    // running UPWARD from the anchor and nothing below it. Ignoring it would silently
+    // widen every old project to the default; carrying the number across as if it were
+    // periods would widen it by the degree count. It is converted so the TOTAL WIDTH is
+    // preserved and re-centred on the played note - N steps up becomes N/(2D) periods each
+    // way, which is exactly what the new default is to the old one (2 periods up -> +-1).
+    if (rt.hasProperty ("aPer"))
+        s.adapt.regPeriods = (double) rt.getProperty ("aPer", s.adapt.regPeriods);
+    else if (rt.hasProperty ("aSteps"))
+    {
+        const int steps = (int) rt.getProperty ("aSteps", -1);
+        s.adapt.regPeriods = steps < 0 ? -1.0
+                                       : (double) steps / (2.0 * (double) juce::jmax (1, getScaleDegrees()));
+    }
     s.lookahead         = (bool)   rt.getProperty ("look",    s.lookahead);
     return s;
 }

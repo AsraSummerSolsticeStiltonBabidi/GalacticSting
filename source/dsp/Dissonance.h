@@ -891,20 +891,31 @@ namespace dissonance
     constexpr int kAdaptRegisterCap   = 7;
     constexpr int kAdaptRegisterCapRt = 3;
 
-    // HOW WIDE THE DEFAULT RANGE IS, in PERIODS of whatever tuning is loaded. The panel
-    // asks for it as a step count (N degrees above the note being played), so this number
-    // times the scale's degree count is the N a fresh instance starts with: 24 steps in
-    // 12-EDO, 62 in 31-EDO, 26 in Bohlen-Pierce - the same musical width in every tuning.
+    // HOW WIDE THE DEFAULT RANGE IS, in PERIODS of whatever tuning is loaded, EACH WAY
+    // from the note being played. The band is [anchor - N periods, anchor + N periods], so
+    // this number is a HALF-WIDTH and the default band is 2N periods wide in total.
+    //
+    // The unit is the TUNING'S OWN PERIOD, not an octave and no longer a step count: the
+    // panel asks for periods directly, so the same number is the same musical width in
+    // every tuning (one period is 1200 c in 12-EDO, 1902 c in Bohlen-Pierce) and nothing
+    // has to be re-derived when the scale changes. See PluginProcessor::adaptRegistersFor
+    // for how N periods become the two frequencies, and for what happens under an absolute
+    // .tun table, where "period" is an estimate rather than a fact.
     //
     // MEASURED, not assumed - see SpectrumTests "(8) HOW WIDE SHOULD THE RANGE BE?", which
-    // optimises one seed over 0.5/1/2/3/4 periods and judges each answer densely at the
-    // anchor, at its own worst register, and one period ABOVE the range. Two periods is
-    // where those three stop trading against each other: it costs the played register
-    // almost nothing over a half-period range, and it is the narrowest width whose
-    // neighbour one period up is not left dramatically worse than a spectrum optimised
-    // there. Wider buys a little more insurance outside and pays for it at the anchor,
-    // which is the one register the player is certain to hear.
-    constexpr double kAdaptRegisterDefaultPeriods = 2.0;
+    // optimises one seed over half-widths of 0 / 0.5 / 1 / 1.5 / 2 periods and judges each
+    // answer densely at the anchor and at fixed registers TWO PERIODS BELOW to THREE ABOVE
+    // it. One period each way is where the trades stop: it is the narrowest half-width
+    // that is not beaten from any anchor, it keeps the total band at the two periods the
+    // upward form measured, and it keeps the register count at 3 - which is exactly what
+    // the realtime follower's cap (kAdaptRegisterCapRt) can afford, so the follower samples
+    // the default band exactly rather than approximately.
+    constexpr double kAdaptRegisterDefaultPeriods = 1.0;
+
+    // The widest half-width the panel accepts. 8 periods each way is 16 periods of band -
+    // past the keyboard in every tuning this instrument loads, so the clamp can never be
+    // the thing that decides a musical question, and a typo cannot price a run in hours.
+    constexpr double kAdaptRegisterMaxPeriods = 8.0;
 
     //==========================================================================
     // WHAT A RUN WILL COST, IN MILLISECONDS, BEFORE IT IS STARTED.

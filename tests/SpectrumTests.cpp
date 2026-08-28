@@ -2096,22 +2096,24 @@ int main()
         }
 
         //---------------------------------------------------------------------
-        // (8) HOW WIDE SHOULD THE RANGE BE? The panel asks for ONE number - N steps above
-        // the note being played - so the default N is a real decision and "two octaves"
-        // was a guess nobody had measured. This measures it.
+        // (8) HOW WIDE SHOULD THE RANGE BE? The panel asks for ONE number - N PERIODS EACH
+        // WAY from the note being played - so the default N is a real decision and neither
+        // "two octaves" nor "the same total width as before" is one anybody had measured.
+        // This measures it, in the form the control now has.
         //
         // The same seed, the same anchor (the note under the fingers), optimised over
-        // widths of 0.5 .. 4 periods with the SHIPPING sampling rule, then judged on a
+        // HALF-WIDTHS of 0 .. 2 periods with the SHIPPING sampling rule, then judged on a
         // dense sweep at three places that matter:
         //   - AT THE ANCHOR      : the register actually being played - the one thing the
         //                          player is guaranteed to hear;
         //   - WORST INSIDE       : the ugliest register the range promised to cover;
-        //   - ONE PERIOD ABOVE   : the hole question. A narrow range says nothing about
-        //                          the register just outside it, and a player who moves up
-        //                          one octave lands exactly there.
-        // The reference for "above" is the spectrum optimised AT that register on its own:
-        // that is the best any spectrum could do there, so the ratio is how much the range
-        // choice costs somebody who steps outside it.
+        //   - ONE PERIOD OUTSIDE : the hole question, and it is now a hole at BOTH ends. A
+        //                          narrow band says nothing about the register just outside
+        //                          it, and a player who moves an octave lands exactly there
+        //                          - in either direction.
+        // The reference for every probe is the spectrum optimised AT that register on its
+        // own: that is the best any spectrum could do there, so the ratio is how much the
+        // width choice costs somebody who plays there.
         {
             const double anch = atOct (kLowHz, 3.0);           // 261.6 Hz: the register a player sits in
             const auto atOne = [&] (const std::vector<dissonance::Partial>& sp, double spF0, double f)
@@ -2119,130 +2121,203 @@ int main()
                 return dissonance::scoreOverRegisters (sp, spF0, { f }, oneNote, true,
                                                        dissonance::Goal::Min, 0.0, 0.0).perRegister[0];
             };
-            // WIDTH 0 is the old single-pitch behaviour, kept in the table as the baseline
-            // every other row has to beat somewhere.
-            const double widths[] = { 0.0, 0.5, 1.0, 2.0, 3.0, 4.0 };
-            // The probes are FIXED absolute registers - the anchor and one, two, three,
-            // four and five periods above it - so a column means the same pitch in every
-            // row. (Judging each width "one period above ITS OWN top" compares a different
-            // register per row, which is exactly how a width can look good by being asked
-            // an easier question.) Each probe's reference is a spectrum optimised for that
-            // register ALONE: the best anything could do there, so a penalty of 1.00x is
-            // "as good as if you had adapted for this register on purpose".
-            const double probes[] = { 0.0, 1.0, 2.0, 3.0, 4.0, 5.0 };
-            double refAt[6] = {};
-            for (int i = 0; i < 6; ++i)
+            // HALF-WIDTH 0 is the old single-pitch behaviour, kept in the table as the
+            // baseline every other row has to beat somewhere.
+            const double halves[] = { 0.0, 0.5, 1.0, 1.5, 2.0 };
+            constexpr int kRows = 5;
+            // The probes are FIXED absolute registers - two periods BELOW the anchor up to
+            // three above it - so a column means the same pitch in every row, and the half
+            // of the keyboard the upward-only band never had an opinion about is now half
+            // the table. (Judging each width "one period outside ITS OWN edge" compares a
+            // different register per row, which is exactly how a width can look good by
+            // being asked an easier question.)
+            const double probes[] = { -2.0, -1.0, 0.0, 1.0, 2.0, 3.0 };
+            constexpr int kProbes = 6;
+            double refAt[kProbes] = {};
+            for (int i = 0; i < kProbes; ++i)
             {
                 const double f = atOct (anch, probes[i]);
                 refAt[i] = atOne (adaptOver (anch, f, f, 1).spectrum, anch, f);
             }
+            // The band the previous design produced, kept as a row of its own: N periods
+            // UP from the anchor and nothing below it. It is the thing "por arriba y por
+            // abajo" is a complaint about, so the table has to contain it or the change is
+            // an assertion rather than a measurement.
+            const auto upwardRun = adaptOver (anch, anch, atOct (anch, 2.0),
+                                              dissonance::registerCountFor (anch, atOct (anch, 2.0),
+                                                                            dissonance::kAdaptRegisterCap));
+            double symBelow = 0.0, upBelow = 0.0;
             {
-                std::printf ("  range WIDTH, anchored at %.1f Hz (dense-judged):\n", anch);
-                std::printf ("    width     pts   at anchor  worst inside  1 period above"
+                std::printf ("  range HALF-WIDTH (each way), anchored at %.1f Hz (dense-judged):\n", anch);
+                std::printf ("    +-width   pts   at anchor  worst inside  1 per outside"
                              "   | penalty vs a spectrum optimised for that register alone\n");
-                std::printf ("    %-56s|   +0     +1     +2     +3     +4     +5 periods\n", "");
-                double anchorAt[6] = {}, penAbove[6] = {}, meanPen04[6] = {};
+                std::printf ("    %-56s|   -2     -1     +0     +1     +2     +3 periods\n", "");
+                double anchorAt[kRows] = {}, penOut[kRows] = {}, meanPen[kRows] = {};
                 int row = 0;
-                for (const double w : widths)
+                for (const double w : halves)
                 {
-                    const double top = atOct (anch, w);
-                    const int pts = dissonance::registerCountFor (anch, top, dissonance::kAdaptRegisterCap);
-                    const auto run = adaptOver (anch, anch, top, pts);
+                    const double lo = atOct (anch, -w), hi = atOct (anch, w);
+                    const int pts = dissonance::registerCountFor (lo, hi, dissonance::kAdaptRegisterCap);
+                    const auto run = adaptOver (anch, lo, hi, pts);
                     double m = 0, worst = 0, wHz = 0;
-                    judge (run.spectrum, anch, anch, top, m, worst, wHz);
+                    judge (run.spectrum, anch, lo, hi, m, worst, wHz);
                     const double here = atOne (run.spectrum, anch, anch);
-                    const double out  = atOne (run.spectrum, anch, atOct (top, 1.0));
-                    const auto refAbove = adaptOver (anch, atOct (top, 1.0), atOct (top, 1.0), 1);
-                    const double refOut = atOne (refAbove.spectrum, anch, atOct (top, 1.0));
+                    // "One period outside" is now the MEAN of the two shoulders, because a
+                    // symmetric band has two of them and reporting only the upper one would
+                    // hide exactly the half this redesign is about.
+                    const double outHi = atOne (run.spectrum, anch, atOct (hi,  1.0));
+                    const double outLo = atOne (run.spectrum, anch, atOct (lo, -1.0));
+                    const double refHi = atOne (adaptOver (anch, atOct (hi, 1.0), atOct (hi, 1.0), 1).spectrum,
+                                                anch, atOct (hi, 1.0));
+                    const double refLo = atOne (adaptOver (anch, atOct (lo, -1.0), atOct (lo, -1.0), 1).spectrum,
+                                                anch, atOct (lo, -1.0));
+                    const double pOut = 0.5 * (outHi / std::max (1.0e-9, refHi)
+                                             + outLo / std::max (1.0e-9, refLo));
                     std::printf ("    %.1f per %4d  %10.3f  %12.3f  %8.3f %5.2fx |",
-                                 w, pts, here, worst, out, out / std::max (1.0e-9, refOut));
-                    double sum04 = 0.0;
-                    for (int i = 0; i < 6; ++i)
+                                 w, pts, here, worst, 0.5 * (outHi + outLo), pOut);
+                    double sum = 0.0;
+                    for (int i = 0; i < kProbes; ++i)
                     {
-                        const double p = atOne (run.spectrum, anch, atOct (anch, probes[i]))
-                                       / std::max (1.0e-9, refAt[i]);
-                        std::printf (" %5.2fx", p);
-                        if (i <= 4) sum04 += p;
+                        const double pen = atOne (run.spectrum, anch, atOct (anch, probes[i]))
+                                         / std::max (1.0e-9, refAt[i]);
+                        std::printf (" %5.2fx", pen);
+                        sum += pen;
                     }
                     std::printf ("\n");
-                    anchorAt[row] = here; penAbove[row] = out / std::max (1.0e-9, refOut);
-                    meanPen04[row] = sum04 / 5.0;
+                    anchorAt[row] = here; penOut[row] = pOut;
+                    meanPen[row] = sum / (double) kProbes;
+                    if (std::abs (w - dissonance::kAdaptRegisterDefaultPeriods) < 1.0e-9)
+                        symBelow = atOne (run.spectrum, anch, atOct (anch, -1.0)) / std::max (1.0e-9, refAt[1]);
                     ++row;
                 }
-                std::printf ("    mean penalty over the anchor and four periods above it:");
-                for (int i = 0; i < row; ++i) std::printf ("  %.1f per %.2fx", widths[i], meanPen04[i]);
+                std::printf ("    mean penalty over -2..+3 periods:");
+                for (int i = 0; i < row; ++i) std::printf ("  %.1f per %.2fx", halves[i], meanPen[i]);
                 std::printf ("\n");
-                // (i) WIDENING COSTS THE PLAYED REGISTER, and the cost is real but
+                // (i) THE POINT OF THE WHOLE CHANGE: the band now buys something BELOW the
+                // played note. Measured against the band the panel used to build - two
+                // periods UP from the anchor, nothing under it - one period below the
+                // anchor is a register the old form never looked at, and it shows.
+                upBelow = atOne (upwardRun.spectrum, anch, atOct (anch, -1.0))
+                        / std::max (1.0e-9, refAt[1]);
+                std::printf ("    one period BELOW the anchor: %.2fx under the old upward-only"
+                             " 2-period band, %.2fx under the symmetric +-%.1f one\n",
+                             upBelow, symBelow, dissonance::kAdaptRegisterDefaultPeriods);
+                check (symBelow < upBelow,
+                       "the symmetric band really does account for the register BELOW the note played -"
+                       " which the anchor-and-up band it replaces never did");
+                // (ii) WIDENING COSTS THE PLAYED REGISTER, and the cost is real but
                 // bounded. If it were not bounded the honest default would be "no
                 // range at all", because the anchor is the one register the player is
                 // certain to hear.
-                std::printf ("    at the anchor: %.3f with no range -> %.3f at 2 periods"
-                             " -> %.3f at 4 periods\n", anchorAt[0], anchorAt[3], anchorAt[5]);
-                check (anchorAt[3] < anchorAt[0] * 1.35,
-                       "a two-period range costs the register being played less than 35% against no range at all");
-                // (ii) THE HOLE IS REAL. Optimising at ONE pitch leaves the register a
-                // period up measurably worse than a range does - that is what makes the
-                // width a decision rather than a shrug.
-                std::printf ("    one period above a ZERO-width range: %.2fx"
-                             " vs %.2fx above a two-period range\n", penAbove[0], penAbove[3]);
-                check (meanPen04[3] < meanPen04[0],
-                       "a two-period range really is better across the anchor and the four periods above it"
-                       " than optimising at the played pitch alone");
-                // (iii) THE WIDTH FIELD ACTUALLY DOES SOMETHING. This is the check that
+                std::printf ("    at the anchor: %.3f with no range -> %.3f at +-1 period"
+                             " -> %.3f at +-2 periods\n", anchorAt[0], anchorAt[2], anchorAt[4]);
+                check (anchorAt[2] < anchorAt[0] * 1.35,
+                       "a one-period-each-way range costs the register being played less than 35%"
+                       " against no range at all");
+                // (iii) WHAT THE COVERAGE AVERAGE DOES *NOT* DECIDE. Under the upward-only
+                // band this column was the whole argument (a zero-width answer was 1.51x
+                // over +0..+4 against 1.25x for a two-period band), because the probes ran
+                // four periods UP, where a spectrum optimised at one pitch falls apart.
+                // Symmetrically the same numbers are nearly flat - every half-width lands
+                // within a few percent of every other - so the coverage average CANNOT be
+                // what picks the default, and pretending it does would be fitting a
+                // decision to noise. Printed, checked as the flat thing it is, and the
+                // decision is made by (ii) above and (v) below instead.
+                double penLo = 1.0e9, penHi = 0.0;
+                for (int i = 0; i < kRows; ++i) { penLo = std::min (penLo, meanPen[i]); penHi = std::max (penHi, meanPen[i]); }
+                std::printf ("    one period outside a ZERO-width range: %.2fx"
+                             " vs %.2fx outside a +-1-period range; the coverage average spans"
+                             " only %.2f..%.2f over every half-width (%.1f%%)\n",
+                             penOut[0], penOut[2], penLo, penHi, 100.0 * (penHi / penLo - 1.0));
+                check (penHi < penLo * 1.15,
+                       "across a symmetric band the coverage average barely separates one half-width from"
+                       " another - so it is not what the default can be argued from");
+                // (iv) THE WIDTH FIELD ACTUALLY DOES SOMETHING. This is the check that
                 // replaces the deleted minimax aggregate rather than merely deleting it.
-                // Under minimax the range's worst register was ALWAYS the anchor (the range
-                // starts there and runs up), so "only the worst register counts" was "only
-                // the anchor counts": the anchor scored 10.742 at 0, 0.5, 1, 2, 3 and 4
-                // periods - identical to five decimals - and the Steps field could not change
-                // the result at all. Under the mean it has to, or the control is decorative.
-                std::printf ("    the anchor moves %.1f%% between a zero-width and a four-period range"
+                // Under minimax the upward band's worst register was ALWAYS the anchor (the
+                // band started there and ran up), so "only the worst register counts" was
+                // "only the anchor counts" and the width field could not change the result
+                // at all. Under the mean it has to, or the control is decorative.
+                std::printf ("    the anchor moves %.1f%% between a zero-width and a +-2-period range"
                              " (under minimax it moved 0.0%%: 10.742 at every width)\n",
-                             100.0 * std::abs (anchorAt[5] - anchorAt[0]) / anchorAt[0]);
-                check (std::abs (anchorAt[5] - anchorAt[0]) > 0.05 * anchorAt[0],
+                             100.0 * std::abs (anchorAt[4] - anchorAt[0]) / anchorAt[0]);
+                check (std::abs (anchorAt[4] - anchorAt[0]) > 0.05 * anchorAt[0],
                        "and the WIDTH really changes the answer - the control the minimax aggregate made inert");
             }
             // ...and the same question asked from three different registers, because a
             // default fitted to middle C would be a default fitted to one measurement. Only
-            // the summary is printed: the mean penalty over the anchor and the four periods
-            // above it, which is the number the choice turns on.
+            // the summary is printed: the mean penalty over the five registers from two
+            // periods below the anchor to two above it, which is the number the choice
+            // turns on.
             {
-                std::printf ("  the same sweep from three anchors (mean penalty over the anchor and +4 periods):\n");
-                const double anchors[] = { atOct (kLowHz, 1.0), atOct (kLowHz, 3.0), atOct (kLowHz, 5.0) };
-                int bestCount[6] = {};
+                std::printf ("  the same sweep from three anchors (mean penalty over -2..+2 periods):\n");
+                const double anchors[] = { atOct (kLowHz, 2.0), atOct (kLowHz, 3.0), atOct (kLowHz, 5.0) };
+                int bestCount[kRows] = {};
+                double worstGiveUp = 1.0;
                 for (const double a : anchors)
                 {
+                    double defPen = 0.0;   // the shipped default's own penalty at this anchor
                     double refs[5] = {};
                     for (int i = 0; i < 5; ++i)
                     {
-                        const double f = atOct (a, (double) i);
+                        const double f = atOct (a, (double) i - 2.0);
                         refs[i] = atOne (adaptOver (a, f, f, 1).spectrum, a, f);
                     }
                     std::printf ("    anchor %7.1f Hz:", a);
                     int best = 0; double bestVal = 1.0e9;
-                    for (int r = 0; r < 6; ++r)
+                    for (int r = 0; r < kRows; ++r)
                     {
-                        const double top = atOct (a, widths[r]);
-                        const auto run = adaptOver (a, a, top,
-                                                    dissonance::registerCountFor (a, top, dissonance::kAdaptRegisterCap));
+                        const double lo = atOct (a, -halves[r]), hi = atOct (a, halves[r]);
+                        const auto run = adaptOver (a, lo, hi,
+                                                    dissonance::registerCountFor (lo, hi, dissonance::kAdaptRegisterCap));
                         double sum = 0.0;
                         for (int i = 0; i < 5; ++i)
-                            sum += atOne (run.spectrum, a, atOct (a, (double) i)) / std::max (1.0e-9, refs[i]);
+                            sum += atOne (run.spectrum, a, atOct (a, (double) i - 2.0)) / std::max (1.0e-9, refs[i]);
                         const double pen = sum / 5.0;
-                        std::printf ("  %.1f per %.2fx", widths[r], pen);
+                        std::printf ("  %.1f per %.2fx", halves[r], pen);
                         if (pen < bestVal) { bestVal = pen; best = r; }
+                        if (std::abs (halves[r] - dissonance::kAdaptRegisterDefaultPeriods) < 1.0e-9)
+                            defPen = pen;
                     }
-                    std::printf ("   (best: %.1f periods)\n", widths[best]);
+                    std::printf ("   (best: %.1f periods each way, %.2fx; the default gives up %.1f%%)\n",
+                                 halves[best], bestVal, 100.0 * (defPen / bestVal - 1.0));
                     ++bestCount[best];
+                    worstGiveUp = std::max (worstGiveUp, defPen / bestVal);
                 }
-                // The DEFAULT is not simply the best cell of that table: the widest range
-                // always wins a coverage average, and it pays for it at the anchor - the
-                // one register the player is certain to hear - and in registers per run,
-                // which the realtime follower cannot afford (kAdaptRegisterCapRt = 3, i.e.
-                // exactly a two-period range at one register per octave). What the table has
-                // to show is that no NARROWER width wins outright, because that would make
-                // the default indefensible.
-                check (bestCount[0] + bestCount[1] + bestCount[2] == 0,
-                       "from every anchor, a range narrower than two periods is beaten - the default is not too wide");
+                // The DEFAULT is not the best cell of that table and does not need to be:
+                // the spread is a few percent (see (iii)), so what has to hold is that the
+                // shipped default gives up almost NOTHING on coverage against the best
+                // width at every anchor. If it ever did, the two reasons it is chosen for -
+                // the cost at the played register, and exact sampling under the realtime
+                // cap - would be buying something the player could hear losing.
+                std::printf ("    worst case, the default gives up %.1f%% of the best width's coverage\n",
+                             100.0 * (worstGiveUp - 1.0));
+                check (worstGiveUp < 1.05,
+                       "from every anchor, the shipped default is within 5% of the best half-width measured");
+            }
+            // (v) THE REASON THE DEFAULT IS THIS WIDTH AND NOT A WIDER ONE: it is the
+            // widest half-width the REALTIME follower samples exactly. The objective is
+            // evaluated at one point per octave and the follower's cap is 3 points
+            // (kAdaptRegisterCapRt), so at +-1 period in an octave-periodic tuning the
+            // follower and the Adapt button optimise over literally the same registers -
+            // while at +-1.5 the follower is already sampling its own band more coarsely
+            // than the rule asks for. Nothing about that is degraded silently (the panel
+            // prints both counts), but it is a real difference and the default should not
+            // start on the wrong side of it.
+            {
+                const auto sameBothCaps = [&] (double half)
+                {
+                    const double lo = atOct (anch, -half), hi = atOct (anch, half);
+                    return dissonance::registerCountFor (lo, hi, dissonance::kAdaptRegisterCapRt)
+                        == dissonance::registerCountFor (lo, hi, dissonance::kAdaptRegisterCap);
+                };
+                std::printf ("    exact under the realtime cap: +-1.0 %s, +-1.5 %s, +-2.0 %s\n",
+                             sameBothCaps (1.0) ? "yes" : "no", sameBothCaps (1.5) ? "yes" : "no",
+                             sameBothCaps (2.0) ? "yes" : "no");
+                check (sameBothCaps (dissonance::kAdaptRegisterDefaultPeriods),
+                       "the default band is sampled EXACTLY by the realtime follower, not just by the button");
+                check (! sameBothCaps (dissonance::kAdaptRegisterDefaultPeriods + 0.5),
+                       "and it is the widest one that is - half a period more and the follower under-samples");
             }
             // WHAT THE ANCHOR-AND-UP FORM COSTS IN TIME, which is not free and shows up in
             // the realtime follower's landing latency (RhythmVerify times it end to end).
@@ -2277,20 +2352,22 @@ int main()
                                  what, (int) rg.f0.size(), r.sweepsDone, ms);
                     return ms;
                 };
-                std::printf ("  the SAME two-period width, placed two ways (the follower's own shape):\n");
-                const double straddle = timeOne ("octave either side (old)", anch * 0.5, anch * 2.0);
-                const double upward   = timeOne ("two periods up (now)",     anch, atOct (anch, 2.0));
-                std::printf ("    the anchor-and-up form costs %.2fx the time of the straddling one\n",
-                             upward / std::max (1.0e-9, straddle));
+                std::printf ("  the SAME two-period band, placed three ways (the follower's own shape):\n");
+                const double upward   = timeOne ("two periods up (old)",      anch, atOct (anch, 2.0));
+                const double straddle = timeOne ("+-1 period (now)",          atOct (anch, -1.0), atOct (anch, 1.0));
+                const double wide     = timeOne ("+-2 periods",               atOct (anch, -2.0), atOct (anch, 2.0));
+                std::printf ("    the symmetric form costs %.2fx the time of the upward one at the same"
+                             " total width, and %.2fx at twice it\n",
+                             straddle / std::max (1.0e-9, upward), wide / std::max (1.0e-9, upward));
             }
             // ...and the DEFAULT the panel ships (kAdaptRegisterDefaultPeriods) has to be one
-            // of the widths this table measured, or the table is not about the product.
-            std::printf ("  the panel's default range is %.1f periods of the loaded tuning\n",
+            // of the half-widths this table measured, or the table is not about the product.
+            std::printf ("  the panel's default range is +-%.1f periods of the loaded tuning\n",
                          dissonance::kAdaptRegisterDefaultPeriods);
             bool measured = false;
-            for (const double w : widths)
+            for (const double w : halves)
                 if (std::abs (w - dissonance::kAdaptRegisterDefaultPeriods) < 1.0e-9) measured = true;
-            check (measured, "and that default is a width this table actually measured");
+            check (measured, "and that default is a half-width this table actually measured");
         }
     }
 

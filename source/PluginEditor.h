@@ -319,14 +319,14 @@ public:
         // back to back; comparing the rects would call that a shared wall while the
         // screen shows a doubled border. These are what paint() puts on the glass.
         float wallSpectrumRight = 0.0f, wallTuningRight = 0.0f, wallColumnLeft = 0.0f;
-        // The Steps field's HOVER, in the language this probe was taken in. The average /
+        // The Periods field's HOVER, in the language this probe was taken in. The average /
         // worst-case selector and the sentence under it are gone (minimax could not change
-        // the result - see adaptRegStepsEdit), and the one thing that must not go with them
+        // the result - see adaptRegPeriodsEdit), and the one thing that must not go with them
         // is the answer to "so how ARE those registers combined?". It lives in this tooltip
         // now, and a tooltip is invisible to every other check in this build - including to
         // the bilingual sweep, which restores the language before it returns, so it has to
         // be read HERE or not at all.
-        juce::String regStepsTip;
+        juce::String regPeriodsTip;
         // EVERY DIVIDER LINE the SPECTRUM panel strokes, named, exactly as
         // spectrumDividers() returns them to paint(). A divider is a bare drawLine with
         // no component behind it, so a wall that stops short of the panel floor is
@@ -467,10 +467,11 @@ public:
     // is really given. A range that reads one width and searches another is the bug this
     // probe exists to catch, and it now has one more way to happen than it did: the anchor
     // moves with the hands.
-    struct RegisterProbe { int steps = 0, fitting = 0, anchorKey = 0, keyLo = 0, keyHi = 0;
-                           double loHz = 0.0, hiHz = 0.0; juce::String stepsText, spanText; };
+    struct RegisterProbe { int anchorKey = 0;
+                           double periods = 0.0, fitDown = 0.0, fitUp = 0.0;
+                           double loHz = 0.0, hiHz = 0.0; juce::String periodsText, spanText; };
     RegisterProbe registerProbeForTests() const;
-    void setAdaptRegisterStepsForTests (const juce::String& n);
+    void setAdaptRegisterPeriodsForTests (const juce::String& n);
     // Test hook (RhythmVerify): what the panel would print on the Adapt button, and what
     // one run / one realtime update is predicted to cost with the settings as they stand.
     juce::String adaptButtonTextForTests() const { return adaptGoBtn.getButtonText(); }
@@ -4312,50 +4313,66 @@ private:
     juce::ComboBox   adaptGoalBox;     // minimum / maximum / inside a range
     juce::TextEditor adaptLoEdit, adaptHiEdit;   // the range's two ends (goal = range)
     juce::Label      adaptPartialsLbl, adaptRangeLbl, adaptInfoLbl;
-    //== THE REGISTER RANGE the adaptation optimises over: ONE number, N, counted in STEPS
-    //   of the loaded tuning, running UPWARD from the note being played (see
-    //   FractalAdditiveAudioProcessor::registerAnchorKey for which note that is).
+    //== THE REGISTER BAND the adaptation optimises over: ONE number, N, counted in the
+    //   TUNING'S OWN PERIODS and running BOTH WAYS from the note being played - the band is
+    //   [anchor - N periods, anchor + N periods] (see
+    //   FractalAdditiveAudioProcessor::registerAnchorKey for which note the anchor is).
     //
-    //   It was two absolute bounds before - "C2".."C4", then periods 2..4 - and both forms
-    //   had the same defect underneath the notation: they were pinned to fixed pitches, so
-    //   the adaptation handed back the same spectrum whichever register was actually being
-    //   played, which is the complaint this whole thread started from. Anchor + count
-    //   follows the hands, and a count of STEPS is the one unit every tuning has: 24 steps
-    //   is two octaves in 12-EDO, 62 steps is two periods in 31-EDO, 26 is two in
-    //   Bohlen-Pierce, and none of that needs an octave to be named.
+    //   It was two absolute bounds first ("C2".."C4", then periods 2..4), which were pinned
+    //   to fixed pitches so the adaptation handed back the same spectrum whichever register
+    //   was played; then a COUNT OF STEPS running upward, which followed the hands but was
+    //   two things at once: unreadable as a width ("62" is two periods in 31-EDO) and
+    //   one-sided, so the spectrum was never asked what it does BELOW the note. This form
+    //   answers both: a period is the unit the tuning itself is built from, so the number
+    //   needs no division to be read and is never re-derived on a scale change, and the
+    //   band straddles the played note.
     //
     //   Sethares' critical band is a width in Hz, so the answer genuinely differs per
-    //   register - which registers a spectrum was optimised for therefore has to be on
-    //   screen, not implied.
+    //   register - and differs going DOWN as much as going up: the interval that beats
+    //   worst is ~434 cents in the bass and ~61 cents four octaves up. Which registers a
+    //   spectrum was optimised for therefore has to be on screen, not implied.
     //
     //   There is no aggregate selector beside it any more. `adaptAggBox` offered mean over
-    //   the range vs minimax (the worst register), and minimax stopped being a choice the
-    //   day the range was anchored at the played note and made to run UPWARD: the worst
-    //   register of an upward range is the anchor itself, so minimax optimised the anchor
-    //   alone and THIS field stopped changing the result - 10.742 at every width. The
+    //   the range vs minimax (the worst register); minimax stopped being a choice the day
+    //   the range was anchored at the played note, and it has not come back with the
+    //   symmetric band - the mean is what SpectrumTests (8) measures every width on. The
     //   aggregate is the mean, always; the tooltip on this field says so.
-    juce::TextEditor adaptRegStepsEdit;
-    // `adaptRegSpanLbl` is what stops N being a magic number: it names the ANCHOR the range
-    // hangs off and says what N amounts to in periods, so the width is readable without
-    // arithmetic and the user can see WHICH note is being counted from.
+    juce::TextEditor adaptRegPeriodsEdit;
+    // `adaptRegSpanLbl` is what stops N being a magic number: it names the ANCHOR the band
+    // hangs off and the two keys it really reaches, so the width is readable without
+    // arithmetic, the user can see WHICH note is being counted from, and a band shortened
+    // by the end of the keyboard says so instead of looking symmetric.
     juce::Label      adaptRegLbl, adaptRegSpanLbl;
-    // N, in the user's own unit. < 0 means "not typed yet": until then the field shows -
-    // and the search uses - the default width for whatever scale is loaded, so swapping
-    // 12-EDO for 31-EDO on a fresh instance still gives two periods rather than two thirds
-    // of one. Once the user types, the NUMBER is theirs and is never reinterpreted: N is
-    // their statement of how wide in the tuning's own units, and re-deriving it on a scale
-    // change is precisely the silent rewrite this control is built to avoid.
-    int              adaptRegSteps = -1;
+    // N, in periods. < 0 means "not typed yet": until then the field shows - and the search
+    // uses - dissonance::kAdaptRegisterDefaultPeriods. Unlike the step count this replaces,
+    // a typed N needs no protection from a tuning change: periods ARE the tuning's units,
+    // so "1.5" means one and a half periods of whatever is loaded, before and after.
+    double           adaptRegPeriods = -1.0;
     int              registerDegreesPerPeriod() const;
-    int              registerStepsEffective() const;       // N as typed, or the default width
-    int              registerStepsFitting() const;         // ...and how many of them the board has
+    double           registerPeriodsEffective() const;     // N as typed, or the default width
+    // ...and how much of it the 128-key board really has on each side of the anchor. They
+    // differ from N only near the ends of the keyboard, and when they do the panel SAYS the
+    // shorter numbers: quietly sliding the anchor to make N fit would optimise for
+    // registers the user never asked about, with nothing on screen to show it.
+    double           registerPeriodsFittingDown() const;
+    double           registerPeriodsFittingUp() const;
+    double           registerPeriodsFrom (double endHz) const;   // Hz -> periods off the anchor
     juce::String     registerPeriodText (int key) const;   // key -> the period it starts
     juce::String     registerKeyText (int key) const;      // key -> "period:degree", e.g. "3:0"
     juce::String     adaptRegSpanText() const;             // the sentence under the N field
-    juce::String     adaptRegSpanLine (const juce::String& anchor, int steps, int fit,
-                                       const juce::String& periods) const;
+    juce::String     adaptRegSpanLine (const juce::String& anchor, double periods,
+                                       double fitDown, double fitUp,
+                                       const juce::String& loHz, const juce::String& hiHz,
+                                       const juce::String& qualifier) const;
+    // How the period the band is built on is qualified, if at all: empty for a scale that
+    // states its own, a marker for a .tun table where it is Fibló's estimate or - worse -
+    // the fallback nobody supplied. Appended to the line under the field, because a band
+    // measured in a unit the tuning does not really have must not look like a fact.
+    juce::String     registerPeriodQualifier() const;
+    juce::String     registerPeriodQualifierText (bool estimated) const;
+    juce::String     registerHzText (double hz) const;      // a band end, as the panel prints it
     void             syncAdaptRegisterSpan();
-    void             commitAdaptRegisterSteps();
+    void             commitAdaptRegisterPeriods();
     // The key whose ACTIVE-TUNING pitch is nearest `hz` - how a register in Hz is named
     // back to the user. Through the tuning, so a shifted or table-anchored instrument
     // names its own keys and not 12-EDO's.

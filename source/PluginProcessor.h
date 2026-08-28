@@ -925,26 +925,58 @@ public:
         // clusters as nearly free and builds them, which is precisely the roughness that
         // dominates two octaves up.
         //
-        // ONE NUMBER, and it is a COUNT OF SCALE STEPS: the range runs from the anchor key
-        // (see registerAnchorKey) to `regSteps` degrees of the loaded tuning above it. Two
-        // absolute bounds could not do this - they were pinned to fixed pitches, so the
-        // adaptation answered with the same spectrum whichever register was actually being
-        // played, and they had to be re-read every time the tuning changed. A step count is
-        // the same musical width in any tuning (24 in 12-EDO, 62 in 31-EDO, 26 in
-        // Bohlen-Pierce are all two periods) and it FOLLOWS the hands.
+        // ONE NUMBER, and it is a COUNT OF PERIODS EACH WAY: the band runs from
+        // `regPeriods` periods BELOW the anchor key (see registerAnchorKey) to the same
+        // number of periods ABOVE it. Both halves matter - the interval that beats worst
+        // is ~434 cents low and ~61 cents four octaves up, so the register a fifth below
+        // the played note is as different a question as the one above it, and an
+        // anchor-and-up band (what this was) simply never asked it.
         //
-        // < 0 means "the default width", which is kAdaptRegisterDefaultPeriods periods of
-        // whatever scale is loaded - so a follower running with the window shut still spans
-        // the register being played instead of collapsing to one pitch.
-        int    regSteps  = -1;
+        // WHY PERIODS AND NOT STEPS. A step count was the previous unit and it was exact
+        // but unreadable: "62" is two periods in 31-EDO and 62 periods in a one-degree
+        // scale, so every value had to be divided by the degree count before it meant
+        // anything, and a typed number had to be deliberately protected from being
+        // re-derived when the tuning changed. A period IS the tuning's own unit: the same
+        // number is the same musical width in every scale, nothing is re-derived, and the
+        // only tuning that has no period of its own is the absolute .tun table - where
+        // adaptRegistersFor uses the period Fibló measured for the file and the panel says
+        // so, rather than pretending.
+        //
+        // < 0 means "the default width", which is kAdaptRegisterDefaultPeriods (measured,
+        // see SpectrumTests (8)) - so a follower running with the window shut still spans
+        // the registers around the note being played instead of collapsing to one pitch.
+        double regPeriods = -1.0;
     };
+    // WHERE THE PERIOD USED BY THE REGISTER BAND COMES FROM. A .scl (or MTS) states its
+    // own period, so the band is exact. An absolute 128-key .tun states 128 pitches and
+    // NOTHING about repetition: what periodRatio()/degreesPerPeriod() answer there is
+    // Fibló's estimate for the file, or - when the file has nothing ascending to measure -
+    // the 2/1-over-12-keys fallback, which is a guess and not a measurement. The panel
+    // shows which of the three it is standing on, because a band silently built on a made
+    // up period is exactly the "silently wrong" this instrument refuses to be.
+    enum class RegisterPeriodSource { Scale, TableEstimate, TableFallback };
+    struct RegisterPeriodInfo
+    {
+        RegisterPeriodSource source = RegisterPeriodSource::Scale;
+        double ratio    = 2.0;      // the period in force, as a frequency ratio
+        int    keys     = 12;       // ...and how many MIDI keys of THIS tuning span it
+        double devCents = 0.0;      // worst cents the .tun strays from it (table modes only)
+    };
+    RegisterPeriodInfo registerPeriodInfo() const;
     // The KEY the register range hangs off: the lowest note being HELD, else the last one
     // played, else 60. In that order and for that reason - the hand-pressed Adapt must have
     // a defensible anchor without the user holding a key down while they reach for the
     // mouse, and "middle C" is only ever the answer before a single note has been played.
     int registerAnchorKey() const noexcept;
-    // How many steps the DEFAULT range spans under the scale loaded right now.
-    int defaultRegisterSteps() const noexcept;
+    // THE BAND'S TWO ENDS IN Hz, resolved exactly as adaptRegistersFor resolves them (it
+    // calls this). Registers are FREQUENCIES, not notes: the objective is sampled at
+    // pitches, so the ends are the anchor's frequency multiplied and divided by the
+    // tuning's period raised to `periods`. Going through the key ladder instead - anchor
+    // +- round(periods x degrees) keys, which is what the step-count form did - rounded
+    // every fractional width to the nearest key: 1.5 periods of a five-note scale came out
+    // 120 cents wide of what was asked for, silently. Only the CLAMP is in keys, because
+    // "the instrument stops here" really is a statement about the keyboard.
+    void registerBandHz (double periods, double& loHz, double& hiHz) const noexcept;
     // The registers a run would use, resolved exactly as startSpectrumAdapt resolves them -
     // the panel prints these, so what it claims and what the search does cannot drift.
     // A member, not a static: the range is now anchor-relative and step-counted, so it can

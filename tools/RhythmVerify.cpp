@@ -3019,14 +3019,24 @@ int main()
                         // explicitly "explain it in some hover", so the sentence has to be
                         // IN the neighbouring control's tooltip, in the language on screen -
                         // a tooltip no other check in this build can see.
-                        const auto& tip = P.regStepsTip;
+                        const auto& tip = P.regPeriodsTip;
                         const bool says = lang == 1 ? tip.contains ("MITJANA")
                                                     : tip.contains ("AVERAGE");
-                        std::printf ("    Steps hover: %d chars, says the aggregate is the average: %s (%s)\n",
-                                     tip.length(), says ? "yes" : "NO", lang == 1 ? "ca" : "en");
+                        // ...and the same rule for the OTHER thing this field's hover is the
+                        // only home of: that the band reaches both ways. The caption is one
+                        // word ("Periods") and the line under it is numbers, so if the hover
+                        // stops saying it, nothing on screen says it in words at all.
+                        const bool both = lang == 1 ? tip.contains ("PER SOTA")
+                                                    : tip.contains ("BELOW");
+                        std::printf ("    Periods hover: %d chars, says the aggregate is the average: %s,"
+                                     " says the band reaches below the note: %s (%s)\n",
+                                     tip.length(), says ? "yes" : "NO", both ? "yes" : "NO",
+                                     lang == 1 ? "ca" : "en");
                         check (says,
-                               "and the Steps field's hover says the spectrum is optimised as the AVERAGE"
+                               "and the Periods field's hover says the spectrum is optimised as the AVERAGE"
                                " across the register span");
+                        check (both,
+                               "and that the band runs BELOW the played note as well as above it");
                     }
 
                     // THE WRAPPING READ-OUTS. A juce::Label lays out in as many lines as
@@ -3883,13 +3893,15 @@ int main()
                 }
             }
 
-            // (3) ONE NUMBER: N STEPS ABOVE THE NOTE BEING PLAYED. The range used to be two
-            //     absolute bounds (note names, then period numbers) and both forms were
-            //     pinned to fixed pitches - so the adaptation answered with the same
-            //     spectrum whichever register was actually played, which is the complaint
-            //     the whole feature came from. What has to hold now is different in kind:
-            //     the width is a COUNT in the tuning's own steps, and the range hangs off a
-            //     note that MOVES. Neither is visible to any other check in this build.
+            // (3) ONE NUMBER: N PERIODS EACH WAY FROM THE NOTE BEING PLAYED. The range was
+            //     two absolute bounds first (note names, then period numbers), both pinned
+            //     to fixed pitches so the adaptation answered with the same spectrum
+            //     whichever register was actually played; then a count of STEPS running
+            //     UPWARD, which followed the hands but never asked what the spectrum does
+            //     BELOW them and could not be read as a width without dividing by the
+            //     degree count. What has to hold now: the width is in the TUNING'S OWN
+            //     PERIODS, the band straddles the anchor, and the anchor MOVES. None of it
+            //     is visible to any other check in this build.
             {
                 const int D = juce::jmax (1, p.getScaleDegrees());
                 juce::AudioBuffer<float> rbuf (2, blk);
@@ -3902,23 +3914,35 @@ int main()
                     rbuf.clear();
                     p.processBlock (rbuf, m);
                 };
+                // The band's ends are FREQUENCIES (a fractional width lands between keys),
+                // so everything below is judged in cents off the anchor - the unit the
+                // claim is actually made in.
+                const auto centsOff = [&] (int anchorKey, double hz)
+                {
+                    const double a = p.getNoteFrequency (anchorKey);
+                    return (a > 0.0 && hz > 0.0) ? 1200.0 * std::log2 (hz / a) : 0.0;
+                };
 
-                // (3a) THE DEFAULT IS A WIDTH, NOT A NUMBER OF KEYS. Two periods of the
-                //      LOADED scale (see dissonance::kAdaptRegisterDefaultPeriods, which
-                //      SpectrumTests measures), so it is the same musical span in every
-                //      tuning instead of "24" meaning two periods here and two thirds of
-                //      one somewhere else.
+                // (3a) THE DEFAULT IS A WIDTH IN PERIODS, and the SAME number in every
+                //      tuning - that is the whole reason the unit changed from steps
+                //      (see dissonance::kAdaptRegisterDefaultPeriods, which SpectrumTests
+                //      measures). The band it produces is symmetric about the anchor.
                 const auto d0 = ed->registerProbeForTests();
-                std::printf ("  default width: %d steps of %d/period = %.1f periods; \"%s\"\n",
-                             d0.steps, D, d0.steps / (double) D, d0.spanText.toRawUTF8());
-                check (d0.steps == (int) std::lround (dissonance::kAdaptRegisterDefaultPeriods * D),
-                       "a fresh panel starts at the measured default width, in the loaded scale's own steps");
-                check (d0.stepsText == juce::String (d0.steps),
+                std::printf ("  default width: %.1f periods of a %d-degree scale = %.1f c each way; \"%s\"\n",
+                             d0.periods, D, centsOff (d0.anchorKey, d0.hiHz), d0.spanText.toRawUTF8());
+                check (std::abs (d0.periods - dissonance::kAdaptRegisterDefaultPeriods) < 1.0e-9,
+                       "a fresh panel starts at the measured default width, in the tuning's own periods");
+                check (d0.periodsText == juce::String (dissonance::kAdaptRegisterDefaultPeriods, 1),
                        "and the field shows that number rather than leaving the user to guess it");
+                check (std::abs (centsOff (d0.anchorKey, d0.hiHz)
+                                 - 1200.0 * dissonance::kAdaptRegisterDefaultPeriods) < 0.05
+                       && std::abs (centsOff (d0.anchorKey, d0.loHz)
+                                    + 1200.0 * dissonance::kAdaptRegisterDefaultPeriods) < 0.05,
+                       "and one period each way in 12-EDO really is 1200 cents DOWN and 1200 UP");
                 check (d0.spanText.contains (juce::String (dissonance::kAdaptRegisterDefaultPeriods, 1))
                        || d0.spanText.contains (juce::String (dissonance::kAdaptRegisterDefaultPeriods, 1)
                                                     .replaceCharacter ('.', ',')),
-                       "and the line under it says what that comes to in PERIODS - N alone is a magic number");
+                       "and the line under it repeats the width - two frequencies alone are a magic number");
 
                 // (3b) THE ANCHOR RULE, all three branches. Held (lowest), else last
                 //      played, else key 60. The middle branch is the one that makes the
@@ -3938,28 +3962,34 @@ int main()
                 check (held.spanText.contains (":"),
                        "and the panel NAMES that note (period:degree), so the user can see what the width is counted from");
 
-                // (3c) THE RANGE RESOLVES ANCHOR -> ANCHOR + N THROUGH THE TUNING, and it
-                //      MOVES with the hands. Playing an octave up must move both ends: the
-                //      original bug was that it did not.
+                // (3c) THE BAND RESOLVES ANCHOR +- N PERIODS THROUGH THE TUNING, IT
+                //      STRADDLES THE ANCHOR, and it MOVES with the hands. The straddling
+                //      half is the new part: the band used to START at the played key, so
+                //      keyLo == anchorKey was the shipping behaviour and is now a bug.
                 play ({ 72 }, true);
                 const auto up = ed->registerProbeForTests();
                 play ({ 72 }, false);
-                std::printf ("  playing 72: keys %d..%d, %.1f..%.1f Hz (was %.1f..%.1f Hz from key 48)\n",
-                             up.keyLo, up.keyHi, up.loHz, up.hiHz, held.loHz, held.hiHz);
-                check (up.keyLo == 72 && up.keyHi == juce::jlimit (0, 127, 72 + up.steps),
-                       "the range runs from the played key to N steps above it");
-                check (std::abs (up.loHz - p.getNoteFrequency (72)) < 1.0e-9
-                       && std::abs (up.hiHz - p.getNoteFrequency (up.keyHi)) < 1.0e-9,
-                       "and both ends are the ACTIVE TUNING's own frequencies for those keys");
+                std::printf ("  playing 72: %.1f..%.1f Hz, %.1f c either side (was %.1f..%.1f Hz from key 48)\n",
+                             up.loHz, up.hiHz, centsOff (72, up.hiHz), held.loHz, held.hiHz);
+                const double wantC = 1200.0 * up.periods;   // 12-EDO: one period is 1200 c
+                check (std::abs (centsOff (72, up.loHz) + wantC) < 0.05
+                       && std::abs (centsOff (72, up.hiHz) - wantC) < 0.05,
+                       "the band runs N periods BELOW the played key and N periods above it");
+                const double anchorHz72 = p.getNoteFrequency (72);
+                check (up.loHz < anchorHz72 && up.hiHz > anchorHz72,
+                       "so the note being played is INSIDE the band, not standing at its bottom edge");
+                check (std::abs (up.loHz - p.getNoteFrequency (60)) < 1.0e-9
+                       && std::abs (up.hiHz - p.getNoteFrequency (84)) < 1.0e-9,
+                       "and at a whole number of periods both ends land on the ACTIVE TUNING's own keys");
                 check (up.loHz > held.loHz * 1.5 && up.hiHz > held.hiHz * 1.5,
                        "and moving up the keyboard really does move the registers being optimised for");
 
                 // (3d) WHAT THE PANEL SHOWS IS WHAT THE SEARCH GETS. The editor pushes the
-                //      step COUNT and the processor resolves it; if those two ever disagreed
-                //      the panel would be describing a run that never happened.
+                //      width in PERIODS and the processor resolves it; if those two ever
+                //      disagreed the panel would be describing a run that never happened.
                 {
                     FractalAdditiveAudioProcessor::SpectrumAdaptSettings st;
-                    st.regSteps = up.steps;
+                    st.regPeriods = up.periods;
                     const auto regs = p.adaptRegistersFor (st, p.getNoteFrequency (60), false);
                     const auto now = ed->registerProbeForTests();
                     check (! regs.f0.empty()
@@ -3968,64 +3998,151 @@ int main()
                            "the Hz the search is really given are the Hz the panel is showing");
                 }
 
-                // (3e) A TYPED N IS THE USER'S, AND IT IS IN STEPS. Loading a scale with a
-                //      different degree count must NOT re-derive it: N is their statement of
-                //      how wide in the tuning's own units, and rewriting it on a scale swap
-                //      is the silent change this control exists to prevent. An UNTYPED one
-                //      does follow the scale - that is the default, not a setting.
-                ed->setAdaptRegisterStepsForTests ("31");
+                // (3e) THE BOUNDS ARE THE TUNING'S OWN PERIOD, IN CENTS, IN EVERY TUNING.
+                //      This is the check the unit change is FOR: "N periods" has to come out
+                //      as N times whatever that scale's period really is - 1200 c in 12-EDO,
+                //      1200 in 19-EDO with a different degree count under it, 1902 c for
+                //      Bohlen-Pierce's 3/1, and 1200 again for a five-note octave scale
+                //      whose keys are 240 c apart. A step count could not state this at all;
+                //      an implementation that quietly used 12-EDO arithmetic, or that fell
+                //      back to an octave, fails here and nowhere else.
+                {
+                    struct Tun { const char* name; const char* text; int degrees; double periodC; };
+                    const juce::String edo19 = [] { juce::String s; for (int i = 1; i <= 19; ++i)
+                                                        s << " " << juce::String (1200.0 * i / 19.0, 5) << "\n"; return s; } ();
+                    const juce::String bp    = [] { juce::String s; for (int i = 1; i <= 13; ++i)
+                                                        s << " " << juce::String (1901.955 * i / 13.0, 5) << "\n"; return s; } ();
+                    const Tun tuns[] = {
+                        { "12-EDO",        nullptr, 12, 1200.0 },
+                        { "19-EDO",        nullptr, 19, 1200.0 },
+                        { "Bohlen-Pierce", nullptr, 13, 1901.955 },
+                        { "5-note octave", nullptr,  5, 1200.0 } };
+                    const juce::String texts[4] = {
+                        "! e12.scl\n12-EDO\n 12\n!\n" + [] { juce::String s; for (int i = 1; i <= 12; ++i)
+                                                        s << " " << juce::String (100.0 * i, 5) << "\n"; return s; } (),
+                        "! e19.scl\n19-EDO\n 19\n!\n" + edo19,
+                        "! bp.scl\nBohlen-Pierce\n 13\n!\n" + bp,
+                        "! p5.scl\n5 per octave\n 5\n!\n 240.00000\n 480.00000\n 720.00000\n 960.00000\n 1200.00000\n" };
+                    // Two widths, so the check is about N*period and not about "one period
+                    // happens to be one degree-count of keys".
+                    const double widths[] = { 1.0, 1.5 };
+                    for (int t = 0; t < 4; ++t)
+                    {
+                        juce::String e;
+                        // check() takes a const char*, so every message here is materialised
+                        // into a named local first: a temporary juce::String would be dead
+                        // by the time the failure line is printed.
+                        const juce::String mLoad = juce::String ("the ") + tuns[t].name + " scale loads";
+                        const juce::String mDeg  = juce::String ("...with the ") + juce::String (tuns[t].degrees)
+                                                 + " degrees per period it declares";
+                        check (p.loadScalaText (texts[t], tuns[t].name, e), mLoad.toRawUTF8());
+                        check (p.getScaleDegrees() == tuns[t].degrees, mDeg.toRawUTF8());
+                        for (const double w : widths)
+                        {
+                            ed->setAdaptRegisterPeriodsForTests (juce::String (w, 1));
+                            play ({ 60 }, true); play ({ 60 }, false);
+                            ed->resized();
+                            const auto r = ed->registerProbeForTests();
+                            const double anchorHz = p.getNoteFrequency (r.anchorKey);
+                            const double dn = 1200.0 * std::log2 (anchorHz / r.loHz);
+                            const double upC = 1200.0 * std::log2 (r.hiHz / anchorHz);
+                            std::printf ("  %-14s +-%.1f per: %.1f..%.1f Hz, -%.1f c / +%.1f c"
+                                         " (the scale's own period is %.1f c, so %.1f c is asked for)\n",
+                                         tuns[t].name, w, r.loHz, r.hiHz, dn, upC,
+                                         tuns[t].periodC, w * tuns[t].periodC);
+                            // 0.05 c, not "about right": the ends are the anchor's frequency
+                            // times the tuning's own period ratio, so they are exact to
+                            // floating point, and a loose bound would pass an implementation
+                            // that used the wrong period - or the old one, which rounded the
+                            // width onto the nearest KEY and missed by up to half a step
+                            // (120 cents in the five-note scale below).
+                            const juce::String mBand = juce::String ("in ") + tuns[t].name
+                                                     + " the band reaches exactly " + juce::String (w, 1)
+                                                     + " of THAT tuning's periods each way";
+                            check (std::abs (dn  - w * tuns[t].periodC) < 0.05
+                                   && std::abs (upC - w * tuns[t].periodC) < 0.05,
+                                   mBand.toRawUTF8());
+                        }
+                    }
+                }
+
+                // (3f) A TYPED N NEEDS NO PROTECTION FROM A TUNING CHANGE any more, and that
+                //      is the point of the unit: a period IS the tuning's own unit, so 1.5
+                //      means one and a half periods of whatever is loaded, before the swap
+                //      and after it. Under the step count this needed a rule (and a bug
+                //      where the rule was missing); here it is arithmetic.
+                p.clearScala();
+                ed->setAdaptRegisterPeriodsForTests ("1.5");
+                play ({ 60 }, true); play ({ 60 }, false);
+                ed->resized();
                 const auto typed = ed->registerProbeForTests();
                 juce::String sclErr;
+                // Bohlen-Pierce on purpose: swapping 12-EDO for another octave-based scale
+                // would leave the band the same number of CENTS wide and prove nothing. A
+                // 3/1 period makes the same typed 1.5 mean a genuinely different width.
                 const bool loaded = p.loadScalaText (
-                    "! r.scl\n31-EDO\n 31\n!\n"
-                    + [] { juce::String s; for (int i = 1; i <= 31; ++i)
-                               s << " " << juce::String (1200.0 * i / 31.0, 5) << "\n"; return s; } (),
-                    "edo31", sclErr);
+                    "! bp2.scl\nBohlen-Pierce\n 13\n!\n"
+                    + [] { juce::String s; for (int i = 1; i <= 13; ++i)
+                               s << " " << juce::String (1901.955 * i / 13.0, 5) << "\n"; return s; } (),
+                    "bp2", sclErr);
+                play ({ 60 }, true); play ({ 60 }, false);
                 ed->resized();
                 const auto after = ed->registerProbeForTests();
-                std::printf ("  typed 31 steps, then loaded %d-EDO: still %d steps = %.1f periods (\"%s\")\n",
-                             p.getScaleDegrees(), after.steps, after.steps / (double) juce::jmax (1, p.getScaleDegrees()),
-                             after.spanText.toRawUTF8());
-                check (loaded, "the 31-EDO scale loads");
-                check (typed.steps == 31 && after.steps == 31,
-                       "a typed width survives a tuning change unchanged - N is the user's number, in steps");
-                check (after.spanText.contains ("1.0") || after.spanText.contains ("1,0"),
-                       "and the panel re-states what it now amounts to (31 steps of 31 = one period)");
+                std::printf ("  typed 1.5 periods in 12-EDO (%.1f c each way), then loaded Bohlen-Pierce:"
+                             " still %.1f periods, now %.1f c each way (\"%s\")\n",
+                             centsOff (typed.anchorKey, typed.hiHz), after.periods,
+                             centsOff (after.anchorKey, after.hiHz), after.spanText.toRawUTF8());
+                check (loaded, "the Bohlen-Pierce scale loads");
+                check (std::abs (typed.periods - 1.5) < 1.0e-9 && std::abs (after.periods - 1.5) < 1.0e-9,
+                       "a typed width survives a tuning change unchanged - it is already in the tuning's units");
+                check (std::abs (centsOff (typed.anchorKey, typed.hiHz) - 1800.0) < 0.05
+                       && std::abs (centsOff (after.anchorKey, after.hiHz) - 1.5 * 1901.955) < 0.05,
+                       "and the same 1.5 periods is 1800 cents in 12-EDO and 2853 in Bohlen-Pierce - the width"
+                       " follows the scale, the NUMBER does not");
 
                 // The clamps, both of them, and both stated in the field rather than behind
                 // it. 0 is legal - "just the register I am playing", the single-pitch
-                // objective chosen on purpose - and 127 is the whole board, which is a
-                // number of KEYS and so can never depend on the tuning.
-                ed->setAdaptRegisterStepsForTests ("999");
+                // objective chosen on purpose - and the ceiling is a guard against a typo
+                // pricing a run in hours, not a musical decision.
+                ed->setAdaptRegisterPeriodsForTests ("99");
                 const auto big = ed->registerProbeForTests();
-                ed->setAdaptRegisterStepsForTests ("0");
+                ed->setAdaptRegisterPeriodsForTests ("0");
                 const auto zero = ed->registerProbeForTests();
-                check (big.steps == 127 && big.stepsText == "127",
-                       "a width past the keyboard snaps to the board IN THE FIELD, not behind it");
-                check (zero.steps == 0 && zero.keyLo == zero.keyHi,
+                check (std::abs (big.periods - dissonance::kAdaptRegisterMaxPeriods) < 1.0e-9
+                       && big.periodsText == juce::String (dissonance::kAdaptRegisterMaxPeriods, 1),
+                       "a width past the ceiling snaps to it IN THE FIELD, not behind it");
+                check (zero.periods == 0.0 && std::abs (zero.loHz - zero.hiHz) < 1.0e-9,
                        "and 0 is legal: one register, the played one");
                 // Rubbish snaps back to the number in force rather than becoming "no width",
                 // which the processor would read as the default and quietly undo the typing.
-                ed->setAdaptRegisterStepsForTests ("");
+                ed->setAdaptRegisterPeriodsForTests ("");
                 const auto junk = ed->registerProbeForTests();
-                check (junk.steps == zero.steps && junk.stepsText.isNotEmpty(),
+                check (junk.periods == zero.periods && junk.periodsText.isNotEmpty(),
                        "unreadable text snaps back to the width in force, never to \"no width\"");
-                // ...and the anchor at the very top of the board, where N genuinely does not
-                // fit. The shortened range must be SAID.
-                ed->setAdaptRegisterStepsForTests ("60");
+                // ...and the anchor near the top of the board, where N genuinely does not fit
+                // ABOVE while it fits perfectly below. The band is cut at that end only, and
+                // the shortened half must be SAID rather than left looking symmetric - which
+                // is a failure the upward-only form could not even have.
+                p.clearScala();   // back to 12-EDO: the numbers below are that scale's
+                ed->setAdaptRegisterPeriodsForTests ("2.0");
                 play ({ 120 }, true);
+                ed->resized();
                 const auto top = ed->registerProbeForTests();
                 play ({ 120 }, false);
-                std::printf ("  60 steps above key 120: %d fit, keys %d..%d, \"%s\"\n",
-                             top.fitting, top.keyLo, top.keyHi, top.spanText.toRawUTF8());
-                check (top.fitting == 7 && top.keyHi == 127,
-                       "at the top of the keyboard the range stops at the last key - the anchor is never moved to make N fit");
-                check (top.spanText.contains ("7"),
-                       "and the panel says how many steps really fit instead of showing a width it is not using");
+                std::printf ("  +-2 periods around key 120: -%.2f/+%.2f fit, %.1f..%.1f Hz, \"%s\"\n",
+                             top.fitDown, top.fitUp, top.loHz, top.hiHz, top.spanText.toRawUTF8());
+                check (std::abs (top.hiHz - p.getNoteFrequency (127)) < 1.0e-9
+                       && std::abs (top.loHz - p.getNoteFrequency (96)) < 1.0e-9,
+                       "at the top of the keyboard the band stops at the last key - the anchor is never moved to make N fit");
+                check (std::abs (top.fitDown - 2.0) < 1.0e-6 && std::abs (top.fitUp - 7.0 / 12.0) < 1.0e-6,
+                       "and the two halves are genuinely different there: the full width down, seven semitones up");
+                check (! top.spanText.contains ("+-") && top.spanText.contains ("-2.0")
+                       && top.spanText.contains ("0.6"),
+                       "so the panel drops the symmetric \"+-\" form and prints each side's real reach");
 
                 // Back to a known state for everything downstream: 12-EDO, default width.
                 p.clearScala();
-                ed->setAdaptRegisterStepsForTests (juce::String (p.defaultRegisterSteps()));
+                ed->setAdaptRegisterPeriodsForTests (juce::String (dissonance::kAdaptRegisterDefaultPeriods, 1));
                 play ({ 60 }, true); play ({ 60 }, false);
                 ed->resized();
             }
@@ -4058,10 +4175,10 @@ int main()
                 {
                     FractalAdditiveAudioProcessor::SpectrumAdaptSettings s;
                     s.partials = 16; s.periodRatio = 8.0; s.minGapCents = 20.0;
-                    // Six octaves of range, in the unit the setting is now in: 72 steps of
-                    // 12-EDO. The estimator has to price the registers that width really
-                    // produces, not a pair of frequencies nothing else uses any more.
-                    s.shapeAmps = true; s.regSteps = 72;
+                    // Six octaves of band, in the unit the setting is now in: three periods
+                    // each way in 12-EDO. The estimator has to price the registers that
+                    // width really produces, not a pair of frequencies nothing else uses.
+                    s.shapeAmps = true; s.regPeriods = 3.0;
                     const double f0 = 261.6;
                     s.rootOnly = false;
                     const double heavy = p.estimateAdaptMs (s, 31, f0, false);
@@ -4172,21 +4289,23 @@ int main()
             const double afterReal = p.measureCurrentAgainstTarget (alphas, f0, true, regs);
             std::printf ("  12ED2 x 8 partials: model %.2f -> %.2f, really sounding %.2f -> %.2f\n",
                          info.before, info.after, beforeReal, afterReal);
-            // THE REGISTER RANGE, end to end through the real processor. A settings block
-            // with no width set means the DEFAULT width - two periods of the loaded scale,
-            // counted UP from the anchor key (test (a) above left that at key 60) - and the
+            // THE REGISTER BAND, end to end through the real processor. A settings block
+            // with no width set means the DEFAULT width - one period of the loaded scale
+            // EACH WAY from the anchor key (test (a) above left that at key 60) - and the
             // result must SAY which registers it was optimised for, because with a
             // single-pitch objective (the bug this replaces) the answer is different.
             const double anchorHz = p.getNoteFrequency (p.registerAnchorKey());
-            const double topHz    = p.getNoteFrequency (juce::jlimit (0, 127, p.registerAnchorKey()
-                                                                              + p.defaultRegisterSteps()));
+            double botHz = 0.0, topHz = 0.0;
+            p.registerBandHz (dissonance::kAdaptRegisterDefaultPeriods, botHz, topHz);
             std::printf ("  registers: %d points, %.2f..%.2f Hz (anchor key %d at %.2f Hz, target f0 %.2f),"
                          " aggregated as the mean\n",
                          info.regPoints, info.regLoHz, info.regHiHz, p.registerAnchorKey(),
                          anchorHz, f0);
-            check (info.regPoints == 3 && std::abs (info.regLoHz - anchorHz) < 1.0e-6
+            check (info.regPoints == 3 && std::abs (info.regLoHz - botHz) < 1.0e-6
                    && std::abs (info.regHiHz - topHz) < 1.0e-6,
-                   "an unset width is two periods UP from the note played, sampled at three registers");
+                   "an unset width is one period either side of the note played, sampled at three registers");
+            check (info.regLoHz < anchorHz * 0.999 && info.regHiHz > anchorHz * 1.001,
+                   "so the played note sits INSIDE the band the spectrum was optimised over, not at its floor");
             check ((int) info.perRegister.size() == info.regPoints
                    && (int) info.registerF0.size() == info.regPoints,
                    "and the result carries one measured number per register");
