@@ -374,6 +374,28 @@ public:
     // the bug. (showPopup() is dispatched asynchronously; the probe delivers that one
     // callback by hand, since the verifier has no dispatch loop - see the body.)
     static int comboReopenProbeForTests (int attempts);
+    // TESTS: how much clear space the CUSTOM RATIOS box really leaves around the numbers
+    // typed into it. "adapta la caja de custom ratios para que los numeros no toquen su
+    // borde." Two separate ways that went wrong, neither visible to any rect check:
+    //   - a TextEditor's clearances are asymmetric (setIndents has no bottom or right
+    //     twin, and the default border is {1,1,1,3}), so the bottom row sat 1 px from
+    //     the outline;
+    //   - this LookAndFeel strokes a TextEditor's outline as a PILL of radius height/2,
+    //     which on the 70 px tall ratios box is a 35 px arc biting deep into the first
+    //     and last rows - the corners of the text area were OUTSIDE the drawn shape.
+    // `clip` is the border inset, i.e. the only region the editor can put ink in at all
+    // (the viewport clips there), read back out of JUCE rather than restated here.
+    struct RatiosInkProbe
+    {
+        juce::Rectangle<int> box;   // the editor itself
+        juce::Rectangle<int> clip;  // where any glyph can land: nothing outside reaches the glass
+        juce::Rectangle<int> ink;   // bounding box of the glyphs currently laid out
+        float radius = 0.0f;        // the corner radius the outline is stroked with
+        float minGap = 0.0f;        // clear px between the outline's inner edge and `clip`
+        bool  clipInsideOutline = true; // all four corners of `clip` inside the drawn shape
+        bool  inkInsideClip = true;
+    };
+    RatiosInkProbe ratiosInkProbeForTests (const juce::String& typed);
     // TESTS: what the MAIN window says about whose patch its controls are. The preset
     // field is frozen (and disabled) while a playground corner is being edited; nothing
     // else in the build can see that, and getting it wrong is how a user loads a preset

@@ -188,6 +188,23 @@ namespace
         return p;
     }
 
+    // THE OUTLINE A TEXT EDITOR IS DRAWN WITH: the rect its border is stroked along, the
+    // corner radius and the pen width. ONE place, because GalacticLnF strokes exactly
+    // this and ratiosInkProbeForTests measures exactly this - a probe that rebuilt the
+    // shape from its own copy of the radius could not see a radius paint() had changed.
+    //
+    // A PILL (radius = half the height) is right for a ONE-LINE field, and wrong for a
+    // multi-line text AREA: on the 70 px tall custom-ratios box the same rule gave a
+    // 35 px radius, and the arc cut so far into the first and last rows that the digits
+    // sat on top of the border - "adapta la caja de custom ratios para que los numeros no
+    // toquen su borde". A text area gets the modest corner the macro panels use instead.
+    struct EditorOutline { juce::Rectangle<float> rect; float radius, thickness; };
+    EditorOutline textEditorOutline (float w, float h, bool multiLine)
+    {
+        const auto r = juce::Rectangle<float> (0.0f, 0.0f, w, h).reduced (0.9f);
+        return { r, multiLine ? 6.0f : h * 0.5f, 1.4f };
+    }
+
     // How far INSIDE its own top-right corner a frame's drawn border passes, walked along
     // the diagonal in half-pixel steps: 0.5 for a square corner (the first sample is
     // already inside), 2.5 for the 9 px rounding - the corner is a quadratic Bezier whose
@@ -927,9 +944,9 @@ namespace
         }
         void drawTextEditorOutline (juce::Graphics& g, int width, int height, juce::TextEditor& te) override
         {
+            const auto o = textEditorOutline ((float) width, (float) height, te.isMultiLine());
             g.setColour (te.findColour (juce::TextEditor::outlineColourId));
-            g.drawRoundedRectangle (juce::Rectangle<float> (0.0f, 0.0f, (float) width, (float) height).reduced (0.9f),
-                                    (float) height * 0.5f, 1.4f);
+            g.drawRoundedRectangle (o.rect, o.radius, o.thickness);
         }
     };
 }
@@ -2298,7 +2315,16 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     intervalEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
     intervalEdit.setColour (juce::TextEditor::outlineColourId, cTimbre.withAlpha (0.7f));
     intervalEdit.setColour (juce::TextEditor::textColourId, juce::Colours::white);
-    intervalEdit.setIndents (8, 4);
+    // "adapta la caja de custom ratios para que los numeros no toquen su borde."
+    // A TextEditor's clearances are NOT symmetric out of the box: setIndents gives a left
+    // and a TOP indent with no bottom or right twin, and the default border is
+    // {1,1,1,3} - so the last row of digits was drawn one pixel from the outline and the
+    // first row started inside the pill's arc. The border is what actually CLIPS, so the
+    // room on all four sides is set there, and the indents only add to the two sides that
+    // have them. Measured by ratiosInkProbeForTests, which reads these values back out of
+    // JUCE rather than repeating them.
+    intervalEdit.setBorder (juce::BorderSize<int> (4, 5, 5, 6)); // top, left, bottom, right
+    intervalEdit.setIndents (4, 2);
     intervalEdit.setFont (juce::Font (juce::FontOptions (13.0f)));
     // A real multi-line text AREA now: the shared engine box hands the custom view far
     // more room than the old one-line strip, so a long interval list wraps and stays
@@ -3245,6 +3271,41 @@ juce::StringArray FractalAdditiveAudioProcessorEditor::presetSearchProbeForTests
     // at all rather than one that works.
     panel.refilter();
     return panel.shown;
+}
+
+FractalAdditiveAudioProcessorEditor::RatiosInkProbe
+FractalAdditiveAudioProcessorEditor::ratiosInkProbeForTests (const juce::String& typed)
+{
+    RatiosInkProbe r;
+    intervalEdit.setText (typed, false);
+
+    r.box = intervalEdit.getLocalBounds();
+    // The BORDER is what the viewport is inset by, so it is what clips: no glyph can be
+    // drawn outside this, whatever the text says. Read back from JUCE, not restated.
+    const auto b = intervalEdit.getBorder();
+    r.clip = r.box.reduced (0, 0)
+                  .withTrimmedLeft (b.getLeft()).withTrimmedRight (b.getRight())
+                  .withTrimmedTop (b.getTop()).withTrimmedBottom (b.getBottom());
+    r.ink  = intervalEdit.getTextBounds (juce::Range<int> (0, intervalEdit.getTotalNumChars())).getBounds();
+    r.inkInsideClip = r.ink.isEmpty() || r.clip.contains (r.ink);
+
+    const auto o = textEditorOutline ((float) r.box.getWidth(), (float) r.box.getHeight(),
+                                      intervalEdit.isMultiLine());
+    r.radius = o.radius;
+    // The stroke is centred on o.rect, so its INNER edge is half a pen-width further in.
+    const auto inner = o.rect.reduced (o.thickness * 0.5f);
+    const float innerRad = juce::jmax (0.0f, o.radius - o.thickness * 0.5f);
+    r.minGap = juce::jmin (juce::jmin ((float) r.clip.getX() - inner.getX(),
+                                       (float) r.clip.getY() - inner.getY()),
+                           juce::jmin (inner.getRight()  - (float) r.clip.getRight(),
+                                       inner.getBottom() - (float) r.clip.getBottom()));
+    juce::Path shape;
+    shape.addRoundedRectangle (inner, innerRad);
+    const auto c = r.clip.toFloat();
+    for (auto pt : { c.getTopLeft(), c.getTopRight(), c.getBottomLeft(), c.getBottomRight() })
+        if (! shape.contains (pt.x, pt.y))
+            r.clipInsideOutline = false;   // the pill's arc is eating the text area's corner
+    return r;
 }
 
 int FractalAdditiveAudioProcessorEditor::comboReopenProbeForTests (int attempts)

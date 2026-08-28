@@ -3085,6 +3085,30 @@ int main()
             check (names (cust) == "engine|both, slope|fractal, fractal|morph, morph|range",
                    "the custom view adds no divider of its own - the thin line between the "
                    "Remove button and the ratios box is gone");
+
+            // THE CUSTOM RATIOS BOX'S OWN CLEARANCES.
+            // "adapta la caja de custom ratios para que los numeros no toquen su borde."
+            // Still in the custom view - it is the only one that lays this box out.
+            std::printf ("\nthe custom ratios box:\n");
+            const auto ink = ed->ratiosInkProbeForTests (
+                // Enough tokens to WRAP: a one-line ink would never come near the bottom,
+                // and the bottom is the side a TextEditor gives no indent to.
+                "1 9/8 5/4 4/3 3/2 5/3 15/8 2 9/4 5/2 8/3 3 10/3 15/4 4 "
+                "17/4 9/2 19/4 5 21/4 11/2 23/4 6 25/4 13/2 27/4 7");
+            std::printf ("  box %dx%d  clip (%d,%d %dx%d)  ink (%d,%d %dx%d)  radius %.1f  gap %.1f\n",
+                         ink.box.getWidth(), ink.box.getHeight(),
+                         ink.clip.getX(), ink.clip.getY(), ink.clip.getWidth(), ink.clip.getHeight(),
+                         ink.ink.getX(), ink.ink.getY(), ink.ink.getWidth(), ink.ink.getHeight(),
+                         ink.radius, ink.minGap);
+            check (ink.minGap >= 2.0f,
+                   "the ratios box keeps clear pixels between its outline and the area any "
+                   "digit can be drawn in - on all four sides");
+            check (ink.clipInsideOutline,
+                   "...and the whole of that area is INSIDE the drawn outline: the pill's arc "
+                   "no longer cuts across the first and last rows of numbers");
+            check (ink.inkInsideClip,
+                   "the numbers really are laid out inside it");
+
             p.setTimbreEnabled (false);
             ed->refreshEngineDressing();
         }
