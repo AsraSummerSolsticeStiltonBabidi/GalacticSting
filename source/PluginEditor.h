@@ -12,6 +12,80 @@
 #include <vector>
 
 //==============================================================================
+// HOW MUCH ROOM A CONTROL LEAVES FOR ITS OWN WORD, AND HOW WIDE IT MUST BE TO HOLD IT.
+//
+// "haz un repaso de todos los textos que quedan cortados como 'not in this spectrum' y
+//  arreglalos"
+//
+// Three different places need these numbers and they have to agree: the LookAndFeel that
+// PAINTS the control, resized() which SIZES it, and the text sweep which CHECKS it. They
+// did not agree - the tuning buttons were sized with a plain 12 pt font while the
+// LookAndFeel drew them in ~15 pt bold, and every caption was sized as if a juce::Label
+// drew into its whole width when JUCE reserves 5 px a side - so "Afegeix al banc" was
+// 24 px too narrow and drawFittedText silently squashed it. This is a bilingual product:
+// Catalan runs 20-40% longer than English, so a width that is a hard-coded number is a
+// truncation waiting for a language switch.
+//
+// Each function mirrors exactly the painter named beside it. Nothing here guesses.
+namespace fgfit
+{
+    // GalacticLnF::getTextButtonFont.
+    inline juce::Font textButtonFont (int h)
+    { return juce::Font (juce::FontOptions (juce::jmin (16.0f, (float) h * 0.62f)).withStyle ("Bold")); }
+    // The drawn tuning-fork glyph plus its gap (GalacticLnF::drawButtonText).
+    inline float textButtonForkWidth (int h)
+    {
+        const float fh = juce::jmin (13.0f, (float) h - 4.0f);
+        return (float) ((int) std::ceil (fh * 0.62f) + 3) + 2.0f;
+    }
+    // GalacticLnF::drawButtonText reduces the bounds by 4 px each side.
+    inline float textButtonRoom (int w, int h, bool fork)
+    { return (float) w - 8.0f - (fork ? textButtonForkWidth (h) : 0.0f); }
+    inline int textButtonWidth (const juce::String& text, int h, bool fork)
+    {
+        return (int) std::ceil (juce::GlyphArrangement::getStringWidth (textButtonFont (h), text))
+             + 8 + (fork ? (int) std::ceil (textButtonForkWidth (h)) : 0) + 2; // +2: rounding
+    }
+    inline int textButtonWidth (const juce::Button& b)
+    { return textButtonWidth (b.getButtonText(), b.getHeight(), b.getProperties().contains ("fork")); }
+
+    // LookAndFeel_V4::drawToggleButton: a tick box of fontSize*1.1 at x=4, the text
+    // starting 10 px after it, 2 px spare at the right.
+    inline juce::Font toggleFont (int h)
+    { return juce::Font (juce::FontOptions (juce::jmin (15.0f, (float) h * 0.75f))); }
+    inline float toggleRoom (int w, int h)
+    { return (float) w - (float) juce::roundToInt (juce::jmin (15.0f, (float) h * 0.75f) * 1.1f) - 12.0f; }
+    inline int toggleWidth (const juce::String& text, int h)
+    {
+        return (int) std::ceil (juce::GlyphArrangement::getStringWidth (toggleFont (h), text))
+             + juce::roundToInt (juce::jmin (15.0f, (float) h * 0.75f) * 1.1f) + 12 + 2;
+    }
+    inline int toggleWidth (const juce::ToggleButton& b)
+    { return toggleWidth (b.getButtonText(), b.getHeight()); }
+
+    // juce::Label: drawLabel works inside getBorderSize(), in getLabelFont()'s face.
+    inline juce::Font labelFont (const juce::Label& l)
+    { return l.getLookAndFeel().getLabelFont (const_cast<juce::Label&> (l)); }
+    inline int labelWidth (const juce::Label& l)
+    {
+        return (int) std::ceil (juce::GlyphArrangement::getStringWidth (labelFont (l), l.getText()))
+             + l.getBorderSize().getLeftAndRight() + 3;
+    }
+    // ...and, for the ones that are meant to WRAP, the height that text takes at a
+    // given box width. A fixed height on a bilingual paragraph is a cut last line.
+    inline int labelHeight (const juce::Label& l, int boxWidth)
+    {
+        juce::AttributedString as;
+        as.setText (l.getText());
+        as.setFont (labelFont (l));
+        as.setJustification (l.getJustificationType());
+        as.setWordWrap (juce::AttributedString::byWord);
+        juce::TextLayout tl;
+        tl.createLayout (as, (float) juce::jmax (1, boxWidth - l.getBorderSize().getLeftAndRight()));
+        return (int) std::ceil (tl.getHeight()) + l.getBorderSize().getTopAndBottom() + 2;
+    }
+}
+
 class FractalAdditiveAudioProcessorEditor : public juce::AudioProcessorEditor,
                                             private juce::Timer
 {
@@ -452,6 +526,44 @@ public:
         bool  inkInsideClip = true;
     };
     RatiosInkProbe ratiosInkProbeForTests (const juce::String& typed);
+
+    //==========================================================================
+    // EVERY DRAWN STRING IN THE WHOLE EDITOR, MEASURED AGAINST THE RECT IT IS DRAWN INTO.
+    //
+    // "haz un repaso de todos los textos que quedan cortados como 'not in this spectrum'
+    //  y arreglalos"
+    //
+    // The existing checks name their controls one by one, so they can only ever see the
+    // text somebody remembered to register - and a truncation is precisely what nobody
+    // remembered. This one WALKS THE TREE instead: every visible Label, Button and
+    // ComboBox under the editor, whatever panel it lives in, named by its path so the
+    // report says where to go. Nothing to keep in step, so a control added tomorrow is
+    // measured tomorrow.
+    //
+    // `need` is what the string measures in the very font that control draws it in;
+    // `avail` is the width that control really leaves for text (a Label's border, a
+    // TextButton's corner indents, a ToggleButton's tick box, a ComboBox's arrow), each
+    // taken from the LookAndFeel that actually paints it. Multi-line labels are
+    // word-wrapped instead and report `needHeight` against the box.
+    struct TextFit
+    {
+        juce::String path;      // "rhythmPanel/slot0Lbl", ...
+        juce::String kind;      // Label / TextButton / ToggleButton / ComboBox
+        juce::String text;
+        juce::Rectangle<int> bounds;   // the control, in editor coordinates
+        float need = 0.0f,  avail = 0.0f;   // single-line width
+        float needH = 0.0f, availH = 0.0f;  // wrapped height, for the ones that wrap
+        bool  wraps = false;
+        float over() const { return wraps ? needH - availH : need - avail; }
+    };
+    // Lays the editor out in the given language, walks it, and puts the language back.
+    std::vector<TextFit> textFitProbeForTests (bool useCatalan);
+private:
+    // Recursive half of textFitProbeForTests: every visible Label / Button / ComboBox
+    // under `parent`, measured against the room its own LookAndFeel leaves it.
+    void walkTextFits (const juce::Component& parent, const juce::String& path,
+                       std::vector<TextFit>& out) const;
+public:
     // TESTS: what the MAIN window says about whose patch its controls are. The preset
     // field is frozen (and disabled) while a playground corner is being edited; nothing
     // else in the build can see that, and getting it wrong is how a user loads a preset
@@ -1242,6 +1354,10 @@ private:
     // polyrhythm with the sounding timbre (see RhythmEngine.h for the maths).
     struct RhythmPanel : juce::Component, juce::ListBoxModel
     {
+        // The -12 / +12 steppers on every slot row. 30 px left 22 for the word, and
+        // "+12" measures 26 in the font a 22 px button draws in, so both were squashed
+        // on every row of the panel at once.
+        static constexpr int kStepBtnW = 36;
         FractalAdditiveAudioProcessor* proc = nullptr;
         std::function<juce::String (double)> ratioName;                       // 3/2 or 702c
         std::function<juce::String (const char*, const char*)> trF;           // EN/CA
@@ -1841,10 +1957,22 @@ private:
                     if (t != nullptr && ! missing && ratioName)
                         rl = juce::String::fromUTF8 (" \xc2\xb7 ") + ratioName ((double) t->partials[(size_t) p].ratio);
                     else if (missing)
-                        rl = " - not in this spectrum";
+                        // The row is 96 px wide. " - not in this spectrum" measured 170
+                        // in the font it is drawn in, so it was cut off mid-word - the
+                        // user's own example - AND it was raw English in a bilingual
+                        // product. One red word says the same thing and fits; the
+                        // sentence is in the row's hover.
+                        rl = trF ? " - " + trF ("missing", "no hi \xc3\xa9s") : juce::String (" - missing");
                     slotLbl[i].setColour (juce::Label::textColourId,
                                           missing ? juce::Colour (0xffe0453f) : juce::Colour (0xffc4ccda));
                     slotLbl[i].setText ("P" + juce::String (p + 1) + rl, juce::dontSendNotification);
+                    slotLbl[i].setTooltip (missing && trF
+                        ? trF ("This train is routed to a partial the CURRENT spectrum does not have, so it "
+                               "cannot pulse. Route it to a partial that exists, or load the spectrum it came from.",
+                               "Aquest tren est\xc3\xa0 encaminat a un parcial que l'espectre ACTUAL no t\xc3\xa9, "
+                               "aix\xc3\xad que no pot polsar. Encamina'l a un parcial que existeixi, o carrega "
+                               "l'espectre d'on venia.")
+                        : juce::String());
                     if (! pitchE[i].hasKeyboardFocus (false))
                         pitchE[i].setText (s.useRatio.load() && ratioName
                                                ? ratioName (s.ratio.load())
@@ -1935,19 +2063,25 @@ private:
             auto top = r.removeFromTop (30);
             closeB.setBounds (top.removeFromRight (24).withSizeKeepingCentre (22, 22));
             top.removeFromRight (5);
-            helpB.setBounds (top.removeFromRight (104).withSizeKeepingCentre (104, 22)); // "How to route"
+            {   // "How to route" / "Com encaminar" - the Catalan is 6 px longer.
+                const int hw = juce::jmax (104, fgfit::textButtonWidth (helpB.getButtonText(), 22, false));
+                helpB.setBounds (top.removeFromRight (hw).withSizeKeepingCentre (hw, 22));
+            }
             heading.setBounds (top); // big title, no toggle inside it
             r.removeFromTop (6);
 
             // Two big pill toggles, each with a caption: MIDI OUT (send to DAW) and
             // PLAY IN FIBLÓ (interpret the rhythm here; the held note stays silent).
             {
+                // Widths from the CAPTIONS, not from numbers: "MIDI out (to DAW)" is
+                // "Sortida MIDI (al DAW)" in Catalan and needed 23 px more than the
+                // column it was given, so it shipped condensed.
                 auto tg = r.removeFromTop (46);
-                auto p1 = tg.removeFromLeft (118);
+                auto p1 = tg.removeFromLeft (juce::jmax (118, fgfit::labelWidth (outLbl)));
                 onT.setBounds (p1.removeFromTop (26).withSizeKeepingCentre (84, 24));
                 outLbl.setBounds (p1);
                 tg.removeFromLeft (14);
-                auto p2 = tg.removeFromLeft (140);
+                auto p2 = tg.removeFromLeft (juce::jmax (140, fgfit::labelWidth (selfLbl)));
                 selfT.setBounds (p2.removeFromTop (26).withSizeKeepingCentre (96, 24));
                 selfLbl.setBounds (p2);
                 tg.removeFromLeft (16);
@@ -1959,7 +2093,7 @@ private:
                 auto fr = r.removeFromTop (24);
                 feedbackT.setBounds (fr.removeFromLeft (160));
                 fr.removeFromLeft (8);
-                feedbackLbl.setBounds (fr.removeFromLeft (54));
+                feedbackLbl.setBounds (fr.removeFromLeft (juce::jmax (54, fgfit::labelWidth (feedbackLbl))));
                 fr.removeFromLeft (6);
                 feedbackS.setBounds (fr.removeFromLeft (juce::jmin (240, fr.getWidth())).reduced (0, 1));
             }
@@ -1973,12 +2107,12 @@ private:
                 secRate.setBounds (ra.removeFromTop (13));
                 ra.removeFromTop (3);
                 auto g1 = ra.removeFromTop (24);
-                divLbl.setBounds (g1.removeFromLeft (50));
+                divLbl.setBounds (g1.removeFromLeft (juce::jmax (50, fgfit::labelWidth (divLbl))));
                 g1.removeFromLeft (4);
                 nDn.setBounds (g1.removeFromLeft (20).reduced (0, 2));
                 nVal.setBounds (g1.removeFromLeft (26));
                 nUp.setBounds (g1.removeFromLeft (20).reduced (0, 2));
-                timesLbl.setBounds (g1.removeFromLeft (66));
+                timesLbl.setBounds (g1.removeFromLeft (juce::jmax (66, fgfit::labelWidth (timesLbl))));
                 g1.removeFromLeft (4);
                 xDn.setBounds (g1.removeFromLeft (20).reduced (0, 2));
                 xVal.setBounds (g1.removeFromLeft (26));
@@ -2008,7 +2142,7 @@ private:
             r.removeFromTop (4);
             {
                 auto g3 = grpRow (secTempo);
-                tempoT.setBounds (g3.removeFromLeft (150));
+                tempoT.setBounds (g3.removeFromLeft (juce::jmax (150, fgfit::toggleWidth (tempoT))));
                 g3.removeFromLeft (4);
                 tempoX2.setBounds (g3.removeFromLeft (32).reduced (0, 1));
                 g3.removeFromLeft (4);
@@ -2019,9 +2153,9 @@ private:
             r.removeFromTop (4);
             {
                 auto g4 = grpRow (secGate); // NOTE START: quantize/mono toggles
-                qTempoT.setBounds (g4.removeFromLeft (218));
+                qTempoT.setBounds (g4.removeFromLeft (juce::jmax (218, fgfit::toggleWidth (qTempoT))));
                 g4.removeFromLeft (6);
-                monoT.setBounds (g4.removeFromLeft (76));
+                monoT.setBounds (g4.removeFromLeft (juce::jmax (76, fgfit::toggleWidth (monoT))));
                 g4.removeFromLeft (6);
                 qPulseT.setBounds (g4);
             }
@@ -2042,7 +2176,7 @@ private:
                 auto velCol = head.removeFromRight (76);
                 velSlopeS.setBounds (velCol.withY (velCol.getY() - 1).withHeight (15));
                 velHead.setBounds (velCol.withY (velCol.getY() + 14).withHeight (13));
-                head.removeFromRight (4 + 30 + 3 + 30 + 6); // over the -12/+12 pair + gaps
+                head.removeFromRight (4 + kStepBtnW + 3 + kStepBtnW + 6); // over the -12/+12 pair + gaps
                 noteHead.setBounds (head);        // over the pitch box
             }
             // Scrollable slot rows: the viewport takes all space above the info
@@ -2076,9 +2210,9 @@ private:
                 row.removeFromRight (4);
                 velS[i].setBounds (row.removeFromRight (76));
                 row.removeFromRight (4);
-                s12P[i].setBounds (row.removeFromRight (30));
+                s12P[i].setBounds (row.removeFromRight (kStepBtnW));
                 row.removeFromRight (3);
-                s12M[i].setBounds (row.removeFromRight (30));
+                s12M[i].setBounds (row.removeFromRight (kStepBtnW));
                 row.removeFromRight (6);
                 pitchE[i].setBounds (row.reduced (0, 1));
             }
@@ -3058,14 +3192,18 @@ private:
         {
             auto r = getLocalBounds().reduced (10, 8);
             auto head = r.removeFromTop (26);
-            resetAllB.setBounds (head.removeFromRight (96).reduced (0, 2));
+            resetAllB.setBounds (head.removeFromRight (juce::jmax (96, fgfit::textButtonWidth (
+                                     resetAllB.getButtonText(), 22, false))).reduced (0, 2));
             head.removeFromRight (8);
             onT.setBounds (head.removeFromRight (58).reduced (0, 2));
             head.removeFromRight (8);
             headLbl.setBounds (head);
             r.removeFromTop (2);
             statLbl.setBounds (r.removeFromTop (16));
-            factsLbl.setBounds (r.removeFromTop (52));
+            // Three paragraphs, in two languages, at whatever width the window is: a
+            // fixed 52 px was 23 short of both, so the last line was cut off inside the
+            // panel with nothing to say it had been.
+            factsLbl.setBounds (r.removeFromTop (juce::jmax (52, fgfit::labelHeight (factsLbl, r.getWidth()))));
             warnLbl.setBounds (r.removeFromTop (warnLbl.getText().isEmpty() ? 0 : 32));
             r.removeFromTop (4);
             view.setBounds (r);
@@ -3335,6 +3473,9 @@ private:
                 cornerLbl[i].setFont (juce::Font (juce::FontOptions (14.0f).withStyle ("Bold")));
                 cornerLbl[i].setColour (juce::Label::textColourId, playgroundCornerColour (i));
                 cornerLbl[i].setJustificationType (juce::Justification::centred);
+                // A single bold letter in a 16 px box: JUCE's default 5 px side border
+                // left 6 px for a glyph that measures 8-10, so even "A" was condensed.
+                cornerLbl[i].setBorderSize (juce::BorderSize<int> (0, 1, 0, 1));
                 cornerLbl[i].setInterceptsMouseClicks (false, false);
                 addAndMakeVisible (cornerLbl[i]);
 

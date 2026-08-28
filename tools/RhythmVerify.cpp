@@ -6160,6 +6160,71 @@ int main()
     }
 
     //==========================================================================
+    // --- NO STRING IN THE WHOLE EDITOR IS CUT OFF, IN EITHER LANGUAGE ----------------
+    // "haz un repaso de todos los textos que quedan cortados como 'not in this spectrum'
+    //  y arreglalos"
+    // Named checks can only see the text somebody registered, and a truncation is
+    // exactly what nobody registered. This walks the whole tree instead - every visible
+    // Label, Button and ComboBox in every panel - and measures the string against the
+    // room its own LookAndFeel leaves it, in English and in Catalan.
+    {
+        std::printf ("\nevery drawn string against the box it is drawn in:\n");
+        auto pt = std::make_unique<FractalAdditiveAudioProcessor>();
+        pt->prepareToPlay (sr, blk);
+        std::unique_ptr<juce::AudioProcessorEditor> tbase (pt->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (tbase.get());
+        if (ed == nullptr) check (false, "the editor was created");
+        else
+        {
+            // Route a rhythm slot to a partial the spectrum does NOT have, so the row
+            // that carries the user's own example - "not in this spectrum" - is really
+            // on screen while the sweep runs. A state no default window ever shows.
+            // ...which needs a LIVE spectrum to compare against: with no template the
+            // row cannot know the partial is missing and just says "P901".
+            {
+                juce::AudioBuffer<float> tb (2, blk);
+                juce::MidiBuffer on;  on.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+                tb.clear(); pt->processBlock (tb, on);
+                for (int i = 0; i < 60; ++i)
+                { juce::MidiBuffer none; tb.clear(); pt->processBlock (tb, none); pt->pollParametersForTests(); juce::Thread::sleep (2); }
+                juce::MidiBuffer off; off.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+                tb.clear(); pt->processBlock (tb, off);
+                for (int i = 0; i < 10; ++i) { juce::MidiBuffer none; tb.clear(); pt->processBlock (tb, none); }
+            }
+            pt->getRhythm().slots[0].partial  = 0;   pt->getRhythm().slots[0].enabled = true;
+            pt->getRhythm().slots[1].partial  = 900; pt->getRhythm().slots[1].enabled = true;
+            int totalOver = 0, measured = 0;
+            for (int lang = 0; lang < 2; ++lang)
+            {
+                auto fits = ed->textFitProbeForTests (lang == 1);
+                measured += (int) fits.size();
+                std::sort (fits.begin(), fits.end(),
+                           [] (const auto& a, const auto& b) { return a.over() > b.over(); });
+                int over = 0;
+                for (const auto& f : fits)
+                {
+                    if (f.over() <= 0.5f) continue;
+                    ++over;
+                    if (over <= 40)
+                        std::printf ("  %s %-12s needs %4.0f in %4.0f px %s  at (%d,%d %dx%d)  [%s]  %s\n",
+                                     lang == 1 ? "ca" : "en", f.kind.toRawUTF8(),
+                                     f.wraps ? f.needH : f.need, f.wraps ? f.availH : f.avail,
+                                     f.wraps ? "tall" : "wide",
+                                     f.bounds.getX(), f.bounds.getY(), f.bounds.getWidth(), f.bounds.getHeight(),
+                                     f.text.toRawUTF8(), f.path.toRawUTF8());
+                }
+                std::printf ("  %s: %d of %d drawn strings do not fit\n",
+                             lang == 1 ? "ca" : "en", over, (int) fits.size());
+                totalOver += over;
+            }
+            check (measured > 90, "the sweep really walked the whole window");
+            check (totalOver == 0,
+                   "every Label, Button and ComboBox in the editor fits the box it is drawn "
+                   "in, in BOTH languages");
+        }
+    }
+
+    //==========================================================================
     // --- A CONTROL MOVES WHILE NOTES ARE HELD ---------------------------------------
     // "mover controles con notas apretadas sigue siendo buggy, a veces no deja mover el
     //  control y a veces si, solo si has movido el control un instante antes de empezar

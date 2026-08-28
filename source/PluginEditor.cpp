@@ -362,10 +362,12 @@ namespace
             return juce::Font (juce::FontOptions (juce::jmax (12.5f, l.getFont().getHeight())).withStyle ("Bold"));
         }
 
+        // fgfit (see PluginEditor.h) is the ONE place these numbers live: this painter,
+        // the resized() that sizes these buttons to their words, and the text sweep that
+        // checks them all read from it. A font stated twice is a truncation waiting for
+        // a translation - it was, in the tuning row.
         juce::Font getTextButtonFont (juce::TextButton&, int buttonHeight) override
-        {
-            return juce::Font (juce::FontOptions (juce::jmin (16.0f, (float) buttonHeight * 0.62f)).withStyle ("Bold"));
-        }
+        { return fgfit::textButtonFont (buttonHeight); }
 
         // Slider value read-outs: a small font + generous horizontal squish so the
         // value ALWAYS fits (e.g. two decimals) instead of being clipped to "...".
@@ -446,6 +448,7 @@ namespace
             if (b.getProperties().contains ("fork"))
             {
                 const float fh = juce::jmin (13.0f, (float) b.getHeight() - 4.0f);
+                // (the width taken here is textButtonForkWidth minus the 2 px gap below)
                 auto fr = area.removeFromLeft ((int) std::ceil (fh * 0.62f) + 3).toFloat()
                               .withSizeKeepingCentre (fh * 0.62f, fh);
                 g.strokePath (tuningForkPath (fr), juce::PathStrokeType (juce::jmax (1.2f, fh * 0.14f),
@@ -2798,8 +2801,15 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     for (auto* b : { &rhythmPanel.octAllUp, &rhythmPanel.octAllDn })
         b->setTooltip (tr ("Shift ALL pulses together by whole octaves (-4..+4). Ratio pitches move by exact 2/1s; steps pitches by whole periods of the scale.",
                            "Despla\xc3\xa7""a TOTS els polsos alhora per octaves senceres (-4..+4). Els tons en ratio es mouen per 2/1 exactes; els de passos per per\xc3\xado" "des sencers de l'escala."));
-    rhythmPanel.listHead.setText (tr ("Partials of the current patch (click to route)",
-                                      "Parcials del patch actual (clica per encaminar)"), dontSendNotification);
+    // Short enough for the 236 px column it sits over. The long form - "of the current
+    // patch" - was 28 px wider than the column in English and 43 in Catalan, so it was
+    // drawn condensed; it lives in the hover now, where it has all the room it wants.
+    rhythmPanel.listHead.setText (tr ("Partials (click to route)",
+                                      "Parcials (clica per encaminar)"), dontSendNotification);
+    rhythmPanel.listHead.setTooltip (tr ("The partials of the patch loaded right now. Click one to route it "
+                                         "to a pulse train.",
+                                         "Els parcials del patch carregat ara mateix. Clica'n un per "
+                                         "encaminar-lo a un tren de polsos."));
     rhythmPanel.pickHint.setText (juce::String::fromUTF8 (catalan
                                       ? "\xe2\x9f\xb5 Clica un parcial per encaminar-lo"
                                       : "\xe2\x9f\xb5 Click a partial to route it"), dontSendNotification);
@@ -2833,7 +2843,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Needs MPE out. Sets every routed pulse's pitch to the JUST ratio of ITS OWN partial (P3 -> 3/1...), so the receiving synth plays the partials' exact pitches.",
         "Necessita MPE out. Posa el to de cada pols al ratio JUST del SEU parcial (P3 -> 3/1...), perqu\xc3\xa8 el sinte receptor toqui els tons exactes dels parcials."));
     rhythmPanel.helpB.setTooltip (tr ("Routing & setup help", "Ajuda d'encaminament i configuraci\xc3\xb3"));
-    rhythmPanel.noteHead.setText (tr ("Steps from the played note", "Passos des de la nota tocada"),
+    // The column header over the pitch boxes, 165 px wide: the full Catalan sentence
+    // measured 167 and the English 157 against 155 of usable width, so both were drawn
+    // condensed. Shortened here and stated in full in the hover below.
+    rhythmPanel.noteHead.setText (tr ("Steps from the note", "Passos des de la nota"),
                                   dontSendNotification);
     rhythmPanel.noteHead.setTooltip (tr (
         "Each train sends the PLAYED note shifted by this many scale steps: \"7st\" = 7 steps up, \"7st-\" = 7 steps down. Never a fixed note. With MPE out, ratios (\"3/2\") and cents (\"702c\") are also FROM the played note.",
@@ -3290,6 +3303,16 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     adaptList.emptyText = tr ("Press Adapt to move the partials to where these notes beat least (or most).",
                               "Prem Adapta per moure els parcials on aquestes notes baten menys (o m\xc3\xa9s).");
 
+    // THE SUB-PANELS MUST BE LAID OUT AGAIN, NOT ONLY RE-WORDED.
+    // Component::setBounds only calls resized() when the SIZE changes, and these three
+    // panels are always given the same size - so each was laid out exactly once, in
+    // whatever language the editor was built in, and every later language switch put
+    // Catalan strings into boxes measured for English. That is why the rhythm panel's
+    // captions were the last things in the window still drawn condensed: they size
+    // themselves from their own text (fgfit), and nothing ever asked them to.
+    rhythmPanel.resized();
+    playgroundPanel.resized();
+    partialPanel.resized();
     repaint(); // title uses the language
 }
 
@@ -3319,6 +3342,202 @@ juce::StringArray FractalAdditiveAudioProcessorEditor::presetSearchProbeForTests
     // at all rather than one that works.
     panel.refilter();
     return panel.shown;
+}
+
+namespace
+{
+    // A readable name for one component in the walk: its own name if it has one, else
+    // the class, so the report says WHERE the clipped string is instead of "label 47".
+    juce::String probeNameFor (const juce::Component& c)
+    {
+        if (c.getName().isNotEmpty()) return c.getName();
+        juce::String cls (typeid (c).name());
+        // MSVC gives "class juce::Label"; keep the last word, drop the namespaces.
+        cls = cls.fromLastOccurrenceOf (" ", false, false)
+                 .fromLastOccurrenceOf ("::", false, false);
+        return cls;
+    }
+
+    // How much room a control really leaves for its text, and in which font - from
+    // fgfit, the same functions the layout sizes these controls with, so the check and
+    // the painter cannot drift apart. Returns false for a Button that paints its own
+    // graphics (the pencil), whose button TEXT is only its name and never reaches the
+    // glass at all.
+    bool buttonTextRoom (const juce::Button& b, juce::Font& fontOut, float& availOut, int& maxLines)
+    {
+        maxLines = 1;
+        if (const auto* t = dynamic_cast<const juce::ToggleButton*> (&b))
+        {
+            if (t->getName() == "onled")   // the green/red pill: "ON" / "OFF", centred
+            {
+                fontOut  = juce::Font (juce::FontOptions ((float) b.getHeight() * 0.62f).withStyle ("Bold"));
+                availOut = (float) b.getWidth();
+                return true;
+            }
+            fontOut  = fgfit::toggleFont (b.getHeight());
+            availOut = fgfit::toggleRoom (b.getWidth(), b.getHeight());
+            return true;
+        }
+        if (dynamic_cast<const juce::TextButton*> (&b) != nullptr)
+        {
+            fontOut  = fgfit::textButtonFont (b.getHeight());
+            availOut = fgfit::textButtonRoom (b.getWidth(), b.getHeight(),
+                                              b.getProperties().contains ("fork"));
+            maxLines = (float) b.getHeight() >= fontOut.getHeight() * 1.9f ? 2 : 1;
+            return true;
+        }
+        return false;
+    }
+
+    // Word-wrap `text` in `font` at `width` and report the height it takes. The same
+    // measurement drawFittedText makes before it starts condensing.
+    float wrappedHeight (const juce::String& text, const juce::Font& font, float width,
+                         juce::Justification just, float& widthOut)
+    {
+        juce::AttributedString as;
+        as.setText (text);
+        as.setFont (font);
+        as.setJustification (just);
+        as.setWordWrap (juce::AttributedString::byWord);
+        juce::TextLayout tl;
+        tl.createLayout (as, width);
+        widthOut = tl.getWidth();
+        return tl.getHeight();
+    }
+}
+
+void FractalAdditiveAudioProcessorEditor::walkTextFits (
+    const juce::Component& parent, const juce::String& path,
+    std::vector<TextFit>& out) const
+{
+    int index = 0;
+    for (auto* c : parent.getChildren())
+    {
+        const int myIndex = index++;
+        if (c == nullptr || ! c->isVisible() || c->getWidth() <= 0) continue;
+        // Most of these components have no name, so the index makes the path unique and
+        // stable - and the report prints the TEXT and the rect too, which is what a hand
+        // actually needs to find one.
+        const auto here = path + "/" + probeNameFor (*c) + "#" + juce::String (myIndex);
+
+        // A string that fits on ONE line needs no wrapping test; one that does not may
+        // still be fine if its box is tall enough for the extra lines the painter is
+        // allowed to use. Both cases go through here so there is one rule, not three.
+        auto record = [this, c, &out] (const juce::String& path_, const char* kind,
+                                       const juce::String& text, const juce::Font& font,
+                                       float avail, float availH, int maxLines,
+                                       juce::Justification just)
+        {
+            TextFit f;
+            f.path = path_; f.kind = kind; f.text = text;
+            f.bounds = getLocalArea (c, c->getLocalBounds());
+            f.need   = juce::GlyphArrangement::getStringWidth (font, text);
+            f.avail  = avail;
+            f.availH = availH;
+            if (f.need > f.avail && maxLines > 1)
+            {
+                f.wraps = true;
+                f.needH = wrappedHeight (text, font, avail, just, f.need);
+                // Wrapped: the question is now whether the LINES fit, and never more
+                // than the painter is allowed to draw.
+                f.availH = juce::jmin (availH, font.getHeight() * (float) maxLines * 1.15f);
+            }
+            out.push_back (f);
+        };
+
+        if (const auto* box = dynamic_cast<const juce::ComboBox*> (c))
+        {
+            const auto txt = box->getText();
+            if (txt.isNotEmpty())
+            {
+                auto& lnf = box->getLookAndFeel();
+                const auto font = lnf.getComboBoxFont (const_cast<juce::ComboBox&> (*box));
+                // comboTextWidth is the very function positionComboBoxText lays the
+                // label out with, so a renamed item cannot fit here and clip on screen.
+                const float w = (float) GalacticLnF::comboTextWidth (box->getWidth(), box->getHeight());
+                const float h = (float) box->getHeight() - 2.0f;
+                // The label inside a ComboBox is a juce::Label, so a TALL box really does
+                // get a second line - that is how the mode selector shows its full names.
+                const int lines = juce::jmax (1, (int) (h / font.getHeight()));
+                record (here, "ComboBox", txt, font, w, h, lines, juce::Justification::centredLeft);
+            }
+            continue;   // its label is the box's own; do not measure it twice
+        }
+        if (const auto* b = dynamic_cast<const juce::Button*> (c))
+        {
+            const auto txt = b->getButtonText();
+            juce::Font font; float avail = 0.0f; int lines = 1;
+            if (txt.isNotEmpty() && buttonTextRoom (*b, font, avail, lines))
+                record (here, dynamic_cast<const juce::ToggleButton*> (b) != nullptr ? "ToggleButton" : "Button",
+                        txt, font, avail, (float) b->getHeight(), lines, juce::Justification::centred);
+            continue;
+        }
+        if (const auto* l = dynamic_cast<const juce::Label*> (c))
+        {
+            const auto txt = l->getText();
+            if (txt.isNotEmpty())
+            {
+                const auto area = l->getBorderSize().subtractedFrom (l->getLocalBounds());
+                const auto font = l->getLookAndFeel().getLabelFont (const_cast<juce::Label&> (*l));
+                const int lines = juce::jmax (1, (int) ((float) area.getHeight() / font.getHeight()));
+                record (here, "Label", txt, font, (float) area.getWidth(), (float) area.getHeight(),
+                        lines, l->getJustificationType());
+            }
+            // No `continue`: a Slider's value box IS a Label and lives under the slider,
+            // so the recursion below still has to reach it.
+        }
+        walkTextFits (*c, here, out);
+    }
+}
+
+std::vector<FractalAdditiveAudioProcessorEditor::TextFit>
+FractalAdditiveAudioProcessorEditor::textFitProbeForTests (bool useCatalan)
+{
+    const bool was = catalan;
+    catalan = useCatalan;
+    // applyLanguage() and a relayout, for the same reason layoutProbeInLanguage does it:
+    // a Label's text was written once by applyLanguage, so probing on the flag alone
+    // would measure this language's geometry against the other language's strings.
+    applyLanguage();
+    if (getWidth() > 0) resized();
+
+    std::vector<TextFit> out;
+    walkTextFits (*this, {}, out);
+
+    // THE PANELS THAT ARE NORMALLY SHUT. The user's own example - "not in this
+    // spectrum" - lives in the Spectrum-to-Rhythm panel, which is invisible until a
+    // button is pressed, so a sweep of what happens to be on screen would never have
+    // seen it. Opened here, walked, and put straight back.
+    {
+        const bool rhythmWas = rhythmPanel.isVisible();
+        rhythmPanel.numRows = processorRef.getTemplatePartialCount();
+        rhythmPanel.list.updateContent();
+        rhythmPanel.refreshSlots();
+        rhythmPanel.refreshLive();
+        rhythmPanel.setVisible (true);
+        if (getWidth() > 0) resized();
+        walkTextFits (rhythmPanel, "rhythm", out);
+        rhythmPanel.setVisible (rhythmWas);
+    }
+    // The two FLOATING panels are not children of this editor at all (they live in their
+    // own windows), so they have to be walked by name. Given the size their windows open
+    // at, so the measurement is the one the user sees.
+    {
+        playgroundPanel.applyLanguage();
+        playgroundPanel.setSize (560, 520);
+        playgroundPanel.refresh (true);
+        walkTextFits (playgroundPanel, "playground", out);
+
+        partialPanel.applyLanguage();
+        partialPanel.setSize (760, 520);
+        partialPanel.resized();
+        walkTextFits (partialPanel, "partials", out);
+    }
+
+    catalan = was;
+    applyLanguage();
+    if (getWidth() > 0) resized();
+    return out;
 }
 
 FractalAdditiveAudioProcessorEditor::DragProbe
@@ -5649,6 +5868,11 @@ void FractalAdditiveAudioProcessorEditor::makeLabel (juce::Label& l, juce::Colou
     l.setJustificationType (juce::Justification::centred);
     l.setColour (juce::Label::textColourId, c.brighter (0.15f));
     l.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+    // JUCE reserves 5 px of every Label for a border nothing here draws, which on a
+    // 22 px caption is nearly half its width - and drawLabel then condenses the word to
+    // fit what is left. These captions are inline text in a panel, not framed fields:
+    // 2 px is all the breathing room they need.
+    l.setBorderSize (juce::BorderSize<int> (0, 2, 0, 2));
     addAndMakeVisible (l);
 }
 
@@ -6116,8 +6340,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
     auto caption = [] (juce::Label& l, juce::Rectangle<int>& row, int nominal, int keepForControl = 24)
     {
         l.setJustificationType (juce::Justification::centredLeft);
-        const int need = juce::GlyphArrangement::getStringWidthInt (l.getFont(), l.getText()) + 4;
-        const int w    = juce::jmax (nominal, need);
+        // fgfit::labelWidth, not a hand-rolled measurement: a juce::Label does NOT draw
+        // into its whole width (getBorderSize is taken off first, 5 px a side by
+        // default) and GalacticLnF draws it in a BOLD face with a 12.5 px floor. Sizing
+        // to l.getFont()'s width plus 4 got both of those wrong at once, so "Period",
+        // "Per\xc3\xado" "de" and "smallest interval (c)" were all quietly condensed.
+        const int w = juce::jmax (nominal, fgfit::labelWidth (l));
         l.setBounds (row.removeFromLeft (juce::jmin (w, juce::jmax (0, row.getWidth() - keepForControl))));
     };
 
@@ -6278,8 +6506,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
             si.removeFromTop (3);
             auto r2 = si.removeFromTop (22);
-            chordPerLbl.setJustificationType (juce::Justification::centredLeft);
-            chordPerLbl.setBounds (r2.removeFromLeft (44));
+            // 44 was measured for "Period"; "Per\xc3\xado" "de" needs 4 more and was condensed.
+            caption (chordPerLbl, r2, 44, 50);
             chordPeriodEdit.setBounds (r2.removeFromLeft (44).reduced (0, 1));
             if (adapt)
             {
@@ -6684,7 +6912,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
               auto rr = c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))
                           .withWidth (juce::jmin (c.getWidth(), 158));
               caption (lblRefA, rr, 34, 70);
-              lblRefHz.setBounds (rr.removeFromRight (22));
+              lblRefHz.setBounds (rr.removeFromRight (juce::jmax (22, fgfit::labelWidth (lblRefHz))));
               refAEdit.setBounds (rr); }
             { auto c = ecOct.reduced (6, 1);   c.removeFromLeft (78);
               // Same shape as PHASE / GAIN / REFERENCE: the stepper sits RIGHT of the
@@ -6899,11 +7127,14 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 saveTuningBtn.setVisible (true);
                 tuningBankAddBtn.setVisible (true);
                 clearSclButton.setVisible (false);  // Reset removed - the mode selector does it
-                const juce::Font bf (juce::FontOptions (12.0f));
                 const auto fit = [&] (juce::TextButton& b)
                 {
-                    const int fork = b.getProperties().contains ("fork") ? 13 : 0; // drawn glyph
-                    const int w = juce::GlyphArrangement::getStringWidthInt (bf, b.getButtonText()) + 14 + fork;
+                    // GalacticLnF's own width rule, in the font the button really draws
+                    // in: measured here with a plain 12 pt while the LookAndFeel painted
+                    // ~15 pt bold, "Afegeix al banc" came out 24 px too narrow and was
+                    // silently squashed.
+                    const int w = fgfit::textButtonWidth (b.getButtonText(), mrow.getHeight(),
+                                                          b.getProperties().contains ("fork"));
                     b.setBounds (mrow.removeFromLeft (juce::jmin (w, juce::jmax (0, mrow.getWidth()))));
                     mrow.removeFromLeft (4);
                 };
@@ -7020,7 +7251,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 lblTuningBank.setBounds (bkrow.removeFromLeft (38));
                 tuningBankClearBtn.setBounds (bkrow.removeFromRight (24).reduced (1, 1));
                 bkrow.removeFromRight (3);
-                tuningBankLoadBtn.setBounds (bkrow.removeFromRight (46).reduced (1, 0));
+                tuningBankLoadBtn.setBounds (bkrow.removeFromRight (juce::jmax (46,
+                                                 fgfit::textButtonWidth (tuningBankLoadBtn.getButtonText(), 24, false) + 2))
+                                             .reduced (1, 0));
                 bkrow.removeFromRight (4);
                 compact (tuningBankBox, bkrow);
                 // Honest failure instead of zero-height ghosts: if the box ran out of
