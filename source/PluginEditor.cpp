@@ -6761,18 +6761,28 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
         if (! customView)
         {
-            //-- HARMONIC view: BASE | HARMONICS over PRIME, TEMPER along the bottom --
+            //-- HARMONIC view: BASE | HARMONICS over PRIME, TEMPER inside PRIME -------
             auto hb = engineBoxBounds.reduced (5, 0);
             hb.removeFromTop (chipH); hb.removeFromBottom (3);
-            // TEMPER is reachable from BOTH views (see the ctor comment): here it spans
-            // the bottom of the box, under the cells.
-            temperToggle.setBounds (hb.removeFromBottom (20));
+            // TEMPER is reachable from BOTH views (see the ctor comment). Here it goes
+            // at the FOOT OF THE PRIME CELL - "haz que el boton temper to tuning este
+            // debajo de todo dentro de la seccion prime" - not spanning the whole box
+            // under the cells, where it read as a fourth column of the box rather than
+            // as something the prime filter owns. The 20 px row it used to take back
+            // goes to the three cells.
             // Base is the wider column so the Base-pitch combo can show "Transposed
             // down" in full without clipping.
             hcBase      = hb.removeFromLeft (hb.getWidth() * 52 / 100);
             auto midCol = hb;
-            hcHarm      = midCol.withHeight (midCol.getHeight() * 2 / 5);
-            hcPrime     = midCol.withTrimmedTop (midCol.getHeight() * 2 / 5);
+            // HARMONICS holds exactly ONE fader, so it takes exactly what that fader
+            // needs and PRIME gets everything else. As a 2/5 : 3/5 fraction it was
+            // hoarding 14 px that prime now needs: with TEMPER moved inside it, the
+            // prime cell has to hold a mode box, nine tick boxes with their labels AND
+            // that row, and the ticks came out 8 px tall - present, laid out, inside
+            // their box, and far too small to hit.
+            const int harmH = juce::jmin (midCol.getHeight() / 2, lblH + 24 + 6); // label + fader + its 3 px inset
+            hcHarm      = midCol.withHeight (harmH);
+            hcPrime     = midCol.withTrimmedTop (harmH);
             {
                 auto bi = hcBase.reduced (5, 3); bi.removeFromTop (lblH);
                 auto left = bi.removeFromLeft (bi.getWidth() * 34 / 100);
@@ -6790,6 +6800,17 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 for (int i = 0; i < 9; ++i) { primeToggle[i].setVisible (wl); primeLbl[i].setVisible (wl); }
 
                 auto pi = hcPrime.reduced (5, 3); pi.removeFromTop (lblH);
+                // TEMPER, at the FOOT of the prime cell - reserved BEFORE the mode row
+                // and the primes, so the row that must never vanish cannot inherit the
+                // leftovers of the two states above it (the nine whitelist ticks are the
+                // taller of them). Sized to its own words, like every other control in
+                // this pass: a tick box the width of a whole cell is not a tick box.
+                {
+                    auto tr2 = pi.removeFromBottom (20);
+                    temperToggle.setBounds (tr2.removeFromLeft (
+                        juce::jmin (fgfit::snugToggleWidth (temperToggle, 20), tr2.getWidth())));
+                    pi.removeFromBottom (3);
+                }
                 // Limit / Whitelist, at the width those two words need - not the whole
                 // cell. It held a 247 px box for a six-letter mode name.
                 {
@@ -6830,17 +6851,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
             auto ci = engineBoxBounds.reduced (6, 0);
             ci.removeFromTop (chipH + 2); ci.removeFromBottom (4);
-            auto brow = ci.removeFromTop (24);
-            // TEMPER on the right of the top row (reachable from BOTH views).
-            temperToggle.setBounds (brow.removeFromRight (juce::jmin (170, brow.getWidth() * 40 / 100)));
-            brow.removeFromRight (6);
-            // [Load / Remove][Random] - two buttons that never change in number, so the
-            // row does not re-shape under the user's hand the way it did when the Off
-            // pill appeared and disappeared with the loaded scale. RANDOM is always
-            // there because it is the one control that can CREATE a spectrum out of
-            // nothing, which is exactly the state where a workspace is emptiest.
-            loadTimbreButton.setBounds (brow.removeFromLeft (brow.getWidth() * 1 / 2).reduced (2, 0));
-            randomSpectrumBtn.setBounds (brow.reduced (2, 0));
             // The bottom rows first, then EVERYTHING left goes to the intervals box:
             // the custom view has far fewer controls than the harmonic one, and the
             // freed space is exactly what the typed spectrum needed - it was one 24 px
@@ -6849,7 +6859,34 @@ void FractalAdditiveAudioProcessorEditor::resized()
             ci.removeFromBottom (4);
             auto statusRow = ci.removeFromBottom (16);
             ci.removeFromBottom (4);
-            ci.removeFromTop (5);
+            // [Load / Remove][Random][Temper to tuning] - UNDER the ratios box now:
+            // "haz que los botones remove random y temper to tuning esten abajo de la
+            // caja de ratios de custom tuning, la cual podras subir un poco arriba para
+            // hacer espacio". They were the box's top row, so the thing you type into
+            // began a third of the way down its own panel; the box now starts directly
+            // under the chip strip and the buttons sit beneath it, where the result of
+            // pressing them is what you are already looking at.
+            //
+            // Two buttons that never change in number, so the row does not re-shape
+            // under the user's hand the way it did when the Off pill appeared and
+            // disappeared with the loaded scale. RANDOM is always there because it is
+            // the one control that can CREATE a spectrum out of nothing, which is
+            // exactly the state where a workspace is emptiest. TEMPER is reachable from
+            // BOTH views (see the ctor comment) and joins them at the same size rule.
+            auto brow = ci.removeFromBottom (24);
+            ci.removeFromBottom (4);
+            {
+                auto b = brow.reduced (2, 0);
+                auto take = [&b] (juce::Component& c, int w)
+                {
+                    c.setBounds (b.removeFromLeft (juce::jmin (w, juce::jmax (0, b.getWidth()))));
+                    b.removeFromLeft (6);
+                };
+                take (loadTimbreButton,  fgfit::snugTextButtonWidth (loadTimbreButton, 24));
+                take (randomSpectrumBtn, fgfit::snugTextButtonWidth (randomSpectrumBtn, 24));
+                take (temperToggle,      fgfit::snugToggleWidth (temperToggle, 24));
+            }
+            ci.removeFromTop (2);                 // the ratios box rides higher now
             intervalEditHome = ci.reduced (1, 0); // multi-line: type intervals, Enter builds
             intervalEdit.setBounds (intervalEditHome);
             timbreStatusLabel.setBounds (statusRow);

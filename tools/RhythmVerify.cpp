@@ -2750,6 +2750,59 @@ int main()
                            "the temper tick box got its whole row inside the Custom Engine");
                 }
 
+            // ...AND WHERE IT SITS, which is a different claim in each view.
+            //
+            // "haz que el boton temper to tuning este debajo de todo dentro de la
+            //  seccion prime"  (harmonic view)
+            // "haz que los botones remove random y temper to tuning esten abajo de la
+            //  caja de ratios de custom tuning"  (custom view)
+            //
+            // Two placements of ONE button - it is laid out in both views - so both are
+            // asserted, in the pass that shows that view. Nothing else in this file
+            // could see it move: it stayed the same size, inside the same box, clear of
+            // every neighbour, in the wrong place.
+            {
+                auto rect = [&L] (const char* nm)
+                {
+                    juce::Rectangle<int> r;
+                    for (const auto& c : L.controls) if (c.first == nm) r = c.second;
+                    return r;
+                };
+                juce::Rectangle<int> primeCell;
+                for (const auto& c : L.cells) if (c.first == "eng.prime") primeCell = c.second;
+                const auto temper = rect ("cust.temper");
+                if (pass == 2)   // CUSTOM view
+                {
+                    const auto ratios = rect ("cust.intervals");
+                    const auto load   = rect ("cust.load");
+                    const auto rnd    = rect ("cust.random");
+                    std::printf ("  custom view: ratios box bottom %d | load y %d, random y %d, temper y %d\n",
+                                 ratios.getBottom(), load.getY(), rnd.getY(), temper.getY());
+                    check (! ratios.isEmpty() && ! load.isEmpty(),
+                           "the custom view shows its ratios box and its buttons");
+                    check (load.getY() >= ratios.getBottom() && rnd.getY() >= ratios.getBottom()
+                               && temper.getY() >= ratios.getBottom(),
+                           "Load/Remove, Random and Temper all sit BELOW the ratios box");
+                    check (ratios.getY() < load.getY(),
+                           "and the ratios box rode up into the room they left at the top");
+                }
+                else             // HARMONIC view
+                {
+                    std::printf ("  harmonic view: prime cell %d..%d | temper %d..%d\n",
+                                 primeCell.getY(), primeCell.getBottom(),
+                                 temper.getY(), temper.getBottom());
+                    check (! primeCell.isEmpty() && primeCell.contains (temper),
+                           "TEMPER is inside the PRIME cell, not spanning the whole box under it");
+                    // "debajo de todo": nothing in that cell may be below it. 6 px of
+                    // slack is the cell's own bottom inset, no more.
+                    check (temper.getBottom() >= primeCell.getBottom() - 6,
+                           "and it is at the very bottom of that cell");
+                    for (const auto& c : L.controls)
+                        if (c.first.startsWith ("harm.") && c.second.getY() >= temper.getBottom())
+                            check (false, "nothing in the prime section is laid out below TEMPER");
+                }
+            }
+
             // ...and no two of them may sit on top of each other.
             int clashes = 0;
             juce::String clashName;
