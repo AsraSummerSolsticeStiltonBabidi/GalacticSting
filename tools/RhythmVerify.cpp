@@ -2817,6 +2817,45 @@ int main()
                 check (squeezed == 0,
                        lang == 1 ? "no label component is squashed to fit (Catalan)"
                                  : "no label component is squashed to fit (English)");
+
+                // EVERY COMBO'S WIDEST ITEM, AND EVERY BUTTON'S WORD, AGAINST ITS BOX.
+                //
+                // "hay varios botones y desplegables ahora mismo que son absurdamente
+                //  anchos, reduce su anchura" - and narrowing a control is precisely how
+                // truncation appears. Neither of these two kinds of control can report
+                // it: a ComboBox draws as much of the item as the cell holds and a
+                // TextButton condenses to 70% and then clips, so a box six pixels too
+                // narrow passes every bounds, overlap and cell check in this file.
+                //
+                // Until now only shepMode / shepRise (combos) and three buttons whose
+                // WORD is a feature were measured, by name. That is the list a change
+                // forgets to extend: the six controls narrowed in this pass were on none
+                // of them. So the sweep is over everything the probe registers, in both
+                // languages, and the widest ITEM is what a combo is judged by - the
+                // selected one only clips after the user has already picked it.
+                {
+                    int cut = 0; juce::String worstW; float worstBy = 0.0f;
+                    auto tooTight = [&] (const juce::String& nm, const juce::String& txt,
+                                         float need, int avail)
+                    {
+                        const float over = need - (float) avail;
+                        if (over <= 0.0f) return;
+                        ++cut;
+                        if (over > worstBy) { worstBy = over; worstW = nm + " \"" + txt + "\""; }
+                    };
+                    for (const auto& t : P.comboTexts) tooTight (t.name, t.text, t.need, t.avail);
+                    for (const auto& t : P.buttonFits) tooTight (t.name, t.text, t.need, t.avail);
+                    std::printf ("  %s: %d combos + %d buttons measured, %d too narrow for their own words%s\n",
+                                 lang == 1 ? "catalan" : "english",
+                                 (int) P.comboTexts.size(), (int) P.buttonFits.size(), cut,
+                                 cut > 0 ? (" (worst: " + worstW + " by "
+                                            + juce::String ((int) std::ceil (worstBy)) + " px)").toRawUTF8() : "");
+                    check (P.comboTexts.size() >= 6 && P.buttonFits.size() >= 8,
+                           "the sweep really had combos and buttons to walk");
+                    check (cut == 0,
+                           lang == 1 ? "every combo item and every button word fits its box (Catalan)"
+                                     : "every combo item and every button word fits its box (English)");
+                }
             }
         }
 

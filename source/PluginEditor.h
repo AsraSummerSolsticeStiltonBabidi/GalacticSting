@@ -63,6 +63,74 @@ namespace fgfit
     inline int toggleWidth (const juce::ToggleButton& b)
     { return toggleWidth (b.getButtonText(), b.getHeight()); }
 
+    // GalacticLnF::drawToggleButton's "onled" pill: the word ON / OFF drawn centred in
+    // the WHOLE button, bold, at h * 0.62. The pill has no juce::Button text at all
+    // (the painted sub-label above it is its name), so every other measurement in this
+    // file reads it as an empty string and would happily size it to nothing.
+    inline juce::Font onLedFont (int h)
+    { return juce::Font (juce::FontOptions ((float) h * 0.62f).withStyle ("Bold")); }
+    inline int onLedWidth (int h)  // "OFF" is the longer of the two words
+    { return (int) std::ceil (juce::GlyphArrangement::getStringWidth (onLedFont (h), "OFF")) + 2; }
+
+    // GalacticLnF::positionComboBoxText: the label is inset by height/3 on the left and
+    // has to stop clear of the chevron, which drawComboBox puts height/2 in from the
+    // right end. Three places need this number and they have to agree: the painter, the
+    // resized() that sizes a box to the words it holds, and the probe that checks it. A
+    // ComboBox neither clips visibly nor resizes - it draws as much of the item as the
+    // cell happens to hold - so a formula copied out by hand let "Sync Project Tempo"
+    // appear on screen as "Sync Project Te" with every check in the build still green.
+    inline int comboTextWidth (int boxWidth, int boxHeight) noexcept
+    { return boxWidth - boxHeight / 3 - boxHeight / 2; }
+    // ...and the inverse: the box width a word of `textWidth` needs.
+    inline int comboWidthForText (int textWidth, int boxHeight) noexcept
+    { return textWidth + boxHeight / 3 + boxHeight / 2 + 2; } // +2: the label's own rounding
+
+    // ...and two more things stand between that room and the ITEM the user reads, both
+    // of which a width check has to know about or it certifies boxes that truncate:
+    //   - juce::Label keeps its own {1,5,1,5} border off the bounds it is given, so ten
+    //     more pixels never hold text;
+    //   - the item is drawn in GalacticLnF::getLabelFont's face, which is BOLD with a
+    //     12.5 px floor - not in the lighter face LookAndFeel_V4::getComboBoxFont sizes
+    //     the label with.
+    inline constexpr int kComboLabelBorder = 10;      // juce::Label's default 5 px a side
+    inline juce::Font comboItemFont (int h)
+    {
+        return juce::Font (juce::FontOptions (juce::jmax (12.5f, juce::jmin (16.0f, (float) h * 0.85f)))
+                               .withStyle ("Bold"));
+    }
+    inline int comboItemRoom (int boxWidth, int boxHeight) noexcept
+    { return comboTextWidth (boxWidth, boxHeight) - kComboLabelBorder; }
+    inline int comboWidthForItem (int itemWidth, int boxHeight) noexcept
+    { return comboWidthForText (itemWidth + kComboLabelBorder, boxHeight); }
+
+    // THE ONE PADDING RULE for a control sized to the words it actually holds.
+    //
+    // "hay varios botones y desplegables ahora mismo que son absurdamente anchos,
+    //  reduce su anchura". Six controls were taking a share of their row - a half, a
+    //  third, whatever was left - so a pill with the word "OFF" on it was 275 px wide
+    //  and "Recent..." was 300. Each is now sized to its own text, and they all add the
+    //  SAME breathing room on top of the painter's bare minimum so the panel reads as
+    //  one system rather than six separate decisions about what looks about right.
+    //
+    // The minimum each function above returns is the painter's own: exactly enough for
+    // the glyphs plus the insets that painter reserves. kSnugPad is the air around them.
+    inline constexpr int kSnugPad = 12;
+    inline int snugTextButtonWidth (const juce::TextButton& b, int h)
+    { return textButtonWidth (b.getButtonText(), h, b.getProperties().contains ("fork")) + kSnugPad; }
+    inline int snugToggleWidth (const juce::ToggleButton& b, int h)
+    { return (b.getName() == "onled" ? onLedWidth (h) : toggleWidth (b.getButtonText(), h)) + kSnugPad; }
+    // The WIDEST item a combo can show, never the selected one: the box does not resize
+    // when the user picks another item, so a slot sized to today's choice draws
+    // tomorrow's cut off - and nothing on screen says it was cut.
+    inline int snugComboWidth (const juce::ComboBox& c, int h)
+    {
+        const auto f = comboItemFont (h);   // from the TARGET height, not the current one
+        int w = 0;
+        for (int i = 0; i < c.getNumItems(); ++i)
+            w = juce::jmax (w, juce::GlyphArrangement::getStringWidthInt (f, c.getItemText (i)));
+        return comboWidthForItem (w, h) + kSnugPad;
+    }
+
     // juce::Label: drawLabel works inside getBorderSize(), in getLabelFont()'s face.
     inline juce::Font labelFont (const juce::Label& l)
     { return l.getLookAndFeel().getLabelFont (const_cast<juce::Label&> (l)); }
@@ -203,6 +271,16 @@ public:
             int   avail = 0;
         };
         std::vector<ComboText> comboTexts;
+        // ...and the same measurement for every BUTTON that is sized to its own word.
+        // A juce::TextButton does not condense and does not resize: drawFittedText
+        // squashes the string to 70% and then clips it, so a button narrowed to fit
+        // English shows a Catalan word cut in half with every bounds check still green.
+        // Narrowing controls is exactly how that appears, so the six controls of this
+        // pass - and every other button in the window - are measured here. `avail` is
+        // the room the painter really leaves (fgfit::textButtonRoom / toggleRoom, the
+        // fork glyph and the tick box already taken off); `need` is the string's width
+        // in the painter's own font.
+        std::vector<ComboText> buttonFits;
         // The BUTTONS whose word is the whole feature: the custom view's one button that
         // is "Load" or "Remove" depending on what is loaded, and the tuning bank's add
         // button. A wrong word on the first of those means a green Load that deletes the

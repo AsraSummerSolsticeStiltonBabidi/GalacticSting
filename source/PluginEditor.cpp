@@ -918,24 +918,14 @@ namespace
             g.strokePath (p, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         }
 
-        // Keep the selected-item text clear of the rounded left end.
-        //
-        // The usable text width is stated ONCE, here, because three places need to agree
-        // on it: this function, resized() (which sizes the Shepard row's boxes to the
-        // words they hold) and layoutProbe() (which measures whether the word fits). A
-        // combo neither clips visibly nor resizes - it just draws as much as the cell
-        // holds - so a formula copied out by hand would let "Sync Project Tempo" appear
-        // on screen as "Sync Project Te" with every check in the build still green.
-        static int comboTextWidth (int boxWidth, int boxHeight) noexcept
-        { return boxWidth - boxHeight / 3 - boxHeight / 2; }
-        // ...and the inverse: the box width a word of `textWidth` needs.
-        static int comboWidthForText (int textWidth, int boxHeight) noexcept
-        { return textWidth + boxHeight / 3 + boxHeight / 2 + 2; } // +2: the label's own rounding
-
+        // Keep the selected-item text clear of the rounded left end. The usable width is
+        // fgfit::comboTextWidth - the ONE place it lives, shared with the resized() that
+        // sizes a box to its words and with the probe that checks it fits (see the
+        // comment there for what a second copy of this formula cost).
         void positionComboBoxText (juce::ComboBox& box, juce::Label& label) override
         {
             const int inset = box.getHeight() / 3;
-            label.setBounds (inset, 1, comboTextWidth (box.getWidth(), box.getHeight()), box.getHeight() - 2);
+            label.setBounds (inset, 1, fgfit::comboTextWidth (box.getWidth(), box.getHeight()), box.getHeight() - 2);
             label.setFont (getComboBoxFont (box));
         }
 
@@ -3454,7 +3444,7 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
                 const auto font = lnf.getComboBoxFont (const_cast<juce::ComboBox&> (*box));
                 // comboTextWidth is the very function positionComboBoxText lays the
                 // label out with, so a renamed item cannot fit here and clip on screen.
-                const float w = (float) GalacticLnF::comboTextWidth (box->getWidth(), box->getHeight());
+                const float w = (float) fgfit::comboTextWidth (box->getWidth(), box->getHeight());
                 const float h = (float) box->getHeight() - 2.0f;
                 // The label inside a ComboBox is a juce::Label, so a TALL box really does
                 // get a second line - that is how the mode selector shows its full names.
@@ -5632,6 +5622,30 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
         if (const auto* l = dynamic_cast<const juce::Label*> (&c); l != nullptr && l->getText().isNotEmpty())
             p.componentLabels.push_back ({ name, l->getText(), l->getBounds(),
                 (float) juce::GlyphArrangement::getStringWidthInt (l->getFont(), l->getText()) });
+        // ...and a BUTTON carries a word that has to fit the box it was given, measured
+        // against the room the painter really leaves it (see LayoutProbe::buttonFits).
+        // Recorded through the SAME `add` every control goes through, so a button that
+        // is laid out is a button that is measured - a separate hand-kept list is how
+        // the one control a change actually narrowed ends up being the one not checked.
+        const int bh = c.getHeight(), bw = c.getWidth();
+        if (const auto* tb = dynamic_cast<const juce::TextButton*> (&c);
+            tb != nullptr && tb->getButtonText().isNotEmpty())
+            p.buttonFits.push_back ({ name, tb->getButtonText(),
+                (float) juce::GlyphArrangement::getStringWidth (fgfit::textButtonFont (bh), tb->getButtonText()),
+                (int) std::floor (fgfit::textButtonRoom (bw, bh, tb->getProperties().contains ("fork"))) });
+        else if (const auto* tg = dynamic_cast<const juce::ToggleButton*> (&c); tg != nullptr)
+        {
+            // The "onled" pill prints ON / OFF itself, centred in the whole button, and
+            // has no juce::Button text at all - measured as an empty string it would
+            // "fit" any width, including a width too small for the word it draws.
+            if (tg->getName() == "onled")
+                p.buttonFits.push_back ({ name, "OFF",
+                    (float) juce::GlyphArrangement::getStringWidth (fgfit::onLedFont (bh), "OFF"), bw });
+            else if (tg->getButtonText().isNotEmpty())
+                p.buttonFits.push_back ({ name, tg->getButtonText(),
+                    (float) juce::GlyphArrangement::getStringWidth (fgfit::toggleFont (bh), tg->getButtonText()),
+                    (int) std::floor (fgfit::toggleRoom (bw, bh)) });
+        }
     };
     // A read-out that is MEANT to wrap. Its cell is the text area drawLabel really uses
     // (the Label's own border removed - JUCE's default is 5 px each side, which is 10 px
@@ -5782,16 +5796,36 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
         // never drift from what is actually drawn. Measured in the box's live font.
         if (c.isVisible())
         {
-            const auto f = c.getLookAndFeel().getComboBoxFont (const_cast<juce::ComboBox&> (c));
+            // MEASURED THE WAY THE ITEM IS ACTUALLY DRAWN, which is not the way this
+            // probe used to measure it. Four things stand between the box's width and
+            // the room the word gets, and the old measurement missed three of them:
+            //   - positionComboBoxText leaves the label fgfit::comboTextWidth (chevron
+            //     and left inset off) - the one part it did have;
+            //   - juce::Label keeps its own {1,5,1,5} border off that, so 10 more px go;
+            //   - GalacticLnF::getLabelFont draws the item BOLD (12.5 px floor), while
+            //     this probe measured it in getComboBoxFont's lighter face;
+            //   - drawLabel word-wraps into however many WHOLE lines the height allows,
+            //     which is why the 34 px mode box legitimately holds a long sentence.
+            // Both of the misses ran the same way - towards "it fits" - so the probe was
+            // quietly certifying boxes ~10 px narrower than the word needs.
+            const auto f     = fgfit::comboItemFont (c.getHeight());
+            const int availW = fgfit::comboItemRoom (c.getWidth(), c.getHeight());
+            const int availH = (c.getHeight() - 2) - 2; // label bounds, then its own border
+            const int rows   = juce::jmax (1, (int) ((float) availH / f.getHeight()));
             juce::String widest; float need = 0.0f;
             for (int i = 0; i < c.getNumItems(); ++i)
             {
                 const auto t = c.getItemText (i);
-                const auto w = (float) juce::GlyphArrangement::getStringWidthInt (f, t);
+                // Laid out exactly as drawFittedText lays it out - wrapped over `rows`
+                // lines - but with NO horizontal squashing allowed (the painter's own
+                // 0.7 fallback IS the failure: a condensed item is a broken one).
+                juce::GlyphArrangement ga;
+                ga.addFittedText (f, t, 0.0f, 0.0f, (float) juce::jmax (1, availW), (float) juce::jmax (1, availH),
+                                  juce::Justification::centredLeft, rows, 1.0f);
+                const auto w = ga.getBoundingBox (0, -1, true).getWidth();
                 if (w > need) { need = w; widest = t; }
             }
-            p.comboTexts.push_back ({ name, widest, need,
-                                      GalacticLnF::comboTextWidth (c.getWidth(), c.getHeight()) });
+            p.comboTexts.push_back ({ name, widest, need, availW });
         }
     };
     combo ("basePitch",   basePitchBox);   combo ("phase",       phaseBox);
@@ -6419,7 +6453,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // and "all vs all" are one short line in both languages), and in the adaptation
             // those six pixels are the difference between four adapted partials on screen
             // and five - the list is the leftover of this column and pays for every row.
-            tuneScopeBox.setBounds (si.removeFromTop (24));
+            // ...and only as wide as "all vs all" / "tot vs tot" needs. It used to take
+            // the column's whole width for two three-word items.
+            {
+                auto scr = si.removeFromTop (24);
+                tuneScopeBox.setBounds (scr.removeFromLeft (
+                             juce::jmin (fgfit::snugComboWidth (tuneScopeBox, 24), scr.getWidth())));
+            }
             si.removeFromTop (3);
         }
         si.removeFromTop (1);
@@ -6742,7 +6782,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 for (int i = 0; i < 9; ++i) { primeToggle[i].setVisible (wl); primeLbl[i].setVisible (wl); }
 
                 auto pi = hcPrime.reduced (5, 3); pi.removeFromTop (lblH);
-                compact (primeModeBox, pi.removeFromTop (22));
+                // Limit / Whitelist, at the width those two words need - not the whole
+                // cell. It held a 247 px box for a six-letter mode name.
+                {
+                    auto pmr = pi.removeFromTop (22);
+                    compact (primeModeBox, pmr.removeFromLeft (
+                                 juce::jmin (fgfit::snugComboWidth (primeModeBox, 22), pmr.getWidth())));
+                }
                 pi.removeFromTop (2);
                 if (wl)
                 {
@@ -6838,7 +6884,14 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
             {
                 auto mi = beMorph.reduced (6, 3); mi.removeFromTop (lblH);
-                morphToggle.setBounds (mi.removeFromTop (20));
+                // The ON/OFF pill is sized to the word it prints, not to the cell: it
+                // was 275 px of flat colour carrying three letters, which read as a
+                // banner rather than a switch.
+                {
+                    auto mrow0 = mi.removeFromTop (20);
+                    morphToggle.setBounds (mrow0.removeFromLeft (
+                                 juce::jmin (fgfit::snugToggleWidth (morphToggle, 20), mrow0.getWidth())));
+                }
                 mi.removeFromTop (2);
                 auto mr = mi.removeFromTop (juce::jmin (19, juce::jmax (0, mi.getHeight())));
                 caption (lblMorphTime, mr, 34, 60);
@@ -7067,7 +7120,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 selRow.removeFromLeft (3);
                 modOnT.setBounds (selRow.removeFromLeft (juce::jmin (46, cw3)));
                 selRow.removeFromLeft (3);
-                modUnmapBtn.setBounds (selRow);
+                // Unmap is sized to the word "Unmap" / "Desassigna", not to whatever the
+                // row had left over - which was a third of the box for six letters.
+                modUnmapBtn.setBounds (selRow.removeFromLeft (
+                    juce::jmin (fgfit::snugTextButtonWidth (modUnmapBtn, selRow.getHeight()),
+                                selRow.getWidth())));
                 in.removeFromTop (3);
                 if (isEnv)
                 {
@@ -7111,6 +7168,21 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // leftovers exactly in the states with the most buttons showing. Its height
             // is PAID FOR by merging the old bend and Recent rows into one below, so
             // the bank row keeps the same worst case it had.
+            // Under a tuning whose period is NOT an octave the Shepard block needs a
+            // SECOND line, for the rise-interval box.
+            //
+            // Measured honestly - fgfit::comboItemRoom takes off the label's own 5 px
+            // border and measures the item in the BOLD face it is really drawn in - the
+            // four controls want ~466 px of the 447 this panel has, so on one line the
+            // ms/beats rate control was left 13 px wide: a fader nobody can grab. The
+            // probe used to certify that row because it measured the lighter face against
+            // the label's FULL width, which is 26 px of room that does not exist.
+            const bool riseChoice = shepard::periodDiffersFromOctave (processorRef.getTuningPeriodRatio());
+            // Both lines come off the bottom FIRST, for the reason the single one did:
+            // reserved after the pile of optional rows above, they would inherit the
+            // zero-height leftovers in exactly the states with the most buttons showing.
+            auto riseRow = riseChoice ? ti.removeFromBottom (22) : juce::Rectangle<int>();
+            if (riseChoice) ti.removeFromBottom (3);
             auto shepRow = ti.removeFromBottom (22);
             ti.removeFromBottom (3);
             auto mrow = ti.removeFromTop (24);
@@ -7175,14 +7247,22 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // (Load / Save / + are laid out beside the mode selector above; the row that
             // used to be here is gone, which gives the tuning bank its height back.)
             const int tmode = processorRef.getTuningMode();
+            // The three "load this tuning from somewhere" buttons each get a row, and in
+            // that row exactly the width their own sentence needs - not the panel's whole
+            // width. "Load spectrum's tuning" was a 420 px slab for 22 characters. Same
+            // padding rule as every other narrowed control (fgfit::kSnugPad), and all
+            // three share ONE helper so a rename cannot widen one and not its neighbours.
+            auto snugRow = [this] (juce::Rectangle<int>& ti, juce::TextButton& b)
+            {
+                ti.removeFromTop (3);
+                auto row = ti.removeFromTop (22).reduced (2, 0);
+                b.setBounds (row.removeFromLeft (
+                    juce::jmin (fgfit::snugTextButtonWidth (b, 22), row.getWidth())));
+            };
             // Only for scales this synth wrote: they carry their own patch.
             const bool hasPatch = processorRef.activeSclHasPreset();
             loadItsSpectrumBtn.setVisible (hasPatch);
-            if (hasPatch)
-            {
-                ti.removeFromTop (3);
-                loadItsSpectrumBtn.setBounds (ti.removeFromTop (22).reduced (2, 0));
-            }
+            if (hasPatch) snugRow (ti, loadItsSpectrumBtn);
             // Only when the preset just loaded carries a tuning that actually
             // differs from the one active now (recomputed live: loading it, or
             // changing the tuning some other way, makes the button disappear again) -
@@ -7192,11 +7272,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             const bool hasPresetTuning = processorRef.hasPendingPresetTuning()
                                        && ! processorRef.presetHasDrifted();
             loadPresetTuningBtn.setVisible (hasPresetTuning);
-            if (hasPresetTuning)
-            {
-                ti.removeFromTop (3);
-                loadPresetTuningBtn.setBounds (ti.removeFromTop (22).reduced (2, 0));
-            }
+            if (hasPresetTuning) snugRow (ti, loadPresetTuningBtn);
             // The custom spectrum's own tuning, whenever it HAS one (derived by Adapt,
             // or loaded from a scale file). Same idiom as the preset row above, but it
             // stays VISIBLE when that tuning is already active - disabled and saying so
@@ -7206,9 +7282,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
             loadSpectrumTuningBtn.setVisible (hasProvTuning);
             if (hasProvTuning)
             {
+                // The WORD first, then the width: this button says "Load spectrum's
+                // tuning" or "Tuning already loaded" depending on state, and sizing it
+                // before refreshSpectrumTuningButton() rewrote it would measure the
+                // word that is about to be replaced.
                 refreshSpectrumTuningButton();
-                ti.removeFromTop (3);
-                loadSpectrumTuningBtn.setBounds (ti.removeFromTop (22).reduced (2, 0));
+                snugRow (ti, loadSpectrumTuningBtn);
             }
             // Pitch bend and Recent share ONE row now (bend left, Recent right): the
             // Shepard row at the bottom is paid for with exactly the row this merge
@@ -7232,7 +7311,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // of them IS how you get into Scala mode, so gating them on already
                 // being there was a dead end. It also keeps "+ to bank" from ever
                 // feeding a list you cannot see.
-                recentOpenBtn.setBounds (bendRow.reduced (2, 0));
+                auto rec = bendRow.reduced (2, 0);
+                recentOpenBtn.setBounds (rec.removeFromLeft (
+                    juce::jmin (fgfit::snugTextButtonWidth (recentOpenBtn, 22), rec.getWidth())));
             }
             recentLabel.setVisible (false);
             for (int i = 0; i < 3; ++i) recentBtn[i].setVisible (false);
@@ -7281,27 +7362,25 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // is measured, not the selected one, or the box would resize under the
                 // user as they change modes.
                 const int shepH = juce::jmin (24, shepRow.getHeight());
-                auto needFor = [shepH] (const juce::ComboBox& c, int nominal)
-                {
-                    auto& lf = c.getLookAndFeel();
-                    const auto f = lf.getComboBoxFont (const_cast<juce::ComboBox&> (c));
-                    int w = 0;
-                    for (int i = 0; i < c.getNumItems(); ++i)
-                        w = juce::jmax (w, juce::GlyphArrangement::getStringWidthInt (f, c.getItemText (i)));
-                    return juce::jmax (nominal, GalacticLnF::comboWidthForText (w, shepH));
-                };
+                // fgfit::snugComboWidth, the same rule (and the same padding) the six
+                // narrowed controls elsewhere in this window use: this row measured its
+                // own widest item before that rule existed, and two copies of one
+                // measurement are how a padding "system" quietly stops being one.
+                auto needFor = [shepH] (juce::ComboBox& c, int nominal)
+                { return juce::jmax (nominal, fgfit::snugComboWidth (c, shepH)); };
 
                 auto sh = shepRow;
                 shepOnT.setBounds (sh.removeFromLeft (86));
                 sh.removeFromLeft (4);
                 compact (shepModeBox, sh.removeFromLeft (juce::jmin (needFor (shepModeBox, 94), sh.getWidth())));
                 sh.removeFromLeft (6);
-                const bool riseChoice = shepard::periodDiffersFromOctave (processorRef.getTuningPeriodRatio());
+                // The rise interval keeps its own line (see riseRow above), right under
+                // the mode box it belongs to, so the rate control keeps a usable width.
                 shepRiseBox.setVisible (riseChoice);
                 if (riseChoice)
                 {
-                    compact (shepRiseBox, sh.removeFromRight (juce::jmin (needFor (shepRiseBox, 108), sh.getWidth())));
-                    sh.removeFromRight (6);
+                    auto rr = riseRow.withTrimmedLeft (86 + 4);
+                    compact (shepRiseBox, rr.removeFromLeft (juce::jmin (needFor (shepRiseBox, 108), rr.getWidth())));
                 }
                 const bool sync = shepModeBox.getSelectedId() == 2;
                 shepTimeFader.setVisible (! sync);
