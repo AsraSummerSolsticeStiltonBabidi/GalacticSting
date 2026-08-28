@@ -2094,6 +2094,7 @@ int main()
             { 16, 31, 1, 1, false, false, "16 partials, 31 notes, ALL-vs-all, 1 reg" } };
 
         double worstRatio = 1.0, bestRatio = 1.0e9, sumPairs = 0.0, sumMs = 0.0;
+        std::vector<double> rowRatios;   // every timeable row, for the MEDIAN below
         for (const auto& c : cfgs)
         {
             const double f0 = 220.0;
@@ -2133,6 +2134,7 @@ int main()
             {
                 worstRatio = std::max (worstRatio, ratio);
                 bestRatio  = std::min (bestRatio, ratio);
+                rowRatios.push_back (ratio);
             }
             std::printf ("    %-46s  %2d sweeps  %10.0f pairs   predicted %8.1f ms   measured %8.1f ms   x%.2f%s\n",
                          c.what, done, pairs, pred, ms, ratio, ms < 2.0 ? "  (below the timing floor)" : "");
@@ -2142,29 +2144,83 @@ int main()
                    (std::string ("  ...and it returned all ") + std::to_string (c.N) + " partials").c_str());
         }
         const double fitted = sumMs * 1.0e6 / std::max (1.0, sumPairs);
-        std::printf ("    fitted %.2f ns/pair (header says %.2f); prediction band x%.2f .. x%.2f\n",
-                     fitted, dissonance::kAdaptNsPerPair, bestRatio, worstRatio);
+        const double probed = dissonance::adaptNsPerPair();
+        std::printf ("    fitted %.2f ns/pair over the whole table; the runtime probe said %.2f"
+                     " (fallback %.2f); prediction band x%.2f .. x%.2f\n",
+                     fitted, probed, dissonance::kAdaptNsPerPairFallback, bestRatio, worstRatio);
         // A single constant has to cover every timeable row within a factor of two either
         // way. That is loose enough for a cold cache and a busy machine and far too tight
         // for a wrong exponent: dropping the register factor alone puts row 4 out by 7x.
+        // This is the SHAPE check - it fits its own constant and so says nothing about
+        // whether the number on the button is right.
         check (bestRatio > 0.5 && worstRatio < 2.0,
                "one ns/pair constant predicts every configuration within a factor of 2");
-        // ...and the constant shipped in the header is the one the machine actually shows.
-        check (fitted > dissonance::kAdaptNsPerPair * 0.5 && fitted < dissonance::kAdaptNsPerPair * 2.0,
-               "and kAdaptNsPerPair is within a factor of 2 of the measured fit");
+
+        // ...AND THE NUMBER THE PANEL ACTUALLY PRINTS TRACKS THE CLOCK.
+        //
+        // This replaces "a literal in the header is close to a fit computed here", which
+        // compared two constants and said nothing at all about the user's experience.
+        // What matters is predicted/measured for the estimate the button really shows,
+        // and in particular that it is not systematically LOW: with the hard-coded 9.8
+        // EVERY timeable row came in under its prediction - x0.48 .. x0.67 across every
+        // measurement taken - so every search took 1.5x to 2x longer than the plugin had
+        // promised, and 2-3x on a loaded machine. Nobody notices a red test; they notice
+        // waiting three times as long as the button said.
+        //
+        // Asserted on the MEDIAN row rather than the worst one. These rows take 35 ms to
+        // 1 s, and a single one of them can lose a scheduling slice and swing 30% on its
+        // own; the worst-of-six is therefore a measurement of the busiest millisecond of
+        // the test run, not of the model. The median over five timeable rows moves only
+        // if the model is really off. Measured over ~25 repeat runs on ONE machine, whose
+        // own fitted cost was seen anywhere between 11.2 and 21.8 ns/pair depending on
+        // how busy and how warm it was - which is itself the argument against any literal:
+        //     hard-coded 9.8 ns/pair   ->  median row x0.52 .. x0.83  (0.52 while the
+        //                                  machine ran slow, 0.83 while it ran fast: the
+        //                                  constant is only ever right by coincidence)
+        //     runtime-calibrated       ->  median row x0.83 .. x1.58, wherever the
+        //                                  machine happened to be - it follows it
+        // 0.80 is the line between them. The upper end is a loose 1.80 on purpose: the
+        // probe runs once, at process start, where a cold clock still reads high, and
+        // over-estimating is only a discourtesy - the run finishes early - while
+        // under-estimating is the defect this exists to remove.
+        std::sort (rowRatios.begin(), rowRatios.end());
+        const double medianRatio = rowRatios.empty() ? 0.0 : rowRatios[rowRatios.size() / 2];
+        std::printf ("    median row x%.2f over %d timeable rows;"
+                     " the probe is x%.2f of the table's own fit\n",
+                     medianRatio, (int) rowRatios.size(), probed / std::max (1.0e-9, fitted));
+        check (medianRatio > 0.80 && medianRatio < 1.80,
+               "the estimate the panel prints tracks the clock - it is not systematically optimistic");
+        // ...and the probe's small configuration really does predict the big ones: it is
+        // measured on ~0.3 million pair terms and used to price runs of 53 million. With
+        // the old literal this ratio was 0.47 .. 0.87 (it drifts with the machine, not with the
+        // problem); calibrated it is 0.81 .. 1.65.
+        check (probed > fitted * 0.8 && probed < fitted * 2.0,
+               "the ~0.3M-pair probe generalises to the 53M-pair run it is used to price");
         // THE HARD BOUND is the only thing left that refuses, and it must refuse only the
         // absurd: 16 partials against a 31-note scale in "all vs all" - the configuration
         // the old dialog rejected outright - has to be OFFERED, and a 24-partial spectrum
         // against a full 128-key table in the same scope has to be the thing that is not.
+        //
+        // Asserted on PAIR COUNTS against kAdaptAbsurdPairs, which is what the plugin now
+        // compares too. This assertion used to compare calibrated ms estimates against
+        // kAdaptAbsurdMs, and one run under heavy load showed why that was wrong twice
+        // over: the whole table fitted at 176 ns/pair (11x nominal), the estimate
+        // honestly said the 31x16 search would take over ten minutes THAT MINUTE - and
+        // the check failed, i.e. the plugin would have refused a search it exists to
+        // offer, because a load spike had been cached into the one-shot probe. The set
+        // of offered searches is a property of the REQUEST; only its price follows the
+        // machine.
         {
-            const double offered = dissonance::adaptEstimateMs (16, 31, false, 7, true, 6);
-            const double absurd  = dissonance::adaptEstimateMs (24, 128, false, 7, true, 6);
-            std::printf ("    31 notes x 16 partials all-vs-all, 7 reg, +amps: %.1f s (bound %.0f s)\n"
-                         "    128 notes x 24 partials all-vs-all, 7 reg, +amps: %.0f s\n",
-                         offered * 0.001, dissonance::kAdaptAbsurdMs * 0.001, absurd * 0.001);
-            check (offered < dissonance::kAdaptAbsurdMs,
-                   "the search the old dialog refused is under the hard bound - it is offered");
-            check (absurd > dissonance::kAdaptAbsurdMs,
+            const double offered = dissonance::adaptTotalPairs (16, 31, false, 7, true, 6);
+            const double absurd  = dissonance::adaptTotalPairs (24, 128, false, 7, true, 6);
+            std::printf ("    31 notes x 16 partials all-vs-all, 7 reg, +amps: %.2e pairs (~%.1f s here); bound %.2e pairs\n"
+                         "    128 notes x 24 partials all-vs-all, 7 reg, +amps: %.2e pairs (~%.0f s here)\n",
+                         offered, dissonance::adaptEstimateMs (16, 31, false, 7, true, 6) * 0.001,
+                         dissonance::kAdaptAbsurdPairs,
+                         absurd, dissonance::adaptEstimateMs (24, 128, false, 7, true, 6) * 0.001);
+            check (offered < dissonance::kAdaptAbsurdPairs,
+                   "the search the old dialog refused is under the hard bound - it is offered ON EVERY MACHINE");
+            check (absurd > dissonance::kAdaptAbsurdPairs,
                    "and a 128-note table at 24 partials all-vs-all is over it - that one is refused");
         }
     }

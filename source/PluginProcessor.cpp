@@ -2334,24 +2334,31 @@ bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSetti
     // simply could not be adapted to in the scope that hears every note against every
     // other). The estimate now goes on the button; only the genuinely absurd is stopped.
     //
-    // The bound is kAdaptAbsurdMs = 10 minutes, and it exists because there IS a shape
-    // beyond argument: 24 partials against a 128-key absolute table in "all vs all" is
-    // ~44 minutes, minutes per single sweep, and it would be indistinguishable from a
-    // hang. The refusal states the number rather than a verdict.
+    // The bound is kAdaptAbsurdPairs - ten minutes priced at the NOMINAL per-pair cost,
+    // fixed in pair terms - and it exists because there IS a shape beyond argument:
+    // 24 partials against a 128-key absolute table in "all vs all" is ~44 minutes,
+    // minutes per single sweep, and it would be indistinguishable from a hang. The
+    // refusal states the number rather than a verdict. Compared in PAIRS, not against
+    // the calibrated ms estimate, because the estimate follows the machine and the
+    // one-shot calibration probe can catch a load spike: measured once, that combination
+    // refused the 31x16 all-vs-all search this very function was fixed to offer (see
+    // kAdaptAbsurdPairs). The estimate still prices the button; only the refusal is
+    // machine-independent.
     const auto regs = adaptRegistersFor (s, f0Hz, realtime);
+    const int  nRegs = (int) std::max<size_t> (1, regs.f0.size());
     const double estMs = dissonance::adaptEstimateMs (N, (int) targetAlphas.size(), s.rootOnly,
-                                                      (int) std::max<size_t> (1, regs.f0.size()),
-                                                      s.shapeAmps);
-    if (estMs > dissonance::kAdaptAbsurdMs)
+                                                      nRegs, s.shapeAmps);
+    if (dissonance::adaptTotalPairs (N, (int) targetAlphas.size(), s.rootOnly,
+                                     nRegs, s.shapeAmps, 6) > dissonance::kAdaptAbsurdPairs)
     {
-        errorOut = "This search is estimated at " + juce::String (estMs / 60000.0, 1)
-                 + " minutes (" + juce::String ((int) targetAlphas.size()) + " notes x "
+        errorOut = "This search is " + juce::String ((int) targetAlphas.size()) + " notes x "
                  + juce::String (N) + " partials"
                  + (s.rootOnly ? juce::String (", 0 vs all") : juce::String (", all vs all"))
-                 + ", " + juce::String ((int) regs.f0.size()) + " registers), past the "
-                 + juce::String ((int) (dissonance::kAdaptAbsurdMs / 60000.0))
-                 + "-minute limit. Fewer partials, fewer registers, or the \"0 vs all\" scope "
-                   "will bring it inside.";
+                 + ", " + juce::String ((int) regs.f0.size()) + " registers - past the hard cap "
+                   "(about " + juce::String ((int) (dissonance::kAdaptAbsurdMs / 60000.0))
+                 + " minutes of computation; on this machine an estimated "
+                 + juce::String (estMs / 60000.0, 1) + "). Fewer partials, fewer registers, or "
+                   "the \"0 vs all\" scope will bring it inside.";
         return false;
     }
 
@@ -4828,12 +4835,15 @@ bool FractalAdditiveAudioProcessor::startCornerAdapt (int corner, const std::vec
     const double topRatio = std::exp2 ((totalC - std::max (1.0, gap)) / 1200.0);
 
     // Priced with the realtime register cap (this IS a follower), and only the absurd is
-    // refused - same bound, same reason as startSpectrumAdapt.
+    // refused - same bound, same reason, same PAIR-count comparison as startSpectrumAdapt
+    // (the calibrated estimate follows the machine and its one-shot probe can catch a
+    // load spike; the refusal must not).
     const auto regs = adaptRegistersFor (s, f0, /*realtime*/ true);
+    const int  nRegs = (int) std::max<size_t> (1, regs.f0.size());
     const double estMs = dissonance::adaptEstimateMs (N, (int) alphas.size(), s.rootOnly,
-                                                      (int) std::max<size_t> (1, regs.f0.size()),
-                                                      s.shapeAmps);
-    if (estMs > dissonance::kAdaptAbsurdMs)
+                                                      nRegs, s.shapeAmps);
+    if (dissonance::adaptTotalPairs (N, (int) alphas.size(), s.rootOnly,
+                                     nRegs, s.shapeAmps, 6) > dissonance::kAdaptAbsurdPairs)
     {
         errorOut = "This corner's adaptation is estimated at " + juce::String (estMs / 60000.0, 1)
                  + " minutes per search - it cannot follow anything at that price.";

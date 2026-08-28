@@ -28,6 +28,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 
 namespace dissonance
@@ -961,13 +962,40 @@ namespace dissonance
              * adaptPairsPerEval (nPartials, nNotes, rootOnly);
     }
 
-    // Nanoseconds per pair term, MEASURED (see the calibration table printed by
-    // SpectrumTests). It is a property of the CPU - two std::exp calls, a divide and a
-    // handful of adds - so it does not depend on the size of the problem, and the test
-    // proves that by fitting this one number across configurations spanning 34 thousand to
-    // 53 million pair terms, both scopes, 1 and 7 registers, with and without amplitude
-    // shaping. Every one of them lands inside x0.6 .. x1.1 of its measurement.
-    constexpr double kAdaptNsPerPair = 9.8;
+    // NANOSECONDS PER PAIR TERM - AND WHY IT IS NO LONGER A LITERAL.
+    //
+    // The pair COUNT above is exact arithmetic and travels to any machine. The price of
+    // one pair does not: it is two std::exp calls, a divide and a handful of adds on
+    // whatever CPU is running, at whatever clock the OS is giving it. It used to be a
+    // hard-coded 9.8, fitted once on the developing machine, and that number then told
+    // every other machine a story about itself.
+    //
+    // Measured against that 9.8 on the machine this was fixed on: the fitted cost was
+    // 15.64 ns/pair on an idle run and 20.65 .. 33.14 ns/pair on a loaded one - 1.6x to
+    // 3.4x the constant. Every single row of the calibration table came in SLOWER than
+    // predicted (x0.55 .. x0.67 of the measurement), so the millisecond figure printed
+    // on the Adapt button was not merely imprecise, it was biased in the one direction
+    // that costs the user something: a "45 s" search really took 75 s, and on a busy
+    // machine two and a half minutes. A musician plans around that number.
+    //
+    // So it is measured HERE, on the machine that is asking, once per process, by
+    // running the real adaptSpectrum on a small fixed configuration and dividing by the
+    // pair count that same model predicts for it. The trade, stated plainly:
+    //   - it costs ~10 ms, once, on the first thread that asks for an estimate. Every
+    //     caller is on the message thread (the Adapt read-out, startSpectrumAdapt,
+    //     startCornerAdapt) - never the audio thread.
+    //   - it is not cached to disk. A per-machine file would survive restarts but would
+    //     also go stale on a CPU-governor change, and it is one more thing to invalidate;
+    //     ~10 ms once per plugin instance is cheaper than being wrong.
+    //   - it is deliberately measured through adaptSpectrum, not through a synthetic
+    //     kernel, so everything the real run pays for - allocation, the line-search
+    //     bookkeeping, the register loop - is inside the number instead of beside it.
+    // A probe that lands somewhere impossible (a descheduled thread, a broken clock)
+    // falls back to the seed below rather than printing nonsense.
+    constexpr double kAdaptNsPerPairFallback = 16.0;
+
+    // Defined after adaptSpectrum, which it has to call to measure anything.
+    inline double adaptNsPerPair();
 
     // The estimate the panel prints. `sweeps` is the ceiling adaptSpectrum is given (6):
     // a run that converges early finishes SOONER than this, never later, so the number on
@@ -976,7 +1004,7 @@ namespace dissonance
                                    bool shapeAmps, int sweeps = 6)
     {
         return adaptTotalPairs (nPartials, nNotes, rootOnly, registers, shapeAmps, sweeps)
-             * kAdaptNsPerPair * 1.0e-6;
+             * adaptNsPerPair() * 1.0e-6;
     }
 
     // THE ONE HARD BOUND, and why it is where it is.
@@ -989,6 +1017,24 @@ namespace dissonance
     // SWEEP, and it would be indistinguishable from a hang. That is the only case refused,
     // and the refusal states the number instead of pronouncing a verdict.
     constexpr double kAdaptAbsurdMs = 600000.0;
+
+    // ...AND THE REFUSAL COMPARES PAIR COUNTS, NOT THE CALIBRATED ESTIMATE.
+    //
+    // The bound describes an absurd REQUEST, so it must be a property of the request -
+    // notes x partials x scope x registers - and not of whoever is running it. Comparing
+    // the runtime-calibrated estimate against kAdaptAbsurdMs looked equivalent, and was
+    // not: the calibration probe runs ONCE per process, at first use, which is a busy
+    // moment by nature, and a probe taken during a load spike sticks for the whole
+    // session. Observed while testing on a machine under load: the whole run fitted at
+    // 176 ns/pair (11x nominal), the probe read 213, and the 31-note x 16-partial
+    // all-vs-all search - the exact configuration the old dialog was fixed to OFFER -
+    // came out over the ten-minute line and was REFUSED. A transient at load time had
+    // silently shrunk the feature set, which is the same defect the bound's own comment
+    // apologises for once already. So the cap is the ten minutes priced at the NOMINAL
+    // per-pair cost, fixed in pairs: the same searches are offered on every machine, the
+    // calibrated estimate still puts each one's honest price on the button, and a slow
+    // machine keeps its Stop click instead of losing the feature.
+    constexpr double kAdaptAbsurdPairs = kAdaptAbsurdMs * 1.0e6 / kAdaptNsPerPairFallback;
 
     // Above this, the Adapt button wears its price and the panel warns. 3 s is the point
     // where a musician stops expecting an answer "now" and starts wondering if it worked.
@@ -1234,6 +1280,107 @@ namespace dissonance
         return adaptSpectrum (std::move (seed), f0, alphas, rootOnly, goal, rangeLo, rangeHi,
                               minGapCents, maxRatio, shapeAmps, ampRangeDb, sweeps,
                               Registers {}, progress);
+    }
+
+    //==========================================================================
+    // THE CALIBRATION PROBE (see kAdaptNsPerPairFallback for why it exists at all).
+    //
+    // One real adaptSpectrum run on a fixed, deliberately small configuration, divided
+    // by the pair count adaptTotalPairs predicts for that same run. Two details matter:
+    //
+    //   - The WARM-UP run is not decoration, and it is a FULL probe-shaped run rather
+    //     than a token one. The very first adaptSpectrum in a process pays for cold
+    //     branch predictors, a cold i-cache and the first std::exp - timed directly that
+    //     read 35 ns/pair against a true ~16 here - and, worse, a core that has just been
+    //     handed work is still ramping its clock. A few thousand pairs fixed the caches
+    //     but left the frequency ramp inside the measurement, which is what pushed one
+    //     run's probe to 29.9 ns/pair against a 19.7 fit. A full discarded run first.
+    //   - `res.sweepsDone`, never the requested sweeps. adaptSpectrum stops early when a
+    //     sweep buys nothing, and charging the model for sweeps it never ran would
+    //     calibrate the machine to the optimiser's luck.
+    //   - THE MEDIAN of three repetitions, not one timing, not the mean, not the fastest.
+    //     One timing measures "the machine at this instant", and the instant a plugin
+    //     first draws its Adapt read-out is a busy one: taken once, right after a build,
+    //     this probe read 29.8 ns/pair against a 19.4 ns fit over the following seconds -
+    //     a 60% OVER-estimate. The median throws that outlier away. The MINIMUM was
+    //     rejected for the opposite reason: it measures the machine uncontended, and the
+    //     real search will run inside a DAW that is doing other things, so calibrating to
+    //     the best-ever sample puts the bias back where it started - too low.
+    //
+    // The probe is ~0.3M pair terms per repetition - a few milliseconds each, comfortably
+    // above the clock's resolution and well above the sub-millisecond floor where the
+    // allocator and the timer dominate, and ~25 ms in total: one hitch, once per process,
+    // in exchange for a number the user can plan around.
+    inline double measureAdaptNsPerPair()
+    {
+        constexpr double kF0     = 220.0;
+        const     double kTotalC = 1200.0 * std::log2 (4.0);   // a 4/1 period: room for the seed
+        constexpr double kGap    = 20.0;
+        const     double kTop    = std::exp2 ((kTotalC - kGap) / 1200.0);
+
+        const auto run = [&] (int n, int notes, bool rootOnly, int sweeps, bool shapeAmps)
+        {
+            std::vector<Partial> seed;
+            seed.reserve ((size_t) n);
+            for (int i = 0; i < n; ++i)
+            {
+                const double r = std::exp2 (kTotalC * (double) i / (double) n / 1200.0);
+                seed.push_back ({ kF0 * r, std::pow (r, -1.0) });
+            }
+            std::vector<double> alphas;
+            alphas.reserve ((size_t) notes);
+            for (int i = 0; i < notes; ++i) alphas.push_back (std::exp2 ((double) i / 31.0));
+            Registers rg;
+            rg.f0 = registerPoints (kF0, kF0, 1);
+            return adaptSpectrum (seed, kF0, alphas, rootOnly, Goal::Min, 0.0, 0.0,
+                                  kGap, kTop, shapeAmps, 6.0, sweeps, rg);
+        };
+
+        // THE PROBE'S SHAPE IS THE DEAR ONE, ON PURPOSE. A pair term is not quite the
+        // same price in every scope: measured over the calibration table, "0 vs all"
+        // costs ~19-23 ns/pair (its n^2 cross loop) against ~17-18 for "all vs all", and
+        // amplitude line searches are dearer than position ones. One constant cannot be
+        // exact for both, so it is measured on the EXPENSIVE combination - 0-vs-all with
+        // amplitude shaping - and the cheaper shapes then come out over-estimated rather
+        // than under. Calibrated on the cheap shape instead, the "0 vs all" rows of the
+        // table came back at x0.70 of their real time: the estimate would still have been
+        // 30% optimistic on exactly the scope the panel defaults to.
+        constexpr int kN = 8, kNotes = 5, kSweeps = 2, kReps = 3;
+        constexpr bool kRootOnly = true, kAmps = true;
+
+        run (kN, kNotes, kRootOnly, kSweeps, kAmps);   // warm-up, timed by nobody
+
+        std::vector<double> samples;
+        samples.reserve ((size_t) kReps);
+        for (int rep = 0; rep < kReps; ++rep)
+        {
+            const auto t0  = std::chrono::steady_clock::now();
+            const auto res = run (kN, kNotes, kRootOnly, kSweeps, kAmps);
+            const double ms = std::chrono::duration<double, std::milli> (
+                                  std::chrono::steady_clock::now() - t0).count();
+            const double pairs = adaptTotalPairs (kN, kNotes, kRootOnly, 1, kAmps,
+                                                  std::max (1, res.sweepsDone));
+            if (! std::isfinite (ms) || ! (ms > 0.0) || ! (pairs > 0.0))
+                continue;
+            samples.push_back (ms * 1.0e6 / pairs);
+        }
+        if (samples.empty())
+            return kAdaptNsPerPairFallback;
+        std::sort (samples.begin(), samples.end());
+        const double ns = samples[samples.size() / 2];
+        // A number outside this band is not a slow CPU, it is a broken measurement (the
+        // thread lost its slice, the clock stepped). Printing an estimate built on it
+        // would be exactly the dishonesty this whole probe exists to remove.
+        return (ns > 1.0 && ns < 1000.0) ? ns : kAdaptNsPerPairFallback;
+    }
+
+    // Measured once, on the first thread that asks. C++11 guarantees the function-local
+    // static's initialisation is thread-safe and runs exactly once, so two panels opening
+    // at the same moment cannot run two probes or read a half-written double.
+    inline double adaptNsPerPair()
+    {
+        static const double measured = measureAdaptNsPerPair();
+        return measured;
     }
 
     struct ExtremeInfo { double ratio; double value; };
