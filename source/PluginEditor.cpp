@@ -3273,6 +3273,19 @@ juce::StringArray FractalAdditiveAudioProcessorEditor::presetSearchProbeForTests
     return panel.shown;
 }
 
+FractalAdditiveAudioProcessorEditor::NadShownProbe
+FractalAdditiveAudioProcessorEditor::nadShownProbeForTests() const
+{
+    NadShownProbe n;
+    n.rows             = (int) nadList.rows.size();
+    n.equalStep        = nadList.equalStep;
+    n.degreesPerPeriod = processorRef.getScaleDegrees();
+    for (const auto& r : nadList.rows)
+        for (const int d : r.degs)
+            n.maxDegree = juce::jmax (n.maxDegree, d);
+    return n;
+}
+
 FractalAdditiveAudioProcessorEditor::RatiosInkProbe
 FractalAdditiveAudioProcessorEditor::ratiosInkProbeForTests (const juce::String& typed)
 {
@@ -7202,7 +7215,16 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
 
     // n-AD list: recompute when the selection or the scale/timbre changes; publish
     // results when the worker finishes (values coloured green -> red like the list).
-    if (nadView.isVisible() && specModeBox.getSelectedId() == 1 && tuneSourceBox.getSelectedId() != 2)
+    // THE GATE IS "IS THIS LIST ON SCREEN", NOT "WHICH SOURCE IS SELECTED".
+    // It used to also require tuneSourceBox != 2 - i.e. it refused to recompute in the
+    // FREE-SEARCH source. But that source is exactly where the "Tuning info" button
+    // lives: load a chord from the search and the view flips to this same list, showing
+    // the loaded chord's own degrees. With the recompute switched off there, the rows
+    // left over from whatever scale was on screen before simply stayed - so a 5-note
+    // chord loaded as the scale was captioned with 12-TET's answer: "en una pentatonica
+    // me dice 7 y 11 como recomendaciones de acordes en ese tuning". nadView.isVisible()
+    // is already exactly "one of the two views that show this list is up".
+    if (nadView.isVisible() && specModeBox.getSelectedId() == 1)
     {
         // Live: any change to the tuning, the timbre or ANY of the four shared
         // controls recomputes on its own - "From current tuning" has no Find button.
@@ -7260,7 +7282,14 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         if (processorRef.getNadGeneration() != lastNadGen)
         {
             lastNadGen = processorRef.getNadGeneration();
-            const auto res = processorRef.getNadResults();
+            // A row's chips are degree INDICES into the scale the worker ran over. If the
+            // tuning has moved on since, those indices name degrees the scale in force
+            // does not have, and printing them is the whole complaint. Belt and braces
+            // behind the gate above: the list shows nothing rather than something wrong,
+            // and the pending recompute fills it a tick later.
+            const bool sameScale = processorRef.getNadResultDegrees() == processorRef.getScaleDegrees();
+            const auto res = sameScale ? processorRef.getNadResults()
+                                       : std::vector<FractalAdditiveAudioProcessor::NadRow>();
             double lo = 1.0e30, hi = -1.0e30;
             for (const auto& r : res) { lo = juce::jmin (lo, r.value); hi = juce::jmax (hi, r.value); }
             // In an equal-step tuning every shape is valid from every degree, so the

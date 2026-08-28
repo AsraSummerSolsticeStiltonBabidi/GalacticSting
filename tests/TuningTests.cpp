@@ -601,6 +601,94 @@ int main()
         }
     }
 
+    //==========================================================================
+    // A DEGREE NUMBER IS AN INDEX INTO *THIS* SCALE, 0..N-1 - never a semitone.
+    //
+    // "los resultados de tuning info aparecen con numeros que no corresponden a los
+    //  numeros de tunings que no son 12edo, tipo en una pentatonica me dice 7 y 11 como
+    //  recomendaciones de acordes en ese tuning, cuando el periodo es 2"
+    //
+    // Everything in the UI that prints a degree as a NUMBER indexes the loaded scale by
+    // degreesPerPeriod(): the recommendation chips, the Degrees list, the keyboard hues.
+    // So the number that source hands out has to be the loaded scale's own count for
+    // every shape of tuning, and each degree it names has to sit inside one period.
+    // If this ever answered 12 for a five-note scale, every readout downstream would
+    // print semitones and call them degrees.
+    {
+        std::printf ("\ndegree numbers belong to the loaded scale, whatever its shape:\n");
+
+        // Checks the whole contract in one place: N degrees, and degrees 0..N-1 all
+        // ascending inside one period (degree N IS the period).
+        auto degreesRunFrom0 = [] (TuningManager& t, int expectN, const char* what)
+        {
+            const int N = t.degreesPerPeriod();
+            std::printf ("  %-22s -> %d degrees, period %.5f\n", what, N, t.periodRatio());
+            check (N == expectN, what);
+            bool inside = N > 0, ascending = true;
+            double prev = 0.0;
+            for (int d = 0; d < N; ++d)
+            {
+                double r = 0.0;
+                if (! t.scalaDegreeRatio (d, r)) { inside = false; break; }
+                if (! (r >= 1.0 - 1.0e-9 && r < t.periodRatio() - 1.0e-9)) inside = false;
+                if (r <= prev - 1.0e-9) ascending = false;
+                prev = r;
+            }
+            check (inside, "  ...and degrees 0..N-1 all land inside ONE period");
+            check (ascending, "  ...in order, so a bigger number is never a lower pitch");
+        };
+
+        juce::String err;
+        {   // (1) A five-note scale: the user's pentatonic. Legal numbers are 0..4.
+            TuningManager t;
+            check (t.loadScalaString ("! penta.scl\nmajor pentatonic\n 5\n!\n 9/8\n 5/4\n 3/2\n 5/3\n 2/1\n",
+                                      "penta", err), "a five-note pentatonic loads");
+            t.setMode (TuningManager::Mode::Scala);
+            degreesRunFrom0 (t, 5, "5-note pentatonic");
+        }
+        {   // (2) 19-EDO: more degrees than 12, so a 12-wide table would UNDER-count.
+            juce::String s ("! edo19.scl\n19-EDO\n 19\n!\n");
+            for (int i = 1; i <= 19; ++i) s << " " << juce::String (1200.0 * (double) i / 19.0, 6) << "\n";
+            TuningManager t;
+            check (t.loadScalaString (s, "edo19", err), "a 19-EDO scale loads");
+            t.setMode (TuningManager::Mode::Scala);
+            degreesRunFrom0 (t, 19, "19-EDO");
+        }
+        {   // (3) Bohlen-Pierce: 13 degrees to a 3/1 period. Both numbers are unusual,
+            //     and a readout that assumed an octave would place every degree wrongly.
+            juce::String s ("! bp.scl\nBohlen-Pierce equal\n 13\n!\n");
+            for (int i = 1; i <= 13; ++i)
+                s << " " << juce::String (1200.0 * std::log2 (3.0) * (double) i / 13.0, 6) << "\n";
+            TuningManager t;
+            check (t.loadScalaString (s, "bp13", err), "a Bohlen-Pierce 3/1 scale loads");
+            t.setMode (TuningManager::Mode::Scala);
+            check (std::abs (t.periodRatio() - 3.0) < 1.0e-6, "  its period really is 3/1, not 2/1");
+            degreesRunFrom0 (t, 13, "Bohlen-Pierce 13");
+        }
+        {   // (4) An absolute .tun table: the file states 128 pitches and NO degrees, so
+            //     the count is how many KEYS span the period. 24 keys to the octave here,
+            //     which must be answered as 24 - not as the file's key count and not as 12.
+            // STRETCHED, so it cannot be reduced back to a .scl: any table whose period
+            // repeats exactly IS a scale and is converted to one, and then this is not
+            // testing the table path at all. Quarter-tone steps that widen as they climb.
+            double f[128];
+            for (int n = 0; n < 128; ++n)
+                f[n] = 8.1757989156 * std::pow (2.0, (50.0 * (double) n + 0.004 * (double) (n * n)) / 1200.0);
+            TuningManager t;
+            check (t.loadTunString (makeTun (f), "tun24", err), "a quarter-tone .tun table loads");
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.usesAbsoluteTable(), "  held as an absolute table (no degrees in the file)");
+            const auto est = t.getTablePeriodEstimate();
+            std::printf ("  %-22s -> %d keys per period, period %.5f (estimate: %d keys, found %d)\n",
+                         "stretched .tun table", t.degreesPerPeriod(), t.periodRatio(),
+                         est.keys, (int) est.found);
+            check (est.found && t.degreesPerPeriod() == est.keys,
+                   "  the degree count is the KEYS the FILE's own period spans, not a constant");
+            check (t.degreesPerPeriod() == 24,
+                   "  quarter-tone steps -> 0..23, so no readout can print a 12-ET semitone here");
+        }
+    }
+
     std::printf ("\n%s (%d failure%s)\n", failures == 0 ? "ALL PASSED" : "FAILURES",
                  failures, failures == 1 ? "" : "s");
     return failures == 0 ? 0 : 1;

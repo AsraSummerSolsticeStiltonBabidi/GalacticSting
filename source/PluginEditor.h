@@ -208,6 +208,25 @@ public:
     // deletes anything and the red Remove always does" is only checkable from here.
     void clickCustomLoadRemoveForTests() { if (loadTimbreButton.onClick) loadTimbreButton.onClick(); }
     void clickRandomSpectrumForTests()   { if (randomSpectrumBtn.onClick) randomSpectrumBtn.onClick(); }
+    // Test hook (RhythmVerify): double-click a row of the chord-search results, which is
+    // the ONLY way into the "Tuning info" view - it loads the chord as the scale and
+    // flips the list over to that scale's own degrees. Through the real callback, so the
+    // view flip and the resized() that follows it are the ones that ship.
+    void loadChordResultForTests (int row) { if (chordList.onLoad) chordList.onLoad (row); }
+    // TESTS: what the chord-recommendation list ("Tuning info") is SHOWING right now -
+    // read off the rows it will paint, not off the worker's output. Every chip is a
+    // degree INDEX, so `maxDegree` must always be inside 0..degreesPerPeriod-1 of the
+    // scale that is loaded: "los resultados de tuning info aparecen con numeros que no
+    // corresponden a los numeros de tunings que no son 12edo, tipo en una pentatonica me
+    // dice 7 y 11". Nothing else in the build can see a stale row.
+    struct NadShownProbe
+    {
+        int  rows = 0;
+        int  maxDegree = -1;          // the biggest chip number on screen
+        int  degreesPerPeriod = 0;    // what the LOADED scale actually has
+        bool equalStep = false;       // rows shown as "any +n" offsets rather than degrees
+    };
+    NadShownProbe nadShownProbeForTests() const;
 
     // Test hooks (RhythmVerify): drive the Spectrum-vs-Tuning panel the way a hand does -
     // pick a mode, pick the adaptation's target, press REALTIME - and read back what the

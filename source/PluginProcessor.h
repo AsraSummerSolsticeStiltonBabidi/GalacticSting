@@ -893,6 +893,12 @@ public:
     bool nadWasOverBudget() const noexcept { return nadOverBudget.load(); }
     int  getNadUsedDegrees()  const noexcept { return nadUsedD.load(); }
     int  getNadTotalDegrees() const noexcept { return nadTotalD.load(); }
+    // HOW MANY DEGREES THE PUBLISHED ROWS WERE COMPUTED OVER. Published with the
+    // results, not read live off the tuning: a row's numbers are degree INDICES into
+    // the scale that was loaded when the worker ran, so a caller that shows them beside
+    // a different scale is printing degrees that scale does not have. That is exactly
+    // what "en una pentatonica me dice 7 y 11" was - 12-TET's answer left on screen.
+    int  getNadResultDegrees() const noexcept { return nadResultD.load(); }
     std::vector<NadRow> getNadResults() const
     {
         const juce::ScopedLock sl (nadLock);
@@ -1888,7 +1894,7 @@ private:
     // n-ad worker state.
     std::unique_ptr<std::thread> nadThread;
     std::atomic<bool> nadCancel { false }, nadBusy { false }, nadOverBudget { false };
-    std::atomic<int>  nadGeneration { 0 }, nadUsedD { 0 }, nadTotalD { 0 };
+    std::atomic<int>  nadGeneration { 0 }, nadUsedD { 0 }, nadTotalD { 0 }, nadResultD { 0 };
     mutable juce::CriticalSection nadLock;
     std::vector<NadRow> nadResults;
 

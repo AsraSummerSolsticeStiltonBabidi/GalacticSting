@@ -6160,6 +6160,81 @@ int main()
     }
 
     //==========================================================================
+    // --- "TUNING INFO" NEVER NUMBERS A DEGREE THE SCALE DOES NOT HAVE ---------------
+    //
+    // "los resultados de tuning info aparecen con numeros que no corresponden a los
+    //  numeros de tunings que no son 12edo, tipo en una pentatonica me dice 7 y 11 como
+    //  recomendaciones de acordes en ese tuning, cuando el periodo es 2"
+    //
+    // Every chip in that list is a DEGREE INDEX into the loaded scale, so on a 5-note
+    // scale the only legal numbers are 0..4. "7" and "11" are 12-TET's degrees, left on
+    // screen: the recompute was gated on the "from current tuning" SOURCE, and the
+    // Tuning-info view lives in the other source (it is where a chord loaded from the
+    // free search shows its own degrees), so in that view the list was never recomputed
+    // at all. Driven through the real buttons and the real timer tick.
+    {
+        std::printf ("\n\"Tuning info\" numbers only degrees the loaded scale has:\n");
+        auto p2 = std::make_unique<FractalAdditiveAudioProcessor>();
+        p2->prepareToPlay (sr, blk);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p2->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+
+        if (ed == nullptr) check (false, "the editor was created");
+        else
+        {
+            // The worker publishes on its own thread; the editor only picks the rows up
+            // on a timer tick, and this build has no message loop to deliver one.
+            auto settle = [&]
+            {
+                for (int i = 0; i < 1200 && p2->isNadBusy(); ++i) juce::Thread::sleep (5);
+                ed->tickTimerForTests();
+            };
+
+            // (a) The same list in the OTHER source, over 12-TET's twelve degrees. This
+            //     is the state whose leftovers used to be shown under a 5-note scale.
+            ed->setSpecModeForTests (1);     // "Find tunings based on beating"
+            ed->setTuneSourceForTests (1);   // ...from the current tuning
+            ed->tickTimerForTests();
+            settle();
+            const auto a = ed->nadShownProbeForTests();
+            std::printf ("  12-TET: %d rows, biggest chip %d, scale has %d degrees\n",
+                         a.rows, a.maxDegree, a.degreesPerPeriod);
+            check (a.rows > 0 && a.maxDegree >= 0, "12-TET fills the recommendation list");
+            check (a.maxDegree <= a.degreesPerPeriod - 1,
+                   "...and every chip is a degree 12-TET really has (0..11)");
+
+            // (b) Now the free chord search, a five-note chord LOADED as the scale, and
+            //     the "Tuning info" view it flips to - the user's exact path.
+            ed->setTuneSourceForTests (2);   // ...from all possible tunings (free search)
+            juce::String err;
+            check (p2->startChordSearch (5, 2.0, "2/1", 8, false, 30.0, true, err),
+                   "a five-note chord search starts");
+            for (int i = 0; i < 4000 && p2->isChordSearchRunning(); ++i) juce::Thread::sleep (5);
+            ed->tickTimerForTests();         // the results reach the list
+            ed->loadChordResultForTests (0); // double-click row 1: load it AND jump to Tuning info
+            std::printf ("  loaded \"%s\" -> %d degrees\n",
+                         p2->getGeneratedSclName().toRawUTF8(), p2->getScaleDegrees());
+            check (p2->getScaleDegrees() == 5,
+                   "the loaded chord IS the scale now, and it is a five-note one");
+            ed->tickTimerForTests();
+            settle();
+            const auto b = ed->nadShownProbeForTests();
+            std::printf ("  Tuning info: %d rows, biggest chip %d, scale has %d degrees%s\n",
+                         b.rows, b.maxDegree, b.degreesPerPeriod, b.equalStep ? " (offsets)" : "");
+            check (b.maxDegree <= b.degreesPerPeriod - 1,
+                   "every number \"Tuning info\" shows is a degree THIS scale has - no 7 or 11 "
+                   "in a five-note tuning");
+            check (b.rows > 0, "...and it really did recompute, rather than going blank");
+            // The stamp the display gate reads. A worker publishes on its own thread, so
+            // rows CAN land after the tuning has moved; the editor refuses to show rows
+            // whose stamp does not match the scale in force rather than print indices
+            // into a scale that is gone.
+            check (p2->getNadResultDegrees() == p2->getScaleDegrees(),
+                   "the published rows carry the degree count they index into");
+        }
+    }
+
+    //==========================================================================
     // --- run 43: ADAPTIVE CORNERS stay live inside the playground morph ---------------
     // "quiero que los presets puedan tener espectro adaptativo y aun asi morphear entre
     //  ellos en el preset playground... quiero que afecte, para dar pie a morphs locos,

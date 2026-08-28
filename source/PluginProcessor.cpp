@@ -2124,6 +2124,10 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
                 const juce::ScopedLock sl (nadLock);
                 nadResults = std::move (out);
             }
+            // The degree COUNT these rows index into, stamped before the generation bump
+            // so a reader that sees the new generation also sees the matching D. Their
+            // numbers mean nothing next to any other scale.
+            nadResultD.store (D);
             nadGeneration.fetch_add (1);
         }
         nadBusy = false;
