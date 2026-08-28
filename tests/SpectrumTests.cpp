@@ -531,6 +531,229 @@ int main()
     }
 
     //--------------------------------------------------------------------------
+    // THE INTEGER HANDOVER, x.99 -> x+1.00.
+    //
+    // Going from 1.99 to 2.00 IS crossing a step, and it is the one step the blend never
+    // takes itself: at x+1.00 compileSpectrum drops the blend and returns the single
+    // integer level. Whatever gap the blend leaves at t->1 is paid in that one click, and
+    // once the reveal ramps had shrunk every other click it was the biggest one left.
+    //
+    // The gap was a UNIFORM GAIN, and it came from a silent MERGE. blendFractalTemplates
+    // used to sum each level's ~1-cent bin into a single amplitude and push the whole
+    // upper-level bin onto the LOWER level's partials, so k upper partials sharing a bin
+    // with one lower partial were folded onto that one ratio with their amplitudes added.
+    // Folding k partials of amplitude a into one of amplitude k*a multiplies that bin's
+    // sum of squares by k, so the RMS normalisation in finalisePartials divided the whole
+    // template by too much, and everything that did NOT fold - the loud low partials the
+    // ear follows - came out uniformly quiet. Measured over the 32 loudest partials of
+    // the upper level, the blend at x.999 sat -0.427 dB (Base 4 Odd 2->3), -0.332 dB
+    // (Base 8 All 1->2) and -0.914 dB (Base 16 All 1->2) below it, spread only
+    // 0.010-0.025 dB across those partials - a gain error, not a timbre error - and the
+    // handover click measured 0.740 / 0.993 / 1.480 dB, up to 5.7x the average click of
+    // its crossing. At Base 4 Odd 2->3 the blend also held 7119 partials against level
+    // 3's 14480: 7361 of the user's partials merged away with nothing said.
+    //
+    // The guard that existed could not see any of this. It compares COSINE SIMILARITY,
+    // which normalises both spectra before comparing and is therefore blind to exactly
+    // the quantity that was wrong. These assertions are in dB and in partial COUNTS,
+    // which is what a uniform gain and a silent fold actually move.
+    std::printf ("fractal fader: the integer handover (x.99 -> x+1.00):\n");
+    {
+        constexpr int kBands = 120;   // 10 octaves at 1/12 octave, as above
+        auto bandsDb = [kBands] (const SpectrumTemplate& t)
+        {
+            std::vector<double> e ((size_t) kBands, 0.0);
+            for (const auto& p : t.partials)
+            {
+                const int b = (int) std::floor (std::log2 (std::max (1.0e-9, (double) p.ratio)) * 12.0);
+                if (b >= 0 && b < kBands) e[(size_t) b] += (double) p.amp * (double) p.amp;
+            }
+            std::vector<double> d ((size_t) kBands);
+            for (int i = 0; i < kBands; ++i)
+                d[(size_t) i] = 10.0 * std::log10 (std::max (e[(size_t) i], 1.0e-8));
+            return d;
+        };
+        auto dist = [] (const std::vector<double>& a, const std::vector<double>& b)
+        {
+            double s = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) { const double x = a[i] - b[i]; s += x * x; }
+            return std::sqrt (s / (double) a.size());
+        };
+
+        // Base N with N > 1 is where the bins genuinely collide: the ratio grid is k/N,
+        // so at the top of the reach consecutive harmonics are a fraction of a cent apart
+        // and several of them land in one bin. Prime mode's bins hold one partial each,
+        // which is why the fold was invisible in the mode the original report named.
+        struct HCfg { const char* name; SpectrumSettings s; int Llo; };
+        std::vector<HCfg> cfgs;
+        { SpectrumSettings s; s.baseN = 4;  s.selection = (float) Selection::Odd; s.reach = 256;
+          cfgs.push_back ({ "Base 4 Odd",  s, 2 }); }
+        { SpectrumSettings s; s.baseN = 8;  s.selection = (float) Selection::All; s.reach = 256;
+          cfgs.push_back ({ "Base 8 All",  s, 1 }); }
+        { SpectrumSettings s; s.baseN = 16; s.selection = (float) Selection::All; s.reach = 256;
+          cfgs.push_back ({ "Base 16 All", s, 1 }); }
+
+        for (const auto& c : cfgs)
+        {
+            SpectrumSettings s = c.s;
+            s.fractalLevel = (float) (c.Llo + 1);    const auto up   = compileSpectrum (s);
+            s.fractalLevel = (float) c.Llo + 0.999f; const auto top  = compileSpectrum (s);
+            s.fractalLevel = (float) c.Llo + 0.99f;  const auto last = compileSpectrum (s);
+            s.fractalLevel = (float) c.Llo + 0.98f;  const auto prev = compileSpectrum (s);
+
+            // GAIN, read at 0.999 rather than on the fader's 0.01 grid so that what is
+            // left of the survivors' own fade (1/1000 of a geometric path) cannot be
+            // mistaken for the offset being hunted. The median over the 32 LOUDEST
+            // partials, so neither one outlier nor the inaudible tail can invent or hide
+            // an offset; those 32 are also the ones that never fold, which is precisely
+            // why they carried the error.
+            std::vector<Partial> loudest (up.partials);
+            std::sort (loudest.begin(), loudest.end(),
+                       [] (const Partial& a, const Partial& b) { return a.amp > b.amp; });
+            if (loudest.size() > 32) loudest.resize (32);
+            std::vector<double> off;
+            for (const auto& p : loudest)
+            {
+                const float a = ampAtRatio (top, (double) p.ratio, 1.0e-4 * (double) p.ratio);
+                if (a > 0.0f && p.amp > 0.0f)
+                    off.push_back (20.0 * std::log10 ((double) a / (double) p.amp));
+            }
+            std::sort (off.begin(), off.end());
+            const double med    = off.empty() ? 99.0 : off[off.size() / 2];
+            const double spread = off.empty() ? 99.0 : off.back() - off.front();
+
+            // The handover click itself, and the click immediately before it, on the
+            // fader's own grid. A gain paid back in one step shows up as the last click
+            // dwarfing its neighbour; an ordinary end-of-crossing click does not.
+            const double lastClick = dist (bandsDb (last), bandsDb (up));
+            const double prevClick = dist (bandsDb (prev), bandsDb (last));
+
+            std::printf ("  %-12s %d->%d  gain at x.999 %+.4f dB (spread %.4f over %d partials);"
+                         " handover click %.4f dB vs %.4f dB before it; partials upper %d, blend %d\n",
+                         c.name, c.Llo, c.Llo + 1, med, spread, (int) off.size(),
+                         lastClick, prevClick, (int) up.partials.size(), (int) top.partials.size());
+
+            // 0.05 dB: a factor of 6 below the smallest failure the fold produced
+            // (0.332 dB) and 50x above what pairing leaves (measured +0.0008 / +0.0009 /
+            // +0.0000 dB). It is also about twice the smallest step the fader can make
+            // anywhere (0.023 dB), so it cannot fail on the fader's own quantisation.
+            check (std::abs (med) < 0.05,
+                   "HANDOVER: the top of a crossing carries the upper level's own GAIN, not a fraction of it");
+            // The count is the merge caught directly: every upper-level partial has to be
+            // somewhere in the blend at its OWN ratio. (The blend may hold MORE - a lower
+            // partial the upper level kills is still there, faded to nothing.)
+            check ((int) top.partials.size() >= (int) up.partials.size(),
+                   "HANDOVER: and no upper-level partial has been folded onto a neighbour's ratio");
+            // Measured against the click before it, after pairing: 0.046 vs 0.094,
+            // 0.144 vs 0.260, 0.419 vs 0.539 - every handover SMALLER than its
+            // neighbour. Folding: 0.740 vs 0.061, 0.993 vs 0.233, 1.481 vs 0.483,
+            // i.e. 12.2x, 4.3x and 3.1x the click before it.
+            check (lastClick < 3.0 * prevClick + 0.02,
+                   "HANDOVER: so the last click of a crossing is an ordinary click, not a step");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // A SINGLE NEW PARTIAL MUST STILL USE THE WHOLE FADER.
+    //
+    // The reveal gives each new partial a dB ramp and staggers the ramp STARTS over
+    // [0, 1-kRevealRampW] by the geometric mean of its position by count and by energy.
+    // With a big fresh set the last start lands at 1-kRevealRampW and the last ramp
+    // therefore ends at 1.0, which is the design. With a TINY fresh set both stagger
+    // factors collapse towards zero: with exactly ONE new partial - Harmonics = Prime at
+    // prime limit 2, so the base is {1,2}; or a 2-degree Scala timbre at Reps 1 - its
+    // ramp started at 0 and, at a fixed width of 0.5, was over by the midpoint. Measured
+    // on 1/12-octave band energy, clicks 51-100 then carried 3.2% / 5.9% / 3.1% of the
+    // crossing's loudness path: the top half of the fader did nothing.
+    //
+    // The fix widens the ramp to 1 - lastStart, so the last new partial always lands on
+    // t = 1. Because lastStart <= 1 - kRevealRampW always, the width can only ever GROW,
+    // never shrink - so the per-click bound that kRevealRampW buys (at least 50 fader
+    // clicks per ramp) survives it, and this block re-checks uniformity on the spot
+    // rather than taking that on trust.
+    std::printf ("fractal fader: a single new partial still uses the whole fader:\n");
+    {
+        constexpr int kBands = 120;
+        auto bandsDb = [kBands] (const SpectrumTemplate& t)
+        {
+            std::vector<double> e ((size_t) kBands, 0.0);
+            for (const auto& p : t.partials)
+            {
+                const int b = (int) std::floor (std::log2 (std::max (1.0e-9, (double) p.ratio)) * 12.0);
+                if (b >= 0 && b < kBands) e[(size_t) b] += (double) p.amp * (double) p.amp;
+            }
+            std::vector<double> d ((size_t) kBands);
+            for (int i = 0; i < kBands; ++i)
+                d[(size_t) i] = 10.0 * std::log10 (std::max (e[(size_t) i], 1.0e-8));
+            return d;
+        };
+        auto dist = [] (const std::vector<double>& a, const std::vector<double>& b)
+        {
+            double s = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) { const double x = a[i] - b[i]; s += x * x; }
+            return std::sqrt (s / (double) a.size());
+        };
+
+        struct TCfg { const char* name; SpectrumSettings s; int Llo; };
+        std::vector<TCfg> cfgs;
+        { SpectrumSettings s; s.selection = (float) Selection::Prime;
+          s.primeLimit = 2; s.primeLimitPos = 1.0f; cfgs.push_back ({ "Prime, 2-limit", s, 1 }); }
+        { SpectrumSettings s; s.selection = (float) Selection::Prime;
+          s.primeLimit = 2; s.primeLimitPos = 1.0f; cfgs.push_back ({ "Prime, 2-limit", s, 2 }); }
+        { SpectrumSettings s; s.source = Source::ScalaTimbre; s.timbreDegrees = { 1.0f, 1.5f };
+          s.timbrePeriod = 2.0f; s.timbrePeriodRepeats = 1;
+          cfgs.push_back ({ "Scala 2 degrees", s, 1 }); }
+
+        for (const auto& c : cfgs)
+        {
+            SpectrumSettings s = c.s;
+            s.fractalLevel = (float) c.Llo;       const auto L = compileSpectrum (s);
+            s.fractalLevel = (float) (c.Llo + 1); const auto H = compileSpectrum (s);
+
+            // The PREMISE, asserted rather than assumed: if a settings change ever made
+            // these configs bring two new partials the numbers below would still look
+            // fine and the test would have stopped testing what it says it tests.
+            int fresh = 0;
+            for (const auto& p : H.partials)
+                if (! hasRatio (L, (double) p.ratio, 1.0e-4 * (double) p.ratio)) ++fresh;
+
+            std::vector<std::vector<double>> B;
+            for (int k = 0; k <= 100; ++k)
+            {
+                s.fractalLevel = (float) c.Llo + 0.01f * (float) k;
+                B.push_back (bandsDb (compileSpectrum (s)));
+            }
+            double firstHalf = 0.0, secondHalf = 0.0, mx = 0.0; int arg = 0;
+            for (int k = 1; k <= 100; ++k)
+            {
+                const double d = dist (B[(size_t) k - 1], B[(size_t) k]);
+                (k <= 50 ? firstHalf : secondHalf) += d;
+                if (d > mx) { mx = d; arg = k; }
+            }
+            const double total = firstHalf + secondHalf;
+            const double K     = total > 0.0 ? mx / (total / 100.0) : 0.0;
+            std::printf ("  %-16s %d->%d  %d new partial(s); clicks 1-50 %.1f%%, 51-100 %.1f%%;"
+                         " worst click %.4f dB @%d, K=%.2f\n",
+                         c.name, c.Llo, c.Llo + 1, fresh,
+                         100.0 * firstHalf / std::max (1.0e-12, total),
+                         100.0 * secondHalf / std::max (1.0e-12, total), mx, arg, K);
+
+            check (fresh == 1, "exactly one partial is new at the upper level (the premise of this test)");
+            // 25%: half the fader's travel is asked to deliver at least half of a fair
+            // share. Measured 54.7% / 62.0% / 52.0% with the adaptive width, 3.2% / 5.9%
+            // / 3.1% with the fixed one - so this sits 2x under the fix and 4x over the
+            // failure.
+            check (secondHalf > 0.25 * total,
+                   "TOP HALF: the second half of the crossing still carries the fader's work");
+            // Same K <= 4 the twelve-config sweep above uses. Widening the ramp must not
+            // buy the top half at the cost of a lumpier fader: measured 1.12 / 1.25 /
+            // 1.07 after, against 2.15 / 2.38 / 2.06 before.
+            check (K <= 4.0,
+                   "TOP HALF: and the wider ramp does not make any single click stand out");
+        }
+    }
+
+    //--------------------------------------------------------------------------
     std::printf ("continuous Harmonics axis (Even - All - Odd - Prime):\n");
     {
         SpectrumSettings s; s.baseN = 1; s.reach = 9; s.curveSlope = 0.0f;

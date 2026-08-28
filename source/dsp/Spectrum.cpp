@@ -234,13 +234,17 @@ namespace spectrum
     // The fractional-fractality reveal schedule. Both numbers are MEASURED, not tuned
     // by ear, and the note on blendFractalTemplates below says what they buy.
     //
-    //   kRevealRampW  - how much of one crossing a single new partial takes to fade in.
-    //                   The Fractal fader steps 0.01, so half a crossing is 50 clicks:
-    //                   no partial can ever change by more than ~1/50 of its ramp in one
-    //                   click. The old schedule gave each partial 1/fresh.size() of the
-    //                   crossing - 0.0033 with 304 new partials - i.e. THREE TIMES
-    //                   FINER than the fader itself, which is why one click switched
-    //                   whole partials on at full height.
+    //   kRevealRampW  - the NARROWEST a single new partial's fade-in is ever allowed to
+    //                   be, as a fraction of one crossing. The Fractal fader steps 0.01,
+    //                   so half a crossing is 50 clicks: no partial can ever change by
+    //                   more than ~1/50 of its ramp in one click. The old schedule gave
+    //                   each partial 1/fresh.size() of the crossing - 0.0033 with 304 new
+    //                   partials - i.e. THREE TIMES FINER than the fader itself, which is
+    //                   why one click switched whole partials on at full height.
+    //                   The ramp actually used is WIDER than this whenever the fresh set
+    //                   is small enough that the last ramp would otherwise finish early
+    //                   (see "THE RAMP WIDENS" in blendFractalTemplates). Widening only
+    //                   ever buys MORE clicks per ramp, so this bound survives it.
     //   kRevealFloorDb- where that fade starts, relative to the partial's own final
     //                   amplitude. It has to be below hearing at the moment the partial
     //                   appears: the loudest new partial measured over every config
@@ -296,74 +300,112 @@ namespace spectrum
         const auto key = [] (float r)
         { return (long long) std::llround (1200.0 * std::log2 (std::max (1.0e-9, (double) r))); };
 
-        // Accumulate BOTH levels into ONE bin map, so every bin is blended exactly once.
+        // ONE PARTIAL AT A TIME, NEVER A BIN AT A TIME. Both lists leave their compile
+        // sorted ascending by ratio, so they are sorted by key too and a two-pointer merge
+        // finds the coincidences without a map. Inside a bin that both levels occupy the
+        // partials are PAIRED ONE FOR ONE in ascending-ratio order; a bin holding more
+        // upper-level partials than lower-level ones leaves the surplus as genuinely NEW,
+        // at their OWN ratios.
         //
-        // This used to walk hi's partials and look each one up in a map of lo's: whenever
-        // several hi partials shared a bin with one lo partial - which is the normal case,
-        // because at level L the ratio grid is kMin^(L-1) times finer - EACH of them was
-        // emitted carrying that lo partial's FULL amplitude. The lo energy was duplicated
-        // once per collision, so the timbre jumped the instant Fractal left "off", for any
-        // t however small, and the extra partials pushed the set over the cap. That is the
-        // "raising fractal a hair changed the sound irreversibly" report: at Base 16 the
-        // count went 16369 -> 16384 with the truncation flag set.
-        struct Bin { double loAmp = 0.0, hiAmp = 0.0; };
-        std::unordered_map<long long, Bin> bins;
-        bins.reserve ((lo.partials.size() + hi.partials.size()) * 2);
-        for (const auto& p : lo.partials) bins[key (p.ratio)].loAmp += (double) p.amp;
-        for (const auto& p : hi.partials) bins[key (p.ratio)].hiAmp += (double) p.amp;
-
-        // EVERY lower-level partial survives, at its own ratio - the bins are used only to
-        // work out how much energy each one should carry, never to merge them. It keeps
-        // its share of the bin, so a bin holding several partials splits the blended
-        // energy between them in proportion instead of handing each one the full amount.
-        //   t = 0 -> scale 1, i.e. exactly `lo`.
-        //   t = 1 -> the bin carries the upper level's energy, distributed proportionally.
+        // What this replaces summed each level's bin into a single amplitude and pushed
+        // the whole upper-level bin energy onto the LOWER level's partials. k upper
+        // partials sharing a bin with one lower partial were FOLDED onto that one ratio
+        // with their k amplitudes added, and two failures came out of that:
+        //   * PARTIALS DISAPPEARED. Measured at Base 4 Odd, level 2->3: the blend at 0.999
+        //     held 7119 partials against level 3's 14480. 7361 of the user's partials
+        //     merged away with nothing said - which this synth does not do.
+        //   * A UNIFORM GAIN ERROR AT THE TOP OF EVERY CROSSING. Folding k partials of
+        //     amplitude a into one of amplitude k*a multiplies that bin's sum of squares
+        //     by k, so the RMS normalisation in finalisePartials divided the WHOLE
+        //     template by too much. Everything that did NOT fold - the loud low partials
+        //     the ear is actually following - came out a uniform gain below the upper
+        //     level: measured -0.427 dB (Base 4 Odd 2->3), -0.332 dB (Base 8 1->2),
+        //     -0.914 dB (Base 16 1->2), spread only 0.010-0.025 dB over the 32 loudest
+        //     partials, which is what makes it a GAIN error and not a timbre error.
+        //     The fader paid it all back in ONE click at the handover from x.99 to the
+        //     single-level compile at x+1.00: 1.480 dB at Base 16 1->2, 5.7x the average
+        //     click of that crossing and the biggest click left anywhere on the fader.
+        // Pairing one for one fixes both at the root - every upper-level partial keeps its
+        // own ratio, so t=1 IS the upper level and there is no gain left to pay back.
+        // Measured handover click after: 0.046 / 0.144 / 0.419 dB, each one SMALLER than
+        // the click before it. The alternative considered - keep the fold and undo its
+        // effect on the normaliser with a uniform gain - was rejected on measurement: it
+        // does correct the loud partials (-0.427 dB -> +0.003 dB) but it scales the
+        // already-too-loud folded bins up as well, and the handover click got WORSE, not
+        // better (0.740 -> 0.930, 0.993 -> 1.092, 1.480 -> 1.684 dB). It also left the
+        // merged partials merged.
         //
-        // The survivor's path between those two is GEOMETRIC - lA^(1-t) * hA^t, a
-        // straight line in dB - not linear in amplitude. Both forms agree exactly at
-        // t = 0 (scale 1) and at t = 1 (scale hA/lA), so no patch parked on an integer
-        // level moves; only the shape in between does, and a straight line in dB is what
-        // an ear hears as an even fade. It is worth little on its own - isolated, the
-        // survivor rescale moves the spectrum 0.030 dB over the first fader click
-        // against the reveal's 10.157 dB - but it costs nothing and it is the ONLY
-        // mechanism at all when the base harmonic set is closed under multiplication
-        // (Harmonics = All/Odd/Even, or a pure prime LIMIT), where there are no new
-        // partials to reveal.
+        // WHAT IS LEFT. Where the upper level itself overflows the keep-loudest cap
+        // (Base 16 All 1->2 wants 113432 partials and kMaxPartials is 16384) the blend and
+        // the single-level compile keep DIFFERENT 16384 of them, because a fresh partial
+        // still short of full amplitude ranks differently, and 0.419 dB of handover
+        // survives there. That is the cap, not the blend: at a reach where nothing is
+        // truncated the same config's handover is 0.046-0.105 dB in every config swept,
+        // and `truncated` is set on both sides so the meter says so.
         //
-        // hA == 0 - the partial does not exist at the upper level - keeps the LINEAR
-        // (1-t) fade, because a geometric path can never reach zero: pow(0, t) would
-        // kill the partial outright on the first click instead of fading it out. That is
-        // also exactly what the previous formula did for this case, so nothing changed.
+        // Dropping the two hash maps for a merge walk also made the blend cheaper, not
+        // dearer, despite emitting more partials: measured median blend cost 53.99 ->
+        // 45.32 ms (Base 4 All L3->L4, 16k+16k) and 20.40 -> 0.56 ms (Base 16 All L1->L2).
+        //
+        // A partial the upper level KILLS fades LINEARLY, not geometrically: a geometric
+        // path can never reach zero (pow(0, t) would kill it outright on the first click
+        // instead of fading it out).
         std::vector<Partial> parts, fresh;
-        parts.reserve (lo.partials.size());
+        parts.reserve (lo.partials.size() + hi.partials.size());
         fresh.reserve (hi.partials.size());
-        for (const auto& p : lo.partials)
-        {
-            const auto it = bins.find (key (p.ratio));
-            const double lA = (it != bins.end()) ? it->second.loAmp : 0.0;
-            const double hA = (it != bins.end()) ? it->second.hiAmp : 0.0;
-            // exp2/log2 rather than pow: measured 1.6x faster over the 16k-partial
-            // worst case (0.97 ms -> 0.59 ms for the two blend loops at Base 4, L3->L4).
-            const double scale = (lA > 0.0 && hA > 0.0)
-                                     ? std::exp2 (t * std::log2 (hA / lA))
-                                     : 1.0 - t;
-            parts.push_back ({ p.ratio, (float) ((double) p.amp * scale) });
-        }
-        // Upper-level partials with no counterpart below are the genuinely NEW ones.
-        for (const auto& p : hi.partials)
-        {
-            const auto it = bins.find (key (p.ratio));
-            if (it == bins.end() || it->second.loAmp <= 0.0)
-                fresh.push_back (p);
-        }
 
-        std::sort (fresh.begin(), fresh.end(),
-                   [] (const Partial& a, const Partial& b) { return a.ratio < b.ratio; });
+        const auto dying = [&parts, t] (const Partial& p)
+        { parts.push_back ({ p.ratio, (float) ((double) p.amp * (1.0 - t)) }); };
+
+        // A partial that exists at BOTH levels walks a GEOMETRIC path from its lower
+        // amplitude to its upper one - lA^(1-t) * hA^t, a straight line in dB. Both forms
+        // agree exactly at t = 0 (scale 1) and t = 1 (scale hA/lA), so no patch parked on
+        // an integer level moves; only the shape in between does, and a straight line in
+        // dB is what an ear hears as an even fade. It is worth little on its own -
+        // isolated, the survivor rescale moves the spectrum 0.030 dB over the first fader
+        // click against the reveal's 10.157 dB - but it costs nothing and it is the ONLY
+        // mechanism at all when the base harmonic set is closed under multiplication
+        // (Harmonics = All/Odd/Even, or a pure prime LIMIT), where nothing is fresh.
+        //
+        // exp2/log2 rather than pow: measured 1.6x faster over the 16k-partial worst case
+        // (0.97 ms -> 0.59 ms for the two blend loops at Base 4, L3->L4).
+        const auto surviving = [&parts, t] (const Partial& l, const Partial& h)
+        {
+            const double lA = (double) l.amp, hA = (double) h.amp;
+            const double scale = (lA > 0.0 && hA > 0.0) ? std::exp2 (t * std::log2 (hA / lA))
+                                                        : 1.0 - t;
+            parts.push_back ({ l.ratio, (float) (lA * scale) });
+        };
+
+        const size_t nLo = lo.partials.size(), nHi = hi.partials.size();
+        size_t i = 0, j = 0;
+        while (i < nLo && j < nHi)
+        {
+            const long long kl = key (lo.partials[i].ratio);
+            const long long kh = key (hi.partials[j].ratio);
+            if (kl < kh) { dying (lo.partials[i++]); continue; }
+            if (kh < kl) { fresh.push_back (hi.partials[j++]); continue; }
+
+            size_t i2 = i, j2 = j;
+            while (i2 < nLo && key (lo.partials[i2].ratio) == kl) ++i2;
+            while (j2 < nHi && key (hi.partials[j2].ratio) == kl) ++j2;
+            const size_t pairs = std::min (i2 - i, j2 - j);
+            for (size_t p = 0;     p < pairs;   ++p) surviving (lo.partials[i + p], hi.partials[j + p]);
+            for (size_t p = pairs; p < i2 - i;  ++p) dying (lo.partials[i + p]);
+            for (size_t p = pairs; p < j2 - j;  ++p) fresh.push_back (hi.partials[j + p]);
+            i = i2; j = j2;
+        }
+        for (; i < nLo; ++i) dying (lo.partials[i]);
+        for (; j < nHi; ++j) fresh.push_back (hi.partials[j]);
+
+        // `fresh` is filled in hi's own order, which is already ascending by ratio, so it
+        // needs no sort - and the reveal below depends on that order.
+        //
         // Partials that exist ONLY at the upper level enter from low to high: raising
         // Fractal adds detail progressively rather than crossfading a whole level in.
-        // Each one gets its own dB ramp of width kRevealRampW; the ramps START in
-        // ascending-ratio order, spaced by the geometric mean of "how many partials are
-        // below me" and "how much of the new ENERGY is below me" (see the header note).
+        // Each one gets its own dB ramp; the ramps START in ascending-ratio order, spaced
+        // by the geometric mean of "how many partials are below me" and "how much of the
+        // new ENERGY is below me" (see the header note).
         if (! fresh.empty())
         {
             double totalEnergy = 0.0;
@@ -371,22 +413,50 @@ namespace spectrum
 
             const double n     = (double) fresh.size();
             const double slope = kRevealFloorDb / kDbPerLog2; // dB floor in log2 units
+
+            // THE RAMP WIDENS WHEN THE FRESH SET IS SMALL, so that the LAST new partial
+            // finishes exactly at t = 1 instead of somewhere in the middle of the fader.
+            //
+            // The stagger below places start(i) in [0, 1-kRevealRampW]; the largest of
+            // those, `lastStart`, is reached by the last partial, and a fixed ramp width
+            // of kRevealRampW then ended the reveal at lastStart + kRevealRampW. With a
+            // big fresh set lastStart -> 1-kRevealRampW and that is 1.0, as intended. With
+            // a TINY fresh set both stagger factors collapse: with exactly ONE new partial
+            // (Harmonics = Prime at prime limit 2, or a 2-degree Scala timbre at Reps 1)
+            // byCount is 0, lastStart is 0, and the whole reveal was over by t = 0.5.
+            // Measured on 1/12-octave band energy, clicks 51-100 of those crossings then
+            // carried 3.2% / 5.9% / 3.1% of the loudness path against clicks 1-50: the top
+            // half of the fader did nothing it was designed to do.
+            //
+            // So the ramp is widened by exactly the gap: rampW = 1 - lastStart. Because
+            // lastStart <= 1-kRevealRampW always, rampW >= kRevealRampW ALWAYS - it can
+            // only ever buy MORE fader clicks per ramp, never fewer, so the per-click
+            // bound kRevealRampW was chosen for survives this untouched. Large fresh sets
+            // barely notice (Prime 1->2, 304 fresh: 0.5000 -> 0.5008).
+            //
+            // fresh is ascending in ratio and amplitude falls with ratio, so the last
+            // partial is the quietest one and both factors are at their maximum there.
+            const double eLast     = (double) fresh.back().amp * (double) fresh.back().amp;
+            const double cLast     = (n - 1.0) / n;
+            const double gLast     = totalEnergy > 0.0 ? (totalEnergy - eLast) / totalEnergy : cLast;
+            const double lastStart = std::sqrt (cLast * gLast) * (1.0 - kRevealRampW);
+            const double rampW     = 1.0 - lastStart;   // >= kRevealRampW by construction
+
             double belowEnergy = 0.0;
-
-            for (size_t i = 0; i < fresh.size(); ++i)
+            for (size_t f = 0; f < fresh.size(); ++f)
             {
-                const double byCount  = (double) i / n;
+                const double byCount  = (double) f / n;
                 const double byEnergy = totalEnergy > 0.0 ? belowEnergy / totalEnergy : byCount;
-                belowEnergy += (double) fresh[i].amp * (double) fresh[i].amp;
+                belowEnergy += (double) fresh[f].amp * (double) fresh[f].amp;
 
-                // Both factors are non-decreasing in i, so the start is too, so the loop
+                // Both factors are non-decreasing in f, so the start is too, so the loop
                 // can stop at the first partial whose ramp has not opened yet.
                 const double start = std::sqrt (byCount * byEnergy) * (1.0 - kRevealRampW);
-                const double u     = (t - start) / kRevealRampW;   // 0 -> silence, 1 -> full
+                const double u     = (t - start) / rampW;   // 0 -> silence, 1 -> full
                 if (u <= 0.0) break;
 
                 const double w = (u >= 1.0) ? 1.0 : std::exp2 (slope * (1.0 - u));
-                parts.push_back ({ fresh[i].ratio, (float) ((double) fresh[i].amp * w) });
+                parts.push_back ({ fresh[f].ratio, (float) ((double) fresh[f].amp * w) });
             }
         }
 
