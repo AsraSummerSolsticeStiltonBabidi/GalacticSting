@@ -119,6 +119,32 @@ namespace fgfit
     { return textButtonWidth (b.getButtonText(), h, b.getProperties().contains ("fork")) + kSnugPad; }
     inline int snugToggleWidth (const juce::ToggleButton& b, int h)
     { return (b.getName() == "onled" ? onLedWidth (h) : toggleWidth (b.getButtonText(), h)) + kSnugPad; }
+    // A TAB CHIP.
+    //
+    // "haz que los botones harmonic/custom tengan el mismo tamano que los de los
+    //  sub-menus dentro del menu modulator (pitch, filter, custom, etc)"
+    //
+    // The engine chips (HARMONIC / CUSTOM) and the modulator sub-tabs (AMP / PITCH /
+    // FILTER / CUSTOM) are the same control doing the same job - a row of exclusive
+    // chips that titles the box under it and recolours it - so they are one size, one
+    // band height, one inset, one font. They were 104 x 16 and 58 x 19: the engine pair
+    // was wider AND shorter, and its text a whole point smaller, because each row
+    // carried its own literals.
+    //
+    // The corner radius needs no number here: GalacticLnF::drawButtonBackground fills
+    // every button that is not named "round" as a square rect, so both rows already
+    // share it and a radius stated here would be a second, drifting copy of nothing.
+    namespace chip
+    {
+        inline constexpr int kHeight = 19;  // the band a chip row occupies, chips filling it
+        inline constexpr int kInsetX = 1;   // air each chip keeps either side of itself
+        // A chip's own width: its word in the font that height gives it, the painter's
+        // own 4 px a side, and the same kSnugPad every other control in this window is
+        // padded with. Never a fixed constant: "HARMÒNIC" is not "HARMONIC".
+        inline int width (const juce::TextButton& b)
+        { return textButtonWidth (b.getButtonText(), kHeight, false) + kSnugPad + 2 * kInsetX; }
+    }
+
     // The WIDEST item a combo can show, never the selected one: the box does not resize
     // when the user picks another item, so a slot sized to today's choice draws
     // tomorrow's cut off - and nothing on screen says it was cut.

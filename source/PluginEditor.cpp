@@ -5685,6 +5685,13 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("cust.reps",        timbreRepeatsFader); add ("cust.repsLbl", lblTimbreRepeats);
     add ("cust.temper",      temperToggle); // laid out in BOTH views of the engine box
 
+    // The two CHIP ROWS, so a build can see that they are still one size. They are the
+    // same control doing the same job (see fgfit::chip) and they were 104 x 16 against
+    // 58 x 19 - a difference nothing here could measure, because neither row was probed.
+    add ("eng.chipHarmonic", engineChip[0]);   add ("eng.chipCustom", engineChip[1]);
+    add ("mod.tabAmp",       envTabB[0]);      add ("mod.tabPitch",   envTabB[1]);
+    add ("mod.tabFilter",    envTabB[2]);      add ("mod.tabCustom",  envTabB[3]);
+
     add ("both.slope",       slopeFader);      add ("both.pencil",    partialEditBtn);
     add ("both.manual",      partialManualT);  add ("both.fractal",   fractalFader);
     add ("both.morph",       morphToggle);
@@ -6720,7 +6727,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
         bothEnginesBounds = sp;
 
         const int lblH  = 15; // inline sub-label band (BASE / HARMONICS / DECAY / ...)
-        const int chipH = 18; // the box's title band - the engine chips live in it
+        // The box's title band IS the chip row, at the one height every chip row in this
+        // window uses (fgfit::chip) - the modulator sub-tabs included.
+        const int chipH = fgfit::chip::kHeight;
 
         // Which engine's controls the shared box shows = which engine SOUNDS
         // (engineInForce), the same rule that lights the chips: clicking a chip both
@@ -6732,12 +6741,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
         //-- the chip strip IS the box title (like the Modulators box's tab row) -----
         {
             auto eb = engineBoxBounds.reduced (5, 0);
-            auto chips = eb.removeFromTop (chipH);
+            auto chips = eb.removeFromTop (fgfit::chip::kHeight);
             for (int i = 0; i < 2; ++i)
-            {
-                engineChip[i].setBounds (chips.removeFromLeft (104).reduced (1, 1));
-                chips.removeFromLeft (3);
-            }
+                engineChip[i].setBounds (chips.removeFromLeft (
+                    juce::jmin (fgfit::chip::width (engineChip[i]), juce::jmax (0, chips.getWidth())))
+                        .reduced (fgfit::chip::kInsetX, 0));
         }
 
         // View switching: only the selected engine's controls exist on screen. Hidden,
@@ -6998,7 +7006,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
             auto in = eb.reduced (3).reduced (5, 4);
             in.removeFromTop (20);                // clear the box title - chips sit BELOW it
-            auto chips = in.removeFromTop (19);
+            // The SAME chip band as the engine chips above (fgfit::chip), which is what
+            // makes the two rows one size. These four share the box's width evenly
+            // because there are exactly four of them and they fill it; the engine pair
+            // is sized to its words. Height, inset and font are the shared part.
+            auto chips = in.removeFromTop (fgfit::chip::kHeight);
             const int cw4 = chips.getWidth() / 4;
             for (int k = 0; k < 4; ++k)
             {
@@ -7006,7 +7018,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
                                       envTab == k ? tabCols[k] : tabCols[k].withAlpha (0.20f));
                 envTabB[k].setColour (juce::TextButton::textColourOffId,
                                       envTab == k ? juce::Colours::black : juce::Colour (0xffb9c0d0));
-                envTabB[k].setBounds (chips.removeFromLeft (k == 3 ? chips.getWidth() : cw4).reduced (1, 0));
+                envTabB[k].setBounds (chips.removeFromLeft (k == 3 ? chips.getWidth() : cw4)
+                                          .reduced (fgfit::chip::kInsetX, 0));
             }
             in.removeFromTop (4);
 

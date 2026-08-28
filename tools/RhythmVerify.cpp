@@ -2494,6 +2494,42 @@ int main()
             check (! L.spectrum.intersects (L.essentials) && ! L.spectrum.intersects (L.tuning),
                    "and it overlaps neither of them");
 
+            // THE TWO CHIP ROWS ARE ONE CONTROL AT ONE SIZE.
+            //
+            // "haz que los botones harmonic/custom tengan el mismo tamano que los de los
+            //  sub-menus dentro del menu modulator (pitch, filter, custom, etc)"
+            //
+            // HARMONIC / CUSTOM and AMP / PITCH / FILTER / CUSTOM do the same job at the
+            // top of their box, and they were 104 x 16 against 58 x 19 - the engine pair
+            // wider AND shorter, its text a whole point smaller, because each row carried
+            // its own literals. They read from fgfit::chip now; this is what stops a hand
+            // from putting a private number back into one of them.
+            {
+                auto rect = [&L] (const char* nm)
+                {
+                    juce::Rectangle<int> r;
+                    for (const auto& c : L.controls) if (c.first == nm) r = c.second;
+                    return r;
+                };
+                const auto ch0 = rect ("eng.chipHarmonic"), ch1 = rect ("eng.chipCustom");
+                const auto ta  = rect ("mod.tabAmp"),       tf  = rect ("mod.tabFilter");
+                std::printf ("  chips: HARMONIC %dx%d, CUSTOM %dx%d | tabs: AMP %dx%d, FILTER %dx%d\n",
+                             ch0.getWidth(), ch0.getHeight(), ch1.getWidth(), ch1.getHeight(),
+                             ta.getWidth(), ta.getHeight(), tf.getWidth(), tf.getHeight());
+                check (! ch0.isEmpty() && ! ta.isEmpty(), "both chip rows are on screen");
+                check (ch0.getHeight() == ta.getHeight() && ch1.getHeight() == ta.getHeight()
+                           && ta.getHeight() == tf.getHeight(),
+                       "an engine chip is exactly as tall as a modulator sub-tab (so its "
+                       "text is drawn in the same size - the font follows the height)");
+                // ...and each chip is sized to ITS OWN word, not to a shared constant.
+                // "HARMONIC" and "CUSTOM" are different lengths in both languages, so
+                // equal widths here can only mean a fixed number came back.
+                check (ch0.getWidth() != ch1.getWidth(),
+                       "and each engine chip is as wide as its own word, not a fixed 104");
+                check (ch0.getWidth() < 104 && ch1.getWidth() < 104,
+                       "which is narrower than the slab they used to be");
+            }
+
             // THE SHARED WALL. SPECTRUM's right border, TUNING's right border and the
             // Spectrum-vs-Tuning column's LEFT border must be ONE drawn line.
             //
@@ -2670,6 +2706,10 @@ int main()
                                 : c.first.startsWith ("tun.")  ? &L.tuning
                                 : c.first.startsWith ("spec.") ? &L.specColumn
                                 : c.first.startsWith ("top.")  ? &L.titleBar
+                                // The two chip rows: the engine chips ARE the engine
+                                // box's title band, the sub-tabs live inside Envelopes.
+                                : c.first.startsWith ("eng.")  ? &L.engineBox
+                                : c.first.startsWith ("mod.")  ? &L.envelopes
                                                                : &L.essentials;
                 if (! box->contains (c.second))
                 { ++outside; if (worstName.isEmpty()) worstName = c.first; }
