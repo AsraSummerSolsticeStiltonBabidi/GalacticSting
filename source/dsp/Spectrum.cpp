@@ -44,14 +44,37 @@ namespace spectrum
 
     // Spectrum range: hard-cut every partial more than 2^N octaves above the played
     // pitch (ratio 1). N == 10 (or more) reaches the full template, so it is a no-op.
+    //
+    // THE LOWEST-RATIO PARTIAL ALWAYS SURVIVES, and that is not a nicety - without it
+    // this cut could delete the ENTIRE spectrum and leave a silent note with no warning
+    // anywhere. "Ratio 1" is only the bottom of the spectrum in Transposed mode; in
+    // ORIGINAL mode the harmonics keep their natural positions, so the lowest partial
+    // sits at ratio N (the base-harmonic shift), not at 1. Measured on the shipping
+    // control, whose minimum is 1 octave: Original N=4 at range 1, and Original N=7 at
+    // ranges 1 and 2, all compiled to ZERO partials - every partial was above the cut,
+    // remove_if took the lot, and the note simply did not sound. A control that can
+    // silence the instrument while claiming to narrow its bandwidth is exactly the
+    // "silent limit" this project forbids.
+    //
+    // The rule is the one the keep-loudest cap below already uses for the same reason:
+    // whatever else goes, the partial carrying the played pitch stays. The result is a
+    // pure sine at the base harmonic - visibly "1 partial" in the amplitude window's
+    // counter and in the meter - instead of silence. Nothing else changes: when any
+    // partial is at or under the ceiling this branch is never taken, so the cut is
+    // bit-for-bit what it was on every patch that was not being emptied.
     static void applyRangeCut (std::vector<Partial>& parts, const SpectrumSettings& s)
     {
-        if (s.spectrumRangeOct >= 10)
+        if (s.spectrumRangeOct >= 10 || parts.empty())
             return;
         const double maxR = std::pow (2.0, (double) s.spectrumRangeOct);
+        const auto lowestIt = std::min_element (parts.begin(), parts.end(),
+                                                [] (const Partial& a, const Partial& b) { return a.ratio < b.ratio; });
+        const Partial lowest = *lowestIt;   // copied BEFORE the erase invalidates the iterator
         parts.erase (std::remove_if (parts.begin(), parts.end(),
                                      [maxR] (const Partial& p) { return (double) p.ratio > maxR; }),
                      parts.end());
+        if (parts.empty())
+            parts.push_back (lowest);
     }
 
     // Shared tail: keep-loudest cap (always keeping the lowest-ratio partial so the

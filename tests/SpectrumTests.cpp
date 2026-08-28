@@ -692,6 +692,89 @@ int main()
     }
 
     //--------------------------------------------------------------------------
+    // ...AND THE RANGE CUT MUST NEVER EMPTY THE SPECTRUM.
+    //
+    // The cut is stated relative to ratio 1 = the played pitch, but ratio 1 is only the
+    // bottom of the spectrum in TRANSPOSED mode. In ORIGINAL mode the harmonics keep
+    // their natural positions, so with base N the lowest partial is at ratio N and a
+    // narrow range can sit entirely BELOW every partial there is.
+    //
+    // Measured before the fix, at the shipping control's own minimum (spectrumRange = 1):
+    //   Original N=4, range 1          ->  0 partials   (silent note, no warning)
+    //   Original N=7, range 1 and 2    ->  0 partials   (idem)
+    // Every (mode, N, range) the control can reach is swept here, both engines' entry
+    // points, so a future change that re-introduces the hole anywhere is caught. The
+    // rule asserted is the one applyRangeCut now implements: the LOWEST-ratio partial
+    // survives whatever the ceiling is, so the played pitch always sounds.
+    std::printf ("Spectrum range can never delete the whole spectrum:\n");
+    {
+        int emptied = 0, worst[3] = { 0, 0, 0 };
+        for (int mode = 0; mode < 2; ++mode)
+            for (int N = 1; N <= 16; ++N)
+                for (int rng = 1; rng <= 10; ++rng)
+                {
+                    SpectrumSettings s;
+                    s.baseN = N;
+                    s.baseMode = mode == 0 ? BaseMode::Transposed : BaseMode::Original;
+                    s.reach = 64;
+                    s.selection = (float) Selection::All;
+                    s.curveSlope = 1.0f;
+                    s.spectrumRangeOct = rng;
+                    const auto t = compileSpectrum (s);
+                    if (t.partials.empty())
+                    {
+                        if (emptied == 0) { worst[0] = mode; worst[1] = N; worst[2] = rng; }
+                        ++emptied;
+                    }
+                }
+        if (emptied > 0)
+            std::printf ("    %d of 320 (mode, N, range) combinations compiled to ZERO partials"
+                         " (first: %s N=%d range=%d)\n",
+                         emptied, worst[0] == 0 ? "Transposed" : "Original", worst[1], worst[2]);
+        check (emptied == 0,
+               "no (base mode, N, range) the controls can reach compiles to a silent spectrum");
+
+        // The three combinations that were MEASURED at zero, named individually so the
+        // regression report says which patch went silent rather than "one of 320".
+        struct Case { int N, rng; };
+        const Case zeroed[] = { { 4, 1 }, { 7, 1 }, { 7, 2 } };
+        bool allSound = true;
+        for (const auto& c : zeroed)
+        {
+            SpectrumSettings s;
+            s.baseN = c.N; s.baseMode = BaseMode::Original; s.reach = 64;
+            s.selection = (float) Selection::All; s.curveSlope = 1.0f;
+            s.spectrumRangeOct = c.rng;
+            const auto t = compileSpectrum (s);
+            // The survivor has to be the LOWEST partial (the played pitch at ratio N),
+            // not just any partial: keeping the loudest one instead would move the pitch.
+            const bool ok = ! t.partials.empty()
+                         && std::abs ((double) t.partials.front().ratio - (double) c.N) < 1e-3;
+            std::printf ("    Original N=%d, range %d: %d partials, lowest ratio %.3f\n",
+                         c.N, c.rng, (int) t.partials.size(),
+                         t.partials.empty() ? 0.0 : (double) t.partials.front().ratio);
+            if (! ok) allSound = false;
+        }
+        check (allSound,
+               "the three configurations measured at 0 partials now keep their played pitch");
+
+        // ...and the cut still cuts. Guaranteeing the lowest partial must not turn into
+        // "the range control does nothing": a range that DOES contain partials keeps
+        // exactly the ones under the ceiling and no more.
+        {
+            SpectrumSettings s;
+            s.baseN = 1; s.baseMode = BaseMode::Transposed; s.reach = 64;
+            s.selection = (float) Selection::All; s.curveSlope = 0.0f;
+            s.spectrumRangeOct = 2;                     // keep ratio <= 4
+            const auto t = compileSpectrum (s);
+            double maxR = 0.0;
+            for (const auto& p : t.partials) maxR = std::max (maxR, (double) p.ratio);
+            check (t.partials.size() == 4 && maxR <= 4.0 + 1e-3,
+                   "a range that does contain partials still cuts everything above it");
+        }
+    }
+
+    //--------------------------------------------------------------------------
     std::printf ("Scala-as-timbre: degrees stacked over periods become the partials:\n");
     {
         // A 12-TET scale (12 degrees), 2 periods, flat slope, no fractal.
