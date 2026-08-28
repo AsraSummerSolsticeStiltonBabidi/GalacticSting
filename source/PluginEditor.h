@@ -353,6 +353,15 @@ public:
     // second copy of the filter that the drop-down itself has stopped using.
     static juce::StringArray presetSearchProbeForTests (const juce::StringArray& names,
                                                         const juce::String& typed);
+    // TESTS: how many times a RefreshingComboBox whose drop-down is TAKEN OVER (the
+    // presets box) can actually be opened. The user's report was "it opens once, I load
+    // a preset, and it never opens again" - ComboBox's private menuActive flag was left
+    // set forever because no PopupMenu ever finished to clear it. This drives the same
+    // public entry point a click does (showPopupIfNotActive) `attempts` times and
+    // returns how many of those reached onShowPopup. Anything less than `attempts` is
+    // the bug. (showPopup() is dispatched asynchronously; the probe delivers that one
+    // callback by hand, since the verifier has no dispatch loop - see the body.)
+    static int comboReopenProbeForTests (int attempts);
     // TESTS: what the MAIN window says about whose patch its controls are. The preset
     // field is frozen (and disabled) while a playground corner is being edited; nothing
     // else in the build can see that, and getting it wrong is how a user loads a preset
@@ -411,7 +420,27 @@ private:
         void showPopup() override
         {
             if (onBeforePopup) onBeforePopup();
-            if (onShowPopup && onShowPopup()) return;
+            if (onShowPopup && onShowPopup())
+            {
+                // THE BOX OPENED EXACTLY ONCE PER EDITOR, THEN DIED FOR GOOD.
+                //
+                // ComboBox::mouseDown -> showPopupIfNotActive() sets the private
+                // menuActive flag and THEN calls showPopup() asynchronously. The only
+                // thing in JUCE that ever clears menuActive again is hidePopup(), and
+                // the only caller of that is comboBoxPopupMenuFinishedCallback - the
+                // modal callback of the PopupMenu that juce::ComboBox::showPopup()
+                // launches. When we take the drop-down over there IS no PopupMenu, so
+                // returning here left menuActive stuck true: every later mouseDown,
+                // mouseUp, Return key and scroll-wheel tick was swallowed by the
+                // `if (! menuActive)` guard and the presets box never opened again.
+                //
+                // hidePopup() is public and does exactly the one thing needed: clear
+                // the flag (plus PopupMenu::dismissAllActiveMenus(), which walks only
+                // PopupMenu's own MenuWindow list and so cannot touch the CallOutBox
+                // onShowPopup just launched).
+                hidePopup();
+                return;
+            }
             juce::ComboBox::showPopup();
         }
     };

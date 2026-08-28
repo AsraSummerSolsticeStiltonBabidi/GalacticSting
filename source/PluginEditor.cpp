@@ -3247,6 +3247,38 @@ juce::StringArray FractalAdditiveAudioProcessorEditor::presetSearchProbeForTests
     return panel.shown;
 }
 
+int FractalAdditiveAudioProcessorEditor::comboReopenProbeForTests (int attempts)
+{
+    RefreshingComboBox box;
+    box.addItem ("one", 1);
+    box.setSelectedId (1, juce::dontSendNotification);
+
+    int opened = 0;
+    // The presets box's contract exactly: "I handled it, do not show the plain menu."
+    // No CallOutBox here - the failure is entirely in ComboBox's own bookkeeping, and a
+    // real callout would need a desktop window and a user to dismiss it.
+    box.onShowPopup = [&opened] { ++opened; return true; };
+
+    for (int i = 0; i < attempts; ++i)
+    {
+        const bool wasActive = box.isPopupActive();
+        // The Return key runs the SAME showPopupIfNotActive() a mouseDown does (that one
+        // is private, so this is the honest way in from outside). If menuActive is stuck
+        // up, this call does nothing at all - precisely what the user saw.
+        box.keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+
+        // showPopupIfNotActive() raises menuActive and then defers showPopup() with
+        // MessageManager::callAsync. This build has no dispatch loop to deliver that
+        // (JUCE_MODAL_LOOPS_PERMITTED is off in the verifier), so the callback's one
+        // statement - safePointer->showPopup() - is delivered by hand, and ONLY on the
+        // transition that actually queued it. Calling showPopup() unconditionally would
+        // be a probe that opens the box itself and could never see the bug.
+        if (! wasActive && box.isPopupActive())
+            box.showPopup();
+    }
+    return opened;
+}
+
 bool FractalAdditiveAudioProcessorEditor::openPresetSearch()
 {
     const auto names = processorRef.getPresetNames();

@@ -6047,6 +6047,23 @@ int main()
         // is a comparison, never a rewrite of the user's own file names.
         check (E ("canco")[0] == names[0] && E ("radio")[0] == names[2],
                "the names the list shows are the real ones - folding compares, it never renames");
+
+        // ...AND IT OPENS MORE THAN ONCE.
+        // "pulse una vez en el boton de presets y cargue uno y ahora pulso otra vez pero
+        //  ya no se despliega la lista"
+        // ComboBox::showPopupIfNotActive() raises the private menuActive flag and then
+        // dispatches showPopup() asynchronously; the ONLY code that lowers it again is
+        // hidePopup(), reached from the modal callback of the PopupMenu that the base
+        // showPopup() launches. A box that takes the drop-down over never launches one,
+        // so the flag stayed up and every later click, Return and scroll was swallowed:
+        // the presets box was dead for the rest of the editor's life. Three attempts,
+        // because the bug lets exactly the FIRST one through.
+        {
+            const int opened = FractalAdditiveAudioProcessorEditor::comboReopenProbeForTests (3);
+            std::printf ("  a taken-over drop-down opened %d time(s) out of 3\n", opened);
+            check (opened == 3,
+                   "the presets drop-down opens EVERY time it is clicked, not just the first");
+        }
     }
 
     //==========================================================================
