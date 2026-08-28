@@ -6160,6 +6160,267 @@ int main()
     }
 
     //==========================================================================
+    // --- A CONTROL MOVES WHILE NOTES ARE HELD ---------------------------------------
+    // "mover controles con notas apretadas sigue siendo buggy, a veces no deja mover el
+    //  control y a veces si, solo si has movido el control un instante antes de empezar
+    //  a tocar teclas"
+    {
+        std::printf ("\ndragging a fader while notes are held:\n");
+        auto pd = std::make_unique<FractalAdditiveAudioProcessor>();
+        pd->prepareToPlay (sr, blk);
+        std::unique_ptr<juce::AudioProcessorEditor> base (pd->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        juce::AudioBuffer<float> db (2, blk);
+
+        auto show = [] (const char* what, const FractalAdditiveAudioProcessorEditor::DragProbe& d)
+        {
+            std::printf ("  %-22s found=%d vis=%d en=%d  %.4f -> %.4f -> %.4f  held=%d "
+                         "focus=%d(%s) sinceFocus=%dms\n",
+                         what, (int) d.found, (int) d.visible, (int) d.enabled,
+                         d.before, d.afterDrag, d.afterSettle, d.heldNotes,
+                         (int) d.editorHasFocus, d.focusOwner.toRawUTF8(), d.msSinceFocused);
+        };
+
+        if (ed == nullptr) check (false, "the editor was created");
+        else
+        {
+            const auto quiet = ed->dragFaderForTests ("slope", 20, 3);
+            show ("silent", quiet);
+            check (quiet.found && quiet.afterDrag != quiet.before,
+                   "with nothing sounding, dragging the SLOPE fader moves it");
+            check (quiet.afterSettle == quiet.afterDrag,
+                   "...and three timer ticks later it is still where the drag left it");
+
+            // Now with a chord really held: note-ons through processBlock, blocks kept
+            // running between the ticks, exactly as a host does while keys are down.
+            juce::MidiBuffer on;
+            for (const int k : { 60, 64, 67 }) on.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0);
+            pd->processBlock (db, on);
+            for (int i = 0; i < 20; ++i)
+            { juce::MidiBuffer none; db.clear(); pd->processBlock (db, none); pd->pollParametersForTests(); }
+            ed->tickTimerForTests();
+
+            const auto held = ed->dragFaderForTests ("slope", -20, 0);
+            show ("3 notes held", held);
+            check (held.found && held.afterDrag != held.before,
+                   "with a chord held, dragging the SLOPE fader still moves it");
+
+            // ...and it must STAY there while the notes go on sounding: a value that is
+            // written back a tick later reads exactly as "no deja mover el control".
+            for (int i = 0; i < 20; ++i)
+            { juce::MidiBuffer none; db.clear(); pd->processBlock (db, none); pd->pollParametersForTests(); }
+            ed->tickTimerForTests(); ed->tickTimerForTests();
+            const auto after = ed->dragFaderForTests ("slope", 0, 3);
+            show ("held, after settle", after);
+            check (std::abs (after.before - held.afterDrag) < 1.0e-6,
+                   "...and it is still there twenty blocks and two ticks later");
+
+            juce::MidiBuffer off;
+            for (const int k : { 60, 64, 67 }) off.addEvent (juce::MidiMessage::noteOff (1, k), 0);
+            pd->processBlock (db, off);
+            for (int i = 0; i < 10; ++i) { juce::MidiBuffer none; db.clear(); pd->processBlock (db, none); }
+
+            //-- ...THROUGH JUCE'S REAL EVENT ROUTING, with a focus grab in the middle.
+            // The slider's own mouseDown/mouseDrag are innocent (above). The question
+            // the report actually asks is about the layer ABOVE them: a drag is a mouse
+            // CAPTURE, and a capture can be taken away. So the editor goes on a real
+            // (off-screen) peer and the events are injected at the peer, which runs
+            // JUCE's hit-testing, capture and focus code exactly as a hand would.
+            ed->setTopLeftPosition (-4000, -4000);  // off every real screen: nothing appears
+            ed->setVisible (true);
+            ed->addToDesktop (0);
+            if (auto* peer = ed->getPeer())
+            {
+                juce::Rectangle<int> slope;
+                for (const auto& c : ed->layoutProbe().controls)
+                    if (c.first == "both.slope") slope = c.second;
+
+                auto inject = [peer] (juce::Point<float> pos, juce::ModifierKeys mods)
+                {
+                    peer->handleMouseEvent (juce::MouseInputSource::InputSourceType::mouse, pos, mods,
+                                            juce::MouseInputSource::defaultPressure,
+                                            juce::MouseInputSource::defaultOrientation,
+                                            juce::Time::currentTimeMillis());
+                };
+                const auto press = juce::ModifierKeys::leftButtonModifier;
+                const juce::Point<float> a ((float) slope.getCentreX(), (float) slope.getCentreY() + 25.0f);
+                const juce::Point<float> b ((float) slope.getCentreX(), (float) slope.getCentreY() - 25.0f);
+
+                // A drag with NOTHING interfering - the control case.
+                const double v0 = ed->dragFaderForTests ("slope", 0, 0).before;
+                inject (a, {}); inject (a, press); inject (b, press); inject (b, {});
+                const double vPlain = ed->dragFaderForTests ("slope", 0, 0).before;
+                std::printf ("  routed drag, undisturbed:      %.4f -> %.4f\n", v0, vPlain);
+                check (std::abs (vPlain - v0) > 1.0e-6,
+                       "a drag injected through JUCE's own routing moves the fader");
+
+                // The SAME drag, with the editor grabbing keyboard focus between the
+                // press and the move - which is what mouseEnter/refocus() do, and what
+                // the report's "sometimes" would have to be explained by.
+                inject (a, {}); inject (a, press);
+                ed->grabKeyboardFocus();
+                const double vMid = ed->dragFaderForTests ("slope", 0, 0).before;
+                inject (b, press); inject (b, {});
+                const double vGrab = ed->dragFaderForTests ("slope", 0, 0).before;
+                std::printf ("  routed drag, focus grabbed mid-press: %.4f -> %.4f\n", vMid, vGrab);
+                check (std::abs (vGrab - vMid) > 1.0e-6,
+                       "...and it STILL moves when the editor grabs keyboard focus mid-drag");
+
+                // ...and with a full relayout in the middle, the other thing the timer
+                // does to this window while notes are sounding.
+                inject (a, {}); inject (a, press);
+                const double vMid2 = ed->dragFaderForTests ("slope", 0, 0).before;
+                ed->resized();
+                inject (b, press); inject (b, {});
+                const double vLay = ed->dragFaderForTests ("slope", 0, 0).before;
+                std::printf ("  routed drag, relayout mid-press:      %.4f -> %.4f\n", vMid2, vLay);
+                check (std::abs (vLay - vMid2) > 1.0e-6,
+                       "...and when the whole editor is laid out again mid-drag");
+
+                //-- IS EVERY CONTROL ACTUALLY THE THING UNDER THE MOUSE?
+                // A control added BEFORE the panel it lives in is buried under that
+                // panel: it still lays out, still paints (the panel is drawn first) and
+                // still shows its tooltip, but the press lands on the panel and the
+                // control cannot be moved at all. That is the literal shape of "a veces
+                // no deja mover el control", per control, and nothing in this build
+                // could see it. Asked the only way that answers it: put the mouse on the
+                // control's own centre and ask JUCE what is under it.
+                int buried = 0, tested = 0;
+                juce::String firstBuried;
+                for (const auto& c : ed->layoutProbe().controls)
+                {
+                    if (c.second.isEmpty()) continue;
+                    ++tested;
+                    inject (c.second.getCentre().toFloat(), {});
+                    auto* under = juce::Desktop::getInstance().getMainMouseSource().getComponentUnderMouse();
+                    // The control itself, or one of its own children (a Slider's text
+                    // box, a ComboBox's label) - both are that control under the hand.
+                    bool ok = false;
+                    for (auto* w = under; w != nullptr; w = w->getParentComponent())
+                        if (w->getBounds() == c.second && w->getParentComponent() == ed) { ok = true; break; }
+                    if (! ok)
+                    {
+                        ++buried;
+                        if (firstBuried.isEmpty())
+                            firstBuried = c.first + " -> " + (under != nullptr ? juce::String (typeid (*under).name())
+                                                                               : juce::String ("nothing"));
+                    }
+                }
+                std::printf ("  %d of %d laid-out controls are not the component under their own centre%s%s\n",
+                             buried, tested, buried > 0 ? "; first: " : "", firstBuried.toRawUTF8());
+                check (tested > 30, "the sweep really had the whole editor to walk");
+                check (buried == 0,
+                       "every laid-out control IS the component under its own centre - none is "
+                       "buried under the panel it lives in, where it would paint and show its "
+                       "tooltip but refuse to be dragged");
+
+                //-- NO FOCUS GRAB WHILE A BUTTON IS DOWN.
+                // The one thing in this editor that changes the keyboard focus at the
+                // instant of a press: mouseEnter -> reclaimFocusUnlessTyping, fired by
+                // the pointer arriving. A focus change while a press is live can revoke
+                // the mouse capture, and JUCE turns a revoked capture into a synthetic
+                // mouse-up: the drag ends mid-gesture. Asked with a REAL injected press,
+                // so the button state is the one JUCE itself would see.
+                inject (a, {});
+                // The keyboard goes elsewhere, as it is whenever the host owns it - the
+                // ONLY state in which the reclaim does anything at all. Without this the
+                // test would pass on "the focus was already ours" and prove nothing.
+                juce::Component::unfocusAllComponents();
+                juce::Thread::sleep (300);   // past the reclaim's own debounce window
+                const auto starved = ed->focusReclaimProbeForTests();
+                inject (a, press);
+                const auto pressed = ed->focusReclaimProbeForTests();
+                std::printf ("  focus reclaim: keyboard elsewhere ours=%d soon=%d held=%d grab=%d"
+                             " | pressed ours=%d soon=%d held=%d grab=%d\n",
+                             (int) starved.alreadyOurs, (int) starved.tooSoon,
+                             (int) starved.mouseHeld,   (int) starved.wouldGrab,
+                             (int) pressed.alreadyOurs, (int) pressed.tooSoon,
+                             (int) pressed.mouseHeld,   (int) pressed.wouldGrab);
+                check (starved.wouldGrab,
+                       "with the keyboard elsewhere and no button down, the editor DOES take it "
+                       "back - the reclaim still does its job");
+                check (pressed.mouseHeld,
+                       "an injected press really registers as a mouse button being held");
+                check (! pressed.wouldGrab,
+                       "...and while it is held the editor will NOT take the keyboard focus, "
+                       "so nothing can revoke the capture the drag is riding on");
+                inject (b, press); inject (b, {});
+
+                // ...and the release must still re-arm the computer keyboard, or every
+                // fader move would silently stop you playing. onDragEnd -> refocus()
+                // runs during the mouseUp, when the button state is already clear.
+                check (ed->hasKeyboardFocus (true),
+                       "letting go of a fader hands the keyboard straight back to the editor");
+            }
+            else check (false, "the editor got a native peer to inject mouse events into");
+            ed->removeFromDesktop();
+
+            //-- HOW LONG THE MESSAGE THREAD IS BUSY while notes are sounding.
+            // A drag is delivered on the message thread. If a timer tick blocks there,
+            // the control simply does not follow the mouse for as long as the block
+            // lasts - "a veces no deja mover el control", with no bug in the slider, the
+            // routing or the focus at all. The heavy case: a scale with many degrees, the
+            // recommendation list on screen, and the realtime spectrum adaptation
+            // republishing the template under a held chord.
+            {
+                juce::String err;
+                juce::String scl ("! e31.scl\n31-EDO\n 31\n!\n");
+                for (int i = 1; i <= 31; ++i) scl << " " << juce::String (1200.0 * (double) i / 31.0, 6) << "\n";
+                pd->loadScalaText (scl, "edo31", err);
+                ed->setSpecModeForTests (1);
+                ed->setTuneSourceForTests (1);
+
+                FractalAdditiveAudioProcessor::RtSettings rs;
+                rs.adapt.partials = 16; rs.adapt.periodRatio = 2.0; rs.adapt.minGapCents = 20.0;
+                rs.adapt.rootOnly = true; rs.adapt.goal = 0; rs.adapt.shapeAmps = true;
+                juce::MidiBuffer chord;
+                for (const int k : { 60, 64, 67, 71 })
+                    chord.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0);
+                db.clear(); pd->processBlock (db, chord);
+                pd->setRealtimeLink (FractalAdditiveAudioProcessor::RtLink::SpectrumFromChord, rs);
+
+                // REAL TIME between ticks, because the two things that make a tick
+                // expensive are rate-limited by the wall clock: the spectrum-driven
+                // recompute of the recommendation list is allowed through once a second,
+                // and each one CANCELS AND JOINS its worker on this very thread. A loop
+                // with no time in it never lets either happen and measures nothing.
+                // Notes are changed as it goes, which is what restarts the adaptation.
+                double worstMs = 0.0; int worstTick = -1;
+                for (int t = 0; t < 90; ++t)
+                {
+                    if (t % 15 == 7)
+                    {
+                        juce::MidiBuffer m;
+                        m.addEvent (juce::MidiMessage::noteOff (1, 71), 0);
+                        m.addEvent (juce::MidiMessage::noteOn (1, 69 + (t % 3), (juce::uint8) 100), 0);
+                        db.clear(); pd->processBlock (db, m);
+                    }
+                    for (int i = 0; i < 6; ++i)
+                    { juce::MidiBuffer none; db.clear(); pd->processBlock (db, none); pd->pollParametersForTests(); }
+                    const double t0 = juce::Time::getMillisecondCounterHiRes();
+                    ed->tickTimerForTests();
+                    const double ms = juce::Time::getMillisecondCounterHiRes() - t0;
+                    if (ms > worstMs) { worstMs = ms; worstTick = t; }
+                    juce::Thread::sleep (33);   // the 30 Hz cadence the editor really runs at
+                }
+                std::printf ("  worst editor timer tick under a held chord + live adaptation: "
+                             "%.1f ms (tick %d of 90)\n", worstMs, worstTick);
+                // 30 Hz timer = 33 ms per tick. A tick that eats more than half of that
+                // is a window that stutters under the hand; anything near 100 ms is a
+                // control that visibly refuses to follow the mouse.
+                check (worstMs < 33.0,
+                       "no timer tick eats a whole frame, so the window keeps following the "
+                       "mouse while notes are held");
+                juce::MidiBuffer allOff;
+                for (const int k : { 60, 64, 67, 71 }) allOff.addEvent (juce::MidiMessage::noteOff (1, k), 0);
+                db.clear(); pd->processBlock (db, allOff);
+                pd->setRealtimeLink (FractalAdditiveAudioProcessor::RtLink::Off, rs);
+                for (int i = 0; i < 10; ++i) { juce::MidiBuffer none; db.clear(); pd->processBlock (db, none); }
+            }
+        }
+    }
+
+    //==========================================================================
     // --- "TUNING INFO" NEVER NUMBERS A DEGREE THE SCALE DOES NOT HAVE ---------------
     //
     // "los resultados de tuning info aparecen con numeros que no corresponden a los

@@ -2694,7 +2694,55 @@ FractalAdditiveAudioProcessorEditor::~FractalAdditiveAudioProcessorEditor()
 }
 
 //==============================================================================
-void FractalAdditiveAudioProcessorEditor::refocus() { grabKeyboardFocus(); }
+// NEVER MOVE THE KEYBOARD FOCUS WHILE A MOUSE BUTTON IS DOWN.
+//
+// "mover controles con notas apretadas sigue siendo buggy, a veces no deja mover el
+//  control y a veces si, solo si has movido el control un instante antes de empezar a
+//  tocar teclas"
+//
+// A drag is not just a stream of events, it is a mouse CAPTURE held by the window the
+// press landed in. When the OS revokes that capture, JUCE does not report an error - it
+// synthesises a mouse-UP (HWNDComponentPeer::doCaptureChanged) and the gesture is simply
+// over, mid-drag, with the control left wherever it happened to be. A focus change is
+// one of the things that can take a capture away when the editor is a child window
+// inside a host, and this editor asks for the keyboard from ~40 places, including from
+// MOUSE MOVEMENT (mouseEnter -> reclaimFocusUnlessTyping) - i.e. in the instant before
+// every press, and only when the focus is not already ours. That is exactly the
+// asymmetry in the report: moving a control first leaves the focus with us
+// (onDragEnd -> refocus), so the grab is a no-op and the next drag is undisturbed.
+//
+// A focus grab in the middle of a press can never help, so it does not happen. The
+// button-down test is Desktop's own: it is false again by the time mouseUp is
+// dispatched (setButtons clears buttonState before sending it), so onDragEnd, onClick
+// and every modal callback still take the keyboard back exactly as before.
+bool FractalAdditiveAudioProcessorEditor::mouseButtonHeld()
+{
+    return juce::Desktop::getInstance().getNumDraggingMouseSources() > 0;
+}
+
+void FractalAdditiveAudioProcessorEditor::refocus()
+{
+    if (mouseButtonHeld()) return;
+    grabKeyboardFocus();
+}
+
+FractalAdditiveAudioProcessorEditor::FocusReclaimProbe
+FractalAdditiveAudioProcessorEditor::focusReclaimState() const
+{
+    FocusReclaimProbe s;
+    // Typing wins: letters belong to the text field, never to the keyboard mapping.
+    s.typing      = dynamic_cast<juce::TextEditor*> (juce::Component::getCurrentlyFocusedComponent()) != nullptr;
+    s.mouseHeld   = mouseButtonHeld();
+    s.alreadyOurs = hasKeyboardFocus (true);
+    // ...and at most one attempt per debounce window. The reclaim runs off mouseEnter,
+    // which fires every time the pointer crosses between the editor and any of its ~90
+    // children; while the focus is NOT ours (a host that wants it back) that is an
+    // unbounded retry, once per mouse move, each one a focus change. The same 250 ms the
+    // play-state debounce uses, and for the same reason: below that it is a flicker.
+    s.tooSoon     = (juce::Time::getMillisecondCounter() - lastFocusReclaimMs) < 250;
+    s.wouldGrab   = ! s.typing && ! s.mouseHeld && ! s.alreadyOurs && ! s.tooSoon;
+    return s;
+}
 
 void FractalAdditiveAudioProcessorEditor::loadRecent (int index)
 {
@@ -3271,6 +3319,46 @@ juce::StringArray FractalAdditiveAudioProcessorEditor::presetSearchProbeForTests
     // at all rather than one that works.
     panel.refilter();
     return panel.shown;
+}
+
+FractalAdditiveAudioProcessorEditor::DragProbe
+FractalAdditiveAudioProcessorEditor::dragFaderForTests (const juce::String& name, int dy, int settleTicks)
+{
+    DragProbe d;
+    juce::Slider* s = nullptr;
+    if      (name == "slope")     s = &slopeFader;
+    else if (name == "baseN")     s = &baseNFader;
+    else if (name == "fractal")   s = &fractalFader;
+    else if (name == "morphTime") s = &morphTimeFader;
+    else if (name == "harmonics") s = &harmonicsFader;
+    if (s == nullptr) return d;
+
+    d.found   = true;
+    d.visible = s->isVisible();
+    d.enabled = s->isEnabled();
+    d.before  = s->getValue();
+
+    // The state a failure would have to be explained by, captured BEFORE the drag.
+    d.heldNotes = (int) heldKeys.size();
+    if (auto* f = juce::Component::getCurrentlyFocusedComponent())
+        d.focusOwner = juce::String (typeid (*f).name());
+    d.editorHasFocus = hasKeyboardFocus (true);
+    d.msSinceFocused = (int) (juce::Time::getMillisecondCounter() - lastFocusedMs);
+
+    const auto src = juce::Desktop::getInstance().getMainMouseSource();
+    const auto t0  = juce::Time::getCurrentTime();
+    const juce::Point<float> down ((float) (s->getWidth() / 2), (float) (s->getHeight() / 2));
+    const juce::Point<float> to   (down.x, down.y + (float) dy);
+    const auto press = juce::ModifierKeys::leftButtonModifier;
+
+    s->mouseDown (juce::MouseEvent (src, down, press, 1.0f, 0, 0, 0, 0, s, s, t0, down, t0, 1, false));
+    s->mouseDrag (juce::MouseEvent (src, to,   press, 1.0f, 0, 0, 0, 0, s, s, t0, down, t0, 1, true));
+    d.afterDrag = s->getValue();
+    s->mouseUp   (juce::MouseEvent (src, to, juce::ModifierKeys(), 1.0f, 0, 0, 0, 0, s, s, t0, down, t0, 1, true));
+
+    for (int i = 0; i < settleTicks; ++i) timerCallback();
+    d.afterSettle = s->getValue();
+    return d;
 }
 
 FractalAdditiveAudioProcessorEditor::NadShownProbe
@@ -7021,9 +7109,9 @@ void FractalAdditiveAudioProcessorEditor::mouseDown (const juce::MouseEvent& e)
 // text field, whose typing must not be hijacked.
 void FractalAdditiveAudioProcessorEditor::reclaimFocusUnlessTyping()
 {
-    if (dynamic_cast<juce::TextEditor*> (juce::Component::getCurrentlyFocusedComponent()) != nullptr) return;
-    if (! hasKeyboardFocus (true))
-        grabKeyboardFocus();
+    if (! focusReclaimState().wouldGrab) return;   // see refocus() for what each test is for
+    lastFocusReclaimMs = juce::Time::getMillisecondCounter();
+    grabKeyboardFocus();
 }
 void FractalAdditiveAudioProcessorEditor::mouseEnter (const juce::MouseEvent&) { reclaimFocusUnlessTyping(); }
 void FractalAdditiveAudioProcessorEditor::broughtToFront()

@@ -206,6 +206,26 @@ public:
     // callbacks. The Load/Remove one is a SINGLE button with two opposite jobs, and
     // which job it has depends on state the verifier can set - so "the green Load never
     // deletes anything and the red Remove always does" is only checkable from here.
+    // INSTRUMENTATION (RhythmVerify): drag a fader the way a hand does - press, move,
+    // release - and report what happened around it. Written for "mover controles con
+    // notas apretadas sigue siendo buggy, a veces no deja mover el control": the claim
+    // is about a DRAG, and a drag is the one thing no probe in this build could see.
+    // Everything that could plausibly refuse one is recorded next to the result, so a
+    // failure says WHICH of them was true at the time instead of just "it did not move".
+    struct DragProbe
+    {
+        bool   found = false, enabled = false, visible = false;
+        double before = 0.0, afterDrag = 0.0, afterSettle = 0.0;
+        // The state the drag happened in.
+        int          heldNotes = 0;       // computer-keyboard keys this editor is sounding
+        juce::String focusOwner;          // the component holding keyboard focus, by class
+        bool         editorHasFocus = false;
+        int          msSinceFocused = 0;  // the pollComputerKeyboard debounce clock
+    };
+    // `name`: "slope", "baseN", "fractal", "morphTime", "harmonics".  `dy`: pixels to
+    // drag downwards.  `settleTicks`: timer ticks to run afterwards, to catch a value
+    // that moves and is then written back.
+    DragProbe dragFaderForTests (const juce::String& name, int dy, int settleTicks);
     void clickCustomLoadRemoveForTests() { if (loadTimbreButton.onClick) loadTimbreButton.onClick(); }
     void clickRandomSpectrumForTests()   { if (randomSpectrumBtn.onClick) randomSpectrumBtn.onClick(); }
     // Test hook (RhythmVerify): double-click a row of the chord-search results, which is
@@ -310,6 +330,23 @@ private:
     void makeLabel (juce::Label&, juce::Colour);
     void refocus();
     void reclaimFocusUnlessTyping(); // regrab keyboard focus after a window switch (not while typing)
+    // Is any mouse button down anywhere right now? Desktop's own answer, and it is
+    // already false again by the time a mouseUp is dispatched - see refocus().
+    static bool mouseButtonHeld();
+    // THE RULE for taking the keyboard back, as data, so the drag tests can ask it
+    // directly instead of inferring it from where the focus happened to land.
+public:
+    struct FocusReclaimProbe
+    {
+        bool typing = false;      // a text field owns the letters
+        bool mouseHeld = false;   // a press is in progress: a focus change could end it
+        bool alreadyOurs = false;
+        bool tooSoon = false;     // another attempt inside the debounce window
+        bool wouldGrab = false;
+    };
+    FocusReclaimProbe focusReclaimProbeForTests() const { return focusReclaimState(); }
+private:
+    FocusReclaimProbe focusReclaimState() const;
     void pollComputerKeyboard(); // reconcile held keys against the real key state
     bool playKeysLive() const;   // may the QWERTY mapping ring notes right now?
     // Repaint the Custom Engine's interval list with one colour per token (see
@@ -4240,6 +4277,7 @@ private:
     void refreshRefAText();  // set the Reference-A text box from the current parameter
     std::map<int, int> heldKeys;
     juce::uint32 lastFocusedMs = 0; // debounce: keep playing through brief focus flickers
+    juce::uint32 lastFocusReclaimMs = 0; // rate limit on the hover-driven focus grab (see refocus)
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (FractalAdditiveAudioProcessorEditor)
 };
