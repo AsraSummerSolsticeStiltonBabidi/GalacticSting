@@ -5140,6 +5140,61 @@ FractalAdditiveAudioProcessorEditor::layoutProbeInLanguage (bool useCatalan)
 // See the header. SPECTRUM and TUNING own the shared wall on their right, so that end is
 // SQUARE; every other corner keeps the 9 px radius. One function, because paint() draws it
 // and layoutProbe() measures it and a second copy of the rule is a check that cannot fail.
+std::vector<std::pair<juce::String, juce::Line<float>>>
+FractalAdditiveAudioProcessorEditor::spectrumDividers() const
+{
+    std::vector<std::pair<juce::String, juce::Line<float>>> out;
+    if (spectrumBounds.isEmpty()) return out;
+
+    // Lines are drawn INSIDE the outer frame: its top line sits at box.y + 16 with a
+    // 2.6 px stroke, so anything starting above ~17.5 pokes through the panel's edge.
+    const float top = (float) spectrumBounds.getY() + 17.5f;
+    const float bot = (float) spectrumBounds.getBottom() - 4.0f;
+
+    // EVERY VERTICAL DIVIDER IN THIS PANEL RUNS THE WHOLE HEIGHT, top to bot. That is
+    // the rule, not a coincidence, and it is why this helper is the only place allowed
+    // to build one: the BASE | HARMONICS wall used to stop at hcPrime's bottom instead,
+    // 23 px above the floor, because the full-width TEMPER row sits under both columns.
+    // A ToggleButton paints nothing but a tick and its text, so the rest of that row is
+    // bare panel and the wall simply ended in mid-air - "la linea de la pared izquierda
+    // de la subcaja de prime esta incompleta, tiene un hueco abajo". TEMPER's text ends
+    // far to the left of that wall, so the line passes through empty button.
+    auto vert = [&out, top, bot] (const char* name, float x)
+    { out.push_back ({ name, juce::Line<float> (x, top, x, bot) }); };
+    auto horiz = [&out] (const char* name, const juce::Rectangle<int>& r)
+    { out.push_back ({ name, juce::Line<float> ((float) r.getX(),     (float) r.getY(),
+                                                (float) r.getRight(), (float) r.getY()) }); };
+
+    // THE WALL between the engine compartment and the shared-controls compartment. It
+    // replaces two frame edges and the gutter between them, so the two compartments
+    // share one line instead of facing each other across three.
+    if (! engineBoxBounds.isEmpty() && ! bothEnginesBounds.isEmpty())
+        vert ("engine|both", 0.5f * (float) (engineBoxBounds.getRight() + bothEnginesBounds.getX()));
+
+    // Harmonic view: the dividers of its three cells. (In the custom view resized()
+    // leaves hc* empty, which reads here as "draw none".)
+    //
+    // The CUSTOM view draws no divider at all any more. It had one horizontal line
+    // between the Load/Remove row and the typed-ratios box below - "hay una linea fina
+    // horizontal en custom spectrum entre el boton remove y la caja de ratios de abajo,
+    // es inecesaria y fea, quitala". The two rows it separated are already separated by
+    // the ratios box's own border.
+    if (! customViewShown() && ! hcBase.isEmpty())
+    {
+        vert  ("base|harmonics", (float) hcHarm.getX());
+        horiz ("harmonics|prime", hcPrime);
+    }
+
+    // The shared-controls compartment: Amp Decay | Fractal | Morph over Range.
+    if (! bothEnginesBounds.isEmpty())
+    {
+        vert  ("slope|fractal", (float) beFractal.getX());
+        vert  ("fractal|morph", (float) beMorph.getX());
+        horiz ("morph|range",   beRange);
+    }
+    return out;
+}
+
 juce::Path FractalAdditiveAudioProcessorEditor::macroFramePath (const juce::Rectangle<int>& box) const
 {
     const bool sharedRight = box == spectrumBounds || box == lFootBounds;
@@ -5328,7 +5383,6 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     auto cell = [&p] (const char* name, const juce::Rectangle<int>& r)
     { if (! r.isEmpty()) p.cells.push_back ({ name, r }); };
     cell ("eng.base",    hcBase);    cell ("eng.harm",    hcHarm);   cell ("eng.prime", hcPrime);
-    cell ("eng.custScale", ccScale); cell ("eng.custBody", ccBody);
     cell ("both.slope",  beSlope);   cell ("both.fractal", beFractal);
     cell ("both.morph",  beMorph);   cell ("both.range",  beRange);
     cell ("ess.phase",   ecPhase);   cell ("ess.gain",    ecGain);
@@ -5396,6 +5450,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     // not a copy kept beside it: a copy is exactly the thing that goes on passing after
     // the real tooltip has been reworded.
     p.regStepsTip       = const_cast<juce::TextEditor&> (adaptRegStepsEdit).getTooltip();
+    p.dividers          = spectrumDividers(); // the very lines paint() strokes
     return p;
 }
 
@@ -5792,41 +5847,12 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         // 2.6 px stroke, so anything starting above ~17.5 pokes through the panel's edge.
         {
             g.setColour (spectrumPanelColour.withAlpha (0.5f));
-            const float top = (float) spectrumBounds.getY() + 17.5f;
-            const float bot = (float) spectrumBounds.getBottom() - 4.0f;
-
-            // THE WALL between the engine compartment and the shared-controls
-            // compartment. It replaces two frame edges and the gutter between them, so
-            // the two compartments now share one line instead of facing each other
-            // across three.
-            if (! engineBoxBounds.isEmpty() && ! bothEnginesBounds.isEmpty())
-            {
-                const float wall = 0.5f * (float) (engineBoxBounds.getRight() + bothEnginesBounds.getX());
-                g.drawLine (wall, top, wall, bot, 1.0f);
-            }
-
-            // Harmonic view: the dividers of its three cells. (The custom view's controls
-            // name themselves; resized() leaves hc* empty, which reads as "draw none".)
-            if (! customViewShown() && ! hcBase.isEmpty())
-            {
-                g.drawLine ((float) hcHarm.getX(), top, (float) hcHarm.getX(), (float) hcPrime.getBottom(), 1.0f);
-                g.drawLine ((float) hcHarm.getX(), (float) hcPrime.getY(),
-                            (float) hcHarm.getRight(), (float) hcPrime.getY(), 1.0f);
-            }
-            // Custom view: the divider between "which spectrum is loaded" and the
-            // spectrum itself.
-            if (customViewShown() && ! ccBody.isEmpty())
-                g.drawLine ((float) ccBody.getX(), (float) ccBody.getY(),
-                            (float) ccBody.getRight(), (float) ccBody.getY(), 1.0f);
-
-            // The shared-controls compartment: Amp Decay | Fractal | Morph over Range.
-            if (! bothEnginesBounds.isEmpty())
-            {
-                g.drawLine ((float) beFractal.getX(), top, (float) beFractal.getX(), bot, 1.0f);
-                g.drawLine ((float) beMorph.getX(),   top, (float) beMorph.getX(),   bot, 1.0f);
-                g.drawLine ((float) beRange.getX(), (float) beRange.getY(),
-                            (float) beRange.getRight(), (float) beRange.getY(), 1.0f);
-            }
+            // ONE list, built by spectrumDividers(), which layoutProbe() also reports.
+            // paint() drawing its own lines while the probe rebuilt them from a second
+            // copy of the rule is exactly how a wall that stopped 23 px short of the
+            // panel floor passed every check in the build.
+            for (const auto& d : spectrumDividers())
+                g.drawLine (d.second, 1.0f);
         }
     }
 
@@ -6298,7 +6324,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
         if (! customView)
         {
             //-- HARMONIC view: BASE | HARMONICS over PRIME, TEMPER along the bottom --
-            ccScale = ccBody = {}; // the custom view's cells: paint() draws no divider for them
             auto hb = engineBoxBounds.reduced (5, 0);
             hb.removeFromTop (chipH); hb.removeFromBottom (3);
             // TEMPER is reachable from BOTH views (see the ctor comment): here it spans
@@ -6361,7 +6386,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
             auto ci = engineBoxBounds.reduced (6, 0);
             ci.removeFromTop (chipH + 2); ci.removeFromBottom (4);
-            const auto ccAll = ci;   // everything below the chip strip
             auto brow = ci.removeFromTop (24);
             // TEMPER on the right of the top row (reachable from BOTH views).
             temperToggle.setBounds (brow.removeFromRight (juce::jmin (170, brow.getWidth() * 40 / 100)));
@@ -6387,15 +6411,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
             timbreStatusLabel.setBounds (statusRow);
             caption (lblTimbreRepeats, repsRow, 38, 60);
             timbreRepeatsFader.setBounds (repsRow.removeFromLeft (juce::jmin (220, repsRow.getWidth())));
-            // The custom view's own two cells, so it gets the SHARED DIVIDER every other
-            // box in the window has. The merge left this view as four rows of controls
-            // floating in one undivided rectangle - the only box in the plugin with no
-            // internal delimitation at all - while the harmonic view it shares the frame
-            // with has three cells and two dividers. Top = what SCALE is loaded (Load /
-            // On-Off / Temper); body = the spectrum itself (the typed intervals, what
-            // they built, and how many times it repeats).
-            ccScale = ccAll.withBottom (intervalEditHome.getY() - 3);
-            ccBody  = ccAll.withTop (ccScale.getBottom());
+            // No cells and no divider here on purpose. This view had one horizontal line
+            // between the Load/Remove row and the typed-ratios box: "hay una linea fina
+            // horizontal en custom spectrum entre el boton remove y la caja de ratios de
+            // abajo, es inecesaria y fea, quitala." The ratios box draws its own border
+            // one pixel below where that line was, so it separated nothing and read as a
+            // doubled edge.
         }
 
         //-- BOTH ENGINES: SLOPE | FRACTAL | MORPH over RANGE --------------------

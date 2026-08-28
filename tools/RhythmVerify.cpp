@@ -3020,6 +3020,75 @@ int main()
             ed->refreshEngineDressing();
         }
 
+        // THE SPECTRUM PANEL'S DIVIDER LINES.
+        //
+        // "la linea de la pared izquierda de la subcaja de prime esta incompleta, tiene
+        //  un hueco abajo."
+        // "hay una linea fina horizontal en custom spectrum entre el boton remove y la
+        //  caja de ratios de abajo, es inecesaria y fea, quitala."
+        //
+        // A divider is a bare drawLine with no component behind it: nothing else in this
+        // file can see one. The BASE | HARMONICS wall stopped at the prime cell's bottom
+        // - 23 px above the panel floor its three neighbours reach - because the
+        // full-width TEMPER row sits under both columns; a ToggleButton paints only a
+        // tick and its text, so that stretch was bare panel and the wall ended in mid-air.
+        // Read off spectrumDividers(), the ONE function paint() strokes from.
+        if (ed != nullptr)
+        {
+            std::printf ("\nthe spectrum panel's divider lines:\n");
+            auto verticals = [] (const FractalAdditiveAudioProcessorEditor::LayoutProbe& q)
+            {
+                std::vector<std::pair<juce::String, juce::Line<float>>> v;
+                for (const auto& d : q.dividers)
+                    if (std::abs (d.second.getStartX() - d.second.getEndX()) < 0.01f)
+                        v.push_back (d);
+                return v;
+            };
+            auto names = [] (const FractalAdditiveAudioProcessorEditor::LayoutProbe& q)
+            {
+                juce::StringArray s;
+                for (const auto& d : q.dividers) s.add (d.first);
+                return s.joinIntoString (", ");
+            };
+
+            p.setTimbreEnabled (false);
+            ed->refreshEngineDressing();
+            const auto harm = ed->layoutProbe();
+            std::printf ("  harmonic view: %s\n", names (harm).toRawUTF8());
+
+            const auto hv = verticals (harm);
+            check (hv.size() == 4,
+                   "the harmonic view draws four vertical walls (engine|both, base|harmonics, "
+                   "slope|fractal, fractal|morph)");
+            bool sameSpan = true;
+            juce::String odd;
+            for (const auto& d : hv)
+            {
+                std::printf ("    %-16s x=%.1f  y %.1f..%.1f\n", d.first.toRawUTF8(),
+                             d.second.getStartX(), d.second.getStartY(), d.second.getEndY());
+                if (! hv.empty()
+                     && (std::abs (d.second.getStartY() - hv[0].second.getStartY()) > 0.01f
+                      || std::abs (d.second.getEndY()   - hv[0].second.getEndY())   > 0.01f))
+                { sameSpan = false; odd = d.first; }
+            }
+            check (sameSpan,
+                   "every vertical wall runs the SAME full height of the panel - none stops "
+                   "short and leaves a hole under it");
+            if (! sameSpan)
+                std::printf ("    the odd one out is \"%s\"\n", odd.toRawUTF8());
+
+            // ...and the CUSTOM view draws NOTHING inside the engine box.
+            p.setTimbreEnabled (true);
+            ed->refreshEngineDressing();
+            const auto cust = ed->layoutProbe();
+            std::printf ("  custom view:   %s\n", names (cust).toRawUTF8());
+            check (names (cust) == "engine|both, slope|fractal, fractal|morph, morph|range",
+                   "the custom view adds no divider of its own - the thin line between the "
+                   "Remove button and the ratios box is gone");
+            p.setTimbreEnabled (false);
+            ed->refreshEngineDressing();
+        }
+
         // THE AMP DECAY FADER AFTER A PENCIL ON/OFF CYCLE.
         //
         // Every control in SPECTRUM wears the panel colour, with ONE stated exception: the

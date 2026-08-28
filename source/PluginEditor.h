@@ -148,8 +148,20 @@ public:
         // the bilingual sweep, which restores the language before it returns, so it has to
         // be read HERE or not at all.
         juce::String regStepsTip;
+        // EVERY DIVIDER LINE the SPECTRUM panel strokes, named, exactly as
+        // spectrumDividers() returns them to paint(). A divider is a bare drawLine with
+        // no component behind it, so a wall that stops short of the panel floor is
+        // invisible to every rect check in the build - which is how the prime column's
+        // left wall shipped with a 23 px hole under it.
+        std::vector<std::pair<juce::String, juce::Line<float>>> dividers;
     };
     LayoutProbe layoutProbe() const;
+    // THE DIVIDER LINES INSIDE THE SPECTRUM PANEL, from the cell rects. paint() strokes
+    // exactly what this returns and layoutProbe() reports exactly what this returns;
+    // there is no second place deciding where a wall starts or ends. Same rule as
+    // macroFramePath, for the same reason: a probe that rebuilt the lines from its own
+    // copy would keep passing after paint() changed them.
+    std::vector<std::pair<juce::String, juce::Line<float>>> spectrumDividers() const;
     // THE OUTLINE A MACRO PANEL IS DRAWN WITH, from its box rect - fill and stroke both.
     // paint() strokes exactly what this returns and layoutProbe() measures exactly what
     // this returns; there is no second place deciding which corners are round.
@@ -4175,11 +4187,6 @@ private:
     // panel while most of its box was air.
     juce::Rectangle<int> engineBoxBounds;
     juce::Rectangle<int> hcBase, hcHarm, hcPrime;  // harmonic view's sub-cells (empty in custom view)
-    // The CUSTOM view's two sub-cells, so it has the same shared divider every other box
-    // in the window has: which SCALE is loaded (Load / On-Off / Temper) above, the
-    // spectrum itself (typed intervals, what they built, Reps) below. Empty in the
-    // harmonic view. Without them this view was the one undivided box in the plugin.
-    juce::Rectangle<int> ccScale, ccBody;
     juce::Rectangle<int> bothEnginesBounds;    // nested: what applies to EITHER engine
     juce::Rectangle<int> beSlope, beFractal, beMorph, beRange; // its sub-cells
     juce::Rectangle<int> essentialsBounds;     // Essentials macro-group frame
