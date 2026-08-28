@@ -284,6 +284,63 @@ int main()
                          (int) (std::min (18000.0, sampleRate * 0.5 - 20.0) / f0));
     }
 
+    // == A PENCIL EDIT MUST BE HEARD: armManualPartialAmpsForEdit really arms it ==
+    // The defect this guards: "partialManual" ships OFF, and with it off
+    // SpectrumEngine::fillGains throws the stored per-partial edits away - so the
+    // pencil accepted a +12 dB drag, showed it on the knob and in the undo stack, and
+    // the audio moved 0.00 dB (the user's "cambiar el volumen de 2 no produce ningun
+    // cambio perceptible"). The fix routes every grid gesture through
+    // armManualPartialAmpsForEdit(), and THIS is the only check in the suite that
+    // hears the result: the unit tests never build the processor, so without it the
+    // arming could silently stop working again and every verifier would stay green.
+    // Measured on the 2*f0-vs-f0 dB difference, not on 2*f0 alone, so the engine's
+    // level normalisation (which rescales everything when one partial grows) cannot
+    // hide or fake the change.
+    {
+        std::printf ("== Pencil edit: +12 dB at 2*f0 is INAUDIBLE stored-only, AUDIBLE once armed ==\n");
+        FractalAdditiveAudioProcessor proc;
+        setP (proc.apvts, "ampAttack", 0.001f);
+        setP (proc.apvts, "ampDecay", 0.001f);
+        setP (proc.apvts, "ampSustain", 1.0f);
+        setP (proc.apvts, "masterGain", 0.0f);
+        set (1, 0, 0, 1.0f, 1, 0, 0) (proc.apvts);   // plain harmonic series
+        setP (proc.apvts, "spectrumRange", 10.0f);
+        setP (proc.apvts, "filterCutoff", 20000.0f);
+        proc.prepareToPlay (sampleRate, blockSize);
+        proc.pollParametersForTests();
+
+        constexpr int note = 48;                     // C3
+        const double f0 = MidiMessage::getMidiNoteInHertz (note);
+        const auto relDb = [&]                       // 2*f0 relative to f0, in dB
+        {
+            auto mag = magnitudeOf (renderWindow (proc, note));
+            const float a1 = peakNear (mag, f0), a2 = peakNear (mag, 2.0 * f0);
+            return 20.0 * std::log10 (std::max (1.0e-12, (double) a2 / std::max (1.0e-12f, a1)));
+        };
+        const double before = relDb();
+
+        // The stored-but-off state: exactly what the editor produced before the fix.
+        proc.setPartialGains ({ { spectrum::gainKey (2.0), 12.0f } }, false);
+        proc.pollParametersForTests();
+        const double storedOnly = relDb();
+
+        // The fix's path: what PartialAmpPanel's onGestureStart now calls first.
+        const bool armed = proc.armManualPartialAmpsForEdit();
+        proc.pollParametersForTests();
+        const double armedDb = relDb();
+        const bool paramOn = proc.apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+
+        std::printf ("  2*f0 vs f0: baseline %+.2f dB, edit stored (manual off) %+.2f dB, armed %+.2f dB  (param %s)\n",
+                     before, storedOnly, armedDb, paramOn ? "ON" : "off");
+        // Stored-only must not move (that silence is the DELIBERATE meaning of the
+        // pill being off), and arming must make the edit clearly audible. The measured
+        // effect is ~+6 dB (the normaliser absorbs the rest of the +12); 3 dB is the
+        // line between "audible change" and "the arming quietly stopped working".
+        if (std::abs (storedOnly - before) > 0.5) { std::printf ("        stored-only edit CHANGED the audio - the pill no longer gates\n"); ++failures; }
+        if (! armed || ! paramOn)                 { std::printf ("        armManualPartialAmpsForEdit did not flip the parameter\n"); ++failures; }
+        if (armedDb - before < 3.0)               { std::printf ("        armed edit still inaudible (%.2f dB < 3 dB) - the defect is back\n", armedDb - before); ++failures; }
+    }
+
     std::printf ("\n%s\n", failures == 0 ? "no partials dropped" : "PARTIALS DROPPED");
     return failures == 0 ? 0 : 1;
 }

@@ -548,12 +548,72 @@ public:
     // Commit one gesture's worth of edits THROUGH the undo stack. `before` is the list
     // as it stood when the gesture started - captured by the caller, because by the time
     // the mouse comes up the live list is already the new one.
+    //
+    // `startNewTransaction == false` is for the gesture that ALSO armed manual mode
+    // (armManualPartialAmpsForEdit below): that call already opened the transaction, and
+    // opening a second one here would split one user action - "I dragged a partial" -
+    // into two undo steps, the second of which leaves manual switched on with no edits.
     void commitPartialGains (std::vector<spectrum::PartialGain> before,
-                             std::vector<spectrum::PartialGain> after)
+                             std::vector<spectrum::PartialGain> after,
+                             bool startNewTransaction = true)
     {
         if (before == after) return;                 // a click that moved nothing
-        undoManager.beginNewTransaction();
+        if (startNewTransaction) undoManager.beginNewTransaction();
         undoManager.perform (new PartialGainsAction (*this, std::move (before), std::move (after)));
+    }
+
+    // THE FIRST PENCIL EDIT OF A SESSION SWITCHES MANUAL MODE ON, ITSELF.
+    //
+    // "partialManual" ships OFF, and while it is off SpectrumEngine::fillGains throws the
+    // resolved edits away (`t.gain.clear()`), so the voice's amplitude loop is skipped
+    // entirely. The gesture was still accepted: the value was stored, the grid dimmed to
+    // 55%, the read-out showed the new dB - and the sound moved by EXACTLY 0.00 dB.
+    // Measured at 2*f0, a +12 dB pencil edit gave +6.01 dB with manual on and +0.00 dB
+    // with it off. That is a control that lies, and it is what the user reported as
+    // "cambiar el volumen de 2 no produce ningun cambio perceptible".
+    //
+    // The alternative - refusing the drag while manual is off - was rejected: the pencil
+    // window exists to draw a spectrum by hand, so opening it, dragging a knob and being
+    // told "no" is a worse answer than doing the obvious thing. The precedent is already
+    // in the plugin: applySpectrumAdapt arms manual the same way, for the same reason.
+    // The pill stays, in both places, so it is one click back off.
+    //
+    // Through the PARAMETER, so the host records it and it is undoable like every other
+    // control; and BEFORE the drag's first frame, so:
+    //   - the very first pixel of the drag is audible, and
+    //   - manualSlopeFrozen catches the PRE-drag slope. Freezing it here rather than
+    //     leaving it to timerCallback is the same ordering applySpectrumAdapt uses: the
+    //     poll builds its settings AFTER this check, so a flip noticed one tick late
+    //     would compile one template at the old slope and a second at the frozen one -
+    //     an audible extra amplitude fade for a spectrum that had not changed.
+    //
+    // Returns true if it actually flipped (and therefore opened the undo transaction).
+    bool armManualPartialAmpsForEdit()
+    {
+        if (apvts.getRawParameterValue ("partialManual")->load() > 0.5f)
+            return false;                            // already on: nothing to arm, nothing to undo
+
+        // Opened HERE so the parameter flip cannot land in the PREVIOUS undo step:
+        // APVTS writes a parameter into the ValueTree (and so onto the undo stack) on its
+        // own 20-500 ms timer, not synchronously, so whichever transaction is open when
+        // that timer fires is the one that gets it. Opening ours now and telling
+        // commitPartialGains not to open another puts the flip and the edit in the same
+        // one whether the flush lands mid-drag or after the mouse comes up.
+        undoManager.beginNewTransaction();
+
+        manualSlopeFrozen = apvts.getRawParameterValue ("curveSlope")->load();
+        lastManualMode    = true;
+        if (auto* pm = apvts.getParameter ("partialManual"))
+        {
+            pm->beginChangeGesture();
+            pm->setValueNotifyingHost (1.0f);
+            pm->endChangeGesture();
+        }
+        // Hand the engine the new state now. It only learns whether the edits are in
+        // force through setOverrides, and waiting for timerCallback to notice would make
+        // the first frames of the drag silent - the very defect this is fixing.
+        setPartialGains (partialGains, true);
+        return true;
     }
     // How many of those edits currently sit on a partial that actually exists. The rest
     // are not lost - their partial is simply not in this spectrum right now.

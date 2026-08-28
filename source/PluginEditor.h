@@ -2658,6 +2658,11 @@ private:
         FractalAdditiveAudioProcessor* proc = nullptr;
         std::function<juce::String (const char*, const char*)> trF;
         std::function<void()> onEdited;                     // editor: refresh the slope cell
+        // Fired the instant a pencil edit arms manual mode by itself. The editor uses it
+        // to grey SLOPE and pop its FROZEN explanation THERE AND THEN, rather than
+        // letting the 30 Hz poll do it silently behind a window the user is not looking at.
+        std::function<void()> onManualArmed;
+        bool armedManualThisGesture = false;                // this drag turned manual on
 
         juce::ToggleButton onT;                             // twin of the pill under the pencil
         std::unique_ptr<ButtonAttachment> onAtt;
@@ -2712,13 +2717,35 @@ private:
         void init (FractalAdditiveAudioProcessor& p)
         {
             proc = &p;
-            grid.onGestureStart = [this] { gestureBefore = proc->getPartialGains(); };
+            grid.onGestureStart = [this]
+            {
+                // ARM MANUAL MODE FIRST, and before gestureBefore is captured.
+                // With "partialManual" off - and it ships off - the engine throws these
+                // edits away, so the drag below moved the sound by exactly 0.00 dB while
+                // the knob, the read-out and the undo stack all said it had worked. See
+                // armManualPartialAmpsForEdit for the measurement and for why arming is
+                // the right answer rather than refusing the drag.
+                // FIRST, because it freezes the slope at its PRE-drag value and puts the
+                // edits in force before pushGains() runs on the drag's first frame.
+                armedManualThisGesture = proc->armManualPartialAmpsForEdit();
+                gestureBefore = proc->getPartialGains();
+                if (armedManualThisGesture)
+                {
+                    refreshText();                     // the panel's banner changes meaning
+                    if (onManualArmed) onManualArmed(); // ...and SLOPE goes inert in the main window
+                }
+            };
             grid.onEdited       = [this] { pushGains(); };
             grid.onGestureEnd   = [this]
             {
                 // ONE undo step per gesture: pushing per frame filled the stack with
                 // hundreds of micro-moves and made Ctrl+Z useless on a hand-drawn curve.
-                proc->commitPartialGains (gestureBefore, proc->getPartialGains());
+                // ...and when this gesture also armed manual mode, that flip is already
+                // inside the transaction armManualPartialAmpsForEdit opened, so ONE
+                // Ctrl+Z takes back the whole action instead of leaving manual on.
+                proc->commitPartialGains (gestureBefore, proc->getPartialGains(),
+                                          /*startNewTransaction*/ ! armedManualThisGesture);
+                armedManualThisGesture = false;
                 lastRev = proc->getPartialGainsRevision();
                 refreshText();
             };
@@ -2843,8 +2870,16 @@ private:
 
             juce::String w;
             if (! manualOn())
-                w << trF ("MANUAL IS OFF - these knobs are stored but not sounding. Switch it on here or under the pencil.",
-                          "EL MODE MANUAL \xc3\x89S APAGAT - aquests controls es desen per\xc3\xb2 no sonen. Activa'l aqu\xc3\xad o sota el llapis.");
+                w << trF ("MANUAL IS OFF - these knobs are stored but not sounding. Your first drag switches it on for you (one Ctrl+Z takes both back).",
+                          "EL MODE MANUAL \xc3\x89S APAGAT - aquests controls es desen per\xc3\xb2 no sonen. El primer arrossegament l'activa per tu (un sol Ctrl+Z ho desf\xc3\xa0 tot).");
+            else
+                // THE AMBUSH, ON SCREEN. Manual mode freezes the compile slope, so
+                // somebody who drags one partial here and then reaches for AMP DECAY in
+                // the main window finds a fader that does nothing and no reason given.
+                // It has to be said where the user is looking - which, mid-drag, is this
+                // window and not the fader three hundred pixels away in another one.
+                w << trF ("MANUAL IS ON - these knobs are the amplitudes now, so AMP DECAY (slope) in the main window is FROZEN where it stood. Switch manual off and it applies again.",
+                          "EL MODE MANUAL \xc3\x89S ACTIU - ara les amplituds venen d'aquests controls, i la CAIGUDA AMP (pendent) de la finestra principal queda CONGELADA tal com estava. Apaga el manual i torna a aplicar-se.");
             if (proc->isSpectrumTruncated())
             {
                 if (w.isNotEmpty()) w << "\n";
@@ -2874,8 +2909,8 @@ private:
             resetAllB.setButtonText (trF ("Reset all", "Reinicia-ho tot"));
             resetAllB.setTooltip (trF ("Drop every per-partial edit, including the ones whose partial is not in this spectrum right now. One Ctrl+Z brings them all back.",
                                        "Descarta totes les edicions per parcial, incloses les dels parcials que ara no hi s\xc3\xb3n. Un sol Ctrl+Z les torna totes."));
-            onT.setTooltip (trF ("Manual per-partial amplitudes. The SAME switch as the one under the pencil - one control in two places. While it is on, SLOPE is frozen.",
-                                 "Amplituds manuals per parcial. \xc3\x89s EL MATEIX interruptor que el de sota el llapis - un control en dos llocs. Mentre estigui actiu, el PENDENT queda congelat."));
+            onT.setTooltip (trF ("Manual per-partial amplitudes. The SAME switch as the one under the pencil - one control in two places. Dragging a knob turns it on for you if it is off, because otherwise the drag would be stored and never sound. While it is on, SLOPE is frozen.",
+                                 "Amplituds manuals per parcial. \xc3\x89s EL MATEIX interruptor que el de sota el llapis - un control en dos llocs. Arrossegar un control l'activa si est\xc3\xa0 apagat, perqu\xc3\xa8 si no l'arrossegament es desaria i no sonaria mai. Mentre estigui actiu, el PENDENT queda congelat."));
             // The two things that surprise everyone, on screen rather than in a tooltip
             // nobody opens: they are not bugs and they are not reversible by guessing.
             factsLbl.setText (trF (

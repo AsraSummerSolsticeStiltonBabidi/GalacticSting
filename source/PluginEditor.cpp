@@ -1071,6 +1071,20 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // No onEdited hook: the main window shows nothing that a knob move changes (the
     // FROZEN tag follows the PARAMETER, and refreshSlopeFreeze already watches that),
     // and repainting the whole Harmonic Engine box on every drag frame was pure cost.
+    //
+    // onManualArmed is the exception, and it is not cosmetic. When the first pencil drag
+    // switches manual mode on by itself, AMP DECAY silently stops working, and somebody
+    // who reaches for it afterwards has been ambushed. So the freeze is shown the instant
+    // it happens rather than up to a 30 Hz tick later: grey fader, FROZEN tag, and the
+    // fader's tooltip already rewritten by the time a hand arrives at it.
+    //
+    // Deliberately NOT a forced TooltipWindow::displayTip here. The tip would be aimed at
+    // the main window while the mouse is mid-drag in the floating knob window - JUCE hides
+    // a displayed tip on the next mouse move, so it would flash and vanish, and it can sit
+    // behind that always-on-top window anyway. The warning the user actually sees is the
+    // banner in the panel they are looking at (PartialAmpPanel::refreshText), which says
+    // the same thing and stays up for as long as it is true.
+    partialPanel.onManualArmed = [this] { refreshSlopeFreeze(); };
     partialPanel.init (processorRef);
     // Fractal is a cell of the BOTH ENGINES box now (it multiplies whatever spectrum the
     // running engine produced), so it has no GroupComponent of its own - its frame is
@@ -2678,8 +2692,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Draw the spectrum by hand: opens a resizable window with *one knob per partial* of the current sound. Every partial is there, however many - nothing is hidden or capped.\nThe switch below is the same switch as the one inside the window; while it is on, !SLOPE is frozen!.",
         "Dibuixa l'espectre a m\xc3\xa0: obre una finestra redimensionable amb *un control per parcial* del so actual. Hi ha tots els parcials, siguin quants siguin - res amagat ni limitat.\nL'interruptor de sota \xc3\xa9s el mateix que el de dins la finestra; mentre estigui actiu, !el PENDENT queda congelat!."));
     partialManualT.setTooltip (tr (
-        "Manual per-partial amplitudes on/off. The SAME switch as the one inside the pencil's window - one control in two places. Off by default; while it is on, !SLOPE is frozen! where it stood and the amplitudes come from the knobs.",
-        "Activa/desactiva les amplituds manuals per parcial. \xc3\x89s EL MATEIX interruptor que el de dins la finestra del llapis - un control en dos llocs. Apagat per defecte; mentre estigui actiu, !el PENDENT queda congelat! on era i les amplituds venen dels controls."));
+        "Manual per-partial amplitudes on/off. The SAME switch as the one inside the pencil's window - one control in two places. Off by default, but your first drag on a partial knob switches it on for you (otherwise that drag would be stored and never heard); while it is on, !SLOPE is frozen! where it stood and the amplitudes come from the knobs.",
+        "Activa/desactiva les amplituds manuals per parcial. \xc3\x89s EL MATEIX interruptor que el de dins la finestra del llapis - un control en dos llocs. Apagat per defecte, per\xc3\xb2 el teu primer arrossegament d'un parcial l'activa (si no, aquell arrossegament es desaria i no sonaria mai); mentre estigui actiu, !el PENDENT queda congelat! on era i les amplituds venen dels controls."));
     if (partialWindow != nullptr)
         partialWindow->setName (tr ("Fibl\xc3\xb3 - partial amplitudes", "Fibl\xc3\xb3 - amplituds dels parcials"));
     partialPanel.applyLanguage();
@@ -4614,8 +4628,11 @@ void FractalAdditiveAudioProcessorEditor::refreshSlopeFreeze()
     slopeFader.setEnabled (! frozen);
     applySlopeFaderColour();
     slopeFader.setTooltip (frozen
-        ? tr ("!Frozen!: *manual per-partial amplitudes* are on, so the amplitudes come from the pencil's knobs and this fader does nothing. It is kept exactly where it stood - switch manual off and it applies again.",
-              "!Congelat!: les *amplituds manuals per parcial* estan actives, les amplituds venen dels controls del llapis i aquest fader no fa res. Es conserva tal com estava - apaga el manual i torna a aplicar-se.")
+        // Names the CAUSE, because the commonest way to arrive here is not the pill: it
+        // is dragging one knob in the pencil's window, which arms manual mode for you.
+        // "Frozen" on its own left that user hunting for a switch they never touched.
+        ? tr ("!Frozen!: *manual per-partial amplitudes* are on - switched on either by the pill below the pencil or by your first drag inside the pencil's window - so the amplitudes come from those knobs and this fader does nothing. It is kept exactly where it stood: switch manual off and it applies again.",
+              "!Congelat!: les *amplituds manuals per parcial* estan actives - activades amb la pastilla de sota el llapis o pel teu primer arrossegament dins la finestra del llapis - i per aix\xc3\xb2 les amplituds venen d'aquells controls i aquest fader no fa res. Es conserva tal com estava: apaga el manual i torna a aplicar-se.")
         : tr ("Amplitude roll-off. 0 = flat/bright, 1 = saw, 2 = triangle.  (Also thins the highs when a Custom Engine scale is the spectrum.)",
               "Caiguda d'amplitud. 0 = pla/brillant, 1 = serra, 2 = triangle.  (Tamb\xc3\xa9 aprima els aguts quan l'espectre ve d'una escala del Motor Personalitzat.)"));
     repaint (bothEnginesBounds); // SLOPE (and its FROZEN tag) live in that box now
