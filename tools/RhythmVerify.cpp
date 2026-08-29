@@ -67,16 +67,36 @@ static bool awaitTemplateChange (const FractalAdditiveAudioProcessor& p, juce::u
 // the processor and then owns whatever the processor ACTUALLY wrote: savePreset()
 // sanitises the name, and naming the file by hand a second time is the mistake that left
 // run48-A.gsting behind (the save wrote ".gsting", the cleanup deleted ".fibpreset").
+// ONE PREFIX for every scratch preset this suite writes, so the sweeps below can be a
+// single rule rather than a list of names somebody has to remember to extend. run 48's
+// files were called "run48-A/B" and so were invisible to a sweep looking for the others.
+static constexpr const char* kScratchPrefix = "zzz-verify-";
+
 struct ScopedPreset
 {
     ScopedPreset() = default;
-    ~ScopedPreset() { file.deleteFile(); }
+    // The destructor is where a leak is CHEAP to explain: it knows which preset this is
+    // and which block made it. Discovered instead by the end-of-run audit, 3000 lines
+    // later, all it can say is that some file appeared - a run that left run48-A/B behind
+    // while the audit named zzz-verify-mix-A/B could not be pinned on any block at all.
+    ~ScopedPreset()
+    {
+        if (file == juce::File()) return;
+        file.deleteFile();
+        if (file.existsAsFile())
+        {
+            std::printf ("  [FAIL] the scratch preset \"%s\" was removed from the user's folder\n",
+                         name.toRawUTF8());
+            ++failures;
+        }
+    }
     ScopedPreset (const ScopedPreset&) = delete;
     ScopedPreset& operator= (const ScopedPreset&) = delete;
 
     bool save (FractalAdditiveAudioProcessor& p, const juce::String& want)
     {
-        name = p.savePreset (want);
+        // Every scratch preset carries the prefix, whatever the caller asked for.
+        name = p.savePreset (want.startsWith (kScratchPrefix) ? want : kScratchPrefix + want);
         file = FractalAdditiveAudioProcessor::presetFile (name);
         return name.isNotEmpty() && file.existsAsFile();
     }
@@ -138,6 +158,45 @@ static juce::StringArray presetFolderInventory()
 int main()
 {
     juce::ScopedJuceInitialiser_GUI juceInit;
+
+    // A dropping from a RUN THAT DIED EARLY is in the folder before this one starts, so
+    // the end-of-run diff sees it as one of the user's own files and never mentions it
+    // again: the leak becomes permanent and invisible on its second day. Anything wearing
+    // the scratch prefix can only be ours, so take it away first and SAY SO - this run's
+    // own verdict then covers only this run's own mess.
+    //
+    // ONLY THE OLD ONES, though. There is exactly one preset folder on the machine and it
+    // is the USER'S, so two copies of this suite running at once - a second checkout, a
+    // second agent - share it. Sweeping every scratch file would delete the presets a
+    // live run is in the middle of using and fail it for something it did not do. A file
+    // still being used is seconds old; a dead run's leavings are not, so age is what
+    // separates them.
+    int foreignScratchAtStart = 0;
+    {
+        const juce::int64 cutoffMs = juce::Time::currentTimeMillis() - 30 * 60 * 1000;
+        int stale = 0, live = 0;
+        for (const auto& f : FractalAdditiveAudioProcessor::getPresetFolder()
+                                 .findChildFiles (juce::File::findFiles, false,
+                                                  juce::String (kScratchPrefix) + "*"
+                                                      + FractalAdditiveAudioProcessor::kPresetExt))
+        {
+            if (f.getLastModificationTime().toMilliseconds() > cutoffMs) { ++live; continue; }
+            std::printf ("  [swept] a previous run left \"%s\" in the user's preset folder\n",
+                         f.getFileName().toRawUTF8());
+            f.deleteFile();
+            ++stale;
+        }
+        if (stale > 0)
+            std::printf ("  %d stale scratch preset(s) removed before starting\n", stale);
+        // Not an assertion: it is a statement about the MACHINE, not about the product.
+        // It is also the thing to read first when this run's timings look impossible -
+        // a second suite on the same CPU is why a wall-clock check goes red for nothing.
+        if (live > 0)
+            std::printf ("  NOTE: %d fresh scratch preset(s) present - another run of this "
+                         "suite may be in progress; timings and the folder audit below are "
+                         "not trustworthy while that is true\n", live);
+        foreignScratchAtStart = live;
+    }
 
     const juce::StringArray presetsAtStart = presetFolderInventory();
 
@@ -10329,8 +10388,17 @@ int main()
                      presetsAtStart.size(), leftBehind.size(),
                      leftBehind.isEmpty() ? "" : ": ",
                      leftBehind.joinIntoString (", ").toRawUTF8());
-        check (leftBehind.isEmpty(),
-               "the suite leaves NOTHING behind in the user's preset folder");
+        // The files are gone either way - the user's folder is not left dirty. But this
+        // is only an ASSERTION ABOUT THIS RUN when this run had the folder to itself:
+        // a second copy of the suite writes the very same scratch names into the very
+        // same folder, and blaming a leak on whichever process happened to audit last is
+        // how a green suite is made to look broken. That is not hypothetical - it is
+        // where "run48-A.gsting" came from while this binary could no longer spell it.
+        if (foreignScratchAtStart > 0)
+            std::printf ("  (not asserted: another run of this suite was using this folder)\n");
+        else
+            check (leftBehind.isEmpty(),
+                   "the suite leaves NOTHING behind in the user's preset folder");
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
