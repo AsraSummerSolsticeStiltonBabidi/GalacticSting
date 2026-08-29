@@ -4211,6 +4211,15 @@ int main()
             {
                 ed->setSpecModeForTests (2);
                 ed->resized();
+                // THE BUTTON IS REPAINTED BY THE PANEL'S OWN 30 Hz TIMER, and this harness
+                // has no message loop, so without this tick the text read below is whatever
+                // the constructor happened to set - priced for a different spec mode, before
+                // any tuning was loaded. The check then compared a fresh `ms` against a stale
+                // string and its verdict was decided by nothing but how fast this machine ran
+                // the one-off adaptNsPerPair() probe: measured 724, 1054, 1120, 1134, 1136 and
+                // 1219 ms across six runs of the same binary, either side of the 950 ms line,
+                // so the same product went red or green by the coin-toss of a stopwatch.
+                ed->tickTimerForTests();
                 const double ms = ed->adaptCostMsForTests (false);
                 const auto txt = ed->adaptButtonTextForTests();
                 std::printf ("  loaded tuning, %d degrees: one Adapt ~%.0f ms; button says \"%s\"\n",
@@ -4626,7 +4635,27 @@ int main()
                                    : juce::MidiMessage::noteOff (1, k), 0);
                 p.processBlock (buf, m);
             };
-            auto settle = [&p, &tick] { for (int i = 0; i < 400 && p.isSpectrumAdaptRunning(); ++i) tick (1); tick (3); };
+            // SETTLED means "nothing is owed and nothing is in flight", and waiting only
+            // while the search is RUNNING does not mean that. The launch is throttled by
+            // kRtAdaptTicks, so at the moment this is entered the search usually has not
+            // started yet: the old loop fell straight through, started the search inside
+            // its own three-tick tail, and read the counters with the result still being
+            // computed. Measured: "C-E-G held -> 1 started, 0 applied" on one run in three,
+            // with the product behaving perfectly - a failure that says nothing about the
+            // follower and everything about the harness. Wait for QUIESCENCE instead: the
+            // counters standing still, and nothing running, for longer than the throttle.
+            auto settle = [&p, &tick]
+            {
+                int quiet = 0, lastStarts = -1, lastApplies = -1;
+                for (int i = 0; i < 2000 && quiet < 30; ++i)
+                {
+                    tick (1);
+                    const int s = p.getRealtimeStarts(), a = p.getRealtimeApplies();
+                    if (p.isSpectrumAdaptRunning() || s != lastStarts || a != lastApplies) quiet = 0;
+                    else                                                                   ++quiet;
+                    lastStarts = s; lastApplies = a;
+                }
+            };
 
             p.setRealtimeLink (Proc::RtLink::SpectrumFromChord, rs);
             tick (60);
