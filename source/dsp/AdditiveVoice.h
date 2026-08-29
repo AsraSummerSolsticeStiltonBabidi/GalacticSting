@@ -34,6 +34,7 @@
 #include <juce_dsp/juce_dsp.h>
 
 #include "Spectrum.h"
+#include "PhaseSets.h"
 #include "SpectrumEngine.h"
 #include "CurvedEnv.h"
 #include "SineTable.h"
@@ -223,19 +224,28 @@ public:
         }
         shepActive = wantShep;
 
-        // Deterministic note-on (same note twice = identical). Two phase modes:
-        //   Aligned  - every partial starts at its peak (cosine), so they form a coherent
+        // Deterministic note-on (same note twice = identical). ONE CONTINUOUS AXIS now,
+        // not two modes:
+        //   Phase 0  - every partial starts at its peak (cosine), so they form a coherent
         //              pulse at the difference-tone rate -> a defined tone, not noise.
-        //   Scattered- pseudo-random phases decorrelate the partials into a soft/noisy bed.
+        //   Phase 1  - pseudo-random phases decorrelate the partials into a soft/noisy bed.
+        //   between  - each partial takes the shortest signed path between the two, so the
+        //              crest factor slides rather than switching.
         // Skipped on reuse (keeping the running phases avoids a discontinuity).
         if (! reuse)
         {
             // The WHOLE array, every Shepard slot included (slot s lives at
             // s * kStride): a copy claimed later in the note starts from a phase this
             // note chose, not from whatever the previous note left in that slot.
-            const bool aligned = phaseModeParam->load() < 0.5f;
-            for (int i = 0; i < spectrum::kMaxPartials; ++i)
-                seedPhase (phase, i, aligned);
+            //
+            // Seeded by GLOBAL INDEX, which is what decorrelates the Shepard copies from
+            // each other: a copy is the same partial list transposed, so giving every
+            // copy the same phases would stack their peaks and multiply the coherent
+            // peak by the copy count. That property has to survive the fader, and it
+            // does - seedScattered carries hashPhaseAt(index) toward the aligned phase,
+            // so the copies stay as decorrelated at every fader position as they are at
+            // the top of the travel.
+            seedRange (phase, 0, spectrum::kMaxPartials, scatterAmount());
         }
 
         // Velocity and pressure are GAIN terms, so on a steal they must glide like the
@@ -600,10 +610,9 @@ public:
                     // writing it is a waveform step on every single template change.
                     if (morphWeight <= 0.0)
                     {
-                        const bool alg = phaseModeParam->load() < 0.5f;
+                        const double scatter = scatterAmount();
                         for (int c = 0; c < sl.numCopies; ++c)
-                            for (int j = 0; j < seedSpan; ++j)
-                                seedPhase (alignPhase, sl.off[c] + j, alg);
+                            seedRange (alignPhase, sl.off[c], seedSpan, scatter);
                         // A fresh crossfade: the aligned bank is inaudible, so it can sit
                         // directly AT the destination frequencies for the whole glide
                         // (unchanged behaviour when templates come slower than the morph).
@@ -1003,7 +1012,42 @@ public:
         // peak-normalise (0.5/sum) equalises the PEAK, not the loudness, so sparse
         // (high-pitch, few-partial) notes sit ~11 dB above dense ones; use the RMS target
         // but CAP it so the coherent pulse peak never exceeds 0.5 (no clip) = min(RMS,peak).
-        const bool   aligned = phaseModeParam->load() < 0.5f;
+        //
+        // AND THE FADER HAS TO BLEND THE TWO LAWS, NOT PICK ONE. This used to read
+        // `aligned ? min(rmsN, peakN) : rmsN`, decided by a threshold at 0.5. The two
+        // laws are up to 20.70 dB apart (measured across the twelve reference spectra,
+        // worst on FLAT n=512, printed by PhaseSetTests), so a continuous control
+        // crossing 0.5 while a chord is held would step EVERY sounding voice by that
+        // much IN ONE SAMPLE - a bang in the middle of the gesture the fader exists for.
+        //
+        // The blend weight is (1 - scatter), not scatter: the CAPPED law belongs to the
+        // ALIGNED end, which is the LOW end of the travel. Reading the taper the other
+        // way round leaves both endpoints looking right in a code review and inverts the
+        // whole fader, so it is written out rather than left to be re-derived.
+        //
+        // Blended on the RECIPROCALS, not linearly in gain, and that is a measurement
+        // rather than a preference. A linear blend, rmsN + w*(cappedN - rmsN), is exact
+        // at both ends and still wrong in between: with the two laws 16 dB apart on the
+        // N=8 default patch, FftVerify's fader sweep measured 7.54 dB of the 16.1 dB
+        // span crammed into the FIRST 5% of the travel. That is the dead zone this
+        // user already complained about on the Fractal fader, arriving at the other end
+        // of the same control. Blending 1/gain spreads it: the same sweep now reads its
+        // biggest single step at a fraction of that, and the check refuses more than
+        // 3 dB so the defect cannot come back quietly.
+        //
+        // Not a geometric (dB-linear) blend, which would be the textbook answer: this is
+        // evaluated PER SAMPLE inside the closed form below, and a std::pow per sample is
+        // not affordable here. It is evaluated per sample rather than slewed because a
+        // slewed normGain overshoots on a voice steal - the "some notes are suddenly
+        // much louder" bug the closed form exists to prevent.
+        const double alignWeight = 1.0 - scatterAmount();
+        const double alignRest   = 1.0 - alignWeight;
+        // The two ends are taken by a branch on a BLOCK CONSTANT rather than by the
+        // blend, because 1.0 / (1.0 / c) is not bit-identical to c in floating point,
+        // and "the fader at 0 sounds exactly like the Aligned mode you saved" has to be
+        // an identity, not a rounding.
+        const bool fullyAligned   = alignWeight >= 1.0;
+        const bool fullyScattered = alignWeight <= 0.0;
         double rk = 1.0; // (1-slew)^k, advanced every sample in the loop below
 
         // Filter cutoff TRACKS the played note: cutoff = f0 * 2^(cents/1200 + envOct).
@@ -1146,7 +1190,16 @@ public:
             }
             const double rmsN   = sumSq  > 1.0e-12 ? 0.25 / std::sqrt (sumSq) : 0.0;
             const double peakN  = sumCur > 1.0e-9  ? 0.5  / sumCur            : 0.0;
-            normGain = (float) (aligned ? std::min (rmsN, peakN) : rmsN);
+            // scatter 0 -> min(rmsN, peakN), scatter 1 -> rmsN, both bit-exact, so the
+            // two ends of the fader are the two levels this synth already shipped.
+            // cappedN > 0 implies rmsN > 0 (it is a min of two non-negative numbers, one
+            // of them rmsN), so the guard covers both denominators; at silence both laws
+            // already returned 0 and so does this.
+            const double cappedN = std::min (rmsN, peakN);
+            normGain = (float) (fullyScattered ? rmsN
+                              : fullyAligned   ? cappedN
+                              : cappedN > 0.0  ? 1.0 / (alignWeight / cappedN + alignRest / rmsN)
+                                               : 0.0);
 
             // The amplitude slew is its own pass now: every copy reads the SAME base
             // amplitudes (only the window factor differs), so slewing them once and
@@ -1450,12 +1503,55 @@ private:
     // coherent reference cannot drift apart. `j` is the GLOBAL oscillator index, so
     // in Scattered mode two Shepard copies of the same partial are decorrelated
     // rather than stacked on identical phases.
-    void seedPhase (std::array<double, spectrum::kMaxPartials>& arr, int j, bool aligned) const noexcept
+    // WHERE THE FADER IS, AS THE PHASE ENGINE WANTS IT.
+    //
+    // The parameter is the RAW travel u; every consumer wants x = u^kTaperExponent.
+    // Without the taper the first HALF of the fader buys 18% of a 10.29 dB span - a
+    // dead zone, and it is the exact complaint this user already made about the
+    // Fractal fader, so shipping a second one would be shipping the same bug twice.
+    //
+    // The taper lives HERE and not in PhaseSets.h on purpose: the header refuses to
+    // apply it so that a caller which already has its own curve is not tapered twice.
+    // Applying it once, in one place, is what keeps the phases and the normalisation
+    // law (the two consumers below) moving on ONE curve - if they moved on two, the
+    // gain and the crest would disagree in the middle of the travel and the fader
+    // would get louder and quieter on its way across.
+    //
+    // No allocation, no lock, no String: one atomic load, one clamp, one std::pow -
+    // and the two endpoints skip the pow entirely so scatter 0 and scatter 1 are
+    // bit-exact rather than "0.9999999 of the way there".
+    double scatterAmount() const noexcept
     {
-        if (! juce::isPositiveAndBelow (j, spectrum::kMaxPartials)) return;
-        if (aligned) { arr[(size_t) j] = 0.25; return; } // sin(2*pi*0.25)=1: every partial at its peak
-        const double h = std::sin ((double) j * 12.9898) * 43758.5453;
-        arr[(size_t) j] = h - std::floor (h);
+        if (phaseModeParam == nullptr) return 0.0;
+        const double u = (double) phaseModeParam->load();
+        if (! (u > 0.0)) return 0.0;   // also catches NaN: today's Aligned, exactly
+        if (u >= 1.0)    return 1.0;   // today's Scattered hash, exactly
+        return std::pow (u, (double) spectrum::phaseset::kTaperExponent);
+    }
+
+    // Seed [first, first + count) of one phase array at the fader position `scatter`.
+    //
+    // At scatter 0 this writes 0.25 into every slot - sin(2*pi*0.25) = 1, every partial
+    // at its peak - and at scatter 1 it writes sin(j*12.9898)*43758.5453 frac, index for
+    // index the value the old seedPhase() wrote. Both endpoints are therefore the sound
+    // this synth already shipped; in between, each partial walks the SHORTEST signed way
+    // from its aligned phase to its hash phase, so the crest slides instead of jumping.
+    //
+    // The hash formula now has exactly ONE copy in the build (phaseset::hashPhaseAt).
+    // The old seedPhase() was a second one, and a second copy of this rule is how the
+    // phase engine's Failure 2 hid for a whole version - two spellings that agreed until
+    // one of them was edited.
+    //
+    // The count is clamped to the end of the array. That is a BOUNDS CHECK and not an
+    // answer - it replaces the isPositiveAndBelow guard the old seedPhase carried, so a
+    // caller that miscounts still cannot write into the next Shepard copy's phases
+    // (which are audible) or off the end of the voice.
+    void seedRange (std::array<double, spectrum::kMaxPartials>& arr,
+                    int first, int count, double scatter) const noexcept
+    {
+        if (first < 0 || first >= spectrum::kMaxPartials || count <= 0) return;
+        const int e = std::min (count, spectrum::kMaxPartials - first);
+        spectrum::phaseset::seedScattered (first, e, scatter, arr.data() + (size_t) first);
     }
 
     // Declared here so advanceGlide below can take it by reference; defined with the
@@ -1671,7 +1767,7 @@ private:
     void fillShepardCopies (ShepLayout& sl, int span, int n, double f0, double sr) noexcept
     {
         const double nyq = 0.5 * sr;
-        const bool   alg = phaseModeParam != nullptr && phaseModeParam->load() < 0.5f;
+        const double scatter = scatterAmount();
         const double T   = shepard::taperWidth (sl.blockLogMove);
         const int    cap = sl.oscCap();      // one copy's bank; see ShepLayout::oscCap
         sl.total = 0;
@@ -1710,12 +1806,16 @@ private:
             // ...but never past this slot's own width: `span` can still carry a dense
             // ordinary note's activeCount on the first Shepard block after a steal, and
             // one step past `cap` is the NEXT copy's phases (which are audible).
+            // BOTH BANKS, ALWAYS, AND AT THE SAME FADER POSITION. Seeding one and not the
+            // other is not a cosmetic slip: at a crossfade weight where both are audible,
+            // a partial whose two copies sit half a cycle apart sums to ZERO - the partial
+            // disappears for the length of the fade and comes back when the weight lands.
             if (sl.fresh[(size_t) c])
-                for (int i = 0, e = std::min (span, cap); i < e; ++i)
-                {
-                    seedPhase (phase, off + i, alg);
-                    seedPhase (alignPhase, off + i, alg);
-                }
+            {
+                const int e = std::min (span, cap);
+                seedRange (phase,      off, e, scatter);
+                seedRange (alignPhase, off, e, scatter);
+            }
 
             // THE NEAR-NYQUIST TAPER. A rising copy loses its top partials one by one;
             // dropping them outright is a step of that partial's whole amplitude, and

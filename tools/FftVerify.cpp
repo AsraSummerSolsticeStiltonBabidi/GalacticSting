@@ -408,6 +408,59 @@ int main()
         }
     }
 
+    // == The fader has to be a RAMP, not a switch with a ramp painted on it. ==
+    //
+    // phaseMode used to select the normalisation law by a threshold at 0.5:
+    //   aligned ? min(rmsN, peakN) : rmsN.  Those two laws are up to 20.70 dB apart
+    // (PhaseSetTests measures the gap), so a continuous control crossing 0.5 while a
+    // chord is held would step every sounding voice by that much IN ONE SAMPLE. The
+    // gesture the user asked for is exactly the gesture that would trigger it.
+    //
+    // So: sweep the fader and look at the LEVEL. A threshold shows up as one adjacent
+    // pair miles apart while every other pair barely moves; a blend shows up as a
+    // staircase with no step much bigger than the others. 3.0 dB is the line - the
+    // whole span here is about 16 dB over 20 steps, so a working blend averages 0.8 dB
+    // a step, and the smallest thing a re-introduced threshold could produce is the
+    // several-dB remainder of a 16 dB gap.
+    {
+        std::printf ("== Phase fader: the level must RAMP across the travel, not step ==\n");
+
+        FractalAdditiveAudioProcessor proc;
+        setP (proc.apvts, "baseN", 8.0f);
+        setP (proc.apvts, "harmonics", (float) spectrum::All);
+        setP (proc.apvts, "curveSlope", 1.0f);
+        setP (proc.apvts, "fractalLevel", 1.0f);
+        proc.prepareToPlay (sampleRate, blockSize);
+
+        constexpr int kSteps = 21;
+        double db[kSteps] = {};
+        for (int s = 0; s < kSteps; ++s)
+        {
+            setP (proc.apvts, "phaseMode", (float) s / (float) (kSteps - 1));
+            proc.pollParametersForTests();
+            auto w = renderWindow (proc, 60);
+            double sum = 0.0;
+            for (float v : w) sum += (double) v * (double) v;
+            db[s] = 20.0 * std::log10 (std::max (1.0e-12, std::sqrt (sum / (double) w.size())));
+        }
+
+        double worstStep = 0.0; int worstAt = 0;
+        for (int s = 1; s < kSteps; ++s)
+            if (std::abs (db[s] - db[s - 1]) > worstStep) { worstStep = std::abs (db[s] - db[s - 1]); worstAt = s; }
+
+        std::printf ("  RMS across the travel: %.1f dB at 0.00 -> %.1f dB at 1.00 (span %.1f dB)\n",
+                     db[0], db[kSteps - 1], db[kSteps - 1] - db[0]);
+        std::printf ("  biggest single step %.2f dB, between u=%.2f and u=%.2f\n",
+                     worstStep, (double) (worstAt - 1) / (kSteps - 1), (double) worstAt / (kSteps - 1));
+        if (worstStep > 3.0)
+        { std::printf ("        the fader STEPS - a held chord bangs mid-gesture\n"); ++failures; }
+        // ...and it must actually GO somewhere, or a "blend" that returns a constant
+        // would pass the step test by doing nothing at all.
+        if (db[kSteps - 1] - db[0] < 6.0)
+        { std::printf ("        the fader barely moves the level (%.1f dB) - it is not blending the two laws\n",
+                       db[kSteps - 1] - db[0]); ++failures; }
+    }
+
     std::printf ("\n%s\n", failures == 0 ? "no partials dropped" : "PARTIALS DROPPED");
     return failures == 0 ? 0 : 1;
 }
