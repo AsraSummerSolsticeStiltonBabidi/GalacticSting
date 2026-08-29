@@ -61,6 +61,7 @@ target_sources(FractalAdditive PRIVATE
     source/PluginProcessor.cpp
     source/PluginEditor.cpp
     source/FloatingWindowOwner.cpp
+    source/SnapshotRig.cpp
     source/dsp/Spectrum.cpp
     third_party/MTS-ESP/libMTSClient.cpp)
 
@@ -143,6 +144,7 @@ target_sources(RhythmVerify PRIVATE
     source/PluginProcessor.cpp
     source/PluginEditor.cpp
     source/FloatingWindowOwner.cpp
+    source/SnapshotRig.cpp
     source/dsp/Spectrum.cpp
     third_party/MTS-ESP/libMTSClient.cpp)
 target_include_directories(RhythmVerify PRIVATE source third_party/MTS-ESP)
@@ -163,6 +165,7 @@ target_sources(FftVerify PRIVATE
     source/PluginProcessor.cpp
     source/PluginEditor.cpp
     source/FloatingWindowOwner.cpp
+    source/SnapshotRig.cpp
     source/dsp/Spectrum.cpp
     third_party/MTS-ESP/libMTSClient.cpp)
 target_include_directories(FftVerify PRIVATE source third_party/MTS-ESP)

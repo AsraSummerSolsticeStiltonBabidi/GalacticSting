@@ -684,6 +684,74 @@ public:
     };
     // Lays the editor out in the given language, walks it, and puts the language back.
     std::vector<TextFit> textFitProbeForTests (bool useCatalan);
+
+    //==========================================================================
+    // THE SELF-SNAPSHOT RIG'S HANDS (see source/SnapshotRig.cpp).
+    //
+    // "no lo hagas a ciegas, usa screenshots"
+    //
+    // Nobody can redesign a layout they cannot see, and nothing in this build could see
+    // it: all four verifiers construct the PROCESSOR and never an editor window. The rig
+    // photographs the editor with Component::createComponentSnapshot - no OS compositing,
+    // nothing outside our own bounds - and to do that it must first PUT the editor in the
+    // state being photographed.
+    //
+    // Every one of these is a SETTER that STAYS SET, which is exactly what separates them
+    // from the ...ForTests probes above: layoutProbeInLanguage() and
+    // playgroundProbeForTests() deliberately restore the language they found, because a
+    // probe that left the editor in Catalan would make every later check in a verifier run
+    // measure the wrong strings. A photograph is the opposite job - the pixels have to BE
+    // Catalan when the shutter fires - so the rig needs a language switch that does not
+    // undo itself. Nothing in the plugin calls these; the interactive path never reaches
+    // them (see fgsnap::runIfRequested).
+    void setLanguageForSnapshot (bool useCatalan)
+    {
+        catalan = useCatalan;
+        applyLanguage();                        // Label COMPONENTS' text is written here...
+        if (getWidth() > 0) resized();          // ...and some rows are sized from their own text
+    }
+    // The modulator sub-tab strip (AMP / PITCH / FILTER / CUSTOM) and, inside CUSTOM, which
+    // of the six modulators is bound. Through the real callbacks, so the snapshot shows the
+    // layout a click produces rather than a second arrangement only the rig can reach.
+    void clickEnvTabForSnapshot (int k) { if (envTabB[k & 3].onClick) envTabB[k & 3].onClick(); }
+    void setModSelForSnapshot (int id)  { modSelBox.setSelectedId (id, juce::sendNotificationSync); }
+    // The Spectrum-to-Rhythm panel, which is an in-editor overlay and so lands in the
+    // editor's own snapshot. Same body as rhythmBtn.onClick, minus the focus grab: a
+    // snapshot run has no keyboard to take back.
+    void setRhythmPanelForSnapshot (bool show)
+    {
+        if (show)
+        {
+            rhythmPanel.numRows = processorRef.getTemplatePartialCount();
+            rhythmPanel.list.updateContent();
+            rhythmPanel.refreshSlots();
+            rhythmPanel.refreshLive();
+        }
+        rhythmScrim.setVisible (show);
+        rhythmPanel.setVisible (show);
+        if (getWidth() > 0) resized();
+        if (show) { rhythmScrim.toFront (false); rhythmPanel.toFront (false); }
+    }
+    // The two FLOATING panels, laid out at the size their own window opens at and handed
+    // back for the rig to photograph. They are not children of this editor (they live in
+    // their own top-level windows), so the editor's snapshot can never contain them - and
+    // no window is created here at all, so nothing is ever shown on a screen.
+    juce::Component& floatingPanelForSnapshot (bool playground, int w, int h)
+    {
+        if (playground)
+        {
+            playgroundPanel.applyLanguage();
+            playgroundPanel.setSize (w, h);
+            playgroundPanel.refresh (true);
+            playgroundPanel.setVisible (true);
+            return playgroundPanel;
+        }
+        partialPanel.applyLanguage();
+        partialPanel.resync();          // never photograph a stale partial list
+        partialPanel.setSize (w, h);
+        partialPanel.setVisible (true);
+        return partialPanel;
+    }
 private:
     // Recursive half of textFitProbeForTests: every visible Label / Button / ComboBox
     // under `parent`, measured against the room its own LookAndFeel leaves it.
@@ -734,7 +802,22 @@ private:
     void updateWarning (int templatePartials);
     void runDissonanceTune();
     void saveDissonanceScl();
-    juce::String tr (const char* en, const char* ca) const { return catalan ? juce::String::fromUTF8 (ca) : juce::String (en); }
+    // BOTH sides are decoded as UTF-8, because both sides ARE UTF-8.
+    //
+    // This used to be `catalan ? String::fromUTF8 (ca) : String (en)`, and
+    // juce::String(const char*) reads each BYTE as a code point (CharPointer_ASCII). The
+    // Catalan half was therefore safe and the English half was not, so any English string
+    // carrying a non-ASCII character shipped as mojibake: "Fibló" inside the Periods
+    // tooltip drew as "FiblÃ³", and the bend box's "±48 st (MPE)" - which skipped tr()
+    // altogether precisely BECAUSE it is the same in both languages, and so got no
+    // protection at all - drew as "Â±48 st (MPE)" in all 42 main-editor snapshots.
+    // The whole file is compiled with /utf-8 (see CMakeLists.txt), so a literal is UTF-8
+    // bytes whichever argument it is passed as; there was never a reason to treat the two
+    // differently. Note that this is the ONLY decoder: juce::String::operator<< (const
+    // char*) has the same Latin-1 behaviour, so a non-ASCII fragment streamed into a
+    // String still needs String::fromUTF8 of its own.
+    juce::String tr (const char* en, const char* ca) const
+    { return juce::String::fromUTF8 (catalan ? ca : en); }
     void timerCallback() override;
 
     // ComboBox that refreshes its item list just before its popup opens (so the
@@ -2262,7 +2345,10 @@ private:
                 octAllVal.setBounds (g2.removeFromLeft (26));
                 octAllUp.setBounds (g2.removeFromLeft (20).reduced (0, 2));
                 g2.removeFromLeft (10);
-                stepsAllLbl.setBounds (g2.removeFromLeft (44));   // "Steps"
+                // Sized from its own word, floor 44. "Steps" fitted 44 px and "Passos"
+                // does not - and until the language switch actually reached this caption
+                // nobody could see that, because it never became "Passos" at all.
+                stepsAllLbl.setBounds (g2.removeFromLeft (juce::jmax (44, fgfit::labelWidth (stepsAllLbl))));
                 stepsAllS.setBounds (g2.removeFromLeft (juce::jmin (120, g2.getWidth())).reduced (0, 3));
             }
             r.removeFromTop (4);
@@ -3709,7 +3795,10 @@ private:
         {
             headLbl.setText (trF ? trF ("PRESET PLAYGROUND", "LABORATORI DE PRESETS")
                                  : juce::String ("PRESET PLAYGROUND"), juce::dontSendNotification);
-            modeBtn[0].setButtonText (trF ? trF ("MORPH", "MORPH") : juce::String ("MORPH"));
+            // MORPHING in Catalan, like the SPECTRUM panel's own MORPH sub-label
+            // (tr("MORPH","MORPHING") in layoutProbe's painted labels). It is the same
+            // idea named twice in one instrument, and it printed two different words.
+            modeBtn[0].setButtonText (trF ? trF ("MORPH", "MORPHING") : juce::String ("MORPH"));
             modeBtn[1].setButtonText (trF ? trF ("MIX", "MESCLA") : juce::String ("MIX"));
             modeBtn[0].setTooltip (trF ? trF ("Morph mode: the corners blend into ONE patch - every control and "
                                               "the spectrum move to the point.",
@@ -3772,9 +3861,17 @@ private:
             auto r = getLocalBounds().reduced (10);
             // The mode pair shares the header row, so the pad loses no height to it.
             auto head = r.removeFromTop (20);
-            modeBtn[1].setBounds (head.removeFromRight (64).reduced (0, 1));
+            // BOTH mode buttons take the width the WIDER of the two words needs, floor
+            // 64: MORPH fitted 64 px and MORPHING (its Catalan) does not, and a pair of
+            // buttons that are the same control in two states must stay the same size.
+            // Measured at the height they are about to be given, not at the height they
+            // currently have - on the first pass that is still zero.
+            const int mbH = juce::jmax (1, head.getHeight() - 2);
+            const int mbW = juce::jmax (64, fgfit::textButtonWidth (modeBtn[0].getButtonText(), mbH, false),
+                                            fgfit::textButtonWidth (modeBtn[1].getButtonText(), mbH, false));
+            modeBtn[1].setBounds (head.removeFromRight (mbW).reduced (0, 1));
             head.removeFromRight (3);
-            modeBtn[0].setBounds (head.removeFromRight (64).reduced (0, 1));
+            modeBtn[0].setBounds (head.removeFromRight (mbW).reduced (0, 1));
             head.removeFromRight (6);
             headLbl.setBounds (head);
             r.removeFromTop (4);
@@ -4535,6 +4632,12 @@ private:
     juce::Label meterLabel, helpLabel;
 
     bool catalan = false;
+    // Guards for the read-out refresh applyLanguage() ends with (see its tail).
+    // `editorConstructed` keeps the constructor's own applyLanguage() from running a
+    // timer tick before setSize() and applyEngineState() have happened; `inLanguageRefresh`
+    // makes the refresh non-reentrant, so nothing it touches can start a second one.
+    bool editorConstructed  = false;
+    bool inLanguageRefresh  = false;
     int  baseKey = 60; // MIDI note of the leftmost computer key; Z/X shift it by one period
     int  lastPrimeMode = -1;
     // Packs engineInForce() with "is a custom scale loaded at all" - the second bit

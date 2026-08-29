@@ -1,6 +1,7 @@
 #include "PluginEditor.h"
 #include "BinaryData.h"
 #include "FloatingWindowOwner.h" // keeps the floating windows above the editor (Win32 ownership)
+#include "SnapshotRig.h"         // the editor photographs itself when asked to (--snapshot)
 #include "GalacticPalette.h"
 #include "dsp/Dissonance.h"
 
@@ -1180,14 +1181,18 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     primeLimitFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 40, 15);
     primeLimitFader.setSliderSnapsToMousePosition (false);
     primeLimitFader.normalSensitivity = 300;
-    primeLimitFader.textFromValueFunction = [] (double v)
+    primeLimitFader.textFromValueFunction = [this] (double v)
     {
-        static const char* names[] = { "Off", "23", "19", "17", "13", "11", "7", "5", "3", "2" };
+        // The only WORD in this read-out; the other nine entries are prime numbers. It
+        // was a bare const char* and so was the one label on the fader that never
+        // changed language - and "No" is the very word its own tooltip uses for this
+        // position ("No = sense filtre de primers").
+        const juce::String names[] = { tr ("Off", "No"), "23", "19", "17", "13", "11", "7", "5", "3", "2" };
         const int lo = juce::jlimit (0, 9, (int) std::floor (v));
         const double t = v - (double) lo;
-        if (t < 0.01) return juce::String (names[lo]);
-        return juce::String (names[lo]) + juce::String::fromUTF8 ("\xe2\x86\x92")
-             + juce::String (names[juce::jmin (9, lo + 1)])
+        if (t < 0.01) return names[lo];
+        return names[lo] + juce::String::fromUTF8 ("\xe2\x86\x92")
+             + names[juce::jmin (9, lo + 1)]
              + " " + juce::String ((int) std::lround (t * 100.0)) + "%";
     };
     primeLimitFader.updateText();
@@ -1514,15 +1519,12 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuningBankBox.setColour (juce::ComboBox::outlineColourId, cTuning.withAlpha (0.7f));
     tuningBankBox.setColour (juce::ComboBox::textColourId, juce::Colours::white);
     tuningBankBox.setMouseClickGrabsKeyboardFocus (false);
-    tuningBankBox.setTooltip (tr (
-        "Bank of scales: pick a slot to make it the active tuning. This selector is a PARAMETER, so a host can automate switching between the loaded scales.",
-        "Banc d'escales: tria una ranura per fer-la l'afinaci\xc3\xb3 activa. Aquest selector \xc3\xa9s un PAR\xc3\x80METRE, aix\xc3\xad que un host pot automatitzar el canvi entre les escales carregades."));
+    // (tooltip in applyLanguage - a tooltip set here would keep the launch language)
     tuningBankBox.onChange = [this] { processorRef.setTuningBankSlotParam (tuningBankBox.getSelectedId() - 1); refocus(); };
     addAndMakeVisible (tuningBankBox);
     tuningBankLoadBtn.setColour (juce::TextButton::buttonColourId, cLoad);
     tuningBankLoadBtn.setMouseClickGrabsKeyboardFocus (false);
-    tuningBankLoadBtn.setTooltip (tr ("Load a .tun / .scl / .ascl into the selected bank slot.",
-                                      "Carrega un .tun / .scl / .ascl a la ranura seleccionada del banc."));
+    // (tooltip in applyLanguage)
     tuningBankLoadBtn.onClick = [this] { openTuningBankChooser(); };
     // Put the tuning that is playing RIGHT NOW into the bank (any mode: a generated
     // scale, an edited one, an EDO...), without going through a file.
@@ -1607,8 +1609,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuningBankClearBtn.setButtonText ("X");
     tuningBankClearBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xffe0453f));
     tuningBankClearBtn.setMouseClickGrabsKeyboardFocus (false);
-    tuningBankClearBtn.setTooltip (tr ("Remove the selected tuning from the bank.",
-                                       "Treu l'afinaci\xc3\xb3 seleccionada del banc."));
+    // (tooltip in applyLanguage)
     tuningBankClearBtn.onClick = [this]
     {
         const int slot0 = tuningBankBox.getSelectedId() - 2; // id i+2 -> slot i
@@ -1791,9 +1792,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     rhythmBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xfff2f2f2));
     rhythmBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::black);
     rhythmBtn.setMouseClickGrabsKeyboardFocus (false);
-    rhythmBtn.setTooltip (tr (
-        "SPECTRUM VS RHYTHM: turns partials of the current patch into MIDI pulse trains - exact polyrhythms derived from the spectrum's frequency ratios, sample-locked to the sound - sent out of this plugin's MIDI OUTPUT to any other track/instrument. Click to open the panel.",
-        "ESPECTRE A RITME: converteix parcials del patch actual en trens de polsos MIDI - poliritmes exactes derivats de les relacions de freq\xc3\xbc\xc3\xa8ncia de l'espectre, clavats al so mostra a mostra - que surten per la SORTIDA MIDI del plugin cap a qualsevol altra pista/instrument. Clica per obrir el panell."));
+    // (tooltip in applyLanguage)
     rhythmBtn.onClick = [this]
     {
         const bool show = ! rhythmPanel.isVisible();
@@ -1840,17 +1839,14 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     rhythmVelSlopeAtt = std::make_unique<SliderAttachment>(processorRef.apvts, "rhythmVelSlope", rhythmPanel.velSlopeS);
     rhythmStepsAllAtt = std::make_unique<SliderAttachment>(processorRef.apvts, "rhythmStepsAll", rhythmPanel.stepsAllS);
     addMapListener (rhythmPanel.stepsAllS, "rhythmStepsAll");
-    rhythmPanel.stepsAllLbl.setText (tr ("Steps", "Passos"), juce::dontSendNotification);
-    rhythmPanel.stepsAllS.setTooltip (tr (
-        "Shifts EVERY step-pitched pulse by this many scale steps from the played note (JI/ratio pulses have no step, so they are unaffected). Right-click to map a modulator.",
-        "Desplaç""a TOTS els polsos amb to per passos aquests passos d'""escala des de la nota tocada (els polsos JI/raó no en tenen, i no els afecta). Clic dret per assignar-hi un modulador."));
+    // (label + tooltip in applyLanguage: "Steps" was set here once and stayed English
+    //  through every later language switch - it is one of the strings the en/ca drawn-text
+    //  assertion in SnapshotRig.cpp was added to catch.)
     // Modulatable, like every other fader: right-click to route a modulator.
     addMapListener (rhythmPanel.velSlopeS, "rhythmVelSlope");
     addMapListener (rhythmPanel.octAllVal, "rhythmOctAll");     // Octave (all pulses)
-    rhythmPanel.velSlopeS.setTooltip (tr (
-        "Velocity SLOPE across the spectrum. 0 = flat (every pulse keeps its own velocity). To the right the HIGH partials start losing velocity; to the left the low ones. At the end of its travel the ramp is vertical and no pulse has any velocity left. Right-click to map a modulator.",
-        "PENDENT de velocitat sobre l'espectre. 0 = plana (cada pols mant\xc3\xa9 la seva). Cap a la dreta els parcials AGUTS comencen a perdre velocitat; cap a l'esquerra els greus. Al final del recorregut la pendent \xc3\xa9s vertical i cap pols conserva velocitat. Clic dret per assignar-hi un modulador."));
-    rhythmMpeAtt  = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmMpe",  rhythmPanel.mpeT);
+    // (tooltip in applyLanguage)
+    rhythmMpeAtt = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmMpe",  rhythmPanel.mpeT);
     rhythmTempoAtt = std::make_unique<ButtonAttachment>  (processorRef.apvts, "rhythmTempoSync", rhythmPanel.tempoT);
     rhythmModeAtt = std::make_unique<ComboBoxAttachment> (processorRef.apvts, "rhythmMode", rhythmPanel.modeBox);
 
@@ -1899,9 +1895,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     presetDirtyMark.setFont (juce::Font (juce::FontOptions (16.0f).withStyle ("Bold")));
     presetDirtyMark.setJustificationType (juce::Justification::centredLeft);
     presetDirtyMark.setInterceptsMouseClicks (false, false);
-    presetDirtyMark.setTooltip (tr (
-        "*Changed since loaded.*\nSome parameter no longer matches this preset - moved by something other than one of its OWN modulators (a knob, host automation, an undo).\n!Save stores it as a NEW preset! instead of overwriting the original.",
-        "*Canviat des de la c\xc3\xa0rrega.*\nAlg\xc3\xban par\xc3\xa0metre ja no coincideix amb aquest preset - l'ha mogut alguna cosa que no \xc3\xa9s un dels seus PROPIS moduladors (un bot\xc3\xb3, automatitzaci\xc3\xb3, un desfer).\n!Desar el guarda com un preset NOU! en lloc de sobreescriure l'original."));
+    // (tooltip in applyLanguage)
     addChildComponent (presetDirtyMark);
     refreshPresetList();
 
@@ -2294,15 +2288,12 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // their TOTAL beating (every pair counted). Items rebuilt live per tuning.
     nadBox.setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
     nadBox.setMouseClickGrabsKeyboardFocus (false);
-    nadBox.setTooltip (tr (
-        "What the list below shows: Degrees = each scale step against the tonic. Dyads, triads, tetrads... = EVERY combination of that many scale notes, ranked by total beating (all pairs counted, not just against 0).",
-        "Qu\xc3\xa8 mostra la llista: Graus = cada pas contra la t\xc3\xb2nica. D\xc3\xad""ades, tr\xc3\xad""ades, t\xc3\xa8trades... = TOTES les combinacions d'aquest nombre de notes, ordenades pel batec total (tots els parells, no nom\xc3\xa9s contra el 0)."));
+    // (tooltip in applyLanguage)
     addChildComponent (nadBox); // kept for state; the shared "Notes" box drives it now
     nadView.setViewedComponent (&nadList, false);
     nadView.setScrollBarsShown (true, false);
     addChildComponent (nadView);
-    nadList.tip = tr ("Combinations of scale degrees with the LEAST total beating first (colour = the value's height on the beating range).",
-                      "Combinacions de graus de l'escala amb MENYS batec total primer (color = al\xc3\xa7""ada del valor dins el rang de batec).");
+    // (tip in applyLanguage)
 
     segList.proc      = &processorRef;
     segList.ratioName = [] (double r) { return justName (r); };
@@ -2688,8 +2679,26 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     setWantsKeyboardFocus (true);
     setSize (1200, 650); // +30 vs before for the keyboard's below-key hover-delta strip
     startTimerHz (30); // also the reconcile rate for stuck/ghost computer-keyboard notes
+    // From here on a language switch may re-run the live read-out pass itself (see the
+    // tail of applyLanguage). Not before: the applyLanguage() above runs ahead of
+    // setSize() and applyEngineState(), and a timer tick there would read a half-built
+    // editor and, worse, set lastEngineShown so applyEngineState() would then skip.
+    editorConstructed = true;
     juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<juce::Component> (this)]
     { if (safe != nullptr) safe->grabKeyboardFocus(); });
+
+    // THE ONE CALL SITE OF THE SELF-SNAPSHOT RIG (source/SnapshotRig.h).
+    //
+    // juce_add_plugin writes the Standalone's main(), so there is no entry point of ours
+    // to put this in; the command line is reachable from here through JUCEApplicationBase.
+    // On an ordinary launch this returns after one enum-less test and one StringArray
+    // lookup, before touching anything at all: in a plugin wrapper isStandaloneApp() is
+    // false and it leaves immediately, and in a standalone with no --snapshot flag it
+    // leaves on the next line. Nothing below it runs, nothing is allocated by it, and no
+    // state of this editor is read or written - a normal launch behaves exactly as it did
+    // before this line existed. It is last in the constructor for the same reason: by the
+    // time it can do anything, this editor is fully built.
+    fgsnap::runIfRequested();
 }
 
 FractalAdditiveAudioProcessorEditor::~FractalAdditiveAudioProcessorEditor()
@@ -2778,10 +2787,28 @@ void FractalAdditiveAudioProcessorEditor::loadRecent (int index)
     refocus();
 }
 
+namespace
+{
+    // Ask every Slider under `root` to re-render its value box. See the call site at the
+    // end of applyLanguage(): a Slider only refreshes that text when its VALUE moves, so
+    // a read-out that is a WORD survives a language switch untouched.
+    void updateSliderValueTexts (juce::Component& root)
+    {
+        for (auto* child : root.getChildren())
+        {
+            if (auto* s = dynamic_cast<juce::Slider*> (child)) s->updateText();
+            updateSliderValueTexts (*child);
+        }
+    }
+}
+
 void FractalAdditiveAudioProcessorEditor::applyLanguage()
 {
     using juce::dontSendNotification;
     langButton.setButtonText (catalan ? "ENG" : "CAT");
+    // The credit line. It was set once in the constructor and never again, so it was the
+    // one string in the title bar that could not change language.
+    vibeLabel.setText (tr ("Vibe coded by", "Vibe coded per"), dontSendNotification);
     menuButton.setButtonText (tr ("Menu", "Men\xc3\xba"));
     rhythmBtn.setButtonText (tr ("Spectrum vs Rhythm", "Espectre vs ritme"));
     partialEditBtn.setTooltip (tr (
@@ -2871,7 +2898,11 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.noteHead.setTooltip (tr (
         "Each train sends the PLAYED note shifted by this many scale steps: \"7st\" = 7 steps up, \"7st-\" = 7 steps down. Never a fixed note. With MPE out, ratios (\"3/2\") and cents (\"702c\") are also FROM the played note.",
         "Cada tren envia la nota TOCADA despla\xc3\xa7""ada aquests passos d'escala: \"7st\" = 7 amunt, \"7st-\" = 7 avall. Mai una nota fixa. Amb MPE out, els ratios (\"3/2\") i cents (\"702c\") tamb\xc3\xa9 s\xc3\xb3n DES DE la nota tocada."));
-    rhythmPanel.durHead.setText ("GATE", dontSendNotification);
+    // GATE stays GATE in both languages: it is the universal name of the MIDI note
+    // length on every sequencer, Catalan ones included. Written as an explicit tr() pair
+    // rather than a bare literal so the en/ca drawn-text assertion can tell a DECISION
+    // from an oversight - a raw literal here would look exactly like the "Steps" bug.
+    rhythmPanel.durHead.setText (tr ("GATE", "GATE"), dontSendNotification);
     rhythmPanel.durHead.setTooltip (tr (
         "GATE: how long each pulse's MIDI note lasts (5-500 ms). It is NOT latency - pulse timing stays sample-locked; this only sets where the note-off lands.",
         "GATE: quant dura la nota MIDI de cada pols (5-500 ms). NO \xc3\xa9s lat\xc3\xa8ncia - els polsos queden clavats a la mostra; nom\xc3\xa9s fixa on cau el note-off."));
@@ -2909,10 +2940,16 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     gFilter.setText        (tr ("Filter", "Filtre"));
     gAmpEnv.setText        (tr ("Modulators", "Moduladors")); // shared chip-tabbed box
     gPitchEnv.setText      (tr ("Pitch Envelope", "Envolupant to"));
+    // THE MODULATOR TAB STRIP, and the one rule this window applies to a panel word:
+    // translate it unless the Catalan word IS the English one. AMP is the same
+    // abbreviation in both (amplitud), so it stays; PITCH and FILTER are not, so they
+    // move; and CUSTOM becomes PROPI here for the same reason the engine chip below
+    // already says PROPI - one English word printing as two different Catalan words in
+    // two chip rows of the same window is the inconsistency this pass exists to end.
     envTabB[0].setButtonText (tr ("AMP",    "AMP"));
     envTabB[1].setButtonText (tr ("PITCH",  "TO"));
     envTabB[2].setButtonText (tr ("FILTER", "FILTRE"));
-    envTabB[3].setButtonText (tr ("CUSTOM", "CUSTOM"));
+    envTabB[3].setButtonText (tr ("CUSTOM", "PROPI"));
     for (auto* b : { &envTabB[0], &envTabB[1], &envTabB[2] })
         b->setTooltip (tr ("The envelopes share this box - click a title to switch.",
                            "Les envolupants comparteixen aquesta caixa - clica un t\xc3\xadtol per canviar."));
@@ -3191,7 +3228,15 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (basePitchBox, { tr ("Transposed down", "Transposada avall"), tr ("Original", "Original") });
     localise (phaseBox,     { tr ("Aligned", "Alineat"), tr ("Scattered", "Dispers") });
     localise (primeModeBox, { tr ("Limit", "L\xc3\xadmit"), tr ("Whitelist", "Llista") });
-    localise (bendBox,      { "\xc2\xb1""2 st", "\xc2\xb1""12 st", "\xc2\xb1""48 st (MPE)" });
+    // THROUGH tr(), even though the three items are the same word in both languages.
+    // Written as raw const char* they went through juce::String(const char*), which reads
+    // each byte as a code point, and U+00B1 shipped as "Â±48 st (MPE)" - the most-repeated
+    // visual defect in the product (visible in every one of the 42 main-editor snapshots).
+    // tr() is the one place that decodes UTF-8, so "same in both languages" is spelled as
+    // an identical pair rather than as an escape from the decoder.
+    localise (bendBox,      { tr ("\xc2\xb1""2 st",        "\xc2\xb1""2 st"),
+                              tr ("\xc2\xb1""12 st",       "\xc2\xb1""12 st"),
+                              tr ("\xc2\xb1""48 st (MPE)", "\xc2\xb1""48 st (MPE)") });
     // "Sync (beats)" said nothing about WHOSE beats: the user read it as a beat
     // subdivision of the rise rather than a lock to the host clock. Name the thing it
     // actually locks to. (Only the TEXT changes - changeItemText keeps the item's
@@ -3331,6 +3376,51 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     adaptList.emptyText = tr ("Press Adapt to move the partials to where these notes beat least (or most).",
                               "Prem Adapta per moure els parcials on aquestes notes baten menys (o m\xc3\xa9s).");
 
+    // MOVED HERE OUT OF THE CONSTRUCTOR. Every one of these was written exactly once, at
+    // construction, so it kept whatever language the editor was BUILT in for the rest of
+    // its life: the rhythm panel's "Steps" caption never became "Passos", and eight
+    // tooltips never changed language at all. A string set in the constructor is a string
+    // that cannot be translated - this is the whole of cause (a).
+    //
+    // BEFORE the sub-panel relayout below, not after: the rhythm panel sizes this caption
+    // from its own text, so a caption rewritten after the layout is measured against the
+    // other language's width.
+    rhythmPanel.stepsAllLbl.setText (tr ("Steps", "Passos"), dontSendNotification);
+    rhythmPanel.stepsAllS.setTooltip (tr (
+        "Shifts EVERY step-pitched pulse by this many scale steps from the played note (JI/ratio pulses have no step, so they are unaffected). Right-click to map a modulator.",
+        "Despla\xc3\xa7""a TOTS els polsos amb to per passos aquests passos d'escala des de la nota tocada (els polsos JI/ra\xc3\xb3 no en tenen, i no els afecta). Clic dret per assignar-hi un modulador."));
+    rhythmPanel.velSlopeS.setTooltip (tr (
+        "Velocity SLOPE across the spectrum. 0 = flat (every pulse keeps its own velocity). To the right the HIGH partials start losing velocity; to the left the low ones. At the end of its travel the ramp is vertical and no pulse has any velocity left. Right-click to map a modulator.",
+        "PENDENT de velocitat sobre l'espectre. 0 = plana (cada pols mant\xc3\xa9 la seva). Cap a la dreta els parcials AGUTS comencen a perdre velocitat; cap a l'esquerra els greus. Al final del recorregut la pendent \xc3\xa9s vertical i cap pols conserva velocitat. Clic dret per assignar-hi un modulador."));
+    rhythmBtn.setTooltip (tr (
+        "SPECTRUM VS RHYTHM: turns partials of the current patch into MIDI pulse trains - exact polyrhythms derived from the spectrum's frequency ratios, sample-locked to the sound - sent out of this plugin's MIDI OUTPUT to any other track/instrument. Click to open the panel.",
+        "ESPECTRE A RITME: converteix parcials del patch actual en trens de polsos MIDI - poliritmes exactes derivats de les relacions de freq\xc3\xbc\xc3\xa8ncia de l'espectre, clavats al so mostra a mostra - que surten per la SORTIDA MIDI del plugin cap a qualsevol altra pista/instrument. Clica per obrir el panell."));
+    tuningBankBox.setTooltip (tr (
+        "Bank of scales: pick a slot to make it the active tuning. This selector is a PARAMETER, so a host can automate switching between the loaded scales.",
+        "Banc d'escales: tria una ranura per fer-la l'afinaci\xc3\xb3 activa. Aquest selector \xc3\xa9s un PAR\xc3\x80METRE, aix\xc3\xad que un host pot automatitzar el canvi entre les escales carregades."));
+    tuningBankLoadBtn.setTooltip (tr ("Load a .tun / .scl / .ascl into the selected bank slot.",
+                                      "Carrega un .tun / .scl / .ascl a la ranura seleccionada del banc."));
+    tuningBankClearBtn.setTooltip (tr ("Remove the selected tuning from the bank.",
+                                       "Treu l'afinaci\xc3\xb3 seleccionada del banc."));
+    // Rebuilt, not just re-tooltipped: its first item is the translated "- none -" /
+    // "- cap -", and the only thing that ever rebuilt this list was the timer, once every
+    // 30 ticks and only when the NUMBER of items changed - which a language switch never
+    // does. So the one word in it stayed English for ever.
+    refreshTuningBank();
+    presetDirtyMark.setTooltip (tr (
+        "*Changed since loaded.*\nSome parameter no longer matches this preset - moved by something other than one of its OWN modulators (a knob, host automation, an undo).\n!Save stores it as a NEW preset! instead of overwriting the original.",
+        "*Canviat des de la c\xc3\xa0rrega.*\nAlg\xc3\xban par\xc3\xa0metre ja no coincideix amb aquest preset - l'ha mogut alguna cosa que no \xc3\xa9s un dels seus PROPIS moduladors (un bot\xc3\xb3, automatitzaci\xc3\xb3, un desfer).\n!Desar el guarda com un preset NOU! en lloc de sobreescriure l'original."));
+    nadBox.setTooltip (tr (
+        "What the list below shows: Degrees = each scale step against the tonic. Dyads, triads, tetrads... = EVERY combination of that many scale notes, ranked by total beating (all pairs counted, not just against 0).",
+        "Qu\xc3\xa8 mostra la llista: Graus = cada pas contra la t\xc3\xb2nica. D\xc3\xad""ades, tr\xc3\xad""ades, t\xc3\xa8trades... = TOTES les combinacions d'aquest nombre de notes, ordenades pel batec total (tots els parells, no nom\xc3\xa9s contra el 0)."));
+    nadList.tip = tr ("Combinations of scale degrees with the LEAST total beating first (colour = the value's height on the beating range).",
+                      "Combinacions de graus de l'escala amb MENYS batec total primer (color = al\xc3\xa7""ada del valor dins el rang de batec).");
+    // NEVER TRANSLATED AT ALL - cause (b). The rhythm panel's mode box was filled with two
+    // English literals in RhythmPanel::init() and had only its TOOLTIP localised, so the
+    // words the user reads stayed English while the explanation of them was in Catalan.
+    localise (rhythmPanel.modeBox, { tr ("Lowest note", "Nota m\xc3\xa9s greu"),
+                                     tr ("All notes",   "Totes les notes") });
+
     // THE SUB-PANELS MUST BE LAID OUT AGAIN, NOT ONLY RE-WORDED.
     // Component::setBounds only calls resized() when the SIZE changes, and these three
     // panels are always given the same size - so each was laid out exactly once, in
@@ -3341,6 +3431,42 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.resized();
     playgroundPanel.resized();
     partialPanel.resized();
+
+    // EVERY SLIDER'S VALUE BOX RE-RENDERS.
+    //
+    // juce::Slider caches whatever its textFromValueFunction returned and only asks for
+    // it again when the VALUE moves. Most of ours print numbers, but two print WORDS -
+    // the harmonics fader ("Even/All/Odd/Prime" -> "Parells/Tots/Senars/Primers") and the
+    // prime-limit fader ("Off") - and those kept the old language's word on screen until
+    // the user happened to drag them. Swept over the whole tree rather than named one by
+    // one, because the next fader with a worded read-out must not have to remember this.
+    updateSliderValueTexts (*this);
+    updateSliderValueTexts (playgroundPanel);   // not children of this editor: they live
+    updateSliderValueTexts (partialPanel);      // in their own floating windows
+
+    // ...AND THE LIVE READ-OUTS ARE RE-RUN, NOT LEFT TO THE NEXT TIMER TICK.
+    //
+    // A whole class of strings in this window is written by the 30 Hz timer, not by this
+    // function: the "N partials audible - M in the full timbre" line under the panels, the
+    // Custom-engine status, the adaptation read-out, the register band, the LOOKAHEAD
+    // button, the tuning-bank combo's "- none -". Every one of them is a correct tr()
+    // pair; none of them was in the new language when this function returned, and the
+    // rhythm panel's read-outs (its "(hold a note to pulse)" line, the "- missing" suffix
+    // on a routed slot, the BPM read-out) are never rewritten by the timer at all while
+    // the panel is shut, so those stayed English for ever.
+    //
+    // refreshSlots/refreshLive first because the timer does not touch a hidden panel;
+    // then one timer pass for everything else. Guarded both ways: not before the
+    // constructor has finished (the first applyLanguage() runs before setSize() and
+    // applyEngineState(), and a timer tick there would read a half-built editor), and
+    // never reentrantly.
+    if (editorConstructed && ! inLanguageRefresh)
+    {
+        const juce::ScopedValueSetter<bool> guard (inLanguageRefresh, true);
+        rhythmPanel.refreshSlots();
+        rhythmPanel.refreshLive();
+        timerCallback();
+    }
     repaint(); // title uses the language
 }
 
@@ -5062,7 +5188,15 @@ FractalAdditiveAudioProcessorEditor::playgroundProbeForTests (int w, int h, bool
     // point and every corner's name - all of it off live processor state, so a null or a
     // stale index in there is a crash in a window nothing else in the build ever opens.
     {
-        juce::Image img (juce::Image::ARGB, juce::jmax (1, w), juce::jmax (1, h), true);
+        // SOFTWARE, not the default native image type. On Windows a JUCE 8 native image
+        // is a Direct2D bitmap, and this throwaway one is never read back on purpose -
+        // its Graphics context is destroyed, which is where Direct2D's own
+        // createPersistentBackup runs. Under the self-snapshot rig (which builds one
+        // instrument per scenario and calls this in a loop) that readback died in
+        // juce::readFromDirect2DBitmap, taking the whole run with it. A plain CPU bitmap
+        // has no device to lose, and this image's only job was ever to make paint() run.
+        juce::Image img (juce::SoftwareImageType().create (juce::Image::ARGB,
+                                                           juce::jmax (1, w), juce::jmax (1, h), true));
         juce::Graphics g (img);
         playgroundPanel.paintEntireComponent (g, true);
     }
@@ -6510,7 +6644,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
         {
             auto credit = r1.removeFromLeft (150).withHeight (18);
             vibeLabel.setJustificationType (juce::Justification::centredLeft);
-            vibeLabel.setBounds (credit.removeFromLeft (92));
+            // Sized from its own words, floor 92, capped so the link beside it keeps at
+            // least 48 px for "Asra3". "Vibe coded per" is 4 px wider than "Vibe coded
+            // by" and was drawn condensed the moment this line started translating.
+            vibeLabel.setBounds (credit.removeFromLeft (
+                juce::jlimit (92, 100, fgfit::labelWidth (vibeLabel))));
             credit.removeFromLeft (2);
             vibeLink.setBounds (credit);
         }
