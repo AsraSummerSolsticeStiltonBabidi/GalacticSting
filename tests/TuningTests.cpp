@@ -689,6 +689,81 @@ int main()
         }
     }
 
+    //--------------------------------------------------------------------------
+    // equalDivisionsOfOctave: the gate the keyboard's NOTE NAMES hang off. Ups-and-downs
+    // spelling names the degrees of an equal division of the OCTAVE, so anything else
+    // has to answer 0 and keep its degree numbers. The failure this guards against is
+    // not a crash - it is a keyboard confidently printing "C D E F G A B" over a scale
+    // whose degrees are nothing of the kind.
+    std::printf ("equal divisions of the octave (the note-name gate):\n");
+    {
+        // A helper that builds an N-EDO .scl the way a real one is written.
+        const auto edoScl = [] (int n)
+        {
+            juce::String s;
+            s << n << "-EDO\n " << n << "\n!\n";
+            for (int i = 1; i <= n; ++i)
+                s << " " << juce::String (1200.0 * (double) i / (double) n, 6) << "\n";
+            return s;
+        };
+
+        {
+            TuningManager t;  // untouched = 12-TET
+            check (t.equalDivisionsOfOctave() == 12, "plain 12-TET answers 12");
+        }
+        for (int n : { 5, 19, 22, 31, 53 })
+        {
+            TuningManager t; juce::String err;
+            check (t.loadScalaString (edoScl (n), "edo", err), "an N-EDO .scl loads");
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.equalDivisionsOfOctave() == n, "  ...and is measured back as its own N");
+        }
+        {
+            // 96-EDO: wide enough that a window starting at the reference key would run
+            // off the top of the keyboard. The answer must not depend on where we asked.
+            TuningManager t; juce::String err;
+            t.loadScalaString (edoScl (96), "edo96", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.equalDivisionsOfOctave() == 96,
+                   "96-EDO answers 96 - the measuring window slides down instead of running off key 127");
+        }
+        {
+            // Bohlen-Pierce: 13 EQUAL steps, but of 3/1. Equal is not enough; the period
+            // has to be the octave, or the letters name intervals that are not there.
+            juce::String bp; bp << "Bohlen-Pierce\n 13\n!\n";
+            for (int i = 1; i <= 13; ++i)
+                bp << " " << juce::String (1200.0 * std::log2 (3.0) * (double) i / 13.0, 6) << "\n";
+            TuningManager t; juce::String err;
+            t.loadScalaString (bp, "bp", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.degreesPerPeriod() == 13, "Bohlen-Pierce has 13 degrees...");
+            check (t.equalDivisionsOfOctave() == 0,
+                   "  ...and answers 0: its period is 3/1, so there are no octave degrees to name");
+        }
+        {
+            // Ptolemy's intense diatonic: an octave, seven degrees, UNequal steps.
+            TuningManager t; juce::String err;
+            t.loadScalaString ("Ptolemy 5-limit major\n 7\n!\n 9/8\n 5/4\n 4/3\n 3/2\n 5/3\n 15/8\n 2/1\n",
+                               "ji", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.equalDivisionsOfOctave() == 0,
+                   "a 5-limit JI major scale answers 0 - an octave, but not divided equally");
+        }
+        {
+            // One cent off equal, everywhere. This is the tolerance's whole job: a scale
+            // a cent away from 12-EDO is a different scale, and naming its degrees after
+            // 12-EDO's would be a quiet lie about what is sounding.
+            juce::String warped; warped << "almost 12-EDO\n 12\n!\n";
+            for (int i = 1; i <= 12; ++i)
+                warped << " " << juce::String (100.0 * (double) i + (i == 5 ? 1.0 : 0.0), 6) << "\n";
+            TuningManager t; juce::String err;
+            t.loadScalaString (warped, "warp", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.degreesPerPeriod() == 12, "a scale one cent off 12-EDO still has 12 degrees...");
+            check (t.equalDivisionsOfOctave() == 0, "  ...and is NOT called 12-EDO");
+        }
+    }
+
     std::printf ("\n%s (%d failure%s)\n", failures == 0 ? "ALL PASSED" : "FAILURES",
                  failures, failures == 1 ? "" : "s");
     return failures == 0 ? 0 : 1;

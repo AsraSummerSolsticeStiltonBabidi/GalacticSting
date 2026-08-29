@@ -204,6 +204,53 @@ public:
         return 2.0;
     }
 
+    // How many EQUAL steps this tuning cuts the OCTAVE into, or 0 when it does not cut
+    // the octave into equal steps at all. This is the question the keyboard's note-name
+    // option turns on: ups-and-downs spelling names the degrees of an equal division of
+    // the OCTAVE and nothing else, because the letters A..G are the octave's own diatonic
+    // scale - laid over Bohlen-Pierce or over an unequal scale they would name pitches
+    // after intervals those pitches do not stand in.
+    //
+    // MEASURED, not declared, and therefore the same answer in every mode: it reads the
+    // pitches the active tuning gives real MIDI keys. A 31-EDO .scl, an MTS-ESP master
+    // serving 31-EDO and a .tun table that happens to hold 31 equal steps all answer 31;
+    // a 5-limit JI major scale, a stretched piano table and a 3/1-period scale all
+    // answer 0, however they were loaded. Message thread (it walks up to 128 keys).
+    //
+    // `tolCents` is deliberately tight. A scale one cent off equal is a DIFFERENT scale,
+    // and calling it an EDO would print names that quietly lie about what is sounding.
+    int equalDivisionsOfOctave (double tolCents = 0.5) const
+    {
+        const int N = degreesPerPeriod();
+        if (N < 1 || N > 127) return 0;
+
+        // ONE test decides this, and it is a measurement: are the N steps from a key to
+        // the key N above it all 1200/N cents? That already answers "is the period the
+        // octave" - N equal steps of 1200/N cents ARE an octave - so periodRatio() is
+        // deliberately not consulted. Asking it too would be a second source of truth
+        // that can disagree with the pitches actually sounding, and the pitches win.
+        //
+        // Measured over one whole period of real keys. Starting at the reference key
+        // where there is room, and sliding down only when a wide scale would run off the
+        // top - the answer must not depend on which end of the keyboard we asked from.
+        const int start = juce::jmin (kRefKey, 127 - N);
+        if (start < 0) return 0;
+
+        const double f0 = frequencyForNote (start);
+        if (! (f0 > 0.0) || shouldFilterNote (start)) return 0;
+        for (int i = 1; i <= N; ++i)
+        {
+            // An MTS master may leave keys UNMAPPED. A keyboard with holes in it is not
+            // an equal division of anything, whatever the mapped keys measure.
+            if (shouldFilterNote (start + i)) return 0;
+            const double f = frequencyForNote (start + i);
+            if (! (f > 0.0)) return 0;
+            const double cents = 1200.0 * std::log2 (f / f0);
+            if (std::abs (cents - (double) i * 1200.0 / (double) N) > tolCents) return 0;
+        }
+        return N;
+    }
+
     //== Audio thread =========================================================
     // Note-on gate: an MTS-ESP master with a partial keyboard map can mark keys
     // as unmapped, which must NOT sound. 12-TET and Scala never filter.
