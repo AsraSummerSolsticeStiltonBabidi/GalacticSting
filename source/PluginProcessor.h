@@ -619,6 +619,8 @@ public:
     // are not lost - their partial is simply not in this spectrum right now.
     int getPartialGainsMatched() const noexcept { return spectrumEngine.getGainMatchedCount(); }
     juce::uint32 getTemplateGeneration() const noexcept { return spectrumEngine.getGeneration(); }
+    // "Is the spectrum worker still owed anything?" - see SpectrumEngine::isBuildPending.
+    bool isSpectrumBuildPending() const { return spectrumEngine.isBuildPending(); }
 
     //==========================================================================
     // Tuning bank: load as many .scl files as you like (effectively unlimited - the

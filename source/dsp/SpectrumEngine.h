@@ -66,6 +66,25 @@ namespace spectrum
             return i < 0 ? nullptr : &pool[(size_t) i];
         }
 
+        // Message thread: is a build or a blend queued, or in flight right now?
+        //
+        // This exists for the offline verifiers. They have no message loop and no ear, so
+        // they have to KNOW that a publish they asked for has happened before they measure
+        // what is sounding - and the worker is Priority::low, so "sleep a bit and hope" is
+        // a race that a busy machine loses. Measured: 1907 ms and 2309 ms to publish while
+        // a verifier ran back-to-back processBlock calls against it, against 3.0 ms of
+        // actual compile work. That race is most of why the rhythm suite could report
+        // 2, 3, 11, 12, 17 and 19 failures from the same binary at the same commit.
+        //
+        // The pending flag and `working` are read together under the request lock, and the
+        // worker sets `working` under that same lock as it clears the flag, so there is no
+        // instant where a job is neither pending nor in flight.
+        bool isBuildPending() const
+        {
+            const std::lock_guard<std::mutex> lk (requestMutex);
+            return hasRequest || hasBlend || working.load (std::memory_order_acquire);
+        }
+
         int  getPartialCount() const noexcept { return liveCount.load(); }
         int  getRawCount()     const noexcept { return rawCount.load(); }
         bool isTruncated()     const noexcept { return truncated.load(); }
@@ -226,6 +245,10 @@ namespace spectrum
                     // definition from the settings the blend supersedes.
                     if (hasBlend)        { job = blend;     hasBlend   = false; haveBlend = true; epoch = pubEpoch; }
                     else if (hasRequest) { s   = requested; hasRequest = false; have      = true; epoch = pubEpoch; }
+                    // Taken under the SAME lock that clears the pending flag, so there is
+                    // no instant at which isBuildPending() can see neither the request nor
+                    // the work - which is the whole point of it (see that function).
+                    working.store (have || haveBlend, std::memory_order_release);
                 }
 
                 if (haveBlend)
@@ -254,6 +277,8 @@ namespace spectrum
                     if (! abortBuild.load() && ! superseded)   // also discards a build cancelled at teardown
                         publish (std::move (t));
                 }
+
+                working.store (false, std::memory_order_release);
             }
         }
 
@@ -355,7 +380,7 @@ namespace spectrum
         std::atomic<bool> abortBuild { false };
         mutable std::atomic<int> renderedCount { 0 };
 
-        std::mutex        requestMutex;
+        mutable std::mutex requestMutex;
         std::mutex        buildMutex;
         SpectrumSettings  requested;
         bool              hasRequest = false;
@@ -365,6 +390,9 @@ namespace spectrum
         // cannot publish an older spectrum over a newer one (see publishNow).
         unsigned long long pubEpoch = 0;
         juce::WaitableEvent wakeUp;
+        // True from the moment the worker takes a job until it has finished publishing it.
+        // Read together with the two pending flags by isBuildPending().
+        std::atomic<bool> working { false };
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SpectrumEngine)
     };
