@@ -32,8 +32,10 @@
 // rather than leaving it to be discovered.
 //
 // TRANSPORT DISCONTINUITY. A loop jumping back must not replay what is still in
-// flight: those events belong to bars the transport has left. flush() drops them, and
-// the processor pairs it with an all-notes-off so nothing can be stranded holding.
+// flight: those events belong to bars the transport has left. flushKeepingNoteOffs()
+// drops them but still DELIVERS any note-off caught in the ring (see its own note: the
+// note-on it closes has already sounded and been counted downstream), and the processor
+// pairs the flush with an all-notes-off so nothing can be stranded holding.
 // A budget CHANGE flushes for the same reason - events already stamped for the old
 // timeline would arrive at the wrong distance from the notes around them.
 //
@@ -60,6 +62,35 @@ public:
 
     // Drop everything still in flight. See the transport note above.
     void flush() noexcept { buf.clear(); }
+
+    // The flush a TRANSPORT DISCONTINUITY wants: drop everything still in flight EXCEPT
+    // the note-offs, which are re-stamped to sample 0 of the block being processed and
+    // so leave with this very block.
+    //
+    // WHY A NOTE-OFF IS NOT THE SAME AS A NOTE-ON HERE. The note-on it belongs to left
+    // the ring one budget EARLIER: it has already sounded and, more to the point, has
+    // already been counted by everything downstream of this delay - the note gate, the
+    // mono glide, the modulator tally, and the rhythm engine's held chord. Dropping only
+    // its note-off leaves all four believing the key is still down, and the rhythm engine
+    // then goes on generating pulse trains from a key nobody is holding and emitting that
+    // MIDI to the DAW for the rest of the session. Silencing the voices - which the
+    // processor does beside this call - cures the audio and none of that bookkeeping.
+    // A note-off for a note-on that is dropped here too is harmless: it closes a key
+    // nothing is holding, which every consumer downstream already treats as a no-op.
+    //
+    // RT-safe by construction: the kept events move between the two pre-sized member
+    // buffers and never touch the caller's, so nothing here can allocate.
+    void flushKeepingNoteOffs() noexcept
+    {
+        keep.clear();
+        for (const auto meta : buf)
+        {
+            const auto m = meta.getMessage();
+            if (m.isNoteOff() || m.isAllNotesOff() || m.isAllSoundOff())
+                keep.addEvent (m, 0);
+        }
+        buf.swapWith (keep);
+    }
 
     bool isEmpty() const noexcept { return buf.isEmpty(); }
 

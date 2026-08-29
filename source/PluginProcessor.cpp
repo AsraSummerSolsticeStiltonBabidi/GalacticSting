@@ -3336,10 +3336,17 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         // into the other.
         if ((jumped && (budget > 0 || ! laDelay.isEmpty())) || pendingFlush)
         {
-            // Dropping buffered note-ons is the point; dropping a buffered note-OFF
-            // would strand whatever it was going to close, so every voice is silenced
-            // with it. (Silence at a loop point is what the host asked for anyway.)
-            laDelay.flush();
+            // Dropping buffered note-ons is the point; a buffered note-OFF is a
+            // different animal and is DELIVERED with this block instead. Its note-on
+            // left the ring one budget earlier: it has already sounded and has already
+            // been counted by the note gate, the mono glide, the modulator tally and the
+            // rhythm engine's held chord. Dropping it left all four believing the key
+            // was still down - and the rhythm engine then generated pulse trains from a
+            // key nobody was holding and emitted that MIDI to the DAW for the rest of
+            // the session (measured: 24 ghost pulses in the 600 blocks after one wrap).
+            // The turnOffAllVoices below silences the audio; only the delivered note-off
+            // can correct the bookkeeping.
+            laDelay.flushKeepingNoteOffs();
             laPeek.reset();
             monoGate.reset();
             synth.turnOffAllVoices (false);

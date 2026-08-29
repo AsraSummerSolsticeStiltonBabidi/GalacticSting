@@ -11018,13 +11018,16 @@ int main()
 
 
     // --- run 52: THE TRANSPORT, AND WHAT IT IS ALLOWED TO DESTROY --------------------
-    // Three claims about the same twenty lines of processBlock, measured separately
-    // because they fail for three different reasons and one fix does not imply another:
+    // Four claims about the same twenty lines of processBlock, measured separately
+    // because they fail for four different reasons and one fix does not imply another:
     //   (A) with lookahead OFF - the shipping default - pressing PLAY or STOP, or a loop
     //       wrapping, must not touch a key the player is holding down;
     //   (B) with lookahead ARMED the same jump DELIBERATELY still kills, because there
     //       the ring really does hold events stamped for bars the transport has left;
-    //   (C) a pending flush must be consumed by the block that owns it, never by the next.
+    //   (C) a pending flush must be consumed by the block that owns it, never by the next;
+    //   (D) whatever a flush throws away, a note-OFF already in flight must still be
+    //       delivered, or everything downstream of the delay goes on believing the key
+    //       is down - the rhythm engine loudest of all.
     // Every take here is offline and sample-counted - no wall clock anywhere in this run.
     {
         std::printf ("\nrun 52: the transport, and what it is allowed to destroy:\n");
@@ -11056,6 +11059,8 @@ int main()
         };
         auto noteOn52  = [] (int k) { juce::MidiBuffer m;
             m.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0); return m; };
+        auto noteOff52 = [] (int k) { juce::MidiBuffer m;
+            m.addEvent (juce::MidiMessage::noteOff (1, k), 0); return m; };
 
         //-- (A) LOOKAHEAD OFF: THE TRANSPORT MUST NOT CUT A HELD KEY --------------------
         // rtSet.lookahead defaults to false, so budget == 0 is not "a configuration" -
@@ -11215,6 +11220,71 @@ int main()
                    "attaching a PLAYHEAD does not swallow the note - a pending flush fires in its own block, not the next");
         }
 
+        //-- (D) A NOTE-OFF IN FLIGHT IS STILL DELIVERED --------------------------------
+        // The note-on it belonged to left the ring one budget earlier: it has already
+        // sounded and, more to the point, has already been counted by everything
+        // downstream of the delay - the note gate, the mono glide, the modulator tally
+        // and the rhythm engine's held chord. Dropping only its note-off leaves all four
+        // believing the key is still down, and the rhythm engine then generates pulse
+        // trains from a key nobody is holding and emits that MIDI to the DAW for the rest
+        // of the session. Silencing the voices, which the flush already does, cures the
+        // audio and none of that.
+        {
+            auto p = make52();
+            // One pulse train, routed and fast: divisor 2^3 puts harmonic 2 of key 60 at
+            // ~65 Hz, so a train that is still running is unmistakable within the tail
+            // below instead of being one pulse every 367 blocks at the default 2^8.
+            {
+                auto sp = [&p] (const char* id, float v)
+                { auto* q = p->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v));
+                  p->pollParametersForTests(); };
+                sp ("rhythmOn", 1.0f);          // pulses leave the plugin, so they are countable
+                sp ("rhythmDivN", 3.0f);
+                p->getRhythm().slots[0].partial = 1; p->getRhythm().slots[0].enabled = true;
+                p->getRhythm().slots[0].steps   = 0; p->getRhythm().slots[0].durMs = 5.0f;
+            }
+            Head52 head;
+            head.pos.setBpm (120.0); head.pos.setIsPlaying (true); head.pos.setPpqPosition (0.0);
+            p->setPlayHead (&head);
+            Proc::RtSettings rs; rs.lookahead = true;
+            p->setRealtimeLink (Proc::RtLink::SpectrumFromTuning, rs);
+            const int bud = p->getLookaheadSamples();
+
+            juce::AudioBuffer<float> ab (2, b52);
+            double ppq = 0.0;
+            const double dPpq = (double) b52 * 120.0 / (60.0 * sr52);
+            int pulsesBefore = 0, pulsesAfter = 0;
+            const int budBlocks = bud / b52;
+            const int onBlock   = 2;
+            const int offBlock  = onBlock + budBlocks + 40;   // the note has long since sounded
+            const int wrapBlock = offBlock + 4;               // its note-off is still in the ring
+            const int settle    = wrapBlock + budBlocks + 40; // past every gate the wrap owed
+            const int tail      = 600;
+            for (int i = 0; i < settle + tail; ++i)
+            {
+                juce::MidiBuffer m;
+                if (i == onBlock)  m = noteOn52 (60);
+                if (i == offBlock) m = noteOff52 (60);
+                if (i == wrapBlock) ppq = 0.0;                // the loop wraps
+                head.pos.setPpqPosition (ppq); ppq += dPpq;
+                ab.clear();
+                p->processBlock (ab, m);
+                for (const auto meta : m)
+                    if (meta.getMessage().isNoteOn())
+                    { if (i < offBlock) ++pulsesBefore; else if (i >= settle) ++pulsesAfter; }
+            }
+            std::printf ("  rhythm MIDI out: %d pulse note-ons while the key was down,"
+                         " %d in the %d blocks AFTER the wrap ate its note-off\n",
+                         pulsesBefore, pulsesAfter, tail);
+            check (pulsesBefore > 0,
+                   "run 52(D) control: this configuration really does emit pulse MIDI while a key is held");
+            check (pulsesAfter == 0,
+                   "a note-off caught in the flush is still delivered - no ghost pulses from a key nobody is holding");
+            check (p->activeVoiceCountForTests() == 0,
+                   "...and nothing is left sounding either");
+            p->setRealtimeLink (Proc::RtLink::Off, rs);
+            p->setPlayHead (nullptr);
+        }
     }
 
     // --- the audit: what did this suite leave behind, and where? ---------------------
