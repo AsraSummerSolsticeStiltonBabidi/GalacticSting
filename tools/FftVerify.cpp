@@ -341,6 +341,73 @@ int main()
         if (armedDb - before < 3.0)               { std::printf ("        armed edit still inaudible (%.2f dB < 3 dB) - the defect is back\n", armedDb - before); ++failures; }
     }
 
+    // == "Phase" turned from a Choice into a fader: does yesterday's project still ==
+    // == sound the same today?  The parameter ID is REUSED, so an old chunk lands in ==
+    // == the new parameter with no name to tell them apart.  If the two shapes ever ==
+    // == disagree about what 1.0 means, a user reopening a saved project hears their ==
+    // == Scattered patch come back Aligned - a 4.5x-32x crest change, i.e. a ==
+    // == completely different sound, with nothing on screen to explain it. ==
+    //
+    // The blob is written by a REAL AudioParameterChoice object, not by our belief
+    // about one: APVTS stores the DENORMALISED value (ParameterAdapter::flushToTree
+    // writes unnormalisedValue = convertFrom0to1 (parameter.getValue())), so that is
+    // exactly the arithmetic reproduced here. Asserting our assumption instead of
+    // measuring it is how a migration passes its own test and fails a user's project.
+    {
+        std::printf ("== Phase: a project saved by the OLD Choice parameter, opened by the fader ==\n");
+
+        AudioParameterChoice oldShape ({ "phaseMode", 1 }, "Phase",
+                                       StringArray { "Aligned", "Scattered" }, 0);
+
+        for (int idx = 0; idx <= 1; ++idx)
+        {
+            // What the old build actually wrote into the chunk for this choice.
+            const float stored = oldShape.convertFrom0to1 (oldShape.convertTo0to1 ((float) idx));
+
+            FractalAdditiveAudioProcessor proc;
+            auto tree = proc.apvts.copyState();
+
+            // A pre-fader chunk has no "phaseGlide" child at all - that parameter did
+            // not exist. Removing it is what makes this blob genuinely OLD rather than
+            // a new one with one property edited.
+            tree.removeChild (tree.getChildWithProperty ("id", "phaseGlide"), nullptr);
+            auto ph = tree.getChildWithProperty ("id", "phaseMode");
+            ph.setProperty ("value", stored, nullptr);
+
+            MemoryBlock blob;
+            if (auto xml = tree.createXml())
+                FractalAdditiveAudioProcessor::copyXmlToBinary (*xml, blob);
+            proc.setStateInformation (blob.getData(), (int) blob.getSize());
+            proc.pollParametersForTests();
+
+            const float got = proc.apvts.getRawParameterValue ("phaseMode")->load();
+            const float want = idx == 0 ? 0.0f : 1.0f;   // 0 = Aligned, 1 = Scattered
+            std::printf ("  %-9s old chunk value %.3f  ->  fader %.3f (want %.3f)\n",
+                         idx == 0 ? "Aligned" : "Scattered", stored, got, want);
+            if (std::abs (got - want) > 1.0e-4f)
+            { std::printf ("        OLD PROJECT OPENS ON A DIFFERENT SOUND\n"); ++failures; }
+
+            // The same number is what a saved AUTOMATION LANE holds, because a host
+            // stores normalised values: a two-choice parameter normalises index 1 to
+            // 1.0, and so must the fader, or every drawn lane is rescaled silently.
+            if (auto* p = proc.apvts.getParameter ("phaseMode"))
+                if (std::abs (p->convertTo0to1 (want) - oldShape.convertTo0to1 ((float) idx)) > 1.0e-4f)
+                { std::printf ("        automation lane at %d no longer means the same phase\n", idx); ++failures; }
+        }
+
+        // And the other half of the migration: the parameter must now actually be
+        // CONTINUOUS. If someone reverts it to a Choice the two checks above still
+        // pass - they only look at the ends - and the whole feature is gone.
+        {
+            FractalAdditiveAudioProcessor proc;
+            setP (proc.apvts, "phaseMode", 0.5f);
+            const float mid = proc.apvts.getRawParameterValue ("phaseMode")->load();
+            std::printf ("  midpoint 0.500 -> %.3f\n", mid);
+            if (std::abs (mid - 0.5f) > 1.0e-3f)
+            { std::printf ("        Phase is not continuous - it snapped to %.3f\n", mid); ++failures; }
+        }
+    }
+
     std::printf ("\n%s\n", failures == 0 ? "no partials dropped" : "PARTIALS DROPPED");
     return failures == 0 ? 0 : 1;
 }

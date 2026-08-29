@@ -153,9 +153,42 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         NormalisableRange<float> (1.0f, 4.0f, 0.01f), 1.0f));
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "spectrumRange", 1 }, "Spectrum Range (oct)", 1, 10, 10));
-    params.push_back (std::make_unique<AudioParameterChoice>(
+    // PHASE, CONTINUOUS. Was a two-way Choice {Aligned, Scattered}; it is now a fader,
+    // 0 = every partial at its peak (one pulse), 1 = as scattered as PhaseSets.h can
+    // prove is better than the shipping hash.
+    //
+    // THE ID IS KEPT ON PURPOSE. "phaseMode" is what the mod matrix routes to, what the
+    // playground corners capture, and what every automation lane a user has already
+    // drawn addresses. Renaming it would silently drop all three - the modulator would
+    // point at nothing, the corner would restore a default, and the lane would go dead -
+    // and none of those failures announce themselves.
+    //
+    // AND THE OLD STATE STILL LOADS WITHOUT A MIGRATION STEP, which is worth writing
+    // down because it is arithmetic and not luck. APVTS stores the DENORMALISED value
+    // (ParameterAdapter::flushToTree writes unnormalisedValue), and AudioParameterChoice
+    // denormalises to the choice INDEX over NormalisableRange(0, numChoices - 1). With
+    // exactly two choices that range is [0, 1], so an old chunk holds 0.0 for Aligned and
+    // 1.0 for Scattered - already this parameter's own values, and already the host's own
+    // normalised 0.0/1.0 for any automation lane. FftVerify's phase-state round trip feeds
+    // a blob written by the OLD parameter object through setStateInformation and asserts
+    // both ends, so if anyone ever widens this range the check fails instead of a user's
+    // saved project quietly opening on a different sound.
+    params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "phaseMode", 1 }, "Phase",
-        StringArray { "Aligned", "Scattered" }, 0));
+        NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.0f));
+    // How a MID-NOTE fader move reaches voices that are already sounding. It cannot
+    // reach them by just rewriting the phase accumulators: a phase step is a waveform
+    // discontinuity, i.e. a click on every sounding partial at once.
+    //   Pitchbend - detune each partial by a momentary offset until it has walked to
+    //               its new phase, then put the frequency back. Continuous, but the
+    //               note is briefly out of tune with itself.
+    //   Dry/Wet   - crossfade the two oscillator banks, old phases to new. Always in
+    //               tune, but both sets are audible during the fade so partials that
+    //               land half a cycle apart thin out while it runs.
+    // The user asked for the choice by name rather than have one imposed.
+    params.push_back (std::make_unique<AudioParameterChoice>(
+        ParameterID { "phaseGlide", 1 }, "Phase Glide",
+        StringArray { "Pitchbend", "Dry/Wet" }, 0));
 
     //-- Amp envelope -----------------------------------------------------------
     auto timeRange = [] (float maxSeconds)
