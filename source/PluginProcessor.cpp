@@ -3272,6 +3272,18 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         for (auto& row : modKeyHeld) row.fill (false);
     }
 
+    // AudioProcessor::reset() raised this (see the header for why the work is not done
+    // there). Everything above already ran - reset() sets pendingHardSilence too, and it
+    // is what silences the voices, empties the lookahead ring and clears the mono glide's
+    // held-key stack. What is left is the one thing a PRESET LOAD deliberately does not
+    // want: the running pattern's own position. A host reset means "forget what you were
+    // doing", so the phases, the gates, the held chord and the engine clock all go back
+    // to zero and the next note starts a pattern instead of joining one that is still
+    // mid-cycle from before the bypass.
+    // resetState() is prepare() minus its single ensureSize, so nothing here allocates.
+    if (pendingHostReset.exchange (false, std::memory_order_acq_rel))
+        rhythm.resetState();
+
     // Merge on-screen / computer-keyboard notes into the incoming MIDI stream.
     keyboardState.processNextMidiBuffer (midiMessages, 0, nSamp, true);
 

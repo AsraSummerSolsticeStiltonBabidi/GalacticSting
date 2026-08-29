@@ -11018,8 +11018,9 @@ int main()
 
 
     // --- run 52: THE TRANSPORT, AND WHAT IT IS ALLOWED TO DESTROY --------------------
-    // Four claims about the same twenty lines of processBlock, measured separately
-    // because they fail for four different reasons and one fix does not imply another:
+    // Five claims about what the transport and the host are allowed to destroy, measured
+    // separately because they fail for five different reasons and one fix implies none
+    // of the others:
     //   (A) with lookahead OFF - the shipping default - pressing PLAY or STOP, or a loop
     //       wrapping, must not touch a key the player is holding down;
     //   (B) with lookahead ARMED the same jump DELIBERATELY still kills, because there
@@ -11027,7 +11028,9 @@ int main()
     //   (C) a pending flush must be consumed by the block that owns it, never by the next;
     //   (D) whatever a flush throws away, a note-OFF already in flight must still be
     //       delivered, or everything downstream of the delay goes on believing the key
-    //       is down - the rhythm engine loudest of all.
+    //       is down - the rhythm engine loudest of all;
+    //   (E) AudioProcessor::reset() is the host's "stop making sound now", and it owes
+    //       both halves: silence, AND a synth that is not left deaf.
     // Every take here is offline and sample-counted - no wall clock anywhere in this run.
     {
         std::printf ("\nrun 52: the transport, and what it is allowed to destroy:\n");
@@ -11284,6 +11287,104 @@ int main()
                    "...and nothing is left sounding either");
             p->setRealtimeLink (Proc::RtLink::Off, rs);
             p->setPlayHead (nullptr);
+        }
+        //-- (E) reset() IS THE HOST'S "STOP MAKING SOUND NOW" --------------------------
+        // A bypass or a panic calls it and expects silence. It must also NOT leave the
+        // synth deaf: a reset that silences for ever is the opposite failure and is just
+        // as reportable, so both halves are asserted in one take.
+        {
+            auto p = make52();
+            juce::AudioBuffer<float> ab (2, b52);
+            auto pump = [&] (int blocks, juce::MidiBuffer first) -> double
+            {
+                double sum = 0.0; int n = 0;
+                for (int i = 0; i < blocks; ++i)
+                {
+                    juce::MidiBuffer m; if (i == 0) m = first;
+                    ab.clear();
+                    p->processBlock (ab, m);
+                    const float* r = ab.getReadPointer (0);
+                    for (int k = 0; k < b52; ++k) { sum += (double) r[k] * r[k]; ++n; }
+                }
+                return n > 0 ? std::sqrt (sum / (double) n) : 0.0;
+            };
+            const double rmsOn = pump (80, noteOn52 (60));
+            const int    vOn   = p->activeVoiceCountForTests();
+            p->reset();
+            // The kill is a fast FADE, not a hard cut, because a hard cut clicks - so
+            // silence is asserted AFTER it, not during it. Five blocks is 6.7 ms here
+            // against a fade measured at about 1 ms of equivalent energy; the window
+            // that follows is the one that has to be flat, and it is 40 blocks long so
+            // a fade that had quietly become a slow release could not hide inside it.
+            const double rmsFade  = pump (5, {});
+            const double rmsReset = pump (40, {});
+            const int    vReset   = p->activeVoiceCountForTests();
+            const double rmsNew   = pump (80, noteOn52 (67));
+            const int    vNew     = p->activeVoiceCountForTests();
+            std::printf ("  reset(): voices %d -> %d -> %d (new note), rms %.5f -> %.7f (fade) ->"
+                         " %.7f -> %.5f\n",
+                         vOn, vReset, vNew, rmsOn, rmsFade, rmsReset, rmsNew);
+            check (vOn == 1 && rmsOn > 1.0e-4, "run 52(E) control: the note really is sounding before the reset");
+            check (vReset == 0 && rmsReset < 1.0e-6,
+                   "reset() silences the sounding voice - a host bypass or panic does not leave a note hanging");
+            check (vNew == 1 && rmsNew > 1.0e-4,
+                   "...and the synth is not left DEAF: a note struck after the reset sounds normally");
+
+            // The lookahead ring is part of "stop making sound now" too: a note already
+            // buffered when the reset arrives must never surface a budget later.
+            auto q = make52();
+            Proc::RtSettings rs; rs.lookahead = true;
+            q->setRealtimeLink (Proc::RtLink::SpectrumFromTuning, rs);
+            const int bud = q->getLookaheadSamples();
+            juce::AudioBuffer<float> qb (2, b52);
+            double sum = 0.0; int n = 0;
+            for (int i = 0; i < bud / b52 + 200; ++i)
+            {
+                juce::MidiBuffer m; if (i == 0) m = noteOn52 (60);
+                if (i == 2) q->reset();
+                qb.clear();
+                q->processBlock (qb, m);
+                const float* r = qb.getReadPointer (0);
+                for (int k = 0; k < b52; ++k) { sum += (double) r[k] * r[k]; ++n; }
+            }
+            const double rmsBuffered = std::sqrt (sum / (double) n);
+            std::printf ("  reset() 2 blocks after a note entered a %d-sample ring: rms over the whole take %.7f\n",
+                         bud, rmsBuffered);
+            check (rmsBuffered < 1.0e-6,
+                   "reset() flushes the lookahead ring - a buffered note does not surface a budget later");
+            q->setRealtimeLink (Proc::RtLink::Off, rs);
+
+            // THE ONE THING THE OLD reset() DID RIGHT, and it must survive being rewritten:
+            // any pulse gate that is OPEN when the reset lands still owes its note-off, or
+            // the receiving track is left with a suspended note and no rhythm under it.
+            // Gate length is set long on purpose so a gate is certainly open at the moment
+            // reset() is called - the balance below is only a real question while one is.
+            auto g = make52();
+            {
+                auto sp = [&g] (const char* id, float v)
+                { auto* x = g->apvts.getParameter (id); x->setValueNotifyingHost (x->convertTo0to1 (v));
+                  g->pollParametersForTests(); };
+                sp ("rhythmOn", 1.0f);
+                sp ("rhythmDivN", 3.0f);
+                g->getRhythm().slots[0].partial = 1; g->getRhythm().slots[0].enabled = true;
+                g->getRhythm().slots[0].steps   = 0; g->getRhythm().slots[0].durMs = 500.0f;
+            }
+            juce::AudioBuffer<float> gb (2, b52);
+            int gOns = 0, gOffs = 0;
+            for (int i = 0; i < 400; ++i)
+            {
+                juce::MidiBuffer m; if (i == 0) m = noteOn52 (60);
+                if (i == 60) g->reset();          // mid-gate, by construction
+                gb.clear();
+                g->processBlock (gb, m);
+                for (const auto meta : m)
+                { if (meta.getMessage().isNoteOn()) ++gOns; else if (meta.getMessage().isNoteOff()) ++gOffs; }
+            }
+            std::printf ("  reset() during an open %g ms pulse gate: %d pulse note-ons, %d note-offs\n",
+                         500.0, gOns, gOffs);
+            check (gOns > 0, "run 52(E) control: a pulse gate really was open when the reset landed");
+            check (gOns == gOffs,
+                   "reset() still owes every open pulse gate its note-off - nothing hangs in the receiving track");
         }
     }
 

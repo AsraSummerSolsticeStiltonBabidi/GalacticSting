@@ -30,9 +30,24 @@ public:
     //==========================================================================
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override {}
-    // Host reset (transport re-arm, state clear): flush any sounding rhythm-MIDI
-    // notes so none hang in the receiving track.
-    void reset() override { rhythm.flushOpenGates(); }
+    // HOST RESET: "stop making sound now, and forget what you were doing".
+    // A bypass, a panic button and a transport re-arm all arrive here, and until this
+    // was written it only flushed the rhythm-MIDI gates - so a note the player was
+    // holding went on sounding for ever through a bypass, and a panic silenced nothing
+    // at all. It owes both halves: silence, AND a synth that is not left deaf, so the
+    // very next note must still play normally.
+    //
+    // The work itself is NOT done here. reset() can be called from the message thread
+    // while the audio thread is inside processBlock, and voice / NoteGate / MonoGlide /
+    // lookahead-ring state is only ever allowed to be touched from one of them - the
+    // same rule restoreState() already follows through pendingHardSilence. So this only
+    // RAISES the request; the next block carries it out, one block being the shortest
+    // honest latency for "silence" from a thread that does not own the voices.
+    void reset() override
+    {
+        pendingHardSilence.store (true, std::memory_order_release);
+        pendingHostReset .store (true, std::memory_order_release);
+    }
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
@@ -1536,6 +1551,12 @@ private:
     // (audio thread) - see there for why. A preset/project load must never leave a
     // note stuck sounding.
     std::atomic<bool>           pendingHardSilence { false };
+    // Set by reset() (any thread); consumed in the same place, one block later. It is a
+    // SECOND flag rather than a wider pendingHardSilence because the two requests are not
+    // the same request: a state swap must not forget where the running pattern was in its
+    // cycle, a host reset must. Keeping them apart is what lets reset() also re-zero the
+    // rhythm engine without changing what a preset load does.
+    std::atomic<bool>           pendingHostReset { false };
 
     // Scala-as-timbre state (message thread; read into SpectrumSettings each poll).
     std::vector<float> timbreDegrees;

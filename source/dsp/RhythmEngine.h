@@ -92,6 +92,16 @@ public:
         // main trains, pending flush) so out.addEvent never allocates in processBlock.
         out.ensureSize ((size_t) (3 * kFbMaxOn + kFbMaxOff + 4 * kSlots * kMaxNotes
                                   + kSlots * kMaxNotes + kFbMaxOff) * 16);
+        resetState();
+    }
+
+    // Everything prepare() clears, WITHOUT the one line in it that can allocate.
+    // Split out so AudioProcessor::reset() - the host's "stop making sound now", which a
+    // bypass and a panic both go through - can be honoured on the AUDIO thread, where
+    // out.ensureSize is not allowed to run. Calling it never changes a buffer size, so
+    // the sizing prepare() did still holds.
+    void resetState() noexcept
+    {
         // Before wiping the gate state, remember any OUTPUT notes that are still
         // sounding so the next block can send their note-offs. Otherwise a re-prepare
         // (sample-rate/block-size change, plugin re-init, transport re-arm...) would
