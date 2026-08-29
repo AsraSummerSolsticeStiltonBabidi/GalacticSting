@@ -117,6 +117,26 @@ set_target_properties(SpectrumTests PROPERTIES
     CXX_STANDARD_REQUIRED ON)
 
 #-------------------------------------------------------------------------------
+# Unit tests for the (JUCE-free) phase-set engine behind the Aligned<->Scattered
+# fader. Same shape as SpectrumTests because it has the same dependency: the real
+# compileSpectrum, so the partial lists it measures are the ones the plugin plays.
+#
+# WHY IT IS A SEPARATE TARGET AND NOT A FILE IN SpectrumTests: its measuring rig is
+# a direct std::sin over the true unquantised ratios and deliberately shares NOTHING
+# with the engine it scores. Version 1 of that engine shipped a GREEN suite and a
+# BROKEN feature because the test called the engine's own analysis grid; keeping the
+# rig in its own translation unit with its own main() is what stops that from
+# silently coming back through a shared helper.
+#-------------------------------------------------------------------------------
+add_executable(PhaseSetTests
+    tests/PhaseSetTests.cpp
+    source/dsp/Spectrum.cpp)
+target_include_directories(PhaseSetTests PRIVATE source)
+set_target_properties(PhaseSetTests PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON)
+
+#-------------------------------------------------------------------------------
 # Unit tests for the ups-and-downs note-name speller. JUCE-free like the header it
 # tests, so the whole thing builds and runs in about a second - which is what makes it
 # worth running on every edit of an algorithm whose wrong answers still look like names.
