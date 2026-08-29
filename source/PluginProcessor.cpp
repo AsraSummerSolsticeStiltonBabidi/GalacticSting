@@ -3308,7 +3308,33 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                 laLastPpq    = playing ? ppq : -1.0e30;
             }
 
-        if (jumped || laFlush.exchange (false, std::memory_order_acq_rel))
+        // CONSUME THE PENDING-FLUSH FLAG UNCONDITIONALLY, AND BEFORE THE TEST BELOW.
+        // It used to be the right-hand side of `jumped || laFlush.exchange (...)`, which
+        // SHORT-CIRCUITS: on a block that had jumped, the exchange never ran, so the
+        // pending flush survived into the NEXT block and destroyed a ring that by then
+        // held a real note. Measured with lookahead armed, identical processors, identical
+        // MIDI, identical block counts, the only difference being whether a playhead was
+        // attached: no playhead -> first audible sample 12032 (one budget, as designed);
+        // with one -> the note NEVER sounded. It fires on every offline bounce and every
+        // transport start with lookahead armed, because applyLookahead leaves the flag set
+        // on the first poll after prepareToPlay (laLastSr starts at 0).
+        const bool pendingFlush = laFlush.exchange (false, std::memory_order_acq_rel);
+
+        // A JUMP ONLY FLUSHES WHAT THERE IS TO FLUSH. rtSet.lookahead defaults to false,
+        // so budget == 0 with an empty ring is not "a configuration" - it is what every
+        // player gets who never opens the realtime panel, and there is then nothing in
+        // flight for a transport discontinuity to invalidate. Without this guard, simply
+        // pressing PLAY cut off every key the player was holding (measured: voices 1 -> 0,
+        // rms 0.02508 -> 0.00000), and the jump edge is symmetric so STOP and a loop wrap
+        // cut them too. That kill arrived in d44263e; its parent had no transport-jump
+        // handling at all.
+        // With lookahead ARMED the kill deliberately REMAINS, because there the two cases
+        // are genuinely different: the ring really does hold events the host stamped for
+        // bars the transport has left, replaying them at the loop point is a ghost note
+        // nobody wrote, and a buffered note-on dropped with its note-off would hold for
+        // ever. run 52 asserts both halves side by side so neither can be "simplified"
+        // into the other.
+        if ((jumped && (budget > 0 || ! laDelay.isEmpty())) || pendingFlush)
         {
             // Dropping buffered note-ons is the point; dropping a buffered note-OFF
             // would strand whatever it was going to close, so every voice is silenced

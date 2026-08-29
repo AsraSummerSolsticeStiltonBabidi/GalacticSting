@@ -11016,6 +11016,207 @@ int main()
         p->assignPlaygroundCorner (1, {}, err);
     }
 
+
+    // --- run 52: THE TRANSPORT, AND WHAT IT IS ALLOWED TO DESTROY --------------------
+    // Three claims about the same twenty lines of processBlock, measured separately
+    // because they fail for three different reasons and one fix does not imply another:
+    //   (A) with lookahead OFF - the shipping default - pressing PLAY or STOP, or a loop
+    //       wrapping, must not touch a key the player is holding down;
+    //   (B) with lookahead ARMED the same jump DELIBERATELY still kills, because there
+    //       the ring really does hold events stamped for bars the transport has left;
+    //   (C) a pending flush must be consumed by the block that owns it, never by the next.
+    // Every take here is offline and sample-counted - no wall clock anywhere in this run.
+    {
+        std::printf ("\nrun 52: the transport, and what it is allowed to destroy:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        constexpr double sr52 = 48000.0;
+        constexpr int    b52  = 64;
+
+        struct Head52 : juce::AudioPlayHead
+        {
+            juce::AudioPlayHead::PositionInfo pos;
+            juce::Optional<juce::AudioPlayHead::PositionInfo> getPosition() const override { return pos; }
+        };
+
+        // A processor with a flat sustaining envelope and nothing standing between a
+        // note-on and its voice: quantize-to-pulse is ON by default and would hold notes
+        // back for reasons that have nothing to do with the transport.
+        auto make52 = [&] ()
+        {
+            auto p = std::make_unique<Proc>();
+            p->prepareToPlay (sr52, b52);
+            auto sp = [&p] (const char* id, float v)
+            { auto* q = p->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            sp ("morph", 0.0f);
+            sp ("ampAttack", 0.001f); sp ("ampDecay", 0.001f);
+            sp ("ampSustain", 1.0f);  sp ("ampRelease", 0.003f);
+            sp ("rhythmQPulse", 0.0f);
+            return p;
+        };
+        auto noteOn52  = [] (int k) { juce::MidiBuffer m;
+            m.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 100), 0); return m; };
+
+        //-- (A) LOOKAHEAD OFF: THE TRANSPORT MUST NOT CUT A HELD KEY --------------------
+        // rtSet.lookahead defaults to false, so budget == 0 is not "a configuration" -
+        // it is what every player gets who never opens the realtime panel. The kill this
+        // guards against arrived in d44263e (whose parent has no transport-jump handling
+        // at all) and it is symmetric, so STOP cut the held key exactly as PLAY did.
+        {
+            auto p = make52();
+            Head52 head;
+            head.pos.setBpm (120.0); head.pos.setIsPlaying (false); head.pos.setPpqPosition (0.0);
+            p->setPlayHead (&head);
+            check (! p->isLookaheadArmed() && p->getLookaheadSamples() == 0,
+                   "run 52(A) measures the state a player who never opens the realtime panel is in: lookahead OFF");
+
+            juce::AudioBuffer<float> ab (2, b52);
+            double ppq = 0.0;
+            const double dPpq = (double) b52 * 120.0 / (60.0 * sr52);
+            auto pump = [&] (int blocks, juce::MidiBuffer first) -> double
+            {
+                double sum = 0.0; int n = 0;
+                for (int i = 0; i < blocks; ++i)
+                {
+                    juce::MidiBuffer m; if (i == 0) m = first;
+                    head.pos.setPpqPosition (ppq);
+                    if (head.pos.getIsPlaying()) ppq += dPpq;
+                    ab.clear();
+                    p->processBlock (ab, m);
+                    const float* r = ab.getReadPointer (0);
+                    for (int k = 0; k < b52; ++k) { sum += (double) r[k] * r[k]; ++n; }
+                }
+                return n > 0 ? std::sqrt (sum / (double) n) : 0.0;
+            };
+
+            pump (40, noteOn52 (60));                       // key pressed, transport stopped
+            const double rmsHeld = pump (40, {});
+            const int    vHeld   = p->activeVoiceCountForTests();
+
+            head.pos.setIsPlaying (true);                   // ... the player presses PLAY
+            const double rmsPlay = pump (40, {});
+            const int    vPlay   = p->activeVoiceCountForTests();
+
+            ppq = 0.0;                                      // ... the loop wraps under it
+            const double rmsWrap = pump (40, {});
+            const int    vWrap   = p->activeVoiceCountForTests();
+
+            head.pos.setIsPlaying (false);                  // ... and the player presses STOP
+            const double rmsStop = pump (40, {});
+            const int    vStop   = p->activeVoiceCountForTests();
+
+            std::printf ("  key HELD, lookahead off: voices %d -> %d (play) -> %d (loop wrap) -> %d (stop),"
+                         " rms %.5f -> %.5f -> %.5f -> %.5f\n",
+                         vHeld, vPlay, vWrap, vStop, rmsHeld, rmsPlay, rmsWrap, rmsStop);
+            check (vHeld == 1 && rmsHeld > 1.0e-4,
+                   "run 52(A) control: the held key really is sounding before the transport moves");
+            check (vPlay == vHeld && rmsPlay > rmsHeld * 0.5,
+                   "pressing PLAY does not touch a key the player is holding (lookahead off: nothing is in flight)");
+            check (vWrap == vHeld && rmsWrap > rmsHeld * 0.5,
+                   "...nor does the loop wrapping under it");
+            check (vStop == vHeld && rmsStop > rmsHeld * 0.5,
+                   "...nor does pressing STOP (the jump edge is symmetric, so it killed too)");
+            p->setPlayHead (nullptr);
+        }
+
+        //-- (B) LOOKAHEAD ARMED: the same jump STILL flushes, and that is on purpose ----
+        // The two halves differ because what they are protecting differs. Armed, the ring
+        // holds events the host stamped for bars it has now left; replaying them at the
+        // loop point is a ghost note the player never wrote. Off, there is no ring at all,
+        // so there is nothing the jump could possibly invalidate.
+        {
+            auto p = make52();
+            Head52 head;
+            head.pos.setBpm (120.0); head.pos.setIsPlaying (true); head.pos.setPpqPosition (0.0);
+            p->setPlayHead (&head);
+            Proc::RtSettings rs; rs.lookahead = true;
+            // SpectrumFromTuning arms the budget without a chord-driven search: this run
+            // measures MIDI timing, and a searcher launching on every note-on would only
+            // add CPU to a take that must stay deterministic.
+            p->setRealtimeLink (Proc::RtLink::SpectrumFromTuning, rs);
+            const int bud = p->getLookaheadSamples();
+            check (bud > 0, "run 52(B) control: arming lookahead really does buy a budget");
+
+            juce::AudioBuffer<float> ab (2, b52);
+            double ppq = 0.0;
+            const double dPpq = (double) b52 * 120.0 / (60.0 * sr52);
+            auto pump = [&] (int blocks, juce::MidiBuffer first)
+            {
+                for (int i = 0; i < blocks; ++i)
+                {
+                    juce::MidiBuffer m; if (i == 0) m = first;
+                    head.pos.setPpqPosition (ppq); ppq += dPpq;
+                    ab.clear();
+                    p->processBlock (ab, m);
+                }
+            };
+            pump (4, {});
+            pump (bud / b52 + 40, noteOn52 (60));   // past the budget: the note is sounding
+            const int vArmed = p->activeVoiceCountForTests();
+            ppq = 0.0;                              // the loop wraps
+            pump (8, {});
+            const int vAfter = p->activeVoiceCountForTests();
+            std::printf ("  key HELD, lookahead ARMED (%d-sample budget): voices %d -> %d across a loop wrap\n",
+                         bud, vArmed, vAfter);
+            check (vArmed == 1, "run 52(B) control: the delayed note really did sound");
+            check (vAfter == 0,
+                   "with lookahead ARMED a loop wrap still silences - the ring holds bars the transport has left");
+            p->setRealtimeLink (Proc::RtLink::Off, rs);
+            p->setPlayHead (nullptr);
+        }
+
+        //-- (C) A PENDING FLUSH IS CONSUMED BY THE BLOCK THAT OWNS IT ------------------
+        // `jumped || laFlush.exchange (...)` short-circuits: on a block that had jumped
+        // the exchange never ran, so the pending flush survived into the NEXT block and
+        // destroyed a ring that by then held a real note. The pending flag is set on the
+        // first poll after prepareToPlay (laLastSr starts at 0), so this fires on every
+        // offline bounce and every transport start with lookahead armed.
+        // The two takes are the SAME processor, the SAME MIDI and the SAME block count.
+        // The only difference is whether a playhead is attached - which is the only thing
+        // that can make `jumped` true - so a difference between them can only be this.
+        {
+            int budSeen = 0;
+            auto firstAudible = [&] (bool withHead) -> long long
+            {
+                auto p = make52();
+                Head52 head;
+                head.pos.setBpm (120.0); head.pos.setIsPlaying (true); head.pos.setPpqPosition (0.0);
+                if (withHead) p->setPlayHead (&head);
+                Proc::RtSettings rs; rs.lookahead = true;
+                p->setRealtimeLink (Proc::RtLink::SpectrumFromTuning, rs);   // <- leaves a flush pending
+                budSeen = p->getLookaheadSamples();
+                juce::AudioBuffer<float> ab (2, b52);
+                double ppq = 0.0;
+                const double dPpq = (double) b52 * 120.0 / (60.0 * sr52);
+                long long onset = -1, at = 0;
+                for (int i = 0; i < 400 && onset < 0; ++i)
+                {
+                    juce::MidiBuffer m; if (i == 0) m = noteOn52 (60);
+                    head.pos.setPpqPosition (ppq); ppq += dPpq;
+                    ab.clear();
+                    p->processBlock (ab, m);
+                    const float* r = ab.getReadPointer (0);
+                    for (int k = 0; k < b52; ++k)
+                        if (onset < 0 && std::abs (r[k]) > 1.0e-7f) onset = at + k;
+                    at += b52;
+                }
+                p->setRealtimeLink (Proc::RtLink::Off, rs);
+                p->setPlayHead (nullptr);
+                return onset;
+            };
+            const long long noHead   = firstAudible (false);
+            const long long withHead = firstAudible (true);
+            std::printf ("  a note struck in the first block, lookahead armed: first audible sample"
+                         " %lld with no playhead, %lld with one (budget %d; -1 = never sounded)\n",
+                         noHead, withHead, budSeen);
+            check (noHead == (long long) budSeen,
+                   "run 52(C) control: with no playhead the note sounds exactly one budget later");
+            check (withHead == noHead,
+                   "attaching a PLAYHEAD does not swallow the note - a pending flush fires in its own block, not the next");
+        }
+
+    }
+
     // --- the audit: what did this suite leave behind, and where? ---------------------
     {
         std::printf ("\npreset folders, before and after:\n");
