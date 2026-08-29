@@ -4261,7 +4261,9 @@ void FractalAdditiveAudioProcessorEditor::savePresetFlow()
             const auto name = aw->getTextEditorContents ("name").trim();
             if (result == 1 && name.isNotEmpty())
             {
-                const auto stored = safe->processorRef.savePreset (name); // sanitised name, or empty
+                auto why = FractalAdditiveAudioProcessor::PresetWriteRefusal::None;
+                int blockedCorner = -1;
+                const auto stored = safe->processorRef.savePreset (name, why, blockedCorner);
                 if (stored.isNotEmpty())
                 {
                     safe->refreshPresetList();
@@ -4270,11 +4272,33 @@ void FractalAdditiveAudioProcessorEditor::savePresetFlow()
                 }
                 else
                 {
+                    // THE REFUSAL IS SPOKEN, and it names the corner. A save the
+                    // fixed-point rule turns down - this name is on a playground corner
+                    // and the controls are showing the pad's BLEND, not that preset -
+                    // must say so in those words: a silent no-op, or a generic "try
+                    // another name", would leave the user believing the corner they were
+                    // listening to had been saved, which is the same kind of lie as the
+                    // drain itself (case #88). Any other failure keeps the old wording.
+                    const auto letter = juce::String::charToString (
+                        (juce::juce_wchar) ('A' + juce::jmax (0, blockedCorner)));
+                    const auto msg =
+                        why == FractalAdditiveAudioProcessor::PresetWriteRefusal::CornerFixedPoint
+                          ? safe->tr ("\"%N%\" is on playground corner %C%, and these controls are "
+                                      "showing the pad's blend, not that preset. Saving over it would "
+                                      "make the corner a blend of itself, drifting a little further "
+                                      "every time you reload the project. Save under a different name, "
+                                      "or use that corner's own Edit button.",
+                                      "\"%N%\" \xc3\xa9s a la cantonada %C% del laboratori, i aquests "
+                                      "controls mostren la barreja del tauler, no pas aquell preset. "
+                                      "Desar-hi a sobre convertiria la cantonada en una barreja d'ella "
+                                      "mateixa, i s'allunyaria una mica m\xc3\xa9s cada cop que "
+                                      "obr\xc3\xadssiu el projecte. Deseu-lo amb un altre nom, o feu "
+                                      "servir el bot\xc3\xb3 Edit d'aquella cantonada.")
+                                .replace ("%N%", name).replace ("%C%", letter)
+                          : safe->tr ("Could not save the preset. Try a different name.",
+                                      "No s'ha pogut desar el preset. Prova un altre nom.");
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        safe->tr ("Save preset", "Desar preset"),
-                        safe->tr ("Could not save the preset. Try a different name.",
-                                  "No s'ha pogut desar el preset. Prova un altre nom."),
-                        safe.getComponent());
+                        safe->tr ("Save preset", "Desar preset"), msg, safe.getComponent());
                 }
             }
             safe->refocus();

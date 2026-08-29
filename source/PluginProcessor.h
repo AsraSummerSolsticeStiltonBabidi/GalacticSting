@@ -678,10 +678,27 @@ public:
     // to name one, so that cannot happen again by typing.
     static constexpr const char* kPresetExt = ".gsting";
     static juce::File getPresetFolder();
+    // TESTS ONLY: point every preset read and write at a scratch directory instead of
+    // the user's Documents folder. run 48 saved through savePreset() into the USER'S
+    // real folder and then deleted "<name>.fibpreset", so its cleanup removed nothing
+    // and run48-A/B.gsting sat beside the player's own patches until somebody noticed.
+    // A suite that must WRITE presets redirects the folder rather than promising to
+    // tidy up. An empty File restores the real folder.
+    static void setPresetFolderForTests (const juce::File& dir);
     static juce::File presetFile (const juce::String& name)
     { return getPresetFolder().getChildFile (name + kPresetExt); }
     juce::StringArray getPresetNames();
-    juce::String savePreset (const juce::String& name); // returns the stored name, or empty on failure
+    // Why a preset write was refused. The PROCESSOR decides the rule; the EDITOR writes
+    // the sentence, because the sentence has to be in the user's language and the
+    // processor has no tr(). CornerFixedPoint carries the corner it was refused for.
+    enum class PresetWriteRefusal { None, BadName, CornerFixedPoint, WriteFailed };
+    // Returns the stored name (sanitised), or empty on failure with `why` set. A CORNER
+    // IS A FIXED POINT: while the pad is driving, the controls are the blend's OUTPUT,
+    // so a save under an assigned corner's own name is REFUSED, out loud - that write is
+    // what closes case #88's drain through the .gsting file. See writePresetFile, which
+    // is where the rule lives.
+    juce::String savePreset (const juce::String& name, PresetWriteRefusal& why, int& corner);
+    juce::String savePreset (const juce::String& name); // ...when the caller has nowhere to show it
     bool loadPreset (const juce::String& name);
     // True once ANY parameter's BASE value (a knob turned, host automation, undo...)
     // no longer matches what was in the loaded preset - modulation from the
@@ -830,6 +847,18 @@ public:
     // can prove an edit reaches the SOUND and not merely the store.
     int getPlaygroundCornerRevForTests (int corner) const noexcept
     { return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].rev : -1; }
+
+    // TESTS: the corner STORE's own parameter values - the blend's INPUT, in
+    // getParameters() order. A corner is a fixed point of the blend, so twenty save /
+    // re-assign round trips must leave this vector bit-identical; case #88 is what
+    // happens when it does not. Empty for an unassigned corner.
+    std::vector<float> getPlaygroundCornerParamsForTests (int corner) const
+    {
+        return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].params
+                                                                     : std::vector<float>{};
+    }
+    // TESTS: the corner store's value for one parameter id (NaN if unassigned/unknown).
+    float getPlaygroundCornerParamForTests (int corner, const juce::String& id) const;
 
     // The corner's compiled template, so a test can prove it CHANGES when the chord does.
     std::shared_ptr<const spectrum::SpectrumTemplate> getPlaygroundCornerTemplateForTests (int corner) const
@@ -1464,6 +1493,11 @@ private:
     void applyTuningMode (int paramIndex);
     bool lastZoneMpe = false;
 
+    // THE ONLY PLACE A .gsting IS WRITTEN, and where the fixed-point rule that closes
+    // case #88 is enforced - one gate rather than one check per call site, because
+    // there is no such thing as remembering to add the third one. See the .cpp.
+    bool writePresetFile (const juce::String& safeName, const juce::ValueTree& state,
+                          bool isCornerOwnSave, PresetWriteRefusal& why, int& corner);
     juce::ValueTree captureState();
     void restoreState (const juce::ValueTree&);
 
@@ -1674,8 +1708,22 @@ private:
         // all four corners for every parameter, thirty times a second; an id lookup per
         // read is 200x200 string compares per frame for no benefit, because the index
         // order is identical for every corner by construction.
+        //
+        // TOTAL, ALWAYS. Every parameter has a value here the moment the corner is
+        // assigned: the preset's own where the file carries it, the parameter's DEFAULT
+        // where the preset PREDATES it (fillCornerDefaults). There used to be a parallel
+        // `hasParam` flag meaning "this preset predates that parameter", and every reader
+        // answered that state differently - push skipped it (so the corner-edit surface
+        // kept the BLEND's value there and the pull absorbed it back into the corner,
+        // hunt entry 10), the continuous blend renormalised it away (so the parameter was
+        // ruled 100 % by the OTHER corner and the vertex became path-dependent, hunt
+        // entry 11), the discrete branch skipped it (so a corner whose preset never
+        // mentioned mono was left permanently monophonic, hunt entry 8), while MIX mode's
+        // ParamBank::fill quietly used the default. FOUR readers, four answers.
+        // Deleting the flag is what makes that unrepresentable: there is now ONE answer,
+        // it is the default, it is decided once at assign time, and morph, mix and edit
+        // cannot disagree about it because there is nothing left to disagree about.
         std::vector<float> params;
-        std::vector<char>  hasParam;   // 0 = this preset predates that parameter
         std::vector<spectrum::PartialGain> gains;
         bool manual = false;                                  // "partialManual"
         juce::String timbreName, timbreSource;                // the Custom Engine's own scale
@@ -1714,10 +1762,13 @@ private:
         bool edited = false;
         int  rev    = 0;
         bool assigned() const noexcept { return name.isNotEmpty(); }
-        // The preset's value for parameter #i, or false if this preset predates it.
+        // THIS CORNER'S value for parameter #i. Always succeeds for a corner that has
+        // been assigned (the store is total - see `params`); false only for an index
+        // that is not a parameter at all, which is a programming error, not a preset
+        // that predates something.
         bool value (int i, double& out) const noexcept
         {
-            if (i < 0 || (size_t) i >= params.size() || ! hasParam[(size_t) i]) return false;
+            if (i < 0 || (size_t) i >= params.size()) return false;
             out = (double) params[(size_t) i];
             return true;
         }
@@ -1777,6 +1828,9 @@ private:
     // part of a corner and must survive a round trip untouched.
     void pushCornerToLiveSurface (int corner);
     void pullPlaygroundCornerEdit();
+    // Every parameter at its DEFAULT - the base every corner store is built on, and the
+    // one answer to "what does this corner mean for a parameter its preset predates?".
+    void fillCornerDefaults (PlaygroundCorner& c) const;
 
     //== ADAPTIVE CORNERS (see the public block). Message thread except where noted. ==
     // One finished corner search. It carries its OWN identity (corner + preset name) and

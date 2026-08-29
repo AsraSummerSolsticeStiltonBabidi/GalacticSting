@@ -132,24 +132,28 @@ static bool awaitSpectrumIdle (const FractalAdditiveAudioProcessor& p, const cha
 
 struct Ev { int sample; bool on; int note, ch; int vel = 0; };
 
-// THE USER'S PRESET FOLDER IS NOT A SCRATCH DIRECTORY.
+// THE USER'S PRESET FOLDER IS NOT A SCRATCH DIRECTORY, so this suite does not write in it.
 //
-// Documents/Galactic Sting/Presets holds the player's own patches, and this suite writes
-// presets into it because the real save/load path knows no other folder. run 48 saved
-// through savePreset() - which writes ".gsting" - and then deleted "<name>.fibpreset", so
-// its own two deleteFile() calls deleted nothing and run48-A.gsting and run48-B.gsting sat
-// in the user's folder beside their own patches until somebody removed them by hand.
-// zzz-verify-mix-A/B survived the same way when a run died before its cleanup.
+// Documents/Galactic Sting/Presets holds the player's own patches, and this suite used to
+// write its presets there because the real save/load path knew no other folder. run 48
+// saved through savePreset() - which writes ".gsting" - and then deleted
+// "<name>.fibpreset", so its own two deleteFile() calls deleted nothing and run48-A.gsting
+// and run48-B.gsting sat in the user's folder beside their own patches until somebody
+// removed them by hand. zzz-verify-mix-A/B survived the same way when a run died before
+// its cleanup - and, measured on 2026-08-29, ALSO when two RhythmVerify processes ran at
+// once: the second process's files landed in the first one's end-of-run audit, because
+// both were writing the same directory. Promising to tidy up cannot fix either.
 //
-// Per-site cleanup will go on being written wrong, so the folder is inventoried before
-// anything runs and AUDITED at the end: the audit names every file the suite added, fails
-// loudly, and then removes it. A leak nobody is told about is a leak that comes back.
-static juce::StringArray presetFolderInventory()
+// So the whole run is redirected to a scratch directory of its own, named after this
+// PROCESS (setPresetFolderForTests). Two things are then checked at the end: that the
+// user's real folder is byte-for-byte the list it was before anything ran, and that the
+// scratch folder is empty - the second is the same per-site cleanup audit as before, kept
+// because a leak nobody is told about is a leak that comes back.
+static juce::StringArray presetFolderInventory (const juce::File& dir)
 {
     juce::StringArray names;
-    for (const auto& f : FractalAdditiveAudioProcessor::getPresetFolder()
-                             .findChildFiles (juce::File::findFiles, false,
-                                              juce::String ("*") + FractalAdditiveAudioProcessor::kPresetExt))
+    for (const auto& f : dir.findChildFiles (juce::File::findFiles, false,
+                                             juce::String ("*") + FractalAdditiveAudioProcessor::kPresetExt))
         names.add (f.getFileName());
     names.sort (true);
     return names;
@@ -158,6 +162,8 @@ static juce::StringArray presetFolderInventory()
 int main()
 {
     juce::ScopedJuceInitialiser_GUI juceInit;
+
+    const juce::File realPresets = FractalAdditiveAudioProcessor::getPresetFolder();
 
     // A dropping from a RUN THAT DIED EARLY is in the folder before this one starts, so
     // the end-of-run diff sees it as one of the user's own files and never mentions it
@@ -171,11 +177,11 @@ int main()
     // live run is in the middle of using and fail it for something it did not do. A file
     // still being used is seconds old; a dead run's leavings are not, so age is what
     // separates them.
-    int foreignScratchAtStart = 0;
+    int foreignScratchAtStart = 0; (void) foreignScratchAtStart; // reported only: the redirect below is the real protection
     {
         const juce::int64 cutoffMs = juce::Time::currentTimeMillis() - 30 * 60 * 1000;
         int stale = 0, live = 0;
-        for (const auto& f : FractalAdditiveAudioProcessor::getPresetFolder()
+        for (const auto& f : realPresets
                                  .findChildFiles (juce::File::findFiles, false,
                                                   juce::String (kScratchPrefix) + "*"
                                                       + FractalAdditiveAudioProcessor::kPresetExt))
@@ -198,7 +204,15 @@ int main()
         foreignScratchAtStart = live;
     }
 
-    const juce::StringArray presetsAtStart = presetFolderInventory();
+    const juce::StringArray presetsAtStart = presetFolderInventory (realPresets);
+
+    // ...and then do not touch it again. Sweeping old droppings is a courtesy; the REAL
+    // protection is that nothing this suite saves ever lands in the user's folder at all.
+    // The redirect goes in before the first processor exists, so every block inherits it.
+    const juce::File scratchPresets = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                          .getChildFile ("fiblo-verify-presets-"
+                                              + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+    FractalAdditiveAudioProcessor::setPresetFolderForTests (scratchPresets);
 
     constexpr double sr = 48000.0;
     constexpr int    blk = 256;
@@ -10659,33 +10673,397 @@ int main()
         }
     }
 
-    // --- the audit: did this suite leave anything in the user's preset folder? --------
+    // --- run 51: CASE #88 - A CORNER IS A FIXED POINT OF ITS OWN BLEND ---------------
+    // "si por ejemplo voy adelante y atras entre dos presets uno con menos amp sustain
+    //  que el otro, el volumen va bajando hasta silenciarse... curiosamente con el modo
+    //  mix pasa lo mismo."
+    //
+    // Run 47 drove ten A->B->A round trips through the real drivePlayground at its real
+    // cadence and found 0 of ~200 parameters drifted, RMS ratio 1.000. The poll path is
+    // clean and the loop does not live in memory: IT CLOSES THROUGH THE .gsting FILE.
+    // While the pad drives, the live control surface is the blend's OUTPUT; a corner's
+    // stored values and a corner's file are the blend's INPUT. Anywhere output can reach
+    // input the corner stops being a fixed point and becomes the previous
+    // interpolation's result, so every further trip drags it geometrically towards the
+    // other corner - "va bajando hasta silenciarse" is a geometric series.
+    //
+    // Three doors, measured here:
+    //   (a) Save a preset under an assigned corner's own name while parked mid-pad, then
+    //       re-assign that corner        -> the corner's file IS the blend.
+    //   (b) Same save, then a genuine host project save + reload, which re-reads every
+    //       corner from disk by name     -> the drift comes back in with the project.
+    //   (c) An UNTOUCHED corner-edit visit, on a corner whose preset predates a
+    //       parameter -> the blend's value for that parameter is absorbed into the
+    //       corner store and the "*" says nothing happened.
+    // And (d): what a corner MEANS for a parameter its preset predates has to be ONE
+    // answer that morph, mix and edit all agree on, or the vertex is path-dependent.
     {
-        std::printf ("\nthe user's preset folder, before and after:\n");
-        juce::StringArray leftBehind;
-        for (const auto& f : FractalAdditiveAudioProcessor::getPresetFolder()
-                                 .findChildFiles (juce::File::findFiles, false,
-                                                  juce::String ("*") + FractalAdditiveAudioProcessor::kPresetExt))
-            if (! presetsAtStart.contains (f.getFileName()))
+        std::printf ("\nrun 51: case #88 - a corner must be a FIXED POINT of its own blend:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        constexpr double psr = 48000.0;
+        constexpr int    pblk = 256;
+
+        // A folder of its own even within the suite's own scratch folder, because this
+        // block rewrites the SAME preset name twenty times: nothing else may be reading
+        // "zzz88-A" while it walks. Restores whatever was in force before, never "the
+        // user's real folder" - that mistake would hand the twenty overwrites straight
+        // to Documents/Galactic Sting/Presets.
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run51-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        struct ScratchFolder
+        {
+            explicit ScratchFolder (const juce::File& d)
+                : dir (d), prev (Proc::getPresetFolder()) { Proc::setPresetFolderForTests (d); }
+            ~ScratchFolder() { Proc::setPresetFolderForTests (prev); dir.deleteRecursively(); }
+            juce::File dir, prev;
+        } scratchGuard (scratch);
+        check (Proc::getPresetFolder() == scratch,
+               "run 51 writes its presets in a scratch folder of its own");
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (psr, pblk);
+        juce::AudioBuffer<float> ab (2, pblk);
+
+        auto sp = [&] (const char* id, float plain)
+        {
+            if (auto* q = p->apvts.getParameter (id))
+                q->setValueNotifyingHost (q->convertTo0to1 (plain));
+        };
+        auto gp = [&] (const char* id) { return p->apvts.getRawParameterValue (id)->load(); };
+        auto paramDefault = [&] (const char* id)
+        {
+            auto* q = p->apvts.getParameter (id);
+            return q != nullptr ? q->convertFrom0to1 (q->getDefaultValue()) : 0.0f;
+        };
+        auto frame = [&] { p->pollParametersForTests(); juce::MidiBuffer m; ab.clear(); p->processBlock (ab, m); };
+        auto park  = [&] (float x, float y, int frames = 12)
+        {
+            sp ("pgX", x); sp ("pgY", y);
+            for (int i = 0; i < frames; ++i) frame();
+        };
+        // Run 47's measurement, unchanged: a freshly-struck note, RMS well into its sustain.
+        auto noteRms = [&]
+        {
+            awaitSpectrumIdle (*p, "run 51 blend before an RMS reading");
+            const int holdBlocks = (int) (0.6 * psr / pblk);
+            const int from = (int) (0.3 * psr / pblk);
+            double sum = 0.0; long n = 0;
+            for (int b = 0; b < holdBlocks; ++b)
             {
-                leftBehind.add (f.getFileName());
-                f.deleteFile();      // named first, then removed: the user gets their folder back
+                juce::MidiBuffer m;
+                if (b == 0) m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+                ab.clear(); p->processBlock (ab, m);
+                if (b >= from)
+                {
+                    const float* L = ab.getReadPointer (0);
+                    for (int i = 0; i < pblk; ++i) { sum += (double) L[i] * L[i]; ++n; }
+                }
             }
-        std::printf ("  %d presets before, %d added by this run%s%s\n",
-                     presetsAtStart.size(), leftBehind.size(),
+            { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+              ab.clear(); p->processBlock (ab, m); }
+            for (int b = 0; b < (int) (1.5 * psr / pblk); ++b)
+            { juce::MidiBuffer m; ab.clear(); p->processBlock (ab, m); }
+            return std::sqrt (sum / (double) juce::jmax (1L, n));
+        };
+
+        // TWO CORNERS THAT DIFFER ONLY IN LEVEL, which is the user's own case ("uno con
+        // menos amp sustain que el otro"): everything else identical, so any change in
+        // the rendered RMS at corner A is the drain and nothing else.
+        auto writeCorners = [&]
+        {
+            sp ("timbreOn", 0.0f); sp ("timbreTemper", 0.0f); sp ("phaseMode", 0.0f);
+            sp ("morph", 0.0f); sp ("pgMode", 0.0f);
+            sp ("ampAttack", 0.005f); sp ("ampDecay", 0.05f); sp ("ampRelease", 0.05f);
+            sp ("filterCutoff", 12000.0f); sp ("baseN", 1.0f); sp ("curveSlope", 1.5f);
+            sp ("ampSustain", 0.90f); sp ("masterGain", 0.0f);
+            p->pollParametersForTests();
+            check (p->savePreset ("zzz88-A").isNotEmpty(), "corner preset A saved (sustain 0.90, gain 0 dB)");
+            sp ("ampSustain", 0.05f); sp ("masterGain", -18.0f);
+            p->pollParametersForTests();
+            check (p->savePreset ("zzz88-B").isNotEmpty(), "corner preset B saved (sustain 0.05, gain -18 dB)");
+        };
+        writeCorners();
+
+        juce::String err;
+        check (p->assignPlaygroundCorner (0, "zzz88-A", err), "A on corner 0");
+        check (p->assignPlaygroundCorner (1, "zzz88-B", err), "B on corner 1");
+        check (p->isPlaygroundActive(), "two corners engage the pad");
+
+        // ---- THE RULE ITSELF, before the drain it exists to kill is measured --------
+        // A CORNER IS A FIXED POINT. Three things have to hold at once for that to be a
+        // rule and not a lockout, so all three are asserted, not just the refusal: it
+        // refuses the write that closes the loop, it refuses ONLY that write, and it
+        // leaves the one legitimate door onto a corner's file open.
+        {
+            park (0.5f, 0.0f);                 // the pad drives: the surface is blend(A, B)
+            const auto before = Proc::presetFile ("zzz88-A").loadFileAsString();
+
+            auto why  = Proc::PresetWriteRefusal::None;
+            int  blkd = -1;
+            const auto refused = p->savePreset ("zzz88-A", why, blkd);
+            check (refused.isEmpty() && why == Proc::PresetWriteRefusal::CornerFixedPoint && blkd == 0,
+                   "saving over an assigned corner's own name while the pad drives is REFUSED, "
+                   "and the refusal names the corner so the editor can say which one");
+            check (Proc::presetFile ("zzz88-A").loadFileAsString() == before,
+                   "...and corner A's file is byte-for-byte untouched - refused, not half-written");
+
+            // NOT a lockout: every other name still saves mid-pad, exactly as before. A
+            // rule that stopped the user saving the blend they just dialled in would be a
+            // worse bug than the drain.
+            auto why2 = Proc::PresetWriteRefusal::None; int b2 = -1;
+            check (p->savePreset ("zzz88-blend", why2, b2).isNotEmpty()
+                       && why2 == Proc::PresetWriteRefusal::None,
+                   "...while saving that same blend under a name of its own is still allowed");
+            Proc::presetFile ("zzz88-blend").deleteFile();
+
+            // And the door that IS legitimate: inside corner A's Edit session the surface
+            // is corner A - beginPlaygroundCornerEdit put it there - so its own Save onto
+            // its own name goes through. That asymmetry is the whole rule.
+            check (p->beginPlaygroundCornerEdit (0), "corner A's Edit session opens");
+            check (p->savePlaygroundCornerAs (0, "zzz88-A") == "zzz88-A",
+                   "...and the corner's OWN Edit -> Save, onto its own name, still goes through");
+            p->endPlaygroundCornerEdit();
+
+            // Put file and corner back exactly as this block found them: the Edit -> Save
+            // above legitimately rewrote zzz88-A, and the measurement below compares the
+            // corner's store against what its file says.
+            Proc::presetFile ("zzz88-A").replaceWithText (before);
+            juce::String e3;
+            check (p->assignPlaygroundCorner (0, "zzz88-A", e3),
+                   "corner A restored from its original file for the measurement");
+            park (0.0f, 0.0f);
+        }
+
+        // ---- (a)/(b) SAVE MID-PAD, THEN RE-READ THE CORNER. Twenty round trips. ----
+        constexpr int kTrips = 20;
+        auto roundTrips = [&] (bool viaProjectReload, const char* label)
+        {
+            park (0.0f, 0.0f);
+            const auto store0 = p->getPlaygroundCornerParamsForTests (0);
+            const double rms0 = noteRms();
+            std::vector<double> sus, gain, rms;
+            sus.push_back (p->getPlaygroundCornerParamForTests (0, "ampSustain"));
+            gain.push_back (p->getPlaygroundCornerParamForTests (0, "masterGain"));
+            rms.push_back (rms0);
+            int firstDrift = -1;
+
+            for (int trip = 0; trip < kTrips; ++trip)
+            {
+                // Parked MID-PAD: the surface is the blend of A and B, not A.
+                park (0.5f, 0.0f);
+                // The user hits Save and types the name the corner already carries. This
+                // is the whole gesture - nothing exotic, nothing scripted.
+                p->savePreset ("zzz88-A");
+                if (viaProjectReload)
+                {
+                    // A genuine host project save + reload: setStateInformation re-reads
+                    // every corner from disk BY NAME (captureState stores only names).
+                    juce::MemoryBlock mb;
+                    p->getStateInformation (mb);
+                    auto q = std::make_unique<Proc>();
+                    q->prepareToPlay (psr, pblk);
+                    q->setStateInformation (mb.getData(), (int) mb.getSize());
+                    p = std::move (q);
+                }
+                else
+                {
+                    juce::String e2;
+                    p->assignPlaygroundCorner (0, "zzz88-A", e2);
+                }
+                park (0.0f, 0.0f);
+                const auto now = p->getPlaygroundCornerParamsForTests (0);
+                if (firstDrift < 0 && now != store0) firstDrift = trip;
+                sus.push_back (p->getPlaygroundCornerParamForTests (0, "ampSustain"));
+                gain.push_back (p->getPlaygroundCornerParamForTests (0, "masterGain"));
+                if (trip < 6 || trip == kTrips - 1) rms.push_back (noteRms());
+            }
+
+            std::printf ("  [%s] corner A's STORED ampSustain per cycle:", label);
+            for (size_t i = 0; i < sus.size() && i < 9; ++i) std::printf (" %.4f", sus[i]);
+            std::printf (" ... %.4f\n", sus.back());
+            std::printf ("  [%s] corner A's STORED masterGain  per cycle:", label);
+            for (size_t i = 0; i < gain.size() && i < 9; ++i) std::printf (" %.2f", gain[i]);
+            std::printf (" ... %.2f\n", gain.back());
+            std::printf ("  [%s] rendered RMS at corner A     :", label);
+            for (const double v : rms) std::printf (" %.5f", v);
+            std::printf ("\n");
+
+            // Is the fall MONOTONE and GEOMETRIC? Each cycle's remaining gap to B's own
+            // value, over the previous cycle's gap, is the blend weight; a CONSTANT
+            // ratio is the signature of a feedback loop closing, as opposed to noise or
+            // a one-off mistake. This is the claim the fix has to kill.
+            {
+                bool mono = true; double rMin = 1.0e9, rMax = -1.0e9;
+                for (size_t i = 1; i < sus.size(); ++i)
+                {
+                    if (sus[i] > sus[i - 1] + 1.0e-6) mono = false;
+                    const double gPrev = sus[i - 1] - 0.05, gNow = sus[i] - 0.05;
+                    if (gPrev > 1.0e-4) { rMin = std::min (rMin, gNow / gPrev); rMax = std::max (rMax, gNow / gPrev); }
+                }
+                std::printf ("  [%s] fall: monotone %s, gap ratio %.4f..%.4f, first drifting cycle %d\n",
+                             label, mono ? "YES" : "no", rMin, rMax, firstDrift);
+            }
+
+            const auto storeEnd = p->getPlaygroundCornerParamsForTests (0);
+            check (storeEnd == store0,
+                   viaProjectReload
+                     ? "twenty save + PROJECT RELOAD cycles leave corner A's stored values bit-identical"
+                     : "twenty save + RE-ASSIGN cycles leave corner A's stored values bit-identical");
+            const double rmsEnd = rms.back();
+            check (rmsEnd > rms0 * 0.98 && rmsEnd < rms0 * 1.02,
+                   viaProjectReload
+                     ? "...and the note at corner A is as loud as it started (no drain through the project)"
+                     : "...and the note at corner A is as loud as it started (no drain through the file)");
+        };
+        roundTrips (false, "save + re-assign");
+
+        // Start (b) from clean files: (a) has already rewritten zzz88-A if the bug is live.
+        p->assignPlaygroundCorner (0, {}, err);
+        p->assignPlaygroundCorner (1, {}, err);
+        writeCorners();
+        check (p->assignPlaygroundCorner (0, "zzz88-A", err), "A back on corner 0, from a clean file");
+        check (p->assignPlaygroundCorner (1, "zzz88-B", err), "B back on corner 1");
+        roundTrips (true, "save + project reload");
+
+        // ---- (c) AN UNTOUCHED CORNER-EDIT VISIT MUST CHANGE NOTHING ----------------
+        // A corner whose preset PREDATES a parameter is ordinary: any preset saved
+        // before a feature existed predates it, and five of the seven presets in the
+        // user's own folder predate at least one. Built here by deleting one parameter
+        // from a saved file, which is byte-for-byte what an older preset looks like.
+        {
+            p->assignPlaygroundCorner (0, {}, err);
+            p->assignPlaygroundCorner (1, {}, err);
+            writeCorners();
+            auto oldFile = Proc::presetFile ("zzz88-A");
+            bool stripped = false;
+            if (auto xml = juce::XmlDocument::parse (oldFile))
+            {
+                juce::XmlElement* victim = nullptr;
+                for (auto* ch : xml->getChildIterator())
+                    if (ch->getStringAttribute ("id") == "ampSustain") { victim = ch; break; }
+                if (victim != nullptr) { xml->removeChildElement (victim, true); stripped = xml->writeTo (oldFile); }
+            }
+            check (stripped, "corner A's preset is rewritten WITHOUT ampSustain (a preset that predates it)");
+
+            check (p->assignPlaygroundCorner (0, "zzz88-A", err), "the predating preset goes on corner 0");
+            check (p->assignPlaygroundCorner (1, "zzz88-B", err), "B on corner 1");
+
+            // Park MID-PAD so the blend is driving the surface, then visit corner 0's
+            // editor and leave without touching a thing.
+            park (0.5f, 0.0f);
+            const float blendSus = gp ("ampSustain");
+            const auto store0 = p->getPlaygroundCornerParamsForTests (0);
+            const float sus0   = p->getPlaygroundCornerParamForTests (0, "ampSustain");
+            park (0.0f, 0.0f);
+            const double rmsBefore = noteRms();
+
+            park (0.5f, 0.0f);
+            check (p->beginPlaygroundCornerEdit (0), "Edit opens on the corner whose preset predates ampSustain");
+            for (int i = 0; i < 8; ++i) frame();      // an untouched visit: nothing but time passes
+            p->endPlaygroundCornerEdit();
+            for (int i = 0; i < 8; ++i) frame();
+
+            const auto store1 = p->getPlaygroundCornerParamsForTests (0);
+            const float sus1  = p->getPlaygroundCornerParamForTests (0, "ampSustain");
+            park (0.0f, 0.0f);
+            const double rmsAfter = noteRms();
+            std::printf ("  untouched corner-edit visit: the blend was driving ampSustain at %.4f; "
+                         "corner 0's stored value %.4f -> %.4f (default %.4f); \"*\" says %s; "
+                         "RMS at corner A %.5f -> %.5f\n",
+                         blendSus, sus0, sus1, paramDefault ("ampSustain"),
+                         p->isPlaygroundCornerEdited (0) ? "EDITED" : "nothing happened",
+                         rmsBefore, rmsAfter);
+            check (store1 == store0,
+                   "an UNTOUCHED corner-edit visit leaves the corner's stored values exactly as it found them");
+            check (! p->isPlaygroundCornerEdited (0),
+                   "...and the \"*\" is right that nothing happened");
+            check (rmsAfter > rmsBefore * 0.98 && rmsAfter < rmsBefore * 1.02,
+                   "...and corner A still sounds exactly as loud as before the visit");
+
+            // ---- (d) ONE ANSWER for a parameter the corner's preset predates -------
+            // The corner's own preset has no value for ampSustain, so the corner must
+            // mean the parameter's DEFAULT - the rule ParamBank::fill already applies in
+            // MIX mode and cornerValueOr already documents. Anything else makes the
+            // vertex path-dependent: parked exactly on corner 0 the value would be
+            // whatever the last write happened to leave there.
+            const float dflt = paramDefault ("ampSustain");
+            park (0.0f, 0.0f);
+            const float vertexFresh = gp ("ampSustain");
+            park (0.5f, 0.0f);
+            const float mid = gp ("ampSustain");
+            park (1.0f, 0.0f);
+            park (0.0f, 0.0f);
+            const float vertexAfter = gp ("ampSustain");
+            std::printf ("  predated parameter: default %.4f; at corner 0 fresh %.4f, "
+                         "at mid-pad %.4f, back at corner 0 %.4f\n",
+                         dflt, vertexFresh, mid, vertexAfter);
+            check (std::abs (vertexFresh - vertexAfter) < 1.0e-4f,
+                   "the vertex value for a predated parameter is NOT path-dependent");
+            check (std::abs (vertexFresh - dflt) < 1.0e-4f,
+                   "...and it is the parameter's DEFAULT - the one answer morph, mix and edit share");
+            // STRICTLY BETWEEN, not merely "within the range". Written as a range first,
+            // this assertion PASSED while the parameter read 0.0500 - corner B's own
+            // value - at every point on the pad including corner 0's vertex, which is
+            // the precise symptom (hunt entry 11) it exists to catch: B's value is an
+            // endpoint of the range, so a range test can never see 100%-ruled-by-B.
+            const float lo = std::min (dflt, 0.05f), hi = std::max (dflt, 0.05f);
+            check (mid > lo + 0.05f * (hi - lo) && mid < hi - 0.05f * (hi - lo),
+                   "...so mid-pad really blends the two corners instead of being ruled 100% by one");
+        }
+
+        p->assignPlaygroundCorner (0, {}, err);
+        p->assignPlaygroundCorner (1, {}, err);
+    }
+
+    // --- the audit: what did this suite leave behind, and where? ---------------------
+    {
+        std::printf ("\npreset folders, before and after:\n");
+        // (1) THE SCRATCH FOLDER: the same per-site cleanup audit as before. Every file
+        // still here is a block that saved a preset and did not remove it.
+        const auto leftBehind = presetFolderInventory (scratchPresets);
+        std::printf ("  scratch folder %s: %d preset(s) left behind%s%s\n",
+                     scratchPresets.getFileName().toRawUTF8(), leftBehind.size(),
                      leftBehind.isEmpty() ? "" : ": ",
                      leftBehind.joinIntoString (", ").toRawUTF8());
-        // The files are gone either way - the user's folder is not left dirty. But this
-        // is only an ASSERTION ABOUT THIS RUN when this run had the folder to itself:
-        // a second copy of the suite writes the very same scratch names into the very
-        // same folder, and blaming a leak on whichever process happened to audit last is
-        // how a green suite is made to look broken. That is not hypothetical - it is
-        // where "run48-A.gsting" came from while this binary could no longer spell it.
-        if (foreignScratchAtStart > 0)
-            std::printf ("  (not asserted: another run of this suite was using this folder)\n");
-        else
-            check (leftBehind.isEmpty(),
-                   "the suite leaves NOTHING behind in the user's preset folder");
+        check (leftBehind.isEmpty(),
+               "every block that saved a preset cleaned it up again");
+
+        // (2) THE USER'S OWN FOLDER. What is asserted here is a fact about THIS PROCESS,
+        // not about the directory, and the difference matters.
+        //
+        // The tempting assertion - "the user's folder is byte-for-byte the list it was" -
+        // is not this suite's to make: measured on 2026-08-29, two RhythmVerify processes
+        // running at once made it fail BOTH WAYS in consecutive runs of the same binary
+        // (5 -> 7 presets, then 7 -> 5) as the other process's presets appeared and were
+        // cleaned up again. A verdict that flips on what a different program is doing is
+        // the same non-determinism that made every other verdict here untrustworthy, and
+        // it would have blamed this run for someone else's files.
+        //
+        // What this process CAN prove is that it never had the user's folder open. The
+        // redirect is installed before the first processor exists, and every block that
+        // narrows it further restores what it FOUND, so the folder in force at the end
+        // must still be the scratch one. A block that restored to {} instead of to its
+        // predecessor - exactly what run 51's ScratchFolder guard did until it was fixed,
+        // which would have handed twenty overwrites of one name to the user's folder -
+        // lands here as a failure, deterministically, with no other process able to
+        // affect the verdict.
+        check (FractalAdditiveAudioProcessor::getPresetFolder() == scratchPresets,
+               "the preset-folder redirect held for the WHOLE run: no block left the "
+               "user's own folder in force under a later block's saves");
+
+        FractalAdditiveAudioProcessor::setPresetFolderForTests ({});
+        scratchPresets.deleteRecursively();
+        const auto realNow = presetFolderInventory (realPresets);
+        // Still REPORTED as a list, not a count - a run that deleted one patch and added
+        // one of its own would pass a count - but reported, not asserted, and it names
+        // the only thing it can honestly mean.
+        std::printf ("  the user's folder: %d preset(s) before, %d after%s\n",
+                     presetsAtStart.size(), realNow.size(),
+                     realNow == presetsAtStart
+                       ? "  (unchanged)"
+                       : "  <- CHANGED, and not by this run: something else is writing it"
+                         " (a second RhythmVerify? the plugin open in a host?)");
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);

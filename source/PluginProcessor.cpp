@@ -4,6 +4,7 @@
 #include "BinaryData.h"
 
 #include <string>
+#include <limits>
 #include <unordered_map>
 
 namespace
@@ -4233,8 +4234,21 @@ void FractalAdditiveAudioProcessor::setStateInformation (const void* data, int s
 // File presets (.gsting XML). User presets live in Documents/Galactic Sting/Presets;
 // factory presets shipped in a "Presets" folder next to the binary are copied in on
 // first run so they "come with the download".
+// TESTS ONLY (see the header). Never written outside a verifier: production reads it
+// once per call and finds it empty.
+static juce::File presetFolderOverrideForTests;
+
+void FractalAdditiveAudioProcessor::setPresetFolderForTests (const juce::File& dir)
+{
+    presetFolderOverrideForTests = dir;
+    if (dir != juce::File()) dir.createDirectory();
+}
+
 juce::File FractalAdditiveAudioProcessor::getPresetFolder()
 {
+    if (presetFolderOverrideForTests != juce::File())
+        return presetFolderOverrideForTests;
+
     auto dir = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
                    .getChildFile ("Galactic Sting").getChildFile ("Presets");
     if (! dir.exists())
@@ -4283,21 +4297,85 @@ bool FractalAdditiveAudioProcessor::presetHasDrifted() const
     return false;
 }
 
-juce::String FractalAdditiveAudioProcessor::savePreset (const juce::String& name)
+//==============================================================================
+// THE FIXED-POINT RULE, and the ONLY place in the program a .gsting is ever written.
+//
+//   A CORNER IS A FIXED POINT OF THE BLEND. What is captured, saved or re-read for a
+//   corner must be the corner's OWN stored state, never the surface the blend is
+//   currently driving.
+//
+// CASE #88, the user's oldest report: "si por ejemplo voy adelante y atras entre dos
+// presets uno con menos amp sustain que el otro, el volumen va bajando hasta
+// silenciarse... curiosamente con el modo mix pasa lo mismo."
+//
+// It never reproduced in memory, and could not: ten A->B->A round trips through the
+// real drivePlayground drift nothing (run 47). THE LOOP CLOSES THROUGH THE FILE. While
+// the pad drives, the live control surface is the blend's OUTPUT; a corner's file is
+// the blend's INPUT. Save a preset under an assigned corner's own name while parked
+// mid-pad and that corner's file becomes blend(A, B). Re-assign it - or simply reopen
+// the project, because captureState stores corner NAMES and setStateInformation re-reads
+// every one of them from disk - and the corner IS the previous interpolation's output.
+// The next trip blends that with B again, so the corner walks towards B by the blend
+// weight every cycle. Measured, run 51: stored ampSustain 0.9000 0.4750 0.2625 0.1563
+// ... 0.0501, masterGain 0.00 -9.00 -13.50 ... -17.99 dB, rendered RMS 0.04097 ->
+// 0.00029 (-43 dB), monotone, gap ratio 0.4706..0.5075. A geometric series, exactly as
+// reported, through the re-assign door AND through a genuine host project reload.
+//
+// So while the playground is driving, a preset write may not land on the file an
+// assigned corner points at. The one way to write a corner's file is the corner's own
+// Edit -> Save (savePlaygroundCornerAs), where the controls have been STANDING IN for
+// that corner since beginPlaygroundCornerEdit pushed it onto them, so the surface is
+// the corner's own state and not a blend of anything.
+//
+// This lives HERE, in one function every write goes through, rather than as a check at
+// savePreset and another at savePlaygroundCornerAs, because there is no such thing as
+// remembering to add the third one. And it REFUSES OUT LOUD: the reason travels back to
+// the editor, which puts it in front of the user in their own language. A silent no-op
+// would be a different bug of the same family.
+bool FractalAdditiveAudioProcessor::writePresetFile (const juce::String& safeName,
+                                                     const juce::ValueTree& state,
+                                                     bool isCornerOwnSave,
+                                                     PresetWriteRefusal& why, int& corner)
+{
+    why    = PresetWriteRefusal::None;
+    corner = -1;
+
+    if (safeName.isEmpty())
+    { why = PresetWriteRefusal::BadName; return false; }
+
+    if (! isCornerOwnSave && pgActive)
+        for (int i = 0; i < kPlaygroundCorners; ++i)
+            if (pgCorner[(size_t) i].assigned() && pgCorner[(size_t) i].name == safeName)
+            {
+                why = PresetWriteRefusal::CornerFixedPoint;
+                corner = i;
+                return false;
+            }
+
+    auto xml = state.createXml();
+    if (xml == nullptr || ! xml->writeTo (presetFile (safeName)))
+    { why = PresetWriteRefusal::WriteFailed; return false; }
+    return true;
+}
+
+juce::String FractalAdditiveAudioProcessor::savePreset (const juce::String& name,
+                                                        PresetWriteRefusal& why, int& corner)
 {
     // Returns the name actually stored (filename characters are sanitised, so it
-    // can differ from what was typed), or empty on failure - the editor shows it.
+    // can differ from what was typed), or empty on failure - the editor shows it,
+    // and `why` always says which of the reasons it was.
     const auto safe = juce::File::createLegalFileName (name).trim();
-    if (safe.isEmpty())
+    if (! writePresetFile (safe, captureState(), false, why, corner))
         return {};
-    auto file = presetFile (safe);
-    if (auto xml = captureState().createXml())
-        if (xml->writeTo (file))
-        {
-            snapshotLoadedPreset (safe);
-            return safe;
-        }
-    return {};
+    snapshotLoadedPreset (safe);
+    return safe;
+}
+
+juce::String FractalAdditiveAudioProcessor::savePreset (const juce::String& name)
+{
+    PresetWriteRefusal why = PresetWriteRefusal::None;
+    int corner = -1;
+    return savePreset (name, why, corner);
 }
 
 bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
@@ -4357,6 +4435,18 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
 // log-vs-linear choice per family, nearest-corner-with-hysteresis) and in
 // spectrum::blendTemplates (the partial-list crossfade); this is the wiring.
 //==============================================================================
+// Every parameter, at its DEFAULT. The base a corner is built on, so the store is total
+// from the first instant (see PlaygroundCorner::params): a preset that predates a
+// parameter means the parameter's default, in morph, in mix and in corner edit alike.
+void FractalAdditiveAudioProcessor::fillCornerDefaults (PlaygroundCorner& c) const
+{
+    const auto& all = getParameters();
+    c.params.assign ((size_t) all.size(), 0.0f);
+    for (int i = 0; i < all.size(); ++i)
+        if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]))
+            c.params[(size_t) i] = p->convertFrom0to1 (p->getDefaultValue());
+}
+
 bool FractalAdditiveAudioProcessor::assignPlaygroundCorner (int corner, const juce::String& presetName,
                                                             juce::String& errorOut)
 {
@@ -4393,16 +4483,16 @@ bool FractalAdditiveAudioProcessor::assignPlaygroundCorner (int corner, const ju
         c.name = presetName;
 
         // Parameter values, indexed by getParameters() order (see PlaygroundCorner).
+        // DEFAULTS FIRST, then whatever the file carries on top: that is what makes the
+        // store TOTAL, and "the parameter's default" the one answer for a parameter this
+        // preset predates. Never the live patch's value - a corner must sound the same
+        // whatever happened to be loaded when it was dropped here.
         const auto& all = getParameters();
-        c.params.assign ((size_t) all.size(), 0.0f);
-        c.hasParam.assign ((size_t) all.size(), 0);
+        fillCornerDefaults (c);
         for (int i = 0; i < all.size(); ++i)
             if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]))
                 if (auto child = tree.getChildWithProperty ("id", p->paramID); child.isValid())
-                {
-                    c.params[(size_t) i]   = (float) (double) child.getProperty ("value");
-                    c.hasParam[(size_t) i] = 1;
-                }
+                    c.params[(size_t) i] = (float) (double) child.getProperty ("value");
 
         // The Custom Engine's own scale, and the per-partial amplitude edits: both are
         // state, not parameters, and both are part of what this corner SOUNDS like.
@@ -4639,7 +4729,16 @@ void FractalAdditiveAudioProcessor::endPlaygroundCornerEdit()
     pgDirty = true;   // the morph owns the controls again: re-apply EVERYTHING
 }
 
-// Corner -> the live control surface. Only what a corner actually owns (rule 5).
+// Corner -> the live control surface. Everything a corner owns, and only that (rule 5:
+// the tuning and the point are excluded and must survive untouched).
+//
+// EVERY non-excluded parameter is written, without exception. This used to skip the
+// parameters the corner's preset predated, which left the BLEND's value for them
+// standing on a surface that was supposed to be the corner - and the next
+// pullPlaygroundCornerEdit read it straight back into the corner store, so an untouched
+// visit walked the corner towards the other one while the "*" said nothing had happened
+// (hunt entry 10, run 51(c): stored ampSustain nan -> 0.0500, the blend's value).
+// Because the store is total there is now nothing to skip.
 void FractalAdditiveAudioProcessor::pushCornerToLiveSurface (int corner)
 {
     const auto& c = pgCorner[(size_t) corner];
@@ -4654,7 +4753,7 @@ void FractalAdditiveAudioProcessor::pushCornerToLiveSurface (int corner)
                 == presetmorph::MorphSpace::Excluded)
             continue;
         double v = 0.0;
-        if (! c.value (i, v)) continue;   // the corner's preset predates this parameter
+        if (! c.value (i, v)) continue;   // not a parameter at all (see PlaygroundCorner::value)
         const float norm = juce::jlimit (0.0f, 1.0f, p->convertTo0to1 ((float) v));
         if (std::abs (p->getValue() - norm) > 1.0e-6f)
             p->setValueNotifyingHost (norm);
@@ -4674,10 +4773,7 @@ void FractalAdditiveAudioProcessor::pullPlaygroundCornerEdit()
     bool changed = false;
     const auto& all = getParameters();
     if (c.params.size() != (size_t) all.size())
-    {
-        c.params.assign ((size_t) all.size(), 0.0f);
-        c.hasParam.assign ((size_t) all.size(), 0);
-    }
+        fillCornerDefaults (c);   // total, always - never a row of zeroes
     for (int i = 0; i < all.size(); ++i)
     {
         auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]);
@@ -4691,10 +4787,9 @@ void FractalAdditiveAudioProcessor::pullPlaygroundCornerEdit()
         // through setValue (captureState relies on the same fact), so a corner cannot
         // absorb an LFO's momentary displacement and freeze it as a value.
         const float v = p->convertFrom0to1 (p->getValue());
-        if (! c.hasParam[(size_t) i] || std::abs (c.params[(size_t) i] - v) > 1.0e-7f)
+        if (std::abs (c.params[(size_t) i] - v) > 1.0e-7f)
         {
-            c.params[(size_t) i]   = v;
-            c.hasParam[(size_t) i] = 1;
+            c.params[(size_t) i] = v;
             changed = true;
         }
     }
@@ -4763,13 +4858,15 @@ juce::String FractalAdditiveAudioProcessor::savePlaygroundCornerAs (int corner, 
     if (corner != pgEditCorner) return {};
 
     const auto safe = juce::File::createLegalFileName (name).trim();
-    if (safe.isEmpty()) return {};
 
-    // The edited corner is standing ON the live control surface, so captureState()
-    // describes it exactly - the very tree savePreset would write for it.
-    auto file = presetFile (safe);
-    auto xml  = captureState().createXml();
-    if (xml == nullptr || ! xml->writeTo (file))
+    // The edited corner is standing ON the live control surface - beginPlaygroundCornerEdit
+    // pushed every one of its values there and pullPlaygroundCornerEdit has been reading
+    // them back ever since - so captureState() describes THAT CORNER, not a blend. This
+    // is the one save the fixed-point rule lets through onto a corner's own file, and
+    // that is why: here the surface IS the corner's stored state (see writePresetFile).
+    PresetWriteRefusal why = PresetWriteRefusal::None;
+    int blocked = -1;
+    if (! writePresetFile (safe, captureState(), true, why, blocked))
         return {};
 
     // The corner now IS that file: renamed, and the "*" goes away because the edits it
@@ -4780,6 +4877,21 @@ juce::String FractalAdditiveAudioProcessor::savePlaygroundCornerAs (int corner, 
     c.edited = false;
     ++c.rev;
     return safe;
+}
+
+float FractalAdditiveAudioProcessor::getPlaygroundCornerParamForTests (int corner,
+                                                                       const juce::String& id) const
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners))
+        return std::numeric_limits<float>::quiet_NaN();
+    // NaN means "this corner has NO stored value for that parameter" - which, before the
+    // fixed-point fix, is the state an untouched corner-edit visit turned into "the
+    // blend's value, and the * says nothing happened" (hunt entry 10).
+    const auto& c = pgCorner[(size_t) corner];
+    double v = 0.0;
+    if (! c.value (paramIndexOf (id.toRawUTF8()), v))
+        return std::numeric_limits<float>::quiet_NaN();
+    return (float) v;
 }
 
 int FractalAdditiveAudioProcessor::getPlaygroundAssignedCount() const
@@ -4814,11 +4926,10 @@ int FractalAdditiveAudioProcessor::paramIndexOf (const char* id) const
     return -1;
 }
 
-// A corner preset's value for a parameter. The fallback is the parameter's DEFAULT,
-// never the live patch: a corner must sound the same whatever was loaded when it was
-// assigned. One helper, because the corner compile and the adaptive-corner compile
-// both need it and two copies would eventually disagree about what "the corner's
-// value" means.
+// A corner's value for a parameter, by id. The store is total (fillCornerDefaults ran
+// before the file was read), so the default a preset that predates the parameter means
+// is already sitting in it - this is a lookup, not a fallback, and the last place that
+// could have held a second opinion about what "the corner's value" means is gone.
 float FractalAdditiveAudioProcessor::cornerValueOr (const PlaygroundCorner& c, const char* id) const
 {
     double v = 0.0;
@@ -5017,7 +5128,7 @@ void FractalAdditiveAudioProcessor::applyCornerAdaptResult (PlaygroundCorner& c,
     {
         const int i = paramIndexOf (id);
         if (juce::isPositiveAndBelow (i, (int) c.params.size()))
-        { c.params[(size_t) i] = v; c.hasParam[(size_t) i] = 1; }
+            c.params[(size_t) i] = v;
     };
     setParam ("timbreOn", 1.0f);        // the adapted spectrum replaces the corner's
     setParam ("partialManual", 0.0f);   // engine, exactly as the follower replaces the live one
@@ -5556,18 +5667,28 @@ void FractalAdditiveAudioProcessor::applyPlaygroundContinuous (const double w[kP
         {
             // Nearest corner - one winner for every discrete setting at once, so the
             // engine, the scale and the manual switch can never come from three
-            // different presets (see nearestCorner in PresetMorph.h).
+            // different presets (see nearestCorner in PresetMorph.h). The winner ALWAYS
+            // has a value (the store is total), so a corner whose preset predates a
+            // discrete setting now reproduces that setting's default at its own vertex
+            // instead of leaving whatever the pad last wrote - which is what left a
+            // corner that never mentioned mono permanently monophonic (hunt entry 8).
             if (pgWinner < 0 || ! pgCorner[(size_t) pgWinner].value (i, target))
                 continue;
         }
         else
         {
+            // Every corner with weight contributes, always: the store is total, so the
+            // weights are never renormalised over "the corners that happen to know this
+            // parameter". That renormalisation is what let one corner rule a parameter
+            // 100 % across the whole pad and made the vertex path-dependent (hunt entry
+            // 11), and it disagreed with MIX mode, where ParamBank::fill has always used
+            // the default. One rule now, in both modes.
             double v[kPlaygroundCorners], ww[kPlaygroundCorners];
             int n = 0;
             for (int k = 0; k < kPlaygroundCorners; ++k)
                 if (w[k] > 0.0 && pgCorner[(size_t) k].value (i, v[n]))
                     ww[n++] = w[k];
-            if (n == 0) continue;      // no assigned corner knows this parameter
+            if (n == 0) continue;      // nothing assigned at all
             target = presetmorph::blendScalar (v, ww, n, space);
         }
 
