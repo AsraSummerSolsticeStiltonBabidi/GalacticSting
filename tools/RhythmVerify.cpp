@@ -7781,11 +7781,25 @@ int main()
             const double d4 = bench (4, 8, 32, "extreme 32 notes: 4 corners @default 8");
             const double r0 = bench (0, 0, 4, "realistic chord:  main alone");
             const double r4 = bench (4, 8, 4, "realistic chord:  4 corners @default 8");
-            juce::ignoreUnused (e0, r0);
+            juce::ignoreUnused (e0);
             check (d4 < e4 * 0.75,
                    "the VISIBLE voice control genuinely buys back CPU (default 8 well under 32)");
-            check (r4 < 10.0,
-                   "a realistic mix - 4 corners + main, default voice budget - fits the 10.67 ms block budget");
+            // AGAINST THIS RUN'S OWN MAIN ENGINE, not against a stopwatch. `r4 < 10.0 ms`
+            // was a wall-clock reading on a shared machine: the same binary measured this
+            // pair at 1.325/4.644 and at 0.766/2.288 ms per block, a 2x swing for reasons
+            // entirely outside this file. A number that moves like that cannot be a
+            // verdict - it goes red on an innocent change and the first person it
+            // inconveniences deletes it. The absolute ms/block is what a user needs to be
+            // told and it is printed above; what is ASSERTED is the structural claim, and
+            // it is a ratio, so machine speed cancels: four corners plus the main engine
+            // still tracking underneath is FIVE engines rendering the same chord, and the
+            // mix must cost no more than that - no per-corner overhead beyond the audio
+            // each corner actually renders. Measured 3.0-3.5x.
+            const double mixRatio = r0 > 0.0 ? r4 / r0 : 0.0;
+            std::printf ("  the mix costs %.2fx the main engine alone, measured in the same run"
+                         " (4 corners + main = 5 engines)\n", mixRatio);
+            check (mixRatio > 0.0 && mixRatio < 5.0,
+                   "a realistic mix costs no more than its five engines - the corners add no overhead of their own");
         }
 
         fileA.deleteFile();
@@ -8322,8 +8336,22 @@ int main()
             const auto dflt = report ("the DEFAULT spectrum", 60);
             check (dflt.second.second > dflt.first.second * 2,
                    "Shepard mode really multiplies the partial set (the copies are all sounding)");
-            check (dflt.second.first < 0.5 * blockMs,
-                   "and at the default spectrum one Shepard voice renders in well under realtime");
+            // "WELL UNDER REALTIME" USED TO BE A STOPWATCH READING (< 0.5 x the block's own
+            // duration), and it was measured swinging 3.4x - 1.31 to 4.45 ms/block - between
+            // runs of the same binary on the same machine. A number that moves for reasons
+            // outside this file cannot be an assertion. The absolute cost is still printed,
+            // in ms and as a percentage of realtime, because that is what a user has to be
+            // told; what is ASSERTED is the engineering claim underneath it, and it is a
+            // ratio, so machine speed cancels: a Shepard partial is not a more expensive
+            // kind of partial than an ordinary one. Measured 0.9x at C4.
+            const double oscOff = dflt.first.first  / std::max (1.0, (double) dflt.first.second);
+            const double oscOn  = dflt.second.first / std::max (1.0, (double) dflt.second.second);
+            std::printf ("    per oscillator: %.4f us off, %.4f us on (x%.2f) - the mode's cost is its"
+                         " oscillator COUNT, not a more expensive oscillator\n",
+                         oscOff * 1000.0, oscOn * 1000.0, oscOff > 0.0 ? oscOn / oscOff : 0.0);
+            check (oscOff > 0.0 && oscOn < oscOff * 2.5,
+                   "and a Shepard copy's partial costs no more than an ordinary partial (the mode buys"
+                   " oscillators, it does not make them dearer)");
 
             // ...and at a DENSE one, which is where the honest ceiling is. The mode
             // multiplies the partial count by however many copies are inside the window,
