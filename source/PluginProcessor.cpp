@@ -307,6 +307,24 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "morphTime", 1 }, "Morph Time", timeRange (5.0f), 0.300f));
 
+    //-- DRY/WET TRANSITION: the OTHER way to make a spectrum change smooth, and a
+    //   deliberately independent one. Morph glides partial FREQUENCIES from where they are
+    //   to where they are going (a per-partial pitch bend); this CROSSFADES - the previous
+    //   spectrum fades out while the new one fades in, simultaneously, over this time, with
+    //   no frequency movement at all. It is the alternative the user asked for ("es una
+    //   alternativa al pitch bending de morph"), not a refinement of it.
+    //
+    //   THE TWO CANNOT BOTH ACT. A voice has exactly one crossfade machine - the
+    //   phase[]/alignPhase[] bank pair with a single weight (see AdditiveVoice.h) - and
+    //   both features are that machine driven by different rules. MORPH WINS: with Morph on,
+    //   this is inert and the panel greys it out and says why, rather than leaving the user
+    //   to believe two smoothings are running. Same range and same skew as Morph Time, so
+    //   the fader feels identical.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "dryWet", 1 }, "Dry/Wet Transition", false));
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "dryWetTime", 1 }, "Dry/Wet Time", timeRange (5.0f), 0.300f));
+
     //-- Tuning ----------------------------------------------------------------
     // Index 0 (plain 12ED2) is no longer OFFERED - MTS-ESP already falls back to
     // 12-TET on its own when no master is connected, so it is the honest default

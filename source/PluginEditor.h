@@ -389,6 +389,13 @@ public:
     // exactly as the 30 Hz timer does. The verifier has no message loop, so a pencil
     // on/off cycle is otherwise unreachable - and that cycle is the bug.
     void refreshSlopeFreezeForTests() { refreshSlopeFreeze(); }
+    // Test hooks (RhythmVerify run 50): "Morph wins" is a claim about the SCREEN, so the
+    // verifier drives the same call the timer makes and reads the same two components the
+    // user would click. The enablement is deliberately NOT re-derived from the parameter
+    // here - that would be the test asserting its own arithmetic instead of the panel's.
+    void applyDryWetEnablementForTests() { applyDryWetEnablement(); }
+    bool dryWetControlsEnabledForTests() const
+    { return dryWetToggle.isEnabled() && dryWetTimeFader.isEnabled(); }
     // Test hook (RhythmVerify): click an engine chip the way a hand does. Exists for
     // the one behaviour a probe of engineInForce cannot reach: with NO scale loaded,
     // clicking CUSTOM must still open that view (it is the only place the Load button
@@ -4093,6 +4100,13 @@ private:
     juce::String presetTextBeforeCornerEdit;
     juce::Rectangle<int> titleClickArea; // the title squares; clicking them plays the jingle
     juce::ToggleButton primeToggle[9], morphToggle;
+    // DRY/WET TRANSITION - the crossfade alternative to Morph, sitting between it and
+    // OCTAVE RANGE because that is where the user asked for it and because it belongs
+    // there: the two are the two answers to "a spectrum change must not be abrupt".
+    // Morph WINS when both are on (they are one crossfade machine per voice - see
+    // AdditiveVoice.h), so these two are DISABLED and the painted sub-label wears an
+    // amber MORPH ON tag, the same idiom AMP DECAY uses when manual amps freeze it.
+    juce::ToggleButton dryWetToggle;
     juce::ToggleButton temperToggle; // lives INSIDE the Custom Engine box (the scale it bypasses)
     std::unique_ptr<ButtonAttachment> temperAtt;
     // SPECTRUM panel: the two ENGINES as chips - the TITLE ROW of the one shared
@@ -4180,7 +4194,7 @@ private:
     // -1 = not applied yet, so the first timer tick (and every language switch, which
     // resets it) writes the slope fader's frozen/normal look and its bilingual tooltip.
     int   lastManualFrozenShown = -1;
-    juce::Slider       morphTimeFader;
+    juce::Slider       morphTimeFader, dryWetTimeFader;
     juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
     int                undoTxnTick = 0; // paces the tuning-bank combo refresh
     juce::String       lastSeenTimbreSource; // re-seeds intervalEdit when the timbre changes elsewhere
@@ -4469,7 +4483,7 @@ private:
     juce::GroupComponent gFilter, gAmpEnv, gPitchEnv, gTuning, gSpecScale, gScaleDiss;
     juce::Label lblBaseN, lblBasePitch, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
                 lblTimbreRepeats, lblBend, lblPeriod, lblSteps, lblRefA, lblRefHz, lblPitchAmt,
-                lblMorphTime, lblTuningBank, tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel,
+                lblMorphTime, lblDryWetTime, lblTuningBank, tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel,
                 tuningPeriodLbl;
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], pitchAdsrLbl[4], primeLbl[9];
 
@@ -4479,8 +4493,8 @@ private:
     std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4], pitchAdsrAtt[4];
     std::unique_ptr<ComboBoxAttachment> basePitchAtt, phaseAtt,
                                         primeModeAtt, tuningAtt, bendAtt, tuningBankAtt;
-    std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], morphAtt;
-    std::unique_ptr<SliderAttachment>   morphTimeAtt;
+    std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], morphAtt, dryWetAtt;
+    std::unique_ptr<SliderAttachment>   morphTimeAtt, dryWetTimeAtt;
 
     //== MONOPHONIC GLIDE (the PITCH tab of the shared envelope box) ============
     // The toggle sits on the PITCH tab because that is where the user asked for it, and
@@ -4542,7 +4556,12 @@ private:
     juce::Rectangle<int> engineBoxBounds;
     juce::Rectangle<int> hcBase, hcHarm, hcPrime;  // harmonic view's sub-cells (empty in custom view)
     juce::Rectangle<int> bothEnginesBounds;    // nested: what applies to EITHER engine
-    juce::Rectangle<int> beSlope, beFractal, beMorph, beRange; // its sub-cells
+    juce::Rectangle<int> beSlope, beFractal, beMorph, beDryWet, beRange; // its sub-cells
+    // Whether MORPH is on, as it was the last time the Dry/Wet controls were enabled or
+    // disabled. -1 = never applied, so the first timer tick writes it. Cached for the same
+    // reason lastManualFrozenShown is: setEnabled repaints, and this runs at timer rate.
+    int lastMorphWinsShown = -1;
+    void applyDryWetEnablement();
     juce::Rectangle<int> essentialsBounds;     // Essentials macro-group frame
     juce::Rectangle<int> ecPhase, ecGain, ecRef, ecOct; // its 4 sub-cells (dividers/labels in paint)
     juce::Rectangle<int> lBarBounds, lFootBounds; // the inverted-L Tuning box: dissonance BAR (right) + controls FOOT (bottom-left)

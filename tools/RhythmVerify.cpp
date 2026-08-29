@@ -9485,6 +9485,414 @@ int main()
         p->setPlayHead (nullptr);
     }
 
+    // --- run 50: the DRY/WET TRANSITION - a crossfade, not a bend ---------------------
+    // "cuando esta en on actua de manera similar a morph, en cada cambio de espectro no hay
+    // brusquedad si no un fade in fade out simultaneo de el estado previo al estado nuevo
+    // del espectro, es una alternativa al pitch bending de morph."
+    //
+    // Morph BENDS: mid-glide a partial sounds at a frequency that is in neither spectrum.
+    // This CROSSFADES: mid-transition BOTH spectra sound, each at its own frequencies, and
+    // nothing is ever heard in between. That difference is the whole feature, it is audible,
+    // and it is invisible to every other check in this build - so it is measured here, in
+    // the rendered audio, with the same click metric run 26 uses standing beside it.
+    //
+    // THE SPECTRUM IS CHOSEN TO MAKE THE QUESTION ANSWERABLE: a typed Custom Engine timbre
+    // of exactly two partials, 1 and 2 of the played pitch, replaced by exactly two, 1 and
+    // 3. Same count, so nothing appears or disappears; a flat amplitude curve, so both are
+    // easy to find; and the one partial that changes moves far enough (523 -> 785 Hz at
+    // middle C) that its morph midpoint (641 Hz) is five FFT bins clear of both ends.
+    {
+        std::printf ("dry/wet transition (a crossfade between two standing spectra):\n");
+        constexpr int    eb  = 64;
+        constexpr double srD = 48000.0;
+        constexpr int    fo  = 11, fftN = 1 << fo;   // 42.7 ms window, 23.4 Hz bins
+
+        struct Take
+        {
+            std::vector<float> x;
+            size_t change = 0;            // sample at which the new template went live
+            double f0 = 0.0;
+            double jumpPeak = 0.0;        // run 26's metric over the whole take
+            double endJump  = 0.0;        // ...and over the 40 ms around the hand-over
+            int    oldN = 0, newN = 0;
+            bool   loaded = false;
+            double oldTop = 0.0, newTop = 0.0;   // the one ratio that moves, before and after
+        };
+
+        auto take = [&] (bool morphOn, bool dwOn, float time, double tailS) -> Take
+        {
+            Take t;
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (srD, eb);
+            auto s = [&] (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            // A flat, fully sustained envelope and no fractal: anything that moves in this
+            // recording is the transition, not the ADSR and not a convolution.
+            s ("ampAttack", 0.002f); s ("ampDecay", 0.002f); s ("ampSustain", 1.0f);
+            s ("ampCurveA", 0.0f);   s ("ampCurveD", 0.0f);
+            // Slope 1, NOT flat. A flat spectrum would give the two typed timbres identical
+            // amplitudes, and then the hand-over at the end of a transition - curAmp taking
+            // over the values the incoming bank was rendering - would be a copy of one
+            // number onto the same number, i.e. untestable. At slope 1 the moving partial is
+            // at 1/2 before and 1/3 after, so the hand-over has something to get wrong.
+            s ("fractalLevel", 0.0f); s ("curveSlope", 1.0f); s ("timbreRepeats", 1.0f);
+            s ("morph",  morphOn ? 1.0f : 0.0f); s ("morphTime",  time);
+            s ("dryWet", dwOn    ? 1.0f : 0.0f); s ("dryWetTime", time);
+
+            // The Custom Engine, typed. loadTimbreText only PARSES and stores - the
+            // template is compiled by the message-thread poll, which an offline harness has
+            // to drive itself, exactly as every other run here does.
+            // AND WAIT FOR THE COMPILE - on the CONDITION, not on the clock. The template is
+            // built on the engine's worker thread while rendering offline runs thousands of
+            // times faster than real time, so a hundred blocks here are microseconds of wall
+            // time and the "new" spectrum is still the old one. A fixed sleep is a race and
+            // this file has watched it lose: at 30 ms, one take in nine came back on the
+            // startup harmonic spectrum (1024 partials) and every reading taken from it was
+            // of a spectrum that never changed - a silent pass, or a false failure.
+            const auto awaitTemplate = [&] (juce::uint32 differentFrom) -> bool
+            {
+                for (int i = 0; i < 400; ++i)   // 2 s of patience, then give up and say so
+                {
+                    const auto* tt = p->getLiveTemplate();
+                    if (tt != nullptr && tt->generation != differentFrom) return true;
+                    juce::Thread::sleep (5);
+                }
+                return false;
+            };
+            const auto* t00 = p->getLiveTemplate();
+            const juce::uint32 genStart = t00 != nullptr ? t00->generation : 0u;
+
+            juce::String err;
+            t.loaded = p->loadTimbreText ("1 2 8", err);   // partials at 1 and 2; 8 is the period
+            p->pollParametersForTests();
+            t.loaded = awaitTemplate (genStart) && t.loaded;
+            juce::AudioBuffer<float> b (2, eb);
+            for (int i = 0; i < 40; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+            { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, 0.9f), 0);
+              b.clear(); p->processBlock (b, m); }
+
+            std::vector<float> x;
+            const auto render = [&] (int blocks)
+            {
+                for (int i = 0; i < blocks; ++i)
+                {
+                    juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                    const float* L = b.getReadPointer (0);
+                    x.insert (x.end(), L, L + eb);
+                }
+            };
+            render ((int) std::ceil (0.25 * srD / eb));   // let the note settle
+            const auto* t0 = p->getLiveTemplate();
+            const juce::uint32 gen0 = t0 != nullptr ? t0->generation : 0u;
+            t.oldN = t0 != nullptr ? (int) t0->partials.size() : 0;
+            if (t0 != nullptr && t.oldN >= 2) t.oldTop = (double) t0->partials[1].ratio;
+
+            t.loaded = p->loadTimbreText ("1 3 8", err) && t.loaded;   // partials at 1 and 3
+            p->pollParametersForTests();
+            // Waited for the same way, so the swap is live before the first recorded block
+            // and the transition begins exactly at the start of the tail.
+            t.loaded = awaitTemplate (gen0) && t.loaded;
+            const int blocks = (int) std::ceil (tailS * srD / eb);
+            for (int i = 0; i < blocks; ++i)
+            {
+                juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                if (t.change == 0)
+                {
+                    const auto* tn = p->getLiveTemplate();
+                    if (tn != nullptr && tn->generation != gen0) t.change = x.size();
+                }
+                const float* L = b.getReadPointer (0);
+                x.insert (x.end(), L, L + eb);
+            }
+            const auto* t1 = p->getLiveTemplate();
+            t.newN = t1 != nullptr ? (int) t1->partials.size() : 0;
+            if (t1 != nullptr && t.newN >= 2) t.newTop = (double) t1->partials[1].ratio;
+            t.f0   = p->getNoteFrequency (60);
+            double mj = 0.0, pk = 0.0, ej = 0.0;
+            // ...and the same metric NARROWED to the 40 ms around the moment the transition
+            // ENDS. That is where the hand-over lives - the incoming bank's phases, ratios
+            // and amplitudes being taken over by the running one - and it is one instant in
+            // a recording of seconds, so a step there can hide inside a whole-take maximum
+            // that some louder part of the note already sets.
+            const size_t endAt = t.change + (size_t) ((double) time * srD);
+            const size_t eLo = endAt > (size_t) (0.02 * srD) ? endAt - (size_t) (0.02 * srD) : 1;
+            const size_t eHi = std::min (x.size(), endAt + (size_t) (0.02 * srD));
+            for (size_t i = 0; i < x.size(); ++i)
+            {
+                pk = std::max (pk, (double) std::abs (x[i]));
+                if (i > 0) mj = std::max (mj, (double) std::abs (x[i] - x[i - 1]));
+                if (i >= eLo && i < eHi) ej = std::max (ej, (double) std::abs (x[i] - x[i - 1]));
+            }
+            t.jumpPeak = pk > 0.0 ? mj / pk : 0.0;
+            t.endJump  = pk > 0.0 ? ej / pk : 0.0;
+            std::printf ("    take[morph %d, dry/wet %d, %.3f s]: %d->%d partials, top %.3f->%.3f,"
+                         " swap at %zu of %zu, jump/peak %.3f (%.3f at the hand-over)\n",
+                         morphOn ? 1 : 0, dwOn ? 1 : 0, (double) time, t.oldN, t.newN,
+                         t.oldTop, t.newTop, t.change, x.size(), t.jumpPeak, t.endJump);
+            t.x = std::move (x);
+            { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }   // let the note go
+            return t;
+        };
+
+        // The magnitude spectrum of one 42.7 ms window CENTRED on `centre`, Hann-windowed.
+        juce::dsp::FFT fftD (fo);
+        std::vector<float> fbufD (2 * (size_t) fftN);
+        const auto spectrumAt = [&] (const std::vector<float>& x, size_t centre)
+        {
+            std::vector<float> out ((size_t) fftN / 2, 0.0f);
+            if (centre < (size_t) fftN / 2 || centre + (size_t) fftN / 2 > x.size()) return out;
+            const size_t at = centre - (size_t) fftN / 2;
+            std::fill (fbufD.begin(), fbufD.end(), 0.0f);
+            for (int i = 0; i < fftN; ++i)
+                fbufD[(size_t) i] = (0.5f - 0.5f * std::cos (2.0f * juce::MathConstants<float>::pi
+                                                              * (float) i / (float) (fftN - 1)))
+                                  * x[at + (size_t) i];
+            fftD.performFrequencyOnlyForwardTransform (fbufD.data());
+            std::copy (fbufD.begin(), fbufD.begin() + fftN / 2, out.begin());
+            return out;
+        };
+        // ...read at one frequency by SUMMING the five bins around it, not by taking the
+        // tallest. A Hann window spreads a sinusoid over three bins and how tall the tallest
+        // one is depends on where the partial falls BETWEEN bin centres - up to 15% for a
+        // partial landing exactly half way, which is where 785 Hz falls at this FFT size.
+        // That bias is a property of the measurement, not of the synth, and reading it as
+        // one bin made a perfectly exact endpoint look 13% short. Five bins is wide enough
+        // to collect the whole main lobe and far narrower than the 11-bin spacing of the
+        // partials being told apart.
+        const auto magAt = [&] (const std::vector<float>& mag, double hz)
+        {
+            const int k = (int) std::lround (hz * (double) fftN / srD);
+            double m = 0.0;
+            for (int d = -2; d <= 2; ++d)
+                if (k + d >= 0 && k + d < (int) mag.size()) m += (double) mag[(size_t) (k + d)];
+            return m;
+        };
+
+        // ---- (a) A CROSSFADE, MEASURED: both spectra at once, nothing in between --------
+        // Two seconds, so a 42.7 ms window is a snapshot rather than a smear of the whole
+        // transition, and the three probe points are unambiguously early / middle / late.
+        {
+            const auto dw = take (/*morph*/ false, /*dryWet*/ true, 2.0f, 2.6);
+            const auto mo = take (/*morph*/ true,  /*dryWet*/ false, 2.0f, 2.6);
+            const double fOld = dw.f0 * 2.0, fNew = dw.f0 * 3.0;
+            const double fBetween = dw.f0 * std::sqrt (6.0);   // where a MORPH would be at half
+            // Every reading is a partial's magnitude AS A FRACTION OF THE FUNDAMENTAL's, in
+            // the same frame. The fundamental is in both spectra and never moves, so it is
+            // the one reference immune to the voice's own per-sample normalisation.
+            //
+            // `secs` is measured from the moment the new template went live; a NEGATIVE one
+            // reads a window entirely BEFORE it, which is the only honest way to sample the
+            // near endpoint - a window centred on the change straddles it.
+            const auto probe = [&] (const Take& tk, double secs, double& oldR, double& newR, double& midR)
+            {
+                const size_t half = (size_t) fftN / 2 + 256;
+                const size_t c = secs < 0.0 ? (tk.change > half ? tk.change - half : 0)
+                                            : tk.change + (size_t) (secs * srD);
+                const auto m = spectrumAt (tk.x, c);
+                const double f0m = std::max (1.0e-9, magAt (m, tk.f0));
+                oldR = magAt (m, fOld) / f0m; newR = magAt (m, fNew) / f0m; midR = magAt (m, fBetween) / f0m;
+            };
+            double dwOp = 0, dwNp = 0, dwMp = 0, dwO1 = 0, dwN1 = 0, dwM1 = 0;
+            double dwO5 = 0, dwN5 = 0, dwM5 = 0, dwO3 = 0, dwN3 = 0, dwM3 = 0;
+            double dwOe = 0, dwNe = 0, dwMe = 0, moO5 = 0, moN5 = 0, moM5 = 0;
+            probe (dw, -1.0, dwOp, dwNp, dwMp);   // before   : only the old spectrum
+            probe (dw,  0.5, dwO1, dwN1, dwM1);   // a quarter in
+            probe (dw,  1.0, dwO5, dwN5, dwM5);   // half way
+            probe (dw,  1.5, dwO3, dwN3, dwM3);   // three quarters
+            probe (dw,  2.2, dwOe, dwNe, dwMe);   // after    : only the new spectrum
+            probe (mo,  1.0, moO5, moN5, moM5);
+            std::printf ("  partials as a fraction of the fundamental (%.1f / %.1f / %.1f Hz):\n",
+                         fOld, fBetween, fNew);
+            std::printf ("    dry/wet   before old %.3f  between %.3f  new %.3f\n", dwOp, dwMp, dwNp);
+            std::printf ("    dry/wet   1/4    old %.3f  between %.3f  new %.3f\n", dwO1, dwM1, dwN1);
+            std::printf ("    dry/wet   half   old %.3f  between %.3f  new %.3f\n", dwO5, dwM5, dwN5);
+            std::printf ("    dry/wet   3/4    old %.3f  between %.3f  new %.3f\n", dwO3, dwM3, dwN3);
+            std::printf ("    dry/wet   after  old %.3f  between %.3f  new %.3f\n", dwOe, dwMe, dwNe);
+            std::printf ("    morph     half   old %.3f  between %.3f  new %.3f\n", moO5, moM5, moN5);
+            std::printf ("    the two spectra: %d partials, top ratio %.3f -> %d partials, top ratio %.3f"
+                         " (loaded %s, swap landed %s)\n",
+                         dw.oldN, dw.oldTop, dw.newN, dw.newTop,
+                         dw.loaded ? "yes" : "NO", dw.change > 0 ? "yes" : "NO");
+            check (dw.loaded && dw.oldN == 2 && dw.newN == 2
+                   && std::abs (dw.oldTop - 2.0) < 1.0e-4 && std::abs (dw.newTop - 3.0) < 1.0e-4
+                   && dw.change > 0,
+                   "the two typed spectra really are two partials each, at 1 and 2 then 1 and 3,"
+                   " and the swap really landed");
+            // THE DEFINING PROPERTY. Half way through, both spectra are sounding at their
+            // OWN frequencies and there is nothing between them.
+            check (dwO5 > 0.10 && dwN5 > 0.10,
+                   "half way through a dry/wet transition BOTH spectra are sounding at once");
+            check (dwM5 < 0.15 * std::min (dwO5, dwN5),
+                   "and NOTHING sounds between them - no partial changed frequency, which is what"
+                   " makes this a crossfade and not a morph");
+            // ...and the same instant under a MORPH is the opposite, which is what stops
+            // this being a test that any smoothing at all would pass: the old partial has
+            // LEFT the frequency it was on and is sounding between the two.
+            check (moM5 > 0.15 && moO5 < 0.2 * moM5,
+                   "where a MORPH at the same instant has its partial BETWEEN the two, and nothing"
+                   " left where the old one was");
+            // AMPLITUDES CROSS OVER, in the right direction and monotonically.
+            check (dwO1 > dwO5 && dwO5 > dwO3 && dwN1 < dwN5 && dwN5 < dwN3,
+                   "the old spectrum fades DOWN and the new one fades UP across the transition");
+            check (dwO1 > dwN1 && dwN3 > dwO3,
+                   "...crossing over in the middle - the old one still leads at a quarter in, the new"
+                   " one leads at three quarters");
+            // THE TWO ENDPOINTS ARE EXACTLY THE OLD AND THE NEW SPECTRUM, and each one is
+            // checked against the spectrum it is supposed to be rather than against the
+            // other. At slope 1 the compiler gives a partial the amplitude ratio^-1, so the
+            // moving partial has to sit at exactly 1/2 of the fundamental before and exactly
+            // 1/3 after. An endpoint that merely "looks settled" - the amplitude slew's
+            // 63%-of-the-way, say - lands between those two numbers and fails here.
+            const double wantOld = 1.0 / dw.oldTop, wantNew = 1.0 / dw.newTop;
+            std::printf ("    endpoints: old/f0 before = %.3f (want %.3f), new/f0 after = %.3f"
+                         " (want %.3f); strays before = %.3f, after = %.3f\n",
+                         dwOp, wantOld, dwNe, wantNew, dwNp, dwOe);
+            check (dwNp < 0.06 * dwOp && dwOe < 0.06 * dwNe,
+                   "at the start only the OLD spectrum sounds, and at the end only the NEW one");
+            check (std::abs (dwOp - wantOld) < 0.12 * wantOld
+                   && std::abs (dwNe - wantNew) < 0.12 * wantNew,
+                   "and each endpoint is that spectrum EXACTLY - the amplitudes the compiler gave it,"
+                   " not an amplitude slew caught part way");
+            // EQUAL POWER, not linear. Two different spectra are uncorrelated, so a linear
+            // crossfade loses 3 dB in the middle; the transition must not audibly duck.
+            const auto rmsAt = [&] (const Take& tk, double secs)
+            {
+                const size_t c = secs < 0.0 ? (tk.change > 4096 ? tk.change - 4096 : 0)
+                                            : tk.change + (size_t) (secs * srD);
+                if (c < 2048 || c + 2048 > tk.x.size()) return 0.0;
+                double s2 = 0.0;
+                for (size_t i = c - 2048; i < c + 2048; ++i) s2 += (double) tk.x[i] * tk.x[i];
+                return std::sqrt (s2 / 4096.0);
+            };
+            const double r0 = rmsAt (dw, -1.0), r5 = rmsAt (dw, 1.0), r9 = rmsAt (dw, 2.2);
+            std::printf ("    loudness through the transition: %.4f -> %.4f -> %.4f (%.1f%% at the middle)\n",
+                         r0, r5, r9, 100.0 * r5 / std::max (1.0e-9, 0.5 * (r0 + r9)));
+            // ...and the level rides through the transition without a step or a hole. Not
+            // dead flat, and it cannot be: the per-voice normalisation is derived from the
+            // two banks' amplitude sums mixed by the same weight, which is exact for a
+            // partial the two spectra SHARE (phase-locked, so it really is one partial) and
+            // an over-estimate for one that moved (two partials at half gain each). Here half
+            // the energy is shared, so the middle sits ~1.3 dB under the ends. A step, a
+            // hole, or a swell is the failure; 2 dB of smooth ride over two seconds is not.
+            check (r5 > 0.80 * 0.5 * (r0 + r9) && r5 < 1.20 * 0.5 * (r0 + r9),
+                   "and the level rides smoothly through the middle of the crossfade rather than"
+                   " ducking into a hole or swelling");
+        }
+
+        // ---- (b) MORPH WINS when both are on, and it is audible ------------------------
+        // The two features are one crossfade machine per voice, so exactly one can act. The
+        // panel says which; this proves which, in the audio, so the UI's claim is not the
+        // only evidence for it.
+        {
+            const auto both = take (/*morph*/ true, /*dryWet*/ true, 2.0f, 2.6);
+            const auto m = spectrumAt (both.x, both.change + (size_t) (1.0 * srD));
+            const double f0m = std::max (1.0e-9, magAt (m, both.f0));
+            const double mid = magAt (m, both.f0 * std::sqrt (6.0)) / f0m;
+            const double old = magAt (m, both.f0 * 2.0) / f0m;
+            std::printf ("  both switches ON, half way: between %.3f, old %.3f -> %s\n",
+                         mid, old, mid > old ? "MORPH is what acted" : "the crossfade acted");
+            check (mid > 0.15 && old < 0.2 * mid,
+                   "with BOTH on it is the MORPH that acts - one machine, and the panel greys the other"
+                   " out rather than letting the user believe both are running");
+        }
+
+        // ---- (c) NO CLICK, at three transition times, with morph on and off -------------
+        // Run 26's metric: a click IS a discontinuity, so measure the largest sample-to-
+        // sample jump normalised by the take's own peak. The control is the same swap with
+        // both switches off, which is the amplitude fade the synth already had.
+        {
+            const auto ctrlTake = take (false, false, 0.050f, 0.60);
+            const double ctrl = ctrlTake.jumpPeak, ctrlEnd = ctrlTake.endJump;
+            struct Row { const char* label; bool morph; bool dw; float t; };
+            const Row rows[] = {
+                { "dry/wet 1 ms",            false, true,  0.001f },
+                { "dry/wet 50 ms",           false, true,  0.050f },
+                { "dry/wet 2 s",             false, true,  2.000f },
+                { "morph on, dry/wet 1 ms",  true,  true,  0.001f },
+                { "morph on, dry/wet 50 ms", true,  true,  0.050f },
+                { "morph on, dry/wet 2 s",   true,  true,  2.000f } };
+            std::printf ("  discontinuity (jump/peak), control = both off: %.3f (%.3f at the hand-over)\n",
+                         ctrl, ctrlEnd);
+            int clicks = 0, endClicks = 0;
+            for (const auto& r : rows)
+            {
+                const auto tk = take (r.morph, r.dw, r.t, r.t > 1.0f ? 2.6 : 0.60);
+                std::printf ("    %-26s %.3f  (%.3f at the hand-over)\n", r.label, tk.jumpPeak, tk.endJump);
+                // The same generous bound run 26 uses: what this catches is a full-scale
+                // coherent impulse (jump/peak near 1), not a few percent of extra slope.
+                if (tk.jumpPeak > ctrl * 2.5 + 0.02) ++clicks;
+                // The hand-over gets a TIGHTER bound, because there the control take is the
+                // same note doing nothing in particular: this is 40 ms of steady tone, and a
+                // phase, ratio or amplitude taken over wrongly shows up as a step against it.
+                if (tk.endJump > ctrlEnd * 1.6 + 0.01) ++endClicks;
+            }
+            check (ctrl > 0.0, "the control take made sound");
+            check (clicks == 0,
+                   "no transition time clicks - 1 ms, 50 ms and 2 s, with Morph off and with Morph on");
+            check (endClicks == 0,
+                   "...and none at the moment a transition ENDS, where the incoming bank's phases,"
+                   " frequencies and amplitudes are handed to the running one");
+        }
+
+        // ---- (d) AND THE PANEL SAYS SO ------------------------------------------------
+        // The rule is "Morph wins"; the requirement is that the UI must not let the user
+        // believe both are acting. That is a claim about the SCREEN, so it is measured on
+        // the screen: with Morph on, both controls are dead and an amber MORPH ON tag is
+        // painted beside a greyed DRY/WET - and that tag has to FIT, in both languages, in
+        // a state the layout sweep never enters on its own (it probes with Morph off).
+        {
+            auto owned = std::make_unique<FractalAdditiveAudioProcessor>();
+            owned->prepareToPlay (srD, eb);
+            std::unique_ptr<juce::AudioProcessorEditor> base (owned->createEditor());
+            auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+            check (ed != nullptr, "the editor builds");
+            if (ed != nullptr)
+            {
+                const auto setMorph = [&] (bool on)
+                {
+                    if (auto* q = owned->apvts.getParameter ("morph")) q->setValueNotifyingHost (on ? 1.0f : 0.0f);
+                    owned->pollParametersForTests();
+                    ed->applyDryWetEnablementForTests();
+                    ed->resized();
+                };
+                const auto tagged = [&] (const FractalAdditiveAudioProcessorEditor::LayoutProbe& pr,
+                                         const char* nm, juce::Rectangle<int>* cellOut, float* wOut)
+                {
+                    for (const auto& l : pr.paintedLabels)
+                        if (l.name == nm) { if (cellOut) *cellOut = l.cell; if (wOut) *wOut = l.textWidth; return true; }
+                    return false;
+                };
+                for (int lang = 0; lang < 2; ++lang)
+                {
+                    setMorph (false);
+                    auto off = ed->layoutProbeInLanguage (lang == 1);
+                    const bool offTag = tagged (off, "both.morphWins", nullptr, nullptr);
+                    setMorph (true);
+                    auto on = ed->layoutProbeInLanguage (lang == 1);
+                    juce::Rectangle<int> cell; float w = 0.0f;
+                    const bool onTag = tagged (on, "both.morphWins", &cell, &w);
+                    std::printf ("  %s: with Morph off the DRY/WET cell carries no tag (%s);"
+                                 " with it on the tag needs %.1f px of %d\n",
+                                 lang == 1 ? "ca" : "en", offTag ? "IT DOES" : "correct", w, cell.getWidth());
+                    check (! offTag,
+                           "with Morph OFF the Dry/Wet cell wears no warning - the control really is live");
+                    check (onTag, "and with Morph ON the panel paints a reason beside a greyed DRY/WET");
+                    check (w <= (float) cell.getWidth() + 0.5f,
+                           "...and that reason FITS its rect, in this language");
+                    check (! ed->dryWetControlsEnabledForTests(),
+                           "...while the two controls themselves are dead, so nothing on screen claims"
+                           " two smoothings are running");
+                    setMorph (false);
+                    check (ed->dryWetControlsEnabledForTests(),
+                           "and switching Morph off hands them straight back - the user's setting was never"
+                           " rewritten, only overruled");
+                }
+                ed->layoutProbeInLanguage (false);   // leave the panel in English
+            }
+        }
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

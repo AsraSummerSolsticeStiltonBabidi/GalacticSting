@@ -1021,6 +1021,24 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     morphTimeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 14);
     makeLabel (lblMorphTime, cSlope);
 
+    // DRY/WET TRANSITION: the same pair of controls, one cell down, driving the OTHER way
+    // of making a spectrum change smooth - a simultaneous fade-out of the old spectrum and
+    // fade-in of the new one, with no frequency movement at all. Built identically to Morph
+    // on purpose ("un fader de tiempo como el de morph y un boton de on off"): same pill,
+    // same fader style, same parameter range and skew, so the two read as two settings of
+    // one idea rather than two different mechanisms.
+    dryWetToggle.setName ("onled");
+    dryWetToggle.setMouseClickGrabsKeyboardFocus (false);
+    dryWetToggle.onClick = [this] { refocus(); };
+    addAndMakeVisible (dryWetToggle);
+    dryWetAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "dryWet", dryWetToggle);
+    addMapListener (dryWetToggle, "dryWet");
+    configFader (dryWetTimeFader, "dryWetTime", dryWetTimeAtt, cSlope,
+                 "Dry/wet transition time in seconds: how long the old spectrum takes to fade out while the new one fades in.");
+    dryWetTimeFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    dryWetTimeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 14);
+    makeLabel (lblDryWetTime, cSlope);
+
     // Harmonics is a magnetic FADER now (Even - All - Odd - Prime), so a modulator
     // can sweep it and it can sit BETWEEN two sets (blended).
     configFader (harmonicsFader, "harmonics", harmonicsAtt, cHarmonic,
@@ -2775,6 +2793,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     if (partialWindow != nullptr)
         partialWindow->setName (tr ("Fibl\xc3\xb3 - partial amplitudes", "Fibl\xc3\xb3 - amplituds dels parcials"));
     partialPanel.applyLanguage();
+    lastMorphWinsShown = -1;      // ...and the Dry/Wet cell's enablement, whose colour is language-free
     lastManualFrozenShown = -1;   // re-apply the slope fader's tooltip in the new language
     lastEngineShown       = -1;   // and re-light the engine chips with the new words
     rhythmPanel.heading.setText (tr ("SPECTRUM VS RHYTHM", "ESPECTRE VS RITME"), dontSendNotification);
@@ -2967,6 +2986,14 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     morphTimeFader.setTooltip (tr (
         "How long the glide takes, in seconds. It applies to EVERY spectrum change, whatever caused it (Base, Harmonics, Prime, Fractal, engine switch, an adapted spectrum, a modulator...) - not just Base.",
         "Quant dura el lliscament, en segons. S'aplica a QUALSEVOL canvi d'espectre, el causi el que el causi (Base, Harm\xc3\xb2nics, Primers, Fractal, canvi de motor, un espectre adaptat, un modulador...) - no nom\xc3\xa9s Base."));
+    lblDryWetTime.setText (tr ("Time", "Temps"), dontSendNotification);
+    dryWetToggle.setButtonText ({});   // same reason as Morph's: the painted label names it
+    dryWetToggle.setTooltip (tr (
+        "DRY/WET TRANSITION ON: whenever the spectrum CHANGES - for any of the same reasons Morph lists - the spectrum you were hearing FADES OUT while the new one FADES IN, at the same time, over the Time below. Both sound together during the transition and neither one moves: no partial changes frequency at any point, which is exactly what makes it an alternative to Morph rather than a version of it. Morph BENDS each partial from its old place to its new one; this crossfades between two standing spectra.\nAt the start of a transition you hear precisely the old spectrum, at the end precisely the new one, and the two are mixed equal-power in between so the loudness does not dip through the middle.\nMORPH WINS. The two cannot both act: a voice has ONE crossfade between two banks of oscillators, and these are that one machine driven by two different rules. So with Morph on this control is switched off and says so, rather than sitting there looking active.",
+        "TRANSICI\xc3\x93 SEC/HUMIT ACTIVA: quan l'espectre CANVIA - per qualsevol dels motius que llista el Morphing - l'espectre que senties s'ESVAEIX mentre el nou APAREIX, alhora, durant el Temps de sota. Tots dos sonen junts durant la transici\xc3\xb3 i cap dels dos es mou: cap parcial no canvia de freq\xc3\xbc\xc3\xa8ncia en cap moment, i aix\xc3\xb2 \xc3\xa9s precisament el que en fa una alternativa al Morphing i no una variant seva. El Morphing DOBLEGA cada parcial del seu lloc antic al nou; aix\xc3\xb2 fon dos espectres quiets l'un dins l'altre.\nAl comen\xc3\xa7""ament de la transici\xc3\xb3 sents exactament l'espectre antic, al final exactament el nou, i entremig es barregen a pot\xc3\xa8ncia constant perqu\xc3\xa8 el volum no caigui pel mig.\nEL MORPHING GUANYA. Tots dos no poden actuar alhora: una veu t\xc3\xa9 UNA sola fosa creuada entre dos bancs d'oscilladors, i aix\xc3\xb2 s\xc3\xb3n aquella mateixa m\xc3\xa0quina governada per dues regles diferents. Per aix\xc3\xb2, amb el Morphing actiu, aquest control queda apagat i ho diu, en comptes de quedar-s'hi fent veure que funciona."));
+    dryWetTimeFader.setTooltip (tr (
+        "How long the crossfade takes, in seconds. Same range and same feel as Morph Time, and it applies to EVERY spectrum change whatever caused it. Very short settings still land click-free: below about 5 ms the phase hand-over cannot be made smooth, so that is the floor the transition actually uses.",
+        "Quant dura la fosa creuada, en segons. El mateix abast i el mateix tacte que el Temps de Morphing, i s'aplica a QUALSEVOL canvi d'espectre, el causi el que el causi. Els valors molt curts continuen arribant sense clic: per sota d'uns 5 ms el relleu de fase no es pot fer suau, i aquest \xc3\xa9s el m\xc3\xadnim que la transici\xc3\xb3 fa servir de debo."));
     lblTimbreRepeats.setText (tr ("Reps", "Reps"), dontSendNotification);
     lblBend.setText      (tr ("Pitch bend", "Pitch bend"), dontSendNotification);
     lblPeriod.setText    (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
@@ -3550,6 +3577,7 @@ FractalAdditiveAudioProcessorEditor::dragFaderForTests (const juce::String& name
     else if (name == "baseN")     s = &baseNFader;
     else if (name == "fractal")   s = &fractalFader;
     else if (name == "morphTime") s = &morphTimeFader;
+    else if (name == "dryWetTime") s = &dryWetTimeFader;
     else if (name == "harmonics") s = &harmonicsFader;
     if (s == nullptr) return d;
 
@@ -5109,6 +5137,28 @@ void FractalAdditiveAudioProcessorEditor::applySlopeFaderColour()
     slopeFader.setColour (juce::Slider::trackColourId, col.withAlpha (0.55f));
 }
 
+// MORPH WINS, AND IT SAYS SO. Both features are the same crossfade between two banks of
+// oscillators inside a voice (see AdditiveVoice.h), so exactly one of them can act; with
+// Morph on this one does nothing at all. Leaving its pill and its fader live would be the
+// panel telling the user two smoothings are running when one of them is inert - the same
+// failure the AMP DECAY / FROZEN pair exists to prevent, so it is answered the same way:
+// the controls go dead and the painted name goes grey with an amber MORPH ON beside it.
+//
+// It changes NO parameter. The user's Dry/Wet setting is theirs and comes back the instant
+// Morph goes off; silently switching it off would be a rewrite of their patch.
+void FractalAdditiveAudioProcessorEditor::applyDryWetEnablement()
+{
+    const bool morphWins = processorRef.apvts.getRawParameterValue ("morph")->load() > 0.5f;
+    if ((morphWins ? 1 : 0) == lastMorphWinsShown) return;   // timer rate: setEnabled repaints
+    lastMorphWinsShown = morphWins ? 1 : 0;
+    dryWetToggle.setEnabled (! morphWins);
+    dryWetTimeFader.setEnabled (! morphWins);
+    const auto col = morphWins ? juce::Colour (0xff5a6070) : cSlope;
+    dryWetTimeFader.setColour (juce::Slider::thumbColourId, col);
+    dryWetTimeFader.setColour (juce::Slider::trackColourId, col.withAlpha (0.55f));
+    repaint (bothEnginesBounds);   // the DRY/WET name and its MORPH ON tag are painted there
+}
+
 void FractalAdditiveAudioProcessorEditor::refreshSlopeFreeze()
 {
     const bool frozen = processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
@@ -5391,14 +5441,16 @@ void FractalAdditiveAudioProcessorEditor::recolourSpectrumControls (juce::Colour
     // (stepped, magnetic, plain) and a deduced initializer-list has no common type.
     for (juce::Slider* s : { (juce::Slider*) &baseNFader, (juce::Slider*) &harmonicsFader,
                              (juce::Slider*) &primeLimitFader, (juce::Slider*) &timbreRepeatsFader,
-                             (juce::Slider*) &fractalFader, (juce::Slider*) &morphTimeFader })
+                             (juce::Slider*) &fractalFader, (juce::Slider*) &morphTimeFader,
+                             (juce::Slider*) &dryWetTimeFader })
         fader (*s);
     // slopeFader is deliberately NOT in that list: it has a SECOND state (frozen by manual
     // per-partial amplitudes) and exactly one function is allowed to write its colour.
     // See applySlopeFaderColour - two writers is what turned it green.
     applySlopeFaderColour();
     for (juce::ComboBox* b : { &basePitchBox, &primeModeBox }) combo (*b);
-    for (auto* l : { &lblBaseN, &lblBasePitch, &lblPrimeLimit, &lblTimbreRepeats, &lblMorphTime })
+    for (auto* l : { &lblBaseN, &lblBasePitch, &lblPrimeLimit, &lblTimbreRepeats, &lblMorphTime,
+                     &lblDryWetTime })
         label (*l);
     for (int i = 0; i < 9; ++i) { tick (primeToggle[i]); label (primeLbl[i]); }
     // TEMPER's tick used to be forced to the harmonic blue "because that is the engine it
@@ -5557,6 +5609,26 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
             }
             add ("both.fractal", tr ("FRACTAL", "FRACTAL"),                   band (beFractal), cPanel);
             add ("both.morph",   tr ("MORPH", "MORPHING"),                    band (beMorph),   cPanel);
+            // DRY/WET says so when it is inert, exactly the way AMP DECAY does above: the
+            // two features are one crossfade machine and Morph wins, so with Morph on this
+            // control cannot act and the panel must not let it look as if it did. Greyed
+            // name + amber reason, the pair that means "this control cannot affect the
+            // sound right now" - the second of the two exceptions to "one colour".
+            const bool morphWins = processorRef.apvts.getRawParameterValue ("morph")->load() > 0.5f;
+            const auto dryWet = tr ("DRY/WET", "SEC/HUMIT");
+            const auto dwBand = band (beDryWet);
+            add ("both.dryWet", dryWet, dwBand, morphWins ? juce::Colour (0xff8f96a8) : cPanel);
+            if (morphWins)
+            {
+                // Starts after the MEASURED width of the name beside it, for the same reason
+                // the FROZEN tag does: the Catalan "SEC/HUMIT" is wider than "DRY/WET" and a
+                // hard-coded offset would print the two words on top of each other.
+                const juce::Font f (juce::FontOptions (11.5f).withStyle ("Bold"));
+                const int used = juce::GlyphArrangement::getStringWidthInt (f, dryWet) + 8;
+                add ("both.morphWins", tr ("MORPH ON", "MORPHING ON"),
+                     dwBand.withTrimmedLeft (juce::jmin (used, juce::jmax (0, dwBand.getWidth() - 56))),
+                     cOverride, 10.0f, true);
+            }
             add ("both.range",   tr ("OCTAVE RANGE", "ABAST OCTAVES"), band (beRange.translated (0, 3)), cPanel);
         }
     }
@@ -5782,6 +5854,8 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("both.manual",      partialManualT);  add ("both.fractal",   fractalFader);
     add ("both.morph",       morphToggle);
     add ("both.morphTime",   morphTimeFader);  add ("both.morphLbl",  lblMorphTime);
+    add ("both.dryWet",      dryWetToggle);
+    add ("both.dryWetTime",  dryWetTimeFader); add ("both.dryWetLbl", lblDryWetTime);
     add ("both.rangeVal",    sprVal);          add ("both.rangeUp",   sprUp);
     add ("both.rangeDn",     sprDn);
 
@@ -5880,7 +5954,8 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     { if (! r.isEmpty()) p.cells.push_back ({ name, r }); };
     cell ("eng.base",    hcBase);    cell ("eng.harm",    hcHarm);   cell ("eng.prime", hcPrime);
     cell ("both.slope",  beSlope);   cell ("both.fractal", beFractal);
-    cell ("both.morph",  beMorph);   cell ("both.range",  beRange);
+    cell ("both.morph",  beMorph);   cell ("both.dryWet", beDryWet);
+    cell ("both.range",  beRange);
     cell ("ess.phase",   ecPhase);   cell ("ess.gain",    ecGain);
     cell ("ess.ref",     ecRef);     cell ("ess.oct",     ecOct);
 
@@ -7002,16 +7077,29 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // doubled edge.
         }
 
-        //-- BOTH ENGINES: SLOPE | FRACTAL | MORPH over RANGE --------------------
+        //-- BOTH ENGINES: SLOPE | FRACTAL | MORPH over DRY/WET over RANGE -------
         {
             auto bo = bothEnginesBounds.reduced (5, 0);
             bo.removeFromTop (chipH); bo.removeFromBottom (3);
             const int bW = bo.getWidth();
             beSlope   = bo.removeFromLeft (bW * 31 / 100);
             beFractal = bo.removeFromLeft (bW * 23 / 100);
+            // THREE cells in this column now, not two: DRY/WET goes BETWEEN Morph and
+            // Octave Range, which is where the user asked for it and where it belongs - it
+            // and Morph are the two answers to the same question, so they read as a pair.
+            //
+            // The column is ~113 px tall and Morph's old shape (a pill row, then a fader
+            // row) took 62 of them, so three of that shape do not exist here. Both cells
+            // are laid out on ONE row instead - pill, then caption, then fader - which is
+            // 36 px and, more to the point, makes the two IDENTICAL: "un fader de tiempo
+            // como el de morph y un boton de on off" is a promise about how the second one
+            // looks, and it is only kept if the first one still looks like it. RANGE keeps
+            // the remainder because its stepper row is the tallest single control here.
             auto mcol = bo;
-            beMorph   = mcol.withHeight (mcol.getHeight() * 55 / 100);
-            beRange   = mcol.withTrimmedTop (mcol.getHeight() * 55 / 100);
+            const int pairH = juce::jlimit (26, 46, (mcol.getHeight() - 40) / 2);
+            beMorph   = mcol.removeFromTop (pairH);
+            beDryWet  = mcol.removeFromTop (pairH);
+            beRange   = mcol;
             {
                 auto si = beSlope.reduced (6, 3); si.removeFromTop (lblH);
                 // The pencil and its ON/OFF pill take a narrow column on the RIGHT of the
@@ -7029,28 +7117,33 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 auto fi = beFractal.reduced (6, 3); fi.removeFromTop (lblH);
                 fractalFader.setBounds (fi);
             }
+            // MORPH and DRY/WET are ONE shape, laid out by one lambda: the ON/OFF pill
+            // sized to the word it prints (it was 275 px of flat colour carrying three
+            // letters, which read as a banner rather than a switch), then the "Time"
+            // caption, then the fader in whatever is left. Two calls rather than two
+            // copies, because the promise these two controls make is that they are the
+            // same control twice - and two hand-kept copies drift.
+            const auto smoothingCell = [&] (juce::Rectangle<int> cell, juce::ToggleButton& pill,
+                                            juce::Label& lbl, juce::Slider& fader)
             {
-                auto mi = beMorph.reduced (6, 3); mi.removeFromTop (lblH);
-                // The ON/OFF pill is sized to the word it prints, not to the cell: it
-                // was 275 px of flat colour carrying three letters, which read as a
-                // banner rather than a switch.
-                {
-                    auto mrow0 = mi.removeFromTop (20);
-                    morphToggle.setBounds (mrow0.removeFromLeft (
-                                 juce::jmin (fgfit::snugToggleWidth (morphToggle, 20), mrow0.getWidth())));
-                }
-                mi.removeFromTop (2);
-                auto mr = mi.removeFromTop (juce::jmin (19, juce::jmax (0, mi.getHeight())));
-                caption (lblMorphTime, mr, 34, 60);
-                morphTimeFader.setBounds (mr);
-            }
+                auto ci2 = cell.reduced (6, 2); ci2.removeFromTop (lblH - 2);
+                auto r = ci2.removeFromTop (juce::jmin (19, juce::jmax (0, ci2.getHeight())));
+                const int pillH = juce::jmax (1, r.getHeight());
+                pill.setBounds (r.removeFromLeft (
+                        juce::jmin (fgfit::snugToggleWidth (pill, pillH), r.getWidth())));
+                r.removeFromLeft (6);
+                caption (lbl, r, 34, 60);
+                fader.setBounds (r);
+            };
+            smoothingCell (beMorph,  morphToggle,  lblMorphTime,  morphTimeFader);
+            smoothingCell (beDryWet, dryWetToggle, lblDryWetTime, dryWetTimeFader);
             {
                 // RANGE: the spectrum's octave span, as the same [value][+][-] stepper it
                 // had in Essentials. Its name is the painted OCTAVE RANGE sub-label now,
                 // so the row's own "Spectrum" label was deleted rather than hidden - a
                 // member hidden on every single layout pass is a member nothing can ever
                 // show, and it kept a dead entry alive in the layout probe.
-                auto ri = beRange.reduced (6, 3); ri.removeFromTop (lblH + 3);
+                auto ri = beRange.reduced (6, 2); ri.removeFromTop (lblH);
                 auto rr = ri.removeFromTop (juce::jmin (24, juce::jmax (0, ri.getHeight())));
                 sprVal.setBounds (rr.removeFromLeft (40));
                 sprUp.setBounds  (rr.removeFromLeft (24).reduced (0, 1));
@@ -7706,6 +7799,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
 
     refreshModWatch(); // live-modulation marker on every watched fader (see the header)
     refreshSlopeFreeze(); // SLOPE goes grey + "FROZEN" while manual amplitudes are on
+    applyDryWetEnablement(); // DRY/WET goes dead + "MORPH ON" while Morph owns the crossfade
     refreshShepardSyncState(); // beats box goes amber while Sync has no BPM to sync to
     // The amplitude window follows the spectrum: the template is rebuilt on a background
     // thread whenever Base/Fractal/primes/tuning move, and the stored edits can change

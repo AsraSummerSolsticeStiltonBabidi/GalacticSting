@@ -91,6 +91,8 @@ public:
 
         morphParam     = src.raw ("morph");
         morphTimeParam = src.raw ("morphTime");
+        xfadeParam     = src.raw ("dryWet");
+        xfadeTimeParam = src.raw ("dryWetTime");
 
         // SHEPARD MODE. Read from THIS voice's source like every other control, so a
         // playground corner whose preset is a Shepard patch really is one - the mode
@@ -281,7 +283,7 @@ public:
         // the first block cleanly SNAP curRatio onto the current template (a frequency
         // snap with continuous phase = click-free) instead of gliding from a stale ratio.
         morphActive = false; morphPos = 1.0; prevN = 0; morphWeight = 0.0;
-        morphWPos = 0.0; morphFadeOut = false;
+        morphWPos = 0.0; morphFadeOut = false; xfadeActive = false; xfadeAmpSnap = false;
         // The amp glide starts a note at the 7 ms de-click minimum, steal included: a
         // stolen voice's amplitudes must hand over to the NEW note in milliseconds, not
         // inherit a seconds-long constant from the old note's in-flight morph.
@@ -471,9 +473,21 @@ public:
             // stuck on the wrong spectrum until re-triggered.
             const juce::uint32 gen = tmpl->generation;
             const bool morphOn = morphParam != nullptr && morphParam->load() > 0.5f;
+            // DRY/WET TRANSITION - the crossfade alternative to Morph's pitch glide (see
+            // PluginProcessor.cpp, where the two parameters are declared, for the decision
+            // and its reason). MORPH WINS when both are on: they are one machine, and a
+            // hidden priority is worse than a stated one - the panel greys this out and says
+            // so, so nothing on screen claims two smoothings are running.
+            const bool xfadeOn = ! morphOn && xfadeParam != nullptr && xfadeParam->load() > 0.5f;
+            // A fade already in flight is never CONVERTED from one kind to the other (see
+            // xfadeActive): at the two endpoints the banks are silent or identical and either
+            // kind may start, in between re-placing them is a write to an audible bank. So a
+            // mode change part-way through falls through to the ramp-out branch instead.
+            const bool settled = ! morphActive || morphWeight <= 1.0e-6 || morphWeight >= 0.999;
+            const bool canCross = ! snapAmps && prevN > 0 && newN > 0;
             if (gen != lastGen)
             {
-                if (morphOn && ! snapAmps && prevN > 0 && newN > 0)
+                if (morphOn && canCross && (! xfadeActive || settled))
                 {
                     const int lo = std::min (prevN, newN);
                     const int hi = std::max (prevN, newN);
@@ -523,6 +537,7 @@ public:
                         for (int j = 0; j < seedSpan; ++j)
                             if (alignRatio[(size_t) j] > 1.0e-12) // a slot the aligned bank never held keeps its own ratio
                                 curRatio[(size_t) j] = alignRatio[(size_t) j];
+                        adoptXfadeAmps (seedSpan);
                         morphWeight = 0.0; morphWPos = 0.0;
                     }
                     else if (! wasMorphing)
@@ -531,6 +546,7 @@ public:
                         // renderNextBlock), so the weight can be released here without a step.
                         morphWeight = 0.0; morphWPos = 0.0;
                     }
+                    xfadeActive = false;   // this is a MORPH from here on
 
                     for (int j = 0; j < lo; ++j) // shared ranks: straight old[j] -> new[j]
                     {
@@ -608,18 +624,119 @@ public:
                                 : morphTgtLog[(size_t) j]; // a slot the bank never held starts at target
                     }
                 }
+                else if (xfadeOn && canCross && (xfadeActive || settled))
+                {
+                    // ================= THE DRY/WET TRANSITION =========================
+                    // A simultaneous fade-out of the PREVIOUS spectrum and fade-in of the
+                    // NEW one, over Dry/Wet Time, with NO frequency movement anywhere. That
+                    // is the whole difference from Morph, which bends every partial from
+                    // where it is to where it is going and never has two spectra sounding.
+                    //
+                    // It reuses this voice's ONE crossfade machine rather than adding a
+                    // second: the running bank (phase[], curRatio[], curAmp[]) keeps the old
+                    // spectrum and the aligned bank (alignPhase[], alignRatio[], tgtAmp[])
+                    // holds the new one, mixed by the same weight. So the invariant above
+                    // holds unchanged and word for word - alignPhase[] is written only at
+                    // weight 0, phase[] only at weight 1 - and violating it here would
+                    // produce the same full-scale impulse it produces for a morph.
+                    // No lo/hi PAIR here, unlike the morph above: a morph has to MAP old
+                    // ranks onto new ones because every partial travels, and a crossfade
+                    // maps nothing - each bank keeps its own list where it is.
+                    const int hi = std::max (prevN, newN);
+                    const int seedSpan = std::min (std::max (hi, activeCount), sl.oscCap());
+                    const bool wasFading = morphActive;
+                    if (wasFading && morphWeight >= 0.999)
+                    {
+                        // The previous transition finished: the output IS the aligned bank,
+                        // so hand its phases, ratios AND amplitudes back and release the
+                        // weight. Exactly the morph path's hand-over plus the amplitudes,
+                        // which a crossfade needs and a morph does not (a morph's two banks
+                        // always share one amplitude - they are the same partials).
+                        for (int c = 0; c < sl.numCopies; ++c)
+                            for (int j = 0; j < seedSpan; ++j)
+                                phase[(size_t) (sl.off[c] + j)] = alignPhase[(size_t) (sl.off[c] + j)];
+                        for (int j = 0; j < seedSpan; ++j)
+                            if (alignRatio[(size_t) j] > 1.0e-12)
+                                curRatio[(size_t) j] = alignRatio[(size_t) j];
+                        adoptXfadeAmps (seedSpan);
+                        morphWeight = 0.0; morphWPos = 0.0;
+                    }
+                    else if (! wasFading)
+                    {
+                        morphWeight = 0.0; morphWPos = 0.0;
+                    }
+
+                    // WHERE THE TWO BANKS SIT. Neither of them moves for the whole
+                    // transition - these are the only writes, and they are constants:
+                    //   shared ranks      : running keeps the OLD ratio, aligned takes the NEW.
+                    //   ranks only in the NEW spectrum : BOTH take the new ratio, and the
+                    //       partial simply fades in from silence (curAmp is at 0 there). Left
+                    //       at its stale value the running bank would sound a phantom partial
+                    //       at an unrelated old frequency and fade it out - audible, and a
+                    //       frequency the user never asked for.
+                    //   ranks only in the OLD spectrum : both keep the old ratio and fade out
+                    //       together, which is exactly what an outgoing spectrum should do.
+                    for (int j = 0; j < hi; ++j)
+                    {
+                        const double nr = j < newN ? (double) ps[(size_t) j].ratio : curRatio[(size_t) j];
+                        if (j >= prevN) curRatio[(size_t) j] = nr;      // new-only: no phantom
+                        morphStartLog[(size_t) j] = std::log2 (std::max (1.0e-12, curRatio[(size_t) j]));
+                        morphTgtLog  [(size_t) j] = std::log2 (std::max (1.0e-12, nr));
+                        alignStartLog[(size_t) j] = morphTgtLog[(size_t) j];
+                    }
+                    morphN = hi; morphActive = true; xfadeActive = true; morphFadeOut = false;
+                    // No glide clock to restart: the ratios are already where both banks
+                    // belong. morphPos is parked AT the end so the hand-over at the tail of
+                    // renderNextBlock is gated on the WEIGHT alone, which is the only thing
+                    // that moves during a crossfade.
+                    morphPos = 1.0;
+
+                    // The destination bank's phases, seeded ONLY at weight 0 - the same half
+                    // of the invariant, for the same reason. A template landing mid-transition
+                    // does NOT re-seed: it re-aims the ratios above (a frequency change on a
+                    // continuous phase is inaudible) and lets the weight carry on rising, so
+                    // a stream of templates crossfades towards the newest one instead of
+                    // restarting and stalling half-way.
+                    if (morphWeight <= 0.0)
+                    {
+                        // PHASE-LOCKED TO THE BANK IT IS REPLACING, not seeded to the
+                        // coherent reference a morph uses. A crossfade's two banks share
+                        // every partial the two spectra have in common - and a spectrum
+                        // change usually moves some partials and leaves others exactly
+                        // where they were. Seeded independently, such a partial would be
+                        // sounding TWICE at one frequency with an arbitrary phase between
+                        // the copies: constructive at one transition, a near-null at the
+                        // next, on partials that did not change at all. Starting the new
+                        // bank AT the old bank's phase makes every unchanged partial
+                        // exactly itself for the whole transition - it simply carries on -
+                        // and leaves only the partials that really moved to cross over.
+                        // (The morph's coherent seeding is for the other thing: a glide
+                        // that must ARRIVE phase-aligned. Nothing glides here.)
+                        for (int c = 0; c < sl.numCopies; ++c)
+                            for (int j = 0; j < seedSpan; ++j)
+                                alignPhase[(size_t) (sl.off[c] + j)] = phase[(size_t) (sl.off[c] + j)];
+                        // ...and its amplitudes, which are equally free to write at weight 0
+                        // and equally forbidden at any other. Deferred by one flag because
+                        // tgtAmp does not hold the NEW template's amplitudes yet - the slope
+                        // rescale and the per-partial edits are applied to it further down.
+                        xfadeAmpSnap = true;
+                    }
+                }
                 else if (morphActive && morphWeight > 1.0e-6)
                 {
-                    // Snapping (Morph switched off, or an empty template) while a crossfade
-                    // is part-way through: dropping the term outright removes
-                    // morphWeight * (aligned - running) from every partial in one sample,
-                    // which is the same coherent step as above. Ramp it out instead.
+                    // Snapping (Morph or Dry/Wet switched off, one of them taken over
+                    // mid-fade, or an empty template) while a crossfade is part-way through:
+                    // dropping the term outright removes the aligned bank's whole
+                    // contribution from every partial in one sample, which is the same
+                    // coherent step as above. Ramp it out instead, and leave xfadeActive
+                    // set: the ramp still renders the incoming bank at its own amplitudes,
+                    // and the hand-over at the end still has to give them back.
                     morphFadeOut = true;
                     if (! snapAmps) tmplGlideSamps = (int) (kTmplGlideHold * currentSampleRate);
                 }
                 else
                 {
-                    morphActive = false; morphFadeOut = false;
+                    morphActive = false; morphFadeOut = false; xfadeActive = false;
                     morphWeight = 0.0; morphWPos = 0.0;
                     // Morph OFF: the ratios snap below (phase-continuous, no click), but the
                     // AMPLITUDES get a real fade-out/fade-in of kTmplGlideSec instead of the
@@ -641,6 +758,24 @@ public:
                 // instead of vanishing between two samples.
                 morphWStep = -1.0 / (0.005 * currentSampleRate);
                 for (int j = 0; j < newN; ++j)
+                    curRatio[(size_t) j] = (double) ps[(size_t) j].ratio;
+            }
+            else if (morphActive && xfadeActive)
+            {
+                // A DRY/WET TRANSITION: nothing but the weight moves. No ratio glide, no
+                // morphPos - the two banks were placed where they belong when the template
+                // arrived and neither is allowed to shift, because a partial that shifted
+                // would be a morph. Only the crossfade clock advances.
+                //
+                // The same 5 ms floor as the morph weight, and for the same reason: below it
+                // the phase hand-over is a step rather than a fade. Dry/Wet Time keeps its
+                // full range on the fader - a 1 ms setting simply lands as the shortest
+                // click-free transition this machine can make, which is what the panel's
+                // hover says.
+                const double dt = xfadeTimeParam != nullptr
+                                    ? std::max (0.001, (double) xfadeTimeParam->load()) : 0.3;
+                morphWStep = 1.0 / (std::max (0.005, dt) * currentSampleRate);
+                for (int j = morphN; j < newN; ++j)   // partials that appeared mid-transition
                     curRatio[(size_t) j] = (double) ps[(size_t) j].ratio;
             }
             else if (morphActive)
@@ -778,6 +913,24 @@ public:
         // tracked with two scalar multiplies per sample - no O(n) re-sum, no lag, no clip.
         const int    span = std::max (n, activeCount);
         const double sr   = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
+        // A DRY/WET TRANSITION renders the aligned bank at tgtAmp - the NEW spectrum's own
+        // amplitudes, which is what makes the far endpoint exactly the new spectrum instead
+        // of an amplitude slew's 63%-of-the-way. Every other reader of tgtAmp guards with
+        // (i < n); this one is indexed by the render span, so the tail has to be really
+        // zero rather than whatever an older, longer template left there - otherwise a
+        // fading-out slot would sound at a stale amplitude for the whole transition.
+        const bool xfMix = morphActive && xfadeActive;
+        for (int i = n; i < span && i < (int) tgtAmp.size(); ++i)
+            tgtAmp[(size_t) i] = 0.0;
+        // The deferred snap (see xfadeAmpSnap): tgtAmp is only NOW the new template's own
+        // amplitudes, slope and per-partial edits included, and the bank that is about to
+        // start fading in has to begin exactly there.
+        if (xfadeAmpSnap)
+        {
+            for (int i = 0; i < span && i < (int) xfadeAmp.size(); ++i)
+                xfadeAmp[(size_t) i] = tgtAmp[(size_t) i];
+            xfadeAmpSnap = false;
+        }
 
         // Each copy's own partial count, increments and near-Nyquist taper. This is
         // also where the meter's number comes from: with Shepard on it reports the
@@ -792,7 +945,15 @@ public:
         // reads as a hard cut over a big timbre change), and at the 7 ms click-free
         // minimum the rest of the time.
         double glideTarget = 0.007;
-        if (morphActive && morphTimeParam != nullptr)
+        if (xfMix && xfadeTimeParam != nullptr)
+            // A crossfade does not NEED the running bank's amplitudes to move at all - the
+            // two banks carry their own - but curAmp is still slewing towards the new
+            // template from before the transition began, and yanking it there in 7 ms would
+            // pull the OUTGOING spectrum's amplitudes onto the incoming one's while it is
+            // still audible. Over the transition's own time it barely moves before the
+            // hand-over copies the real values in.
+            glideTarget = std::max (0.007, (double) xfadeTimeParam->load());
+        else if (morphActive && morphTimeParam != nullptr)
             glideTarget = std::max (0.007, (double) morphTimeParam->load());
         else if (tmplGlideSamps > 0)
             glideTarget = kTmplGlideSec;
@@ -816,6 +977,11 @@ public:
         // entire Morph Time (seconds) instead of milliseconds.
         const float gainSlew = (float) (1.0 - std::exp (-1.0 / (0.007 * sr)));
         double sumCur0 = 0.0, sumTarget = 0.0, sumTargetSq = 0.0, coefA = 0.0, coefB = 0.0;
+        // The SAME three coefficients for the incoming bank, which slews toward the same
+        // targets at the same rate and therefore obeys the same closed form. Only filled
+        // during a crossfade; otherwise xfadeAmp is not rendered and these stay at the
+        // running bank's values, which is what the non-crossfade branch below reads.
+        double sumAlg0 = 0.0, coefA2 = 0.0, coefB2 = 0.0;
         for (int i = 0; i < span; ++i)
         {
             const double c0 = curAmp[(size_t) i];           // amps are non-negative
@@ -826,6 +992,12 @@ public:
             sumTargetSq += tg * tg;
             coefA       += tg * d;
             coefB       += d  * d;
+            if (xfMix)
+            {
+                const double a0 = xfadeAmp[(size_t) i];
+                const double e  = a0 - tg;
+                sumAlg0 += a0; coefA2 += tg * e; coefB2 += e * e;
+            }
         }
         // Equal-loudness per voice = normalise to a fixed RMS. In Aligned mode a plain
         // peak-normalise (0.5/sum) equalises the PEAK, not the loudness, so sparse
@@ -921,6 +1093,16 @@ public:
             {
                 if (morphFadeOut)
                     morphW = std::max (0.0, morphW + morphWStep);
+                else if (xfMix)
+                {
+                    // A crossfade runs its clock STRAIGHT. The morph's ease-in below is
+                    // there to bring its coherent phase reference in gently; a crossfade
+                    // starts phase-locked and has no reference to bring in, and a squared
+                    // ramp would simply spend most of the time sitting on the old spectrum
+                    // and then hurry - which is not "fade out while the other fades in".
+                    morphWPos += morphWStep;
+                    morphW = std::max (morphW, std::min (1.0, morphWPos));
+                }
                 else
                 {
                     morphWPos += morphWStep;
@@ -928,10 +1110,40 @@ public:
                     morphW = std::max (morphW, tw * tw); // ease-in, monotonic within a fade
                 }
             }
+            // THE TWO BANKS' GAINS - ONE law for both features, and deliberately the linear
+            // one. Equal-power (sqrt) is the textbook choice for crossfading two UNCORRELATED
+            // sources, and it was wrong here: a crossfade's banks are phase-locked (see the
+            // seeding above), so every partial the two spectra share is one partial sounding
+            // through both gains, and sqrt would make it swell 3 dB in the middle of a
+            // transition it is not even part of. Linear keeps every unchanged partial exactly
+            // constant; the partials that really do cross over are the only ones that dip,
+            // and they are the ones the listener is hearing change anyway. Bit-for-bit the
+            // expression this replaces when both banks share one amplitude, i.e. under a
+            // morph, and exactly (1, 0) at weight 0 and (0, 1) at weight 1 - which is what
+            // makes a transition's two endpoints the old and the new spectrum exactly.
+            const double algG = morphW;
+            const double runG = 1.0 - morphW;
             // Exact per-sample normalisation from the closed-form running sums (no lag).
             rk *= oneMinusSlew;
-            const double sumCur = (sumTarget   + (sumCur0 - sumTarget) * rk)      * Sw;
-            const double sumSq  = (sumTargetSq + (2.0 * coefA + coefB * rk) * rk) * Sw2;
+            const double curSum = sumTarget   + (sumCur0 - sumTarget) * rk;
+            const double curSq  = sumTargetSq + (2.0 * coefA + coefB * rk) * rk;
+            // Under a crossfade the two banks carry DIFFERENT amplitudes (the running one
+            // curAmp, the incoming one xfadeAmp), so the sums the normalisation is derived
+            // from have to be the mixture of both. Interpolated BY THE WEIGHT, not by its
+            // square: with phase-locked banks a partial common to both spectra really is
+            // one partial at its own amplitude the whole way through, and w-squared would
+            // model it as two independent ones and duck the normalisation 3 dB under it.
+            // Exact at both endpoints either way, which is what keeps them the old and the
+            // new spectrum. Without this the voice normalises to the OUTGOING spectrum
+            // alone and drifts as the incoming one arrives.
+            double sumCur = curSum * Sw, sumSq = curSq * Sw2;
+            if (xfMix)
+            {
+                const double algCur = sumTarget   + (sumAlg0 - sumTarget) * rk;
+                const double algSq  = sumTargetSq + (2.0 * coefA2 + coefB2 * rk) * rk;
+                sumCur = (runG * curSum + algG * algCur) * Sw;
+                sumSq  = (runG * curSq  + algG * algSq)  * Sw2;
+            }
             const double rmsN   = sumSq  > 1.0e-12 ? 0.25 / std::sqrt (sumSq) : 0.0;
             const double peakN  = sumCur > 1.0e-9  ? 0.5  / sumCur            : 0.0;
             normGain = (float) (aligned ? std::min (rmsN, peakN) : rmsN);
@@ -945,25 +1157,37 @@ public:
             {
                 const double target = (i < n) ? tgtAmp[(size_t) i] : 0.0;
                 curAmp[(size_t) i] += (target - curAmp[(size_t) i]) * slew;
+                // The incoming bank moves on the same clock, so the closed-form sums above
+                // describe it exactly too. A no-op unless a template landed mid-transition:
+                // xfadeAmp was snapped ONTO these targets when the transition began.
+                if (xfMix) xfadeAmp[(size_t) i] += (target - xfadeAmp[(size_t) i]) * slew;
             }
 
             // One oscillator bank per copy, at slot * kStride. The advance is identical
             // for all of them - only the increments (this copy's root) and the window
             // factor differ.
-            const auto advance = [&] (int j) -> double
+            // `j` is the oscillator slot (per Shepard copy), `i` the partial rank the two
+            // amplitudes are indexed by. It returns the sample ALREADY scaled, because under
+            // a Dry/Wet transition the two banks no longer share one amplitude: the running
+            // one carries the outgoing spectrum's (curAmp) and the aligned one the incoming
+            // spectrum's (tgtAmp). Under a morph both gains multiply the same curAmp, so
+            // this is curAmp * ((1-w)*s + w*sa) - the expression it replaces, factored.
+            const double* algAmp = xfMix ? xfadeAmp.data() : curAmp.data();
+            const auto advance = [&] (int j, int i) -> double
             {
                 double p = phase[(size_t) j] + inc[(size_t) j];
                 if (p >= 1.0) p -= 1.0;
                 phase[(size_t) j] = p;
-                double s = (double) sine.lookup (p);
+                const double s = (double) sine.lookup (p);
                 if (morphActive) // crossfade the running phase -> the coherent destination phase
                 {
                     double pa = alignPhase[(size_t) j] + alignInc[(size_t) j]; // advances at the DEST freq
                     if (pa >= 1.0) pa -= 1.0;
                     alignPhase[(size_t) j] = pa;
-                    s += morphW * ((double) sine.lookup (pa) - s);
+                    return curAmp[(size_t) i] * runG * s
+                         + algAmp[(size_t) i] * algG * (double) sine.lookup (pa);
                 }
-                return s;
+                return curAmp[(size_t) i] * s;
             };
 
             double acc = 0.0;
@@ -976,12 +1200,12 @@ public:
                 const int nc  = sl.count[(size_t) c];
                 double accC = 0.0;
                 for (int i = 0; i < nf; ++i)
-                    accC += curAmp[(size_t) i] * advance (off + i);
+                    accC += advance (off + i, i);
                 // The copy's own near-Nyquist taper (see fillShepardCopies): partials
                 // leave a rising copy by FADING through it, never by disappearing
                 // between two blocks.
                 for (int i = nf; i < nc; ++i)
-                    accC += curAmp[(size_t) i] * sl.tap[(size_t) c][(size_t) (i - nf)] * advance (off + i);
+                    accC += sl.tap[(size_t) c][(size_t) (i - nf)] * advance (off + i, i);
                 acc += w * accC;
             }
 
@@ -1054,6 +1278,14 @@ public:
             for (int c = 0; c < sl.numCopies; ++c)
                 for (int i = 0; i < adoptSpan; ++i)
                     phase[(size_t) (sl.off[c] + i)] = alignPhase[(size_t) (sl.off[c] + i)];
+            // A DRY/WET transition also hands its AMPLITUDES over. The next block renders one
+            // bank at curAmp, and the last sample of the transition was the aligned bank at
+            // tgtAmp; without this copy the two differ by however far the amp slew still had
+            // to go, and that difference lands in a single sample as a step. Free exactly
+            // here and nowhere else: at weight 1 the running bank is silent.
+            // (curRatio needs no hand-over: with morphActive false the next block snaps it
+            // onto this same template, which is where alignRatio already sat.)
+            adoptXfadeAmps (adoptSpan);
             morphActive = false;
             morphWeight = 0.0; morphWPos = 0.0; // safe here: the two banks are identical
         }
@@ -1061,7 +1293,7 @@ public:
         {
             // The ramp-out reached silence: the aligned bank contributes nothing now, so
             // dropping it is a no-op.
-            morphActive = false; morphFadeOut = false; morphWPos = 0.0;
+            morphActive = false; morphFadeOut = false; morphWPos = 0.0; xfadeActive = false;
         }
 
         // Keep fading-out tails alive until they are inaudible.
@@ -1193,6 +1425,25 @@ private:
         fastKillGain = 1.0f;
         releasing    = false;
         clearCurrentNote();
+    }
+
+    // HAND A FINISHED DRY/WET TRANSITION'S AMPLITUDES OVER, in one place because there are
+    // three points where a transition can end (a new template arriving on the morph path,
+    // one arriving on the crossfade path, and the transition simply completing) and every
+    // one of them has to do it. During a transition the running bank renders the OUTGOING
+    // spectrum at curAmp while the aligned bank renders the INCOMING one at xfadeAmp; once
+    // the weight has reached 1 the running bank is silent, the aligned bank is the whole
+    // output, and the next block renders ONE bank at curAmp. So curAmp must BE xfadeAmp by
+    // then, or the first sample after the hand-over steps between the two.
+    // Called only at weight >= 0.999 - the same half of the invariant that governs phase[].
+    // A no-op when the fade in flight is a morph, whose two banks share one amplitude.
+    void adoptXfadeAmps (int span) noexcept
+    {
+        if (! xfadeActive) return;
+        const int lim = std::min (span, (int) curAmp.size());
+        for (int i = 0; i < lim; ++i)
+            curAmp[(size_t) i] = xfadeAmp[(size_t) i];
+        xfadeActive = false;
     }
 
     // The two phase modes, in ONE place so the note-on seeding and the morph's
@@ -1552,6 +1803,8 @@ private:
     std::atomic<float>* manualParam     = nullptr; // manual per-partial amps -> slope inert
     std::atomic<float>* morphParam     = nullptr;
     std::atomic<float>* morphTimeParam = nullptr;
+    std::atomic<float>* xfadeParam     = nullptr;  // Dry/Wet Transition on/off
+    std::atomic<float>* xfadeTimeParam = nullptr;  // ...and how long one takes
 
     spectrum::CurvedEnv adsr, filterAdsr, pitchAdsr; // per-segment curves (see CurvedEnv.h)
     // Last parameters actually pushed to each ADSR (sentinel = force first apply).
@@ -1564,6 +1817,20 @@ private:
     std::array<double, spectrum::kMaxPartials> inc    {}; // frequency (cycles/sample), from curRatio
     std::array<double, spectrum::kMaxPartials> tgtAmp {}; // target amplitude (from template)
     std::array<double, spectrum::kMaxPartials> curAmp {}; // slewed amplitude actually rendered
+    // THE INCOMING BANK'S OWN AMPLITUDES, during a Dry/Wet transition only. A morph does
+    // not need them - its two banks are the same partials and share curAmp - but a
+    // crossfade's two banks are two different spectra, and the incoming one has to be at
+    // the NEW amplitudes from the first sample or the far endpoint is not the new spectrum,
+    // it is wherever an amplitude slew had got to.
+    //
+    // SNAPPED at weight 0 (free: the bank is inaudible) and SLEWED thereafter. The slew is
+    // not decoration: under a stream of templates - an adaptive follower, a modulator on a
+    // spectrum control - a new one lands mid-transition while this bank is audible at
+    // sqrt(weight), and writing its amplitudes straight in would step the loudest half of
+    // the output. The frequencies may snap there (a frequency move on a continuous phase is
+    // inaudible); the amplitudes may not.
+    std::array<double, spectrum::kMaxPartials> xfadeAmp {};
+    bool xfadeAmpSnap = false;   // consumed once tgtAmp holds the NEW template's amplitudes
     std::array<double, spectrum::kMaxPartials> curRatio      {}; // current (gliding) ratio per partial
     std::array<double, spectrum::kMaxPartials> morphStartLog {}; // log2 start ratio during a morph
     std::array<double, spectrum::kMaxPartials> morphTgtLog   {}; // log2 target ratio during a morph
@@ -1584,6 +1851,17 @@ private:
     // in the mid-fade state where any write to phase[]/alignPhase[] clicks.
     double        morphWPos   = 0.0;
     bool          morphActive = false;
+    // WHICH KIND of fade is in flight, latched when it STARTS and never changed while it
+    // runs. Morph and Dry/Wet share one crossfade machine and one gain law, but they place
+    // the two banks completely differently: a morph has both banks GLIDING towards one
+    // destination and seeds the incoming one on the coherent phase reference, while a
+    // crossfade pins each bank to a standing spectrum and phase-locks the incoming one to
+    // the outgoing bank. Re-placing the banks half way through means writing alignPhase[]
+    // or alignRatio[] while they are audible, which is exactly the full-scale step the
+    // invariant above exists to forbid. So a mode change mid-fade does not convert the fade:
+    // it takes the ramp-out path below, and the NEXT template change starts the other kind
+    // cleanly from weight 0.
+    bool          xfadeActive = false;
     // Ramping the crossfade weight back OUT (Morph switched off, or an empty template)
     // rather than dropping the term in one sample.
     bool          morphFadeOut = false;
