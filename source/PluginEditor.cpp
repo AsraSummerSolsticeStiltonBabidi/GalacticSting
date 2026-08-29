@@ -7603,7 +7603,26 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 fit (saveTuningBtn);
                 fit (tuningBankAddBtn);
             }
-            tuningNameLabel.setBounds (mrow); // shows the loaded scale's file name
+            // THE SCALE NAME IS THE IDENTITY OF THE LOADED TUNING, so it must not be
+            // the scrap left over by everything else on its row. Sized as whatever
+            // `mrow` still held after the mode selector and the three buttons, it came
+            // out 21 px wide in Catalan while "12ED2" measures 39, and a juce::Label
+            // does not clip when it is short of room - it CONDENSES the glyphs to 75%,
+            // so the panel drew a squashed name and every bounds check in the build
+            // stayed green. Nothing about that is Catalan-specific: this text is a FILE
+            // NAME, its length is unbounded, and a long .scl starves the same cell in
+            // any language - Catalan's wider buttons only cross the threshold first.
+            // So the name stays inline only while the leftover genuinely holds it, and
+            // takes a row of its own the moment it does not.
+            const int nameNeed = tuningNameLabel.getText().isEmpty()
+                               ? 0 : fgfit::labelWidth (tuningNameLabel);
+            if (nameNeed > mrow.getWidth() && ti.getHeight() >= 22)
+            {
+                ti.removeFromTop (2);
+                tuningNameLabel.setBounds (ti.removeFromTop (20));
+            }
+            else
+                tuningNameLabel.setBounds (mrow);
             // Period of the active scale, in red, always visible. For an absolute 128-key
             // table it is Fibló's ESTIMATE, so the same row also carries the field that
             // overrides it (and a reset back to the estimate) - the readout alone would
@@ -8482,6 +8501,11 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         default: sname = {}; break;
     }
     tuningNameLabel.setText (sname, juce::dontSendNotification);
+    // The NAME decides its own cell - resized() gives it a row of its own when the mode
+    // row cannot hold it - and setText() does not lay anything out. Without this, loading
+    // a scale whose name is longer than the last one leaves it in the old, too-narrow
+    // cell, drawn condensed, until some unrelated relayout happens to come along.
+    if (sname != lastTuningNameLaidOut) { lastTuningNameLaidOut = sname; resized(); }
 
     // Say what is loaded even while the engine is OFF - switching it off no longer
     // discards the scale, so the box must not look empty. And say when the scale is ON

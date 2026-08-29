@@ -4645,6 +4645,10 @@ private:
     // off), and the custom view's Off button hangs on it. -1 = never applied yet.
     int  lastEngineShown = -1;
     int  lastResetOffState = -1; // packs Reset/Off visibility to detect changes for relayout
+    // The scale name the tuning row was last laid out FOR. Its width decides whether the
+    // name fits beside the mode selector or needs a row of its own, and setText() does no
+    // layout - so without this a scale loaded at run time keeps the previous name's cell.
+    juce::String lastTuningNameLaidOut { "\x01" }; // never a real name: forces the first pass
     int  lastDissGeneration = 0; // refresh the degree list / shortfall notice once per generation
     int  lastKbLo = -1, lastKbNum = -1; // last keyboard window applied (re-adapt on tuning change)
     // SPECTRUM macro-panel: the outer frame, its three nested boxes and their sub-cells.
