@@ -54,8 +54,15 @@ juce_add_plugin(FractalAdditive
     # finding the file. The DISPLAYED name keeps its accents - see JucePlugin_Name below.
     PRODUCT_NAME                "Fiblo Galactic")
 
-# Embedded assets (title font + the one-shot startup jingle).
-juce_add_binary_data(GalacticAssets SOURCES assets/fonts/Kablammo.ttf assets/audio/jingle.wav)
+# Embedded assets (title font, the microtonal accidental font, and the one-shot startup
+# jingle). notes.otf carries the ups-and-downs accidentals the keyboard's note names are
+# spelled in - they ride on ordinary ASCII letters, so without this face embedded the
+# names would not be missing, they would be WRONG (C sharp reading as the letters "Cc").
+# Licence and credits: assets/fonts/NOTATION-LICENSES.txt.
+juce_add_binary_data(GalacticAssets SOURCES
+    assets/fonts/Kablammo.ttf
+    assets/fonts/notes.otf
+    assets/audio/jingle.wav)
 
 target_sources(FractalAdditive PRIVATE
     source/PluginProcessor.cpp

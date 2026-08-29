@@ -380,6 +380,17 @@ namespace
             { "24-spec-segment", "right column: from spectrum's segment", tEditor, fNone,
               [] (Proc&, Ed& e) { e.setSpecModeForTests (3); } },
 
+            // THE KEYBOARD WEARING NOTE NAMES instead of degree numbers. A name is far
+            // wider than a digit and is drawn in a different typeface, so this is the one
+            // scenario where the degree band, the interval label under it and the period
+            // number above the tonic are all laid out around text the rest of the matrix
+            // never sees. 19-EDO because it is spelled with ordinary sharps and flats -
+            // "C# Db" - so a reader can check the picture against what they already know.
+            { "32-keyboard-note-names", "keyboard: note NAMES instead of degree numbers (19-EDO)",
+              tEditor, fSizes | fScale2,
+              [] (Proc& p, Ed& e) { loadScale (p, kScale19, "19edo");
+                                    e.setNoteNamesForSnapshot (true); } },
+
             // The TUNING panel, with and without the conditional Shepard rise dropdown.
             { "30-tuning-octave-period", "tuning panel, octave period (no rise dropdown)", tEditor, fNone,
               [] (Proc& p, Ed&) { loadScale (p, kScale19, "19edo"); setParam (p, "shepOn", 1.0f); } },
@@ -659,7 +670,10 @@ namespace
             p->prepareToPlay (48000.0, 512);
             std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
             if (auto* ed = dynamic_cast<Ed*> (base.get()))
+            {
+                ed->setNoteNamesForSnapshot (false);   // the shipped default, not this machine's
                 gEditorMin = findSmallestLaidOutSize (*ed);
+            }
             say ("  editor floor used by the matrix: "
                       + juce::String (gEditorMin.w) + " x " + juce::String (gEditorMin.h));
         }
@@ -681,6 +695,12 @@ namespace
             auto* ed = dynamic_cast<Ed*> (base.get());
             if (ed == nullptr) { say ("  FAIL " + juce::String (sc.id) + ": no editor"); ++failed; continue; }
             ed->setSize (1200, 650);
+            // EVERY SCENARIO STARTS FROM THE SHIPPED DEFAULT, whatever this machine's user
+            // prefers. Note names are a PREFERENCE read out of a global settings file, so
+            // without this line the same 84 pictures would come out differently on a
+            // machine where somebody had switched them on - and a baseline that depends on
+            // who photographed it is not a baseline. Scenario 32 asks for them back.
+            ed->setNoteNamesForSnapshot (false);
             sc.setup (*proc, *ed);
             ed->tickTimerForTests();   // no message loop here: this is what the 30 Hz timer would do
 

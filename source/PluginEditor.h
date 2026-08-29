@@ -2,6 +2,7 @@
 
 #include "PluginProcessor.h"
 #include "ScaleKeyboard.h"
+#include "NoteNames.h"
 #include "PartialAmpEdit.h"
 #include "IntervalTokens.h"
 #include "GalacticPalette.h"
@@ -469,6 +470,42 @@ public:
     // shrank to fit.
     std::vector<ScaleKeyboard::PeriodTag> keyboardPeriodTagsForTests() const
     { return keyboard.periodTagProbe(); }
+
+    // Test hooks (RhythmVerify) for the NOTE-NAME option. The keyboard is asked what it
+    // is really drawing; the editor is asked what it would tell the user. A check that
+    // built its own names, or its own reason, would be testing itself.
+    struct NoteNameProbe
+    {
+        bool         optionOn    = false;  // the user's preference, as persisted
+        int          edo         = 0;      // equal divisions of the octave, 0 = not an EDO
+        int          namedCount  = 0;      // names the editor has cached for this tuning
+        bool         showing     = false;  // is the KEYBOARD drawing names right now
+        bool         fits        = false;  // ...and would they fit the narrowest key
+        float        fontAtMinKey = 0.0f;  // the height they get at kCellW
+        juce::String widest;               // the widest name on this keyboard
+        juce::String reason;               // why numbers, in the current language ("" = names)
+        // The very face the keyboard draws names in. Carried so a check can run the
+        // layout for EDOs this tuning is not - the keyboard only ever holds one at a
+        // time, and the widest name of them all belongs to one nobody loaded.
+        juce::Typeface::Ptr face;
+    };
+    NoteNameProbe noteNameProbeForTests() const;
+    // The same probe, and the period tags, taken in the OTHER language and restoring the
+    // one they found - exactly as layoutProbeInLanguage does. The names themselves are
+    // language-free, but the REASON the keyboard gives for showing numbers is not, and
+    // neither is the interval label the degree band shares its key with.
+    NoteNameProbe noteNameProbeInLanguage (bool useCatalan);
+    std::vector<ScaleKeyboard::PeriodTag> keyboardPeriodTagsInLanguage (bool useCatalan);
+    // Flip the option exactly as the menu item does (preference write included), so a
+    // check exercises the real path rather than a private copy of it.
+    void setNoteNamesForTests (bool on);
+    // The same flip WITHOUT writing the preference, for the snapshot rig. Deliberately not
+    // setNoteNamesForTests: the rig runs on the user's own machine, out of the shipped
+    // standalone, and a run that photographs this feature must not leave it switched on
+    // for them afterwards. It is also what pins every OTHER scenario to the shipped
+    // default - otherwise the 82 pictures would differ depending on a setting belonging to
+    // whoever took them, which is not a baseline a redesign can be built on.
+    void setNoteNamesForSnapshot (bool on);
     // Test hooks (RhythmVerify): the adaptation's register range - the step count the field
     // shows, the anchor it is counted from, the keys it resolves to and the Hz the search
     // is really given. A range that reads one width and searches another is the bug this
@@ -4677,6 +4714,16 @@ private:
     void rebuildScaleDissList();   // (re)build + sort degreeList.rows from the cached activeDiss
     void commitRefA();       // parse the Reference-A text box -> set the refA parameter
     void refreshRefAText();  // set the Reference-A text box from the current parameter
+    // NOTE NAMES. `noteNamesOn` mirrors the persisted preference (the processor owns it);
+    // the cache is the spelling of the CURRENT tuning, keyed on its EDO so it is rebuilt
+    // only when the answer can have changed. See refreshDegreeNames().
+    void         refreshDegreeNames();
+    juce::String noteNamesReason() const;
+    bool         scaleIsJustIntonation() const;
+    bool                      noteNamesOn = false;
+    int                       degreeNameEdo = -1;  // -1 = never built, 0 = "not an EDO"
+    std::vector<juce::String> degreeNameCache;
+
     std::map<int, int> heldKeys;
     juce::uint32 lastFocusedMs = 0; // debounce: keep playing through brief focus flickers
     juce::uint32 lastFocusReclaimMs = 0; // rate limit on the hover-driven focus grab (see refocus)

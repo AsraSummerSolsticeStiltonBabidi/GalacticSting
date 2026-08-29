@@ -15,6 +15,21 @@ namespace
         return tf;
     }
 
+    // The microtonal accidental face (notes.otf by Sintel, from tessera - MIT; see
+    // assets/fonts/NOTATION-LICENSES.txt). Loaded once, like the title face.
+    //
+    // It is not a decoration. In this font the accidentals ride on ordinary ASCII
+    // letters, so the ups-and-downs name for C sharp is the two characters "Cc" and any
+    // other typeface draws it as the literal letters C and c - a WRONG NOTE NAME, not a
+    // missing-glyph box, and therefore invisible to every check that only inspects
+    // rectangles. If this ever fails to load, the keyboard keeps its degree numbers.
+    const juce::Typeface::Ptr& notesTypeface()
+    {
+        static juce::Typeface::Ptr tf = juce::Typeface::createSystemTypefaceFor (
+            BinaryData::notes_otf, (size_t) BinaryData::notes_otfSize);
+        return tf;
+    }
+
     // SECTION COLOURS - every one of them from galactic::palette (source/GalacticPalette.h),
     // which is where they are DECIDED and where a test can read them.
     //
@@ -1714,6 +1729,19 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         m.addItem (1, tr ("Reset all parameters", "Reinicia tots els par\xc3\xa0metres"));
         m.addItem (2, catalan ? juce::String ("Language: English")
                               : juce::String::fromUTF8 ("Idioma: catal\xc3\xa0"));
+        // NOTE NAMES. Ticked when the preference is on. When it is on but this tuning
+        // cannot be named, the item SAYS WHY on its own line rather than silently doing
+        // nothing - "solo para tunings regulares y para JI" means most scales get numbers,
+        // and an option that looks broken is worse than one that explains itself.
+        {
+            const auto why = noteNamesReason();
+            juce::String label = tr ("Note names on the keyboard",
+                                     "Noms de nota al teclat");
+            if (why.isNotEmpty())
+                label += " - " + tr ("numbers: ", "n\xc3\xbameros: ") + why;
+            m.addItem (3, label, true, noteNamesOn);
+            m.addItem (4, tr ("Note names: credits", "Noms de nota: cr\xc3\xa8" "dits"));
+        }
         m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (menuButton),
             [this] (int r)
             {
@@ -1738,6 +1766,42 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                 {
                     catalan = ! catalan;
                     applyLanguage();
+                }
+                else if (r == 3)
+                {
+                    setNoteNamesForTests (! noteNamesOn);   // the one path, menu and check
+                }
+                else if (r == 4)
+                {
+                    // The credit, where someone using the feature can actually find it.
+                    // Names, not just licences: the notation, the algorithm and the font
+                    // are three different people's work.
+                    juce::NativeMessageBox::showMessageBoxAsync (
+                        juce::MessageBoxIconType::InfoIcon,
+                        tr ("Note names: credits", "Noms de nota: cr\xc3\xa8" "dits"),
+                        juce::String::fromUTF8 (
+                            catalan
+                              ? "Notaci\xc3\xb3 d'ups and downs, de Kite Giedraitis.\n\n"
+                                "Algorisme de grafia adaptat de \"Notation\", de Richie Greene "
+                                "(llic\xc3\xa8ncia MIT) - github.com/richiegreene/notation\n\n"
+                                "Glifs d'alteraci\xc3\xb3: notes.otf, de Sintel, del projecte tessera "
+                                "(llic\xc3\xa8ncia MIT) - github.com/Sin-tel/tessera\n\n"
+                                "La notaci\xc3\xb3 HEJI per a entonaci\xc3\xb3 justa (Marc Sabat i Thomas "
+                                "Nicholson, amb Wolfgang von Schweinitz) encara NO hi \xc3\xa9s: els seus "
+                                "glifs SMuFL nom\xc3\xa9s existeixen aqu\xc3\xad en format WOFF2, que JUCE no pot "
+                                "carregar, i dibuixar-los donaria quadres buits.\n\n"
+                                "Textos complets de les llic\xc3\xa8ncies: assets/fonts/NOTATION-LICENSES.txt"
+                              : "Ups and downs notation, devised by Kite Giedraitis.\n\n"
+                                "Spelling algorithm ported from \"Notation\" by Richie Greene "
+                                "(MIT licence) - github.com/richiegreene/notation\n\n"
+                                "Accidental glyphs: notes.otf by Sintel, from tessera "
+                                "(MIT licence) - github.com/Sin-tel/tessera\n\n"
+                                "HEJI, the just-intonation notation by Marc Sabat and Thomas "
+                                "Nicholson with Wolfgang von Schweinitz, is NOT here yet: its "
+                                "SMuFL glyphs exist here only as WOFF2, which JUCE cannot load, "
+                                "and drawing them would give empty boxes.\n\n"
+                                "Full licence texts: assets/fonts/NOTATION-LICENSES.txt"),
+                        this);
                 }
                 refocus();
             });
@@ -2444,6 +2508,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addAndMakeVisible (helpLabel);
 
     keyboard.setDegreeLabeller ([this] (int d) { return degreeLabel (processorRef, d); });
+    // Note names (off unless the user turned them on in a previous session - the
+    // preference lives in the processor's global settings file, not in patch state).
+    noteNamesOn = processorRef.getKeyboardNoteNames();
+    refreshDegreeNames();
     keyboard.setHoverTextProvider ([this] (int d) -> juce::String
     {
         // Floating window: EVERY key answers. A degree with no just interval near
@@ -2800,6 +2868,188 @@ namespace
             updateSliderValueTexts (*child);
         }
     }
+}
+
+//==============================================================================
+// NOTE NAMES ON THE KEYBOARD.
+//
+// The keyboard asks for a name per degree through a std::function it may call once per
+// key per repaint, so the SPELLING IS CACHED HERE and the function is an array lookup.
+// Spelling on demand would rebuild the whole name vector - one std::string per degree -
+// dozens of times a second on the message thread, for an answer that only changes when
+// the tuning does.
+//
+// The cache is keyed on the EDO itself (0 = "this tuning is not an equal division of the
+// octave"), so it is rebuilt exactly when the answer can have changed: a new .scl, an
+// MTS master appearing, the mode switching. `namesOff` is remembered separately from an
+// empty cache because "the user turned them off" and "this tuning has no names" are
+// different states and the menu has to tell them apart.
+void FractalAdditiveAudioProcessorEditor::refreshDegreeNames()
+{
+    const int edo = noteNamesOn ? processorRef.getEqualDivisionsOfOctave() : 0;
+    if (edo == degreeNameEdo)
+        return;   // same tuning, same answer - and this runs from resized()
+
+    degreeNameEdo = edo;
+    degreeNameCache.clear();
+    for (const auto& s : notenames::edoNames (edo))
+        degreeNameCache.push_back (juce::String (s));   // ASCII by construction
+
+    // No names to give? Hand the keyboard nothing, and it keeps its numbers. The face
+    // may also be null if the embedded font failed to load - same outcome, no boxes.
+    if (degreeNameCache.empty() || notesTypeface() == nullptr)
+    {
+        keyboard.setDegreeNamer (nullptr, {});
+        return;
+    }
+    keyboard.setDegreeNamer (
+        [this] (int d) -> juce::String
+        {
+            // The cache belongs to ONE tuning. If the scale changed under it and nothing
+            // has refreshed us yet, handing out its names is not a MISSING label, it is a
+            // WRONG one - 12-EDO's letters printed over a seven-note just scale, which no
+            // rectangle check can see. The guard is a comparison of two integers, so it is
+            // affordable on the per-key path the keyboard calls this from: the cache only
+            // ever holds an EDO's worth of names, so a degree count that no longer matches
+            // it means the cache is stale and the keys must go back to numbers.
+            return (degreeNameEdo > 0
+                    && (int) degreeNameCache.size() == degreeNameEdo
+                    && processorRef.getScaleDegrees() == degreeNameEdo
+                    && juce::isPositiveAndBelow (d, (int) degreeNameCache.size()))
+                     ? degreeNameCache[(size_t) d] : juce::String();
+        },
+        notesTypeface());
+}
+
+// Is EVERY degree of this scale a genuine ratio - the "y para JI" half of the request?
+// Asked by SOURCE, not by arithmetic: getDegreeIsRational reports what the .scl actually
+// wrote, so a degree spelled "3/2" is just and a degree spelled "701.955" is not, however
+// close the two sound. A cents approximation of a just scale is a tempered scale, and
+// telling its player "this is just intonation" would be a confident lie.
+bool FractalAdditiveAudioProcessorEditor::scaleIsJustIntonation() const
+{
+    const int D = processorRef.getScaleDegrees();
+    if (D < 2) return false;
+    long long p = 1, q = 1;
+    // Degree 0 is the unison in every tuning, so it proves nothing and is skipped; the
+    // top index D is the period, which must be just too - a just scale inside a stretched
+    // octave is not a JI scale.
+    for (int d = 1; d <= D; ++d)
+        if (! processorRef.getDegreeIsRational (d, p, q))
+            return false;
+    return true;
+}
+
+// Why the keyboard is showing NUMBERS while the option is on - in words, in the user's
+// language. An option that silently does nothing is the thing the task forbade: when
+// neither ups-and-downs nor JI applies, the toggle has to SAY so.
+juce::String FractalAdditiveAudioProcessorEditor::noteNamesReason() const
+{
+    if (! noteNamesOn) return {};
+
+    // Built with the language flag directly rather than through tr(): every one of these
+    // carries a NUMBER, and tr() takes literals. The Catalan is written with explicit
+    // UTF-8 escapes, like every other accented string in this file.
+    const int edo = processorRef.getEqualDivisionsOfOctave();
+    if (edo == 0)
+    {
+        // THE OTHER HALF OF THE REQUEST, named out loud. "solo para tunings regulares y
+        // para JI" asked for two notations, and this build ships one. A just scale
+        // answering only "not an equal division of the octave" would be true and useless:
+        // it would read as "your scale is wrong" when what is missing is the FONT. See
+        // section 4 of assets/fonts/NOTATION-LICENSES.txt for why HEJI is not here.
+        if (scaleIsJustIntonation())
+            return catalan
+                     ? juce::String::fromUTF8 (
+                           "l'entonaci\xc3\xb3 justa es nota amb HEJI, i aquesta versi\xc3\xb3 no en porta els glifs")
+                     : juce::String (
+                           "just intonation is notated with HEJI, whose glyphs are not in this build");
+        return catalan ? juce::String::fromUTF8 ("aquesta afinaci\xc3\xb3 no divideix l'octava en parts iguals")
+                       : juce::String ("this tuning is not an equal division of the octave");
+    }
+    if (edo > notenames::kMaxEdo)
+        return catalan ? juce::String::fromUTF8 ("m\xc3\xa9s de ") + juce::String (notenames::kMaxEdo)
+                             + juce::String::fromUTF8 (" graus per octava")
+                       : juce::String ("more than ") + juce::String (notenames::kMaxEdo)
+                             + juce::String (" degrees per octave");
+    if (degreeNameCache.empty())
+        return catalan ? juce::String (edo) + juce::String::fromUTF8 (
+                             " EDO no t\xc3\xa9 cap grafia que doni un nom diferent a cada grau")
+                       : juce::String (edo) + juce::String (
+                             "-EDO has no spelling that gives every degree a different name");
+    if (! keyboard.namesFitTheKeys())
+        return catalan ? juce::String::fromUTF8 ("els noms de ") + juce::String (edo)
+                             + juce::String::fromUTF8 (" EDO no caben en una tecla")
+                       : juce::String ("the names of ") + juce::String (edo)
+                             + juce::String ("-EDO are too wide for a key");
+    return {};
+}
+
+void FractalAdditiveAudioProcessorEditor::setNoteNamesForSnapshot (bool on)
+{
+    // No preference write - see the declaration. degreeNameEdo is reset so the re-spell
+    // is unconditional: the cache is keyed on the EDO alone, and a scenario that loads a
+    // scale and then asks for names is exactly the sequence where "same number, nothing
+    // to do" would photograph the previous tuning's keys.
+    noteNamesOn   = on;
+    degreeNameEdo = -1;
+    refreshDegreeNames();
+    keyboard.repaint();
+}
+
+void FractalAdditiveAudioProcessorEditor::setNoteNamesForTests (bool on)
+{
+    noteNamesOn = on;
+    processorRef.setKeyboardNoteNames (on);   // persisted immediately, globally
+    refreshDegreeNames();
+    keyboard.repaint();
+}
+
+FractalAdditiveAudioProcessorEditor::NoteNameProbe
+FractalAdditiveAudioProcessorEditor::noteNameProbeForTests() const
+{
+    NoteNameProbe p;
+    p.optionOn     = noteNamesOn;
+    p.edo          = processorRef.getEqualDivisionsOfOctave();
+    p.namedCount   = (int) degreeNameCache.size();
+    p.showing      = keyboard.showingNames();
+    p.fits         = keyboard.namesFitTheKeys();
+    p.widest       = keyboard.widestDegreeText();
+    p.reason       = noteNamesReason();
+    // At the NARROWEST key the keyboard ever draws, not the one this window produced.
+    // The NAME height, even when numbers are winning: "9.9 pt, needs 8.5" is what tells
+    // a reader whether a tuning missed the fit by a hair or by a mile.
+    p.fontAtMinKey = keyboard.nameFontAtMinKey();
+    p.face         = notesTypeface();
+    return p;
+}
+
+FractalAdditiveAudioProcessorEditor::NoteNameProbe
+FractalAdditiveAudioProcessorEditor::noteNameProbeInLanguage (bool useCatalan)
+{
+    const bool was = catalan;
+    catalan = useCatalan;
+    applyLanguage();
+    resized();
+    auto p = noteNameProbeForTests();
+    catalan = was;
+    applyLanguage();
+    resized();
+    return p;
+}
+
+std::vector<ScaleKeyboard::PeriodTag>
+FractalAdditiveAudioProcessorEditor::keyboardPeriodTagsInLanguage (bool useCatalan)
+{
+    const bool was = catalan;
+    catalan = useCatalan;
+    applyLanguage();
+    resized();
+    auto t = keyboard.periodTagProbe();
+    catalan = was;
+    applyLanguage();
+    resized();
+    return t;
 }
 
 void FractalAdditiveAudioProcessorEditor::applyLanguage()
@@ -6638,6 +6888,12 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 
 void FractalAdditiveAudioProcessorEditor::resized()
 {
+    // Re-spell the keys if the tuning moved. The timer does this too, but the timer is
+    // not running in the offline verifiers - and, more to the point, a stale name is a
+    // WRONG name, so the two cheapest moments to notice are both worth taking. It costs
+    // one integer comparison when nothing changed (see refreshDegreeNames).
+    refreshDegreeNames();
+
     auto full = getLocalBounds();
     auto titleBar = full.removeFromTop (78); // matches paint()'s titleArea
     langButton.setVisible (false); // language now lives inside the Menu popup
@@ -8465,6 +8721,11 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             if (heldHi >= 0)
                 keyboard.ensureVisible (heldLo, heldHi);
         }
+        // ...and re-spell the degrees if the tuning moved under us. Cheap: it compares
+        // one integer and only rebuilds when the EDO itself changed (see
+        // refreshDegreeNames). Here rather than at every load site because the tuning can
+        // change from six of them - a .scl, the bank, MTS, Init, undo, a preset.
+        refreshDegreeNames();
     }
 
     const int  rendered  = processorRef.getPartialCount();

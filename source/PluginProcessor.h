@@ -295,6 +295,10 @@ public:
 
     // Degrees per period of the active tuning (for the colour keyboard).
     int getScaleDegrees() const noexcept { return tuning.degreesPerPeriod(); }
+    // How many EQUAL steps the active tuning cuts the OCTAVE into, or 0 when it does not
+    // cut the octave into equal steps at all. The keyboard's note-name option hangs off
+    // this - see TuningManager::equalDivisionsOfOctave. Message thread.
+    int getEqualDivisionsOfOctave() const { return tuning.equalDivisionsOfOctave(); }
 
     // True when EVERY degree sits one equal step from the last (any N-EDO, or any
     // scale that happens to be equal-stepped). In such a tuning a chord shape has
@@ -418,6 +422,29 @@ public:
 
     // Recently-used .scl files (persisted across sessions, newest first, max 3).
     juce::StringArray getRecentSclPaths() const { return recentSclPaths; }
+
+    //== USER PREFERENCES, not patch state =====================================
+    // "quiero que ... el sinte se acuerde de si el usuario la activo o no y que se abra
+    // ya con ese setting al re-abrirse."
+    //
+    // Note names on the keyboard are a PREFERENCE about how this person reads a
+    // keyboard, not a property of the sound. They therefore live in the same global
+    // settings file as the recent-.scl list (appProps) and NOT in getStateInformation:
+    // patch state travels with the project and with every preset, so a preference stored
+    // there would flip back the moment someone loaded a preset saved before they turned
+    // it on - which is exactly the "it forgot again" the user asked twice to be rid of.
+    // Stored globally, it survives closing the plugin, the host, and the machine, and it
+    // is the same in every project and every instance.
+    bool getKeyboardNoteNames() const noexcept { return keyboardNoteNames; }
+    void setKeyboardNoteNames (bool on)
+    {
+        keyboardNoteNames = on;
+        if (appProps != nullptr)
+        {
+            appProps->setValue ("keyboardNoteNames", on);
+            appProps->saveIfNeeded();   // written NOW: a host that is killed rather than
+        }                               // closed never runs a destructor to flush it
+    }
 
     //==========================================================================
     // Timbre -> rhythm MIDI out (see RhythmEngine.h). The editor edits the slots
@@ -1515,9 +1542,11 @@ private:
     juce::Random       randomSpectrumRng { (juce::int64) juce::Time::getHighResolutionTicks() };
     juce::String       lastRandomSpectrumText; // redraw if a draw repeats the previous one
 
-    // Persistent recent-.scl list (global app settings, shared across instances).
+    // Persistent recent-.scl list + UI preferences (global app settings, shared across
+    // instances). See setKeyboardNoteNames for why a preference is not patch state.
     std::unique_ptr<juce::PropertiesFile> appProps;
     juce::StringArray                     recentSclPaths;
+    bool                                  keyboardNoteNames = false; // OFF by default
 
     // Tuning bank: per-instance .scl slots (name + raw source), persisted in state.
     std::array<juce::String, kBankSlots> bankName, bankSource;

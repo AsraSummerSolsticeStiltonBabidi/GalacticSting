@@ -158,6 +158,24 @@ and to keep in a public repo. The title-drawing code loads it via `BinaryData::K
 change the title font, drop another `.ttf`/`.otf` in `assets/fonts/`, update the
 `juce_add_binary_data(...)` line in `CMakeLists.txt`, and point `titleTypeface()` at the new symbol.
 
+**Embedded font — `assets/fonts/notes.otf`** (by Sintel, from
+[tessera](https://github.com/Sin-tel/tessera), **MIT**) is bundled for the keyboard's optional
+microtonal note names. Embedding and commercial use are fine; the MIT licence only requires that
+the notice travels with the binary, which is what `assets/fonts/NOTATION-LICENSES.txt` is for.
+That file also carries the rest of the credits for that feature, and the plugin shows them at
+**Menu → "Note names: credits"**:
+
+- the notation is **ups and downs**, devised by **Kite Giedraitis**;
+- the speller in `source/NoteNames.h` is a port of `edoNames()` from **"Notation" by Richie
+  Greene** (MIT);
+- **HEJI** — the just-intonation notation by **Marc Sabat** and **Thomas Nicholson** with
+  **Wolfgang von Schweinitz** — is credited but **not shipped**: its accidentals are SMuFL
+  codepoints, the only font here that carries them is a **Bravura** (SIL OFL) subset in WOFF2,
+  and `juce::Typeface::createSystemTypefaceFor` reads OTF/TTF but not WOFF2. Drawing them anyway
+  would put a row of missing-glyph boxes on every just degree, so a JI scale keeps its degree
+  numbers and the menu says why. Adding a SMuFL **OTF/TTF** under `assets/fonts/` is the whole of
+  what is missing.
+
 ---
 
 ## Collaborating on this repo (GitHub)

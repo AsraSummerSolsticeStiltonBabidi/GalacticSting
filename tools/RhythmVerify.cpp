@@ -4059,6 +4059,293 @@ int main()
                 }
             }
 
+            // (2b) NOTE NAMES INSTEAD OF DEGREE NUMBERS - the option, off by default,
+            //      remembered between sessions.
+            //
+            //      "crees que podriamos implementar esta notacion en el teclado como
+            //       opcion? ... solo para tunings regulares y para JI ... quiero que por
+            //       default este off esa opcion pero que se pueda activar y el sinte se
+            //       acuerde de si el usuario la activo o no"
+            //
+            //      A name is far wider than a digit, so everything the period-tag work
+            //      above pinned - the fit, the border clearance, the shared column - has
+            //      to hold again for text the keyboard never used to draw. And a name is
+            //      the one label on this keyboard that can be WRONG rather than missing:
+            //      the accidentals ride on ASCII letters, so drawing "Cc" in any other
+            //      face prints the letters C and c, which no rectangle check can see.
+            {
+                std::printf ("note names on the keyboard (ups and downs):\n");
+                auto edoScl = [] (int n)
+                {
+                    juce::String s;
+                    s << "! e.scl\n" << juce::String (n) << "-EDO\n " << juce::String (n) << "\n!\n";
+                    for (int i = 1; i <= n; ++i)
+                        s << " " << juce::String (1200.0 * (double) i / (double) n, 6) << "\n";
+                    return s;
+                };
+                juce::String err;
+                // The user's own preference. Restored at the end of this block: it lives in
+                // a GLOBAL settings file, and a verifier that left it flipped would have
+                // silently changed the setting on the machine it ran on.
+                const bool userPref = p.getKeyboardNoteNames();
+
+                // OFF BY DEFAULT, and off means numbers - not blank keys.
+                p.loadScalaText (edoScl (12), "edo12", err);
+                ed->setNoteNamesForTests (false);
+                ed->resized();
+                {
+                    const auto np = ed->noteNameProbeForTests();
+                    check (! np.optionOn && ! np.showing,
+                           "with the option off the keyboard numbers its degrees, as it always did");
+                    check (np.reason.isEmpty(),
+                           "and offers no excuse for it - nothing was asked for");
+                    const auto tags = ed->keyboardPeriodTagsForTests();
+                    check (! tags.empty() && tags.front().zeroText == "0",
+                           "degree 0 still wears a \"0\"");
+                }
+
+                // ON, with an EDO that has a spelling.
+                ed->setNoteNamesForTests (true);
+                ed->resized();
+                {
+                    const auto np = ed->noteNameProbeForTests();
+                    std::printf ("  12-EDO: %d names, widest \"%s\", %.1f pt at a %d px key\n",
+                                 np.namedCount, np.widest.toRawUTF8(), np.fontAtMinKey,
+                                 ScaleKeyboard::kCellW);
+                    check (np.edo == 12 && np.namedCount == 12,
+                           "12-EDO is recognised and spelled");
+                    check (np.showing && np.reason.isEmpty(),
+                           "and the keyboard is drawing the names");
+                    const auto tags = ed->keyboardPeriodTagsForTests();
+                    check (! tags.empty() && tags.front().zeroText == "C",
+                           "degree 0 now wears its NAME - \"C\", not \"0\"");
+                    check (! tags.empty() && tags.front().names,
+                           "and the probe knows it is measuring a name, not a digit");
+                }
+
+                // OFF AGAIN, AND ON AGAIN, ON THE SAME TUNING. The one transition where
+                // the scale does not move: the degree count is 12 before and after, so
+                // nothing about the tuning tells the keyboard to change its mind. It is
+                // therefore the only check that can catch a keyboard which caches what its
+                // keys say and goes on drawing the names the user just switched off - and
+                // every OTHER case in this block changes the degree count, so all of them
+                // would keep passing.
+                for (int round = 0; round < 2; ++round)
+                {
+                    ed->setNoteNamesForTests (false);
+                    ed->resized();
+                    const auto off  = ed->noteNameProbeForTests();
+                    const auto offT = ed->keyboardPeriodTagsForTests();
+                    check (! off.showing && ! offT.empty() && offT.front().zeroText == "0"
+                           && ! offT.front().names,
+                           "switching the option off puts the NUMBERS back on the very same tuning");
+                    ed->setNoteNamesForTests (true);
+                    ed->resized();
+                    const auto on  = ed->noteNameProbeForTests();
+                    const auto onT = ed->keyboardPeriodTagsForTests();
+                    check (on.showing && ! onT.empty() && onT.front().zeroText == "C"
+                           && onT.front().names,
+                           "...and switching it back on puts the names back");
+                }
+
+                // EVERY EDO THIS CAN EVER SPELL, at the NARROWEST key the keyboard draws.
+                // Not the four this verifier happens to load: the widest name in the whole
+                // notation belongs to an EDO nobody will open, and that is exactly where a
+                // squeezed label ships. Either the layout holds, or the keyboard refuses
+                // the names and keeps its numbers - there is no third outcome.
+                {
+                    const auto np   = ed->noteNameProbeForTests();
+                    const auto tags = ed->keyboardPeriodTagsForTests();
+                    check (np.face != nullptr, "the accidental face is embedded and loaded");
+                    if (np.face != nullptr && ! tags.empty())
+                    {
+                        const float cellW = (float) ScaleKeyboard::kCellW;
+                        const float cellH = tags.front().cellH;
+                        const auto  label = tags.front().label;
+                        const auto  key   = ScaleKeyboard::cellRectForTests (cellW, cellH);
+                        const float col   = ScaleKeyboard::degreeCentreXForTests (cellW, cellH, label);
+                        int spellable = 0, shown = 0, refused = 0;
+                        int squeezed = 0, border = 0, offCol = 0, stacked = 0;
+                        int widestEdoShown = 0; juce::String widestShown;
+                        float widestShownW = -1.0f;
+                        juce::String firstBad;
+                        for (int m = 1; m <= notenames::kMaxEdo; ++m)
+                        {
+                            const auto names = notenames::edoNames (m);
+                            if (names.empty()) continue;
+                            ++spellable;
+                            // The widest name of THIS EDO, measured the way the keyboard
+                            // measures it rather than counted in characters.
+                            juce::String widest;
+                            float bestW = -1.0f;
+                            for (const auto& s : names)
+                            {
+                                const juce::String js (s);
+                                const float w = ScaleKeyboard::labelTextWidth (js, 20.0f, np.face);
+                                if (w > bestW) { bestW = w; widest = js; }
+                            }
+                            // The three-character period number is the worst case above it.
+                            const auto z = ScaleKeyboard::layOutPeriodTagForCell (
+                                cellW, cellH, label, "-10", juce::String (names[0]), widest, np.face);
+                            if (z.zeroFont < ScaleKeyboard::kMinNameFont) { ++refused; continue; }
+                            ++shown;
+                            if (bestW > widestShownW)
+                            { widestShownW = bestW; widestShown = widest; widestEdoShown = m; }
+                            // Everything the numbers already had to satisfy, for a name.
+                            const float need = ScaleKeyboard::labelTextWidth (
+                                juce::String (names[0]), z.zeroFont, np.face);
+                            if (need > z.zero.getWidth())
+                            { ++squeezed; if (firstBad.isEmpty()) firstBad = juce::String (m) + "-EDO"; }
+                            const auto ti = z.tag.getSmallestIntegerContainer().toFloat();
+                            const auto zi = z.zero.getSmallestIntegerContainer().toFloat();
+                            const float e = juce::jmin (
+                                juce::jmin (ti.getY() - key.getY(), key.getBottom() - zi.getBottom()),
+                                juce::jmin (juce::jmin (ti.getX() - key.getX(), key.getRight() - ti.getRight()),
+                                            juce::jmin (zi.getX() - key.getX(), key.getRight() - zi.getRight())));
+                            if (e < 1.0f) ++border;
+                            if (std::abs (z.zero.getCentreX() - col) > 0.51f) ++offCol;
+                            if (z.tag.getBottom() > z.zero.getY() + 0.01f) ++stacked;
+                        }
+                        std::printf ("  %d spellable EDOs: %d fit a %d px key (widest shown \"%s\","
+                                     " %d-EDO), %d refused and kept their numbers\n",
+                                     spellable, shown, ScaleKeyboard::kCellW,
+                                     widestShown.toRawUTF8(), widestEdoShown, refused);
+                        check (shown > 0, "some EDOs' names do fit a key");
+                        check (refused > 0,
+                               "and some do NOT - the fit is a real gate, not a formality");
+                        check (squeezed == 0,
+                               juce::String ("no name the keyboard agrees to draw is squeezed to fit"
+                                             + (firstBad.isEmpty() ? juce::String() : " (" + firstBad + ")")).toRawUTF8());
+                        check (border == 0, "and none of them touches the key's border");
+                        check (offCol == 0, "and every degree-0 NAME stays on the degree column");
+                        check (stacked == 0, "and the period number still sits ABOVE the name, never beside it");
+                    }
+                }
+
+                // "solo para tunings regulares y para JI": everything else keeps its
+                // numbers AND SAYS WHY, in whichever language is on screen. An option that
+                // silently does nothing is the failure the request named.
+                {
+                    juce::String bp ("! bp.scl\nBohlen-Pierce\n 13\n!\n");
+                    for (int i = 1; i <= 13; ++i)
+                        bp << " " << juce::String (1200.0 * std::log2 (3.0) * (double) i / 13.0, 6) << "\n";
+                    p.loadScalaText (bp, "bp", err);
+                    ed->resized();
+                    const auto en = ed->noteNameProbeInLanguage (false);
+                    const auto ca = ed->noteNameProbeInLanguage (true);
+                    std::printf ("  Bohlen-Pierce: EN \"%s\" / CA \"%s\"\n",
+                                 en.reason.toRawUTF8(), ca.reason.toRawUTF8());
+                    check (en.optionOn && ! en.showing,
+                           "with the option still ON, a 3/1-period scale keeps its degree numbers");
+                    check (en.reason.isNotEmpty() && ca.reason.isNotEmpty(),
+                           "and the menu says why, in both languages");
+                    check (en.reason != ca.reason, "and the two languages really are two texts");
+                    const auto tags = ed->keyboardPeriodTagsForTests();
+                    check (! tags.empty() && tags.front().zeroText == "0" && ! tags.front().names,
+                           "and the keys are back to numbers, not blank");
+                }
+                {
+                    // JUST INTONATION - the other half of "solo para tunings regulares y
+                    // para JI", and the half this build cannot draw. The scale is refused
+                    // like any other, but the reason must name HEJI: told only "not an
+                    // equal division of the octave", a player reads it as "your scale is
+                    // wrong" when what is missing is a font.
+                    p.loadScalaText ("! ji.scl\nPtolemy\n 7\n!\n 9/8\n 5/4\n 4/3\n 3/2\n 5/3\n 15/8\n 2/1\n",
+                                     "ji", err);
+                    ed->resized();
+                    const auto en = ed->noteNameProbeInLanguage (false);
+                    const auto ca = ed->noteNameProbeInLanguage (true);
+                    std::printf ("  Ptolemy (JI): EN \"%s\"\n", en.reason.toRawUTF8());
+                    check (! en.showing && en.reason.isNotEmpty(),
+                           "a just-intonation scale keeps its numbers too - HEJI is not in this build");
+                    check (en.reason.contains ("HEJI") && ca.reason.contains ("HEJI"),
+                           "and it says so by name, in both languages - not \"not an EDO\"");
+                    check (en.reason != ca.reason, "and the two really are two texts");
+
+                    // ...while a scale of the same SIZE written in cents is NOT called just.
+                    // The two sound within a cent of each other; only the source separates
+                    // them, and calling a tempered scale "just intonation" would be a lie
+                    // the player has no way to check.
+                    p.loadScalaText ("! near.scl\nPtolemy in cents\n 7\n!\n 203.910\n 386.314\n"
+                                     " 498.045\n 701.955\n 884.359\n 1088.269\n 1200.000\n",
+                                     "near", err);
+                    ed->resized();
+                    const auto npc = ed->noteNameProbeForTests();
+                    check (! npc.showing && ! npc.reason.contains ("HEJI"),
+                           "the same scale written in CENTS is not called just intonation");
+                }
+                {
+                    // 4-EDO: an equal division of the octave with no diatonic skeleton to
+                    // hang letters on. It must come back as NUMBERS with a reason, not as
+                    // four plausible-looking names - the speller returns nothing here, and
+                    // this is the check that the UI honours that rather than inventing.
+                    p.loadScalaText (edoScl (4), "edo4", err);
+                    ed->resized();
+                    const auto np = ed->noteNameProbeForTests();
+                    std::printf ("  4-EDO: %d names, reason \"%s\"\n",
+                                 np.namedCount, np.reason.toRawUTF8());
+                    check (np.edo == 4 && np.namedCount == 0 && ! np.showing,
+                           "4-EDO is an equal division of the octave and still gets no names");
+                    check (np.reason.isNotEmpty(), "and the menu says why rather than doing nothing");
+                    const auto tags = ed->keyboardPeriodTagsForTests();
+                    check (! tags.empty() && tags.front().zeroText == "0" && ! tags.front().names,
+                           "and its keys are numbered, not blank");
+                }
+
+                // THE PART THE USER ASKED FOR TWICE: it is remembered. Not in the patch -
+                // in the global settings - so it cannot be undone by loading a project or
+                // a preset saved before the option existed.
+                {
+                    p.loadScalaText (edoScl (31), "edo31", err);
+                    ed->setNoteNamesForTests (true);
+                    ed->resized();
+                    check (p.getKeyboardNoteNames(), "turning the option on writes the preference");
+
+                    juce::MemoryBlock mb;
+                    p.getStateInformation (mb);
+                    p.setStateInformation (mb.getData(), (int) mb.getSize());
+                    check (p.getKeyboardNoteNames(),
+                           "and a full save/load of the plugin's state leaves it on - it is a "
+                           "preference, not patch state");
+
+                    // A FRESH EDITOR, built the way the host builds one when the window is
+                    // reopened. This is "que se abra ya con ese setting al re-abrirse".
+                    std::unique_ptr<juce::AudioProcessorEditor> e2 (p.createEditor());
+                    auto* ed2 = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (e2.get());
+                    check (ed2 != nullptr, "a second editor is built");
+                    if (ed2 != nullptr)
+                    {
+                        ed2->setSize (ed->getWidth(), ed->getHeight());
+                        ed2->resized();
+                        const auto np = ed2->noteNameProbeForTests();
+                        check (np.optionOn, "and it opens with the option already on");
+                        check (np.showing && np.edo == 31 && np.namedCount == 31,
+                               "with 31-EDO's names on the keys from the first paint");
+                    }
+
+                    // ...and off is remembered just as hard.
+                    ed->setNoteNamesForTests (false);
+                    check (! p.getKeyboardNoteNames(), "turning it off writes the preference too");
+                    std::unique_ptr<juce::AudioProcessorEditor> e3 (p.createEditor());
+                    auto* ed3 = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (e3.get());
+                    if (ed3 != nullptr)
+                    {
+                        ed3->setSize (ed->getWidth(), ed->getHeight());
+                        ed3->resized();
+                        check (! ed3->noteNameProbeForTests().optionOn,
+                               "and a fresh editor opens with numbers again");
+                    }
+                }
+
+                // Put the machine back the way we found it: 12-TET (what the block above
+                // left, and what the register checks below are written against) and the
+                // USER'S OWN note-name preference, which lives in a global settings file
+                // that a verifier has no business rewriting.
+                ed->setNoteNamesForTests (userPref);
+                p.clearScala();
+                ed->resized();
+            }
+
             // (3) ONE NUMBER: N PERIODS EACH WAY FROM THE NOTE BEING PLAYED. The range was
             //     two absolute bounds first (note names, then period numbers), both pinned
             //     to fixed pitches so the adaptation answered with the same spectrum

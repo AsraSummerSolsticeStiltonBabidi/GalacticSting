@@ -51,6 +51,10 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     appProps = std::make_unique<juce::PropertiesFile> (o);
     recentSclPaths.addLines (appProps->getValue ("recentScl"));
     recentSclPaths.removeEmptyStrings();
+    // The keyboard's note-name preference, read back BEFORE any editor is built so the
+    // first editor opens already in the state the user left it in - "que se abra ya con
+    // ese setting al re-abrirse". Defaults to false, so a fresh install shows numbers.
+    keyboardNoteNames = appProps->getBoolValue ("keyboardNoteNames", false);
 
     // Decode the jingle once, here, so clicking the title never has to touch a
     // decoder on the audio thread. It does NOT start playing - see triggerJingle().

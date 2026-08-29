@@ -99,6 +99,84 @@ public:
     // under the degree number - the interval each Sethares minimum lands on.
     void setDegreeLabeller (std::function<juce::String(int)> fn) { getLabel = std::move (fn); }
 
+    //== DEGREE NAMES instead of degree numbers ================================
+    // Optional, off unless the editor turns it on. `fn` returns the NAME of a degree
+    // (empty string = this tuning has none), `face` is the typeface those names must be
+    // drawn in. The face is not decoration: in notes.otf the accidentals ride on ordinary
+    // ASCII letters, so C sharp is the two characters "Cc" and drawing them in any other
+    // font produces the literal letters C and c - a wrong note name, not a missing glyph,
+    // and therefore invisible to every check that only looks at rectangles. Pass a null
+    // provider or a null face to go back to the numbers.
+    void setDegreeNamer (std::function<juce::String(int)> fn, juce::Typeface::Ptr face)
+    {
+        getDegreeName = std::move (fn);
+        nameFace      = std::move (face);
+        ++namerGen;   // the widest-label cache is keyed on this - see refreshWidestCache
+        repaint();
+    }
+    // Is a namer installed AND does this tuning have a name for every degree? A tuning
+    // half-named would put "C" on one key and "7" on the next, so it is all or nothing.
+    // Cached on the same key as the widest label, and for the same reason: paint() asks
+    // twice per frame and the walk is O(degrees). See refreshWidestCache.
+    bool namerActive() const { refreshWidestCache(); return cachedNamerActive; }
+    // Do this tuning's names fit? Measured at kCellW - the NARROWEST key the keyboard
+    // ever draws, which by construction is never the one on screen - against the widest
+    // name the tuning produces, in the face they are drawn in. A name that does not fit
+    // is not clipped by drawFittedText: it is squeezed horizontally until it ellipsises,
+    // which looks deliberate rather than broken. Below kMinNameFont the keyboard keeps
+    // its numbers, and the menu says which of the two reasons it was.
+    bool namesFitTheKeys() const { return namerActive() && nameFontAtMinKey() >= kMinNameFont; }
+    // The height the NAMES would be drawn at on the narrowest key - the number
+    // namesFitTheKeys() judges, exposed so a check (and the menu's explanation) can
+    // report how close to the line a tuning is instead of only "yes" or "no".
+    float nameFontAtMinKey() const
+    {
+        return getDegreeName == nullptr ? 0.0f
+             : fittedLabelFontForCell ((float) kCellW, keysHeight(), widestNameText(), nameFace);
+    }
+    // ...and the height whatever is ACTUALLY drawn gets there, names or numbers.
+    float labelFontAtMinKey() const
+    {
+        return fittedLabelFontForCell ((float) kCellW, keysHeight(), widestDegreeText(), labelFace());
+    }
+    // Is the keyboard actually SHOWING names right now?
+    bool showingNames() const { return namerActive() && namesFitTheKeys(); }
+
+    // The font height a whole ROW of degree labels gets on a `cellW` x `cellH` key: the
+    // height the band allows, brought down until `widest` fits the key. ONE height for
+    // the whole row on purpose - fitting each key on its own put a 21 pt "C" next to a
+    // 9 pt "wwwGa", which reads as a rendering fault rather than a scale. Public so a
+    // check can ask about the smallest key instead of whichever one a test window made.
+    float fittedLabelFontForCell (float cellW, float cellH, const juce::String& widest,
+                                  juce::Typeface::Ptr face) const
+    {
+        auto cell = juce::Rectangle<float> (0.0f, 0.0f, cellW, cellH).reduced (0.6f);
+        const juce::String label = getLabel ? getLabel (0) : juce::String();
+        float fontH = 0.0f;
+        const auto band = degreeArea (cell, label, cellW, fontH);
+        return shrinkToWidth (fontH, widest, maxLabelWidth (band), face);
+    }
+    // The smallest a NAME may be drawn before the keyboard gives up and keeps its
+    // numbers. Below this the accidentals - a half sharp against a three-quarter sharp -
+    // stop being distinguishable, which is worse than an honest number.
+    static constexpr float kMinNameFont = 8.5f;
+
+    // What one degree WEARS, and the widest of them: the name when names are showing,
+    // the number otherwise. Every measurement goes through these two, so a probe can
+    // never be sizing text the screen has stopped drawing.
+    juce::String degreeText (int degree) const
+    {
+        return showingNames() ? getDegreeName (degree) : juce::String (degree);
+    }
+    juce::String widestDegreeText() const
+    {
+        return showingNames() ? widestNameText() : widestNumberText();
+    }
+    juce::Typeface::Ptr labelFace() const
+    {
+        return showingNames() ? nameFace : juce::Typeface::Ptr();
+    }
+
     // Optional hover text per degree (ratio -> cents, or cents -> nearest just
     // interval). Shown ONLY after the mouse rests ~0.5 s on a key, never while
     // that key is being clicked/dragged.
@@ -186,8 +264,40 @@ public:
     // is exactly the ~7 px of dead air the two numbers used to sit apart.
     static float boldTextWidth (const juce::String& s, float fontHeight)
     {
-        return (float) juce::GlyphArrangement::getStringWidthInt (
-            juce::Font (juce::FontOptions (fontHeight).withStyle ("Bold")), s);
+        return labelTextWidth (s, fontHeight, {});
+    }
+    // The font a degree label is drawn in. A null face means the default bold face (the
+    // numbers); a face means the notation face (the names). ONE function, so a width that
+    // was measured can never have been measured in a different font from the one drawn.
+    static juce::Font labelFont (float fontHeight, juce::Typeface::Ptr face)
+    {
+        return face != nullptr ? juce::Font (juce::FontOptions (face).withHeight (fontHeight))
+                               : juce::Font (juce::FontOptions (fontHeight).withStyle ("Bold"));
+    }
+    static float labelTextWidth (const juce::String& s, float fontHeight, juce::Typeface::Ptr face)
+    {
+        return (float) juce::GlyphArrangement::getStringWidthInt (labelFont (fontHeight, face), s);
+    }
+    // The width a label really has to live in inside its band: the band less the border
+    // clearance the stack keeps on both sides, less the 1 px either side every label rect
+    // carries so drawFittedText never has to scale the glyphs to place them.
+    static float maxLabelWidth (const juce::Rectangle<float>& band)
+    {
+        return juce::jmax (4.0f, band.getWidth() - 2.0f * kEdge - 2.0f);
+    }
+    // `startH` brought down until `text` fits `maxW` in `face`. Iterative, not one
+    // division: glyph advances are quantised, so a single scale by maxW/w lands a hair
+    // over the line often enough that the first name of every wide EDO ellipsised.
+    static float shrinkToWidth (float startH, const juce::String& text,
+                                float maxW, juce::Typeface::Ptr face)
+    {
+        if (text.isEmpty() || startH <= 0.0f) return startH;
+        float h = startH;
+        const float w = labelTextWidth (text, h, face);
+        if (w > maxW && w > 0.0f) h = startH * maxW / w;
+        for (int i = 0; i < 24 && h > 1.0f && labelTextWidth (text, h, face) > maxW; ++i)
+            h *= 0.96f;
+        return h;
     }
     // THE "0" AND ITS PERIOD NUMBER, STACKED.
     //
@@ -221,15 +331,23 @@ public:
     // `cell` is trimmed in place to exactly the room the interval label may use - the same
     // contract degreeArea has, so ONE call decides both and a change to either can never
     // orphan the other.
+    // `zeroText` is what the degree-0 key WEARS - "0" when the keyboard is numbering its
+    // degrees, that degree's NAME ("C") when it is naming them - and `widestText` is the
+    // widest label anywhere on the keyboard, because the stack has to line up with its
+    // neighbours and they all share one font height. `face` is the typeface both are
+    // drawn in; null means the default bold face. The period number above is ALWAYS a
+    // number in the bold face, whatever the degrees wear: it is a coordinate, not a
+    // degree, and drawing "3" in the notation face would turn it into an accidental.
     static ZeroLayout layOutZeroStack (juce::Rectangle<float>& cell,
                                        const juce::String& label,
-                                       float cellW, const juce::String& tagIn)
+                                       float cellW, const juce::String& tagIn,
+                                       const juce::String& zeroText = "0",
+                                       const juce::String& widestText = "0",
+                                       juce::Typeface::Ptr face = {})
     {
-        constexpr float kEdge = 2.0f;   // clear space between the pair and the key's border
-        constexpr float kVGap = 1.0f;   // between the period number and the "0" it annotates
-
         ZeroLayout z;
-        const juce::String t = tagIn.isEmpty() ? juce::String ("0") : tagIn;
+        const juce::String t  = tagIn.isEmpty() ? juce::String ("0") : tagIn;
+        const juce::String z0 = zeroText.isEmpty() ? juce::String ("0") : zeroText;
 
         // The band, and the font a NON-zero degree would get on this key: the stack has to
         // line up with its neighbours, so it starts from their geometry rather than its own.
@@ -237,7 +355,11 @@ public:
         auto band = degreeArea (cell, label, cellW, zeroFont);
         // Widest glyph either number may have. The rects are the glyph plus 1 px either
         // side, so subtracting that 2 px here is what keeps kEdge clear of the key edge.
-        const float maxW = juce::jmax (4.0f, band.getWidth() - 2.0f * kEdge - 2.0f);
+        const float maxW = maxLabelWidth (band);
+        // ...and the height the WHOLE ROW settled on, which the "0" (or the "C") must
+        // share. Sizing it from its own width alone would give a one-character degree-0
+        // key a bigger glyph than the "vCc" beside it.
+        zeroFont = shrinkToWidth (zeroFont, widestText, maxW, face);
 
         // 1. The period number's font: 0.34 of the key width, clamped 8..12, brought down
         //    (7 pt floor) only if even that overruns the key.
@@ -262,11 +384,11 @@ public:
         // 3. Only now, if the pair still does not fit, does the "0" get smaller.
         const float room = band.getHeight() - 2.0f * kEdge - z.tagFont - kVGap;
         z.zeroFont  = juce::jmax (7.0f, juce::jmin (zeroFont, room));
-        float zeroW = boldTextWidth ("0", z.zeroFont);
+        float zeroW = labelTextWidth (z0, z.zeroFont, face);
         if (zeroW > maxW)
         {
             z.zeroFont = juce::jmax (7.0f, z.zeroFont * maxW / juce::jmax (1.0f, zeroW));
-            zeroW      = boldTextWidth ("0", z.zeroFont);
+            zeroW      = labelTextWidth (z0, z.zeroFont, face);
         }
 
         // The stack, centred in the band on the key's own centre line. Each rect is its
@@ -289,10 +411,13 @@ public:
     // it is exactly where a period number would be squeezed unnoticed.
     static ZeroLayout layOutPeriodTagForCell (float cellW, float cellH,
                                               const juce::String& degreeLabel,
-                                              const juce::String& tag)
+                                              const juce::String& tag,
+                                              const juce::String& zeroText = "0",
+                                              const juce::String& widestText = "0",
+                                              juce::Typeface::Ptr face = {})
     {
         auto cell = juce::Rectangle<float> (0.0f, 0.0f, cellW, cellH).reduced (0.6f);
-        return layOutZeroStack (cell, degreeLabel, cellW, tag);
+        return layOutZeroStack (cell, degreeLabel, cellW, tag, zeroText, widestText, face);
     }
     // The key rect layOutPeriodTagForCell lays out in - the border nothing may touch. Same
     // construction, one place, so a margin check cannot be measuring a different key.
@@ -309,6 +434,11 @@ public:
         float f = 0.0f;
         return degreeArea (cell, degreeLabel, cellW, f).reduced (1.0f, 0.0f).getCentreX();
     }
+    // Clear space between a label and the key's border, and between the period number and
+    // the degree it annotates. Class-level because the width every label is fitted into
+    // (maxLabelWidth) is derived from the first one, and the two must not drift apart.
+    static constexpr float kEdge = 2.0f;
+    static constexpr float kVGap = 1.0f;
 
     // Test hook (RhythmVerify): every degree-0 key on screen, with the exact rects and
     // fonts paint() uses and the width the period number really needs in that font. A
@@ -328,6 +458,12 @@ public:
         float cellW = 0.0f, cellH = 0.0f;
         juce::String label;
         juce::Rectangle<float> area;
+        // What degree 0 is actually WEARING ("0", or "C" when names are on), the widest
+        // label anywhere on this keyboard, and whether names are showing at all. Carried
+        // because "zeroTextWidth" alone cannot say WHICH text was measured, and a check
+        // that assumes "0" would keep passing after the keyboard started drawing "C".
+        juce::String zeroText, widestText;
+        bool names = false;
         // The KEY as painted. The border the stack must not touch - and the only rect a
         // "does it fit" check may be measured against.
         juce::Rectangle<float> cell;
@@ -349,6 +485,10 @@ public:
         const int D = juce::jmax (1, getDegrees ? getDegrees() : 12);
         const int cells = numCells();
         const float w = (float) keysWidth() / (float) juce::jmax (1, cells);
+        // Exactly what paint() resolves, once, before its loop.
+        const bool         names       = showingNames();
+        const juce::String widestLabel = names ? widestNameText() : widestNumberText();
+        const juce::Typeface::Ptr face = names ? nameFace : juce::Typeface::Ptr();
         for (int i = 0; i < cells; ++i)
         {
             const int note = baseKey + i;
@@ -361,11 +501,13 @@ public:
             const auto cell = cellRect (i);
             t.cell  = cell;
             t.label = getLabel ? getLabel (0) : juce::String();
+            t.names = names; t.widestText = widestLabel;
+            t.zeroText = names ? getDegreeName (0) : juce::String (0);
             auto rest = cell;                                  // trimmed to the label's room
-            const auto z = layOutZeroStack (rest, t.label, w, tag);
+            const auto z = layOutZeroStack (rest, t.label, w, tag, t.zeroText, widestLabel, face);
             t.zero = z.zero; t.tag = z.tag; t.tagFont = z.tagFont; t.zeroFont = z.zeroFont;
-            t.cellW = w; t.cellH = (float) getHeight() - (float) stripH; t.area = z.band;
-            t.zeroTextWidth = boldTextWidth ("0", z.zeroFont);
+            t.cellW = w; t.cellH = keysHeight(); t.area = z.band;
+            t.zeroTextWidth = labelTextWidth (t.zeroText, z.zeroFont, face);
             t.tagTextWidth  = boldTextWidth (tag, z.tagFont);
             t.gap = z.zero.getY() - z.tag.getBottom();
             // The rects paint() actually hands drawFittedText, not the float ones.
@@ -405,6 +547,14 @@ public:
         const float keysY = (float) stripH;                      // strip on TOP, keys BELOW it (at screen bottom)
         const float keysH = (float) getHeight() - (float) stripH;
 
+        // NAMES OR NUMBERS, decided ONCE for the whole keyboard and never per key: a row
+        // where some keys carry a name and others a number is not a scale, it is a bug.
+        // Resolved here rather than inside the loop because showingNames() walks every
+        // degree, and asking it once per key turned a repaint into O(keys x degrees).
+        const bool         names       = showingNames();
+        const juce::String widestLabel = names ? widestNameText() : widestNumberText();
+        const juce::Typeface::Ptr face = names ? nameFace : juce::Typeface::Ptr();
+
         // Info strip ABOVE the keys: dark; shows period-key Hz normally, hover deltas on hover.
         g.setColour (juce::Colour (0xff0c0c12));
         g.fillRect (juce::Rectangle<float> (0.0f, 0.0f, (float) getWidth(), (float) stripH));
@@ -437,6 +587,7 @@ public:
             const auto ink = col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white;
             g.setColour (ink);
             {
+                const juce::String dText = names ? getDegreeName (degree) : juce::String (degree);
                 auto rest = cell;
                 if (degree == 0)
                 {
@@ -444,7 +595,7 @@ public:
                     // ONE call decides the pair AND what is left for the interval label -
                     // the stack borrows height downwards, so a label laid out from an
                     // untrimmed cell would print straight through the "0".
-                    const auto z = layOutZeroStack (rest, label, w, tag);
+                    const auto z = layOutZeroStack (rest, label, w, tag, dText, widestLabel, face);
                     // The period number goes ON TOP, smaller AND quieter: it is a
                     // coordinate, not a degree, and at full ink it read as a second scale
                     // degree sitting on the same key.
@@ -457,16 +608,21 @@ public:
                     // drawn WHOLE (getSmallestIntegerContainer, never a rounded-down
                     // toNearestInt) - rounding a rect one pixel narrower than the text is
                     // precisely what makes drawFittedText squeeze a number nobody can see.
-                    g.setFont (juce::Font (juce::FontOptions (z.zeroFont).withStyle ("Bold")));
-                    g.drawFittedText ("0", z.zero.getSmallestIntegerContainer(),
+                    g.setFont (labelFont (z.zeroFont, face));
+                    g.drawFittedText (dText, z.zero.getSmallestIntegerContainer(),
                                       juce::Justification::centred, 1, 0.5f);
                 }
                 else
                 {
                     float fontH = 0.0f;
                     const auto area = degreeArea (rest, label, w, fontH);
-                    g.setFont (juce::Font (juce::FontOptions (fontH).withStyle ("Bold")));
-                    g.drawFittedText (juce::String (degree), area.reduced (1.0f, 0.0f).toNearestInt(),
+                    // The WHOLE ROW's height, from the widest label on the keyboard, not
+                    // this key's own text: sized per key, "C" would tower over the "vCc"
+                    // beside it. With numbers this is the height it always was, because a
+                    // one- or two-digit degree is never the binding constraint.
+                    fontH = shrinkToWidth (fontH, widestLabel, maxLabelWidth (area), face);
+                    g.setFont (labelFont (fontH, face));
+                    g.drawFittedText (dText, area.reduced (1.0f, 0.0f).toNearestInt(),
                                       juce::Justification::centred, 1, 0.5f);
                 }
                 if (label.isNotEmpty())
@@ -739,6 +895,71 @@ private:
         fontOut = juce::jmin (cell.getHeight() * 0.66f, w * 0.66f);
         return cell;
     }
+    // The height a KEY has (the component less the info strip on top), which is what every
+    // degree-label measurement is laid out in. Named because "getHeight() - stripH" was
+    // being written out at each call site, and one of them forgetting the strip would have
+    // measured the fit in a band the keys do not have.
+    float keysHeight() const { return juce::jmax (1.0f, (float) getHeight() - (float) stripH); }
+    // The widest NAME and the widest NUMBER this tuning puts on a key. Both walk every
+    // degree: the widest is very often not degree 0 and not the last one either (in
+    // 22-EDO it is "vCc", degree 2), and guessing it from the count is how a keyboard
+    // ships with one squeezed key nobody notices until they play in that register.
+    juce::String widestNameText()   const { refreshWidestCache(); return cachedWidestName; }
+    juce::String widestNumberText() const { refreshWidestCache(); return cachedWidestNumber; }
+
+    // ...MEASURED ONCE PER TUNING, not once per repaint. One paint asks for the widest
+    // label three times over (showingNames -> namesFitTheKeys -> nameFontAtMinKey, then
+    // again for the row's font height), and each ask laid out every degree's text: 3 x D
+    // text measurements on the message thread per frame, which a 512-degree scale turns
+    // into fifteen hundred of them. The answer cannot change without one of the two
+    // things below changing, so it is computed when they do.
+    //
+    // WHAT INVALIDATES IT. The degree COUNT, and a `namerGen` the editor bumps every time
+    // it installs a namer - which it does on every change of the spelling, including
+    // installing none (see refreshDegreeNames). A new tuning is always one or the other:
+    // a scale with a different number of degrees, or the same number spelled differently,
+    // which arrives as a fresh setDegreeNamer. Cache a name past either and the keyboard
+    // would size this tuning's keys to the LAST tuning's widest word.
+    void refreshWidestCache() const
+    {
+        const int D = juce::jmax (1, getDegrees ? getDegrees() : 12);
+        if (cacheGen == namerGen && cacheDegrees == D) return;
+        cacheGen = namerGen; cacheDegrees = D;
+
+        cachedWidestName   = juce::String();
+        // A tuning half-named would put "C" on one key and "7" on the next, so names are
+        // all or nothing: ONE empty degree and the whole keyboard keeps its numbers.
+        cachedNamerActive  = getDegreeName != nullptr && nameFace != nullptr;
+        if (getDegreeName != nullptr)
+        {
+            float best = -1.0f;
+            for (int d = 0; d < D; ++d)
+            {
+                const auto s = getDegreeName (d);
+                if (s.isEmpty()) cachedNamerActive = false;
+                // Measured at a fixed reference height, not by character count: "wwC" is
+                // three characters and narrower than the two-character "Aa" in some faces.
+                const float w = labelTextWidth (s, 20.0f, nameFace);
+                if (w > best) { best = w; cachedWidestName = s; }
+            }
+        }
+        cachedWidestNumber = juce::String();
+        {
+            float best = -1.0f;
+            for (int d = 0; d < D; ++d)
+            {
+                const juce::String s (d);
+                const float w = boldTextWidth (s, 20.0f);
+                if (w > best) { best = w; cachedWidestNumber = s; }
+            }
+        }
+    }
+    // Bumped by setDegreeNamer; compared by refreshWidestCache. `mutable` on the cache
+    // because measuring is what the const observers (paint's helpers, the probes) do.
+    int                  namerGen = 0;
+    mutable int          cacheGen = -1, cacheDegrees = -1;
+    mutable bool         cachedNamerActive = false;
+    mutable juce::String cachedWidestName, cachedWidestNumber;
     bool isScrollable() const { return rangeCount > numCells(); }
     int  arrowW()      const { return kArrowW; }
     int  keysWidth()   const { return juce::jmax (1, getWidth() - 2 * arrowW()); }
@@ -806,6 +1027,8 @@ private:
     std::function<juce::String(int)>     getSourceLabel; // note -> "from n/1" (segment scales)
     std::function<double(int)>           getNoteHz;      // note -> frequency (period keys show it)
     std::function<DissInfo(int,int)>     getHoverDiss;   // (hovered, other) -> dissonance line + colour
+    std::function<juce::String(int)>     getDegreeName;  // degree -> ups-and-downs name ("" = none)
+    juce::Typeface::Ptr                  nameFace;       // the face those names MUST be drawn in
     juce::Colour sourceColour { 0xffff9a3c };            // Spectrum-to-Tuning colour for the source label
     static constexpr int stripH = 56;                    // top info strip (3 delta lines + dissonance band)
     int baseKey   = 48; // leftmost VISIBLE key (the scroll position)
