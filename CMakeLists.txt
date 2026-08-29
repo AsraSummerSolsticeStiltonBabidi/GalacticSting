@@ -109,6 +109,17 @@ set_target_properties(SpectrumTests PROPERTIES
     CXX_STANDARD_REQUIRED ON)
 
 #-------------------------------------------------------------------------------
+# Unit tests for the ups-and-downs note-name speller. JUCE-free like the header it
+# tests, so the whole thing builds and runs in about a second - which is what makes it
+# worth running on every edit of an algorithm whose wrong answers still look like names.
+#-------------------------------------------------------------------------------
+add_executable(NoteNameTests tests/NoteNameTests.cpp)
+target_include_directories(NoteNameTests PRIVATE source)
+set_target_properties(NoteNameTests PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON)
+
+#-------------------------------------------------------------------------------
 # Unit tests for the microtuning subsystem (needs juce_core + the MTS client).
 #-------------------------------------------------------------------------------
 add_executable(TuningTests
