@@ -4220,7 +4220,12 @@ private:
     juce::Slider  slopeFader, gainFader, cutoffFader, resFader, fEnvAmtFader, pEnvAmtFader;
     juce::Slider  ampAdsr[4], filtAdsr[4], pitchAdsr[4];
     juce::ComboBox tuneSourceBox, tuneScopeBox; // beating mode: source + scope
-    juce::ComboBox basePitchBox, phaseBox, primeModeBox, tuningBox, bendBox,
+    // PHASE is a fader now, not a two-way box: the user asked for a progressive control
+    // between aligned and scattered, and phaseGlideBox is the "how does a move reach a
+    // note that is already sounding" choice they asked for beside it.
+    juce::Slider   phaseFader;
+    juce::ComboBox phaseGlideBox;
+    juce::ComboBox basePitchBox, primeModeBox, tuningBox, bendBox,
                    dissCountBox, dissModeBox, tuningBankBox;
     RefreshingComboBox presetBox;
     juce::Label presetDirtyMark; // "*" - some parameter drifted from the loaded preset
@@ -4623,9 +4628,9 @@ private:
 
     std::unique_ptr<SliderAttachment>   baseNAtt, slopeAtt, fractalAtt, gainAtt,
                                         cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, pEnvAmtAtt,
-                                        harmonicsAtt;
+                                        harmonicsAtt, phaseAtt;
     std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4], pitchAdsrAtt[4];
-    std::unique_ptr<ComboBoxAttachment> basePitchAtt, phaseAtt,
+    std::unique_ptr<ComboBoxAttachment> basePitchAtt, phaseGlideAtt,
                                         primeModeAtt, tuningAtt, bendAtt, tuningBankAtt;
     std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], morphAtt, dryWetAtt;
     std::unique_ptr<SliderAttachment>   morphTimeAtt, dryWetTimeAtt;

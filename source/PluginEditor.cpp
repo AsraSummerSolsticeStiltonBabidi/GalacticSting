@@ -1138,7 +1138,18 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     configFader (fractalFader, "fractalLevel", fractalAtt, cFractal, "Fractal self-similarity level (1 = off)");
     // Essentials macro (Phase / Gain / Reference) - one framed box drawn
     // in paint() like the Harmonic Engine, so no per-cell GroupComponents here.
-    configCombo (phaseBox, "phaseMode", phaseAtt, cEssentials, "Aligned: tonal pulse, never clips.  Scattered: louder, noisier.");
+    // PHASE, the fader. 0 = Aligned, 1 = Scattered, and every position between them is
+    // a real sound now rather than a rounding to one of the two - which is the whole
+    // request. The end words live in the tooltip and in the value read-out, because the
+    // cell's painted sub-label already says PHASE and a second title would not fit.
+    configFader (phaseFader, "phaseMode", phaseAtt, cEssentials,
+                 "0 = Aligned (tonal pulse, never clips), 1 = Scattered (louder, noisier). Anywhere between is a real blend.");
+    phaseFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    phaseFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 38, 14);
+    // How a move made WHILE NOTES ARE SOUNDING reaches them. Sits in the same cell as
+    // the fader because it is a property of the fader, not a mode of the synth.
+    configCombo (phaseGlideBox, "phaseGlide", phaseGlideAtt, cEssentials,
+                 "How a Phase move reaches notes already sounding. Pitchbend: each partial detunes briefly until it lands. Dry/Wet: crossfades the old phases into the new.");
     configFader (gainFader, "masterGain", gainAtt, cEssentials, "Master output gain");
     gainFader.setSliderStyle (juce::Slider::LinearHorizontal);
     gainFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 46, 14);
@@ -3363,9 +3374,16 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     fractalFader.setTooltip (tr (
         "Replaces each partial with a scaled copy of the whole spectrum, this many levels deep. 1 = off. Continuous: between whole levels the next level's new partials fade in from low to high. Snaps to the 4 marked levels - hold Ctrl for free fine setting.",
         "Substitueix cada parcial per una c\xc3\xb2pia escalada de tot l'espectre, tants nivells com indiquis. 1 = apagat. Continu: entre nivells sencers els parcials nous del nivell seg\xc3\xbc""ent entren de greu a agut. S'imanta als 4 nivells marcats - mant\xc3\xa9n Ctrl per ajust fi lliure."));
-    phaseBox.setTooltip (tr (
-        "Starting phase of the partials. 'Aligned': all peak together, forming a periodic pulse - tonal, never clips, and with dense spectra the pulse itself is heard as a low difference tone. 'Scattered': random phases - smoother, louder, no pulse.",
-        "Fase inicial dels parcials. 'Alineat': tots fan el pic alhora i formen un pols peri\xc3\xb2""dic - tonal, mai clipa, i amb espectres densos el pols s'escolta com un to diferencial greu. 'Dispers': fases aleat\xc3\xb2ries - m\xc3\xa9s suau, m\xc3\xa9s fort, sense pols."));
+    // The old tooltip promised "Aligned: never clips" as a property of the whole
+    // control. That stops being true at any position past 0, because the peak-capped
+    // normalisation law is only fully in force at the very bottom of the travel - so
+    // the promise is now attached to the END where it holds, not to the control.
+    phaseFader.setTooltip (tr (
+        "Starting phase of the partials, as a continuous fade. 0 = Aligned: all peak together, forming a periodic pulse - tonal, never clips, and with dense spectra the pulse itself is heard as a low difference tone. 1 = Scattered: pseudo-random phases - smoother, louder, no pulse. In between, every partial moves the shortest way from one to the other and the level follows.",
+        "Fase inicial dels parcials, com un fos continu. 0 = Alineat: tots fan el pic alhora i formen un pols peri\xc3\xb2""dic - tonal, mai clipa, i amb espectres densos el pols s'escolta com un to diferencial greu. 1 = Dispers: fases pseudoaleat\xc3\xb2ries - m\xc3\xa9s suau, m\xc3\xa9s fort, sense pols. Enmig, cada parcial va pel cam\xc3\xad m\xc3\xa9s curt d'un a l'altre i el volum el segueix."));
+    phaseGlideBox.setTooltip (tr (
+        "How a Phase move reaches notes that are ALREADY SOUNDING. 'Pitchbend': each partial is detuned by a tiny amount until it has walked to its new phase, then put back in tune - continuous, but the note is briefly out of tune with itself. 'Dry/Wet': the old phases are crossfaded into the new ones - always in tune, but both sets are audible while it runs.",
+        "Com arriba un moviment de Fase a les notes que JA SONEN. 'Bend': cada parcial es desafina una mica fins que arriba a la seva fase nova i despr\xc3\xa9s torna afinat - continu, per\xc3\xb2 la nota queda un moment desafinada amb ella mateixa. 'Sec/Humit': les fases velles es fonen amb les noves - sempre afinat, per\xc3\xb2 mentre dura se senten els dos conjunts."));
     gainFader.setTooltip (tr ("Final output volume, in dB.", "Volum final de sortida, en dB."));
     primeModeBox.setTooltip (tr (
         "How prime numbers filter the harmonics. 'Limit': a harmonic passes only if its largest prime factor is at most the chosen limit. 'Whitelist': it passes only if EVERY prime factor is ticked below.",
@@ -3476,7 +3494,11 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         b.setSelectedId (keep, juce::dontSendNotification); // refresh displayed text
     };
     localise (basePitchBox, { tr ("Transposed down", "Transposada avall"), tr ("Original", "Original") });
-    localise (phaseBox,     { tr ("Aligned", "Alineat"), tr ("Scattered", "Dispers") });
+    // Phase's two words moved onto the fader's ends (its tooltip and its read-out); what
+    // is left to localise in this cell is the glide choice. Short on purpose: it shares
+    // one Essentials row with the fader, and a long item would squash the fader rather
+    // than wrap - the painter's 0.7 horizontal fallback IS the failure.
+    localise (phaseGlideBox, { tr ("Pitchbend", "Bend"), tr ("Dry/Wet", "Sec/Humit") });
     localise (primeModeBox, { tr ("Limit", "L\xc3\xadmit"), tr ("Whitelist", "Llista") });
     // THROUGH tr(), even though the three items are the same word in both languages.
     // Written as raw const char* they went through juce::String(const char*), which reads
@@ -6273,7 +6295,8 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("both.rangeVal",    sprVal);          add ("both.rangeUp",   sprUp);
     add ("both.rangeDn",     sprDn);
 
-    add ("ess.phase",        phaseBox);        add ("ess.gain",       gainFader);
+    add ("ess.phase",        phaseFader);      add ("ess.phaseGlide", phaseGlideBox);
+    add ("ess.gain",         gainFader);
     add ("ess.refA",         refAEdit);        add ("ess.refALbl",    lblRefA);
     add ("ess.refHz",        lblRefHz);
     add ("ess.octVal",       octVal);          add ("ess.octUp",      octUp);
@@ -6418,7 +6441,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
             p.comboTexts.push_back ({ name, widest, need, availW });
         }
     };
-    combo ("basePitch",   basePitchBox);   combo ("phase",       phaseBox);
+    combo ("basePitch",   basePitchBox);   combo ("phaseGlide",  phaseGlideBox);
     combo ("primeMode",   primeModeBox);   combo ("bend",        bendBox);
     combo ("modSel",      modSelBox);      combo ("lfoWave",     lfoWaveBox);
     combo ("lfoRateMode", lfoRateModeBox); combo ("lfoPhaseMode", lfoPhaseModeBox);
@@ -7621,8 +7644,36 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // Reference value used to clip its descenders).
             // PHASE / GAIN / REFERENCE: the control sits to the RIGHT of its inline
             // sub-label (drawn in paint at the cell's left), slightly narrower.
-            { auto c = ecPhase.reduced (6, 1); c.removeFromLeft (78);
-              compact (phaseBox, c.removeFromLeft (juce::jmin (112, c.getWidth()))); }
+            // PHASE now carries TWO controls in the one cell the combo used to have: the
+            // fader, and the glide box that says how a mid-note move reaches sounding
+            // voices. The glide box is taken off the RIGHT first and capped, so what the
+            // fader keeps is whatever is left - a narrow window shrinks the fader (which
+            // still drags fine) instead of squashing the box's words (which the painter
+            // would only fix by condensing them 0.7x, i.e. by breaking them).
+            { auto c = ecPhase.reduced (6, 1);
+              // THE LABEL BAND GIVES WAY BEFORE THE CONTROLS DO. At the 870x540 floor
+              // this cell is 154 px wide; the 78 px band the other three rows reserve
+              // leaves 76 px for two controls, and the first draft of this row shipped a
+              // FADER 18 PX WIDE - unaimable, and the snapshot rig does not fail on it.
+              // The band only has to clear the painted word (PHASE is ~33 px, FASE ~27),
+              // so below the width where everything fits it drops to 40 and the row loses
+              // its left alignment with GAIN / REFERENCE / OCTAVE instead of losing its
+              // fader. Above that width nothing moves and the four rows line up as before.
+              const int lbl = c.getWidth() >= 78 + 4 + 54 + 96 ? 78 : 40;
+              c.removeFromLeft (lbl);
+              // The glide box is taken off the RIGHT and capped, so a narrow window
+              // shrinks the fader (which still drags) rather than squashing the box's
+              // words - the painter's 0.7x horizontal fallback IS the failure.
+              const int glideW = juce::jlimit (54, 84, c.getWidth() * 2 / 5);
+              compact (phaseGlideBox, c.removeFromRight (glideW));
+              c.removeFromRight (4);
+              // ...and the numeric read-out is the first thing to go: a 38 px number box
+              // inside a 56 px cell leaves an 18 px track, and a fader you cannot aim is
+              // worse than a fader you cannot read.
+              phaseFader.setTextBoxStyle (c.getWidth() >= 92 ? juce::Slider::TextBoxRight
+                                                             : juce::Slider::NoTextBox,
+                                          false, 38, 14);
+              phaseFader.setBounds (c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))); }
             { auto c = ecGain.reduced (6, 1);  c.removeFromLeft (78);
               gainFader.setBounds (c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))); }
             { auto c = ecRef.reduced (6, 1);   c.removeFromLeft (78);
