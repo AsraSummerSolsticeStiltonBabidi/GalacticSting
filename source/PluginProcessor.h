@@ -639,7 +639,18 @@ public:
 
     //==========================================================================
     // File presets (.gsting). Called from the editor.
+    //
+    // ONE SPELLING OF THE EXTENSION, because the literal was written out in a dozen
+    // places across this file and the verifiers, and one of those copies drifted:
+    // RhythmVerify's run 48 saved through savePreset() (which writes ".gsting") and
+    // then deleted "<name>.fibpreset", so its own cleanup deleted nothing and the
+    // suite left run48-A.gsting and run48-B.gsting sitting in the USER'S real preset
+    // folder, run after run, next to their own patches. presetFile() is the only way
+    // to name one, so that cannot happen again by typing.
+    static constexpr const char* kPresetExt = ".gsting";
     static juce::File getPresetFolder();
+    static juce::File presetFile (const juce::String& name)
+    { return getPresetFolder().getChildFile (name + kPresetExt); }
     juce::StringArray getPresetNames();
     juce::String savePreset (const juce::String& name); // returns the stored name, or empty on failure
     bool loadPreset (const juce::String& name);

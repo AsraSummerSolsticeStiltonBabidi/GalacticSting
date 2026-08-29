@@ -4240,7 +4240,7 @@ juce::File FractalAdditiveAudioProcessor::getPresetFolder()
         auto factory = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
                            .getParentDirectory().getChildFile ("Presets");
         if (factory.isDirectory())
-            for (const auto& f : factory.findChildFiles (juce::File::findFiles, false, "*.gsting"))
+            for (const auto& f : factory.findChildFiles (juce::File::findFiles, false, juce::String ("*") + kPresetExt))
                 f.copyFileTo (dir.getChildFile (f.getFileName()));
     }
     return dir;
@@ -4249,7 +4249,7 @@ juce::File FractalAdditiveAudioProcessor::getPresetFolder()
 juce::StringArray FractalAdditiveAudioProcessor::getPresetNames()
 {
     juce::StringArray names;
-    for (const auto& f : getPresetFolder().findChildFiles (juce::File::findFiles, false, "*.gsting"))
+    for (const auto& f : getPresetFolder().findChildFiles (juce::File::findFiles, false, juce::String ("*") + kPresetExt))
         names.add (f.getFileNameWithoutExtension());
     names.sortNatural();
     return names;
@@ -4286,7 +4286,7 @@ juce::String FractalAdditiveAudioProcessor::savePreset (const juce::String& name
     const auto safe = juce::File::createLegalFileName (name).trim();
     if (safe.isEmpty())
         return {};
-    auto file = getPresetFolder().getChildFile (safe + ".gsting");
+    auto file = presetFile (safe);
     if (auto xml = captureState().createXml())
         if (xml->writeTo (file))
         {
@@ -4298,7 +4298,7 @@ juce::String FractalAdditiveAudioProcessor::savePreset (const juce::String& name
 
 bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
 {
-    auto file = getPresetFolder().getChildFile (name + ".gsting");
+    auto file = presetFile (name);
     if (! file.existsAsFile())
         return false;
     if (auto xml = juce::XmlDocument::parse (file))
@@ -4371,7 +4371,7 @@ bool FractalAdditiveAudioProcessor::assignPlaygroundCorner (int corner, const ju
 
     if (presetName.isNotEmpty())
     {
-        auto file = getPresetFolder().getChildFile (presetName + ".gsting");
+        auto file = presetFile (presetName);
         if (! file.existsAsFile())
         { errorOut = "That preset no longer exists."; refreshPlaygroundActive(); return false; }
 
@@ -4763,7 +4763,7 @@ juce::String FractalAdditiveAudioProcessor::savePlaygroundCornerAs (int corner, 
 
     // The edited corner is standing ON the live control surface, so captureState()
     // describes it exactly - the very tree savePreset would write for it.
-    auto file = getPresetFolder().getChildFile (safe + ".gsting");
+    auto file = presetFile (safe);
     auto xml  = captureState().createXml();
     if (xml == nullptr || ! xml->writeTo (file))
         return {};

@@ -84,11 +84,59 @@ static void awaitTemplateQuiet (const FractalAdditiveAudioProcessor& p,
     }
 }
 
+// One scratch preset in the user's real folder, taken away again on the way out of the
+// scope that made it - including the paths where a block returns early. It saves through
+// the processor and then owns whatever the processor ACTUALLY wrote: savePreset()
+// sanitises the name, and naming the file by hand a second time is the mistake that left
+// run48-A.gsting behind (the save wrote ".gsting", the cleanup deleted ".fibpreset").
+struct ScopedPreset
+{
+    ScopedPreset() = default;
+    ~ScopedPreset() { file.deleteFile(); }
+    ScopedPreset (const ScopedPreset&) = delete;
+    ScopedPreset& operator= (const ScopedPreset&) = delete;
+
+    bool save (FractalAdditiveAudioProcessor& p, const juce::String& want)
+    {
+        name = p.savePreset (want);
+        file = FractalAdditiveAudioProcessor::presetFile (name);
+        return name.isNotEmpty() && file.existsAsFile();
+    }
+
+    juce::String name;
+    juce::File   file;
+};
+
 struct Ev { int sample; bool on; int note, ch; int vel = 0; };
+
+// THE USER'S PRESET FOLDER IS NOT A SCRATCH DIRECTORY.
+//
+// Documents/Galactic Sting/Presets holds the player's own patches, and this suite writes
+// presets into it because the real save/load path knows no other folder. run 48 saved
+// through savePreset() - which writes ".gsting" - and then deleted "<name>.fibpreset", so
+// its own two deleteFile() calls deleted nothing and run48-A.gsting and run48-B.gsting sat
+// in the user's folder beside their own patches until somebody removed them by hand.
+// zzz-verify-mix-A/B survived the same way when a run died before its cleanup.
+//
+// Per-site cleanup will go on being written wrong, so the folder is inventoried before
+// anything runs and AUDITED at the end: the audit names every file the suite added, fails
+// loudly, and then removes it. A leak nobody is told about is a leak that comes back.
+static juce::StringArray presetFolderInventory()
+{
+    juce::StringArray names;
+    for (const auto& f : FractalAdditiveAudioProcessor::getPresetFolder()
+                             .findChildFiles (juce::File::findFiles, false,
+                                              juce::String ("*") + FractalAdditiveAudioProcessor::kPresetExt))
+        names.add (f.getFileName());
+    names.sort (true);
+    return names;
+}
 
 int main()
 {
     juce::ScopedJuceInitialiser_GUI juceInit;
+
+    const juce::StringArray presetsAtStart = presetFolderInventory();
 
     constexpr double sr = 48000.0;
     constexpr int    blk = 256;
@@ -9300,15 +9348,17 @@ int main()
         //-- (f) MIX MODE: the rule reaches every sub-engine, or nothing here means anything
         {
             fresh();
-            const auto dir = FractalAdditiveAudioProcessor::getPresetFolder();
-            dir.createDirectory();
+            FractalAdditiveAudioProcessor::getPresetFolder().createDirectory();
             juce::String err;
-            sp ("baseN", 2.0f);  const auto nameA = p->savePreset ("run48-A");
-            sp ("baseN", 5.0f);  const auto nameB = p->savePreset ("run48-B");
-            juce::File fA = dir.getChildFile (nameA + ".fibpreset");
-            juce::File fB = dir.getChildFile (nameB + ".fibpreset");
-            p->assignPlaygroundCorner (0, nameA, err);
-            p->assignPlaygroundCorner (1, nameB, err);
+            ScopedPreset presetA, presetB;
+            sp ("baseN", 2.0f);  const bool okA = presetA.save (*p, "run48-A");
+            sp ("baseN", 5.0f);  const bool okB = presetB.save (*p, "run48-B");
+            // The assertion runs 45 and 47 already end with, at the OTHER end: a preset
+            // that was never written is a corner assignment that silently does nothing,
+            // and every voice count below would then be measuring the default patch.
+            check (okA && okB, "the two corner presets really were written to disk");
+            p->assignPlaygroundCorner (0, presetA.name, err);
+            p->assignPlaygroundCorner (1, presetB.name, err);
             sp ("pgMode", 1.0f);            // MIX
             sp ("pgVoices", 8.0f);
             for (int i = 0; i < 20; ++i) { p->pollParametersForTests(); juce::Thread::sleep (10); }
@@ -9328,7 +9378,7 @@ int main()
             sp ("pgMode", 0.0f);
             p->assignPlaygroundCorner (0, {}, err);
             p->assignPlaygroundCorner (1, {}, err);
-            fA.deleteFile(); fB.deleteFile();
+            // presetA/presetB delete themselves as this scope closes.
         }
 
         // Does the pitch actually TRAVEL from one note to the other? Sample the rendered f0
@@ -10145,6 +10195,26 @@ int main()
                 ed->layoutProbeInLanguage (false);   // leave the panel in English
             }
         }
+    }
+
+    // --- the audit: did this suite leave anything in the user's preset folder? --------
+    {
+        std::printf ("\nthe user's preset folder, before and after:\n");
+        juce::StringArray leftBehind;
+        for (const auto& f : FractalAdditiveAudioProcessor::getPresetFolder()
+                                 .findChildFiles (juce::File::findFiles, false,
+                                                  juce::String ("*") + FractalAdditiveAudioProcessor::kPresetExt))
+            if (! presetsAtStart.contains (f.getFileName()))
+            {
+                leftBehind.add (f.getFileName());
+                f.deleteFile();      // named first, then removed: the user gets their folder back
+            }
+        std::printf ("  %d presets before, %d added by this run%s%s\n",
+                     presetsAtStart.size(), leftBehind.size(),
+                     leftBehind.isEmpty() ? "" : ": ",
+                     leftBehind.joinIntoString (", ").toRawUTF8());
+        check (leftBehind.isEmpty(),
+               "the suite leaves NOTHING behind in the user's preset folder");
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
