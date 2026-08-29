@@ -9027,12 +9027,16 @@ int main()
         // A patch whose pitch is easy to read and whose ENVELOPE is easy to catch
         // retriggering: 1 ms attack, 30 ms decay to a 0.2 sustain, so a re-attack is a
         // five-fold RMS bump that no smoothing can hide.
-        sp ("morph", 0.0f);
-        sp ("ampAttack", 0.001f); sp ("ampDecay", 0.030f);
-        sp ("ampSustain", 0.2f);  sp ("ampRelease", 0.010f);
-        sp ("phaseMode", 0.0f);
-        sp ("filterCutoff", 9600.0f);   // wide open in cents: the filter must not colour f0
-        sp ("pitchEnvAmount", 0.0f);
+        auto applyPatch = [&]
+        {
+            sp ("morph", 0.0f);
+            sp ("ampAttack", 0.001f); sp ("ampDecay", 0.030f);
+            sp ("ampSustain", 0.2f);  sp ("ampRelease", 0.010f);
+            sp ("phaseMode", 0.0f);
+            sp ("filterCutoff", 9600.0f);   // wide open in cents: the filter must not colour f0
+            sp ("pitchEnvAmount", 0.0f);
+        };
+        applyPatch();
 
         juce::AudioBuffer<float> ab (2, b8);
         std::vector<float> x;
@@ -9107,9 +9111,37 @@ int main()
         const double fHi = p->getNoteFrequency (67);   // a fifth: two clearly separate pitches
         constexpr double glideMs = 200.0;
 
+        // EVERY LETTERED BLOCK BELOW STARTS FROM A PROCESSOR NOBODY ELSE HAS TOUCHED.
+        //
+        // They used to share one, and the sharing quietly disarmed the checks. Block (f)
+        // saves its corner presets by MOVING Base N and left it on 5, which put the
+        // spectrum's lowest partial on the 5th harmonic - so (g)'s autocorrelation read a
+        // pitch two octaves adrift and failed a claim the glide was keeping perfectly.
+        // That was patched by hand, at the end of (f), by putting Base N back; the same
+        // class then came round again in (i), whose own CONTROL arm - the arm that exists
+        // to prove the measurement can see a glide at all - measured "0% of the readings
+        // lie between the two pitches with the gate off, 0% with it ON" while the
+        // identical glide forty lines earlier travelled fine. A control arm that reads
+        // zero cannot distinguish the bug it is there to catch from a broken rig.
+        //
+        // One general fix instead of a growing list of per-symptom restores: a new
+        // processor and the same declared patch at the head of each block. The hand-patch
+        // in (f) is deleted with it, because a general fix that leaves the workaround in
+        // place has never been tested. (The lambdas below all reach `p` by reference, so
+        // replacing it here is all it takes; (c) and (d) deliberately keep (b)'s
+        // processor and recording - they are three readings of ONE take.)
+        auto fresh = [&]
+        {
+            p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr8, b8);
+            applyPatch();
+            sp ("glideTime", (float) glideMs);
+            x.clear(); clk = 0;
+        };
+
         //-- (a) the CONTROL: mono OFF is a jump, and a second key adds a voice ----------
+        fresh();
         sp ("monoGlide", 0.0f);
-        sp ("glideTime", (float) glideMs);
         check (p->synthVoiceCountForTests() == 32, "with the mode off the pool is the full 32 voices");
         x.clear(); clk = 0;
         pump (40, on (60));
@@ -9124,6 +9156,9 @@ int main()
         check (polyActive == 2, "polyphonic: a second key really does add a second voice");
 
         //-- (b) MONO ON: one voice, and the pitch BENDS ---------------------------------
+        // (b), (c) and (d) are three readings of ONE take, so they share this processor
+        // and this recording; the reset is here, at the head of the take.
+        fresh();
         sp ("monoGlide", 1.0f);
         check (p->synthVoiceCountForTests() == 1,
                "switching Monophonic glide on drops the pool to ONE voice (no chords possible)");
@@ -9247,6 +9282,11 @@ int main()
                "...while a note struck after every key came up DOES retrigger it (and starts at its own pitch)");
 
         //-- (e) switching the mode off gives the polyphony back --------------------------
+        // The mode is armed HERE rather than inherited, so this block still measures a
+        // transition rather than whatever the block before it happened to leave behind.
+        fresh();
+        sp ("monoGlide", 1.0f);
+        check (p->synthVoiceCountForTests() == 1, "(the mode really is on before it is switched off)");
         sp ("monoGlide", 0.0f);
         check (p->synthVoiceCountForTests() == 32, "switching it off restores the full voice pool");
         x.clear(); clk = 0;
@@ -9259,6 +9299,7 @@ int main()
 
         //-- (f) MIX MODE: the rule reaches every sub-engine, or nothing here means anything
         {
+            fresh();
             const auto dir = FractalAdditiveAudioProcessor::getPresetFolder();
             dir.createDirectory();
             juce::String err;
@@ -9288,11 +9329,6 @@ int main()
             p->assignPlaygroundCorner (0, {}, err);
             p->assignPlaygroundCorner (1, {}, err);
             fA.deleteFile(); fB.deleteFile();
-            // Base N is put BACK. The two corner presets above were saved by moving it, and
-            // leaving it on 5 left the spectrum's lowest partial at the 5th harmonic - so
-            // the f0 probe in (g) below read a pitch two octaves adrift and failed a claim
-            // about the glide that the glide was keeping perfectly.
-            sp ("baseN", 1.0f);
         }
 
         // Does the pitch actually TRAVEL from one note to the other? Sample the rendered f0
@@ -9335,6 +9371,7 @@ int main()
         // member channels, and the first carries a per-note BEND: the glide has to start
         // from the pitch that note is really sounding at, bend included, not from its key.
         {
+            fresh();
             sp ("monoGlide", 1.0f);
             sp ("tuningMode", 3.0f);      // MPE zone: +-48 semitones per note, tuning = Equal
             const double fBent = p->getNoteFrequency (60) * std::exp2 (2.0 / 12.0);  // +2 semitones
@@ -9372,6 +9409,8 @@ int main()
         // through it: re-latching would reset the rise phase to zero, which is the swoop out
         // of nothing that latch exists to prevent.
         {
+            fresh();
+            sp ("monoGlide", 1.0f);       // the takeover this block is about needs the mode on
             sp ("shepOn", 1.0f);
             sp ("shepMode", 0.0f);        // Free (ms), so no host tempo is needed
             sp ("shepTime", 4000.0f);
@@ -9409,6 +9448,8 @@ int main()
         // stands the gate's Mono down while glide is on; this is the measurement that says
         // so, and it is the one that fails if that line is removed.
         {
+            fresh();
+            sp ("monoGlide", 1.0f);       // the glide under test - armed here, not inherited
             const double freeTravel  = glideTravel (60, 1, 67, 1, glideMs);
             sp ("rhythmMono", 1.0f);
             const double gatedTravel = glideTravel (60, 1, 67, 1, glideMs);
