@@ -5912,8 +5912,14 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
         // rather than in a separate list so it can never name a control the layout no
         // longer produces.
         if (const auto* l = dynamic_cast<const juce::Label*> (&c); l != nullptr && l->getText().isNotEmpty())
+            // ...in the font the PAINTER really uses, which is not the one the Label was
+            // given: GalacticLnF::getLabelFont puts a 12.5 px floor under it and draws it
+            // BOLD. Measured with l->getFont() this check read a lighter, sometimes
+            // smaller face than the screen shows, so it under-reported - it certified as
+            // fitting exactly the labels that condense in front of the user, which is the
+            // hand-copied-formula mistake the rest of fgfit exists to make impossible.
             p.componentLabels.push_back ({ name, l->getText(), l->getBounds(),
-                (float) juce::GlyphArrangement::getStringWidthInt (l->getFont(), l->getText()) });
+                (float) juce::GlyphArrangement::getStringWidthInt (fgfit::labelFont (*l), l->getText()) });
         // ...and a BUTTON carries a word that has to fit the box it was given, measured
         // against the room the painter really leaves it (see LayoutProbe::buttonFits).
         // Recorded through the SAME `add` every control goes through, so a button that
