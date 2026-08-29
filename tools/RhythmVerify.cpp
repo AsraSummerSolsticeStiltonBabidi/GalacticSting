@@ -28,6 +28,62 @@ static void check (bool ok, const char* what)
     if (! ok) ++failures;
 }
 
+//==============================================================================
+// WAIT FOR THE BUILDER; NEVER GUESS AT IT.
+//
+// The spectrum is compiled on a Priority::low worker (SpectrumEngine.h). A verifier
+// that sleeps a fixed time and then runs a tight processBlock loop STARVES that
+// worker: measured 1907 ms and 2309 ms to publish under `sleep (120)` followed by
+// ~1600 back-to-back blocks, against 3.0 ms of actual compileSpectrum work and 4 ms
+// with a tight poll. Every "the spectrum changed" claim downstream of such a sleep is
+// therefore a race, and that race is most of why six runs of this same binary at the
+// same commit produced 2/3/11/12/17/19 failures with near-disjoint sets: "Base 1 vs
+// Base 7 differs" is a deterministic spectral claim that only ever went red because
+// the rebuild had not landed yet.
+//
+// The engine already keeps the counter that answers the question, so ask it. Silent
+// when the build lands (it always should); a loud, counted failure when it does not,
+// because a timeout here means every spectral claim below is reading a stale template
+// and must not be allowed to pass by accident.
+static bool awaitTemplateChange (const FractalAdditiveAudioProcessor& p, juce::uint32 gen0,
+                                 const char* what, double timeoutMs = 15000.0)
+{
+    const double t0 = juce::Time::getMillisecondCounterHiRes();
+    while (p.getTemplateGeneration() == gen0)
+    {
+        if (juce::Time::getMillisecondCounterHiRes() - t0 > timeoutMs)
+        {
+            std::printf ("  [FAIL] the spectrum rebuild published within %.0f ms (%s)\n", timeoutMs, what);
+            ++failures;
+            return false;
+        }
+        juce::Thread::sleep (1);
+    }
+    return true;
+}
+
+// The other half of the same problem: after a GROUP of parameter edits, some of which may
+// or may not ask for a rebuild, there is no one generation to wait for. Wait for the
+// builder to go QUIET instead - the counter unchanged for `stableMs` - so a template can
+// never land in the middle of the measurement that follows and change the spectrum under
+// it. (Safe to call with nothing pending: `set` runs the poll synchronously, so by the
+// time this is entered the request, if there is one, is already queued with the worker.)
+static void awaitTemplateQuiet (const FractalAdditiveAudioProcessor& p,
+                                double stableMs = 80.0, double timeoutMs = 15000.0)
+{
+    const double t0 = juce::Time::getMillisecondCounterHiRes();
+    auto   gen   = p.getTemplateGeneration();
+    double since = t0;
+    for (;;)
+    {
+        juce::Thread::sleep (2);
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        if (const auto g = p.getTemplateGeneration(); g != gen) { gen = g; since = now; }
+        if (now - since >= stableMs || now - t0 > timeoutMs)
+            return;
+    }
+}
+
 struct Ev { int sample; bool on; int note, ch; int vel = 0; };
 
 int main()
@@ -7849,9 +7905,16 @@ int main()
         // back puts the sound back.
         auto capture = [&] (float baseN, std::vector<float>& out)
         {
+            // The new template must be PUBLISHED before the note below is played, or the
+            // capture records the previous spectrum and "editing the spectrum edits the
+            // Shepard" fails for a reason that has nothing to do with the Shepard. Wait on
+            // the generation counter (see awaitTemplateChange); the pump afterwards is only
+            // the engine settling on it, with nothing sounding.
+            const auto genBefore = p->getTemplateGeneration();
+            const bool rebuilds  = (int) p->apvts.getRawParameterValue ("baseN")->load() != (int) baseN;
             set ("baseN", baseN);
-            juce::Thread::sleep (120);        // the builder thread compiles the new template
-            pump (0.8);                       // ...and publishes it; nothing is sounding
+            if (rebuilds) awaitTemplateChange (*p, genBefore, "run 46 capture: Base N");
+            pump (0.3);
             out.clear();
             keyDown (60);
             for (int i = 0; i < 60; ++i)      // ~0.32 s
@@ -7901,7 +7964,11 @@ int main()
         set ("phaseMode", 1.0f);      // Scattered
         set ("baseN",     1.0f);
         set ("ampSustain", 1.0f);
-        pump (0.8);
+        // ...and none of those may land in the MIDDLE of the three seconds measured below:
+        // a template published mid-note is a real spectrum change, and the click bound and
+        // the centroid would both be measuring it rather than the wrap.
+        awaitTemplateQuiet (*p);
+        pump (0.3);
         {
             keyDown (60);
             pump (0.3);               // past the attack: the envelope is at sustain
@@ -8151,8 +8218,14 @@ int main()
             // so a patch that is already expensive becomes several times as expensive:
             // the number below is what a user has to be told, not a number measured on
             // the cheapest possible patch and quoted as if it were the cost.
-            set ("fractalLevel", 4.0f);
-            juce::Thread::sleep (400);          // let the off-thread rebuild land
+            // A LEVEL-4 fractal is the heaviest compile in the file, and 400 ms was a
+            // guess at it: the CPU numbers below are meaningless if they are measured
+            // while the previous template is still the live one.
+            {
+                const auto genBefore = p->getTemplateGeneration();
+                set ("fractalLevel", 4.0f);
+                awaitTemplateChange (*p, genBefore, "run 46 CPU: fractal level 4");
+            }
             pump (0.6);
             const auto dense = report ("a DENSE spectrum (fractal level 4), played LOW", 24);
 
