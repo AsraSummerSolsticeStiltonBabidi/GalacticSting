@@ -538,6 +538,7 @@ namespace
             { "Div",          "the same abbreviation in both: divide / divideix" },
             { "Glide",        "the term of art in Catalan too (see \"Glide monof\xc3\xb2nic\")" },
             { "Pitch bend",   "the term of art in Catalan too (the Catalan tooltips say \"bend\")" },
+            { "Bend",         "the Phase glide mode: same term of art, and short because it shares its Essentials row with the Phase fader" },
             { "Shepard",      "a person's name" },
             { "\xc2\xb1""2 st",        "a bend range: sign, number and the st abbreviation" },
             { "\xc2\xb1""12 st",       "a bend range: sign, number and the st abbreviation" },

@@ -3504,7 +3504,15 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // is left to localise in this cell is the glide choice. Short on purpose: it shares
     // one Essentials row with the fader, and a long item would squash the fader rather
     // than wrap - the painter's 0.7 horizontal fallback IS the failure.
-    localise (phaseGlideBox, { tr ("Pitchbend", "Bend"), tr ("Dry/Wet", "Sec/Humit") });
+    // "Bend" in BOTH languages, and the English word is the one that had to give. This
+    // box shares an Essentials row with the Phase fader, so it gets 67 px - 47 px of
+    // text - and RhythmVerify's drawn-string sweep measured "Pitchbend" needing 65 px in
+    // it. Widening the box takes the width straight out of the fader (56 px at the
+    // 870x540 floor already), so the word goes short instead and the tooltip carries the
+    // full meaning. Through tr() even though the two are now the same word: tr() is the
+    // one place UTF-8 is decoded, and a raw const char* here is how "Â±48 st (MPE)"
+    // shipped in 42 snapshots.
+    localise (phaseGlideBox, { tr ("Bend", "Bend"), tr ("Dry/Wet", "Sec/Humit") });
     localise (primeModeBox, { tr ("Limit", "L\xc3\xadmit"), tr ("Whitelist", "Llista") });
     // THROUGH tr(), even though the three items are the same word in both languages.
     // Written as raw const char* they went through juce::String(const char*), which reads
