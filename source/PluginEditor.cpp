@@ -7724,11 +7724,19 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // difference - the Reference read-out finally has room to breathe.
             // THREE cells, not four: PHASE moved out to the SPECTRUM panel, beside OCTAVE
             // RANGE, so GAIN and REFERENCE divide what its row used to hold.
-            const int octH = juce::jmin (40, e.getHeight() / 3);
-            const int ch   = (e.getHeight() - octH) / 2;
+            //
+            // EVEN THIRDS. OCTAVE used to be capped at 40 px and the other two split what
+            // was left, which is invisible at the 870x540 floor (37/37/38 either way) but
+            // turns into 126/126/40 at 1600x900: two cells that swell as the window grows
+            // and a third that cannot, so the box's last divider sits stranded near the
+            // bottom edge and the panel reads as unfinished rather than as three fields.
+            // Every cell centres its own control (jmin (22, ...) below), so an even cell
+            // spends its extra height as symmetric air around the control rather than on
+            // a stretched widget - the growth is distributed, never pooled.
+            const int ch = e.getHeight() / 3;
             ecGain  = e.removeFromTop (ch);
             ecRef   = e.removeFromTop (ch);
-            ecOct   = e;
+            ecOct   = e;   // the remainder, so the three cells always tile the box exactly
             // Tighter label band + slimmer padding = the controls breathe (the
             // Reference value used to clip its descenders).
             // PHASE / GAIN / REFERENCE: the control sits to the RIGHT of its inline
@@ -8013,11 +8021,42 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
             else
                 tuningNameLabel.setBounds (mrow);
+
+            //== THE SLACK IS SHARED OUT, NOT POOLED ================================
+            // Every row below is a fixed height taken off the top, and the Shepard block
+            // was reserved off the bottom, so whatever the panel has spare ended up as
+            // ONE void in the middle: 168 px at 1600x900 against 43 at 1200x650, with
+            // the Shepard row orphaned against the bottom edge and the rows above
+            // huddled under the title. It is the same fault as a paragraph set with all
+            // its leading at the end.
+            //
+            // So the spare height is divided evenly over the gaps that are still to
+            // come - one before each remaining row, plus the one that is left between
+            // the last row and the Shepard block - and each of those gaps grows by that
+            // share. Nothing stretches: the rows keep their heights and their controls,
+            // only the air between them changes, which is why no string can start
+            // clipping because of this.
+            //
+            // The three optional "load this tuning from..." buttons are decided HERE
+            // rather than at the row that draws them, because the count of them is what
+            // makes the division right - measured after the fact it would be a guess.
+            const bool hasPatch = processorRef.activeSclHasPreset();
+            const bool hasPresetTuning = processorRef.hasPendingPresetTuning()
+                                       && ! processorRef.presetHasDrifted();
+            const bool hasProvTuning = processorRef.hasSpectrumProvenance();
+            const int  nSnug = (hasPatch ? 1 : 0) + (hasPresetTuning ? 1 : 0) + (hasProvTuning ? 1 : 0);
+            // What is still to be placed: 2 + period(18), nSnug x (3 + 22),
+            // 3 + bend(22), 3 + bank(24).
+            const int  need  = 72 + 25 * nSnug;
+            // ...over the gaps that can carry it: the four fixed ones (period, bend,
+            // bank, and the last-row-to-Shepard gap) plus one per optional button.
+            const int  lead  = juce::jmax (0, ti.getHeight() - need) / (4 + nSnug);
+
             // Period of the active scale, in red, always visible. For an absolute 128-key
             // table it is Fibló's ESTIMATE, so the same row also carries the field that
             // overrides it (and a reset back to the estimate) - the readout alone would
             // state a guess as if the tuning had declared it.
-            ti.removeFromTop (2);
+            ti.removeFromTop (2 + lead);
             {
                 auto prow = ti.removeFromTop (18);
                 const bool isTable = processorRef.tuningIsAbsoluteTable();
@@ -8050,15 +8089,16 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // width. "Load spectrum's tuning" was a 420 px slab for 22 characters. Same
             // padding rule as every other narrowed control (fgfit::kSnugPad), and all
             // three share ONE helper so a rename cannot widen one and not its neighbours.
-            auto snugRow = [this] (juce::Rectangle<int>& ti, juce::TextButton& b)
+            auto snugRow = [this, lead] (juce::Rectangle<int>& ti, juce::TextButton& b)
             {
-                ti.removeFromTop (3);
+                ti.removeFromTop (3 + lead);   // its share of the panel's spare height
                 auto row = ti.removeFromTop (22).reduced (2, 0);
                 b.setBounds (row.removeFromLeft (
                     juce::jmin (fgfit::snugTextButtonWidth (b, 22), row.getWidth())));
             };
             // Only for scales this synth wrote: they carry their own patch.
-            const bool hasPatch = processorRef.activeSclHasPreset();
+            // (hasPatch / hasPresetTuning / hasProvTuning were decided above, where their
+            // count is what divides the spare height.)
             loadItsSpectrumBtn.setVisible (hasPatch);
             if (hasPatch) snugRow (ti, loadItsSpectrumBtn);
             // Only when the preset just loaded carries a tuning that actually
@@ -8067,8 +8107,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // AND the preset itself has not drifted (a knob/automation/undo moved
             // something outside its own modulators): once it has drifted, "this
             // preset's tuning" is no longer an honest thing to offer.
-            const bool hasPresetTuning = processorRef.hasPendingPresetTuning()
-                                       && ! processorRef.presetHasDrifted();
             loadPresetTuningBtn.setVisible (hasPresetTuning);
             if (hasPresetTuning) snugRow (ti, loadPresetTuningBtn);
             // The custom spectrum's own tuning, whenever it HAS one (derived by Adapt,
@@ -8076,7 +8114,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // stays VISIBLE when that tuning is already active - disabled and saying so
             // (refreshSpectrumTuningButton) - because vanishing right after the click
             // would read as the button failing rather than the job being done.
-            const bool hasProvTuning = processorRef.hasSpectrumProvenance();
             loadSpectrumTuningBtn.setVisible (hasProvTuning);
             if (hasProvTuning)
             {
@@ -8095,7 +8132,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             const bool bendVis = tmode != 3;
             lblBend.setVisible (bendVis); bendBox.setVisible (bendVis);
             {
-                ti.removeFromTop (3);
+                ti.removeFromTop (3 + lead);   // its share of the panel's spare height
                 auto bendRow = ti.removeFromTop (22);
                 if (bendVis)
                 {
@@ -8122,9 +8159,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
             tuningBankClearBtn.setVisible (bankUi);
             if (bankUi)
             {
-                ti.removeFromTop (3);
+                ti.removeFromTop (3 + lead);   // its share of the panel's spare height
                 // Bank row: the label rides on the LEFT of the row (a separate label
                 // row no longer fits) - [BANK][combo (flex)][+ .scl][X remove].
+                // Whatever is still under it - one share of the slack, by construction -
+                // is the gap up to the Shepard block, so that gap matches the others
+                // instead of being the whole void.
                 auto bkrow = ti.removeFromTop (juce::jmax (0, juce::jmin (24, ti.getHeight())));
                 lblTuningBank.setJustificationType (juce::Justification::centredLeft);
                 lblTuningBank.setBounds (bkrow.removeFromLeft (38));
