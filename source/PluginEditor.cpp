@@ -7067,7 +7067,28 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // between two parallel lines. Reclaiming it widens rows 1-2 by 9 px and the
         // right column by 6, so nothing had to shrink to pay for it - which is why
         // nothing in either box needed re-fitting.
-        const int wallX = area.getRight() - 208;
+        // HOW WIDE THIS COLUMN IS. It used to be a flat 208 px at EVERY window size, so
+        // a 1600x900 window handed its whole extra 400 px to rows 1-2 - panels that were
+        // already comfortable (the tuning name's cell went 57 -> 229 px) - while the one
+        // panel that genuinely overflows stayed exactly as cramped as at the floor.
+        // The strings that paid for that are all in here: "De totes les afinacions
+        // possibles" was over its combo by 39.96 px, "TEMPS REAL" over its button by
+        // 18.42, "+ amplituds" over its toggle - all three at the SHIPPED 1200x650, in
+        // Catalan, which is the binding language.
+        //
+        // The growth is measured from the SHIPPED 1200x650 (1188 px of usable width),
+        // not from zero, so every window at or below that size keeps the exact 208 it
+        // was fitted to - the floor included. A first attempt took a flat 22% of the
+        // width instead, which is 261 px at 1200: rows 1-2 lost 53 px there and started
+        // clipping strings of their own ("Transposada avall" needed 117 px of a 109 px
+        // combo, the CUSTOM modulator chip 45 of 44), which is the same fault moved to a
+        // different panel rather than fixed. Only the width the window did not have at
+        // 1200 is redistributed, and 30% of it comes here.
+        //
+        // Capped at 300: past that the column is wider than its longest sentence needs
+        // and the SPECTRUM row is paying for empty gutter.
+        const int specW = juce::jlimit (208, 300, 208 + (area.getWidth() - 1188) * 3 / 10);
+        const int wallX = area.getRight() - specW;
         // Box inset + the two stroke offsets. ROUNDED, not truncated: 2*1.3 truncates to
         // 2 and leaves the two strokes 0.6 px apart, which is a visible pink sliver down
         // the orange border - the doubled wall in miniature.
