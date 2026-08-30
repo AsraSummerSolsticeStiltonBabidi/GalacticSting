@@ -7228,18 +7228,36 @@ void FractalAdditiveAudioProcessorEditor::resized()
             auto r2 = si.removeFromTop (22);
             // 44 was measured for "Period"; "Per\xc3\xado" "de" needs 4 more and was condensed.
             caption (chordPerLbl, r2, 44, 50);
-            chordPeriodEdit.setBounds (r2.removeFromLeft (44).reduced (0, 1));
+            // ONE RIGHT EDGE for the values in this stack. Every row here is
+            // [caption][value], and the captions are wildly different lengths - "Notes"
+            // against "smallest interval (c)" - so left-placing each value put the three
+            // of them at three different x (1035 / 1036 / 1116 in the shipped window):
+            // a stack that reads as one column but is not one. Their captions cannot be
+            // made one width (the longest is 125 px inside a 192 px column, which would
+            // leave the Notes row's Min/Max box 13 px), so the alignment is taken on the
+            // side that CAN hold: the values end where the row ends, which is also where
+            // the Notes row's Min/Max box and the buttons under them end.
+            // In the adaptation the period is not the last thing on its row - the
+            // "+ amplitudes" toggle follows it - so there it stays left, beside the
+            // caption it belongs to.
             if (adapt)
             {
+                chordPeriodEdit.setBounds (r2.removeFromLeft (44).reduced (0, 1));
                 r2.removeFromLeft (6);
                 adaptAmpsToggle.setBounds (r2);      // "+ amplitudes"
             }
+            else
+                chordPeriodEdit.setBounds (r2.removeFromRight (juce::jmin (44, r2.getWidth()))
+                                             .reduced (0, 1));
             // The result count is fixed at 16 - one control less to think about.
             chordCountLbl.setVisible (false); chordCountBox.setVisible (false);
             si.removeFromTop (3);
             auto r3 = si.removeFromTop (22);
             caption (chordMinLbl, r3, 112, 48); // "smallest interval (c)" / "interval mes petit (c)"
-            chordMinEdit.setBounds (r3.removeFromLeft (juce::jmin (48, r3.getWidth())).reduced (0, 1));
+            // ...and this is the value whose caption is the long one, so it is the row
+            // that was 80 px out of line with the two above it. Nothing follows it in
+            // either mode, so it takes the shared right edge unconditionally.
+            chordMinEdit.setBounds (r3.removeFromRight (juce::jmin (48, r3.getWidth())).reduced (0, 1));
             if (adapt && adaptGoalBox.getSelectedId() == 3)
             {
                 si.removeFromTop (3);
@@ -7281,20 +7299,25 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 auto r4 = si.removeFromTop (24);
                 // Find takes the left ~60%, REALTIME the rest: the follower is a mode, not
                 // the primary action, and it must never be the button the hand lands on.
-                chordGoBtn.setBounds (r4.removeFromLeft (r4.getWidth() * 3 / 5).reduced (1, 0));
-                chordRtBtn.setBounds (r4.reduced (1, 0));
+                // The 2 px gap between the pair is trimmed off their INNER edges only:
+                // reducing both ends pulled the row 1 px in from the column on each side,
+                // so this pair alone contributed two more of the seven different edges
+                // this narrow column used to have.
+                chordGoBtn.setBounds (r4.removeFromLeft (r4.getWidth() * 3 / 5).withTrimmedRight (1));
+                chordRtBtn.setBounds (r4.withTrimmedLeft (1));
             }
             if (adapt)
             {
                 si.removeFromTop (3);
                 auto r4 = si.removeFromTop (24);
-                adaptGoBtn.setBounds (r4.removeFromLeft (r4.getWidth() * 3 / 5).reduced (1, 0));
-                adaptRtBtn.setBounds (r4.reduced (1, 0));
+                // Same pair, same shared edges as the search's Find / REALTIME above.
+                adaptGoBtn.setBounds (r4.removeFromLeft (r4.getWidth() * 3 / 5).withTrimmedRight (1));
+                adaptRtBtn.setBounds (r4.withTrimmedLeft (1));
                 // LOOKAHEAD on its own row UNDER the follower it belongs to: it is the
                 // follower's latency trade and means nothing without it, so it must not
                 // sit where it could be mistaken for a third action.
                 si.removeFromTop (2);
-                lookaheadBtn.setBounds (si.removeFromTop (22).reduced (1, 0));
+                lookaheadBtn.setBounds (si.removeFromTop (22));   // the column's own edges
                 si.removeFromTop (1);
                 // THE one read-out (see adaptReadoutText). 28 px is two lines at 10.5 pt,
                 // and every sentence it can print is written to fit two - RhythmVerify
@@ -7312,8 +7335,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     ! chordDegView ? cSpecScale.withAlpha (0.85f) : juce::Colour (0xff44445e));
                 chordViewFwd.setColour (juce::TextButton::buttonColourId,
                     chordDegView ? cSpecScale.withAlpha (0.85f) : juce::Colour (0xff44445e));
-                chordViewBack.setBounds (r5.removeFromLeft (r5.getWidth() / 2).reduced (1, 0));
-                chordViewFwd.setBounds  (r5.reduced (1, 0));
+                chordViewBack.setBounds (r5.removeFromLeft (r5.getWidth() / 2).withTrimmedRight (1));
+                chordViewFwd.setBounds  (r5.withTrimmedLeft (1));
             }
             // The chord search keeps its own progress line. The adaptation does NOT: its
             // read-out above carries the progress, and a second line that was blank most
@@ -8131,13 +8154,22 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // the choice is irrelevant there) - Recent then takes the whole row.
             const bool bendVis = tmode != 3;
             lblBend.setVisible (bendVis); bendBox.setVisible (bendVis);
+            // ONE LABEL COLUMN for this panel. "Pitch bend" reserved 74 px and "Bank" 38,
+            // so two adjacent rows started their controls 36 px apart - the kind of drift
+            // that has no name on screen and just makes the panel look slightly wrong.
+            // Sized to the WIDER of the two words in the language actually on screen
+            // (fgfit::labelWidth, because a juce::Label draws inside its border in a bold
+            // face and a cell measured any other way condenses the glyphs silently), with
+            // 74 as the floor so nothing that fitted before can stop fitting.
+            const int tunLblW = juce::jmax (74, fgfit::labelWidth (lblBend),
+                                                fgfit::labelWidth (lblTuningBank));
             {
                 ti.removeFromTop (3 + lead);   // its share of the panel's spare height
                 auto bendRow = ti.removeFromTop (22);
                 if (bendVis)
                 {
                     lblBend.setJustificationType (juce::Justification::centredLeft);
-                    lblBend.setBounds (bendRow.removeFromLeft (74));
+                    lblBend.setBounds (bendRow.removeFromLeft (tunLblW));
                     compact (bendBox, bendRow.removeFromLeft (juce::jmin (120, bendRow.getWidth())));
                     bendRow.removeFromLeft (6);
                 }
@@ -8167,7 +8199,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // instead of being the whole void.
                 auto bkrow = ti.removeFromTop (juce::jmax (0, juce::jmin (24, ti.getHeight())));
                 lblTuningBank.setJustificationType (juce::Justification::centredLeft);
-                lblTuningBank.setBounds (bkrow.removeFromLeft (38));
+                lblTuningBank.setBounds (bkrow.removeFromLeft (tunLblW));
                 tuningBankClearBtn.setBounds (bkrow.removeFromRight (24).reduced (1, 1));
                 bkrow.removeFromRight (3);
                 tuningBankLoadBtn.setBounds (bkrow.removeFromRight (juce::jmax (46,
