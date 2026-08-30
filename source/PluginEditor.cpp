@@ -1146,10 +1146,9 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                  "0 = Aligned (tonal pulse, never clips), 1 = Scattered (louder, noisier). Anywhere between is a real blend.");
     phaseFader.setSliderStyle (juce::Slider::LinearHorizontal);
     phaseFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 38, 14);
-    // How a move made WHILE NOTES ARE SOUNDING reaches them. Sits in the same cell as
-    // the fader because it is a property of the fader, not a mode of the synth.
-    configCombo (phaseGlideBox, "phaseGlide", phaseGlideAtt, cEssentials,
-                 "How a Phase move reaches notes already sounding. Pitchbend: each partial detunes briefly until it lands. Dry/Wet: crossfades the old phases into the new.");
+    // There is no glide box beside the fader any more: how a mid-note move reaches
+    // sounding notes, and how long it takes, both come from the SPECTRUM panel's
+    // Morph / Dry-Wet transition now (see the phaseGlide note in createParameterLayout).
     configFader (gainFader, "masterGain", gainAtt, cEssentials, "Master output gain");
     gainFader.setSliderStyle (juce::Slider::LinearHorizontal);
     gainFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 46, 14);
@@ -3381,15 +3380,23 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     phaseFader.setTooltip (tr (
         "Starting phase of the partials, as a continuous fade. 0 = Aligned: all peak together, forming a periodic pulse - tonal, never clips, and with dense spectra the pulse itself is heard as a low difference tone. 1 = Scattered: pseudo-random phases - smoother, louder, no pulse. In between, every partial moves the shortest way from one to the other and the level follows.",
         "Fase inicial dels parcials, com un fos continu. 0 = Alineat: tots fan el pic alhora i formen un pols peri\xc3\xb2""dic - tonal, mai clipa, i amb espectres densos el pols s'escolta com un to diferencial greu. 1 = Dispers: fases pseudoaleat\xc3\xb2ries - m\xc3\xa9s suau, m\xc3\xa9s fort, sense pols. Enmig, cada parcial va pel cam\xc3\xad m\xc3\xa9s curt d'un a l'altre i el volum el segueix."));
-    // HONEST ABOUT WHAT THIS BUILD DOES. The two modes are the two ways a Phase move can
-    // reach a note that is already sounding, and neither is wired to the oscillators yet:
-    // this build re-phases at note-on. The level DOES follow the fader continuously
-    // mid-note (the normalisation law is blended by the same control), so a move on a
-    // held chord is audible - it is the phases that wait for the next note. Saying so
-    // here costs a sentence; letting a player discover it during a set costs the set.
-    phaseGlideBox.setTooltip (tr (
-        "How a Phase move will reach notes that are ALREADY SOUNDING. 'Pitchbend': each partial is detuned by a tiny amount until it has walked to its new phase, then put back in tune - continuous, but the note is briefly out of tune with itself. 'Dry/Wet': the old phases are crossfaded into the new ones - always in tune, but both sets are audible while it runs. IN THIS BUILD neither is active yet: a Phase move changes the level of held notes immediately and their phases from the next note on.",
-        "Com arribar\xc3\xa0 un moviment de Fase a les notes que JA SONEN. 'Bend': cada parcial es desafina una mica fins que arriba a la seva fase nova i despr\xc3\xa9s torna afinat - continu, per\xc3\xb2 la nota queda un moment desafinada amb ella mateixa. 'Sec/Humit': les fases velles es fonen amb les noves - sempre afinat, per\xc3\xb2 mentre dura se senten els dos conjunts. EN AQUESTA VERSI\xc3\x93 cap dels dos actua encara: moure Fase canvia el volum de les notes que sonen a l'instant i les seves fases a partir de la nota seg\xc3\xbc""ent."));
+    // HONEST ABOUT WHAT THIS BUILD DOES, IN THE ONE PLACE THE USER READS.
+    //
+    // The glide dropdown is gone, so its sentence has to live here or nowhere - and the
+    // sentence still has to be TRUE. Live re-phasing is NOT implemented: this build
+    // changes a held note's LEVEL immediately (the normalisation law is blended by the
+    // same control) and its PHASES only from the next note-on. So this names where the
+    // mode and the duration WILL come from - the SPECTRUM panel's transition, which is
+    // now the single place that answers "how is a spectrum change made smooth" - without
+    // claiming a re-phasing that would not happen. A tooltip promising a glide the
+    // oscillators never perform is worse than no tooltip: the player trusts it on stage.
+    //
+    // APPENDED rather than retyped, so the continuous-fade paragraph above stays the one
+    // copy of itself; two hand-kept halves of one tooltip drift, and only one of them
+    // would get corrected.
+    phaseFader.setTooltip (phaseFader.getTooltip() + tr (
+        "\nWHILE NOTES ARE SOUNDING: a Phase move changes their LEVEL at once, and their PHASES from the next note on - this build does not re-phase a held note. There is no phase-glide setting to choose any more: when live re-phasing lands it takes BOTH its mode and its duration from the SPECTRUM panel's transition, because re-phasing IS a spectrum change. Morph on: by pitchbend, over Morph Time. Dry/Wet on: by crossfade, over Dry/Wet Time. Both on: Morph wins, exactly as it does for the spectrum itself. Both off: no live re-phasing at all.",
+        "\nMENTRE SONEN LES NOTES: moure la Fase els canvia el VOLUM a l'instant, i les FASES a partir de la nota seg\xc3\xbc""ent - aquesta versi\xc3\xb3 no refasa una nota que ja sona. Ja no hi ha cap opci\xc3\xb3 de fosa de fase per triar: quan arribi el refasat en directe, en prendr\xc3\xa0 el mode I la durada de la transici\xc3\xb3 del plaf\xc3\xb3 ESPECTRE, perqu\xc3\xa8 refasar \xc3\x89S un canvi d'espectre. Morphing actiu: per pitchbend, durant el Temps de Morphing. Sec/Humit actiu: per fosa creuada, durant el Temps de Sec/Humit. Tots dos actius: guanya el Morphing, igual que amb l'espectre mateix. Tots dos apagats: cap refasat en directe."));
     gainFader.setTooltip (tr ("Final output volume, in dB.", "Volum final de sortida, en dB."));
     primeModeBox.setTooltip (tr (
         "How prime numbers filter the harmonics. 'Limit': a harmonic passes only if its largest prime factor is at most the chosen limit. 'Whitelist': it passes only if EVERY prime factor is ticked below.",
@@ -3500,19 +3507,13 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         b.setSelectedId (keep, juce::dontSendNotification); // refresh displayed text
     };
     localise (basePitchBox, { tr ("Transposed down", "Transposada avall"), tr ("Original", "Original") });
-    // Phase's two words moved onto the fader's ends (its tooltip and its read-out); what
-    // is left to localise in this cell is the glide choice. Short on purpose: it shares
-    // one Essentials row with the fader, and a long item would squash the fader rather
-    // than wrap - the painter's 0.7 horizontal fallback IS the failure.
-    // "Bend" in BOTH languages, and the English word is the one that had to give. This
-    // box shares an Essentials row with the Phase fader, so it gets 67 px - 47 px of
-    // text - and RhythmVerify's drawn-string sweep measured "Pitchbend" needing 65 px in
-    // it. Widening the box takes the width straight out of the fader (56 px at the
-    // 870x540 floor already), so the word goes short instead and the tooltip carries the
-    // full meaning. Through tr() even though the two are now the same word: tr() is the
-    // one place UTF-8 is decoded, and a raw const char* here is how "Â±48 st (MPE)"
-    // shipped in 42 snapshots.
-    localise (phaseGlideBox, { tr ("Bend", "Bend"), tr ("Dry/Wet", "Sec/Humit") });
+    // Phase has NOTHING to localise here any more. Its two end words live on the fader
+    // (its tooltip and its read-out), and the glide choice that used to need a localised
+    // two-item box is gone entirely - the mode comes from the SPECTRUM panel's Morph /
+    // Dry-Wet transition, whose own words are already translated where they are drawn.
+    // That also retires the "Bend" compromise: the box was 67 px wide, "Pitchbend"
+    // measured 65 px in RhythmVerify's drawn-string sweep, and the English word had to be
+    // shortened to keep it off the fader. No box, no compromise.
     localise (primeModeBox, { tr ("Limit", "L\xc3\xadmit"), tr ("Whitelist", "Llista") });
     // THROUGH tr(), even though the three items are the same word in both languages.
     // Written as raw const char* they went through juce::String(const char*), which reads
@@ -6309,7 +6310,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("both.rangeVal",    sprVal);          add ("both.rangeUp",   sprUp);
     add ("both.rangeDn",     sprDn);
 
-    add ("ess.phase",        phaseFader);      add ("ess.phaseGlide", phaseGlideBox);
+    add ("ess.phase",        phaseFader);
     add ("ess.gain",         gainFader);
     add ("ess.refA",         refAEdit);        add ("ess.refALbl",    lblRefA);
     add ("ess.refHz",        lblRefHz);
@@ -6455,7 +6456,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
             p.comboTexts.push_back ({ name, widest, need, availW });
         }
     };
-    combo ("basePitch",   basePitchBox);   combo ("phaseGlide",  phaseGlideBox);
+    combo ("basePitch",   basePitchBox);
     combo ("primeMode",   primeModeBox);   combo ("bend",        bendBox);
     combo ("modSel",      modSelBox);      combo ("lfoWave",     lfoWaveBox);
     combo ("lfoRateMode", lfoRateModeBox); combo ("lfoPhaseMode", lfoPhaseModeBox);
@@ -7658,30 +7659,15 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // Reference value used to clip its descenders).
             // PHASE / GAIN / REFERENCE: the control sits to the RIGHT of its inline
             // sub-label (drawn in paint at the cell's left), slightly narrower.
-            // PHASE now carries TWO controls in the one cell the combo used to have: the
-            // fader, and the glide box that says how a mid-note move reaches sounding
-            // voices. The glide box is taken off the RIGHT first and capped, so what the
-            // fader keeps is whatever is left - a narrow window shrinks the fader (which
-            // still drags fine) instead of squashing the box's words (which the painter
-            // would only fix by condensing them 0.7x, i.e. by breaking them).
-            { auto c = ecPhase.reduced (6, 1);
-              // THE LABEL BAND GIVES WAY BEFORE THE CONTROLS DO. At the 870x540 floor
-              // this cell is 154 px wide; the 78 px band the other three rows reserve
-              // leaves 76 px for two controls, and the first draft of this row shipped a
-              // FADER 18 PX WIDE - unaimable, and the snapshot rig does not fail on it.
-              // The band only has to clear the painted word (PHASE is ~33 px, FASE ~27),
-              // so below the width where everything fits it drops to 40 and the row loses
-              // its left alignment with GAIN / REFERENCE / OCTAVE instead of losing its
-              // fader. Above that width nothing moves and the four rows line up as before.
-              const int lbl = c.getWidth() >= 78 + 4 + 54 + 96 ? 78 : 40;
-              c.removeFromLeft (lbl);
-              // The glide box is taken off the RIGHT and capped, so a narrow window
-              // shrinks the fader (which still drags) rather than squashing the box's
-              // words - the painter's 0.7x horizontal fallback IS the failure.
-              const int glideW = juce::jlimit (54, 84, c.getWidth() * 2 / 5);
-              compact (phaseGlideBox, c.removeFromRight (glideW));
-              c.removeFromRight (4);
-              // ...and the numeric read-out is the first thing to go: a 38 px number box
+            // PHASE is back to ONE control in its cell: the glide box that used to share
+            // this row is gone, because the mode it chose now comes from the SPECTRUM
+            // panel's transition. That retires the special case this row needed - it was
+            // the only one of the four that had to shrink its label band to 40 px to fit
+            // two controls, and the draft that did NOT shrink it shipped a FADER 18 PX
+            // WIDE at the 870x540 floor. One control, so the plain 78 px band the other
+            // three rows use is affordable again and all four line up.
+            { auto c = ecPhase.reduced (6, 1);   c.removeFromLeft (78);
+              // The numeric read-out is still the first thing to go: a 38 px number box
               // inside a 56 px cell leaves an 18 px track, and a fader you cannot aim is
               // worse than a fader you cannot read.
               phaseFader.setTextBoxStyle (c.getWidth() >= 92 ? juce::Slider::TextBoxRight

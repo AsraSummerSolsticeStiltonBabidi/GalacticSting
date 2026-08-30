@@ -359,7 +359,19 @@ int main()
         AudioParameterChoice oldShape ({ "phaseMode", 1 }, "Phase",
                                        StringArray { "Aligned", "Scattered" }, 0);
 
+        // TWO shapes of old chunk, because the user has BOTH on disk and neither may
+        // refuse to open:
+        //   stale = 0  a PRE-fader project: no "phaseGlide" child at all.
+        //   stale = 1  a project saved by YESTERDAY'S build, which still had the
+        //              phaseGlide parameter and therefore wrote a child for it. That
+        //              parameter has since been deleted, so this chunk now names one
+        //              the plugin does not own. APVTS reads state by asking each
+        //              parameter it OWNS for its child, so the extra one should simply
+        //              never be looked at - but "should" is the word that ships bugs,
+        //              and a user whose set does not load is not consoled by a design
+        //              argument. Measured here instead.
         for (int idx = 0; idx <= 1; ++idx)
+        for (int stale = 0; stale <= 1; ++stale)
         {
             // What the old build actually wrote into the chunk for this choice.
             const float stored = oldShape.convertFrom0to1 (oldShape.convertTo0to1 ((float) idx));
@@ -367,10 +379,19 @@ int main()
             FractalAdditiveAudioProcessor proc;
             auto tree = proc.apvts.copyState();
 
-            // A pre-fader chunk has no "phaseGlide" child at all - that parameter did
-            // not exist. Removing it is what makes this blob genuinely OLD rather than
-            // a new one with one property edited.
+            // Whichever shape we are testing, START from a tree with no phaseGlide child
+            // (the parameter is gone, so a fresh state has none) and put one back only
+            // for the stale case. Written the way the deleted AudioParameterChoice wrote
+            // it - a PARAM child carrying the denormalised index - so this is yesterday's
+            // chunk rather than our idea of one.
             tree.removeChild (tree.getChildWithProperty ("id", "phaseGlide"), nullptr);
+            if (stale == 1)
+            {
+                ValueTree glide ("PARAM");
+                glide.setProperty ("id", "phaseGlide", nullptr);
+                glide.setProperty ("value", 1.0f, nullptr); // "Dry/Wet", the non-default
+                tree.appendChild (glide, nullptr);
+            }
             auto ph = tree.getChildWithProperty ("id", "phaseMode");
             ph.setProperty ("value", stored, nullptr);
 
@@ -382,10 +403,18 @@ int main()
 
             const float got = proc.apvts.getRawParameterValue ("phaseMode")->load();
             const float want = idx == 0 ? 0.0f : 1.0f;   // 0 = Aligned, 1 = Scattered
-            std::printf ("  %-9s old chunk value %.3f  ->  fader %.3f (want %.3f)\n",
-                         idx == 0 ? "Aligned" : "Scattered", stored, got, want);
+            std::printf ("  %-9s %-18s old chunk value %.3f  ->  fader %.3f (want %.3f)\n",
+                         idx == 0 ? "Aligned" : "Scattered",
+                         stale == 1 ? "(+ dead phaseGlide)" : "(no phaseGlide)",
+                         stored, got, want);
             if (std::abs (got - want) > 1.0e-4f)
             { std::printf ("        OLD PROJECT OPENS ON A DIFFERENT SOUND\n"); ++failures; }
+
+            // The deleted parameter must not come back to life as a ghost: if anything
+            // ever re-registers it, the "it is simply ignored" argument above stops
+            // holding and this catches that rather than the user's next session.
+            if (proc.apvts.getParameter ("phaseGlide") != nullptr)
+            { std::printf ("        phaseGlide still exists as a parameter\n"); ++failures; }
 
             // The same number is what a saved AUTOMATION LANE holds, because a host
             // stores normalised values: a two-choice parameter normalises index 1 to

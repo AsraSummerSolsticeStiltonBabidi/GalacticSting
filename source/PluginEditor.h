@@ -4221,10 +4221,10 @@ private:
     juce::Slider  ampAdsr[4], filtAdsr[4], pitchAdsr[4];
     juce::ComboBox tuneSourceBox, tuneScopeBox; // beating mode: source + scope
     // PHASE is a fader now, not a two-way box: the user asked for a progressive control
-    // between aligned and scattered, and phaseGlideBox is the "how does a move reach a
-    // note that is already sounding" choice they asked for beside it.
+    // between aligned and scattered. The "how does a move reach a note that is already
+    // sounding" choice that used to sit beside it is GONE - that answer comes from the
+    // SPECTRUM panel's Morph / Dry-Wet transition, so there is nothing to keep in sync.
     juce::Slider   phaseFader;
-    juce::ComboBox phaseGlideBox;
     juce::ComboBox basePitchBox, primeModeBox, tuningBox, bendBox,
                    dissCountBox, dissModeBox, tuningBankBox;
     RefreshingComboBox presetBox;
@@ -4630,7 +4630,7 @@ private:
                                         cutoffAtt, resAtt, fEnvAmtAtt, timbreRepeatsAtt, pEnvAmtAtt,
                                         harmonicsAtt, phaseAtt;
     std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4], pitchAdsrAtt[4];
-    std::unique_ptr<ComboBoxAttachment> basePitchAtt, phaseGlideAtt,
+    std::unique_ptr<ComboBoxAttachment> basePitchAtt,
                                         primeModeAtt, tuningAtt, bendAtt, tuningBankAtt;
     std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], morphAtt, dryWetAtt;
     std::unique_ptr<SliderAttachment>   morphTimeAtt, dryWetTimeAtt;

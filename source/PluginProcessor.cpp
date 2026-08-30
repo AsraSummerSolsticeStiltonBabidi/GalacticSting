@@ -176,19 +176,31 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "phaseMode", 1 }, "Phase",
         NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.0f));
-    // How a MID-NOTE fader move reaches voices that are already sounding. It cannot
-    // reach them by just rewriting the phase accumulators: a phase step is a waveform
-    // discontinuity, i.e. a click on every sounding partial at once.
-    //   Pitchbend - detune each partial by a momentary offset until it has walked to
-    //               its new phase, then put the frequency back. Continuous, but the
-    //               note is briefly out of tune with itself.
-    //   Dry/Wet   - crossfade the two oscillator banks, old phases to new. Always in
-    //               tune, but both sets are audible during the fade so partials that
-    //               land half a cycle apart thin out while it runs.
-    // The user asked for the choice by name rather than have one imposed.
-    params.push_back (std::make_unique<AudioParameterChoice>(
-        ParameterID { "phaseGlide", 1 }, "Phase Glide",
-        StringArray { "Pitchbend", "Dry/Wet" }, 0));
+    // THERE IS NO "phaseGlide" PARAMETER ANY MORE, AND THAT IS THE POINT.
+    //
+    // How a MID-NOTE Phase move reaches voices that are already sounding is not a
+    // separate choice the user has to keep in sync with anything: it is ALREADY
+    // answered by the SPECTRUM panel's transition, because re-phasing IS a spectrum
+    // change and those two controls exist to say how a spectrum change is made smooth.
+    //   Morph on   -> PITCHBEND: each partial takes a momentary frequency offset until
+    //                 it has walked to its new phase. That is literally what Morph does
+    //                 to a spectrum change, so Phase borrows it rather than restating it.
+    //   Dry/Wet on -> CROSSFADE: the old phases fade out while the new ones fade in.
+    //                 Again the same machine, driven by the same rule.
+    //   Both on    -> MORPH WINS, exactly as it does for the spectrum itself (see the
+    //                 Dry/Wet block below): a voice has ONE crossfade between two banks,
+    //                 so there is only one answer available and it is Morph's.
+    //   Both off   -> no live re-phasing at all; the new phases take effect at the next
+    //                 note-on. The level still follows the fader immediately, because
+    //                 the normalisation law is blended live.
+    // and the DURATION is that same transition's Time fader (morphTime / dryWetTime).
+    //
+    // WHY DELETING IT IS SAFE FOR PROJECTS SAVED BY YESTERDAY'S BUILD: APVTS reads the
+    // state by asking each parameter it OWNS for its child node, so a child naming a
+    // parameter that no longer exists is never looked at and is dropped on the next
+    // save. FftVerify's phase-state round trip feeds a chunk that still carries a
+    // <PARAM id="phaseGlide"> child through setStateInformation and asserts phaseMode
+    // survives it, so this stays a checked claim rather than a remembered one.
 
     //-- Amp envelope -----------------------------------------------------------
     auto timeRange = [] (float maxSeconds)

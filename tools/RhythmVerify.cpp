@@ -3130,7 +3130,19 @@ int main()
                                  (int) P.comboTexts.size(), (int) P.buttonFits.size(), cut,
                                  cut > 0 ? (" (worst: " + worstW + " by "
                                             + juce::String ((int) std::ceil (worstBy)) + " px)").toRawUTF8() : "");
-                    check (P.comboTexts.size() >= 6 && P.buttonFits.size() >= 8,
+                    // A FLOOR AGAINST AN EMPTY SWEEP, NOT AN INVENTORY. All this has to
+                    // prove is that the probe handed us controls to measure - a sweep
+                    // that walks nothing reports "0 too narrow" and looks like a pass,
+                    // which is the failure being guarded against.
+                    //
+                    // It was 6, and the view with the fewest combos had exactly 6, so
+                    // deleting the phaseGlide box (its mode comes from the SPECTRUM
+                    // panel's Morph / Dry-Wet transition now) failed this check while
+                    // every real measurement still said "0 too narrow for their own
+                    // words". A threshold pinned to the current inventory fails on any
+                    // deletion and teaches the next person to ignore it, so it sits low
+                    // enough to mean what it says.
+                    check (P.comboTexts.size() >= 4 && P.buttonFits.size() >= 8,
                            "the sweep really had combos and buttons to walk");
                     check (cut == 0,
                            lang == 1 ? "every combo item and every button word fits its box (Catalan)"
