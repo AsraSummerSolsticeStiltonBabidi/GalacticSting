@@ -4705,14 +4705,19 @@ private:
     juce::Rectangle<int> engineBoxBounds;
     juce::Rectangle<int> hcBase, hcHarm, hcPrime;  // harmonic view's sub-cells (empty in custom view)
     juce::Rectangle<int> bothEnginesBounds;    // nested: what applies to EITHER engine
-    juce::Rectangle<int> beSlope, beFractal, beMorph, beDryWet, beRange; // its sub-cells
+    // its sub-cells. bePhase sits to the RIGHT of beRange on the same row - the two
+    // together are the row that beRange alone used to be, which is why the divider above
+    // them is drawn from their union and not from either one.
+    juce::Rectangle<int> beSlope, beFractal, beMorph, beDryWet, beRange, bePhase;
     // Whether MORPH is on, as it was the last time the Dry/Wet controls were enabled or
     // disabled. -1 = never applied, so the first timer tick writes it. Cached for the same
     // reason lastManualFrozenShown is: setEnabled repaints, and this runs at timer rate.
     int lastMorphWinsShown = -1;
     void applyDryWetEnablement();
     juce::Rectangle<int> essentialsBounds;     // Essentials macro-group frame
-    juce::Rectangle<int> ecPhase, ecGain, ecRef, ecOct; // its 4 sub-cells (dividers/labels in paint)
+    // its 3 sub-cells (dividers/labels in paint). PHASE used to be a fourth and is now a
+    // sub-section of the SPECTRUM panel, beside OCTAVE RANGE.
+    juce::Rectangle<int> ecGain, ecRef, ecOct;
     juce::Rectangle<int> lBarBounds, lFootBounds; // the inverted-L Tuning box: dissonance BAR (right) + controls FOOT (bottom-left)
     void refreshDegreeList (bool showNotice = true); // generated-scale shortfall notice
     void updateScaleDissonance();  // recompute the active-scale dissonance when timbre/tuning change

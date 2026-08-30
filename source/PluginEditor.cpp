@@ -1136,13 +1136,18 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // running engine produced), so it has no GroupComponent of its own - its frame is
     // that box's, and its title is a painted sub-label like SLOPE and MORPH.
     configFader (fractalFader, "fractalLevel", fractalAtt, cFractal, "Fractal self-similarity level (1 = off)");
-    // Essentials macro (Phase / Gain / Reference) - one framed box drawn
+    // Essentials macro (Gain / Reference / Octave) - one framed box drawn
     // in paint() like the Harmonic Engine, so no per-cell GroupComponents here.
     // PHASE, the fader. 0 = Aligned, 1 = Scattered, and every position between them is
     // a real sound now rather than a rounding to one of the two - which is the whole
     // request. The end words live in the tooltip and in the value read-out, because the
-    // cell's painted sub-label already says PHASE and a second title would not fit.
-    configFader (phaseFader, "phaseMode", phaseAtt, cEssentials,
+    // sub-section's painted title already says PHASE and a second one would not fit.
+    //
+    // cSlope, NOT cEssentials: the fader lives in the SPECTRUM panel now, in the same
+    // column as SLOPE / MORPH / DRY-WET, and the hue is what tells a player which
+    // compartment a control belongs to. Left on the Essentials hue it would read as a
+    // stray from the box below - the one thing the move was meant to stop.
+    configFader (phaseFader, "phaseMode", phaseAtt, cSlope,
                  "0 = Aligned (tonal pulse, never clips), 1 = Scattered (louder, noisier). Anywhere between is a real blend.");
     phaseFader.setSliderStyle (juce::Slider::LinearHorizontal);
     phaseFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 38, 14);
@@ -6075,6 +6080,10 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
                      cOverride, 10.0f, true);
             }
             add ("both.range",   tr ("OCTAVE RANGE", "ABAST OCTAVES"), band (beRange.translated (0, 3)), cPanel);
+            // PHASE shares OCTAVE RANGE's row, to its right, and is titled in the same
+            // style as every other sub-section here - that title IS its name, which is why
+            // the fader carries no label component of its own.
+            add ("both.phase",   tr ("PHASE", "FASE"),                 band (bePhase.translated (0, 3)), cPanel);
         }
     }
     if (! essentialsBounds.isEmpty())
@@ -6082,7 +6091,6 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
         // Essentials' labels sit LEFT of their control (vertically centred), in the same
         // band resized() reserves for them (6 px in, 78 wide, minus a 2 px gap).
         auto left = [] (juce::Rectangle<int> c) { return c.reduced (6, 0).withWidth (76); };
-        add ("ess.phase", tr ("PHASE", "FASE"),                    left (ecPhase), cEssentials);
         add ("ess.gain",  tr ("GAIN", "GUANY"),                    left (ecGain),  cEssentials);
         add ("ess.ref",   tr ("REFERENCE", "REFER\xc3\x88NCIA"),   left (ecRef),   cEssentials);
         // OCTAVE reads like the three rows above it now: label LEFT of the stepper,
@@ -6164,7 +6172,11 @@ FractalAdditiveAudioProcessorEditor::spectrumDividers() const
     {
         vert  ("slope|fractal", (float) beFractal.getX());
         vert  ("fractal|morph", (float) beMorph.getX());
-        horiz ("morph|range",   beRange);
+        // From the UNION: OCTAVE RANGE and PHASE are two sub-sections on ONE row, so the
+        // line above them must span the whole column. Drawn from beRange alone it would
+        // stop where the stepper's share ends and leave the fader hanging off an
+        // unfinished divider.
+        horiz ("morph|range",   beRange.getUnion (bePhase));
     }
     return out;
 }
@@ -6310,7 +6322,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("both.rangeVal",    sprVal);          add ("both.rangeUp",   sprUp);
     add ("both.rangeDn",     sprDn);
 
-    add ("ess.phase",        phaseFader);
+    add ("both.phase",       phaseFader);
     add ("ess.gain",         gainFader);
     add ("ess.refA",         refAEdit);        add ("ess.refALbl",    lblRefA);
     add ("ess.refHz",        lblRefHz);
@@ -6407,8 +6419,8 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     cell ("eng.base",    hcBase);    cell ("eng.harm",    hcHarm);   cell ("eng.prime", hcPrime);
     cell ("both.slope",  beSlope);   cell ("both.fractal", beFractal);
     cell ("both.morph",  beMorph);   cell ("both.dryWet", beDryWet);
-    cell ("both.range",  beRange);
-    cell ("ess.phase",   ecPhase);   cell ("ess.gain",    ecGain);
+    cell ("both.range",  beRange);   cell ("both.phase",  bePhase);
+    cell ("ess.gain",    ecGain);
     cell ("ess.ref",     ecRef);     cell ("ess.oct",     ecOct);
 
     // Every combo applyLanguage() re-words, and what it currently has selected.
@@ -6921,7 +6933,10 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         g.setColour (cEssentials.withAlpha (0.5f)); // shared horizontal dividers between the cells
         const float lx = (float) essentialsBounds.getX() + 4.0f;
         const float rx = (float) essentialsBounds.getRight() - 4.0f;
-        for (auto* cell : { &ecGain, &ecRef, &ecOct })
+        // From ecRef down: a divider is drawn at each cell's TOP, so the FIRST cell must
+        // not be in this list or the line lands on the title band. That used to be
+        // ecPhase; with PHASE moved to the SPECTRUM panel it is ecGain.
+        for (auto* cell : { &ecRef, &ecOct })
             g.drawLine (lx, (float) cell->getY(), rx, (float) cell->getY(), 1.0f);
     }
 
@@ -7605,12 +7620,49 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // so the row's own "Spectrum" label was deleted rather than hidden - a
                 // member hidden on every single layout pass is a member nothing can ever
                 // show, and it kept a dead entry alive in the layout probe.
+                //
+                // PHASE SHARES THIS ROW, to its RIGHT, as its own titled sub-section -
+                // which is where the user asked for it and it is the only side of the
+                // column with room. The split is NOT even, on purpose: RANGE's three
+                // controls are FIXED width (40 + 24 + 4 + 24 = 92 px), so extra pixels do
+                // nothing for them, while width is the whole difference between a fader
+                // you can aim and one you cannot. RANGE therefore keeps just what it
+                // needs and every spare pixel goes to the fader.
+                //
+                // MEASURED AT THE FLOOR RATHER THAN HOPED FOR, because the previous pass
+                // shipped an 18 px fader here by hoping: at 870x540 this column's cell is
+                // 155 px, so RANGE keeps 104 and PHASE gets 51 - a 41 px painted title
+                // band ("PHASE" 33 px, "FASE" 27) and a 39 px fader, which is exactly
+                // what the SLOPE fader beside it already ships at. The binding constraint
+                // was never the fader, it was the Catalan "ABAST OCTAVES" at 88 px: RANGE
+                // keeping 104 leaves its band 94 px, so the title still clears by 6 px.
+                //
+                // Neither side may reach zero width: the layout probe FAILS a control
+                // collapsed to nothing, which would raise the window's minimum size
+                // instead of merely looking cramped. Hence the clamp, and the cap at half
+                // the row so OCTAVE RANGE always reads as the row's primary control.
+                const int phaseW = juce::jlimit (34, juce::jmax (34, beRange.getWidth() / 2),
+                                                 beRange.getWidth() - 104);
+                bePhase = beRange.removeFromRight (phaseW);
+
                 auto ri = beRange.reduced (6, 2); ri.removeFromTop (lblH);
                 auto rr = ri.removeFromTop (juce::jmin (24, juce::jmax (0, ri.getHeight())));
                 sprVal.setBounds (rr.removeFromLeft (40));
                 sprUp.setBounds  (rr.removeFromLeft (24).reduced (0, 1));
                 rr.removeFromLeft (4);
                 sprDn.setBounds  (rr.removeFromLeft (24).reduced (0, 1));
+
+                // PHASE, laid out to the same recipe as its neighbours: painted title
+                // band, then the control on one row.
+                auto pi = bePhase.reduced (6, 2); pi.removeFromTop (lblH);
+                auto pr = pi.removeFromTop (juce::jmin (24, juce::jmax (0, pi.getHeight())));
+                // The numeric read-out is the first thing to go, for the same reason it
+                // was in Essentials: a 38 px number box inside a 45 px cell leaves a 7 px
+                // track. The ends are named in the tooltip.
+                phaseFader.setTextBoxStyle (pr.getWidth() >= 96 ? juce::Slider::TextBoxRight
+                                                                : juce::Slider::NoTextBox,
+                                            false, 38, 14);
+                phaseFader.setBounds (pr);
             }
         }
     }
@@ -7647,11 +7699,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
             auto e = essentialsBounds.reduced (5, 4);
             e.removeFromTop (20); // clear the "ESSENTIALS" title band
             // OCTAVE holds ONE stepper row now (RANGE moved into SPECTRUM), so it needs
-            // much less than the half-box it used to take and the other three cells get
-            // the difference - the Reference read-out finally has room to breathe.
+            // much less than the half-box it used to take and the other cells get the
+            // difference - the Reference read-out finally has room to breathe.
+            // THREE cells, not four: PHASE moved out to the SPECTRUM panel, beside OCTAVE
+            // RANGE, so GAIN and REFERENCE divide what its row used to hold.
             const int octH = juce::jmin (40, e.getHeight() / 3);
-            const int ch   = (e.getHeight() - octH) / 3;
-            ecPhase = e.removeFromTop (ch);
+            const int ch   = (e.getHeight() - octH) / 2;
             ecGain  = e.removeFromTop (ch);
             ecRef   = e.removeFromTop (ch);
             ecOct   = e;
@@ -7659,21 +7712,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // Reference value used to clip its descenders).
             // PHASE / GAIN / REFERENCE: the control sits to the RIGHT of its inline
             // sub-label (drawn in paint at the cell's left), slightly narrower.
-            // PHASE is back to ONE control in its cell: the glide box that used to share
-            // this row is gone, because the mode it chose now comes from the SPECTRUM
-            // panel's transition. That retires the special case this row needed - it was
-            // the only one of the four that had to shrink its label band to 40 px to fit
-            // two controls, and the draft that did NOT shrink it shipped a FADER 18 PX
-            // WIDE at the 870x540 floor. One control, so the plain 78 px band the other
-            // three rows use is affordable again and all four line up.
-            { auto c = ecPhase.reduced (6, 1);   c.removeFromLeft (78);
-              // The numeric read-out is still the first thing to go: a 38 px number box
-              // inside a 56 px cell leaves an 18 px track, and a fader you cannot aim is
-              // worse than a fader you cannot read.
-              phaseFader.setTextBoxStyle (c.getWidth() >= 92 ? juce::Slider::TextBoxRight
-                                                             : juce::Slider::NoTextBox,
-                                          false, 38, 14);
-              phaseFader.setBounds (c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))); }
             { auto c = ecGain.reduced (6, 1);  c.removeFromLeft (78);
               gainFader.setBounds (c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))); }
             { auto c = ecRef.reduced (6, 1);   c.removeFromLeft (78);
