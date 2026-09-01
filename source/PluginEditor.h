@@ -95,11 +95,29 @@ namespace fgfit
     //     12.5 px floor - not in the lighter face LookAndFeel_V4::getComboBoxFont sizes
     //     the label with.
     inline constexpr int kComboLabelBorder = 10;      // juce::Label's default 5 px a side
-    inline juce::Font comboItemFont (int h)
+
+    // A COMBO WHOSE ITEM READS BELOW THE TITLE ABOVE IT, opted into by NAME - the same
+    // idiom GalacticLnF already uses to turn a ToggleButton into an ON/OFF pill
+    // ("onled"). Every other box in this window is a VALUE under a painted sub-label and
+    // is meant to be the louder of the two; the TRANSITION box holds what used to BE two
+    // painted sub-labels ("haz que ... esos nombres sean mas pequenos"), so its item has
+    // to sit a step under the 11.5 px title rather than 1 px over it, which is where the
+    // ordinary rule's 12.5 px floor would put it.
+    inline constexpr const char* kSmallComboName = "smallcombo";
+    inline juce::Font comboItemFont (int h, bool small)
     {
+        if (small)   // 10..11 px: under the 11.5 px painted sub-label at every box height
+            return juce::Font (juce::FontOptions (juce::jmax (10.0f, juce::jmin (11.0f, (float) h * 0.62f)))
+                                   .withStyle ("Bold"));
         return juce::Font (juce::FontOptions (juce::jmax (12.5f, juce::jmin (16.0f, (float) h * 0.85f)))
                                .withStyle ("Bold"));
     }
+    inline juce::Font comboItemFont (int h) { return comboItemFont (h, false); }
+    // The SAME question asked of a box rather than a number, so the painter, the resized()
+    // that sizes the box to its words and the probe that checks they fit cannot disagree
+    // about which of the two faces this box is drawn in.
+    inline juce::Font comboItemFont (const juce::ComboBox& c, int h)
+    { return comboItemFont (h, c.getName() == kSmallComboName); }
     inline int comboItemRoom (int boxWidth, int boxHeight) noexcept
     { return comboTextWidth (boxWidth, boxHeight) - kComboLabelBorder; }
     inline int comboWidthForItem (int itemWidth, int boxHeight) noexcept
@@ -152,7 +170,7 @@ namespace fgfit
     // tomorrow's cut off - and nothing on screen says it was cut.
     inline int snugComboWidth (const juce::ComboBox& c, int h)
     {
-        const auto f = comboItemFont (h);   // from the TARGET height, not the current one
+        const auto f = comboItemFont (c, h);   // from the TARGET height, not the current one
         int w = 0;
         for (int i = 0; i < c.getNumItems(); ++i)
             w = juce::jmax (w, juce::GlyphArrangement::getStringWidthInt (f, c.getItemText (i)));
@@ -390,13 +408,19 @@ public:
     // exactly as the 30 Hz timer does. The verifier has no message loop, so a pencil
     // on/off cycle is otherwise unreachable - and that cycle is the bug.
     void refreshSlopeFreezeForTests() { refreshSlopeFreeze(); }
-    // Test hooks (RhythmVerify run 50): "Morph wins" is a claim about the SCREEN, so the
-    // verifier drives the same call the timer makes and reads the same two components the
-    // user would click. The enablement is deliberately NOT re-derived from the parameter
-    // here - that would be the test asserting its own arithmetic instead of the panel's.
-    void applyDryWetEnablementForTests() { applyDryWetEnablement(); }
-    bool dryWetControlsEnabledForTests() const
-    { return dryWetToggle.isEnabled() && dryWetTimeFader.isEnabled(); }
+    // Test hooks (RhythmVerify run 50): what the TRANSITION box shows is a claim about the
+    // SCREEN, so the verifier drives the same call the timer makes and then reads the same
+    // three things the user would see. Nothing here re-derives the answer from the
+    // parameters - that would be the test asserting its own arithmetic instead of the
+    // panel's - it reports what the components are actually holding.
+    void applyTransitionModeForTests() { applyTransitionMode(); }
+    // 1 = Off, 2 = Morph, 3 = Dry/Wet (the box's own item ids), 0 = nothing selected.
+    int  transitionItemShownForTests() const { return transitionBox.getSelectedId(); }
+    // Which of the two Time faders is the one on screen, and whether it can be moved.
+    // (Off shows the Dry/Wet one, greyed: see applyTransitionMode.)
+    bool morphTimeFaderShownForTests() const { return morphTimeFader.isVisible(); }
+    bool transitionTimeFaderLiveForTests() const
+    { return (morphTimeFader.isVisible() ? morphTimeFader : dryWetTimeFader).isEnabled(); }
     // Test hook (RhythmVerify): click an engine chip the way a hand does. Exists for
     // the one behaviour a probe of engineInForce cannot reach: with NO scale loaded,
     // clicking CUSTOM must still open that view (it is the only place the Load button
@@ -4292,14 +4316,13 @@ private:
     bool         cornerEditUiActive = false;   // the TRANSITION guard, not a repeat of the above
     juce::String presetTextBeforeCornerEdit;
     juce::Rectangle<int> titleClickArea; // the title squares; clicking them plays the jingle
-    juce::ToggleButton primeToggle[9], morphToggle;
-    // DRY/WET TRANSITION - the crossfade alternative to Morph, sitting between it and
-    // OCTAVE RANGE because that is where the user asked for it and because it belongs
-    // there: the two are the two answers to "a spectrum change must not be abrupt".
-    // Morph WINS when both are on (they are one crossfade machine per voice - see
-    // AdditiveVoice.h), so these two are DISABLED and the painted sub-label wears an
-    // amber MORPH ON tag, the same idiom AMP DECAY uses when manual amps freeze it.
-    juce::ToggleButton dryWetToggle;
+    juce::ToggleButton primeToggle[9];
+    // THE TRANSITION MODE - Off / Morph / Dry/Wet - as ONE dropdown where Morph and
+    // Dry/Wet used to be two cells with two ON/OFF pills. It owns NO parameter: it is a
+    // view of the "morph" and "dryWet" booleans, which are unchanged (see the constructor
+    // for the four-states-three-sounds mapping and why it is exact). Kept in sync by
+    // applyTransitionMode off the same 30 Hz timer that used to grey the Dry/Wet cell.
+    juce::ComboBox transitionBox;
     juce::ToggleButton temperToggle; // lives INSIDE the Custom Engine box (the scale it bypasses)
     std::unique_ptr<ButtonAttachment> temperAtt;
     // SPECTRUM panel: the two ENGINES as chips - the TITLE ROW of the one shared
@@ -4387,6 +4410,12 @@ private:
     // -1 = not applied yet, so the first timer tick (and every language switch, which
     // resets it) writes the slope fader's frozen/normal look and its bilingual tooltip.
     int   lastManualFrozenShown = -1;
+    // The TRANSITION cell's Time fader, as TWO sliders sharing one rectangle with exactly
+    // one visible: the panel asks for one fader, but "morphTime" and "dryWetTime" are two
+    // parameters and each mode must keep the time its user set for it (and its automation
+    // lane). Swapping one slider's attachment at runtime would do the same job by throwing
+    // an Attachment away and building another every time the mode changes; two permanent
+    // attachments and a visibility flip cannot get that wrong.
     juce::Slider       morphTimeFader, dryWetTimeFader;
     juce::TextButton   menuButton; // top-bar menu: Init (reset all) / Panic - works in the VST too
     int                undoTxnTick = 0; // paces the tuning-bank combo refresh
@@ -4676,7 +4705,7 @@ private:
     juce::GroupComponent gFilter, gAmpEnv, gPitchEnv, gTuning, gSpecScale, gScaleDiss;
     juce::Label lblBaseN, lblBasePitch, lblPrimeLimit, lblCutoff, lblRes, lblEnvAmt,
                 lblTimbreRepeats, lblBend, lblPeriod, lblSteps, lblRefA, lblRefHz, lblPitchAmt,
-                lblMorphTime, lblDryWetTime, lblTuningBank, tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel,
+                lblTransTime, lblTuningBank, tuningStatusLabel, tuningNameLabel, timbreStatusLabel, recentLabel,
                 tuningPeriodLbl;
     juce::Label ampAdsrLbl[4], filtAdsrLbl[4], pitchAdsrLbl[4], primeLbl[9];
 
@@ -4686,7 +4715,7 @@ private:
     std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4], pitchAdsrAtt[4];
     std::unique_ptr<ComboBoxAttachment> basePitchAtt,
                                         primeModeAtt, tuningAtt, bendAtt, tuningBankAtt;
-    std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], morphAtt, dryWetAtt;
+    std::unique_ptr<ButtonAttachment>   primeToggleAtt[9];
     std::unique_ptr<SliderAttachment>   morphTimeAtt, dryWetTimeAtt;
 
     //== MONOPHONIC GLIDE (the PITCH tab of the shared envelope box) ============
@@ -4762,12 +4791,17 @@ private:
     // its sub-cells. bePhase sits to the RIGHT of beRange on the same row - the two
     // together are the row that beRange alone used to be, which is why the divider above
     // them is drawn from their union and not from either one.
-    juce::Rectangle<int> beSlope, beFractal, beMorph, beDryWet, beRange, bePhase;
-    // Whether MORPH is on, as it was the last time the Dry/Wet controls were enabled or
-    // disabled. -1 = never applied, so the first timer tick writes it. Cached for the same
-    // reason lastManualFrozenShown is: setEnabled repaints, and this runs at timer rate.
-    int lastMorphWinsShown = -1;
-    void applyDryWetEnablement();
+    juce::Rectangle<int> beSlope, beFractal, beTrans, beRange, bePhase;
+    // The TRANSITION item (1 Off / 2 Morph / 3 Dry/Wet) the box was last set to show.
+    // -1 = never applied, so the first timer tick writes it. Cached for the same reason
+    // lastManualFrozenShown is: this runs at timer rate and the work it guards swaps
+    // visibility, re-lays the cell and repaints.
+    int lastTransitionShown = -1;
+    void applyTransitionMode();
+    // Write the two booleans the TRANSITION box is a view of, as one host gesture each.
+    void setTransitionParams (bool morphOn, bool dryWetOn);
+    // The ONE writer of the two Time faders' colour (see applySlopeFaderColour).
+    void applyTransitionFaderColour();
     juce::Rectangle<int> essentialsBounds;     // Essentials macro-group frame
     // its 3 sub-cells (dividers/labels in paint). PHASE used to be a fourth and is now a
     // sub-section of the SPECTRUM panel, beside OCTAVE RANGE.

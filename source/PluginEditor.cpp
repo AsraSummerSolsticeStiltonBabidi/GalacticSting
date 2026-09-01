@@ -387,6 +387,20 @@ namespace
         juce::Font getTextButtonFont (juce::TextButton&, int buttonHeight) override
         { return fgfit::textButtonFont (buttonHeight); }
 
+        // The CLOSED box's read-out. Only a small-item box (see fgfit::kSmallComboName)
+        // overrides anything: every other combo keeps LookAndFeel_V4's font exactly, so
+        // this cannot move a single control that did not ask for it. Routed through fgfit
+        // so the text sweep, which measures whatever getComboBoxFont returns, measures the
+        // face the item is really drawn in. The OPEN menu is untouched - a mode you are
+        // choosing from a list wants to be read easily, and only the panel needs the
+        // chosen name to sit under its title.
+        juce::Font getComboBoxFont (juce::ComboBox& box) override
+        {
+            if (box.getName() == fgfit::kSmallComboName)
+                return fgfit::comboItemFont (box, box.getHeight());
+            return juce::LookAndFeel_V4::getComboBoxFont (box);
+        }
+
         // Slider value read-outs: a small font + generous horizontal squish so the
         // value ALWAYS fits (e.g. two decimals) instead of being clipped to "...".
         juce::Label* createSliderTextBox (juce::Slider& s) override
@@ -945,6 +959,12 @@ namespace
             const int inset = box.getHeight() / 3;
             label.setBounds (inset, 1, fgfit::comboTextWidth (box.getWidth(), box.getHeight()), box.getHeight() - 2);
             label.setFont (getComboBoxFont (box));
+            // ...and let getLabelFont keep it. drawLabel does not use the font set here:
+            // it asks getLabelFont, which puts a 12.5 px BOLD floor under everything. For
+            // a small-item box that floor is the whole thing being opted out of, so the
+            // label is renamed into the existing "small" escape hatch. Done HERE because
+            // this is the one place that owns the box label's font.
+            if (box.getName() == fgfit::kSmallComboName) label.setName ("small");
         }
 
         void fillTextEditorBackground (juce::Graphics& g, int width, int height, juce::TextEditor& te) override
@@ -1019,41 +1039,68 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     makeLabel (lblBaseN, cHarmonic); makeLabel (lblBasePitch, cHarmonic);
     lblBasePitch.setJustificationType (juce::Justification::centredLeft); // top-LEFT of its combo, like the others
 
-    // Morphing: when ON, a spectrum change glides each partial to its new position
-    // (a per-partial pitch bend) over the Morph time, instead of snapping. It glides
-    // ANY template change, from either engine, so it wears the shared (mint) colour and
-    // lives in the BOTH ENGINES box - inside the Harmonic Engine it was dimmed whenever
-    // a custom scale took over, while it went on morphing that scale's partials.
-    // An ON/OFF pill, not a tick box: the painted MORPH sub-label above it is already the
-    // name, so a checkbox ALSO labelled "Morph" read as a second, different control.
-    morphToggle.setName ("onled"); // green(on)/red(off) pill, drawn by GalacticLnF
-    morphToggle.setMouseClickGrabsKeyboardFocus (false);
-    morphToggle.onClick = [this] { refocus(); };
-    addAndMakeVisible (morphToggle);
-    morphAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "morph", morphToggle);
-    addMapListener (morphToggle, "morph");
+    // TRANSITION: ONE question - how does a spectrum change LAND? - asked once.
+    //
+    // "haz que morph y dry/wet sean dos opciones dentro de un mismo desplegable en el
+    //  submenu transition, asi economizamos espacio, que las dos a la vez no tienen
+    //  sentido, haz que la default sea drywet"
+    //
+    // Morph and Dry/Wet used to be two cells, each with its own ON/OFF pill, its own
+    // painted name and its own Time fader - six controls answering one question, plus a
+    // greyed-out cell and an amber MORPH ON tag whose whole job was to explain that the
+    // second answer could not act while the first one did. They are ONE crossfade machine
+    // per voice (see AdditiveVoice.h and bf0f768), so exactly one of them can ever act,
+    // and a dropdown is the shape of a question with one answer.
+    //
+    // THE PARAMETERS DO NOT CHANGE, and that is the point. "morph" and "dryWet" are still
+    // the two booleans they always were: the DSP reads them unchanged, every automation
+    // lane already drawn on them still moves them, every project ever saved still restores
+    // them, and the preset playground still blends them. This box is a VIEW of that pair,
+    // not a new parameter laid over it - which is also why it is the honest view: the
+    // pair has four states and only THREE sounds, because with Morph on the crossfade
+    // cannot act at all. Off / Morph / Dry/Wet is that set of three, exactly.
+    //
+    //   both off  -> Off       a spectrum change lands instantly (the 50 ms template fade)
+    //   morph     -> Morph     every partial GLIDES to its new place
+    //   dryWet    -> Dry/Wet   the old spectrum fades out while the new one fades in
+    //   both on   -> Morph     what a project with both flags set already SOUNDS like
+    //
+    // OFF IS AN ITEM, not "turn the Time fader down". The Time fader cannot express it:
+    // its range bottoms out at 1 ms and the crossfade clamps itself to a 5 ms floor
+    // (below that the phase hand-over cannot be made click-free), so there is no fader
+    // position that means "no transition". It is also a state a player chooses on purpose
+    // - it is what every build before bf0f768 did - and a state you can only reach by
+    // failing to find it is a state that has been removed.
+    transitionBox.setName (fgfit::kSmallComboName);   // its item reads BELOW the TRANSITION title
+    transitionBox.setMouseClickGrabsKeyboardFocus (false);
+    addAndMakeVisible (transitionBox);
+    // No ComboBoxAttachment: this box does not own a parameter, it shows two. Items carry
+    // FIXED ids (1/2/3) rather than positions, so applyLanguage can re-word them without
+    // the selection sliding onto a different mode.
+    transitionBox.onChange = [this]
+    {
+        const int id = transitionBox.getSelectedId();
+        if (id <= 0) return;              // mid-relabel: getSelectedId reads 0, see applyLanguage
+        setTransitionParams (id == 2, id == 3);
+        refocus();
+    };
+    // The right-click "Map to" menu, kept from the two pills this replaced: the mode is
+    // still modulable, and the one it routes is the one the box is currently showing -
+    // a modulator on "morph" gates Morph, one on "dryWet" gates the crossfade.
+    addMapListener (transitionBox, "morph");
+
+    // ONE Time fader, for whichever mode is selected - but still the two PARAMETERS, so
+    // each mode keeps the time the user set for it and neither lane is disturbed. The two
+    // sliders share one rectangle and exactly one of them is ever visible; `resized()`
+    // lays out only that one, and the layout probe records only what is on screen.
     configFader (morphTimeFader, "morphTime", morphTimeAtt, cSlope, "Morph transition time in seconds: how long partials take to glide to the new spectrum.");
     morphTimeFader.setSliderStyle (juce::Slider::LinearHorizontal);
     morphTimeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 14);
-    makeLabel (lblMorphTime, cSlope);
-
-    // DRY/WET TRANSITION: the same pair of controls, one cell down, driving the OTHER way
-    // of making a spectrum change smooth - a simultaneous fade-out of the old spectrum and
-    // fade-in of the new one, with no frequency movement at all. Built identically to Morph
-    // on purpose ("un fader de tiempo como el de morph y un boton de on off"): same pill,
-    // same fader style, same parameter range and skew, so the two read as two settings of
-    // one idea rather than two different mechanisms.
-    dryWetToggle.setName ("onled");
-    dryWetToggle.setMouseClickGrabsKeyboardFocus (false);
-    dryWetToggle.onClick = [this] { refocus(); };
-    addAndMakeVisible (dryWetToggle);
-    dryWetAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "dryWet", dryWetToggle);
-    addMapListener (dryWetToggle, "dryWet");
     configFader (dryWetTimeFader, "dryWetTime", dryWetTimeAtt, cSlope,
                  "Dry/wet transition time in seconds: how long the old spectrum takes to fade out while the new one fades in.");
     dryWetTimeFader.setSliderStyle (juce::Slider::LinearHorizontal);
     dryWetTimeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 14);
-    makeLabel (lblDryWetTime, cSlope);
+    makeLabel (lblTransTime, cSlope);
 
     // Harmonics is a magnetic FADER now (Even - All - Odd - Prime), so a modulator
     // can sweep it and it can sit BETWEEN two sets (blended).
@@ -2761,6 +2808,13 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 
     setWantsKeyboardFocus (true);
     setSize (1200, 650); // +30 vs before for the keyboard's below-key hover-delta strip
+    // The TRANSITION cell, before the first paint and NOT left to the first timer tick.
+    // configFader made BOTH Time faders visible and they share ONE rectangle, so until
+    // this runs the panel is two sliders stacked on each other - which is exactly what
+    // RhythmVerify's "no two controls overlap" check caught, in an editor built by a
+    // verifier that has no message loop to tick a timer with. After setSize, because it
+    // re-lays the cell it just changed.
+    applyTransitionMode();
     startTimerHz (30); // also the reconcile rate for stuck/ghost computer-keyboard notes
     // From here on a language switch may re-run the live read-out pass itself (see the
     // tail of applyLanguage). Not before: the applyLanguage() above runs ahead of
@@ -3085,7 +3139,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     if (partialWindow != nullptr)
         partialWindow->setName (tr ("Fibl\xc3\xb3 - partial amplitudes", "Fibl\xc3\xb3 - amplituds dels parcials"));
     partialPanel.applyLanguage();
-    lastMorphWinsShown = -1;      // ...and the Dry/Wet cell's enablement, whose colour is language-free
+    lastTransitionShown = -1;     // ...and the TRANSITION cell, so the re-worded item is re-selected
     lastManualFrozenShown = -1;   // re-apply the slope fader's tooltip in the new language
     lastEngineShown       = -1;   // and re-light the engine chips with the new words
     rhythmPanel.heading.setText (tr ("SPECTRUM VS RHYTHM", "ESPECTRE VS RITME"), dontSendNotification);
@@ -3275,27 +3329,36 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     glideFader.setTooltip (tr (
         "How long the pitch takes to travel from the previous note to the new one, in milliseconds. It is a TIME, not a rate: two octaves take exactly as long as a semitone. The fader is logarithmic (1 ms to 5 s, half its travel below 100 ms). Only does anything while Monophonic glide is on.",
         "Quant triga l'al\xc3\xa7""ada a anar de la nota anterior a la nova, en millisegons. \xc3\x89s un TEMPS, no una velocitat: dues octaves triguen exactament el mateix que un semit\xc3\xb2. El fader \xc3\xa9s logar\xc3\xadtmic (1 ms a 5 s, mitja cursa per sota de 100 ms). Nom\xc3\xa9s fa res amb el Glide monof\xc3\xb2nic actiu."));
-    lblMorphTime.setText (tr ("Time", "Temps"), dontSendNotification);
-    // No text: the painted MORPH sub-label above it is the name, and the toggle saying
-    // "Morph" under a heading that says MORPH read as two different controls.
-    morphToggle.setButtonText ({});
-    // The tooltip must name the SCOPE: morph rides on every spectrum change from any
-    // source. Users read it as a Base-only glide, because Base is where they first
-    // hear it - so the causes are spelled out.
-    morphToggle.setTooltip (tr (
-        "Morph ON: whenever the spectrum CHANGES - for ANY reason: Base, Harmonics, Prime, Fractal, Range, switching engine, loading or typing a scale, an adapted spectrum from Spectrum vs Tuning, a modulator moving any of those - every partial GLIDES to its place in the new spectrum over the Time below, instead of jumping. OFF: every change lands instantly.",
-        "Morph ACTIU: quan l'espectre CANVIA - per QUALSEVOL motiu: Base, Harm\xc3\xb2nics, Primers, Fractal, Abast, canviar de motor, carregar o escriure una escala, un espectre adaptat d'Espectre vs afinaci\xc3\xb3, un modulador que mogui qualsevol d'aquests - cada parcial LLISCA al seu lloc del nou espectre durant el Temps de sota, en comptes de saltar-hi. APAGAT: cada canvi cau a l'instant."));
+    lblTransTime.setText (tr ("Time", "Temps"), dontSendNotification);
+    // THE TRANSITION ITEMS, re-worded in place. The ids are fixed (1 Off, 2 Morph,
+    // 3 Dry/Wet) and the selection is put back explicitly, because changeItemText leaves
+    // the box's displayed label disagreeing with its selected item for as long as it
+    // takes to finish - and getSelectedId() reads 0 through exactly that window. A
+    // language switch that dropped the selection would be the whole cell going blank
+    // (RhythmVerify's combo sweep asserts no box loses its selection across two
+    // round-trips of both languages, which is what caught that class of bug before).
+    {
+        const int keep = transitionBox.getSelectedId();
+        transitionBox.clear (dontSendNotification);
+        transitionBox.addItem (tr ("Off",     "Cap"),          1);
+        transitionBox.addItem (tr ("Morph",   "Morphing"),     2);
+        transitionBox.addItem (tr ("Dry/Wet", "Sec/Humit"),    3);
+        transitionBox.setSelectedId (keep > 0 ? keep : 3, dontSendNotification);
+    }
+    // ONE tooltip where there were two, because there is one control. It must name the
+    // SCOPE - a transition rides on every spectrum change from any source, and users read
+    // it as a Base-only effect because Base is where they first hear it - and it must say
+    // what each of the three items does, including Off, which is the one that has no
+    // Time and no visible sign that it is doing its job.
+    transitionBox.setTooltip (tr (
+        "How a spectrum CHANGE lands - for ANY reason it changes: Base, Harmonics, Prime, Fractal, Range, switching engine, loading or typing a scale, an adapted spectrum from Spectrum vs Tuning, a modulator moving any of those.\n*Off* - the change lands instantly.\n*Morph* - every partial GLIDES to its place in the new spectrum, over the Time beside this. A per-partial pitch bend: mid-glide you hear frequencies that are in neither spectrum.\n*Dry/Wet* - the spectrum you were hearing FADES OUT while the new one FADES IN, over the Time beside this. Nothing moves in frequency at any point; you hear both standing spectra at once, and the two are mixed so the loudness does not dip through the middle.\nOne at a time, because a voice has ONE crossfade between two banks of oscillators and both of these are that same machine under different rules.",
+        "Com cau un CANVI d'espectre - pel motiu que sigui: Base, Harm\xc3\xb2nics, Primers, Fractal, Abast, canviar de motor, carregar o escriure una escala, un espectre adaptat d'Espectre vs afinaci\xc3\xb3, un modulador que mogui qualsevol d'aquests.\n*Cap* - el canvi cau a l'instant.\n*Morphing* - cada parcial LLISCA al seu lloc del nou espectre, durant el Temps del costat. \xc3\x89s un pitch bend per parcial: a mig lliscament sents freq\xc3\xbc\xc3\xa8ncies que no s\xc3\xb3n de cap dels dos espectres.\n*Sec/Humit* - l'espectre que senties s'ESVAEIX mentre el nou APAREIX, durant el Temps del costat. No es mou res de freq\xc3\xbc\xc3\xa8ncia en cap moment; sents els dos espectres quiets alhora, barrejats de manera que el volum no caigui pel mig.\nNom\xc3\xa9s un alhora, perqu\xc3\xa8 una veu t\xc3\xa9 UNA sola fosa creuada entre dos bancs d'oscilladors i tots dos s\xc3\xb3n aquella mateixa m\xc3\xa0quina sota regles diferents."));
     morphTimeFader.setTooltip (tr (
-        "How long the glide takes, in seconds. It applies to EVERY spectrum change, whatever caused it (Base, Harmonics, Prime, Fractal, engine switch, an adapted spectrum, a modulator...) - not just Base.",
-        "Quant dura el lliscament, en segons. S'aplica a QUALSEVOL canvi d'espectre, el causi el que el causi (Base, Harm\xc3\xb2nics, Primers, Fractal, canvi de motor, un espectre adaptat, un modulador...) - no nom\xc3\xa9s Base."));
-    lblDryWetTime.setText (tr ("Time", "Temps"), dontSendNotification);
-    dryWetToggle.setButtonText ({});   // same reason as Morph's: the painted label names it
-    dryWetToggle.setTooltip (tr (
-        "DRY/WET TRANSITION ON: whenever the spectrum CHANGES - for any of the same reasons Morph lists - the spectrum you were hearing FADES OUT while the new one FADES IN, over the Time below. Neither one moves: no partial changes frequency at any point. Morph BENDS each partial from its old place to its new one; this crossfades between two standing spectra.\nThe two are mixed equal-power, so the loudness does not dip through the middle.\nMORPH WINS: a voice has ONE crossfade between two banks of oscillators, and these are that one machine driven by two different rules. With Morph on, this control is switched off and says so.",
-        "TRANSICI\xc3\x93 SEC/HUMIT ACTIVA: quan l'espectre CANVIA - per qualsevol dels motius que llista el Morphing - l'espectre que senties s'ESVAEIX mentre el nou APAREIX, durant el Temps de sota. Cap dels dos es mou: cap parcial no canvia de freq\xc3\xbc\xc3\xa8ncia en cap moment. El Morphing DOBLEGA cada parcial del seu lloc antic al nou; aix\xc3\xb2 fon dos espectres quiets l'un dins l'altre.\nEls dos es barregen a pot\xc3\xa8ncia constant, perqu\xc3\xa8 el volum no caigui pel mig.\nEL MORPHING GUANYA: una veu t\xc3\xa9 UNA sola fosa creuada entre dos bancs d'oscilladors, i aix\xc3\xb2 s\xc3\xb3n aquella mateixa m\xc3\xa0quina governada per dues regles diferents. Amb el Morphing actiu, aquest control queda apagat i ho diu."));
+        "How long the glide takes, in seconds. It applies to EVERY spectrum change, whatever caused it (Base, Harmonics, Prime, Fractal, engine switch, an adapted spectrum, a modulator...) - not just Base.\nMorph and Dry/Wet keep their own Time, so switching between them brings each one's back.",
+        "Quant dura el lliscament, en segons. S'aplica a QUALSEVOL canvi d'espectre, el causi el que el causi (Base, Harm\xc3\xb2nics, Primers, Fractal, canvi de motor, un espectre adaptat, un modulador...) - no nom\xc3\xa9s Base.\nEl Morphing i el Sec/Humit tenen cadascun el seu Temps, o sigui que canviar d'un a l'altre torna a treure el que \xc3\xa9s seu."));
     dryWetTimeFader.setTooltip (tr (
-        "How long the crossfade takes, in seconds. Same range and feel as Morph Time, and it applies to EVERY spectrum change whatever caused it. Below about 5 ms the phase hand-over cannot be made click-free, so 5 ms is the floor the transition actually uses.",
-        "Quant dura la fosa creuada, en segons. El mateix abast i tacte que el Temps de Morphing, i s'aplica a QUALSEVOL canvi d'espectre, el causi el que el causi. Per sota d'uns 5 ms el relleu de fase no es pot fer sense clic, i 5 ms \xc3\xa9s el m\xc3\xadnim que la transici\xc3\xb3 fa servir de debo."));
+        "How long the crossfade takes, in seconds. Same range and feel as Morph Time, and it applies to EVERY spectrum change whatever caused it. Below about 5 ms the phase hand-over cannot be made click-free, so 5 ms is the floor the transition actually uses.\nMorph and Dry/Wet keep their own Time, so switching between them brings each one's back. With the transition Off this fader is greyed: there is no transition for it to time.",
+        "Quant dura la fosa creuada, en segons. El mateix abast i tacte que el Temps de Morphing, i s'aplica a QUALSEVOL canvi d'espectre, el causi el que el causi. Per sota d'uns 5 ms el relleu de fase no es pot fer sense clic, i 5 ms \xc3\xa9s el m\xc3\xadnim que la transici\xc3\xb3 fa servir de debo.\nEl Morphing i el Sec/Humit tenen cadascun el seu Temps, o sigui que canviar d'un a l'altre torna a treure el que \xc3\xa9s seu. Amb la transici\xc3\xb3 a Cap aquest fader queda apagat: no hi ha cap transici\xc3\xb3 a cronometrar."));
     lblTimbreRepeats.setText (tr ("Reps", "Reps"), dontSendNotification);
     lblBend.setText      (tr ("Pitch bend", "Pitch bend"), dontSendNotification);
     lblPeriod.setText    (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
@@ -3400,8 +3463,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // copy of itself; two hand-kept halves of one tooltip drift, and only one of them
     // would get corrected.
     phaseFader.setTooltip (phaseFader.getTooltip() + tr (
-        "\nWHILE NOTES ARE SOUNDING: a Phase move changes their LEVEL at once, and their PHASES only from the next note on - this build does not re-phase a held note. When live re-phasing lands it will take BOTH its mode and its duration from the SPECTRUM panel's transition, because re-phasing IS a spectrum change. Morph on: by pitchbend, over Morph Time. Dry/Wet on: by crossfade, over Dry/Wet Time. Both on: Morph wins, exactly as it does for the spectrum itself. Both off: no live re-phasing at all.",
-        "\nMENTRE SONEN LES NOTES: moure la Fase els canvia el VOLUM a l'instant, i les FASES nom\xc3\xa9s a partir de la nota seg\xc3\xbc""ent - aquesta versi\xc3\xb3 no refasa una nota que ja sona. Quan arribi el refasat en directe, en prendr\xc3\xa0 el mode I la durada de la transici\xc3\xb3 del plaf\xc3\xb3 ESPECTRE, perqu\xc3\xa8 refasar \xc3\x89S un canvi d'espectre. Morphing actiu: per pitchbend, durant el Temps de Morphing. Sec/Humit actiu: per fosa creuada, durant el Temps de Sec/Humit. Tots dos actius: guanya el Morphing, igual que amb l'espectre mateix. Tots dos apagats: cap refasat en directe."));
+        "\nWHILE NOTES ARE SOUNDING: a Phase move changes their LEVEL at once, and their PHASES only from the next note on - this build does not re-phase a held note. When live re-phasing lands it will take BOTH its mode and its duration from the SPECTRUM panel's TRANSITION, because re-phasing IS a spectrum change. Transition Morph: by pitchbend, over its Time. Transition Dry/Wet: by crossfade, over its Time. Transition Off: no live re-phasing at all.",
+        "\nMENTRE SONEN LES NOTES: moure la Fase els canvia el VOLUM a l'instant, i les FASES nom\xc3\xa9s a partir de la nota seg\xc3\xbc""ent - aquesta versi\xc3\xb3 no refasa una nota que ja sona. Quan arribi el refasat en directe, en prendr\xc3\xa0 el mode I la durada de la transici\xc3\xb3 del plaf\xc3\xb3 ESPECTRE, perqu\xc3\xa8 refasar \xc3\x89S un canvi d'espectre. Transici\xc3\xb3 a Morphing: per pitchbend, durant el seu Temps. Transici\xc3\xb3 a Sec/Humit: per fosa creuada, durant el seu Temps. Transici\xc3\xb3 a Cap: cap refasat en directe."));
     gainFader.setTooltip (tr ("Final output volume, in dB.", "Volum final de sortida, en dB."));
     primeModeBox.setTooltip (tr (
         "How prime numbers filter the harmonics. 'Limit': a harmonic passes only if its largest prime factor is at most the chosen limit. 'Whitelist': it passes only if EVERY prime factor is ticked below.",
@@ -5669,26 +5732,84 @@ void FractalAdditiveAudioProcessorEditor::applySlopeFaderColour()
     slopeFader.setColour (juce::Slider::trackColourId, col.withAlpha (0.55f));
 }
 
-// MORPH WINS, AND IT SAYS SO. Both features are the same crossfade between two banks of
-// oscillators inside a voice (see AdditiveVoice.h), so exactly one of them can act; with
-// Morph on this one does nothing at all. Leaving its pill and its fader live would be the
-// panel telling the user two smoothings are running when one of them is inert - the same
-// failure the AMP DECAY / FROZEN pair exists to prevent, so it is answered the same way:
-// the controls go dead and the painted name goes grey with an amber MORPH ON beside it.
+// THE TRANSITION BOX IS A VIEW OF TWO BOOLEANS, and this is the half that reads them.
+// It runs off the 30 Hz timer, so the box follows the parameters however they move - a
+// host automation lane, a modulator, a preset, a playground corner, an undo - not just
+// the user's own click on it.
 //
-// It changes NO parameter. The user's Dry/Wet setting is theirs and comes back the instant
-// Morph goes off; silently switching it off would be a rewrite of their patch.
-void FractalAdditiveAudioProcessorEditor::applyDryWetEnablement()
+// FOUR STATES, THREE SOUNDS. Both features are the same crossfade between two banks of
+// oscillators inside a voice (see AdditiveVoice.h and bf0f768), so exactly one can act
+// and MORPH WINS: a patch carrying both flags SOUNDS like Morph, so Morph is what the
+// box shows. That is not a decision made here, it is the voice's rule reported honestly -
+// and it is why an old project with both flags set opens on the right item without any
+// migration. Nothing is written back: leaving the flags as the user's own state means a
+// lane that raises and lowers "dryWet" under a held Morph still means exactly what it
+// meant, instead of being silently rewritten by the panel it is being watched on.
+void FractalAdditiveAudioProcessorEditor::applyTransitionMode()
 {
-    const bool morphWins = processorRef.apvts.getRawParameterValue ("morph")->load() > 0.5f;
-    if ((morphWins ? 1 : 0) == lastMorphWinsShown) return;   // timer rate: setEnabled repaints
-    lastMorphWinsShown = morphWins ? 1 : 0;
-    dryWetToggle.setEnabled (! morphWins);
-    dryWetTimeFader.setEnabled (! morphWins);
-    const auto col = morphWins ? juce::Colour (0xff5a6070) : cSlope;
-    dryWetTimeFader.setColour (juce::Slider::thumbColourId, col);
-    dryWetTimeFader.setColour (juce::Slider::trackColourId, col.withAlpha (0.55f));
-    repaint (bothEnginesBounds);   // the DRY/WET name and its MORPH ON tag are painted there
+    const bool morphOn = processorRef.apvts.getRawParameterValue ("morph")->load()  > 0.5f;
+    const bool dwOn    = processorRef.apvts.getRawParameterValue ("dryWet")->load() > 0.5f;
+    const int  item    = morphOn ? 2 : (dwOn ? 3 : 1);
+    if (item == lastTransitionShown) return;    // timer rate: everything below repaints
+    lastTransitionShown = item;
+    transitionBox.setSelectedId (item, juce::dontSendNotification);
+
+    // WHICH Time fader is on screen. Morph shows its own; Dry/Wet and Off both show the
+    // crossfade's. Off shows it because Dry/Wet is the mode the box defaults to, so the
+    // greyed number is the time that will apply the moment the user leaves Off - and
+    // because the alternative, remembering the last live mode, is a piece of UI-only
+    // state that a reopened project cannot restore and that would put a different number
+    // under the same patch depending on what had been clicked first.
+    const bool showMorph = (item == 2);
+    morphTimeFader.setVisible (showMorph);
+    dryWetTimeFader.setVisible (! showMorph);
+
+    // GREYED WHEN THERE IS NOTHING TO TIME. With the transition Off no fade of any kind
+    // runs, so a live fader here would be the panel offering to time something that is
+    // not happening - the same failure the AMP DECAY / FROZEN pair exists to prevent, and
+    // answered the same way.
+    morphTimeFader.setEnabled (item != 1);
+    dryWetTimeFader.setEnabled (item != 1);
+    applyTransitionFaderColour();
+    resized();                     // the fader that just appeared has to be given the row
+    repaint (bothEnginesBounds);
+}
+
+// THE ONE WRITER of the two Time faders' colour, for the reason applySlopeFaderColour is
+// the one writer of SLOPE's: they have a second state (the transition Off, where they can
+// time nothing) and a control whose colour is set from two places ends up wearing
+// whichever of them ran last.
+void FractalAdditiveAudioProcessorEditor::applyTransitionFaderColour()
+{
+    const bool off = processorRef.apvts.getRawParameterValue ("morph")->load()  <= 0.5f
+                  && processorRef.apvts.getRawParameterValue ("dryWet")->load() <= 0.5f;
+    const auto col = off ? juce::Colour (0xff5a6070) : spectrumPanelColour;
+    for (juce::Slider* s : { &morphTimeFader, &dryWetTimeFader })
+    {
+        s->setColour (juce::Slider::thumbColourId, col);
+        s->setColour (juce::Slider::trackColourId, col.withAlpha (0.55f));
+    }
+}
+
+// The other half: the box's own gesture, written back to the two parameters. One gesture
+// each, because a host recording this sees two lanes move and both have to be a complete
+// begin/end pair or the DAW keeps writing after the mouse is up.
+void FractalAdditiveAudioProcessorEditor::setTransitionParams (bool morphOn, bool dryWetOn)
+{
+    auto put = [this] (const char* id, bool on)
+    {
+        if (auto* p = processorRef.apvts.getParameter (id))
+        {
+            const float v = on ? 1.0f : 0.0f;
+            if (juce::approximatelyEqual (p->getValue(), v)) return;   // no empty gestures
+            p->beginChangeGesture();
+            p->setValueNotifyingHost (v);
+            p->endChangeGesture();
+        }
+    };
+    put ("morph",  morphOn);
+    put ("dryWet", dryWetOn);
+    applyTransitionMode();   // the box drew itself; the fader and the greying follow now
 }
 
 void FractalAdditiveAudioProcessorEditor::refreshSlopeFreeze()
@@ -5973,16 +6094,19 @@ void FractalAdditiveAudioProcessorEditor::recolourSpectrumControls (juce::Colour
     // (stepped, magnetic, plain) and a deduced initializer-list has no common type.
     for (juce::Slider* s : { (juce::Slider*) &baseNFader, (juce::Slider*) &harmonicsFader,
                              (juce::Slider*) &primeLimitFader, (juce::Slider*) &timbreRepeatsFader,
-                             (juce::Slider*) &fractalFader, (juce::Slider*) &morphTimeFader,
-                             (juce::Slider*) &dryWetTimeFader })
+                             (juce::Slider*) &fractalFader })
         fader (*s);
     // slopeFader is deliberately NOT in that list: it has a SECOND state (frozen by manual
     // per-partial amplitudes) and exactly one function is allowed to write its colour.
     // See applySlopeFaderColour - two writers is what turned it green.
     applySlopeFaderColour();
-    for (juce::ComboBox* b : { &basePitchBox, &primeModeBox }) combo (*b);
-    for (auto* l : { &lblBaseN, &lblBasePitch, &lblPrimeLimit, &lblTimbreRepeats, &lblMorphTime,
-                     &lblDryWetTime })
+    // The two TRANSITION Time faders are out of the list for exactly the same reason and
+    // were the same accident waiting to happen: they too have a second, greyed state (the
+    // transition Off), and while they sat in the list an engine switch repainted the grey
+    // away and the enablement's own before/after guard then refused to put it back.
+    applyTransitionFaderColour();
+    for (juce::ComboBox* b : { &basePitchBox, &primeModeBox, &transitionBox }) combo (*b);
+    for (auto* l : { &lblBaseN, &lblBasePitch, &lblPrimeLimit, &lblTimbreRepeats, &lblTransTime })
         label (*l);
     for (int i = 0; i < 9; ++i) { tick (primeToggle[i]); label (primeLbl[i]); }
     // TEMPER's tick used to be forced to the harmonic blue "because that is the engine it
@@ -6171,27 +6295,12 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
                      cOverride, 10.0f, true);
             }
             add ("both.fractal", tr ("FRACTAL", "FRACTAL"),                   band (beFractal), cPanel);
-            add ("both.morph",   tr ("MORPH", "MORPHING"),                    band (beMorph),   cPanel);
-            // DRY/WET says so when it is inert, exactly the way AMP DECAY does above: the
-            // two features are one crossfade machine and Morph wins, so with Morph on this
-            // control cannot act and the panel must not let it look as if it did. Greyed
-            // name + amber reason, the pair that means "this control cannot affect the
-            // sound right now" - the second of the two exceptions to "one colour".
-            const bool morphWins = processorRef.apvts.getRawParameterValue ("morph")->load() > 0.5f;
-            const auto dryWet = tr ("DRY/WET", "SEC/HUMIT");
-            const auto dwBand = band (beDryWet);
-            add ("both.dryWet", dryWet, dwBand, morphWins ? juce::Colour (0xff8f96a8) : cPanel);
-            if (morphWins)
-            {
-                // Starts after the MEASURED width of the name beside it, for the same reason
-                // the FROZEN tag does: the Catalan "SEC/HUMIT" is wider than "DRY/WET" and a
-                // hard-coded offset would print the two words on top of each other.
-                const juce::Font f (juce::FontOptions (11.5f).withStyle ("Bold"));
-                const int used = juce::GlyphArrangement::getStringWidthInt (f, dryWet) + 8;
-                add ("both.morphWins", tr ("MORPH ON", "MORPHING ON"),
-                     dwBand.withTrimmedLeft (juce::jmin (used, juce::jmax (0, dwBand.getWidth() - 56))),
-                     cOverride, 10.0f, true);
-            }
+            // ONE TITLE where MORPH and DRY/WET were two, and no warning tag under it.
+            // That tag ("MORPH ON", beside a greyed DRY/WET) existed to explain why one of
+            // two controls could not act; with one dropdown there is no second control to
+            // explain away, and the state it warned about - both flags on at once - is not
+            // reachable from this panel any more.
+            add ("both.transition", tr ("TRANSITION", "TRANSICI\xc3\x93"), band (beTrans), cPanel);
             add ("both.range",   tr ("OCTAVE RANGE", "ABAST OCTAVES"), band (beRange.translated (0, 3)), cPanel);
             // PHASE shares OCTAVE RANGE's row, to its right, and is titled in the same
             // style as every other sub-section here - that title IS its name, which is why
@@ -6284,12 +6393,12 @@ FractalAdditiveAudioProcessorEditor::spectrumDividers() const
     if (! bothEnginesBounds.isEmpty())
     {
         vert  ("slope|fractal", (float) beFractal.getX());
-        vert  ("fractal|morph", (float) beMorph.getX());
+        vert  ("fractal|transition", (float) beTrans.getX());
         // From the UNION: OCTAVE RANGE and PHASE are two sub-sections on ONE row, so the
         // line above them must span the whole column. Drawn from beRange alone it would
         // stop where the stepper's share ends and leave the fader hanging off an
         // unfinished divider.
-        horiz ("morph|range",   beRange.getUnion (bePhase));
+        horiz ("transition|range", beRange.getUnion (bePhase));
     }
     return out;
 }
@@ -6428,10 +6537,11 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
 
     add ("both.slope",       slopeFader);      add ("both.pencil",    partialEditBtn);
     add ("both.manual",      partialManualT);  add ("both.fractal",   fractalFader);
-    add ("both.morph",       morphToggle);
-    add ("both.morphTime",   morphTimeFader);  add ("both.morphLbl",  lblMorphTime);
-    add ("both.dryWet",      dryWetToggle);
-    add ("both.dryWetTime",  dryWetTimeFader); add ("both.dryWetLbl", lblDryWetTime);
+    add ("both.transition",  transitionBox);
+    // Both Time faders go through `add`, whose visibility gate records exactly the one
+    // that is on screen - the same way the Shepard row's shepTime/shepDiv pair is probed.
+    add ("both.morphTime",   morphTimeFader);
+    add ("both.dryWetTime",  dryWetTimeFader); add ("both.transLbl", lblTransTime);
     add ("both.rangeVal",    sprVal);          add ("both.rangeUp",   sprUp);
     add ("both.rangeDn",     sprDn);
 
@@ -6531,7 +6641,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     { if (! r.isEmpty()) p.cells.push_back ({ name, r }); };
     cell ("eng.base",    hcBase);    cell ("eng.harm",    hcHarm);   cell ("eng.prime", hcPrime);
     cell ("both.slope",  beSlope);   cell ("both.fractal", beFractal);
-    cell ("both.morph",  beMorph);   cell ("both.dryWet", beDryWet);
+    cell ("both.transition", beTrans);
     cell ("both.range",  beRange);   cell ("both.phase",  bePhase);
     cell ("ess.gain",    ecGain);
     cell ("ess.ref",     ecRef);     cell ("ess.oct",     ecOct);
@@ -6561,7 +6671,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
             //     which is why the 34 px mode box legitimately holds a long sentence.
             // Both of the misses ran the same way - towards "it fits" - so the probe was
             // quietly certifying boxes ~10 px narrower than the word needs.
-            const auto f     = fgfit::comboItemFont (c.getHeight());
+            const auto f     = fgfit::comboItemFont (c, c.getHeight());
             const int availW = fgfit::comboItemRoom (c.getWidth(), c.getHeight());
             const int availH = (c.getHeight() - 2) - 2; // label bounds, then its own border
             const int rows   = juce::jmax (1, (int) ((float) availH / f.getHeight()));
@@ -6582,6 +6692,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
         }
     };
     combo ("basePitch",   basePitchBox);
+    combo ("transition",  transitionBox);
     combo ("primeMode",   primeModeBox);   combo ("bend",        bendBox);
     combo ("modSel",      modSelBox);      combo ("lfoWave",     lfoWaveBox);
     combo ("lfoRateMode", lfoRateModeBox); combo ("lfoPhaseMode", lfoPhaseModeBox);
@@ -7744,21 +7855,22 @@ void FractalAdditiveAudioProcessorEditor::resized()
             const int bW = bo.getWidth();
             beSlope   = bo.removeFromLeft (bW * 31 / 100);
             beFractal = bo.removeFromLeft (bW * 23 / 100);
-            // THREE cells in this column now, not two: DRY/WET goes BETWEEN Morph and
-            // Octave Range, which is where the user asked for it and where it belongs - it
-            // and Morph are the two answers to the same question, so they read as a pair.
+            // TWO cells in this column, where there were three: MORPH and DRY/WET are one
+            // TRANSITION cell now ("asi economizamos espacio"). It sits between FRACTAL's
+            // wall and OCTAVE RANGE, which is where the pair already lived.
             //
-            // The column is ~113 px tall and Morph's old shape (a pill row, then a fader
-            // row) took 62 of them, so three of that shape do not exist here. Both cells
-            // are laid out on ONE row instead - pill, then caption, then fader - which is
-            // 36 px and, more to the point, makes the two IDENTICAL: "un fader de tiempo
-            // como el de morph y un boton de on off" is a promise about how the second one
-            // looks, and it is only kept if the first one still looks like it. RANGE keeps
-            // the remainder because its stepper row is the tallest single control here.
+            // OCTAVE RANGE / PHASE KEEP EXACTLY THE HEIGHT THEY HAD, computed from the
+            // very expression that used to size the two smoothing cells, and the whole row
+            // the merge freed goes to TRANSITION. That is deliberate: this column's total
+            // height is fixed by the panel, so the saving cannot become empty space - it
+            // has to be spent somewhere - and spending it on the cell that lost a row
+            // means nothing below it moves by a pixel. At the 870x540 floor that is what
+            // makes the merge worth doing at all: the pair's control rows were 9 px tall
+            // there (a 26 px cell, less the sub-label band), which is not a size a combo
+            // or a fader can be used at. One cell of 52 gives them 16 px each.
             auto mcol = bo;
-            const int pairH = juce::jlimit (26, 46, (mcol.getHeight() - 40) / 2);
-            beMorph   = mcol.removeFromTop (pairH);
-            beDryWet  = mcol.removeFromTop (pairH);
+            const int rangeH = mcol.getHeight() - 2 * juce::jlimit (26, 46, (mcol.getHeight() - 40) / 2);
+            beTrans   = mcol.removeFromTop (juce::jmax (0, mcol.getHeight() - rangeH));
             beRange   = mcol;
             {
                 auto si = beSlope.reduced (6, 3); si.removeFromTop (lblH);
@@ -7777,26 +7889,38 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 auto fi = beFractal.reduced (6, 3); fi.removeFromTop (lblH);
                 fractalFader.setBounds (fi);
             }
-            // MORPH and DRY/WET are ONE shape, laid out by one lambda: the ON/OFF pill
-            // sized to the word it prints (it was 275 px of flat colour carrying three
-            // letters, which read as a banner rather than a switch), then the "Time"
-            // caption, then the fader in whatever is left. Two calls rather than two
-            // copies, because the promise these two controls make is that they are the
-            // same control twice - and two hand-kept copies drift.
-            const auto smoothingCell = [&] (juce::Rectangle<int> cell, juce::ToggleButton& pill,
-                                            juce::Label& lbl, juce::Slider& fader)
+            // THE TRANSITION CELL: title band, the mode dropdown on its own row, then the
+            // "Time" caption and its fader on the next.
+            //
+            // TWO ROWS AND NOT ONE, and the floor is what decides it. Side by side the row
+            // would have to hold the box (sized to its widest ITEM - the box does not
+            // resize when the mode changes, so anything less clips the others silently),
+            // the caption, and a fader that carries a 42 px value read-out. At 870x540
+            // this cell is 141 px wide inside its inset: the box alone wants ~85 of them
+            // and the caption ~46, which leaves the fader about ten. Stacked, the box gets
+            // the whole width and so does the fader, at every size - and the cell still
+            // costs one row less than the two it replaced.
             {
-                auto ci2 = cell.reduced (6, 2); ci2.removeFromTop (lblH - 2);
-                auto r = ci2.removeFromTop (juce::jmin (19, juce::jmax (0, ci2.getHeight())));
-                const int pillH = juce::jmax (1, r.getHeight());
-                pill.setBounds (r.removeFromLeft (
-                        juce::jmin (fgfit::snugToggleWidth (pill, pillH), r.getWidth())));
-                r.removeFromLeft (6);
-                caption (lbl, r, 34, 60);
-                fader.setBounds (r);
-            };
-            smoothingCell (beMorph,  morphToggle,  lblMorphTime,  morphTimeFader);
-            smoothingCell (beDryWet, dryWetToggle, lblDryWetTime, dryWetTimeFader);
+                auto ci2 = beTrans.reduced (6, 2); ci2.removeFromTop (lblH - 2);
+                // Rows grow with the cell so the wide sizes are not two thin controls
+                // floating in a tall box, and the pair is centred in what is left rather
+                // than pinned under the title with all the slack at the bottom.
+                const int rowH = juce::jlimit (15, 24, (ci2.getHeight() - 3) / 2);
+                auto blk = ci2.withSizeKeepingCentre (ci2.getWidth(),
+                                                      juce::jmin (ci2.getHeight(), rowH * 2 + 3));
+                auto boxRow = blk.removeFromTop (juce::jmin (rowH, blk.getHeight()));
+                blk.removeFromTop (juce::jmin (3, blk.getHeight()));
+                transitionBox.setBounds (boxRow.removeFromLeft (
+                        juce::jmin (fgfit::snugComboWidth (transitionBox, juce::jmax (1, boxRow.getHeight())),
+                                    boxRow.getWidth())));
+                auto tr2 = blk;
+                caption (lblTransTime, tr2, 34, 60);
+                // Only the VISIBLE fader is given the rectangle; the other one keeps
+                // whatever bounds it had and is not drawn, laid out or probed. Both are
+                // set so a mode change cannot leave the incoming fader at a stale size.
+                morphTimeFader.setBounds (tr2);
+                dryWetTimeFader.setBounds (tr2);
+            }
             {
                 // RANGE: the spectrum's octave span, as the same [value][+][-] stepper it
                 // had in Essentials. Its name is the painted OCTAVE RANGE sub-label now,
@@ -8569,7 +8693,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
 
     refreshModWatch(); // live-modulation marker on every watched fader (see the header)
     refreshSlopeFreeze(); // SLOPE goes grey + "FROZEN" while manual amplitudes are on
-    applyDryWetEnablement(); // DRY/WET goes dead + "MORPH ON" while Morph owns the crossfade
+    applyTransitionMode();   // the TRANSITION box follows the two booleans, however they moved
     refreshShepardSyncState(); // beats box goes amber while Sync has no BPM to sync to
     // The amplitude window follows the spectrum: the template is rebuilt on a background
     // thread whenever Base/Fractal/primes/tuning move, and the stored edits can change

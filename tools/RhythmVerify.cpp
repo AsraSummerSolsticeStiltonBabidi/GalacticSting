@@ -25,7 +25,19 @@ static int failures = 0;
 static void check (bool ok, const char* what)
 {
     std::printf ("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
-    if (! ok) ++failures;
+    // A FAILURE IS ALSO NAMED ON STDERR, and stdout is flushed behind it. This run once
+    // ended "FAILURES (1 failures)" with no [FAIL] line anywhere in the redirected output
+    // - the string "FAIL" appeared exactly once in 1838 lines, in the summary - so the one
+    // thing the log had to say was the one thing missing from it, and finding out that the
+    // check was "and no two controls overlap" cost a rebuild with a trace bolted on. Two
+    // lines here mean the next one names itself.
+    if (! ok)
+    {
+        ++failures;
+        std::fflush (stdout);
+        std::fprintf (stderr, "  [FAIL] %s\n", what);
+        std::fflush (stderr);
+    }
 }
 
 //==============================================================================
@@ -3405,7 +3417,7 @@ int main()
             const auto hv = verticals (harm);
             check (hv.size() == 4,
                    "the harmonic view draws four vertical walls (engine|both, base|harmonics, "
-                   "slope|fractal, fractal|morph)");
+                   "slope|fractal, fractal|transition)");
             bool sameSpan = true;
             juce::String odd;
             for (const auto& d : hv)
@@ -3428,7 +3440,7 @@ int main()
             ed->refreshEngineDressing();
             const auto cust = ed->layoutProbe();
             std::printf ("  custom view:   %s\n", names (cust).toRawUTF8());
-            check (names (cust) == "engine|both, slope|fractal, fractal|morph, morph|range",
+            check (names (cust) == "engine|both, slope|fractal, fractal|transition, transition|range",
                    "the custom view adds no divider of its own - the thin line between the "
                    "Remove button and the ratios box is gone");
 
@@ -11130,12 +11142,21 @@ int main()
                    " frequencies and amplitudes are handed to the running one");
         }
 
-        // ---- (d) AND THE PANEL SAYS SO ------------------------------------------------
-        // The rule is "Morph wins"; the requirement is that the UI must not let the user
-        // believe both are acting. That is a claim about the SCREEN, so it is measured on
-        // the screen: with Morph on, both controls are dead and an amber MORPH ON tag is
-        // painted beside a greyed DRY/WET - and that tag has to FIT, in both languages, in
-        // a state the layout sweep never enters on its own (it probes with Morph off).
+        // ---- (d) AND THE PANEL SAYS WHICH ONE IS RUNNING ------------------------------
+        // MORPH and DRY/WET are ONE dropdown now: "haz que morph y dry/wet sean dos
+        // opciones dentro de un mismo desplegable en el submenu transition". That box owns
+        // no parameter - it is a VIEW of the "morph" and "dryWet" booleans - and a view
+        // that can disagree with what the voice is doing is worse than no view at all, so
+        // what it shows is measured against every state those two flags can be in.
+        //
+        // FOUR STATES, THREE ITEMS, and the fourth is the one worth measuring: with both
+        // flags set the voice MORPHS (a voice has one crossfade between two banks, so
+        // Morph wins - bf0f768, and the audio checks above), and the box must therefore
+        // read Morph. That is also what makes an old project open on the right item with
+        // no migration at all, so it is a claim about users' files and not only about a
+        // combo. The widest ITEM has to fit too, in both languages: a ComboBox neither
+        // clips visibly nor resizes when the mode changes, so a box wide enough for the
+        // selected word silently truncates the others.
         {
             auto owned = std::make_unique<FractalAdditiveAudioProcessor>();
             owned->prepareToPlay (srD, eb);
@@ -11144,44 +11165,60 @@ int main()
             check (ed != nullptr, "the editor builds");
             if (ed != nullptr)
             {
-                const auto setMorph = [&] (bool on)
+                const auto setFlags = [&] (bool morphOn, bool dwOn)
                 {
-                    if (auto* q = owned->apvts.getParameter ("morph")) q->setValueNotifyingHost (on ? 1.0f : 0.0f);
+                    if (auto* q = owned->apvts.getParameter ("morph"))  q->setValueNotifyingHost (morphOn ? 1.0f : 0.0f);
+                    if (auto* q = owned->apvts.getParameter ("dryWet")) q->setValueNotifyingHost (dwOn    ? 1.0f : 0.0f);
                     owned->pollParametersForTests();
-                    ed->applyDryWetEnablementForTests();
+                    ed->applyTransitionModeForTests();   // the same call the 30 Hz timer makes
                     ed->resized();
                 };
-                const auto tagged = [&] (const FractalAdditiveAudioProcessorEditor::LayoutProbe& pr,
-                                         const char* nm, juce::Rectangle<int>* cellOut, float* wOut)
+                // The four states, once: what the box SHOWS is an item id, which is the
+                // same number in either language.
+                struct Row { bool morph, dw; int want; const char* what; };
+                const Row rows[] = { { false, false, 1, "both off  -> Off" },
+                                     { true,  false, 2, "morph     -> Morph" },
+                                     { false, true,  3, "dryWet    -> Dry/Wet" },
+                                     { true,  true,  2, "both on   -> Morph (the voice's own rule)" } };
+                for (const auto& r : rows)
                 {
-                    for (const auto& l : pr.paintedLabels)
-                        if (l.name == nm) { if (cellOut) *cellOut = l.cell; if (wOut) *wOut = l.textWidth; return true; }
-                    return false;
-                };
+                    setFlags (r.morph, r.dw);
+                    const int got = ed->transitionItemShownForTests();
+                    std::printf ("  %-42s box shows %d\n", r.what, got);
+                    check (got == r.want,
+                           "the TRANSITION box shows what the voice will actually do with these two flags");
+                    // ...and the ONE Time fader on screen is that mode's own, so the
+                    // number under it is the time that will really be used.
+                    check (ed->morphTimeFaderShownForTests() == (r.want == 2),
+                           "...and the Time fader on screen belongs to the mode it shows");
+                    // Off can time nothing, so its fader is dead - the same idiom AMP
+                    // DECAY uses when manual amplitudes freeze it.
+                    check (ed->transitionTimeFaderLiveForTests() == (r.want != 1),
+                           "...and it is live exactly when there is a transition to time");
+                }
+
+                // The WIDEST item against the room the painter really leaves it, read off
+                // the probe's own combo measurement (see LayoutProbe::comboTexts). From
+                // the RETURNED probe and never from the editor afterwards:
+                // layoutProbeInLanguage measures in the language asked for and then puts
+                // the editor back the way it found it, so a check that re-read the live
+                // box would measure English twice and report the Catalan words untested.
+                setFlags (false, true);
                 for (int lang = 0; lang < 2; ++lang)
                 {
-                    setMorph (false);
-                    auto off = ed->layoutProbeInLanguage (lang == 1);
-                    const bool offTag = tagged (off, "both.morphWins", nullptr, nullptr);
-                    setMorph (true);
-                    auto on = ed->layoutProbeInLanguage (lang == 1);
-                    juce::Rectangle<int> cell; float w = 0.0f;
-                    const bool onTag = tagged (on, "both.morphWins", &cell, &w);
-                    std::printf ("  %s: with Morph off the DRY/WET cell carries no tag (%s);"
-                                 " with it on the tag needs %.1f px of %d\n",
-                                 lang == 1 ? "ca" : "en", offTag ? "IT DOES" : "correct", w, cell.getWidth());
-                    check (! offTag,
-                           "with Morph OFF the Dry/Wet cell wears no warning - the control really is live");
-                    check (onTag, "and with Morph ON the panel paints a reason beside a greyed DRY/WET");
-                    check (w <= (float) cell.getWidth() + 0.5f,
-                           "...and that reason FITS its rect, in this language");
-                    check (! ed->dryWetControlsEnabledForTests(),
-                           "...while the two controls themselves are dead, so nothing on screen claims"
-                           " two smoothings are running");
-                    setMorph (false);
-                    check (ed->dryWetControlsEnabledForTests(),
-                           "and switching Morph off hands them straight back - the user's setting was never"
-                           " rewritten, only overruled");
+                    const auto pr = ed->layoutProbeInLanguage (lang == 1);
+                    bool seen = false;
+                    for (const auto& c : pr.comboTexts)
+                        if (c.name == "transition")
+                        {
+                            seen = true;
+                            std::printf ("  %s: widest TRANSITION item \"%s\" needs %.1f px of %d\n",
+                                         lang == 1 ? "ca" : "en", c.text.toRawUTF8(), c.need, c.avail);
+                            check (c.need <= (float) c.avail + 0.5f,
+                                   "every TRANSITION item fits the box, in this language - the box does not"
+                                   " resize when the mode changes and a clipped item says nothing");
+                        }
+                    check (seen, "...and that box is actually probed, in this language");
                 }
                 ed->layoutProbeInLanguage (false);   // leave the panel in English
             }
