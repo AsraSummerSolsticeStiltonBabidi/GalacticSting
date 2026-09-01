@@ -690,6 +690,60 @@ public:
     };
     RatiosInkProbe ratiosInkProbeForTests (const juce::String& typed);
 
+    // TESTS: DOES THE CUSTOM ENGINE'S INTERVAL BOX STILL DRIVE THE SPECTRUM?
+    //
+    // "el custom spectrum no funciona bien ahora, solo funciona al modo random, no
+    //  reacciona a los intervalos que se escriben o borran en la caja de texto."
+    //
+    // Nothing in the build asserted that TYPING into that box changes the sound, which is
+    // exactly how it could stop doing so unnoticed. This drives the box the way a user
+    // does - one KeyPress per character, backspaces to delete, then Return - so it can
+    // see a break anywhere on the path, not just in the handler.
+    //
+    // The two POSTED callbacks are delivered BY HAND, because there is no message loop in
+    // the verifier and, more to the point, because trusting them would test nothing:
+    // TextEditor::textChanged() and TextEditor::returnPressed() both go through
+    // postCommandMessage(), so `onTextChange` and `onReturnKey` arrive later or never.
+    // (This is the same rule presetSearchProbeForTests states for its own filter.)
+    struct IntervalBoxProbe
+    {
+        juce::String boxText;        // what the box holds when Return is pressed
+        juce::String timbreSource;   // what the processor believes was typed, afterwards
+        bool  visible = false;       // the box is on screen in the custom view...
+        bool  enabled = false;       // ...and can be typed into at all
+        bool  readOnly = true;
+        juce::Rectangle<int> bounds; // where it was laid out
+        int   timbreNotes = 0;       // degrees the Custom Engine holds after the Return
+        bool  hadFocus = false;      // the box really held the keyboard while typing
+    };
+    // `tickTimer` runs THIS editor's own 30 Hz timerCallback() after every keystroke,
+    // which is what really happens while a human types: a person is nowhere near 30
+    // characters a second, so every single key lands between two ticks. That timer
+    // re-seeds this very box from the processor, so "does typing survive a tick" is a
+    // question only this mode can ask - and the product's build has
+    // JUCE_MODAL_LOOPS_PERMITTED=0, so there is no dispatch loop to borrow instead.
+    // If the caller has put the editor on a real (off-screen) peer, the keys are injected
+    // there and the box holds REAL keyboard focus; otherwise they go straight to it.
+    IntervalBoxProbe typeIntervalsProbeForTests (const juce::String& typed, int backspaces,
+                                                 bool tickTimer = false);
+
+    // TESTS: WHAT HAPPENS TO AN EDIT THAT HAS NOT BEEN APPLIED YET.
+    //
+    // Typing into the box does not change the sound until Return; until then the box is
+    // holding a draft. The 30 Hz timer also RE-SEEDS this box from the processor. Whether
+    // those two can collide - whether a draft can be thrown away without the user doing
+    // anything - is what this measures. Types `edit` on the end of whatever the box holds,
+    // then does what refocus() does (hands the keyboard back to the editor), then ticks
+    // the timer, and reports what is left in the box.
+    struct IntervalDraftProbe
+    {
+        juce::String seeded;    // what the box held before the edit
+        juce::String afterEdit; // ...and after typing the edit, before focus moved
+        juce::String afterTick; // ...and after the keyboard left and the timer ticked
+        bool survived = false;  // afterTick == afterEdit
+    };
+    IntervalDraftProbe intervalDraftProbeForTests (const juce::String& edit);
+
     //==========================================================================
     // EVERY DRAWN STRING IN THE WHOLE EDITOR, MEASURED AGAINST THE RECT IT IS DRAWN INTO.
     //

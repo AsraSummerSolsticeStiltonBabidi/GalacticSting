@@ -11924,6 +11924,182 @@ int main()
                          " (a second RhythmVerify? the plugin open in a host?)");
     }
 
+    // --- run 52: THE CUSTOM ENGINE'S TEXT BOX DRIVES THE SPECTRUM -------------------
+    //
+    // "el custom spectrum no funciona bien ahora, solo funciona al modo random, no
+    //  reacciona a los intervalos que se escriben o borran en la caja de texto."
+    //
+    // Nothing in this build ever asserted that TYPING into the Spectrum Builder changes
+    // what sounds - the box had a layout check (its clearances) and a colour check (its
+    // token spans) and no behaviour check at all, which is precisely how it could stop
+    // working without a single verdict going red.
+    //
+    // Measured on the COMPILED PARTIAL LIST, not on the processor's stored text: the
+    // stored text can be perfect while nothing rebuilds, and the sound is the claim.
+    {
+        std::printf ("\nthe Custom Engine's interval box drives the spectrum:\n");
+        auto owned = std::make_unique<FractalAdditiveAudioProcessor>();
+        auto& p = *owned;
+        p.prepareToPlay (44100.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "the editor builds");
+        if (ed != nullptr)
+        {
+            ed->clickEngineChipForTests (1);   // the CUSTOM view: where the box lives
+
+            // The ratios the live template really carries inside one period, rounded to
+            // the cent - the sound, read back, rather than the settings that asked for it.
+            auto sounding = [&p] () -> juce::String
+            {
+                p.pollParametersForTests();          // the rebuild test lives in the timer
+                awaitSpectrumIdle (p, "typed intervals");
+                const auto* t = p.getLiveTemplate();
+                if (t == nullptr) return "<none>";
+                juce::StringArray s;
+                for (const auto& q : t->partials)
+                    if (q.ratio <= 2.0001f)
+                        s.add (juce::String ((int) std::llround (1200.0 * std::log2 ((double) q.ratio))) + "c");
+                return s.joinIntoString (" ");
+            };
+
+            // TWICE. First with nothing else running - the plain question, "does the
+            // handler work". Then LIVE: the editor on a real (off-screen) peer, so the
+            // box holds REAL keyboard focus and the keys arrive through JUCE's own
+            // routing, and this editor's 30 Hz timer ticking after every keystroke, which
+            // is what a human's typing speed guarantees. That timer re-seeds this very box
+            // from the processor; whether typing survives it is the question the first
+            // pass structurally cannot ask, and it is the one the report is about.
+            for (int mode = 0; mode < 2; ++mode)
+            {
+                const bool live = mode == 1;
+                if (live)
+                {
+                    ed->setTopLeftPosition (-4000, -4000); // off every real screen
+                    ed->setVisible (true);
+                    ed->addToDesktop (0);
+                    if (ed->getPeer() == nullptr) { std::printf ("  (no peer; live pass skipped)\n"); break; }
+                }
+                std::printf ("  --- %s ---\n", live ? "LIVE: real peer, real focus, the 30 Hz timer ticking between keys"
+                                                    : "quiet: the handler alone, nothing else running");
+
+                const auto a = ed->typeIntervalsProbeForTests ("5/4 3/2 2", 0, live);
+                const auto soundA = sounding();
+                std::printf ("  typed \"5/4 3/2 2\" -> box \"%s\", processor \"%s\", %d degrees, focus %d\n"
+                             "    sounding (<= 1 period): %s\n",
+                             a.boxText.toRawUTF8(), a.timbreSource.toRawUTF8(), a.timbreNotes,
+                             (int) a.hadFocus, soundA.toRawUTF8());
+                check (a.visible && a.enabled && ! a.readOnly && ! a.bounds.isEmpty(),
+                       "the interval box is on screen, laid out, and can be typed into");
+                check (a.boxText == "5/4 3/2 2",
+                       "every character typed into it arrives - the box holds exactly what was typed");
+                check (a.timbreSource == "5/4 3/2 2",
+                       "...and pressing Return hands that text to the Custom Engine");
+                check (a.timbreNotes == 3, "which reads it as three degrees (1/1, 5/4, 3/2 at period 2)");
+                // Whole tokens, never substrings: "702c" is inside "1702c" and "-702c",
+                // and a check that can be satisfied by a partial nobody asked about is
+                // not a check. (It also nearly shipped as `contains ("386c")` against a
+                // read-out printing 386.314c, which passed nothing and proved nothing.)
+                auto has = [] (const juce::String& s, const char* cents)
+                { return juce::StringArray::fromTokens (s, " ", "").contains (cents); };
+                check (has (soundA, "386c") && has (soundA, "702c") && has (soundA, "1200c"),
+                       "and the SOUND is that spectrum: 5/4 (386c) and 3/2 (702c) inside a"
+                       " 2/1 period (1200c), in the compiled template");
+
+                // ...AND DELETING ONE CHANGES IT BACK. Two backspaces take " 2" off the
+                // end, which makes 3/2 the period and drops the 702c partial from inside
+                // it - a change no "did the text change" check could tell from a no-op.
+                const auto b = ed->typeIntervalsProbeForTests ("5/4 3/2 2", 2, live);
+                const auto soundB = sounding();
+                std::printf ("  then 2 backspaces -> box \"%s\", processor \"%s\", %d degrees, focus %d\n"
+                             "    sounding (<= 1 period): %s\n",
+                             b.boxText.toRawUTF8(), b.timbreSource.toRawUTF8(), b.timbreNotes,
+                             (int) b.hadFocus, soundB.toRawUTF8());
+                check (b.boxText == "5/4 3/2",
+                       "backspace deletes from the box - it holds what is left");
+                check (b.timbreSource == "5/4 3/2",
+                       "...and Return hands the SHORTER list over, so a deletion is an edit too");
+                check (b.timbreNotes == 2, "two degrees now (1/1 and 5/4, at period 3/2)");
+                check (soundB != soundA,
+                       "and the compiled partial set really changed - the box drives the sound,"
+                       " it does not merely store a string");
+                // 3/2 is now the PERIOD, so 702c is still there (it is the repeat) - what
+                // must be gone is the OCTAVE the deleted token used to be: with the stack
+                // repeating at 702c there is no partial at 1200c any more. Naming the
+                // right cent value is the whole difference between a check that would
+                // have caught this regression and one that fails on a spectrum that is
+                // perfectly correct.
+                check (! has (soundB, "1200c"),
+                       "the deleted 2/1 is gone: the stack repeats at 3/2 now, so nothing"
+                       " sits on the octave any more");
+            }
+            // AN EDIT THAT HAS NOT BEEN APPLIED YET, when the keyboard moves on.
+            // "no reacciona a los intervalos que se escriben o borran en la caja de
+            //  texto." Typing does not change the sound until Return - so until then the
+            //  box holds a DRAFT, and a draft the program throws away on its own is
+            //  indistinguishable, from the chair, from a box that ignores what you type.
+            {
+                juce::String err;
+                p.loadTimbreText ("5/4 3/2 2", err);
+                const auto d = ed->intervalDraftProbeForTests (" 7/4");
+                std::printf ("  a draft in the box: seeded \"%s\" -> typed \"%s\""
+                             " -> after the keyboard moved on \"%s\"\n",
+                             d.seeded.toRawUTF8(), d.afterEdit.toRawUTF8(), d.afterTick.toRawUTF8());
+                check (d.seeded == "5/4 3/2 2", "the box shows the spectrum that is loaded");
+                check (d.afterEdit == "5/4 3/2 2 7/4", "and it takes the typed edit");
+                check (d.survived,
+                       "an edit still sitting in the box SURVIVES the keyboard moving on -"
+                       " nothing throws away what the user typed but has not applied yet");
+            }
+
+            if (ed->isOnDesktop()) ed->removeFromDesktop();
+
+            // ...AT EVERY WINDOW SIZE, not just the shipped one. The box is laid out from
+            // what is LEFT of the engine panel after its three bottom rows are reserved,
+            // so a panel that loses height does not shrink it evenly - it takes the whole
+            // loss out of this one control. A box a few pixels tall is still "visible",
+            // still "enabled" and still passes every rect check in this file, and it is
+            // one you cannot click into or read: from the user's chair that is exactly
+            // "it does not react to what I type", with Random - a button - still working.
+            std::printf ("  the interval box across the window's size range:\n");
+            auto boxAt = [ed] (int w, int h)
+            {
+                ed->setSize (w, h);
+                juce::Rectangle<int> box;
+                for (const auto& c : ed->layoutProbe().controls)
+                    if (c.first == "cust.intervals") box = c.second;
+                std::printf ("    %4dx%-4d -> %dx%d at (%d,%d)\n", w, h,
+                             box.getWidth(), box.getHeight(), box.getX(), box.getY());
+                return box.getHeight();
+            };
+            int worstH = 1 << 20; juce::String worstAt;
+            // From the snapshot rig's own measured floor (870x540 - it photographs there,
+            // and that is the picture the collapse was found in) up past the shipped size.
+            for (const auto sz : { std::pair<int,int> { 870, 540 }, { 1200, 540 }, { 1110, 560 },
+                                   { 1400, 600 }, { 1600, 900 }, { 1920, 1080 } })
+                if (const int h = boxAt (sz.first, sz.second); h < worstH)
+                { worstH = h; worstAt = juce::String (sz.first) + "x" + juce::String (sz.second); }
+            const int shipped = boxAt (1200, 650);
+
+            // ONE readable row of its own 13 px font inside its own 4/5 px borders. Below
+            // this the box holds text nobody can see: at 870x540 it was 3 px and at
+            // 1200x540 it was 13, on screen and enabled the whole time, which is
+            // indistinguishable from a box that ignores what is typed into it.
+            check (worstH >= 22,
+                   "the interval box stays tall enough to show a line of what is typed in it,"
+                   " at every size the editor is laid out at - it is never the row the panel"
+                   " takes all its shrinkage out of");
+            if (worstH < 22)
+                std::printf ("    the worst is %d px tall, at %s\n", worstH, worstAt.toRawUTF8());
+            // ...and the fix pays for itself out of SLACK, so the window everybody has
+            // actually seen is untouched. A change here that moved the shipped layout by
+            // one pixel would be a redesign smuggled in as a bug fix.
+            check (shipped == 68,
+                   "and the SHIPPED 1200x650 layout is pixel-identical: the rows only give"
+                   " way where the panel cannot afford them");
+        }
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

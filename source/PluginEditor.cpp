@@ -4075,6 +4075,88 @@ FractalAdditiveAudioProcessorEditor::ratiosInkProbeForTests (const juce::String&
     return r;
 }
 
+FractalAdditiveAudioProcessorEditor::IntervalBoxProbe
+FractalAdditiveAudioProcessorEditor::typeIntervalsProbeForTests (const juce::String& typed,
+                                                                 int backspaces, bool tickTimer)
+{
+    IntervalBoxProbe r;
+    auto* peer = getPeer();   // present only when the caller put us on an off-screen peer
+
+    auto press = [this, peer] (const juce::KeyPress& k)
+    {
+        if (peer != nullptr) peer->handleKeyPress (k);
+        else                 intervalEdit.keyPressed (k);
+    };
+    // AFTER EVERY KEYSTROKE, the two things that really follow one in the plugin: the
+    // POSTED onTextChange (delivered by hand - postCommandMessage never arrives without a
+    // message loop, and a probe that trusted it would be testing nothing), and, if asked,
+    // one tick of this editor's own 30 Hz timer.
+    auto afterKey = [this, tickTimer]
+    {
+        recolourIntervalTokens();
+        if (tickTimer) timerCallback();
+    };
+
+    setIntervalText ({});   // start from an empty box, through the one seeding helper
+    if (peer != nullptr) intervalEdit.grabKeyboardFocus();
+
+    // ONE KeyPress PER CHARACTER, not setText: a probe that assigns the text cannot see a
+    // box that has stopped accepting keys, and "typing does nothing" is the report.
+    for (auto p = typed.getCharPointer(); ! p.isEmpty(); ++p)
+    {
+        press (juce::KeyPress (0, juce::ModifierKeys(), *p));
+        afterKey();
+    }
+    for (int i = 0; i < backspaces; ++i)
+    {
+        press (juce::KeyPress (juce::KeyPress::backspaceKey));
+        afterKey();
+    }
+
+    r.boxText  = intervalEdit.getText();
+    r.visible  = intervalEdit.isVisible();
+    r.enabled  = intervalEdit.isEnabled();
+    r.readOnly = intervalEdit.isReadOnly();
+    r.bounds   = intervalEdit.getBounds();
+    r.hadFocus = intervalEdit.hasKeyboardFocus (false);
+
+    // RETURN. keyPressed() alone only reaches TextEditor::returnPressed(), which is a
+    // postCommandMessage, so the handler is delivered by hand for the same reason.
+    press (juce::KeyPress (juce::KeyPress::returnKey));
+    if (intervalEdit.onReturnKey != nullptr) intervalEdit.onReturnKey();
+    if (tickTimer) { timerCallback(); timerCallback(); }
+
+    r.timbreSource = processorRef.getTimbreSource();
+    r.timbreNotes  = processorRef.getTimbreNoteCount();
+    return r;
+}
+
+FractalAdditiveAudioProcessorEditor::IntervalDraftProbe
+FractalAdditiveAudioProcessorEditor::intervalDraftProbeForTests (const juce::String& edit)
+{
+    IntervalDraftProbe r;
+    timerCallback();                       // let the re-seed put the loaded spectrum in
+    r.seeded = intervalEdit.getText();
+
+    if (auto* peer = getPeer()) { juce::ignoreUnused (peer); intervalEdit.grabKeyboardFocus(); }
+    intervalEdit.setCaretPosition (intervalEdit.getTotalNumChars());
+    for (auto p = edit.getCharPointer(); ! p.isEmpty(); ++p)
+    {
+        intervalEdit.keyPressed (juce::KeyPress (0, juce::ModifierKeys(), *p));
+        recolourIntervalTokens();
+    }
+    r.afterEdit = intervalEdit.getText();
+
+    // WHAT refocus() DOES, and it is called by nearly every control in this window: the
+    // editor takes the keyboard back. No click on the box is undone by this; the draft
+    // is simply no longer the focused component's.
+    grabKeyboardFocus();
+    timerCallback();
+    r.afterTick = intervalEdit.getText();
+    r.survived  = r.afterTick == r.afterEdit;
+    return r;
+}
+
 int FractalAdditiveAudioProcessorEditor::comboReopenProbeForTests (int attempts)
 {
     RefreshingComboBox box;
@@ -7584,10 +7666,36 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // the custom view has far fewer controls than the harmonic one, and the
             // freed space is exactly what the typed spectrum needed - it was one 24 px
             // line squeezed into a fifth of the panel.
-            auto repsRow = ci.removeFromBottom (22);
-            ci.removeFromBottom (4);
-            auto statusRow = ci.removeFromBottom (16);
-            ci.removeFromBottom (4);
+            //
+            // ...BUT THE BOX YOU TYPE INTO IS THE LAST THING TO SHRINK, NOT THE FIRST.
+            // "everything left" also means every pixel the panel is SHORT of comes out of
+            // this one control, because it is the only one taking the remainder. At
+            // 1200x540 that left it 13 px tall, and at the 870x540 floor the snapshot rig
+            // photographs, its own text is not visible at all: a pink outline, on screen,
+            // enabled, holding "5/4 3/2 2" and showing none of it. From the player's chair
+            // that is a box which ignores everything typed or deleted in it, while Load,
+            // Random and Temper - buttons - go on working perfectly.
+            //
+            // So the rows below give way FIRST, each down to a floor of its own (a 20 px
+            // button is still hittable; an 18 px fader still draggable), and only what is
+            // left after that comes out of the box. The give is ZERO whenever the panel
+            // can afford the natural heights, which is every size at or above the shipped
+            // 1200x650 - measured, not assumed: RhythmVerify run 52 asserts the box is
+            // still exactly 68 px there, so this cannot move the layout anybody has seen.
+            constexpr int kBoxWants   = 43;                     // two 13 px rows inside its 4/5 px borders
+            constexpr int kBelowNat   = 22 + 4 + 16 + 4 + 24 + 4;
+            constexpr int kBelowFloor = 18 + 2 + 12 + 2 + 20 + 2;
+            const int give = juce::jlimit (0, kBelowNat - kBelowFloor,
+                                           kBoxWants - (ci.getHeight() - 2 - kBelowNat));
+            // Each row moves the same fraction of the way to its own floor, so they stay
+            // in proportion instead of one of them collapsing while its neighbour keeps
+            // its full height - the fault this whole block exists to stop, one level down.
+            auto shrunk = [give, span = kBelowNat - kBelowFloor] (int natural, int floor)
+            { return natural - (natural - floor) * give / span; };
+            auto repsRow = ci.removeFromBottom (shrunk (22, 18));
+            ci.removeFromBottom (shrunk (4, 2));
+            auto statusRow = ci.removeFromBottom (shrunk (16, 12));
+            ci.removeFromBottom (shrunk (4, 2));
             // [Load / Remove][Random][Temper to tuning] - UNDER the ratios box now:
             // "haz que los botones remove random y temper to tuning esten abajo de la
             // caja de ratios de custom tuning, la cual podras subir un poco arriba para
@@ -7602,8 +7710,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // the one control that can CREATE a spectrum out of nothing, which is
             // exactly the state where a workspace is emptiest. TEMPER is reachable from
             // BOTH views (see the ctor comment) and joins them at the same size rule.
-            auto brow = ci.removeFromBottom (24);
-            ci.removeFromBottom (4);
+            auto brow = ci.removeFromBottom (shrunk (24, 20));
+            ci.removeFromBottom (shrunk (4, 2));
             {
                 auto b = brow.reduced (2, 0);
                 auto take = [&b] (juce::Component& c, int w)
