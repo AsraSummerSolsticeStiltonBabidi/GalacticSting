@@ -778,6 +778,15 @@ void FractalAdditiveAudioProcessor::timerCallback()
         if (mg != lastMonoGlide)
         {
             lastMonoGlide = mg;
+            monoShrinkTicks = 0;
+            applyMonoVoiceCount (mg);
+        }
+        else if (synth.getNumVoices() > (mg ? 1 : kPolyVoices))
+        {
+            // A shrink thrown under a held chord does not finish in one go: the notes it
+            // has to drop are faded first and the pool follows only once they are quiet
+            // (see applyMonoVoiceCount). This is the later tick that finishes it, and it
+            // costs one integer compare on every other tick there has ever been.
             applyMonoVoiceCount (mg);
         }
     }
@@ -2880,8 +2889,70 @@ void FractalAdditiveAudioProcessor::applyMonoVoiceCount (bool mono)
     const int want = mono ? 1 : kPolyVoices;
     while (synth.getNumVoices() < want)
         synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning, modEngine));
-    if (synth.getNumVoices() > want)
-        synth.reduceNumVoices (want);
+    if (synth.getNumVoices() <= want) { monoShrinkTicks = 0; return; }
+
+    // SHRINKING WITH KEYS DOWN. This is a panel switch and an automatable parameter, so
+    // it WILL be thrown mid-chord, and reduceNumVoices() on its own got two things wrong
+    // there - both of them audible.
+    //
+    //   * It DELETES sounding voices. A deleted voice stops mid-waveform: there is no
+    //     fade, because the object that would render one is gone.
+    //   * The wrong note survived. JUCE's findVoiceToSteal protects the lowest and the
+    //     topmost sounding notes and gives the LOWEST the final say, so the note left
+    //     ringing was the bottom of the chord - against this mode's own written contract,
+    //     which is last-note priority ("the newest key always wins; a low-note rule would
+    //     be a different instrument", MonoGlide.h). Measured on a 60/72/65 chord with 65
+    //     pressed last: the survivor was 60.
+    //
+    // One two-step shrink answers both. FADE FIRST: every sounding voice except the one
+    // the contract says to keep is ASKED to fade itself out over its own 5 ms fast kill,
+    // the same fade a voice steal already uses. The request is an atomic flag the voice
+    // consumes at the top of its own render (AdditiveVoice::requestFadeOut) rather than a
+    // call made from here, because beginFastKill() from the message thread would mutate
+    // ADSR state and currentlyPlayingNote underneath a block the audio thread is rendering
+    // and MPESynthesiser's voicesLock is not reachable from outside.
+    //
+    // DELETE SECOND, on a later 60 Hz tick, once those voices have gone quiet. That is
+    // also what makes the SURVIVOR right without any index surgery from this thread:
+    // findFreeVoice() hands reduceNumVoices the INACTIVE voices first, so the one still
+    // sounding is the one left standing, and every read of voice state that decides it
+    // happens inside JUCE, under its own lock.
+    int active = 0;
+    juce::MPESynthesiserVoice* held = nullptr;   // newest voice whose KEY is still down
+    juce::MPESynthesiserVoice* any  = nullptr;   // newest sounding voice, held or not
+    for (int v = 0; v < synth.getNumVoices(); ++v)
+    {
+        auto* mv = synth.getVoice (v);
+        if (mv == nullptr || ! mv->isActive()) continue;
+        ++active;
+        if (any == nullptr || mv->noteOnTime > any->noteOnTime) any = mv;
+        // A key that has been LET GO is not what "the last note" means: a released note is
+        // in its tail, and keeping the newest key still under the player's finger is the
+        // same rule MonoGlide's own held-key stack follows.
+        const auto ks = mv->getCurrentlyPlayingNote().keyState;
+        if (ks == juce::MPENote::keyDown || ks == juce::MPENote::keyDownAndSustained)
+            if (held == nullptr || mv->noteOnTime > held->noteOnTime) held = mv;
+    }
+    auto* keep = held != nullptr ? held : any;
+
+    if (active > want && monoShrinkTicks < kMonoShrinkTicks)
+    {
+        ++monoShrinkTicks;
+        // Re-asked every tick rather than once: a key pressed DURING the shrink takes the
+        // newest slot, and last-note priority has to follow it there too.
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive() && av != keep)
+                    av->requestFadeOut();
+        return;   // the delete waits for the fades; re-entered from the 60 Hz tick
+    }
+
+    // Either the fades have landed, or nothing is rendering them - a stopped transport, a
+    // bypassed plugin - and the mode's ONE-VOICE promise must not wait for ever on a voice
+    // that will never be asked for another sample. The cap is half a second of ticks;
+    // anything that could be heard faded a hundred times over before then.
+    monoShrinkTicks = 0;
+    synth.reduceNumVoices (want);
 }
 
 //==============================================================================

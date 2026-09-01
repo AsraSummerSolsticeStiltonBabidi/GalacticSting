@@ -1458,6 +1458,12 @@ private:
     // voice can bend through. Tracked here so switching back restores the real number.
     static constexpr int kPolyVoices = 32;
     bool lastMonoGlide = false;           // message thread: last value the voice pool follows
+    // The mono shrink is spread over 60 Hz ticks: the notes it has to drop are faded
+    // first and the pool follows once they are quiet (see applyMonoVoiceCount). The cap
+    // is the backstop for the case where nothing is rendering those fades at all - half a
+    // second, after which the ONE-VOICE promise is kept regardless.
+    int monoShrinkTicks = 0;
+    static constexpr int kMonoShrinkTicks = 30;
     void applyMonoVoiceCount (bool mono); // message thread; see the definition
     //== ADAPTIVE LOOKAHEAD (see LookaheadDelay.h) =============================
     LookaheadDelay laDelay;   // the MIDI is re-stamped `laSamples` later

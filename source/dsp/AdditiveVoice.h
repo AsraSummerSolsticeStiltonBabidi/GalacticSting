@@ -130,8 +130,26 @@ public:
     }
 
     //==========================================================================
+    // "FADE YOURSELF OUT." Message thread -> audio thread, for the MONO SHRINK: when the
+    // Monophonic Glide switch is thrown under a held chord the voice pool has to drop to
+    // one, and the notes that go must leave over a fade rather than be deleted
+    // mid-waveform. It is a REQUEST, not the act: calling beginFastKill() from the message
+    // thread would mutate this voice's ADSR state and currentlyPlayingNote underneath a
+    // block the audio thread is in the middle of rendering, and MPESynthesiser's
+    // voicesLock - the thing that makes its own paths safe - is not reachable from
+    // outside. So the flag is atomic and the VOICE consumes it, at the top of its own
+    // render, where nothing else can be touching it.
+    void requestFadeOut() noexcept { fadeRequest.store (true, std::memory_order_release); }
+
     void noteStarted() override
     {
+        // A new note VOIDS any pending fade request: the shrink that asked for it was
+        // about the note this voice used to hold. Cleared here because an inactive voice
+        // is never rendered, so a request that arrived just as the old note ended would
+        // otherwise sit armed and fast-kill the next note's attack - the same stuck-flag
+        // trap beginFastKill() documents.
+        fadeRequest.store (false, std::memory_order_relaxed);
+
         // An MTS-ESP master may leave this key unmapped -> it must not sound.
         if (tuning.shouldFilterNote ((int) currentlyPlayingNote.initialNote))
         {
@@ -409,6 +427,13 @@ public:
     //==========================================================================
     void renderNextBlock (juce::AudioBuffer<float>& output, int startSample, int numSamples) override
     {
+        // The mono shrink's fade request (see requestFadeOut), consumed on the only thread
+        // that is allowed to touch this voice's state. Skipped when a fade is already
+        // running: beginFastKill() on a voice whose envelope has already finished calls
+        // finishNote(), which would cut a fade already in progress short - the very step
+        // the request exists to avoid.
+        if (fadeRequest.exchange (false, std::memory_order_acquire) && ! fastKill)
+            beginFastKill();
         if (! adsr.isActive() && ! fastKill)
             return;
         // A ZERO-LENGTH render is not a block. JUCE's MPESynthesiser calls one on every
@@ -2063,6 +2088,9 @@ private:
     bool  fastKill = false;
     float fastKillGain = 1.0f;
     float fastKillDelta = 0.0f;
+    // Set by the message thread (requestFadeOut), consumed by renderNextBlock. The ONLY
+    // cross-thread write to this voice, and it is one atomic bool.
+    std::atomic<bool> fadeRequest { false };
     bool  releasing = false; // in the note-off release tail: freeze ADSR params (see updateAdsrParameters)
 
     //== MONOPHONIC GLIDE state (see noteStarted and advanceGlide) =============

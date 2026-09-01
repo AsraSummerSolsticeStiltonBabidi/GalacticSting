@@ -9642,6 +9642,36 @@ int main()
             for (int i = 0; i < win; ++i) { const double v = x[at + (size_t) i]; s2 += v * v; }
             return std::sqrt (s2 / (double) win);
         };
+        // A ONE-SAMPLE DISCONTINUITY, and the reference that says whether it is one.
+        // An RMS over any window is structurally blind to this: the energy is identical
+        // whether a term leaves the output in one sample or is ramped out over five
+        // milliseconds. So `edgeAt` is the single jump across the sample in question and
+        // `neighAt` is the biggest jump the same waveform makes in the millisecond either
+        // side of it - a ramp cannot beat that reference, and a cliff cannot help but.
+        // Used by (k) and (l), which are the two places a sounding voice is interfered
+        // with by something other than a note the player pressed.
+        auto edgeAt = [&] (size_t K) -> double
+        {
+            return (K == 0 || K >= x.size()) ? 0.0
+                 : std::abs ((double) x[K] - (double) x[K - 1]);
+        };
+        auto neighAt = [&] (size_t K, int w) -> double
+        {
+            double m = 0.0;
+            if (K < (size_t) w + 1 || K + (size_t) w + 1 >= x.size()) return m;
+            for (size_t i = K - (size_t) w; i + 1 < K; ++i)
+                m = std::max (m, std::abs ((double) x[i + 1] - (double) x[i]));
+            for (size_t i = K + 1; i + 1 < K + (size_t) w; ++i)
+                m = std::max (m, std::abs ((double) x[i + 1] - (double) x[i]));
+            return m;
+        };
+        auto peakOf = [&] (size_t at, int win) -> double
+        {
+            double m = 0.0;
+            for (int i = 0; i < win && at + (size_t) i < x.size(); ++i)
+                m = std::max (m, std::abs ((double) x[at + (size_t) i]));
+            return m;
+        };
 
         const double fLo = p->getNoteFrequency (60);
         const double fHi = p->getNoteFrequency (67);   // a fifth: two clearly separate pitches
@@ -10114,30 +10144,6 @@ int main()
         // pitch of the portamento, which legitimately makes the waveform steeper and
         // was enough to hide the cliff behind the note-on's honest cost.
         {
-            const size_t noSample = ~(size_t) 0;
-            auto edgeAt = [&] (size_t K) -> double
-            {
-                return (K == 0 || K >= x.size()) ? 0.0
-                     : std::abs ((double) x[K] - (double) x[K - 1]);
-            };
-            auto neighAt = [&] (size_t K, int w) -> double
-            {
-                double m = 0.0;
-                if (K < (size_t) w + 1 || K + (size_t) w + 1 >= x.size()) return m;
-                for (size_t i = K - (size_t) w; i + 1 < K; ++i)
-                    m = std::max (m, std::abs ((double) x[i + 1] - (double) x[i]));
-                for (size_t i = K + 1; i + 1 < K + (size_t) w; ++i)
-                    m = std::max (m, std::abs ((double) x[i + 1] - (double) x[i]));
-                return m;
-            };
-            auto peakOf = [&] (size_t at, int win) -> double
-            {
-                double m = 0.0;
-                if (at == noSample) return m;
-                for (int i = 0; i < win && at + (size_t) i < x.size(); ++i)
-                    m = std::max (m, std::abs ((double) x[at + (size_t) i]));
-                return m;
-            };
 
             // Same gesture twice: once with Morph ON (a crossfade really is in flight when
             // the second key lands) and once with it OFF (the control - there is no weight
@@ -10203,6 +10209,86 @@ int main()
             check (busyOn > 1.0e-9 && stepOn <= 1.2 * busyOn,
                    "and with a crossfade half way through, the note-on is STILL not a jump - "
                    "the weight is ramped out, not dropped");
+        }
+
+        //-- (l) SWITCHING THE MODE ON UNDER A HELD CHORD ---------------------------------
+        // The switch is automatable and lives on a panel, so it WILL be thrown with keys
+        // down. Dropping the pool to one voice means voices have to go, and two separate
+        // things were wrong with how they went.
+        //
+        //   * They were DELETED. reduceNumVoices() removes the voice objects outright, so
+        //     a sounding voice stopped mid-waveform - a step, not a fade.
+        //   * The WRONG one survived. JUCE's findVoiceToSteal protects the lowest and the
+        //     topmost sounding note and gives the lowest the final say, so the note left
+        //     playing was the BOTTOM of the chord. This mode's contract, written out in
+        //     MonoGlide.h, is last-note priority: "the newest key always wins; a low-note
+        //     rule would be a different instrument."
+        //
+        // The chord is pressed 60, 72, 65 so that the lowest note, the highest note and
+        // the last one pressed are three DIFFERENT keys. A test on a chord pressed in
+        // rising order cannot tell last-note priority from highest-note priority, and one
+        // pressed in falling order cannot tell it from lowest - either would have passed
+        // on the behaviour this block exists to reject.
+        {
+            fresh();
+            sp ("monoGlide", 0.0f);          // start polyphonic, with a real chord down
+            sp ("spectrumRange", 3.0f);      // a smooth tone: see (k)
+            awaitSpectrumIdle (*p, "run 48 (l): the chord's spectrum");
+            x.clear(); clk = 0;
+            pump (30, on (60));
+            pump (30, on (72));
+            pump (60, on (65));              // ...pressed LAST, and neither the lowest nor the highest
+            const int chordVoices = p->activeVoiceCountForTests();
+
+            const size_t L = x.size();       // the switch is thrown between these two blocks
+            sp ("monoGlide", 1.0f);
+            // The shrink is allowed to take a few ticks - the losers fade first and the
+            // pool follows once they are quiet - so the 60 Hz timer is driven here the way
+            // the host drives it, one call per rendered block.
+            int ticks = 0;
+            for (; ticks < 60 && p->synthVoiceCountForTests() > 1; ++ticks)
+            { pump (1, {}); p->pollParametersForTests(); }
+            pump (60, {});
+
+            const int    left  = p->activeVoiceCountForTests();
+            const int    pool  = p->synthVoiceCountForTests();
+            const double stayHz = p->voiceSoundingHzForTests();
+            const double heard  = f0At (L + (size_t) (0.150 * sr8), (int) (0.030 * sr8));
+            const double edge   = edgeAt (L);
+            const double neigh  = neighAt (L, (int) (0.001 * sr8));
+            const double pk     = peakOf (L - (size_t) (0.020 * sr8), (int) (0.020 * sr8));
+            // DID THE DROPPED NOTES FADE, OR VANISH? Compare the millisecond after the
+            // switch with the millisecond before it. A deleted voice takes its whole
+            // contribution with it at once, so two of three notes leaving cuts the level
+            // straight to about 1/sqrt(3); a 5 ms fade has barely started by then and the
+            // chord is still almost all there. This is the measurement, not the
+            // one-sample edge above: dropping notes from a chord is SUPPOSED to lower the
+            // level, and what is being asserted is that it lowers it over time.
+            const int    wMs    = (int) (0.001 * sr8);
+            const double rB     = rmsAt (L - (size_t) wMs, wMs);
+            const double rA     = rmsAt (L, wMs);
+            const double keepR  = rB > 1.0e-9 ? rA / rB : -1.0;
+            const double wantHz = p->getNoteFrequency (65);
+            std::printf ("  chord 60/72/65 (65 pressed last), then the switch: %d voice(s) before, %d after, "
+                         "pool %d, settled on %.2f Hz (last key %.2f, lowest %.2f), heard %.2f Hz\n",
+                         chordVoices, left, pool, stayHz, wantHz, p->getNoteFrequency (60), heard);
+            std::printf ("  the jump ACROSS the switch is %.5f, the biggest jump 1 ms either side is %.5f "
+                         "(%.1fx), peak %.5f, shrink took %d tick(s)\n",
+                         edge, neigh, neigh > 1.0e-12 ? edge / neigh : -1.0, pk, ticks);
+            std::printf ("  RMS of the millisecond after the switch / the millisecond before it: %.3f "
+                         "(%.5f -> %.5f)\n", keepR, rB, rA);
+            check (chordVoices == 3, "the rig is armed: three keys really were sounding on three voices");
+            check (pool == 1, "the pool does end up at ONE voice - the mode's promise is kept");
+            check (left == 1, "...and exactly one note is left sounding");
+            check (stayHz > 0.0 && std::abs (1200.0 * std::log2 (stayHz / wantHz)) < 5.0,
+                   "...and it is the note pressed LAST, not the lowest one JUCE would have protected");
+            check (heard > 0.0 && std::abs (1200.0 * std::log2 (heard / wantHz)) < 25.0,
+                   "...which is also the pitch the rendered audio settles on");
+            check (keepR > 0.8,
+                   "...and the notes it had to drop LEAVE OVER A FADE - a millisecond after the "
+                   "switch the chord is still nearly all there, not cut to a third");
+            check (neigh > 1.0e-9 && edge <= 1.2 * neigh,
+                   "...with no one-sample step across the switch either");
         }
 
         sp ("monoGlide", 0.0f);
