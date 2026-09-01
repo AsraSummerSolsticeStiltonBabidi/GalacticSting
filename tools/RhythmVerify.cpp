@@ -7000,6 +7000,188 @@ int main()
             }
         }
 
+        // RULE 7: A CORNER-EDIT SESSION IS NOT PART OF THE LIVE PATCH'S HISTORY.
+        //
+        // The scratch surface writes through the SAME UndoManager as the live patch, so
+        // every knob turned and every partial drawn while editing a corner used to land
+        // on the live patch's undo stack as a step that WRITES INTO THE LIVE PATCH.
+        // Measured before the fix, with the whole gesture available in the shipped GUI
+        // (enter corner edit, drag the pencil, click OK, press Ctrl+Z):
+        //   after leaving edit mode  gains=1 [120000:-9.00]   <- the user's own drawing
+        //   after one Ctrl+Z         gains=0                  <- WIPED, and not by them
+        //   after Ctrl+Y             gains=1 [190196:11.00]   <- the CORNER's drawing,
+        //                                                        now on the live patch
+        // Hand-drawn amplitudes are not recoverable from anywhere else, so that first
+        // Ctrl+Z destroyed work. Raw undoManager.undo() on purpose: the stack itself has
+        // to be clean, not merely the one key path the editor happens to use.
+        {
+            std::printf ("  -- undo after a corner-edit session (rule 7) --\n");
+            // MIX MODE, for the same reason the top of this block uses it: in MORPH the
+            // blend rewrites every continuous control sixty times a second, so a live
+            // parameter proves nothing about who wrote it. In MIX the playground writes
+            // nothing to the live patch, so a knob that moved, moved because undo moved it.
+            sp ("pgMode", 1.0f);
+            tick (6);
+            // A PARAMETER ONLY REACHES THE UNDO STACK ON APVTS'S OWN TIMER, never
+            // synchronously - and this harness has no message loop to run that timer, so
+            // the parameter half of this defect is INVISIBLE by default: the knob checks
+            // below would pass on a build that still drops a corner's values onto the
+            // live patch. This is APVTS::flushParameterValuesToValueTree by hand (private
+            // there, and runDispatchLoopUntil is compiled out without modal loops): the
+            // same property write, with the same undo manager. Writing a value the tree
+            // already holds records nothing, so this only ever pushes REAL changes.
+            auto settle = [&]
+            {
+                tick (4);
+                for (auto* ap : p->getParameters())
+                    if (auto* q = dynamic_cast<juce::RangedAudioParameter*> (ap))
+                        if (auto ch = p->apvts.state.getChildWithProperty ("id", q->paramID); ch.isValid())
+                            ch.setProperty ("value", (double) q->convertFrom0to1 (q->getValue()),
+                                            &p->undoManager);
+            };
+            std::vector<spectrum::PartialGain> liveG;
+            spectrum::setPartialGain (liveG, spectrum::gainKey (3.0), -9.0f);
+            p->commitPartialGains (p->getPartialGains(), liveG);
+            tick (2);
+            settle();
+            const auto  liveGains = p->getPartialGains();
+            const float liveCut   = gp ("filterCutoff");
+            check (liveGains.size() == 1, "the live patch carries a hand-drawn partial to lose");
+            // THE USER'S OWN LAST EDIT, and deliberately a PARAMETER rather than the
+            // drawing: it is what the first Ctrl+Z after the session is supposed to land
+            // on, and keeping it distinct from the spectrum is what stops "undo ate the
+            // drawing" and "undo did its job" from looking the same in this output.
+            // A step of its own, so "undo took the drawing back" and "undo took the knob
+            // back" cannot be read off the same line of output.
+            p->undoManager.beginNewTransaction();
+            const float gainWas = gp ("masterGain");
+            sp ("masterGain", -3.0f);
+            settle();
+            // ...and it has to be a STEP OF ITS OWN, or the session's writes coalesce into
+            // it and one Ctrl+Z would legitimately take both back - which would hide the
+            // defect instead of measuring it. Plain knob turns share a transaction until
+            // something opens a new one, and the pencil, the tuning box and the spectrum
+            // box all do, so this is the stack any of them leaves behind.
+            p->undoManager.beginNewTransaction();
+            const float cornerCutWas  = p->getPlaygroundCornerParamForTests (1, "filterCutoff");
+            const bool  cornerStarWas = p->isPlaygroundCornerEdited (1);   // earlier blocks left it starred
+
+            check (p->beginPlaygroundCornerEdit (1), "entering a corner-edit session");
+            tick (3);
+            sp ("filterCutoff", 6543.0f);   // a knob turned INSIDE the corner's session
+            tick (20);
+            settle();
+            std::vector<spectrum::PartialGain> cornerG;   // ...and a pencil drag in it
+            spectrum::setPartialGain (cornerG, spectrum::gainKey (7.0), 11.0f);
+            // THE INVARIANT ITSELF, not only its downstream effect: nothing this plugin
+            // mints may reach the live patch's stack while a session is open. The unwind
+            // on the way out hides a breach of this in the ordinary case - and the one
+            // case it cannot cover, a boundary marker dropped off the bottom of a full
+            // stack, is exactly where a stray PartialGainsAction is the unrecoverable
+            // one: a parameter left behind is a number, a wiped drawing is gone.
+            const int stackInSession = p->undoManager.getUndoDescriptions().size();
+            p->commitPartialGains (p->getPartialGains(), cornerG);
+            check (p->undoManager.getUndoDescriptions().size() == stackInSession,
+                   "a pencil drag inside a corner-edit session puts NO step on the live patch's stack");
+            tick (4);
+            settle();
+
+            // A BARE Ctrl+Z INSIDE THE SESSION had no edit-mode gate at all: it unwound
+            // the LIVE patch's history into the scratch surface, the next pull absorbed
+            // the result into the corner, and the "*" then blamed the user for a change
+            // they never made. UndoManager::undo() unwinds the currently-open transaction
+            // too, so there was no grace period to hide behind - measured inside the
+            // first second: "fast undo: surface 4000 (starred yes); corner B now reads
+            // 4000 (saved 9000)". There is no per-corner history to walk instead, so the
+            // honest answer is to refuse.
+            {
+                const float surfaceWas = gp ("filterCutoff");
+                const float storedWas  = p->getPlaygroundCornerParamForTests (1, "filterCutoff");
+                check (! p->performUndo(),
+                       "Ctrl+Z INSIDE a corner-edit session is refused - a corner has no history of its own");
+                check (! p->performRedo(), "...and so is Ctrl+Y, for the same reason");
+                tick (8);
+                std::printf ("    inside the session: surface %.0f -> %.0f, corner B stored %.0f -> %.0f\n",
+                             surfaceWas, gp ("filterCutoff"), storedWas,
+                             p->getPlaygroundCornerParamForTests (1, "filterCutoff"));
+                check (std::abs (gp ("filterCutoff") - surfaceWas) < 1.0f,
+                       "...so it cannot unwind the live patch's history into the scratch surface");
+                check (std::abs (p->getPlaygroundCornerParamForTests (1, "filterCutoff") - storedWas) < 1.0f,
+                       "...nor replace the corner's stored sound with a copy of the live patch");
+            }
+
+            p->endPlaygroundCornerEdit();   // the OK button
+            tick (4);
+            settle();                       // whatever leaving wrote back reaches the stack too
+
+            auto sameAsLive = [&]
+            {
+                const auto g = p->getPartialGains();
+                if (g.size() != liveGains.size()) return false;
+                for (size_t i = 0; i < g.size(); ++i)
+                    if (g[i].key != liveGains[i].key || std::abs (g[i].dB - liveGains[i].dB) > 1.0e-4f)
+                        return false;
+                return true;
+            };
+            auto show = [&] (const char* when)
+            {
+                const auto g = p->getPartialGains();
+                juce::String what = g.empty() ? juce::String ("-")
+                                              : juce::String (g[0].key) + ":" + juce::String (g[0].dB, 2);
+                std::printf ("    %-24s gains=%d [%s] cutoff=%.0f masterGain=%.2f  stack=%d/%s\n",
+                             when, (int) g.size(), what.toRawUTF8(), gp ("filterCutoff"), gp ("masterGain"),
+                             p->undoManager.getUndoDescriptions().size(),
+                             p->undoManager.canRedo() ? "redoable" : "end");
+            };
+            std::printf ("    (the user's own last edit was masterGain %.2f -> -3.00)\n", gainWas);
+            show ("after leaving edit mode");
+            check (sameAsLive(), "leaving edit mode hands the hand-drawn spectrum back");
+
+            p->undoManager.undo();
+            tick (4);
+            show ("after one Ctrl+Z");
+            check (sameAsLive(),
+                   "one Ctrl+Z after a corner-edit session does NOT wipe the user's own hand-drawn spectrum");
+            check (std::abs (gp ("filterCutoff") - liveCut) < 1.0f,
+                   "...and does not drop the corner's knob values onto the live patch either");
+            // WHAT IT LANDS ON INSTEAD. The session is now ONE step, and that step writes
+            // only the corner: undoing it takes the corner's edits back (something this
+            // feature never had at all) and leaves the live patch alone. It is also the
+            // only way to clear the redo stack the unwind fills - JUCE drops future
+            // transactions when an action is performed and by no other route - so the
+            // choice is this step or a Ctrl+Y that can still reinstall a corner.
+            std::printf ("    corner B's stored cutoff: saved %.0f, edited to 6543, now %.0f (starred %s)\n",
+                         cornerCutWas, p->getPlaygroundCornerParamForTests (1, "filterCutoff"),
+                         p->isPlaygroundCornerEdited (1) ? "yes" : "no");
+            check (std::abs (p->getPlaygroundCornerParamForTests (1, "filterCutoff") - cornerCutWas) < 1.0f
+                   && p->isPlaygroundCornerEdited (1) == cornerStarWas,
+                   "...it lands on the corner-edit session as ONE step: the corner's edits and its * go back");
+            check (std::abs (gp ("masterGain") + 3.0f) < 0.01f,
+                   "...and the user's own last edit is untouched by it");
+
+            p->undoManager.undo();
+            tick (4);
+            show ("after a second Ctrl+Z");
+            check (std::abs (gp ("masterGain") - gainWas) < 0.01f,
+                   "...so the NEXT Ctrl+Z is the user's own last edit, which is what undo is for");
+            check (sameAsLive(), "...and the hand-drawn spectrum is still theirs at that point too");
+
+            p->undoManager.redo();          // the user's own edit comes forward first
+            tick (4);
+            check (std::abs (gp ("masterGain") + 3.0f) < 0.01f,
+                   "redo brings the user's own edit forward again, as it always did");
+            p->undoManager.redo();          // ...and then the corner-edit session
+            tick (4);
+            show ("after Ctrl+Y, Ctrl+Y");
+            check (std::abs (p->getPlaygroundCornerParamForTests (1, "filterCutoff") - 6543.0f) < 1.0f
+                   && p->isPlaygroundCornerEdited (1),
+                   "...and redo puts the corner's edits back ON THE CORNER, * and all");
+            check (sameAsLive(),
+                   "...never installing the CORNER's drawing on the live patch");
+            check (std::abs (gp ("filterCutoff") - liveCut) < 1.0f,
+                   "...nor the corner's knobs");
+        }
+
         fA.deleteFile(); fB.deleteFile(); fS.deleteFile();
         check (! fA.existsAsFile() && ! fB.existsAsFile() && ! fS.existsAsFile(),
                "the corner-edit verifier's presets are cleaned up");

@@ -8339,8 +8339,14 @@ bool FractalAdditiveAudioProcessorEditor::keyPressed (const juce::KeyPress& key)
     const int  period = juce::jmax (1, processorRef.getScaleDegrees());
     // Ctrl-Z / Ctrl-Y: undo / redo any parameter change (also reachable in the DAW
     // because the editor swallows them while focused).
-    if (key == juce::KeyPress ('z', juce::ModifierKeys::ctrlModifier, 0)) { processorRef.undoManager.undo(); return true; }
-    if (key == juce::KeyPress ('y', juce::ModifierKeys::ctrlModifier, 0)) { processorRef.undoManager.redo(); return true; }
+    // THROUGH THE PROCESSOR, never straight at the undo manager: a bare Ctrl+Z here had
+    // no edit-mode gate, so inside a corner-edit session it unwound the LIVE patch's
+    // history into the scratch surface, the next pull absorbed that into the corner, and
+    // the "*" then blamed the user for a change they never made. performUndo() refuses
+    // while a corner is being edited. The key is still consumed either way - it is being
+    // deliberately swallowed, not passed on to something else to act on.
+    if (key == juce::KeyPress ('z', juce::ModifierKeys::ctrlModifier, 0)) { processorRef.performUndo(); return true; }
+    if (key == juce::KeyPress ('y', juce::ModifierKeys::ctrlModifier, 0)) { processorRef.performRedo(); return true; }
     // Left/right arrows scroll the colour keyboard's visible window by one period.
     if (key == juce::KeyPress::leftKey)  { keyboard.scrollView (-period); return true; }
     if (key == juce::KeyPress::rightKey) { keyboard.scrollView ( period); return true; }

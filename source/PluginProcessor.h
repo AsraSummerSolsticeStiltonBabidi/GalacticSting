@@ -191,6 +191,11 @@ public:
         // to go back to, so undoing a typed spectrum back to an adapted one silently
         // lost its "Load spectrum's tuning" button (caught by RhythmVerify b2). The
         // same order protects `before` = timbreSource, which the load overwrites too.
+        // RULE 7: TimbreTextAction has PartialGainsAction's shape - it always writes the
+        // LIVE spectrum - so a copy of it minted while a corner is being edited is the
+        // same data-loss bug with a typed scale instead of a drawn one. The corner picks
+        // the text up from pullPlaygroundCornerEdit like every other edit in a session.
+        if (pgEditCorner >= 0) return loadTimbreText (text, errorOut);
         std::unique_ptr<TimbreTextAction> act (new TimbreTextAction (*this, timbreSource, text));
         if (! loadTimbreText (text, errorOut)) return false;   // rejected: nothing is pushed
         undoManager.beginNewTransaction();
@@ -206,6 +211,7 @@ public:
     void clearTimbreUndoable()
     {
         if (timbreSource.isEmpty() && timbreDegrees.empty()) return;
+        if (pgEditCorner >= 0) { clearTimbre(); return; }   // rule 7, as above
         const auto before = timbreSource;
         undoManager.beginNewTransaction();
         undoManager.perform (new TimbreTextAction (*this, before, juce::String()));
@@ -524,8 +530,42 @@ public:
                              bool startNewTransaction = true)
     {
         if (before == after) return;                 // a click that moved nothing
+        // RULE 7: while a corner is being edited the pencil is drawing THAT CORNER, not
+        // the live patch - but this action always writes the LIVE gains, so a copy of it
+        // left on the shared stack is what wiped a hand-drawn spectrum one Ctrl+Z after
+        // leaving edit mode (gains=1 -> gains=0, and redo then installed the corner's
+        // drawing). The edit still reaches the corner: pullPlaygroundCornerEdit reads
+        // getPartialGains() every tick and the corner's own rev carries it.
+        if (pgEditCorner >= 0)
+        {
+            setPartialGains (std::move (after),
+                             apvts.getRawParameterValue ("partialManual")->load() > 0.5f);
+            return;
+        }
         if (startNewTransaction) undoManager.beginNewTransaction();
         undoManager.perform (new PartialGainsAction (*this, std::move (before), std::move (after)));
+    }
+
+    //== UNDO / REDO, THROUGH THE PROCESSOR ======================================
+    // The editor's Ctrl+Z used to call undoManager.undo() straight. Inside a corner-edit
+    // session that unwound the LIVE PATCH's history into the scratch surface, and the
+    // next pull absorbed the result into the corner and stamped it with the "*" - so the
+    // honesty mark blamed the user for a change they never made. Measured inside the
+    // first second of a session: "fast undo: surface 4000 (starred yes); corner B now
+    // reads 4000 (saved 9000)". UndoManager::undo() unwinds the currently-open
+    // transaction too, so there is no grace period to hide behind.
+    //
+    // There is no per-corner history to walk instead, so the honest answer is to refuse.
+    // Returns false when nothing was done, so a caller can say so.
+    bool performUndo()
+    {
+        if (pgEditCorner >= 0) return false;   // a corner has no history of its own
+        return undoManager.undo();
+    }
+    bool performRedo()
+    {
+        if (pgEditCorner >= 0) return false;
+        return undoManager.redo();
     }
 
     // THE FIRST PENCIL EDIT OF A SESSION SWITCHES MANUAL MODE ON, ITSELF.
@@ -565,7 +605,13 @@ public:
         // that timer fires is the one that gets it. Opening ours now and telling
         // commitPartialGains not to open another puts the flip and the edit in the same
         // one whether the flush lands mid-drag or after the mouse comes up.
-        undoManager.beginNewTransaction();
+        //
+        // RULE 7: not while a corner is being edited. Opening a transaction there starts
+        // a step on the LIVE patch's stack for a flip that belongs to the corner, and the
+        // corner's own rev already carries it. (commitPartialGains pushes nothing in a
+        // session either, so there is no split gesture to protect against here.)
+        if (pgEditCorner < 0)
+            undoManager.beginNewTransaction();
 
         manualSlopeFrozen = apvts.getRawParameterValue ("curveSlope")->load();
         lastManualMode    = true;
@@ -1777,6 +1823,84 @@ private:
     // would appear the instant Edit was pressed, on a corner nobody had touched. That
     // makes the warning meaningless, which is worse than not having it.
     bool pgEditPrimed = false;
+
+    //== RULE 7: A CORNER-EDIT SESSION IS NOT PART OF THE LIVE PATCH'S HISTORY ===
+    //
+    // The scratch surface writes through the SAME UndoManager as the live patch. Every
+    // knob turned and every partial drawn while editing a corner therefore landed on the
+    // live patch's undo stack as a step that WRITES INTO THE LIVE PATCH, and the whole
+    // gesture is one the shipped GUI offers: Edit a corner, drag the pencil, click OK,
+    // press Ctrl+Z. Measured before this fix:
+    //     after leaving edit mode  gains=1 [190196:-9.00] cutoff=1611
+    //     after one Ctrl+Z         gains=0               cutoff=6543
+    //     after Ctrl+Y             gains=1 [336883:11.00] cutoff=1611
+    // - the user's hand-drawn spectrum wiped, the corner's cutoff on the live patch, and
+    // redo installing the CORNER's drawing there. Hand-drawn amplitudes exist nowhere
+    // else, so that first keystroke destroyed work with no way back.
+    //
+    // The cure is that the session leaves the stack as it found it. Two halves:
+    //   * the actions this file mints (gains, timbre) are simply not minted while a
+    //     session is open - the corner's own rev carries the edit;
+    //   * the APVTS parameter writes cannot be intercepted (APVTS holds the undo manager
+    //     by const pointer and flushes on its own timer), so they are UNWOUND on the way
+    //     out, back through a boundary marker pushed on the way in.
+    //
+    // Undoing is not the same as dropping, and dropping is what one would want - but
+    // JUCE's UndoManager cannot drop transactions. clearUndoHistory() takes the user's
+    // own history with it, which is the same data-loss bug wearing a different hat.
+    //
+    // The marker itself. It does nothing to the patch in either direction; it exists so
+    // the unwind knows where the session's own transactions start and, above all, where
+    // to STOP - undoing one transaction too many would eat the user's own last edit.
+    struct CornerEditBoundaryAction : public juce::UndoableAction
+    {
+        explicit CornerEditBoundaryAction (FractalAdditiveAudioProcessor& p) : proc (p) {}
+        bool perform() override { return true; }   // a marker performs nothing
+        bool undo()    override { proc.pgEditUnwound = true; return true; }
+        int  getSizeInUnits() override { return 16; }
+        FractalAdditiveAudioProcessor& proc;
+    };
+    // ...and the ONE step the whole session leaves behind, in place of the dozens it used
+    // to leave. It writes only the CORNER - never the live patch - so neither Ctrl+Z nor
+    // Ctrl+Y can put somebody's corner on the user's sound. It is also the only way to
+    // clear the redo stack the unwind fills: JUCE drops future transactions when a new
+    // action is performed and by no other route. Undoing it takes back the corner edits,
+    // which is a step this feature never had at all.
+    struct CornerEditSessionAction : public juce::UndoableAction
+    {
+        CornerEditSessionAction (FractalAdditiveAudioProcessor& p, int c,
+                                 PlaygroundCorner prev, PlaygroundCorner next)
+            : proc (p), corner (c), after (std::move (next)), before (std::move (prev)) {}
+        bool perform() override { return applyOne (after); }
+        bool undo()    override { return applyOne (before); }
+        int  getSizeInUnits() override
+        { return (int) ((before.params.size() + after.params.size()) * sizeof (float)) + 512; }
+        bool applyOne (const PlaygroundCorner& c)
+        {
+            auto& dst = proc.pgCorner[(size_t) corner];
+            const int rev = dst.rev;
+            dst = c;
+            // The mix sub-engine keys its bank refill on rev, and the blend needs a
+            // generation bump: without both, taking the edits back would be inaudible
+            // until something else happened to recompile the spectrum.
+            dst.rev = rev + 1;
+            proc.pgDirty = true;
+            return true;
+        }
+        FractalAdditiveAudioProcessor& proc;
+        int corner;
+        PlaygroundCorner after, before;
+    };
+    // Raised by the marker's undo(): "the unwind has reached the start of the session".
+    bool pgEditUnwound = false;
+    // The corner as it stood BEFORE the session, so leaving can hand the session to
+    // CornerEditSessionAction as one undoable step.
+    PlaygroundCorner pgEditCornerBefore;
+    // How deep the undo stack was once the marker was on it. The unwind stops on the
+    // marker; this stops it anyway if the marker has been dropped off the bottom of a
+    // full stack, because unwinding past it would be eating the user's own history.
+    int pgEditStackDepth = 0;
+
     // Write corner `corner`'s stored values onto the live control surface, and read the
     // surface back into the corner. Both skip every parameter presetmorph excludes -
     // the tuning, the reference, the transpose and the playground's own point are NOT

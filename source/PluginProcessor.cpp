@@ -4799,6 +4799,17 @@ bool FractalAdditiveAudioProcessor::beginPlaygroundCornerEdit (int corner)
     pgEditCompilePending  = false;
     pgEditPrimed          = false;   // the next pull is the baseline, not an edit
 
+    // RULE 7: FENCE THE SESSION OFF FROM THE LIVE PATCH'S UNDO HISTORY (see the block
+    // above CornerEditBoundaryAction). The marker goes down BEFORE the pin and before
+    // pushCornerToLiveSurface, because both of those write parameters and a parameter
+    // write is a step on the shared stack that puts corner values on the live patch when
+    // it is undone. `pgEditCornerBefore` is what makes the whole session one undoable
+    // step on the way out.
+    pgEditCornerBefore = pgCorner[(size_t) corner];
+    undoManager.beginNewTransaction();
+    undoManager.perform (new CornerEditBoundaryAction (*this));
+    pgEditStackDepth = undoManager.getUndoDescriptions().size();
+
     // Rule 6: morph mode pins the point onto the corner being edited.
     if (! isPlaygroundMixMode())
         for (const char* id : { "pgX", "pgY" })
@@ -4817,7 +4828,36 @@ bool FractalAdditiveAudioProcessor::beginPlaygroundCornerEdit (int corner)
 void FractalAdditiveAudioProcessor::endPlaygroundCornerEdit()
 {
     if (pgEditCorner < 0) return;
+    const int corner = pgEditCorner;
     pgEditCorner = -1;
+
+    // RULE 7: TAKE THE SESSION BACK OFF THE SHARED UNDO STACK, first, before anything
+    // else is written. Every transaction minted while the controls were a scratch
+    // surface writes into the LIVE patch when undone or redone: that is what wiped a
+    // hand-drawn spectrum on the first Ctrl+Z after leaving and let Ctrl+Y install the
+    // corner's own drawing on the user's sound.
+    //
+    // Undoing them (JUCE cannot drop transactions, and clearUndoHistory() would take the
+    // user's own history with it) also walks every parameter back to what the live patch
+    // had, which the explicit restore below then confirms value by value.
+    //
+    // TWO stop conditions, because unwinding one transaction too far eats the user's own
+    // last edit: the marker's undo() raises pgEditUnwound, and the depth guard catches
+    // the case where the marker has been dropped off the bottom of a full stack. Erring
+    // towards leaving residue beats erring towards eating history.
+    const auto cornerAfter = pgCorner[(size_t) corner];
+    pgEditUnwound = false;
+    bool unwound  = false;
+    while (! pgEditUnwound
+           && undoManager.canUndo()
+           && undoManager.getUndoDescriptions().size() >= pgEditStackDepth)
+    {
+        undoManager.undo();
+        unwound = true;
+    }
+    // The session's edits belong to the CORNER, and the unwind is about the live patch's
+    // history only - nothing it undoes may take the corner's own content with it.
+    pgCorner[(size_t) corner] = cornerAfter;
 
     // Hand the LIVE PATCH back. Deliberately NOT restoreState(): that would re-read
     // every corner's .gsting from disk (its PLAYGROUND child re-assigns them), which
@@ -4901,6 +4941,22 @@ void FractalAdditiveAudioProcessor::endPlaygroundCornerEdit()
 
     pgEditLiveState = {};
     pgEditLivePresetSnap.clear();
+
+    // RULE 7, the other half: ONE STEP for the whole session, in place of the dozens it
+    // used to leave. It writes only the corner, so no direction of it can reach the live
+    // patch - and performing it is the only way to clear the redo stack the unwind just
+    // filled, because JUCE drops future transactions on a new action and by no other
+    // route. Skipped when the session minted nothing: there is then no redo stack to
+    // clear and a step that does nothing is a Ctrl+Z that appears broken.
+    if (unwound)
+    {
+        undoManager.beginNewTransaction ("corner edit");
+        undoManager.perform (new CornerEditSessionAction (*this, corner,
+                                                          pgEditCornerBefore, cornerAfter));
+    }
+    pgEditCornerBefore = {};
+    pgEditStackDepth   = 0;
+
     pgDirty = true;   // the morph owns the controls again: re-apply EVERYTHING
 }
 
