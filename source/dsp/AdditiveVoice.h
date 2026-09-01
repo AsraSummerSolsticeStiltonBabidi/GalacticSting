@@ -292,8 +292,44 @@ public:
         // spectrum, then snap abruptly when the stale morph finishes. prevN=0 also makes
         // the first block cleanly SNAP curRatio onto the current template (a frequency
         // snap with continuous phase = click-free) instead of gliding from a stale ratio.
-        morphActive = false; morphPos = 1.0; prevN = 0; morphWeight = 0.0;
-        morphWPos = 0.0; morphFadeOut = false; xfadeActive = false; xfadeAmpSnap = false;
+        //
+        // ...but THE CROSSFADE WEIGHT IS NOT PART OF THAT RESET when the voice is
+        // sounding. This file states one invariant about it - alignPhase[] may be written
+        // only at weight 0 and phase[] only at weight 1 - because at any weight in between
+        // BOTH banks are audible, and zeroing the weight outright removes
+        // morphWeight * (aligned - running) from every partial in a single sample. That is
+        // exactly the coherent step the fade-out path a few hundred lines below exists to
+        // avoid, and its comment already says so.
+        //
+        // The reset predates the crossfade and for years nothing hit it, because a steal
+        // re-attacked the amplitude envelope and the re-attack masked the step. MONO GLIDE
+        // removed both excuses at once: one voice means every second note is a steal, and
+        // the legato rule deliberately suppresses that re-attack - while templates now
+        // arrive in streams (10 Hz drag bumps, the realtime follower), so a note-on landing
+        // mid-crossfade is the ordinary case rather than a coincidence. Measured on a
+        // mono-glide takeover 213 ms into a 300 ms morph (weight 0.506): the jump across
+        // the note-on was 0.00172 against 0.00116 for the biggest jump the same waveform
+        // made in the millisecond either side of it, and 0.00008 for the identical takeover
+        // with Morph off - 21x, on a one-sample discontinuity no window RMS can see.
+        //
+        // So: ramp it out instead. morphFadeOut makes the render loop walk the weight down
+        // over 5 ms while the new note's ratios snap in, and the block-end handler clears
+        // the rest of the morph state the moment it lands. xfadeActive is deliberately left
+        // standing for the same reason the fade-out path leaves it: under a Dry/Wet
+        // transition the ramp still renders the incoming bank at its own amplitudes.
+        // Guarded on `reuse` - a voice that is not sounding has no step to make, and a cold
+        // note re-seeds phase[] from scratch, so keeping a stale aligned bank alive across
+        // it would be a ghost of the previous note rather than a fade of this one.
+        if (reuse && morphActive && morphWeight > 1.0e-6)
+        {
+            morphFadeOut = true;
+            morphPos = 1.0; prevN = 0; morphWPos = 0.0;
+        }
+        else
+        {
+            morphActive = false; morphPos = 1.0; prevN = 0; morphWeight = 0.0;
+            morphWPos = 0.0; morphFadeOut = false; xfadeActive = false; xfadeAmpSnap = false;
+        }
         // The amp glide starts a note at the 7 ms de-click minimum, steal included: a
         // stolen voice's amplitudes must hand over to the NEW note in milliseconds, not
         // inherit a seconds-long constant from the old note's in-flight morph.
@@ -1424,6 +1460,13 @@ public:
     double soundingHzForTests() const noexcept
     { return pitchLogValid ? std::exp2 (lastPitchLog) : 0.0; }
     bool   glidingForTests() const noexcept { return glideLeft > 0; }
+    // The morph/crossfade weight this voice ended its last block on: 0 = the running bank
+    // alone, 1 = the aligned bank alone, anything between = BOTH audible. Verifiers only,
+    // and it exists because the invariant this file states ("alignPhase written only at
+    // weight 0, phase only at weight 1") is otherwise unmeasurable - a test that fires a
+    // note-on mid-crossfade has to be able to say the crossfade really was mid-flight,
+    // rather than measuring nothing and calling it a pass.
+    double morphWeightForTests() const noexcept { return morphActive ? morphWeight : 0.0; }
 
     double shepRiseRatioForTests() const noexcept { return std::exp2 (smShepP); }
     bool   shepActiveForTests()    const noexcept { return shepActive; }

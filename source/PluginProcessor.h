@@ -454,6 +454,13 @@ public:
                 if (av->isActive()) return av->glidingForTests();
         return false;
     }
+    double voiceMorphWeightForTests() const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) return av->morphWeightForTests();
+        return 0.0;
+    }
     // Voices in one playground MIX sub-engine (-1 when that corner has no engine).
     // Declared here, defined after kPlaygroundCorners exists.
     int mixVoiceCountForTests (int corner) const noexcept;

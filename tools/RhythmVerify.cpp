@@ -10089,6 +10089,122 @@ int main()
             }
         }
 
+        //-- (k) A TAKEOVER MID-MORPH RAMPS THE CROSSFADE OUT - it does not drop it -------
+        // AdditiveVoice states one invariant about the morph crossfade: alignPhase[] may
+        // only be written at weight 0 and phase[] only at weight 1, because at any weight
+        // in between BOTH banks are audible and moving either one is a coherent step in
+        // every partial at once. The note-on reset zeroed morphWeight outright, which is
+        // the same step taken from the other side: the aligned bank's whole contribution
+        // left the output between two samples.
+        //
+        // The reset predates the crossfade, and for a long time nothing hit it: a steal
+        // re-attacked the amplitude envelope, which masked the step. MONO GLIDE removed
+        // both excuses - one voice means every second note is a steal, and the legato rule
+        // deliberately suppresses that re-attack - while templates now arrive in streams
+        // (10 Hz drag bumps, the realtime follower), so a note landing mid-morph is the
+        // normal case rather than a coincidence.
+        //
+        // The metric is ONE SAMPLE WIDE and it has to be: run 48's steal check is an RMS
+        // over a 5 ms window, and a one-sample cliff is invisible to it - the energy is
+        // identical whether the weight leaves in one sample or is ramped out over five
+        // milliseconds. So what is measured is the single jump ACROSS the note-on
+        // boundary, against the biggest jump the very same waveform makes in the
+        // millisecond either side of it. A ramp cannot beat that reference; a cliff
+        // cannot help but. Measuring over a window instead would fold in the rising
+        // pitch of the portamento, which legitimately makes the waveform steeper and
+        // was enough to hide the cliff behind the note-on's honest cost.
+        {
+            const size_t noSample = ~(size_t) 0;
+            auto edgeAt = [&] (size_t K) -> double
+            {
+                return (K == 0 || K >= x.size()) ? 0.0
+                     : std::abs ((double) x[K] - (double) x[K - 1]);
+            };
+            auto neighAt = [&] (size_t K, int w) -> double
+            {
+                double m = 0.0;
+                if (K < (size_t) w + 1 || K + (size_t) w + 1 >= x.size()) return m;
+                for (size_t i = K - (size_t) w; i + 1 < K; ++i)
+                    m = std::max (m, std::abs ((double) x[i + 1] - (double) x[i]));
+                for (size_t i = K + 1; i + 1 < K + (size_t) w; ++i)
+                    m = std::max (m, std::abs ((double) x[i + 1] - (double) x[i]));
+                return m;
+            };
+            auto peakOf = [&] (size_t at, int win) -> double
+            {
+                double m = 0.0;
+                if (at == noSample) return m;
+                for (int i = 0; i < win && at + (size_t) i < x.size(); ++i)
+                    m = std::max (m, std::abs ((double) x[at + (size_t) i]));
+                return m;
+            };
+
+            // Same gesture twice: once with Morph ON (a crossfade really is in flight when
+            // the second key lands) and once with it OFF (the control - there is no weight
+            // to drop, so whatever this arm measures is the takeover's honest cost).
+            double stepOn = 0.0, busyOn = 0.0, pkOn = 0.0, wOn = 0.0;
+            double stepOff = 0.0, busyOff = 0.0;
+            for (int arm = 0; arm < 2; ++arm)
+            {
+                const bool morphOn = arm == 0;
+                fresh();
+                sp ("monoGlide", 1.0f);
+                sp ("morph", morphOn ? 1.0f : 0.0f);
+                sp ("morphTime", 0.300f);
+                // A SPARSE spectrum on purpose. With ten octaves of partials the waveform
+                // is so jagged sample to sample that a genuine cliff hides inside its own
+                // noise floor; three octaves is a smooth tone whose steps are the ones the
+                // synth actually took.
+                sp ("spectrumRange", 3.0f);
+                sp ("baseN", 1.0f);
+                awaitSpectrumIdle (*p, "run 48 (k): the spectrum the note starts on");
+                x.clear(); clk = 0;
+                pump (60, on (60));                    // settle on the low note
+                // The morph's target MOVES EVERY PARTIAL: the harmonic base shift is a
+                // frequency change, so the aligned bank really is a different signal from
+                // the running one and the weight between them really is audible. A change
+                // that only appends partials at unchanged frequencies leaves the two banks
+                // nearly identical - dropping the weight would then be a step of nothing,
+                // and the test would pass on a rig that measures nothing.
+                const auto gen0 = p->getTemplateGeneration();
+                sp ("baseN", 7.0f);
+                awaitTemplateChange (*p, gen0, "run 48 (k): the morph's target spectrum");
+                pump (40, {});                         // ~213 ms of a 300 ms morph: mid-fade
+                const double w = p->voiceMorphWeightForTests();
+                const size_t K = x.size();             // the takeover lands on the next block
+                pump (2, on (67));
+                pump (40, {});
+
+                const int wNeigh = (int) (0.001 * sr8);   // one millisecond either side
+                const double busy = neighAt (K, wNeigh);
+                const double step = edgeAt (K);
+                if (morphOn) { stepOn = step; busyOn = busy; wOn = w;
+                               pkOn = peakOf (K - (size_t) (0.020 * sr8), (int) (0.020 * sr8)); }
+                else         { stepOff = step; busyOff = busy; }
+
+                juce::MidiBuffer o1; o1.addEvent (juce::MidiMessage::noteOff (1, 67), 0);
+                juce::MidiBuffer o2; o2.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+                pump (2, o1); pump (2, o2); pump (40, {});
+            }
+
+            std::printf ("  takeover mid-morph (crossfade weight %.3f when the key went down): the jump "
+                         "ACROSS the note-on is %.5f, the biggest jump 1 ms either side is %.5f "
+                         "(%.1fx), peak %.5f\n",
+                         wOn, stepOn, busyOn, busyOn > 1.0e-12 ? stepOn / busyOn : -1.0, pkOn);
+            std::printf ("  the same takeover with Morph OFF: across %.5f, either side %.5f (%.1fx)\n",
+                         stepOff, busyOff, busyOff > 1.0e-12 ? stepOff / busyOff : -1.0);
+            // The rig has to be armed before its verdict means anything: a weight that was
+            // never mid-fade cannot be dropped, and the two assertions below would then be
+            // measuring the ordinary cost of a note-on and calling the bug fixed.
+            check (wOn > 0.05 && wOn < 0.95,
+                   "the rig is armed: the crossfade really is part-way through when the second key lands");
+            check (busyOff > 1.0e-9 && stepOff <= 1.2 * busyOff,
+                   "the control: with Morph OFF the identical takeover is not a jump at all");
+            check (busyOn > 1.0e-9 && stepOn <= 1.2 * busyOn,
+                   "and with a crossfade half way through, the note-on is STILL not a jump - "
+                   "the weight is ramped out, not dropped");
+        }
+
         sp ("monoGlide", 0.0f);
     }
 
