@@ -2758,6 +2758,68 @@ static void testSlopeCompilePosition()
 //   past plan.n, at scatter 1 the seeded phase is what AdditiveVoice::seedPhase(j,
 //   aligned = false) writes today, BIT FOR BIT; at scatter 0 it is kAlignedPhase; and
 //   in between it is the same interpolation the plan itself gets.
+//==============================================================================
+// THE FADER'S SLOPE TABLE IS THE FADER'S OWN CURVE, NOT A SECOND COPY OF IT.
+//
+// scatterDeltas() exists so a LIVE re-phase - the Phase fader moved while a note is
+// HELD, so its partials have to walk to their new phases on the audio thread - can ask
+// "how far does partial j still have to travel" with one multiply instead of a std::sin
+// per partial per Shepard copy per voice. That is a performance shortcut around an
+// interpolation curve, and a second copy of an interpolation curve that quietly stops
+// matching the first is the exact failure this header was written to end.
+//
+// So the table is not trusted, it is CHECKED: interpolatePhases is re-derived from it at
+// 41 fader positions across the whole index range, with `==` and not a tolerance,
+// because a phase that is right to 1e-16 is a different double and renders a different
+// sample. Sabotage either the table's wrap or interpolatePhases' and this goes red.
+static void testScatterDeltaIsTheCurve()
+{
+    const double* d = scatterDeltas();
+    check (d != nullptr, "R9: the fader slope table exists");
+    if (d == nullptr) return;
+
+    // Every index the table holds, sampled densely at the two ends (where the Shepard
+    // copies and the ordinary bank live) and across the whole range.
+    std::vector<int> idx;
+    for (int i = 0; i < 4096; ++i) idx.push_back (i);
+    for (int i = 4096; i < kScatterDeltaCount; i += 7) idx.push_back (i);
+    idx.push_back (kScatterDeltaCount - 1);
+
+    int    bad = 0, firstBad = -1; double worst = 0.0; double worstS = 0.0;
+    double rangeBad = 0.0;
+    for (int i : idx)
+    {
+        // The delta is a SHORTEST SIGNED path, so it can never leave [-0.5, 0.5).
+        if (! (d[i] >= -0.5 && d[i] < 0.5)) rangeBad = std::max (rangeBad, std::abs (d[i]));
+
+        const double h = refHashAt (i);
+        for (int k = 0; k <= 40; ++k)
+        {
+            const double s = (double) k / 40.0;
+            double want = 0.0;
+            interpolatePhases (&h, 1, s, &want);
+            // The identity the live re-phase stands on, spelled the way the voice uses
+            // it: phase(i, s) == wrap01 (kAlignedPhase + s * delta(i)).
+            double got = kAlignedPhase + s * d[i];
+            got -= std::floor (got);
+            if (got != want)
+            {
+                ++bad;
+                if (firstBad < 0) { firstBad = i; worstS = s; }
+                worst = std::max (worst, std::abs (got - want));
+            }
+        }
+    }
+    check (rangeBad == 0.0,
+           "R9: every fader slope is a shortest signed delta in [-0.5, 0.5)",
+           rangeBad > 0.0 ? fmt ("worst |delta| = %.6f", rangeBad) : "");
+    check (bad == 0,
+           "R9: the fader slope table reproduces interpolatePhases EXACTLY, at 41 fader"
+           " positions on every index a voice can address",
+           bad == 0 ? "" : fmt ("%d disagreements, first at index %d, s = %.3f, worst %.3g",
+                                bad, firstBad, worstS, worst));
+}
+
 static void testSeedPastThePlan()
 {
     const int  kOscCapShepard = 1638;      // AdditiveVoice::oscCap() with Shepard on
@@ -3285,6 +3347,7 @@ int main (int argc, char** argv)
     testShortNoteSampling();
     testAmplitudesAreAPrecondition();
     testSlopeCompilePosition();
+    testScatterDeltaIsTheCurve();
     testSeedPastThePlan();
     testSetChosenByRenderedPrefix();
 

@@ -18,6 +18,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <vector>
 
@@ -171,9 +172,563 @@ static juce::StringArray presetFolderInventory (const juce::File& dir)
     return names;
 }
 
-int main()
+//==============================================================================
+// THE PHASE FADER UNDER A HELD NOTE (run 53), lifted out of main() so it can be
+// re-run ON ITS OWN: `RhythmVerify --phase`.
+//
+// The whole suite takes minutes, and a check that is expensive to re-run is a check
+// that gets re-run less often than it should. This block is the one that a change to
+// the phase engine has to be measured against, and its sabotage pass - break the fix,
+// watch the assertion go red, undo it, watch it go green - is only honest if running
+// it four times is cheap. It was not, so this is now a function.
+static void runPhaseFaderChecks()
+{
+    // --- run 53: THE PHASE FADER UNDER A HELD NOTE ----------------------------------
+    //
+    // "cuando muevo el fader de fase mientras el sonido suena el volumen aumenta pero no
+    //  se produce el efecto o no del todo, es extrano. quiero que el aumento de volumen al
+    //  desfasar los parciales sea solo por los parciales desfasandose y por la
+    //  normalizacion no arbitrario."
+    //
+    // He is describing a consequence arriving without its cause. The normalisation law is
+    // blended across the fader because the two ends of it are up to 20.70 dB apart, and it
+    // used to be blended from the LIVE PARAMETER - while a held note's partials do not
+    // re-phase until something moves them. So the gain moved and the crest factor it is
+    // compensating did not, which is the definition of arbitrary loudness.
+    //
+    // Two claims here, and they are different claims:
+    //   (A) with no transition selected the phases CANNOT move under a held note, so the
+    //       LEVEL MUST NOT MOVE EITHER.
+    //   (B) with Morph on the phases DO move, over Morph Time, and they must ARRIVE.
+    //       Arrival is measured against a CONTROL voice played at the destination fader
+    //       position from its own note-on: it advances at exactly the same increments, so
+    //       once the move has landed the two phase arrays are the same array, partial for
+    //       partial. Nothing else can produce that agreement.
+    //
+    // And the level claim is separable because of a fact about sums of sines: the RMS of a
+    // partial bank does not depend on the partials' phases AT ALL. So every dB of level
+    // change across the gesture is the normalisation law, and the phases show up in the
+    // CREST factor instead. Both are printed, both are asserted.
+    {
+        std::printf ("\nrun 53: the Phase fader under a HELD note - the level follows the phases:\n");
+        constexpr double sr53   = 48000.0;
+        constexpr int    eb53   = 256;
+        constexpr int    warm   = 60;   // blocks before the note: let the builder land
+        constexpr int    hold   = 94;   // ~0.5 s of steady note before the fader moves
+        constexpr int    after  = 190;  // ~1.0 s after it, so a 150 ms move has long landed
+        constexpr int    kPh    = 2048;
+
+        struct Take
+        {
+            std::vector<float>  x;            // the rendered left channel, whole run
+            std::vector<double> ph;           // the running bank's phases at the end
+            int    nph  = 0;
+            double snd  = -1.0;               // where the SOUNDING phases sit on the fader
+            int    mark = 0;                  // sample index at which the fader was moved
+            double lawDb = 0.0;               // 20log10(rmsN / min(rmsN,peakN)) for this spectrum
+            double cents = 0.0;               // worst detune the re-phase applied, in cents
+            long long sm[shepard::kMaxCopies] = {};             // Shepard grid indices of the copies that were sounding
+            int    sc[shepard::kMaxCopies] = {};                // ...and how many partials each of them renders
+            double sw[shepard::kMaxCopies] = {};                // ...and how open each one's window is
+            int    nsm = 0;
+            int    probeSlot = 0;             // which oscillator slot the phase probe read
+            long long probeM = 0;             // ...and which grid index was living in it
+        };
+
+        // One take. `from` is where the fader starts (and where the note-on seeds the
+        // phases); `to` is where it is dragged to at the mark. from == to is a control.
+        // `bump` also changes the SPECTRUM at the mark, so the fader move lands while a
+        // real morph is in flight - the case where alignPhase[] is audible and where a
+        // correction that reached only one bank would null a partial outright. The
+        // rebuild is awaited BEFORE the next block renders, in every take, so the new
+        // template lands on the same block number in the take and in its control and the
+        // phase comparison stays an equality rather than a race.
+        // `dw` selects the OTHER transition: Dry/Wet instead of Morph, which answers the
+        // same gesture by crossfading the two phase sets rather than detuning anything.
+        auto take = [&] (float from, float to, bool morphOn, float tSec,
+                         bool bump = false, bool shep = false, bool dw = false) -> Take
+        {
+            Take r;
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (sr53, eb53);
+            auto s = [&] (const char* id, float v)
+            {
+                if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+                p->pollParametersForTests();
+            };
+            // A perfectly flat, fully-sustained note: any level change we measure is the
+            // normalisation and not an envelope still moving. The filter envelope is taken
+            // out for the same reason (the filter itself may stay - it is linear and its
+            // magnitudes do not depend on phase, so it cancels exactly in every ratio).
+            s ("ampAttack", 0.002f); s ("ampDecay", 0.002f); s ("ampSustain", 1.0f);
+            s ("ampCurveA", 0.0f);   s ("ampCurveD", 0.0f);
+            s ("filterAttack", 0.002f); s ("filterSustain", 1.0f); s ("filterEnvAmount", 0.0f);
+            s ("morph",  (morphOn && ! dw) ? 1.0f : 0.0f);
+            s ("morphTime", tSec);
+            s ("dryWet", dw ? 1.0f : 0.0f);
+            s ("dryWetTime", tSec);
+            s ("shepOn", shep ? 1.0f : 0.0f);
+            // A FAST rise, so copies really are claimed and re-seeded DURING the gesture.
+            // At the 8 s default a 150 ms move finishes long before any slot is recycled,
+            // and the trap this case exists for - a re-entering copy that takes the
+            // correction on top of its own re-seeding and so travels twice as far - would
+            // never be reached at all. At 500 ms a slot turns over every ~62 ms.
+            if (shep) s ("shepTime", 500.0f);
+            s ("phaseMode", from);
+            awaitSpectrumIdle (*p, "run 53 setup");
+
+            juce::AudioBuffer<float> b (2, eb53);
+            auto block = [&] (juce::MidiBuffer m)
+            {
+                b.clear(); p->processBlock (b, m);
+                const float* L = b.getReadPointer (0);
+                r.x.insert (r.x.end(), L, L + eb53);
+            };
+            for (int i = 0; i < warm; ++i) block ({});
+            { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 45, 0.8f), 0); block (std::move (m)); }
+            for (int i = 1; i < hold; ++i) block ({});
+            r.mark = (int) r.x.size();
+            if (bump) { s ("baseN", 5.0f); awaitSpectrumIdle (*p, "run 53 spectrum bump"); }
+            if (to != from) s ("phaseMode", to);
+            for (int i = 0; i < after; ++i) block ({});
+
+            r.ph.assign (kPh, 0.0);
+            r.snd = p->voiceSoundingScatterForTests();
+            r.cents = p->voiceRephaseWorstCentsForTests();
+            r.nsm   = p->voiceShepardForTests (r.sm, nullptr, r.sw, r.sc, shepard::kMaxCopies);
+            // WHICH BANK, AND HOW MUCH OF IT ACTUALLY SOUNDS. With Shepard off there is one
+            // bank at slot 0 and activeCount is its length. With it on, each copy has its
+            // own slot and its own partial count (a copy that has risen carries fewer under
+            // Nyquist), and the slots above that count are advanced by nothing at all - so
+            // comparing them compares two banks that are both SILENT, in a test about what
+            // is heard. Read the copy whose WINDOW IS WIDEST OPEN, and only as far as it
+            // sounds. Widest-open and not most-partials, which was the first attempt: the
+            // copy carrying the most partials is the LOWEST one, which is the NEWEST one,
+            // which is the one sitting on the bottom edge at a window value of ~1e-5 -
+            // i.e. the least audible copy in the stack. A phase claim measured there is a
+            // claim about something nobody can hear, and it fails for a reason
+            // (a copy takes a correction only for the samples it is actually rendered on,
+            // and a copy crossing the edge is rendered for part of one buffer) that has no
+            // audible consequence at all. The copy the listener IS hearing must be exact.
+            int base = 0, cap = kPh;
+            if (r.nsm > 0)
+            {
+                // Among the copies that are REALLY sounding (a window of 0.05 is -26 dB,
+                // well clear of the ~1e-5 an edge-crossing copy sits at), take the one
+                // carrying the MOST partials - the widest evidence available about
+                // something the listener can actually hear.
+                int best = -1;
+                for (int i = 0; i < r.nsm; ++i)
+                    if (r.sw[i] >= 0.05 && (best < 0 || r.sc[i] > r.sc[best])) best = i;
+                for (int i = 0; best < 0 && i < r.nsm; ++i)      // nothing open: widest anyway
+                    if (best < 0 || r.sw[i] > r.sw[best]) best = i;
+                base = (int) (((r.sm[best] % shepard::kSlots) + shepard::kSlots) % shepard::kSlots) * shepard::kStride;
+                cap  = r.sc[best];
+                r.probeSlot = base / shepard::kStride;
+                r.probeM    = r.sm[best];
+            }
+            r.nph = std::min (cap, p->voicePhasesForTests (r.ph.data(), kPh, base));
+
+            // The two laws, from the template that is actually sounding. rmsN is the
+            // scattered end, min(rmsN, peakN) the aligned end; their ratio is the ENTIRE
+            // level change the fader is allowed to make, and it is what claim (c) is
+            // compared against.
+            if (const auto* t = p->getLiveTemplate())
+            {
+                const double f0 = 110.0;                      // note 45, 12-TET, A4 = 440
+                const double maxR = 0.5 * sr53 / f0;
+                double sum = 0.0, sq = 0.0;
+                for (size_t i = 0; i < t->partials.size(); ++i)
+                {
+                    if ((double) t->partials[i].ratio > maxR) break;
+                    double a = (double) t->partials[i].amp;
+                    if (i < t->gain.size()) a *= (double) t->gain[i];
+                    sum += a; sq += a * a;
+                }
+                const double rmsN  = sq  > 0.0 ? 0.25 / std::sqrt (sq) : 0.0;
+                const double peakN = sum > 0.0 ? 0.5  / sum            : 0.0;
+                const double cap   = std::min (rmsN, peakN);
+                r.lawDb = cap > 0.0 ? 20.0 * std::log10 (rmsN / cap) : 0.0;
+            }
+            return r;
+        };
+
+        // RMS and peak over [a, b). 110 Hz into 48 kHz makes 0.2 s exactly 22 periods, so
+        // a window of 9600 samples measures a harmonic bank's RMS with no leakage at all.
+        auto rms = [] (const std::vector<float>& x, int a, int b)
+        {
+            double s = 0.0; int n = 0;
+            for (int i = std::max (0, a); i < std::min ((int) x.size(), b); ++i) { s += (double) x[i] * x[i]; ++n; }
+            return n > 0 ? std::sqrt (s / n) : 0.0;
+        };
+        auto pk = [] (const std::vector<float>& x, int a, int b)
+        {
+            double m = 0.0;
+            for (int i = std::max (0, a); i < std::min ((int) x.size(), b); ++i) m = std::max (m, std::abs ((double) x[i]));
+            return m;
+        };
+        // THE PER-SAMPLE METRIC, and it is per-sample on purpose. An RMS over 5 ms is
+        // structurally blind to a one-sample step - it averages it away against 240 clean
+        // samples - and several defects in this file shipped behind exactly that blindness.
+        auto worstStep = [] (const std::vector<float>& x, int a, int b)
+        {
+            double m = 0.0;
+            for (int i = std::max (1, a); i < std::min ((int) x.size(), b); ++i)
+                m = std::max (m, std::abs ((double) x[i] - (double) x[i - 1]));
+            return m;
+        };
+        // ...compared RAW against BOTH controls, not as a fraction of the window's own peak.
+        // Normalising by the peak is how the first version of this check was defeated: the
+        // naive re-phase (write the new phases and be done) was measured at a step of
+        // 0.29993 against a control's 0.05608 - five times worse - and still passed,
+        // because the same artefact had lifted the peak it was being divided by. And the
+        // two controls are BOTH needed: the gesture starts on the aligned waveform and ends
+        // on the scattered one, and those have very different natural slopes, so a bound
+        // taken from either alone is a bound on the wrong signal for half the move.
+        auto stepCheck = [&] (const Take& m, const Take& a, const Take& b,
+                              int settle, const char* what)
+        {
+            const double sm = worstStep (m.x, m.mark - eb53, m.mark + settle);
+            const double sa = worstStep (a.x, a.mark - eb53, a.mark + settle);
+            const double sb = worstStep (b.x, b.mark - eb53, b.mark + settle);
+            std::printf ("    worst PER-SAMPLE step %.5f; the two controls %.5f and %.5f\n",
+                         sm, sa, sb);
+            check (sm <= std::max (sa, sb) * 1.6 + 0.01, what);
+        };
+        auto dB = [] (double num, double den) { return (num > 0.0 && den > 0.0) ? 20.0 * std::log10 (num / den) : 0.0; };
+        // How far apart two takes' phase banks are, worst case, in degrees - plus how MANY
+        // slots disagree and which one first. The counts matter: a handful of bad slots is
+        // a partial that took the wrong route, and ALL of them is a bank that never
+        // participated at all, and the two have nothing to do with each other.
+        auto worstPhaseDegN = [] (const Take& a, const Take& b, int* bad, int* first)
+        {
+            const int n = std::min (a.nph, b.nph);
+            double w = 0.0;
+            if (bad != nullptr) *bad = 0;
+            if (first != nullptr) *first = -1;
+            for (int i = 0; i < n; ++i)
+            {
+                double d = a.ph[(size_t) i] - b.ph[(size_t) i];
+                d -= std::floor (d);
+                if (d > 0.5) d -= 1.0;
+                const double deg = std::abs (d) * 360.0;
+                if (deg > 0.5)
+                {
+                    if (bad != nullptr) ++*bad;
+                    if (first != nullptr && *first < 0) *first = i;
+                }
+                w = std::max (w, deg);
+            }
+            return w;
+        };
+        auto worstPhaseDeg = [&] (const Take& a, const Take& b)
+        { return worstPhaseDegN (a, b, nullptr, nullptr); };
+
+        // ================= (A) BOTH TRANSITIONS OFF ==================================
+        // The phases cannot move, so nothing may. This is the half the user felt directly.
+        {
+            const auto swept = take (0.0f, 1.0f, false, 0.300f);   // the gesture he played
+            const auto still = take (0.0f, 0.0f, false, 0.300f);   // the control: no gesture
+            const int  w = 9600;                                   // 0.2 s = 22 periods at 110 Hz
+            const double before = rms (swept.x, swept.mark - w, swept.mark);
+            const double afterR = rms (swept.x, swept.mark + 6 * eb53, swept.mark + 6 * eb53 + w);
+            const double ctrlB  = rms (still.x, still.mark - w, still.mark);
+            const double ctrlA  = rms (still.x, still.mark + 6 * eb53, still.mark + 6 * eb53 + w);
+            std::printf ("  transitions OFF: fader 0 -> 1 under a held note\n"
+                         "    level across the move  %+.3f dB   (control, no move: %+.3f dB)\n"
+                         "    sounding fader position after the move: %.3f  (the parameter says 1.000)\n"
+                         "    the two laws are %.2f dB apart on this spectrum\n",
+                         dB (afterR, before), dB (ctrlA, ctrlB), swept.snd, swept.lawDb);
+            check (std::abs (dB (afterR, before)) <= 0.20,
+                   "with no transition selected, moving the Phase fader under a held note does"
+                   " NOT change its level - the phases cannot move, so the normalisation may not");
+            check (swept.snd <= 0.001,
+                   "...because the level is derived from where the SOUNDING phases are,"
+                   " which is still 0, and not from where the fader is");
+            check (swept.lawDb > 3.0,
+                   "(and the two normalisation laws really are far enough apart on this patch"
+                   " for the previous behaviour to have been audible)");
+            check (worstPhaseDeg (swept, still) <= 1.0e-6,
+                   "and the phases themselves are untouched, partial for partial");
+        }
+
+        // ================= (B) MORPH ON: THE PHASES REALLY MOVE ======================
+        {
+            const float T = 0.150f;
+            const auto moved = take (0.0f, 1.0f, true, T);   // seeded aligned, dragged to scattered
+            const auto dest  = take (1.0f, 1.0f, true, T);   // the CONTROL: born at the destination
+            const auto orig  = take (0.0f, 0.0f, true, T);   // the CONTROL: never moved
+            const int  w = 9600;
+            const int  settle = (int) (0.4 * sr53);          // well past a 150 ms move
+
+            const double worstDeg = worstPhaseDeg (moved, dest);
+            std::printf ("  Morph ON (%.0f ms): fader 0 -> 1 under a held note\n"
+                         "    sounding fader position after the move: %.6f  (parameter 1.000)\n"
+                         "    worst phase error vs a voice BORN at the destination: %.6f deg over %d partials\n"
+                         "    worst detune the move applied: %.1f cents (of the partial it was applied to)\n",
+                         T * 1000.0, moved.snd, worstDeg, std::min (moved.nph, dest.nph), moved.cents);
+            check (moved.nph > 4, "the probe actually read a partial bank back");
+            check (moved.snd >= 0.999,
+                   "the sounding fader position ARRIVES at the parameter - the phases really moved");
+            check (worstDeg <= 0.5,
+                   "and every partial arrives at the phase the fader's own interpolation asks for,"
+                   " to under half a degree, measured against a voice born there");
+
+            // (b) NO SAMPLE-TO-SAMPLE DISCONTINUITY, per sample, over the whole move.
+            stepCheck (moved, orig, dest, settle,
+                       "re-phasing a held note makes no sample-to-sample discontinuity: the"
+                       " worst per-sample step over the whole move is one the tone already had");
+
+            // (c) THE LEVEL, AND WHAT EXPLAINS IT.
+            const double before = rms (moved.x, moved.mark - w, moved.mark);
+            const double afterR = rms (moved.x, moved.mark + settle, moved.mark + settle + w);
+            const double destR  = rms (dest.x,  dest.mark  + settle, dest.mark  + settle + w);
+            const double origR  = rms (orig.x,  orig.mark  + settle, orig.mark  + settle + w);
+            const double crestB = before > 0.0 ? pk (moved.x, moved.mark - w, moved.mark) / before : 0.0;
+            const double crestA = afterR > 0.0 ? pk (moved.x, moved.mark + settle, moved.mark + settle + w) / afterR : 0.0;
+            std::printf ("    level: %+.3f dB across the move; the normalisation law alone predicts %+.3f dB\n"
+                         "    against the two controls: born-at-destination %+.3f dB, never-moved %+.3f dB\n"
+                         "    crest factor (peak/rms): %.3f before -> %.3f after\n",
+                         dB (afterR, before), moved.lawDb, dB (afterR, destR), dB (origR, before), crestB, crestA);
+            // The law HELD FIXED is exactly the never-moved control: same phases moving or
+            // not, the RMS of a partial bank is phase-independent, so `orig` is the level
+            // this note would have kept if the normalisation had not followed. The whole
+            // difference between it and the moved take is therefore the law, and the law's
+            // own predicted size is computed from the template above - not from the audio.
+            check (std::abs (dB (afterR, before) - moved.lawDb) <= 0.60,
+                   "the level change across the move is the NORMALISATION LAW and nothing else:"
+                   " it matches the two laws' own ratio, computed from the template");
+            check (std::abs (dB (origR, before)) <= 0.20,
+                   "...and the control that never moved the fader did not change level at all");
+            check (std::abs (dB (afterR, destR)) <= 0.20,
+                   "...and the moved note ends at exactly the level of a note BORN at the"
+                   " destination: the same phases, so the same law, so the same loudness");
+            check (crestA < crestB * 0.95,
+                   "and the CREST FACTOR fell - which is where the phases show up, since the"
+                   " RMS cannot see them at all");
+        }
+
+        // ============ (B2) THE FADER MOVES WHILE A MORPH IS ALREADY IN FLIGHT =========
+        // The case the traps are about. Mid-morph BOTH oscillator banks are audible at
+        // once, so a correction that reached only one of them would leave a partial's two
+        // copies drifting apart - at weight 0.5 they sum to ZERO and the partial vanishes
+        // for the length of the fade - and the wholesale alignPhase -> phase copy at morph
+        // completion would annihilate a correction in flight unless both banks carried it.
+        {
+            const float T = 0.300f;
+            const auto moved = take (0.0f, 1.0f, true, T, true);   // fader move + spectrum change
+            const auto dest  = take (1.0f, 1.0f, true, T, true);   // the same morph, born scattered
+            const auto orig  = take (0.0f, 0.0f, true, T, true);   // the same morph, no fader move
+            const int  settle = (int) (0.6 * sr53);
+            const int  w = 9600;
+            const double worstDeg = worstPhaseDeg (moved, dest);
+            // A partial nulled by two banks half a cycle apart is a DIP, and a dip in the
+            // middle of a fade is invisible to any endpoint check - so the whole trough is
+            // measured, not just where it started and where it ended.
+            //
+            // Measured against the NEVER-MOVED take, which is the same note making the same
+            // morph without the fader gesture. The two start equal and the law can only
+            // carry the moved one UP from there (it is monotone in scatter, and phases do
+            // not change an RMS), so anything that dips BELOW the control is cancellation -
+            // exactly what a correction reaching one bank and not the other produces.
+            // (Against the DESTINATION take it would read 0.374x for an honest reason: at
+            // the start of the gesture the moved note really is 7.34 dB quieter, because it
+            // is still aligned. A metric that cannot tell that from a null is no metric.)
+            double dip = 1.0e9;
+            for (int a = moved.mark; a + 2400 < moved.mark + settle; a += 1200)
+            {
+                const double m = rms (moved.x, a, a + 2400);
+                const double c = rms (orig.x,  a, a + 2400);
+                if (c > 1.0e-9) dip = std::min (dip, m / c);
+            }
+            std::printf ("  the fader moved MID-MORPH (%.0f ms, spectrum changed at the same instant):\n"
+                         "    sounding fader position after it: %.6f   worst phase error vs the same"
+                         " morph born scattered: %.6f deg\n"
+                         "    shallowest 50 ms level trough vs the never-moved take: %.3fx\n",
+                         T * 1000.0, moved.snd, worstDeg, dip);
+            check (moved.snd >= 0.999,
+                   "a fader move that lands mid-morph still arrives");
+            check (worstDeg <= 0.5,
+                   "...and every partial lands on the same phase the identical morph would have"
+                   " produced had the note been played scattered - which is only true if the"
+                   " correction reached BOTH banks, since the completed morph copies one over"
+                   " the other wholesale");
+            stepCheck (moved, orig, dest, settle,
+                       "...with no sample-to-sample discontinuity anywhere in it");
+            check (dip >= 0.90,
+                   "...and no partial is NULLED part-way through: the level never troughs"
+                   " below the take that made the same morph without the gesture, which is"
+                   " what two banks half a cycle apart would do to every partial they share");
+        }
+
+        // ============ (B3) SHEPARD ON: A COPY RE-ENTERING MUST NOT MOVE TWICE =========
+        // A freshly claimed Shepard slot is re-seeded at the position the sounding bank is
+        // at, and then owes exactly what its siblings still owe. Seed it at the FADER and
+        // hand it the debt as well and it travels twice as far; give it no debt at all and
+        // one copy sits at a different crest from the rest, which the voice's single
+        // normalisation number cannot describe.
+        {
+            const float T = 0.150f;
+            const auto moved = take (0.0f, 1.0f, true, T, false, true);
+            const auto dest  = take (1.0f, 1.0f, true, T, false, true);
+            const auto orig  = take (0.0f, 0.0f, true, T, false, true);
+            const int  settle = (int) (0.4 * sr53);
+            int bad = 0, firstBad = -1;
+            const double worstDeg = worstPhaseDegN (moved, dest, &bad, &firstBad);
+            std::printf ("  SHEPARD on, fader 0 -> 1 under a held note:\n"
+                         "    sounding fader position after it: %.6f   worst phase error: %.6f deg"
+                         " over %d slots (%d disagree, first at %d)\n",
+                         moved.snd, worstDeg, std::min (moved.nph, dest.nph), bad, firstBad);
+            {
+                juce::String slots;
+                for (int i = 0; i < moved.nsm; ++i)
+                    slots += juce::String ((int) (((moved.sm[i] % shepard::kSlots) + shepard::kSlots) % shepard::kSlots)) + " ";
+                std::printf ("    %d copies sounding, in oscillator slots: %s\n"
+                             "    probe read slot %d (grid %lld, %d partials); the control read slot %d"
+                             " (grid %lld, %d partials)\n",
+                             moved.nsm, slots.toRawUTF8(),
+                             moved.probeSlot, moved.probeM, moved.nph,
+                             dest.probeSlot,  dest.probeM,  dest.nph);
+                std::printf ("    same bank vs the NEVER-MOVED take: %.6f deg"
+                             " (0 would mean this copy took none of the move)\n",
+                             worstPhaseDeg (moved, orig));
+                // WHERE THIS COPY ACTUALLY ENDED UP ON THE FADER, read out of its own
+                // phases. Against the never-moved take, partial j's phase differs by
+                // exactly s * delta_j, so dividing by that partial's own delta gives s -
+                // and doing it for every partial says whether the copy travelled a
+                // consistent distance (one number, repeated) or a ragged one.
+                {
+                    const double* d = spectrum::phaseset::scatterDeltas();
+                    const int b = moved.probeSlot * shepard::kStride;
+                    double lo = 9.0, hi = -9.0, sum = 0.0; int cnt = 0;
+                    for (int i = 0; i < std::min (moved.nph, orig.nph); ++i)
+                    {
+                        const double dj = d[b + i];
+                        if (std::abs (dj) < 0.05) continue;      // tiny delta -> noisy divide
+                        double dp = moved.ph[(size_t) i] - orig.ph[(size_t) i];
+                        dp -= std::floor (dp); if (dp > 0.5) dp -= 1.0;
+                        const double s = dp / dj;
+                        lo = std::min (lo, s); hi = std::max (hi, s); sum += s; ++cnt;
+                    }
+                    int nLo = 0, nMid = 0, nHi = 0, firstHi = -1;
+                    for (int i = 0; i < std::min (moved.nph, orig.nph); ++i)
+                    {
+                        const double dj = d[b + i];
+                        if (std::abs (dj) < 0.05) continue;
+                        double dp = moved.ph[(size_t) i] - orig.ph[(size_t) i];
+                        dp -= std::floor (dp); if (dp > 0.5) dp -= 1.0;
+                        const double s = dp / dj;
+                        if (s < 0.1) ++nLo; else if (s > 0.9) { ++nHi; if (firstHi < 0) firstHi = i; }
+                        else ++nMid;
+                    }
+                    if (cnt > 0)
+                        std::printf ("    this copy's OWN fader position, read back from its phases:"
+                                     " mean %.4f, range %.4f..%.4f over %d partials\n"
+                                     "      %d still at 0, %d part-way, %d arrived (first arrived at index %d)\n",
+                                     sum / cnt, lo, hi, cnt, nLo, nMid, nHi, firstHi);
+                }
+            }
+            check (moved.snd >= 0.999, "a Shepard voice re-phases too, and arrives");
+            check (worstDeg <= 0.5,
+                   "...and every slot lands where the same stack played scattered would have"
+                   " put it - a copy that took the correction on top of its own re-seeding"
+                   " would have travelled twice as far");
+            stepCheck (moved, orig, dest, settle,
+                       "...with no sample-to-sample discontinuity while the copies rotate");
+        }
+
+        // ============ (B4) DRY/WET: A CROSSFADE, NOT A BEND ==========================
+        // The other transition answers the same gesture differently, and the panel has
+        // always said so: the old phases fade OUT while the new ones fade IN, with nothing
+        // detuned anywhere. That last clause is the point of the mode and it is what is
+        // asserted - a re-phase that reached for Morph's momentary detune here would leave
+        // a pitch blip on the low partials that this mode exists to avoid.
+        {
+            const float T = 0.200f;
+            const auto moved = take (0.0f, 1.0f, false, T, false, false, true);
+            const auto dest  = take (1.0f, 1.0f, false, T, false, false, true);
+            const auto orig  = take (0.0f, 0.0f, false, T, false, false, true);
+            const int  settle = (int) (0.5 * sr53);
+            const int  w = 9600;
+            const double worstDeg = worstPhaseDeg (moved, dest);
+            const double before = rms (moved.x, moved.mark - w, moved.mark);
+            const double afterR = rms (moved.x, moved.mark + settle, moved.mark + settle + w);
+            const double destR  = rms (dest.x,  dest.mark  + settle, dest.mark  + settle + w);
+            double dip = 1.0e9;
+            for (int a = moved.mark; a + 2400 < moved.mark + settle; a += 1200)
+            {
+                const double m = rms (moved.x, a, a + 2400);
+                const double c = rms (orig.x,  a, a + 2400);
+                if (c > 1.0e-9) dip = std::min (dip, m / c);
+            }
+            std::printf ("  DRY/WET on (%.0f ms): fader 0 -> 1 under a held note\n"
+                         "    sounding fader position after it: %.6f   worst phase error: %.6f deg\n"
+                         "    level %+.3f dB (law predicts %+.3f); vs born-at-destination %+.3f dB;"
+                         " shallowest trough %.3fx\n"
+                         "    worst detune applied: %.3f cents\n",
+                         T * 1000.0, moved.snd, worstDeg,
+                         dB (afterR, before), moved.lawDb, dB (afterR, destR), dip, moved.cents);
+            check (moved.snd >= 0.999,
+                   "with DRY/WET selected the fader re-phases a held note too, and arrives");
+            check (worstDeg <= 0.5,
+                   "...landing on exactly the phases a note born at the destination has");
+            check (moved.cents == 0.0,
+                   "...and it does it WITHOUT DETUNING ANYTHING - which is the whole"
+                   " difference between this mode and Morph, and the reason to pick it");
+            stepCheck (moved, orig, dest, settle, "...with no sample-to-sample discontinuity");
+            check (dip >= 0.90,
+                   "...and no partial nulls between the two banks on the way across");
+            check (std::abs (dB (afterR, before) - moved.lawDb) <= 0.60
+                   && std::abs (dB (afterR, destR)) <= 0.20,
+                   "...and the level it ends on is the destination's own, reached by the"
+                   " normalisation law and nothing else");
+        }
+
+        // ============ (B5) DRY/WET *AND* SHEPARD: THE TWO BANKS DISAGREE =============
+        // The one case where a Shepard copy's two oscillator banks are legitimately at
+        // DIFFERENT fader positions at the same time: mid phase-crossfade the running bank
+        // is still the old phase set and the aligned bank is already the new one. A copy
+        // claimed while that is in flight has to be seeded into each bank at THAT bank's
+        // position - seed both at the running bank's and the hand-over at the end of the
+        // fade drops that copy back onto the old phases, so the whole stack moves except
+        // the one copy that happened to enter the window during the gesture, and it then
+        // rises to full loudness carrying the wrong crest for seconds. The stack is run
+        // fast on purpose so a copy really is claimed inside the gesture.
+        {
+            // LONGER than the 500 ms rise, so a copy is GUARANTEED to be claimed while
+            // the crossfade is in flight - which is the entire case this block is about.
+            const float T = 0.600f;
+            const auto moved = take (0.0f, 1.0f, false, T, false, true, true);
+            const auto dest  = take (1.0f, 1.0f, false, T, false, true, true);
+            const auto orig  = take (0.0f, 0.0f, false, T, false, true, true);
+            const int  settle = (int) (0.85 * sr53);
+            const double worstDeg = worstPhaseDeg (moved, dest);
+            std::printf ("  DRY/WET *and* SHEPARD, fader 0 -> 1 under a held note:\n"
+                         "    sounding fader position after it: %.6f   worst phase error: %.6f deg"
+                         " over %d slots of grid %lld; detune applied %.3f cents\n",
+                         moved.snd, worstDeg, moved.nph, moved.probeM, moved.cents);
+            check (moved.snd >= 0.999, "the stack re-phases by crossfade, and arrives");
+            check (worstDeg <= 0.5,
+                   "...including a copy claimed while the crossfade was in flight, whose two"
+                   " banks are at two different fader positions at once");
+            stepCheck (moved, orig, dest, settle, "...with no sample-to-sample discontinuity");
+            check (moved.cents == 0.0, "...and still without detuning anything");
+        }
+    }
+
+}
+
+int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI juceInit;
+
+    // ONE BLOCK, ON DEMAND: only the Phase-fader checks. See runPhaseFaderChecks.
+    if (argc > 1 && std::strcmp (argv[1], "--phase") == 0)
+    {
+        runPhaseFaderChecks();
+        std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
+        return failures == 0 ? 0 : 1;
+    }
 
     const juce::File realPresets = FractalAdditiveAudioProcessor::getPresetFolder();
 
@@ -12358,6 +12913,7 @@ int main()
         }
     }
 
+<<<<<<< ours
     // --- run 53: A TALLER PANEL SPREADS ITS ROWS INSTEAD OF GROWING ONE HOLE --------
     //
     // Commit 5c970cf fixed two panels that turned extra height into a single void, and
@@ -12526,6 +13082,9 @@ int main()
                    " with SLOPE frozen for a spectrum nobody drew");
         }
     }
+=======
+    runPhaseFaderChecks();
+>>>>>>> theirs
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;

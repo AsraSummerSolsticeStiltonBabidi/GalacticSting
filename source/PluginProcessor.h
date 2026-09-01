@@ -485,6 +485,36 @@ public:
                 if (av->isActive()) return av->morphWeightForTests();
         return 0.0;
     }
+    //== PHASE FADER probes (verifiers only) ===================================
+    // Where the SOUNDING phases sit on the Phase fader, and what those phases are.
+    // The pair is how run 53 separates the two halves of the reported symptom: the
+    // level is a function of the first, and the second is the thing that has to have
+    // moved before the first is allowed to.
+    double voiceSoundingScatterForTests() const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) return av->soundingScatterForTests();
+        return -1.0;
+    }
+    int voicePhasesForTests (double* out, int maxN, int base = 0) const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) return av->phasesForTests (out, maxN, base);
+        return 0;
+    }
+    // The worst detune a live re-phase actually applied, in cents of the partial it was
+    // applied to. The whole answer to "a single transition time cannot be inaudible
+    // across the whole bank" is a measured number, and this is where it comes from.
+    double voiceRephaseWorstCentsForTests() const noexcept
+    {
+        double w = 0.0;
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) w = std::max (w, av->rephaseWorstCentsForTests());
+        return w;
+    }
     // Voices in one playground MIX sub-engine (-1 when that corner has no engine).
     // Declared here, defined after kPlaygroundCorners exists.
     int mixVoiceCountForTests (int corner) const noexcept;

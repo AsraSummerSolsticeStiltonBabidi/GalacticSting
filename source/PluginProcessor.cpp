@@ -185,14 +185,27 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     //   Morph on   -> PITCHBEND: each partial takes a momentary frequency offset until
     //                 it has walked to its new phase. That is literally what Morph does
     //                 to a spectrum change, so Phase borrows it rather than restating it.
-    //   Dry/Wet on -> CROSSFADE: the old phases fade out while the new ones fade in.
-    //                 Again the same machine, driven by the same rule.
+    //                 It TRACKS A DRAG continuously (the offset is proportional to how
+    //                 fast the fader is moving), and the price is that the offset is an
+    //                 offset in Hz, so it is a real interval on a low partial - measured
+    //                 and reported by RhythmVerify run 53 rather than assumed away.
+    //   Dry/Wet on -> CROSSFADE: the old phases fade out while the new ones fade in, with
+    //                 NOTHING DETUNED anywhere - which is the reason to pick it. Again the
+    //                 same machine, driven by the same rule. The incoming bank's phases
+    //                 may not be re-placed while it is audible, so a drag lands in steps
+    //                 of one transition each instead of tracking.
     //   Both on    -> MORPH WINS, exactly as it does for the spectrum itself (see the
     //                 Dry/Wet block below): a voice has ONE crossfade between two banks,
     //                 so there is only one answer available and it is Morph's.
     //   Both off   -> no live re-phasing at all; the new phases take effect at the next
-    //                 note-on. The level still follows the fader immediately, because
-    //                 the normalisation law is blended live.
+    //                 note-on - AND SO DOES THE LEVEL. This line used to end "the level
+    //                 still follows the fader immediately, because the normalisation law
+    //                 is blended live", and that was the bug the user found by playing
+    //                 it: "el volumen aumenta pero no se produce el efecto o no del
+    //                 todo". The normalisation exists to compensate the crest factor the
+    //                 phases produce, so moving it while the phases stand still is not a
+    //                 compensation at all, it is arbitrary loudness. A held note's level
+    //                 now moves when, and only when, its phases do.
     // and the DURATION is that same transition's Time fader (morphTime / dryWetTime).
     //
     // WHY DELETING IT IS SAFE FOR PROJECTS SAVED BY YESTERDAY'S BUILD: APVTS reads the
@@ -3306,6 +3319,13 @@ bool FractalAdditiveAudioProcessor::saveCurrentTuningScl (const juce::File& f, j
 //==============================================================================
 void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    // Build the phase engine's fader-slope table HERE, on a thread that is allowed to be
+    // slow. A live re-phase reads it on the audio thread, and the FIRST read is the one
+    // that fills 16384 entries behind an initialisation guard - 16384 std::sin calls and
+    // a lock, in a render callback, exactly once, which is a dropout nobody could ever
+    // reproduce. Idempotent, so calling it on every prepare costs nothing.
+    spectrum::phaseset::warmScatterDeltas();
+
     synth.setCurrentPlaybackSampleRate (sampleRate);
     previewCollector.reset (sampleRate);
     noteGate.prepare (sampleRate);

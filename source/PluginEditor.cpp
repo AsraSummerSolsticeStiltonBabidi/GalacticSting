@@ -1195,7 +1195,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // compartment a control belongs to. Left on the Essentials hue it would read as a
     // stray from the box below - the one thing the move was meant to stop.
     configFader (phaseFader, "phaseMode", phaseAtt, cSlope,
-                 "0 = Aligned (tonal pulse, never clips), 1 = Scattered (louder, noisier). Anywhere between is a real blend.");
+                 "0 = Aligned (tonal pulse, never clips), 1 = Scattered (louder, noisier). Anywhere between is a real blend. "
+                 "Under a held note it re-phases over the Morph / Dry-Wet transition - with both off, at the next note.");
     phaseFader.setSliderStyle (juce::Slider::LinearHorizontal);
     phaseFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 38, 14);
     // There is no glide box beside the fader any more: how a mid-note move reaches

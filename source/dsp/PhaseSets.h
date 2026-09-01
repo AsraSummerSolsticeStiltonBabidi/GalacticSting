@@ -2453,6 +2453,63 @@ namespace phaseset
     }
 
     //==========================================================================
+    // THE FADER'S PER-PARTIAL SLOPE, TABULATED ONCE FOR THE WHOLE PLUGIN.
+    //
+    // WHAT IT IS. interpolatePhases carries partial `index` from kAlignedPhase toward its
+    // hash along the SHORTEST SIGNED path, so the phase it writes at fader position s is
+    //
+    //     phase (index, s)  ==  wrap01 (kAlignedPhase + s * scatterDeltas()[index])
+    //
+    // for every s in [0, 1] - the same three operations, in the same order, so it is an
+    // identity and not an approximation. One number per partial is therefore the WHOLE
+    // curve, and it depends on nothing but the index: not on the note, not on the
+    // template, not on which voice is asking.
+    //
+    // WHY IT EXISTS. A LIVE re-phase - the fader moved while a note is HELD, so its
+    // partials have to walk to their new phases instead of waiting for the next note-on -
+    // has to ask "how far does partial j still have to travel" ON THE AUDIO THREAD, and
+    // re-ask it every block for the length of a drag. Deriving that from seedScattered
+    // costs one std::sin per partial per Shepard copy per voice: at 512 partials, 8
+    // copies and 32 voices that is 131072 sines in a block, which is not a rounding error
+    // on the budget, it IS the budget. Read from here it is one multiply.
+    //
+    // WHY IT CANNOT DRIFT AWAY FROM THE CURVE. It is built out of hashPhaseAt and
+    // kAlignedPhase - the same two things interpolatePhases is built out of - and
+    // testScatterDeltaIsTheCurve re-derives interpolatePhases from this table at 41 fader
+    // positions across the whole index range and demands the two agree bit for bit. A
+    // second copy of an interpolation curve that quietly stops matching the first is the
+    // exact failure this header was written to end (Failure 2), so the table is CHECKED
+    // against the curve rather than trusted to stay next to it.
+    //
+    // NO ALLOCATION, EVER: the storage is a function-local static, so it lives in BSS and
+    // the only cost of the first call is filling it. Call warmScatterDeltas() once from
+    // prepareToPlay - the audio thread must never be the one to meet the initialisation
+    // guard, because that first call is 16384 sines and a lock.
+    inline constexpr int kScatterDeltaCount = spectrum::kMaxPartials;
+
+    inline const double* scatterDeltas() noexcept
+    {
+        struct Table
+        {
+            double d[kScatterDeltaCount];
+            Table() noexcept
+            {
+                for (int i = 0; i < kScatterDeltaCount; ++i)
+                {
+                    double v = hashPhaseAt (i) - kAlignedPhase;
+                    v -= std::floor (v);        // -> [0,1)
+                    if (v > 0.5) v -= 1.0;      // -> shortest signed delta in [-0.5, 0.5)
+                    d[i] = v;
+                }
+            }
+        };
+        static const Table t;
+        return t.d;
+    }
+    // Build the table on a thread that is allowed to be slow. Idempotent.
+    inline void warmScatterDeltas() noexcept { (void) scatterDeltas(); }
+
+    //==========================================================================
     // NOTE-ON, in one call. Allocation-free: everything expensive is already in the
     // cached plan.
     //

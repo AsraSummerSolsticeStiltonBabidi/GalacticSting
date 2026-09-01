@@ -42,8 +42,14 @@
 #include "ModEngine.h"
 #include "ShepardEngine.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
+
+// The live re-phase reads one slope per oscillator slot out of the phase engine's own
+// table, so the table has to be at least as long as this voice's oscillator array.
+static_assert (spectrum::phaseset::kScatterDeltaCount >= spectrum::kMaxPartials,
+               "phaseset::scatterDeltas() must cover every oscillator slot a voice owns");
 
 class AdditiveVoice : public juce::MPESynthesiserVoice
 {
@@ -263,7 +269,20 @@ public:
             // does - seedScattered carries hashPhaseAt(index) toward the aligned phase,
             // so the copies stay as decorrelated at every fader position as they are at
             // the top of the travel.
-            seedRange (phase, 0, spectrum::kMaxPartials, scatterAmount());
+            const double s0 = scatterAmount();
+            seedRange (phase, 0, spectrum::kMaxPartials, s0);
+            // ...AND REMEMBER WHERE ON THE FADER THAT PUT THEM. Everything downstream that
+            // wants to know "how scattered is this voice" must ask THIS number and not the
+            // live parameter, because the two stop agreeing the moment the fader moves
+            // under a held note. See soundingScatter() in renderNextBlock.
+            runScatter = algScatter = s0;
+            // A cold note starts ON the fader, so it owes nothing: any debt left over from
+            // the note this voice used to hold would bend the new note's partials for no
+            // reason. The whole array, for the same reason seedRange above covers it - a
+            // Shepard slot claimed later in the note must not inherit a stale debt either.
+            rephaseDest = s0; rephaseLeft = 0; rephaseK = 0.0; rephaseAimed = 0;
+            rephaseWorstRel = 0.0;
+            std::fill (rephaseRem.begin(), rephaseRem.end(), 0.0);
         }
 
         // Velocity and pressure are GAIN terms, so on a steal they must glide like the
@@ -503,6 +522,19 @@ public:
         ShepLayout sl;
         planShepard (sl, tmpl, f0, numSamples);
 
+        // WHICH TRANSITION IS IN FORCE, hoisted out of the template-change branch below
+        // because the PHASE FADER borrows the same two controls: re-phasing a held note IS
+        // a spectrum change, and Morph / Dry/Wet exist to say how a spectrum change is made
+        // smooth (see the "THERE IS NO phaseGlide PARAMETER" note in PluginProcessor.cpp).
+        // MORPH WINS when both are on, exactly as it does for the spectrum itself - a voice
+        // has ONE crossfade between two banks, so there is only one answer available.
+        const bool morphOn = morphParam != nullptr && morphParam->load() > 0.5f;
+        const bool xfadeOn = ! morphOn && xfadeParam != nullptr && xfadeParam->load() > 0.5f;
+        // Read ONCE per block. Every consumer that used to call scatterAmount() separately
+        // now shares this number, so a fader that moves between two reads inside one block
+        // cannot leave the phases seeded at one position and the level derived from another.
+        const double sNow = scatterAmount();
+
         // No infrasound gate: a very low fundamental (wide-period tunings can map a
         // key to a few Hz) is not silenced, because its HARMONICS - at 2x, 3x, ...
         // the fundamental - are audible even when the fundamental itself is not, so
@@ -543,13 +575,13 @@ public:
             // morph toward the OLD template yet mark lastGen as the NEW one - so it
             // stuck on the wrong spectrum until re-triggered.
             const juce::uint32 gen = tmpl->generation;
-            const bool morphOn = morphParam != nullptr && morphParam->load() > 0.5f;
-            // DRY/WET TRANSITION - the crossfade alternative to Morph's pitch glide (see
-            // PluginProcessor.cpp, where the two parameters are declared, for the decision
-            // and its reason). MORPH WINS when both are on: they are one machine, and a
-            // hidden priority is worse than a stated one - the panel greys this out and says
-            // so, so nothing on screen claims two smoothings are running.
-            const bool xfadeOn = ! morphOn && xfadeParam != nullptr && xfadeParam->load() > 0.5f;
+            // morphOn / xfadeOn are read once at the top of the block now (the Phase fader
+            // needs the same two answers). DRY/WET TRANSITION - the crossfade alternative to
+            // Morph's pitch glide (see PluginProcessor.cpp, where the two parameters are
+            // declared, for the decision and its reason). MORPH WINS when both are on: they
+            // are one machine, and a hidden priority is worse than a stated one - the panel
+            // greys this out and says so, so nothing on screen claims two smoothings run.
+            //
             // A fade already in flight is never CONVERTED from one kind to the other (see
             // xfadeActive): at the two endpoints the banks are silent or identical and either
             // kind may start, in between re-placing them is a write to an audible bank. So a
@@ -609,6 +641,10 @@ public:
                             if (alignRatio[(size_t) j] > 1.0e-12) // a slot the aligned bank never held keeps its own ratio
                                 curRatio[(size_t) j] = alignRatio[(size_t) j];
                         adoptXfadeAmps (seedSpan);
+                        // The running bank IS the aligned bank now, so it is at the aligned
+                        // bank's fader position too. Forgetting this leaves the level law
+                        // describing phases that were replaced two lines ago.
+                        runScatter = algScatter;
                         morphWeight = 0.0; morphWPos = 0.0;
                     }
                     else if (! wasMorphing)
@@ -671,9 +707,22 @@ public:
                     // writing it is a waveform step on every single template change.
                     if (morphWeight <= 0.0)
                     {
-                        const double scatter = scatterAmount();
+                        // SEEDED WHERE THE SOUNDING PHASES ARE, NOT WHERE THE FADER IS. If a
+                        // live re-phase is part-way through, runScatter is behind the
+                        // parameter, and seeding the incoming bank AT the parameter would
+                        // hand it the destination while the running bank is still walking
+                        // there - so the shared correction below (which reaches both banks,
+                        // as it must) would carry the incoming bank a second time and
+                        // overshoot it by the whole outstanding move. Placed here instead,
+                        // the two banks travel together and both land exactly on target;
+                        // that is also what makes the wholesale alignPhase -> phase copy at
+                        // morph completion harmless to a correction in flight.
                         for (int c = 0; c < sl.numCopies; ++c)
-                            seedRange (alignPhase, sl.off[c], seedSpan, scatter);
+                            seedRange (alignPhase, sl.off[c], seedSpan, runScatter);
+                        // The incoming bank's own fader position. The level law is blended
+                        // between the two banks by the same crossfade weight the audio is,
+                        // because at any weight in between BOTH are what the listener has.
+                        algScatter = runScatter;
                         // A fresh crossfade: the aligned bank is inaudible, so it can sit
                         // directly AT the destination frequencies for the whole glide
                         // (unchanged behaviour when templates come slower than the morph).
@@ -729,6 +778,7 @@ public:
                             if (alignRatio[(size_t) j] > 1.0e-12)
                                 curRatio[(size_t) j] = alignRatio[(size_t) j];
                         adoptXfadeAmps (seedSpan);
+                        runScatter = algScatter;   // see the same hand-over on the morph path
                         morphWeight = 0.0; morphWPos = 0.0;
                     }
                     else if (! wasFading)
@@ -785,6 +835,10 @@ public:
                         for (int c = 0; c < sl.numCopies; ++c)
                             for (int j = 0; j < seedSpan; ++j)
                                 alignPhase[(size_t) (sl.off[c] + j)] = phase[(size_t) (sl.off[c] + j)];
+                        // Copied phases means a copied fader position: a Dry/Wet transition's
+                        // incoming bank starts exactly as scattered as the outgoing one, so
+                        // the level law must not budge when the transition begins.
+                        algScatter = runScatter;
                         // ...and its amplitudes, which are equally free to write at weight 0
                         // and equally forbidden at any other. Deferred by one flag because
                         // tgtAmp does not hold the NEW template's amplitudes yet - the slope
@@ -818,6 +872,87 @@ public:
                     if (! snapAmps) tmplGlideSamps = (int) (kTmplGlideHold * currentSampleRate);
                 }
                 lastGen = gen;
+            }
+
+            //== THE PHASE FADER'S OWN CROSSFADE (the Dry/Wet answer) ==================
+            //
+            // Dry/Wet says a change is made smooth by fading the old out while the new
+            // fades in, with NO frequency movement anywhere, and that promise covers a
+            // re-phase exactly as it covers a spectrum change - see the "THERE IS NO
+            // phaseGlide PARAMETER" note in PluginProcessor.cpp. So under Dry/Wet the
+            // Phase fader does NOT take Morph's momentary detune: the old phases fade out
+            // and the new ones fade in. Nothing is detuned, which is the reason to choose
+            // it - there is no pitch blip on a low partial however short the time is set.
+            //
+            // It is the SAME crossfade machine, placed the same way and under the same
+            // invariant, which is why it is written here rather than as a second one:
+            // alignPhase[] is WRITTEN ONLY AT WEIGHT 0. So it starts only when the machine
+            // is free, and when it is not it simply is not started - runScatter is what
+            // remembers that the fader has moved and has not been answered, so the next
+            // block tries again and nothing is lost. Re-placing a bank that is audible is
+            // the full-scale impulse the whole file exists to avoid.
+            //
+            // WHAT THE TWO BANKS ARE. Both are THIS spectrum at THESE frequencies; only
+            // the phases differ, by the fader's own per-partial delta. So they share
+            // curRatio (nothing glides), they are given identical amplitudes (a partial
+            // common to both must not swell or duck - it is one partial sounding through
+            // two gains, which is exactly why the gain law here is linear and not
+            // equal-power), and the level law blends across the weight because the two
+            // banks really are at two different fader positions at once.
+            //
+            // A DRAG therefore lands in steps of one transition each, since the incoming
+            // bank's phases may not be re-placed while it is audible. Morph's detune tracks
+            // a drag continuously. That is a real difference between the two modes and not
+            // a defect in either.
+            // (rephaseLeft: never while one of Morph's detunes is still in flight - the
+            // mode was switched mid-gesture, and running both would move the phases twice.)
+            else if (xfadeOn && ! morphActive && morphWeight <= 0.0 && ! snapAmps
+                     && rephaseLeft <= 0 && newN > 0 && std::abs (sNow - runScatter) > 1.0e-12)
+            {
+                const int seedSpan = std::min (std::max (newN, activeCount), sl.oscCap());
+                const double* dtab = spectrum::phaseset::scatterDeltas();
+                const double  shift = sNow - runScatter;
+                for (int c = 0; c < sl.numCopies; ++c)
+                {
+                    const int off = sl.off[c];
+                    const int lim = std::min (seedSpan, spectrum::kMaxPartials - off);
+                    for (int i = 0; i < lim; ++i)
+                    {
+                        // The SAME bank, moved bodily to the new fader position: each
+                        // partial's own aligned-to-scattered delta, scaled by how far the
+                        // fader travelled. Taken off the RUNNING phase rather than re-seeded
+                        // from the hash, so a partial the move barely touches (a small delta,
+                        // or a small travel) carries straight on through the transition
+                        // instead of crossing over to an unrelated phase and back.
+                        double q = phase[(size_t) (off + i)] + shift * dtab[off + i];
+                        q -= std::floor (q);
+                        alignPhase[(size_t) (off + i)] = q;
+                    }
+                }
+                // Neither bank moves in frequency: park both glide endpoints on the ratios
+                // that are already sounding, so the alignRatio fill below lands on exactly
+                // curRatio and morphPos has nothing left to do.
+                for (int j = 0; j < seedSpan; ++j)
+                {
+                    const double l = std::log2 (std::max (1.0e-12, curRatio[(size_t) j]));
+                    morphStartLog[(size_t) j] = morphTgtLog[(size_t) j] = alignStartLog[(size_t) j] = l;
+                }
+                // Amplitude-identical banks. NOT xfadeAmpSnap (which aims the incoming bank
+                // at tgtAmp): the two banks here are the same spectrum, so any difference
+                // between them would be a level step the listener hears as the transition
+                // starting, on a control that is only supposed to move phases.
+                //
+                // Over the RENDER SPAN and not seedSpan, which is a narrower thing (one
+                // Shepard copy's bank). The normalisation reads xfadeAmp across the whole
+                // span to build the incoming bank's closed-form sums, so a tail left at an
+                // older template's amplitude there is a wrong gain on every sample of the
+                // transition - not a wrong phase somewhere inaudible.
+                const int ampSpan = std::min (std::max (newN, activeCount), (int) xfadeAmp.size());
+                for (int i = 0; i < ampSpan; ++i)
+                    xfadeAmp[(size_t) i] = curAmp[(size_t) i];
+                morphN = newN; morphActive = true; xfadeActive = true; morphFadeOut = false;
+                morphPos = 1.0; morphWeight = 0.0; morphWPos = 0.0;
+                algScatter = sNow;      // the incoming bank IS at the new position
             }
 
             if (morphActive && morphFadeOut)
@@ -1009,6 +1144,25 @@ public:
         // number on the panel.
         fillShepardCopies (sl, span, n, f0, sr);
         engine.reportRendered (sl.total);
+
+        // LIVE RE-PHASING. Runs AFTER fillShepardCopies because it needs this block's
+        // increments (a correction may not push a partial into the Nyquist clamp) and
+        // this block's `fresh` flags (a re-entering Shepard copy has just been seeded and
+        // must not be moved twice). See updateRephase for the whole rule.
+        // MORPH ONLY. Dry/Wet's answer to the same gesture is the crossfade placed above -
+        // that is the mode's whole promise ("the old fades out while the new fades in, and
+        // nothing is detuned"), and running both machines on one gesture would move every
+        // partial twice.
+        updateRephase (sl, span, sNow, morphOn,
+                       morphTimeParam != nullptr ? (double) morphTimeParam->load() : 0.3,
+                       sr, numSamples);
+        const bool   rephasing = rephaseK > 0.0;
+        // How far the SOUNDING fader position moves per sample while that runs - the
+        // number the normalisation law is ramped along, so the level lands exactly when
+        // the phases do. Zero (a literal, so the arithmetic below is exact) when idle.
+        const double sndStep   = rephasing ? rephaseK * (rephaseDest - runScatter) : 0.0;
+        double       sndBase   = runScatter;
+        const int    startSample0 = startSample;   // how many samples this block really renders
         // AMPLITUDES glide over the Morph Time while a morph runs (a hardcoded 7 ms here
         // once meant only the FREQUENCIES ever glided), over the kTmplGlideSec fade for
         // a short window after a template change with Morph off (7 ms hides a step but
@@ -1101,14 +1255,24 @@ public:
         // not affordable here. It is evaluated per sample rather than slewed because a
         // slewed normGain overshoots on a voice steal - the "some notes are suddenly
         // much louder" bug the closed form exists to prevent.
-        const double alignWeight = 1.0 - scatterAmount();
-        const double alignRest   = 1.0 - alignWeight;
-        // The two ends are taken by a branch on a BLOCK CONSTANT rather than by the
-        // blend, because 1.0 / (1.0 / c) is not bit-identical to c in floating point,
-        // and "the fader at 0 sounds exactly like the Aligned mode you saved" has to be
-        // an identity, not a rounding.
-        const bool fullyAligned   = alignWeight >= 1.0;
-        const bool fullyScattered = alignWeight <= 0.0;
+        //
+        // AND THE LAW IS ASKED WHERE THE *PHASES* ARE, NOT WHERE THE FADER IS. This read
+        // used to be scatterAmount() - the live parameter - and that is the defect the
+        // user reported in these words: "cuando muevo el fader de fase mientras el sonido
+        // suena el volumen aumenta pero no se produce el efecto". He is describing a
+        // consequence arriving without its cause. A held note's partials do not re-phase
+        // the instant the fader moves (they cannot: a phase can only be moved by detuning
+        // the partial for a while, which is what the re-phase below does over the panel's
+        // transition time, and which does not happen at all when both transitions are
+        // off). Reading the live fader here therefore moved the LEVEL by up to 20.70 dB
+        // while the crest factor - the thing the level is compensating for - had not
+        // moved at all, so the gain change was pure arbitrary loudness. The rule is one
+        // line: THE LEVEL FOLLOWS THE PHASES AND NEVER LEADS THEM.
+        //
+        // Under a crossfade the two banks sit at two fader positions (runScatter and
+        // algScatter) and BOTH are audible, so the law is blended between them by the
+        // same weight the audio is - see sndScatter inside the loop.
+        const double dAlgScatter = morphActive ? (algScatter - runScatter) : 0.0;
         double rk = 1.0; // (1-slew)^k, advanced every sample in the loop below
 
         // Filter cutoff TRACKS the played note: cutoff = f0 * 2^(cents/1200 + envOct).
@@ -1279,8 +1443,23 @@ public:
             // of them rmsN), so the guard covers both denominators; at silence both laws
             // already returned 0 and so does this.
             const double cappedN = std::min (rmsN, peakN);
-            normGain = (float) (fullyScattered ? rmsN
-                              : fullyAligned   ? cappedN
+            // WHERE THE PHASES THIS SAMPLE IS MADE OF ACTUALLY SIT ON THE FADER: the
+            // running bank's position, plus the aligned bank's difference at the weight
+            // that bank is being mixed in at. Evaluated PER SAMPLE for the same reason
+            // the weight itself is - a level that stepped once per buffer would be a
+            // zipper on exactly the gesture this control exists for.
+            //
+            // Costs one multiply and two adds while nothing is moving, and the two ends
+            // stay BIT-EXACT: dAlgScatter is a literal 0.0 unless a crossfade is running,
+            // and runScatter + 0.0 is runScatter. That matters because the branches below
+            // exist to keep "the fader at 0 sounds exactly like the Aligned mode you
+            // saved" an identity rather than a rounding (1.0 / (1.0 / c) is not c).
+            sndBase += sndStep;
+            const double sndScatter  = sndBase + morphW * dAlgScatter;
+            const double alignWeight = 1.0 - sndScatter;
+            const double alignRest   = 1.0 - alignWeight;
+            normGain = (float) (alignWeight <= 0.0 ? rmsN
+                              : alignWeight >= 1.0 ? cappedN
                               : cappedN > 0.0  ? 1.0 / (alignWeight / cappedN + alignRest / rmsN)
                                                : 0.0);
 
@@ -1311,14 +1490,34 @@ public:
             const double* algAmp = xfMix ? xfadeAmp.data() : curAmp.data();
             const auto advance = [&] (int j, int i) -> double
             {
-                double p = phase[(size_t) j] + inc[(size_t) j];
+                // THE LIVE RE-PHASE OFFSET, in cycles per sample. A phase is the integral
+                // of a frequency, so the ONLY way to move one without a discontinuity is
+                // to detune the partial briefly - this is that detune, and it is a
+                // read-only per-partial quantity folded in AT THE POINT OF USE because
+                // inc[] and alignInc[] are ASSIGNED (=, not +=) from curRatio/alignRatio
+                // every block and cannot hold anything of their own.
+                //
+                // IT REACHES BOTH BANKS ON THE SAME CLOCK, and that is not tidiness. At a
+                // crossfade weight near 0.5 both banks are audible at once; a partial
+                // whose two copies drift half a cycle apart sums to ZERO, so applying the
+                // offset to one bank only NULLS that partial for the length of the fade
+                // and brings it back when the weight lands. Measured, not hypothetical.
+                //
+                // Constant within the block and decayed once per block (see updateRephase)
+                // while it is applied per SAMPLE: a step in a FREQUENCY offset leaves the
+                // phase continuous, so it is inaudible, and paying for the decay per
+                // sample would be a read-modify-write of a 16 k array in the hot loop.
+                const double rp = rephasing ? rephaseK * rephaseRem[(size_t) j] : 0.0;
+                double p = phase[(size_t) j] + inc[(size_t) j] + rp;
                 if (p >= 1.0) p -= 1.0;
+                else if (p < 0.0) p += 1.0;   // rp may be negative; inc alone never is
                 phase[(size_t) j] = p;
                 const double s = (double) sine.lookup (p);
                 if (morphActive) // crossfade the running phase -> the coherent destination phase
                 {
-                    double pa = alignPhase[(size_t) j] + alignInc[(size_t) j]; // advances at the DEST freq
+                    double pa = alignPhase[(size_t) j] + alignInc[(size_t) j] + rp; // DEST freq + the same detune
                     if (pa >= 1.0) pa -= 1.0;
+                    else if (pa < 0.0) pa += 1.0;
                     alignPhase[(size_t) j] = pa;
                     return curAmp[(size_t) i] * runG * s
                          + algAmp[(size_t) i] * algG * (double) sine.lookup (pa);
@@ -1385,6 +1584,10 @@ public:
         // it is refilled from curRatio at the top of every block.
         if (glideLeft > 0 && sinceGlide > 0) advanceGlide (sinceGlide, sl, span, f0);
 
+        // Charge the re-phase for the samples that were REALLY rendered (the loop can
+        // break early on a finished envelope), which is exactly what startSample counted.
+        drainRephase (sl, span, startSample - startSample0);
+
         // The note has now rendered: any pressure arriving from here on is a real
         // gesture during the note, so it glides rather than snapping.
         pressureSnap = false;
@@ -1422,6 +1625,7 @@ public:
             for (int c = 0; c < sl.numCopies; ++c)
                 for (int i = 0; i < adoptSpan; ++i)
                     phase[(size_t) (sl.off[c] + i)] = alignPhase[(size_t) (sl.off[c] + i)];
+            runScatter = algScatter;   // the phases came from there, so the level law does too
             // A DRY/WET transition also hands its AMPLITUDES over. The next block renders one
             // bank at curAmp, and the last sample of the transition was the aligned bank at
             // tgtAmp; without this copy the two differ by however far the amp slew still had
@@ -1492,6 +1696,34 @@ public:
     // note-on mid-crossfade has to be able to say the crossfade really was mid-flight,
     // rather than measuring nothing and calling it a pass.
     double morphWeightForTests() const noexcept { return morphActive ? morphWeight : 0.0; }
+
+    // WHERE THE FADER IS FOR THE PHASES THAT ARE ACTUALLY SOUNDING (0 = aligned, 1 =
+    // scattered), which is what the normalisation law is derived from. It is NOT the
+    // parameter: under a held note the two disagree for the length of a re-phase, and
+    // the whole point of this feature is that they are allowed to.
+    double soundingScatterForTests() const noexcept { return runScatter; }
+    // The biggest frequency offset a live re-phase has actually applied on this note,
+    // in CENTS of the partial it was applied to - the only honest unit for it, because
+    // the same absolute offset is a swoop on a 55 Hz partial and nothing at 4.4 kHz.
+    double rephaseWorstCentsForTests() const noexcept
+    { return rephaseWorstRel > 0.0 ? 1200.0 * std::log2 (1.0 + rephaseWorstRel) : 0.0; }
+    // The running bank's phases, slot for slot. Verifiers only, and it exists so
+    // "the partials really arrived at the interpolated targets" can be a measured
+    // number of degrees rather than a claim: a control voice played at the destination
+    // fader position from its note-on advances at the same increments, so the two
+    // arrays must agree once the move has landed.
+    // `base` is the oscillator slot to start at - 0 for an ordinary voice, and
+    // slot * shepard::kStride to read ONE Shepard copy's bank. It matters which: the
+    // copies do not all carry the same number of partials (a risen copy has fewer under
+    // Nyquist), and slot 0 is whichever grid index happens to hash there, so a verifier
+    // that always read slot 0 would compare 26 partials on one run and 383 on the next.
+    int phasesForTests (double* out, int maxN, int base = 0) const noexcept
+    {
+        if (base < 0 || base >= spectrum::kMaxPartials) return 0;
+        const int k = std::min (std::min (maxN, activeCount), spectrum::kMaxPartials - base);
+        for (int i = 0; i < k; ++i) out[i] = phase[(size_t) (base + i)];
+        return k;
+    }
 
     double shepRiseRatioForTests() const noexcept { return std::exp2 (smShepP); }
     bool   shepActiveForTests()    const noexcept { return shepActive; }
@@ -1701,6 +1933,178 @@ private:
     }
 
     //==========================================================================
+    // LIVE RE-PHASING: THE PHASE FADER MOVED WHILE THIS NOTE WAS SOUNDING.
+    //
+    // "cuando muevo el fader de fase mientras el sonido suena el volumen aumenta pero no
+    //  se produce el efecto o no del todo." He was right, and precisely right: the level
+    // followed the fader immediately while the PHASES did not move until the next
+    // note-on, so he was hearing the consequence without the cause. The rule this file
+    // now keeps is one line - THE LEVEL FOLLOWS THE PHASES AND NEVER LEADS THEM - and
+    // this function is the half that makes the phases actually go.
+    //
+    // THE MATHS IS STATELESS. seedScattered places partial j at
+    // wrap01(kAlignedPhase + s * d_j), so moving the fader by ds owes every partial
+    // exactly ds * d_j cycles, where d_j is that partial's own aligned-to-scattered
+    // delta. That is phaseset::scatterDeltas()[j] - the header's OWN curve, tabulated,
+    // never a second copy of it (testScatterDeltaIsTheCurve re-derives interpolatePhases
+    // from the table so the two cannot drift apart).
+    //
+    // WHAT MOVES A PHASE. Only a frequency offset: phase is the integral of frequency, so
+    // a partial walks to its new phase by being briefly detuned and nothing else can do
+    // it without a step. rephaseRem[j] is the debt still owed IN CYCLES and rephaseK the
+    // fraction of it to pay per sample, so the offset is rephaseK * rephaseRem[j] - a
+    // block constant times a per-partial number, folded in at the point of use because
+    // inc[]/alignInc[] are re-ASSIGNED from curRatio/alignRatio every block and cannot
+    // park anything of their own. Both banks get the same offset (see advance()).
+    //
+    // WHAT A SINGLE TIME CANNOT DO, SAID OUT LOUD. Half a cycle in T seconds is an offset
+    // of 0.5/T Hz WHATEVER the partial's own frequency is, so the same move is a large
+    // INTERVAL down low and an inaudible one up high: at T = 5 ms it is +1794 cents on a
+    // 55 Hz partial and +39 cents on a 4400 Hz one. No single T is inaudible across a
+    // whole bank, and pretending otherwise would be the lie. What is done about it:
+    //   - the time is the panel's own transition Time, which the user sets, floored at
+    //     kRephaseMinSec for the same reason the crossfade weight is floored there;
+    //   - a DRAG re-aims every block, so the offset is proportional to the drag RATE and
+    //     not to 0.5/T at all (a 0.5 s drag at 110 Hz measures a few cents). It is a JUMP
+    //     - an automation step, a preset recall - that costs, and it costs once;
+    //   - the worst offset actually applied is measured and reportable
+    //     (rephaseWorstCentsForTests), so this stays a number and not a hope.
+    //
+    // AND NO PARTIAL IS EVER PINNED. The offset must not push a partial into the 0.4999
+    // Nyquist clamp (silently freezing a partial's frequency is the same class of
+    // violation as silently dropping it) nor through zero into a reversed one. It never
+    // has to: a phase debt is defined MODULO ONE CYCLE, so rephaseRem[j] and
+    // rephaseRem[j] +/- 1 reach the identical phase by opposite routes. A partial whose
+    // upward route would clip takes the downward one instead, and vice versa - it arrives
+    // at the same time as everyone else, just by the other side. That is legal at ANY
+    // moment (it changes the route, never the destination), which is why the check can
+    // simply run every block against this block's real increments.
+    void updateRephase (const ShepLayout& sl, int span, double sNow, bool allowed,
+                        double tSec, double sr, int numSamples) noexcept
+    {
+        const int e = std::min (span, sl.oscCap());
+        if (e <= 0) { rephaseK = 0.0; return; }
+
+        // A NEW AIM. Gated on `allowed`: with BOTH transitions off there is nothing that
+        // says how a mid-note phase move should be made smooth, so it is not made at all
+        // and the new phases wait for the next note-on - which is what the panel promises,
+        // and which is honest precisely because the LEVEL now waits with them. A move
+        // already in flight is never abandoned when the mode is switched off mid-gesture:
+        // stopping it would strand the partials between two fader positions for ever.
+        // With nothing in flight the destination IS where the phases are. Re-stated rather
+        // than assumed, because runScatter also moves on its own: a Dry/Wet phase crossfade
+        // hands it over when the fade completes, and a stale rephaseDest would then be a
+        // phantom debt for the next Morph gesture to deliver on top of its own.
+        if (rephaseLeft <= 0) rephaseDest = runScatter;
+        const double ds = (allowed && std::abs (sNow - rephaseDest) > 1.0e-12)
+                            ? sNow - rephaseDest : 0.0;
+        if (ds != 0.0)
+        {
+            rephaseDest = sNow;
+            // EVERY new aim restarts the clock, exactly as the morph's own glide does and
+            // for the same reason: keeping the old countdown would let a continuous drag
+            // (a fresh value ~60x a second) run the remaining time down to nothing and
+            // turn the last stretch of the gesture into a snap.
+            rephaseLeft = (int) std::lround (std::max (kRephaseMinSec, tSec) * sr);
+            if (rephaseLeft < 1) rephaseLeft = 1;
+        }
+        if (rephaseLeft <= 0) { rephaseK = 0.0; return; }
+
+        const double  outstanding = rephaseDest - runScatter;
+        const double* dtab = spectrum::phaseset::scatterDeltas();
+        for (int c = 0; c < sl.numCopies; ++c)
+        {
+            const int off = sl.off[(size_t) c];
+            const int lim = std::min (e, spectrum::kMaxPartials - off);
+            // A FRESHLY SEEDED SHEPARD COPY OWES NOTHING. fillShepardCopies has just placed
+            // it AT the destination (it was silent, so it was free to place anywhere), and
+            // handing it the correction as well is the trap: it would travel the distance
+            // twice. Zeroed rather than left alone, because the slot may still be carrying
+            // the debt of the grid index that used to live in it.
+            //
+            // Otherwise: a slot this move has never covered - a rank the template only grew
+            // into after the move began - is WRITTEN with the whole outstanding debt rather
+            // than added to, since it has none of its own yet.
+            const bool whole = sl.fresh[(size_t) c];
+            const int  had   = whole ? 0 : std::min (lim, rephaseAimed);
+            for (int i = 0; i < had; ++i)
+                rephaseRem[(size_t) (off + i)] += ds * dtab[off + i];
+            for (int i = had; i < lim; ++i)
+                rephaseRem[(size_t) (off + i)] = outstanding * dtab[off + i];
+        }
+        rephaseAimed = std::max (rephaseAimed, e);
+
+        // THE RATE. Stretched to the block when the move would finish inside it, so the
+        // offset is applied for exactly as long as the debt lasts and can never overshoot
+        // past the target - at most one buffer later than asked, which is under the 5 ms
+        // floor anyway.
+        const int over = std::max (numSamples, rephaseLeft);
+        rephaseK = 1.0 / (double) over;
+
+        // NO PARTIAL PINNED, NO PARTIAL REVERSED. Checked against BOTH banks (they glide
+        // at different frequencies during a morph and share one offset), over exactly the
+        // slots the render loop will touch.
+        for (int c = 0; c < sl.numCopies; ++c)
+        {
+            const int off = sl.off[(size_t) c];
+            const int cnt = std::min (sl.count[(size_t) c], std::min (e, spectrum::kMaxPartials - off));
+            for (int i = 0; i < cnt; ++i)
+            {
+                const size_t j = (size_t) (off + i);
+                const double o  = rephaseK * rephaseRem[j];
+                const double hi = morphActive ? std::max (inc[j], alignInc[j]) : inc[j];
+                const double lo = morphActive ? std::min (inc[j], alignInc[j]) : inc[j];
+                if      (hi + o >= kIncCeil)  rephaseRem[j] -= 1.0;   // same phase, the long way DOWN
+                else if (lo + o <= kIncFloor) rephaseRem[j] += 1.0;   // same phase, the long way UP
+                // The biggest detune this note has been asked to make, as a fraction of
+                // the partial's own frequency - the honest form of "how big a pitch blip
+                // was that", because the same absolute offset is enormous low and nothing
+                // high. Costs one multiply while a move runs and nothing at all otherwise.
+                const double a = std::abs (rephaseK * rephaseRem[j]);
+                if (lo > 1.0e-12 && a > rephaseWorstRel * lo) rephaseWorstRel = a / lo;
+            }
+        }
+    }
+
+    // Charge the move for `rendered` samples: drain the debt by the fraction that was
+    // actually paid, and walk the SOUNDING fader position the same fraction of the way.
+    // Both banks moved by the identical offset, so both positions advance by the identical
+    // amount and their difference - which the level law blends across - is untouched.
+    void drainRephase (const ShepLayout& sl, int span, int rendered) noexcept
+    {
+        if (rephaseK <= 0.0 || rendered <= 0) return;
+        const double f = std::min (1.0, rephaseK * (double) rendered);
+        // Over the WHOLE span, including the slots a Shepard copy is not currently
+        // sounding (its own count stops below span once its root has risen). Those slots
+        // did not move, so their debt is being written off - deliberately, because the
+        // invariant everything here rests on is that rem[j] IS (rephaseDest - runScatter)
+        // times that partial's delta, and a slot carrying a private, staler debt would
+        // break it for every later aim. Nothing is heard: a partial only comes back into a
+        // copy's range through the near-Nyquist taper, i.e. from an amplitude of zero.
+        const int    e = std::min (span, sl.oscCap());
+        const double dAbs = (rephaseDest - runScatter) * f;
+        for (int c = 0; c < sl.numCopies; ++c)
+        {
+            const int off = sl.off[(size_t) c];
+            const int lim = std::min (e, spectrum::kMaxPartials - off);
+            for (int i = 0; i < lim; ++i) rephaseRem[(size_t) (off + i)] *= (1.0 - f);
+        }
+        runScatter += dAbs;
+        algScatter += dAbs;
+        if (f >= 1.0)
+        {
+            // Landed. EXACTLY on the destination rather than on the accumulated sum, for
+            // the same reason the portamento lands exactly on zero: a residue of a
+            // thousandth of a fader unit would sit on the note for its whole life and the
+            // level law would be derived from it.
+            const double snap = rephaseDest - runScatter;
+            runScatter += snap; algScatter += snap;   // both banks moved together; both land together
+            rephaseLeft = 0; rephaseK = 0.0;
+        }
+        else rephaseLeft = std::max (1, rephaseLeft - rendered);
+    }
+
+    //==========================================================================
     // SHEPARD MODE. The rules, the bounds and the pure maths live in
     // ShepardEngine.h; these two functions are the per-block bookkeeping.
     //
@@ -1865,7 +2269,30 @@ private:
     void fillShepardCopies (ShepLayout& sl, int span, int n, double f0, double sr) noexcept
     {
         const double nyq = 0.5 * sr;
-        const double scatter = scatterAmount();
+        // THE FADER POSITION OF THE BANK THIS COPY IS JOINING, not the live parameter.
+        // A slot re-entering the window has to be as scattered as its seven siblings or
+        // the voice has two crest factors at once and its ONE normalisation number can
+        // only be honest about one of them. Identical to the old scatterAmount() read
+        // whenever the fader has not moved under a held note, which is every case that
+        // existed before this number did.
+        const double scatter = runScatter;
+        // WHERE A COPY THAT IS NOT SOUNDING GETS PLACED, which is a different question and
+        // it took a measurement to see that. A copy is (re)seeded only while its window is
+        // exactly zero - newly claimed, or sitting on an edge - so it is free to be put
+        // ANYWHERE, and the right answer is not "where the sounding phases are" but "where
+        // they are going". A copy placed at the current position and then handed the
+        // outstanding correction moves twice; placed there and handed nothing, it rises
+        // into the band wearing the fader position it was claimed at while its seven
+        // siblings wear the new one, and the voice has ONE normalisation number and cannot
+        // describe two crest factors. Measured before this line existed, RhythmVerify run
+        // 53's Shepard case at a 500 ms rise: the copies claimed during the gesture read
+        // back at fader 0.01 and 0.02 while the rest had arrived at 1.00.
+        //
+        // The two banks get their OWN destinations, because they legitimately have two:
+        // under a Dry/Wet phase crossfade the running bank is still the old phase set and
+        // the aligned bank is already the new one, and the hand-over at the end is what
+        // moves the voice. With nothing in flight all three numbers are equal and this is
+        // the read it replaces, unchanged.
         const double T   = shepard::taperWidth (sl.blockLogMove);
         const int    cap = sl.oscCap();      // one copy's bank; see ShepLayout::oscCap
         sl.total = 0;
@@ -1912,7 +2339,13 @@ private:
             {
                 const int e = std::min (span, cap);
                 seedRange (phase,      off, e, scatter);
-                seedRange (alignPhase, off, e, scatter);
+                // ...and the ALIGNED bank at ITS position, which is a different number
+                // during a Dry/Wet phase crossfade: the running bank is still the old
+                // phase set and the incoming one is already the new one. Seeded at the
+                // running bank's position instead, this copy would be handed over to the
+                // old phases when the fade completes - the whole stack would have moved
+                // except the copy that happened to enter the window during the gesture.
+                seedRange (alignPhase, off, e, algScatter);
             }
 
             // THE NEAR-NYQUIST TAPER. A rising copy loses its top partials one by one;
@@ -2067,6 +2500,51 @@ private:
     int           prevN       = 0;     // partials rendered last block (nearest-neighbour source)
     juce::uint32  lastGen     = 0;     // last template generation seen (detects a spectrum change)
 
+    //== WHERE THE PHASE FADER IS FOR THE PHASES THAT ARE ACTUALLY SOUNDING =====
+    // Not the parameter. The parameter is where the USER has put the control; these two
+    // are where the two oscillator banks were PLACED, and under a held note they are
+    // allowed to disagree with it - a phase cannot be moved without detuning the partial
+    // for a while, so the move takes the panel's transition time (or, with both
+    // transitions off, does not happen until the next note-on at all).
+    //
+    // Every consumer of "how scattered is this voice" reads these, never the parameter:
+    //   - the normalisation law, so the LEVEL follows the phases instead of leading them
+    //     (the reported symptom: the fader got louder without doing anything);
+    //   - a Shepard copy re-entering the window, so it joins the bank it is joining;
+    //   - the aligned bank's coherent seeding, so a morph starts from what is sounding.
+    // runScatter belongs to phase[], algScatter to alignPhase[]; they are handed over
+    // wherever one bank is copied onto the other, and blended by the crossfade weight
+    // wherever both are audible.
+    double runScatter = 0.0;
+    double algScatter = 0.0;
+
+    //== LIVE RE-PHASING state (see updateRephase / drainRephase) ==============
+    // The phase each oscillator slot still OWES, in cycles, signed, and defined modulo
+    // one cycle - which is what lets a partial that would be pushed into the Nyquist
+    // clamp take the same journey the other way round instead of being pinned.
+    // Per-slot rather than a single scalar because that modulo choice is per partial and
+    // has to stay made for the rest of the move, or the fraction already delivered and
+    // the fraction still to come would be two different journeys.
+    std::array<double, spectrum::kMaxPartials> rephaseRem {};
+    double rephaseDest = 0.0;   // the fader position the phases are travelling TO
+    double rephaseK    = 0.0;   // fraction of the debt paid per sample (0 = nothing in flight)
+    int    rephaseLeft = 0;     // samples of the move still to run
+    int    rephaseAimed = 0;    // slots this move has already been aimed over (see updateRephase)
+    // The biggest detune the move has asked for, as a fraction of the partial's own
+    // frequency. Reported, never acted on - it is how "how big was the pitch blip" stays
+    // a measured number instead of an estimate from the formula.
+    double rephaseWorstRel = 0.0;
+    // The same 5 ms floor the crossfade WEIGHT uses, and for a related reason: below it
+    // the frequency offset needed to walk half a cycle stops being a detune and becomes a
+    // chirp (0.5/T Hz - at 5 ms that is +1794 cents on a 55 Hz partial). Morph Time and
+    // Dry/Wet Time keep their full range for everything else they drive.
+    static constexpr double kRephaseMinSec = 0.005;
+    // The ceiling is the SAME 0.4999 fillShepardCopies clamps at (a partial may not be
+    // pushed to or past Nyquist) and the floor keeps every frequency strictly positive (a
+    // reversed partial is not the partial the user asked for either).
+    static constexpr double kIncCeil  = 0.4999;
+    static constexpr double kIncFloor = 1.0e-9;
+
     int   activeCount = 0;     // slots to process (includes fading-out tails)
     bool  snapAmps    = true;  // snap amps to target this block (cold note start)
     float normGain    = 1.0f;  // per-voice normalisation gain (recomputed per sample)
@@ -2122,6 +2600,10 @@ private:
     double smShepRate = 0.125;   // smoothed rise rate (intervals per second)
     std::array<long long, shepard::kSlots> shepM    {};  // grid index held by each slot
     std::array<bool,      shepard::kSlots> shepUsed {};
+    // WHERE EACH SLOT'S BANK SITS ON THE PHASE FADER. Normally every slot equals
+    // runScatter - they all take the same correction - but a copy the render loop skips
+    // (window exactly zero) takes none of it, and this is what notices. See
+    // fillShepardCopies.
     // Last block's copies, for the verifiers only (see shepProbeForTests).
     int shepProbeCount = 0;
     std::array<long long, shepard::kSlots> shepProbeM    {};
