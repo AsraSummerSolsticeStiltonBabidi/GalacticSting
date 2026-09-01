@@ -9999,6 +9999,96 @@ int main()
                    "and the note gate's own Mono no longer turns the glide back into a jump");
         }
 
+        //-- (j) THE GLIDE IS CHARGED FOR SAMPLES RENDERED, AT EVERY SUB-BLOCK SIZE -------
+        // Everything above this point renders at ONE block size (256) and never varies
+        // it, and that is exactly what hid the worst bug this feature ever had: the glide
+        // was advanced from inside the FILTER CUTOFF chunk gate, a counter re-seeded to 32
+        // at the top of every renderNextBlock. A sub-block of 31 samples or fewer never
+        // reached the branch, so glideLeft never decremented: the note stopped dead 700
+        // cents flat and stayed there for ever, and because lastPitchLog carries the glide
+        // offset the NEXT takeover started from the stuck pitch too.
+        //
+        // Sub-blocks that short are not exotic. MPESynthesiserBase::renderNextBlock
+        // renders 1 sample for the first event of a block and always renders the trailing
+        // remainder whatever its size, so ANY host buffer size produces them - which is
+        // why the second half of this block plays the same glide at a perfectly ordinary
+        // 256-sample buffer with a stream of controller messages underneath it, the way a
+        // real MPE controller or a moving automation lane sends them.
+        //
+        // Both halves assert BOTH ends of the claim: WHERE the glide arrives and HOW LONG
+        // it took. An arrival check alone passes on a glide that took twice as long, and
+        // a duration check alone passes on one that stopped early at the wrong pitch.
+        {
+            const int sizes[] = { 8, 16, 24, 31, 32, 64, 256, 2048 };
+            const int glideSamples = (int) std::lround (glideMs * 0.001 * sr8);
+            // Rendered per size: enough to settle on the low note, then the glide plus a
+            // long tail - if the portamento were stuck, "still stuck" would be measured
+            // here, a third of a second after it should have arrived.
+            const int settleN = (int) (0.100 * sr8);
+            const int afterN  = (int) (0.600 * sr8);
+            const int cc      = 20;   // undefined controller: inert to the synth, but it
+                                      // still splits the block into sub-blocks
+            for (int si = 0; si < (int) (sizeof (sizes) / sizeof (sizes[0])) + 1; ++si)
+            {
+                // One extra pass past the end of the table: the same 256-sample buffer,
+                // this time with controller traffic every 100 samples.
+                const bool  ccPass = si == (int) (sizeof (sizes) / sizeof (sizes[0]));
+                const int   bs     = ccPass ? 256 : sizes[si];
+                p = std::make_unique<FractalAdditiveAudioProcessor>();
+                p->prepareToPlay (sr8, bs);
+                applyPatch();
+                sp ("glideTime", (float) glideMs);
+                sp ("monoGlide", 1.0f);
+                x.clear(); clk = 0;
+
+                juce::AudioBuffer<float> bb (2, bs);
+                auto step = [&] (const juce::MidiBuffer& m)
+                {
+                    juce::MidiBuffer mm (m);
+                    if (ccPass)
+                        for (int s = 0; s < bs; s += 100)
+                            mm.addEvent (juce::MidiMessage::controllerEvent (1, cc, 64), s);
+                    bb.clear();
+                    p->processBlock (bb, mm);
+                    const float* r = bb.getReadPointer (0);
+                    for (int k = 0; k < bs; ++k) x.push_back (r[k]);
+                };
+
+                for (int done = 0, first = 1; done < settleN; done += bs, first = 0)
+                    step (first ? on (60) : juce::MidiBuffer {});
+
+                const size_t at = x.size();
+                int elapsed = -1;
+                for (int done = 0, first = 1; done < afterN; done += bs, first = 0)
+                {
+                    step (first ? on (67) : juce::MidiBuffer {});
+                    if (elapsed < 0 && ! p->voiceGlidingForTests()) elapsed = done + bs;
+                }
+
+                // The voice's own end-of-block pitch, and the pitch actually HEARD a third
+                // of a second after the glide was due - a stuck glide fails both.
+                const double hz    = p->voiceSoundingHzForTests();
+                const double heard = f0At (at + (size_t) (0.450 * sr8), (int) (0.030 * sr8));
+                const double cents = hz > 0.0 ? 1200.0 * std::log2 (hz / fHi) : -9999.0;
+                const double hCent = heard > 0.0 ? 1200.0 * std::log2 (heard / fHi) : -9999.0;
+                // Block granularity is the only slack the measurement itself needs: the
+                // glide can only be seen to have ended on a block boundary.
+                const int    slack = 2 * bs + 64;
+                std::printf ("  block %5d%s: arrived %.2f Hz (%+.1f c), heard %.2f Hz (%+.1f c), "
+                             "glide took %d samples (asked %d, slack %d)\n",
+                             bs, ccPass ? " +CC" : "    ", hz, cents, heard, hCent,
+                             elapsed, glideSamples, slack);
+                juce::String tag ("block size ");
+                tag << bs << (ccPass ? " with controller traffic" : "");
+                check (std::abs (cents) < 5.0,
+                       (tag + ": the glide ARRIVES on the new note's tuned pitch").toRawUTF8());
+                check (std::abs (hCent) < 20.0,
+                       (tag + ": ...and that is the pitch the rendered audio sounds at").toRawUTF8());
+                check (elapsed > 0 && std::abs (elapsed - glideSamples) <= slack,
+                       (tag + ": ...having taken the Glide Time asked for, no more and no less").toRawUTF8());
+            }
+        }
+
         sp ("monoGlide", 0.0f);
     }
 

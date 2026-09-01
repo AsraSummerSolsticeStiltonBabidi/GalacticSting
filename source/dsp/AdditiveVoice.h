@@ -1059,6 +1059,24 @@ public:
         // buffer size.
         constexpr int kCutoffChunk = 32;
         int sinceCutoff = kCutoffChunk;
+        // SAMPLES ACTUALLY RENDERED since the portamento last moved, which is the only
+        // thing the glide is allowed to be driven by.
+        //
+        // It used to ride on sinceCutoff alone, and that counter is a best-effort CUTOFF
+        // refresh: a LOCAL, re-seeded to 32 at the top of every renderNextBlock, so its
+        // branch is entered for the first time on the 32nd sample and a sub-block of 31
+        // samples or fewer never entered it at all. Skipping a cutoff refresh is
+        // inaudible and always was allowed; skipping the glide meant glideLeft never
+        // decremented and glideOff never reached zero - measured at exactly the cliff, a
+        // 31-sample sub-block left the note sitting 700 cents flat and STILL there three
+        // seconds later. lastPitchLog carries glideOff, so the next takeover then started
+        // from the stuck pitch too and mono mode lost pitch control after the first note.
+        //
+        // Sub-blocks under 32 samples are ROUTINE at any host buffer size:
+        // MPESynthesiserBase::renderNextBlock renders 1 sample for the first event of a
+        // block and always renders the trailing remainder whatever its size, so ordinary
+        // CC/MPE traffic alone stretched a 200 ms glide to 320 ms at a 256-sample buffer.
+        int sinceGlide = 0;
         const auto refreshCutoff = [&]
         {
             const double octs = (double) modded (ModEngine::PvFCutoff, fCutoffParam) / 1200.0
@@ -1093,11 +1111,15 @@ public:
 
         while (--numSamples >= 0)
         {
+            ++sinceGlide;
             if (--sinceCutoff <= 0)
             {
                 // The portamento moves first, so the cutoff's key tracking reads the
-                // pitch this chunk is actually about to sound at.
-                if (glideLeft > 0) advanceGlide (kCutoffChunk, sl, span, f0);
+                // pitch this chunk is actually about to sound at. Charged with the
+                // samples COUNTED above (exactly kCutoffChunk when the gate fires) and
+                // never with the constant, so the flush after the loop cannot
+                // double-count what this branch already paid for.
+                if (glideLeft > 0) { advanceGlide (sinceGlide, sl, span, f0); sinceGlide = 0; }
                 refreshCutoff();
                 sinceCutoff = kCutoffChunk;
             }
@@ -1293,6 +1315,14 @@ public:
                 break;
             }
         }
+
+        // THE REMAINDER. Whatever the chunk gate above did not cover - the whole of a
+        // sub-block shorter than kCutoffChunk, or the last partial chunk of a long one -
+        // still SOUNDED, so the glide has to be charged for it before lastPitchLog is
+        // written below. Without this the portamento simply stopped wherever the
+        // chunking left it (see sinceGlide). Rescaling inc[] one extra time is free:
+        // it is refilled from curRatio at the top of every block.
+        if (glideLeft > 0 && sinceGlide > 0) advanceGlide (sinceGlide, sl, span, f0);
 
         // The note has now rendered: any pressure arriving from here on is a real
         // gesture during the note, so it glides rather than snapping.
