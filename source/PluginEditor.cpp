@@ -9433,7 +9433,11 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
 
     const int  rendered  = processorRef.getPartialCount();
     const int  templ     = processorRef.getTemplatePartialCount();
-    const bool truncated = processorRef.isSpectrumTruncated();
+    // Two ways the same sentence can be true: the TEMPLATE hit kMaxPartials on compile,
+    // or a SHEPARD copy wanted more than its one kStride slot holds while the band's
+    // bottom edge caught up with a density change. Both are caps that change what is
+    // heard, so both wear the same label rather than one of them being silent.
+    const bool truncated = processorRef.isSpectrumTruncated() || processorRef.isShepardSlotCapped();
     juce::String meter;
     if (templ == 0)
     {

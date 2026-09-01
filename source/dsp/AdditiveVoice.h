@@ -444,7 +444,53 @@ public:
     }
 
     //==========================================================================
+    // ONE PLAN CANNOT OUTLAST ITS SLOTS. planShepard gives every grid index whose window
+    // is non-zero anywhere in the plan its own slot, and there are only kSlots of them.
+    // A LIVE buffer never gets near that (the fastest rise takes 2400 samples to move one
+    // interval at 48 kHz), but an OFFLINE RENDER buffer does: at 8192 samples the grid
+    // moves 3.4 intervals, the plan asks for 12 slots, and the clamp that used to say
+    // "defensive; never fires" deleted a copy whose window was still 0.269 - a partial
+    // dropped in silence AND a step, in one event.
+    //
+    // So the BLOCK is split on the horizon the slots can honestly cover (see
+    // shepard::maxPlanSamples) rather than the STACK being trimmed to fit the block.
+    // With the mode off, or at any rate a live buffer can outrun, `limit` is at least
+    // numSamples and this is exactly one call - bit-for-bit the block this file always
+    // rendered. Nothing is allocated: renderChunk is the same function under a new name.
     void renderNextBlock (juce::AudioBuffer<float>& output, int startSample, int numSamples) override
+    {
+        int limit = numSamples;
+        if (shepActive && currentSampleRate > 0.0)
+            limit = shepard::maxPlanSamples (currentSampleRate, shepardRiseSeconds());
+        while (numSamples > 0)
+        {
+            const int nS = std::min (numSamples, limit);
+            renderChunk (output, startSample, nS);
+            startSample += nS;
+            numSamples  -= nS;
+            // finishNote() inside renderChunk ends the note mid-buffer; the remaining
+            // chunks would be no-ops anyway (renderChunk returns immediately on an
+            // inactive voice), but stopping here says so out loud.
+            if (! adsr.isActive() && ! fastKill)
+                break;
+        }
+    }
+
+    // The rise rate this voice is being driven at, RIGHT NOW, in seconds per interval.
+    // ONE reader for the two places that need it - the block splitter above and
+    // planShepard - because a second copy of these three parameter reads is how the
+    // splitter and the plan would come to disagree about how fast the stack is moving,
+    // which is exactly the disagreement the split exists to prevent.
+    double shepardRiseSeconds() const noexcept
+    {
+        return shepard::riseSeconds (shepModeParam != nullptr && shepModeParam->load() > 0.5f,
+                                     shepTimeParam != nullptr ? (double) shepTimeParam->load() : 8000.0,
+                                     shepDivParam  != nullptr ? (int)    shepDivParam->load()  : 9,
+                                     modBpm);
+    }
+
+private:
+    void renderChunk (juce::AudioBuffer<float>& output, int startSample, int numSamples)
     {
         // The mono shrink's fade request (see requestFadeOut), consumed on the only thread
         // that is allowed to touch this voice's state. Skipped when a fade is already
@@ -560,6 +606,28 @@ public:
                 if ((double) ps[(size_t) i].ratio > maxRatio) break; // sorted asc -> rest are higher
                 newN = i + 1;
             }
+            // THE ONE SILENT CUT LEFT IN THIS FILE, AND IT IS MEASURED. `count` above is
+            // clamped to kStride with the mode on, so if the walk reaches the end without
+            // meeting Nyquist, the deepest copy wanted MORE partials than its slot holds
+            // and the rest are simply absent - not tapered, not faded, gone. The density
+            // floor exists so this cannot happen, which is exactly why the claim needs a
+            // number rather than a comment: run 53 asserts this counter stays at zero
+            // through a mid-note density change, which is the one moment the floor is
+            // catching up and the cut could bite.
+            if (sl.windowed && newN == count && count < (int) ps.size())
+            {
+                ++shepEvCutBlocks;
+                shepEvCutWorst = std::max (shepEvCutWorst, (int) ps.size() - count);
+                // ...AND IT IS ON SCREEN WHILE IT LASTS. A cap that changes what is heard
+                // may not be silent, and this one is reachable: for the ~16 ms in which the
+                // band's bottom edge is travelling up to a density change (see planShepard)
+                // the deepest copies are still audible and cannot fit their slot. Held for
+                // half a second because the event is far shorter than one frame of the
+                // editor's 60 Hz poll, and a flag nobody can see is not visible.
+                shepCapHold = (int) (0.5 * currentSampleRate);
+            }
+            shepCapped.store (shepCapHold > 0, std::memory_order_relaxed);
+            shepCapHold = std::max (0, shepCapHold - numSamples);
 
             // Spectral MORPHING: when the template CHANGES, each partial glides from
             // where it is NOW to its new position over Morph Time (a per-partial pitch
@@ -1334,6 +1402,22 @@ public:
         }
         else { wc[0] = 1.0; }
 
+        // WHAT THE STACK IS NORMALISED BY, and it is a CONSTANT for the block.
+        //
+        // This used to be the window's own running sum, recomputed every sample - and
+        // dividing by that divides the window straight back out. On the ordinary
+        // 8-interval band nothing showed, because a raised cosine over a uniform grid of
+        // q copies sums to exactly q/2 and its square to exactly 3q/8, so the running sum
+        // WAS this constant (4.0 and 3.0) to rounding. But when a dense spectrum or a wide
+        // rise interval narrows the band to one interval, the running sum IS the single
+        // copy's window: the divisor went to zero exactly where the window did, the voice
+        // held full level all the way to the edge, and the silent wrap the whole illusion
+        // rests on stopped happening. Measured at a 16/1-period tuning with Base N at 64:
+        // as loud at a window sum of 0.098 as at 0.95 - a ratio of 0.90 where it should
+        // have been 10.2. See shepard::windowSumPeak for why there are two of them.
+        const double Sw  = sl.windowed ? sl.normSw  : 1.0;   // feeds the PEAK law
+        const double Sw2 = sl.windowed ? sl.normSw2 : 1.0;   // feeds the RMS law
+
         while (--numSamples >= 0)
         {
             ++sinceGlide;
@@ -1349,17 +1433,11 @@ public:
                 sinceCutoff = kCutoffChunk;
             }
 
-            // Window values for this sample, and the two sums the normalisation needs.
-            // Both scale EXACTLY: every oscillator of copy c carries the same factor
-            // w_c, so sum(amp) over the whole stack is sum(w) * sum(amp) over the base
-            // list and sum(amp^2) is sum(w^2) * sum(amp^2). The closed-form running
-            // sums below therefore stay exact - a Shepard voice is normalised as
-            // honestly as a plain one, and its loudness does not breathe with how many
-            // copies happen to be inside the window.
-            double Sw = 1.0, Sw2 = 1.0;
+            // Window values for this sample. Every oscillator of copy c carries the same
+            // factor w_c, so sum(amp) over the whole stack is (sum of w) * sum(amp) over
+            // the base list, and sum(amp^2) is (sum of w^2) * sum(amp^2). The closed-form
+            // running sums below therefore stay exact.
             if (sl.windowed)
-            {
-                Sw = 0.0; Sw2 = 0.0;
                 for (int c = 0; c < sl.numCopies; ++c)
                 {
                     const double nc = cx[c] * cd - sx[c] * sd;
@@ -1372,10 +1450,8 @@ public:
                     // leave the top and re-enter the bottom silent. Writing the formula
                     // out a second time here is how a sabotage of the rule would leave
                     // every test green.
-                    const double w = shepard::windowFromCos (uu[c], nc);
-                    wc[c] = w; Sw += w; Sw2 += w * w;
+                    wc[c] = shepard::windowFromCos (uu[c], nc);
                 }
-            }
             // Crossfade weight, advanced PER SAMPLE. Doing this once per block meant that
             // for any Morph Time below one buffer the weight went 0 -> 1 between two
             // samples, switching every partial onto the coherent reference simultaneously:
@@ -1663,6 +1739,7 @@ public:
         }
     }
 
+public:
     //== Test probe (single-threaded verifiers only) ===========================
     // The Shepard copies this voice rendered last block: grid index, ROOT frequency
     // (the transposed played pitch this copy's whole spectrum is built on), the
@@ -1727,6 +1804,45 @@ public:
 
     double shepRiseRatioForTests() const noexcept { return std::exp2 (smShepP); }
     bool   shepActiveForTests()    const noexcept { return shepActive; }
+    // The meter's honesty flag: this voice's deepest Shepard copy wanted more partials
+    // than one kStride slot holds, so some of them are not sounding. See the comment at
+    // shepCapHold - the ONE cap left that changes what is heard, and it says so on screen.
+    bool   shepardSlotCapped()     const noexcept { return shepCapped.load (std::memory_order_relaxed); }
+
+    //== The Shepard's three STATED invariants, made measurable ==================
+    // Prose cannot be sabotaged, so none of these is left to a comment. Each is the
+    // worst case seen since shepEvidenceResetForTests(), and each is a number the
+    // rules in ShepardEngine.h are already written in:
+    //   claimW  - the window a slot was (re)claimed at. The rule is "a slot is claimed
+    //             at a window edge, where the window is ~0, and that is what makes
+    //             re-seeding it inaudible"; a re-seed writes phase[] AND alignPhase[],
+    //             so this number IS the amplitude step the re-seed can cause.
+    //   claimX  - the crossfade weight at that same moment. The file's other invariant
+    //             is that alignPhase[] is only ever WRITTEN while the weight is 0; at
+    //             weight w a write contributes w x delta.
+    //   planned - the widest grid union any block asked for BEFORE the kSlots clamp.
+    //             > kSlots means the clamp deleted a copy, and dropW says how loud it
+    //             was when it went. Both exist because "defensive; never fires" is a
+    //             claim, and a claim nothing measures is worth nothing.
+    //   loStep  - the biggest ONE-BLOCK jump of the band's bottom edge, in log2 Hz. The
+    //             band is what every copy's window position is measured against, so a
+    //             jump here steps every sounding copy at once.
+    void shepEvidenceResetForTests() noexcept
+    {
+        shepEvClaimW = 0.0; shepEvClaimX = 0.0; shepEvDropW = 0.0; shepEvLoStep = 0.0;
+        shepEvPlanned = 0; shepEvDropped = 0; shepEvMinCopies = 1 << 30; shepEvBlocks = 0;
+        shepEvCutBlocks = 0; shepEvCutWorst = 0;
+        shepPrevLoValid = false;
+    }
+    void shepEvidenceForTests (double& claimW, double& claimX, double& dropW, double& loStep,
+                               int& planned, int& dropped, int& minCopies, int& blocks,
+                               int& cutBlocks, int& cutWorst) const noexcept
+    {
+        claimW = shepEvClaimW; claimX = shepEvClaimX; dropW = shepEvDropW; loStep = shepEvLoStep;
+        planned = shepEvPlanned; dropped = shepEvDropped;
+        minCopies = shepEvMinCopies == (1 << 30) ? 0 : shepEvMinCopies; blocks = shepEvBlocks;
+        cutBlocks = shepEvCutBlocks; cutWorst = shepEvCutWorst;
+    }
 
 private:
     //==========================================================================
@@ -1807,6 +1923,13 @@ private:
         fastKill     = false;
         fastKillGain = 1.0f;
         releasing    = false;
+        // The meter's Shepard cap flag is held for half a second so a human can see it,
+        // and a voice that stops rendering stops counting that half second down - so it
+        // is dropped HERE, where every note ends. Otherwise a single dense-patch tweak
+        // would leave "(safety cap)" on the meter for the rest of the session, which is
+        // the same dishonesty as hiding it, pointing the other way.
+        shepCapHold = 0;
+        shepCapped.store (false, std::memory_order_relaxed);
         clearCurrentNote();
     }
 
@@ -2127,6 +2250,10 @@ private:
         int       tapFrom[shepard::kSlots] = {};   // first index carrying the near-Nyquist taper
         bool      fresh  [shepard::kSlots] = {};   // slot (re)claimed this block -> re-seed its phases
         double    tap    [shepard::kSlots][shepard::kTaperMax]; // deliberately NOT zeroed: 5 kB a block
+        // What the normalisation divides the stack by. GEOMETRY, not the window's
+        // current value - see shepard::windowSumPeak / windowSumMeanSq and the block
+        // in renderChunk that uses them.
+        double    normSw = 1.0, normSw2 = 1.0;
         // How far into ONE copy's bank any loop may walk. With the mode off the whole
         // array is one bank; with it on, a slot is kStride wide and a step further is
         // the next copy's phases.
@@ -2163,12 +2290,9 @@ private:
         // (setTransportForMod - the same number its LFOs lock to), so the rise is
         // sample-locked to the transport without any new plumbing. No BPM on offer and
         // the free ms value takes over; the panel says so from the processor's flag.
-        const bool sync = shepModeParam != nullptr && shepModeParam->load() > 0.5f;
-        const double riseSec = shepard::riseSeconds (sync,
-            shepTimeParam != nullptr ? (double) shepTimeParam->load() : 8000.0,
-            shepDivParam  != nullptr ? (int)    shepDivParam->load()  : 9,
-            modBpm);
-        const double rateTarget = 1.0 / juce::jmax (0.05, riseSec);
+        // ...read through the SAME function renderNextBlock's block splitter uses, so the
+        // two can never disagree about how fast the stack is moving.
+        const double rateTarget = 1.0 / juce::jmax (shepard::kMinRiseSec, shepardRiseSeconds());
 
         // THE DENSITY FLOOR. A copy below the played pitch has MORE partials under
         // Nyquist than the key does, and each copy's oscillators live in one kStride
@@ -2191,6 +2315,7 @@ private:
             // RUNNING Shepard; a new note gliding up from the last note's band would
             // be a swoop nobody played.
             smShepP = pTarget; smShepLo = band.lo; smShepSpan = band.span; smShepRate = rateTarget;
+            shepLo  = juce::jmax (band.lo, floorFor (shepard::kDensityHard));
             shepFresh = false;
         }
         else
@@ -2201,10 +2326,6 @@ private:
             smShepSpan += a * (band.span  - smShepSpan);
             smShepRate += a * (rateTarget - smShepRate);
         }
-        // The HARD floor is applied AFTER the glide rather than glided towards: a
-        // template that suddenly turns dense must not spend 150 ms with a bottom copy
-        // that needs more partials than its slot can hold.
-        smShepLo = juce::jmax (smShepLo, floorFor (shepard::kDensityHard));
 
         const double P      = juce::jmax (1.0e-6, smShepP);
         const double W      = juce::jmax (1.0e-6, smShepSpan);
@@ -2212,15 +2333,85 @@ private:
         const double gStart = shepG;
         const double gEnd   = shepG + smShepRate * dt;
 
-        // Which grid indices are inside the window at ANY moment of this block: the
-        // bottom bound taken at the END of the block (a copy entering underneath), the
-        // top bound at the START (one still on its way out). Both bounds slide down as
-        // g rises, so the union is at most kMaxCopies + 2 == kSlots wide - which is
-        // exactly why hashing the grid index by kSlots can never collide.
-        long long mLo = (long long) std::ceil  ((smShepLo     - A) / P - gEnd);
-        long long mHi = (long long) std::floor ((smShepLo + W - A) / P - gStart);
+        // THE BOTTOM EDGE MOVES ACROSS THE BLOCK, NOT BETWEEN TWO BLOCKS.
+        //
+        // The HARD density floor still binds INSTANTLY - it has to. It is what keeps the
+        // deepest copy inside one kStride slot, and the alternative is the base list
+        // truncating at kStride, which is thousands of partials cut in silence: the one
+        // thing this synth may never do. But applying it to the edge itself, between two
+        // blocks, moved the band 4.42 octaves in one buffer under a held key (Base N
+        // pushed to 64 mid-note). Every sounding copy's window position stepped at once,
+        // slots were deactivated and re-claimed wherever the window happened to be
+        // (measured: a slot claimed at window 0.972, where the file's own rule says a
+        // slot is claimed "at a window edge, where the window is ~0 ... and that is what
+        // makes re-seeding it inaudible"), and the re-seed writes BOTH phase[] and
+        // alignPhase[] - the second of which this file promises is only ever written at
+        // crossfade weight 0.
+        //
+        // So the edge travels from where the window actually stands (shepLo) to where the
+        // floor demands, AS A RAMP INSIDE THE BLOCK, folded into the same per-sample
+        // window motion the rise already uses. That is what makes the guarantee hold
+        // rather than merely be claimed: while the edge rises every copy's u FALLS, so a
+        // copy retiring leaves through u = 0 and a copy arriving enters through u = 1 -
+        // and windowFromCos is exactly zero at both.
+        const double loStart = shepLo;
+        const double loWant  = juce::jmax (smShepLo, floorFor (shepard::kDensityHard));
+        // How far the edge may travel in ONE plan. The plan needs
+        //   (span/period) + |grid drift| + 1  slots and it has kSlots, so the drift budget
+        // is kSlots - span/period - 1 intervals. Taken from the band's ACTUAL width rather
+        // than from the kMaxCopies worst case, because a narrow band leaves far more room
+        // and a density change is exactly when the band is narrowing: at 8 intervals the
+        // budget is 1, at the 3.52 a dense template asks for it is 5.5.
+        // The rise spends part of it and the edge spends the rest, and the two pull
+        // OPPOSITE ways on u - which is why the two bounds are not the same. A move
+        // bigger than this finishes over the next few plans; 4.42 octaves takes a handful
+        // of 256-sample blocks, and every one of them is smooth.
+        const double riseDrift = juce::jmax (0.0, gEnd - gStart);
+        const double budget    = juce::jmax (1.0, (double) shepard::kSlots - W / P - 1.0);
+        const double upMax   = P * (budget + riseDrift);   // edge rising: cancels the rise
+        const double downMax = P * juce::jmax (0.0, budget - riseDrift); // edge falling: adds to it
+        const double loEnd   = juce::jlimit (loStart - downMax, loStart + upMax, loWant);
+        shepLo = loEnd;
+
+        // Which grid indices are inside the window at ANY moment of this block. u rises
+        // with g and FALLS as the bottom edge lifts, so neither bound can be assumed to
+        // move one way any more: take both at both ends of the block and use the union.
+        // With the drift budget above that union is at most kMaxCopies + 2 == kSlots
+        // wide - which is exactly why hashing the grid index by kSlots cannot collide.
+        const double bot0 = (loStart     - A) / P - gStart, bot1 = (loEnd     - A) / P - gEnd;
+        const double top0 = (loStart + W - A) / P - gStart, top1 = (loEnd + W - A) / P - gEnd;
+        long long mLo = (long long) std::ceil  (std::min (bot0, bot1));
+        long long mHi = (long long) std::floor (std::max (top0, top1));
         if (mHi < mLo) mHi = mLo;                                   // always at least the root copy
-        if (mHi - mLo + 1 > shepard::kSlots) mHi = mLo + shepard::kSlots - 1; // defensive; never fires
+        // EVIDENCE, not prose. The line below used to carry the comment "defensive;
+        // never fires" - and at an offline-render block size it fired, deleting a copy
+        // whose window was still a third of full scale. What makes it true now is the
+        // chunking in renderNextBlock (see shepard::maxPlanSamples); what PROVES it is
+        // this counter, which run 46 asserts stays at zero.
+        {
+            const int planned = (int) (mHi - mLo + 1);
+            if (planned > shepEvPlanned) shepEvPlanned = planned;
+            if (planned > shepard::kSlots)
+            {
+                ++shepEvDropped;
+                // How loud the deleted copies were at ANY point of this block: the
+                // number the "no partial leaves except through a window zero" rule is
+                // written in. Only reached when the clamp really bites, so the cos()
+                // calls cost nothing on the path that matters.
+                for (long long mm = mLo + shepard::kSlots; mm <= mHi; ++mm)
+                {
+                    const double uA = ((A + (gStart + (double) mm) * P) - loStart) / W;
+                    const double uB = ((A + (gEnd   + (double) mm) * P) - loEnd)   / W;
+                    for (int q = 0; q <= 16; ++q)
+                    {
+                        const double u = uA + (uB - uA) * ((double) q / 16.0);
+                        const double w = shepard::windowFromCos (u, std::cos (juce::MathConstants<double>::twoPi * u));
+                        if (w > shepEvDropW) shepEvDropW = w;
+                    }
+                }
+                mHi = mLo + shepard::kSlots - 1;
+            }
+        }
 
         // Deactivate BEFORE claiming: with the union exactly kSlots wide, the slot a
         // copy just vacated at one edge is the one the copy entering the other edge
@@ -2238,17 +2429,55 @@ private:
             sl.m[c]       = mm;
             sl.off[c]     = slot * shepard::kStride;
             sl.rootMul[c] = std::exp2 ((gMid + (double) mm) * P);
-            sl.u0[c]      = ((A + (gStart + (double) mm) * P) - smShepLo) / W;
-            // A slot claimed for a NEW grid index is claimed at a window edge, where
-            // the window is ~0: the copy re-entering at the bottom starts SILENT. That
-            // is the no-reset guarantee, and it is what makes re-seeding it inaudible.
+            sl.u0[c]      = ((A + (gStart + (double) mm) * P) - loStart) / W;
+            // A slot claimed for a NEW grid index is claimed at a window edge, where the
+            // window is ~0: the copy re-entering at the bottom starts SILENT. That is the
+            // no-reset guarantee, and it is what makes re-seeding it inaudible. It holds
+            // because mLo and mHi are the UNION over the block: a grid index that was not
+            // inside the window at the block's start is outside [0,1] here, and
+            // windowFromCos is exactly zero there. shepEvClaimW below is the number that
+            // says so, and run 53 asserts on it - the sentence alone was worth nothing
+            // while the bottom edge could jump 4.42 octaves between two blocks.
             sl.fresh[c] = ! shepUsed[(size_t) slot] || shepM[(size_t) slot] != mm;
+            if (sl.fresh[c])
+            {
+                // The window the re-seed is about to happen at. The rule says ~0; this
+                // is the number that says whether it really was.
+                const double u = sl.u0[c];
+                const double w = shepard::windowFromCos (u, std::cos (juce::MathConstants<double>::twoPi * u));
+                // The two numbers the two invariants are written in, tracked SEPARATELY
+                // because they are separate claims about separate banks. The worst window
+                // any claim happened at is the amplitude step re-seeding phase[] can cause;
+                // the worst crossfade weight any claim happened at is what the file's other
+                // rule ("alignPhase[] is only ever WRITTEN while the weight is 0") is about.
+                // A max taken over the same event would let one hide behind the other.
+                if (w > shepEvClaimW) shepEvClaimW = w;
+                if (morphActive && morphWeight > shepEvClaimX) shepEvClaimX = morphWeight;
+            }
             shepUsed[(size_t) slot] = true;
             shepM[(size_t) slot]    = mm;
         }
+        if (c < shepEvMinCopies) shepEvMinCopies = c;
+        ++shepEvBlocks;
+        if (shepPrevLoValid)
+        {
+            const double step = std::abs (loEnd - shepPrevLo);
+            if (step > shepEvLoStep) shepEvLoStep = step;
+        }
+        shepPrevLo = loEnd; shepPrevLoValid = true;
         sl.numCopies     = c;
         sl.windowed      = true;
-        sl.du            = smShepRate * P / W / sr;
+        // The normalisation's divisors, from the BAND's shape alone (see
+        // shepard::windowSumPeak). Constant for the block, so the window survives into
+        // the output instead of being divided out of it.
+        sl.normSw        = shepard::windowSumPeak   (W / P);
+        sl.normSw2       = shepard::windowSumMeanSq (W / P);
+        // The window position's advance per SAMPLE. It is the same number for every copy
+        // - which is what lets one complex rotation drive all of them - and it now
+        // carries BOTH motions: the grid rising (u up) and the band's bottom edge lifting
+        // (u down). Folding the edge in here is the whole S3 fix: the edge's travel
+        // becomes part of the smooth per-sample window instead of a step between blocks.
+        sl.du            = ((gEnd - gStart) * P - (loEnd - loStart)) / W / (double) numSamples;
         sl.blockLogMove  = smShepRate * P * dt;
         sl.lowestRootMul = std::exp2 ((gStart + (double) mLo) * P);
 
@@ -2595,7 +2824,13 @@ private:
     bool   shepFresh  = true;    // adopt band/rate instantly (a cold note, not a glide)
     double shepG      = 0.0;     // the rising grid phase, in rise intervals
     double smShepP    = 1.0;     // smoothed log2(rise ratio)
-    double smShepLo   = 5.0;     // smoothed window bottom edge (log2 Hz)
+    double smShepLo   = 5.0;     // smoothed window bottom edge TARGET (log2 Hz)
+    // ...and the edge actually IN FORCE at the end of the last block. Separate from the
+    // glide's own state because the HARD density floor clamps what is in force without
+    // being allowed to yank the glide with it: the edge travels to the clamp across the
+    // block (see planShepard), the glide keeps heading for the comfortable target, and
+    // the two meet without any copy's window ever stepping.
+    double shepLo     = 5.0;
     double smShepSpan = 8.0;     // smoothed window span (log2)
     double smShepRate = 0.125;   // smoothed rise rate (intervals per second)
     std::array<long long, shepard::kSlots> shepM    {};  // grid index held by each slot
@@ -2610,4 +2845,16 @@ private:
     std::array<double,    shepard::kSlots> shepProbeRoot {};
     std::array<double,    shepard::kSlots> shepProbeW    {};
     std::array<int,       shepard::kSlots> shepProbeN    {};
+    // Worst cases since the last reset, for shepEvidenceForTests. Plain scalars written
+    // from the audio thread and read by a single-threaded verifier: no allocation, no
+    // lock, no string, and nothing here is ever read by the audio path itself.
+    double shepEvClaimW = 0.0, shepEvClaimX = 0.0, shepEvDropW = 0.0, shepEvLoStep = 0.0;
+    int    shepEvPlanned = 0, shepEvDropped = 0, shepEvMinCopies = 1 << 30, shepEvBlocks = 0;
+    int    shepEvCutBlocks = 0, shepEvCutWorst = 0;   // the base list hit the kStride cap
+    // ...and the same event as the METER sees it. Written on the audio thread, read by the
+    // editor's timer: a relaxed atomic, so no lock and no allocation, and a frame of
+    // staleness on a meter is not a correctness question. See shepCapHold above.
+    std::atomic<bool> shepCapped { false };
+    int               shepCapHold = 0;   // samples left to keep the flag up
+    double shepPrevLo = 0.0; bool shepPrevLoValid = false;  // for shepEvLoStep
 };

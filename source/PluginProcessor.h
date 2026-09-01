@@ -79,6 +79,18 @@ public:
     int  getTemplatePartialCount() const noexcept { return spectrumEngine.getPartialCount(); }
     int  getRawPartialCount() const noexcept { return spectrumEngine.getRawCount(); }
     bool isSpectrumTruncated() const noexcept { return spectrumEngine.isTruncated(); }
+    // The SHEPARD's own version of the same honesty: while the band's bottom edge is
+    // travelling up to a density change, the deepest copies want more partials than one
+    // kStride slot holds and the rest are not sounding. Kept separate from the engine's
+    // flag (that one describes the TEMPLATE and is republished on every compile) and
+    // OR-ed into the same meter, so the one cap left in the Shepard is never silent.
+    bool isShepardSlotCapped() const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<const AdditiveVoice*> (synth.getVoice (v)))
+                if (av->shepardSlotCapped()) return true;
+        return false;
+    }
 
     //==========================================================================
     // Microtuning (12-TET / MTS-ESP / Scala). Called from the editor.
@@ -433,6 +445,36 @@ public:
                 if (av->isActive())
                     return av->shepRiseRatioForTests();
         return 0.0;
+    }
+    // TESTS ONLY: the worst-case evidence for the Shepard's three stated invariants
+    // (see AdditiveVoice::shepEvidenceForTests). Reset covers EVERY voice, because the
+    // note under test may be a stolen one and a per-voice reset would measure a fresh
+    // voice while the evidence sat on the one that was actually playing.
+    void shepardEvidenceResetForTests()
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                av->shepEvidenceResetForTests();
+    }
+    // ...and the worst case across every voice, for the same reason.
+    void shepardEvidenceForTests (double& claimW, double& claimX, double& dropW, double& loStep,
+                                  int& planned, int& dropped, int& minCopies, int& blocks,
+                                  int& cutBlocks, int& cutWorst)
+    {
+        claimW = claimX = dropW = loStep = 0.0; planned = dropped = blocks = 0; minCopies = 0;
+        cutBlocks = cutWorst = 0;
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+            {
+                double cw, cx, dw, ls; int pl, dr, mc, bl, cb, cwo;
+                av->shepEvidenceForTests (cw, cx, dw, ls, pl, dr, mc, bl, cb, cwo);
+                if (bl == 0) continue;
+                if (cw > claimW) { claimW = cw; claimX = cx; }
+                dropW = std::max (dropW, dw); loStep = std::max (loStep, ls);
+                planned = std::max (planned, pl); dropped += dr; blocks += bl;
+                cutBlocks += cb; cutWorst = std::max (cutWorst, cwo);
+                minCopies = (minCopies == 0) ? mc : std::min (minCopies, mc);
+            }
     }
     // TRUE while the rate control is in Sync mode but the host offers no BPM, so
     // the FREE (ms) value is what actually drives the rise. The editor shows this

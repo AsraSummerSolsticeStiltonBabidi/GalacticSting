@@ -12913,7 +12913,8 @@ int main (int argc, char** argv)
         }
     }
 
-<<<<<<< ours
+
+
     // --- run 53: A TALLER PANEL SPREADS ITS ROWS INSTEAD OF GROWING ONE HOLE --------
     //
     // Commit 5c970cf fixed two panels that turned extra height into a single void, and
@@ -13082,9 +13083,474 @@ int main (int argc, char** argv)
                    " with SLOPE frozen for a spectrum nobody drew");
         }
     }
-=======
+
     runPhaseFaderChecks();
->>>>>>> theirs
+
+
+    // --- run 54: THE SHEPARD'S THREE STATED INVARIANTS, MEASURED --------------------
+    //
+    // Run 46 proves the Shepard on the DEFAULT patch at a 256-sample block. Every one of
+    // the three defects below lives outside that one corner, and each of them breaks a
+    // rule this codebase writes down in prose:
+    //
+    //   S1  "the window reaches EXACTLY zero at both edges, so the copy leaving the top
+    //        leaves silent". A dense enough spectrum lifts the band's bottom edge until
+    //        the band is narrower than two rise intervals and the stack is ONE copy - and
+    //        the per-voice normaliser then divides that one copy's window straight back
+    //        out, so the wrap stops being silent and the whole illusion's guarantee is
+    //        void. Measured as the LEVEL the voice holds while its only copy's window
+    //        sweeps 0 -> 1 -> 0.
+    //
+    //   S2  "defensive; never fires", on the kSlots clamp in planShepard. At an
+    //        offline-render block size the grid union really is wider than kSlots, and
+    //        the clamp deletes a copy in the middle of the window.
+    //
+    //   S3  "a slot is claimed at a window edge, where the window is ~0 ... and that is
+    //        what makes re-seeding it inaudible", and "alignPhase[] is only ever WRITTEN
+    //        while the crossfade weight is 0". A template that turns dense mid-note moves
+    //        the band's bottom edge in ONE step, which re-claims slots wherever the window
+    //        happens to be and re-seeds both banks there.
+    //
+    // The metric throughout is PER-SAMPLE, and deliberately so: an RMS over a 5 ms window
+    // is structurally blind to a one-sample discontinuity, and that blindness is exactly
+    // how these three shipped past a suite that was already measuring loudness.
+    {
+        std::printf ("\nrun 53: the Shepard's three stated invariants, measured:\n");
+        constexpr double ssr = 48000.0;
+
+        // The analytic ceiling for a SMOOTH render of exactly the partials sounding in
+        // this block: |x[k]-x[k-1]| <= sum_j a_j * 2 sin(pi f_j / sr), calibrated from
+        // the block's own RMS because the overall gain is unknown here. Same rig run 46
+        // uses for the default patch; it is repeated on the states run 46 never enters.
+        struct StepMetric
+        {
+            float prev = 0.0f; bool have = false;
+            double worst = 0.0; float maxJump = 0.0f; double bound = 0.0;
+            void feed (const juce::AudioBuffer<float>& b, int nS, double sumA2, double sumB)
+            {
+                const float* L = b.getReadPointer (0);
+                double energy = 0.0; float jump = 0.0f;
+                for (int i = 0; i < nS; ++i)
+                {
+                    const float x = L[i];
+                    energy += (double) x * x;
+                    if (have) jump = std::max (jump, std::abs (x - prev));
+                    prev = x; have = true;
+                }
+                const double rms = std::sqrt (energy / (double) nS);
+                const double G   = sumA2 > 1.0e-18 ? rms / std::sqrt (0.5 * sumA2) : 0.0;
+                const double bnd = G * sumB * 1.35 + 1.0e-4;
+                maxJump = std::max (maxJump, jump);
+                bound   = std::max (bound, bnd);
+                if (bnd > 0.0) worst = std::max (worst, (double) jump / bnd);
+            }
+        };
+
+        struct TestPlayHead : juce::AudioPlayHead
+        {
+            double bpm = 120.0;
+            juce::Optional<juce::AudioPlayHead::PositionInfo> getPosition() const override
+            { juce::AudioPlayHead::PositionInfo pi; pi.setBpm (bpm); pi.setIsPlaying (false); return pi; }
+        };
+
+        long long pm [shepard::kSlots];
+        double    pr [shepard::kSlots], pw[shepard::kSlots];
+        int       pcn[shepard::kSlots];
+
+        // ONE harness, re-made per scenario because the BLOCK SIZE is one of the
+        // variables under test and prepareToPlay is what fixes it.
+        auto makeRig = [&] (int blk, TestPlayHead& ph)
+        {
+            auto q = std::make_unique<FractalAdditiveAudioProcessor>();
+            q->prepareToPlay (ssr, blk);
+            q->setPlayHead (&ph);
+            return q;
+        };
+
+        //== S1: a dense spectrum narrows the band - what happens at the bottom of it ==
+        {
+            TestPlayHead ph;
+            constexpr int blk = 256;
+            auto p = makeRig (blk, ph);
+            juce::AudioBuffer<float> b (2, blk);
+            auto set = [&] (const char* id, float plain)
+            {
+                auto* q = p->apvts.getParameter (id);
+                q->setValueNotifyingHost (q->convertTo0to1 (plain));
+                p->pollParametersForTests();
+            };
+            juce::MidiBuffer pending;
+            auto pump = [&] (double seconds)
+            {
+                const int nB = juce::jmax (1, (int) std::lround (seconds * ssr / blk));
+                for (int i = 0; i < nB; ++i)
+                {
+                    juce::MidiBuffer m; if (i == 0) m.swapWith (pending);
+                    b.clear(); p->processBlock (b, m);
+                }
+                return nB;
+            };
+
+            // The densest LOW-REACHING spectrum the panel can ask for: everything the
+            // fractal engine makes, hard-cut to the bottom few octaves, so hundreds of
+            // partials sit under ratio 8 and the density floor really binds. This is a
+            // reachable patch, not a contrivance - spectrumRange is a knob on the panel.
+            set ("shepOn", 0.0f);
+            set ("phaseMode", 1.0f);
+            set ("ampSustain", 1.0f);
+            set ("ampRelease", 0.30f);
+            set ("shepMode", 0.0f);      // Free (ms)
+            set ("shepTime", 700.0f);    // several wraps inside the measured window
+            // THE TWO KNOBS THAT NARROW THE BAND, both first-class controls on the panel:
+            //   Base Harmonic N at its top packs 16321 partials from ratio 1 upward, which
+            //     lifts the density floor to log2(nyquist / ratio[kDensityGuard]) and takes
+            //     the audible band from 9.97 octaves down to 3.52;
+            //   a tuning whose PERIOD is wide, with the rise dropdown set to "Period pitch
+            //     bend", makes each rise step 4 octaves instead of 1 (riseRatio clamps at
+            //     16, so this is a case the engine explicitly anticipates).
+            // 3.52 octaves is LESS than one 4-octave step, so bandFor takes its degenerate
+            // branch: the band is exactly one rise interval wide and the stack is ONE copy.
+            // Nothing here is a contrivance - it is two panel controls at settings the code
+            // names in its own constants.
+            juce::String err;
+            check (p->loadScalaText ("! wide\nwide-period test\n 1\n 16/1\n", "wide-period", err),
+                   "a 16/1-period scale loads (riseRatio's own ceiling, so the engine expects it)");
+            set ("shepRise", 1.0f);      // "Period pitch bend"
+            {
+                const auto gen0 = p->getTemplateGeneration();
+                set ("baseN", 64.0f);
+                awaitTemplateChange (*p, gen0, "run 53: the dense narrow spectrum");
+                awaitSpectrumIdle (*p, "run 53: the dense narrow spectrum");
+            }
+            if (const auto* T = p->getLiveTemplate())
+            {
+                const int np = (int) T->partials.size();
+                const double rG = np > shepard::kDensityGuard
+                                ? (double) T->partials[(size_t) shepard::kDensityGuard].ratio : 0.0;
+                const double loD = rG > 1.0e-9 ? std::log2 (0.5 * ssr / rG) : -1.0e9;
+                const auto bd = shepard::bandFor (ssr, std::log2 (16.0), loD);
+                std::printf ("  patch: %d partials, ratio[%d] = %.3f -> density floor %.3f log2 Hz;"
+                             " band %.3f oct over a %.3f oct rise step = %.2f copies\n",
+                             np, shepard::kDensityGuard, rG, loD, bd.span, std::log2 (16.0),
+                             bd.span / std::log2 (16.0));
+            }
+            pump (0.3);
+
+            set ("shepOn", 1.0f);
+            pending.addEvent (juce::MidiMessage::noteOn (1, 72, 0.9f), 0);
+            pump (0.4);
+            p->shepardEvidenceResetForTests();
+
+            StepMetric sm;
+            int    minCopies = 99, maxCopies = 0;
+            double loudestAtLowWindow = 0.0, worstWindowSeen = 0.0;
+            double peakLo = 1.0e9, peakHi = 0.0;
+            const int blocks = (int) (3.0 * ssr / blk);
+            for (int k = 0; k < blocks; ++k)
+            {
+                juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                const int n = p->voiceShepardForTests (pm, pr, pw, pcn, shepard::kSlots);
+                if (n == 0) continue;
+                minCopies = std::min (minCopies, n); maxCopies = std::max (maxCopies, n);
+                const auto* T = p->getLiveTemplate();
+                double sumA2 = 0.0, sumB = 0.0, sumW = 0.0;
+                if (T != nullptr)
+                    for (int c = 0; c < n; ++c)
+                    {
+                        sumW += pw[c];
+                        const int nc = std::min (pcn[c], (int) T->partials.size());
+                        for (int i = 0; i < nc; ++i)
+                        {
+                            const double a = (double) T->partials[(size_t) i].amp * pw[c];
+                            const double f = std::min ((double) T->partials[(size_t) i].ratio * pr[c], 0.4999 * ssr);
+                            sumA2 += a * a;
+                            sumB  += a * 2.0 * std::sin (juce::MathConstants<double>::pi * f / ssr);
+                        }
+                    }
+                sm.feed (b, blk, sumA2, sumB);
+                // THE S1 MEASUREMENT, and it is a RATIO, not a level. The window is the
+                // whole illusion: a copy leaving the top must LEAVE SILENT, so the voice's
+                // amplitude has to fall with the window sum. If the normaliser divides the
+                // window back out, the level is the SAME at a window sum of 0.05 as at 1.0
+                // - and then the wrap is not silent and the guarantee the design rests on
+                // is void. Two buckets, near the bottom of the window and near its top.
+                const double mag = (double) b.getMagnitude (0, blk);
+                if (sumW > 1.0e-9 && sumW < 0.10)
+                { loudestAtLowWindow = std::max (loudestAtLowWindow, mag); worstWindowSeen = std::max (worstWindowSeen, sumW); }
+                if (sumW > 0.90) peakHi = std::max (peakHi, mag);
+                if (mag > 1.0e-6) peakLo = std::min (peakLo, mag);
+            }
+            double cw, cx, dw, ls; int pl, dr, mc, bl, cb, cwo;
+            p->shepardEvidenceForTests (cw, cx, dw, ls, pl, dr, mc, bl, cb, cwo);
+            std::printf ("  dense narrow band: %d..%d copies over %d blocks\n",
+                         minCopies, maxCopies, blocks);
+            std::printf ("  loudest block with the stack's window sum BELOW 0.10: %.4f (worst such sum %.3f);"
+                         " loudest with it ABOVE 0.90: %.4f -> the window survives to the output by a factor"
+                         " of %.2f (it should be about %.2f)\n",
+                         loudestAtLowWindow, worstWindowSeen, peakHi,
+                         loudestAtLowWindow > 1.0e-9 ? peakHi / loudestAtLowWindow : 0.0,
+                         worstWindowSeen > 1.0e-9 ? 1.0 / worstWindowSeen : 0.0);
+            std::printf ("  click metric (dense narrow band): max per-sample jump %.5f, bound %.5f"
+                         " (worst jump/bound %.2f)\n", sm.maxJump, sm.bound, sm.worst);
+            check (minCopies <= 1,
+                   "a dense spectrum under a wide rise interval really does narrow the stack to"
+                   " ONE copy (the test is standing in the state it claims)");
+            // THE SILENT WRAP, MEASURED IN THE AUDIO INSTEAD OF IN THE WINDOW. Run 46 checks
+            // that the WINDOW is ~0 at a wrap, which stays true however the voice is
+            // normalised - it was true while this was broken. What has to hold is that the
+            // OUTPUT follows it down: with one copy, a normaliser that divided by the
+            // window's own sum cancelled it exactly, and the voice was as loud at a window
+            // sum of 0.098 as at 0.95 (ratio 0.90 where the window says 10.2). Anything
+            // above 5 here is a voice whose level really does fall with its window.
+            check (loudestAtLowWindow > 1.0e-9 && peakHi / loudestAtLowWindow > 5.0,
+                   "and at ONE copy the voice's level still falls with the window - the copy"
+                   " leaving the top really does leave silent (it did not: ratio 0.90)");
+            std::printf ("  evidence: worst claim window %.4f at crossfade weight %.3f;"
+                         " widest planned union %d; copies dropped %d (worst %.4f); worst lo step %.4f oct\n",
+                         cw, cx, pl, dr, dw, ls);
+            check (dr == 0 && pl <= shepard::kSlots,
+                   "...and a one-copy stack still never asks for more slots than there are");
+            pending.addEvent (juce::MidiMessage::noteOff (1, 72), 0);
+            pump (2.0);
+        }
+
+        //== S2: an OFFLINE-RENDER block size, and the clamp that "never fires" =======
+        {
+            TestPlayHead ph;
+            constexpr int blk = 8192;             // a bounce buffer, not a live one
+            auto p = makeRig (blk, ph);
+            juce::AudioBuffer<float> b (2, blk);
+            auto set = [&] (const char* id, float plain)
+            {
+                auto* q = p->apvts.getParameter (id);
+                q->setValueNotifyingHost (q->convertTo0to1 (plain));
+                p->pollParametersForTests();
+            };
+            juce::MidiBuffer pending;
+            auto pump = [&] (int nB)
+            {
+                for (int i = 0; i < nB; ++i)
+                {
+                    juce::MidiBuffer m; if (i == 0) m.swapWith (pending);
+                    b.clear(); p->processBlock (b, m);
+                }
+            };
+            set ("shepOn", 1.0f);
+            set ("shepMode", 1.0f);      // Sync Project Tempo
+            set ("shepDiv", 0.0f);       // 1/16 at 120 BPM -> the fastest rise there is
+            set ("phaseMode", 1.0f);
+            set ("ampSustain", 1.0f);
+            awaitSpectrumIdle (*p, "run 53: the offline-block patch");
+            pump (4);
+            pending.addEvent (juce::MidiMessage::noteOn (1, 60, 0.9f), 0);
+            pump (4);
+            p->shepardEvidenceResetForTests();
+            StepMetric sm;
+            for (int k = 0; k < 24; ++k)
+            {
+                juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                const int n = p->voiceShepardForTests (pm, pr, pw, pcn, shepard::kSlots);
+                const auto* T = p->getLiveTemplate();
+                double sumA2 = 0.0, sumB = 0.0;
+                if (T != nullptr)
+                    for (int c = 0; c < n; ++c)
+                    {
+                        const int nc = std::min (pcn[c], (int) T->partials.size());
+                        for (int i = 0; i < nc; ++i)
+                        {
+                            const double a = (double) T->partials[(size_t) i].amp * pw[c];
+                            const double f = std::min ((double) T->partials[(size_t) i].ratio * pr[c], 0.4999 * ssr);
+                            sumA2 += a * a;
+                            sumB  += a * 2.0 * std::sin (juce::MathConstants<double>::pi * f / ssr);
+                        }
+                    }
+                sm.feed (b, blk, sumA2, sumB);
+            }
+            double cw, cx, dw, ls; int pl, dr, mc, bl, cb, cwo;
+            p->shepardEvidenceForTests (cw, cx, dw, ls, pl, dr, mc, bl, cb, cwo);
+            std::printf ("  %d-sample blocks, fastest sync rise: widest planned union %d slots (kSlots = %d),"
+                         " %d blocks deleted a copy, loudest deleted copy's window %.4f\n",
+                         blk, pl, shepard::kSlots, dr, dw);
+            // "DEFENSIVE; NEVER FIRES" IS NOW A MEASUREMENT. It used to be a comment, and at
+            // this exact block size it was false: the plan asked for 12 slots and the clamp
+            // deleted a copy whose window was still 0.2689 - a partial dropped in silence
+            // and a step in one event. renderNextBlock splits the block on what the slots
+            // can honestly cover (shepard::maxPlanSamples); this is the assertion that says
+            // the sentence is true, and it fails the moment the split is removed.
+            check (bl > 0, "the offline-block scenario really rendered Shepard blocks");
+            check (pl <= shepard::kSlots,
+                   "at an OFFLINE-RENDER block size the plan still never asks for more grid"
+                   " indices than there are slots (it asked for 12 of 10)");
+            check (dr == 0 && dw < 1.0e-9,
+                   "...so the kSlots clamp never fires, and no copy is deleted in mid-window");
+            std::printf ("  click metric (offline block): max per-sample jump %.5f, bound %.5f"
+                         " (worst jump/bound %.2f)\n", sm.maxJump, sm.bound, sm.worst);
+            check (sm.worst <= 1.0,
+                   "...and no per-sample step at that block size exceeds what these partials"
+                   " can smoothly produce");
+            pending.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+            pump (8);
+        }
+
+        //== S3: the template turns DENSE under a held note ===========================
+        {
+            TestPlayHead ph;
+            constexpr int blk = 256;
+            auto p = makeRig (blk, ph);
+            juce::AudioBuffer<float> b (2, blk);
+            auto set = [&] (const char* id, float plain)
+            {
+                auto* q = p->apvts.getParameter (id);
+                q->setValueNotifyingHost (q->convertTo0to1 (plain));
+                p->pollParametersForTests();
+            };
+            juce::MidiBuffer pending;
+            auto pump = [&] (double seconds)
+            {
+                const int nB = juce::jmax (1, (int) std::lround (seconds * ssr / blk));
+                for (int i = 0; i < nB; ++i)
+                {
+                    juce::MidiBuffer m; if (i == 0) m.swapWith (pending);
+                    b.clear(); p->processBlock (b, m);
+                }
+                return nB;
+            };
+            set ("shepOn", 1.0f);
+            set ("shepMode", 0.0f);
+            set ("shepTime", 2000.0f);
+            set ("phaseMode", 1.0f);
+            set ("ampSustain", 1.0f);
+            set ("ampRelease", 0.30f);
+            set ("baseN", 1.0f);
+            // MORPH ON, and slow. The second invariant this scenario is about is
+            // "alignPhase[] is only ever WRITTEN while the crossfade weight is 0", and a
+            // re-seed writes BOTH banks - so the density change has to land while a
+            // crossfade is genuinely mid-flight, or the check measures nothing and passes.
+            set ("morph", 1.0f);
+            set ("morphTime", 1.5f);
+            awaitSpectrumIdle (*p, "run 53: the sparse spectrum before the density change");
+            pump (0.3);
+            pending.addEvent (juce::MidiMessage::noteOn (1, 72, 0.9f), 0);
+            pump (0.6);
+            p->shepardEvidenceResetForTests();
+
+            StepMetric sm;
+            bool   sawCapFlag = false;
+            double worstMorphW = 0.0;
+            // The change itself: Base Harmonic N pushed to the top under the held key, which
+            // takes the template from 1024 partials to 16321 and its density floor from
+            // 4.87 to 10.00 log2 Hz. This is a patch tweak while a note is down - the most
+            // ordinary thing anyone does with a synth - and it is what moves the band.
+            set ("baseN", 64.0f);
+            for (int k = 0; k < (int) (2.5 * ssr / blk); ++k)
+            {
+                juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                const int n = p->voiceShepardForTests (pm, pr, pw, pcn, shepard::kSlots);
+                const auto* T = p->getLiveTemplate();
+                double sumA2 = 0.0, sumB = 0.0;
+                if (T != nullptr)
+                    for (int c = 0; c < n; ++c)
+                    {
+                        const int nc = std::min (pcn[c], (int) T->partials.size());
+                        for (int i = 0; i < nc; ++i)
+                        {
+                            const double a = (double) T->partials[(size_t) i].amp * pw[c];
+                            const double f = std::min ((double) T->partials[(size_t) i].ratio * pr[c], 0.4999 * ssr);
+                            sumA2 += a * a;
+                            sumB  += a * 2.0 * std::sin (juce::MathConstants<double>::pi * f / ssr);
+                        }
+                    }
+                sm.feed (b, blk, sumA2, sumB);
+                sawCapFlag  = sawCapFlag || p->isShepardSlotCapped();
+                worstMorphW = std::max (worstMorphW, p->voiceMorphWeightForTests());
+            }
+            double cw, cx, dw, ls; int pl, dr, mc, bl, cb, cwo;
+            p->shepardEvidenceForTests (cw, cx, dw, ls, pl, dr, mc, bl, cb, cwo);
+            std::printf ("  template turns dense under a held key: worst ONE-BLOCK move of the band's"
+                         " bottom edge %.4f oct (it jumped 4.4234 before this was a ramp)\n", ls);
+            std::printf ("  worst slot claim: window %.4f, worst crossfade weight at any claim %.3f;"
+                         " the crossfade really did run (peak weight %.3f)\n", cw, cx, worstMorphW);
+            check (worstMorphW > 0.05,
+                   "the density change really landed mid-crossfade (the check below is measuring"
+                   " something)");
+            // THE TWO INVARIANTS THIS FILE WRITES DOWN, and ONE number settles both.
+            //
+            // A slot claim re-seeds phase[] AND alignPhase[]. The file says a slot is
+            // claimed "at a window edge, where the window is ~0 ... and that is what makes
+            // re-seeding it inaudible", and separately that alignPhase[] is only ever
+            // written while the crossfade weight is 0 - because at weight w a write
+            // contributes w x delta, which at 0.5 is 34% of full scale.
+            //
+            // Claims DO still happen while a crossfade is in flight (cx above is not 0, and
+            // it should not be - a density change is exactly what starts one). What makes
+            // that harmless is the FIRST invariant holding: the write goes into a copy whose
+            // window factor is exactly zero, so w x delta reaches the output multiplied by
+            // 0. The weight's own rule is about writes that are AUDIBLE, and at a window
+            // zero none is. Before the bottom edge became a ramp this measured 0.9721 -
+            // a re-seed of both banks at 97% of full window, mid-crossfade.
+            check (cw < 1.0e-3,
+                   "every slot is claimed where the window really is ZERO - so re-seeding it"
+                   " writes BOTH banks into silence, whatever the crossfade is doing");
+            std::printf ("  base list hit the kStride cap in %d of %d blocks (worst: %d partials"
+                         " short of the template); meter showed the cap: %s\n",
+                         cb, bl, cwo, sawCapFlag ? "yes" : "NO");
+            // THE ONE CAP LEFT, AND IT IS NOT SILENT. While the bottom edge travels up to a
+            // density change the deepest copies are still audible and cannot fit their
+            // kStride slot. That is a limit which changes what is heard, so it goes on the
+            // meter for as long as a human could see it - and it must be BRIEF, because a
+            // cap that outlives the edge's travel would be a permanent cut wearing a
+            // transient's clothes.
+            check (cb == 0 || sawCapFlag,
+                   "...and while the deepest copy does not fit its slot, the meter SAYS SO"
+                   " (the cap is never silent)");
+            check (cb <= 12,
+                   "...and it lasts only the handful of blocks the edge takes to travel, not"
+                   " the length of the note");
+            std::printf ("  click metric (density change): max per-sample jump %.5f, bound %.5f"
+                         " (worst jump/bound %.2f)\n", sm.maxJump, sm.bound, sm.worst);
+            check (sm.worst <= 1.0,
+                   "no per-sample step exceeds what these partials can smoothly produce, across"
+                   " the density change");
+            pending.addEvent (juce::MidiMessage::noteOff (1, 72), 0);
+            pump (2.0);
+
+            // ...AND IT GOES AWAY AGAIN, WHICH ONLY A SHORT NOTE CAN PROVE. The flag is
+            // HELD for half a second so a human can see a 16 ms event, and a voice that
+            // has stopped rendering stops counting that half second down. Letting the
+            // note above run its course does not test anything: its 0.30 s release keeps
+            // rendering long enough for the hold to expire on its own, so the check passed
+            // with the clean-up deliberately deleted. This one takes the key UP 50 ms
+            // after the density change, while the hold is still live, so the flag really
+            // is up at the moment the note ends - and without the drop in finishNote()
+            // "(safety cap)" would then sit on the meter for the rest of the session. A
+            // permanent warning about a transient is the same lie as no warning at all.
+            {
+                const auto gen0 = p->getTemplateGeneration();
+                set ("baseN", 1.0f);
+                awaitTemplateChange (*p, gen0, "run 53: back to the sparse spectrum");
+                awaitSpectrumIdle (*p, "run 53: back to the sparse spectrum");
+                set ("ampRelease", 0.05f);
+                pump (0.5);
+                pending.addEvent (juce::MidiMessage::noteOn (1, 72, 0.9f), 0);
+                pump (0.4);
+                set ("baseN", 64.0f);
+                pump (0.05);                       // the cap fires inside this
+                const bool upWhileHeld = p->isShepardSlotCapped();
+                pending.addEvent (juce::MidiMessage::noteOff (1, 72), 0);
+                pump (0.25);                       // 0.05 s release: the note is over well
+                                                   // inside the flag's own half-second hold
+                check (upWhileHeld,
+                       "a note released 50 ms after the density change still had the cap flag"
+                       " UP when it ended (the check below is measuring something)");
+                check (! p->isShepardSlotCapped(),
+                       "...and the meter drops it with the note - the cap reads as the"
+                       " transient it is, instead of staying lit for the session");
+                set ("ampRelease", 0.30f);
+                pump (1.0);
+            }
+        }
+    }
+
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;

@@ -120,10 +120,44 @@ namespace shepard
     // Seconds per rise interval, from the two rate dresses plus the host clock.
     // With Sync chosen and NO bpm on offer the FREE value takes over - the same
     // honesty rule v1 had, and the editor still says so.
+    // The FASTEST rise there is, expressed ONCE. Both dresses land on it: the free
+    // fader cannot go below it and a sync division at an absurd BPM is clamped to it.
+    // It has to live here rather than at the two use sites because the block splitter
+    // below sizes a plan from it, and a splitter working from a faster rate than the
+    // plan really uses would cut every offline buffer into needless chunks.
+    inline constexpr double kMinRiseSec = 0.05;
     inline double riseSeconds (bool sync, double freeMs, int divIdx, double bpm) noexcept
     {
-        if (sync && bpm > 1.0) return beatsForDiv (divIdx) * 60.0 / bpm;
-        return juce::jlimit (0.05, 600.0, (std::isfinite (freeMs) ? freeMs : 8000.0) * 0.001);
+        if (sync && bpm > 1.0) return juce::jmax (kMinRiseSec, beatsForDiv (divIdx) * 60.0 / bpm);
+        return juce::jlimit (kMinRiseSec, 600.0, (std::isfinite (freeMs) ? freeMs : 8000.0) * 0.001);
+    }
+
+    //== How much audio ONE plan may cover =====================================
+    // A plan (planShepard) hands every grid index whose window is non-zero ANYWHERE
+    // inside it its own slot, and a slot cannot hold two grid indices at once. Over a
+    // stretch in which the grid advances by `d` intervals the plan needs
+    //     d + (span / period) + 1   slots,
+    // and span/period is at most kMaxCopies by construction (bandFor caps it there, and
+    // the glide is a convex combination of two values that both obey the cap, so it
+    // obeys it too). With kSlots slots available that leaves
+    //     d <= kSlots - kMaxCopies - 1 == 1 interval.
+    //
+    // WHY THIS EXISTS. The clamp in planShepard that trims the list to kSlots used to
+    // carry the comment "defensive; never fires". At a 48 kHz 8192-sample OFFLINE
+    // RENDER block and the fastest rise the grid advances 3.4 intervals in one buffer,
+    // the plan asks for 12 slots, and the clamp deletes a copy whose window is still
+    // 0.269 of full scale: a partial dropped in silence and a step in the same event.
+    // renderNextBlock splits the block on this instead, so the sentence is now true
+    // because the code makes it true - and run 53 asserts the clamp never fires.
+    inline int maxPlanSamples (double sr, double riseSec) noexcept
+    {
+        constexpr double intervals = (double) (kSlots - kMaxCopies - 1);
+        static_assert (kSlots - kMaxCopies - 1 >= 1, "a plan must be able to cover at least one interval");
+        const double s = intervals * juce::jmax (1.0e-4, riseSec) * juce::jmax (1.0, sr);
+        // The floor keeps a pathological rate from splitting a block into single samples;
+        // it is far below any rate the panel can ask for (the fastest is 0.05 s per
+        // interval, which at 48 kHz is 2400 samples - a plan longer than any live buffer).
+        return (int) juce::jlimit (64.0, 1.0e9, std::floor (s));
     }
 
     //== The window ============================================================
@@ -163,6 +197,33 @@ namespace shepard
         const double span = juce::jmin (lTop - lBot, (double) kMaxCopies * periodLog);
         return { 0.5 * (lTop + lBot) - 0.5 * span, span };
     }
+
+    //== What a Shepard voice is normalised BY ==================================
+    // THE RULE: the divisor is a property of the BAND, never of where the window
+    // happens to be standing. A normaliser that divides by the window's CURRENT sum
+    // divides the window straight back out, and the window reaching exactly zero at
+    // both edges is the entire silent-wrap guarantee - so that normaliser makes the
+    // copy leaving the top leave at FULL LEVEL, and the illusion is void.
+    //
+    // Nobody noticed because the two agree exactly in the ordinary case. On a uniform
+    // grid of q = span/period copies the raised cosine sums to exactly q/2, and its
+    // square to exactly 3q/8, for every integer q >= 3 - and the band is 8 intervals
+    // wide whenever the audible range and the density floor allow it. It is only when
+    // a dense spectrum or a wide rise interval NARROWS the band that the instantaneous
+    // sum starts to ripple, and at one copy it does not ripple, it IS the window:
+    // measured at a 16/1-period tuning with Base N at 64, the voice was as loud at a
+    // window sum of 0.098 as at 0.95.
+    //
+    // Two references because the two laws want different things, and both are
+    // geometry-only so neither can undo the window:
+    //   PEAK law (0.5 / sum a_j): must never UNDERSTATE the sum, or the all-in-phase
+    //     peak it is holding down at 0.5 is exceeded. jmax with 1.0 is what a single
+    //     copy can reach on its own; it is exact for every integer q and for q <= 2,
+    //     and no more than 5% low in between (measured across q = 1 .. 8).
+    //   RMS law (0.25 / sqrt(sum a_j^2)): wants the MEAN, because RMS is an average
+    //     measure and 3q/8 is that mean exactly, at every q.
+    inline double windowSumPeak (double q) noexcept { return juce::jmax (1.0, 0.5 * q); }
+    inline double windowSumMeanSq (double q) noexcept { return juce::jmax (1.0e-6, 0.375 * q); }
 
     // How wide (in octaves) the near-Nyquist taper should be. The floor is a
     // musical constant; the second term is what keeps a FAST rise smooth - the
