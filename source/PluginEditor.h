@@ -3411,8 +3411,8 @@ private:
             resetAllB.setButtonText (trF ("Reset all", "Reinicia-ho tot"));
             resetAllB.setTooltip (trF ("Drop every per-partial edit, including the ones whose partial is not in this spectrum right now. One Ctrl+Z brings them all back.",
                                        "Descarta totes les edicions per parcial, incloses les dels parcials que ara no hi s\xc3\xb3n. Un sol Ctrl+Z les torna totes."));
-            onT.setTooltip (trF ("Manual per-partial amplitudes. The SAME switch as the one under the pencil - one control in two places. Dragging a knob turns it on for you if it is off, because otherwise the drag would be stored and never sound. While it is on, SLOPE is frozen.",
-                                 "Amplituds manuals per parcial. \xc3\x89s EL MATEIX interruptor que el de sota el llapis - un control en dos llocs. Arrossegar un control l'activa si est\xc3\xa0 apagat, perqu\xc3\xa8 si no l'arrossegament es desaria i no sonaria mai. Mentre estigui actiu, el PENDENT queda congelat."));
+            onT.setTooltip (trF ("Manual per-partial amplitudes. The SAME switch as the one under the pencil. Dragging a knob turns it on for you if it is off, because otherwise the drag would be stored and never sound. While it is on, SLOPE is frozen.",
+                                 "Amplituds manuals per parcial. \xc3\x89s EL MATEIX interruptor que el de sota el llapis. Arrossegar un control l'activa si est\xc3\xa0 apagat, perqu\xc3\xa8 si no l'arrossegament es desaria i no sonaria mai. Mentre estigui actiu, el PENDENT queda congelat."));
             // The two things that surprise everyone, on screen rather than in a tooltip
             // nobody opens: they are not bugs and they are not reversible by guessing.
             factsLbl.setText (trF (
@@ -3837,16 +3837,16 @@ private:
             // idea named twice in one instrument, and it printed two different words.
             modeBtn[0].setButtonText (trF ? trF ("MORPH", "MORPHING") : juce::String ("MORPH"));
             modeBtn[1].setButtonText (trF ? trF ("MIX", "MESCLA") : juce::String ("MIX"));
-            modeBtn[0].setTooltip (trF ? trF ("Morph mode: the corners blend into ONE patch - every control and "
-                                              "the spectrum move to the point.",
-                                              "Mode morph: les cantonades es fonen en UN sol patch - cada control "
+            modeBtn[0].setTooltip (trF ? trF ("The corners blend into ONE patch - every control and the "
+                                              "spectrum move to the point.",
+                                              "Les cantonades es fonen en UN sol patch - cada control "
                                               "i l'espectre segueixen el punt.")
                                        : juce::String());
-            modeBtn[1].setTooltip (trF ? trF ("Mix mode: the four presets SOUND AT ONCE, each as its own full "
-                                              "engine, and the point balances their volumes (equal power). Your "
-                                              "own patch is untouched and comes back when you leave.",
-                                              "Mode mescla: els quatre presets SONEN ALHORA, cadascun amb el seu "
-                                              "propi motor complet, i el punt equilibra els seus volums (pot\xc3\xa8ncia "
+            modeBtn[1].setTooltip (trF ? trF ("The four presets SOUND AT ONCE, each as its own full engine, "
+                                              "and the point balances their volumes (equal power). Your own "
+                                              "patch is untouched and comes back when you leave.",
+                                              "Els quatre presets SONEN ALHORA, cadascun amb el seu propi "
+                                              "motor complet, i el punt equilibra els seus volums (pot\xc3\xa8ncia "
                                               "constant). El teu patch no es toca i torna quan en surts.")
                                        : juce::String());
             voicesLbl.setText (trF ? trF ("Mix voices per corner", "Veus de mescla per cantonada")
