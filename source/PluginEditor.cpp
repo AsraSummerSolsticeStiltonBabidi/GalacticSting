@@ -5954,7 +5954,38 @@ void FractalAdditiveAudioProcessorEditor::applyEngineState()
     using E = FractalAdditiveAudioProcessor::EngineInForce;
     const auto st = processorRef.engineInForce();
     const bool loaded = processorRef.timbreLoaded();
-    lastEngineShown = (int) st * 2 + (loaded ? 1 : 0);
+    // canTemper rides in the same signature the timer watches, so LOADING A TUNING with
+    // no usable period re-dresses the toggle even when temper is off and the engine in
+    // force does not change. Without it the control would keep offering a snap it cannot
+    // perform until something else happened to redraw the panel.
+    const bool canTemper = processorRef.temperIsPossible();
+    lastEngineShown = ((int) st * 2 + (loaded ? 1 : 0)) * 2 + (canTemper ? 1 : 0);
+
+    // TEMPER, REFUSED OUT LOUD. Temper snaps partials onto "degree x period^k", so with a
+    // tuning that states no ascending period (a descending .scl, a degenerate period-1
+    // scale) there is no grid to snap to. The synth used to substitute 2/1 and temper the
+    // spectrum to an octave the user never wrote, invisibly. It now does nothing at all -
+    // and this is where it SAYS so, on the control itself, so the refusal is never
+    // something the user has to deduce from the sound.
+    temperToggle.setEnabled (canTemper);
+    if (canTemper)
+    {
+        // BOTH the word and the tooltip go back. Setting only the word left a control
+        // that worked while still explaining, on hover, that it was unavailable - the
+        // stale half of a two-part message is its own lie.
+        temperToggle.setButtonText (tr ("Temper to tuning", "Tempera a l'afinaci\xc3\xb3"));
+        temperToggle.setTooltip (tr (
+            "ON: the HARMONIC ENGINE keeps generating partials and each one is snapped to the nearest pitch of the ACTIVE TUNING loaded in the Tuning box (degree x period^k), following it live - both engines work TOGETHER and the Custom Engine's own scale is bypassed. In MPE input mode the host does not hand the plugin a scale, so the grid there is plain 12-TET. OFF: no snapping (the Custom Engine's .scl, if loaded and ON, is the spectrum by itself).",
+            "ON: el MOTOR HARM\xc3\x92NIC segueix generant parcials i cadascun s'ajusta al to m\xc3\xa9s proper de l'AFINACI\xc3\x93 ACTIVA carregada a la caixa Tuning (grau x per\xc3\xado" "de^k), seguint-la en viu - els dos motors treballen JUNTS i l'escala del Motor propi queda de banda. En mode d'entrada MPE l'amfitri\xc3\xb3 no d\xc3\xb3na cap escala al plugin, aix\xc3\xad que all\xc3\xa0 la graella \xc3\xa9s 12-TET. OFF: sense ajust (l'.scl del Motor propi, si est\xc3\xa0 carregat i actiu, \xc3\xa9s l'espectre per si mateix)."));
+    }
+    else
+    {
+        temperToggle.setButtonText (tr ("Temper to tuning - no period",
+                                        "Tempera a l'afinaci\xc3\xb3 - sense per\xc3\xado" "de"));
+        temperToggle.setTooltip (tr (
+            "UNAVAILABLE: this tuning states no period that ascends (a descending scale, or a period of 1/1), so there is no \"degree x period^k\" grid to snap partials onto. Fibl\xc3\xb3 will NOT invent an octave here - the harmonic engine keeps running untempered and your tuning is left exactly as you wrote it. Load a tuning whose last interval rises above 1/1 to use this.",
+            "NO DISPONIBLE: aquesta afinaci\xc3\xb3 no declara cap per\xc3\xado" "de que pugi (una escala descendent, o un per\xc3\xado" "de d'1/1), aix\xc3\xad que no hi ha cap graella \"grau x per\xc3\xado" "de^k\" on ajustar els parcials. Fibl\xc3\xb3 NO s'inventar\xc3\xa0 cap octava aqu\xc3\xad - el motor harm\xc3\xb2nic segueix sonant sense temperar i la teva afinaci\xc3\xb3 queda exactament com l'has escrita. Carrega una afinaci\xc3\xb3 amb l'\xc3\xbaltim interval per sobre d'1/1 per fer-lo servir."));
+    }
 
     // The pin only ever holds the custom view open as an EMPTY workspace: any real
     // non-harmonic engine state observed here (a scale switched on, temper engaged -
@@ -9096,8 +9127,9 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // the harmonic controls back to their defaults (as this once did) silently destroyed
     // the user's settings the moment a .scl was loaded, and made the sound depend on the
     // editor being open.
-    if (lastEngineShown != (int) processorRef.engineInForce() * 2
-                           + (processorRef.timbreLoaded() ? 1 : 0))
+    if (lastEngineShown != ((int) processorRef.engineInForce() * 2
+                            + (processorRef.timbreLoaded() ? 1 : 0)) * 2
+                           + (processorRef.temperIsPossible() ? 1 : 0))
     {
         // applyEngineState() re-dresses the Load/Remove button itself: "is a spectrum
         // loaded" is half of the very state this comparison is watching, so the button's

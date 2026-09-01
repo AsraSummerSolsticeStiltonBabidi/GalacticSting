@@ -42,6 +42,7 @@
 #include <juce_core/juce_core.h>
 #include "libMTSClient.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -177,7 +178,13 @@ public:
     // In TABLE mode this is the estimated (or user-typed) period: it answers the
     // keyboard colouring, the snapping grid, the chord search and the dissonance
     // lists, and it is NOT what makes any pitch - the table already fixed all 128.
-    double periodRatio() const noexcept
+    // The period the ACTIVE tuning ACTUALLY STATES, or 0.0 when it states none that
+    // could be a repeat interval. This is the honest answer, and the one thing that
+    // RETUNES SOUND must ask - see hasUsablePeriod() below for the failure that made
+    // this split necessary. A period must ASCEND: 1/1 is degenerate (every "period"
+    // lands on the same pitch) and a descending .scl's period is < 1 (perfectly legal
+    // to write, and NOT a repeat interval going up).
+    double statedPeriodRatio() const noexcept
     {
         switch (mode.load (std::memory_order_relaxed))
         {
@@ -188,6 +195,7 @@ public:
                                        ? tablePeriod.load (std::memory_order_relaxed)
                                        : scalaPeriod.load (std::memory_order_relaxed);
                     if (p > 1.0001 && std::isfinite (p)) return p;
+                    return 0.0; // the scale states a period, and it is not a usable one
                 }
                 break;
             case Mode::MtsEsp:
@@ -195,13 +203,32 @@ public:
                 {
                     const double p = (double) MTS_GetPeriodRatio (client);
                     if (p > 1.0001 && std::isfinite (p)) return p;
+                    return 0.0;
                 }
                 break;
             case Mode::Equal:
             default:
                 break;
         }
-        return 2.0;
+        return 2.0; // 12-TET (and MTS with no master, which falls back to it) really is 2/1
+    }
+
+    // Does the active tuning have a period at all? periodRatio() below answers 2.0 when
+    // it does not, so that a DISPLAY (key colours, a degree readout) always has a finite
+    // number to lay out with - but that fallback is an octave nobody asked for, and
+    // anything that MOVES A PITCH has to ask this first instead.
+    //
+    // The concrete failure this prevents: with a descending .scl loaded (period 1/2) or a
+    // degenerate period-1 scale, "Temper to tuning" used to snap every harmonic-engine
+    // partial onto a 2/1 grid that appears nowhere in the user's file, and nothing on
+    // screen said so. The user's tuning is never silently changed - so temper now REFUSES
+    // here and says why on the control.
+    bool hasUsablePeriod() const noexcept { return statedPeriodRatio() > 1.0001; }
+
+    double periodRatio() const noexcept
+    {
+        const double p = statedPeriodRatio();
+        return p > 1.0001 ? p : 2.0;
     }
 
     // How many EQUAL steps this tuning cuts the OCTAVE into, or 0 when it does not cut
@@ -454,6 +481,141 @@ public:
     {
         return tableMode.load (std::memory_order_relaxed)
             && scalaValid.load (std::memory_order_relaxed);
+    }
+
+    // Frequency ratio of scale degree `d` relative to degree 0 (the tonic on key 60).
+    // Lives here, next to the scale it reads, so the .tun writer below and the editor's
+    // interval labels cannot drift apart in what they call "degree d" - they used to be
+    // one function on the processor and one implicit assumption in the exporter.
+    // Degree d is mapped to an IN-RANGE key of the same degree class (walking down whole
+    // periods) rather than clamping the MIDI note, so dense scales (72-EDO etc.) work.
+    double degreeRatio (int d) const
+    {
+        const int D = juce::jmax (1, degreesPerPeriod());
+        const double per = periodRatio();
+        // Degree index -> (period count, step inside the period), floored so negative
+        // degrees work too. The PERIOD factor is applied explicitly, never inferred
+        // from where the degree happens to land on the keyboard.
+        const int wraps = (int) std::floor ((double) d / (double) D);
+        const int step  = d - wraps * D;
+        // Scala: read the scale's own degree ratio. The 128-key table only holds 128
+        // degree classes, so a scale with more degrees than that CANNOT be read back
+        // through it (degrees 68..D-61 used to all collapse onto key 127's value).
+        double r = 0.0;
+        if (scalaDegreeRatio (step, r))
+            return r * std::pow (per, (double) wraps);
+        // No scale to ask (MTS, an absolute 128-key table): read the KEY the degree lands
+        // on, which for a table is the file's own pitch. Keys past 127 are walked DOWN by
+        // whole periods rather than clamped - a table with a wide period spans more than
+        // 68 keys per period, and clamping made every degree above that report key 127.
+        int key = kRefKey + step, extra = 0;
+        while (key > 127) { key -= D; ++extra; }
+        while (key < 0)   { key += D; --extra; }
+        const double f0 = frequencyForNote (kRefKey);
+        const double f  = frequencyForNote (juce::jlimit (0, 127, key));
+        return f0 > 0.0 ? (f / f0) * std::pow (per, (double) (wraps + extra)) : 1.0;
+    }
+
+    //== .tun export ==========================================================
+    // The CURRENT tuning as AnaMark .tun (v2) text. This is the primary interchange
+    // format: unlike .scl it carries the reference frequency, so a scale exported here
+    // reopens at the same absolute pitch instead of losing its A and being guessed at by
+    // whatever loads it. Every MIDI note is written out, so a mapping of any size
+    // survives - a .scl would need a .kbm alongside it to say the same thing.
+    //
+    // It lives HERE rather than on the processor so that the round trip - export, reload,
+    // compare degree count AND period AND pitches - is a unit test and not a thing only
+    // the running plugin could ever have caught. It could not, and did not.
+    bool writeTunText (juce::String& out, juce::String& errorOut) const
+    {
+        const double f0 = frequencyForNote (0);
+        if (! (f0 > 0.0) || ! std::isfinite (f0))
+        { errorOut = "The current tuning has no usable pitch for MIDI note 0."; return false; }
+
+        // What Fibló exports is a SCALE whenever it HAS one, never a scale it merely
+        // guessed at. A .tun can legitimately hold a non-repeating mapping - a stretched
+        // piano curve, per-note tweaks - and Fibló holds exactly that as an absolute
+        // 128-key table; for those the [Scale Begin] block is omitted rather than filled
+        // with the estimated period, which would state as fact a structure the tuning
+        // does not have. The 128 exact pitches below carry it losslessly either way, and
+        // reloading the file lands back in table mode.
+        //
+        // hasUsablePeriod(), NOT periodRatio() > 1.0001: that test could never fire,
+        // because periodRatio() answers 2.0 exactly when there is no period. A
+        // descending or period-1 scale therefore used to export a [Scale Begin] block
+        // declaring "N degrees per period of 1200 cents" for a scale whose period is
+        // nothing of the kind - the file stating a structure its own author never wrote.
+        const bool   isTable = usesAbsoluteTable();
+        const int    degrees = degreesPerPeriod();
+        const double period  = statedPeriodRatio();
+        if (! isTable && (degrees <= 0 || ! hasUsablePeriod()))
+        {
+            errorOut = "This tuning has no repeating scale behind it (an MTS-ESP master can "
+                       "supply an arbitrary 128-key table, and a descending or period-1 scale "
+                       "repeats at nothing), so it cannot be written as a scale. Nothing was "
+                       "saved.";
+            return false;
+        }
+
+        const auto centsAt = [this, f0] (int n)
+        {
+            const double fn = frequencyForNote (n);
+            return (fn > 0.0 && std::isfinite (fn)) ? 1200.0 * std::log2 (fn / f0) : 0.0;
+        };
+
+        juce::String s;
+        s << "; AnaMark TUN v2 - written by Fiblo Galactic\n"
+          << "; " << getStatusText() << "\n\n";
+
+        if (isTable)
+        {
+            // Said in a comment, so no reader can mistake it for structure: the period is
+            // Fibló's estimate (or the user's own choice), not something the file repeats at.
+            const auto est = getTablePeriodEstimate();
+            s << "; 128-key tuning table - this mapping does not repeat, so it declares no scale.\n"
+              << "; period used inside Fiblo: " << juce::String (1200.0 * std::log2 (periodRatio()), 6)
+              << " cents (" << (tablePeriodIsUserSet() ? "chosen by the user" : "Fiblo's estimate")
+              << ", " << juce::String (tablePeriodDevCents(), 2) << " cents off at worst"
+              << (est.found ? "" : ", nothing to measure") << ")\n\n";
+        }
+        else
+        {
+            // Declare the SCALE, so the file says what it is instead of leaving a reader to
+            // infer a period from 128 numbers. Degrees as cents above 1/1, then the period
+            // as the closing interval - the same shape a .scl has, which is what makes this
+            // a scale file rather than a table that happens to repeat.
+            //
+            // basekey says WHICH MIDI KEY carries degree 0. Without it the block was not
+            // enough to place the scale: the 128 pitches below are cents above key 0, and
+            // key 0 is degree 0 only when the degree count happens to divide 60. For the
+            // user's own 7-note just major, key 0 is degree 3. A reader that trusted the
+            // block therefore rooted the scale a third away from the one loaded, and
+            // Fibló's own reader could not use the block at all - so it re-guessed the
+            // structure from the pitches and sometimes guessed a different scale.
+            s << "[Scale Begin]\n"
+              << "; " << degrees << " degrees per period of "
+              << juce::String (1200.0 * std::log2 (period), 6) << " cents\n"
+              << "basekey=" << kRefKey << "\n"
+              << "degree 0=0.000000\n";
+            for (int d = 1; d <= degrees; ++d)
+            {
+                const double r = d < degrees ? degreeRatio (d) : period;
+                s << "degree " << d << "=" << juce::String (1200.0 * std::log2 (std::max (1.0e-9, r)), 10) << "\n";
+            }
+            s << "[Scale End]\n\n";
+        }
+
+        s << "[Tuning]\n";
+        for (int n = 0; n < 128; ++n)
+            s << "note " << n << "=" << juce::String ((int) std::llround (centsAt (n))) << "\n";
+        // The exact block is what actually carries the pitch: integer cents above are
+        // only the coarse fallback for readers that predate it.
+        s << "\n[Exact Tuning]\nbasefreq=" << juce::String (f0, 10) << "\n";
+        for (int n = 0; n < 128; ++n)
+            s << "note " << n << "=" << juce::String (centsAt (n), 6) << "\n";
+
+        out = s;
+        return true;
     }
 
     // The period Fibló measured for the loaded table (message thread). `found` is false
@@ -733,6 +895,61 @@ public:
     // absolute 128-key table instead (loadAbsoluteTable). It is still exact-or-nothing:
     // a stretched or per-key-mapped .tun is never quietly flattened into a scale that
     // it is not, which would hand the user back a tuning they did not write.
+    // Read the STRUCTURE a .tun's [Scale Begin] block declares: how many degrees per
+    // period, and what the period is in cents. Only the two numbers - the pitches
+    // themselves always come from [Exact Tuning], and the caller proves the declaration
+    // against them before using it (see tryStructure in tunToScala).
+    //
+    // The block lists "degree 0" (always 0 cents) up to "degree N", where degree N IS the
+    // period - the same shape a .scl has. So N degree lines above zero means N degrees per
+    // period. A block that is missing, empty or whose top degree does not ascend declares
+    // nothing, and the caller falls back to measuring.
+    static bool readTunScaleBlock (const juce::String& text, int& degreesOut, double& periodCentsOut)
+    {
+        juce::StringArray raw;
+        raw.addLines (text);
+
+        juce::String section;
+        int    top = -1;         // highest degree index seen
+        double topCents = 0.0;   // and its cents value - the period
+        int    seen = 0;
+
+        for (const auto& rawLine : raw)
+        {
+            const auto line = stripTunComment (rawLine).trim();
+            if (line.isEmpty()) continue;
+
+            if (line.startsWithChar ('['))
+            {
+                section = line.fromFirstOccurrenceOf ("[", false, false)
+                              .upToFirstOccurrenceOf ("]", false, false).trim().toLowerCase();
+                continue;
+            }
+            if (section != "scale begin") continue;
+
+            const int eq = line.indexOfChar ('=');
+            if (eq < 0) continue;
+            // "degree 3" and "degree3" both, exactly as parseTun treats "note 60".
+            const auto key = line.substring (0, eq).trim().toLowerCase().removeCharacters (" \t");
+            const auto val = line.substring (eq + 1).trim();
+            if (! key.startsWith ("degree") || key.length() <= 6
+                || ! key.substring (6).containsOnly ("0123456789"))
+                continue;
+            if (! isTunNumber (val)) continue;
+
+            const int    d = key.substring (6).getIntValue();
+            const double v = val.getDoubleValue();
+            if (d < 0 || d > 127 || ! std::isfinite (v)) continue;
+            ++seen;
+            if (d > top) { top = d; topCents = v; }
+        }
+
+        if (top < 1 || seen < 2 || ! (topCents > 0.0)) return false;
+        degreesOut     = top;   // degrees 0..top-1; degree `top` is the period
+        periodCentsOut = topCents;
+        return true;
+    }
+
     static bool tunToScala (const juce::String& tunText, const juce::String& name,
                             juce::String& sclOut, juce::String& errorOut)
     {
@@ -752,26 +969,105 @@ public:
         // the file never described. Demand at least a dozen repeats as evidence.
         constexpr int kMinPairs = 12;
 
-        int    firstK = 0, simpleK = 0;
-        double firstP = 0.0, simpleP = 0.0;
-        for (int k = 1; k <= 128 - kMinPairs; ++k)
+        // Take a candidate structure (degrees per period + period) and, if the file's own
+        // 128 pitches really are that structure, hand back the degree list. Everything is
+        // derived from the PITCHES; the structure only says how to slice them, and a
+        // slice that does not reproduce all 128 keys is rejected. Factored out so the
+        // DECLARED structure and the SEARCHED one go through the identical proof.
+        double      periodCents = 0.0;
+        int         count       = 0;
+        double      fRef        = 0.0;
+        std::vector<double> degCents;
+
+        const auto tryStructure = [&] (int tryCount, double tryPeriodCents)
         {
-            const double P = c[(size_t) k] - c[0];
-            if (! (P > kTolCents) || ! std::isfinite (P))
-                continue; // a period has to ascend; a descending/unison one is not a repeat
+            if (tryCount < 1 || tryCount > 127 || ! (tryPeriodCents > kTolCents)
+                || ! std::isfinite (tryPeriodCents))
+                return false;
 
-            bool repeats = true;
-            for (int n = 0; n + k < 128 && repeats; ++n)
-                repeats = std::abs ((c[(size_t) (n + k)] - c[(size_t) n]) - P) <= kTolCents;
-            if (! repeats)
-                continue;
+            const double per = std::pow (2.0, tryPeriodCents / 1200.0);
+            // The file's own map, continued outside 0..127 by its period, so the degrees
+            // can be taken from the window that starts on middle C (where loadScalaString
+            // always puts degree 0) even when the scale has more degrees than the keys
+            // above middle C - a 100-note EDO would otherwise run off the end of the file.
+            const auto keyFreq = [&] (int n)
+            {
+                const int oct = (int) std::floor ((double) n / (double) tryCount);
+                return f[(size_t) (n - oct * tryCount)] * std::pow (per, (double) oct);
+            };
 
-            if (firstK == 0) { firstK = k; firstP = P; }
-            if (isSimplePeriod (P)) { simpleK = k; simpleP = P; break; }
+            const double ref = keyFreq (kRefKey);
+            if (! (ref > 0.0) || ! std::isfinite (ref))
+                return false;
+
+            std::vector<double> dc ((size_t) tryCount, 0.0);
+            for (int j = 0; j < tryCount; ++j)
+                dc[(size_t) j] = 1200.0 * std::log2 (keyFreq (kRefKey + j) / ref);
+
+            // Self-check: reproduce all 128 keys the way loadScalaString will (degree
+            // (n-60) mod count, times period^octave, anchored on ref) and compare with
+            // the file. This is the guarantee, not a debug aid: any mistake in the wrap
+            // above - or a [Scale Begin] block that does not describe its own pitches -
+            // would otherwise ship as a subtly wrong tuning.
+            for (int n = 0; n < 128; ++n)
+            {
+                const int d    = n - kRefKey;
+                const int oct  = (int) std::floor ((double) d / (double) tryCount);
+                const int step = d - oct * tryCount;
+                const double got = ref * std::pow (per, (double) oct)
+                                 * std::pow (2.0, dc[(size_t) step] / 1200.0);
+                if (! (std::abs (1200.0 * std::log2 (got / f[(size_t) n])) <= kTolCents))
+                    return false;
+            }
+
+            count = tryCount; periodCents = tryPeriodCents; fRef = ref; degCents = std::move (dc);
+            return true;
+        };
+
+        // (A) THE FILE'S OWN DECLARATION FIRST. A [Scale Begin] block states how many
+        // degrees the writer meant and what they repeat at. Guessing that from 128 numbers
+        // cannot always recover it: the search below takes the SMALLEST exact repeat and
+        // only overrides it for a CANONICAL period, so a scale of 9 equal degrees per
+        // 1000 cents came back as 1 degree per 111.111 cents - same pitches, a structure
+        // the user never wrote, and it is what the degree readouts and the keyboard then
+        // showed. Fibló's own exporter writes this block, so its own round trip was losing
+        // the answer it had just written down.
+        //
+        // Verified, never trusted: tryStructure proves the declaration against all 128
+        // pitches, so a foreign block that disagrees with its own file is ignored rather
+        // than believed.
+        {
+            int declCount = 0; double declPeriodCents = 0.0;
+            if (readTunScaleBlock (tunText, declCount, declPeriodCents))
+                tryStructure (declCount, declPeriodCents);
         }
 
-        const int    count       = simpleK != 0 ? simpleK : firstK;
-        const double periodCents = simpleK != 0 ? simpleP : firstP;
+        // (B) Otherwise measure it: the smallest exact repeat, overridden by a canonical
+        // period when one also repeats (12 per 2/1 beats the equally true 1 per 100c).
+        if (count == 0)
+        {
+            int    firstK = 0, simpleK = 0;
+            double firstP = 0.0, simpleP = 0.0;
+            for (int k = 1; k <= 128 - kMinPairs; ++k)
+            {
+                const double P = c[(size_t) k] - c[0];
+                if (! (P > kTolCents) || ! std::isfinite (P))
+                    continue; // a period has to ascend; a descending/unison one is not a repeat
+
+                bool repeats = true;
+                for (int n = 0; n + k < 128 && repeats; ++n)
+                    repeats = std::abs ((c[(size_t) (n + k)] - c[(size_t) n]) - P) <= kTolCents;
+                if (! repeats)
+                    continue;
+
+                if (firstK == 0) { firstK = k; firstP = P; }
+                if (isSimplePeriod (P)) { simpleK = k; simpleP = P; break; }
+            }
+
+            if (simpleK != 0) tryStructure (simpleK, simpleP);
+            if (count == 0 && firstK != 0) tryStructure (firstK, firstP);
+        }
+
         if (count == 0)
         {
             // Not an error the user ever sees: loadTunString takes this as "hold it as an
@@ -779,48 +1075,6 @@ public:
             errorOut = "This .tun does not repeat at any interval, so it cannot be held as a "
                        "scale (degrees + period).";
             return false;
-        }
-
-        const double periodRatio = std::pow (2.0, periodCents / 1200.0);
-
-        // The file's own map, continued outside 0..127 by its period, so the degrees
-        // can be taken from the window that starts on middle C (where loadScalaString
-        // always puts degree 0) even when the scale has more degrees than the keys
-        // above middle C - a 100-note EDO would otherwise run off the end of the file.
-        const auto keyFreq = [&] (int n)
-        {
-            const int oct = (int) std::floor ((double) n / (double) count);
-            return f[(size_t) (n - oct * count)] * std::pow (periodRatio, (double) oct);
-        };
-
-        const double fRef = keyFreq (kRefKey);
-        if (! (fRef > 0.0) || ! std::isfinite (fRef))
-        {
-            errorOut = "This .tun has no usable pitch on middle C.";
-            return false;
-        }
-
-        std::vector<double> degCents ((size_t) count, 0.0);
-        for (int j = 0; j < count; ++j)
-            degCents[(size_t) j] = 1200.0 * std::log2 (keyFreq (kRefKey + j) / fRef);
-
-        // Self-check: reproduce all 128 keys the way loadScalaString will (degree
-        // (n-60) mod count, times period^octave, anchored on fRef) and compare with
-        // the file. This is the guarantee, not a debug aid: any mistake in the wrap
-        // above would otherwise ship as a subtly wrong tuning.
-        for (int n = 0; n < 128; ++n)
-        {
-            const int d    = n - kRefKey;
-            const int oct  = (int) std::floor ((double) d / (double) count);
-            const int step = d - oct * count;
-            const double got = fRef * std::pow (periodRatio, (double) oct)
-                             * std::pow (2.0, degCents[(size_t) step] / 1200.0);
-            if (! (std::abs (1200.0 * std::log2 (got / f[(size_t) n])) <= kTolCents))
-            {
-                errorOut = "This .tun cannot be represented exactly as a scale (key "
-                         + juce::String (n) + " would be off). Nothing was loaded.";
-                return false;
-            }
         }
 
         // Cents are written with 10 decimals: ~1e-7 cents of round-trip error, four

@@ -764,6 +764,185 @@ int main()
         }
     }
 
+    //==========================================================================
+    // TEMPER MODE MUST NOT INVENT AN OCTAVE.
+    //
+    // "Temper to tuning" snaps every harmonic-engine partial onto the grid
+    // "degree x period^k". That grid EXISTS only if the tuning states a period that
+    // ASCENDS. Two legal .scl files state none:
+    //
+    //   * a DESCENDING scale - the last listed interval is below 1/1;
+    //   * a degenerate period of exactly 1/1 - every "period" lands on the same pitch.
+    //
+    // periodRatio() answers 2.0 for both, because displays (key colours, degree
+    // readouts) always need a finite number to lay out with. Temper used to read THAT
+    // and snap the whole spectrum to a 2/1 grid appearing nowhere in the user's file,
+    // with nothing on screen saying so - the user's tuning, silently changed.
+    //
+    // So there are now TWO questions, and this is the pair the sound path must ask:
+    // statedPeriodRatio() / hasUsablePeriod() tell the truth (0.0 / false), and only
+    // periodRatio() keeps the display fallback. The processor gates temper on
+    // hasUsablePeriod() and the toggle says why it is refused.
+    std::printf ("\ntemper mode refuses a tuning with no period, instead of inventing 2/1:\n");
+    {
+        auto probe = [] (const char* scl, const char* what, bool expectUsable, double expectStated)
+        {
+            TuningManager t; juce::String err;
+            check (t.loadScalaString (scl, "probe", err), what);
+            t.setMode (TuningManager::Mode::Scala);
+            std::printf ("  %-26s -> stated %.5f, usable %d, display fallback %.5f\n",
+                         what, t.statedPeriodRatio(), (int) t.hasUsablePeriod(), t.periodRatio());
+            check (t.hasUsablePeriod() == expectUsable, "  ...usable-period verdict");
+            check (std::abs (t.statedPeriodRatio() - expectStated) < 1.0e-9,
+                   "  ...and the period it STATES is the file's own, never a substitute");
+        };
+
+        // (1) A degenerate period of exactly 1/1. Representable, legal to write, and no
+        //     grid at all: degree x 1^k is the degree list over and over on one pitch.
+        probe ("! unison.scl\nperiod of exactly 1/1\n 3\n!\n 1/1\n 1/1\n 1/1\n",
+               "period-1 scale", false, 0.0);
+
+        // (2) A DESCENDING scale: every listed interval falls. Its period is 1/2, which
+        //     is not a repeat interval going up, so temper has nothing to snap to.
+        probe ("! down.scl\ndescending\n 3\n!\n -300.0\n -700.0\n 1/2\n",
+               "descending scale", false, 0.0);
+
+        // (3) The control: a normal octave scale still tempers, to ITS OWN 2/1 - the fix
+        //     must refuse the two above without disabling temper for everybody else.
+        probe ("! penta.scl\nmajor pentatonic\n 5\n!\n 9/8\n 5/4\n 3/2\n 5/3\n 2/1\n",
+               "normal 2/1 pentatonic", true, 2.0);
+
+        // (4) ...and a non-octave period is a usable period too: the refusal is about
+        //     "does it ascend", never about "is it an octave".
+        probe ("! bp.scl\nBohlen-Pierce-ish\n 4\n!\n 7/5\n 9/5\n 11/5\n 3/1\n",
+               "3/1 period scale", true, 3.0);
+
+        // And the display fallback is still there for whoever needs a number: a caller
+        // that only paints must never divide by zero because the scale is degenerate.
+        {
+            TuningManager t; juce::String err;
+            t.loadScalaString ("! unison.scl\nperiod of exactly 1/1\n 2\n!\n 1/1\n 1/1\n", "u", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (std::abs (t.periodRatio() - 2.0) < 1.0e-12,
+                   "periodRatio() still hands displays a finite 2.0 - it is the SOUND path that must ask");
+        }
+    }
+
+    //==========================================================================
+    // A .tun EXPORT IS A ROUND TRIP, OR IT IS NOTHING.
+    //
+    // The user asked for .tun export specifically so their tunings would TRAVEL. An
+    // exporter that alters them is worse than none - and Fibló's did: the [Scale Begin]
+    // block it wrote was ignored by its own reader, which re-guessed the structure from
+    // the 128 pitches. The guess takes the SMALLEST exact repeat and only overrides it
+    // for a CANONICAL period, so 9 equal degrees per 1000 cents came back as 1 degree
+    // per 111.111 cents. Same frequencies to the last decimal; a different scale in
+    // every readout, on the keyboard, and in what the next export then declared.
+    //
+    // So the assertion is the whole trip: load, export, load the export, and compare the
+    // PITCHES *and* the STRUCTURE - degree count, period, and whether it is held as a
+    // repeating scale at all.
+    std::printf ("\n.tun export round trip - pitches AND structure survive:\n");
+    {
+        auto roundTrip = [] (TuningManager& src, const char* what, bool expectTable, int expectDegrees)
+        {
+            juce::String tun, err;
+            if (! src.writeTunText (tun, err))
+            { check (false, what); std::printf ("      export refused: %s\n", err.toRawUTF8()); return; }
+
+            TuningManager back;
+            if (! back.loadTunString (tun, "roundtrip", err))
+            { check (false, what); std::printf ("      reload refused: %s\n", err.toRawUTF8()); return; }
+            back.setMode (TuningManager::Mode::Scala);
+
+            double worst = 0.0;
+            for (int n = 0; n < 128; ++n)
+                worst = std::max (worst, centsApart (back.frequencyForNote (n), src.frequencyForNote (n)));
+
+            std::printf ("  %-24s in: %d deg / %.4fc / table %d   out: %d deg / %.4fc / table %d"
+                         "   worst %.6fc\n",
+                         what, src.degreesPerPeriod(), 1200.0 * std::log2 (src.periodRatio()),
+                         (int) src.usesAbsoluteTable(),
+                         back.degreesPerPeriod(), 1200.0 * std::log2 (back.periodRatio()),
+                         (int) back.usesAbsoluteTable(), worst);
+
+            check (worst <= 0.01, "  every one of the 128 pitches comes back (<= 0.01c)");
+            check (back.usesAbsoluteTable() == expectTable,
+                   expectTable ? "  a non-repeating map stays a TABLE - no scale is invented for it"
+                               : "  a scale comes back as a SCALE, not flattened into a table");
+            check (back.degreesPerPeriod() == expectDegrees, "  the degree count is the one that went in");
+            if (! expectTable)
+                check (std::abs (1200.0 * std::log2 (back.periodRatio() / src.periodRatio())) <= 0.01,
+                       "  and so is the period - the export never re-slices the user's scale");
+        };
+
+        juce::String err;
+
+        // (1) A normal octave .scl: seven unequal degrees. Key 0 is degree 3 here, not
+        //     degree 0, which is exactly why the exported block has to say where degree 0
+        //     sits instead of leaving a reader to assume key 0.
+        {
+            TuningManager t;
+            check (t.loadScalaString ("Ptolemy 5-limit major\n 7\n!\n 9/8\n 5/4\n 4/3\n 3/2\n 5/3\n 15/8\n 2/1\n",
+                                      "ji", err), "a 7-note just major loads");
+            t.setMode (TuningManager::Mode::Scala);
+            roundTrip (t, "7-note just major", false, 7);
+        }
+
+        // (2) A NON-OCTAVE, NON-CANONICAL period. This is the case the guess destroyed:
+        //     nothing in kCanonPeriods is 1000 cents, so the smallest exact repeat (one
+        //     equal step) won and the scale came back as 1 degree per 111.111 cents.
+        {
+            juce::String s ("nine equal degrees per 1000 cents\n 9\n!\n");
+            for (int i = 1; i <= 9; ++i) s << " " << juce::String (1000.0 * (double) i / 9.0, 6) << "\n";
+            TuningManager t;
+            check (t.loadScalaString (s, "n9", err), "a 9-per-1000c scale loads");
+            t.setMode (TuningManager::Mode::Scala);
+            roundTrip (t, "9 per 1000c", false, 9);
+        }
+
+        // (3) Bohlen-Pierce: a non-octave period that IS canonical (3/1). It survived the
+        //     guess, so it is the control that proves the fix did not break what worked.
+        {
+            juce::String s ("Bohlen-Pierce equal\n 13\n!\n");
+            for (int i = 1; i <= 13; ++i)
+                s << " " << juce::String (1200.0 * std::log2 (3.0) * (double) i / 13.0, 6) << "\n";
+            TuningManager t;
+            check (t.loadScalaString (s, "bp", err), "a Bohlen-Pierce 3/1 scale loads");
+            t.setMode (TuningManager::Mode::Scala);
+            roundTrip (t, "Bohlen-Pierce 13 per 3/1", false, 13);
+        }
+
+        // (4) An ABSOLUTE, NON-REPEATING .tun - a stretched piano curve. It has no scale,
+        //     so the export must declare none and the reload must stay a table. Inventing
+        //     a scale here would be the same lie in the other direction.
+        {
+            double fr[128];
+            for (int n = 0; n < 128; ++n)
+                fr[n] = 8.1757989156 * std::pow (2.0, (100.0 * (double) n + 0.004 * (double) (n * n)) / 1200.0);
+            TuningManager t;
+            check (t.loadTunString (makeTun (fr), "stretched", err), "a stretched .tun table loads");
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.usesAbsoluteTable(), "  and is held as an absolute table");
+            roundTrip (t, "stretched .tun table", true, t.degreesPerPeriod());
+        }
+
+        // (5) THE USER'S OWN SCALES, read off disk exactly as the plugin reads them. These
+        //     are the files this whole feature exists for; a round trip that works only on
+        //     scales written by the test is not the promise that was made.
+        for (const char* fn : { "scales/19_edo.scl", "scales/just_intonation_major.scl" })
+        {
+            juce::File f (juce::File::getCurrentWorkingDirectory().getChildFile (fn));
+            if (! f.existsAsFile())
+            { std::printf ("  (skipped %s - not found from %s)\n", fn,
+                           juce::File::getCurrentWorkingDirectory().getFullPathName().toRawUTF8()); continue; }
+            TuningManager t;
+            check (t.loadScalaFile (f, err), fn);
+            t.setMode (TuningManager::Mode::Scala);
+            roundTrip (t, f.getFileName().toRawUTF8(), false, t.degreesPerPeriod());
+        }
+    }
+
     std::printf ("\n%s (%d failure%s)\n", failures == 0 ? "ALL PASSED" : "FAILURES",
                  failures, failures == 1 ? "" : "s");
     return failures == 0 ? 0 : 1;

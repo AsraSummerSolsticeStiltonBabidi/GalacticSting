@@ -93,85 +93,17 @@ public:
         tuning.setMode (TuningManager::Mode::Scala);
         return true;
     }
-    // Write the CURRENT tuning as an AnaMark .tun (v2). This is the primary interchange
-    // format now: unlike .scl it carries the reference frequency, so a scale exported
-    // here reopens at the same absolute pitch instead of losing its A and being guessed
-    // at by whatever loads it. Every MIDI note is written out, so a mapping of any size
-    // survives - a .scl would need a .kbm alongside it to say the same thing.
+    // Write the CURRENT tuning as an AnaMark .tun (v2). The text itself is built by
+    // TuningManager::writeTunText - it belongs beside the scale it describes, and only
+    // there can a unit test load a scale, export it and load the export back.
     bool saveCurrentTuningTun (const juce::File& f, juce::String& errorOut)
     {
-        const double f0 = tuning.frequencyForNote (0);
-        if (! (f0 > 0.0) || ! std::isfinite (f0))
-        { errorOut = "The current tuning has no usable pitch for MIDI note 0."; return false; }
-
-        // What Fiblo exports is a SCALE whenever it HAS one, never a scale it merely
-        // guessed at. A .tun can legitimately hold a non-repeating mapping - a stretched
-        // piano curve, per-note tweaks - and Fiblo now holds exactly that as an absolute
-        // 128-key table; for those the [Scale Begin] block is omitted rather than filled
-        // with the estimated period, which would state as fact a structure the tuning
-        // does not have. The 128 exact pitches below carry it losslessly either way, and
-        // reloading the file lands back in table mode.
-        const bool   isTable = tuning.usesAbsoluteTable();
-        const int    degrees = tuning.degreesPerPeriod();
-        const double period  = tuning.periodRatio();
-        if (! isTable && (degrees <= 0 || ! (period > 1.0001) || ! std::isfinite (period)))
-        {
-            errorOut = "This tuning has no repeating scale behind it (an MTS-ESP master can "
-                       "supply an arbitrary 128-key table), so it cannot be written as a scale. "
-                       "Nothing was saved.";
-            return false;
-        }
-
-        const auto centsAt = [this, f0] (int n)
-        {
-            const double fn = tuning.frequencyForNote (n);
-            return (fn > 0.0 && std::isfinite (fn)) ? 1200.0 * std::log2 (fn / f0) : 0.0;
-        };
-
-        juce::String s;
-        s << "; AnaMark TUN v2 - written by Fiblo Galactic\n"
-          << "; " << getTuningStatus() << "\n\n";
-
-        if (isTable)
-        {
-            // Said in a comment, so no reader can mistake it for structure: the period is
-            // Fiblo's estimate (or the user's own choice), not something the file repeats at.
-            const auto est = tuning.getTablePeriodEstimate();
-            s << "; 128-key tuning table - this mapping does not repeat, so it declares no scale.\n"
-              << "; period used inside Fiblo: " << juce::String (1200.0 * std::log2 (period), 6)
-              << " cents (" << (tuning.tablePeriodIsUserSet() ? "chosen by the user" : "Fiblo's estimate")
-              << ", " << juce::String (tuning.tablePeriodDevCents(), 2) << " cents off at worst"
-              << (est.found ? "" : ", nothing to measure") << ")\n\n";
-        }
-        else
-        {
-            // Declare the SCALE, so the file says what it is instead of leaving a reader to
-            // infer a period from 128 numbers. Degrees as cents above 1/1, then the period
-            // as the closing interval - the same shape a .scl has, which is what makes this
-            // a scale file rather than a table that happens to repeat.
-            s << "[Scale Begin]\n"
-              << "; " << degrees << " degrees per period of "
-              << juce::String (1200.0 * std::log2 (period), 6) << " cents\n";
-            for (int d = 1; d <= degrees; ++d)
-            {
-                const double r = d < degrees ? getDegreeRatio (d) : period;
-                s << "degree " << d << "=" << juce::String (1200.0 * std::log2 (std::max (1.0e-9, r)), 6) << "\n";
-            }
-            s << "[Scale End]\n\n";
-        }
-
-        s << "[Tuning]\n";
-        for (int n = 0; n < 128; ++n)
-            s << "note " << n << "=" << juce::String ((int) std::llround (centsAt (n))) << "\n";
-        // The exact block is what actually carries the pitch: integer cents above are
-        // only the coarse fallback for readers that predate it.
-        s << "\n[Exact Tuning]\nbasefreq=" << juce::String (f0, 10) << "\n";
-        for (int n = 0; n < 128; ++n)
-            s << "note " << n << "=" << juce::String (centsAt (n), 6) << "\n";
-
-        if (! f.replaceWithText (s)) { errorOut = "Could not write " + f.getFullPathName(); return false; }
+        juce::String text;
+        if (! tuning.writeTunText (text, errorOut)) return false;
+        if (! f.replaceWithText (text)) { errorOut = "Could not write " + f.getFullPathName(); return false; }
         return true;
     }
+
 
     void clearScala();
     juce::String getTuningStatus() const { return tuning.getStatusText(); }
@@ -360,36 +292,21 @@ public:
     // only when it is really a choice - see shepard::periodDiffersFromOctave.
     double getTuningPeriodRatio() const noexcept { return tuning.periodRatio(); }
 
+    // Can "Temper to tuning" do anything at all? Temper snaps partials onto
+    // "degree x period^k", which needs a period that ASCENDS - a descending .scl or a
+    // degenerate period-1 scale states none. The editor asks so the toggle can be
+    // greyed WITH A REASON instead of appearing to work while the spectrum is silently
+    // snapped to a 2/1 grid the user's file never contained.
+    bool temperIsPossible() const noexcept { return tuning.hasUsablePeriod(); }
+
     // Frequency ratio of scale degree `d` relative to degree 0 (the tonic on
     // key 60), for the keyboard's just-interval labels. Degree d is mapped to an
     // IN-RANGE key of the same degree class (walking down whole periods) rather
     // than clamping the MIDI note, so dense scales (72-EDO etc.) label correctly.
-    double getDegreeRatio (int d) const
-    {
-        const int D = juce::jmax (1, tuning.degreesPerPeriod());
-        const double per = tuning.periodRatio();
-        // Degree index -> (period count, step inside the period), floored so negative
-        // degrees work too. The PERIOD factor is applied explicitly, never inferred
-        // from where the degree happens to land on the keyboard.
-        const int wraps = (int) std::floor ((double) d / (double) D);
-        const int step  = d - wraps * D;
-        // Scala: read the scale's own degree ratio. The 128-key table only holds 128
-        // degree classes, so a scale with more degrees than that CANNOT be read back
-        // through it (degrees 68..D-61 used to all collapse onto key 127's value).
-        double r = 0.0;
-        if (tuning.scalaDegreeRatio (step, r))
-            return r * std::pow (per, (double) wraps);
-        // No scale to ask (MTS, an absolute 128-key table): read the KEY the degree lands
-        // on, which for a table is the file's own pitch. Keys past 127 are walked DOWN by
-        // whole periods rather than clamped - a table with a wide period spans more than
-        // 68 keys per period, and clamping made every degree above that report key 127.
-        int key = 60 + step, extra = 0;
-        while (key > 127) { key -= D; ++extra; }
-        while (key < 0)   { key += D; --extra; }
-        const double f0 = tuning.frequencyForNote (60);
-        const double f  = tuning.frequencyForNote (juce::jlimit (0, 127, key));
-        return f0 > 0.0 ? (f / f0) * std::pow (per, (double) (wraps + extra)) : 1.0;
-    }
+    // Moved into TuningManager (see TuningManager::degreeRatio) so the .tun exporter and
+    // every readout mean the same thing by "degree d" - the exporter used to reach this
+    // through the processor, which is why nothing cheap could test what it wrote.
+    double getDegreeRatio (int d) const { return tuning.degreeRatio (d); }
 
     // Genuine JI test BY SOURCE: is scale degree `d` (0..getScaleDegrees(), where the
     // top index is the period) a rational-sourced interval, and if so its exact p/q?
@@ -1310,7 +1227,11 @@ public:
     enum class EngineInForce { Harmonic, CustomScale, Tempered };
     EngineInForce engineInForce() const noexcept
     {
-        if (apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f) return EngineInForce::Tempered;
+        // Mirrors currentSettings() exactly, because the UI names the engine from here:
+        // with the toggle ON but no usable period to temper TO, nothing is tempered, so
+        // saying "Tempered" would label the spectrum after a snap that did not happen.
+        if (apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f)
+            return temperIsPossible() ? EngineInForce::Tempered : EngineInForce::Harmonic;
         if (isTimbreActive())                                           return EngineInForce::CustomScale;
         return EngineInForce::Harmonic;
     }

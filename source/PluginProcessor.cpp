@@ -679,7 +679,17 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::settingsFromValues (
     // corner's engine is decided by ITS values, not by the live ones.
     const bool temper   = get ("timbreTemper") > 0.5f;
     const bool customOn = ! degrees.empty() && get ("timbreOn") > 0.5f;
-    if (temper)
+    // Temper's grid is "degree x period^k", so it EXISTS only when the tuning states a
+    // period that ascends. hasUsablePeriod() is asked instead of periodRatio() because
+    // that one answers 2.0 for a tuning with no period at all (it feeds displays, which
+    // always need a number) - and snapping to that 2.0 tempers the spectrum to an octave
+    // the user's file never contained. A descending .scl and a degenerate period-1 scale
+    // are both legal and both hit it. So temper REFUSES here: the harmonic engine runs
+    // UNTEMPERED, no partial moves, and the toggle on screen says why (see the editor's
+    // temperToggle). Falling through to the Custom Engine instead would be a second
+    // silent substitution, so it is deliberately not done.
+    const bool canTemper = tuning.hasUsablePeriod();
+    if (temper && canTemper)
     {
         s.source         = spectrum::Source::Harmonic;
         s.temperToTimbre = true;
@@ -688,8 +698,12 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::settingsFromValues (
         s.timbreDegrees.reserve ((size_t) D);
         for (int d = 0; d < D; ++d)
             s.timbreDegrees.push_back ((float) getDegreeRatio (d));
-        s.timbrePeriod = (float) tuning.periodRatio(); // the tuning's OWN period, not a key lookup
-        if (! (s.timbrePeriod > 1.0001f)) { s.timbrePeriod = 2.0f; }
+        s.timbrePeriod = (float) tuning.statedPeriodRatio(); // the tuning's OWN period, never a fallback
+    }
+    else if (temper)
+    {
+        s.source         = spectrum::Source::Harmonic;
+        s.temperToTimbre = false; // refused, and visibly so - never quietly tempered to 2/1
     }
     else if (customOn)
     {
