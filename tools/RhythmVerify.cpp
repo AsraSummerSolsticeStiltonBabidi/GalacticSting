@@ -1822,6 +1822,9 @@ int main()
             s ("ampCurveA", 0.0f);   s ("ampCurveD", 0.0f);
             s ("fractalLevel", 1.0f); s ("curveSlope", 2.0f); s ("baseN", 1.0f);
             s ("morph", morphOn ? 1.0f : 0.0f);
+            s ("dryWet", 0.0f);   // ...and NO crossfade under it. The panel asks one TRANSITION question now and its
+            // default answer is Dry/Wet, so a rig that only says "morph off" is asking for a
+            // 0.3 s crossfade on every spectrum change it makes. Every rig below states it.
             s ("morphTime", morphTime);
 
             juce::AudioBuffer<float> b (2, eb);
@@ -1954,6 +1957,7 @@ int main()
             { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
               p->pollParametersForTests(); };
             s ("rhythmOn", 0.0f); s ("rhythmSelfPlay", 0.0f); s ("morph", 0.0f);
+            s ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
             // Flat amp envelope: everything we measure is the MODULATION, not the ADSR.
             s ("ampAttack", 0.001f); s ("ampDecay", 0.001f); s ("ampSustain", 1.0f); s ("ampRelease", 0.005f);
             // A long, deep modulation envelope so the sweep is unmistakable.
@@ -2106,6 +2110,7 @@ int main()
             { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
               p->pollParametersForTests(); };
             s ("rhythmOn", 0.0f); s ("rhythmSelfPlay", 0.0f); s ("morph", 0.0f);
+            s ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
             s ("ampAttack", 0.001f); s ("ampDecay", 0.001f); s ("ampSustain", 1.0f);
             s ("baseN", 1.0f); s ("fractalLevel", 1.0f); s ("filterCutoff", 9600.0f);
             s ("curveSlope", 1.0f);
@@ -5189,6 +5194,7 @@ int main()
         { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
           p->pollParametersForTests(); };
         s ("morph", 0.0f);
+        s ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
         s ("ampAttack", 0.001f); s ("ampDecay", 0.001f); s ("ampSustain", 1.0f); s ("ampRelease", 0.005f);
         s ("fractalLevel", 1.0f); s ("curveSlope", 1.0f); s ("baseN", 1.0f);
         s ("spectrumRange", 2.0f);                // ratio <= 4: harmonics 1..4 only
@@ -5311,6 +5317,7 @@ int main()
             // arrivals, which is exactly where the old alignInc snap was heard at
             // nearly full strength.
             s ("morph", morphOn ? 1.0f : 0.0f); s ("morphTime", 2.0f);
+            s ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
             juce::AudioBuffer<float> b (2, eb);
             for (int i = 0; i < 60; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
             { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
@@ -5586,6 +5593,7 @@ int main()
             r->p = std::make_unique<FractalAdditiveAudioProcessor>();
             r->p->prepareToPlay (sr4, eb);
             r->set ("morph", morphOn ? 1.0f : 0.0f);
+            r->set ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
             r->set ("morphTime", morphTime);
             r->set ("ampAttack", 0.001f); r->set ("ampDecay", 0.001f);
             r->set ("ampSustain", 1.0f);  r->set ("ampRelease", 0.005f);
@@ -5717,6 +5725,7 @@ int main()
             auto setQ = [&p] (const char* id, float v)
             { auto* q = p->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v)); };
             setQ ("morph", 1.0f); setQ ("morphTime", 2.0f);
+            setQ ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
             p->pollParametersForTests();
 
             juce::MidiBuffer on;
@@ -5921,6 +5930,7 @@ int main()
           p->pollParametersForTests(); };
         // Morph OFF: the reported case, and the one where a template change is a bare swap.
         setR ("morph", 0.0f);
+        setR ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
         // Short envelope segments so the chord change itself is over within ~20 ms and the
         // only event left in the analysis window is the spectrum landing.
         setR ("ampAttack", 0.001f); setR ("ampDecay", 0.001f);
@@ -7795,6 +7805,7 @@ int main()
             { if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
             sp ("ampAttack", 0.001f); sp ("ampDecay", 0.001f); sp ("ampSustain", 1.0f);
             sp ("ampRelease", 0.003f); sp ("morph", morphOn ? 1.0f : 0.0f); sp ("morphTime", 0.3f);
+            sp ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
             p.pollParametersForTests();
 
             juce::String err;
@@ -8230,6 +8241,15 @@ int main()
             sp ("timbreOn", 0.0f); sp ("timbreTemper", 0.0f);
             sp ("ampAttack", 0.005f); sp ("ampSustain", 1.0f); sp ("ampDecay", 0.2f);
             sp ("baseN", 1.0f); sp ("curveSlope", 1.0f); sp ("masterGain", 0.0f);
+            // NO TRANSITION anywhere in this run, including inside the corner PRESETS
+            // saved from this state - the transition is a Discrete morph-space value, so
+            // the winner corner would hand it straight back to any rig that loads these
+            // files. The panel's one TRANSITION question defaults to Dry/Wet now, and a
+            // 0.3 s crossfade running under the mode-flip click metric below is a second
+            // moving thing in a measurement whose whole point is that only ONE moves.
+            // The transition's own click behaviour is measured, with the mode stated, in
+            // run 26 and run 50.
+            sp ("dryWet", 0.0f); sp ("morph", 0.0f);
             poll();
             check (p->savePreset ("zzz-verify-mix-A").isNotEmpty(), "mix corner preset A saved (harmonic)");
             check (p->loadTimbreText ("5/4 3/2 2", err), "corner B gets the custom scale");
@@ -8393,6 +8413,7 @@ int main()
                 auto rs = [&] (const char* id, float v)
                 { if (auto* q = r->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
                 rs ("pgMode", 1.0f); rs ("ampAttack", 0.005f); rs ("ampSustain", 1.0f);
+                rs ("dryWet", 0.0f); rs ("morph", 0.0f);   // see the corner presets above
                 r->pollParametersForTests();
                 juce::String e2;
                 r->assignPlaygroundCorner (0, "zzz-verify-mix-S1", e2);
@@ -9490,6 +9511,7 @@ int main()
                                 const char* label)
         {
             sp ("morph", morphOn ? 1.0f : 0.0f);
+            sp ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
             sp ("pgMode", mixMode ? 1.0f : 0.0f);
             park (0.0f, 0.0f, 12);
             juce::Thread::sleep (250);
@@ -9548,6 +9570,7 @@ int main()
         heldTripRms (false, false, 5,  6, "morph off, FAST drags (jump path)");
         heldTripRms (false, true,  25, 6, "MIX mode, slow drags");
         sp ("pgMode", 0.0f); sp ("morph", 0.0f);
+        sp ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
         park (0.0f, 0.0f, 12);
 
         // ---- the DRAG's frequency glide: partials BEND with Morph on ---------------
@@ -9562,6 +9585,7 @@ int main()
             auto glideSamples = [&] (bool morphOn)
             {
                 sp ("morph", morphOn ? 1.0f : 0.0f); sp ("morphTime", 0.4f);
+                sp ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
                 park (0.0f, 0.0f, 12);
                 juce::Thread::sleep (250);
                 for (int i = 0; i < 4; ++i) frame();
@@ -9631,6 +9655,7 @@ int main()
             auto dragJump = [&] (bool morphOn, bool drag)
             {
                 sp ("morph", morphOn ? 1.0f : 0.0f);
+                sp ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
                 park (0.0f, 0.0f, 12);
                 juce::Thread::sleep (250);
                 { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
@@ -9674,6 +9699,7 @@ int main()
             check (onDrag <= ctrl * 2.5f + 0.02f,
                    "a morph-ON gliding drag round trip does not click either");
             sp ("morph", 0.0f);
+            sp ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
         }
 
         // ---- MIX mode: same trips, nothing may touch the live patch, RMS holds -----
@@ -9748,6 +9774,7 @@ int main()
         auto applyPatch = [&]
         {
             sp ("morph", 0.0f);
+            sp ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
             sp ("ampAttack", 0.001f); sp ("ampDecay", 0.030f);
             sp ("ampSustain", 0.2f);  sp ("ampRelease", 0.010f);
             sp ("phaseMode", 0.0f);
@@ -10338,6 +10365,7 @@ int main()
                 fresh();
                 sp ("monoGlide", 1.0f);
                 sp ("morph", morphOn ? 1.0f : 0.0f);
+                sp ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
                 sp ("morphTime", 0.300f);
                 // A SPARSE spectrum on purpose. With ten octaves of partials the waveform
                 // is so jagged sample to sample that a genuine cliff hides inside its own
@@ -10497,6 +10525,7 @@ int main()
         { auto* q = p->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v));
           p->pollParametersForTests(); };
         sp ("morph", 0.0f);
+        sp ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
         sp ("ampAttack", 0.001f); sp ("ampDecay", 0.001f);
         sp ("ampSustain", 1.0f);  sp ("ampRelease", 0.003f);
         // Quantize-to-pulse is ON by default and would hold a note back for reasons that
@@ -11260,6 +11289,7 @@ int main()
         {
             sp ("timbreOn", 0.0f); sp ("timbreTemper", 0.0f); sp ("phaseMode", 0.0f);
             sp ("morph", 0.0f); sp ("pgMode", 0.0f);
+            sp ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
             sp ("ampAttack", 0.005f); sp ("ampDecay", 0.05f); sp ("ampRelease", 0.05f);
             sp ("filterCutoff", 12000.0f); sp ("baseN", 1.0f); sp ("curveSlope", 1.5f);
             sp ("ampSustain", 0.90f); sp ("masterGain", 0.0f);
@@ -11541,6 +11571,7 @@ int main()
             { auto* q = p->apvts.getParameter (id); q->setValueNotifyingHost (q->convertTo0to1 (v));
               p->pollParametersForTests(); };
             sp ("morph", 0.0f);
+            sp ("dryWet", 0.0f);   // transition off too (it now defaults to Dry/Wet)
             sp ("ampAttack", 0.001f); sp ("ampDecay", 0.001f);
             sp ("ampSustain", 1.0f);  sp ("ampRelease", 0.003f);
             sp ("rhythmQPulse", 0.0f);

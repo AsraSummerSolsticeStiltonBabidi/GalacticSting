@@ -437,6 +437,60 @@ int main()
         }
     }
 
+    // == The TRANSITION now defaults to Dry/Wet - and old projects must not follow it ==
+    //
+    // The panel asks ONE question ("TRANSITION: Off / Morph / Dry/Wet") and its default
+    // answer is Dry/Wet, so the "dryWet" flag ships DEFAULTING TO ON. That default is a
+    // trap for every project older than the feature: APVTS restores state by asking each
+    // parameter it owns for its <PARAM> child, and a parameter whose child is ABSENT is
+    // left holding whatever it already had - which, on the fresh instance a host builds
+    // before handing over a chunk, is that new default. Without the migration in
+    // restoreState, every patch saved before bf0f768 would reopen with a 0.3 s crossfade
+    // under every spectrum change, on a sound whose author never had the control at all.
+    //
+    // Three chunks, because all three exist on disk and each must come back as itself.
+    {
+        std::printf ("== Transition: what an OLD project opens as, now that Dry/Wet is the default ==\n");
+
+        // A brand new instance, first: this is the half the user asked for, and if it
+        // ever goes back to OFF the migration below would still pass while the feature
+        // it protects has quietly gone.
+        {
+            FractalAdditiveAudioProcessor fresh;
+            const float dw = fresh.apvts.getRawParameterValue ("dryWet")->load();
+            const float mo = fresh.apvts.getRawParameterValue ("morph")->load();
+            std::printf ("  a NEW instance: dryWet %.0f, morph %.0f (want 1, 0 - the Dry/Wet default)\n", dw, mo);
+            if (dw < 0.5f || mo > 0.5f)
+            { std::printf ("        a new instance no longer starts on Dry/Wet\n"); ++failures; }
+        }
+
+        // 0: no "dryWet" child at all - a project older than the transition itself.
+        // 1: a child saying OFF, written by a build that had the control.
+        // 2: a child saying ON.
+        for (int shape = 0; shape <= 2; ++shape)
+        {
+            FractalAdditiveAudioProcessor proc;
+            auto tree = proc.apvts.copyState();
+            auto dwChild = tree.getChildWithProperty ("id", "dryWet");
+            if (shape == 0) tree.removeChild (dwChild, nullptr);
+            else            dwChild.setProperty ("value", shape == 2 ? 1.0f : 0.0f, nullptr);
+
+            MemoryBlock blob;
+            if (auto xml = tree.createXml())
+                FractalAdditiveAudioProcessor::copyXmlToBinary (*xml, blob);
+            proc.setStateInformation (blob.getData(), (int) blob.getSize());
+            proc.pollParametersForTests();
+
+            const float got  = proc.apvts.getRawParameterValue ("dryWet")->load();
+            const float want = shape == 2 ? 1.0f : 0.0f;
+            static const char* what[3] = { "no dryWet child (pre-feature project)",
+                                           "child says OFF", "child says ON" };
+            std::printf ("  %-38s -> dryWet %.0f (want %.0f)\n", what[shape], got, want);
+            if (std::abs (got - want) > 1.0e-4f)
+            { std::printf ("        OLD PROJECT OPENS ON A DIFFERENT TRANSITION\n"); ++failures; }
+        }
+    }
+
     // == The fader has to be a RAMP, not a switch with a ramp painted on it. ==
     //
     // phaseMode used to select the normalisation law by a threshold at 0.5:

@@ -370,8 +370,21 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     //   this is inert and the panel greys it out and says why, rather than leaving the user
     //   to believe two smoothings are running. Same range and same skew as Morph Time, so
     //   the fader feels identical.
+    //
+    //   IT DEFAULTS TO ON, and Morph does not: "haz que la default sea drywet". The panel
+    //   asks ONE question now - TRANSITION: Off / Morph / Dry/Wet - and this pair of
+    //   booleans is what that question is stored in (see the combo in PluginEditor.cpp),
+    //   so "the default option is Dry/Wet" is exactly this flag starting true. A brand new
+    //   instance therefore CROSSFADES its spectrum changes instead of snapping them.
+    //
+    //   OLD PROJECTS ARE NOT DRAGGED WITH IT. APVTS leaves a parameter whose <PARAM> child
+    //   is missing from the loaded chunk at whatever it currently holds - which on a fresh
+    //   instance is this default - so a project saved before this feature existed would
+    //   silently open with a 0.3 s crossfade on every spectrum change it never had. The
+    //   absent child is exactly what marks it as older than the feature, and restoreState
+    //   turns the flag back off when it sees that. Measured there, not assumed.
     params.push_back (std::make_unique<AudioParameterBool>(
-        ParameterID { "dryWet", 1 }, "Dry/Wet Transition", false));
+        ParameterID { "dryWet", 1 }, "Dry/Wet Transition", true));
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "dryWetTime", 1 }, "Dry/Wet Time", timeRange (5.0f), 0.300f));
 
@@ -4119,6 +4132,16 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     // The one-shot MTS adoption must not second-guess it.
     mtsCheckPending = false;
 
+    // WHICH <PARAM> CHILDREN THE CHUNK ITSELF CARRIES, asked HERE and not one line later.
+    // apvts.replaceState does `state = newState`, and a juce::ValueTree assignment shares
+    // the same reference-counted object rather than copying it - so from the next line on,
+    // `tree` IS apvts.state. Its reconnect pass (updateParameterConnectionsToChildTrees)
+    // then APPENDS a child for every parameter the chunk was missing, which means asking
+    // `tree` afterwards whether a child is absent always answers "no, it is there". The
+    // absence of a child is the only evidence that a chunk predates a parameter, and it
+    // survives exactly until replaceState runs.
+    const bool chunkHasNoDryWet = ! tree.getChildWithProperty ("id", "dryWet").isValid();
+
     // Unmap BEFORE replaceState: replaceState's internal flush must not capture
     // base+mod for the OLD routings into the fresh tree.
     for (int m = 0; m < ModEngine::kMods; ++m) modEngine.unmapAll (m);
@@ -4150,6 +4173,20 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
                 p->setValueNotifyingHost (p->convertTo0to1 ((float) newIdx));
         }
     }
+
+    // A state saved BEFORE the Dry/Wet transition existed (it shipped in bf0f768) has no
+    // "dryWet" child, and that flag now DEFAULTS TO ON because the panel's one TRANSITION
+    // question defaults to Dry/Wet. replaceState leaves a parameter whose child is absent
+    // at whatever it currently holds - the default, on the fresh instance a host builds
+    // before handing it a chunk - so without this line every project older than that
+    // commit would reopen with a 0.3 s crossfade under every spectrum change, on a patch
+    // whose author never had the control at all. The missing child IS the evidence: the
+    // build that wrote it could only be instant, so instant is what it must come back as.
+    // (Read into chunkHasNoDryWet above replaceState - see the note there for why asking
+    // `tree` at this point would always answer "the child is present".)
+    if (chunkHasNoDryWet)
+        if (auto* p = apvts.getParameter ("dryWet"))
+            p->setValueNotifyingHost (0.0f);
 
     if (auto ms = tree.getChildWithName ("MODS"); ms.isValid())
     {
