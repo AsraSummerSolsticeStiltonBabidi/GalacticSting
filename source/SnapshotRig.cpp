@@ -557,6 +557,9 @@ namespace
             { "19edo",   "the loaded scale's own name" },
             { "tritave", "the loaded scale's own name" },
             { "= ... BPM", "BPM, and dots standing in for a tempo the host has not given" },
+            // Not a sentence: the credit link's hover IS the address it opens, and an
+            // address does not have a Catalan spelling.
+            { "https://www.instagram.com/asra3333333/", "a URL - the author's own link, shown so the hover says where the click goes" },
         };
         for (const auto& d : kDeclared)
             if (s == juce::String::fromUTF8 (d.text)) return true;
@@ -827,7 +830,12 @@ namespace
                     for (const auto& b : probe.buttonTexts)     scan ("button " + b.first, b.second);
                     scan ("regPeriodsTooltip", probe.regPeriodsTip);
                 }
-                // ASSERTION 2's raw material: this view's drawn text, by component path.
+                // ASSERTION 2's raw material: this view's user-visible text, by component
+                // path AND kind. `fits` now carries a "Tooltip" row for every visible
+                // TooltipClient as well as the drawn Labels/Buttons/ComboBoxes (see
+                // walkTextFits), which is what lets the gate below see a HOVER at all -
+                // the kind is part of the key, so a control's word and its hover are two
+                // independent rows and one being translated cannot cover for the other.
                 {
                     auto& into = v.catalan ? drawnCa : drawnEn;
                     const auto key = juce::String (v.size.w) + "x" + juce::String (v.size.h)
@@ -887,10 +895,18 @@ namespace
             }
 
             // ASSERTION 2. Same scenario, same size, same scale, both languages: any
-            // component drawing the SAME text in both is untranslated unless it is
+            // component showing the SAME text in both is untranslated unless it is
             // declared. Compared by component PATH, so this is the drawn result and not
             // a claim about the source - a tr() pair that exists but is never re-applied
             // (the whole of cause (a)) fails here exactly like a missing one.
+            //
+            // TOOLTIPS COUNT. This used to compare DRAWN text only, and a hover is not
+            // drawn - so a tooltip could not fail this gate however English it stayed.
+            // That hole is what let tuneScopeBox's hover and the octave/range steppers'
+            // survive commit 2b51e2f's sweep: bare literals in the constructor,
+            // unreachable by applyLanguage(), with both rigs reporting green. walkTextFits
+            // now emits a "Tooltip" row per visible TooltipClient, so a hover that never
+            // changes language fails the run exactly like a caption that never does.
             for (const auto& viewEn : drawnEn)
             {
                 const auto itCa = drawnCa.find (viewEn.first);

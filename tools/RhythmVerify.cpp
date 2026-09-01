@@ -7323,11 +7323,18 @@ int main()
             }
             pt->getRhythm().slots[0].partial  = 0;   pt->getRhythm().slots[0].enabled = true;
             pt->getRhythm().slots[1].partial  = 900; pt->getRhythm().slots[1].enabled = true;
-            int totalOver = 0, measured = 0;
+            // `drawn` counts DRAWN strings only. The probe also returns a "Tooltip" row
+            // per visible TooltipClient now (the language gates in SnapshotRig.cpp need
+            // them), and those have no box to overflow - so counting them here would
+            // have inflated the "did the sweep really walk the window" floor below with
+            // rows that can never fail it.
+            int totalOver = 0, drawn = 0, hovers = 0;
             for (int lang = 0; lang < 2; ++lang)
             {
                 auto fits = ed->textFitProbeForTests (lang == 1);
-                measured += (int) fits.size();
+                int thisDrawn = 0, thisHovers = 0;
+                for (const auto& f : fits) (f.kind == "Tooltip" ? thisHovers : thisDrawn) += 1;
+                drawn += thisDrawn; hovers += thisHovers;
                 std::sort (fits.begin(), fits.end(),
                            [] (const auto& a, const auto& b) { return a.over() > b.over(); });
                 int over = 0;
@@ -7343,14 +7350,197 @@ int main()
                                      f.bounds.getX(), f.bounds.getY(), f.bounds.getWidth(), f.bounds.getHeight(),
                                      f.text.toRawUTF8(), f.path.toRawUTF8());
                 }
-                std::printf ("  %s: %d of %d drawn strings do not fit\n",
-                             lang == 1 ? "ca" : "en", over, (int) fits.size());
+                std::printf ("  %s: %d of %d drawn strings do not fit (+%d hovers, collected"
+                             " for the language gates, no box to overflow)\n",
+                             lang == 1 ? "ca" : "en", over, thisDrawn, thisHovers);
                 totalOver += over;
             }
-            check (measured > 90, "the sweep really walked the whole window");
+            std::printf ("  %d drawn strings and %d hovers walked over both languages\n",
+                         drawn, hovers);
+            check (drawn > 90, "the sweep really walked the whole window");
+            check (hovers > 40, "...and it collected the HOVERS too - the strings no drawn-text "
+                                "check can see, and the ones SnapshotRig's language gates read");
             check (totalOver == 0,
                    "every Label, Button and ComboBox in the editor fits the box it is drawn "
                    "in, in BOTH languages");
+        }
+    }
+
+    //==========================================================================
+    // --- A TUNING WITH NO PERIOD IS NEVER DESCRIBED AS HAVING AN OCTAVE -------------
+    //
+    // TuningManager splits the question in two: statedPeriodRatio() is the truth and
+    // answers 0.0 when a tuning states no ASCENDING repeat interval, while periodRatio()
+    // keeps a 2.0 fallback so a painter always has a finite number. The SOUND path was
+    // moved onto the truth (temper refuses, and says why). The DISPLAY path had not
+    // been, so every read-out that describes the scale still described a descending
+    // .scl and a degenerate 1/1 scale as if the user's file contained an octave:
+    //
+    //   * the Tuning box's red field printed the file's own period line ("1/2", "1") and
+    //     nothing else, so the one number that says WHY four other read-outs behave
+    //     differently read like an ordinary period;
+    //   * the degrees list ended on a period row that was degree 0 x that same 2/1,
+    //     scored and coloured like a measurement;
+    //   * the n-ad list called the scale equal-stepped against a 1200-cent grid and
+    //     printed "any", i.e. "this shape works from every degree" about a scale that
+    //     never comes back to itself;
+    //   * the adaptation's register band counted in those 2/1s with no qualifier, while
+    //     an absolute .tun with the very same problem got one;
+    //   * and the Shepard's rise-interval box simply was not there, with the rise
+    //     running at 2/1 and nothing on screen saying why the choice was withheld.
+    //
+    // Two legal .scl files state no period, and both are checked here against a control
+    // that does state one - the point is never "refuse non-octave tunings", it is
+    // "describe what the file says".
+    {
+        std::printf ("\na tuning that states no period is not described as having one:\n");
+        auto pp = std::make_unique<FractalAdditiveAudioProcessor>();
+        pp->prepareToPlay (sr, blk);
+        std::unique_ptr<juce::AudioProcessorEditor> pbase (pp->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (pbase.get());
+        if (ed == nullptr) check (false, "the editor was created");
+        else
+        {
+            juce::AudioBuffer<float> pb (2, blk);
+            // A LIVE spectrum, so the degrees list really has something to rank: with an
+            // empty analysis spectrum computeActiveScaleDissonance returns nothing at all
+            // and "there is no period row" would pass for the wrong reason.
+            auto settle = [&]
+            {
+                juce::MidiBuffer on;  on.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+                pb.clear(); pp->processBlock (pb, on);
+                for (int i = 0; i < 40; ++i)
+                { juce::MidiBuffer none; pb.clear(); pp->processBlock (pb, none); pp->pollParametersForTests(); }
+                juce::MidiBuffer off; off.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+                pb.clear(); pp->processBlock (pb, off);
+                for (int i = 0; i < 10; ++i) { juce::MidiBuffer none; pb.clear(); pp->processBlock (pb, none); }
+                // The read-outs are written by the editor's timer, not by the load.
+                for (int i = 0; i < 3; ++i) ed->tickTimerForTests();
+                ed->resized();
+            };
+            auto labelText = [ed] (const char* name) -> juce::String
+            {
+                for (const auto& l : ed->layoutProbe().componentLabels)
+                    if (l.name == name) return l.text;
+                return {};
+            };
+            auto controlIsOnScreen = [ed] (const char* name)
+            {
+                for (const auto& c : ed->layoutProbe().controls) if (c.first == name) return true;
+                return false;
+            };
+            auto shepHover = [ed] () -> juce::String
+            {
+                // The SHEPARD switch's hover is where the withheld choice is explained.
+                for (const auto& f : ed->textFitProbeForTests (false))
+                    if (f.kind == "Tooltip" && f.text.contains ("rises for ever")) return f.text;
+                return {};
+            };
+
+            // `periodShows` is the substring the red Period field must still contain: the
+            // file's own last line, never a substitute and never dropped.
+            struct Case { const char* scl; const char* what; bool statesPeriod; const char* periodShows; };
+            const Case cases[] =
+            {
+                // A degenerate period of exactly 1/1: every "period" lands on the same
+                // pitch, so there is no repeat interval at all.
+                { "! unison.scl\nperiod of exactly 1/1\n 3\n!\n 1/1\n 1/1\n 1/1\n",
+                  "period-1 scale", false, "1" },
+                // A DESCENDING scale: its period is 1/2, perfectly legal to write and not
+                // a repeat interval going UP.
+                { "! down.scl\ndescending\n 3\n!\n -300.0\n -700.0\n 1/2\n",
+                  "descending .scl", false, "1/2" },
+                // THE TRAP THE OLD CODE FELL INTO. Its DEGREES are three equal 400-cent
+                // steps, so measured against periodRatio()'s 2/1 fallback it looked like
+                // a perfectly regular 3-EDO and the n-ad list printed "any" - "this shape
+                // works from every degree" about a scale whose period line is 1/2. The
+                // two cases above never reached that code path; this one does.
+                { "! trap.scl\nequal thirds, descending period\n 3\n!\n 400.0\n 800.0\n 1/2\n",
+                  "equal steps, descending period", false, "1/2" },
+                // THE CONTROL. A 3/1 period is a usable period: everything below must
+                // still describe it, and describe it as 3/1 rather than as an octave.
+                { "! bp.scl\nBohlen-Pierce-ish\n 4\n!\n 7/5\n 9/5\n 11/5\n 3/1\n",
+                  "3/1 period scale", true, "3" },
+            };
+
+            for (const auto& c : cases)
+            {
+                juce::String err;
+                std::printf ("\n  %s:\n", c.what);
+                check (pp->loadScalaText (c.scl, c.what, err), "  the scale loads");
+                settle();
+
+                check (pp->tuningStatesPeriod() == c.statesPeriod,
+                       "  the processor's verdict on whether a period is stated");
+
+                // (1) THE RED FIELD under the keyboard, which is what the key colours
+                //     above it are read against.
+                const auto per = labelText ("tun.period");
+                std::printf ("    period field: \"%s\"\n", per.toRawUTF8());
+                check (per.contains (c.periodShows),
+                       "  ...still prints the file's OWN period line, never a substitute");
+                check (per.contains ("(no repeat)") == ! c.statesPeriod,
+                       c.statesPeriod ? "  ...and does not qualify a period that really repeats"
+                                      : "  ...and says that line is not a repeat interval going up");
+                // ...AND THE LONGER STRING STILL FITS, IN BOTH LANGUAGES. The marker is
+                // only ever on screen under a tuning no default scenario loads, so the
+                // window's own sweeps never measure it: a caption that clips (or, being a
+                // Label, condenses to 70%) would ship invisible to every other check.
+                for (int lang = 0; lang < 2; ++lang)
+                    for (const auto& l : ed->layoutProbeInLanguage (lang == 1).componentLabels)
+                        if (l.name == "tun.period")
+                        {
+                            const bool fits = l.textWidth <= (float) l.cell.getWidth() + 0.5f;
+                            if (! fits)
+                                std::printf ("    %s period field needs %.0f px in %d\n",
+                                             lang == 1 ? "ca" : "en", l.textWidth, l.cell.getWidth());
+                            check (fits, lang == 1 ? "  ...and the Catalan field still fits its cell"
+                                                   : "  ...and the English field still fits its cell");
+                        }
+
+                // (2) THE DEGREES LIST. Its last row is "degree 0, one period up", which
+                //     only exists if there is a period. Degree indices are 0..D, so the
+                //     highest degree present says whether the period row was written.
+                const auto diss = pp->computeActiveScaleDissonance();
+                int topDegree = -1;
+                for (const auto& d : diss) topDegree = juce::jmax (topDegree, d.degree);
+                const int D = pp->getScaleDegrees();
+                std::printf ("    degrees list: %d rows, top degree %d of %d\n",
+                             (int) diss.size(), topDegree, D);
+                check (! diss.empty(), "  ...the list was really computed (a live spectrum)");
+                check (topDegree == (c.statesPeriod ? D : D - 1),
+                       c.statesPeriod ? "  ...and it ends on the scale's own period row"
+                                      : "  ...and it stops before a period row it would have to invent");
+
+                // (3) THE n-AD LIST'S "any". Equal-stepped means "the scale repeats AND
+                //     every step of the repeat is the same size"; without a period the
+                //     first half is false, so no shape may be shown as rootless.
+                check (pp->tuningIsEqualStep() == false || c.statesPeriod,
+                       "  ...no combination is called rootless in a scale that never repeats");
+
+                // (4) THE REGISTER BAND'S UNIT. The qualifier already existed for an
+                //     absolute .tun with nothing ascending in it; it now follows the
+                //     FACT rather than the file format.
+                using Src = FractalAdditiveAudioProcessor::RegisterPeriodSource;
+                const auto pi = pp->registerPeriodInfo();
+                check ((pi.source == Src::NoneStated) == ! c.statesPeriod,
+                       "  ...the register band says whether its unit is a fact");
+
+                // (5) THE SHEPARD RISE INTERVAL. The box is a choice only under a stated
+                //     non-octave period; when the tuning states none, the switch's own
+                //     hover carries the reason instead of the choice just vanishing.
+                const bool riseBox = controlIsOnScreen ("tun.shepRise");
+                const auto hover   = shepHover();
+                std::printf ("    rise box on screen: %d, hover %d chars\n",
+                             (int) riseBox, hover.length());
+                check (riseBox == c.statesPeriod,
+                       c.statesPeriod ? "  ...the rise-interval choice is offered (3/1 is not the octave)"
+                                      : "  ...and no rise-interval choice is offered");
+                check (hover.isNotEmpty(), "  ...the SHEPARD switch has a hover at all");
+                check (hover.contains ("states no period") == ! c.statesPeriod,
+                       c.statesPeriod ? "  ...which does not claim a missing period"
+                                      : "  ...which SAYS the scale states no period, so the choice is withheld");
+            }
         }
     }
 
@@ -12165,6 +12355,175 @@ int main()
             check (shipped == 68,
                    "and the SHIPPED 1200x650 layout is pixel-identical: the rows only give"
                    " way where the panel cannot afford them");
+        }
+    }
+
+    // --- run 53: A TALLER PANEL SPREADS ITS ROWS INSTEAD OF GROWING ONE HOLE --------
+    //
+    // Commit 5c970cf fixed two panels that turned extra height into a single void, and
+    // nothing has asserted it since - the fix is real, both rigs are green either way,
+    // and it can be undone by any future edit to resized() without a verdict moving.
+    // This is that verdict, at three sizes and in both languages, because the row
+    // heights come from the strings in the language on screen.
+    //
+    //   TUNING took every row off the top at a fixed height and reserved the Shepard
+    //   block off the bottom, so all the slack pooled between them: 168 px of empty
+    //   panel at 1600x900 against 43 at 1200x650, the Shepard row orphaned against the
+    //   bottom edge and every other row huddled under the title. The spare height is
+    //   divided over the gaps now, so the leftover gap is the size of its neighbours
+    //   rather than the whole void.
+    //
+    //   ESSENTIALS capped OCTAVE at 40 px and split the rest between GAIN and
+    //   REFERENCE: 37/37/38 at the floor (invisible) and 126/126/40 at 1600x900, two
+    //   cells swelling with the window and a third that cannot, with the last divider
+    //   stranded near the bottom edge.
+    //
+    // Both are measured through the SAME probe the window is drawn from - the cells
+    // paint() strokes its dividers between, and the control rects resized() assigns -
+    // so this cannot pass against a layout only the test can reach.
+    {
+        std::printf ("\na taller panel spreads its rows instead of growing one hole:\n");
+        auto owned = std::make_unique<FractalAdditiveAudioProcessor>();
+        auto& p = *owned;
+        p.prepareToPlay (44100.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "the editor builds");
+        if (ed != nullptr)
+        {
+            // The tuning panel's rows, top to bottom, by the control that spans each
+            // row's full height. Collected by NAME and then sorted by y, so an optional
+            // row appearing (or a future row being added) cannot silently reorder this.
+            const char* rowAnchors[] = { "tun.period", "tun.itsSpectrum", "tun.presetTuning",
+                                         "tun.specTuning", "tun.recent", "tun.bankLbl",
+                                         "tun.shepOn" };
+            for (const auto sz : { std::pair<int,int> { 870, 540 }, { 1200, 650 }, { 1600, 900 } })
+                for (int lang = 0; lang < 2; ++lang)
+                {
+                    ed->setSize (sz.first, sz.second);
+                    const auto L = ed->layoutProbeInLanguage (lang == 1);
+                    const juce::String where = juce::String (sz.first) + "x" + juce::String (sz.second)
+                                             + " " + (lang == 1 ? "ca" : "en");
+
+                    //-- ESSENTIALS: three cells, and they tile the box evenly ---------
+                    auto cellH = [&L] (const char* n)
+                    {
+                        for (const auto& c : L.cells) if (c.first == n) return c.second.getHeight();
+                        return -1;
+                    };
+                    const int hg = cellH ("ess.gain"), hr = cellH ("ess.ref"), ho = cellH ("ess.oct");
+                    std::printf ("  %-12s ESSENTIALS gain/ref/oct = %d/%d/%d\n",
+                                 where.toRawUTF8(), hg, hr, ho);
+                    check (hg > 0 && hr > 0 && ho > 0, "  the three ESSENTIALS cells are laid out");
+                    // <= 2: the third cell IS the remainder (so the three always tile the
+                    // box exactly), and a box height that is not a multiple of three
+                    // leaves it one or two pixels taller. The defect this replaces was
+                    // 126/126/40 - a gap of 86.
+                    check (juce::jmax (hg, hr, ho) - juce::jmin (hg, hr, ho) <= 2,
+                           "  ...as even thirds - the extra height is air around each control,"
+                           " never two cells that swell and a third capped at 40 px");
+
+                    //-- TUNING: the slack is shared out, not pooled -------------------
+                    std::vector<juce::Rectangle<int>> rows;
+                    for (const char* n : rowAnchors)
+                        for (const auto& c : L.controls)
+                            if (c.first == n) rows.push_back (c.second);
+                    std::sort (rows.begin(), rows.end(),
+                               [] (const auto& a, const auto& b) { return a.getY() < b.getY(); });
+                    std::vector<int> gaps;
+                    for (size_t i = 1; i < rows.size(); ++i)
+                        gaps.push_back (rows[i].getY() - rows[i - 1].getBottom());
+                    juce::String printed;
+                    for (const int g : gaps) printed << g << " ";
+                    std::printf ("  %-12s TUNING %d rows, gaps: %s\n",
+                                 where.toRawUTF8(), (int) rows.size(), printed.toRawUTF8());
+                    // >= 2 gaps: at the 870x540 floor the bank row hides itself rather
+                    // than laying out at an unreadable height (the `fits` guard in
+                    // resized()), so the floor legitimately walks one row fewer.
+                    check (gaps.size() >= 2, "  the tuning panel really has rows to space");
+                    if (! gaps.empty())
+                    {
+                        const int lo = *std::min_element (gaps.begin(), gaps.end());
+                        const int hi = *std::max_element (gaps.begin(), gaps.end());
+                        // The share is an integer division over 4 + (optional rows) gaps,
+                        // and the LAST gap also carries the division's remainder, so the
+                        // gaps can differ by up to that divisor. They cannot differ by
+                        // 165, which is what "one row got all the air" looks like.
+                        check (hi - lo <= 7,
+                               "  every gap between the tuning panel's rows is the same size -"
+                               " the spare height is shared out, never pooled into one void");
+                        // ...and at a TALL window it really is spare height being shared:
+                        // gaps of 3 px everywhere would satisfy the line above while the
+                        // void sat somewhere this walk cannot see.
+                        if (sz.second >= 900)
+                            check (lo >= 10,
+                                   "  ...and at 1600x900 the gaps have actually GROWN, so the"
+                                   " panel's extra height went into them");
+                    }
+                }
+        }
+    }
+
+    // --- run 54: ONE PENCIL DRAG IS ONE Ctrl+Z, HOWEVER LONG THE DRAG TOOK ---------
+    //
+    // The processor's 60 Hz timer cuts parameter edits into ~1-second undo transactions
+    // so that a slider drag undoes as one step instead of hundreds of micro-moves. A
+    // PENCIL drag is one user action too, and it easily lasts longer than a second - so
+    // that cut landed INSIDE it.
+    //
+    // On the first pencil drag of a session that is not a cosmetic split. The gesture
+    // arms manual mode: armManualPartialAmpsForEdit() opens the transaction and the
+    // parameter flip reaches the undo stack on the APVTS's own 20-500 ms timer, early in
+    // the drag, while the amplitudes are committed at mouse-up. With a cut between them
+    // the flip and the edits are two steps, so ONE Ctrl+Z takes back the amplitudes and
+    // leaves MANUAL MODE ARMED WITH NO EDITS - the state commit f40623d exists to
+    // forbid, and the state in which SLOPE is frozen for a spectrum nobody drew.
+    //
+    // Both drags below are identical except for how long they take.
+    {
+        std::printf ("\none pencil drag is one Ctrl+Z, however long the drag takes:\n");
+        for (const int ticks : { 0, 60, 200 })
+        {
+            auto owned = std::make_unique<FractalAdditiveAudioProcessor>();
+            auto& p = *owned;
+            p.prepareToPlay (44100.0, 512);
+            std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+            auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+            if (ed == nullptr) { check (false, "the editor builds"); continue; }
+
+            // A live template, so the pencil grid has knobs to drag at all.
+            {
+                juce::AudioBuffer<float> b (2, 512);
+                juce::MidiBuffer on; on.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+                b.clear(); p.processBlock (b, on);
+                for (int i = 0; i < 40; ++i)
+                { juce::MidiBuffer none; b.clear(); p.processBlock (b, none); p.pollParametersForTests(); }
+                juce::MidiBuffer off; off.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+                b.clear(); p.processBlock (b, off);
+                for (int i = 0; i < 10; ++i) { juce::MidiBuffer none; b.clear(); p.processBlock (b, none); }
+            }
+
+            const auto r = ed->pencilGestureUndoProbeForTests (1, -9.0f, ticks);
+            std::printf ("  a drag spanning %3d timer ticks (~%.1f s): armed=%d, %d knobs,"
+                         " undo steps %d -> %d (flip flushed) -> %d (drag ticks) -> %d;"
+                         " one Ctrl+Z -> manual=%d, %d edit(s) left\n",
+                         ticks, (double) ticks / 60.0, (int) r.armed, r.cells,
+                         r.stepsBefore, r.stepsAfterFlush, r.stepsAfterTicks, r.stepsAfter,
+                         (int) r.manualAfterUndo, r.editsAfterUndo);
+
+            check (r.cells > 1, "  the pencil grid really had knobs to drag");
+            check (r.armed, "  the first drag of the session armed manual mode itself");
+            check (r.stepsAfter - r.stepsBefore == 1,
+                   "  the whole gesture is ONE undo step - the ~1 s transaction cut does not"
+                   " fall inside a drag");
+            check (r.undid, "  and Ctrl+Z has something to take back");
+            // The two halves of the same claim, because either one alone can pass while
+            // the user is still left somewhere they never asked to be.
+            check (r.editsAfterUndo == 0,
+                   "  one Ctrl+Z takes the hand-drawn amplitudes back...");
+            check (! r.manualAfterUndo,
+                   "  ...AND switches manual mode back off - never armed with no edits,"
+                   " with SLOPE frozen for a spectrum nobody drew");
         }
     }
 

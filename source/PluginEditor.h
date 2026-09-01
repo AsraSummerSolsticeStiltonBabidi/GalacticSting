@@ -769,6 +769,30 @@ public:
     IntervalDraftProbe intervalDraftProbeForTests (const juce::String& edit);
 
     //==========================================================================
+    // TESTS: ONE PENCIL DRAG IS ONE Ctrl+Z, HOWEVER LONG THE DRAG TOOK.
+    //
+    // Driven through the grid's OWN callbacks (onGestureStart / onEdited / onGestureEnd),
+    // which is the whole point: those three are what a mouse really calls, so a fix that
+    // only worked in a path the test invented would not be measured here. The processor's
+    // 60 Hz timer is run `ticks` times between the edit and the mouse-up, which is how a
+    // slow drag is reproduced offline - at 60 ticks the ~1 s undo cut used to fire in the
+    // middle of the gesture and make it two steps, the second of which leaves manual mode
+    // armed with no edits (see FractalAdditiveAudioProcessor::beginUndoGesture).
+    struct PencilUndoProbe
+    {
+        bool armed = false;          // this gesture had to switch manual mode on
+        int  cells = 0;              // knobs the grid was showing (0 = nothing was dragged)
+        int  stepsBefore = 0;        // undo steps on the stack before the gesture...
+        int  stepsAfterFlush = 0;    // ...once the manual-mode flip has been written...
+        int  stepsAfterTicks = 0;    // ...after the drag's timer ticks...
+        int  stepsAfter  = 0;        // ...and after it: the difference is what Ctrl+Z costs
+        bool undid = false;          // the one Ctrl+Z did something
+        bool manualAfterUndo = true; // ...and afterwards, is manual STILL armed?
+        int  editsAfterUndo = -1;    // ...with how many hand-drawn amplitudes left
+    };
+    PencilUndoProbe pencilGestureUndoProbeForTests (int cell, float dB, int ticksMidDrag);
+
+    //==========================================================================
     // EVERY DRAWN STRING IN THE WHOLE EDITOR, MEASURED AGAINST THE RECT IT IS DRAWN INTO.
     //
     // "haz un repaso de todos los textos que quedan cortados como 'not in this spectrum'
@@ -1203,6 +1227,13 @@ private:
                      juce::Colour chip, valueCol; bool isPeriod; };
         std::vector<Row> rows;
         juce::String tip;
+        // WHY THE LAST ROW IS MISSING. This list always ended on the PERIOD - degree 0
+        // one period up, in a red box - and for a tuning that states no ascending period
+        // that row was degree 0 times periodRatio()'s 2.0 display fallback: an octave the
+        // user's file never contained, scored and coloured like a fact. The row is gone
+        // in that case (see computeActiveScaleDissonance) and this line says so, because
+        // a list that is quietly one row shorter is the same defect one layer along.
+        juce::String noteText;
         static constexpr int kRowH = 19;
         // Hovering a row SOUNDS that dyad (0 + this degree); only one sounds at a time.
         std::function<void (int)> onHover;
@@ -1216,7 +1247,8 @@ private:
         void mouseExit (const juce::MouseEvent&) override
         { if (hoverRow != -1) { hoverRow = -1; if (onHover) onHover (-1); repaint(); } }
         juce::String getTooltip() override { return tip; }
-        int contentHeight() const { return (int) rows.size() * kRowH; }
+        int contentHeight() const
+        { return (int) rows.size() * kRowH + (noteText.isNotEmpty() ? kRowH : 0); }
         void paint (juce::Graphics& g) override
         {
             // Every row is the DYAD "0 + that degree": a red "0" chip (the root key,
@@ -1262,6 +1294,12 @@ private:
                 g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
                 g.drawText (r.value, valueX, y, W - valueX, rowH, juce::Justification::centredLeft, false);
                 y += rowH;
+            }
+            if (noteText.isNotEmpty())   // same voice as the n-ad list's status line
+            {
+                g.setColour (juce::Colour (0xff8f96a8));
+                g.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Italic")));
+                g.drawText (noteText, 2, y, W - 4, rowH, juce::Justification::centredLeft, false);
             }
         }
     };
@@ -3235,6 +3273,18 @@ private:
     // the honest counters, and the scrolling grid.
     struct PartialAmpPanel : juce::Component
     {
+        // A gesture is released by mouse-up - and a mouse-up is NOT guaranteed if this
+        // window is torn down mid-drag. A hold left standing would stop the processor's
+        // ~1 s undo cut for the rest of the session, which is the unbounded-ActionSet
+        // bug that cut exists to prevent, so the teardown releases it too.
+        ~PartialAmpPanel() override
+        {
+            if (proc != nullptr && undoGestureHeld) proc->endUndoGesture();
+        }
+        // True between this panel's own beginUndoGesture and endUndoGesture. Tracked
+        // here rather than inferred from the grid's drag state so the destructor above
+        // releases EXACTLY what this panel took, once.
+        bool undoGestureHeld = false;
         FractalAdditiveAudioProcessor* proc = nullptr;
         std::function<juce::String (const char*, const char*)> trF;
         std::function<void()> onEdited;                     // editor: refresh the slope cell
@@ -3299,6 +3349,14 @@ private:
             proc = &p;
             grid.onGestureStart = [this]
             {
+                // HOLD OFF THE ~1 s UNDO CUT for as long as this drag lasts. The
+                // processor's 60 Hz timer opens a new transaction every second so a
+                // slider drag undoes as one step - and that cut used to land inside a
+                // pencil drag longer than about a second, splitting it in two. On the
+                // gesture that also arms manual mode (below) the halves are the flip and
+                // the amplitudes, so one Ctrl+Z took back the edits and left manual ARMED
+                // WITH NO EDITS. First, before anything opens a transaction.
+                if (! undoGestureHeld) { proc->beginUndoGesture(); undoGestureHeld = true; }
                 // ARM MANUAL MODE FIRST, and before gestureBefore is captured.
                 // With "partialManual" off - and it ships off - the engine throws these
                 // edits away, so the drag below moved the sound by exactly 0.00 dB while
@@ -3326,6 +3384,9 @@ private:
                 proc->commitPartialGains (gestureBefore, proc->getPartialGains(),
                                           /*startNewTransaction*/ ! armedManualThisGesture);
                 armedManualThisGesture = false;
+                // ...and the timer may cut again: the gesture is over, and the commit
+                // above is already inside the transaction it belongs to.
+                if (undoGestureHeld) { proc->endUndoGesture(); undoGestureHeld = false; }
                 lastRev = proc->getPartialGainsRevision();
                 refreshText();
             };
@@ -4381,6 +4442,26 @@ private:
     // tooltip says so. Colour and tooltip move together, in ONE place, called by the
     // timer and by applyLanguage() (which resets lastShepNoBpm so the words re-render).
     void refreshShepardSyncState();
+    // ...and the SHEPARD switch's own hover, which is the only place the rise-interval
+    // choice can be explained when the choice is not on screen. The rise box appears
+    // only when the tuning's period differs from the octave; a tuning that states NO
+    // ascending period (a descending .scl, a degenerate 1/1) has nothing to offer, and
+    // the box used to just not be there - the rise quietly ran at 2/1 with no way to
+    // find out why. Owns the whole tooltip, exactly like refreshShepardSyncState owns
+    // the beats box's, and is called by the timer and by applyLanguage() (which resets
+    // lastShepRiseState so the words re-render).
+    void refreshShepardRiseState();
+    // IS THE RISE INTERVAL A CHOICE AT ALL? ONE definition, because three places ask -
+    // resized() (which puts the box on screen), the timer's relayout memo, and the
+    // hover above - and two of them disagreeing means a box that is laid out and never
+    // shown, or shown and never laid out. Both halves are needed: a tuning must STATE a
+    // period before "is it the octave" is even a question, and asking periodRatio()
+    // alone answered "it is the octave" for a scale that states nothing.
+    bool shepardRiseChoiceExists() const
+    {
+        return processorRef.tuningStatesPeriod()
+            && shepard::periodDiffersFromOctave (processorRef.getStatedTuningPeriodRatio());
+    }
     // Repaint every control inside the SPECTRUM panel in the engine's colour. The panel
     // is ONE box now, so a fader still wearing its old per-cell hue would be the only
     // thing on screen still claiming the compartments are separate boxes.
@@ -4750,6 +4831,9 @@ private:
     // free ms value is in force, instead of letting it claim a sync that is not
     // happening. See shepardSyncHasNoBpm().
     int lastShepNoBpm = -1;
+    // 0 = period is the octave (nothing to choose), 1 = a real choice is on screen,
+    // 2 = the tuning states no period at all. -1 forces the next refresh to write.
+    int lastShepRiseState = -1;
 
     std::unique_ptr<juce::FileChooser>  fileChooser;
     juce::Component::SafePointer<juce::AlertWindow> activePrompt; // open save-preset dialog, if any

@@ -926,7 +926,13 @@ void FractalAdditiveAudioProcessor::timerCallback()
     // NOTHING ever opened a transaction: every automated change piled into one
     // unbounded ActionSet and the first Ctrl+Z after opening the window reverted the
     // lot back to the values the plugin was instantiated with.
-    if (++undoTxnTick >= 60) // 60 Hz timer -> ~1 s, same grouping as before
+    //
+    // ...but NOT in the middle of a gesture. A pencil drag is one user action that can
+    // last several seconds, and a cut inside it made "I dragged a partial" two Ctrl+Zs -
+    // the second of which leaves manual mode armed with no edits (see beginUndoGesture).
+    if (undoGestureDepth > 0)
+        undoTxnTick = 0;
+    else if (++undoTxnTick >= 60) // 60 Hz timer -> ~1 s, same grouping as before
     {
         undoTxnTick = 0;
         undoManager.beginNewTransaction();
@@ -1526,8 +1532,17 @@ FractalAdditiveAudioProcessor::computeActiveScaleDissonance() const
         return out;
 
     const int D = juce::jmax (1, getScaleDegrees());
-    out.reserve ((size_t) D + 1);
-    for (int s = 0; s <= D; ++s) // 0 = tonic (1/1), D = period
+    // THE LAST ROW IS THE PERIOD, AND ONLY IF THERE IS ONE.
+    // getDegreeRatio(D) is degree 0 one period up, i.e. degree-0's ratio times
+    // periodRatio() - and periodRatio() answers 2.0 when the tuning states nothing.
+    // A descending .scl and a degenerate 1/1 scale therefore both ended this list with
+    // a row reading "2/1", scored as if the user's file had an octave in it. It does
+    // not, so the row is not written: the list says what the scale says and stops. The
+    // editor prints the reason under it (see nadHadNoPeriod / the degrees read-out), so
+    // a shorter list is stated rather than silent.
+    const int last = tuningStatesPeriod() ? D : D - 1;
+    out.reserve ((size_t) last + 1);
+    for (int s = 0; s <= last; ++s) // 0 = tonic (1/1), D = period
     {
         const double r = getDegreeRatio (s);
         out.push_back ({ s, r, dissonance::dissonanceAt (spec, r) });
@@ -2085,8 +2100,16 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
     // The period the search reasons with: the tuning's own unless the user typed a
     // different one in the box (it decides what counts as an equal-step scale and
     // which intervals are just the same pitch class again).
-    const double periodC = 1200.0 * std::log2 (std::max (1.0e-9,
-                              periodOverride > 1.0 ? periodOverride : tuning.periodRatio()));
+    //
+    // 0.0 MEANS "THIS TUNING STATES NONE", and both readers below check for it.
+    // statedPeriodRatio(), not periodRatio(): the fallback would have handed a
+    // descending .scl (or a degenerate 1/1) a 2/1 the file never contained, and the
+    // list would then have called octave-spaced degrees "the same pitch class again"
+    // and dropped them, and called the scale rootless and shown "any". Both are
+    // statements about a repetition that does not exist.
+    const double statedPeriod = periodOverride > 1.0 ? periodOverride : tuning.statedPeriodRatio();
+    const double periodC = statedPeriod > 1.0001 ? 1200.0 * std::log2 (statedPeriod) : 0.0;
+    nadNoPeriod = ! (periodC > 0.0);   // surfaced in the list, never silent
     const double minGap = juce::jlimit (0.0, 600.0, minGapCents);
     // The SAME analysis spectrum and absolute anchor as the Degrees list
     // (computeActiveScaleDissonance): Sethares roughness depends on register and on
@@ -2106,7 +2129,9 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
         // below), which also shrinks the search space from C(D,n) to C(D-1,n-1).
         std::vector<double> cents ((size_t) D);
         for (int d = 0; d < D; ++d) cents[(size_t) d] = 1200.0 * std::log2 (std::max (1.0e-9, ratios[(size_t) d]));
-        bool regular = D >= 2;
+        // periodC == 0 is "no period stated": a shape cannot be rootless in a scale
+        // that never comes back to itself, so the full enumeration is the honest one.
+        bool regular = D >= 2 && periodC > 0.0;
         {
             const double step = periodC / (double) D;
             for (int d = 0; d < D && regular; ++d)
@@ -2171,7 +2196,13 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
                 for (int i = 1; i < notes; ++i)
                 {
                     const double gap = std::abs (cents[(size_t) cc[i]] - cents[(size_t) cc[i - 1]]);
-                    if (gap < floorC || std::abs (gap - periodC) < 0.5) return true;
+                    if (gap < floorC) return true;
+                    // "the same pitch class an octave up" is only a thing to skip when
+                    // the tuning HAS that octave. With periodC == 0 (nothing stated) the
+                    // old form compared every gap against 0 cents and, worse, would have
+                    // compared it against a fabricated 1200 - dropping perfectly ordinary
+                    // pairs from the list for repeating a period the scale does not have.
+                    if (periodC > 0.0 && std::abs (gap - periodC) < 0.5) return true;
                 }
                 return false;
             };
@@ -2378,6 +2409,19 @@ FractalAdditiveAudioProcessor::registerPeriodInfo() const
     RegisterPeriodInfo i;
     i.ratio = tuning.periodRatio();
     i.keys  = juce::jmax (1, getScaleDegrees());
+    // A SCALE THAT STATES NO PERIOD IS NOT A SCALE THAT STATES ONE.
+    // This used to return here for everything that is not an absolute table, i.e. it
+    // called the answer a FACT for every .scl - including a descending one and a
+    // degenerate 1/1, whose stated period is 0.0 and whose `ratio` above is therefore
+    // the 2/1 display fallback. The band's unit was then an octave the user's file
+    // never contained, printed with no qualifier at all, while the .tun that has the
+    // very same problem got one. Now the qualifier follows the fact, not the format.
+    if (! tuning.hasUsablePeriod())
+    {
+        i.source = RegisterPeriodSource::NoneStated;
+        if (tuning.usesAbsoluteTable()) i.devCents = tuning.tablePeriodDevCents();
+        return i;
+    }
     if (! tuning.usesAbsoluteTable())
         return i;                      // a scale (or MTS master) states its own period
     i.devCents = tuning.tablePeriodDevCents();
@@ -2386,7 +2430,7 @@ FractalAdditiveAudioProcessor::registerPeriodInfo() const
     // user's - the one case where the band is standing on a number nobody supplied.
     i.source = (tuning.getTablePeriodEstimate().found || tuning.tablePeriodIsUserSet())
                  ? RegisterPeriodSource::TableEstimate
-                 : RegisterPeriodSource::TableFallback;
+                 : RegisterPeriodSource::NoneStated;
     return i;
 }
 

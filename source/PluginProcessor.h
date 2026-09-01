@@ -262,7 +262,15 @@ public:
     {
         const int D = tuning.degreesPerPeriod();
         if (D < 2) return false;
-        const double periodC = 1200.0 * std::log2 (std::max (1.0e-9, tuning.periodRatio()));
+        // NO STATED PERIOD, NO EQUAL STEPS. "Equal-stepped" here means "the scale
+        // repeats, and every step of the repeat is the same size" - the second half is
+        // meaningless without the first. Asking periodRatio() would have measured the
+        // steps against a 2/1 nobody wrote, and a descending .scl whose steps happen to
+        // divide an octave evenly would have been declared rootless: the n-ad list then
+        // prints "any +10 +18", telling the user a shape works from every degree of a
+        // scale that does not come back to itself at all.
+        if (! tuning.hasUsablePeriod()) return false;
+        const double periodC = 1200.0 * std::log2 (std::max (1.0e-9, tuning.statedPeriodRatio()));
         const double step    = periodC / (double) D;
         for (int d = 0; d < D; ++d)
         {
@@ -298,12 +306,22 @@ public:
     // only when it is really a choice - see shepard::periodDiffersFromOctave.
     double getTuningPeriodRatio() const noexcept { return tuning.periodRatio(); }
 
+    // ...and the SAME question asked honestly: the period the active tuning really
+    // STATES, or 0.0 when it states none that ascends. Anything that DESCRIBES the
+    // tuning to the user has to ask this one, for the same reason the sound path does:
+    // getTuningPeriodRatio() answers 2.0 for a descending .scl and for a degenerate
+    // 1/1 scale, and a read-out built on that number prints an octave the user's file
+    // never contained. Naming it after the question ("does this tuning state a period")
+    // rather than after temper, because temper is no longer the only caller.
+    double getStatedTuningPeriodRatio() const noexcept { return tuning.statedPeriodRatio(); }
+    bool   tuningStatesPeriod() const noexcept         { return tuning.hasUsablePeriod(); }
+
     // Can "Temper to tuning" do anything at all? Temper snaps partials onto
     // "degree x period^k", which needs a period that ASCENDS - a descending .scl or a
     // degenerate period-1 scale states none. The editor asks so the toggle can be
     // greyed WITH A REASON instead of appearing to work while the spectrum is silently
     // snapped to a 2/1 grid the user's file never contained.
-    bool temperIsPossible() const noexcept { return tuning.hasUsablePeriod(); }
+    bool temperIsPossible() const noexcept { return tuningStatesPeriod(); }
 
     // Frequency ratio of scale degree `d` relative to degree 0 (the tonic on
     // key 60), for the keyboard's just-interval labels. Degree d is mapped to an
@@ -567,6 +585,37 @@ public:
         if (pgEditCorner >= 0) return false;
         return undoManager.redo();
     }
+    // How many undo STEPS are on the stack. The unit a test has to count when the claim
+    // is "one gesture is one Ctrl+Z" - the actions inside a step are not the question,
+    // how many times the user has to press Ctrl+Z is.
+    int undoStackDepthForTests() const { return undoManager.getUndoDescriptions().size(); }
+
+    //== ONE GESTURE IS ONE UNDO STEP, EVEN WHEN IT IS SLOW =======================
+    // The 60 Hz timer below cuts parameter edits into ~1-second transactions so a slider
+    // drag undoes as one step instead of hundreds of micro-moves. A PENCIL drag is also
+    // one user action, and it can easily last longer than a second - so that cut landed
+    // INSIDE it and split it in two.
+    //
+    // The half that hurts is the first pencil drag of a session, the one that arms manual
+    // mode: armManualPartialAmpsForEdit() opens the transaction and the flip reaches the
+    // undo stack on the APVTS's own 20-500 ms timer, i.e. early in the drag, while
+    // commitPartialGains lands at mouse-up. With a cut between them, step 2 is the
+    // amplitudes and step 1 is the flip, so ONE Ctrl+Z takes back the edits and leaves
+    // manual mode ARMED WITH NO EDITS - exactly the state f40623d exists to forbid, and
+    // the state in which SLOPE is frozen for a spectrum nobody drew.
+    //
+    // So the cut is held off while a gesture is open. It is a COUNT, not a flag, because
+    // nothing forbids a second grid opening one, and it is released by the panel's
+    // destructor as well as by mouse-up: a mouse-up is not guaranteed if the window dies
+    // mid-drag, and a stuck hold would silently restore the unbounded-ActionSet bug the
+    // cut was added to prevent.
+    void beginUndoGesture() noexcept { ++undoGestureDepth; undoTxnTick = 0; }
+    void endUndoGesture()   noexcept
+    {
+        if (undoGestureDepth > 0) --undoGestureDepth;
+        undoTxnTick = 0;   // the next cut is a full second AFTER the gesture, not mid-flight
+    }
+    int  undoGestureDepthForTests() const noexcept { return undoGestureDepth; }
 
     // THE FIRST PENCIL EDIT OF A SESSION SWITCHES MANUAL MODE ON, ITSELF.
     //
@@ -945,6 +994,12 @@ public:
     bool isNadBusy() const noexcept { return nadBusy.load(); }
     // Honesty surface: never hide a coverage limit silently.
     bool nadWasOverBudget() const noexcept { return nadOverBudget.load(); }
+    // ...and the same rule for the OTHER thing this list can be missing: the tuning it
+    // ranked states no ascending period, so the search could not treat one shape as
+    // standing for all its transpositions (no "any" chip), could not skip a pair that
+    // repeats the period, and nothing here may be read as being "per octave". Published
+    // so the list can SAY that rather than quietly behave differently.
+    bool nadHadNoPeriod() const noexcept { return nadNoPeriod.load(); }
     int  getNadUsedDegrees()  const noexcept { return nadUsedD.load(); }
     int  getNadTotalDegrees() const noexcept { return nadTotalD.load(); }
     // HOW MANY DEGREES THE PUBLISHED ROWS WERE COMPUTED OVER. Published with the
@@ -1008,7 +1063,13 @@ public:
     // the 2/1-over-12-keys fallback, which is a guess and not a measurement. The panel
     // shows which of the three it is standing on, because a band silently built on a made
     // up period is exactly the "silently wrong" this instrument refuses to be.
-    enum class RegisterPeriodSource { Scale, TableEstimate, TableFallback };
+    // Where the number the register band counts in came from. `NoneStated` was called
+    // TableFallback and could only be reached from an absolute .tun - but a .scl that
+    // states no ASCENDING period (descending, or a degenerate 1/1) is the same
+    // situation exactly: the band is being counted in 2/1s that appear nowhere in the
+    // user's file. It is named for the fact now, not for the file format that first
+    // showed it.
+    enum class RegisterPeriodSource { Scale, TableEstimate, NoneStated };
     struct RegisterPeriodInfo
     {
         RegisterPeriodSource source = RegisterPeriodSource::Scale;
@@ -1598,6 +1659,10 @@ private:
     bool wasSelfPlay = false, selfPlayKnown = false;
     int  lastTempoSent = -1; // last CC20 BPM sent by the tempo sync (see timerCallback)
     int  undoTxnTick   = 0;  // groups edits into ~1 s undo transactions (see timerCallback)
+    // How many gestures are open right now. While this is above zero the ~1 s cut is
+    // held off, so a drag that outlasts a second is still ONE Ctrl+Z (see
+    // beginUndoGesture for the failure that made this necessary).
+    int  undoGestureDepth = 0;
 
     // MTS-ESP adoption is a ONE-SHOT check at load (see timerCallback), never repeated.
     // Manual per-partial amplitudes: slope is frozen at the value it had when manual was
@@ -2100,7 +2165,8 @@ private:
 
     // n-ad worker state.
     std::unique_ptr<std::thread> nadThread;
-    std::atomic<bool> nadCancel { false }, nadBusy { false }, nadOverBudget { false };
+    std::atomic<bool> nadCancel { false }, nadBusy { false }, nadOverBudget { false },
+                      nadNoPeriod { false };
     std::atomic<int>  nadGeneration { 0 }, nadUsedD { 0 }, nadTotalD { 0 }, nadResultD { 0 };
     mutable juce::CriticalSection nadLock;
     std::vector<NadRow> nadResults;

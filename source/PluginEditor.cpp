@@ -1219,22 +1219,26 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         }
         refocus();
     };
-    auto configStep = [&] (juce::TextButton& b, const char* txt, const char* id, int delta, const juce::String& tip)
+    // NO TOOLTIP HERE. The two stepper hovers used to be built as plain English
+    // juce::Strings on the next two lines and handed to this lambda, which meant they
+    // were written ONCE, in the constructor, and applyLanguage() never touched them
+    // again: they stayed English for the rest of the editor's life in both languages.
+    // That is exactly cause (a) of commit 2b51e2f ("strings set once in the constructor")
+    // and the same fix applies - the words live in applyLanguage() now (search octTip
+    // there), which is the only place a language switch can reach.
+    auto configStep = [&] (juce::TextButton& b, const char* txt, const char* id, int delta)
     {
         b.setButtonText (txt);
         b.setName ("round"); // circular body (see GalacticLnF::drawButtonBackground)
         b.setColour (juce::TextButton::buttonColourId, cEssentials.withAlpha (0.30f));
         b.setMouseClickGrabsKeyboardFocus (false);
-        b.setTooltip (tip);
         b.onClick = [stepParam, id, delta] { stepParam (id, delta); };
         addAndMakeVisible (b);
     };
-    const auto octTip = juce::String ("Octave transpose: shift the WHOLE synth by whole octaves (+-5).");
-    const auto sprTip = juce::String ("Spectrum's octaves: keep only partials within this many octaves above the played note. 10 = no cut (full spectrum).");
-    configStep (octDn, "-", "octaveShift", -1, octTip);
-    configStep (octUp, "+", "octaveShift",  1, octTip);
-    configStep (sprDn, "-", "spectrumRange", -1, sprTip);
-    configStep (sprUp, "+", "spectrumRange",  1, sprTip);
+    configStep (octDn, "-", "octaveShift", -1);
+    configStep (octUp, "+", "octaveShift",  1);
+    configStep (sprDn, "-", "spectrumRange", -1);
+    configStep (sprUp, "+", "spectrumRange",  1);
     octDn.setColour (juce::TextButton::buttonColourId, cReset.withAlpha (0.85f)); // "-" red
     sprDn.setColour (juce::TextButton::buttonColourId, cReset.withAlpha (0.85f));
     octUp.setColour (juce::TextButton::buttonColourId, cLoad.withAlpha (0.95f));  // "+" green
@@ -1246,8 +1250,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         v->setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
         addAndMakeVisible (*v);
     }
-    octVal.setTooltip (octTip);
-    sprVal.setTooltip (sprTip);
+    // (octVal's and sprVal's hovers are written by applyLanguage() too - same reason.)
 
     configCombo (primeModeBox,  "primeMode",  primeModeAtt,  cHarmonic, "Limit = drop harmonics with a prime factor above the value.  Whitelist = only the ticked primes.");
     // Prime LIMIT as a FADER (so it can be driven by the modulators). The value is
@@ -2143,10 +2146,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuneSourceBox.setSelectedId (1, juce::dontSendNotification);
     tuneScopeBox.addItem ("0 vs all", 1);
     tuneScopeBox.addItem ("all vs all", 2);
-    tuneScopeBox.setTooltip (
-        "How a combination is SCORED.\n"
-        "*0 vs all* - each note is judged only by its beating against the root (0).\n"
-        "*all vs all* - every pair of notes in the combination counts.");
+    // (its hover is written by applyLanguage(); set once here it stayed English for ever)
     tuneScopeBox.setSelectedId (2, juce::dontSendNotification); // "all vs all" by default
     for (auto* b : { &tuneSourceBox, &tuneScopeBox })
     {
@@ -2364,8 +2364,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         ed->setSelectAllWhenFocused (true);
         ed->onReturnKey  = [this] { syncRealtimeLink(); refocus(); };
         ed->onFocusLost  = [this] { syncRealtimeLink(); };
-        ed->setTooltip (tr ("Minimum interval between generated notes, in cents (also to the tonic and the period).",
-                            "Interval m\xc3\xadnim entre notes generades, en cents (tamb\xc3\xa9 respecte a la t\xc3\xb2nica i el per\xc3\xado" "de)."));
+        // (its hover is written by applyLanguage(): a correct tr() pair set ONLY here
+        //  would be frozen in the constructor's language for the editor's whole life)
         addChildComponent (*ed);
         makeLabel (*pr.second, cSpecScale);
         pr.second->setVisible (false);
@@ -2937,6 +2937,37 @@ namespace
             updateSliderValueTexts (*child);
         }
     }
+
+    // ...and hand every Slider's tooltip back to the sub-components JUCE gave a COPY of
+    // it to. Same shape of defect as the line above, same sweep, and it was found the
+    // same way - by a standing check, once tooltips were finally included in one.
+    //
+    // juce_Slider.cpp:606 does `valueBox->setTooltip (owner.getTooltip())` ONCE, while it
+    // is building the text box, and Slider::setTooltip does not propagate afterwards. So
+    // every fader in this window whose hover applyLanguage() re-writes kept its
+    // CONSTRUCTION-TIME English on the little numeric box beside it, in both languages,
+    // for ever: SLOPE, FRACTAL, HARMONICS, the prime limit, PHASE, GAIN, the transition
+    // times. Hovering the number said one thing and hovering the fader two pixels away
+    // said another. The inc/dec buttons of an IncDecButtons slider get the same copy at
+    // juce_Slider.cpp:637, so they are re-pointed here too.
+    void pushSliderTooltipsIntoSubComponents (juce::Component& root)
+    {
+        for (auto* child : root.getChildren())
+        {
+            if (auto* s = dynamic_cast<juce::Slider*> (child))
+            {
+                const auto tip = s->getTooltip();
+                // The children of a Slider are JUCE's own - the value box and, in
+                // IncDecButtons style, the two arrows. Giving them the slider's tooltip
+                // is exactly what JUCE did at construction; this only makes it happen
+                // again, now, in the language that is actually on screen.
+                for (auto* sub : s->getChildren())
+                    if (auto* t = dynamic_cast<juce::SettableTooltipClient*> (sub))
+                        t->setTooltip (tip);
+            }
+            pushSliderTooltipsIntoSubComponents (*child);
+        }
+    }
 }
 
 //==============================================================================
@@ -3284,6 +3315,31 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
                                    "Dibuixa l'ona d'aquest LFO: punts + segments corbats, com una automatitzaci\xc3\xb3."));
     modOnT.setTooltip (tr ("This modulator on/off (off restores its targets to their own values).",
                            "Aquest modulador on/off (off retorna els seus dest\xc3\xadns al seu valor propi)."));
+    // THE CUSTOM TAB'S OWN FADERS, and the pitch envelope's amount. Every one of these
+    // was handed a bare English literal by configFader in the constructor and never
+    // re-set, so the whole CUSTOM modulator panel explained itself in English however
+    // the window was set - the last corner of the editor still doing cause (a). Found by
+    // the "translated?" gate the moment tooltips were let into it.
+    pEnvAmtFader.setTooltip (tr (
+        "How far the pitch envelope bends the pitch (semitones, \xc2\xb1).",
+        "Quant desafina la nota l'envolupant de to (semitons, \xc2\xb1)."));
+    for (auto* a : { &custAdsr[0], &custAdsr[1], &custAdsr[2], &custAdsr[3] })
+        // Same wording as the volume / filter envelopes six lines further down: the four
+        // stage names are the terms of art this window already uses in Catalan, and one
+        // envelope spelling them differently from the other three would be the
+        // inconsistency, not the translation.
+        a->setTooltip (tr ("Custom envelope: Attack, Decay, Sustain (level), Release. Times in seconds.",
+                           "Envolupant pr\xc3\xb2pia: Atac, Decay, Sustain (nivell), Release. Temps en segons."));
+    custRangeFader.setTooltip (tr (
+        "How far this modulator MOVES its mapped parameters (\xc2\xb1 of their full range), riding on each knob's own value. Note: parameters that REBUILD the spectrum (Base, Harmonics, Decay, Fractal, Prime, Range, Reps) follow the modulator at the 60 Hz rebuild rate and glide when Morph is on - everything else follows per audio block.",
+        "Quant MOU aquest modulador els par\xc3\xa0metres que t\xc3\xa9 assignats (\xc2\xb1 del seu rang complet), cavalcant sobre el valor propi de cada control. Nota: els par\xc3\xa0metres que RECONSTRUEIXEN l'espectre (Base, Harm\xc3\xb2nics, Caiguda, Fractal, Primer, Rang, Reps) segueixen el modulador al ritme de reconstrucci\xc3\xb3 de 60 Hz i llisquen amb el Morphing actiu - la resta segueix bloc a bloc."));
+    lfoDivSlider.setTooltip (tr (
+        "Rate divider: halves the base rate per step (base = project BPM or the lowest held note's frequency).",
+        "Divisor de velocitat: parteix per la meitat la velocitat base a cada pas (la base \xc3\xa9s el tempo del DAW o la freq\xc3\xbc\xc3\xa8ncia de la nota m\xc3\xa9s greu que sona)."));
+    lfoHzSlider.setTooltip (tr ("Free LFO rate in Hz.", "Velocitat lliure de l'LFO, en Hz."));
+    lfoPhaseSlider.setTooltip (tr (
+        "Phase offset: where in the wave the oscillation starts.",
+        "Despla\xc3\xa7""ament de fase: en quin punt de l'ona comen\xc3\xa7""a l'oscil\xc2\xb7laci\xc3\xb3."));
     temperToggle.setButtonText (tr ("Temper to tuning", "Tempera a l'afinaci\xc3\xb3"));
     temperToggle.setTooltip (tr (
         "ON: the HARMONIC ENGINE keeps generating partials, each snapped to the nearest pitch of the ACTIVE TUNING in the Tuning box (degree x period^k) and following it live - both engines work TOGETHER and the Custom Engine's own scale is bypassed. In MPE input mode the host hands the plugin no scale, so the grid there is plain 12-TET. OFF: no snapping (the Custom Engine's .scl, if loaded and ON, is the spectrum by itself).",
@@ -3466,6 +3522,24 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "\nWHILE NOTES ARE SOUNDING: a Phase move changes their LEVEL at once, and their PHASES only from the next note on - this build does not re-phase a held note. When live re-phasing lands it will take BOTH its mode and its duration from the SPECTRUM panel's TRANSITION, because re-phasing IS a spectrum change. Transition Morph: by pitchbend, over its Time. Transition Dry/Wet: by crossfade, over its Time. Transition Off: no live re-phasing at all.",
         "\nMENTRE SONEN LES NOTES: moure la Fase els canvia el VOLUM a l'instant, i les FASES nom\xc3\xa9s a partir de la nota seg\xc3\xbc""ent - aquesta versi\xc3\xb3 no refasa una nota que ja sona. Quan arribi el refasat en directe, en prendr\xc3\xa0 el mode I la durada de la transici\xc3\xb3 del plaf\xc3\xb3 ESPECTRE, perqu\xc3\xa8 refasar \xc3\x89S un canvi d'espectre. Transici\xc3\xb3 a Morphing: per pitchbend, durant el seu Temps. Transici\xc3\xb3 a Sec/Humit: per fosa creuada, durant el seu Temps. Transici\xc3\xb3 a Cap: cap refasat en directe."));
     gainFader.setTooltip (tr ("Final output volume, in dB.", "Volum final de sortida, en dB."));
+    // THE TWO STEPPER ROWS' HOVERS. They were built in the constructor as plain English
+    // juce::Strings and never re-set, so OCTAVE's and RANGE's only explanation stayed
+    // English in Catalan - and neither the fit sweep nor the "translated?" check could
+    // see it, because both only ever looked at DRAWN text and a hover is not drawn.
+    // Each is set on all three components of its row (- , value, +) so the hover is the
+    // same wherever the pointer lands, in one place rather than three.
+    {
+        const auto octTip = tr (
+            "Octave transpose: shift the WHOLE synth by whole octaves (\xc2\xb1""5).",
+            "Transposici\xc3\xb3 d'octava: despla\xc3\xa7""a TOT el sintetitzador per octaves senceres (\xc2\xb1""5).");
+        const auto sprTip = tr (
+            "Spectrum's octaves: keep only partials within this many octaves above the played note. 10 = no cut (full spectrum).",
+            "Octaves de l'espectre: mant\xc3\xa9 nom\xc3\xa9s els parcials dins d'aquest nombre d'octaves per sobre de la nota tocada. 10 = sense tall (espectre sencer).");
+        for (auto* b : { &octDn, &octUp }) b->setTooltip (octTip);
+        for (auto* b : { &sprDn, &sprUp }) b->setTooltip (sprTip);
+        octVal.setTooltip (octTip);
+        sprVal.setTooltip (sprTip);
+    }
     primeModeBox.setTooltip (tr (
         "How prime numbers filter the harmonics. 'Limit': a harmonic passes only if its largest prime factor is at most the chosen limit. 'Whitelist': it passes only if EVERY prime factor is ticked below.",
         "Com filtren els primers els harm\xc3\xb2nics. 'L\xc3\xadmit': un harm\xc3\xb2nic passa nom\xc3\xa9s si el seu factor primer m\xc3\xa9s gran \xc3\xa9s com a molt el l\xc3\xadmit triat. 'Llista': passa nom\xc3\xa9s si TOTS els seus factors primers estan marcats a sota."));
@@ -3509,9 +3583,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Rang del pitch bend per nota. +-48 st \xc3\xa9s l'est\xc3\xa0ndard MPE i \xc3\x89S NECESSARI per als sistemes d'afinaci\xc3\xb3 d'Ableton Live 12 i el Microtuner (activa MPE al plugin dins de Live). Fes servir +-2 per a la roda d'un teclat cl\xc3\xa0ssic."));
     //-- SHEPARD MODE (bottom row of the Tuning box) ---------------------------
     shepOnT.setButtonText ("Shepard");
-    shepOnT.setTooltip (tr (
-        "The key you press becomes the root of a tone that rises for ever without ever getting higher - built from THIS synth's spectrum, not from sine waves. The voice sounds its whole spectrum at up to 8 transpositions AT ONCE, one rise interval apart, anchored on the pressed key's own tuned pitch, all climbing together under a FIXED spectral window whose edges reach exactly zero, so copies leave the top and enter underneath in silence - no click, nothing to hide. Everything else about the note is untouched - the three envelopes, the filter, the modulators, morph, manual amplitudes - and letting go of the key releases it like any other note. Latched PER NOTE: flipping this changes the notes you play NEXT, never the ones already sounding. The bounds are stated, never silent: at most 8 copies (the band narrows, centred, rather than losing one) and up to 1638 partials each; a spectrum dense enough to need more lifts the window's bottom edge instead of dropping a single partial.",
-        "La tecla que prems es converteix en l'arrel d'un to que puja sense parar sense arribar mai m\xc3\xa9s amunt - fet amb l'espectre D'AQUEST sinte, no amb sinusoides. La veu fa sonar tot el seu espectre en fins a 8 transposicions ALHORA, separades un interval de pujada, ancorades al to real de la tecla premuda i pujant totes juntes sota una finestra espectral FIXA amb vores que arriben exactament a zero, o sigui que les c\xc3\xb2pies surten per dalt i entren per sota en silenci - sense clics ni res a amagar. La resta de la nota no canvia gens - les tres envolupants, el filtre, els moduladors, el morph, les amplituds manuals - i deixar anar la tecla l'allibera com qualsevol nota. Es fixa PER NOTA: canviar-ho afecta les notes que toquis DESPR\xc3\x88S, mai les que ja sonen. Els l\xc3\xadmits es diuen, mai s'amaguen: com a molt 8 c\xc3\xb2pies (la banda s'estreny, centrada, en comptes de perdre'n cap) i fins a 1638 parcials cadascuna; un espectre prou dens puja la vora inferior de la finestra en comptes de perdre ni un sol parcial."));
+    // (its hover is written by refreshShepardRiseState() below - it carries the
+    //  rise-interval state, which depends on the TUNING and so cannot live here)
     shepModeBox.setTooltip (tr (
         "How the rise time is set. *Free*: the fader beside gives the time to rise one interval, in ms. *Sync* (the default): rising one interval lasts the chosen number of host beats. Switching mode (or moving the rate) GLIDES the speed - a sounding Shepard never jumps.",
         "Com es fixa el temps de pujada. *Lliure*: el fader del costat d\xc3\xb3na el temps de pujar un interval, en ms. *Sinc* (per defecte): pujar un interval dura els beats triats del tempo del DAW. Canviar de mode (o moure la velocitat) fa LLISCAR la marxa - un Shepard que sona mai salta."));
@@ -3525,6 +3598,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // refreshShepardSyncState(); resetting the memo makes it re-render in this language.
     lastShepNoBpm = -1;
     refreshShepardSyncState();
+    // ...and the SHEPARD switch's carries the rise-interval state (see
+    // refreshShepardRiseState), for the same reason and by the same rule.
+    lastShepRiseState = -1;
+    refreshShepardRiseState();
     // (loadTimbreButton's and randomSpectrumBtn's tooltips are set by
     //  refreshCustomEngineButtons above: they depend on which job the button has.)
     timbreRepeatsFader.setTooltip (tr (
@@ -3640,6 +3717,18 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (tuneSourceBox, { tr ("From current tuning", "De l'afinaci\xc3\xb3 actual"),
                                tr ("From all possible tunings", "De totes les afinacions possibles") });
     localise (tuneScopeBox,  { tr ("0 vs all", "0 vs tot"), tr ("all vs all", "tot vs tot") });
+    // Its ITEMS were already localised (line above) but its HOVER was not: it was set
+    // once in the constructor as an English literal, so the two-word items changed
+    // language and the sentence that says what they MEAN never did. The items alone do
+    // not carry the meaning - "0 vs tot" is only intelligible from this hover - so this
+    // is the half that mattered.
+    tuneScopeBox.setTooltip (tr (
+        "How a combination is SCORED.\n"
+        "*0 vs all* - each note is judged only by its beating against the root (0).\n"
+        "*all vs all* - every pair of notes in the combination counts.",
+        "Com es PUNTUA una combinaci\xc3\xb3.\n"
+        "*0 vs tot* - cada nota es jutja nom\xc3\xa9s pel seu batec contra la fonamental (0).\n"
+        "*tot vs tot* - hi compta cada parella de notes de la combinaci\xc3\xb3."));
     lastNadD = 0; // force the n-ad selector's items to rebuild in the new language
 
     // Chord-search mode texts.
@@ -3647,6 +3736,12 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     chordPerLbl.setText   (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
     dissMinLbl.setText    (tr ("smallest interval (c)", "interval m\xc3\xa9s petit (c)"), dontSendNotification);
     chordMinLbl.setText   (tr ("smallest interval (c)", "interval m\xc3\xa9s petit (c)"), dontSendNotification);
+    // The two minimum-interval boxes. Their tr() pair was correct and sat in the
+    // constructor, where applyLanguage() could never reach it - the four-word caption
+    // above each box changed language and the sentence explaining it did not.
+    for (auto* e : { &dissMinEdit, &chordMinEdit })
+        e->setTooltip (tr ("Minimum interval between generated notes, in cents (also to the tonic and the period).",
+                           "Interval m\xc3\xadnim entre notes generades, en cents (tamb\xc3\xa9 respecte a la t\xc3\xb2nica i el per\xc3\xado" "de)."));
     chordCountLbl.setText (tr ("Chords", "Acords"), dontSendNotification);
     chordViewBack.setButtonText (tr ("Results", "Resultats"));
     chordViewFwd.setButtonText  (tr ("Tuning info", "Info afinaci\xc3\xb3"));
@@ -3799,6 +3894,18 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     updateSliderValueTexts (playgroundPanel);   // not children of this editor: they live
     updateSliderValueTexts (partialPanel);      // in their own floating windows
 
+    // The degrees list's own status line ("this scale states no period...") is written
+    // by rebuildScaleDissList, which the timer only reaches when the SCALE changes - and
+    // a language switch is not a scale change. Rebuilt from the analysis already in hand,
+    // so nothing is recomputed and the sentence arrives in this language.
+    rebuildScaleDissList();
+
+    // ...AND EVERY SLIDER'S VALUE BOX GETS THIS LANGUAGE'S HOVER (see the sweep's own
+    // comment: JUCE copied the English one into it once, at construction).
+    pushSliderTooltipsIntoSubComponents (*this);
+    pushSliderTooltipsIntoSubComponents (playgroundPanel);
+    pushSliderTooltipsIntoSubComponents (partialPanel);
+
     // ...AND THE LIVE READ-OUTS ARE RE-RUN, NOT LEFT TO THE NEXT TIMER TICK.
     //
     // A whole class of strings in this window is written by the 30 Hz timer, not by this
@@ -3928,6 +4035,32 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
         // stable - and the report prints the TEXT and the rect too, which is what a hand
         // actually needs to find one.
         const auto here = path + "/" + probeNameFor (*c) + "#" + juce::String (myIndex);
+
+        // THE HOVER, recorded as a row of its own.
+        //
+        // A tooltip is a user-visible string that is NEVER DRAWN into a box of ours, so
+        // until this line it was invisible to every standing check in the build: the fit
+        // sweep only walks drawn text, and the "translated?" gate compares exactly what
+        // the fit sweep collected. That is why three of them (tuneScopeBox's, and the
+        // octave / range steppers') sat in the constructor as bare English literals for
+        // months with both rigs green - the same defect class commit 2b51e2f fixed for
+        // eight others, which only a person happening to hover in Catalan could find.
+        //
+        // `need` and `avail` stay 0 on purpose: a TooltipWindow sizes ITSELF to the
+        // string, so there is no box to overflow and over() is 0 - the fit sweep sees
+        // these rows and correctly has nothing to say about them. What DOES read them is
+        // the pair of language gates in SnapshotRig.cpp, which is the whole point.
+        if (auto* tc = dynamic_cast<juce::TooltipClient*> (c))
+        {
+            const auto tip = tc->getTooltip();
+            if (tip.isNotEmpty())
+            {
+                TextFit f;
+                f.path = here; f.kind = "Tooltip"; f.text = tip;
+                f.bounds = getLocalArea (c, c->getLocalBounds());
+                out.push_back (f);
+            }
+        }
 
         // A string that fits on ONE line needs no wrapping test; one that does not may
         // still be fine if its box is tall enough for the extra lines the painter is
@@ -4217,6 +4350,53 @@ FractalAdditiveAudioProcessorEditor::intervalDraftProbeForTests (const juce::Str
     timerCallback();
     r.afterTick = intervalEdit.getText();
     r.survived  = r.afterTick == r.afterEdit;
+    return r;
+}
+
+FractalAdditiveAudioProcessorEditor::PencilUndoProbe
+FractalAdditiveAudioProcessorEditor::pencilGestureUndoProbeForTests (int cell, float dB, int ticksMidDrag)
+{
+    PencilUndoProbe r;
+    partialPanel.resync();                       // the knobs must match the live spectrum
+    r.cells = partialPanel.grid.model.count();
+    if (! partialPanel.grid.model.valid (cell)) return r;
+
+    r.stepsBefore = processorRef.undoStackDepthForTests();
+
+    // MOUSE DOWN. The real handler: it takes the undo-gesture hold, arms manual mode
+    // (which opens the transaction) and captures the before-state.
+    if (partialPanel.grid.onGestureStart) partialPanel.grid.onGestureStart();
+    r.armed = partialPanel.armedManualThisGesture;
+
+    // THE PARAMETER FLIP REACHES THE UNDO STACK, and it reaches it DURING the drag.
+    // In the product that is APVTS's own 20-500 ms timer writing the value into the
+    // ValueTree through the undo manager; a verifier has no message loop, so the same
+    // flush is asked for by hand. Without this the flip would land at some arbitrary
+    // later point and the probe would be measuring a timeline no user ever sees - and
+    // the mid-drag cut, which is the whole question, would have nothing to separate.
+    processorRef.apvts.copyState();
+    r.stepsAfterFlush = processorRef.undoStackDepthForTests();
+
+    // DRAG. One frame is enough: the defect is about WHEN the transaction boundary
+    // falls, not about how many frames are inside it.
+    partialPanel.grid.model.cells[(size_t) cell].dB = dB;
+    if (partialPanel.grid.onEdited) partialPanel.grid.onEdited();
+
+    // ...AND THE DRAG TAKES TIME. Each tick is one turn of the processor's 60 Hz timer,
+    // so 60 of them is the ~1 s mark where the undo cut used to fall inside the gesture.
+    for (int i = 0; i < ticksMidDrag; ++i) processorRef.pollParametersForTests();
+    r.stepsAfterTicks = processorRef.undoStackDepthForTests();
+
+    // MOUSE UP: commit, and release the hold.
+    if (partialPanel.grid.onGestureEnd) partialPanel.grid.onGestureEnd();
+    r.stepsAfter = processorRef.undoStackDepthForTests();
+
+    // ONE Ctrl+Z. The claim under test is not "the stack is tidy" - it is that a single
+    // undo puts the user back where they started, rather than leaving manual mode armed
+    // over a spectrum nobody drew.
+    r.undid = processorRef.performUndo();
+    r.manualAfterUndo = processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+    r.editsAfterUndo  = (int) processorRef.getPartialGains().size();
     return r;
 }
 
@@ -5416,6 +5596,14 @@ void FractalAdditiveAudioProcessorEditor::rebuildScaleDissList()
                                : yellow.interpolatedWith (red, (float) ((t - 0.5) * 2.0));
         degreeList.rows.push_back (std::move (row));
     }
+    // THE MISSING PERIOD ROW, SAID OUT LOUD. A descending .scl and a degenerate 1/1
+    // scale state no ascending period, so there is no "degree 0, one period up" to rank
+    // and the list stops one row early (computeActiveScaleDissonance). Without this line
+    // the user would just see a shorter list and no reason for it.
+    degreeList.noteText = processorRef.tuningStatesPeriod()
+                            ? juce::String()
+                            : tr ("this scale states no period, so there is no period row",
+                                  "aquesta escala no declara cap per\xc3\xado" "de, o sigui que no hi ha fila de per\xc3\xado" "de");
     // Re-size for the Viewport (scrolls when the list is taller than the box).
     const int visH = dissView.getHeight();
     const int ch   = degreeList.contentHeight();
@@ -6059,6 +6247,36 @@ void FractalAdditiveAudioProcessorEditor::refreshShepardSyncState()
                        "\n!ARA MATEIX el DAW no d\xc3\xb3na cap BPM!, o sigui que mana el temps LLIURE (ms) - els beats prendran el control quan el DAW ofereixi un tempo.")
                  : juce::String()));
     shepDivBox.repaint();
+}
+
+// THE RISE INTERVAL, AND WHY THE CHOICE MAY NOT BE THERE.
+//
+// The rise-interval box appears only when the tuning's period differs from the octave -
+// otherwise there is nothing to pick between. That gate used to be asked of
+// periodRatio(), which answers 2.0 when the tuning states NO ascending period at all
+// (a descending .scl, a degenerate 1/1 scale): the box vanished, the rise ran at 2/1,
+// and the reason - "your scale has no period for me to offer you" - existed nowhere on
+// screen. The tuning's own OFF button says why it is off; this is the same courtesy for
+// a control that is not there at all.
+//
+// It owns the whole SHEPARD hover for the same reason refreshShepardSyncState owns the
+// beats box's: a sentence assembled from two places is a sentence that drifts.
+void FractalAdditiveAudioProcessorEditor::refreshShepardRiseState()
+{
+    // statedPeriodRatio(), never the display fallback - the three states have to be told
+    // apart by the FACT, and the fallback collapses two of them into one.
+    const int state = ! processorRef.tuningStatesPeriod() ? 2
+                    : shepardRiseChoiceExists()           ? 1 : 0;
+    if (state == lastShepRiseState) return;
+    lastShepRiseState = state;
+
+    juce::String tip = tr (
+        "The key you press becomes the root of a tone that rises for ever without ever getting higher - built from THIS synth's spectrum, not from sine waves. The voice sounds its whole spectrum at up to 8 transpositions AT ONCE, one rise interval apart, anchored on the pressed key's own tuned pitch, all climbing together under a FIXED spectral window whose edges reach exactly zero, so copies leave the top and enter underneath in silence - no click, nothing to hide. Everything else about the note is untouched - the three envelopes, the filter, the modulators, morph, manual amplitudes - and letting go of the key releases it like any other note. Latched PER NOTE: flipping this changes the notes you play NEXT, never the ones already sounding. The bounds are stated, never silent: at most 8 copies (the band narrows, centred, rather than losing one) and up to 1638 partials each; a spectrum dense enough to need more lifts the window's bottom edge instead of dropping a single partial.",
+        "La tecla que prems es converteix en l'arrel d'un to que puja sense parar sense arribar mai m\xc3\xa9s amunt - fet amb l'espectre D'AQUEST sinte, no amb sinusoides. La veu fa sonar tot el seu espectre en fins a 8 transposicions ALHORA, separades un interval de pujada, ancorades al to real de la tecla premuda i pujant totes juntes sota una finestra espectral FIXA amb vores que arriben exactament a zero, o sigui que les c\xc3\xb2pies surten per dalt i entren per sota en silenci - sense clics ni res a amagar. La resta de la nota no canvia gens - les tres envolupants, el filtre, els moduladors, el morph, les amplituds manuals - i deixar anar la tecla l'allibera com qualsevol nota. Es fixa PER NOTA: canviar-ho afecta les notes que toquis DESPR\xc3\x88S, mai les que ja sonen. Els l\xc3\xadmits es diuen, mai s'amaguen: com a molt 8 c\xc3\xb2pies (la banda s'estreny, centrada, en comptes de perdre'n cap) i fins a 1638 parcials cadascuna; un espectre prou dens puja la vora inferior de la finestra en comptes de perdre ni un sol parcial.");
+    if (state == 2)
+        tip += tr ("\n!This scale states no period! (it descends, or its period is 1/1), so there is no scale period to rise by and the rise-interval choice is not offered: one step is an octave, 2/1. Nothing about your tuning is changed - the pitches are still the file's own.",
+                   "\n!Aquesta escala no declara cap per\xc3\xado" "de! (baixa, o el seu per\xc3\xado" "de \xc3\xa9s 1/1), o sigui que no hi ha per\xc3\xado" "de d'escala per pujar i no s'ofereix l'opci\xc3\xb3 d'interval de pujada: un pas \xc3\xa9s una octava, 2/1. La teva afinaci\xc3\xb3 no canvia gens - els tons segueixen sent els del fitxer.");
+    shepOnT.setTooltip (tip);
 }
 
 // ONE PANEL, ONE COLOUR. Every control inside SPECTRUM takes the selected engine's hue,
@@ -8250,7 +8468,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // ms/beats rate control was left 13 px wide: a fader nobody can grab. The
             // probe used to certify that row because it measured the lighter face against
             // the label's FULL width, which is 26 px of room that does not exist.
-            const bool riseChoice = shepard::periodDiffersFromOctave (processorRef.getTuningPeriodRatio());
+            const bool riseChoice = shepardRiseChoiceExists();
             // Both lines come off the bottom FIRST, for the reason the single one did:
             // reserved after the pile of optional rows above, they would inherit the
             // zero-height leftovers in exactly the states with the most buttons showing.
@@ -8695,6 +8913,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     refreshSlopeFreeze(); // SLOPE goes grey + "FROZEN" while manual amplitudes are on
     applyTransitionMode();   // the TRANSITION box follows the two booleans, however they moved
     refreshShepardSyncState(); // beats box goes amber while Sync has no BPM to sync to
+    refreshShepardRiseState(); // ...and the switch says why the rise choice is missing
     // The amplitude window follows the spectrum: the template is rebuilt on a background
     // thread whenever Base/Fractal/primes/tuning move, and the stored edits can change
     // with no rebuild at all (an undo, a preset, a reload). Both are polled here rather
@@ -8862,6 +9081,14 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                 txt = tr ("first ", "nom\xc3\xa9s els primers ") + juce::String (processorRef.getNadUsedDegrees())
                     + tr (" of ", " de ") + juce::String (processorRef.getNadTotalDegrees())
                     + tr (" degrees analysed", " graus analitzats");
+            // The chips read differently in a tuning with no period and the reason is not
+            // on screen anywhere else: no "any" row, because a shape cannot stand for its
+            // transpositions in a scale that never repeats, so every combination is listed
+            // at the degrees it really uses. Said here rather than inferred from a longer
+            // list, and never by printing an octave the scale does not have.
+            else if (processorRef.nadHadNoPeriod() && ! nadList.rows.empty())
+                txt = tr ("this scale states no period - shapes are listed where they really are",
+                          "aquesta escala no declara cap per\xc3\xado" "de - les formes es llisten on realment s\xc3\xb3n");
             if (txt != nadList.emptyText) { nadList.emptyText = txt; resized(); nadList.repaint(); }
         }
     }
@@ -9305,8 +9532,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                         // period is not an octave, and resized() is what puts it on
                         // screen - so it belongs HERE or the box would appear only at
                         // the next unrelated relayout after a Bohlen-Pierce load.
-                        | (shepard::periodDiffersFromOctave (
-                               processorRef.getTuningPeriodRatio())  ? 1 << 8 : 0);
+                        | (shepardRiseChoiceExists()                 ? 1 << 8 : 0);
     if (packed != lastResetOffState) { lastResetOffState = packed; resized(); }
     refreshSpectrumTuningButton(); // cheap (sig-guarded): keeps word/enabled honest per tick
 
@@ -9346,6 +9572,16 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         const int D = juce::jmax (1, processorRef.getScaleDegrees());
         auto per = degreeLabel (processorRef, D);
         if (per.endsWith ("/1")) per = per.dropLastCharacters (2); // "2/1" reads better as "2"
+        // THE VALUE IS THE FILE'S OWN AND STAYS. This field already printed "1/2" for a
+        // descending scale and "1" for a degenerate one - the .scl's real last line, and
+        // the only place in the window that value is shown. What was missing is the
+        // consequence: that line is NOT a repeat interval going up, which is why the
+        // degrees list has no period row, why no combination is called rootless, why the
+        // register band's unit is marked, and why the Shepard offers no rise-interval
+        // choice. Printing the number and letting the user work out why four other
+        // read-outs changed is the same silence one step earlier, so the field says it.
+        if (! processorRef.tuningStatesPeriod())
+            per += tr ("  (no repeat)", "  (no repeteix)");
         tuningPeriodLbl.setText (tr ("Period  ", "Per\xc3\xado" "de  ") + per, juce::dontSendNotification);
     }
 
