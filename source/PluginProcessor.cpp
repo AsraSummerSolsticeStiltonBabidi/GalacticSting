@@ -3355,6 +3355,9 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
 
     // Build once synchronously so a template exists before the first note.
     lastPushed = currentSettings();
+    // The plan analyses which partials can sound at this rate, so it has to know it
+    // BEFORE the compile below publishes a template to measure.
+    spectrumEngine.setRenderRate (sampleRate);
     spectrumEngine.buildNow (lastPushed);
 
     applyTuningMode ((int) apvts.getRawParameterValue ("tuningMode")->load());

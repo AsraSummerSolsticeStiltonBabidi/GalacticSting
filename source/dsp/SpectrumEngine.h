@@ -16,6 +16,7 @@
 #include <juce_core/juce_core.h>
 #include "Spectrum.h"
 #include "PartialGains.h"
+#include "PhaseSets.h"
 
 #include <array>
 #include <atomic>
@@ -51,11 +52,20 @@ namespace spectrum
             }
             wakeUp.signal();
         }
-
         // Build synchronously (call once from prepareToPlay so a template always exists).
         void buildNow (const SpectrumSettings& s)
         {
             publish (compileSpectrum (s));
+            // NO planLive() HERE, AND THE REASON IS MEASURED. buildNow() is the message
+            // thread, and the live adaptation reaches it while notes are held: with the
+            // plan built here the editor's worst timer tick went to 93.9 ms against a
+            // 33.6 ms frame - the window stops following the mouse. 38 ms is simply too
+            // much to spend anywhere the message thread can wait for it.
+            //
+            // The worker plans its own publishes behind the release-store instead, so a
+            // template compiled at prepareToPlay has no plan until the first real
+            // recompile - and a voice with no plan gets today's hash, which is the sound
+            // this synth already ships.
         }
 
         //----------------------------------------------------------------------
@@ -65,6 +75,45 @@ namespace spectrum
             const int i = live.load (std::memory_order_acquire);
             return i < 0 ? nullptr : &pool[(size_t) i];
         }
+
+        // The phase plan measured on the live template, or nullptr when there is none.
+        //
+        // ONE acquire-load for both, so a caller that wants the pair takes the slot index
+        // once: reading getLive() and then getLivePlan() can straddle a publish and hand
+        // back a plan measured on a template the caller is not looking at. The pair is
+        // what the guarantee is about - a plan is only ever "not worse than the hash" for
+        // the amplitudes it was built on.
+        const spectrum::phaseset::PhasePlan* getLivePlan() const noexcept
+        {
+            const int i = live.load (std::memory_order_acquire);
+            if (i < 0) return nullptr;
+            // Only if it was measured on the template that is live NOW.
+            const juce::uint32 g = pool[(size_t) i].generation;
+            if (g == 0 || planStamp[(size_t) i].load (std::memory_order_acquire) != g) return nullptr;
+            return &planPool[(size_t) i];
+        }
+        const spectrum::phaseset::PhaseReport* getLiveReport() const noexcept
+        {
+            const int i = live.load (std::memory_order_acquire);
+            if (i < 0) return nullptr;
+            const juce::uint32 g = pool[(size_t) i].generation;
+            if (g == 0 || planStamp[(size_t) i].load (std::memory_order_acquire) != g) return nullptr;
+            return &reportPool[(size_t) i];
+        }
+        struct LivePair { const SpectrumTemplate* t = nullptr; const spectrum::phaseset::PhasePlan* p = nullptr; };
+        LivePair getLivePair() const noexcept
+        {
+            const int i = live.load (std::memory_order_acquire);
+            if (i < 0) return {};
+            return { &pool[(size_t) i], &planPool[(size_t) i] };
+        }
+
+        // The rate the voices render at, for the plan's analysis. Set from prepareToPlay;
+        // a plan built at the wrong rate would analyse partials that cannot sound, or
+        // miss ones that can. Templates published before this is set use the 48 kHz
+        // default and are re-planned by the recompile prepareToPlay already triggers.
+        void setRenderRate (double sr) noexcept
+        { if (sr > 0.0) renderRate.store (sr, std::memory_order_relaxed); }
 
         // Message thread: is a build or a blend queued, or in flight right now?
         //
@@ -226,6 +275,42 @@ namespace spectrum
         void reportRendered (int n) const noexcept { renderedCount.store (n, std::memory_order_relaxed); }
         int  getRenderedCount() const noexcept     { return renderedCount.load (std::memory_order_relaxed); }
 
+        // MEASURE THE LIVE SLOT'S PLAN, AFTER IT IS ALREADY SOUNDING.
+        //
+        // buildPlan is 38 ms at the compile budget. Done before the release-store, that
+        // is 38 ms of extra latency on EVERY recompile - a patch tweak under a held note
+        // taking that much longer to be heard - and it broke four verifier scenarios that
+        // render a fixed number of blocks after a change. Done inside buildMutex it was
+        // worse still: buildNow() runs on the message thread, and the editor's worst timer
+        // tick went from 0.2 ms to 41.1 ms against a 33.6 ms frame.
+        //
+        // So the template is published at exactly the speed it always was, and the plan
+        // arrives afterwards. The header says why that is sound: "a late upgrade is
+        // inaudible on notes already sounding, because a plan only reaches a voice at
+        // note-on". Notes that start in the gap get today's hash, which is the sound this
+        // synth already ships.
+        //
+        // THE STAMP IS THE WHOLE SAFETY ARGUMENT. A plan is only ever valid for the exact
+        // amplitudes it was measured on, so the slot records WHICH template generation it
+        // was built for and getLivePlan() hands back nothing unless that matches the live
+        // template's own stamp. A publish that lands mid-measurement therefore discards
+        // the plan instead of pairing it with a spectrum it never saw.
+        void planLive()
+        {
+            const int w = live.load (std::memory_order_acquire);
+            if (w < 0) return;
+            const juce::uint32 g = pool[(size_t) w].generation;
+            if (planStamp[(size_t) w].load (std::memory_order_acquire) == g && g != 0) return;
+            spectrum::phaseset::PhasePlan   plan;
+            spectrum::phaseset::PhaseReport rep = planFor (pool[(size_t) w], plan);
+            // Still the same template? If not, this plan describes a spectrum nobody is
+            // playing and is dropped rather than published against the wrong one.
+            if (live.load (std::memory_order_acquire) != w || pool[(size_t) w].generation != g) return;
+            planPool[(size_t) w]   = std::move (plan);
+            reportPool[(size_t) w] = rep;
+            planStamp[(size_t) w].store (g, std::memory_order_release);
+        }
+
     private:
         void run() override
         {
@@ -275,7 +360,20 @@ namespace spectrum
                         superseded = pubEpoch != epoch;   // publishNow overtook this build
                     }
                     if (! abortBuild.load() && ! superseded)   // also discards a build cancelled at teardown
+                    {
                         publish (std::move (t));
+                        // ...and measure its plan BEHIND the release, only on this path.
+                        //
+                        // NOT after a playground blend: a drag posts a job every 16 ms and
+                        // buildPlan is 38 ms, so planning every frame leaves the worker
+                        // permanently behind the drag - measured, it broke the round-trip
+                        // level check. The header says the same thing (drag budget while a
+                        // control moves, one re-run when it settles), and until that settle
+                        // pass exists a blended template simply has no plan: the stamp will
+                        // not match, getLivePlan() hands back nullptr, and a voice falls
+                        // back to today's hash - the sound this synth already ships.
+                        if (! abortBuild.load()) planLive();
+                    }
                 }
 
                 working.store (false, std::memory_order_release);
@@ -331,12 +429,14 @@ namespace spectrum
         // of them starts a spectral morph. See BlendJob::bumpGeneration.
         void publishKeepingGeneration (SpectrumTemplate t)
         {
+            fillGains (t);
             const std::lock_guard<std::mutex> lk (buildMutex);
             const int cur = live.load();
             const int w   = (cur + 1) % (int) pool.size();
             t.generation = generation.load (std::memory_order_relaxed);
-            fillGains (t);
             pool[(size_t) w] = std::move (t);
+            // The plan is measured AFTER the release below - see planLive().
+            planStamp[(size_t) w].store (0, std::memory_order_relaxed);
             liveCount.store ((int) pool[(size_t) w].partials.size());
             rawCount .store (pool[(size_t) w].rawCount);
             truncated.store (pool[(size_t) w].truncated);
@@ -347,12 +447,23 @@ namespace spectrum
         // Serialised between worker and buildNow (never called on the audio thread).
         void publish (SpectrumTemplate t)
         {
+            // GAINS AND PLAN BEFORE THE LOCK, NOT INSIDE IT.
+            //
+            // buildMutex serialises the worker against buildNow(), and buildNow() runs on
+            // the message thread. Measuring a phase plan inside that lock therefore adds
+            // its whole cost to a message-thread wait: written that way first and
+            // measured, the editor's worst timer tick under a held chord went from 0.2 ms
+            // to 41.1 ms against a 33.6 ms frame - the window stops following the mouse.
+            // Neither call needs the lock (fillGains takes its own), and the plan is
+            // measured on `t`, which nothing else can see yet.
+            fillGains (t);                       // no template is ever live without its gains
             const std::lock_guard<std::mutex> lk (buildMutex);
             const int w = (live.load() + 1) % (int) pool.size();
             const juce::uint32 g = generation.load (std::memory_order_relaxed) + 1;
             t.generation = g;                    // stamp BEFORE the slot is written + released
-            fillGains (t);                       // no template is ever live without its gains
             pool[(size_t) w] = std::move (t);
+            // The plan is measured AFTER the release below - see planLive().
+            planStamp[(size_t) w].store (0, std::memory_order_relaxed);
             liveCount.store ((int) pool[(size_t) w].partials.size());
             rawCount .store (pool[(size_t) w].rawCount);
             truncated.store (pool[(size_t) w].truncated);
@@ -363,6 +474,47 @@ namespace spectrum
             live.store (w, std::memory_order_release);
         }
 
+
+        //======================================================================
+        // THE PHASE PLAN, PUBLISHED IN LOCKSTEP WITH THE TEMPLATE IT MEASURES.
+        //
+        // It lives here and not inside SpectrumTemplate because PhaseSets.h includes
+        // Spectrum.h - a plan member would close the cycle. A parallel pool costs the
+        // same guarantee for nothing: slot w's plan is written BEFORE the release-store
+        // of `live`, so a voice that acquire-loads the live slot sees the template and
+        // the plan it was measured on as one pair, exactly as it already does for the
+        // generation stamp.
+        //
+        // WHAT IT IS MEASURED ON. The amplitudes the voice will actually RENDER - the
+        // template's own amps multiplied by the resolved per-partial gains - and at the
+        // slope the template was compiled at, which is what those amps already embody.
+        // The header calls this a precondition rather than a refinement: a plan built on
+        // the pre-edit amplitudes measured 2.13 dB WORSE than today's hash after a single
+        // pencil edit.
+        //
+        // WHAT IT COSTS. buildPlan is the expensive call - 38 ms worst case at the
+        // compile budget on the suite's own box - and this is the background compile
+        // thread, next to a compile that is heavier. It is NOT on the audio thread and
+        // NOT per frame.
+
+        //======================================================================
+
+        spectrum::phaseset::PhaseReport planFor (const SpectrumTemplate& t,
+                                                 spectrum::phaseset::PhasePlan& out) const
+        {
+            const int n = (int) t.partials.size();
+            if (n <= 0) { out = spectrum::phaseset::PhasePlan(); return {}; }
+            // The rendered amplitudes, in the template's own partial order.
+            std::vector<spectrum::Partial> rendered (t.partials);
+            if (t.gain.size() == t.partials.size())
+                for (size_t i = 0; i < rendered.size(); ++i)
+                    rendered[i].amp *= t.gain[i];
+            spectrum::phaseset::Options opt;
+            opt.sampleRate = renderRate.load (std::memory_order_relaxed);
+            opt.workBudget = spectrum::phaseset::kWorkBudgetCompile;
+            return spectrum::phaseset::buildPlan (rendered.data(), n, opt, out);
+        }
+
         std::vector<PartialGain> overrides;      // the user's edits (message thread writes)
         bool                     overridesOn = false;
         std::mutex               overrideMutex;
@@ -370,6 +522,14 @@ namespace spectrum
 
         static constexpr int kSlots = 8; // margin so a burst of publishes can't wrap onto a slot a voice is mid-read
         std::array<SpectrumTemplate, kSlots> pool;
+        std::array<spectrum::phaseset::PhasePlan, kSlots> planPool;
+        // Kept beside the plan so the integration can be CHECKED, not just used: the
+        // engine's guarantee is "never worse than the hash", and a number nobody reads
+        // is a guarantee nobody keeps.
+        std::array<spectrum::phaseset::PhaseReport, kSlots> reportPool;
+        // Which template generation each slot's plan was measured on. 0 = none yet.
+        std::array<std::atomic<juce::uint32>, kSlots> planStamp {};
+        std::atomic<double> renderRate { 48000.0 };
 
         std::atomic<int>  live       { -1 };
         std::atomic<juce::uint32> generation { 0 };

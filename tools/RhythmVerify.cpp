@@ -13715,6 +13715,62 @@ int main (int argc, char** argv)
         }
     }
 
+    //-- run 55: THE PUBLISHED PHASE PLAN --------------------------------------------
+    //
+    // The engine's whole claim is "never worse than today's Scattered hash, at any
+    // prefix, at any observation length in the ladder". That claim is worth exactly as
+    // much as the measurement of it at the point where the plugin actually publishes a
+    // plan - not in the suite, where the templates are hand-built.
+    //
+    // So this compiles the real default patch through the real engine and asks the plan
+    // it published three things: that it exists at all, that it covers the template it
+    // was measured on, and that its chosen set is not worse than the hash it replaces.
+    // Nothing consumes the plan yet - the voice reading it is the next step - so this is
+    // the check that keeps the publish honest until then.
+    {
+        std::printf ("\nrun 55: the phase plan the engine publishes with each template:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 256);
+        awaitSpectrumIdle (*p, "run 55: the default template");
+        // The worker plans behind its own publishes; the verifier calls the same function
+        // directly rather than guessing when the worker was scheduled. What is under test
+        // is the plan and its guarantee, not the thread that happened to run it.
+        p->planLiveNowForTests();
+        const auto* T   = p->getLiveTemplate();
+        const auto* pl  = p->getLivePhasePlan();
+        const auto* rep = p->getLivePhaseReport();
+        check (T != nullptr && pl != nullptr && rep != nullptr, "  a template, a plan and a report are all live");
+        if (T != nullptr && pl != nullptr && rep != nullptr)
+        {
+            std::printf ("    template %d partials; plan n=%d analysed=%d sets=%d;"
+                         " crest chosen %.4f vs hash %.4f (last span %.4f vs %.4f)\n",
+                         (int) T->partials.size(), pl->n, rep->analysed, pl->numSets,
+                         rep->crestChosen, rep->crestHash,
+                         rep->crestChosenLastSpan, rep->crestHashLastSpan);
+            check (pl->valid(), "  the published plan is valid");
+            check (pl->n == (int) T->partials.size(),
+                   "  ...and it covers exactly the template it was measured on - a plan of a"
+                   " different length is a plan of a different spectrum");
+            // The guarantee, at both ends of the ladder. kUnmeasured is not a pass:
+            // a plan that measured nothing must say so by being invalid, not by
+            // carrying sentinels past a comparison.
+            // kUnmeasured is -1, a SENTINEL BELOW every real crest and not a ceiling. The
+            // first spelling of this compared "< kUnmeasured", which is false for every
+            // real number and failed a plan that had measured perfectly well.
+            const bool measured = rep->measured && rep->crestChosen > 0.0 && rep->crestHash > 0.0;
+            check (measured, "  the report really measured a crest (not the kUnmeasured sentinel)");
+            if (measured)
+            {
+                check (rep->crestChosen <= rep->crestHash * 1.0001,
+                       "  the chosen set is never worse than the hash it replaces, at span 0");
+                if (rep->crestChosenLastSpan > 0.0 && rep->crestHashLastSpan > 0.0)
+                    check (rep->crestChosenLastSpan <= rep->crestHashLastSpan * 1.0001,
+                           "  ...and at the LAST span of the ladder, which is the one that"
+                           " refutes a single-window claim");
+            }
+        }
+    }
+
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
