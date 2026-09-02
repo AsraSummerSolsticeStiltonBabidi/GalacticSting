@@ -9239,6 +9239,32 @@ void FractalAdditiveAudioProcessorEditor::resized()
     }
 
     // Floating "silent settings" explainer, centred over everything.
+    // A VERTICAL FADER TOO NARROW FOR ITS NUMBER SHOWS NO NUMBER.
+    //
+    // Slider::resized() clamps the value box to the slider's own width, so a fader in a
+    // squeezed column keeps a box it cannot fill: the AMP DECAY fader is 11 px wide at
+    // the 700x550 floor, which leaves its label ONE pixel once juce::Label's own border
+    // is taken off, and "1.000" is then drawn condensed into nothing. The box also costs
+    // the fader 15 px of TRACK to say it - so the crushed state is worse in both
+    // directions at once.
+    //
+    // This is not a new rule: the PHASE fader beside it already drops its read-out below
+    // 96 px for exactly this reason, with the ends named in its tooltip. This applies the
+    // same rule to every fader configFader() built, from the same measurement.
+    //
+    // Run at the END of resized(), because that is the first moment every fader has its
+    // final bounds - and only when the answer CHANGES, since setTextBoxStyle rebuilds the
+    // label. Horizontal faders are left alone: they carry their box to the RIGHT, where
+    // the rule is a different one and its owner already applies it.
+    for (auto* s : configuredFaders)
+    {
+        if (s->getSliderStyle() != juce::Slider::LinearVertical) continue;
+        const int  want  = juce::jmax (46, fgfit::faderValueWidth (*s) + 2);
+        const bool fits  = s->getWidth() >= fgfit::faderValueWidth (*s);
+        const auto style = fits ? juce::Slider::TextBoxBelow : juce::Slider::NoTextBox;
+        if (s->getTextBoxPosition() != style)
+            s->setTextBoxStyle (style, false, want, 15);
+    }
     warningOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (580, 200));
     warningOverlay.toFront (false);
     noticeOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (560, 220));

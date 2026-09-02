@@ -529,6 +529,9 @@ namespace
     // is a fixed 1200x650 with every box placed by hand - so its floor is MEASURED, not
     // asserted: see findSmallestLaidOutSize.
     Size gEditorMin { 1200, 650 };
+    // The smallest size at which NOTHING is clipped - reported, never asserted. See
+    // findSmallestFullyLegibleSize for why the fit-problem count could not be the score.
+    Size gLegible { 0, 0 };
     Size minSize (Target t)
     {
         switch (t) { case tPlayground: return { 420, 380 };
@@ -738,6 +741,57 @@ namespace
     }
 
     //==========================================================================
+    // ...AND THE SMALLEST SIZE AT WHICH NOTHING IS CLIPPED.
+    //
+    // The floor above is a STRUCTURAL question: nothing collapsed, nothing outside the
+    // window, nothing with negative room for its own text. It is the right predicate for
+    // "which small size is worth photographing", and it has one property that makes it
+    // useless as a score: it MOVES. Every fix that stops a control collapsing lets the
+    // search walk further down, into sizes where more strings are cramped - so the
+    // fit-problem count at the floor went 314 -> 216 -> 160 -> 132 -> 106 -> 162 while the
+    // window under it shrank 750 -> 700 -> 690, and no two of those numbers compare.
+    //
+    // This one is monotone. A size only qualifies when EVERY string fits its box, so it
+    // can only come down as clipping is fixed, and it is one number rather than a count
+    // whose meaning depends on which window it was counted in. Reported, never asserted:
+    // it is a measurement of where the design currently stands.
+    //==========================================================================
+    Size findSmallestFullyLegibleSize (Ed& ed)
+    {
+        const Size start { 1600, 900 };
+        Size best { 0, 0 };
+        for (int lang = 0; lang < 2; ++lang)
+        {
+            ed.setLanguageForSnapshot (lang == 1);
+            const auto legible = [&ed] (bool ca)
+            {
+                for (const auto& f : ed.textFitProbeForTests (ca))
+                    if (f.over() > 0.5f) return false;
+                return true;
+            };
+            int w = start.w;
+            for (int trial = start.w; trial >= 640; trial -= 10)
+            {
+                ed.setSize (trial, start.h);
+                if (! laysOut (ed, lang == 1) || ! legible (lang == 1)) break;
+                w = trial;
+            }
+            int h = start.h;
+            for (int trial = start.h; trial >= 360; trial -= 10)
+            {
+                ed.setSize (w, trial);
+                if (! laysOut (ed, lang == 1) || ! legible (lang == 1)) break;
+                h = trial;
+            }
+            say (juce::String ("  smallest fully legible size (") + (lang == 1 ? "ca" : "en") + "): "
+                 + juce::String (w) + " x " + juce::String (h));
+            best.w = juce::jmax (best.w, w);
+            best.h = juce::jmax (best.h, h);
+        }
+        return best;
+    }
+
+    //==========================================================================
     // THE WALK.
     //==========================================================================
     struct View { bool catalan; Size size; float scale; };
@@ -797,6 +851,7 @@ namespace
             {
                 ed->setNoteNamesForSnapshot (false);   // the shipped default, not this machine's
                 gEditorMin = findSmallestLaidOutSize (*ed);
+                gLegible = findSmallestFullyLegibleSize (*ed);
             }
             say ("  editor floor used by the matrix: "
                       + juce::String (gEditorMin.w) + " x " + juce::String (gEditorMin.h));
@@ -1110,7 +1165,9 @@ namespace
                   + juce::String (gMojibake.size()) + " not decoded, "
                   + juce::String (gUntranslated.size()) + " not translated, "
                   + juce::String (gStructural.size()) + " structural, floor "
-                  + juce::String (gEditorMin.w) + "x" + juce::String (gEditorMin.h));
+                  + juce::String (gEditorMin.w) + "x" + juce::String (gEditorMin.h)
+                  + ", fully legible at "
+                  + juce::String (gLegible.w) + "x" + juce::String (gLegible.h));
     }
 } // namespace
 
