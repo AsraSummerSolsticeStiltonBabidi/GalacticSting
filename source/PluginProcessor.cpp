@@ -3359,6 +3359,8 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     // BEFORE the compile below publishes a template to measure.
     spectrumEngine.setRenderRate (sampleRate);
     spectrumEngine.buildNow (lastPushed);
+    // ...and ask the worker to plan it, off the message thread (see requestPlan).
+    spectrumEngine.requestPlan();
 
     applyTuningMode ((int) apvts.getRawParameterValue ("tuningMode")->load());
     // The voice pool and the latency budget both depend on things prepareToPlay is the

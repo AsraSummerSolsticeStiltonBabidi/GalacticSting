@@ -125,13 +125,34 @@ namespace spectrum
         // actual compile work. That race is most of why the rhythm suite could report
         // 2, 3, 11, 12, 17 and 19 failures from the same binary at the same commit.
         //
+        // ASK THE WORKER TO PLAN THE LIVE TEMPLATE, without compiling anything.
+        //
+        // prepareToPlay compiles SYNCHRONOUSLY (buildNow) and deliberately does not plan:
+        // 38 ms on the message thread is a lost frame, measured. That left the template a
+        // session opens with - the one the FIRST note plays - as the only one with no
+        // plan, until the user happened to change something. This closes that without
+        // putting a millisecond back on the message thread: the worker wakes, plans the
+        // slot that is already live, and publishes nothing.
+        //
+        // Counted in isBuildPending() so awaitSpectrumIdle() and the verifiers wait for it
+        // like they wait for a compile - a plan that lands after the check looked is a
+        // plan the check will call missing.
+        void requestPlan()
+        {
+            {
+                const std::lock_guard<std::mutex> lk (requestMutex);
+                hasPlanRequest = true;
+            }
+            wakeUp.signal();
+        }
+
         // The pending flag and `working` are read together under the request lock, and the
         // worker sets `working` under that same lock as it clears the flag, so there is no
         // instant where a job is neither pending nor in flight.
         bool isBuildPending() const
         {
             const std::lock_guard<std::mutex> lk (requestMutex);
-            return hasRequest || hasBlend || working.load (std::memory_order_acquire);
+            return hasRequest || hasBlend || hasPlanRequest || working.load (std::memory_order_acquire);
         }
 
         int  getPartialCount() const noexcept { return liveCount.load(); }
@@ -321,7 +342,7 @@ namespace spectrum
 
                 SpectrumSettings s;
                 BlendJob job;
-                bool have = false, haveBlend = false;
+                bool have = false, haveBlend = false, havePlan = false;
                 unsigned long long epoch = 0;
                 {
                     const std::lock_guard<std::mutex> lk (requestMutex);
@@ -330,11 +351,17 @@ namespace spectrum
                     // definition from the settings the blend supersedes.
                     if (hasBlend)        { job = blend;     hasBlend   = false; haveBlend = true; epoch = pubEpoch; }
                     else if (hasRequest) { s   = requested; hasRequest = false; have      = true; epoch = pubEpoch; }
+                    // A bare plan request is the lowest priority of the three: a compile
+                    // or a blend will publish a NEW template and plan it anyway, which
+                    // makes this one moot.
+                    if (! have && ! haveBlend && hasPlanRequest) { hasPlanRequest = false; havePlan = true; }
                     // Taken under the SAME lock that clears the pending flag, so there is
                     // no instant at which isBuildPending() can see neither the request nor
                     // the work - which is the whole point of it (see that function).
-                    working.store (have || haveBlend, std::memory_order_release);
+                    working.store (have || haveBlend || havePlan, std::memory_order_release);
                 }
+
+                if (havePlan && ! abortBuild.load()) planLive();
 
                 if (haveBlend)
                 {
@@ -544,6 +571,7 @@ namespace spectrum
         std::mutex        buildMutex;
         SpectrumSettings  requested;
         bool              hasRequest = false;
+        bool              hasPlanRequest = false;   // plan the live slot, compile nothing
         BlendJob          blend;                  // guarded by requestMutex
         bool              hasBlend   = false;     // coalesced: the latest point wins
         // Guarded by requestMutex. Bumped by publishNow so a build that started earlier

@@ -488,11 +488,6 @@ public:
     // that is never worse than the hash is a claim, and a claim nobody measures is a
     // comment. Not used by the audio path yet: this publishes and checks the plan, the
     // voice consuming it is the next step.
-    // Measure the live template's plan on THIS thread. The worker does this behind its
-    // own publishes; the verifiers call it directly rather than trying to guess when the
-    // worker was scheduled - it is the same function, and what is under test is the plan,
-    // not the scheduling.
-    void planLiveNowForTests() { spectrumEngine.planLive(); }
     const spectrum::phaseset::PhasePlan* getLivePhasePlan() const noexcept
     { return spectrumEngine.getLivePlan(); }
     const spectrum::phaseset::PhaseReport* getLivePhaseReport() const noexcept

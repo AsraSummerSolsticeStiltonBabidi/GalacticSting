@@ -13732,10 +13732,9 @@ int main (int argc, char** argv)
         auto p = std::make_unique<FractalAdditiveAudioProcessor>();
         p->prepareToPlay (48000.0, 256);
         awaitSpectrumIdle (*p, "run 55: the default template");
-        // The worker plans behind its own publishes; the verifier calls the same function
-        // directly rather than guessing when the worker was scheduled. What is under test
-        // is the plan and its guarantee, not the thread that happened to run it.
-        p->planLiveNowForTests();
+        // prepareToPlay asks the worker for a plan (requestPlan), and awaitSpectrumIdle
+        // above counts that request as pending - so by here the plan is either measured
+        // or the engine is telling us it will not be.
         const auto* T   = p->getLiveTemplate();
         const auto* pl  = p->getLivePhasePlan();
         const auto* rep = p->getLivePhaseReport();
