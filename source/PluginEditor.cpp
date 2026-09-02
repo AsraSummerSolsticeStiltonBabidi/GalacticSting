@@ -1446,6 +1446,15 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         {
             cb->setColour (juce::ComboBox::outlineColourId, cCustom.withAlpha (0.7f));
             cb->setMouseClickGrabsKeyboardFocus (false);
+            // SMALL-ITEM BOXES. These three hold PHRASES - "Fundamental / 2^n",
+            // "Restart each note" - not one-word modes, and at LookAndFeel_V4's default
+            // (16 px, which getLabelFont then draws BOLD) the rate mode needed 129 px in
+            // the 108 it had and was drawn shrunk. The hatch exists for exactly this: a
+            // box whose item is a sentence sitting under a painted sub-label, where the
+            // sub-label is what the eye reads first and the item only has to be legible.
+            // All three together, not the one that overflowed, or the row would carry two
+            // different type sizes side by side.
+            cb->setName (fgfit::kSmallComboName);
             addChildComponent (*cb);
         }
         lfoWaveBox.onChange     = [this] { resized(); }; // Draw button appears with "Custom (draw)"
@@ -2451,6 +2460,13 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     segHelpLbl.setJustificationType (juce::Justification::topLeft);
     segHelpLbl.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
     segHelpLbl.setFont (juce::Font (juce::FontOptions (10.5f)));
+    // ...and the painter has to KEEP that 10.5, which it only does through the "small"
+    // escape hatch: GalacticLnF::getLabelFont puts a 12.5 px BOLD floor under every other
+    // label, and drawLabel asks IT, not the font set here. At 12.5 px only ONE line fits
+    // this 26 px box, so a two-line hint was drawn as one line squashed to 70% - the
+    // silent condensation a juce::Label does instead of clipping. This is the same class
+    // of hint as the play-keys line, which is what the hatch was made for.
+    segHelpLbl.setName ("small");
     addAndMakeVisible (segHelpLbl);
 
     // Spectrum Builder: typed intervals -> partials (Enter applies them).
@@ -3262,7 +3278,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // Help popup text (the "?" button). fromUTF8 directly: tr()'s English branch
     // does not decode UTF-8 accents.
     rhythmPanel.helpText = juce::String::fromUTF8 (catalan
-        ? "ENCAMINAMENT (qualsevol DAW):\nEn una altra pista d'instrument, tria com a ENTRADA MIDI la SORTIDA MIDI d'aquest plugin (no l'entrada de la pista del Fibl\xc3\xb3!) i activa el monitoratge d'entrada.\nA Ableton: MIDI From -> pista del Fibl\xc3\xb3 -> 2n selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In.\n\nTEMPO DEL DAW (CC20):\n. Ableton (f\xc3\xa0" "cil): arrossega el dispositiu Max for Live \"Fibl\xc3\xb3 Tempo Sync\" (a User Library > Presets > MIDI Effects) a una pista MIDI que rebi la sortida del Fibl\xc3\xb3, i activa Sync de tempo. Sense mapejar res: el tempo segueix el pols 1.\n. Altres DAW (Reaper, FL...): instal\xc2\xb7la loopMIDI (gratu\xc3\xaft), crea un port; envia la sortida MIDI del Fibl\xc3\xb3 a aquest port; al DAW, mapeja el tempo a l'entrada loopMIDI (rang 20-147) i activa Sync de tempo.\n\nLAT\xc3\x88NCIA: els polsos surten clavats a la mostra; el DAW pot afegir un buffer al MIDI entre pistes - fes servir un buffer petit."
+        ? "ENCAMINAMENT (qualsevol DAW):\nEn una altra pista d'instrument, tria com a ENTRADA MIDI la SORTIDA MIDI d'aquest plugin (no l'entrada de la pista del Fibl\xc3\xb3!) i activa el monitoratge d'entrada.\nA Ableton: MIDI From -> pista del Fibl\xc3\xb3 -> 2n selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In.\n\nTEMPO DEL DAW (CC20):\n. Ableton (f\xc3\xa0" "cil): arrossega el dispositiu Max for Live \"Fibl\xc3\xb3 Tempo Sync\" (a User Library > Presets > MIDI Effects) a una pista MIDI que rebi la sortida del Fibl\xc3\xb3, i activa Sync de tempo. Sense mapejar res: el tempo ix el pols 1.\n. Altres DAW (Reaper, FL...): instal\xc2\xb7la loopMIDI (gratu\xc3\xaft), crea un port; envia la sortida MIDI del Fibl\xc3\xb3 a aquest port; al DAW, mapeja el tempo a l'entrada loopMIDI (rang 20-147) i activa Sync de tempo.\n\nLAT\xc3\x88NCIA: els polsos surten clavats a la mostra; el DAW pot afegir un buffer al MIDI entre pistes - fes servir un buffer petit."
         : "ROUTING (any DAW):\nOn another instrument track, choose this plugin's MIDI OUTPUT as the track's MIDI INPUT (not the Fibl\xc3\xb3 track's own input!) and enable input monitoring.\nIn Ableton: MIDI From -> the Fibl\xc3\xb3 track -> 2nd selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In.\n\nDAW TEMPO (CC20):\n. Ableton (easy): drag the Max for Live device \"Fibl\xc3\xb3 Tempo Sync\" (in User Library > Presets > MIDI Effects) onto a MIDI track that receives the Fibl\xc3\xb3's MIDI output, and turn Tempo sync on. No mapping needed - the tempo follows pulse 1.\n. Other DAWs (Reaper, FL...): install loopMIDI (free), create a port; send the Fibl\xc3\xb3's MIDI output to that port; in the DAW, MIDI-map the tempo to the loopMIDI input (range 20-147) and turn Tempo sync on.\n\nLATENCY: pulses leave sample-locked; the DAW may add one buffer to inter-track MIDI - use a small buffer size.");
     rhythmPanel.mpeT.setButtonText ("MPE out");
     rhythmPanel.mpeT.setTooltip (tr (
@@ -3367,8 +3383,11 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     segTopToggle.setButtonText (tr ("= top", "= sup"));
     segTopToggle.setTooltip (tr ("Use the highest selected partial as the period (instead of the typed value).",
                                  "Fes servir el parcial seleccionat m\xc3\xa9s agut com a per\xc3\xado" "de (en lloc del valor escrit)."));
-    segHelpLbl.setText (tr ("Click partials to add them to the scale; Shift-click for a range. Lowest selected = tonic (C3).",
-                            "Clica parcials per afegir-los a l'escala; Shift-clic per un rang. El m\xc3\xa9s greu seleccionat = t\xc3\xb2nica (C3)."),
+    // Short enough for the two lines the box really has (192 px at 10.5 px, so ~380 px of
+    // room): the old sentence needed 529 and was drawn condensed. "Lowest = tonic" says
+    // what "Lowest selected = tonic" said - only selected partials are in the scale.
+    segHelpLbl.setText (tr ("Click a partial to add it; Shift-click a range. Lowest = tonic (C3).",
+                            "Clica un parcial per afegir-lo; Shift-clic un rang. El m\xc3\xa9s greu = t\xc3\xb2nica (C3)."),
                         juce::dontSendNotification);
     segList.tip = tr ("Each partial of the current spectrum. Click to add/remove it as a scale degree (live). Shift-click selects the span to the last click. The lowest selected is the tonic (C3); all selected share one colour.",
                       "Cada parcial de l'espectre actual. Clica per afegir/treure'l com a grau de l'escala (en viu). Shift-clic selecciona el tram fins a l'\xc3\xbaltim clic. El m\xc3\xa9s greu seleccionat \xc3\xa9s la t\xc3\xb2nica (C3); tots els seleccionats comparteixen color.");
@@ -3969,6 +3988,22 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         rhythmPanel.refreshSlots();
         rhythmPanel.refreshLive();
         timerCallback();
+    }
+    // EVERY FADER'S VALUE BOX IS AS WIDE AS THE VALUE IT SHOWS.
+    //
+    // Done here, and not in configFader, because here every piece is finally in place:
+    // the attachment's text function, the suffix the caller sets afterwards, and the
+    // language, which can change a unit word. Slider::resized() clamps the box to the
+    // slider's width, so this is a ceiling and not a promise - but a box that asks for
+    // less than its own text needs can never be honest, whatever the column does.
+    //
+    // 46 stays the floor, so nothing that fitted before gets narrower, and the style is
+    // only re-set when the number actually changes: setTextBoxStyle rebuilds the label.
+    for (auto* s : configuredFaders)
+    {
+        const int want = juce::jmax (46, fgfit::faderValueWidth (*s) + 2);
+        if (s->getTextBoxWidth() != want)
+            s->setTextBoxStyle (juce::Slider::TextBoxBelow, false, want, 15);
     }
     repaint(); // title uses the language
 }
@@ -7135,6 +7170,12 @@ void FractalAdditiveAudioProcessorEditor::configFader (juce::Slider& s, const ju
     s.onDragEnd = [this] { refocus(); };
     addAndMakeVisible (s);
     att = std::make_unique<SliderAttachment> (processorRef.apvts, paramID, s);
+    // Remembered so the value boxes can be sized ONCE, later, when every fader's text is
+    // final: the suffix (" ms", " c", " %") is set by the caller AFTER this function
+    // returns, and the parameter's own text function arrives with the attachment on the
+    // line above. Measured here, "120.0 ms" measures as "120.0" - which is exactly how
+    // the glide fader ended up with a 46 px box it could not fill honestly.
+    configuredFaders.push_back (&s);
     // Double-click ANY fader = straight back to its default value.
     if (auto* prm = processorRef.apvts.getParameter (paramID))
         s.setDoubleClickReturnValue (true, prm->convertFrom0to1 (prm->getDefaultValue()));
@@ -8431,7 +8472,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 {
                     const bool isExtra = i < extras[t];
                     if (! on || ! isExtra) { sets[t][i]->setVisible (false); labs[t][i]->setVisible (false); continue; }
-                    auto c = area2.removeFromLeft (juce::jmax (34, in.getWidth() / 7));
+                    // The column is at least as wide as this fader's own read-out needs:
+                    // the flat 34 knew nothing about the value box inside it, which is how
+                    // the glide fader ended up drawing "120.0 ms" condensed to 70% in a
+                    // 24 px label. Still at least 34, so nothing that fitted gets narrower.
+                    const int colW = juce::jmax (34, fgfit::faderValueWidth (*sets[t][i]),
+                                                 in.getWidth() / 7);
+                    auto c = area2.removeFromLeft (juce::jmin (colW, juce::jmax (34, area2.getWidth())));
                     sets[t][i]->setVisible (true);
                     labs[t][i]->setVisible (true);
                     labs[t][i]->setBounds (c.removeFromTop (13));
@@ -8526,7 +8573,25 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 else
                 {
                     auto combos = in.removeFromTop (20);
-                    lfoWaveBox.setBounds (combos.removeFromLeft (combos.getWidth() / 2).reduced (1, 0));
+                    // SPLIT BY WHAT EACH BOX HOLDS, not down the middle. The wave box
+                    // shows one short word; the rate-mode box shows "Fundamental / 2^n",
+                    // which needs 129 px and was being handed 108 - clipped at the shipped
+                    // size, in both languages, while the PHASE box below it (shorter
+                    // items) had the whole row to itself. fgfit::snugComboWidth is the
+                    // same rule the six narrowed controls elsewhere use, measured in the
+                    // font the item is really drawn in.
+                    const int waveNeed = fgfit::snugComboWidth (lfoWaveBox, 20);
+                    const int rateNeed = fgfit::snugComboWidth (lfoRateModeBox, 20);
+                    // Both fit: each takes what it needs and the leftover goes to the
+                    // rate box, which is the one whose items grow with translation.
+                    // Neither fits: they share in PROPORTION to what they asked for, so
+                    // the shortfall is not paid entirely by whichever comes first.
+                    const int rowW = combos.getWidth();
+                    int waveW = waveNeed;
+                    if (waveNeed + rateNeed > rowW && waveNeed + rateNeed > 0)
+                        waveW = rowW * waveNeed / (waveNeed + rateNeed);
+                    waveW = juce::jlimit (24, juce::jmax (24, rowW - 24), waveW);
+                    lfoWaveBox.setBounds (combos.removeFromLeft (waveW).reduced (1, 0));
                     lfoRateModeBox.setBounds (combos.reduced (1, 0));
                     in.removeFromTop (2);
                     lfoPhaseModeBox.setBounds (in.removeFromTop (20).reduced (1, 0));

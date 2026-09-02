@@ -177,6 +177,35 @@ namespace fgfit
         return comboWidthForItem (w, h) + kSnugPad;
     }
 
+
+    // A VERTICAL fader is never narrower than the value it reads out.
+    //
+    // Slider::resized() clamps the text box to the slider's own width, so a 46 px box
+    // asked for in configFader becomes 34 - and 24 after juce::Label's own {1,5,1,5}
+    // border. "120.0 ms" needs 39 there, so the glide fader's read-out was drawn
+    // condensed to 70%: not clipped, not out of bounds, just quietly unreadable, which is
+    // exactly the failure a bounds check cannot see.
+    //
+    // Measured from the slider's OWN text ACROSS its range, in the 10 px face
+    // GalacticLnF::getLabelFont gives a slider's child label - so renaming a suffix or
+    // widening a range moves the column with it, instead of leaving a magic 34 behind.
+    //
+    // Across the range, not just at the ends: the widest string is not always at an
+    // endpoint - one more decimal can cost more than one more digit saves. Measured, the
+    // glide fader's widest IS its maximum ("5000.0 ms"), so today this sampling changes
+    // no column; it is here so that the next fader whose middle reads wider than its ends
+    // does not have to be found on the glass. Stated plainly because it earns nothing
+    // right now: removing it and measuring the ends alone leaves the rig at zero.
+    inline int faderValueWidth (const juce::Slider& s)
+    {
+        const juce::Font f (juce::FontOptions (10.0f));
+        auto& sl = const_cast<juce::Slider&> (s);
+        float w = 0.0f;
+        for (int i = 0; i <= 32; ++i)
+            w = juce::jmax (w, juce::GlyphArrangement::getStringWidth (
+                                   f, sl.getTextFromValue (sl.proportionOfLengthToValue ((double) i / 32.0))));
+        return (int) std::ceil (w) + 10;   // the label's own left+right border
+    }
     // juce::Label: drawLabel works inside getBorderSize(), in getLabelFont()'s face.
     inline juce::Font labelFont (const juce::Label& l)
     { return l.getLookAndFeel().getLabelFont (const_cast<juce::Label&> (l)); }
@@ -585,6 +614,9 @@ private:
     // value - so picking e.g. the right sustain point under modulation is visual,
     // not guesswork. Polled on the existing 30 Hz timer; see timerCallback().
     std::vector<juce::Slider*> modWatchSliders;
+    // Every fader configFader() built, so their value boxes can be sized to the text they
+    // really show - which is only knowable after the suffixes are set. See applyLanguage().
+    std::vector<juce::Slider*> configuredFaders;
     void refreshModWatch();
     void configCombo (juce::ComboBox&, const juce::String& paramID,
                       std::unique_ptr<ComboBoxAttachment>&, juce::Colour, const juce::String& tooltip);
