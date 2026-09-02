@@ -157,6 +157,17 @@ namespace fgfit
     namespace chip
     {
         inline constexpr int kHeight = 19;  // the band a chip row occupies, chips filling it
+        // A CHIP STRIP STANDS IN A CONTROL ROW, not in a band of its own height.
+        //
+        // The strip and the panel beside it start on the same y, and a 19 px chip next to
+        // a 24 px combo puts their two words 2.5 px apart - a line across the window that
+        // is very nearly straight, which reads worse than one that obviously is not. The
+        // chip keeps its own 19 px (it is shared with the engine strip, and growing it
+        // would move that too); it is CENTRED in a row's height instead, which lands both
+        // baselines on the same pixel.
+        inline constexpr int kRowHeight = 24;
+        inline juce::Rectangle<int> centreInRow (juce::Rectangle<int> row)
+        { return row.withSizeKeepingCentre (row.getWidth(), kHeight); }
         inline constexpr int kInsetX = 1;   // air each chip keeps either side of itself
         // A chip's own width: its word in the font that height gives it, the painter's
         // own 4 px a side, and the same kSnugPad every other control in this window is

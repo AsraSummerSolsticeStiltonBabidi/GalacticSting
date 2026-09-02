@@ -13094,6 +13094,36 @@ int main (int argc, char** argv)
                            "  ...as even thirds - the extra height is air around each control,"
                            " never two cells that swell and a third capped at 40 px");
 
+                    //-- the chip strip and the mode box start on the same line ---------
+                    // They are in different panels, side by side, and their first rows
+                    // begin at the same y - so the two words in them read as one line
+                    // across the window. A 19 px chip in a band of its own height next to
+                    // a 24 px combo put those words 2.5 px apart, which is worse than an
+                    // obvious misalignment: it reads as a mistake nobody can name. The
+                    // chip keeps its 19 px (the engine strip shares that number) and
+                    // stands centred in a control row instead.
+                    {
+                        auto rectOf = [&L] (const char* n)
+                        {
+                            for (const auto& c : L.controls) if (c.first == n) return c.second;
+                            return juce::Rectangle<int>();
+                        };
+                        const auto chip = rectOf ("mod.tabAmp");
+                        const auto mode = rectOf ("tun.mode");
+                        if (! chip.isEmpty() && ! mode.isEmpty() && chip.getY() < mode.getBottom()
+                            && mode.getY() < chip.getBottom())
+                        {
+                            const int dc = std::abs ((chip.getY() + chip.getHeight() / 2)
+                                                     - (mode.getY() + mode.getHeight() / 2));
+                            std::printf ("  %-12s chip strip centre vs mode box centre: %d px\n",
+                                         where.toRawUTF8(), dc);
+                            check (dc <= 1,
+                                   "  the chip strip and the mode box beside it share a centre line"
+                                   " - a 19 px chip stands centred in a control row, not in a band"
+                                   " of its own height");
+                        }
+                    }
+
                     //-- TUNING: the slack is shared out, not pooled -------------------
                     std::vector<juce::Rectangle<int>> rows;
                     for (const char* n : rowAnchors)

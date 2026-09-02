@@ -8607,7 +8607,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             };
             if (! chipsWrap)
             {
-                shareOut (in.removeFromTop (fgfit::chip::kHeight), 0, 4);
+                shareOut (fgfit::chip::centreInRow (in.removeFromTop (fgfit::chip::kRowHeight)), 0, 4);
             }
             else
             {
@@ -8617,7 +8617,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 for (int row = 0; row < 2; ++row)
                 {
                     if (row == 1) in.removeFromTop (2);
-                    shareOut (in.removeFromTop (fgfit::chip::kHeight), row * 2, 2);
+                    shareOut (fgfit::chip::centreInRow (in.removeFromTop (fgfit::chip::kRowHeight)), row * 2, 2);
                 }
             }
             for (int k = 0; k < 4; ++k)
