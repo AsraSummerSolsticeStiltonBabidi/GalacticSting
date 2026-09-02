@@ -36,9 +36,26 @@ FetchContent_MakeAvailable(JUCE)
 #-------------------------------------------------------------------------------
 juce_add_plugin(FractalAdditive
     COMPANY_NAME                "Asra3"
-    BUNDLE_ID                   com.asrabeats.fractaladditive
+    BUNDLE_ID                   com.asrabeats.fiblogalactic
     PLUGIN_MANUFACTURER_CODE    Asrb
-    PLUGIN_CODE                 Frac
+    # A SEPARATE PLUGIN FROM "Galactic Sting", ON PURPOSE.
+    #
+    # JUCE builds the VST3 class ID out of the manufacturer code and this one, so while
+    # this read `Frac` the new bundle and the installed "Galactic Sting.vst3" carried the
+    # SAME CID (...4173726246726163, which is "AsrbFrac" in ASCII) under two different
+    # filenames. A host that finds one identity in two files picks one of them, and which
+    # one it picks is not something a project file can express - so an old session could
+    # silently come back on the new binary, or the reverse.
+    #
+    # The two are now different plugins. Old projects resolve to "Galactic Sting" and open
+    # the old binary, which is what its presets were written against; this one is offered
+    # beside it under its own name. Deliberately NOT a compatibility shim: the user asked
+    # for the separation rather than for the old state to be carried forward.
+    #
+    # The user's preset folder is untouched by this - Documents/Galactic Sting/Presets is
+    # a path in the source, not something derived from the plugin code - so every .gsting
+    # file still loads here.
+    PLUGIN_CODE                 Fbgl
     IS_SYNTH                    TRUE
     NEEDS_MIDI_INPUT            TRUE
     NEEDS_MIDI_OUTPUT           TRUE          # timbre->rhythm MIDI out (RhythmEngine)
