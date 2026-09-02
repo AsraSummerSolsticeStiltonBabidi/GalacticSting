@@ -3806,7 +3806,27 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // as a different font (RhythmVerify measured exactly that on the word this replaces).
     adaptRegLbl.setText      (tr ("Periods", "Per\xc3\xado" "des"), dontSendNotification);
     refreshAdaptButtonText();
-    adaptAmpsToggle.setButtonText (tr ("+ amps", "+ amplituds"));
+    // THE TICK IS THE "+".
+    //
+    // "+ amplituds" needed 75.11 px of the 62 its cell left it and drew 13.11 px past the
+    // toggle at the SHIPPED 1200x650, and again at the 870x540 floor - a ToggleButton
+    // does not clip its word, it just draws it over whatever is to its right.
+    //
+    // Nowhere in this column can hold it. The content is 192 px wide at EVERY window size
+    // the product ships (the column is a flat 208 from the floor to 1200x650), a
+    // ToggleButton spends 28 px of its width on the tick box and its gap before a letter
+    // is drawn, and the widest slot any row here can free is 102 px - two pixels short of
+    // the 104 the Catalan wanted. A row of its own is the one thing that would fit it and
+    // it is the one thing this panel cannot pay for: the adapted-partial list is the
+    // LEFTOVER of this column, RhythmVerify holds it to three unscrolled rows, and in the
+    // goal-Range shape it is already down to 56 px of the 54 that bar demands.
+    //
+    // So the LABEL gives way, and what it gives up is the "+" - which the tick box was
+    // already saying. A checkbox reading "amplitudes" is a checkbox that turns amplitudes
+    // on; the "+" was a second copy of the tick, in the row's most expensive pixels. Both
+    // languages drop it, so the two still say the same thing, and the noun each keeps is
+    // its own real word rather than an abbreviation shared out of desperation.
+    adaptAmpsToggle.setButtonText (tr ("amps", "amplituds"));
     chordRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
     adaptRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
     adaptTargetBox.setTooltip (tr (
@@ -7738,13 +7758,18 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // side that CAN hold: the values end where the row ends, which is also where
             // the Notes row's Min/Max box and the buttons under them end.
             // In the adaptation the period is not the last thing on its row - the
-            // "+ amplitudes" toggle follows it - so there it stays left, beside the
+            // amplitudes toggle follows it - so there it stays left, beside the
             // caption it belongs to.
             if (adapt)
             {
                 chordPeriodEdit.setBounds (r2.removeFromLeft (44).reduced (0, 1));
-                r2.removeFromLeft (6);
-                adaptAmpsToggle.setBounds (r2);      // "+ amplitudes"
+                // ...and the toggle takes EVERY remaining pixel of the row. The 6 px gap
+                // that used to be spent here bought nothing: LookAndFeel_V4 draws the tick
+                // box 4 px in from the button's own left edge, so the air was already
+                // there and the gap was 6 px of it taken off the one control on this row
+                // that had none to spare (see the button text in applyLanguage - the
+                // Catalan word is 13.11 px longer than the box it was drawn in).
+                adaptAmpsToggle.setBounds (r2);
             }
             else
                 chordPeriodEdit.setBounds (r2.removeFromRight (juce::jmin (44, r2.getWidth()))
