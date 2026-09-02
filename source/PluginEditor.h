@@ -3817,6 +3817,7 @@ private:
         // spectra, and the fidelity rule is that a CPU limit is a control the user
         // holds, never a cap the code hides.
         juce::Label        voicesLbl;
+        juce::String       voicesBaseText;   // see the mono-glide suffix in the timer
         juce::Slider       voicesSlider { juce::Slider::IncDecButtons, juce::Slider::TextBoxLeft };
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> voicesAtt;
         PlaygroundPad      pad;
@@ -3988,8 +3989,12 @@ private:
                                               "motor complet, i el punt equilibra els seus volums (pot\xc3\xa8ncia "
                                               "constant). El teu patch no es toca i torna quan en surts.")
                                        : juce::String());
-            voicesLbl.setText (trF ? trF ("Mix voices per corner", "Veus de mescla per cantonada")
-                                   : juce::String ("Mix voices per corner"), juce::dontSendNotification);
+            // Kept as a member because the mono-glide state appends to it every tick, and
+            // re-deriving it there would need trF at a point where the language may have
+            // changed since - the suffix must never end up bolted onto itself.
+            voicesBaseText = trF ? trF ("Mix voices per corner", "Veus de mescla per cantonada")
+                                 : juce::String ("Mix voices per corner");
+            voicesLbl.setText (voicesBaseText, juce::dontSendNotification);
             voicesSlider.setTooltip (trF ? trF ("Polyphony of EACH corner engine in mix mode. Mix runs up to five "
                                                 "engines at once (four corners plus your patch tracking "
                                                 "underneath), so this is the CPU trade-off - a visible one, never "
@@ -4163,6 +4168,20 @@ private:
                               && proc->apvts.getRawParameterValue ("monoGlide")->load() > 0.5f;
             voicesSlider.setEnabled (mode == 1 && ! monoNow);
             voicesLbl.setAlpha (mode == 1 && ! monoNow ? 1.0f : 0.45f);
+            // ...and SAY WHICH NUMBER IS IN FORCE. Greying the control tells the user it is
+            // not theirs to move; it does not stop the box reading 8 while every corner
+            // engine is actually running ONE voice, which is a control displaying a number
+            // that is not the one the synth is using. The status line explains the rule in
+            // prose, but prose below a box showing "8" loses to the box. The suffix is on
+            // the LABEL rather than the slider's own text box because that box is driven by
+            // the parameter attachment - writing a display value there would either fight
+            // the attachment or, worse, move the parameter and lose what the user chose.
+            voicesLbl.setText (voicesBaseText
+                                   + (monoNow ? (trF ? trF (" - 1 while glide is on",
+                                                            " - 1 mentre el glide \xc3\xa9s actiu")
+                                                     : juce::String (" - 1 while glide is on"))
+                                              : juce::String()),
+                               juce::dontSendNotification);
 
             juce::String s;
             if (n < 2)
