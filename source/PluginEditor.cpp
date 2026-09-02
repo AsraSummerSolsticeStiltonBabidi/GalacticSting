@@ -9035,7 +9035,22 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 auto sh = shepRow;
                 shepOnT.setBounds (sh.removeFromLeft (86));
                 sh.removeFromLeft (4);
-                compact (shepModeBox, sh.removeFromLeft (juce::jmin (needFor (shepModeBox, 94), sh.getWidth())));
+                // THE RATE CONTROL'S MINIMUM IS RESERVED BEFORE THE MODE BOX IS SIZED.
+                //
+                // The mode box took whatever its widest item asked for and the rate
+                // control got the remainder - which at the 870x540 floor is FOUR PIXELS.
+                // A 4 px ComboBox has negative room once its chevron and insets are taken
+                // off: nothing to read, nothing to click, and the rig counted it as a text
+                // problem because the box was inside its row and had a positive width.
+                // The mode names the control; it cannot be allowed to eat it.
+                //
+                // 46 px is the least a beats box ("1/16") or a millisecond fader can be
+                // and still be one, and the mode box keeps everything above that.
+                const bool sync = shepModeBox.getSelectedId() == 2;
+                const int  kRateMin = 46;
+                const int  modeRoom = juce::jmax (46, sh.getWidth() - 6 - kRateMin);
+                compact (shepModeBox, sh.removeFromLeft (juce::jmin (needFor (shepModeBox, 94),
+                                                                     juce::jmin (modeRoom, sh.getWidth()))));
                 sh.removeFromLeft (6);
                 // The rise interval keeps its own line (see riseRow above), right under
                 // the mode box it belongs to, so the rate control keeps a usable width.
@@ -9045,7 +9060,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     auto rr = riseRow.withTrimmedLeft (86 + 4);
                     compact (shepRiseBox, rr.removeFromLeft (juce::jmin (needFor (shepRiseBox, 108), rr.getWidth())));
                 }
-                const bool sync = shepModeBox.getSelectedId() == 2;
                 shepTimeFader.setVisible (! sync);
                 shepDivBox.setVisible (sync);
                 // The beats box holds "1/16".."16": it never needed 86 px, and the room

@@ -315,6 +315,23 @@ namespace
         for (const auto& f : fits)
         {
             const bool bad = f.over() > 0.5f;
+            // NEGATIVE ROOM IS NOT A TIGHT FIT, IT IS A BROKEN CONTROL.
+            //
+            // A ComboBox whose width is smaller than its own chevron and insets reports a
+            // negative `avail`: there is no room for any text at all, and there is nothing
+            // to click either. The Shepard beats box was laid out 4 px wide at the floor
+            // (avail -16) because the mode box beside it took whatever its widest item
+            // asked for and left the remainder. It counted as one text-fit problem among
+            // hundreds, and the layout's own "does it lay out" predicate passed it,
+            // because the box had a positive WIDTH.
+            //
+            // Reported with the note the structural gate classifies on, so this can never
+            // come back as a number in a list nobody reads.
+            if (f.avail < 0.0f || f.availH < 0.0f)
+                problems.add (obj ({ { "where", qs (f.path + " (" + f.kind + ") \"" + f.text + "\"") },
+                                     { "note",  qs ("collapsed to nothing") },
+                                     { "need",  num (f.need) },
+                                     { "avail", num (f.avail) } }));
             if (bad)
                 problems.add (obj ({ { "where", qs (f.path + " (" + f.kind + ") \"" + f.text + "\"") },
                                      { "need",  num (f.wraps ? f.needH : f.need) },
@@ -654,12 +671,27 @@ namespace
         return false;
     }
 
-    bool laysOut (Ed& ed)
+    bool laysOut (Ed& ed, bool catalan)
     {
         const auto win = ed.getLocalBounds();
         const auto L   = ed.layoutProbe();
         for (const auto& c : L.controls)
             if (c.second.getWidth() <= 0 || c.second.getHeight() <= 0) return false;
+        // ...AND NO CONTROL IS SMALLER THAN ITS OWN CHROME.
+        //
+        // The predicate used to ask only whether a rectangle was positive, which is a
+        // weaker question than the rig's own gate asks two hundred lines below: a button
+        // 20 px wide has a POSITIVE width and NEGATIVE room for its glyph once its border
+        // and insets are taken off. Nothing can be read in it and nothing can be clicked.
+        //
+        // The two questions have to be the same question. While they were not, freeing one
+        // 4 px combo let the search walk 150 px further down into sizes where five other
+        // controls had already gone past the same point - and the "floor" the rig then
+        // photographed everything at was a size the editor does not lay out at all.
+        // ...in the language the search is currently walking: measuring English widths
+        // during the Catalan pass would certify a size Catalan does not lay out at.
+        for (const auto& f : ed.textFitProbeForTests (catalan))
+            if (f.avail < 0.0f || f.availH < 0.0f) return false;
         const juce::Rectangle<int> boxes[] = { L.spectrum, L.essentials, L.tuning,
                                                L.envelopes, L.specColumn };
         for (const auto& b : boxes)
@@ -683,14 +715,14 @@ namespace
             for (int trial = start.w; trial >= 640; trial -= 10)
             {
                 ed.setSize (trial, start.h);
-                if (! laysOut (ed)) break;
+                if (! laysOut (ed, lang == 1)) break;
                 w = trial;
             }
             int h = start.h;
             for (int trial = start.h; trial >= 360; trial -= 10)
             {
                 ed.setSize (w, trial);
-                if (! laysOut (ed)) break;
+                if (! laysOut (ed, lang == 1)) break;
                 h = trial;
             }
             say (juce::String ("  smallest laid-out size (") + (lang == 1 ? "ca" : "en") + "): "
