@@ -617,6 +617,9 @@ private:
     // Every fader configFader() built, so their value boxes can be sized to the text they
     // really show - which is only knowable after the suffixes are set. See applyLanguage().
     std::vector<juce::Slider*> configuredFaders;
+    // ESSENTIALS could not fit its sub-label beside its control, so the label is drawn
+    // above it instead. Set by resized(), read by paintedSubLabels() - the two must agree.
+    bool essStacked = false;
     void refreshModWatch();
     void configCombo (juce::ComboBox&, const juce::String& paramID,
                       std::unique_ptr<ComboBoxAttachment>&, juce::Colour, const juce::String& tooltip);

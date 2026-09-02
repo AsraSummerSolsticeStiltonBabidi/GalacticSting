@@ -6605,8 +6605,15 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
     if (! essentialsBounds.isEmpty())
     {
         // Essentials' labels sit LEFT of their control (vertically centred), in the same
-        // band resized() reserves for them (6 px in, 78 wide, minus a 2 px gap).
-        auto left = [] (juce::Rectangle<int> c) { return c.reduced (6, 0).withWidth (76); };
+        // band resized() reserves for them (6 px in, 78 wide, minus a 2 px gap) - or
+        // ABOVE it, in the cell's top 13 px, when resized() could not afford the side
+        // band and stacked the cell instead (see essStacked). One flag, read by the two
+        // places that have to agree about where the word goes.
+        auto left = [this] (juce::Rectangle<int> c)
+        {
+            return essStacked ? c.reduced (6, 1).withHeight (13)
+                              : c.reduced (6, 0).withWidth (76);
+        };
         add ("ess.gain",  tr ("GAIN", "GUANY"),                    left (ecGain),  cEssentials);
         add ("ess.ref",   tr ("REFERENCE", "REFER\xc3\x88NCIA"),   left (ecRef),   cEssentials);
         // OCTAVE reads like the three rows above it now: label LEFT of the stepper,
@@ -8379,19 +8386,45 @@ void FractalAdditiveAudioProcessorEditor::resized()
             ecGain  = e.removeFromTop (ch + (rem > 0 ? 1 : 0));
             ecRef   = e.removeFromTop (ch + (rem > 1 ? 1 : 0));
             ecOct   = e;   // the remainder, so the three cells always tile the box exactly
-            // Tighter label band + slimmer padding = the controls breathe (the
+            // THE LABEL GOES ABOVE THE CONTROL WHEN THE ROW CANNOT HOLD BOTH.
+            //
+            // The sub-label band is a fixed 78 px at the cell's left. At the 870x540
+            // floor the box is 176 px wide, so that leaves 76 for the controls - and the
+            // OCTAVE row alone needs 92 ([value 40][+ 24][gap 4][- 24]). What happened
+            // instead was silent: the "-" button came out 8 px wide with NO room at all
+            // for its glyph, and REFERENCE's "C3 =" caption came out 6 px. Both were
+            // inside their cell, neither had collapsed to zero, and every geometric check
+            // in the build stayed green while two controls on screen were unusable.
+            //
+            // Narrowing the band is not the fix: it would clip the painted word instead
+            // ("REFERÈNCIA" needs 66 of the 76 it has). So when the row is too narrow for
+            // both, the label takes the TOP of the cell and the control the whole width
+            // underneath - 13 + 22 = 35 in a 37 px cell. paintedSubLabels() reads the same
+            // flag, so the word is drawn where the space was actually reserved for it.
+            const int kEssLabelW  = 78;
+            const int kEssCtlNeed = 92;   // the OCTAVE stepper, the widest fixed row here
+            essStacked = ecOct.reduced (6, 1).getWidth() - kEssLabelW < kEssCtlNeed;
+            // One helper so the three cells cannot drift apart, and so "stacked" means
+            // exactly one thing.
+            auto essCell = [this, kEssLabelW] (juce::Rectangle<int> cell)
+            {
+                auto c = cell.reduced (6, 1);
+                if (essStacked) c.removeFromTop (13);
+                else            c.removeFromLeft (kEssLabelW);
+                return c;
+            };
             // Reference value used to clip its descenders).
-            // PHASE / GAIN / REFERENCE: the control sits to the RIGHT of its inline
-            // sub-label (drawn in paint at the cell's left), slightly narrower.
-            { auto c = ecGain.reduced (6, 1);  c.removeFromLeft (78);
+            // GAIN / REFERENCE / OCTAVE: the control sits to the RIGHT of its inline
+            // sub-label (drawn in paint at the cell's left), or under it when stacked.
+            { auto c = essCell (ecGain);
               gainFader.setBounds (c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))); }
-            { auto c = ecRef.reduced (6, 1);   c.removeFromLeft (78);
+            { auto c = essCell (ecRef);
               auto rr = c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))
                           .withWidth (juce::jmin (c.getWidth(), 158));
               caption (lblRefA, rr, 34, 70);
               lblRefHz.setBounds (rr.removeFromRight (juce::jmax (22, fgfit::labelWidth (lblRefHz))));
               refAEdit.setBounds (rr); }
-            { auto c = ecOct.reduced (6, 1);   c.removeFromLeft (78);
+            { auto c = essCell (ecOct);
               // Same shape as PHASE / GAIN / REFERENCE: the stepper sits RIGHT of the
               // painted OCTAVE label (see paintedSubLabels()), not below it - it was the
               // one cell in the box laid out the other way round.
