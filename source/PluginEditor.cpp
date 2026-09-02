@@ -8087,7 +8087,20 @@ void FractalAdditiveAudioProcessorEditor::resized()
             hcPrime     = midCol.withTrimmedTop (harmH);
             {
                 auto bi = hcBase.reduced (5, 3); bi.removeFromTop (lblH);
-                auto left = bi.removeFromLeft (bi.getWidth() * 34 / 100);
+                // THE WORD IS RESERVED BEFORE THE FADER, not after it. The N fader took a
+                // flat 34% and the pitch box took the remainder, so the box's longest item
+                // - "Transposed down", "Transposada avall" - was the first thing in the
+                // whole window to stop fitting as the window narrowed: it is what the
+                // rig's legibility measurement names as the binding control in BOTH
+                // languages. A fader is elastic and a word is not, so the box states what
+                // it needs and the fader lives on the rest.
+                //
+                // Still capped at the same 34%, so nothing that fits today gets wider, and
+                // floored at 40 px so the fader never becomes a line.
+                const int pitchNeed = fgfit::snugComboWidth (basePitchBox, 24);
+                const int leftW = juce::jlimit (40, juce::jmax (40, bi.getWidth() * 34 / 100),
+                                                bi.getWidth() - 5 - pitchNeed);
+                auto left = bi.removeFromLeft (leftW);
                 lblBaseN.setBounds (left.removeFromTop (13)); baseNFader.setBounds (left);
                 bi.removeFromLeft (5);
                 lblBasePitch.setBounds (bi.removeFromTop (13));
