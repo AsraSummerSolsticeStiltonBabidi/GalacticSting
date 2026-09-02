@@ -763,28 +763,46 @@ namespace
         for (int lang = 0; lang < 2; ++lang)
         {
             ed.setLanguageForSnapshot (lang == 1);
-            const auto legible = [&ed] (bool ca)
+            // ...and WHAT stops it going lower. A number with no name is a number nobody
+            // can act on: "1200x550" says the design is bound somewhere without saying
+            // where, and the whole point of this measurement is that the next person can
+            // walk straight to it. Returns the worst offender at the size that failed.
+            juce::String blockerW, blockerH;
+            const auto firstClip = [&ed] (bool ca, juce::String& into)
             {
+                float worst = 0.0f;
                 for (const auto& f : ed.textFitProbeForTests (ca))
-                    if (f.over() > 0.5f) return false;
-                return true;
+                    if (f.over() > worst)
+                    {
+                        worst = f.over();
+                        into = f.path + " (" + f.kind + ") \"" + f.text + "\" needs "
+                             + juce::String (f.wraps ? f.needH : f.need, 1) + " in "
+                             + juce::String (f.wraps ? f.availH : f.avail, 1);
+                    }
+                return worst > 0.5f;
             };
             int w = start.w;
             for (int trial = start.w; trial >= 640; trial -= 10)
             {
                 ed.setSize (trial, start.h);
-                if (! laysOut (ed, lang == 1) || ! legible (lang == 1)) break;
+                juce::String why;
+                if (! laysOut (ed, lang == 1)) { blockerW = "the layout itself"; break; }
+                if (firstClip (lang == 1, why)) { blockerW = why; break; }
                 w = trial;
             }
             int h = start.h;
             for (int trial = start.h; trial >= 360; trial -= 10)
             {
                 ed.setSize (w, trial);
-                if (! laysOut (ed, lang == 1) || ! legible (lang == 1)) break;
+                juce::String why;
+                if (! laysOut (ed, lang == 1)) { blockerH = "the layout itself"; break; }
+                if (firstClip (lang == 1, why)) { blockerH = why; break; }
                 h = trial;
             }
             say (juce::String ("  smallest fully legible size (") + (lang == 1 ? "ca" : "en") + "): "
                  + juce::String (w) + " x " + juce::String (h));
+            if (blockerW.isNotEmpty()) say ("    width stops there because: "  + blockerW);
+            if (blockerH.isNotEmpty()) say ("    height stops there because: " + blockerH);
             best.w = juce::jmax (best.w, w);
             best.h = juce::jmax (best.h, h);
         }

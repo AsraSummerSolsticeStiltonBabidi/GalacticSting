@@ -8558,14 +8558,43 @@ void FractalAdditiveAudioProcessorEditor::resized()
                                 + chipNeed (envTabB[2]) + chipNeed (envTabB[3]);
             const bool chipsWrap = chipsNeed > in.getWidth();
             juce::Rectangle<int> chipRect[4];
+            // EQUAL TABS WHILE THEY FIT, PROPORTIONAL WHEN THEY DO NOT.
+            //
+            // Four equal quarters is the look a tab strip wants, and it holds while the
+            // box is wide. It stops being honest the moment the widest WORD does not fit
+            // its quarter: "CUSTOM" needs 45.8 px of text room and an even quarter gives
+            // it 45.0 at 1190 px of window - eight tenths of a pixel, and the strip
+            // silently condenses. AMP has 22 px it is not using at that size.
+            //
+            // So the even split is kept until it fails, and then the row divides by what
+            // each word measures. The shipped 1200x650 and everything above it are
+            // untouched; below that the four tabs stop being the same width and start
+            // being legible, which is the trade this whole pass keeps making.
+            const auto shareOut = [&chipRect, &chipNeed, this] (juce::Rectangle<int> row, int first, int count)
+            {
+                // The FULL row width, captured once: removeFromLeft shrinks `row` as it
+                // goes, so a share computed from row.getWidth() inside the loop is a share
+                // of what is left, not of the row. Written that way first, and measured -
+                // it gave the last chip 98 px of a 220 px row and the one before it 33.
+                const int rowW = row.getWidth();
+                int total = 0, widest = 0;
+                for (int k = 0; k < count; ++k)
+                {
+                    const int n = chipNeed (envTabB[first + k]);
+                    total += n; widest = juce::jmax (widest, n);
+                }
+                const int even = rowW / count;
+                const bool evenFits = widest <= even;
+                for (int k = 0; k < count; ++k)
+                    chipRect[first + k] = (k == count - 1)
+                        ? row
+                        : row.removeFromLeft (evenFits ? even
+                                                       : rowW * chipNeed (envTabB[first + k])
+                                                             / juce::jmax (1, total));
+            };
             if (! chipsWrap)
             {
-                // These four share the box's width evenly because there are exactly four
-                // of them and they fill it; the engine pair is sized to its words.
-                auto chips = in.removeFromTop (fgfit::chip::kHeight);
-                const int cw4 = chips.getWidth() / 4;
-                for (int k = 0; k < 4; ++k)
-                    chipRect[k] = chips.removeFromLeft (k == 3 ? chips.getWidth() : cw4);
+                shareOut (in.removeFromTop (fgfit::chip::kHeight), 0, 4);
             }
             else
             {
@@ -8575,10 +8604,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 for (int row = 0; row < 2; ++row)
                 {
                     if (row == 1) in.removeFromTop (2);
-                    auto r = in.removeFromTop (fgfit::chip::kHeight);
-                    const int half = r.getWidth() / 2;
-                    chipRect[row * 2]     = r.removeFromLeft (half);
-                    chipRect[row * 2 + 1] = r;
+                    shareOut (in.removeFromTop (fgfit::chip::kHeight), row * 2, 2);
                 }
             }
             for (int k = 0; k < 4; ++k)
