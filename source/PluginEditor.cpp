@@ -8456,19 +8456,60 @@ void FractalAdditiveAudioProcessorEditor::resized()
             auto in = eb.reduced (3).reduced (5, 4);
             in.removeFromTop (20);                // clear the box title - chips sit BELOW it
             // The SAME chip band as the engine chips above (fgfit::chip), which is what
-            // makes the two rows one size. These four share the box's width evenly
-            // because there are exactly four of them and they fill it; the engine pair
-            // is sized to its words. Height, inset and font are the shared part.
-            auto chips = in.removeFromTop (fgfit::chip::kHeight);
-            const int cw4 = chips.getWidth() / 4;
+            // makes the two rows one size. Height, inset and font are the shared part.
+            //
+            // TWO ROWS OF TWO WHEN FOUR WILL NOT FIT ON ONE. The four used to divide the
+            // box's width evenly, which is fine while the box is wide and a lie when it is
+            // not: at the 750x550 floor the box is 121 px, so each chip gets 25 and its
+            // WORD gets 17 - against 38 for "FILTER" and 46 for "CUSTOM". These words are
+            // the feature. They are the only thing on screen that says which of the four
+            // modulator targets you are editing, and a chip strip that has silently
+            // condensed all four to 70% is a navigation control you have to guess at.
+            //
+            // Measured against what the words really need - the painter's own width for
+            // the text plus the inset each chip keeps, and NOT fgfit::chip::width, which
+            // adds kSnugPad on top. That pad is breathing room a chip sized to its own
+            // word asks for; using it as the WRAP threshold made the strip fold at
+            // 1200x650, where all four words fit a single row comfortably. The question
+            // here is "can these four words be read side by side", not "can they have
+            // their ideal padding".
+            auto chipNeed = [] (const juce::TextButton& b)
+            { return fgfit::textButtonWidth (b.getButtonText(), fgfit::chip::kHeight, false)
+                     + 2 * fgfit::chip::kInsetX; };
+            const int chipsNeed = chipNeed (envTabB[0]) + chipNeed (envTabB[1])
+                                + chipNeed (envTabB[2]) + chipNeed (envTabB[3]);
+            const bool chipsWrap = chipsNeed > in.getWidth();
+            juce::Rectangle<int> chipRect[4];
+            if (! chipsWrap)
+            {
+                // These four share the box's width evenly because there are exactly four
+                // of them and they fill it; the engine pair is sized to its words.
+                auto chips = in.removeFromTop (fgfit::chip::kHeight);
+                const int cw4 = chips.getWidth() / 4;
+                for (int k = 0; k < 4; ++k)
+                    chipRect[k] = chips.removeFromLeft (k == 3 ? chips.getWidth() : cw4);
+            }
+            else
+            {
+                // Two rows, two chips each, in reading order. AMP/PITCH above,
+                // FILTER/CUSTOM below - the same order the single row has, so the strip
+                // does not reshuffle itself as the window is dragged.
+                for (int row = 0; row < 2; ++row)
+                {
+                    if (row == 1) in.removeFromTop (2);
+                    auto r = in.removeFromTop (fgfit::chip::kHeight);
+                    const int half = r.getWidth() / 2;
+                    chipRect[row * 2]     = r.removeFromLeft (half);
+                    chipRect[row * 2 + 1] = r;
+                }
+            }
             for (int k = 0; k < 4; ++k)
             {
                 envTabB[k].setColour (juce::TextButton::buttonColourId,
                                       envTab == k ? tabCols[k] : tabCols[k].withAlpha (0.20f));
                 envTabB[k].setColour (juce::TextButton::textColourOffId,
                                       envTab == k ? juce::Colours::black : juce::Colour (0xffb9c0d0));
-                envTabB[k].setBounds (chips.removeFromLeft (k == 3 ? chips.getWidth() : cw4)
-                                          .reduced (fgfit::chip::kInsetX, 0));
+                envTabB[k].setBounds (chipRect[k].reduced (fgfit::chip::kInsetX, 0));
             }
             in.removeFromTop (4);
 
