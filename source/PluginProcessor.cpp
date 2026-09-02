@@ -4206,33 +4206,91 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     // survives exactly until replaceState runs.
     const bool chunkHasNoDryWet = ! tree.getChildWithProperty ("id", "dryWet").isValid();
 
+    // THE SAME TRAP, ONE PARAMETER OLDER - and the reason this block had to move up here.
+    // A state saved before the Harmonics fader existed (98a66ed) is recognised ONLY by the
+    // absence of a "harmonics" child, and that evidence dies on the replaceState line below
+    // for exactly the reason written above. The migration that reads it used to sit AFTER
+    // replaceState, where the question always answered "no, the child is there", so it had
+    // never run once since the day it was written - and the projects it exists for have
+    // been opening on the WRONG PRIME LIMIT ever since. See the migration itself for what
+    // that costs and for the one window it deliberately does not cover.
+    //
+    // The two legacy NUMBERS are snapshotted here as well, not re-read afterwards. Reading
+    // them later happens to work today (the reconnect pass leaves an existing child's value
+    // alone and flushes the identical number straight back), but that is an accident of the
+    // old and new ranges coinciding; taken here, the migration is reading THE CHUNK, which
+    // is the only thing it was ever about.
+    const bool chunkPredatesHarmonics = ! tree.getChildWithProperty ("id", "harmonics").isValid();
+    bool legacyHasSelection = false, legacyHasPrimeLimit = false;
+    int  legacySelectionIdx = 0,     legacyPrimeLimitIdx = 0;
+    if (chunkPredatesHarmonics)
+    {
+        const auto sel = tree.getChildWithProperty ("id", "selection");
+        const auto pl  = tree.getChildWithProperty ("id", "primeLimit");
+        legacyHasSelection  = sel.isValid();
+        legacyHasPrimeLimit = pl .isValid();
+        legacySelectionIdx  = juce::jlimit (0, 3, (int) (double) sel.getProperty ("value", 0.0));
+        legacyPrimeLimitIdx = juce::jlimit (0, 9, (int) (double) pl .getProperty ("value", 0.0));
+    }
+
     // Unmap BEFORE replaceState: replaceState's internal flush must not capture
     // base+mod for the OLD routings into the fresh tree.
     for (int m = 0; m < ModEngine::kMods; ++m) modEngine.unmapAll (m);
     apvts.replaceState (tree);
 
-    // A state saved BEFORE the Harmonics fader existed needs two migrations (the
-    // absence of a "harmonics" child is what marks it as old).
-    if (! tree.getChildWithProperty ("id", "harmonics").isValid())
+    // A state saved BEFORE the Harmonics fader existed needs two migrations. The evidence
+    // (chunkPredatesHarmonics and the two legacy indices) was read above replaceState,
+    // because by this line the chunk and apvts.state are the same object and every child
+    // the chunk was missing has been appended to it.
+    //
+    // WHAT THESE PROJECTS OPEN AS WITHOUT THIS BLOCK, which is why it is worth reviving
+    // rather than deleting:
+    //   primeLimit  The old chunk DOES carry a child for it, so replaceState applies its
+    //               number verbatim - and that number is an index into an order that has
+    //               since been REVERSED (09c47e9). Saved "23", the mildest limit, was
+    //               index 9 and comes back as index 9 in today's order, which is limit 2:
+    //               everything but the powers of two silently gone. Saved "2", the
+    //               harshest, comes back as 23, i.e. no filtering at all. Only "Off"
+    //               survives, because 0 is 0 in both orders. A patch reopening with most
+    //               of its spectrum removed and nothing on screen to say so is the exact
+    //               failure this synth must not have.
+    //   harmonics   No child at all, so the reconnect pass appends a valueless <PARAM> for
+    //               it, that append fires valueTreeChildAdded -> setNewState, and with no
+    //               "value" property to read setNewState writes the DEFAULT. The fader
+    //               lands on All whatever it held a moment earlier, so the saved
+    //               Even/Odd/Prime choice is thrown away - on a fresh instance and equally
+    //               on a running plugin fed an old preset.
+    // Both migrations were re-checked against the parameters as they exist today, not as
+    // they existed when they were written: the old Choice really did list
+    // {All,Even,Odd,Prime} and {Off,2,3,5..23} (a7eaa51), APVTS stores a Choice as its
+    // denormalised INDEX, and the maps below still land on the current enum and the
+    // current 0..9 fader.
+    //
+    // THE WINDOW THIS DOES NOT COVER, said out loud rather than papered over: the prime
+    // reorder shipped in 09c47e9, SIX HOURS AFTER the harmonics fader in 98a66ed. A chunk
+    // written in between carries a harmonics child AND the old ascending prime order, so
+    // the gate skips it and it still opens on the reversed limit. Nothing in such a chunk
+    // distinguishes it from one written today, and guessing would corrupt CURRENT projects
+    // to rescue that window - so it is left alone on purpose.
+    if (chunkPredatesHarmonics)
     {
         // 1. The "selection" choice (0=All 1=Even 2=Odd 3=Prime) -> the continuous
         //    Harmonics axis (0=Even 1=All 2=Odd 3=Prime).
-        if (auto legacy = tree.getChildWithProperty ("id", "selection"); legacy.isValid())
+        if (legacyHasSelection)
         {
             static const float map[4] = { (float) spectrum::All, (float) spectrum::Even,
                                           (float) spectrum::Odd, (float) spectrum::Prime };
-            const int idx = juce::jlimit (0, 3, (int) (double) legacy.getProperty ("value", 0.0));
             if (auto* p = apvts.getParameter ("harmonics"))
-                p->setValueNotifyingHost (p->convertTo0to1 (map[idx]));
+                p->setValueNotifyingHost (p->convertTo0to1 (map[legacySelectionIdx]));
         }
         // 2. Prime Limit was listed ascending (Off,2,3,5..23); it now runs the other
         //    way (Off,23,19..2) so raising the fader always filters MORE.
-        if (auto legacy = tree.getChildWithProperty ("id", "primeLimit"); legacy.isValid())
+        if (legacyHasPrimeLimit)
         {
             static const int oldOrder[10] = { 0, 2, 3, 5, 7, 11, 13, 17, 19, 23 };
-            const int oldIdx = juce::jlimit (0, 9, (int) (double) legacy.getProperty ("value", 0.0));
             int newIdx = 0;
-            for (int i = 0; i < 10; ++i) if (primeLimitValues[i] == oldOrder[oldIdx]) { newIdx = i; break; }
+            for (int i = 0; i < 10; ++i)
+                if (primeLimitValues[i] == oldOrder[legacyPrimeLimitIdx]) { newIdx = i; break; }
             if (auto* p = apvts.getParameter ("primeLimit"))
                 p->setValueNotifyingHost (p->convertTo0to1 ((float) newIdx));
         }
@@ -4240,11 +4298,12 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
 
     // A state saved BEFORE the Dry/Wet transition existed (it shipped in bf0f768) has no
     // "dryWet" child, and that flag now DEFAULTS TO ON because the panel's one TRANSITION
-    // question defaults to Dry/Wet. replaceState leaves a parameter whose child is absent
-    // at whatever it currently holds - the default, on the fresh instance a host builds
-    // before handing it a chunk - so without this line every project older than that
-    // commit would reopen with a 0.3 s crossfade under every spectrum change, on a patch
-    // whose author never had the control at all. The missing child IS the evidence: the
+    // question defaults to Dry/Wet. A parameter whose child is absent comes back at its
+    // DEFAULT - the reconnect pass appends a valueless <PARAM>, and the append fires
+    // valueTreeChildAdded -> setNewState, which with no "value" to read writes the default
+    // (measured, see the Harmonics migration above) - so without this line every project
+    // older than that commit would reopen with a 0.3 s crossfade under every spectrum
+    // change, on a patch whose author never had the control at all. The missing child IS the evidence: the
     // build that wrote it could only be instant, so instant is what it must come back as.
     // (Read into chunkHasNoDryWet above replaceState - see the note there for why asking
     // `tree` at this point would always answer "the child is present".)

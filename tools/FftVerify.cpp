@@ -491,6 +491,180 @@ int main()
         }
     }
 
+    // == A project older than the Harmonics fader: Prime Limit came back INVERTED ==
+    //
+    // Two parameters changed shape on 2026-07-25 and both are recognised by ONE piece of
+    // evidence - the chunk having no "harmonics" child:
+    //   selection  -> harmonics   the Choice {All,Even,Odd,Prime} became the continuous
+    //                             axis {Even,All,Odd,Prime}. An old chunk has no child for
+    //                             it, and a missing child does NOT leave the fader where it
+    //                             stood: the reconnect pass appends a valueless <PARAM>,
+    //                             the append fires valueTreeChildAdded -> setNewState, and
+    //                             setNewState with no "value" property writes the DEFAULT.
+    //                             The saved choice is simply lost, and the fader reads All.
+    //   primeLimit                the Choice list was REVERSED, {Off,2,3,..,23} ->
+    //                             {Off,23,19,..,2}. This one DOES have a child, and APVTS
+    //                             stores a Choice denormalised, i.e. as its index - so the
+    //                             old index lands in the new order and means its opposite.
+    //                             Saved "23" (the mildest limit) reopens as limit 2 and
+    //                             keeps only the powers of two; saved "2" reopens as 23
+    //                             and filters nothing. Only "Off" survives, because 0 is 0
+    //                             in both orders - so a test that tried only Off would
+    //                             pass on the single index that is its own image.
+    //
+    // The migration for this existed but sat AFTER apvts.replaceState, where the evidence
+    // is already gone (replaceState shares the tree and its reconnect pass appends a child
+    // for every parameter the chunk was missing), so it had never run. This is the check
+    // that says whether it runs now, and it is written against a HAND-BUILT chunk in the
+    // old shape rather than against a belief about one.
+    {
+        std::printf ("== A project older than the Harmonics fader: Prime Limit must not invert ==\n");
+
+        static const int   oldPrimeOrder[10] = { 0, 2, 3, 5, 7, 11, 13, 17, 19, 23 };
+        static const int   newPrimeOrder[10] = { 0, 23, 19, 17, 13, 11, 7, 5, 3, 2 };
+        static const float wantAxis[4] = { (float) spectrum::All,  (float) spectrum::Even,
+                                           (float) spectrum::Odd,  (float) spectrum::Prime };
+        static const char* oldSelName[4] = { "All", "Even", "Odd", "Prime" };
+
+        // Every old prime index, with the selection cycling so all four choices are
+        // covered too.
+        for (int oldPl = 0; oldPl < 10; ++oldPl)
+        {
+            const int oldSel = oldPl % 4;
+
+            FractalAdditiveAudioProcessor proc;
+
+            // Move BOTH faders somewhere distinctive BEFORE handing over the chunk, so a
+            // pass can never be the instance simply never having moved. It also pins the
+            // mechanism down: with the migration dead this prints Harmonics 1.00 for every
+            // row - the DEFAULT, not the 3.00 set one line up - which is the measured proof
+            // that a missing child is reset rather than left alone, and therefore that the
+            // saved Even/Odd/Prime choice is unrecoverable without this migration.
+            setP (proc.apvts, "harmonics",  (float) spectrum::Prime);
+            setP (proc.apvts, "primeLimit", 4.0f);
+            proc.pollParametersForTests();
+
+            auto tree = proc.apvts.copyState();
+            tree.removeChild (tree.getChildWithProperty ("id", "harmonics"), nullptr);
+            ValueTree sel ("PARAM");
+            sel.setProperty ("id", "selection", nullptr);
+            sel.setProperty ("value", (float) oldSel, nullptr);
+            tree.appendChild (sel, nullptr);
+            tree.getChildWithProperty ("id", "primeLimit").setProperty ("value", (float) oldPl, nullptr);
+
+            MemoryBlock blob;
+            if (auto xml = tree.createXml())
+                FractalAdditiveAudioProcessor::copyXmlToBinary (*xml, blob);
+            proc.setStateInformation (blob.getData(), (int) blob.getSize());
+            proc.pollParametersForTests();
+
+            const float gotAxis = proc.apvts.getRawParameterValue ("harmonics")->load();
+            const int   gotIdx  = jlimit (0, 9, (int) std::lround (proc.apvts.getRawParameterValue ("primeLimit")->load()));
+            const int   gotLim  = newPrimeOrder[gotIdx];
+
+            std::printf ("  old chunk  selection=%-5s primeLimit=%-2s  ->  Harmonics %.2f (want %.2f), limit %2d (want %2d)\n",
+                         oldSelName[oldSel], oldPrimeOrder[oldPl] == 0 ? "Off" : String (oldPrimeOrder[oldPl]).toRawUTF8(),
+                         gotAxis, wantAxis[oldSel], gotLim, oldPrimeOrder[oldPl]);
+
+            if (std::abs (gotAxis - wantAxis[oldSel]) > 1.0e-3f)
+            { std::printf ("        the saved Harmonics choice was thrown away\n"); ++failures; }
+            if (gotLim != oldPrimeOrder[oldPl])
+            { std::printf ("        THE PRIME LIMIT INVERTED - the patch reopens on a different spectrum\n"); ++failures; }
+        }
+
+        // What that costs in partials, which is the half a user would actually hear. An
+        // old patch on limit 23 (barely any filtering) reopening under the reversed order
+        // lands on limit 2 and keeps only the powers of two.
+        {
+            const auto countFor = [] (bool oldShape) -> int
+            {
+                FractalAdditiveAudioProcessor proc;
+                setP (proc.apvts, "baseN", 1.0f);
+                setP (proc.apvts, "fractalLevel", 4.0f);
+                setP (proc.apvts, "harmonics", (float) spectrum::All);
+                setP (proc.apvts, "primeLimit", oldShape ? 0.0f : 1.0f); // 1 = limit 23 today
+                proc.pollParametersForTests();
+
+                auto tree = proc.apvts.copyState();
+                if (oldShape)
+                {
+                    tree.removeChild (tree.getChildWithProperty ("id", "harmonics"), nullptr);
+                    ValueTree s ("PARAM");
+                    s.setProperty ("id", "selection", nullptr);
+                    s.setProperty ("value", 0.0f, nullptr);      // "All", in the old order
+                    tree.appendChild (s, nullptr);
+                    tree.getChildWithProperty ("id", "primeLimit").setProperty ("value", 9.0f, nullptr); // old "23"
+                    MemoryBlock blob;
+                    if (auto xml = tree.createXml())
+                        FractalAdditiveAudioProcessor::copyXmlToBinary (*xml, blob);
+                    proc.setStateInformation (blob.getData(), (int) blob.getSize());
+                    proc.pollParametersForTests();
+                }
+                // DRAIN THE SPECTRUM WORKER BEFORE MEASURING, or this check reports a
+                // number that has nothing to do with the migration.
+                //
+                // The polls above each queue a rebuild on the Priority::low SpectrumBuilder
+                // thread, and the FIRST of them was queued with primeLimit still Off. If
+                // the worker has already picked that one up, buildNow()'s synchronous
+                // publish is simply overwritten by the stale one a moment later - measured
+                // here as 1024 partials (Off, nothing filtered) instead of 375 (limit 23),
+                // on 1 run in 5 while another build was loading the machine. Waiting for
+                // isSpectrumBuildPending() to clear is what RhythmVerify's awaitSpectrumIdle
+                // does for the same reason; a sleep would only move the race.
+                const auto settle = [&proc]
+                {
+                    const double t0 = Time::getMillisecondCounterHiRes();
+                    while (proc.isSpectrumBuildPending()
+                           && Time::getMillisecondCounterHiRes() - t0 < 15000.0)
+                        Thread::sleep (1);
+                };
+                settle();
+                proc.prepareToPlay (sampleRate, blockSize);   // buildNow() is synchronous
+                settle();
+                return proc.getTemplatePartialCount();
+            };
+
+            const int viaOldChunk = countFor (true);
+            const int direct      = countFor (false);
+            std::printf ("  the same patch, limit 23, Fractal 4: %d partials via the old chunk, %d set directly\n",
+                         viaOldChunk, direct);
+            if (viaOldChunk != direct)
+            { std::printf ("        %d partials LOST to the migration alone\n", direct - viaOldChunk); ++failures; }
+        }
+
+        // THE OTHER HALF, and the one that makes deleting the gate unsafe: a chunk that
+        // DOES carry a harmonics child is a chunk from a build that already had the new
+        // prime order, so its primeLimit index must be taken at face value. Remap that and
+        // every project saved since 09c47e9 opens on the wrong limit - a far bigger blast
+        // radius than the one this migration repairs.
+        for (int idx : { 1, 5, 9 })
+        {
+            FractalAdditiveAudioProcessor proc;
+            auto tree = proc.apvts.copyState();
+            tree.getChildWithProperty ("id", "primeLimit").setProperty ("value", (float) idx, nullptr);
+            tree.getChildWithProperty ("id", "harmonics") .setProperty ("value", (float) spectrum::Odd, nullptr);
+            // A stale "selection" child as well: some chunks carry one from a build that
+            // still wrote it, and its mere presence must not start a migration.
+            ValueTree sel ("PARAM");
+            sel.setProperty ("id", "selection", nullptr);
+            sel.setProperty ("value", 3.0f, nullptr);
+            tree.appendChild (sel, nullptr);
+
+            MemoryBlock blob;
+            if (auto xml = tree.createXml())
+                FractalAdditiveAudioProcessor::copyXmlToBinary (*xml, blob);
+            proc.setStateInformation (blob.getData(), (int) blob.getSize());
+            proc.pollParametersForTests();
+
+            const int   got     = jlimit (0, 9, (int) std::lround (proc.apvts.getRawParameterValue ("primeLimit")->load()));
+            const float gotAxis = proc.apvts.getRawParameterValue ("harmonics")->load();
+            std::printf ("  a CURRENT chunk (has harmonics) primeLimit=%d -> %d, Harmonics %.2f (want %d, %.2f)\n",
+                         idx, got, gotAxis, idx, (float) spectrum::Odd);
+            if (got != idx || std::abs (gotAxis - (float) spectrum::Odd) > 1.0e-3f)
+            { std::printf ("        the migration fired on a CURRENT project\n"); ++failures; }
+        }
+    }
+
     // == The fader has to be a RAMP, not a switch with a ramp painted on it. ==
     //
     // phaseMode used to select the normalisation law by a threshold at 0.5:
