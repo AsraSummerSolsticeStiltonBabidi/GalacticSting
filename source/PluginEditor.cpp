@@ -1036,6 +1036,13 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // its fader went on working.
     configFader (baseNFader,   "baseN",    baseNAtt,     cHarmonic, "Base harmonic N");
     configCombo (basePitchBox, "baseMode", basePitchAtt, cHarmonic, "Original = harmonics at natural positions.  Transposed down = lowest partial at the played pitch.");
+    // A SMALL-ITEM BOX: its item is a PHRASE ("Transposed down", "Transposada avall")
+    // read under the painted "Pitch" caption right above it, which is exactly what the
+    // hatch is for - the caption is what the eye finds, the item only has to be legible.
+    // Measured: this box's longest item is what the rig's legibility walk names as the
+    // binding control in BOTH languages, so the type size it asks for is the type size
+    // the whole window's minimum width is standing on.
+    basePitchBox.setName (fgfit::kSmallComboName);
     makeLabel (lblBaseN, cHarmonic); makeLabel (lblBasePitch, cHarmonic);
     lblBasePitch.setJustificationType (juce::Justification::centredLeft); // top-LEFT of its combo, like the others
 
@@ -7596,7 +7603,22 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // to l.getFont()'s width plus 4 got both of those wrong at once, so "Period",
         // "Per\xc3\xado" "de" and "smallest interval (c)" were all quietly condensed.
         const int w = juce::jmax (nominal, fgfit::labelWidth (l));
-        l.setBounds (row.removeFromLeft (juce::jmin (w, juce::jmax (0, row.getWidth() - keepForControl))));
+        // THE LABEL'S OWN NEED OUTRANKS THE CONTROL'S NOMINAL RESERVE.
+        //
+        // `keepForControl` is what the control beside this label would LIKE. It used to be
+        // absolute, so a narrow row squeezed the caption instead: "C3 =" needs 27 px of
+        // text room and was handed 25 - and being a juce::Label it did not clip, it
+        // condensed, which is the failure with no visible symptom. It was the control the
+        // rig's legibility walk named as binding the whole window's minimum width.
+        //
+        // So the allowance is at least what the reserve leaves, and may rise to what the
+        // label actually needs - never past leaving the control 24 px, which is the least
+        // an editor or a read-out can be and still be one. The control is elastic; a word
+        // is not.
+        const int soft = juce::jmax (0, row.getWidth() - keepForControl);
+        const int hard = juce::jmax (0, row.getWidth() - 24);
+        const int give = juce::jmax (soft, juce::jmin (fgfit::labelWidth (l), hard));
+        l.setBounds (row.removeFromLeft (juce::jmin (w, give)));
     };
 
     // [ THE ACTION ][ REALTIME ] - the pair the Spectrum-vs-Tuning column ends both of its
