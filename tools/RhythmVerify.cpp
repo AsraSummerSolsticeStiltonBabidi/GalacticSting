@@ -9265,6 +9265,120 @@ int main (int argc, char** argv)
                 std::printf ("  %-40s %.3f ms/block (%.0f%% of budget)\n", label, ms, ms / 10.667 * 100.0);
                 return ms;
             };
+            // TURNING THE VOICE COUNT DOWN WITH KEYS HELD must fade, not delete. Same two
+            // faults applyMonoVoiceCount documents, in the sub-engines: reduceNumVoices()
+            // deletes SOUNDING voices, and a deleted voice stops mid-waveform because the
+            // object that would render its fade is gone. This is the control people reach
+            // for when the CPU meter climbs, so it gets thrown mid-chord by design.
+            {
+                auto r = std::make_unique<Proc>();
+                r->prepareToPlay (48000.0, 256);
+                auto rs = [&] (const char* id, float v)
+                { if (auto* q = r->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
+                rs ("ampSustain", 1.0f);
+                rs ("pgMode", 1.0f);
+                rs ("pgVoices", 8.0f);
+                {
+                    juce::String e2;
+                    static const char* nm[2] = { "zzz-verify-mix-A", "zzz-verify-mix-B" };
+                    for (int i = 0; i < 2; ++i) r->assignPlaygroundCorner (i, nm[i], e2);
+                }
+                for (int i = 0; i < 6; ++i) { r->pollParametersForTests(); juce::Thread::sleep (2); }
+
+                juce::AudioBuffer<float> b (2, 256);
+                {
+                    juce::MidiBuffer m;
+                    for (int n = 0; n < 8; ++n)
+                        m.addEvent (juce::MidiMessage::noteOn (1, 52 + n * 3, (juce::uint8) 100), 0);
+                    b.clear(); r->processBlock (b, m);
+                }
+                for (int i = 0; i < 40; ++i)
+                { juce::MidiBuffer m; b.clear(); r->processBlock (b, m);
+                  if ((i % 12) == 0) r->pollParametersForTests(); }
+                const double before = b.getRMSLevel (0, 0, b.getNumSamples());
+
+                // THE CONTROL ARM, and it is what makes the number mean anything. A dense
+                // spectrum moves a long way between two samples all by itself, so "the
+                // worst step is 0.12" is not a verdict until the same chord, undisturbed,
+                // has been asked the same question. Measure that first.
+                // WHAT TO MEASURE, and the first two answers were both wrong. A per-sample
+                // step cannot see this: a dense spectrum moves 0.235 between two samples on
+                // its own, and six deleted voices out of eight - each already a fraction of
+                // one corner of a mix - move less than that, so deleting them outright
+                // scored 0.45x the chord's own motion and passed. An RMS over a whole block
+                // is blinder still.
+                // The ENVELOPE is what separates them. A deleted voice takes its share of
+                // the signal away between one sample and the next, so a short window
+                // straddling the delete drops in a single step; a 5 ms fade spreads the
+                // same loss over ~240 samples at 48 kHz, so no one window can drop by much.
+                // Worst single-window drop RATIO is therefore the metric, and it is scored
+                // against the same chord undisturbed, in the same run.
+                auto worstEnvDrop = [&] (int blocks)
+                {
+                    constexpr int W = 64;                 // 1.3 ms - shorter than the fade
+                    double worst = 0.0, prev = -1.0;
+                    for (int i = 0; i < blocks; ++i)
+                    {
+                        r->pollParametersForTests();     // the 60 Hz poll drives the shrink
+                        juce::MidiBuffer e; b.clear(); r->processBlock (b, e);
+                        for (int s = 0; s + W <= b.getNumSamples(); s += W)
+                        {
+                            double sum = 0.0;
+                            for (int k = 0; k < W; ++k)
+                            { const double v = b.getSample (0, s + k); sum += v * v; }
+                            const double rms = std::sqrt (sum / W);
+                            if (prev > 1.0e-5) worst = juce::jmax (worst, 1.0 - rms / prev);
+                            prev = rms;
+                        }
+                    }
+                    return worst;                        // 0 = perfectly level, 1 = to silence
+                };
+                const double quiet = worstEnvDrop (40);   // nothing changing
+
+                rs ("pgVoices", 2.0f);   // 8 -> 2 with every key still down
+
+                // THE ASSERTION THAT ACTUALLY BITES. Two audio metrics were tried first and
+                // BOTH passed the sabotage - a per-sample step (the chord moves 0.235 by
+                // itself) and a 1.3 ms envelope drop (it swings 0.74 by itself). Six of
+                // eight voices inside one corner of a mix are simply worth less than the
+                // spectrum's own motion, so no measurement of the OUTPUT can separate a
+                // fade from a delete here. What can is the pool itself: a fade leaves the
+                // pool oversized for a tick or two while the doomed voices go quiet, and a
+                // delete collapses pool and active together in one instant.
+                int poolRightAfter = -1, activeRightAfter = -1;
+                {
+                    r->pollParametersForTests();
+                    juce::MidiBuffer e; b.clear(); r->processBlock (b, e);
+                    poolRightAfter   = r->mixVoicePoolForTests (0);
+                    activeRightAfter = r->mixVoicesActiveForTests (0);
+                }
+                const double worstStep = worstEnvDrop (40);
+                const double after = b.getRMSLevel (0, 0, b.getNumSamples());
+                std::printf ("  corner 0 one tick after the cut: pool %d, sounding %d "
+                             "(a fade holds the pool; a delete drops both at once)\n",
+                             poolRightAfter, activeRightAfter);
+                check (poolRightAfter > 2,
+                       "the mix shrink asks its voices to FADE before it deletes them - the pool "
+                       "outlives the cut by at least one tick");
+                check (r->mixVoicePoolForTests (0) == 2,
+                       "...and the pool really does reach the count the user asked for");
+                std::printf ("  mix voices 8 -> 2 under 8 held keys: rms %.5f -> %.5f, worst per-sample "
+                             "step %.5f against %.5f for the same chord undisturbed (%.2fx)\n",
+                             before, after, worstStep, quiet,
+                             quiet > 1.0e-9 ? worstStep / quiet : 0.0);
+                // A PER-SAMPLE metric against THIS RUN'S OWN control, because an RMS over a
+                // block cannot see a waveform cut in half between two samples - which is
+                // exactly what a deleted voice does, and exactly how this class of defect
+                // shipped before. Deleting eight voices' worth of signal shows up as a step
+                // far larger than the chord's own motion; a 5 ms fade does not.
+                check (worstStep < juce::jmax (0.02, quiet * 1.5),
+                       "turning mix voices DOWN under held keys fades them out - no voice is "
+                       "deleted mid-waveform");
+                check (after > 0.0001,
+                       "...and the voices the budget keeps are still sounding afterwards");
+
+            }
+
             const double e0 = bench (0, 0, 32, "extreme 32 notes: main alone");
             const double e4 = bench (4, 32, 32, "extreme 32 notes: 4 corners @32 voices");
             const double d4 = bench (4, 8, 32, "extreme 32 notes: 4 corners @default 8");

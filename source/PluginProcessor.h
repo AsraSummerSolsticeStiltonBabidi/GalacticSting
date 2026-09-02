@@ -4,8 +4,10 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_dsp/juce_dsp.h>
 
+#include <algorithm>
 #include <set>
 #include <thread>
+#include <vector>
 
 #include "dsp/AdditiveVoice.h"
 #include "dsp/Dissonance.h"
@@ -489,6 +491,26 @@ public:
     // not increase, and the pitch is the internal counterpart of the audio's own f0
     // probe (a disagreement between them names which half broke).
     int synthVoiceCountForTests() const noexcept { return synth.getNumVoices(); }
+    // One MIX sub-engine's pool size and how many of its voices are sounding. The pair is
+    // what proves the shrink FADES rather than deletes: a fade leaves the pool at its old
+    // size for a tick or two while the doomed voices go quiet, so `pool` may exceed the
+    // requested count while `active` falls. A delete moves both in the same instant, and
+    // that is the difference no audio metric could see - a dense spectrum's own envelope
+    // swings further in 1.3 ms than six of eight sub-engine voices are worth.
+    int mixVoicePoolForTests (int corner) const noexcept
+    {
+        if (corner < 0 || corner >= kPlaygroundCorners || mixEng[(size_t) corner] == nullptr) return -1;
+        return mixEng[(size_t) corner]->synth.getNumVoices();
+    }
+    int mixVoicesActiveForTests (int corner) const noexcept
+    {
+        if (corner < 0 || corner >= kPlaygroundCorners || mixEng[(size_t) corner] == nullptr) return -1;
+        auto& s = mixEng[(size_t) corner]->synth;
+        int n = 0;
+        for (int v = 0; v < s.getNumVoices(); ++v)
+            if (auto* mv = s.getVoice (v); mv != nullptr && mv->isActive()) ++n;
+        return n;
+    }
     int activeVoiceCountForTests() const noexcept
     {
         int c = 0;
@@ -2110,14 +2132,60 @@ private:
         // an inaudible-until-it-crackles trap and a fixed lower number a silent cap).
         // Message thread; MPESynthesiser's own voice lock serialises this against the
         // audio thread, and reduceNumVoices steals sounding voices properly.
+        // Growing is free. SHRINKING has the same two audible faults applyMonoVoiceCount
+        // documents at length, and for the same reason: reduceNumVoices() DELETES sounding
+        // voices, and a deleted voice stops mid-waveform because the object that would
+        // render a fade is gone. This is reached from the 60 Hz poll whenever the user
+        // turns "Mix voices per corner" down, which they will do with keys held - four
+        // sub-engines make it the control people reach for when the CPU meter climbs.
+        //
+        // Same two-step cure. FADE FIRST: every sounding voice above the new count is
+        // ASKED to fade over its own 5 ms fast kill, through the atomic the voice consumes
+        // at the top of its own render - beginFastKill() from this thread would mutate
+        // ADSR state and currentlyPlayingNote underneath a block the audio thread is
+        // rendering, and MPESynthesiser's voicesLock is not reachable from outside.
+        // DELETE SECOND, on a later tick, once they are quiet: findFreeVoice() hands
+        // reduceNumVoices the INACTIVE voices first, so the survivors are chosen inside
+        // JUCE under its own lock rather than by index surgery from here.
+        //
+        // Unlike mono, there is no last-note contract to honour - this is a polyphony
+        // budget, not an articulation - so the newest `want` voices stay and the oldest
+        // fade, which is what a player running out of voices expects.
         void setVoices (FractalAdditiveAudioProcessor& p, int want)
         {
             want = juce::jlimit (1, 32, want);
             while (synth.getNumVoices() < want)
                 synth.addVoice (new AdditiveVoice (p.apvts, spectrum, p.tuning, mods, &bank));
-            if (synth.getNumVoices() > want)
-                synth.reduceNumVoices (want);
+            if (synth.getNumVoices() <= want) { shrinkTicks = 0; return; }
+
+            // Rank the sounding voices by age so the oldest are the ones asked to go.
+            std::vector<juce::MPESynthesiserVoice*> live;
+            for (int v = 0; v < synth.getNumVoices(); ++v)
+                if (auto* mv = synth.getVoice (v); mv != nullptr && mv->isActive())
+                    live.push_back (mv);
+
+            if ((int) live.size() > want && shrinkTicks < kMixShrinkTicks)
+            {
+                ++shrinkTicks;
+                std::sort (live.begin(), live.end(),
+                           [] (auto* a, auto* b) { return a->noteOnTime > b->noteOnTime; });
+                // Re-asked every tick, not once: a key pressed DURING the shrink takes the
+                // newest slot and must not be the one that goes.
+                for (size_t i = (size_t) want; i < live.size(); ++i)
+                    if (auto* av = dynamic_cast<AdditiveVoice*> (live[i]))
+                        av->requestFadeOut();
+                return;   // the delete waits for the fades; re-entered from the 60 Hz tick
+            }
+
+            // Either the fades landed, or nothing is rendering them - a stopped transport,
+            // a bypassed plugin - and the polyphony the user asked for must not wait for
+            // ever on a voice that will never be asked for another sample.
+            shrinkTicks = 0;
+            synth.reduceNumVoices (want);
         }
+        // Half a second of 60 Hz ticks; a 5 ms fade has landed a hundred times over.
+        static constexpr int kMixShrinkTicks = 30;
+        int shrinkTicks = 0;
         ParamBank                 bank;      // the corner preset's values (see ParamBank.h)
         spectrum::SpectrumEngine  spectrum;  // holds the corner's compiled template
         ModEngine                 mods;      // the corner's own modulators, reading `bank`
