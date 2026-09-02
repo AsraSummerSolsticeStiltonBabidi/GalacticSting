@@ -7875,10 +7875,25 @@ void FractalAdditiveAudioProcessorEditor::resized()
         chordView.setVisible (chord && ! showDeg);
         if (adapt)
         {
-            adaptView.setBounds (si);
-            const int ah  = adaptList.contentHeight();
-            const bool as = ah > si.getHeight();
-            adaptList.setSize (as ? si.getWidth() - 10 : si.getWidth(), juce::jmax (si.getHeight(), ah));
+            // HONEST FAILURE, the bank row's rule again: at the 870x540 floor the rows
+            // above fill this column completely and `si` comes out 0 px tall, so the
+            // result list was being laid out VISIBLE with no pixels - a viewport nobody
+            // can see, scroll or click, with nothing on screen saying the panel ran out
+            // of room. One row (24 px) is the least that can show a result; below that it
+            // is hidden instead of drawn as a ghost.
+            //
+            // This makes the failure honest; it does not make the floor big enough. At
+            // 870x540 the Adapt column genuinely cannot show its results, which is a
+            // layout question for the column as a whole, not for this one line.
+            const bool listFits = si.getHeight() >= 24;
+            adaptView.setVisible (listFits);
+            if (listFits)
+            {
+                adaptView.setBounds (si);
+                const int ah  = adaptList.contentHeight();
+                const bool as = ah > si.getHeight();
+                adaptList.setSize (as ? si.getWidth() - 10 : si.getWidth(), juce::jmax (si.getHeight(), ah));
+            }
         }
         else if (seg)
         {
@@ -8310,9 +8325,18 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // Every cell centres its own control (jmin (22, ...) below), so an even cell
             // spends its extra height as symmetric air around the control rather than on
             // a stretched widget - the growth is distributed, never pooled.
-            const int ch = e.getHeight() / 3;
-            ecGain  = e.removeFromTop (ch);
-            ecRef   = e.removeFromTop (ch);
+            // The remainder is SPREAD, not pooled. e.getHeight() is rarely a multiple of
+            // three, and `h/3, h/3, the rest` hands the whole remainder to the last cell:
+            // 167 px comes out 55/55/57, so OCTAVE's divider sits 2 px off where three even
+            // fields would put it and the panel's bottom field reads as the odd one out.
+            // One pixel at a time from the top instead, so no two cells ever differ by more
+            // than one - and the three still tile the box exactly, which is what paint()
+            // needs (every divider is drawn at a cell's TOP edge).
+            const int eh  = e.getHeight();
+            const int ch  = eh / 3;
+            const int rem = eh - ch * 3;              // 0, 1 or 2
+            ecGain  = e.removeFromTop (ch + (rem > 0 ? 1 : 0));
+            ecRef   = e.removeFromTop (ch + (rem > 1 ? 1 : 0));
             ecOct   = e;   // the remainder, so the three cells always tile the box exactly
             // Tighter label band + slimmer padding = the controls breathe (the
             // Reference value used to clip its descenders).
@@ -8591,13 +8615,59 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // takes a row of its own the moment it does not.
             const int nameNeed = tuningNameLabel.getText().isEmpty()
                                ? 0 : fgfit::labelWidth (tuningNameLabel);
-            if (nameNeed > mrow.getWidth() && ti.getHeight() >= 22)
+            // WHEN THE PANEL IS SHORT, THE NAME AND THE PERIOD SHARE ONE ROW.
+            //
+            // Both are single-line READ-OUTS, and at the 870x540 floor the panel is
+            // ~22 px short of its rows: the name takes a whole row of its own (the
+            // leftover beside the mode selector is 13 px), the period takes another, and
+            // what runs out at the far end is the row that carries the pitch-bend
+            // selector and Recent - two real controls, laid out at 12 px in the plain
+            // case and at exactly 0 with a periodic tuning, where the Shepard rise
+            // dropdown takes one row more.
+            //
+            // Merging the two read-outs frees exactly the row those controls need, and
+            // costs nothing: "tritave" is 40 px and "Period  3" is 52 in a 289 px panel,
+            // so side by side they are not even close to touching. It happens ONLY when
+            // the panel cannot afford both rows, so every size that fits today - the
+            // shipped 1200x650 included - is laid out exactly as it was.
+            //
+            // Not merged when the period row carries CONTROLS (an absolute 128-key table
+            // puts the override field and its reset button there): that row is not a
+            // read-out then, and squeezing a name in beside an editor is how the panel
+            // got into this state in the first place.
+            const bool nameOwnRow  = nameNeed > mrow.getWidth() && ti.getHeight() >= 22;
+            const int  periodNeed  = fgfit::labelWidth (tuningPeriodLbl);
+            // What is still to be placed BELOW the name row: 2 + period(18),
+            // nSnug x (3 + 22), 3 + bend(22), 3 + bank(24). Hoisted above the name
+            // decision because whether that row can be afforded is what decides it.
+            const bool hasPatch = processorRef.activeSclHasPreset();
+            const bool hasPresetTuning = processorRef.hasPendingPresetTuning()
+                                       && ! processorRef.presetHasDrifted();
+            const bool hasProvTuning = processorRef.hasSpectrumProvenance();
+            const int  nSnug = (hasPatch ? 1 : 0) + (hasPresetTuning ? 1 : 0) + (hasProvTuning ? 1 : 0);
+            const int  need  = 72 + 25 * nSnug;
+            // The width the shared row would really need. An absolute 128-key table puts
+            // the period OVERRIDE field (72) and, when the user has set one, its reset
+            // button (46) on that row - so the merge is not refused just because the row
+            // carries controls, it is refused when the four things together do not fit.
+            // Refusing on the presence of the controls alone cost the tuning BANK its row
+            // at the shipped size, for a row that had 150 px to spare.
+            const bool periodIsTable = processorRef.tuningIsAbsoluteTable();
+            const int  periodExtra   = periodIsTable
+                                     ? (72 + 5 + (processorRef.tuningTablePeriodIsUserSet() ? 46 + 4 : 0))
+                                     : 0;
+            const bool mergeNamePeriod = nameOwnRow
+                                       && nameNeed + 8 + periodNeed + periodExtra <= ti.getWidth()
+                                       && ti.getHeight() - 22 < need;
+            if (nameOwnRow && ! mergeNamePeriod)
             {
                 ti.removeFromTop (2);
                 tuningNameLabel.setBounds (ti.removeFromTop (20));
             }
-            else
+            else if (! mergeNamePeriod)
                 tuningNameLabel.setBounds (mrow);
+            // (merged: the name is placed by the period row below, which is the row it
+            // now shares - setting bounds here would put it in the 13 px leftover.)
 
             //== THE SLACK IS SHARED OUT, NOT POOLED ================================
             // Every row below is a fixed height taken off the top, and the Shepard block
@@ -8617,17 +8687,47 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // The three optional "load this tuning from..." buttons are decided HERE
             // rather than at the row that draws them, because the count of them is what
             // makes the division right - measured after the fact it would be a guess.
-            const bool hasPatch = processorRef.activeSclHasPreset();
-            const bool hasPresetTuning = processorRef.hasPendingPresetTuning()
-                                       && ! processorRef.presetHasDrifted();
-            const bool hasProvTuning = processorRef.hasSpectrumProvenance();
-            const int  nSnug = (hasPatch ? 1 : 0) + (hasPresetTuning ? 1 : 0) + (hasProvTuning ? 1 : 0);
-            // What is still to be placed: 2 + period(18), nSnug x (3 + 22),
-            // 3 + bend(22), 3 + bank(24).
-            const int  need  = 72 + 25 * nSnug;
-            // ...over the gaps that can carry it: the four fixed ones (period, bend,
-            // bank, and the last-row-to-Shepard gap) plus one per optional button.
-            const int  lead  = juce::jmax (0, ti.getHeight() - need) / (4 + nSnug);
+            // (hasPatch / hasPresetTuning / hasProvTuning / nSnug / need are decided
+            // further up, where whether the name can afford a row of its own depends on
+            // them - see mergeNamePeriod.)
+            //
+            // WHAT THE PANEL CAN AFFORD IS DECIDED BEFORE ANYTHING IS PLACED, in a stated
+            // order and on a ladder: a row hands back its spare height first, and is only
+            // DROPPED when even its minimum will not fit. The row that used to give way
+            // was whichever one the top-down walk reached when the height ran out, which
+            // is not an order but an accident - and it produced both faults this panel had
+            // at the floor: a bend row laid out at 0 px (a control nobody can click, and
+            // nothing on screen saying why), and a bank row that reserved its 27 px, found
+            // it could not use them, hid itself, and left the space behind as a 15 px void
+            // above the Shepard block.
+            //
+            // The bank gives way first - its combo is reachable from the Load button and
+            // the Recent list, so the panel loses a shortcut rather than a capability -
+            // and the bend row second. 14 px is the least a row of controls can be and
+            // still be one; it is the threshold the bank row already used for itself.
+            const int  kRowMin = 14;
+            int  bendH = 22, bankH = 24;
+            bool bendRow = true, bankRow = true;
+            {
+                // Period and the optional "load from..." rows are not on the ladder: the
+                // period read-out is what the panel is FOR, and each snug row exists only
+                // because the state it describes is live right now.
+                const int fixed = 2 + 18 + nSnug * (3 + 22);
+                int over = fixed + (3 + bendH) + (3 + bankH) - ti.getHeight();
+                if (over > 0) { const int g = juce::jmin (over, bankH - kRowMin); bankH -= g; over -= g; }
+                if (over > 0) { bankRow = false; over -= 3 + bankH; }
+                if (over > 0) { const int g = juce::jmin (over, bendH - kRowMin); bendH -= g; over -= g; }
+                if (over > 0) { bendRow = false; }
+            }
+            // What the surviving rows will actually occupy...
+            const int  wants = 2 + 18 + nSnug * (3 + 22)
+                             + (bendRow ? 3 + bendH : 0) + (bankRow ? 3 + bankH : 0);
+            // ...over the gaps that can carry the rest: one before each row that survived,
+            // plus the one left between the last of them and the Shepard block. A dropped
+            // row hands its space back here, which is the whole point of `lead` and what a
+            // row hiding itself AFTER the division was computed quietly broke.
+            const int  gapCount = 1 + nSnug + (bendRow ? 1 : 0) + (bankRow ? 1 : 0) + 1;
+            const int  lead  = juce::jmax (0, ti.getHeight() - wants) / gapCount;
 
             // Period of the active scale, in red, always visible. For an absolute 128-key
             // table it is Fibló's ESTIMATE, so the same row also carries the field that
@@ -8636,7 +8736,16 @@ void FractalAdditiveAudioProcessorEditor::resized()
             ti.removeFromTop (2 + lead);
             {
                 auto prow = ti.removeFromTop (18);
-                const bool isTable = processorRef.tuningIsAbsoluteTable();
+                // The name rides on the LEFT of this row when the two were merged (see
+                // mergeNamePeriod): it keeps exactly the width its own text needs, and
+                // the period read-out takes the rest, so a long name can never push the
+                // period out - the merge only happens when both were measured to fit.
+                if (mergeNamePeriod)
+                {
+                    tuningNameLabel.setBounds (prow.removeFromLeft (nameNeed));
+                    prow.removeFromLeft (8);
+                }
+                const bool isTable = periodIsTable;
                 tablePeriodEdit.setVisible (isTable);
                 tablePeriodResetBtn.setVisible (isTable && processorRef.tuningTablePeriodIsUserSet());
                 if (isTable)
@@ -8707,7 +8816,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // in MPE-input mode (the MPE zone fixes the per-note range at +-48, so
             // the choice is irrelevant there) - Recent then takes the whole row.
             const bool bendVis = tmode != 3;
-            lblBend.setVisible (bendVis); bendBox.setVisible (bendVis);
+            // ...AND on the row surviving the ladder above. Set here, outside the block
+            // that lays the row out: a row that is skipped never reaches the setVisible
+            // inside it, so the two controls stayed VISIBLE carrying the bounds the LAST
+            // window size gave them - drawn at 1200x650 coordinates over the keyboard of
+            // an 870x540 window. Every check in both rigs stayed green through that,
+            // because they were inside the window and neither collapsed.
+            lblBend.setVisible (bendVis && bendRow); bendBox.setVisible (bendVis && bendRow);
             // ONE LABEL COLUMN for this panel. "Pitch bend" reserved 74 px and "Bank" 38,
             // so two adjacent rows started their controls 36 px apart - the kind of drift
             // that has no name on screen and just makes the panel look slightly wrong.
@@ -8717,29 +8832,53 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // 74 as the floor so nothing that fitted before can stop fitting.
             const int tunLblW = juce::jmax (74, fgfit::labelWidth (lblBend),
                                                 fgfit::labelWidth (lblTuningBank));
+            // Hoisted out of the row block below because Recent's visibility is set
+            // further down (with the bank UI), after that block has closed.
+            // Hoisted out of the row block below because Recent's visibility is set
+            // further down (with the bank UI), after that block has closed. The plan
+            // above already decided whether this row exists at all.
+            bool bendRowFits = bendRow;
+            if (bendRow)
             {
                 ti.removeFromTop (3 + lead);   // its share of the panel's spare height
-                auto bendRow = ti.removeFromTop (22);
+                auto bendRowRect = ti.removeFromTop (bendH);
                 if (bendVis)
                 {
                     lblBend.setJustificationType (juce::Justification::centredLeft);
-                    lblBend.setBounds (bendRow.removeFromLeft (tunLblW));
-                    compact (bendBox, bendRow.removeFromLeft (juce::jmin (120, bendRow.getWidth())));
-                    bendRow.removeFromLeft (6);
+                    lblBend.setBounds (bendRowRect.removeFromLeft (tunLblW));
+                    compact (bendBox, bendRowRect.removeFromLeft (juce::jmin (120, bendRowRect.getWidth())));
+                    bendRowRect.removeFromLeft (6);
                 }
                 // Recent is ONE button that opens a floating list of every file loaded;
                 // the bank stays inline. Both stay reachable in every mode - picking one
                 // of them IS how you get into Scala mode, so gating them on already
                 // being there was a dead end. It also keeps "+ to bank" from ever
                 // feeding a list you cannot see.
-                auto rec = bendRow.reduced (2, 0);
+                // HONEST FAILURE, the same rule the bank row below already applies: at
+                // the 870x540 floor this panel is over-subscribed, and this row is the one
+                // the shortage reaches first (the Shepard block is reserved off the bottom,
+                // so what runs out is the middle). It used to lay out anyway - 12 px in the
+                // plain case, and exactly 0 px with a periodic tuning, where the rise
+                // dropdown takes one more row. A VISIBLE control with no pixels is worse
+                // than an absent one: it cannot be clicked, it cannot be seen, and nothing
+                // on screen says the panel ran out of room. 14 px is the bank row's own
+                // threshold, kept identical so the two rows cannot drift apart.
+                // Belt and braces: the plan says this row was afforded, so it must have
+                // its 22 px. If arithmetic ever says otherwise, hide rather than ghost.
+                bendRowFits = bendRowRect.getHeight() >= 14;
+                lblBend.setVisible (bendVis && bendRowFits);
+                bendBox.setVisible (bendVis && bendRowFits);
+                auto rec = bendRowRect.reduced (2, 0);
                 recentOpenBtn.setBounds (rec.removeFromLeft (
                     juce::jmin (fgfit::snugTextButtonWidth (recentOpenBtn, 22), rec.getWidth())));
             }
             recentLabel.setVisible (false);
             for (int i = 0; i < 3; ++i) recentBtn[i].setVisible (false);
-            const bool bankUi = true;
-            recentOpenBtn.setVisible (bankUi);
+            const bool bankUi = bankRow;
+            // Recent lives in the BEND row, not the bank row - it follows that row's fate.
+            // (It was tied to `bankUi` back when that was unconditionally true, which only
+            // became a bug the moment the bank row could be dropped.)
+            recentOpenBtn.setVisible (bendRowFits);
             lblTuningBank.setVisible (bankUi); tuningBankBox.setVisible (bankUi);
             tuningBankLoadBtn.setVisible (bankUi);
             tuningBankClearBtn.setVisible (bankUi);
@@ -8751,7 +8890,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // Whatever is still under it - one share of the slack, by construction -
                 // is the gap up to the Shepard block, so that gap matches the others
                 // instead of being the whole void.
-                auto bkrow = ti.removeFromTop (juce::jmax (0, juce::jmin (24, ti.getHeight())));
+                auto bkrow = ti.removeFromTop (juce::jmax (0, juce::jmin (bankH, ti.getHeight())));
+                // (the plan above already decided this row is affordable; the `fits`
+                // check below stays as belt and braces, not as the decision)
                 lblTuningBank.setJustificationType (juce::Justification::centredLeft);
                 lblTuningBank.setBounds (bkrow.removeFromLeft (tunLblW));
                 tuningBankClearBtn.setBounds (bkrow.removeFromRight (24).reduced (1, 1));

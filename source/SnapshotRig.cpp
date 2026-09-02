@@ -108,7 +108,6 @@ namespace
                                      { "over",  num ((double) (need - (float) avail)) } }));
             return need > (float) avail + 0.5f;
         };
-
         juce::StringArray controls, cells, painted, compLbl, wrapped, variants,
                           comboIds, comboTexts, buttonFits, buttonTexts, dividers, corners;
 
@@ -125,8 +124,86 @@ namespace
             controls.add (obj ({ { "name", qs (c.first) }, { "rect", rectJ (c.second) },
                                  { "inWindow", boo (! outside) } }));
         }
+
+        // ...AND INSIDE ITS OWN PANEL, not merely inside the window.
+        //
+        // A control keeps the bounds the last layout gave it. A row that stops being laid
+        // out - because the panel decided it cannot afford it - therefore keeps the
+        // rectangle it had at the PREVIOUS window size, and if its visibility is set
+        // inside the block that was skipped, it stays on screen wearing them: the pitch
+        // bend selector drew at 1200x650 coordinates over the keyboard of an 870x540
+        // window. It was inside the window, it had not collapsed, and every check in both
+        // rigs stayed green.
+        //
+        // The name prefix says which panel a control belongs to, and the panel rects come
+        // from the same probe, so this cannot drift from the layout.
+        {
+            struct { const char* prefix; juce::Rectangle<int> box; } homes[] =
+            {
+                { "tun.",  p.tuning     },
+                { "ess.",  p.essentials },
+                { "spec.", p.specColumn },
+            };
+            for (const auto& c : p.controls)
+                for (const auto& h : homes)
+                    if (c.first.startsWith (h.prefix) && ! h.box.isEmpty()
+                        && ! h.box.contains (c.second))
+                    {
+                        problems.add (obj ({ { "where", qs ("control " + c.first) },
+                                             { "note", qs ("outside its own panel") },
+                                             { "rect", rectJ (c.second) },
+                                             { "panel", rectJ (h.box) } }));
+                    }
+        }
         for (const auto& c : p.cells)
             cells.add (obj ({ { "name", qs (c.first) }, { "rect", rectJ (c.second) } }));
+
+        // ESSENTIALS' THREE ROWS ARE EVEN THIRDS, AND THEY TILE THEIR BOX.
+        //
+        // Asserted rather than left to the eye because the failure it guards is invisible
+        // at the floor and only shows up when the window GROWS: OCTAVE used to be capped at
+        // 40 px while GAIN and REFERENCE split the remainder, which is 37/37/38 at 870x540
+        // and 126/126/40 at 1600x900 - two cells that swell and a third that cannot, so the
+        // box's last divider ends up stranded near the bottom edge. Every other check in
+        // this rig stays green through that: nothing leaves the window, nothing collapses,
+        // no text clips. Only the RELATIONSHIP between the three heights is wrong, and
+        // until now nothing in the build measured it.
+        //
+        // The cells must also tile the box with no gap and no overlap, because paint()
+        // draws each divider at a cell's TOP edge: a one-pixel gap between two cells is a
+        // divider drawn off the boundary it claims to be, and an overlap is a divider drawn
+        // across the neighbour's control.
+        {
+            juce::Rectangle<int> g, r, o;
+            bool haveG = false, haveR = false, haveO = false;
+            for (const auto& c : p.cells)
+            {
+                if (c.first == "ess.gain") { g = c.second; haveG = true; }
+                if (c.first == "ess.ref")  { r = c.second; haveR = true; }
+                if (c.first == "ess.oct")  { o = c.second; haveO = true; }
+            }
+            if (haveG && haveR && haveO)
+            {
+                const int h0 = g.getHeight(), h1 = r.getHeight(), h2 = o.getHeight();
+                const int lo = juce::jmin (h0, juce::jmin (h1, h2));
+                const int hi = juce::jmax (h0, juce::jmax (h1, h2));
+                // One pixel of slack and no more: integer thirds of a box whose height is
+                // not a multiple of three legitimately differ by one (the last cell takes
+                // the remainder so the three always tile exactly). Nothing else does.
+                if (hi - lo > 1)
+                    problems.add (obj ({ { "where", qs ("ESSENTIALS rows are not even thirds") },
+                                         { "note",  qs (juce::String (h0) + "/" + juce::String (h1)
+                                                        + "/" + juce::String (h2)) },
+                                         { "need",  num ((double) lo) },
+                                         { "avail", num ((double) hi) } }));
+                if (g.getBottom() != r.getY() || r.getBottom() != o.getY())
+                    problems.add (obj ({ { "where", qs ("ESSENTIALS rows do not tile their box") },
+                                         { "note",  qs ("gain.bottom " + juce::String (g.getBottom())
+                                                        + " ref.y " + juce::String (r.getY())
+                                                        + " ref.bottom " + juce::String (r.getBottom())
+                                                        + " oct.y " + juce::String (o.getY())) } }));
+            }
+        }
 
         for (const auto& l : p.paintedLabels)
         {
@@ -486,6 +563,17 @@ namespace
     //    same in both languages" from an accident into something somebody chose.
     //==========================================================================
     juce::StringArray gMojibake, gUntranslated;
+    // STRUCTURAL faults, kept apart from the fit problems and gating the run.
+    //
+    // A fit problem is a string that needs more room than its box has: there are 276 of
+    // them today, most of them Catalan at the shipped size, and they are tracked as a
+    // COUNT that is meant to come down. A structural fault is different in kind - a
+    // VISIBLE control laid out with no pixels, a control outside the window, a row
+    // division that is not the even one it claims to be. There are none of those, they
+    // are never acceptable, and until now they were pooled with the 276 and so could
+    // appear without anything going red. The pool they were in is reported per scenario
+    // and gates nothing; this one fails the run.
+    juce::StringArray gStructural;
 
     // The two lead bytes of a mis-decoded Latin-1 Supplement character, as characters.
     constexpr juce::juce_wchar kLead1 = 0xc2, kLead2 = 0xc3;
@@ -883,6 +971,29 @@ namespace
                 jf.deleteFile();
                 ok = ok && jf.replaceWithText (js, false, false, "\n");
 
+
+                // WHICH OF THOSE PROBLEMS GATE THE RUN.
+                //
+                // A fit problem is a string that wants more room than its box has. There
+                // are 276 of them, most of them Catalan at the shipped size, and they are
+                // tracked as a count that is meant to come down - so they cannot gate
+                // anything today without failing every run.
+                //
+                // A STRUCTURAL fault is a different kind of statement: a visible control
+                // laid out with no pixels at all, a control outside the window, a row
+                // division that is not the even one it claims to be. There are none of
+                // those, they are never acceptable, and pooled with the 276 they could
+                // appear - and did - without a single thing going red. Classified by the
+                // note the check itself wrote, so a new structural check joins this gate
+                // by using one of these notes rather than by remembering to register.
+                for (const auto& j : problems)
+                    if (j.contains ("\"collapsed to nothing\"") || j.contains ("\"outside the window\"")
+                        || j.contains ("\"outside its own panel\"")
+                        || j.contains ("\"where\":\"ESSENTIALS "))
+                    {
+                        const auto line = "  " + name + ": " + j;
+                        if (! gStructural.contains (line)) gStructural.add (line);
+                    }
                 if (ok) ++written; else ++failed;
                 say (juce::String (ok ? "  ok   " : "  FAIL ") + name
                           + "   " + juce::String (img.getWidth()) + "x" + juce::String (img.getHeight())
@@ -951,12 +1062,22 @@ namespace
                    " sameInBothLanguagesOnPurpose() with the reason.");
             for (const auto& l : gUntranslated) say (l);
         }
-        const bool allOk = failed == 0 && gMojibake.isEmpty() && gUntranslated.isEmpty();
+        if (! gStructural.isEmpty())
+        {
+            say (juce::String ("STRUCTURAL FAULTS (") + juce::String (gStructural.size())
+                 + "): a visible control with no pixels, a control outside the window, or a"
+                   " row division that is not what it claims. These are not fit problems and"
+                   " there is no acceptable count of them.");
+            for (const auto& l : gStructural) say (l);
+        }
+        const bool allOk = failed == 0 && gMojibake.isEmpty() && gUntranslated.isEmpty()
+                        && gStructural.isEmpty();
         say (juce::String ("SNAPSHOT ") + (allOk ? "OK" : "FAILED")
                   + ": " + juce::String (written) + " scenario file pair(s) written, "
                   + juce::String (failed) + " failure(s), "
                   + juce::String (gMojibake.size()) + " not decoded, "
-                  + juce::String (gUntranslated.size()) + " not translated, floor "
+                  + juce::String (gUntranslated.size()) + " not translated, "
+                  + juce::String (gStructural.size()) + " structural, floor "
                   + juce::String (gEditorMin.w) + "x" + juce::String (gEditorMin.h));
     }
 } // namespace
