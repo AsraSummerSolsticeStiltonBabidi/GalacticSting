@@ -8712,8 +8712,50 @@ void FractalAdditiveAudioProcessorEditor::resized()
             if (riseChoice) ti.removeFromBottom (3);
             auto shepRow = ti.removeFromBottom (22);
             ti.removeFromBottom (3);
+            // What is still to be placed BELOW the name row: 2 + period(18),
+            // nSnug x (3 + 22), 3 + bend(22), 3 + bank(24). Hoisted ABOVE the mode row
+            // because two decisions taken up there - whether the name can afford a row of
+            // its own, and whether the three fork buttons can afford one - both turn on
+            // what is left after this.
+            const bool hasPatch = processorRef.activeSclHasPreset();
+            const bool hasPresetTuning = processorRef.hasPendingPresetTuning()
+                                       && ! processorRef.presetHasDrifted();
+            const bool hasProvTuning = processorRef.hasSpectrumProvenance();
+            const int  nSnug = (hasPatch ? 1 : 0) + (hasPresetTuning ? 1 : 0) + (hasProvTuning ? 1 : 0);
+            const int  need  = 72 + 25 * nSnug;
             auto mrow = ti.removeFromTop (24);
-            compact (tuningBox, mrow.removeFromLeft (mrow.getWidth() * 34 / 100));
+            // THE THREE FORK BUTTONS TAKE THEIR OWN ROW WHEN THE MODE ROW CANNOT HOLD
+            // THEM. The mode selector takes a fixed 34% of the row and the buttons take
+            // their own widths out of the rest, left to right - so the LAST of them gets
+            // whatever survives. At the 750x550 floor that is 26 px for "Add to Bank",
+            // which needs 91: a fork glyph and about fifteen pixels of a word, condensed
+            // to 70% by a painter that never clips. Every bounds check green, and a button
+            // whose label cannot be read is a button you press to find out what it does.
+            //
+            // Measured against the words in the language on screen. When they do not fit,
+            // the buttons drop to a row of their own and the mode selector keeps the first
+            // row (which also gives the scale NAME the leftover it needs to stay inline).
+            // The row costs 27 px, and the tuning panel's own ladder decides what pays for
+            // it - the bank row first, by the order it already states.
+            const auto btnW = [] (const juce::TextButton& b)
+            { return fgfit::textButtonWidth (b.getButtonText(), 24, b.getProperties().contains ("fork")); };
+            const int btnNeed = btnW (loadSclButton) + 4 + btnW (saveTuningBtn) + 4
+                              + btnW (tuningBankAddBtn);
+            const bool tooTightForButtons = fgfit::snugComboWidth (tuningBox, 24) + 5 + btnNeed
+                                              > mrow.getWidth();
+            // ...but only if the panel can PAY for that row. Everything in this panel is
+            // on one ladder, and a row taken here is a row the ladder below takes from the
+            // bank and then from the pitch-bend selector. A legible "Add to Bank" is not
+            // worth the control that says how far a note bends, so when the extra row
+            // cannot be afforded the buttons stay on the mode row and the ones that do not
+            // fit are HIDDEN - Add to Bank first, then Save. Load never goes: it is the
+            // only route to a scale file, and a synth with no way to load a tuning is not
+            // a microtonal synth.
+            const bool canAffordBtnRow = ti.getHeight() - 24 - 27 >= need;
+            const bool btnOwnRow = tooTightForButtons && canAffordBtnRow;
+            compact (tuningBox, mrow.removeFromLeft (btnOwnRow ? juce::jmin (mrow.getWidth(),
+                                                                             fgfit::snugComboWidth (tuningBox, 24))
+                                                               : mrow.getWidth() * 34 / 100));
             mrow.removeFromLeft (5);
             // Load / Save / + sit immediately to the RIGHT of the mode selector, each at
             // its OWN minimum width. They used to have a row to themselves underneath,
@@ -8726,20 +8768,28 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 saveTuningBtn.setVisible (true);
                 tuningBankAddBtn.setVisible (true);
                 clearSclButton.setVisible (false);  // Reset removed - the mode selector does it
-                const auto fit = [&] (juce::TextButton& b)
+                auto brow = mrow;
+                if (btnOwnRow) { ti.removeFromTop (3); brow = ti.removeFromTop (24); }
+                const auto fit = [&brow] (juce::TextButton& b, bool mayHide)
                 {
                     // GalacticLnF's own width rule, in the font the button really draws
                     // in: measured here with a plain 12 pt while the LookAndFeel painted
                     // ~15 pt bold, "Afegeix al banc" came out 24 px too narrow and was
                     // silently squashed.
-                    const int w = fgfit::textButtonWidth (b.getButtonText(), mrow.getHeight(),
+                    const int w = fgfit::textButtonWidth (b.getButtonText(), brow.getHeight(),
                                                           b.getProperties().contains ("fork"));
-                    b.setBounds (mrow.removeFromLeft (juce::jmin (w, juce::jmax (0, mrow.getWidth()))));
-                    mrow.removeFromLeft (4);
+                    // A button that cannot show its word is HIDDEN, not squashed: the
+                    // painter never clips, it condenses to 70%, so the crushed state is a
+                    // fork with an unreadable smear beside it and no sign anything is
+                    // wrong. Load is never hidden - see above.
+                    if (mayHide && w > brow.getWidth()) { b.setVisible (false); return; }
+                    b.setBounds (brow.removeFromLeft (juce::jmin (w, juce::jmax (0, brow.getWidth()))));
+                    brow.removeFromLeft (4);
                 };
-                fit (loadSclButton);
-                fit (saveTuningBtn);
-                fit (tuningBankAddBtn);
+                fit (loadSclButton,    false);
+                fit (saveTuningBtn,    true);
+                fit (tuningBankAddBtn, true);
+                if (! btnOwnRow) mrow = brow;   // the name reads what the buttons left
             }
             // THE SCALE NAME IS THE IDENTITY OF THE LOADED TUNING, so it must not be
             // the scrap left over by everything else on its row. Sized as whatever
@@ -8776,15 +8826,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // got into this state in the first place.
             const bool nameOwnRow  = nameNeed > mrow.getWidth() && ti.getHeight() >= 22;
             const int  periodNeed  = fgfit::labelWidth (tuningPeriodLbl);
-            // What is still to be placed BELOW the name row: 2 + period(18),
-            // nSnug x (3 + 22), 3 + bend(22), 3 + bank(24). Hoisted above the name
-            // decision because whether that row can be afforded is what decides it.
-            const bool hasPatch = processorRef.activeSclHasPreset();
-            const bool hasPresetTuning = processorRef.hasPendingPresetTuning()
-                                       && ! processorRef.presetHasDrifted();
-            const bool hasProvTuning = processorRef.hasSpectrumProvenance();
-            const int  nSnug = (hasPatch ? 1 : 0) + (hasPresetTuning ? 1 : 0) + (hasProvTuning ? 1 : 0);
-            const int  need  = 72 + 25 * nSnug;
             // The width the shared row would really need. An absolute 128-key table puts
             // the period OVERRIDE field (72) and, when the user has set one, its reset
             // button (46) on that row - so the merge is not refused just because the row
@@ -8977,6 +9018,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // further down (with the bank UI), after that block has closed. The plan
             // above already decided whether this row exists at all.
             bool bendRowFits = bendRow;
+            bool recentFits  = true;
             if (bendRow)
             {
                 ti.removeFromTop (3 + lead);   // its share of the panel's spare height
@@ -9008,8 +9050,15 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 lblBend.setVisible (bendVis && bendRowFits);
                 bendBox.setVisible (bendVis && bendRowFits);
                 auto rec = bendRowRect.reduced (2, 0);
-                recentOpenBtn.setBounds (rec.removeFromLeft (
-                    juce::jmin (fgfit::snugTextButtonWidth (recentOpenBtn, 22), rec.getWidth())));
+                // Same rule as the fork buttons above: a button that cannot show its word
+                // is hidden, not crushed. Recent takes whatever the bend selector left, so
+                // at the floor it was 19 px against the 56 "Recent..." needs - a smear no
+                // one can read on a control whose whole job is to be recognised. Every
+                // file it lists is still reachable through Load.
+                const int recNeed = fgfit::snugTextButtonWidth (recentOpenBtn, 22);
+                recentFits = recNeed <= rec.getWidth();
+                if (recentFits)
+                    recentOpenBtn.setBounds (rec.removeFromLeft (recNeed));
             }
             recentLabel.setVisible (false);
             for (int i = 0; i < 3; ++i) recentBtn[i].setVisible (false);
@@ -9017,7 +9066,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // Recent lives in the BEND row, not the bank row - it follows that row's fate.
             // (It was tied to `bankUi` back when that was unconditionally true, which only
             // became a bug the moment the bank row could be dropped.)
-            recentOpenBtn.setVisible (bendRowFits);
+            recentOpenBtn.setVisible (bendRowFits && recentFits);
             lblTuningBank.setVisible (bankUi); tuningBankBox.setVisible (bankUi);
             tuningBankLoadBtn.setVisible (bankUi);
             tuningBankClearBtn.setVisible (bankUi);
