@@ -8109,8 +8109,17 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // this pass: a tick box the width of a whole cell is not a tick box.
                 {
                     auto tr2 = pi.removeFromBottom (20);
-                    temperToggle.setBounds (tr2.removeFromLeft (
-                        juce::jmin (fgfit::snugToggleWidth (temperToggle, 20), tr2.getWidth())));
+                    // Same rule as the tuning panel's fork buttons: a control that cannot
+                    // show its word is HIDDEN, not squashed. A ToggleButton squeezed below
+                    // its tick box has NEGATIVE room for its text - at 710x550 this one had
+                    // -8 px - and what is left on screen is an unlabelled tick that
+                    // re-tunes the whole spectrum. That is worse than absent: the feature
+                    // is still reachable everywhere the panel is wide enough to say what
+                    // it does.
+                    const int tw = fgfit::snugToggleWidth (temperToggle, 20);
+                    const bool temperFits = tw <= tr2.getWidth();
+                    temperToggle.setVisible (temperFits);
+                    if (temperFits) temperToggle.setBounds (tr2.removeFromLeft (tw));
                     pi.removeFromBottom (3);
                 }
                 // Limit / Whitelist, at the width those two words need - not the whole
@@ -8205,14 +8214,23 @@ void FractalAdditiveAudioProcessorEditor::resized()
             ci.removeFromBottom (shrunk (4, 2));
             {
                 auto b = brow.reduced (2, 0);
-                auto take = [&b] (juce::Component& c, int w)
+                // A control that cannot show its word is HIDDEN, not squashed - the same
+                // rule the tuning panel's fork buttons follow. This row takes three
+                // controls left to right, so the LAST one gets whatever survives: at
+                // 710x550 the Temper toggle got 20 px, which is NEGATIVE room once its
+                // tick box is drawn, leaving an unlabelled tick that re-tunes the whole
+                // spectrum. Load and Random are the two that can create a spectrum from
+                // nothing, so Temper is the one that goes; it is reachable from the
+                // harmonic view too, and from every size wide enough to say what it does.
+                auto take = [&b] (juce::Component& c, int w, bool mayHide = false)
                 {
+                    if (mayHide && w > b.getWidth()) { c.setVisible (false); return; }
                     c.setBounds (b.removeFromLeft (juce::jmin (w, juce::jmax (0, b.getWidth()))));
                     b.removeFromLeft (6);
                 };
                 take (loadTimbreButton,  fgfit::snugTextButtonWidth (loadTimbreButton, 24));
                 take (randomSpectrumBtn, fgfit::snugTextButtonWidth (randomSpectrumBtn, 24));
-                take (temperToggle,      fgfit::snugToggleWidth (temperToggle, 24));
+                take (temperToggle,      fgfit::snugToggleWidth (temperToggle, 24), true);
             }
             ci.removeFromTop (2);                 // the ratios box rides higher now
             intervalEditHome = ci.reduced (1, 0); // multi-line: type intervals, Enter builds
@@ -8328,16 +8346,50 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // collapsed to nothing, which would raise the window's minimum size
                 // instead of merely looking cramped. Hence the clamp, and the cap at half
                 // the row so OCTAVE RANGE always reads as the row's primary control.
+                // THE VALUE BOX IS SIZED TO THE WIDEST NUMBER IT CAN EVER SHOW, and the
+                // room that frees is what pays for the row's two real problems: the "-"
+                // button had ONE pixel of glyph room at the floor, and PHASE's own title
+                // could not fit its cell at any readable size.
+                //
+                // 40 px was a hand-picked number for a box whose whole content is an
+                // integer: "10" measures 15. Measured off the PARAMETER's own ends rather
+                // than the value on screen, or the box would resize under the user as they
+                // step through it - the same trap a combo sized to its selected item falls
+                // into. 24 stays the minimum so it remains a comfortable read.
+                int valW = 24;
+                if (auto* rp = processorRef.apvts.getParameter ("spectrumRange"))
+                {
+                    const auto vf = fgfit::labelFont (sprVal);
+                    for (const float u : { 0.0f, 1.0f })
+                        valW = juce::jmax (valW, juce::GlyphArrangement::getStringWidthInt (
+                                                     vf, juce::String ((int) rp->convertFrom0to1 (u))) + 10);
+                }
+                // What RANGE's compartment really needs: its stepper, plus the 6 px inset
+                // it keeps either side. PHASE gets the rest, and never less than its own
+                // title needs (28 px at the painted floor of 9 px, plus the same insets) -
+                // it was clamped at 34 and losing the "E" of PHASE in silence.
+                const int rangeCtlNeed = valW + 24 + 4 + 24 + 12;   // at full stepper width
+                const int phaseTitle   = 40;
                 const int phaseW = juce::jlimit (34, juce::jmax (34, beRange.getWidth() / 2),
-                                                 beRange.getWidth() - 104);
+                                                 juce::jmax (phaseTitle,
+                                                             beRange.getWidth() - rangeCtlNeed));
                 bePhase = beRange.removeFromRight (phaseW);
 
                 auto ri = beRange.reduced (6, 2); ri.removeFromTop (lblH);
                 auto rr = ri.removeFromTop (juce::jmin (24, juce::jmax (0, ri.getHeight())));
-                sprVal.setBounds (rr.removeFromLeft (40));
-                sprUp.setBounds  (rr.removeFromLeft (24).reduced (0, 1));
-                rr.removeFromLeft (4);
-                sprDn.setBounds  (rr.removeFromLeft (24).reduced (0, 1));
+                // The two stepper buttons shrink together, to a measured floor, instead of
+                // demanding 24 each and letting the LAST of them keep the remainder. That
+                // remainder was ZERO at the floor: a "-" button with no room for its own
+                // glyph, which is a control that exists and cannot be used. 14 px still
+                // holds the WIDER of the two glyphs ("+" measures 8.85, "-" only 4.90) inside
+                // the painter's 4 px a side, and the two are
+                // always the same width - a "+" wider than its "-" reads as a mistake.
+                // 14 was tried first and measured: it fits the "-" and clips the "+".
+                const int stepW = juce::jlimit (17, 24, (rr.getWidth() - valW - 4) / 2);
+                sprVal.setBounds (rr.removeFromLeft (juce::jmin (valW, rr.getWidth())));
+                sprUp.setBounds  (rr.removeFromLeft (juce::jmin (stepW, rr.getWidth())).reduced (0, 1));
+                rr.removeFromLeft (juce::jmin (4, rr.getWidth()));
+                sprDn.setBounds  (rr.removeFromLeft (juce::jmin (stepW, rr.getWidth())).reduced (0, 1));
 
                 // PHASE, laid out to the same recipe as its neighbours: painted title
                 // band, then the control on one row.
