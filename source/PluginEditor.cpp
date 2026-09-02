@@ -2143,7 +2143,9 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     specModeBox.addItem ("Adapt spectrum to tuning based on beating", 2);
     specModeBox.addItem ("From spectrum's segment", 3);
     tuneSourceBox.addItem ("From current tuning", 1);
-    tuneSourceBox.addItem ("From all possible tunings", 2);
+    // "all tunings", not "all possible tunings": see applyLanguage() for why the word
+    // this box could not afford is the one that was adding nothing.
+    tuneSourceBox.addItem ("From all tunings", 2);
     tuneSourceBox.setSelectedId (1, juce::dontSendNotification);
     tuneScopeBox.addItem ("0 vs all", 1);
     tuneScopeBox.addItem ("all vs all", 2);
@@ -3715,8 +3717,26 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         specModeBox.changeItemText (3, tr ("From spectrum's segment", "Del segment de l'espectre"));
         specModeBox.setSelectedId (keepMode, juce::dontSendNotification);
     }
+    // THE SOURCE, IN THE WORDS THE BOX CAN AFFORD.
+    //
+    // This box is already the full width of the Spectrum-vs-Tuning column, and at the
+    // SHIPPED 1200x650 "De totes les afinacions possibles" needed 213.96 px of the 174 it
+    // has - it drew 39.96 px past its own right edge, and a ComboBox neither clips
+    // visibly nor resizes, so what a Catalan player actually read was a sentence that
+    // stopped mid-word with nothing on screen saying so. There is no width to take: the
+    // column is 208 px at every window size from the 870x540 floor to the shipped size,
+    // and the previous pass measured what happens when it is widened there (rows 1-2
+    // start clipping instead).
+    //
+    // So the SENTENCE gives way, and the word it gives up is the one that was carrying
+    // nothing. The pair reads "from current tuning" against "from all tunings": the
+    // contrast that matters is THIS tuning against ALL of them, and "possible" was only
+    // ever restating "all". Both languages lose exactly the same word, so the two still
+    // say the same thing - and the English was not comfortable either, at 165.03 px of
+    // 174 with nine pixels to spare in a box whose items get re-worded on every language
+    // switch.
     localise (tuneSourceBox, { tr ("From current tuning", "De l'afinaci\xc3\xb3 actual"),
-                               tr ("From all possible tunings", "De totes les afinacions possibles") });
+                               tr ("From all tunings", "De totes les afinacions") });
     localise (tuneScopeBox,  { tr ("0 vs all", "0 vs tot"), tr ("all vs all", "tot vs tot") });
     // Its ITEMS were already localised (line above) but its HOVER was not: it was set
     // once in the constructor as an English literal, so the two-word items changed
@@ -3756,8 +3776,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Desa l'afinaci\xc3\xb3 ACTUAL com a fitxer .scl a qualsevol carpeta - incloses les escales editades al teclat (clic dret per reescriure un grau, Ctrl+clic per afegir una nota)."));
     chordGoBtn.setButtonText (tr ("Find", "Troba"));
     chordNotesBox.setTooltip (tr (
-        "How many notes each combination has (the root 1/1 is included). From the current tuning it stops at the number of degrees the scale has; from all possible tunings it goes to 8. More notes = a heavier search.",
-        "Quantes notes t\xc3\xa9 cada combinaci\xc3\xb3 (l'arrel 1/1 hi \xc3\xa9s inclosa). Des de l'afinaci\xc3\xb3 actual arriba fins als graus que t\xc3\xa9 l'escala; des de totes les afinacions possibles arriba a 8. M\xc3\xa9s notes = cerca m\xc3\xa9s pesada."));
+        "How many notes each combination has (the root 1/1 is included). From the current tuning it stops at the number of degrees the scale has; from all tunings it goes to 8. More notes = a heavier search.",
+        "Quantes notes t\xc3\xa9 cada combinaci\xc3\xb3 (l'arrel 1/1 hi \xc3\xa9s inclosa). Des de l'afinaci\xc3\xb3 actual arriba fins als graus que t\xc3\xa9 l'escala; des de totes les afinacions arriba a 8. M\xc3\xa9s notes = cerca m\xc3\xa9s pesada."));
     chordCountBox.setTooltip (tr ("How many chords to list.", "Quants acords llistar."));
     chordMinMaxBox.setTooltip (tr (
         "Min = the most CONSONANT combinations with this exact timbre (Sethares sensory dissonance of all partial pairs). Max = the roughest.",
@@ -7578,7 +7598,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
         // ONE beating mode now, with two selectors inside it:
         //   SOURCE - from the current tuning (combinations of its own degrees) or
-        //            from all possible tunings (a free search, loadable as a tuning)
+        //            from all tunings (a free search, loadable as a tuning)
         //   SCOPE  - rank by the beating against 0 only, or by every pair's beating
         const int  mode = specModeBox.getSelectedId();
         const bool beat = mode == 1;                       // "Find tunings based on beating"

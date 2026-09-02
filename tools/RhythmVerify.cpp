@@ -3734,7 +3734,7 @@ int main (int argc, char** argv)
             struct Shape { int mode, source, goal; const char* what; };
             const Shape shapes[] = {
                 { 1, 1, 1, "search, from the current tuning" },
-                { 1, 2, 1, "search, from all possible tunings (Find + REALTIME)" },
+                { 1, 2, 1, "search, from all tunings (Find + REALTIME)" },
                 { 2, 1, 1, "adapt, goal Min" },
                 { 2, 1, 3, "adapt, goal Range (the extra lo/hi row)" },
                 { 3, 1, 1, "from the spectrum's segment" } };
@@ -8442,7 +8442,7 @@ int main (int argc, char** argv)
 
             // (b) Now the free chord search, a five-note chord LOADED as the scale, and
             //     the "Tuning info" view it flips to - the user's exact path.
-            ed->setTuneSourceForTests (2);   // ...from all possible tunings (free search)
+            ed->setTuneSourceForTests (2);   // ...from all tunings (free search)
             juce::String err;
             check (p2->startChordSearch (5, 2.0, "2/1", 8, false, 30.0, true, err),
                    "a five-note chord search starts");
