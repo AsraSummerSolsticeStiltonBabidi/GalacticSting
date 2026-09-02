@@ -3265,11 +3265,59 @@ int main()
         // ...and every one of them is legible on the page, and is a COLOUR - the two
         // ways an "optimal" separation cheats: park it on white, or park it on grey.
         {
-            const auto c = palette::worstContrast();
-            std::printf ("  least legible: %s at %.1f:1 against the page (was 6.2:1)\n",
-                         c.a, c.distance);
-            check (c.distance >= 7.0,
-                   "every identity colour is WCAG AAA legible against the page");
+            // ON THE SURFACE THE TEXT IS DRAWN ON, not on the easiest surface in the
+            // window. The page is the DARKER ground, so for these light colours it gives
+            // the HIGHER ratio; the labels and outlines that carry the colour sit inside
+            // the panel, on kPanelFill tinted 5% towards that same colour. Measured
+            // there, the shipped set floors at 6.01:1 - real WCAG AA for large text
+            // (3:1) and for normal text (4.5:1), but NOT the AAA this check used to
+            // claim, which it only ever measured against the page.
+            //
+            // The threshold is the honest measured floor rather than an aspiration:
+            // 5.9 stops the palette getting worse (which is what the check is for) while
+            // saying out loud what it actually is. Raising it to 7.0 needs a re-run of
+            // tools/PaletteSearch.cpp with the panel surface in its constraint - it now
+            // has that rule; the shipped hexes predate it.
+            // The surface each colour is really read against, printed. This is what the
+            // check below is measuring, and it is worth seeing: the blend is NOT a lerp
+            // (see colour::blendSrgb) and kEssentials in particular borrows across byte
+            // lanes, so its panel is not the colour a tidy formula would predict.
+            for (const auto& e : palette::identitySet())
+                std::printf ("    %-19s #%06x on page %.2f:1, on its panel #%06x %.2f:1\n",
+                             e.name, e.rgb,
+                             colour::contrastRatio (e.rgb, palette::kPage),
+                             palette::panelSurface (e.rgb),
+                             colour::contrastRatio (e.rgb, palette::panelSurface (e.rgb)));
+            const auto c  = palette::worstContrast();
+            const auto cp = palette::worstContrastOnPage();
+            std::printf ("  least legible: %s at %.2f:1 on %s"
+                         " (the page alone would have said %.2f:1 for %s)\n",
+                         c.a, c.distance, c.b, cp.distance, cp.a);
+            check (c.distance >= 5.9,
+                   "every identity colour clears WCAG AA (4.5:1) on the surface it is drawn on");
+            // ...AND THAT IT IS REALLY MEASURING THE PANEL. The threshold above cannot
+            // tell: measure the page instead and every number goes UP, so the check
+            // passes more easily and the palette is signed off against a surface no
+            // coloured text is drawn on. That is the exact failure this replaced.
+            //
+            // So the direction is asserted too, and it is the claim the old comment had
+            // backwards ("the page is the darker of the two and therefore the harder"):
+            // these are LIGHT colours on a DARK ground, so the DARKER surface is the
+            // EASIER one and the page flatters every colour in the set. If a future
+            // palette goes dark-on-light this fails, which is right - the argument for
+            // measuring the panel would then have to be made again rather than assumed.
+            {
+                bool pageAlwaysEasier = true; const char* odd = "";
+                for (const auto& e : palette::identitySet())
+                    if (! (colour::contrastRatio (e.rgb, palette::kPage)
+                             > colour::contrastRatio (e.rgb, palette::panelSurface (e.rgb))))
+                    { pageAlwaysEasier = false; odd = e.name; }
+                check (pageAlwaysEasier, pageAlwaysEasier
+                         ? "the page flatters every one of them - the panel is the binding surface"
+                         : odd);
+            }
+            check (c.distance < cp.distance,
+                   "...so the reported floor is the PANEL's, strictly below what the page would say");
             double leastChroma = 1.0e9; const char* greyest = "";
             for (const auto& e : palette::identitySet())
             {

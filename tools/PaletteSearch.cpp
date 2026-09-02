@@ -94,13 +94,26 @@ namespace
         return worst;
     }
 
+    // THE CONTRAST A COLOUR REALLY HAS: the worse of its two surfaces. A section colour
+    // is a chip and a border on the PAGE, and labels and outlines inside its own PANEL,
+    // whose fill is kPanelFill tinted 5% towards that same colour. The page is the
+    // darker ground, so for these light colours it is the EASIER of the two - measuring
+    // there alone (which this search did) signed off a set that floors at 6.01:1 on the
+    // panel while reporting 7.00:1. The shipped hexes therefore predate this rule; a
+    // re-run under it will move them.
+    double realContrast (std::uint32_t rgb)
+    {
+        return std::min (colour::contrastRatio (rgb, palette::kPage),
+                         colour::contrastRatio (rgb, palette::panelSurface (rgb)));
+    }
+
     bool legal (const Lab& lab)
     {
         if (lab.L < kMinL || lab.L > kMaxL) return false;
         if (colour::chroma (lab) < kMinChroma) return false;
         const auto lin = colour::fromOklab (lab);
         if (! colour::inGamut (lin)) return false;
-        return colour::contrastRatio (colour::fromLinear (lin), palette::kPage) >= kMinContrast;
+        return realContrast (colour::fromLinear (lin)) >= kMinContrast;
     }
     // Same rules, applied to a colour that already exists as sRGB - which is how the
     // derived blend has to be judged: it is produced, not placed.
@@ -108,7 +121,7 @@ namespace
     {
         const auto lab = colour::toOklab (rgb);
         return lab.L >= kMinL && lab.L <= kMaxL && colour::chroma (lab) >= kMinChroma
-            && colour::contrastRatio (rgb, palette::kPage) >= kMinContrast;
+            && realContrast (rgb) >= kMinContrast;
     }
 
     // The objective. PRIMARY is the trichromatic minimum - that is the rule as stated.
@@ -168,14 +181,14 @@ int main()
                      minPairwise (v, Vision::normal),
                      minPairwise (v, Vision::deuteranopia),
                      minPairwise (v, Vision::protanopia));
-        std::printf ("  BEFORE contrast against the page:");
+        std::printf ("  BEFORE contrast on the surface each is drawn on:");
         double worstC = 1.0e9; std::size_t wc = 0;
         for (std::size_t i = 0; i < v.size(); ++i)
         {
-            const double c = colour::contrastRatio (v[i], palette::kPage);
+            const double c = realContrast (v[i]);
             if (c < worstC) { worstC = c; wc = i; }
         }
-        std::printf (" worst %.1f:1 (%s)\n", worstC, names[wc].c_str());
+        std::printf (" worst %.2f:1 (%s)\n", worstC, names[wc].c_str());
     }
 
     //== SEARCH ============================================================
@@ -350,10 +363,13 @@ int main()
                      minPairwise (v, Vision::normal),
                      minPairwise (v, Vision::deuteranopia),
                      minPairwise (v, Vision::protanopia));
-        std::printf ("  contrast against the page:\n");
+        // Both surfaces, printed side by side, because the gap between them is the whole
+        // reason this constraint changed: the page flatters every one of these colours.
+        std::printf ("  contrast   on the page / inside its own panel (the binding one):\n");
         for (std::size_t i = 0; i < v.size(); ++i)
-            std::printf ("    %-19s #%06x  %5.1f:1\n", names[i].c_str(), v[i],
-                         colour::contrastRatio (v[i], palette::kPage));
+            std::printf ("    %-19s #%06x  %5.2f:1  %5.2f:1\n", names[i].c_str(), v[i],
+                         colour::contrastRatio (v[i], palette::kPage),
+                         colour::contrastRatio (v[i], palette::panelSurface (v[i])));
         // The blend has to stay visibly BETWEEN its parents (rule (a) wins ties).
         const double dp = colour::deltaE (best[0], best[1]);
         std::printf ("  blend: %.1f from Spectrum, %.1f from Tuning, parents %.1f apart\n",

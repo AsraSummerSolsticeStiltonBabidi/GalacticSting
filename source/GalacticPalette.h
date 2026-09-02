@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -157,6 +158,45 @@ namespace colour
         return (std::max (a, b) + 0.05) / (std::min (a, b) + 0.05);
     }
 
+    // juce::Colour::interpolatedWith, byte for byte, so the JUCE-free palette can compute
+    // the exact surface the window paints. NOT a perceptual mix (that is mixOklch's job):
+    // this one has to match what Graphics really puts on screen, and Graphics blends
+    // sRGB components with INTEGERS.
+    //
+    // Not a lerp, which is what makes it worth writing out. JUCE quantises the proportion
+    // to a 0..255 "amount" (juce_Colour.cpp: `roundToInt (proportion * 255.0f)`) and then
+    // does, per byte, `d += ((s - d) * amount) >> 8` (PixelARGB::tween). So a nominal 5%
+    // is really 13/256 = 5.08%, and the shift TRUNCATES rather than rounds. Writing
+    // `x + (y - x) * 0.05` instead lands one or two counts away per channel - small, but
+    // then the number this header reports is not the number on screen, which is the whole
+    // failure this file exists to stop.
+    //
+    // AND IT IS NOT PER CHANNEL EITHER. PixelARGB packs the four bytes into one uint32
+    // (little-endian: A<<24 | R<<16 | G<<8 | B) and tweens TWO LANES of it at a time -
+    // EVEN = {R, B}, ODD = {A, G} - masking each result with 0x00ff00ff afterwards. When
+    // a channel's source byte is BELOW its destination byte the subtraction borrows from
+    // the channel sharing its lane, and the mask then keeps whatever that produced.
+    //
+    // That is not a corner case here: kEssentials is 0x6bff02, whose blue (0x02) is
+    // darker than kPanelFill's (0x1f), so its blue borrows from its red on every repaint.
+    // A tidy per-channel `d + ((s-d)*amount >> 8)` gets that colour's surface wrong, and
+    // a tidy `x + (y-x)*0.05` gets every colour's surface slightly wrong. The whole point
+    // of this header is that the number it reports is the number on screen, so the lanes
+    // are reproduced as lanes.
+    //
+    // Alpha is forced to 0xff on both sides, as the painter's own colours are, so the odd
+    // lane behaves exactly as it does in the window; the result is masked back to RGB.
+    inline std::uint32_t blendSrgb (std::uint32_t dst, std::uint32_t src, double proportion) noexcept
+    {
+        const std::uint32_t amount = (std::uint32_t) std::lround (proportion * 255.0);
+        const std::uint32_t d = 0xff000000u | dst, s = 0xff000000u | src;
+        auto lane = [amount] (std::uint32_t dl, std::uint32_t sl)
+        { return (std::uint32_t) ((dl + (((sl - dl) * amount) >> 8)) & 0x00ff00ffu); };
+        const std::uint32_t even = lane (d & 0x00ff00ffu, s & 0x00ff00ffu);
+        const std::uint32_t odd  = lane ((d >> 8) & 0x00ff00ffu, (s >> 8) & 0x00ff00ffu);
+        return (even | (odd << 8)) & 0x00ffffffu;
+    }
+
     //== Dichromacy (Viénot, Brettel & Mollon 1999) =========================
     // Not decoration: half of this palette's separation is carried by hue, and the two
     // common dichromacies collapse whole regions of hue onto one line. A palette that
@@ -190,10 +230,33 @@ namespace colour
 //==============================================================================
 namespace palette
 {
-    // The page behind everything, and the interior fill of a macro panel. Legibility is
-    // measured against the page: it is the darker of the two and therefore the harder.
+    // The page behind everything, and the interior fill of a macro panel.
+    //
+    // LEGIBILITY IS MEASURED ON THE SURFACE THE TEXT IS ACTUALLY DRAWN ON, which is
+    // BOTH of these - and the panel fill is the one that bites. This header used to
+    // measure against the page alone, "the darker of the two and therefore the harder",
+    // which is backwards: these are light colours on a dark ground, so a DARKER surface
+    // gives a HIGHER contrast ratio. The page is the EASIEST surface in the window, and
+    // measuring only there let eleven identity colours be signed off at 7.0:1 while the
+    // labels, borders and title chips they draw sit on the panel fill - and not even the
+    // bare fill, but the fill tinted 5% towards the section's own colour
+    // (PluginEditor.cpp's macro-panel painter), which lightens it further towards the
+    // very colour being drawn on it. Measured there the real floor is 6.01:1, not 7.0:1 -
+    // Spectrum vs Tuning, on its own panel. SpectrumTests prints all twelve, both ways.
     inline constexpr std::uint32_t kPage        = 0x0c0c12;
     inline constexpr std::uint32_t kPanelFill   = 0x17171f;
+    // The 5% the macro-panel painter tints its interior by, as the painter states it -
+    // juce::Colour then quantises it to 13/256, which colour::blendSrgb reproduces. One
+    // number, here, so the measurement cannot drift away from the paint: the two places
+    // that use it are PluginEditor.cpp's GalacticLnF::drawGroupComponentOutline and the
+    // `macroFrame` lambda inside resized(), and FftVerify checks the result against what
+    // juce::Colour really produces for all twelve colours.
+    inline constexpr double        kPanelTint   = 0.05;
+
+    // The exact interior a panel of colour `rgb` is filled with - what its own labels,
+    // borders and chip text are read against.
+    inline std::uint32_t panelSurface (std::uint32_t rgb) noexcept
+    { return colour::blendSrgb (kPanelFill, rgb, kPanelTint); }
 
     //== THE IDENTITY COLOURS ==============================================
     // The set rule (b) covers: one colour per thing the user has to tell apart.
@@ -264,8 +327,31 @@ namespace palette
         return w;
     }
 
-    // The least legible colour in the set against the page.
+    // The least legible colour in the set, on the surface it is really drawn on.
+    //
+    // Every identity colour appears in two places: as a title chip and border ON THE
+    // PAGE, and as labels/outlines INSIDE its own panel, whose fill is kPanelFill tinted
+    // 5% towards that same colour. The honest number is the WORSE of the two, so this
+    // takes the minimum - `b` names which surface lost. Measuring the page alone (what
+    // this did) reported 7.00:1 for a set whose real floor is 6.01:1: see the comment on
+    // kPage for why the page is the easiest surface, not the hardest.
     inline WorstPair worstContrast() noexcept
+    {
+        WorstPair w;
+        for (const auto& e : identitySet())
+        {
+            const double onPage  = colour::contrastRatio (e.rgb, kPage);
+            const double onPanel = colour::contrastRatio (e.rgb, panelSurface (e.rgb));
+            const double c       = std::min (onPage, onPanel);
+            if (c < w.distance)
+            { w.distance = c; w.a = e.name; w.b = onPanel < onPage ? "its panel fill" : "page"; }
+        }
+        return w;
+    }
+
+    // The same measurement on the page alone - kept ONLY so the checks can print both
+    // numbers side by side and show how much of the old 7.0:1 claim was the surface.
+    inline WorstPair worstContrastOnPage() noexcept
     {
         WorstPair w;
         for (const auto& e : identitySet())

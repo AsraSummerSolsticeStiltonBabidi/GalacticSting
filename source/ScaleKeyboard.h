@@ -1029,7 +1029,18 @@ private:
     std::function<DissInfo(int,int)>     getHoverDiss;   // (hovered, other) -> dissonance line + colour
     std::function<juce::String(int)>     getDegreeName;  // degree -> ups-and-downs name ("" = none)
     juce::Typeface::Ptr                  nameFace;       // the face those names MUST be drawn in
-    juce::Colour sourceColour { 0xffff9a3c };            // Spectrum-to-Tuning colour for the source label
+    // The source label's colour, ALWAYS supplied by setDeltaProviders - the editor passes
+    // the derived Spectrum-vs-Tuning colour, which is a blend of two palette entries and
+    // therefore has no hex of its own to copy here.
+    //
+    // This used to read `{ 0xffff9a3c }` under the comment "Spectrum-to-Tuning colour".
+    // That orange was retired when the palette became a measured, derived set; keeping it
+    // here left a second, wrong answer to "what colour is Spectrum vs Tuning" sitting in
+    // a file that never gets to paint it, which is precisely how GalacticPalette.h stops
+    // being the single source of truth it says it is. White is what a caller who forgets
+    // would get, and white is legible on every surface in this window - so the fallback
+    // states nothing about the palette at all, which is the point.
+    juce::Colour sourceColour { juce::Colours::white };
     static constexpr int stripH = 56;                    // top info strip (3 delta lines + dissonance band)
     int baseKey   = 48; // leftmost VISIBLE key (the scroll position)
     int rangeLo   = 48; // full playable range start

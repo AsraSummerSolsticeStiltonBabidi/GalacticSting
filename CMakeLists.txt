@@ -206,3 +206,12 @@ target_link_libraries(FftVerify PRIVATE
     juce::juce_dsp
     juce::juce_audio_processors
     juce::juce_recommended_config_flags)
+# FftVerify's main() is ONE frame: seventy-odd sections, each with its own locals, all
+# live at once because they are written as blocks in a single function - and MSVC commits
+# the whole frame on entry. It was one call away from the 1 MB default: adding a check
+# with two small arrays and a juce::Colour turned the first deep call in the file into a
+# stack overflow (0xC00000FD, no message, no output). The next check to be added would
+# have done the same. 8 MB, so growing this verifier stays a matter of writing checks.
+if (MSVC)
+    target_link_options(FftVerify PRIVATE /STACK:8388608)
+endif()

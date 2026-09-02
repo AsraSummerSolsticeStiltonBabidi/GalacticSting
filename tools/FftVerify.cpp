@@ -4,6 +4,7 @@
 //   - RMS / peak dBFS (level consistency + clipping)
 
 #include "PluginProcessor.h"
+#include "GalacticPalette.h"   // the JUCE-free palette, pinned against juce::Colour below
 #include "dsp/Spectrum.h"
 
 #include <juce_dsp/juce_dsp.h>
@@ -173,6 +174,55 @@ static void reportEnvelope (const char* name, std::function<void (AudioProcessor
     std::printf ("  %-16s spectral tilt:  400Hz %5.1f   1.5k %5.1f   5k %5.1f   15k %5.1f  (dB below peak)\n",
                  name, envAt (mag, 400, maxMag), envAt (mag, 1500, maxMag),
                  envAt (mag, 5000, maxMag), envAt (mag, 15000, maxMag));
+}
+
+//==============================================================================
+// Its own function, not a block inside main(): main() is one 700-line frame with
+// every section's locals live at once, and MSVC commits all of it on entry. Adding
+// even a few hundred bytes there - two std::array<Entry,12> temporaries and a
+// juce::Colour - was enough to turn the first deep call in the file into a stack
+// overflow: 0xC00000FD, one line of output, no message. A check that costs the
+// verifier its stack is not a check.
+static int checkPanelSurfaces()
+{
+    int failures = 0;
+// THE PALETTE'S PANEL SURFACE IS THE ONE JUCE PAINTS.
+//
+// GalacticPalette.h measures legibility on the interior a macro panel is really
+// filled with - kPanelFill tinted towards the section's own colour - and it has to
+// compute that interior WITHOUT JUCE, because the whole point of that header is that
+// the code defining the palette is the code measuring it.
+//
+// So the reproduction needs pinning against the real thing exactly once, and this is
+// the only verifier that has both: galactic::palette (JUCE-free) and juce::Colour.
+// It is not a formality. juce::Colour::interpolatedWith quantises the proportion to
+// an integer 0..255 and tweens PACKED BYTE LANES with a truncating shift, so a plain
+// `a + (b-a)*0.05` is wrong for every colour by a count or two, and wrong by more for
+// kEssentials, whose blue is darker than the fill and borrows across its lane. A
+// palette header that reports a surface the window does not paint is the same class
+// of defect as the retired hexes it exists to replace.
+{
+    std::printf ("\nthe panel surface the palette measures is the one JUCE paints:\n");
+    const juce::Colour fill (0xff000000u | galactic::palette::kPanelFill);
+    int wrong = 0;
+    for (const auto& e : galactic::palette::identitySet())
+    {
+        const auto juced = fill.interpolatedWith (juce::Colour (0xff000000u | e.rgb),
+                                                  (float) galactic::palette::kPanelTint)
+                               .getARGB() & 0x00ffffffu;
+        const auto ours  = galactic::palette::panelSurface (e.rgb);
+        if (juced != ours)
+        {
+            ++wrong; ++failures;
+            std::printf ("  %-19s JUCE paints #%06x, the palette says #%06x\n",
+                         e.name, juced, ours);
+        }
+    }
+    std::printf ("  %d of %d panel surfaces reproduced exactly\n",
+                 (int) galactic::palette::identitySet().size() - wrong,
+                 (int) galactic::palette::identitySet().size());
+}
+    return failures;
 }
 
 int main()
@@ -717,6 +767,8 @@ int main()
         { std::printf ("        the fader barely moves the level (%.1f dB) - it is not blending the two laws\n",
                        db[kSteps - 1] - db[0]); ++failures; }
     }
+
+    failures += checkPanelSurfaces();
 
     std::printf ("\n%s\n", failures == 0 ? "no partials dropped" : "PARTIALS DROPPED");
     return failures == 0 ? 0 : 1;
