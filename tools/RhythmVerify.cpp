@@ -13586,7 +13586,25 @@ int main (int argc, char** argv)
             // 4.87 to 10.00 log2 Hz. This is a patch tweak while a note is down - the most
             // ordinary thing anyone does with a synth - and it is what moves the band.
             set ("baseN", 64.0f);
-            for (int k = 0; k < (int) (2.5 * ssr / blk); ++k)
+            // AS LONG AS IT TAKES FOR THE CROSSFADE TO START, THEN A FULL PASS FROM THERE.
+            //
+            // This used to render a fixed 2.5 s and hope the crossfade landed inside it.
+            // It usually did; about one run in six it did not, and then worstMorphW stayed
+            // 0, the premise check failed, and the two invariants below measured nothing.
+            // The race is real: baseN 1 -> 64 takes the template from 1024 partials to
+            // 16321 and that compile runs on a background thread, so how much of the
+            // crossfade falls inside a fixed window is a question about the MACHINE, not
+            // about the synth.
+            //
+            // So the loop waits for the crossfade to appear and only then measures a full
+            // 2.5 s of it. Strictly stronger than the fixed window - the invariants now
+            // always see a whole crossfade instead of whatever part of one arrived in
+            // time - and it still FAILS if the crossfade never comes at all, which would
+            // be a real defect rather than a slow compile.
+            const int minBlocks = (int) (2.5 * ssr / blk);
+            const int maxBlocks = (int) (20.0 * ssr / blk);
+            int seenAt = -1;
+            for (int k = 0; k < maxBlocks; ++k)
             {
                 juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
                 const int n = p->voiceShepardForTests (pm, pr, pw, pcn, shepard::kSlots);
@@ -13607,6 +13625,8 @@ int main (int argc, char** argv)
                 sm.feed (b, blk, sumA2, sumB);
                 sawCapFlag  = sawCapFlag || p->isShepardSlotCapped();
                 worstMorphW = std::max (worstMorphW, p->voiceMorphWeightForTests());
+                if (seenAt < 0 && worstMorphW > 0.05) seenAt = k;
+                if (seenAt >= 0 && k - seenAt >= minBlocks) break;
             }
             double cw, cx, dw, ls; int pl, dr, mc, bl, cb, cwo;
             p->shepardEvidenceForTests (cw, cx, dw, ls, pl, dr, mc, bl, cb, cwo);
