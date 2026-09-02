@@ -7485,6 +7485,43 @@ void FractalAdditiveAudioProcessorEditor::resized()
         l.setBounds (row.removeFromLeft (juce::jmin (w, juce::jmax (0, row.getWidth() - keepForControl))));
     };
 
+    // [ THE ACTION ][ REALTIME ] - the pair the Spectrum-vs-Tuning column ends both of its
+    // search modes with, laid out from the WORDS on the two buttons instead of from a
+    // fixed 3/5 - 2/5 split of the row.
+    //
+    // The split was fitted to English and to English alone: "REALTIME" needs 79 px of the
+    // 76 the 2/5 gave it - it was 2.24 px over its own box in the SHIPPED window - and
+    // "TEMPS REAL" needs 96, so the Catalan spilled by 17.42 px in every one of the four
+    // scenarios that show this row. Nothing about a fraction of a row could have found
+    // that: it is the button's word that is long, not the window that is narrow.
+    //
+    // WHO YIELDS TO WHOM. The follower's word never changes (it is a mode name), while the
+    // action's does - "Adapt" grows a duration when a run would take more than a second -
+    // so the FOLLOWER is measured and the ACTION takes the remainder. If the action's word
+    // grows so long that the two no longer fit, the follower falls back to exactly the 2/5
+    // it has today rather than eating into it, which is why this can never be narrower for
+    // either button than what it replaces.
+    //
+    // The follower is capped at half the row on purpose: in Catalan the mode's name is as
+    // long as the action's, so the pair comes out even there. The hierarchy the old
+    // fraction was drawing - "the follower must never be the button the hand lands on" -
+    // is carried by ORDER and COLOUR (the action is the panel's accent, the follower is
+    // grey), neither of which a long word can take away.
+    //
+    // The 2 px gap between the pair is still trimmed off their INNER edges only: reducing
+    // both ends pulled the row 1 px in from the column on each side, so this pair alone
+    // contributed two more of the seven different edges this narrow column used to have.
+    auto actionPair = [] (juce::TextButton& go, juce::TextButton& rt, juce::Rectangle<int> row)
+    {
+        const int h = row.getHeight();
+        auto need = [h] (const juce::TextButton& b)
+        { return fgfit::textButtonWidth (b.getButtonText(), h, b.getProperties().contains ("fork")); };
+        const int keep = row.getWidth() * 2 / 5;               // what the follower has today
+        const int rtW  = juce::jlimit (keep, juce::jmax (keep, row.getWidth() - need (go)), need (rt));
+        go.setBounds (row.removeFromLeft (row.getWidth() - rtW).withTrimmedRight (1));
+        rt.setBounds (row.withTrimmedLeft (1));
+    };
+
     //== Right column: ONE full-height Spectrum-to-Tuning box - mode controls on top,
     //   its result list (chords / dyad degrees / segment picker) INSIDE it below.
     //   The Tuning box is now a plain row-2 box (no more inverted L).
@@ -7739,23 +7776,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
             if (chord)
             {
                 si.removeFromTop (4);
-                auto r4 = si.removeFromTop (24);
-                // Find takes the left ~60%, REALTIME the rest: the follower is a mode, not
-                // the primary action, and it must never be the button the hand lands on.
-                // The 2 px gap between the pair is trimmed off their INNER edges only:
-                // reducing both ends pulled the row 1 px in from the column on each side,
-                // so this pair alone contributed two more of the seven different edges
-                // this narrow column used to have.
-                chordGoBtn.setBounds (r4.removeFromLeft (r4.getWidth() * 3 / 5).withTrimmedRight (1));
-                chordRtBtn.setBounds (r4.withTrimmedLeft (1));
+                actionPair (chordGoBtn, chordRtBtn, si.removeFromTop (24));
             }
             if (adapt)
             {
                 si.removeFromTop (3);
-                auto r4 = si.removeFromTop (24);
                 // Same pair, same shared edges as the search's Find / REALTIME above.
-                adaptGoBtn.setBounds (r4.removeFromLeft (r4.getWidth() * 3 / 5).withTrimmedRight (1));
-                adaptRtBtn.setBounds (r4.withTrimmedLeft (1));
+                actionPair (adaptGoBtn, adaptRtBtn, si.removeFromTop (24));
                 // LOOKAHEAD on its own row UNDER the follower it belongs to: it is the
                 // follower's latency trade and means nothing without it, so it must not
                 // sit where it could be mistaken for a third action.
