@@ -6620,6 +6620,32 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
         // not above it - it was the one cell in the box laid out the other way round.
         add ("ess.oct",   tr ("OCTAVE", "OCTAVA"),                 left (ecOct),   cEssentials);
     }
+    // EVERY PAINTED SUB-LABEL IS SHRUNK UNTIL ITS WORD FITS, before anyone draws or
+    // measures it.
+    //
+    // A painted label has no component to squash: paint() calls drawText with
+    // useEllipsis false, so a word wider than its cell is simply CUT at the edge, with
+    // nothing on screen and nothing in any bounds check to say so. "OCTAVE RANGE" needs
+    // 83 px in the 79 it has at the floor, "ABAST OCTAVES" 88, "CAIGUDA AMP" 77 in 72 -
+    // each of them losing its last letters in one language only.
+    //
+    // Done HERE rather than in the painter because layoutProbe() measures this same list:
+    // a font chosen at paint time would be a font the rig never sees, and the check that
+    // is supposed to catch clipping would go on measuring a size nothing is drawn in.
+    //
+    // 9.0 is the floor. Below that the word is not smaller, it is unreadable, so a cell
+    // that still cannot hold its title at 9 px is a LAYOUT problem and stays reported as
+    // one - the rig keeps saying so rather than this quietly making the type invisible.
+    for (auto& s : v)
+    {
+        const auto widthAt = [&s] (float h)
+        {
+            return (float) juce::GlyphArrangement::getStringWidthInt (
+                       juce::Font (juce::FontOptions (h).withStyle ("Bold")), s.text);
+        };
+        while (s.fontHeight > 9.0f && widthAt (s.fontHeight) > (float) s.cell.getWidth())
+            s.fontHeight -= 0.25f;
+    }
     return v;
 }
 
