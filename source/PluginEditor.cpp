@@ -2089,6 +2089,17 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addAndMakeVisible (shepOnT);
     shepOnAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "shepOn", shepOnT);
     configCombo (shepModeBox, "shepMode", shepModeAtt, cTuning, {});
+    // SMALL-ITEM BOXES, for the same reason the LFO row's three are: these hold PHRASES
+    // ("Sync Project Tempo", "Bend de periode"), not one-word modes, and the row's
+    // meaning is already carried by the SHEPARD toggle beside them.
+    //
+    // Tried and REVERTED one commit ago, on a measurement that was wrong: the walk went
+    // width first and reported 820x680, which read as 60 px of width bought with 130 of
+    // height. Measured both ways round it is 850x550 - a smaller window than the 880x550
+    // it replaces, in both dimensions at once. The change was always right; the ruler was
+    // one-sided.
+    shepModeBox.setName (fgfit::kSmallComboName);
+    shepRiseBox.setName (fgfit::kSmallComboName);
     // Switching mode swaps which rate control is on screen, so it must re-lay the
     // row NOW - the attachment only moves the parameter, never the layout.
     shepModeBox.onChange = [this] { resized(); repaint(); refocus(); };

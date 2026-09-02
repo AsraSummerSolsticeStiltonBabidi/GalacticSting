@@ -767,7 +767,6 @@ namespace
             // can act on: "1200x550" says the design is bound somewhere without saying
             // where, and the whole point of this measurement is that the next person can
             // walk straight to it. Returns the worst offender at the size that failed.
-            juce::String blockerW, blockerH;
             const auto firstClip = [&ed] (bool ca, juce::String& into)
             {
                 float worst = 0.0f;
@@ -781,26 +780,46 @@ namespace
                     }
                 return worst > 0.5f;
             };
-            int w = start.w;
-            for (int trial = start.w; trial >= 640; trial -= 10)
+            // BOTH ORDERS, and the smaller window wins.
+            //
+            // Walking width first and then height at that width does not measure the
+            // layout, it measures the walk: a narrower window can force a TALLER one, so
+            // a change that "won" 60 px of width was really losing 130 of height and the
+            // single headline number hid it (820x680 was reported as an improvement on
+            // 880x550; it is a bigger window by a fifth). Running it the other way round
+            // as well, and keeping whichever corner is the smaller AREA, makes the number
+            // a property of the design rather than of the order it was measured in.
+            const auto walk = [&] (bool widthFirst, juce::String& bw, juce::String& bh)
             {
-                ed.setSize (trial, start.h);
-                juce::String why;
-                if (! laysOut (ed, lang == 1)) { blockerW = "the layout itself"; break; }
-                if (firstClip (lang == 1, why)) { blockerW = why; break; }
-                w = trial;
-            }
-            int h = start.h;
-            for (int trial = start.h; trial >= 360; trial -= 10)
-            {
-                ed.setSize (w, trial);
-                juce::String why;
-                if (! laysOut (ed, lang == 1)) { blockerH = "the layout itself"; break; }
-                if (firstClip (lang == 1, why)) { blockerH = why; break; }
-                h = trial;
-            }
+                int w = start.w, h = start.h;
+                const auto step = [&] (bool moveW)
+                {
+                    const int from = moveW ? start.w : start.h;
+                    const int to   = moveW ? 640 : 360;
+                    for (int trial = from; trial >= to; trial -= 10)
+                    {
+                        ed.setSize (moveW ? trial : w, moveW ? h : trial);
+                        juce::String why;
+                        auto& into = moveW ? bw : bh;
+                        if (! laysOut (ed, lang == 1)) { into = "the layout itself"; break; }
+                        if (firstClip (lang == 1, why)) { into = why; break; }
+                        (moveW ? w : h) = trial;
+                    }
+                };
+                step (widthFirst); step (! widthFirst);
+                return Size { w, h };
+            };
+            juce::String bw1, bh1, bw2, bh2;
+            const auto a = walk (true,  bw1, bh1);
+            const auto b = walk (false, bw2, bh2);
+            const bool takeA = (double) a.w * a.h <= (double) b.w * b.h;
+            const int w = takeA ? a.w : b.w, h = takeA ? a.h : b.h;
             say (juce::String ("  smallest fully legible size (") + (lang == 1 ? "ca" : "en") + "): "
-                 + juce::String (w) + " x " + juce::String (h));
+                 + juce::String (w) + " x " + juce::String (h)
+                 + "   (width-first " + juce::String (a.w) + "x" + juce::String (a.h)
+                 + ", height-first " + juce::String (b.w) + "x" + juce::String (b.h) + ")");
+            const auto& blockerW = takeA ? bw1 : bw2;
+            const auto& blockerH = takeA ? bh1 : bh2;
             if (blockerW.isNotEmpty()) say ("    width stops there because: "  + blockerW);
             if (blockerH.isNotEmpty()) say ("    height stops there because: " + blockerH);
             best.w = juce::jmax (best.w, w);
