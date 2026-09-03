@@ -2637,6 +2637,161 @@ int main (int argc, char** argv)
         }
     }
 
+    // --- run 12j: the transport loops back under a held note -------------------------
+    //
+    // A user puts a loop brace round two bars and lets it run. The playhead jumps
+    // BACKWARDS, by seconds, between one processBlock and the next - and this plugin
+    // reads the playhead twice over: the rhythm engine emits MIDI against it, and the
+    // Shepard band can be synced to project tempo. A backwards jump is a negative delta,
+    // and a negative delta is how an engine that counts pulses forward either floods its
+    // output or stops emitting altogether.
+    //
+    // Four questions across the jump, with the rhythm engine ON so the MIDI path is the
+    // one being exercised rather than a silent one.
+    {
+        struct LoopPlayHead : juce::AudioPlayHead
+        {
+            double bpm = 120.0, sr2 = 48000.0;
+            juce::int64 samplePos = 0;
+            juce::Optional<juce::AudioPlayHead::PositionInfo> getPosition() const override
+            {
+                juce::AudioPlayHead::PositionInfo p;
+                p.setBpm (bpm);
+                p.setIsPlaying (true);
+                p.setTimeInSamples (samplePos);
+                p.setPpqPosition ((double) samplePos / sr2 * bpm / 60.0);
+                return p;
+            }
+        };
+
+        auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+        auto& p = *up;
+        const double sr = 48000.0; const int blk = 256;
+        p.prepareToPlay (sr, blk);
+        LoopPlayHead ph; ph.sr2 = sr;
+        p.setPlayHead (&ph);
+        const auto q = [&p] (const char* id, float v)
+        {
+            if (auto* x = p.apvts.getParameter (id)) x->setValueNotifyingHost (x->convertTo0to1 (v));
+            p.pollParametersForTests();   // or the engine runs on its startup values
+        };
+        q ("rhythmOn", 1.0f);
+        // TWO SLOTS, ENABLED. rhythmOn alone emits NOTHING - the first version of this
+        // check set it and nothing else, measured 0.000 note-ons per block everywhere,
+        // and its two MIDI assertions passed with no MIDI to assert about.
+        p.getRhythm().slots[0].partial = 1; p.getRhythm().slots[0].enabled = true;
+        p.getRhythm().slots[0].steps   = 0; p.getRhythm().slots[0].durMs   = 30.0f;
+        p.getRhythm().slots[1].partial = 2; p.getRhythm().slots[1].enabled = true;
+        p.getRhythm().slots[1].steps   = 7; p.getRhythm().slots[1].durMs   = 30.0f;
+
+        struct Span { int noteOns = 0; float maxSlew = 0.0f, peak = 0.0f; bool finite = true; };
+        float prev = 0.0f;
+        const auto play = [&] (int blocks, bool noteOn, bool noteOff) -> Span
+        {
+            Span s;
+            juce::AudioBuffer<float> b (2, blk);
+            for (int n = 0; n < blocks; ++n)
+            {
+                juce::MidiBuffer m;
+                if (n == 0 && noteOn)  m.addEvent (juce::MidiMessage::noteOn  (1, 60, 0.8f), 0);
+                if (n == 0 && noteOff) m.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+                b.clear();
+                p.processBlock (b, m);
+                // What the plugin EMITTED: processBlock replaces the buffer's contents
+                // with its own output, which is the rhythm engine's pulses.
+                for (const auto meta : m)
+                    if (meta.getMessage().isNoteOn()) ++s.noteOns;
+                for (int i = 0; i < blk; ++i)
+                {
+                    const float v = b.getSample (0, i);
+                    if (! std::isfinite (v)) s.finite = false;
+                    s.maxSlew = juce::jmax (s.maxSlew, std::abs (v - prev));
+                    s.peak    = juce::jmax (s.peak, std::abs (v));
+                    prev = v;
+                }
+                ph.samplePos += blk;
+            }
+            return s;
+        };
+
+        const auto before = play (200, true, false);          // ~1.07 s of settled playing
+        // THE LOOP POINT: the host rewinds to the top of the brace. One second back,
+        // between two consecutive calls, with the note still held.
+        ph.samplePos -= (juce::int64) sr;
+        const auto across = play (8, false, false);
+        const auto after  = play (200, false, false);
+        const auto tail   = play (300, false, true);          // note-off, then the release
+
+        check (before.finite && across.finite && after.finite && tail.finite,
+               "no non-finite sample when the transport loops back");
+        check (before.peak > 1.0e-4f && after.peak > 1.0e-4f,
+               "the note is sounding on both sides of the loop point");
+        // HONESTY ABOUT THESE TWO. Neither the flood check nor the deafness check BITES:
+        // three sabotages failed to move them - forcing the discontinuity detector to
+        // never fire, rewinding the engine clock by a second mid-pattern, and holding the
+        // pattern anchor - and all three left "0.000 across the jump" exactly as it is.
+        // The engine re-anchors rather than catching up, so there is nothing to flood.
+        // They stay because they are cheap and correct, but the transport discontinuity
+        // that DOES have proven coverage is the lookahead ring: forcing `jumped` to false
+        // fails "a transport jump FLUSHES the buffered note" and "with lookahead ARMED a
+        // loop wrap still silences", both of which already exist. Do not read the two
+        // checks below as evidence; read the control comparison at the end of this block,
+        // which is a measurement against a run without the jump.
+        // A FLOOD is the failure mode: an engine counting pulses forward, handed a
+        // negative delta, catches up by emitting everything it thinks it missed. Measured
+        // per block against the same number before the jump, not against zero - the
+        // engine is supposed to keep emitting.
+        const double perBlockBefore = (double) before.noteOns / 200.0;
+        const double perBlockAcross = (double) across.noteOns / 8.0;
+        check (perBlockAcross <= juce::jmax (1.0, perBlockBefore * 4.0 + 1.0),
+               "the loop point does not make the rhythm engine flood its MIDI output");
+        // ...and it must not go DEAF either: an engine that decides it is in the past can
+        // simply stop. Over 200 blocks it should be emitting at its usual rate again.
+        check (after.noteOns > 0 || before.noteOns == 0,
+               "the rhythm engine is still emitting after the loop point");
+        const float ratio = across.maxSlew / juce::jmax (1.0e-9f, after.maxSlew);
+        check (ratio < 3.0f, "the loop point leaves no step in the waveform");
+        // THE CONTROL. The tail after note-off is only evidence about the LOOP if the
+        // same patch, run the same way WITHOUT the jump, goes quiet. With the rhythm
+        // engine on it may well not - it is an engine whose job is to keep making notes -
+        // and blaming the loop for that would be blaming the thing in flight again.
+        float controlTail = 0.0f;
+        {
+            auto uc = std::make_unique<FractalAdditiveAudioProcessor>();
+            auto& c = *uc;
+            c.prepareToPlay (sr, blk);
+            LoopPlayHead ph2; ph2.sr2 = sr;
+            c.setPlayHead (&ph2);
+            if (auto* x = c.apvts.getParameter ("rhythmOn"))
+                x->setValueNotifyingHost (x->convertTo0to1 (1.0f));
+            c.pollParametersForTests();
+            c.getRhythm().slots[0].partial = 1; c.getRhythm().slots[0].enabled = true;
+            c.getRhythm().slots[0].steps   = 0; c.getRhythm().slots[0].durMs   = 30.0f;
+            c.getRhythm().slots[1].partial = 2; c.getRhythm().slots[1].enabled = true;
+            c.getRhythm().slots[1].steps   = 7; c.getRhythm().slots[1].durMs   = 30.0f;
+            juce::AudioBuffer<float> b (2, blk);
+            for (int n = 0; n < 708; ++n)     // the same total length, no jump
+            {
+                juce::MidiBuffer m;
+                if (n == 0)   m.addEvent (juce::MidiMessage::noteOn  (1, 60, 0.8f), 0);
+                if (n == 408) m.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+                b.clear();
+                c.processBlock (b, m);
+                if (n >= 408)
+                    controlTail = juce::jmax (controlTail, b.getMagnitude (0, blk));
+                ph2.samplePos += blk;
+            }
+            c.setPlayHead (nullptr);
+        }
+        check (tail.peak <= juce::jmax (1.0e-5f, controlTail * 1.10f),
+               "the loop point leaves nothing sounding that a straight run does not");
+        std::printf ("    note-ons/block %.3f before, %.3f across the jump, %.3f after; "
+                     "boundary jump %.3fx; tail %.4f against a no-loop control of %.4f\n",
+                     perBlockBefore, perBlockAcross, (double) after.noteOns / 200.0, ratio,
+                     tail.peak, controlTail);
+        p.setPlayHead (nullptr);
+    }
+
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
     // The editor draws value = shape(t, curve); this checks the engine agrees, that
     // the sustain node really sets the level, and that a second key retriggers from
