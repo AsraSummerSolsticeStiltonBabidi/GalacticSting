@@ -718,9 +718,179 @@ static void runPhaseFaderChecks()
 
 }
 
+//==============================================================================
+// THE PARAMETER LIST IS THE CONTRACT.
+//
+// Every saved project, every automation lane and every .gsting preset addresses this
+// synth's controls by their parameter ID. A RENAMED or REMOVED id does not fail loudly -
+// it silently loses that control's automation and its stored value in every project the
+// user has, and the plugin looks fine while doing it. A REORDERED list moves the indices
+// an index-addressed host writes into its lane.
+//
+// So the list is pinned here, in order, and any change has to be made by a hand that
+// reads the diff. Regenerate with:  RhythmVerify.exe --params
+static const char* kParamBaseline[] = {
+    "baseN",
+    "baseMode",
+    "harmonics",
+    "curveSlope",
+    "primeLimit",
+    "primeMode",
+    "primeWL0",
+    "primeWL1",
+    "primeWL2",
+    "primeWL3",
+    "primeWL4",
+    "primeWL5",
+    "primeWL6",
+    "primeWL7",
+    "primeWL8",
+    "fractalLevel",
+    "spectrumRange",
+    "phaseMode",
+    "ampAttack",
+    "ampDecay",
+    "ampSustain",
+    "ampRelease",
+    "ampCurveA",
+    "ampCurveD",
+    "ampCurveR",
+    "filterCurveA",
+    "filterCurveD",
+    "filterCurveR",
+    "pitchCurveA",
+    "pitchCurveD",
+    "pitchCurveR",
+    "masterGain",
+    "modE1A",
+    "modE1D",
+    "modE1S",
+    "modE1R",
+    "modE1Range",
+    "modE1CurveA",
+    "modE1CurveD",
+    "modE1CurveR",
+    "modE1On",
+    "modE2A",
+    "modE2D",
+    "modE2S",
+    "modE2R",
+    "modE2Range",
+    "modE2CurveA",
+    "modE2CurveD",
+    "modE2CurveR",
+    "modE2On",
+    "modE3A",
+    "modE3D",
+    "modE3S",
+    "modE3R",
+    "modE3Range",
+    "modE3CurveA",
+    "modE3CurveD",
+    "modE3CurveR",
+    "modE3On",
+    "modL1Wave",
+    "modL1RateMode",
+    "modL1Div",
+    "modL1Hz",
+    "modL1PhaseMode",
+    "modL1Phase",
+    "modL1Range",
+    "modL1On",
+    "modL2Wave",
+    "modL2RateMode",
+    "modL2Div",
+    "modL2Hz",
+    "modL2PhaseMode",
+    "modL2Phase",
+    "modL2Range",
+    "modL2On",
+    "modL3Wave",
+    "modL3RateMode",
+    "modL3Div",
+    "modL3Hz",
+    "modL3PhaseMode",
+    "modL3Phase",
+    "modL3Range",
+    "modL3On",
+    "filterCutoff",
+    "filterResonance",
+    "filterEnvAmount",
+    "filterAttack",
+    "filterDecay",
+    "filterSustain",
+    "filterRelease",
+    "pitchEnvAmount",
+    "pitchAttack",
+    "pitchDecay",
+    "pitchSustain",
+    "pitchRelease",
+    "partialManual",
+    "morph",
+    "morphTime",
+    "dryWet",
+    "dryWetTime",
+    "tuningMode",
+    "bendRange",
+    "refA",
+    "octaveShift",
+    "tuningBankSlot",
+    "monoGlide",
+    "glideTime",
+    "shepOn",
+    "shepMode",
+    "shepTime",
+    "shepDiv",
+    "shepRise",
+    "rhythmOn",
+    "rhythmSelfPlay",
+    "rhythmDrone",
+    "rhythmFeedback",
+    "rhythmVelSlope",
+    "rhythmFeedbackDecay",
+    "rhythmOctAll",
+    "rhythmStepsAll",
+    "rhythmQTempo",
+    "rhythmMono",
+    "rhythmQPulse",
+    "rhythmDivX",
+    "rhythmDivN",
+    "rhythmMode",
+    "rhythmMpe",
+    "rhythmTempoSync",
+    "rhythmTempoOct",
+    "rhythmJi",
+    "rhythmJiForcedMpe",
+    "timbreTemper",
+    "timbreOn",
+    "specRandom",
+    "timbreRepeats",
+    "pgX",
+    "pgY",
+    "pgMode",
+    "pgVoices",
+};
+
 int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI juceInit;
+
+    // ONE BLOCK, ON DEMAND: the ordered list of parameter IDs, printed one per line.
+    // This is how the baseline below gets regenerated when a parameter is added ON
+    // PURPOSE - by a hand that then reads the diff, which is the whole point of pinning
+    // it. See "the parameter list is the contract" further down.
+    if (argc > 1 && std::strcmp (argv[1], "--params") == 0)
+    {
+        // ON THE HEAP: main is one 7000-line frame at the 1 MB stack limit, and a processor
+        // is not small. Adding one as a LOCAL killed the whole run with no output at all -
+        // the same signature FftVerify showed. See the make_unique calls further down.
+        auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+        auto& proc = *up;
+        for (auto* ap : proc.getParameters())
+            if (auto* wid = dynamic_cast<juce::AudioProcessorParameterWithID*> (ap))
+                std::printf ("%s\n", wid->paramID.toRawUTF8());
+        return 0;
+    }
 
     // ONE BLOCK, ON DEMAND: only the Phase-fader checks. See runPhaseFaderChecks.
     if (argc > 1 && std::strcmp (argv[1], "--phase") == 0)
@@ -1520,6 +1690,51 @@ int main (int argc, char** argv)
             std::printf ("    first difference at byte %d\n      before: %s\n      after : %s\n",
                          (int) firstDiff, win (saved).toRawUTF8(), win (again).toRawUTF8());
         }
+    }
+
+    // --- run 12c: the parameter list, pinned -------------------------------------
+    {
+        auto upp = std::make_unique<FractalAdditiveAudioProcessor>();   // heap: see --params
+        auto& pp = *upp;
+        juce::StringArray live;
+        for (auto* ap : pp.getParameters())
+            if (auto* wid = dynamic_cast<juce::AudioProcessorParameterWithID*> (ap))
+                live.add (wid->paramID);
+
+        juce::StringArray base;
+        for (const auto* s : kParamBaseline) base.add (s);
+
+        check (live.size() == base.size(),
+               "the plugin still exposes exactly the parameters it shipped with");
+        if (live.size() != base.size())
+            std::printf ("    baseline %d, live %d  (regenerate with --params after an "
+                         "intentional change)\n", base.size(), live.size());
+
+        // WHAT changed, not just that something did: an id that vanished has taken the
+        // automation and the stored value of every project with it, an id that appeared
+        // is harmless, and one that only MOVED matters to an index-addressed host. Three
+        // different consequences, so three different lines.
+        juce::StringArray gone, added, moved;
+        for (int i = 0; i < base.size(); ++i)
+            if (! live.contains (base[i])) gone.add (base[i]);
+        for (int i = 0; i < live.size(); ++i)
+            if (! base.contains (live[i])) added.add (live[i]);
+        for (int i = 0; i < juce::jmin (live.size(), base.size()); ++i)
+            if (live[i] != base[i] && live.contains (base[i]) && base.contains (live[i]))
+                moved.add (base[i] + " was " + juce::String (i) + ", now "
+                           + juce::String (live.indexOf (base[i])));
+
+        check (gone.isEmpty(), "no parameter id has been removed or renamed away");
+        if (! gone.isEmpty())
+            std::printf ("    GONE (their automation and saved values go with them): %s\n",
+                         gone.joinIntoString (", ").toRawUTF8());
+        check (added.isEmpty(), "no parameter id has appeared without the baseline being updated");
+        if (! added.isEmpty())
+            std::printf ("    NEW (harmless, but bake it in): %s\n",
+                         added.joinIntoString (", ").toRawUTF8());
+        check (moved.isEmpty(), "no parameter has changed index");
+        if (! moved.isEmpty())
+            std::printf ("    MOVED: %s\n", moved.joinIntoString ("; ").toRawUTF8());
     }
 
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
