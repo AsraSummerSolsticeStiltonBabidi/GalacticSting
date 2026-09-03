@@ -2402,6 +2402,24 @@ namespace phaseset
     // pow(u, kTaperExponent); the taper is a UI decision and does not belong in the
     // signal maths, and putting it here would silently re-taper anything that already
     // had its own curve.
+    //==========================================================================
+    // THE SHORTEST SIGNED PATH FROM THE ALIGNED PHASE TO A TARGET PHASE.
+    //
+    // Three operations, and they were written out three times: in interpolatePhases, in
+    // the scatterDeltas() table, and - once a caller has a PLAN rather than the hash - in
+    // whatever asks "how far does this partial still have to travel". Three copies of one
+    // rule is Failure 2 in miniature, so there is one.
+    //
+    // The identity every caller relies on:
+    //     phase (target, s)  ==  wrap01 (kAlignedPhase + s * scatterDeltaTo (target))
+    inline double scatterDeltaTo (double targetPhase) noexcept
+    {
+        double d = targetPhase - kAlignedPhase;
+        d -= std::floor (d);            // -> [0,1)
+        if (d > 0.5) d -= 1.0;          // -> shortest signed delta in [-0.5, 0.5)
+        return d;
+    }
+
     inline void interpolatePhases (const double* target, int n, double scatter,
                                    double* out) noexcept
     {
@@ -2416,10 +2434,7 @@ namespace phaseset
         for (int i = 0; i < n; ++i)
         {
             if (t >= 1.0) { out[i] = target[i]; continue; }
-            double d = target[i] - kAlignedPhase;
-            d -= std::floor (d);            // -> [0,1)
-            if (d > 0.5) d -= 1.0;          // -> shortest signed delta in [-0.5, 0.5)
-            out[i] = detail::wrap01 (kAlignedPhase + t * d);
+            out[i] = detail::wrap01 (kAlignedPhase + t * scatterDeltaTo (target[i]));
         }
     }
 
@@ -2496,10 +2511,7 @@ namespace phaseset
             {
                 for (int i = 0; i < kScatterDeltaCount; ++i)
                 {
-                    double v = hashPhaseAt (i) - kAlignedPhase;
-                    v -= std::floor (v);        // -> [0,1)
-                    if (v > 0.5) v -= 1.0;      // -> shortest signed delta in [-0.5, 0.5)
-                    d[i] = v;
+                    d[i] = scatterDeltaTo (hashPhaseAt (i));
                 }
             }
         };
