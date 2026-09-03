@@ -97,6 +97,21 @@ namespace
     // the width of the box it is drawn into, because that difference - not the rect - is
     // what a truncation is.
     //==========================================================================
+    // A FINGERPRINT FOR A FILE, so a later run can name WHICH pictures moved without
+    // keeping the old ones. FNV-1a over the bytes, written here rather than reached for:
+    // juce::MD5 lives in juce_cryptography, which this target does not link, and adding a
+    // module to hash a PNG would be a strange trade.
+    juce::String fileFingerprint (const juce::File& f)
+    {
+        juce::MemoryBlock mb;
+        if (! f.loadFileAsData (mb)) return "-";
+        juce::uint64 h = 1469598103934665603ULL;
+        const auto* p = static_cast<const unsigned char*> (mb.getData());
+        for (size_t i = 0; i < mb.getSize(); ++i)
+        { h ^= (juce::uint64) p[i]; h *= 1099511628211ULL; }
+        return juce::String::toHexString ((juce::int64) h);
+    }
+
     juce::String dumpProbe (const Ed::LayoutProbe& p, juce::Rectangle<int> win,
                             juce::StringArray& problems)
     {
@@ -1131,10 +1146,19 @@ namespace
                 say (juce::String (ok ? "  ok   " : "  FAIL ") + name
                           + "   " + juce::String (img.getWidth()) + "x" + juce::String (img.getHeight())
                           + " px, " + juce::String (problems.size()) + " fit problem(s)");
+                // THE PICTURE'S OWN FINGERPRINT, so a later run can say WHICH views moved
+                // without keeping the old images. The rig is deterministic now (see the
+                // pinned calibration above): two runs of one build write byte-identical
+                // PNGs, so a changed hash means the drawing changed and nothing else.
+                //
+                // A hash of the FILE, not of the JUCE Image: the file is what a diff compares
+                // and what a reader can re-check with any tool on their machine.
+                const auto digest = ok ? fileFingerprint (png) : juce::String ("-");
                 index.add (obj ({ { "stem", qs (name) }, { "scenario", qs (sc.id) },
                                   { "language", qs (v.catalan ? "ca" : "en") },
                                   { "w", num (v.size.w) }, { "h", num (v.size.h) },
                                   { "scale", num ((double) v.scale) },
+                                  { "png", qs (digest) },
                                   { "problems", num (problems.size()) } }));
             }
 
