@@ -1494,6 +1494,32 @@ int main (int argc, char** argv)
         proc.getStateInformation (again);
         check (again.getSize() == saved.getSize(),
                "saving twice produces the same state size (no duplicated children)");
+        // ...and the SAME BYTES, which is the question the user actually asks by
+        // reopening a project. A size match is satisfied by a state of the same length
+        // holding different values - a float that reloads as a neighbouring float, a
+        // child written in a different order - and that is exactly the failure that
+        // reads as "my project came back wrong". Reported with the first differing
+        // offset and a window of both sides, because "not equal" on a 10 kB blob is
+        // not a diagnosis.
+        bool sameBytes = again.getSize() == saved.getSize();
+        size_t firstDiff = 0;
+        if (sameBytes)
+            for (size_t i = 0; i < saved.getSize(); ++i)
+                if (((const char*) saved.getData())[i] != ((const char*) again.getData())[i])
+                { sameBytes = false; firstDiff = i; break; }
+        check (sameBytes, "save -> load -> save is byte-for-byte identical");
+        if (! sameBytes && again.getSize() == saved.getSize())
+        {
+            const auto win = [&] (const juce::MemoryBlock& b)
+            {
+                const size_t from = firstDiff > 40 ? firstDiff - 40 : 0;
+                return juce::String (juce::CharPointer_UTF8 ((const char*) b.getData() + from),
+                                     juce::CharPointer_UTF8 ((const char*) b.getData()
+                                                             + juce::jmin (b.getSize(), from + 120)));
+            };
+            std::printf ("    first difference at byte %d\n      before: %s\n      after : %s\n",
+                         (int) firstDiff, win (saved).toRawUTF8(), win (again).toRawUTF8());
+        }
     }
 
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
