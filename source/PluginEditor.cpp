@@ -2076,6 +2076,12 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 
     // Pitch-bend range (inside the Tuning box).
     configCombo (bendBox, "bendRange", bendAtt, cTuning, {});
+    // A SMALL-ITEM BOX: "±48 st (MPE)" needs 98 px of the 92 its row gives it, and the row
+    // cannot spare the difference - widening it made the tuning panel's ladder drop a row
+    // at the floor, which is a whole control lost to gain six pixels. The smaller face
+    // costs no width at all, and this box sits under a "Pitch bend" caption that already
+    // says what it is.
+    bendBox.setName (fgfit::kSmallComboName);
     makeLabel (lblBend, cTuning);
 
     // SHEPARD MODE (the Tuning box's bottom row). It lives in this panel because the
@@ -2188,6 +2194,14 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     specModeBox.setSelectedId (processorRef.isSegmentModeActive() ? 3 : 1, juce::dontSendNotification); // restored state
     specModeBox.setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
     specModeBox.setMouseClickGrabsKeyboardFocus (false);
+    // A SMALL-ITEM BOX, and this one is why the hatch has to be measured rather than
+    // assumed. Its three items are SENTENCES ("Adapt spectrum to tuning based on
+    // beating"), it is 192x34, and that height was chosen so they take TWO lines. At the
+    // default face they take one and get cut - the shipped 1200x650 read "Find tunings
+    // based on beati..." - because juce::Label gives its painter one line per font height
+    // and this font is too tall for two. Dropped to the small face they fit two lines of
+    // 154 px, which is what the box was built for.
+    specModeBox.setName (fgfit::kSmallComboName);
     lastSpecMode = specModeBox.getSelectedId();
     specModeBox.onChange = [this]
     {
@@ -2207,6 +2221,13 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // --- Adapt-spectrum mode (2): target, partial count, goal, range, amplitudes ---
     adaptTargetBox.addItem ("To the loaded tuning", 1);
     adaptTargetBox.addItem ("To the chord held now", 2);
+    // SMALL-ITEM BOXES, for the same reason as the mode box above them: their items are
+    // PHRASES, not one-word modes, and they sit in a column whose painted titles already
+    // say what they are for. At the default face "To the chord held now" needs 165 px of
+    // the 164 the column gives and "De totes les afinacions" needs 167 - one and three
+    // pixels, which is a squeeze nobody can see and every check now reports honestly.
+    tuneSourceBox.setName (fgfit::kSmallComboName);
+    adaptTargetBox.setName (fgfit::kSmallComboName);
     adaptTargetBox.setSelectedId (1, juce::dontSendNotification);
     for (const int n : { 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24 })
         adaptPartialsBox.addItem (juce::String (n), n);
@@ -7016,21 +7037,64 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
             //     which is why the 34 px mode box legitimately holds a long sentence.
             // Both of the misses ran the same way - towards "it fits" - so the probe was
             // quietly certifying boxes ~10 px narrower than the word needs.
-            const auto f     = fgfit::comboItemFont (c, c.getHeight());
-            const int availW = fgfit::comboItemRoom (c.getWidth(), c.getHeight());
-            const int availH = (c.getHeight() - 2) - 2; // label bounds, then its own border
-            const int rows   = juce::jmax (1, (int) ((float) availH / f.getHeight()));
+            // MEASURED OFF THE LABEL THE BOX REALLY DRAWS IN, not off a model of it.
+            //
+            // A ComboBox draws its item through a child juce::Label, so that Label's own
+            // bounds and its own LookAndFeel font ARE the answer - they cannot drift from
+            // the painter the way a reconstruction can, and reconstructions here have now
+            // been wrong in both directions. The first modelled the room with a constant
+            // and the layout with addFittedText, which SHRINKS THE FONT until the text
+            // fits: `need` could never exceed `avail`, so the check could not fail, and
+            // the SPECTRUM mode box shipped reading "Find tunings based on beati..." at
+            // 1200x650 while the probe reported it needing 153.86 of the 154 it had. The
+            // second measured the string honestly but kept the modelled room, and reported
+            // "+-48 st (MPE)" as truncated when it is drawn in full.
+            const auto* lbl = [&c]() -> const juce::Label*
+            {
+                for (int i = 0; i < c.getNumChildComponents(); ++i)
+                    if (auto* l = dynamic_cast<const juce::Label*> (c.getChildComponent (i))) return l;
+                return nullptr;
+            }();
+            const auto  f      = lbl != nullptr ? fgfit::labelFont (*lbl)
+                                                : fgfit::comboItemFont (c, c.getHeight());
+            const int   availW = lbl != nullptr
+                                   ? lbl->getBorderSize().subtractedFrom (lbl->getLocalBounds()).getWidth()
+                                   : fgfit::comboItemRoom (c.getWidth(), c.getHeight());
             juce::String widest; float need = 0.0f;
+            // HOW MANY LINES THE PAINTER IS ALLOWED, from the label's own area and font -
+            // the same jmax(1, height/fontHeight) juce::Label::paint uses. Most of these
+            // boxes get one; the 34 px SPECTRUM mode box was BUILT to get two, and the
+            // whole point of measuring it here is to say whether it really does.
+            const float fh    = f.getHeight();
+            const int   availH2 = lbl != nullptr
+                                    ? lbl->getBorderSize().subtractedFrom (lbl->getLocalBounds()).getHeight()
+                                    : juce::jmax (1, c.getHeight() - 4);
+            const int   rows  = juce::jmax (1, (int) ((float) availH2 / juce::jmax (1.0f, fh)));
             for (int i = 0; i < c.getNumItems(); ++i)
             {
-                const auto t = c.getItemText (i);
-                // Laid out exactly as drawFittedText lays it out - wrapped over `rows`
-                // lines - but with NO horizontal squashing allowed (the painter's own
-                // 0.7 fallback IS the failure: a condensed item is a broken one).
-                juce::GlyphArrangement ga;
-                ga.addFittedText (f, t, 0.0f, 0.0f, (float) juce::jmax (1, availW), (float) juce::jmax (1, availH),
-                                  juce::Justification::centredLeft, rows, 1.0f);
-                const auto w = ga.getBoundingBox (0, -1, true).getWidth();
+                const auto  t    = c.getItemText (i);
+                const float oneW = juce::GlyphArrangement::getStringWidth (f, t);
+                // WRAPPED BY WORDS, COUNTED HONESTLY. Not addFittedText, which is what this
+                // check used to call: it lays the text out exactly as the painter does
+                // INCLUDING shrinking the font until it fits, so the measurement made
+                // itself true and the check could never fail. Greedy fill at the real
+                // width instead, then ask whether the lines fit the rows on offer.
+                int   lines = 1;
+                float lineW = 0.0f;
+                if (rows > 1 && oneW > (float) availW)
+                {
+                    auto words = juce::StringArray::fromTokens (t, " ", "");
+                    for (const auto& w : words)
+                    {
+                        const float ww = juce::GlyphArrangement::getStringWidth (f, w + " ");
+                        if (lineW > 0.0f && lineW + ww > (float) availW) { ++lines; lineW = ww; }
+                        else lineW += ww;
+                    }
+                }
+                // What it NEEDS of the width: nothing more than the box has when the lines
+                // it takes fit the rows it is given; the whole single-line width when they
+                // do not, because that is the width it would have had to have.
+                const float w = (rows > 1 && lines <= rows) ? 0.0f : oneW;
                 if (w > need) { need = w; widest = t; }
             }
             p.comboTexts.push_back ({ name, widest, need, availW });
@@ -8796,27 +8860,31 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 }
                 else
                 {
-                    auto combos = in.removeFromTop (20);
-                    // SPLIT BY WHAT EACH BOX HOLDS, not down the middle. The wave box
-                    // shows one short word; the rate-mode box shows "Fundamental / 2^n",
-                    // which needs 129 px and was being handed 108 - clipped at the shipped
-                    // size, in both languages, while the PHASE box below it (shorter
-                    // items) had the whole row to itself. fgfit::snugComboWidth is the
-                    // same rule the six narrowed controls elsewhere use, measured in the
-                    // font the item is really drawn in.
+                    // ONE BOX PER ROW WHEN TWO WILL NOT FIT ONE, which here is always.
+                    //
+                    // These were side by side, splitting the row in proportion to what
+                    // each asked for. Measured with a probe that no longer lies about it,
+                    // both are squeezed at the shipped size: "Fundamental / 2^n" needs
+                    // 99.6 px of the 92 it gets and "Pròpia (dibuixa)" 83.1 of 77. Nor is
+                    // it close - together they want 239 px of a 218 px row - and no
+                    // pairing of the three boxes fits either, because the phase box wants
+                    // 95 and the smallest partner wants 111.
+                    //
+                    // So each takes a row at its own width. It costs the tab 22 px of
+                    // fader height, which the faders have and the words did not.
                     const int waveNeed = fgfit::snugComboWidth (lfoWaveBox, 20);
                     const int rateNeed = fgfit::snugComboWidth (lfoRateModeBox, 20);
-                    // Both fit: each takes what it needs and the leftover goes to the
-                    // rate box, which is the one whose items grow with translation.
-                    // Neither fits: they share in PROPORTION to what they asked for, so
-                    // the shortfall is not paid entirely by whichever comes first.
-                    const int rowW = combos.getWidth();
-                    int waveW = waveNeed;
-                    if (waveNeed + rateNeed > rowW && waveNeed + rateNeed > 0)
-                        waveW = rowW * waveNeed / (waveNeed + rateNeed);
-                    waveW = juce::jlimit (24, juce::jmax (24, rowW - 24), waveW);
-                    lfoWaveBox.setBounds (combos.removeFromLeft (waveW).reduced (1, 0));
-                    lfoRateModeBox.setBounds (combos.reduced (1, 0));
+                    {
+                        auto r = in.removeFromTop (20);
+                        lfoWaveBox.setBounds (r.removeFromLeft (juce::jmin (juce::jmax (24, waveNeed),
+                                                                            r.getWidth())).reduced (1, 0));
+                    }
+                    in.removeFromTop (2);
+                    {
+                        auto r = in.removeFromTop (20);
+                        lfoRateModeBox.setBounds (r.removeFromLeft (juce::jmin (juce::jmax (24, rateNeed),
+                                                                                r.getWidth())).reduced (1, 0));
+                    }
                     in.removeFromTop (2);
                     lfoPhaseModeBox.setBounds (in.removeFromTop (20).reduced (1, 0));
                     in.removeFromTop (2);
