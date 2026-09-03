@@ -13715,6 +13715,48 @@ int main (int argc, char** argv)
         }
     }
 
+    //-- run 56: THE ASTERISK ON A DEGREE LABEL --------------------------------------
+    //
+    // The keyboard prints a degree's exact ratio when the scale really holds one, and its
+    // cents otherwise - with a trailing "*" when a simple just interval is near enough to
+    // be worth naming, which the hover then spells out. That trailing glyph is a PROMISE:
+    // it says "there is something here to look at". Nothing measured it, and it cannot be
+    // settled by looking - it is one character on a 63 px key, and reading a screenshot of
+    // 19-EDO I could not tell whether the 379-cent degree carried it.
+    //
+    // 19-EDO, because its degrees straddle the rule in both directions:
+    //   degree 6 = 378.9c is 7.4c under 5/4, whose simplicity (20) buys a 17c window -> "*"
+    //   degree 3 = 189.5c has nothing simple within its window at all               -> none
+    //   degree 5 = 315.8c IS 6/5 to within a cent, so it is named as the ratio, not cents
+    {
+        std::printf ("\nrun 56: the \"*\" that promises a nearby just interval:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 256);
+        juce::String err19;
+        juce::String scl19 ("! e19.scl\n19-EDO\n 19\n!\n");
+        for (int i = 1; i <= 19; ++i) scl19 << " " << juce::String (1200.0 * (double) i / 19.0, 6) << "\n";
+        check (p->loadScalaText (scl19, "edo19", err19), "  the 19-EDO scale loads");
+        awaitSpectrumIdle (*p, "run 56: 19-EDO");
+        std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "  the editor builds");
+        if (ed != nullptr)
+        {
+            ed->setSize (1200, 650);
+            const auto l3 = ed->degreeKeyLabelForTests (3);
+            const auto l5 = ed->degreeKeyLabelForTests (5);
+            const auto l6 = ed->degreeKeyLabelForTests (6);
+            std::printf ("    degree 3 \"%s\"   degree 5 \"%s\"   degree 6 \"%s\"\n",
+                         l3.toRawUTF8(), l5.toRawUTF8(), l6.toRawUTF8());
+            check (l6.endsWithChar ('*'),
+                   "  378.9c is 7.4c under 5/4 and says so with the asterisk");
+            check (! l3.endsWithChar ('*'),
+                   "  ...189.5c has no simple neighbour in its window, and does not claim one");
+            check (l5 == "6/5",
+                   "  ...and 315.8c is named as the ratio it is, not as cents");
+        }
+    }
+
     //-- run 55: THE PUBLISHED PHASE PLAN --------------------------------------------
     //
     // The engine's whole claim is "never worse than today's Scattered hash, at any

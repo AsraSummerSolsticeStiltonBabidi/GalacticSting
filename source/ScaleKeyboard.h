@@ -98,6 +98,7 @@ public:
     // Optional: a short just-intonation label per degree (e.g. "3/2"), drawn
     // under the degree number - the interval each Sethares minimum lands on.
     void setDegreeLabeller (std::function<juce::String(int)> fn) { getLabel = std::move (fn); }
+    std::function<juce::String(int)> getDegreeLabeller() const { return getLabel; }
 
     //== DEGREE NAMES instead of degree numbers ================================
     // Optional, off unless the editor turns it on. `fn` returns the NAME of a degree

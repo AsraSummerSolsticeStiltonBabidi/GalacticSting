@@ -443,6 +443,13 @@ public:
     // octave, say - is otherwise unreachable, and "it appears when the tuning changes"
     // could not be measured at all. It is the timer's own layout signature that is
     // under test, so calling resized() directly here would test nothing.
+    // The label the KEYBOARD paints under a degree - the exact ratio when the scale really
+    // holds one, else its cents with a trailing "*" when a nearby just interval exists.
+    // Exposed because that rule is a promise to the player ("the hover will name it") and
+    // nothing measured it: the asterisk is a single glyph on a 63 px key, which is exactly
+    // the kind of thing a screenshot cannot settle and a check can.
+    juce::String degreeKeyLabelForTests (int degree) const
+    { return keyboard.getDegreeLabeller() ? keyboard.getDegreeLabeller() (degree) : juce::String(); }
     void tickTimerForTests() { timerCallback(); }
     // Test hook (RhythmVerify): re-read "partialManual" and redress the SLOPE fader,
     // exactly as the 30 Hz timer does. The verifier has no message loop, so a pencil
