@@ -1863,6 +1863,104 @@ int main (int argc, char** argv)
        #endif
     }
 
+    // --- run 12e: no knob, at either end of its travel, makes a sample that is not a
+    //             number ------------------------------------------------------------
+    //
+    // A NaN or an infinity leaving a plugin does not just silence that track: it
+    // propagates through every sum in the host's mix bus, and the user hears the whole
+    // project go quiet and has no reason to blame this synth. Two targeted finiteness
+    // checks already exist (switches thrown under held notes, voice steals into Shepard),
+    // but nothing had ever asked the plain question of every control: put it at its
+    // minimum, at its maximum, at its middle, play notes, and look at the samples.
+    //
+    // ONE AT A TIME, restoring the default after each, so a failure names one parameter
+    // rather than a combination nobody can reproduce. Two combination passes follow -
+    // everything at minimum, everything at maximum - because a division by zero usually
+    // needs two settings to meet.
+    {
+        auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+        auto& p = *up;
+        const double sr = 48000.0; const int blk = 256;
+        p.prepareToPlay (sr, blk);
+        juce::AudioBuffer<float> b (2, blk);
+
+        std::vector<juce::AudioProcessorParameter*> ps;
+        for (auto* ap : p.getParameters())
+            if (dynamic_cast<juce::AudioProcessorParameterWithID*> (ap) != nullptr)
+                ps.push_back (ap);
+
+        // Four notes, held throughout: a chord exercises the voice pool, the shared
+        // spectrum and the per-voice phase seeding at once.
+        const auto play = [&p, &b, blk] (int blocks)
+        {
+            for (int n = 0; n < blocks; ++n)
+            {
+                juce::MidiBuffer m;
+                if (n == 0)
+                    for (int k : { 48, 55, 60, 67 })
+                        m.addEvent (juce::MidiMessage::noteOn (1, k, 0.8f), 0);
+                b.clear();
+                p.processBlock (b, m);
+            }
+        };
+        const auto badSample = [&b]() -> float
+        {
+            for (int ch = 0; ch < b.getNumChannels(); ++ch)
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                {
+                    const float v = b.getSample (ch, i);
+                    if (! std::isfinite (v)) return v;
+                }
+            return 0.0f;
+        };
+
+        juce::StringArray offenders, runaway;
+        float worstMag = 0.0f;
+        for (auto* q : ps)
+        {
+            const auto id = dynamic_cast<juce::AudioProcessorParameterWithID*> (q)->paramID;
+            const float home = q->getValue();
+            for (const float v : { 0.0f, 1.0f, 0.5f })
+            {
+                q->setValueNotifyingHost (v);
+                play (6);
+                if (! std::isfinite (badSample()))
+                    offenders.add (id + " @ " + juce::String (v, 1));
+                worstMag = juce::jmax (worstMag, b.getMagnitude (0, b.getNumSamples()));
+                if (b.getMagnitude (0, b.getNumSamples()) > 64.0f)
+                    runaway.add (id + " @ " + juce::String (v, 1));
+            }
+            q->setValueNotifyingHost (home);
+        }
+        offenders.removeDuplicates (false);
+        runaway.removeDuplicates (false);
+
+        check (offenders.isEmpty(), "no single parameter, at either end or the middle, "
+                                    "makes a non-finite sample");
+        if (! offenders.isEmpty())
+            std::printf ("    NON-FINITE OUTPUT: %s\n", offenders.joinIntoString (", ").toRawUTF8());
+
+        // ...and the two ends TOGETHER, because a division by zero usually needs two
+        // settings to meet and the one-at-a-time sweep can never put them there.
+        juce::StringArray combos;
+        for (const float v : { 0.0f, 1.0f })
+        {
+            for (auto* q : ps) q->setValueNotifyingHost (v);
+            play (10);
+            if (! std::isfinite (badSample()))
+                combos.add (v == 0.0f ? "everything at minimum" : "everything at maximum");
+        }
+        check (combos.isEmpty(), "nor does every parameter pinned to the same end at once");
+        if (! combos.isEmpty())
+            std::printf ("    NON-FINITE OUTPUT: %s\n", combos.joinIntoString (", ").toRawUTF8());
+
+        std::printf ("    swept %d parameters x 3 positions + 2 combination passes; "
+                     "worst block magnitude %.3f\n", (int) ps.size(), worstMag);
+        if (! runaway.isEmpty())
+            std::printf ("    LOUD (finite, but over 64.0): %s\n",
+                         runaway.joinIntoString (", ").toRawUTF8());
+    }
+
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
     // The editor draws value = shape(t, curve); this checks the engine agrees, that
     // the sustain node really sets the level, and that a second key retriggers from
