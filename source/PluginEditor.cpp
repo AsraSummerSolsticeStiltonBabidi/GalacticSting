@@ -5926,7 +5926,7 @@ void FractalAdditiveAudioProcessorEditor::saveDissonanceScl()
     }
 
     fileChooser = std::make_unique<juce::FileChooser> (
-        tr ("Save the generated scale (.scl)", "Desa l'escala generada (.scl)"),
+        tr (fgdlg::saveGen.en, fgdlg::saveGen.ca),
         juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
             .getChildFile (processorRef.getGeneratedSclName() + ".scl"),
         "*.scl");
@@ -6299,7 +6299,7 @@ void FractalAdditiveAudioProcessorEditor::openScalaChooser()
 {
     // .tun is offered first because it is what the Save button writes by default:
     // a tuning exported from here has to be reloadable from here.
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a tuning (.tun / .scl / .ascl)",
+    fileChooser = std::make_unique<juce::FileChooser> (tr (fgdlg::openTuning.en, fgdlg::openTuning.ca),
                                                        juce::File(), "*.tun;*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
@@ -6316,7 +6316,7 @@ void FractalAdditiveAudioProcessorEditor::openScalaChooser()
 
 void FractalAdditiveAudioProcessorEditor::openTuningBankChooser()
 {
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale into the tuning bank (.tun / .scl / .ascl)",
+    fileChooser = std::make_unique<juce::FileChooser> (tr (fgdlg::openBank.en, fgdlg::openBank.ca),
                                                        juce::File(), "*.tun;*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
@@ -6351,7 +6351,7 @@ void FractalAdditiveAudioProcessorEditor::refreshTuningBank()
 
 void FractalAdditiveAudioProcessorEditor::openTimbreChooser()
 {
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale file as timbre (.tun / .scl / .ascl)",
+    fileChooser = std::make_unique<juce::FileChooser> (tr (fgdlg::openTimbre.en, fgdlg::openTimbre.ca),
                                                        juce::File(), "*.tun;*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)

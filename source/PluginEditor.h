@@ -33,7 +33,24 @@ namespace fgdlg
     inline constexpr Pair rhythmHelp { "Spectrum vs Rhythm",    "Espectre vs ritme" };
     inline constexpr Pair mpeOut     { "MPE out required",      "Cal activar MPE out" };
 
-    inline constexpr Pair all[] = { loadScale, loadTimbre, saveScale, rhythmHelp, mpeOut };
+    // The FILE CHOOSER titles are the same hole one ring out: a chooser is an OS window
+    // too, and three of these five were English while the other two already used tr.
+    inline constexpr Pair openTuning { "Load a tuning (.tun / .scl / .ascl)",
+                                       "Carrega una afinació (.tun / .scl / .ascl)" };
+    inline constexpr Pair openBank   { "Load a scale into the tuning bank (.tun / .scl / .ascl)",
+                                       "Carrega una escala al banc d'afinacions (.tun / .scl / .ascl)" };
+    inline constexpr Pair openTimbre { "Load a scale file as timbre (.tun / .scl / .ascl)",
+                                       "Carrega un fitxer d'escala com a timbre (.tun / .scl / .ascl)" };
+
+    // These two were already correct. They join the table anyway: the gate is only worth
+    // anything if it holds the whole set, and a title that is right today is exactly the
+    // one nobody re-reads.
+    inline constexpr Pair saveTuning { "Save tuning", "Desa l'afinació" };
+    inline constexpr Pair saveGen    { "Save the generated scale (.scl)",
+                                       "Desa l'escala generada (.scl)" };
+
+    inline constexpr Pair all[] = { loadScale, loadTimbre, saveScale, rhythmHelp, mpeOut,
+                                    openTuning, openBank, openTimbre, saveTuning, saveGen };
 }
 
 
