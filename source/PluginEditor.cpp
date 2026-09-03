@@ -8903,9 +8903,18 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // a microtonal synth.
             const bool canAffordBtnRow = ti.getHeight() - 24 - 27 >= need;
             const bool btnOwnRow = tooTightForButtons && canAffordBtnRow;
-            compact (tuningBox, mrow.removeFromLeft (btnOwnRow ? juce::jmin (mrow.getWidth(),
-                                                                             fgfit::snugComboWidth (tuningBox, 24))
-                                                               : mrow.getWidth() * 34 / 100));
+            // THE MODE BOX STATES WHAT ITS WIDEST ITEM NEEDS, and only falls back to a
+            // share of the row when that is the larger of the two. A flat 34% is a
+            // percentage deciding what a word may be: "Scala (.scl)" needs 74 px and the
+            // share handed it 73, which is what the rig's legibility walk named as the
+            // binding control for the whole window in BOTH languages.
+            //
+            // Nothing is taken from the buttons that they are not already prepared to
+            // lose: they measure their own words and hide, in a stated order, when the row
+            // cannot hold them (see the ladder below). A percentage cannot do that.
+            compact (tuningBox, mrow.removeFromLeft (juce::jmin (mrow.getWidth(),
+                                    juce::jmax (fgfit::snugComboWidth (tuningBox, 24),
+                                                btnOwnRow ? 0 : mrow.getWidth() * 34 / 100))));
             mrow.removeFromLeft (5);
             // Load / Save / + sit immediately to the RIGHT of the mode selector, each at
             // its OWN minimum width. They used to have a row to themselves underneath,
