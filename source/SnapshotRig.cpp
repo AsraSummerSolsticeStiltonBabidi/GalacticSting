@@ -510,6 +510,34 @@ namespace
             // editor's own snapshot.
             { "40-rhythm-panel", "Spectrum-to-Rhythm panel open", tEditor, fNone,
               [] (Proc&, Ed& e) { e.setRhythmPanelForSnapshot (true); } },
+            // THE SILENT-SETTINGS EXPLAINER, which nothing had ever photographed. Two
+            // filters that each keep something can between them keep NOTHING - "Harmonics
+            // = Prime" with every prime switched off is the plainest case - and the
+            // overlay that says so paints its own title and body, so it escaped the
+            // translated gate, the decode gate and the fit sweep at once. Its body is
+            // drawn into 8 lines with NO horizontal squash, so a Catalan sentence that
+            // needs a ninth is simply cut, and nothing measured that either.
+            { "41-silent-warning", "the 'no sound: every partial is filtered out' explainer",
+              tEditor, fNone,
+              [] (Proc& p, Ed& e)
+              {
+                  setParam (p, "harmonics", 3.0f);   // Prime only
+                  setParam (p, "primeMode", 1.0f);   // whitelist
+                  setParam (p, "baseN", 2.0f);      // base > 1: the k<=1 exemption is out of reach
+                  for (int i = 0; i < 9; ++i)
+                      setParam (p, ("primeWL" + juce::String (i)).toRawUTF8(), 0.0f);
+                  // PUMPED UNTIL THE TEMPLATE REALLY IS EMPTY. Parameters reach the engine
+                  // through processBlock and the compile runs on a worker, so a scenario
+                  // that only sets values and ticks the timer photographs the state BEFORE
+                  // the one it asked for - which is why this overlay came out blank the
+                  // first time. Capped, and it stops as soon as the count reaches zero.
+                  p.prepareToPlay (48000.0, 256);
+                  juce::AudioBuffer<float> b (2, 256);
+                  for (int k = 0; k < 400 && p.getTemplatePartialCount() != 0; ++k)
+                  { juce::MidiBuffer m; b.clear(); p.processBlock (b, m); juce::Thread::sleep (1); }
+                  e.tickTimerForTests();
+              } },
+
 
             // The two FLOATING windows. Their panels are not children of the editor, so
             // they are photographed in their own right.

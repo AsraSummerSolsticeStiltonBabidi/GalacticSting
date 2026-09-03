@@ -4212,6 +4212,49 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
                  tr ("nothing loaded yet", "encara no s'ha carregat res"), recentOverlay);
         painted ("dissHeader/step",    tr ("Step", "Grau"),      dissHeader);
         painted ("dissHeader/beating", tr ("beating", "batec"),  dissHeader);
+        // THE TWO FLOATING EXPLAINERS, which nothing has ever measured. They paint their
+        // own title and body, so walkTextFits cannot reach them, and they are only on
+        // screen in states no scenario reaches - the two ways a string escapes every gate
+        // in this build at once.
+        //
+        // The BODY is the one at risk: drawFittedText is given 8 lines and NO horizontal
+        // squash, so a Catalan sentence that needs a ninth is not simply taller - it is
+        // SHRUNK to fit or cut. Measured here with the same geometry paint() uses, and
+        // the two overlays do NOT share it: the warning band is 26 px at 18/14 pt, the
+        // notice band 24 px at 17/13.5. A probe that measures the wrong font measures
+        // nothing, so both numbers are passed in rather than assumed equal.
+        //
+        // availH is the EIGHT-LINE cap, not the box: the box is 140 px tall and eight
+        // 14 px lines are 112, so a body wrapping to nine lines would still "fit" the
+        // box while paint() quietly shrank it. The question asked is paint's own.
+        const auto overlayText = [this, &out] (const char* path, const juce::String& text,
+                                               const juce::Component& c, bool isBody,
+                                               int bandH, float titlePt, float bodyPt)
+        {
+            if (text.isEmpty()) return;
+            auto in = c.getLocalBounds().reduced (22, 14);
+            const juce::Font f (juce::FontOptions (isBody ? bodyPt : titlePt)
+                                    .withStyle (isBody ? "" : "Bold"));
+            auto band = in.removeFromTop (bandH);
+            if (isBody) { in.removeFromTop (6); }
+            TextFit t;
+            t.path = path; t.kind = "Painted"; t.text = text;
+            t.bounds = getLocalArea (&c, c.getLocalBounds());
+            t.need   = juce::GlyphArrangement::getStringWidth (f, text);
+            t.avail  = (float) (isBody ? in.getWidth() : band.getWidth());
+            t.availH = isBody ? juce::jmin ((float) in.getHeight(), 8.0f * f.getHeight())
+                              : (float) band.getHeight();
+            if (isBody)
+            {
+                t.wraps = true;
+                t.needH = wrappedHeight (text, f, t.avail, juce::Justification::topLeft, t.need);
+            }
+            out.push_back (t);
+        };
+        overlayText ("warningOverlay/title", warningOverlay.title, warningOverlay, false, 26, 18.0f, 14.0f);
+        overlayText ("warningOverlay/body",  warningOverlay.body,  warningOverlay, true,  26, 18.0f, 14.0f);
+        overlayText ("noticeOverlay/title",  noticeOverlay.title,  noticeOverlay,  false, 24, 17.0f, 13.5f);
+        overlayText ("noticeOverlay/body",   noticeOverlay.body,   noticeOverlay,  true,  24, 17.0f, 13.5f);
     }
         }
 
