@@ -718,6 +718,103 @@ static void runPhaseFaderChecks()
 
 }
 
+
+//==============================================================================
+// THE tr-PAIR AUDIT, ON THE SOURCE.
+//
+// The snapshot rig's translated gate can only see a string that is ON SCREEN in a state
+// some scenario reaches. That leaves whole classes out by construction: the body of a
+// native message box, a menu item, a warning nobody has staged. Six dialog titles sat in
+// English for months inside that blind spot.
+//
+// A string in this build cannot be untranslated by accident in the usual way - tr takes
+// TWO arguments and the compiler insists - so the failure that is actually possible is
+// tr ("x", "x"): the same text on both sides. Twenty-one of those are correct (AMP,
+// FRACTAL, Notes, Triangle, "intervals:" ... the same word or abbreviation in Catalan)
+// and are listed below. Anything else identical is a string somebody meant to translate.
+//
+// Parsed rather than grepped, because the pairs that matter most span LINES and use
+// adjacent-literal concatenation ("de per\xc3\xad" "ode"), which no one-line regex sees.
+// The raw source text is compared, escapes and all: identical escapes are identical
+// strings, and it keeps the parser to the one job it can do reliably.
+namespace traudit
+{
+    // Reads one C string literal sequence at `i` (adjacent literals across whitespace and
+    // newlines are ONE string). Returns false if there is no literal there.
+    //
+    // Over a raw const char*, NOT a juce::String: String::operator[] walks the UTF-8 from
+    // the start every call, so indexing a 400 kB file character by character is O(n^2) -
+    // the first version of this parser hung the whole suite for a quarter of an hour
+    // before anything printed, which looked exactly like a deadlock.
+    inline bool readLiteral (const char* s, size_t n, size_t& i, std::string& out)
+    {
+        auto skipWs = [s, n, &i] { while (i < n && (s[i] == ' ' || s[i] == '\t'
+                                                    || s[i] == '\r' || s[i] == '\n')) ++i; };
+        skipWs();
+        if (i >= n || s[i] != '"') return false;
+        out.clear();
+        while (i < n && s[i] == '"')
+        {
+            ++i;
+            while (i < n && s[i] != '"')
+            {
+                if (s[i] == 92 && i + 1 < n) { out += s[i]; ++i; }   // 92 = backslash
+                out += s[i];
+                ++i;
+            }
+            if (i < n) ++i;                 // the closing quote
+            const size_t save = i;
+            skipWs();
+            if (i >= n || s[i] != '"') { i = save; break; }
+        }
+        return true;
+    }
+
+    // Every (en, ca) pair written as two literals in this file whose sides are IDENTICAL.
+    inline void collect (const juce::File& f, std::vector<std::string>& identical)
+    {
+        const auto held = f.loadFileAsString().toStdString();
+        const char*  s  = held.c_str();
+        const size_t n  = held.size();
+        for (size_t i = 0; i + 4 < n; ++i)
+        {
+            if (s[i] != 't' || s[i + 1] != 'r') continue;
+            if (i > 0 && (juce::CharacterFunctions::isLetterOrDigit ((juce::juce_wchar) s[i - 1])
+                          || s[i - 1] == '_')) continue;
+            size_t j = i + 2;
+            if (j < n && s[j] == 'F') ++j;
+            while (j < n && s[j] == ' ') ++j;
+            if (j >= n || s[j] != '(') continue;
+            ++j;
+            std::string en, ca;
+            if (! readLiteral (s, n, j, en)) continue;
+            while (j < n && (s[j] == ' ' || s[j] == '\t' || s[j] == '\r' || s[j] == '\n')) ++j;
+            if (j >= n || s[j] != ',') continue;
+            ++j;
+            if (! readLiteral (s, n, j, ca)) continue;
+            if (en == ca) identical.push_back (en);
+            i = j;
+        }
+    }
+
+    // The identical pairs that are RIGHT: the same word, abbreviation or symbol in
+    // Catalan. Anything not on this list and identical is a translation somebody forgot.
+    inline bool allowed (const std::string& s)
+    {
+        static const char* ok[] = {
+            " cents", " cents.", "+ .scl", "AMP", "BASE", "BPM / 2^n", "Env", "FRACTAL",
+            "GATE", "Glide", "Mono", "Notes", "OK", "Original", "Pitch bend", "Presets...",
+            "Reps", "St", "Triangle", "VEL", "est.", "intervals: 3/2 2 700c ...",
+            // The pitch-bend ranges. "st" is the abbreviation for a semitone in Catalan
+            // too - the bare "St" three lines up is the same word - and MPE is a standard.
+            // Found by THIS parser and missed by the hand-written perl audit that came
+            // before it, which is the argument for having a parser at all.
+            "\\xc2\\xb12 st", "\\xc2\\xb112 st", "\\xc2\\xb148 st (MPE)"
+        };
+        for (const auto* k : ok) if (s == k) return true;
+        return false;
+    }
+}
 //==============================================================================
 // THE PARAMETER LIST IS THE CONTRACT.
 //
@@ -1735,6 +1832,35 @@ int main (int argc, char** argv)
         check (moved.isEmpty(), "no parameter has changed index");
         if (! moved.isEmpty())
             std::printf ("    MOVED: %s\n", moved.joinIntoString ("; ").toRawUTF8());
+    }
+
+    // --- run 12d: no string is translated into itself by accident -------------------
+    {
+       #ifdef FG_SOURCE_DIR
+        const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
+        const auto files = srcDir.getChildFile ("source")
+                                 .findChildFiles (juce::File::findFiles, false, "*.cpp;*.h");
+        std::vector<std::string> identical;
+        for (const auto& f : files) traudit::collect (f, identical);
+
+        check (! files.isEmpty(), "the tr-pair audit can read the source it audits");
+
+        juce::StringArray unexplained;
+        for (const auto& p : identical)
+            if (! traudit::allowed (p))
+                unexplained.add ("\"" + juce::String (p) + "\"");
+        unexplained.removeDuplicates (false);
+
+        check (unexplained.isEmpty(),
+               "every tr pair whose Catalan equals its English is one that SHOULD be equal");
+        if (! unexplained.isEmpty())
+            std::printf ("    translated into itself: %s\n"
+                         "    (if one of these really is the same word in Catalan, add it to "
+                         "traudit::allowed)\n",
+                         unexplained.joinIntoString (", ").toRawUTF8());
+       #else
+        std::printf ("  [SKIP] tr-pair audit: FG_SOURCE_DIR not defined\n");
+       #endif
     }
 
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------

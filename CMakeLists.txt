@@ -195,7 +195,11 @@ target_include_directories(RhythmVerify PRIVATE source third_party/MTS-ESP)
 target_compile_definitions(RhythmVerify PRIVATE
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
-    JUCE_STRICT_REFCOUNTEDPOINTER=1)
+    JUCE_STRICT_REFCOUNTEDPOINTER=1
+    # The tr-pair audit reads the SOURCE, because that is the only place a string which
+    # is never on screen in any photographed state can be checked at all. Dev-only tool,
+    # dev-only path; the check says so and skips itself if the directory is not there.
+    FG_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(RhythmVerify PRIVATE
     GalacticAssets
     juce::juce_audio_utils
