@@ -187,6 +187,14 @@ public:
     // "is it translated?" gate, because that gate walks the layout probe's lists and this
     // component paints its own text. It is now in the probe too (buttonTexts), so the
     // gate sees it like every other word.
+    // THE WORD ABOVE THE REFERENCE KEY, in the two numbers paint() uses to draw it, so a
+    // probe can ask whether it fits without owning a second copy of the rule. The band is
+    // jmax (keyWidth, kReferenceBandMinWidth) wide, so this constant is the width the
+    // word is GUARANTEED to have: a measurement against it is conservative at any key
+    // width, and it is drawn with drawText (useEllipsis = false), which clips in silence.
+    static constexpr float kReferenceBandMinWidth = 74.0f;
+    static constexpr float kReferenceFontHeight   = 9.5f;
+
     void setReferenceWord (juce::String w) { referenceWord = std::move (w); repaint(); }
     juce::String getReferenceWord() const { return referenceWord; }
     void setHoverTextProvider (std::function<juce::String(int)> fn) { getHoverText = std::move (fn); }
@@ -696,9 +704,9 @@ public:
                         // allowed to spill over the neighbouring key widths instead of
                         // being squeezed horizontally into unreadable letters.
                         auto band = hzArea.removeFromTop (11.0f);
-                        band = band.withSizeKeepingCentre (juce::jmax (band.getWidth(), 74.0f), band.getHeight());
+                        band = band.withSizeKeepingCentre (juce::jmax (band.getWidth(), kReferenceBandMinWidth), band.getHeight());
                         g.setColour (juce::Colour (0xff4fe09a));
-                        g.setFont (juce::Font (juce::FontOptions (9.5f).withStyle ("Bold")));
+                        g.setFont (juce::Font (juce::FontOptions (kReferenceFontHeight).withStyle ("Bold")));
                         g.drawText (referenceWord, band.toNearestInt(), juce::Justification::centred, false);
                         hzArea.setTop (hzArea.getY() - 3.0f); // pull the number up to the word
                     }

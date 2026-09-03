@@ -4346,13 +4346,23 @@ FractalAdditiveAudioProcessorEditor::textFitProbeForTests (bool useCatalan)
     // walks juce::Components, and a word drawn straight onto a Graphics has no component
     // to find. That is not a technicality - it is how the keyboard's "REFERENCE" stayed
     // English through every run of the translated gate, in a window where every other
-    // string changes language. Added by hand, with no geometry, so it is under the
-    // language checks without pretending to a fit measurement it has not made.
+    // string changes language.
+    //
+    // It has a MEASUREMENT now, where before it went in with none. Its band is
+    // jmax (keyWidth, kReferenceBandMinWidth), so the constant is the width the word is
+    // guaranteed to get: a word that fits it fits at every key width, and one that does
+    // not is clipped at the narrowest. That matters here more than anywhere - the word is
+    // drawn with drawText (useEllipsis = false), the one call in this file that cuts a
+    // string without leaving a mark on it.
     {
         TextFit f;
         f.path = "keyboard/reference"; f.kind = "Painted";
         f.text = keyboard.getReferenceWord();
         f.bounds = getLocalArea (&keyboard, keyboard.getLocalBounds());
+        const juce::Font rf (juce::FontOptions (ScaleKeyboard::kReferenceFontHeight)
+                                 .withStyle ("Bold"));
+        f.need  = juce::GlyphArrangement::getStringWidth (rf, f.text);
+        f.avail = ScaleKeyboard::kReferenceBandMinWidth;
         out.push_back (f);
     }
 
