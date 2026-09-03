@@ -3806,6 +3806,15 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (tuneSourceBox, { tr ("From current tuning", "De l'afinaci\xc3\xb3 actual"),
                                tr ("From all tunings", "De totes les afinacions") });
     localise (tuneScopeBox,  { tr ("0 vs all", "0 vs tot"), tr ("all vs all", "tot vs tot") });
+    // TWO BOXES THAT WERE NEVER ON THIS LIST AT ALL. Both are populated with English at
+    // construction, like every other box here, and both were missing their line - so they
+    // stayed English in the Catalan window. "Min" was on screen in 41 of the rig's Catalan
+    // pictures and the translated gate did not object, because it compares the two
+    // languages and these were identical in both. The dissonance one is worse: its items
+    // are not on screen in ANY photographed state, so nothing could have found it by
+    // looking. Same words as adaptGoalBox above, same accents.
+    localise (chordMinMaxBox, { tr ("Min", "M\xc3\xadn"), tr ("Max", "M\xc3\xa0x") });
+    localise (dissModeBox,    { tr ("Minima", "M\xc3\xadnims"), tr ("Maxima", "M\xc3\xa0xims") });
     // Its ITEMS were already localised (line above) but its HOVER was not: it was set
     // once in the constructor as an English literal, so the two-word items changed
     // language and the sentence that says what they MEAN never did. The items alone do

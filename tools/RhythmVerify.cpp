@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <set>
 #include <vector>
 
 static int failures = 0;
@@ -797,6 +798,94 @@ namespace traudit
         }
     }
 
+
+    // A COMBO BOX IS POPULATED IN ENGLISH AT CONSTRUCTION AND TRANSLATED IN
+    // applyLanguage. That is this build's idiom and it is a good one - localise() calls
+    // changeItemText, which keeps each item's POSITION and therefore the contract with
+    // the ComboBoxAttachment. But it means a bare English addItem is CORRECT here and
+    // wrong there, and the only difference is whether a line was written in the other
+    // function. Two boxes were missing theirs.
+    //
+    // So: every box that receives an item with letters in it must appear in a localise
+    // call. The word-test is deliberately crude - two consecutive ASCII letters - because
+    // "1/16", "±12 st" and "BPM / 2^n" are not sentences and must not be flagged.
+    inline bool looksLikeAWord (const std::string& s)
+    {
+        for (size_t i = 0; i + 1 < s.size(); ++i)
+            if (juce::CharacterFunctions::isLetter ((juce::juce_wchar) s[i])
+                && juce::CharacterFunctions::isLetter ((juce::juce_wchar) s[i + 1]))
+                return true;
+        return false;
+    }
+
+    inline void collectCombos (const juce::File& f,
+                               std::set<std::string>& populated, std::set<std::string>& localised)
+    {
+        const auto held = f.loadFileAsString().toStdString();
+        const char*  s  = held.c_str();
+        const size_t n  = held.size();
+        const auto isIdent = [] (char c)
+        { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; };
+        // The identifier immediately before position `at`, i.e. the receiver of a ".call".
+        const auto nameBefore = [s, isIdent] (size_t at) -> std::string
+        {
+            size_t e = at;
+            while (e > 0 && isIdent (s[e - 1])) --e;
+            return std::string (s + e, at - e);
+        };
+
+        const std::string add = ".addItem", loc = "localise";
+        for (size_t i = 0; i + add.size() < n; ++i)
+        {
+            if (held.compare (i, add.size(), add) != 0) continue;
+            size_t j = i + add.size();
+            while (j < n && s[j] == ' ') ++j;
+            if (j >= n || s[j] != '(') continue;
+            ++j;
+            std::string item;
+            if (! readLiteral (s, n, j, item)) continue;
+            if (! looksLikeAWord (item)) continue;
+            const auto who = nameBefore (i);
+            if (! who.empty()) populated.insert (who);
+        }
+        for (size_t i = 0; i + loc.size() < n; ++i)
+        {
+            if (held.compare (i, loc.size(), loc) != 0) continue;
+            if (i > 0 && isIdent (s[i - 1])) continue;
+            size_t j = i + loc.size();
+            while (j < n && s[j] == ' ') ++j;
+            if (j >= n || s[j] != '(') continue;
+            ++j;
+            // Up to the first comma: the box, possibly qualified (rhythmPanel.modeBox).
+            // The LAST identifier in it is the box's own name, which is what addItem saw.
+            size_t k = j;
+            while (k < n && s[k] != ',' && s[k] != ')' && s[k] != '\n') ++k;
+            size_t e = k;
+            while (e > j && ! isIdent (s[e - 1])) --e;
+            size_t b = e;
+            while (b > j && isIdent (s[b - 1])) --b;
+            if (e > b) localised.insert (std::string (s + b, e - b));
+        }
+        // ...and the OTHER route to the same place: a box that has to keep its selection
+        // across the change calls changeItemText itself rather than going through
+        // localise (which re-adds the items). Both are localisation; a check that knew
+        // only one of them called specModeBox untranslated while the pictures showed it
+        // in Catalan.
+        const std::string cit = ".changeItemText";
+        for (size_t i = 0; i + cit.size() < n; ++i)
+        {
+            if (held.compare (i, cit.size(), cit) != 0) continue;
+            const auto who = nameBefore (i);
+            if (! who.empty()) localised.insert (who);
+        }
+    }
+
+    // Boxes whose items have no language to be wrong in, or that are never on screen.
+    inline bool comboExempt (const std::string& box)
+    {
+        // comboReopenProbeForTests builds this one to poke at ComboBox's own bookkeeping.
+        return box == "box";
+    }
     // The identical pairs that are RIGHT: the same word, abbreviation or symbol in
     // Catalan. Anything not on this list and identical is a translation somebody forgot.
     inline bool allowed (const std::string& s)
@@ -1858,6 +1947,21 @@ int main (int argc, char** argv)
                          "    (if one of these really is the same word in Catalan, add it to "
                          "traudit::allowed)\n",
                          unexplained.joinIntoString (", ").toRawUTF8());
+
+        // ...and every combo populated with WORDS is translated in applyLanguage.
+        std::set<std::string> populated, localised;
+        for (const auto& f : files) traudit::collectCombos (f, populated, localised);
+        juce::StringArray silentBoxes;
+        for (const auto& b : populated)
+            if (localised.find (b) == localised.end() && ! traudit::comboExempt (b))
+                silentBoxes.add (juce::String (b));
+        check (silentBoxes.isEmpty(),
+               "every combo box filled with English words is translated in applyLanguage");
+        if (! silentBoxes.isEmpty())
+            std::printf ("    NEVER LOCALISED: %s\n"
+                         "    (a box populated with addItem and missing from applyLanguage's "
+                         "localise calls stays English in the Catalan window)\n",
+                         silentBoxes.joinIntoString (", ").toRawUTF8());
        #else
         std::printf ("  [SKIP] tr-pair audit: FG_SOURCE_DIR not defined\n");
        #endif
