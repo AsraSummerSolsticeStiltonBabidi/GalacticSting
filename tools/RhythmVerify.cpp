@@ -880,6 +880,70 @@ namespace traudit
         }
     }
 
+
+    // THE SAME QUESTION FOR THE CONTROLS THAT ARE NOT COMBOS. A button, a label and a
+    // tooltip are set the same way a combo's items are: English at construction, then
+    // again through tr in applyLanguage. So the same test applies - a receiver that is
+    // ever handed a bare word must also, somewhere, be handed a tr through the SAME
+    // setter. A receiver that only ever gets the bare word never changes language.
+    //
+    // Recorded per receiver AND per setter, because a button whose TEXT is translated can
+    // still have an English tooltip, and that is a real way to be half-translated.
+    inline void collectSetters (const juce::File& f,
+                                std::set<std::string>& bare, std::set<std::string>& viaTr)
+    {
+        const auto held = f.loadFileAsString().toStdString();
+        const char*  s  = held.c_str();
+        const size_t n  = held.size();
+        const auto isIdent = [] (char c)
+        { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; };
+
+        for (const char* setter : { ".setButtonText", ".setText", ".setTooltip" })
+        {
+            const std::string m { setter };
+            for (size_t i = 0; i + m.size() < n; ++i)
+            {
+                if (held.compare (i, m.size(), m) != 0) continue;
+                size_t e = i;
+                while (e > 0 && isIdent (s[e - 1])) --e;
+                if (e == i) continue;
+                const std::string who = std::string (s + e, i - e) + m;
+                size_t j = i + m.size();
+                while (j < n && s[j] == ' ') ++j;
+                if (j >= n || s[j] != '(') continue;
+                ++j;
+                while (j < n && (s[j] == ' ' || s[j] == '\n' || s[j] == '\r' || s[j] == '\t')) ++j;
+                if (j < n && s[j] == '"')
+                {
+                    std::string lit;
+                    size_t k = j;
+                    if (readLiteral (s, n, k, lit) && looksLikeAWord (lit)) bare.insert (who);
+                }
+                else if (j + 2 < n && s[j] == 't' && s[j + 1] == 'r'
+                         && (s[j + 2] == ' ' || s[j + 2] == '(' || s[j + 2] == 'F'))
+                {
+                    viaTr.insert (who);
+                }
+            }
+        }
+    }
+
+    // Receivers whose bare word has no language to be wrong in.
+    inline bool setterExempt (const std::string& who)
+    {
+        static const char* ok[] = {
+            "lblLfoDiv.setText",   // "Div", "Hz", "Ph", "hz": units and abbreviations that
+            "lblLfoHz.setText",    // are written the same way in Catalan.
+            "lblLfoPhase.setText",
+            "lblRefHz.setText",
+            "mpeT.setButtonText",     // MPE is a standard; "out" beside it is part of it.
+            "shepOnT.setButtonText",  // Shepard is a person's name.
+            "vibeLink.setButtonText", // ...and so is Asra3.
+            "vibeLink.setTooltip"     // a URL.
+        };
+        for (const auto* k : ok) if (who == k) return true;
+        return false;
+    }
     // Boxes whose items have no language to be wrong in, or that are never on screen.
     inline bool comboExempt (const std::string& box)
     {
@@ -1962,6 +2026,21 @@ int main (int argc, char** argv)
                          "    (a box populated with addItem and missing from applyLanguage's "
                          "localise calls stays English in the Catalan window)\n",
                          silentBoxes.joinIntoString (", ").toRawUTF8());
+
+        // ...and the same for buttons, labels and tooltips.
+        std::set<std::string> bareSet, trSet;
+        for (const auto& f : files) traudit::collectSetters (f, bareSet, trSet);
+        juce::StringArray silentControls;
+        for (const auto& w : bareSet)
+            if (trSet.find (w) == trSet.end() && ! traudit::setterExempt (w))
+                silentControls.add (juce::String (w));
+        check (silentControls.isEmpty(),
+               "every button, label and tooltip given an English word is also given a tr");
+        if (! silentControls.isEmpty())
+            std::printf ("    ONLY EVER ENGLISH: %s\n"
+                         "    (a receiver handed a bare word and never a tr through the same "
+                         "setter does not change language)\n",
+                         silentControls.joinIntoString (", ").toRawUTF8());
        #else
         std::printf ("  [SKIP] tr-pair audit: FG_SOURCE_DIR not defined\n");
        #endif
