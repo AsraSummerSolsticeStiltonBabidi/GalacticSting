@@ -9153,9 +9153,30 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // Nothing is taken from the buttons that they are not already prepared to
             // lose: they measure their own words and hide, in a stated order, when the row
             // cannot hold them (see the ladder below). A percentage cannot do that.
+            // ...and when the row cannot hold BOTH, the box gives up the comfort before
+            // Load gives up its word.
+            //
+            // Load is the one control on this row that can neither be hidden (it is the
+            // only route to a scale file) nor be crushed - and it was getting 30 px for a
+            // word that needs 32.9, the exact smear this panel's ladder exists to prevent.
+            // The box was taking 174 px at EVERY size, because its widest item is
+            // "MTS-ESP..." and sizing to the widest item is what stops it resizing under
+            // the user's hand as they change modes. That is comfort. At a width where the
+            // row cannot pay for it, showing the item that is CURRENTLY SELECTED is the
+            // part that carries meaning, so the box falls back to that and no further -
+            // never below its own selected word, and Load's width is reserved first.
+            //
+            // The trade is stated rather than silent: at a narrow window the box resizes
+            // when the mode changes. A resizing box is a smaller price than a button
+            // nobody can read, and it is only paid where the alternative is that button.
+            const int loadReserve = btnOwnRow ? 0 : 5 + btnW (loadSclButton);
+            const int modeIdeal   = fgfit::snugComboWidth (tuningBox, 24);
+            const int modeShare   = btnOwnRow ? 0 : mrow.getWidth() * 34 / 100;
+            const int modeAsk     = juce::jmax (modeIdeal, modeShare);
+            const int modeFloor   = fgfit::snugComboWidthForSelection (tuningBox, 24);
             compact (tuningBox, mrow.removeFromLeft (juce::jmin (mrow.getWidth(),
-                                    juce::jmax (fgfit::snugComboWidth (tuningBox, 24),
-                                                btnOwnRow ? 0 : mrow.getWidth() * 34 / 100))));
+                                    juce::jmax (juce::jmin (modeAsk, mrow.getWidth() - loadReserve),
+                                                modeFloor))));
             mrow.removeFromLeft (5);
             // Load / Save / + sit immediately to the RIGHT of the mode selector, each at
             // its OWN minimum width. They used to have a row to themselves underneath,

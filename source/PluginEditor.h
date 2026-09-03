@@ -229,6 +229,22 @@ namespace fgfit
         return comboWidthForItem (w, h) + kSnugPad;
     }
 
+    // ...AND THE SAME QUESTION ASKED OF THE SELECTED ITEM ALONE.
+    //
+    // snugComboWidth above measures the WIDEST item, so the box does not resize under the
+    // user's hand as they change modes - that is comfort, and it is the right default.
+    // But a box is a control that must be READ, and at a size where the row cannot hold
+    // both the widest item and the control beside it, showing what is CURRENTLY selected
+    // is the part that carries meaning. Same font, same padding, same rule - one item
+    // instead of all of them - so the two numbers can never disagree about anything else.
+    inline int snugComboWidthForSelection (const juce::ComboBox& c, int h)
+    {
+        const auto f = comboItemFont (c, h);
+        return comboWidthForItem (juce::GlyphArrangement::getStringWidthInt (f, c.getText()), h)
+             + kSnugPad;
+    }
+
+
 
     // A VERTICAL fader is never narrower than the value it reads out.
     //
