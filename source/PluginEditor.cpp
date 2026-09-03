@@ -4044,6 +4044,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         if (s->getTextBoxWidth() != want)
             s->setTextBoxStyle (juce::Slider::TextBoxBelow, false, want, 15);
     }
+    // The one word the KEYBOARD paints for itself, in the language on screen. It used to
+    // be a literal inside ScaleKeyboard::paint and so was the only user-visible string in
+    // the window that never changed language.
+    keyboard.setReferenceWord (tr ("REFERENCE", "REFER\xc3\x88NCIA"));
     repaint(); // title uses the language
 }
 
@@ -4260,6 +4264,20 @@ FractalAdditiveAudioProcessorEditor::textFitProbeForTests (bool useCatalan)
 
     std::vector<TextFit> out;
     walkTextFits (*this, {}, out);
+
+    // THE STRINGS A COMPONENT PAINTS FOR ITSELF, which walkTextFits cannot reach: it
+    // walks juce::Components, and a word drawn straight onto a Graphics has no component
+    // to find. That is not a technicality - it is how the keyboard's "REFERENCE" stayed
+    // English through every run of the translated gate, in a window where every other
+    // string changes language. Added by hand, with no geometry, so it is under the
+    // language checks without pretending to a fit measurement it has not made.
+    {
+        TextFit f;
+        f.path = "keyboard/reference"; f.kind = "Painted";
+        f.text = keyboard.getReferenceWord();
+        f.bounds = getLocalArea (&keyboard, keyboard.getLocalBounds());
+        out.push_back (f);
+    }
 
     // THE PANELS THAT ARE NORMALLY SHUT. The user's own example - "not in this
     // spectrum" - lives in the Spectrum-to-Rhythm panel, which is invisible until a
@@ -7122,6 +7140,10 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     p.buttonTexts.push_back ({ "cust.load",  loadTimbreButton.getButtonText() });
     p.buttonTexts.push_back ({ "tun.toBank", tuningBankAddBtn.getButtonText() });
     p.buttonTexts.push_back ({ "top.playground", playgroundButton.getButtonText() });
+    // The word the KEYBOARD paints over its reference key. It is here because the
+    // translated-check walks this probe: a component that paints its own text is
+    // otherwise invisible to it, which is how this one stayed English.
+    p.buttonTexts.push_back ({ "keys.reference", keyboard.getReferenceWord() });
     // Recorded only while it exists (its two words are state-dependent, and probing a
     // hidden button would measure a word resized() never put on screen).
     if (loadSpectrumTuningBtn.isVisible())

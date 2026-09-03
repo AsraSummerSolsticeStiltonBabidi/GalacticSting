@@ -180,6 +180,14 @@ public:
     // Optional hover text per degree (ratio -> cents, or cents -> nearest just
     // interval). Shown ONLY after the mouse rests ~0.5 s on a key, never while
     // that key is being clicked/dragged.
+    // THE WORD OVER THE REFERENCE KEY, injected like every other string this component
+    // draws. It was the literal "REFERENCE" in paint(), which made it the one user-visible
+    // string in the window that never changed language - and invisible to the rig's
+    // "is it translated?" gate, because that gate walks the layout probe's lists and this
+    // component paints its own text. It is now in the probe too (buttonTexts), so the
+    // gate sees it like every other word.
+    void setReferenceWord (juce::String w) { referenceWord = std::move (w); repaint(); }
+    juce::String getReferenceWord() const { return referenceWord; }
     void setHoverTextProvider (std::function<juce::String(int)> fn) { getHoverText = std::move (fn); }
     std::function<juce::String(int)> getHoverTextProvider() const { return getHoverText; }
 
@@ -690,7 +698,7 @@ public:
                         band = band.withSizeKeepingCentre (juce::jmax (band.getWidth(), 74.0f), band.getHeight());
                         g.setColour (juce::Colour (0xff4fe09a));
                         g.setFont (juce::Font (juce::FontOptions (9.5f).withStyle ("Bold")));
-                        g.drawText ("REFERENCE", band.toNearestInt(), juce::Justification::centred, false);
+                        g.drawText (referenceWord, band.toNearestInt(), juce::Justification::centred, false);
                         hzArea.setTop (hzArea.getY() - 3.0f); // pull the number up to the word
                     }
                     g.setColour (isRef ? juce::Colour (0xff4fe09a) : juce::Colour (0xffc4ccda));
@@ -1041,6 +1049,7 @@ private:
     // would get, and white is legible on every surface in this window - so the fallback
     // states nothing about the palette at all, which is the point.
     juce::Colour sourceColour { juce::Colours::white };
+    juce::String referenceWord { "REFERENCE" };   // set by applyLanguage; see setReferenceWord
     static constexpr int stripH = 56;                    // top info strip (3 delta lines + dissonance band)
     int baseKey   = 48; // leftmost VISIBLE key (the scroll position)
     int rangeLo   = 48; // full playable range start
