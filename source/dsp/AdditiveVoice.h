@@ -270,6 +270,54 @@ public:
             // so the copies stay as decorrelated at every fader position as they are at
             // the top of the travel.
             const double s0 = scatterAmount();
+            // THE PLAN, WHEN THERE IS ONE. The engine measures a phase set per compiled
+            // template that is never worse than today's hash at the prefix this note will
+            // actually render; without one - a template the worker has not reached yet, a
+            // playground blend - `pl` is null and this is the same call it always was.
+            //
+            // TWO NUMBERS THAT ARE NOT THE SAME NUMBER (the header's Failure 6). The SET
+            // is chosen by the RENDERED PREFIX: how many partials of this template fall
+            // under Nyquist at THIS pitch, which is why a low note and a high note do not
+            // get the same phases. The SPAN is how many oscillator slots to write, which
+            // is a bank size and routinely ten times larger. Collapsing them measured 636
+            // of 1851 cases WORSE than the hash; the types no longer allow it.
+            //
+            // AND THE SPAN STOPS AT THE FIRST SHEPARD SLOT. Copies live in this same array
+            // at slot * kStride and are decorrelated by having the hash of their GLOBAL
+            // index - that is what stops their peaks stacking. The plan's phases are for
+            // the base partial list, so past kStride they would be neither measured for
+            // that copy nor the hash it relies on. seedFromPlan is total in its span, so
+            // the tail past the plan is today's hash either way; the rest of the array is
+            // seeded exactly as before.
+            // THE PLAN THIS NOTE WILL USE, chosen BEFORE anything is seeded - because
+            // seedRange reads it, and every bank and every Shepard copy goes through
+            // seedRange.
+            //
+            // TWO NUMBERS THAT ARE NOT THE SAME NUMBER (the header's Failure 6). The SET
+            // is chosen by the RENDERED PREFIX: how many partials of this template fall
+            // under Nyquist at THIS pitch, which is why a low note and a high note do not
+            // get the same phases. The HEAD is how far into the oscillator array that set
+            // reaches - a bank span, and routinely ten times larger. Collapsing them
+            // measured 636 of 1851 cases WORSE than the hash; the typed accessor is what
+            // keeps them apart here.
+            //
+            // AND THE HEAD STOPS AT THE FIRST SHEPARD SLOT. Copies live in this same array
+            // at slot * kStride and are decorrelated by carrying the hash of their GLOBAL
+            // index - that is what stops their peaks stacking. The plan's phases are for
+            // the base partial list, so past kStride they would be neither measured for
+            // that copy nor the hash it relies on.
+            const auto pair = engine.getLivePair();
+            notePlanSet = nullptr; notePlanHead = 0;
+            if (pair.p != nullptr && pair.p->valid() && pair.t != nullptr && ! pair.t->partials.empty())
+            {
+                const double f0Hz = tuning.frequencyForNote ((int) currentlyPlayingNote.initialNote);
+                const int rp = spectrum::phaseset::renderedPrefix (pair.t->partials.data(),
+                                                                   (int) pair.t->partials.size(),
+                                                                   f0Hz, getSampleRate());
+                const int span = shepActive ? shepard::kStride : spectrum::kMaxPartials;
+                notePlanSet  = pair.p->phasesFor (spectrum::phaseset::RenderedPrefix { rp });
+                notePlanHead = std::min (span, pair.p->n);
+            }
             seedRange (phase, 0, spectrum::kMaxPartials, s0);
             // ...AND REMEMBER WHERE ON THE FADER THAT PUT THEM. Everything downstream that
             // wants to know "how scattered is this voice" must ask THIS number and not the
@@ -992,7 +1040,11 @@ private:
                         // from the hash, so a partial the move barely touches (a small delta,
                         // or a small travel) carries straight on through the transition
                         // instead of crossing over to an unrelated phase and back.
-                        double q = phase[(size_t) (off + i)] + shift * dtab[off + i];
+                        // ...along the slope THIS NOTE is on. dtab is the hash's; a note
+                        // seeded from a plan travels a different one, and using the table
+                        // here left the whole incoming bank on the hash while a note born
+                        // at the destination was on the plan - all 218 partials disagreed.
+                        double q = phase[(size_t) (off + i)] + shift * rephaseSlopeAt (off + i);
                         q -= std::floor (q);
                         alignPhase[(size_t) (off + i)] = q;
                     }
@@ -1999,11 +2051,53 @@ private:
     // answer - it replaces the isPositiveAndBelow guard the old seedPhase carried, so a
     // caller that miscounts still cannot write into the next Shepard copy's phases
     // (which are audible) or off the end of the voice.
+    // HOW FAR PARTIAL `g` STILL HAS TO TRAVEL PER UNIT OF FADER, for THIS note.
+    //
+    // scatterDeltas() answers that for today's hash, from a table, in one multiply. The
+    // moment a note is SEEDED FROM A PLAN the table is aiming somewhere the note is not
+    // going: measured, a note moved to fader 1 landed 179.5 degrees from a note born
+    // there, because the born one used the plan and the moved one integrated the hash's
+    // deltas. Run 53 pins those two as equal and is right to - that equality IS the
+    // fader.
+    //
+    // So inside the plan's head, on the copy the plan describes, the slope comes from the
+    // plan's own phase for that partial; everywhere else - past the head, and on every
+    // Shepard copy, whose decorrelation is the hash of its GLOBAL index - it is the table.
+    // Three operations rather than a lookup, and no std::sin: the same cost argument the
+    // table was built for still holds.
+    double rephaseSlopeAt (int g) const noexcept
+    {
+        if (notePlanSet != nullptr && g < notePlanHead)
+            return spectrum::phaseset::scatterDeltaTo (notePlanSet[g]);
+        return spectrum::phaseset::scatterDeltas()[g];
+    }
+
     void seedRange (std::array<double, spectrum::kMaxPartials>& arr,
                     int first, int count, double scatter) const noexcept
     {
         if (first < 0 || first >= spectrum::kMaxPartials || count <= 0) return;
         const int e = std::min (count, spectrum::kMaxPartials - first);
+        // THE PLAN, WHERE THIS NOTE HAS ONE. Both banks and every Shepard copy come
+        // through here, so making this one function plan-aware is what keeps them
+        // consistent: a note seeded from the plan and then MOVED by the fader has to walk
+        // toward the same phases, and the aligned bank has to be seeded at its own fader
+        // position from the same set. Done anywhere less central, one of the three sites
+        // goes on aiming at the hash - measured, that left a moved note 179.5 degrees from
+        // a note born at the destination.
+        //
+        // Past notePlanHead, and on every Shepard copy (whose `first` is at or past the
+        // base copy's span), it is today's hash by GLOBAL index - which is exactly what
+        // decorrelates the copies from each other.
+        if (notePlanSet != nullptr && first < notePlanHead)
+        {
+            const int h = std::min (first + e, notePlanHead) - first;
+            spectrum::phaseset::interpolatePhases (notePlanSet + first, h, scatter,
+                                                   arr.data() + (size_t) first);
+            if (e > h)
+                spectrum::phaseset::seedScattered (first + h, e - h, scatter,
+                                                   arr.data() + (size_t) (first + h));
+            return;
+        }
         spectrum::phaseset::seedScattered (first, e, scatter, arr.data() + (size_t) first);
     }
 
@@ -2151,9 +2245,9 @@ private:
             const bool whole = sl.fresh[(size_t) c];
             const int  had   = whole ? 0 : std::min (lim, rephaseAimed);
             for (int i = 0; i < had; ++i)
-                rephaseRem[(size_t) (off + i)] += ds * dtab[off + i];
+                rephaseRem[(size_t) (off + i)] += ds * rephaseSlopeAt (off + i);
             for (int i = had; i < lim; ++i)
-                rephaseRem[(size_t) (off + i)] = outstanding * dtab[off + i];
+                rephaseRem[(size_t) (off + i)] = outstanding * rephaseSlopeAt (off + i);
         }
         rephaseAimed = std::max (rephaseAimed, e);
 
@@ -2622,6 +2716,16 @@ private:
     ModEngine::VoiceState       modState;
     float                       modOff  [ModEngine::PvCount] = {};
     juce::RangedAudioParameter* modOwner[ModEngine::PvCount] = {};
+    // THE PLAN THIS NOTE WAS SEEDED FROM, held for the note's life.
+    //
+    // The pointer, not the engine: a re-publish plans a DIFFERENT slot (kSlots is 8, for
+    // exactly this margin), so re-reading the live plan mid-gesture could hand a held note
+    // the slope of a spectrum it is not playing. `head` is how much of the array the plan
+    // actually covers for THIS note - the rendered prefix clamped to the plan and to the
+    // base copy's own span - so everything past it is the hash, which is what the Shepard
+    // copies rely on.
+    const double* notePlanSet  = nullptr;
+    int           notePlanHead = 0;
     bool   modNewNote = false;   // set by noteStarted, consumed by the first render block
     bool   modHeld    = false;   // this voice's own key state, gating its envelopes
     double modBpm = -1.0, modPpq = -1.0;  // transport, pushed in per block by the processor
