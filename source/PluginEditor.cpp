@@ -4255,6 +4255,14 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
         overlayText ("warningOverlay/body",  warningOverlay.body,  warningOverlay, true,  26, 18.0f, 14.0f);
         overlayText ("noticeOverlay/title",  noticeOverlay.title,  noticeOverlay,  false, 24, 17.0f, 13.5f);
         overlayText ("noticeOverlay/body",   noticeOverlay.body,   noticeOverlay,  true,  24, 17.0f, 13.5f);
+        // THE NOTICE THE RIG CANNOT STAGE. "Fewer degrees than requested" only appears
+        // after a dissonance search returns short, which a scenario cannot arrange
+        // without running the search itself - so the longest sentence in the plugin has
+        // never been measured. Asked here at its WORST CASE instead, which is stronger
+        // than photographing one instance: the Notes box offers 1..24, so 24 and 23 are
+        // the widest numbers the sentence can ever carry.
+        overlayText ("noticeOverlay/worstBody", fewerDegreesBody (24, 23),
+                     noticeOverlay, true, 24, 17.0f, 13.5f);
     }
         }
 
@@ -5852,6 +5860,22 @@ void FractalAdditiveAudioProcessorEditor::rebuildScaleDissList()
     degreeList.repaint();
 }
 
+// THE "FEWER DEGREES" BODY, in ONE place. It used to be assembled inline where it was
+// shown, in a state the rig cannot photograph without running a whole dissonance search,
+// so the longest sentence in the plugin was never measured against the eight lines
+// drawFittedText gives it. Built here instead, so the probe can ask the question with
+// the widest numbers the Notes box can produce - it offers 1..24, so two digits each -
+// without a second copy of the words to drift from this one.
+juce::String FractalAdditiveAudioProcessorEditor::fewerDegreesBody (int requested, int found) const
+{
+    return tr ("You asked for ", "N'has demanat ")
+        + juce::String (requested)
+        + tr (" but this timbre's dissonance curve only has ", " per\xc3\xb2 la corba de dissonancia d'aquest timbre nom\xc3\xa9s t\xc3\xa9 ")
+        + juce::String (found)
+        + tr (" usable extremes in the chosen period. A curve only forms a notch where partials interact; sparse spectra (few partials, e.g. a near-sine) form few notches - a pure sine forms none. The scale was generated with all the extremes that exist. Add partials (higher N, Fractal, flatter Decay) or widen the period for more.",
+              " extrems usables dins del per\xc3\xado" "de triat. La corba nom\xc3\xa9s fa un clot on els parcials interactuen; els espectres escassos (pocs parcials) en fan pocs - un sinus pur no en fa cap. L'escala s'ha generat amb tots els extrems existents. Afegeix parcials (N m\xc3\xa9s alta, Fractal, Caiguda m\xc3\xa9s plana) o eixampla el per\xc3\xado" "de per obtenir-ne m\xc3\xa9s.");
+}
+
 void FractalAdditiveAudioProcessorEditor::refreshDegreeList (bool showNotice)
 {
     // The degree LIST is now the live active-scale list (updateScaleDissonance);
@@ -5866,12 +5890,8 @@ void FractalAdditiveAudioProcessorEditor::refreshDegreeList (bool showNotice)
     else
     {
         noticeOverlay.title = tr ("Fewer degrees than requested", "Menys graus dels demanats");
-        noticeOverlay.body  = tr ("You asked for ", "N'has demanat ")
-            + juce::String (processorRef.getDissRequested())
-            + tr (" but this timbre's dissonance curve only has ", " per\xc3\xb2 la corba de dissonancia d'aquest timbre nom\xc3\xa9s t\xc3\xa9 ")
-            + juce::String (processorRef.getDissFound())
-            + tr (" usable extremes in the chosen period. A curve only forms a notch where partials interact; sparse spectra (few partials, e.g. a near-sine) form few notches - a pure sine forms none. The scale was generated with all the extremes that exist. Add partials (higher N, Fractal, flatter Decay) or widen the period for more.",
-                  " extrems usables dins del per\xc3\xado" "de triat. La corba nom\xc3\xa9s fa un clot on els parcials interactuen; els espectres escassos (pocs parcials) en fan pocs - un sinus pur no en fa cap. L'escala s'ha generat amb tots els extrems existents. Afegeix parcials (N m\xc3\xa9s alta, Fractal, Caiguda m\xc3\xa9s plana) o eixampla el per\xc3\xado" "de per obtenir-ne m\xc3\xa9s.");
+        noticeOverlay.body  = fewerDegreesBody (processorRef.getDissRequested(),
+                                                 processorRef.getDissFound());
         noticeOverlay.setVisible (true);
         noticeOverlay.toFront (false);
         noticeOverlay.repaint();

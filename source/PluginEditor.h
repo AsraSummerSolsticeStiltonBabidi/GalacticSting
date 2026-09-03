@@ -992,6 +992,9 @@ private:
     // the processor itself can end it - a corner cleared, the playground disengaging).
     void refreshCornerEditUi();
     void updateWarning (int templatePartials);
+    // The longest sentence in the plugin, in one place so the probe can measure it
+    // without the dissonance search that raises it. See the definition.
+    juce::String fewerDegreesBody (int requested, int found) const;
     void runDissonanceTune();
     void saveDissonanceScl();
     // BOTH sides are decoded as UTF-8, because both sides ARE UTF-8.
