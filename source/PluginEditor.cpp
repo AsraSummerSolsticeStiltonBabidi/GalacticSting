@@ -2977,7 +2977,7 @@ void FractalAdditiveAudioProcessorEditor::loadRecent (int index)
     {
         juce::String err;
         if (! processorRef.loadScalaFile (juce::File (paths[index]), err))
-            juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Could not load scale", err, this);
+            juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr (fgdlg::loadScale.en, fgdlg::loadScale.ca), err, this);
     }
     refocus();
 }
@@ -3316,6 +3316,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "GATE: quant dura la nota MIDI de cada pols (5-500 ms). NO \xc3\xa9s lat\xc3\xa8ncia - els polsos queden clavats a la mostra; nom\xc3\xa9s fixa on cau el note-off."));
     // Help popup text (the "?" button). fromUTF8 directly: tr()'s English branch
     // does not decode UTF-8 accents.
+    rhythmPanel.helpTitle = tr (fgdlg::rhythmHelp.en, fgdlg::rhythmHelp.ca);
     rhythmPanel.helpText = juce::String::fromUTF8 (catalan
         ? "ENCAMINAMENT (qualsevol DAW):\nEn una altra pista d'instrument, tria com a ENTRADA MIDI la SORTIDA MIDI d'aquest plugin (no l'entrada de la pista del Fibl\xc3\xb3!) i activa el monitoratge d'entrada.\nA Ableton: MIDI From -> pista del Fibl\xc3\xb3 -> 2n selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In.\n\nTEMPO DEL DAW (CC20):\n. Ableton (f\xc3\xa0" "cil): arrossega el dispositiu Max for Live \"Fibl\xc3\xb3 Tempo Sync\" (a User Library > Presets > MIDI Effects) a una pista MIDI que rebi la sortida del Fibl\xc3\xb3, i activa Sync de tempo. Sense mapejar res: el tempo ix el pols 1.\n. Altres DAW (Reaper, FL...): instal\xc2\xb7la loopMIDI (gratu\xc3\xaft), crea un port; envia la sortida MIDI del Fibl\xc3\xb3 a aquest port; al DAW, mapeja el tempo a l'entrada loopMIDI (rang 20-147) i activa Sync de tempo.\n\nLAT\xc3\x88NCIA: els polsos surten clavats a la mostra; el DAW pot afegir un buffer al MIDI entre pistes - fes servir un buffer petit."
         : "ROUTING (any DAW):\nOn another instrument track, choose this plugin's MIDI OUTPUT as the track's MIDI INPUT (not the Fibl\xc3\xb3 track's own input!) and enable input monitoring.\nIn Ableton: MIDI From -> the Fibl\xc3\xb3 track -> 2nd selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In.\n\nDAW TEMPO (CC20):\n. Ableton (easy): drag the Max for Live device \"Fibl\xc3\xb3 Tempo Sync\" (in User Library > Presets > MIDI Effects) onto a MIDI track that receives the Fibl\xc3\xb3's MIDI output, and turn Tempo sync on. No mapping needed - the tempo follows pulse 1.\n. Other DAWs (Reaper, FL...): install loopMIDI (free), create a port; send the Fibl\xc3\xb3's MIDI output to that port; in the DAW, MIDI-map the tempo to the loopMIDI input (range 20-147) and turn Tempo sync on.\n\nLATENCY: pulses leave sample-locked; the DAW may add one buffer to inter-track MIDI - use a small buffer size.");
@@ -4391,6 +4392,21 @@ FractalAdditiveAudioProcessorEditor::textFitProbeForTests (bool useCatalan)
         f.need  = juce::GlyphArrangement::getStringWidth (mf, f.text);
         f.avail = (float) (PartialAmpGrid::kCellW - 4);
         out.push_back (f);
+    }
+
+    // THE NATIVE DIALOG TITLES, read from the SAME table the call sites use (fgdlg), so
+    // the gate cannot go stale by holding a copy of a string that has since changed.
+    // With no geometry: the OS sizes its own title bar, so there is no width to measure
+    // and this makes no claim to have measured one.
+    {
+        int i = 0;
+        for (const auto& d : fgdlg::all)
+        {
+            TextFit f;
+            f.path = "dialogTitle#" + juce::String (i++); f.kind = "Painted";
+            f.text = tr (d.en, d.ca);
+            out.push_back (f);
+        }
     }
 
     // THE PANELS THAT ARE NORMALLY SHUT. The user's own example - "not in this
@@ -5922,7 +5938,7 @@ void FractalAdditiveAudioProcessorEditor::saveDissonanceScl()
                 juce::String err;
                 if (! processorRef.saveGeneratedScl (fc.getResult(), err))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        "Save scale", err, this);
+                        tr (fgdlg::saveScale.en, fgdlg::saveScale.ca), err, this);
             }
             refocus();
         });
@@ -6292,7 +6308,7 @@ void FractalAdditiveAudioProcessorEditor::openScalaChooser()
             {
                 juce::String err;
                 if (! processorRef.loadScalaFile (fc.getResult(), err))
-                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Could not load scale", err, this);
+                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr (fgdlg::loadScale.en, fgdlg::loadScale.ca), err, this);
             }
             refocus();
         });
@@ -6344,7 +6360,7 @@ void FractalAdditiveAudioProcessorEditor::openTimbreChooser()
             {
                 juce::String err;
                 if (! processorRef.loadTimbreFile (fc.getResult(), err))
-                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Could not load timbre", err, this);
+                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr (fgdlg::loadTimbre.en, fgdlg::loadTimbre.ca), err, this);
             }
             refocus();
         });

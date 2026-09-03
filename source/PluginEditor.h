@@ -12,6 +12,30 @@
 #include <map>
 #include <numeric>
 #include <vector>
+//==============================================================================
+// THE TITLES OF THE NATIVE DIALOGS, in ONE place.
+//
+// A NativeMessageBox is an OS window, not a juce::Component: it is outside the editor the
+// snapshot rig photographs and outside the tree walkTextFits descends, so a title has no
+// gate of any kind on it. Six of them went out in English under a body that changed
+// language properly - invisible from inside the plugin, obvious the moment a Catalan user
+// presses the button.
+//
+// Both the call sites and the probe read THESE pairs, so the check cannot go stale by
+// copying: a title that drifts here drifts in the report on the same build.
+namespace fgdlg
+{
+    struct Pair { const char* en; const char* ca; };
+
+    inline constexpr Pair loadScale  { "Could not load scale",  "No s'ha pogut carregar l'escala" };
+    inline constexpr Pair loadTimbre { "Could not load timbre", "No s'ha pogut carregar el timbre" };
+    inline constexpr Pair saveScale  { "Save scale",            "Desar escala" };
+    inline constexpr Pair rhythmHelp { "Spectrum vs Rhythm",    "Espectre vs ritme" };
+    inline constexpr Pair mpeOut     { "MPE out required",      "Cal activar MPE out" };
+
+    inline constexpr Pair all[] = { loadScale, loadTimbre, saveScale, rhythmHelp, mpeOut };
+}
+
 
 //==============================================================================
 // HOW MUCH ROOM A CONTROL LEAVES FOR ITS OWN WORD, AND HOW WIDE IT MUST BE TO HOLD IT.
@@ -1828,6 +1852,10 @@ private:
                 p->setValueNotifyingHost (b ? 1.0f : 0.0f);
         }
         juce::String       helpText;                          // shown by the Help button
+        // ...and its TITLE, which was hard-coded English while the body beside it changed
+        // language. A native message box is not a Component, so nothing walks it: the only
+        // way this shows up is by reading the call.
+        juce::String       helpTitle { "Spectrum vs Rhythm" };
         // Slot rows live in a scrollable container: kSlots is large ("unlimited"
         // pulses), so the panel shows a window onto however many are routed.
         juce::Viewport     slotView;
@@ -2017,7 +2045,7 @@ private:
             helpB.onClick = [this]
             {
                 juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon,
-                    "Spectrum vs Rhythm", helpText, this);
+                    helpTitle, helpText, this);
             };
             addAndMakeVisible (helpB);
 
@@ -2334,7 +2362,9 @@ private:
                 {
                     // Ratios/cents need per-note pitch bend -> MPE out must be on.
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        "MPE out required",
+                        // The TITLE went out in English while the body beside it changed language: a
+                        // native box is not a Component, so nothing walks it.
+                        trF ? trF (fgdlg::mpeOut.en, fgdlg::mpeOut.ca) : juce::String (fgdlg::mpeOut.en),
                         trF ? trF ("Ratio and cents pitches (\"3/2\", \"702c\") need MPE out enabled - they are sent retuned with per-note pitch bend. Enable \"MPE out\" or type scale steps (\"7st\").",
                                    "Els tons en ratio o cents (\"3/2\", \"702c\") necessiten MPE out actiu - s'envien reafinats amb pitch bend per nota. Activa \"MPE out\" o escriu passos d'escala (\"7st\").")
                             : juce::String ("Enable MPE out to use ratio/cents pitches."), this);
