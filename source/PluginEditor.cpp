@@ -3737,8 +3737,15 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // subdivision of the rise rather than a lock to the host clock. Name the thing it
     // actually locks to. (Only the TEXT changes - changeItemText keeps the item's
     // POSITION, which is the whole contract with the ComboBoxAttachment.)
+    // "SYNC" IS THE WORD THIS ROW CANNOT AFFORD, so it goes - in both languages, the
+    // same trade the source selector made. It was the single control holding the
+    // fully-legible size at 820 px wide, needing 101.0 (en) / 101.9 (ca) of the 99.0
+    // the row can give it, and three ways of finding it more room are already measured
+    // and rejected. Against "Free (ms)" beside it, "Project Tempo" says which clock the
+    // rate comes from and the syncing is what CHOOSING it means. The parameter's own
+    // choice strings are untouched: those are what the host writes into automation.
     localise (shepModeBox,  { tr ("Free (ms)", "Lliure (ms)"),
-                              tr ("Sync Project Tempo", "Sinc tempo projecte") });
+                              tr ("Project Tempo", "Tempo projecte") });
     localise (shepRiseBox,  { tr ("Octave pitch bend", "Bend d'octava"),
                               tr ("Period pitch bend", "Bend de per\xc3\xad" "ode") });
     voiceEnv.tip = tr (
