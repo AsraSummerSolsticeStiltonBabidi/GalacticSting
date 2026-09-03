@@ -886,6 +886,15 @@ namespace
             std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
             if (auto* ed = dynamic_cast<Ed*> (base.get()))
             {
+    // PIN THE MACHINE-SPEED CALIBRATION before anything is photographed.
+    //
+    // The Adapt button prints what a run will cost, from a probe that measures THIS
+    // machine once per process. Two runs of this rig on one build disagreed on six
+    // pictures because that estimate straddled the 950 ms threshold at which the button
+    // starts naming a duration - so the pictures were not a baseline, they were a
+    // stopwatch. Pinned to the documented fallback, the button is a function of the
+    // settings alone, which is what a photograph is for.
+    dissonance::adaptNsPerPairOverride() = dissonance::kAdaptNsPerPairFallback;
                 ed->setNoteNamesForSnapshot (false);   // the shipped default, not this machine's
                 gEditorMin = findSmallestLaidOutSize (*ed);
                 gLegible = findSmallestFullyLegibleSize (*ed);

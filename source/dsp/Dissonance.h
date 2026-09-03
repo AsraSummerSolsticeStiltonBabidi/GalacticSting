@@ -1385,11 +1385,26 @@ namespace dissonance
         return (ns > 1.0 && ns < 1000.0) ? ns : kAdaptNsPerPairFallback;
     }
 
+    // A FIXED CALIBRATION, FOR PICTURES THAT HAVE TO BE THE SAME TWICE.
+    //
+    // The probe below measures THIS machine, once per process, which is exactly right for
+    // a price printed on a button and exactly wrong for a reproducible photograph: two
+    // snapshot runs on the same build disagreed on six pictures, because the estimate
+    // straddled the 950 ms threshold at which the Adapt button starts naming a duration.
+    // A screenshot that changes when nothing changed cannot be a baseline, and the whole
+    // point of the rig is that it is one.
+    //
+    // Set to a positive value to pin the calibration; 0 (the default) measures. It is the
+    // same idea as the rig forcing the note-name preference to its shipped default: a
+    // machine-dependent number does not belong in a picture that is meant to be compared.
+    inline double& adaptNsPerPairOverride() noexcept { static double v = 0.0; return v; }
+
     // Measured once, on the first thread that asks. C++11 guarantees the function-local
     // static's initialisation is thread-safe and runs exactly once, so two panels opening
     // at the same moment cannot run two probes or read a half-written double.
     inline double adaptNsPerPair()
     {
+        if (const double pinned = adaptNsPerPairOverride(); pinned > 0.0) return pinned;
         static const double measured = measureAdaptNsPerPair();
         return measured;
     }
