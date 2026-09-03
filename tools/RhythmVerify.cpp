@@ -2144,6 +2144,140 @@ int main (int argc, char** argv)
                          runaway.joinIntoString (", ").toRawUTF8());
     }
 
+    // --- run 12f: the same patch at 44.1, 48 and 96 kHz -----------------------------
+    //
+    // A user's project runs at whatever rate their interface is set to, and the classic
+    // way a synth breaks is a quantity computed PER SAMPLE that should have been per
+    // second - an envelope step, an LFO increment, a glide. Nothing had ever compared one
+    // rate against another: three runs happen to use 44100, for other reasons.
+    //
+    // TWO DIFFERENT QUESTIONS, and the first version of this check confused them and
+    // failed. Compared as an envelope in TIME (the same second holds a different number
+    // of samples at each rate, so the honest unit is the loudness of the same 50 ms):
+    //
+    //  * the SHAPE must be the same, to a fraction of a dB. This is the per-sample bug
+    //    test, and a real one would be off by the ratio of the rates, not by a fraction.
+    //  * the LEVEL is NOT expected to be identical, and it is not: 96 kHz comes out
+    //    1.10 dB quieter than 48. That is NYQUIST, and the counts printed beside the
+    //    levels are the evidence rather than a story - 84 partials of this timbre are
+    //    audible at 44.1 kHz, 91 at 48 and 183 at 96, because a higher rate has room for
+    //    more of them under its own ceiling. The template holds 1024 at every rate (the
+    //    first version of this comment claimed the TEMPLATE count differed, which the
+    //    measurement flatly contradicted). More partials sharing one normalisation is a
+    //    lower RMS, the direction is consistent, and 3 dB bounds it - which a gross level
+    //    bug would break while this does not.
+    {
+        struct Rendered { std::vector<float> env; int partials = 0, audible = 0; };
+        const auto renderAt = [] (double sr) -> Rendered
+        {
+            auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+            auto& p = *up;
+            const int blk = 256;
+            p.prepareToPlay (sr, blk);
+            const auto setQ = [&p] (const char* id, float v)
+            { if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
+            // SLOW on purpose: a timing bug is a RATIO, so the envelope has to still be
+            // moving across most of the second being measured. A fast attack that has
+            // reached sustain by window 5 hides a 2x error in the four windows nobody
+            // looks at - measured: the same sabotage showed 0.08 dB with a 10 ms attack.
+            setQ ("modE1A", 0.200f); setQ ("modE1D", 0.600f);
+            setQ ("modE1S", 0.000f); setQ ("modE1R", 0.200f);
+            setQ ("modE1Range", 1.0f);
+            setQ ("modE1On", 1.0f);
+            // MAPPED, or the envelope runs and nothing hears it. The first version of this
+            // check set the four envelope parameters and never attached the modulator to
+            // anything, so pinning the engine to a fixed 48 kHz changed the measurement by
+            // exactly nothing - the check was reading the amp decay alone. masterGain is
+            // linear, so the envelope's shape arrives at the meter undistorted.
+            for (int mi = 0; mi < 4; ++mi) p.getModEngine().unmapAll (mi);
+            p.getModEngine().addTarget (0, "masterGain");
+
+            const int    windows   = 20;
+            const double windowSec = 0.05;
+            Rendered r;
+            r.env.assign ((size_t) windows, 0.0f);
+            std::vector<double> sum ((size_t) windows, 0.0), cnt ((size_t) windows, 0.0);
+
+            juce::AudioBuffer<float> b (2, blk);
+            long long n = 0;
+            const long long total = (long long) (sr * windows * windowSec);
+            bool first = true;
+            while (n < total)
+            {
+                juce::MidiBuffer m;
+                if (first) { m.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0); first = false; }
+                b.clear();
+                p.processBlock (b, m);
+                for (int i = 0; i < blk && n + i < total; ++i)
+                {
+                    const int w = (int) (((double) (n + i) / sr) / windowSec);
+                    if (w >= 0 && w < windows)
+                    {
+                        const double v = b.getSample (0, i);
+                        sum[(size_t) w] += v * v; cnt[(size_t) w] += 1.0;
+                    }
+                }
+                n += blk;
+            }
+            for (int w = 0; w < windows; ++w)
+                r.env[(size_t) w] = (float) std::sqrt (cnt[(size_t) w] > 0.0
+                                                       ? sum[(size_t) w] / cnt[(size_t) w] : 0.0);
+            r.partials = p.getTemplatePartialCount();
+            r.audible  = p.getPartialCount();
+            return r;
+        };
+
+        const auto ref = renderAt (48000.0);
+        double refMean = 0.0;
+        for (float v : ref.env) refMean += v;
+        refMean /= (double) ref.env.size();
+        check (refMean > 1.0e-4, "the sample-rate comparison is made on audio that is actually there");
+
+        float worstShapeDb = 0.0f, worstLevelDb = 0.0f;
+        juce::String worstWhere;
+        for (const double sr : { 44100.0, 96000.0 })
+        {
+            const auto other = renderAt (sr);
+            double mean = 0.0;
+            for (float v : other.env) mean += v;
+            mean /= (double) other.env.size();
+
+            worstLevelDb = juce::jmax (worstLevelDb,
+                std::abs ((float) juce::Decibels::gainToDecibels (mean / juce::jmax (1.0e-9, refMean))));
+
+            for (size_t w = 0; w < ref.env.size(); ++w)
+            {
+                // Only where there IS signal: a window far below the mean is silence at
+                // both rates and its dB ratio is noise about noise.
+                if (ref.env[w] < refMean * 0.1) continue;
+                // SHAPE: each envelope divided by its OWN mean, so the level difference
+                // explained above cannot masquerade as a timing bug.
+                const double a = other.env[w] / mean, bq = ref.env[w] / refMean;
+                const float d = (float) std::abs (juce::Decibels::gainToDecibels (a)
+                                                - juce::Decibels::gainToDecibels (bq));
+                if (d > worstShapeDb)
+                {
+                    worstShapeDb = d;
+                    worstWhere = juce::String ((int) sr) + " Hz, window " + juce::String ((int) w)
+                               + " (" + juce::String ((double) w * 0.05, 2) + " s)";
+                }
+            }
+            std::printf ("    %6.0f Hz: %d of %d template partials audible, mean level %.5f\n",
+                         sr, other.audible, other.partials, mean);
+        }
+        std::printf ("    %6.0f Hz: %d of %d template partials audible, mean level %.5f  (reference)\n",
+                     48000.0, ref.audible, ref.partials, refMean);
+
+        check (worstShapeDb < 0.2f,
+               "44.1 and 96 kHz follow the same envelope SHAPE as 48 kHz, within 0.2 dB");
+        std::printf ("    worst shape disagreement %.4f dB%s\n", worstShapeDb,
+                     worstWhere.isEmpty() ? "" : ("  at " + worstWhere).toRawUTF8());
+        check (worstLevelDb < 3.0f,
+               "...and no rate is more than 3 dB from another in overall level");
+        std::printf ("    worst level difference %.3f dB (Nyquist admits a different number "
+                     "of partials; see the counts above)\n", worstLevelDb);
+    }
+
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
     // The editor draws value = shape(t, curve); this checks the engine agrees, that
     // the sustain node really sets the level, and that a second key retriggers from
