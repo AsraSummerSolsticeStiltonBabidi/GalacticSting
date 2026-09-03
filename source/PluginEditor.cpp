@@ -4048,6 +4048,16 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // be a literal inside ScaleKeyboard::paint and so was the only user-visible string in
     // the window that never changed language.
     keyboard.setReferenceWord (tr ("REFERENCE", "REFER\xc3\x88NCIA"));
+    // The self-painting components' own EN/CA hook. They draw their words straight onto a
+    // Graphics, so nothing else in this file can put those words in the right language -
+    // and, until d8aeeaf, nothing could see that they were in the wrong one.
+    {
+        auto hook = [this] (const char* en, const char* ca) { return tr (en, ca); };
+        waveEditor.trF        = hook;
+        recentOverlay.trF     = hook;
+        recentOverlay.list.trF = hook;
+        dissHeader.trF        = hook;
+    }
     repaint(); // title uses the language
 }
 
@@ -4179,6 +4189,30 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
                 f.bounds = getLocalArea (c, c->getLocalBounds());
                 out.push_back (f);
             }
+    // ...and the same for every other component that paints its own words. Each entry
+    // carries no geometry: it is here for the language checks, not for a fit measurement
+    // it has not made. Keep this list in step with the trF hooks in applyLanguage - a
+    // string that has a hook but no entry here is one the gate still cannot see.
+    {
+        const auto painted = [this, &out] (const char* path, juce::String text,
+                                           const juce::Component& c)
+        {
+            TextFit f;
+            f.path = path; f.kind = "Painted"; f.text = std::move (text);
+            f.bounds = getLocalArea (&c, c.getLocalBounds());
+            out.push_back (f);
+        };
+        painted ("waveEditor/hint",
+                 tr ("LFO wave  -  drag points, double-click adds, right-click deletes,"
+                     " drag a line's middle to curve it",
+                     "Ona de l'LFO  -  arrossega els punts, doble clic n'afegeix,"
+                     " clic dret n'esborra, arrossega el mig d'una l\xc3\xadnia per corbar-la"),
+                 waveEditor);
+        painted ("recentOverlay/empty",
+                 tr ("nothing loaded yet", "encara no s'ha carregat res"), recentOverlay);
+        painted ("dissHeader/step",    tr ("Step", "Grau"),      dissHeader);
+        painted ("dissHeader/beating", tr ("beating", "batec"),  dissHeader);
+    }
         }
 
         // A string that fits on ONE line needs no wrapping test; one that does not may

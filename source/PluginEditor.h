@@ -1467,6 +1467,10 @@ private:
     // hovering explains that the dissonance tracks the synth's timbre live.
     struct DissHeader : juce::Component, juce::TooltipClient
     {
+        // The EN/CA hook every self-painting component in this file needs, for the reason
+        // d8aeeaf documents: the translated gate walks juce::Components, so a word drawn
+        // straight onto a Graphics is invisible to it and stays in one language forever.
+        std::function<juce::String (const char*, const char*)> trF;
         juce::String tip;
         int  splitX = 92;
         juce::String getTooltip() override { return tip; }
@@ -1475,11 +1479,13 @@ private:
             const juce::Colour c (0xff8f96a8);
             g.setColour (c);
             g.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
-            g.drawText ("Step", juce::Rectangle<int> (0, 0, splitX, getHeight()),
+            g.drawText (trF ? trF ("Step", "Grau") : juce::String ("Step"),
+                        juce::Rectangle<int> (0, 0, splitX, getHeight()),
                         juce::Justification::centredLeft, false);
             auto rr = juce::Rectangle<int> (splitX, 0, getWidth() - splitX, getHeight());
             g.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
-            g.drawText ("beating", rr, juce::Justification::centredLeft, false);
+            g.drawText (trF ? trF ("beating", "batec") : juce::String ("beating"),
+                        rr, juce::Justification::centredLeft, false);
         }
     };
 
@@ -1629,8 +1635,15 @@ private:
     // scrollable, click one to load it.
     struct RecentOverlay : juce::Component
     {
+        // The EN/CA hook every self-painting component in this file needs, for the reason
+        // d8aeeaf documents: the translated gate walks juce::Components, so a word drawn
+        // straight onto a Graphics is invisible to it and stays in one language forever.
+        std::function<juce::String (const char*, const char*)> trF;
         struct List : juce::Component
         {
+            // Its own hook: this inner list paints the empty-state line and cannot see
+            // the enclosing overlay's member.
+            std::function<juce::String (const char*, const char*)> trF;
             juce::StringArray paths;
             std::function<void (int)> onPick;
             static constexpr int kRowH = 22;
@@ -1660,7 +1673,9 @@ private:
                 {
                     g.setColour (juce::Colour (0xff8f96a8));
                     g.setFont (juce::Font (juce::FontOptions (12.5f)));
-                    g.drawText ("nothing loaded yet", getLocalBounds(), juce::Justification::centred, false);
+                    g.drawText (trF ? trF ("nothing loaded yet", "encara no s'ha carregat res")
+                                    : juce::String ("nothing loaded yet"),
+                                getLocalBounds(), juce::Justification::centred, false);
                 }
             }
             int hoverRow = -1;
@@ -2877,6 +2892,10 @@ private:
     // (power curve), like curving an automation line. One cycle, x 0..1, y 0..1.
     struct WaveEditor : juce::Component
     {
+        // The EN/CA hook every self-painting component in this file needs, for the reason
+        // d8aeeaf documents: the translated gate walks juce::Components, so a word drawn
+        // straight onto a Graphics is invisible to it and stays in one language forever.
+        std::function<juce::String (const char*, const char*)> trF;
         struct Pt { float x = 0, y = 0, curve = 0; }; // curve bends the segment AFTER this point
         std::vector<Pt> pts { { 0.0f, 0.0f, 0.0f }, { 1.0f, 1.0f, 0.0f } };
         std::function<void()> onChange, onClose;
@@ -2940,7 +2959,12 @@ private:
             g.setColour (juce::Colour (0xff000000u | galactic::palette::kCustomMod));
             g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (1.5f), 10.0f, 3.0f);
             g.setFont (juce::Font (juce::FontOptions (14.0f).withStyle ("Bold")));
-            g.drawText ("LFO wave  -  drag points, double-click adds, right-click deletes, drag a line's middle to curve it",
+            g.drawText (trF ? trF ("LFO wave  -  drag points, double-click adds, right-click deletes,"
+                                   " drag a line's middle to curve it",
+                                   "Ona de l'LFO  -  arrossega els punts, doble clic n'afegeix,"
+                                   " clic dret n'esborra, arrossega el mig d'una l\xc3\xadnia per corbar-la")
+                              : juce::String ("LFO wave  -  drag points, double-click adds, right-click"
+                                              " deletes, drag a line's middle to curve it"),
                         14, 6, getWidth() - 48, 20, juce::Justification::centredLeft);
             auto r = plot();
             g.setColour (juce::Colour (0xff20202b));
