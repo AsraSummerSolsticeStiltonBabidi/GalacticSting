@@ -538,7 +538,29 @@ namespace spectrum
                     rendered[i].amp *= t.gain[i];
             spectrum::phaseset::Options opt;
             opt.sampleRate = renderRate.load (std::memory_order_relaxed);
-            opt.workBudget = spectrum::phaseset::kWorkBudgetCompile;
+            // TWICE THE COMPILE BUDGET, and the reason is measured rather than guessed.
+            //
+            // At kWorkBudgetCompile the report comes back with `reachReduced` set: the
+            // budget, not the pitch, was cutting how far the analysis got. Doubling it
+            // clears that flag AND takes the crest from 1.6078 to 1.5517 against a hash of
+            // 2.0830 - 2.25 dB becomes 2.55. Four times and eight times give 1.5517 to the
+            // last digit, so this is the knee and not a slope: the search has found
+            // everything it can find at this reach.
+            //
+            // WHAT IT COSTS is latency-to-plan, not audio and not the editor: this runs on
+            // the worker BEHIND the release-store (see planLive), so a recompile's plan
+            // simply lands about twice as late, and a note started in that window gets
+            // today's hash - which is the documented fallback and the sound this synth
+            // already shipped. The budget is a deterministic WORK counter, so a slower
+            // machine pays proportionally and nothing changes about what is produced.
+            //
+            // AND NOT MORE REACH. Asking the analysis to cover C1 instead of C2 was
+            // measured at 4x and 16x: the reach is reached (32.7 Hz, and at 16x the budget
+            // stops being the limit at all) and the crest win vanishes completely - chosen
+            // 2.1451 against a hash of 2.1451. The advantage lives at this prefix; spread
+            // over a longer one there is nothing to find, and the engine says so by handing
+            // the hash back.
+            opt.workBudget = 2LL * spectrum::phaseset::kWorkBudgetCompile;
             return spectrum::phaseset::buildPlan (rendered.data(), n, opt, out);
         }
 

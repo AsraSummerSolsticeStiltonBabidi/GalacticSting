@@ -13799,6 +13799,9 @@ int main (int argc, char** argv)
             check (rep->crestChosen < rep->crestHash * 0.999,
                    "  ...and on the default patch it actually WINS, rather than tying with the"
                    " hash it is allowed to fall back to");
+            std::printf ("    the win, in the unit the ear uses: %.2f dB (crest %.4f against %.4f)\n",
+                         20.0 * std::log10 (rep->crestHash / std::max (1.0e-9, rep->crestChosen)),
+                         rep->crestChosen, rep->crestHash);
             }
         }
     }
