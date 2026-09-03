@@ -2409,6 +2409,109 @@ int main (int argc, char** argv)
                      slewWhere.isEmpty() ? "" : ("  (" + slewWhere + ")").toRawUTF8());
     }
 
+    // --- run 12h: two instances in one host do not hear each other -------------------
+    //
+    // A user puts this synth on two tracks. Nothing in a plugin is allowed to make that
+    // change either one - and the ways it can are not hypothetical here: MTS-ESP
+    // registers a process-wide client, the settings file behind the note-name preference
+    // and the recent-.scl list is one file for the whole machine, and the machine-speed
+    // calibration behind the adapt search is a function-local static shared by every
+    // instance.
+    //
+    // Rendered SAMPLE FOR SAMPLE, not as an envelope: two instances of the same code on
+    // the same machine are deterministic, so the honest claim is that the second render
+    // is bit-identical to the first, and anything less than that is a leak worth naming.
+    {
+        const auto renderOne = [] (FractalAdditiveAudioProcessor& p, int note,
+                                   std::vector<float>& out, int blocks)
+        {
+            const int blk = 256;
+            juce::AudioBuffer<float> b (2, blk);
+            out.clear();
+            out.reserve ((size_t) (blocks * blk));
+            for (int n = 0; n < blocks; ++n)
+            {
+                juce::MidiBuffer m;
+                if (n == 0) m.addEvent (juce::MidiMessage::noteOn (1, note, 0.8f), 0);
+                b.clear();
+                p.processBlock (b, m);
+                for (int i = 0; i < blk; ++i) out.push_back (b.getSample (0, i));
+            }
+        };
+        // Two DIFFERENT patches, so a leak has something to carry: different base
+        // harmonic, different selection, different decay.
+        const auto dressA = [] (FractalAdditiveAudioProcessor& p)
+        {
+            const auto q = [&p] (const char* id, float v)
+            { if (auto* x = p.apvts.getParameter (id)) x->setValueNotifyingHost (x->convertTo0to1 (v)); };
+            q ("baseN", 1.0f); q ("harmonics", 1.0f); q ("curveSlope", 1.0f);
+        };
+        const auto dressB = [] (FractalAdditiveAudioProcessor& p)
+        {
+            const auto q = [&p] (const char* id, float v)
+            { if (auto* x = p.apvts.getParameter (id)) x->setValueNotifyingHost (x->convertTo0to1 (v)); };
+            q ("baseN", 5.0f); q ("harmonics", 3.0f); q ("curveSlope", 0.2f);
+        };
+
+        const int blocks = 60;   // ~0.32 s at 48 kHz
+        std::vector<float> aAlone, bAlone, aTogether, bTogether;
+        {
+            auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+            up->prepareToPlay (48000.0, 256); dressA (*up); renderOne (*up, 60, aAlone, blocks);
+        }
+        {
+            auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+            up->prepareToPlay (48000.0, 256); dressB (*up); renderOne (*up, 67, bAlone, blocks);
+        }
+        {
+            // BOTH ALIVE AT ONCE, and interleaved block by block, which is what a host
+            // does - not one finished and then the other.
+            auto ua = std::make_unique<FractalAdditiveAudioProcessor>();
+            auto ub = std::make_unique<FractalAdditiveAudioProcessor>();
+            ua->prepareToPlay (48000.0, 256); ub->prepareToPlay (48000.0, 256);
+            dressA (*ua); dressB (*ub);
+            const int blk = 256;
+            juce::AudioBuffer<float> ba (2, blk), bb (2, blk);
+            for (int n = 0; n < blocks; ++n)
+            {
+                juce::MidiBuffer ma, mb;
+                if (n == 0)
+                {
+                    ma.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+                    mb.addEvent (juce::MidiMessage::noteOn (1, 67, 0.8f), 0);
+                }
+                ba.clear(); ua->processBlock (ba, ma);
+                bb.clear(); ub->processBlock (bb, mb);
+                for (int i = 0; i < blk; ++i) { aTogether.push_back (ba.getSample (0, i));
+                                                bTogether.push_back (bb.getSample (0, i)); }
+            }
+        }
+
+        const auto worstDiff = [] (const std::vector<float>& x, const std::vector<float>& y,
+                                   int& atSample) -> float
+        {
+            float w = 0.0f; atSample = -1;
+            const size_t n = juce::jmin (x.size(), y.size());
+            for (size_t i = 0; i < n; ++i)
+            {
+                const float d = std::abs (x[i] - y[i]);
+                if (d > w) { w = d; atSample = (int) i; }
+            }
+            return w;
+        };
+        int sa = -1, sb = -1;
+        const float dA = worstDiff (aAlone, aTogether, sa);
+        const float dB = worstDiff (bAlone, bTogether, sb);
+        float peak = 0.0f;
+        for (float v : aAlone) peak = juce::jmax (peak, std::abs (v));
+        for (float v : bAlone) peak = juce::jmax (peak, std::abs (v));
+        check (peak > 1.0e-4f, "the two-instance comparison is made on audio that is there");
+        check (dA == 0.0f && dB == 0.0f,
+               "an instance renders the same audio whether or not a second one is running");
+        std::printf ("    peak %.4f; instance A differs by %.3g (sample %d), B by %.3g (sample %d)\n",
+                     peak, dA, sa, dB, sb);
+    }
+
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
     // The editor draws value = shape(t, curve); this checks the engine agrees, that
     // the sustain node really sets the level, and that a second key retriggers from
