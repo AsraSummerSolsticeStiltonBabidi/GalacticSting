@@ -13766,6 +13766,39 @@ int main (int argc, char** argv)
                     check (rep->crestChosenLastSpan <= rep->crestHashLastSpan * 1.0001,
                            "  ...and at the LAST span of the ladder, which is the one that"
                            " refutes a single-window claim");
+            // ...AND HOW MUCH OF THE KEYBOARD IT ACTUALLY COVERS.
+            //
+            // The plan is measured up to a partial-ratio cap, and below the pitch where a
+            // note renders MORE partials than the analysis reached, seedFromPlan hands
+            // back today's hash. The engine reports that pitch and its header says to
+            // paint it; nothing paints it, and until this check nothing had read it - so a
+            // plan covering only the top two octaves would have looked exactly like one
+            // covering the whole keyboard.
+            //
+            // MEASURED: it reaches 65.6 Hz, which is C2 - the engine's own default
+            // `lowestNoteHz`, and the value this build leaves unset. Every note BELOW C2
+            // gets today's Scattered mode, and that is a deliberate trade rather than a
+            // gap: asking for C1 instead was measured on 2026-09-03 and it moved the reach
+            // only to 60.9 Hz while the crest win vanished completely (chosen 2.0861
+            // against a hash of 2.0861 - the same budget spread thinner finds nothing, and
+            // the engine honours its guarantee by handing the hash back). 2.25 dB from C2
+            // up beats nothing at all everywhere.
+            const double lowHz = rep->lowestFullyCoveredHz;
+            std::printf ("    plan reaches down to %.2f Hz (C2 is 65.41); ratio cap %.1f,"
+                         " analysed %d of %d, reach reduced by the budget: %s\n",
+                         lowHz, rep->ratioCap, rep->analysed, pl->n,
+                         rep->reachReduced ? "YES" : "no");
+            check (lowHz >= 0.0 && lowHz <= 65.41 * 1.005,
+                   "  the plan reaches at least C2 - what the engine was asked to cover; below"
+                   " that a note gets today's hash, which is stated rather than discovered");
+            // THE WIN ITSELF, not just its absence of harm. "Never worse than the hash" is
+            // satisfied by handing the hash back, which is a legitimate engine RESULT and
+            // is exactly what widening the reach produced. On this patch the plan really
+            // does win, and a change that quietly turned that into a tie would otherwise
+            // pass every check above it.
+            check (rep->crestChosen < rep->crestHash * 0.999,
+                   "  ...and on the default patch it actually WINS, rather than tying with the"
+                   " hash it is allowed to fall back to");
             }
         }
     }
