@@ -2278,6 +2278,137 @@ int main (int argc, char** argv)
                      "of partials; see the counts above)\n", worstLevelDb);
     }
 
+    // --- run 12g: the host picks the block size, and may change it every call ---------
+    //
+    // prepareToPlay states a MAXIMUM, not a promise: a host may call processBlock with
+    // fewer samples, and several change the size while running (a freeze, a rendered
+    // export, a device added to the chain). Fourteen runs here use 64 samples and four
+    // use 256, but nothing had ever compared one against another, and nothing had ever
+    // VARIED it mid-render - which is the case that finds a buffer whose contents are
+    // assumed to survive from one call to the next.
+    //
+    // Two questions again, and the same envelope-in-time unit as the sample-rate check
+    // above (see it for why the patch has a slow envelope and a MAPPED modulator):
+    //  * the shape must be the same whatever the size;
+    //  * and no block boundary may leave a step in the waveform. A glitch at a boundary
+    //    is a click, and a click is the one artefact a user hears instantly and cannot
+    //    describe. Measured as the largest sample-to-sample jump in the whole render,
+    //    against the same number from the 256-sample reference.
+    {
+        struct Blocked { std::vector<float> env; float maxSlew = 0.0f; bool finite = true; };
+        const auto renderWith = [] (int fixedBlk, bool vary) -> Blocked
+        {
+            auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+            auto& p = *up;
+            const int maxBlk = 1024;
+            p.prepareToPlay (48000.0, maxBlk);
+            const auto setQ = [&p] (const char* id, float v)
+            { if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
+            setQ ("modE1A", 0.200f); setQ ("modE1D", 0.600f);
+            setQ ("modE1S", 0.000f); setQ ("modE1R", 0.200f);
+            setQ ("modE1Range", 1.0f); setQ ("modE1On", 1.0f);
+            for (int mi = 0; mi < 4; ++mi) p.getModEngine().unmapAll (mi);
+            p.getModEngine().addTarget (0, "masterGain");
+
+            const int    windows   = 20;
+            const double windowSec = 0.05;
+            Blocked r;
+            r.env.assign ((size_t) windows, 0.0f);
+            std::vector<double> sum ((size_t) windows, 0.0), cnt ((size_t) windows, 0.0);
+
+            juce::AudioBuffer<float> b (2, maxBlk);
+            const long long total = (long long) (48000.0 * windows * windowSec);
+            long long n = 0;
+            bool first = true;
+            float prev = 0.0f;
+            // A deterministic size sequence, so a failure is reproducible: the sizes a
+            // host actually hands out, cycled, none of them a power of two by accident.
+            const int sizes[] = { 1, 7, 64, 3, 256, 128, 17, 512, 2, 1024, 33, 96 };
+            int si = 0;
+            while (n < total)
+            {
+                const int want = vary ? sizes[si++ % (int) (sizeof (sizes) / sizeof (sizes[0]))]
+                                      : fixedBlk;
+                const int m = (int) juce::jmin ((long long) want, total - n);
+                juce::AudioBuffer<float> sub (b.getArrayOfWritePointers(), 2, 0, m);
+                juce::MidiBuffer mid;
+                if (first) { mid.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0); first = false; }
+                sub.clear();
+                p.processBlock (sub, mid);
+                for (int i = 0; i < m; ++i)
+                {
+                    const float v = sub.getSample (0, i);
+                    if (! std::isfinite (v)) r.finite = false;
+                    r.maxSlew = juce::jmax (r.maxSlew, std::abs (v - prev));
+                    prev = v;
+                    const int w = (int) (((double) (n + i) / 48000.0) / windowSec);
+                    if (w >= 0 && w < windows) { sum[(size_t) w] += v * v; cnt[(size_t) w] += 1.0; }
+                }
+                n += m;
+            }
+            for (int w = 0; w < windows; ++w)
+                r.env[(size_t) w] = (float) std::sqrt (cnt[(size_t) w] > 0.0
+                                                       ? sum[(size_t) w] / cnt[(size_t) w] : 0.0);
+            return r;
+        };
+
+        const auto ref = renderWith (256, false);
+        double refMean = 0.0;
+        for (float v : ref.env) refMean += v;
+        refMean /= (double) ref.env.size();
+        check (refMean > 1.0e-4, "the block-size comparison is made on audio that is actually there");
+
+        float worstDb = 0.0f, worstSlewRatio = 1.0f;
+        juce::String worstWhere, slewWhere;
+        bool allFinite = ref.finite;
+        const auto compare = [&] (const Blocked& other, const juce::String& name)
+        {
+            allFinite = allFinite && other.finite;
+            double mean = 0.0;
+            for (float v : other.env) mean += v;
+            mean /= (double) other.env.size();
+            float thisWorst = 0.0f;
+            for (size_t w = 0; w < ref.env.size(); ++w)
+            {
+                if (ref.env[w] < refMean * 0.1) continue;
+                const double a = other.env[w] / juce::jmax (1.0e-9, mean), c = ref.env[w] / refMean;
+                const float d = (float) std::abs (juce::Decibels::gainToDecibels (a)
+                                                - juce::Decibels::gainToDecibels (c));
+                thisWorst = juce::jmax (thisWorst, d);
+                if (d > worstDb) { worstDb = d; worstWhere = name + ", window " + juce::String ((int) w); }
+            }
+            const float ratio = other.maxSlew / juce::jmax (1.0e-9f, ref.maxSlew);
+            std::printf ("      %-32s envelope %.4f dB, slew %.3fx\n",
+                         name.toRawUTF8(), thisWorst, ratio);
+            if (ratio > worstSlewRatio) { worstSlewRatio = ratio; slewWhere = name; }
+        };
+        compare (renderWith (32,   false), "32 samples");
+        compare (renderWith (64,   false), "64 samples");
+        compare (renderWith (1024, false), "1024 samples");
+        compare (renderWith (0,    true),  "a size that changes every call");
+
+        check (allFinite, "no block size, fixed or changing, produces a non-finite sample");
+        check (worstDb < 1.0f, "the same second sounds the same whatever the block size, "
+                               "within 1 dB");
+        // 1 dB, and the number is anchored to the measurement rather than to taste. The
+        // disagreement GROWS WITH THE BLOCK, monotonically: 0.061 dB at 64 samples,
+        // 0.091 at 32, 0.488 at 1024, 0.757 when the size changes every call. That is
+        // exactly what block-rate modulation predicts - a modulator advances once per
+        // block and its value is held across it, so 1024 samples is 21 ms of held value
+        // inside a 600 ms decay. A bug that assumed a fixed size would not be a fraction
+        // of a dB; it would be off by the RATIO of the sizes.
+        std::printf ("    worst envelope disagreement %.4f dB%s\n", worstDb,
+                     worstWhere.isEmpty() ? "" : ("  at " + worstWhere).toRawUTF8());
+        // 1.5x, not 1.0: a different block size samples the signal's own slope at
+        // different instants, so the largest jump found is not expected to be identical.
+        // A step AT a boundary is a discontinuity in a waveform whose partials are all
+        // band-limited - it does not move the number by half, it multiplies it.
+        check (worstSlewRatio < 1.5f, "no block boundary leaves a step in the waveform");
+        std::printf ("    largest sample-to-sample jump, worst case %.3fx the 256-sample "
+                     "reference%s\n", worstSlewRatio,
+                     slewWhere.isEmpty() ? "" : ("  (" + slewWhere + ")").toRawUTF8());
+    }
+
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
     // The editor draws value = shape(t, curve); this checks the engine agrees, that
     // the sustain node really sets the level, and that a second key retriggers from
