@@ -3246,7 +3246,11 @@ private:
             // could nudge, when it is the point at which the partial stops sounding.
             juce::String vt;
             if (cd.locked)     vt = juce::String::fromUTF8 ("\xe2\x9c\x95");  // locked (see Cell::locked)
-            else if (muted)    vt = "MUTE";
+            // The one word in this cell, and it was the one string in the window that never
+            // went through tr: painted straight onto the Graphics, so walkTextFits could not
+            // reach it and the translated gate never saw an English word sitting in a
+            // Catalan UI. "MUT" is also two glyphs narrower, which this 62 px cell notices.
+            else if (muted)    vt = trF ? trF ("MUTE", "MUT") : "MUTE";
             else if (cd.dB == 0.0f) vt = "0.0";
             else               vt = (cd.dB > 0.0f ? "+" : "") + juce::String (cd.dB, 1);
             g.setColour ((cd.dB == 0.0f ? juce::Colour (0xff8f96a8) : vc).withAlpha (dim));

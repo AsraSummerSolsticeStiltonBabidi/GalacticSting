@@ -4366,6 +4366,25 @@ FractalAdditiveAudioProcessorEditor::textFitProbeForTests (bool useCatalan)
         out.push_back (f);
     }
 
+    // THE ONE WORD IN THE PENCIL WINDOW'S CELLS, which is only ON SCREEN when a partial
+    // is muted - a state no scenario reaches - and is painted straight into the cell, so
+    // walkTextFits could not reach it either. Both of this build's ways of hiding a
+    // string at once, which is why it sat there in English. Declared here so the
+    // translated gate sees it whether or not anything is muted.
+    //
+    // Its band is the cell's bottom 12 px, and the cell is never narrower than kCellW,
+    // so kCellW - 4 is the width the word is guaranteed at any window size.
+    {
+        TextFit f;
+        f.path = "partialAmpGrid/mute"; f.kind = "Painted";
+        f.text = tr ("MUTE", "MUT");
+        f.bounds = getLocalArea (&partialPanel, partialPanel.getLocalBounds());
+        const juce::Font mf (juce::FontOptions (10.5f).withStyle ("Bold"));
+        f.need  = juce::GlyphArrangement::getStringWidth (mf, f.text);
+        f.avail = (float) (PartialAmpGrid::kCellW - 4);
+        out.push_back (f);
+    }
+
     // THE PANELS THAT ARE NORMALLY SHUT. The user's own example - "not in this
     // spectrum" - lives in the Spectrum-to-Rhythm panel, which is invisible until a
     // button is pressed, so a sweep of what happens to be on screen would never have
