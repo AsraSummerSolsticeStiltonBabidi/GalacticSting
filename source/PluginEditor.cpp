@@ -9523,7 +9523,26 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 { return juce::jmax (nominal, fgfit::snugComboWidth (c, shepH)); };
 
                 auto sh = shepRow;
-                shepOnT.setBounds (sh.removeFromLeft (86));
+                // 46 px is the least a beats box ("1/16") or a millisecond fader can be
+                // and still be one. Hoisted above the toggle because the toggle now has
+                // to know what the rest of the row costs before it decides its own width.
+                const int kRateMin = 46;
+                // THE TOGGLE WAS THE LAST CONTROL ON THIS ROW STILL ON A HAND-PICKED
+                // NUMBER. Every other box here is sized from the words it holds; this one
+                // took 86 px whatever "Shepard" actually needs, and at a narrow window
+                // those spare pixels were the ones the mode box was 4.5 short of.
+                //
+                // It keeps its 86 whenever the row can PAY for 86 + the mode box's own
+                // ask + the rate minimum - so the shipped size is pixel-identical - and
+                // falls back to what its word needs only when the row cannot. The same
+                // affordability ladder the TUNING panel and the fork buttons use: a
+                // control gives up its comfort before another gives up its meaning.
+                const int roomyToggle = 86;
+                const int wordToggle  = fgfit::toggleWidth (shepOnT.getButtonText(), shepH);
+                const int rowCanPay   = roomyToggle + 4 + needFor (shepModeBox, 94) + 6 + kRateMin;
+                shepOnT.setBounds (sh.removeFromLeft (sh.getWidth() >= rowCanPay
+                                                          ? roomyToggle
+                                                          : juce::jmax (wordToggle, 1)));
                 sh.removeFromLeft (4);
                 // THE RATE CONTROL'S MINIMUM IS RESERVED BEFORE THE MODE BOX IS SIZED.
                 //
@@ -9537,7 +9556,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // 46 px is the least a beats box ("1/16") or a millisecond fader can be
                 // and still be one, and the mode box keeps everything above that.
                 const bool sync = shepModeBox.getSelectedId() == 2;
-                const int  kRateMin = 46;
+
                 const int  modeRoom = juce::jmax (46, sh.getWidth() - 6 - kRateMin);
                 compact (shepModeBox, sh.removeFromLeft (juce::jmin (needFor (shepModeBox, 94),
                                                                      juce::jmin (modeRoom, sh.getWidth()))));
