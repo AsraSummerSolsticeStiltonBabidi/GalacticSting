@@ -2512,6 +2512,131 @@ int main (int argc, char** argv)
                      peak, dA, sa, dB, sb);
     }
 
+    // --- run 12i: the rate changes under a held note ---------------------------------
+    //
+    // prepareToPlay may be called AGAIN, at any time, without releaseResources in
+    // between: the user changes their interface's sample rate or buffer size while the
+    // synth is sounding, or the host re-prepares for an offline bounce. Every phase
+    // increment, every envelope step and every voice's state was computed for the old
+    // rate at that instant.
+    //
+    // WHAT THIS BUILD DOES, measured rather than assumed: it SILENCES the held note.
+    // Peak 0.134 before the change, 0.000 after. That is a legitimate choice and a common
+    // one - a clean reset beats a voice running on increments for a rate that no longer
+    // exists - and the first version of this check asserted the opposite ("still sounding
+    // on both sides") purely because I expected it to keep playing. The behaviour is
+    // pinned here so that changing it later is a decision somebody takes on purpose.
+    //
+    // The questions that actually matter to a user are the three below.
+    {
+        struct Leg { float maxSlew = 0.0f; float peak = 0.0f; bool finite = true; };
+        const auto runLeg = [] (FractalAdditiveAudioProcessor& p, int blocks, int blk,
+                                float& prev, bool noteOn, int note, bool noteOff) -> Leg
+        {
+            Leg r;
+            juce::AudioBuffer<float> b (2, blk);
+            for (int n = 0; n < blocks; ++n)
+            {
+                juce::MidiBuffer m;
+                if (n == 0 && noteOn)  m.addEvent (juce::MidiMessage::noteOn  (1, note, 0.8f), 0);
+                if (n == 0 && noteOff) m.addEvent (juce::MidiMessage::noteOff (1, note), 0);
+                b.clear();
+                p.processBlock (b, m);
+                for (int i = 0; i < blk; ++i)
+                {
+                    const float v = b.getSample (0, i);
+                    if (! std::isfinite (v)) r.finite = false;
+                    r.maxSlew = juce::jmax (r.maxSlew, std::abs (v - prev));
+                    r.peak    = juce::jmax (r.peak, std::abs (v));
+                    prev = v;
+                }
+            }
+            return r;
+        };
+        // What that note is on a synth that never had its rate changed. Kept as SAMPLES,
+        // not as a peak: after a rate change the plugin should be indistinguishable from
+        // one that started at the new rate, and a peak cannot tell a right note from a
+        // note at the wrong PITCH - which is the symptom a user reports as "everything
+        // went out of tune when I changed my interface".
+        const auto freshRender = [] (double rate, std::vector<float>& out)
+        {
+            auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+            up->prepareToPlay (rate, 512);
+            juce::AudioBuffer<float> b (2, 512);
+            out.clear();
+            for (int n = 0; n < 40; ++n)
+            {
+                juce::MidiBuffer m;
+                if (n == 0) m.addEvent (juce::MidiMessage::noteOn (1, 64, 0.8f), 0);
+                b.clear();
+                up->processBlock (b, m);
+                for (int i = 0; i < 512; ++i) out.push_back (b.getSample (0, i));
+            }
+        };
+
+        for (const double newRate : { 96000.0, 44100.0 })
+        {
+            auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+            auto& p = *up;
+            p.prepareToPlay (48000.0, 256);
+            float prev = 0.0f;
+            const auto before = runLeg (p, 40, 256, prev, true, 60, false);   // ~0.21 s
+            p.prepareToPlay (newRate, 512);                                   // mid-note
+            const auto across = runLeg (p, 2,  512, prev, false, 60, false);
+            const auto after  = runLeg (p, 40, 512, prev, false, 60, false);
+            const auto rel    = runLeg (p, 100, 512, prev, false, 60, true);  // note-off + tail
+            // ...and the one a user would actually notice: play something NEW, and record
+            // it, so it can be compared with a fresh instance note for note.
+            std::vector<float> againSamples, freshSamples;
+            {
+                juce::AudioBuffer<float> b (2, 512);
+                for (int n = 0; n < 40; ++n)
+                {
+                    juce::MidiBuffer m;
+                    if (n == 0) m.addEvent (juce::MidiMessage::noteOn (1, 64, 0.8f), 0);
+                    b.clear();
+                    p.processBlock (b, m);
+                    for (int i = 0; i < 512; ++i) againSamples.push_back (b.getSample (0, i));
+                }
+            }
+            freshRender (newRate, freshSamples);
+            float againPeak = 0.0f, freshPk = 0.0f, worst = 0.0f;
+            for (size_t i = 0; i < againSamples.size(); ++i)
+            {
+                againPeak = juce::jmax (againPeak, std::abs (againSamples[i]));
+                freshPk   = juce::jmax (freshPk,   std::abs (freshSamples[i]));
+                worst     = juce::jmax (worst, std::abs (againSamples[i] - freshSamples[i]));
+            }
+
+            const juce::String at = juce::String ((int) newRate) + " Hz";
+            check (before.finite && across.finite && after.finite && rel.finite,
+                   ("no non-finite sample when the rate changes to " + at).toRawUTF8());
+            check (before.peak > 1.0e-4f,
+                   ("the note is sounding before the change to " + at).toRawUTF8());
+            // The change may silence the held note - it does - but it may never make it
+            // LOUDER, which is what a voice running on stale increments would do.
+            check (after.peak <= before.peak * 1.05f,
+                   ("the change to " + at + " does not make the held note louder").toRawUTF8());
+            check (rel.peak < juce::jmax (1.0e-5f, before.peak * 0.02f),
+                   ("nothing is left sounding after note-off at " + at).toRawUTF8());
+            // THE ONE THAT MATTERS: after the change the plugin must be indistinguishable
+            // from one that started at the new rate - same pitch, same timbre, same level,
+            // sample for sample.
+            // THE GUARD THIS CHECK WAS MISSING. An identity comparison passes when BOTH
+            // sides are silent, and that is not a pass - it is the check having nothing to
+            // say. Found by a sabotage that silenced the fresh instance too and came back
+            // green: "0.0000 vs a fresh instance 0.0000, worst sample difference 0".
+            check (freshPk > 1.0e-4f,
+                   ("the fresh instance at " + at + " is actually making a sound").toRawUTF8());
+            check (worst == 0.0f,
+                   ("a new note after the change to " + at
+                    + " is identical to the same note on a fresh instance").toRawUTF8());
+            std::printf ("    %s: held note %.4f -> %.4f, tail %.3g; new note %.4f vs a fresh "
+                         "instance %.4f, worst sample difference %.3g\n", at.toRawUTF8(),
+                         before.peak, after.peak, rel.peak, againPeak, freshPk, worst);
+        }
+    }
+
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
     // The editor draws value = shape(t, curve); this checks the engine agrees, that
     // the sustain node really sets the level, and that a second key retriggers from
