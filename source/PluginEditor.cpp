@@ -3222,6 +3222,70 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.heading.setText (tr ("SPECTRUM VS RHYTHM", "ESPECTRE VS RITME"), dontSendNotification);
     rhythmPanel.outLbl.setText  (tr ("MIDI out (to DAW)", "Sortida MIDI (al DAW)"), dontSendNotification);
     rhythmPanel.selfLbl.setText (juce::String::fromUTF8 (catalan ? "Sona al Fibl\xc3\xb3" : "Play in Fibl\xc3\xb3"), dontSendNotification);
+    // SIX CONTROLS THAT EXPLAINED NOTHING. Found by asking the probe which components it
+    // records WITHOUT a Tooltip row beside them: seven of seventy-nine, and one of them
+    // is the box that decides what the whole Spectrum-vs-Tuning panel does. The two
+    // symbols in the rhythm panel are the worst of it - "x2" and "/2" name an operation
+    // without naming what it operates on - and "X" is a glyph with no word at all.
+    // (Menu is the seventh and is left alone: the word IS the explanation.)
+    // ...AND THE FOUR IN THE MODULATORS PANEL, which the same sweep found in the custom
+    // view: the box that says WHICH modulator you are editing, and the three that shape
+    // an LFO. A phrase like "Fundamental / 2^n" names a rule without saying what it does.
+    modSelBox.setTooltip (tr (
+        "WHICH modulator these controls edit. Env 1-3 are envelopes (they follow a note); "
+        "LFO 1-3 run continuously. Each keeps its own targets and settings.",
+        "QUIN modulador editen aquests controls. Env 1-3 s\xc3\xb3n envolupants (segueixen una "
+        "nota); LFO 1-3 van cont\xc3\xad" "nuament. Cadascun mant\xc3\xa9 els seus destins."));
+    lfoWaveBox.setTooltip (tr (
+        "The LFO's shape. 'Custom (draw)' opens an editor beside this box where you draw "
+        "the wave yourself, point by point.",
+        "La forma de l'LFO. 'Personalitzada (dibuixa)' obre un editor al costat d'aquesta "
+        "caixa on dibuixes l'ona tu mateix, punt a punt."));
+    lfoRateModeBox.setTooltip (tr (
+        "WHAT SETS THE SPEED. BPM / 2^n locks to the project tempo, halving or doubling. "
+        "Fundamental / 2^n locks to the played note's own frequency, so the LFO stays in "
+        "step with the pitch. Free Hz ignores both.",
+        "QU\xc3\x88 FIXA LA VELOCITAT. BPM / 2^n es lliga al tempo del projecte, dividint o "
+        "doblant. Fundamental / 2^n es lliga a la freq\xc3\xbc\xc3\xa8ncia de la nota tocada, "
+        "o sigui que l'LFO va al pas del to. Free Hz no fa cas de cap dels dos."));
+    lfoPhaseModeBox.setTooltip (tr (
+        "WHERE THE WAVE STARTS. 'Restart each note' begins every note at the same point of "
+        "the wave; 'Project transport' leaves it running with the song, so two notes a bar "
+        "apart hear different parts of it.",
+        "ON COMEN\xc3\x87" "A L'ONA. 'Reinicia a cada nota' comen\xc3\xa7" "a cada nota al "
+        "mateix punt de l'ona; 'Transport del projecte' la deixa c\xc3\xb3rrer amb la "
+        "can\xc3\xa7\xc3\xb3, o sigui que dues notes separades per un comp\xc3\xa0s en senten "
+        "trossos diferents."));
+    specModeBox.setTooltip (tr (
+        "WHAT THIS PANEL DOES. Find = search for tunings whose notes beat least (or most) "
+        "against the spectrum you have. Adapt = keep the tuning and move the SPECTRUM's "
+        "partials to it instead. From spectrum's segment = build a scale out of the "
+        "partials themselves.",
+        "QU\xc3\x88 FA AQUEST PANELL. Troba = cerca afinacions les notes de les quals baten "
+        "menys (o m\xc3\xa9s) contra l'espectre que tens. Adapta = mant\xc3\xa9 l'afinaci\xc3\xb3 "
+        "i mou els parcials de l'ESPECTRE cap a ella. Del segment de l'espectre = construeix "
+        "una escala amb els mateixos parcials."));
+    tuneSourceBox.setTooltip (tr (
+        "WHICH NOTES the search listens to: the tuning loaded now, every tuning in the bank, "
+        "or the chord you are holding.",
+        "QUINES NOTES escolta la cerca: l'afinaci\xc3\xb3 carregada ara, totes les del banc, "
+        "o l'acord que estiguis prement."));
+    tuningBankAddBtn.setTooltip (tr (
+        "Put the tuning loaded now into the bank, so 'From all tunings' can search it and "
+        "the Bank box can reload it later.",
+        "Posa l'afinaci\xc3\xb3 carregada ara al banc, perqu\xc3\xa8 'De totes les afinacions' "
+        "la pugui cercar i la caixa Banc la pugui tornar a carregar."));
+    rhythmPanel.tempoX2.setTooltip (tr (
+        "Send the DAW a tempo twice as fast for the same pulse - use it when the transport "
+        "locks to half the speed you meant.",
+        "Envia al DAW un tempo el doble de r\xc3\xa0pid per al mateix pols - fes-ho servir quan "
+        "el transport es lliga a la meitat de la velocitat que volies."));
+    rhythmPanel.tempoD2.setTooltip (tr (
+        "Send the DAW a tempo half as fast for the same pulse - use it when the transport "
+        "locks to twice the speed you meant.",
+        "Envia al DAW un tempo la meitat de r\xc3\xa0pid per al mateix pols - fes-ho servir quan "
+        "el transport es lliga al doble de la velocitat que volies."));
+    rhythmPanel.closeB.setTooltip (tr ("Close this panel.", "Tanca aquest panell."));
     rhythmPanel.droneT.setButtonText (tr ("Note under pulses", "Nota sota els polsos"));
     rhythmPanel.droneT.setTooltip (tr (
         "With \"Play in Fibló\" on, ALSO sound the held note normally underneath the pulses. Off = only the rhythm sounds.",

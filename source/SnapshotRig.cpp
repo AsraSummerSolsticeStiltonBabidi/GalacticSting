@@ -688,7 +688,7 @@ namespace
     //    it is DECLARED below with a reason. The declaration is the point: it turns "the
     //    same in both languages" from an accident into something somebody chose.
     //==========================================================================
-    juce::StringArray gMojibake, gUntranslated;
+    juce::StringArray gMojibake, gUntranslated, gNoTooltip;
     // STRUCTURAL faults, kept apart from the fit problems and gating the run.
     //
     // A fit problem is a string that needs more room than its box has: there are 276 of
@@ -731,6 +731,17 @@ namespace
     // the reason each one is. The rule this window applies to a panel word is "translate
     // it unless the Catalan word IS the English one", so everything here is a case where
     // translating would invent a word no Catalan musician uses.
+    // A control whose own word is the whole of its explanation. One so far.
+    bool silentControlOnPurpose (const juce::String& path,
+                                 const std::vector<FractalAdditiveAudioProcessorEditor::TextFit>& fits)
+    {
+        for (const auto& f : fits)
+            if (f.path == path
+                && (f.text == "Menu" || f.text == juce::String::fromUTF8 ("Menú")))
+                return true;   // the word IS the explanation, in both languages
+        return false;
+    }
+
     bool sameInBothLanguagesOnPurpose (const juce::String& s)
     {
         struct Decl { const char* text; const char* why; };
@@ -1170,6 +1181,34 @@ namespace
                     auto& m = into[key];
                     for (const auto& f : fits) m[f.path + " (" + f.kind + ")"] = f.text;
                 }
+                // EVERY CONTROL SAYS WHAT IT DOES. A slider, a box or a button with no
+                // tooltip is a control the user has to guess at, and in a synth this
+                // dense that is most of the manual missing. Seven were found by hand the
+                // first time - including the box that decides what the whole
+                // Spectrum-vs-Tuning panel does, and two rhythm buttons labelled "x2" and
+                // "/2" that name an operation without naming what it operates on - so the
+                // question is asked here every run instead.
+                //
+                // "#widest" rows are this rig's own second measurement of a box, not
+                // controls, and the Menu button is the one word that IS its explanation.
+                {
+                    std::set<juce::String> ctrls, tips;
+                    for (const auto& f : fits)
+                    {
+                        if (f.path.contains ("#widest")) continue;
+                        if (f.kind == "Tooltip") tips.insert (f.path);
+                        else if (f.kind == "Slider" || f.kind == "ComboBox"
+                                 || f.kind == "Button" || f.kind == "ToggleButton")
+                            ctrls.insert (f.path);
+                    }
+                    for (const auto& c : ctrls)
+                        if (tips.find (c) == tips.end() && ! silentControlOnPurpose (c, fits))
+                        {
+                            const auto line = "  " + juce::String (sc.id) + " " + c
+                                            + (v.catalan ? "   [ca]" : "   [en]");
+                            if (! gNoTooltip.contains (line)) gNoTooltip.add (line);
+                        }
+                }
 
                 juce::String js;
                 js << "{\n"
@@ -1310,6 +1349,14 @@ namespace
                    " sameInBothLanguagesOnPurpose() with the reason.");
             for (const auto& l : gUntranslated) say (l);
         }
+        if (! gNoTooltip.isEmpty())
+        {
+            say ("");
+            say (juce::String ("NO TOOLTIP (") + juce::String (gNoTooltip.size())
+                 + "): a control the user has to guess at. Give it setTooltip (tr (...)), "
+                   "or declare it in silentControlOnPurpose.");
+            for (const auto& l : gNoTooltip) say (l);
+        }
         if (! gStructural.isEmpty())
         {
             say (juce::String ("STRUCTURAL FAULTS (") + juce::String (gStructural.size())
@@ -1319,12 +1366,14 @@ namespace
             for (const auto& l : gStructural) say (l);
         }
         const bool allOk = failed == 0 && gMojibake.isEmpty() && gUntranslated.isEmpty()
+                        && gNoTooltip.isEmpty()
                         && gStructural.isEmpty();
         say (juce::String ("SNAPSHOT ") + (allOk ? "OK" : "FAILED")
                   + ": " + juce::String (written) + " scenario file pair(s) written, "
                   + juce::String (failed) + " failure(s), "
                   + juce::String (gMojibake.size()) + " not decoded, "
                   + juce::String (gUntranslated.size()) + " not translated, "
+                  + juce::String (gNoTooltip.size()) + " without a tooltip, "
                   + juce::String (gStructural.size()) + " structural, floor "
                   + juce::String (gEditorMin.w) + "x" + juce::String (gEditorMin.h)
                   + ", fully legible at "
