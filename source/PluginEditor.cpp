@@ -3783,6 +3783,24 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Qu\xc3\xa8 est\xc3\xa0 passant, o qu\xc3\xa8 passar\xc3\xa0 si prems Adapta: quant trigar\xc3\xa0 la cerca, si un v\xc3\xadncle en TEMPS REAL hi pot seguir el ritme, i quant batec ha tret l'\xc3\xbaltima adaptaci\xc3\xb3. Els n\xc3\xbameros de Sethares en cru surten aqu\xc3\xad quan una cerca ha acabat.");
     adaptInfoLbl.setTooltip (adaptInfoTipBase);
     {
+        // THE TUNING MODE BOX'S OWN ITEMS, which come straight from the parameter's
+        // StringArray and were never translated at all. Three of the four are the same
+        // word in Catalan - 12ED2 is a name, MTS-ESP a standard, Scala a file format -
+        // and the fourth is two English words that stayed English. Nothing found it
+        // because it is the WIDEST item, so it is never the one a picture shows: every
+        // shot has "Scala (.scl)" selected.
+        //
+        // changeItemText, not localise, because the attachment owns the selection and
+        // re-adding the items would move it. The PARAMETER's strings are untouched: those
+        // are what the host writes into automation lanes.
+        const int keepTuning = tuningBox.getSelectedId();
+        tuningBox.changeItemText (1, tr ("12ED2", "12ED2"));
+        tuningBox.changeItemText (2, tr ("MTS-ESP", "MTS-ESP"));
+        tuningBox.changeItemText (3, tr ("Scala (.scl)", "Scala (.scl)"));
+        tuningBox.changeItemText (4, tr ("MPE (bend input)", "MPE (entrada de bend)"));
+        if (keepTuning > 0) tuningBox.setSelectedId (keepTuning, juce::dontSendNotification);
+    }
+    {
         const int keepMode = specModeBox.getSelectedId(); // BEFORE the texts move - see localise
         specModeBox.changeItemText (1, tr ("Find tunings based on beating", "Troba afinacions pel batec"));
         specModeBox.changeItemText (2, tr ("Adapt spectrum to tuning based on beating",
@@ -4330,6 +4348,36 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
                 // get a second line - that is how the mode selector shows its full names.
                 const int lines = juce::jmax (1, (int) (h / font.getHeight()));
                 record (here, "ComboBox", txt, font, w, h, lines, juce::Justification::centredLeft);
+                // ...AND THE WIDEST ITEM IT HOLDS, which is a different question and the
+                // one that keeps finding defects. A closed ComboBox draws only the item
+                // that is CHOSEN, so every picture measures whatever happened to be
+                // selected when it was taken - the Shepard beats box sat at "4" in every
+                // shot while "1/16" needed 31 px of the 28 it had, and the rig called it
+                // fine. Asked here for every box at once instead of one scenario at a
+                // time: whatever the user picks, the box must be able to show it.
+                //
+                // Reported as its own row so a box that is right about its selection and
+                // wrong about its widest item names which of the two it failed.
+                // ...EXCEPT where the items are the USER'S OWN DATA. A preset picker is
+                // filled with whatever the user called their patches, and one of them here
+                // is 64 characters long and needs 502 px: no box can be asked to hold a
+                // name whose length nobody controls, and asking flagged four boxes in
+                // every one of the 98 scenarios. RefreshingComboBox is exactly the set
+                // that refills itself from disk, which is the same thing said in code.
+                if (dynamic_cast<const RefreshingComboBox*> (box) == nullptr)
+                {
+                    juce::String widest;
+                    float widestW = 0.0f;
+                    for (int i = 0; i < box->getNumItems(); ++i)
+                    {
+                        const auto item = box->getItemText (i);
+                        const float iw = juce::GlyphArrangement::getStringWidth (font, item);
+                        if (iw > widestW) { widestW = iw; widest = item; }
+                    }
+                    if (widest.isNotEmpty() && widest != txt)
+                        record (here + "#widest", "ComboBox", widest, font, w, h, lines,
+                                juce::Justification::centredLeft);
+                }
             }
             continue;   // its label is the box's own; do not measure it twice
         }

@@ -958,6 +958,9 @@ namespace traudit
             " cents", " cents.", "+ .scl", "AMP", "BASE", "BPM / 2^n", "Env", "FRACTAL",
             "GATE", "Glide", "Mono", "Notes", "OK", "Original", "Pitch bend", "Presets...",
             "Reps", "St", "Triangle", "VEL", "est.", "intervals: 3/2 2 700c ...",
+            // The tuning mode box's first three items: a name, a standard and a file
+            // format. Only its fourth has words that Catalan writes differently.
+            "12ED2", "MTS-ESP", "Scala (.scl)",
             // The pitch-bend ranges. "st" is the abbreviation for a semitone in Catalan
             // too - the bare "St" three lines up is the same word - and MPE is a standard.
             // Found by THIS parser and missed by the hand-written perl audit that came
