@@ -4680,7 +4680,6 @@ private:
     juce::Label        lblLfoDiv, lblLfoHz, lblLfoPhase;
     juce::ToggleButton modOnT;                      // per-modulator on/off
     juce::TextButton   modUnmapBtn;                 // unmap this modulator from everything
-    juce::TextButton   lfoWaveEditBtn;              // opens the drawn-wave editor
     std::unique_ptr<SliderAttachment>   custAdsrAtt[4], custRangeAtt, lfoDivAtt, lfoHzAtt, lfoPhaseAtt;
     std::unique_ptr<ComboBoxAttachment> lfoWaveAtt, lfoRateModeAtt, lfoPhaseModeAtt;
     std::unique_ptr<ButtonAttachment>   modOnAtt;
@@ -4727,7 +4726,7 @@ private:
     // beside it is gone - with the engine chips deciding which engine is in force, an
     // Off pill was a second, quieter switch for the same thing, and the pair could
     // disagree on screen. Removing is the destructive half the pill never offered.
-    juce::TextButton loadSclButton, clearSclButton, loadTimbreButton,
+    juce::TextButton loadSclButton, loadTimbreButton,
                      langButton, savePresetButton, dissBtn, dissSaveBtn, recentBtn[3], tuningBankLoadBtn,
                      tuningBankClearBtn;
     // RANDOM SPECTRUM: fires the automatable "specRandom" trigger (see the processor).

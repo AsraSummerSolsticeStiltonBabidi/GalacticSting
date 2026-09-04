@@ -1483,17 +1483,6 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             refocus();
         };
         addChildComponent (modUnmapBtn);
-        lfoWaveEditBtn.setColour (juce::TextButton::buttonColourId, cCustom.withAlpha (0.85f));
-        lfoWaveEditBtn.setMouseClickGrabsKeyboardFocus (false);
-        lfoWaveEditBtn.onClick = [this]
-        {
-            const int l = modSel - 3;
-            if (l < 0) return;
-            waveEditor.fromText (processorRef.getLfoWavePoints (l));
-            waveEditor.setVisible (true);
-            waveEditor.toFront (false);
-        };
-        addChildComponent (lfoWaveEditBtn);
         waveEditor.onChange = [this]
         {
             const int l = modSel - 3;
@@ -1546,12 +1535,6 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     loadSclButton.setTooltip ("Load a Scala scale file (retunes the notes).");
     loadSclButton.onClick = [this] { openScalaChooser(); };
     addAndMakeVisible (loadSclButton);
-    clearSclButton.setColour (juce::TextButton::buttonColourId, cReset);
-    clearSclButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
-    clearSclButton.setMouseClickGrabsKeyboardFocus (false);
-    clearSclButton.setTooltip ("Back to 12-TET.");
-    clearSclButton.onClick = [this] { processorRef.clearScala(); refocus(); };
-    addAndMakeVisible (clearSclButton);
     makeLabel (recentLabel, cTuning); recentLabel.setJustificationType (juce::Justification::centredLeft);
     for (int i = 0; i < 3; ++i)
     {
@@ -3374,9 +3357,6 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     modUnmapBtn.setButtonText (tr ("Unmap", "Desassigna"));
     modUnmapBtn.setTooltip (tr ("Unmap this modulator from EVERYTHING it modulates.",
                                 "Desassigna aquest modulador de TOT el que modula."));
-    lfoWaveEditBtn.setButtonText (tr ("Draw", "Dibuixa"));
-    lfoWaveEditBtn.setTooltip (tr ("Draw this LFO's wave: points + curved segments, like automation.",
-                                   "Dibuixa l'ona d'aquest LFO: punts + segments corbats, com una automatitzaci\xc3\xb3."));
     modOnT.setTooltip (tr ("This modulator on/off (off restores its targets to their own values).",
                            "Aquest modulador on/off (off retorna els seus dest\xc3\xadns al seu valor propi)."));
     // THE CUSTOM TAB'S OWN FADERS, and the pitch envelope's amount. Every one of these
@@ -3507,7 +3487,6 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // as the plugin breaking. They say what they load now.
     loadSclButton.setButtonText    (tr ("Load", "Obrir"));
     loadSclButton.getProperties().set ("fork", true);
-    clearSclButton.setButtonText   (tr ("Reset", "Reinicia"));
     // "Add to Bank", not "+". A lone plus beside Load and Save named neither the thing
     // it adds nor where it adds it, and the two other + buttons on screen (the octave
     // steppers, and the bank's own "+ .scl") add something else entirely.
@@ -3642,8 +3621,6 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     loadSclButton.setTooltip (tr (
         "Load an AnaMark .tun, a Scala .scl or an Ableton .ascl file to retune the keys. The 1/1 sits on middle C unless the file sets its own reference (@ABL REFERENCE_PITCH, or a .tun's basefreq - a .tun always sounds at the absolute pitches it states). A .tun whose mapping does not repeat cannot be held as a scale and is refused rather than approximated.",
         "Carrega un fitxer AnaMark .tun, un Scala .scl o un Ableton .ascl per reafinar les tecles. L'1/1 queda al Do central tret que el fitxer porti la seva refer\xc3\xa8ncia (@ABL REFERENCE_PITCH, o el basefreq d'un .tun - un .tun sempre sona als tons absoluts que indica). Un .tun amb un mapatge que no es repeteix no es pot desar com a escala i es rebutja en comptes d'aproximar-lo."));
-    clearSclButton.setTooltip (tr ("Unload the scale and return to standard 12-TET.",
-                                   "Descarrega l'escala i torna al 12-TET est\xc3\xa0ndard."));
     for (int i = 0; i < 3; ++i)
         recentBtn[i].setTooltip (tr ("Reload this recently used file as the scale.",
                                      "Torna a carregar aquest fitxer recent com a escala."));
@@ -3771,7 +3748,6 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (lfoPhaseModeBox,{ tr ("Restart each note", "Reinicia a cada nota"),
                                 tr ("Project transport", "Transport del projecte") });
     modUnmapBtn.setButtonText  (tr ("Unmap", "Desassigna"));
-    lfoWaveEditBtn.setButtonText (tr ("Draw", "Dibuixa"));
     rhythmPanel.helpB.setButtonText (tr ("How to route", "Com encaminar"));
     chordList.emptyText = tr ("Press Find to search.\nhover a row to hear it\ndouble-click loads it as the scale",
                               "Prem Troba per cercar.\npassa-hi el cursor per escoltar-lo\ndoble clic el carrega com a escala");
@@ -9040,7 +9016,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // for as long as the selected LFO is on "Custom (draw)" - no button to
             // find, and it disappears when you leave that LFO or change its wave.
             const bool drawMode = cust && ! isEnv && lfoWaveBox.getSelectedId() == 6;
-            lfoWaveEditBtn.setVisible (false);
             if (drawMode)
             {
                 const int l = modSel - 3;
@@ -9078,12 +9053,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
             lfoHzSlider.setVisible  (showHz);  lblLfoHz.setVisible  (showHz);
             if (cust)
             {
-                // [modulator][On][Unmap] and, for a drawn LFO wave, [Draw] - which
-                // gets a readable share of the row instead of whatever is left over.
+                // [modulator][On][Unmap]. There was a [Draw] button on the right of this
+                // row; the drawn-wave editor OPENS BY ITSELF now, docked beside the box,
+                // for as long as the selected LFO is on "Custom (draw)". The button had
+                // been setVisible(false) unconditionally ever since - a control that
+                // could not be reached, sized, clicked or photographed, still carrying a
+                // tr() pair the language audits had to keep stepping over.
                 auto selRow = in.removeFromTop (20);
-                const bool drawVis = lfoWaveEditBtn.isVisible();
-                if (drawVis) lfoWaveEditBtn.setBounds (selRow.removeFromRight (56));
-                if (drawVis) selRow.removeFromRight (4);
                 const int nCell = 3;
                 const int cw3 = juce::jmax (30, selRow.getWidth() / nCell - 3);
                 modSelBox.setBounds (selRow.removeFromLeft (cw3));
@@ -9262,7 +9238,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 loadSclButton.setVisible (true);
                 saveTuningBtn.setVisible (true);
                 tuningBankAddBtn.setVisible (true);
-                clearSclButton.setVisible (false);  // Reset removed - the mode selector does it
                 auto brow = mrow;
                 if (btnOwnRow) { ti.removeFromTop (3); brow = ti.removeFromTop (24); }
                 const auto fit = [&brow] (juce::TextButton& b, bool mayHide)
