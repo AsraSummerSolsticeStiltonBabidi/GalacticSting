@@ -2878,6 +2878,147 @@ int main (int argc, char** argv)
             std::printf ("    %d left it unplayable; first was: %s\n", unplayable, firstBad.toRawUTF8());
     }
 
+    // --- run 12l: the MIDI a host can actually send ----------------------------------
+    //
+    // The fourth thing that arrives from outside, and the only one still unswept. A DAW
+    // does not promise well-formed music: a note-off for a note that never sounded, a
+    // note-on with velocity zero (which IS a note-off), All Notes Off in the middle of a
+    // held chord, a sysex dump from some other device on the same port, a controller
+    // sweep at every value, and - for an MPE instrument especially - pitch bend at both
+    // extremes on all sixteen channels at once, which is a per-note channel doing
+    // something no player would do but a badly-configured controller does constantly.
+    //
+    // Same two claims as the file sweeps: the call returns, and what it leaves behind is
+    // still a synth. Plus one more that only makes sense for MIDI - after the storm, a
+    // plain note must still sound, and nothing may be left ringing.
+    {
+        auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+        auto& p = *up;
+        const int blk = 256;
+        p.prepareToPlay (48000.0, blk);
+        juce::AudioBuffer<float> b (2, blk);
+
+        bool finite = true;
+        int blocks = 0;
+        const auto pump = [&] (const juce::MidiBuffer& m)
+        {
+            auto mm = m;
+            b.clear();
+            p.processBlock (b, mm);
+            ++blocks;
+            for (int ch = 0; ch < 2 && finite; ++ch)
+                for (int i = 0; i < blk; ++i)
+                    if (! std::isfinite (b.getSample (ch, i))) { finite = false; break; }
+        };
+
+        // 1. A note-off for a note that never sounded, and a velocity-zero note-on.
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOff (1, 60), 0); pump (m); }
+        { juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 0), 0); pump (m); }
+        // 2. Every note number at once, on every channel: 128 x 16 note-ons in one block.
+        {
+            juce::MidiBuffer m;
+            for (int ch = 1; ch <= 16; ++ch)
+                for (int n = 0; n < 128; ++n)
+                    m.addEvent (juce::MidiMessage::noteOn (ch, n, 0.5f), n % blk);
+            pump (m);
+            for (int k = 0; k < 4; ++k) { juce::MidiBuffer e; pump (e); }
+        }
+        // 3. All Notes Off in the middle of that, then the rest of the channel-mode
+        //    messages a host sends when the transport stops.
+        {
+            juce::MidiBuffer m;
+            for (int ch = 1; ch <= 16; ++ch)
+            {
+                m.addEvent (juce::MidiMessage::allNotesOff (ch), 0);
+                m.addEvent (juce::MidiMessage::allSoundOff (ch), 1);
+                m.addEvent (juce::MidiMessage::allControllersOff (ch), 2);
+            }
+            pump (m);
+        }
+        // 4. PITCH BEND AT BOTH EXTREMES ON ALL SIXTEEN CHANNELS, which is the one that
+        //    matters for MPE: every per-note channel bent as far as it goes, both ways,
+        //    with notes held under them.
+        {
+            juce::MidiBuffer on;
+            for (int ch = 1; ch <= 16; ++ch) on.addEvent (juce::MidiMessage::noteOn (ch, 60, 0.8f), 0);
+            pump (on);
+            for (const int v : { 0, 8192, 16383, 0, 16383 })
+            {
+                juce::MidiBuffer m;
+                for (int ch = 1; ch <= 16; ++ch)
+                    m.addEvent (juce::MidiMessage::pitchWheel (ch, v), 0);
+                pump (m);
+            }
+            juce::MidiBuffer off;
+            for (int ch = 1; ch <= 16; ++ch) off.addEvent (juce::MidiMessage::noteOff (ch, 60), 0);
+            pump (off);
+        }
+        // 5. A controller sweep across every CC and every value, plus channel pressure and
+        //    polyphonic aftertouch - the traffic a breath controller or a touch surface
+        //    makes, at a density no player produces.
+        for (int pass = 0; pass < 4; ++pass)
+        {
+            juce::MidiBuffer m;
+            for (int cc = 0; cc < 128; ++cc)
+                m.addEvent (juce::MidiMessage::controllerEvent (1 + (cc % 16), cc,
+                                                                (pass * 64 + cc) % 128), cc % blk);
+            for (int ch = 1; ch <= 16; ++ch)
+            {
+                m.addEvent (juce::MidiMessage::channelPressureChange (ch, (pass * 40) % 128), 0);
+                m.addEvent (juce::MidiMessage::aftertouchChange (ch, 60, (pass * 33) % 128), 1);
+            }
+            pump (m);
+        }
+        // 6. Somebody else's sysex on the same port, and a program change.
+        {
+            const juce::uint8 blob[] = { 0x7D, 0x01, 0x02, 0x03, 0x04, 0x05 };
+            juce::MidiBuffer m;
+            m.addEvent (juce::MidiMessage::createSysExMessage (blob, (int) sizeof (blob)), 0);
+            m.addEvent (juce::MidiMessage::programChange (1, 42), 1);
+            pump (m);
+        }
+        // 7. Events at the very first and very last sample of a block.
+        {
+            juce::MidiBuffer m;
+            m.addEvent (juce::MidiMessage::noteOn  (1, 48, 0.8f), 0);
+            m.addEvent (juce::MidiMessage::noteOff (1, 48), blk - 1);
+            pump (m);
+        }
+        for (int k = 0; k < 20; ++k) { juce::MidiBuffer e; pump (e); }
+
+        check (finite, "no MIDI a host can send makes a non-finite sample");
+        // NOTHING LEFT RINGING - but measured as a DECAY, not as instant silence. The
+        // first version asked for silence after 40 blocks (0.21 s) and got 0.112, which
+        // is not a stuck note: it is the release of two thousand note-ons that were still
+        // finishing. A stuck voice and a long release look identical in one measurement
+        // and completely different in two.
+        float tail = 0.0f, tailEarly = 0.0f;
+        for (int k = 0; k < 800; ++k)          // ~4.3 s at 48 kHz
+        {
+            juce::MidiBuffer e; b.clear(); p.processBlock (b, e);
+            const float mag = b.getMagnitude (0, blk);
+            if (k < 40) tailEarly = juce::jmax (tailEarly, mag);
+            if (k >= 700) tail = juce::jmax (tail, mag);
+        }
+        check (tail < 1.0e-4f,
+               "and nothing is left ringing: the tail reaches silence once the releases end");
+        std::printf ("    tail: %.4f in the first 0.2 s, %.3g after 3.7 s\n", tailEarly, tail);
+        // ...AND IT STILL PLAYS. A synth that survived the storm by going deaf has not
+        // survived it.
+        float after = 0.0f;
+        for (int k = 0; k < 30; ++k)
+        {
+            juce::MidiBuffer m;
+            if (k == 0) m.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+            b.clear();
+            p.processBlock (b, m);
+            after = juce::jmax (after, b.getMagnitude (0, blk));
+        }
+        check (after > 1.0e-3f, "and a plain note still sounds afterwards");
+        std::printf ("    %d blocks of pathological MIDI; tail %.3g, a note after it %.4f\n",
+                     blocks, tail, after);
+    }
+
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
     // The editor draws value = shape(t, curve); this checks the engine agrees, that
     // the sustain node really sets the level, and that a second key retriggers from
