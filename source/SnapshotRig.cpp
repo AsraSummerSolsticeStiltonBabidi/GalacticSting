@@ -435,6 +435,21 @@ namespace
         "! noperiod.scl\na scale that states no period\n 2\n!\n"
         " 100.0\n 1/1\n";
 
+    // AN N-EDO SCALE, BUILT RATHER THAN TYPED, so a DENSE one is one number away. The two
+    // literals above are 19 and 3 degrees; the keyboard's own painted text - a degree
+    // number and a cents value on every key - has only ever been photographed at those
+    // widths. 53-EDO is not exotic (Turkish and Arabic practice use it) and it makes every
+    // key a third the width, which is where a painted label stops being readable.
+    inline juce::String makeEdo (int n)
+    {
+        juce::String s;
+        s << "! " << n << "edo.scl\n" << n << "-tone equal temperament\n " << n << "\n!\n";
+        for (int i = 1; i < n; ++i)
+            s << " " << juce::String (1200.0 * (double) i / (double) n, 6) << "\n";
+        s << " 2/1\n";
+        return s;
+    }
+
     void loadScale (Proc& p, const char* scl, const char* name)
     { juce::String err; p.loadScalaText (scl, name, err); }
 
@@ -566,6 +581,18 @@ namespace
                   // version of this scenario did - green, and photographing nothing.
                   loadScale (p, kScaleTritave, "tritave");
                   p.loadPreset ("rig-provenance");
+                  e.tickTimerForTests();
+              } },
+            // THE KEYBOARD AT ITS DENSEST. Every key carries a degree number and a cents
+            // value that the keyboard PAINTS ITSELF, and both have only ever been
+            // photographed on a 19-note or a 3-note scale. 53 to the octave is a third of
+            // the width per key, and drawFittedText condenses rather than clips - the
+            // "legible-looking smear" this build refuses everywhere else.
+            { "45-keyboard-53edo", "the keyboard with 53 degrees to the octave", tEditor, fSizes,
+              [] (Proc& p, Ed& e)
+              {
+                  juce::String err;
+                  p.loadScalaText (makeEdo (53), "53edo", err);
                   e.tickTimerForTests();
               } },
 
@@ -781,6 +808,7 @@ namespace
             { "12ED2",   "the loaded scale's own name" },
             { "19edo",   "the loaded scale's own name" },
             { "tritave", "the loaded scale's own name" },
+            { "53edo",   "the loaded scale's own name" },
             { "= ... BPM", "BPM, and dots standing in for a tempo the host has not given" },
             // Not a sentence: the credit link's hover IS the address it opens, and an
             // address does not have a Catalan spelling.
