@@ -3830,6 +3830,48 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& out,
                                                     const juce::MidiBuffer& midi, int nSamp)
 {
+    // THE HOST'S MPE CONFIGURATION MESSAGE UNDOES OUR ZONE, so the zone is checked here
+    // and put back before anything is rendered.
+    //
+    // "lo pongo en mpe, y le envio midi retuneado con mpe y no reacciona, cuando otros
+    // sintes compatibles con mpe si lo hacen." Measured, in two halves:
+    //
+    //   * an MCM whose member count is ZERO - which is how a host says "MPE off", and
+    //     which several send before configuring - deactivates the lower zone, after which
+    //     MPEInstrument::noteOn early-returns for every channel and the synth is
+    //     PERMANENTLY DEAF. applyTuningMode cannot save it: its zone write is behind
+    //     `if (mpe != lastZoneMpe)` and that edge has already been spent.
+    //   * ANY MCM re-writes the zone through JUCE's own handler, which calls setLowerZone
+    //     with a DEFAULTED master range of 2. That silently undoes the +-48 master range
+    //     the comment in applyTuningMode explains at length - a retuning arriving on
+    //     channel 1 then collapses to 1/24 of itself. Measured: a note asking for 320.222
+    //     Hz came out at 263.851, which is 335 cents flat.
+    //
+    // The repair follows the host where following costs nothing and refuses where it
+    // costs the feature: the MEMBER COUNT and the PER-NOTE range are whatever the host
+    // last asked for, because those are its business; the zone is never allowed to be
+    // inactive while this mode is on, and the MASTER range is held at 48, because both of
+    // those are what the UI promises when it hides the bend selector in this mode.
+    //
+    // Only when it has actually drifted: MPEInstrument::setZoneLayout releases every
+    // sounding note, so re-asserting a zone that is already right would cut notes off on
+    // every block.
+    if (lastZoneMpe)
+    {
+        auto layout = synth.getZoneLayout();
+        const auto lower = layout.getLowerZone();
+        const bool dead  = ! lower.isActive();
+        if (dead || lower.masterPitchbendRange != 48)
+        {
+            layout.setLowerZone (dead ? 15 : lower.numMemberChannels,
+                                 dead ? 48 : lower.perNotePitchbendRange,
+                                 48);
+            synth.setZoneLayout (layout);
+            for (auto& e : mixEng)
+                if (e != nullptr) e->synth.setZoneLayout (layout);
+        }
+    }
+
     const bool   on = mixEngaged.load (std::memory_order_acquire);
     const double sr = lastSr > 0.0 ? lastSr : 44100.0;
 

@@ -3019,6 +3019,249 @@ int main (int argc, char** argv)
                      blocks, tail, after);
     }
 
+    // --- run 12m: MPE RETUNING, which is the whole point of the MPE mode ------------
+    //
+    // "lo pongo en mpe, y le envio midi retuneado con mpe y no reacciona, cuando otros
+    // sintes compatibles con mpe si lo hacen."
+    //
+    // In MPE mode this synth deliberately turns its OWN tuning off (applyTuningMode sets
+    // TuningManager::Mode::Equal) because the host is doing the retuning with per-note
+    // pitch bend. So the entire feature is: does an incoming per-note bend move the
+    // pitch, and by exactly how much.
+    //
+    // Measured as a FREQUENCY, by FFT, not as "some audio came out" - the symptom being
+    // chased is a note that sounds at the WRONG pitch, which every "is it finite" and
+    // "does it make a sound" check in this file would happily pass.
+    //
+    // AND IN BOTH ORDERS. A host that retunes sends the bend on the member channel FIRST
+    // and the note-on after it, because the note is meant to arrive already retuned. A
+    // player bends a note that is already sounding. Those are different code paths in
+    // every MPE implementation and only one of them is the user's complaint.
+    {
+        const double sr = 48000.0;
+        const int    blk = 512;
+
+        // The fundamental of whatever is sounding, to a fraction of a cent: FFT the tail
+        // of the render, take the loudest bin, refine it with its two neighbours.
+        const auto measureHz = [sr] (const std::vector<float>& mono) -> double
+        {
+            constexpr int fo = 15;                       // 32768 points: ~1.5 Hz bins
+            const size_t N = (size_t) 1 << fo;
+            if (mono.size() < N) return -1.0;
+            std::vector<float> buf (N * 2, 0.0f);
+            const size_t off = mono.size() - N;
+            for (size_t i = 0; i < N; ++i)
+            {
+                const double w = 0.5 - 0.5 * std::cos (2.0 * juce::MathConstants<double>::pi
+                                                       * (double) i / (double) (N - 1));
+                buf[i] = (float) (mono[off + i] * w);
+            }
+            juce::dsp::FFT fft (fo);
+            fft.performFrequencyOnlyForwardTransform (buf.data());
+            size_t peak = 1;
+            for (size_t i = 2; i < N / 2; ++i) if (buf[i] > buf[peak]) peak = i;
+            if (buf[peak] < 1.0e-6f) return -1.0;      // nothing sounded
+            // Parabolic interpolation on the log magnitude: the bin alone is 1.5 Hz,
+            // which is 10 cents at 260 Hz and would swamp what is being measured. The
+            // denominator is guarded and the correction clamped to half a bin - without
+            // that a flat top gives a divide-by-nothing and a frequency of 9e11 Hz,
+            // which is what the first version reported and briefly looked like the
+            // plugin's fault.
+            const double a = std::log (juce::jmax (1.0e-12f, buf[peak - 1]));
+            const double b = std::log (juce::jmax (1.0e-12f, buf[peak]));
+            const double c = std::log (juce::jmax (1.0e-12f, buf[peak + 1]));
+            const double den = a - 2.0 * b + c;
+            const double d = std::abs (den) < 1.0e-9 ? 0.0
+                           : juce::jlimit (-0.5, 0.5, 0.5 * (a - c) / den);
+            return ((double) peak + d) * sr / (double) N;
+        };
+
+        // note 60 on `chan`, with `bend14` sent BEFORE the note-on or after it.
+        const auto renderMpe = [&] (int chan, int bend14, bool bendFirst) -> std::vector<float>
+        {
+            auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+            auto& p = *up;
+            if (auto* q = p.apvts.getParameter ("tuningMode"))
+                q->setValueNotifyingHost (q->convertTo0to1 (3.0f));   // "MPE (bend input)"
+            p.pollParametersForTests();
+            p.prepareToPlay (sr, blk);
+
+            std::vector<float> mono;
+            juce::AudioBuffer<float> b (2, blk);
+            const int blocks = 100;                                   // ~1.07 s
+            for (int n = 0; n < blocks; ++n)
+            {
+                juce::MidiBuffer m;
+                if (n == 0)
+                {
+                    if (bendFirst)
+                    {
+                        m.addEvent (juce::MidiMessage::pitchWheel (chan, bend14), 0);
+                        m.addEvent (juce::MidiMessage::noteOn (chan, 60, 0.8f), 1);
+                    }
+                    else
+                    {
+                        m.addEvent (juce::MidiMessage::noteOn (chan, 60, 0.8f), 0);
+                    }
+                }
+                if (! bendFirst && n == 4)
+                    m.addEvent (juce::MidiMessage::pitchWheel (chan, bend14), 0);
+                b.clear();
+                p.processBlock (b, m);
+                for (int i = 0; i < blk; ++i) mono.push_back (b.getSample (0, i));
+            }
+            return mono;
+        };
+
+        // +-48 semitones is what the zone is set to and what MPE defaults to, so a
+        // 14-bit value of 8192 + 8192*st/48 is `st` semitones up.
+        const auto bendFor = [] (double semis) { return 8192 + (int) std::llround (8192.0 * semis / 48.0); };
+
+        const double plain = measureHz (renderMpe (2, 8192, true));    // no bend at all
+        check (plain > 100.0, "MPE mode makes a sound at all");
+        std::printf ("    MPE, no bend, channel 2: %.3f Hz (12-TET note 60 is 261.626)\n", plain);
+
+        struct Case { double semis; const char* how; bool bendFirst; };
+        const Case cases[] = {
+            { 3.5, "bend BEFORE the note (a host retuning)", true },
+            { 3.5, "bend AFTER the note (a player bending)", false },
+            { -2.25, "negative bend before the note",        true },
+        };
+        for (const auto& c : cases)
+        {
+            const double want = plain * std::pow (2.0, c.semis / 12.0);
+            const double got  = measureHz (renderMpe (2, bendFor (c.semis), c.bendFirst));
+            const double cents = 1200.0 * std::log2 (got / want);
+            std::printf ("    %-40s want %.3f Hz, got %.3f Hz  (%+.2f cents)\n",
+                         c.how, want, got, cents);
+            check (std::abs (cents) < 10.0,
+                   (juce::String ("MPE per-note bend retunes the note: ") + c.how).toRawUTF8());
+        }
+        // ...and on the MASTER channel too, which is where a host that has not been told
+        // about MPE puts everything. The zone sets both ranges to 48 for exactly this.
+        {
+            const double want = plain * std::pow (2.0, 3.5 / 12.0);
+            const double got  = measureHz (renderMpe (1, bendFor (3.5), true));
+            const double cents = 1200.0 * std::log2 (got / want);
+            std::printf ("    %-40s want %.3f Hz, got %.3f Hz  (%+.2f cents)\n",
+                         "the same bend on channel 1 (master)", want, got, cents);
+            check (std::abs (cents) < 10.0, "MPE bend on the master channel retunes it too");
+        // ...AND AFTER THE HOST HAS INTRODUCED ITSELF. A real MPE host does not just
+        // start playing: it sends an MPE Configuration Message first - RPN 6 on the
+        // master channel, whose value is the number of member channels - and usually an
+        // RPN 0 (pitch bend range) after it. juce::MPEInstrument parses those out of the
+        // incoming stream and RE-WRITES its own zone layout from them, which is the whole
+        // point of the message. This plugin sets its zone ONCE, by hand, at (15, 48, 48).
+        // So the question this asks is: does the plugin's hand-set zone survive the host
+        // saying what it is? If it does not, every one of the checks above passes while a
+        // real DAW gets nothing, which is exactly the complaint.
+        const auto renderAfterMcm = [&] (int members, int rpnBendRange, double semis) -> double
+        {
+            auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+            auto& p = *up;
+            if (auto* q = p.apvts.getParameter ("tuningMode"))
+                q->setValueNotifyingHost (q->convertTo0to1 (3.0f));
+            p.pollParametersForTests();
+            p.prepareToPlay (sr, blk);
+
+            std::vector<float> mono;
+            juce::AudioBuffer<float> b (2, blk);
+            for (int n = 0; n < 100; ++n)
+            {
+                juce::MidiBuffer m;
+                if (n == 0)
+                {
+                    // MCM: RPN 6 on channel 1, value = member channel count.
+                    m.addEvent (juce::MidiMessage::controllerEvent (1, 101, 0), 0);
+                    m.addEvent (juce::MidiMessage::controllerEvent (1, 100, 6), 1);
+                    m.addEvent (juce::MidiMessage::controllerEvent (1, 6, members), 2);
+                    if (rpnBendRange > 0)
+                    {
+                        // RPN 0 on a member channel: the per-note bend range in semitones.
+                        m.addEvent (juce::MidiMessage::controllerEvent (2, 101, 0), 3);
+                        m.addEvent (juce::MidiMessage::controllerEvent (2, 100, 0), 4);
+                        m.addEvent (juce::MidiMessage::controllerEvent (2, 6, rpnBendRange), 5);
+                    }
+                }
+                if (n == 2)
+                {
+                    m.addEvent (juce::MidiMessage::pitchWheel (2, bendFor (semis)), 0);
+                    m.addEvent (juce::MidiMessage::noteOn (2, 60, 0.8f), 1);
+                }
+                b.clear();
+                p.processBlock (b, m);
+                for (int i = 0; i < blk; ++i) mono.push_back (b.getSample (0, i));
+            }
+            return measureHz (mono);
+        };
+        {
+            const double want = plain * std::pow (2.0, 3.5 / 12.0);
+            struct Intro { int members, rpn; const char* how; };
+            const Intro intros[] = {
+                { 15, 0,  "after an MCM (15 members), no RPN 0" },
+                { 15, 48, "after an MCM (15 members) + RPN 0 = 48" },
+                { 14, 48, "after an MCM (14 members), as Live sends" },
+                {  0, 0,  "after an MCM with 0 members (zone off)" },
+            };
+            for (const auto& in : intros)
+            {
+                const double got = renderAfterMcm (in.members, in.rpn, 3.5);
+                if (got < 0.0)
+                {
+                    std::printf ("    %-42s SILENT - no note sounded at all\n", in.how);
+                    check (false, (juce::String ("a note still sounds ") + in.how).toRawUTF8());
+                    continue;
+                }
+                const double cents = 1200.0 * std::log2 (got / want);
+                std::printf ("    %-42s want %.3f Hz, got %.3f Hz  (%+.2f cents)\n",
+                             in.how, want, got, cents);
+                check (std::abs (cents) < 10.0,
+                       (juce::String ("the bend still retunes ") + in.how).toRawUTF8());
+            }
+        }
+        // ...and the same introduction, with the note on the MASTER channel. The comment
+        // in applyTuningMode says both ranges are +-48 precisely so a host that puts
+        // notes on channel 1 still retunes; JUCE's own MCM handler calls setLowerZone
+        // with a DEFAULTED master range of 2, so if the host's message wins, that fix is
+        // silently undone and a retuning collapses to 1/24 of what it should be.
+        {
+            const double want = plain * std::pow (2.0, 3.5 / 12.0);
+            auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+            auto& p = *up;
+            if (auto* q = p.apvts.getParameter ("tuningMode"))
+                q->setValueNotifyingHost (q->convertTo0to1 (3.0f));
+            p.pollParametersForTests();
+            p.prepareToPlay (sr, blk);
+            std::vector<float> mono;
+            juce::AudioBuffer<float> b (2, blk);
+            for (int n = 0; n < 100; ++n)
+            {
+                juce::MidiBuffer m;
+                if (n == 0)
+                {
+                    m.addEvent (juce::MidiMessage::controllerEvent (1, 101, 0), 0);
+                    m.addEvent (juce::MidiMessage::controllerEvent (1, 100, 6), 1);
+                    m.addEvent (juce::MidiMessage::controllerEvent (1, 6, 15), 2);
+                }
+                if (n == 2)
+                {
+                    m.addEvent (juce::MidiMessage::pitchWheel (1, bendFor (3.5)), 0);
+                    m.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 1);
+                }
+                b.clear();
+                p.processBlock (b, m);
+                for (int i = 0; i < blk; ++i) mono.push_back (b.getSample (0, i));
+            }
+            const double got = measureHz (mono);
+            const double cents = got < 0.0 ? -9999.0 : 1200.0 * std::log2 (got / want);
+            std::printf ("    %-42s want %.3f Hz, got %.3f Hz  (%+.2f cents)\n",
+                         "master-channel note after an MCM", want, got, cents);
+            check (std::abs (cents) < 10.0,
+                   "the bend still retunes on the master channel after an MCM");
+        }
+        }
+    }
+
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
     // The editor draws value = shape(t, curve); this checks the engine agrees, that
     // the sustain node really sets the level, and that a second key retriggers from
