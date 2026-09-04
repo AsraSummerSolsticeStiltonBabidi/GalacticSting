@@ -538,6 +538,36 @@ namespace
                   loadScale (p, kScaleNoPeriod, "2ed1");   // its technical name, and no 3-letter run for the language gate to read as a word
                   e.tickTimerForTests();
               } },
+            // THE TWO PROVENANCE BUTTONS, which no picture had ever contained in EITHER
+            // state. They only appear when the loaded scale carries a patch of its own or
+            // a preset brought its tuning with it, and they carry the longest words on the
+            // tuning ladder - "Load its original spectrum" is 26 characters on a row that
+            // HIDES what it cannot fit, in a stated order.
+            //
+            // Reaching that state needs a preset, so the folder is redirected to a scratch
+            // directory FIRST. The user has exactly five patches and a rig that writes into
+            // their folder is a bug in the rig.
+            { "44-tuning-provenance", "the buttons a preset's own tuning puts on screen", tEditor, fSizes,
+              [] (Proc& p, Ed& e)
+              {
+                  auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                     .getChildFile ("fiblo-rig-presets");
+                  scratch.deleteRecursively();
+                  Proc::setPresetFolderForTests (scratch);
+                  loadScale (p, kScale19, "19edo");
+                  Proc::PresetWriteRefusal why {};
+                  int corner = -1;
+                  p.savePreset ("rig-provenance", why, corner);
+                  // ...then move the tuning AWAY from the one the preset carries, because
+                  // hasPendingPresetTuning() is true only while the two DIFFER: loading a
+                  // preset never applies its tuning, the panel offers it separately, and
+                  // the offer is what puts the long button on screen. Saving and reloading
+                  // the same scale leaves nothing to offer, which is what the first
+                  // version of this scenario did - green, and photographing nothing.
+                  loadScale (p, kScaleTritave, "tritave");
+                  p.loadPreset ("rig-provenance");
+                  e.tickTimerForTests();
+              } },
 
             // The Spectrum-to-Rhythm panel: an in-editor overlay, so it lands in the
             // editor's own snapshot.
