@@ -2795,6 +2795,89 @@ int main (int argc, char** argv)
         p.setPlayHead (nullptr);
     }
 
+    // --- run 12k: the host hands us a chunk we did not write -------------------------
+    //
+    // setStateInformation takes ARBITRARY BYTES. A project saved by an older build, a
+    // file that got truncated on the way to disk, another plugin's chunk pasted into the
+    // wrong slot, a preset a friend sent - the host does not check any of it and a crash
+    // here takes the whole session down while it is loading a project, which is the worst
+    // moment there is. Nothing had ever fed it anything but its own output.
+    //
+    // Two claims, and the second is the one that keeps a session alive:
+    //   * the call returns, whatever the bytes were;
+    //   * and the instance is still PLAYABLE afterwards. Refusing a chunk is the right
+    //     answer for almost all of these, but refusing has to leave a synth that still
+    //     makes a finite sound, not a half-restored one.
+    {
+        juce::MemoryBlock good;
+        {
+            auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+            up->prepareToPlay (48000.0, 256);
+            if (auto* q = up->apvts.getParameter ("baseN"))
+                q->setValueNotifyingHost (q->convertTo0to1 (3.0f));
+            up->getStateInformation (good);
+        }
+        check (good.getSize() > 32, "there is a real state chunk to mutate");
+
+        int survived = 0, unplayable = 0;
+        juce::String firstBad;
+        const auto feed = [&] (const void* data, size_t bytes, const juce::String& what)
+        {
+            auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+            auto& p = *up;
+            p.prepareToPlay (48000.0, 256);
+            p.setStateInformation (data, (int) bytes);
+            ++survived;                       // it returned: that is the first claim
+            juce::AudioBuffer<float> b (2, 256);
+            bool ok = true;
+            for (int n = 0; n < 8; ++n)
+            {
+                juce::MidiBuffer m;
+                if (n == 0) m.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+                b.clear();
+                p.processBlock (b, m);
+                for (int ch = 0; ch < 2 && ok; ++ch)
+                    for (int i = 0; i < 256; ++i)
+                        if (! std::isfinite (b.getSample (ch, i))) { ok = false; break; }
+            }
+            if (! ok) { ++unplayable; if (firstBad.isEmpty()) firstBad = what; }
+        };
+
+        const auto* raw = (const char*) good.getData();
+        const size_t n = good.getSize();
+        // 1. Truncated at every 1/32nd: the save that did not finish.
+        for (int i = 0; i <= 32; ++i)
+            feed (raw, n * (size_t) i / 32, "truncated at " + juce::String (i) + "/32");
+        // 2. One byte changed, at 64 evenly spaced offsets, to three different values.
+        for (int k = 0; k < 64; ++k)
+        {
+            const size_t at = n * (size_t) k / 64;
+            for (const char v : { (char) 0x00, (char) 0xFF, (char) 0x41 })
+            {
+                juce::MemoryBlock m (good);
+                ((char*) m.getData())[at] = v;
+                feed (m.getData(), m.getSize(), "byte " + juce::String ((int) at) + " = "
+                                                + juce::String ((int) (unsigned char) v));
+            }
+        }
+        // 3. Not our chunk at all: another plugin's, a text file, nothing.
+        {
+            const char* alien = "<?xml version=\"1.0\"?><SomeOtherPlugin cutoff=\"0.5\"/>";
+            feed (alien, std::strlen (alien), "another plugin's XML");
+            feed ("", 0, "zero bytes");
+            std::vector<char> zeros (4096, 0);
+            feed (zeros.data(), zeros.size(), "4 kB of zeros");
+            std::vector<char> ones (4096, (char) 0xFF);
+            feed (ones.data(), ones.size(), "4 kB of 0xFF");
+        }
+
+        std::printf ("    %d chunks fed; the processor returned from every one\n", survived);
+        check (unplayable == 0,
+               "every chunk the host could hand us leaves a synth that still makes a finite sound");
+        if (unplayable != 0)
+            std::printf ("    %d left it unplayable; first was: %s\n", unplayable, firstBad.toRawUTF8());
+    }
+
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
     // The editor draws value = shape(t, curve); this checks the engine agrees, that
     // the sustain node really sets the level, and that a second key retriggers from
