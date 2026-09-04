@@ -425,6 +425,15 @@ namespace
     const char* kScaleTritave =
         "! tritave.scl\ntritave period (Bohlen-Pierce-ish)\n 3\n!\n"
         " 435.084\n 884.359\n 3/1\n";
+    // ...and one that states NO PERIOD at all - its last degree is 1/1, so
+    // statedPeriodRatio() is 1.0 and hasUsablePeriod() is false. This is the only state
+    // that puts the temper toggle into its long form, "Temper to tuning - no period",
+    // which is 75% wider than the word it usually carries and which no picture had ever
+    // contained. The toggle is HIDDEN when it cannot show its word, so the question this
+    // scale asks is not "does it truncate" but "at what width does the control vanish".
+    const char* kScaleNoPeriod =
+        "! noperiod.scl\na scale that states no period\n 2\n!\n"
+        " 100.0\n 1/1\n";
 
     void loadScale (Proc& p, const char* scl, const char* name)
     { juce::String err; p.loadScalaText (scl, name, err); }
@@ -520,6 +529,13 @@ namespace
                   // chosen, so the default "4" fits any slot and photographs nothing: the
                   // question is whether "1/16" fits, and the only way to ask it is to pick it.
                   setParam (p, "shepDiv", 0.0f);   // "1/16", the widest of the twelve
+                  e.tickTimerForTests();
+              } },
+            // THE TEMPER TOGGLE IN ITS LONG FORM, the state that says WHY it cannot act.
+            { "43-tuning-no-period", "a tuning that states no period (temper says so)", tEditor, fSizes,
+              [] (Proc& p, Ed& e)
+              {
+                  loadScale (p, kScaleNoPeriod, "2ed1");   // its technical name, and no 3-letter run for the language gate to read as a word
                   e.tickTimerForTests();
               } },
 

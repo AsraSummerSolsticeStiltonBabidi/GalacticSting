@@ -6750,8 +6750,20 @@ void FractalAdditiveAudioProcessorEditor::applyEngineState()
     }
     else
     {
-        temperToggle.setButtonText (tr ("Temper to tuning - no period",
-                                        "Tempera a l'afinaci\xc3\xb3 - sense per\xc3\xado" "de"));
+        // THE WORD STAYS SHORT, AND THE TOOLTIP CARRIES THE REASON.
+        //
+        // This branch used to append " - no period" to the button's own text. That row
+        // sizes the toggle to the words it holds and HIDES it when they do not fit - the
+        // right rule - so the longer label made the control vanish outright, at every
+        // size including 1200x650. The message that explains why a feature is unavailable
+        // was exactly the message that could not fit, and the user got neither the
+        // explanation nor the control. Found by scenario 43, which is the first picture
+        // ever taken of a tuning that states no period.
+        //
+        // So the suffix goes, the same trade the source selector and the Shepard row
+        // made. The toggle is already disabled here (setEnabled (canTemper) above), and
+        // the tooltip below says the whole of it.
+        temperToggle.setButtonText (tr ("Temper to tuning", "Tempera a l'afinaci\xc3\xb3"));
         temperToggle.setTooltip (tr (
             "UNAVAILABLE: this tuning states no period that ascends (a descending scale, or a period of 1/1), so there is no \"degree x period^k\" grid to snap partials onto. Fibl\xc3\xb3 will NOT invent an octave here - the harmonic engine keeps running untempered and your tuning is left exactly as you wrote it. Load a tuning whose last interval rises above 1/1 to use this.",
             "NO DISPONIBLE: aquesta afinaci\xc3\xb3 no declara cap per\xc3\xado" "de que pugi (una escala descendent, o un per\xc3\xado" "de d'1/1), aix\xc3\xad que no hi ha cap graella \"grau x per\xc3\xado" "de^k\" on ajustar els parcials. Fibl\xc3\xb3 NO s'inventar\xc3\xa0 cap octava aqu\xc3\xad - el motor harm\xc3\xb2nic segueix sonant sense temperar i la teva afinaci\xc3\xb3 queda exactament com l'has escrita. Carrega una afinaci\xc3\xb3 amb l'\xc3\xbaltim interval per sobre d'1/1 per fer-lo servir."));
