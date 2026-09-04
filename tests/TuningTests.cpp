@@ -701,6 +701,108 @@ int main()
         }
     }
 
+    //======================================================================================
+    std::printf ("the same treatment for a .tun: 128 absolute frequencies, mutated:\n");
+    {
+        // THE SECOND FILE TYPE A USER DRAGS IN, and a completely different parser: an
+        // INI with sections, keys and 128 absolute frequencies, where the .scl side is a
+        // list of intervals. The failure modes are its own - a section header that is
+        // gone, a key that repeats, a basefreq that is text - so it gets its own sweep
+        // rather than trusting the .scl one to have covered the idea.
+        //
+        // Same two claims, and the same reason the second is the one that matters: a
+        // parser that says yes to rubbish silently retunes the user's whole project.
+        // TWO BASES, because loadTunString has two paths and one of them was getting all
+        // the traffic: a REPEATING table is converted to a .scl and goes through
+        // loadScalaString, so a 12-TET .tun never reaches loadAbsoluteTable at all. The
+        // second base is deliberately irregular - no interval repeats per octave - so the
+        // absolute path is swept too. Found by sabotaging the absolute path and watching
+        // this check not notice.
+        double f12[128], fIrr[128];
+        for (int n = 0; n < 128; ++n)
+        {
+            f12[n]  = 440.0 * std::pow (2.0, (n - 69) / 12.0);
+            fIrr[n] = 55.0 * std::pow (2.0, n / 12.0 + 0.011 * std::sin (n * 0.7));
+        }
+        const juce::String base = makeTun (f12);
+        const juce::String baseIrr = makeTun (fIrr);
+
+        int accepted = 0, refused = 0, bad = 0;
+        juce::String firstBad;
+        const auto tryTun = [&] (const juce::String& text, const juce::String& what)
+        {
+            TuningManager t; juce::String err;
+            t.setMode (TuningManager::Mode::Scala);   // .tun loads into the same table
+            if (! t.loadTunString (text, "tunfuzz", err)) { ++refused; return; }
+            ++accepted;
+            bool good = std::isfinite (t.periodRatio()) && t.periodRatio() > 0.0;
+            for (int n = 0; good && n < 128; ++n)
+            {
+                const double fr = t.frequencyForNote (n);
+                if (! std::isfinite (fr) || fr <= 0.0) good = false;
+            }
+            if (! good) { ++bad; if (firstBad.isEmpty()) firstBad = what; }
+        };
+
+        // Truncation, which for an INI means losing whole sections from the bottom up.
+        for (int i = 0; i <= 64; ++i)
+            tryTun (base.substring (0, base.length() * i / 64), "truncated at " + juce::String (i) + "/64");
+        // The structural pieces, each broken in turn: the section headers, the base
+        // frequency, and the note keys' numbering.
+        for (const auto& r : { std::pair<const char*, const char*> { "[Exact Tuning]", "[Exact Tuning" },
+                               { "[Exact Tuning]", "[Exakt Tuning]" },
+                               { "[Exact Tuning]", "" },
+                               { "[Tuning]", "" },
+                               { "basefreq=", "basefreq" },
+                               { "basefreq=", "basefreq=abc" },
+                               { "basefreq=", "basefreq=-1e9" },
+                               { "basefreq=", "basefreq=0" },
+                               { "note 0=", "note -1=" },
+                               { "note 0=", "note 999=" },
+                               { "note 0=", "note x=" },
+                               { "note 0=", "note 0=nan" },
+                               { "note 0=", "note 0=1e400" },
+                               { "note 1=", "note 1=" } })
+            tryTun (base.replace (r.first, r.second), juce::String (r.first) + " -> '" + r.second + "'");
+        // Every line deleted, one at a time, across the whole file.
+        {
+            juce::StringArray lines;
+            lines.addLines (base);
+            for (int i = 0; i < lines.size(); ++i)
+            {
+                auto del = lines; del.remove (i);
+                tryTun (del.joinIntoString ("\n"), "line " + juce::String (i) + " deleted");
+            }
+        }
+        // ...and not a text file at all.
+        // ...and the whole sweep again on the irregular base, which is the only way the
+        // absolute-table path is reached at all.
+        for (int i = 0; i <= 64; ++i)
+            tryTun (baseIrr.substring (0, baseIrr.length() * i / 64),
+                    "irregular, truncated at " + juce::String (i) + "/64");
+        {
+            juce::StringArray lines;
+            lines.addLines (baseIrr);
+            for (int i = 0; i < lines.size(); ++i)
+            {
+                auto del = lines; del.remove (i);
+                tryTun (del.joinIntoString ("\n"), "irregular, line " + juce::String (i) + " deleted");
+            }
+        }
+        tryTun (baseIrr.replace ("basefreq=", "basefreq=0"), "irregular, basefreq 0");
+        tryTun (baseIrr.replace ("[Exact Tuning]", ""), "irregular, no Exact Tuning section");
+
+        tryTun ("", "empty file");
+        tryTun (juce::String::repeatedString ("\n", 5000), "5000 blank lines");
+
+        std::printf ("    %d mutations: %d accepted, %d refused\n", accepted + refused, accepted, refused);
+        check (bad == 0, "every .tun mutation the parser ACCEPTS gives a finite, positive "
+                         "frequency on all 128 keys");
+        if (bad != 0)
+            std::printf ("    %d accepted but unplayable; first was: %s\n", bad, firstBad.toRawUTF8());
+        check (accepted > 0, "and the .tun sweep is not vacuous either");
+    }
+
     //==========================================================================
     // A DEGREE NUMBER IS AN INDEX INTO *THIS* SCALE, 0..N-1 - never a semitone.
     //
