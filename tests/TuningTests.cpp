@@ -291,6 +291,106 @@ int main()
         check (t.loadScalaString ("desc\n1\n1200.0\n", "ok2", err), "plain cents octave accepted");
     }
 
+    //======================================================================================
+    std::printf ("a few thousand mutations of a valid .scl: no crash, and no silent nonsense:\n");
+    {
+        // A USER DRAGS ANY FILE ONTO THIS PLUGIN. The hand-written cases above cover the
+        // mistakes a person makes while EDITING a scale; this covers the file that was
+        // never a scale, or was one until something truncated it. Two claims, and the
+        // second is the one that matters:
+        //   * the parser returns. It may refuse - refusing is the right answer for most of
+        //     these - but it may not crash, hang or read off the end.
+        //   * and when it ACCEPTS, what it accepted has to be a usable tuning. A parser
+        //     that says yes to rubbish silently retunes the user's whole project, which is
+        //     worse than one that says no to something valid: the second is visible.
+        //
+        // Deterministic mutations, not random ones, so a failure is reproducible from the
+        // index alone and the run means the same thing on every machine.
+        const juce::String base =
+            "! fuzz.scl\na scale to break\n 5\n!\n 100.0\n 3/2\n 700.0\n 9/8\n 2/1\n";
+
+        int accepted = 0, refused = 0, bad = 0;
+        juce::String firstBad;
+        const auto tryOne = [&] (const juce::String& text, const juce::String& what)
+        {
+            TuningManager t; juce::String err;
+            // SCALA MODE, or frequencyForNote returns 12-TET and this whole check measures
+            // nothing: the first version left the default mode and PASSED with the table
+            // deliberately corrupted. Third vacuous pass of the session, and the same
+            // shape as the other two - the thing under test was not connected.
+            t.setMode (TuningManager::Mode::Scala);
+            const bool ok = t.loadScalaString (text, "fuzz", err);
+            if (! ok) { ++refused; return; }
+            ++accepted;
+            // ACCEPTED: then it must be a tuning somebody can play. Every one of the 128
+            // keys has to be a FINITE, POSITIVE frequency - a NaN is a dead note that
+            // poisons the host's mix, a zero or a negative is not a pitch at all.
+            //
+            // NOT "strictly ascending", which is what this asked first and got 363 of 364
+            // mutations flagged. A .scl may state its degrees in any order and this build
+            // deliberately accepts descending ones, so a non-monotonic table is the FILE
+            // faithfully represented, not a defect. An assertion that fails on almost
+            // everything is an assertion about the wrong thing.
+            bool good = t.degreesPerPeriod() > 0 && std::isfinite (t.periodRatio())
+                     && t.periodRatio() > 0.0;
+            for (int n = 0; good && n < 128; ++n)
+            {
+                const double f = t.frequencyForNote (n);
+                if (! std::isfinite (f) || f <= 0.0) good = false;
+            }
+            if (! good) { ++bad; if (firstBad.isEmpty()) firstBad = what; }
+        };
+
+        // 1. Truncation at every 1/64th of the file: the half-written download.
+        for (int i = 0; i <= 64; ++i)
+            tryOne (base.substring (0, base.length() * i / 64), "truncated at " + juce::String (i) + "/64");
+        // 2. Every single byte replaced by each of a handful of awkward characters.
+        const char* pokes = "\0\n\r\t 0.-/!x";
+        for (int i = 0; i < base.length(); ++i)
+            for (int p = 0; p < 10; ++p)
+            {
+                auto m = base;
+                m = m.replaceSection (i, 1, juce::String::charToString ((juce::juce_wchar) pokes[p]));
+                tryOne (m, "byte " + juce::String (i) + " -> poke " + juce::String (p));
+            }
+        // 3. Each line duplicated, and each line deleted.
+        {
+            juce::StringArray lines;
+            lines.addLines (base);
+            for (int i = 0; i < lines.size(); ++i)
+            {
+                auto dup = lines; dup.insert (i, lines[i]);
+                tryOne (dup.joinIntoString ("\n"), "line " + juce::String (i) + " duplicated");
+                auto del = lines; del.remove (i);
+                tryOne (del.joinIntoString ("\n"), "line " + juce::String (i) + " deleted");
+            }
+        }
+        // 4. The count line, which is the one number the rest of the file is measured
+        //    against, set to everything it should never be.
+        for (const char* n : { "0", "-1", "1", "4", "6", "2147483647", "-2147483648",
+                               "99999999999999999999", "3.5", "0x10", "", " " })
+        {
+            auto m = base.replace ("\n 5\n", "\n " + juce::String (n) + "\n");
+            tryOne (m, juce::String ("count = '") + n + "'");
+        }
+        // 5. Not a text file at all.
+        {
+            juce::String binary;
+            for (int i = 0; i < 512; ++i) binary += juce::String::charToString ((juce::juce_wchar) (i % 256));
+            tryOne (binary, "512 bytes of binary");
+            tryOne ("", "empty file");
+            tryOne (juce::String::repeatedString ("A", 100000), "100 kB of one letter");
+        }
+
+        std::printf ("    %d mutations: %d accepted, %d refused\n", accepted + refused, accepted, refused);
+        check (bad == 0, "every mutation the parser ACCEPTS is a playable tuning "
+                         "(a finite, positive frequency on all 128 keys)");
+        if (bad != 0)
+            std::printf ("    %d accepted but unplayable; first was: %s\n", bad, firstBad.toRawUTF8());
+        // ...and it must not refuse EVERYTHING either, or the check above is vacuous.
+        check (accepted > 0, "and the sweep is not vacuous: some mutations are still valid scales");
+    }
+
     //--------------------------------------------------------------------------
     // AnaMark .tun. A .tun states 128 ABSOLUTE pitches, so the test that matters is
     // note-for-note: "it loaded" proves nothing about what the keys now sound at.
