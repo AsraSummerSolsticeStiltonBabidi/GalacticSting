@@ -2110,6 +2110,11 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // row NOW - the attachment only moves the parameter, never the layout.
     shepModeBox.onChange = [this] { resized(); repaint(); refocus(); };
     configCombo (shepDivBox, "shepDiv", shepDivAtt, cTuning, {});
+    // ...and it RE-LAYS OUT when the division changes, because its width is reserved from
+    // what the SELECTED item needs. Without this the reservation is only true at the
+    // moment the row was laid out: pick "1/16" at a narrow window and the box keeps the
+    // width "4" was given. configCombo's own handler is kept - it is the focus return.
+    shepDivBox.onChange = [this] { resized(); refocus(); };
     // configFader dresses them as the standard vertical fader; these two live in a
     // 22 px row, so they are re-dressed horizontal with a value box at their right.
     configFader (shepTimeFader, "shepTime", shepTimeAtt, cTuning, {});
@@ -9556,7 +9561,23 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // 46 px is the least a beats box ("1/16") or a millisecond fader can be
                 // and still be one. Hoisted above the toggle because the toggle now has
                 // to know what the rest of the row costs before it decides its own width.
-                const int kRateMin = 46;
+                // 46 px WAS a judgement - "the least a beats box or a millisecond fader
+                // can be and still be one" - and it was the last hand-picked number on
+                // this row. At the floor the beats box got exactly those 46, which is
+                // 18 px of text room, and its widest item "1/16" needs 26: the box was
+                // truncating in silence, and no check saw it because the probe measures
+                // the SELECTED item and "4" fits anywhere.
+                //
+                // Measured now, and measured on the SELECTION rather than the widest item,
+                // because a closed ComboBox only ever draws the one that is chosen - the
+                // widest is what the box ASKS for, so it does not resize as the user
+                // changes it, and the selection is what it must never go below. The ms
+                // fader's read-out is the same question in its other dress, and the larger
+                // of the two is taken so the reservation does not depend on which dress is
+                // showing. Floored at 24, the least any control can be clicked.
+                const int kRateMin = juce::jmax (24,
+                                        juce::jmax (fgfit::snugComboWidthForSelection (shepDivBox, shepH),
+                                                    fgfit::faderValueWidth (shepTimeFader)));
                 // THE TOGGLE WAS THE LAST CONTROL ON THIS ROW STILL ON A HAND-PICKED
                 // NUMBER. Every other box here is sized from the words it holds; this one
                 // took 86 px whatever "Shepard" actually needs, and at a narrow window

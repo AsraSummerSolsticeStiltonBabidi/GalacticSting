@@ -505,6 +505,23 @@ namespace
               [] (Proc& p, Ed&) { loadScale (p, kScale19, "19edo"); setParam (p, "shepOn", 1.0f); } },
             { "31-tuning-tritave-period", "tuning panel, 3/1 period (rise dropdown shows)", tEditor, fSizes,
               [] (Proc& p, Ed&) { loadScale (p, kScaleTritave, "tritave"); setParam (p, "shepOn", 1.0f); } },
+            // THE BEATS BOX, which no picture had ever contained. shepMode defaults to
+            // Sync as a PARAMETER but the editor opens on Free, so the millisecond fader
+            // is what every other Shepard scenario photographed and the box that replaces
+            // it in the other dress was measured by nothing at all. It is a ComboBox, and
+            // a ComboBox truncates its item in silence.
+            { "42-shepard-sync-beats", "the Shepard rate as beats, not milliseconds", tEditor, fSizes,
+              [] (Proc& p, Ed& e)
+              {
+                  loadScale (p, kScaleTritave, "tritave");
+                  setParam (p, "shepOn", 1.0f);
+                  setParam (p, "shepMode", 1.0f);   // Sync Project Tempo
+                  // ...on its WIDEST division. A ComboBox only ever draws the item that is
+                  // chosen, so the default "4" fits any slot and photographs nothing: the
+                  // question is whether "1/16" fits, and the only way to ask it is to pick it.
+                  setParam (p, "shepDiv", 0.0f);   // "1/16", the widest of the twelve
+                  e.tickTimerForTests();
+              } },
 
             // The Spectrum-to-Rhythm panel: an in-editor overlay, so it lands in the
             // editor's own snapshot.
