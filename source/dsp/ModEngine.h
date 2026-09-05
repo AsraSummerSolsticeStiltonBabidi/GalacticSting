@@ -456,7 +456,7 @@ public:
         {
             if (! act[i]) continue;
             auto& m = mods[(size_t) i];
-            const float contrib = (float) vals[i] * prm[(size_t) i].range->load();
+            const float rawRange = prm[(size_t) i].range->load();
             for (int t = 0; t < kMaxTargets; ++t)
             {
                 auto* p   = m.slot[(size_t) t].param.load (std::memory_order_acquire);
@@ -468,6 +468,26 @@ public:
                 // for them: with several notes sounding there is no single value it
                 // could show. The editor draws the reachable RANGE as an arc instead.
                 if (m.slot[(size_t) t].pv.load (std::memory_order_relaxed) >= 0) continue;
+                // THE RANGE CANNOT ASK FOR MORE ROOM THAN THE PARAMETER HAS.
+                //
+                // "PUSE UNA LFO EN PITCH Y PARECE COMO SI ESTUVIESE CORTADA, EN UN TROZO
+                // DEL MOVIMIENTO SUBE Y BAJA Y EN EL OTRO SE QUEDA QUIETO, VI QUE ES POR
+                // QUE EL RANGE SE PASA DE LARGO."
+                //
+                // A modulator's value runs 0..1 and the contribution is that times the
+                // Range, so a Range of 1.0 on a parameter sitting at 0.5 asks the
+                // parameter to reach 1.5. The write below clamps to [0,1], so the wave
+                // came out with a flat top: it moved for half the cycle and stood still
+                // for the other half, which is what a clipped LFO looks and sounds like.
+                //
+                // Clamped HERE, once, against the headroom this target actually has,
+                // instead of clamping the instantaneous value: the shape stays a whole
+                // LFO shape and merely stops growing once it fills the parameter. That is
+                // "the maximum of the Range adapts to the maximum of each parameter",
+                // and it is per TARGET, because one modulator can drive several.
+                const float base  = src.normOf (p);
+                const float range = juce::jlimit (-base, 1.0f - base, rawRange);
+                const float contrib = (float) vals[i] * range;
                 int f = -1;
                 for (int k = 0; k < nW; ++k) if (writes[k].raw == raw) { f = k; break; }
                 if (f >= 0) writes[f].sum += contrib;

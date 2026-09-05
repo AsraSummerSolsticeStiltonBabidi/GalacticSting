@@ -2391,15 +2391,23 @@ int main (int argc, char** argv)
         compare (renderWith (0,    true),  "a size that changes every call");
 
         check (allFinite, "no block size, fixed or changing, produces a non-finite sample");
-        check (worstDb < 1.0f, "the same second sounds the same whatever the block size, "
-                               "within 1 dB");
-        // 1 dB, and the number is anchored to the measurement rather than to taste. The
-        // disagreement GROWS WITH THE BLOCK, monotonically: 0.061 dB at 64 samples,
-        // 0.091 at 32, 0.488 at 1024, 0.757 when the size changes every call. That is
-        // exactly what block-rate modulation predicts - a modulator advances once per
-        // block and its value is held across it, so 1024 samples is 21 ms of held value
-        // inside a 600 ms decay. A bug that assumed a fixed size would not be a fraction
-        // of a dB; it would be off by the RATIO of the sizes.
+        check (worstDb < 2.0f, "the same second sounds the same whatever the block size, "
+                               "within 2 dB");
+        // 2 dB, and the number moved for an honest reason. The disagreement GROWS WITH
+        // THE BLOCK, monotonically: 0.32 dB at 64 samples, 0.40 at 32, 1.38 at 1024,
+        // 1.48 when the size changes every call. That is what block-rate modulation
+        // predicts - a modulator advances once per block and its value is held across it,
+        // so 1024 samples is 21 ms of held value inside a 600 ms decay.
+        //
+        // It used to read 0.76, and the difference is not a regression: before the
+        // modulator's Range was clamped to its target's headroom, this patch drove
+        // masterGain PAST its maximum and the parameter sat PINNED at the top for most
+        // of the envelope. A value that is not moving cannot depend on the block size.
+        // Now the modulation actually follows the envelope, so its true block-rate
+        // resolution shows - which is the thing this run exists to measure.
+        //
+        // A bug that assumed a fixed size would not be a couple of dB; it would be off by
+        // the RATIO of the sizes (measured: 7.8 to 9.7).
         std::printf ("    worst envelope disagreement %.4f dB%s\n", worstDb,
                      worstWhere.isEmpty() ? "" : ("  at " + worstWhere).toRawUTF8());
         // 1.5x, not 1.0: a different block size samples the signal's own slope at
@@ -3561,6 +3569,75 @@ int main (int argc, char** argv)
                      "instant meter the six-note tail dips %.0f%% sooner, which is the beating\n",
                      worst, 100.0 * worst / juce::jmax (1.0e-6, one.smoothed),
                      100.0 * (1.0 - six.instant / juce::jmax (1.0e-6, one.instant)));
+    }
+
+    // --- run 12q: an LFO at full range is a whole wave, not a wave with a flat top ----
+    //
+    // "PUSE UNA LFO EN PITCH Y PARECE COMO SI ESTUVIESE CORTADA, EN UN TROZO DEL
+    // MOVIMIENTO SUBE Y BAJA Y EN EL OTRO SE QUEDA QUIETO, VI QUE ES POR QUE EL RANGE SE
+    // PASA DE LARGO."
+    //
+    // A modulator's value runs 0..1 and its contribution is that times the Range, so a
+    // Range of 1.0 on a parameter sitting mid-travel asks it to reach 1.5. Both write
+    // paths used to clamp the RESULT, which does not make a deeper modulation - it makes
+    // a flat one.
+    //
+    // Measured on the modulated PARAMETER, sampled across a whole cycle: what fraction of
+    // the samples repeat their neighbour exactly. A whole wave hardly ever repeats a
+    // value; a clipped one repeats it for as long as it is stuck.
+    {
+        using Proc = FractalAdditiveAudioProcessor;
+        const auto flatFraction = [] (float range, double& spanOut) -> double
+        {
+            auto up = std::make_unique<Proc>();
+            auto& p = *up;
+            p.prepareToPlay (48000.0, 256);
+            const auto sp = [&] (const char* id, float v)
+            {
+                if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+                p.pollParametersForTests();
+            };
+            sp ("modL1Hz", 8.0f);        // fast enough to see a whole cycle quickly
+            sp ("modL1Range", range);
+            sp ("modL1On", 1.0f);
+            for (int m = 0; m < ModEngine::kMods; ++m) p.getModEngine().unmapAll (m);
+            p.getModEngine().addTarget (3, "masterGain");   // LFO 1 is modulator index 3
+            p.pollParametersForTests();
+
+            juce::AudioBuffer<float> b (2, 256);
+            auto* raw = p.apvts.getRawParameterValue ("masterGain");
+            std::vector<double> seen;
+            for (int n = 0; n < 400; ++n)
+            {
+                juce::MidiBuffer m;
+                if (n == 0) m.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+                b.clear();
+                p.processBlock (b, m);
+                seen.push_back ((double) raw->load());
+            }
+            double lo = 1.0e9, hi = -1.0e9;
+            for (double v : seen) { lo = juce::jmin (lo, v); hi = juce::jmax (hi, v); }
+            spanOut = hi - lo;
+            int flat = 0;
+            for (size_t i = 1; i < seen.size(); ++i)
+                if (std::abs (seen[i] - seen[i - 1]) < 1.0e-6) ++flat;
+            return (double) flat / (double) (seen.size() - 1);
+        };
+
+        double smallSpan = 0.0, fullSpan = 0.0;
+        const double small = flatFraction (0.10f, smallSpan);
+        const double full  = flatFraction (1.00f, fullSpan);
+        std::printf ("    range 0.10: %.1f%% of the cycle repeats its previous value, swept %.2f dB\n",
+                     100.0 * small, smallSpan);
+        std::printf ("    range 1.00: %.1f%% of the cycle repeats its previous value, swept %.2f dB\n",
+                     100.0 * full, fullSpan);
+        check (full < 0.25,
+               "an LFO at FULL range still moves through its whole cycle - no flat top");
+        check (small < 0.25, "...and so does a small one");
+        // ...and the control still CONTROLS. Without this the two checks above would pass
+        // on a build that clamped every Range to the same tiny number.
+        check (smallSpan < fullSpan - 0.5,
+               "and a smaller Range still gives a smaller sweep");
     }
 
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------

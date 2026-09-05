@@ -2738,7 +2738,17 @@ private:
         // The BASE comes from this voice's source (the live knob, or the corner's
         // stored value); the parameter object supplies only the range conversion.
         if (auto* p = modOwner[(size_t) t])
-            return p->convertFrom0to1 (juce::jlimit (0.0f, 1.0f, src.normOf (p) + modOff[(size_t) t]));
+        {
+            // THE OFFSET CANNOT ASK FOR MORE ROOM THAN THE PARAMETER HAS. Clamped
+            // against the headroom instead of clamping the sum, for the same reason as
+            // the global path in ModEngine: an offset that overshoots does not make a
+            // deeper modulation, it makes a FLAT one - the wave moves for part of its
+            // cycle and stands still for the rest. This is the per-voice half of it,
+            // and it is the half a user meets first, because pitch is per-voice.
+            const float base = src.normOf (p);
+            const float off  = juce::jlimit (-base, 1.0f - base, modOff[(size_t) t]);
+            return p->convertFrom0to1 (base + off);
+        }
         return fallback->load();
     }
     const spectrum::SineTable&          sine;

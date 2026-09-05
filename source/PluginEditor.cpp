@@ -1824,6 +1824,25 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                         s.enabled = false; s.partial = -1;
                         s.steps = 0; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f; s.vel = 100;
                     }
+                    // ...AND EVERY MODULATOR ROUTING, which is not a parameter and so
+                    // survived every "reset all parameters" there has ever been.
+                    //
+                    // "AL DARLE A RESET ALL PARAMETERS EL PITCH SE MUEVE COMO SI TUVIESE
+                    // ENVOLVENTE DE PITCH, Y POR MUCHO QUE CAMBIE LA ENVOLVENTE DE PITCH
+                    // NO PUEDO QUITARSELO ... ES POR QUE A PESAR DE RESET ALL PARAMETERS
+                    // SE QUEDO EL LFO PUESTO."
+                    //
+                    // Exactly that: an LFO mapped onto pitch keeps modulating after the
+                    // reset, and nothing in the pitch ENVELOPE can stop it, because it is
+                    // not the envelope doing it. The map lives in ModEngine, outside the
+                    // APVTS, so setting every parameter to its default never touched it.
+                    // Init means init.
+                    for (int m = 0; m < ModEngine::kMods; ++m)
+                        processorRef.getModEngine().unmapAll (m);
+                    // The per-partial pencil edits are the same kind of state: not
+                    // parameters, and a reset that leaves them behind hands the user a
+                    // "default" patch with somebody else's amplitudes in it.
+                    processorRef.setPartialGains ({}, false);
                     rhythmPanel.refreshSlots();
                     rhythmPanel.list.repaint();
                 }
