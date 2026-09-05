@@ -1980,7 +1980,7 @@ private:
             listHead.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
             addAndMakeVisible (listHead);
             // Points at the partial list when On is on but nothing is routed yet.
-            pickHint.setJustificationType (juce::Justification::centredLeft);
+            pickHint.setJustificationType (juce::Justification::centred);
             pickHint.setColour (juce::Label::textColourId, juce::Colour (0xff2fb155)); // green (matches ON)
             pickHint.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
             addChildComponent (pickHint);
@@ -2678,9 +2678,13 @@ private:
                                     + (int) std::ceil (juce::GlyphArrangement::getStringWidth (
                                                            fgfit::labelFont (bpmLbl), "= 199.9 BPM"))
                                     + bpmLbl.getBorderSize().getLeftAndRight() + 3 + 16;
-                const int gateNeed  = juce::jmax (218, fgfit::toggleWidth (qTempoT))
-                                    + 6 + juce::jmax (76, fgfit::toggleWidth (monoT))
-                                    + 6 + juce::jmax (96, fgfit::toggleWidth (qPulseT)) + 16;
+                // MEASURED, not floored. The 218 and the 76 were hand-picked and carried
+                // 34 px more than the words need, which is exactly what pushed this row
+                // over and made the two boxes stack - costing three rows of the partial
+                // list to pad two toggles nobody had measured.
+                const int gateNeed  = fgfit::toggleWidth (qTempoT)
+                                    + 6 + fgfit::toggleWidth (monoT)
+                                    + 6 + fgfit::toggleWidth (qPulseT) + 16;
                 const int boxH = 13 + 3 + 24 + 8;
                 const bool sideBySide = r.getWidth() >= tempoNeed + 6 + gateNeed;
 
@@ -2706,9 +2710,9 @@ private:
                     secGate.setBounds (in.removeFromTop (13));
                     in.removeFromTop (3);
                     auto g4 = in.removeFromTop (24);
-                    qTempoT.setBounds (g4.removeFromLeft (juce::jmax (218, fgfit::toggleWidth (qTempoT))));
+                    qTempoT.setBounds (g4.removeFromLeft (fgfit::toggleWidth (qTempoT)));
                     g4.removeFromLeft (6);
-                    monoT.setBounds (g4.removeFromLeft (juce::jmax (76, fgfit::toggleWidth (monoT))));
+                    monoT.setBounds (g4.removeFromLeft (fgfit::toggleWidth (monoT)));
                     g4.removeFromLeft (6);
                     qPulseT.setBounds (g4);
                 };
@@ -2733,7 +2737,23 @@ private:
             listHead.setBounds (left.removeFromTop (16));
             list.setBounds (left);
             r.removeFromLeft (10);
-            pickHint.setBounds (r.withTrimmedTop (16).withHeight (34)); // over the empty slot rows, points at the list
+
+            // THE EMPTY STATE IS A STATE, not a gap with two notes stuck in it.
+            //
+            // With nothing routed this whole pane is blank, and it used to carry two
+            // small strings floating in different parts of it - a green "click a partial
+            // to route it" pointing left, and a separate "(hold a note to pulse)" down in
+            // the read-out - with four column headers above them naming columns that did
+            // not exist yet. Three unrelated hints and a set of labels for nothing.
+            //
+            // The headers appear when there is a row to head. The hint gets the middle of
+            // the pane it is talking about, centred, at the size of something meant to be
+            // read rather than noticed.
+            const bool anyRouted = ! readSlots().empty();
+            for (auto* h : { &noteHead, &durHead, &velHead }) h->setVisible (anyRouted);
+            velSlopeS.setVisible (anyRouted);
+
+            if (anyRouted)
             {
                 auto head = r.removeFromTop (14);
                 head.removeFromLeft (96);
@@ -2747,6 +2767,11 @@ private:
                 head.removeFromRight (4 + kStepBtnW + 3 + kStepBtnW + 6); // over the -12/+12 pair + gaps
                 noteHead.setBounds (head);        // over the pitch box
             }
+            else
+            {
+                pickHint.setBounds (r.withSizeKeepingCentre (r.getWidth(), 48));
+            }
+
             // Scrollable slot rows: the viewport takes all space above the info
             // read-out ("unlimited" pulses - the panel shows a window onto them).
             auto infoArea = r.removeFromBottom (76);
