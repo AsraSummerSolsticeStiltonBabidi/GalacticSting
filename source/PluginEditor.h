@@ -1931,7 +1931,12 @@ private:
         }
         static juce::String stepsText (int steps)
         {
-            return steps < 0 ? juce::String (-steps) + "step-" : juce::String (steps) + "step";
+            // SHOWN with the minus in front, which is where a reader expects it.
+            // "12step-" is what this used to draw, and a trailing minus reads as a typo
+            // or as a range rather than as a direction. parseSteps accepts BOTH forms
+            // (see it above), so what the user may TYPE is unchanged - only what they are
+            // shown. It round-trips: "-12step" parses back to -12.
+            return (steps < 0 ? "-" + juce::String (-steps) : juce::String (steps)) + "step";
         }
 
         // Best small fraction p/q ~ v (continued fractions, den <= 16) for the
@@ -2733,7 +2738,31 @@ private:
             }
             r.removeFromTop (8);
 
-            auto left = r.removeFromLeft (236);
+            // THE LIST IS AS WIDE AS ITS WIDEST ROW, not 236 px.
+            //
+            // 236 was a hand-picked number and the rows inside it are "P16" and a ratio -
+            // about 110 px of ink at the default 1024-partial template, where the widest
+            // row is "P1024  1024/1". Everything it did not need was taken from the
+            // ROUTED rows on the other side, which are the crowded half: each one carries
+            // a pitch box, two step buttons, a velocity fader, a gate fader and a delete.
+            //
+            // Its own header is the floor, because "Partials (click to route)" - and the
+            // longer "Parcials (clica per encaminar)" - sits directly above it and a
+            // column narrower than its own title is a cut title.
+            int listW = 130;
+            if (proc != nullptr)
+                if (const auto* t = proc->getLiveTemplate())
+                    if (! t->partials.empty() && ratioName)
+                    {
+                        const juce::Font rf (juce::FontOptions (12.5f).withStyle ("Bold"));
+                        const auto widest = ratioName ((double) t->partials.back().ratio);
+                        listW = 50 + (int) std::ceil (juce::GlyphArrangement::getStringWidth (rf, widest))
+                              + 6 + 12;   // +12: the list's own scrollbar
+                    }
+            listW = juce::jlimit (110, 236,
+                                  juce::jmax (listW, fgfit::labelWidth (listHead)));
+
+            auto left = r.removeFromLeft (listW);
             listHead.setBounds (left.removeFromTop (16));
             list.setBounds (left);
             r.removeFromLeft (10);

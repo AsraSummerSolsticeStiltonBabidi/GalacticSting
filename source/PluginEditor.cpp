@@ -3301,6 +3301,40 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.selfT.setTooltip (tr (
         "This synth plays the rhythm itself: the played note becomes a trigger and only the pulses sound. On by default; it engages once you route a partial. No feedback loop: pulses never spawn pulses.",
         "Aquest sinte toca el ritme ell mateix: la nota tocada esdev\xc3\xa9 un activador i nom\xc3\xa9s sonen els polsos. Actiu per defecte; s'activa quan encamines un parcial. Sense bucle: els polsos mai generen polsos."));
+    // EVERY CONTROL IN A ROUTED ROW SAYS WHAT IT DOES. There are five of them per train
+    // and not one had a tooltip: the pitch box, the two ±12 buttons, the velocity fader,
+    // the gate fader and the delete. They are the controls a user touches MOST in this
+    // panel and the only ones it never explained - and nothing had noticed, because no
+    // picture had ever contained a routed row (scenario 53 is the first).
+    //
+    // Set per row, in the language currently on screen, alongside every other string the
+    // panel localises.
+    for (int i = 0; i < RhythmEngine::kSlots; ++i)
+    {
+        rhythmPanel.pitchE[i].setTooltip (tr (
+            "WHAT THIS TRAIN PLAYS. A number of scale steps from the played note "
+            "(\"7step\" up, \"-7step\" down), or a ratio (\"3/2\"), or a note name. "
+            "Steps follow the loaded tuning; a ratio does not.",
+            "QU\xc3\x88 TOCA AQUEST TREN. Un nombre de graus de l'escala des de la nota "
+            "tocada (\"7step\" amunt, \"-7step\" avall), o una ra\xc3\xb3 (\"3/2\"), o un nom "
+            "de nota. Els graus segueixen l'afinaci\xc3\xb3 carregada; una ra\xc3\xb3 no."));
+        rhythmPanel.s12M[i].setTooltip (tr ("An octave down, without retyping the box.",
+                                            "Una octava avall, sense reescriure la caixa."));
+        rhythmPanel.s12P[i].setTooltip (tr ("An octave up, without retyping the box.",
+                                            "Una octava amunt, sense reescriure la caixa."));
+        rhythmPanel.velS[i].setTooltip (tr (
+            "MIDI velocity of this train's pulses (1-127). The knob over the VEL column "
+            "tilts every train at once.",
+            "Velocitat MIDI dels polsos d'aquest tren (1-127). El comandament sobre la "
+            "columna VEL els inclina tots alhora."));
+        rhythmPanel.durS[i].setTooltip (tr (
+            "How long each pulse of this train is held, in milliseconds - the gate. Short "
+            "is a click, long is a note.",
+            "Quant dura cada pols d'aquest tren, en mil\xc2\xb7lisegons - la porta. Curt \xc3\xa9s "
+            "un clic, llarg \xc3\xa9s una nota."));
+        rhythmPanel.delB[i].setTooltip (tr ("Stop routing this partial.",
+                                            "Deixa d'encaminar aquest parcial."));
+    }
     rhythmPanel.velHead.setText (tr ("VEL", "VEL"), dontSendNotification);
     rhythmPanel.velHead.setTooltip (tr ("MIDI velocity of every pulse this train sends (1-127).",
                                         "Velocity MIDI de cada pols que envia aquest tren (1-127)."));

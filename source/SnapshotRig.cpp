@@ -600,6 +600,31 @@ namespace
             // editor's own snapshot.
             { "40-rhythm-panel", "Spectrum-to-Rhythm panel open", tEditor, fNone,
               [] (Proc&, Ed& e) { e.setRhythmPanelForSnapshot (true); } },
+            // ...AND THE SAME PANEL WITH SOMETHING ROUTED, which no picture had ever
+            // shown. Scenario 40 photographs it EMPTY, so the crowded half - a routed row
+            // carrying a pitch box, two step buttons, a velocity fader, a gate fader and
+            // a delete, four columns of headers over them, and the read-out under them -
+            // has never been in front of a fit gate at all.
+            { "53-rhythm-routed", "the rhythm panel with three partials routed", tEditor, fSizes,
+              [] (Proc& p, Ed& e)
+              {
+                  setParam (p, "rhythmOn", 1.0f);
+                  // Three trains at different rates, which is what the panel is for: the
+                  // fundamental plain, a fifth stepped up, and a high partial slowed down.
+                  const int part[3]  = { 0, 2, 6 };
+                  const int steps[3] = { 0, 7, -12 };
+                  const float dur[3] = { 30.0f, 120.0f, 400.0f };
+                  for (int i = 0; i < 3; ++i)
+                  {
+                      auto& s = p.getRhythm().slots[(size_t) i];
+                      s.partial = part[i];
+                      s.enabled = true;
+                      s.steps   = steps[i];
+                      s.durMs   = dur[i];
+                  }
+                  e.setRhythmPanelForSnapshot (true);
+                  e.tickTimerForTests();
+              } },
             // THE SILENT-SETTINGS EXPLAINER, which nothing had ever photographed. Two
             // filters that each keep something can between them keep NOTHING - "Harmonics
             // = Prime" with every prime switched off is the plainest case - and the
