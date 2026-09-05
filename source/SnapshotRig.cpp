@@ -836,6 +836,7 @@ namespace
         struct Decl { const char* text; const char* why; };
         static const Decl kDeclared[] =
         {
+            { "cents",        "the unit is spelled the same in Catalan - the file already declares the \" cents\" pairs beside it" },
             { "AMP",          "the same abbreviation in both: amplitude / amplitud" },
             { "GATE",         "universal sequencer term for MIDI note length" },
             { "VEL",          "universal abbreviation of MIDI velocity / velocity MIDI" },

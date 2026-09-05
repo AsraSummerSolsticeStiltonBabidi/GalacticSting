@@ -955,7 +955,7 @@ namespace traudit
     inline bool allowed (const std::string& s)
     {
         static const char* ok[] = {
-            " cents", " cents.", "+ .scl", "AMP", "BASE", "BPM / 2^n", "Env", "FRACTAL",
+            " cents", " cents.", "cents", "+ .scl", "AMP", "BASE", "BPM / 2^n", "Env", "FRACTAL",
             "GATE", "Glide", "Mono", "Notes", "OK", "Original", "Pitch bend", "Presets...",
             "Reps", "St", "Triangle", "VEL", "est.", "intervals: 3/2 2 700c ...",
             // The tuning mode box's first three items: a name, a standard and a file

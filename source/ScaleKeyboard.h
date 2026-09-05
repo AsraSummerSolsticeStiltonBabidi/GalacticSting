@@ -200,6 +200,45 @@ public:
     void setHoverTextProvider (std::function<juce::String(int)> fn) { getHoverText = std::move (fn); }
     std::function<juce::String(int)> getHoverTextProvider() const { return getHoverText; }
 
+    // THE THREE INFO ROWS ABOVE THE KEYS GET TITLES, ON THE LEFT.
+    //
+    // "PON UN TITULO A LA IZQUIERDA DE LAS TRES FILAS DE INFORMACION QUE HAY ENCIMA DE
+    //  LAS TECLAS: DIFERENCIA DE PASOS, DIFERENCIA DE CENTS, BATIDOS. HAZ SITIO A LA
+    //  IZQUIERDA ENCOGIENDO UN POCO EL TECLADO SI HACE FALTA. CADA TITULO EN NEGRITA/
+    //  SUBRAYADO, QUE SE DISTINGA DEL TEXTO QUE VA SOBRE LAS TECLAS."
+    //
+    // WHY THE GUTTER IS TAKEN FROM BOTH SIDES. The keys are checked to be CENTRED inside
+    // this component - RhythmVerify measures (keysDrawn.x - box.x) against
+    // (box.right - keysDrawn.right) and allows 2 px, at four window widths and on two
+    // tunings. A gutter taken from the left alone is not a caption column, it is the
+    // keyboard going off centre, and it would fail that check for an honest reason. So
+    // both sides give the same 62 px and only the left one is written in. The right one
+    // is the price of the left one being free.
+    static constexpr int   kCaptionW          = 62;
+    static constexpr float kCaptionFontHeight = 9.5f;
+    void setRowCaptions (juce::String steps, juce::String cents, juce::String beating)
+    { capSteps = std::move (steps); capCents = std::move (cents);
+      capBeating = std::move (beating); repaint(); }
+
+    // THE FOUR BANDS OF THE INFO STRIP, top to bottom: step difference, cent difference,
+    // the just ratio when there is one, and the beating value. ONE function answers it,
+    // because the per-key painter fills those bands and the caption gutter labels them -
+    // and a caption laid out from its own arithmetic drifts off the row it names the
+    // first time either side is touched. It also fixed a real problem on the way: the
+    // deltas used to be ONE drawFittedText of a 2- or 3-line string, vertically centred
+    // in a 36 px box, so a hovered pair with no just ratio floated its two lines to a
+    // different height than a pair with one. Nothing could have been labelled.
+    static constexpr float kBeatBandH = 14.0f;
+    struct StripBands { juce::Rectangle<float> line[3], beat; };
+    static StripBands stripBands (juce::Rectangle<float> band)
+    {
+        StripBands b;
+        b.beat = band.removeFromBottom (kBeatBandH);
+        const float h = band.getHeight() / 3.0f;
+        for (auto& r : b.line) r = band.removeFromTop (h);
+        return b;
+    }
+
     // Below-keyboard hover strip: while a key is hovered, each OTHER key shows its
     // distance to it via getDeltaLabel(hoveredNote, otherNote) (multi-line: steps,
     // cents, and a just ratio when exact); the hovered key shows getSourceLabel(note)
@@ -666,11 +705,14 @@ public:
             }
             else if (infoActive)
             {
-                // Bottom BAND: this key's Sethares dissonance AGAINST the hovered one,
-                // in its consonance colour; the delta lines live strictly ABOVE it so
-                // the white numbers can never overlap the coloured values.
-                auto dc = sc;
-                auto db = dc.removeFromBottom (14.0f);
+                // EACH LINE IN ITS OWN BAND, from stripBands() - the same function the
+                // caption gutter lays itself out from, so a caption can never drift off
+                // the row it names. It used to be one drawFittedText of the whole 2- or
+                // 3-line string, vertically centred in the 36 px above the dissonance
+                // band: a hovered pair with a just ratio pushed its first two lines up
+                // and a pair without one let them float back down, so there was no fixed
+                // row for a title to sit beside.
+                const auto rows = stripBands (sc);
                 if (getHoverDiss)
                 {
                     const auto info = getHoverDiss (hoveredNote, note);
@@ -678,15 +720,19 @@ public:
                     {
                         g.setColour (info.colour);
                         g.setFont (juce::Font (juce::FontOptions (juce::jmin (11.0f, w * 0.34f)).withStyle ("Bold")));
-                        g.drawFittedText (info.text, db.toNearestInt(), juce::Justification::centred, 1, 0.4f);
+                        g.drawFittedText (info.text, rows.beat.toNearestInt(), juce::Justification::centred, 1, 0.4f);
                     }
                 }
                 const juce::String d = getDeltaLabel ? getDeltaLabel (hoveredNote, note) : juce::String();
                 if (d.isNotEmpty())
                 {
+                    juce::StringArray lines;
+                    lines.addLines (d);
                     g.setColour (juce::Colour (0xffc4ccda));
                     g.setFont (juce::Font (juce::FontOptions (juce::jmin (10.5f, w * 0.32f))));
-                    g.drawFittedText (d, dc.toNearestInt(), juce::Justification::centred, 3, 0.5f);
+                    for (int L2 = 0; L2 < juce::jmin (3, lines.size()); ++L2)
+                        g.drawFittedText (lines[L2], rows.line[L2].toNearestInt(),
+                                          juce::Justification::centred, 1, 0.5f);
                 }
             }
             else if ((hoveredNote < 0 || ! infoActive) && degree == 0 && getNoteHz) // period keys: their frequency (khz over 1000)
@@ -719,6 +765,40 @@ public:
                                         : juce::String ((int) std::lround (hz)) + "hz");
                     g.drawFittedText (t, hzArea.toNearestInt(), juce::Justification::centred, 1, 0.4f);
                 }
+            }
+        }
+
+        // THE ROW CAPTIONS, in the gutter kCaptionW reserves on the left.
+        //
+        // Only while a key is hovered: with nothing hovered these same three bands hold
+        // the period keys' frequencies and the REFERENCE word, which "steps", "cents" and
+        // "beating" would then be labelling falsely. Laid out from the SAME stripBands()
+        // the per-key text is drawn from, so the two cannot drift apart.
+        //
+        // BOLD AND UNDERLINED, as asked, and the rule is DRAWN because there is no font
+        // underline anywhere in this build - the precedent is the fraction bar under a
+        // ratio in drawIntervalLabel, a fillRect at the MEASURED width of the glyphs. A
+        // rule as wide as the box would be a border; a rule as wide as the word is an
+        // underline, and it is what separates these from the numbers over the keys.
+        if (hoveredNote >= 0)
+        {
+            const auto gutter = juce::Rectangle<float> ((float) arrowW(), 0.0f,
+                                                        (float) kCaptionW, (float) stripH)
+                                    .reduced (3.0f, 3.0f);
+            const auto rows = stripBands (gutter);
+            const juce::Rectangle<float> where[3] = { rows.line[0], rows.line[1], rows.beat };
+            const juce::String           what[3]  = { capSteps, capCents, capBeating };
+            g.setColour (juce::Colour (0xffe8ecf4));
+            g.setFont (juce::Font (juce::FontOptions (kCaptionFontHeight).withStyle ("Bold")));
+            for (int r = 0; r < 3; ++r)
+            {
+                if (what[r].isEmpty()) continue;
+                g.drawText (what[r], where[r].toNearestInt(), juce::Justification::centredRight, false);
+                const float tw = juce::jmin (boldTextWidth (what[r], kCaptionFontHeight),
+                                             where[r].getWidth());
+                const float by = juce::jmin (where[r].getCentreY() + kCaptionFontHeight * 0.55f,
+                                             where[r].getBottom() - 1.0f);
+                g.fillRect (juce::Rectangle<float> (where[r].getRight() - tw, by, tw, 1.0f));
             }
         }
 
@@ -859,7 +939,7 @@ private:
     // same reason: their appearing/disappearing used to shift the geometry too.
     int numCells() const
     {
-        const int usable = juce::jmax (1, getWidth() - 2 * kArrowW);
+        const int usable = juce::jmax (1, getWidth() - 2 * sideW());
         return juce::jmax (1, usable / kCellW);
     }
     // How many of those cells actually CARRY A KEY.
@@ -886,7 +966,7 @@ private:
     {
         const int cells = juce::jmax (1, numCells());
         const float w = (float) keysWidth() / (float) cells;
-        return (float) arrowW() + (float) (cells - liveCells()) * w * 0.5f;
+        return (float) sideW() + (float) (cells - liveCells()) * w * 0.5f;
     }
     // The resting key cell for view index `i`, exactly as paint() builds it (the hover
     // stretch is left out on purpose: it is a transient, and the probe measures the layout
@@ -979,7 +1059,12 @@ private:
     mutable juce::String cachedWidestName, cachedWidestNumber;
     bool isScrollable() const { return rangeCount > numCells(); }
     int  arrowW()      const { return kArrowW; }
-    int  keysWidth()   const { return juce::jmax (1, getWidth() - 2 * arrowW()); }
+    // ARROWS PLUS THE CAPTION GUTTER, on both sides. Every place that decides how wide
+    // the keys are, or where they start, asks THIS - it used to be two separate copies of
+    // "getWidth() - 2 * kArrowW" in numCells() and keysWidth(), and a change to one of
+    // them silently drops every key below the 32 px the layout is built on.
+    int  sideW()       const { return kArrowW + kCaptionW; }
+    int  keysWidth()   const { return juce::jmax (1, getWidth() - 2 * sideW()); }
     // Highest baseKey that still shows keys (never negative when the range is
     // smaller than the window - there is simply nothing to scroll).
     int  maxBaseKey()  const { return juce::jmax (rangeLo, rangeLo + rangeCount - numCells()); }
@@ -1059,6 +1144,9 @@ private:
     // states nothing about the palette at all, which is the point.
     juce::Colour sourceColour { juce::Colours::white };
     juce::String referenceWord { "REFERENCE" };   // set by applyLanguage; see setReferenceWord
+    // The three row captions, English by default so a build with no applyLanguage() call
+    // still says something. setRowCaptions() writes them in the language on screen.
+    juce::String capSteps { "steps" }, capCents { "cents" }, capBeating { "beating" };
     static constexpr int stripH = 56;                    // top info strip (3 delta lines + dissonance band)
     int baseKey   = 48; // leftmost VISIBLE key (the scroll position)
     int rangeLo   = 48; // full playable range start

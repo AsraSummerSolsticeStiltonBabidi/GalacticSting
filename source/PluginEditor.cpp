@@ -4387,6 +4387,11 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // be a literal inside ScaleKeyboard::paint and so was the only user-visible string in
     // the window that never changed language.
     keyboard.setReferenceWord (tr ("REFERENCE", "REFER\xc3\x88NCIA"));
+    // The three info rows above the keys, named on the left. "cents" really is the same
+    // word in Catalan - the unit is spelled that way in both - so it is declared to the
+    // audits rather than translated into itself; the other two are not.
+    keyboard.setRowCaptions (tr ("steps", "passos"), tr ("cents", "cents"),
+                             tr ("beating", "batec"));
     // The self-painting components' own EN/CA hook. They draw their words straight onto a
     // Graphics, so nothing else in this file can put those words in the right language -
     // and, until d8aeeaf, nothing could see that they were in the wrong one.
@@ -4741,6 +4746,32 @@ FractalAdditiveAudioProcessorEditor::textFitProbeForTests (bool useCatalan)
         f.need  = juce::GlyphArrangement::getStringWidth (rf, f.text);
         f.avail = ScaleKeyboard::kReferenceBandMinWidth;
         out.push_back (f);
+    }
+
+    // THE KEYBOARD'S THREE ROW CAPTIONS, painted onto its own Graphics exactly like
+    // REFERENCE above, and only on screen while a key is HOVERED - which is both of this
+    // build's ways of hiding a string at once. No snapshot scenario hovers a key, so the
+    // pictures will never contain them: this registration is the ONLY thing that makes
+    // them visible to the language gate, and it is deliberately NOT conditional on
+    // hoveredNote, or the gate would see them in neither language and be satisfied.
+    //
+    // Measured against the gutter they are guaranteed, less its 3 px inset each side, so
+    // a Catalan caption that would be drawn condensed fails the fit sweep here instead of
+    // looking slightly wrong on somebody's screen.
+    {
+        const char* paths[3] = { "keyboard/rowSteps", "keyboard/rowCents", "keyboard/rowBeating" };
+        const juce::String texts[3] = { tr ("steps", "passos"), tr ("cents", "cents"),
+                                        tr ("beating", "batec") };
+        const juce::Font cf (juce::FontOptions (ScaleKeyboard::kCaptionFontHeight).withStyle ("Bold"));
+        for (int i = 0; i < 3; ++i)
+        {
+            TextFit f;
+            f.path = paths[i]; f.kind = "Painted"; f.text = texts[i];
+            f.bounds = getLocalArea (&keyboard, keyboard.getLocalBounds());
+            f.need  = juce::GlyphArrangement::getStringWidth (cf, f.text);
+            f.avail = (float) (ScaleKeyboard::kCaptionW - 6);
+            out.push_back (f);
+        }
     }
 
     // THE ONE WORD IN THE PENCIL WINDOW'S CELLS, which is only ON SCREEN when a partial
