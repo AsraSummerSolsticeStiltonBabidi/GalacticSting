@@ -3262,6 +3262,90 @@ int main (int argc, char** argv)
         }
     }
 
+    // --- run 12n: saving a corner is a ROUND TRIP, not just a legal write -------------
+    //
+    // Run 51 proves the corner-fixed-point RULE - that saving over an assigned corner's
+    // own name while the pad drives is refused, and refused only then. It does not ask
+    // the question after the write: if you edit a corner, save it, and later put that
+    // file back on the corner, do you get what you saved?
+    //
+    // That is the question a user asks by reopening the project a week later, and it is
+    // the one that would fail QUIETLY: the corner keeps sounding right for the rest of
+    // the session because its in-memory store is still there, and only a reload shows
+    // what actually went to disk.
+    {
+        using Proc = FractalAdditiveAudioProcessor;
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run12n-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        struct ScratchFolder
+        {
+            explicit ScratchFolder (const juce::File& d)
+                : dir (d), prev (Proc::getPresetFolder()) { Proc::setPresetFolderForTests (d); }
+            ~ScratchFolder() { Proc::setPresetFolderForTests (prev); dir.deleteRecursively(); }
+            juce::File dir, prev;
+        } guard (scratch);
+        check (Proc::getPresetFolder() == scratch, "run 12n writes its presets in a scratch folder");
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+        const auto sp = [&] (const char* id, float plain)
+        {
+            if (auto* q = p->apvts.getParameter (id))
+                q->setValueNotifyingHost (q->convertTo0to1 (plain));
+            p->pollParametersForTests();
+        };
+
+        // A patch worth telling apart, saved and hung on corner A.
+        sp ("baseN", 2.0f); sp ("curveSlope", 0.7f); sp ("fractalLevel", 0.25f);
+        Proc::PresetWriteRefusal why {}; int blocked = -1;
+        check (p->savePreset ("rt-base", why, blocked).isNotEmpty(), "the starting patch saves");
+        juce::String err;
+        check (p->assignPlaygroundCorner (0, "rt-base", err), "and hangs on corner A");
+        check (p->assignPlaygroundCorner (1, "rt-base", err), "with a second corner so the pad has work");
+
+        // EDIT IT, change it, save it under a new name.
+        check (p->beginPlaygroundCornerEdit (0), "corner A goes into edit mode");
+        sp ("baseN", 7.0f); sp ("curveSlope", 0.15f); sp ("fractalLevel", 0.80f);
+        const auto saved = p->savePlaygroundCornerAs (0, "rt-edited");
+        check (saved == "rt-edited", "the edited corner saves under its new name");
+        p->endPlaygroundCornerEdit();
+
+        // What the corner IS now, in memory, straight after the save.
+        struct Watch { const char* id; };
+        const Watch watched[] = { { "baseN" }, { "curveSlope" }, { "fractalLevel" } };
+        double inMemory[3] = { 0, 0, 0 };
+        for (int i = 0; i < 3; ++i) inMemory[i] = p->getPlaygroundCornerParamForTests (0, watched[i].id);
+        std::printf ("    corner A after saving: baseN %.3f, slope %.3f, fractal %.3f\n",
+                     inMemory[0], inMemory[1], inMemory[2]);
+
+        // ...and what comes back off the disk. THE SAME FILE, ONTO THE SAME CORNER.
+        check (p->assignPlaygroundCorner (0, "rt-edited", err), "the saved file loads back onto corner A");
+        double fromDisk[3] = { 0, 0, 0 };
+        for (int i = 0; i < 3; ++i) fromDisk[i] = p->getPlaygroundCornerParamForTests (0, watched[i].id);
+        std::printf ("    the same file back:   baseN %.3f, slope %.3f, fractal %.3f\n",
+                     fromDisk[0], fromDisk[1], fromDisk[2]);
+
+        bool same = true;
+        juce::String firstDiff;
+        for (int i = 0; i < 3; ++i)
+        {
+            const bool ok = std::isfinite (inMemory[i]) && std::isfinite (fromDisk[i])
+                         && std::abs (inMemory[i] - fromDisk[i]) < 1.0e-4;
+            if (! ok && firstDiff.isEmpty())
+                firstDiff = juce::String (watched[i].id) + ": " + juce::String (inMemory[i], 4)
+                          + " in memory, " + juce::String (fromDisk[i], 4) + " from disk";
+            same = same && ok;
+        }
+        check (same, "a corner saved and loaded back is the corner that was saved");
+        if (! same) std::printf ("    NOT A ROUND TRIP - %s\n", firstDiff.toRawUTF8());
+
+        // And the values are the EDITED ones, not the ones the corner started with -
+        // otherwise the check above would pass on a save that wrote nothing at all.
+        check (std::abs (fromDisk[0] - 7.0) < 1.0e-4,
+               "...and they are the values the edit put there, not the ones it started with");
+    }
+
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
     // The editor draws value = shape(t, curve); this checks the engine agrees, that
     // the sustain node really sets the level, and that a second key retriggers from
