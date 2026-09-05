@@ -4505,6 +4505,32 @@ FractalAdditiveAudioProcessorEditor::textFitProbeForTests (bool useCatalan)
         out.push_back (f);
     }
 
+    // THE BLEND PAD'S OWN FOUR LABELS, which nothing could see. The pad paints them
+    // straight onto its Graphics, so walkTextFits has no component to find, and until
+    // scenario 52 no picture even contained one - the only playground scenario showed the
+    // panel EMPTY, which is the one state where none of its text is real.
+    //
+    // What they carry is the corner letter, the preset's name and the blend percentage,
+    // and the percentage is the number the whole pad exists to show. Measured against the
+    // box paint() actually used, so a name that grows can never push it out again.
+    {
+        const auto& pad = playgroundPanel.pad;
+        for (int i = 0; i < 4; ++i)
+        {
+            if (pad.lastLabel[i].isEmpty() || pad.lastLabelBox[i].isEmpty()) continue;
+            TextFit f;
+            f.path = "playgroundPad/corner" + juce::String::charToString ((juce::juce_wchar) ('A' + i));
+            f.kind = "Painted";
+            f.text = pad.lastLabel[i];
+            f.bounds = pad.lastLabelBox[i];
+            const juce::Font lf (juce::FontOptions (12.0f).withStyle ("Bold"));
+            f.need  = juce::GlyphArrangement::getStringWidth (lf, f.text);
+            f.avail = (float) pad.lastLabelBox[i].getWidth();
+            f.availH = (float) pad.lastLabelBox[i].getHeight();
+            out.push_back (f);
+        }
+    }
+
     // THE NATIVE DIALOG TITLES, read from the SAME table the call sites use (fgdlg), so
     // the gate cannot go stale by holding a copy of a string that has since changed.
     // With no geometry: the OS sizes its own title bar, so there is no width to measure

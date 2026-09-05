@@ -635,6 +635,43 @@ namespace
               [] (Proc&, Ed&) {} },
             { "51-partial-amp-window", "floating: per-partial amplitudes (pencil)", tPartials, fSizes,
               [] (Proc& p, Ed&) { setParam (p, "partialManual", 1.0f); } },
+            // THE PLAYGROUND WITH SOMETHING IN IT. Scenario 50 photographs it EMPTY -
+            // four "(empty)" boxes and a blend pad with nothing to blend - which is the
+            // one state where none of its text is real. A loaded corner carries a USER'S
+            // OWN PRESET NAME, whose length nobody controls, in a box beside a coloured
+            // letter; the puck sits somewhere; and the mode pair says MORPH or MIX. None
+            // of that had ever been in a picture.
+            //
+            // The presets are written to a SCRATCH folder first. The user's own patches
+            // are theirs, and a rig that writes into their folder is a bug in the rig.
+            { "52-playground-loaded", "the playground with four corners filled", tPlayground, fSizes,
+              [] (Proc& p, Ed& e)
+              {
+                  auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                     .getChildFile ("fiblo-rig-playground");
+                  scratch.deleteRecursively();
+                  Proc::setPresetFolderForTests (scratch);
+                  // Four corners, four different patches, and names of four different
+                  // lengths - the shortest a user would type and the longest they might.
+                  const char* names[4] = { "A", "bell 32",
+                                           "campana que li mola a l'Alfred",
+                                           "AIXO POT SER UN TEMADO FENT 0124 DES DEL 3 FINS AL 0" };
+                  for (int i = 0; i < 4; ++i)
+                  {
+                      setParam (p, "baseN", (float) (1 + i * 3));
+                      setParam (p, "curveSlope", 0.4f + 0.3f * (float) i);
+                      Proc::PresetWriteRefusal why {};
+                      int corner = -1;
+                      p.savePreset (names[i], why, corner);
+                  }
+                  juce::String err;
+                  for (int i = 0; i < 4; ++i) p.assignPlaygroundCorner (i, names[i], err);
+                  // The puck off-centre, so the blend is a real one and the pad has
+                  // something to draw that the empty scenario never shows.
+                  setParam (p, "pgX", 0.72f);
+                  setParam (p, "pgY", 0.31f);
+                  e.tickTimerForTests();
+              } },
         };
         return v;
     }
@@ -1349,6 +1386,16 @@ namespace
                     // component - that has to be the one to notice it.
                     if (! hasWord (text)) continue;
                     if (sameInBothLanguagesOnPurpose (text)) continue;
+                    // A BOX FILLED FROM DISK holds the USER'S OWN WORDS, and a preset
+                    // called "bell 32" is called that in both languages because it is not
+                    // a translation - it is a file name. RefreshingComboBox is exactly the
+                    // set that refills itself from the preset folder, which is the same
+                    // sentence in code, and is already exempt from the widest-item probe
+                    // for the same reason.
+                    // ...and the blend pad's corner labels are that same file name with a letter
+                    // and a percentage around it.
+                    if (row.first.contains ("RefreshingComboBox")
+                        || row.first.contains ("playgroundPad/corner")) continue;
                     const auto line = "  \"" + text.substring (0, 70) + "\"   "
                                     + juce::String (sc.id) + " " + row.first;
                     if (! gUntranslated.contains (line)) gUntranslated.add (line);

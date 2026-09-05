@@ -3786,6 +3786,11 @@ private:
         std::function<juce::String (const char*, const char*)> trF;
         std::function<void()> onMoved;
         bool dragging = false;
+        // THE LABEL AS DRAWN, per corner, with the box it was drawn in - the pad paints
+        // these itself, so walkTextFits cannot reach them and a silent cut here is
+        // invisible to every gate. Recorded in paint() and read by the text-fit probe.
+        mutable juce::String lastLabel[4];
+        mutable juce::Rectangle<int> lastLabelBox[4];
 
         // The square the point actually travels in. Inset so a corner's dot and its
         // percentage are drawn INSIDE the component and never clipped by its edge.
@@ -3898,18 +3903,53 @@ private:
                     g.drawEllipse (juce::Rectangle<float> (rad * 2.0f + 14.0f, rad * 2.0f + 14.0f).withCentre (c), 2.5f);
                 }
 
-                // Name + percentage, pushed OUTWARDS from the corner so it never sits
-                // under the point.
-                auto lab = juce::Rectangle<float> (150.0f, 15.0f)
-                               .withCentre ({ c.x + ((i & 1) ? -58.0f : 58.0f),
-                                              c.y + ((i & 2) ? 17.0f : -17.0f) });
+                // Name + percentage, pushed OUTWARDS from the corner. THREE PIECES,
+                // because only one of them may be cut: the letter says WHICH corner and
+                // the percentage says HOW MUCH of it you are hearing - that number is the
+                // entire reason this pad exists - so the NAME is the elastic part and the
+                // name is what ellipsises.
+                //
+                // It used to be one string in a fixed 150 px box drawn with
+                // drawText (..., useEllipsis = false), which cut the tail. With a real
+                // preset name on the corner the tail is the percentage: "campana que li
+                // mola a l'Alfred" came out as "C  campana que li mola a l'" and the
+                // number was simply gone. Photographed by scenario 52, which is the first
+                // picture of this panel with anything loaded in it.
+                //
+                // The box also stops a puck-radius short of the corner now. The old one
+                // was centred 58 px away and 150 wide, so it reached 17 px PAST the
+                // corner and the last of the text sat under the dot - which the comment
+                // above it said it never did.
+                const juce::Font labFont (juce::FontOptions (12.0f).withStyle ("Bold"));
+                const auto lead = juce::String::charToString ((juce::juce_wchar) ('A' + i));
+                const juce::String head = lead + "  ";
+                const juce::String tail = (active && ! name.isEmpty())
+                                        ? "  " + juce::String (w[i] * 100.0, 0) + "%"
+                                        : juce::String();
+                const float gap  = rad + 5.0f;
+                const float room = juce::jmax (44.0f, a.getWidth() * 0.5f - gap - 4.0f);
+                auto lab = juce::Rectangle<float> (room, 15.0f)
+                               .withCentre ({ 0.0f, c.y + ((i & 2) ? 17.0f : -17.0f) });
+                lab.setX ((i & 1) ? c.x - gap - room : c.x + gap);
+
+                juce::String shown = name.isEmpty()
+                                   ? (trF ? trF ("empty", "buida") : juce::String ("empty"))
+                                   : name;
+                const float fixed = juce::GlyphArrangement::getStringWidth (labFont, head + tail);
+                const float forName = room - fixed - 2.0f;
+                if (juce::GlyphArrangement::getStringWidth (labFont, shown) > forName)
+                {
+                    const auto dots = juce::String::fromUTF8 ("\xe2\x80\xa6");
+                    while (shown.length() > 1
+                           && juce::GlyphArrangement::getStringWidth (labFont, shown + dots) > forName)
+                        shown = shown.dropLastCharacters (1);
+                    shown = shown.trimEnd() + dots;
+                }
                 g.setColour (name.isEmpty() ? juce::Colour (0xff6a7285) : col);
-                g.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
-                juce::String t;
-                t << (char) ('A' + i) << "  ";
-                t << (name.isEmpty() ? (trF ? trF ("empty", "buida") : juce::String ("empty")) : name);
-                if (active && ! name.isEmpty()) t << "  " << juce::String (w[i] * 100.0, 0) << "%";
-                g.drawText (t, lab.toNearestInt(),
+                g.setFont (labFont);
+                lastLabel[i]    = head + shown + tail;
+                lastLabelBox[i] = lab.toNearestInt();
+                g.drawText (head + shown + tail, lab.toNearestInt(),
                             (i & 1) ? juce::Justification::centredRight : juce::Justification::centredLeft, false);
             }
 
