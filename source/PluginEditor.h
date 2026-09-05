@@ -1866,8 +1866,12 @@ private:
         juce::Label        outLbl, selfLbl;           // captions under the two big pill toggles
         juce::ComboBox     modeBox;
         juce::Label        heading, listHead, info, noteHead, durHead, velHead, bpmLbl, pickHint;
-        juce::Rectangle<int> rateBox;                 // framed box around the PULSE RATE group
-        juce::Label        secRate, secOut, secTempo;         // coloured group headers
+        // ONE FRAME PER SECTION, and there are five now. Only PULSE RATE used to have
+        // one; the other three were a coloured word over a hairline and the two big
+        // toggles at the top had no group at all, which is most of why this window read
+        // as a pile rather than as a panel.
+        juce::Rectangle<int> playBox, rateBox, outBox, tempoBox, gateBox;
+        juce::Label        secRate, secOut, secTempo, secPlay;         // coloured group headers
         juce::Label        divLbl, timesLbl, nVal, xVal;      // "divide [n] times by [x]"
         juce::TextButton   nUp, nDn, xUp, xDn;                // tiny round steppers
         juce::TextButton   closeB { "X" }, helpB, jiB, tempoX2, tempoD2;
@@ -2024,6 +2028,7 @@ private:
                 l.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
                 addAndMakeVisible (l);
             };
+            sec (secPlay,  juce::Colour (0xff8fd0ff)); // pale blue - PLAYBACK (the two pills)
             sec (secRate,  juce::Colour (0xff4fe6ff)); // cyan   - PULSE RATE
             sec (secOut,   juce::Colour (0xffff77c8)); // pink   - OUTPUT
             sec (secTempo, juce::Colour (0xffffc95c)); // yellow - DAW TEMPO
@@ -2566,43 +2571,54 @@ private:
             heading.setBounds (top); // big title, no toggle inside it
             r.removeFromTop (6);
 
-            // Two big pill toggles, each with a caption: MIDI OUT (send to DAW) and
-            // PLAY IN FIBLÓ (interpret the rhythm here; the held note stays silent).
+            // FIVE FRAMED SECTIONS, all treated alike. This panel used to be a stack:
+            // two big pills with no group at all, a feedback row, then ONE framed box
+            // (PULSE RATE) and three sections that were a coloured word over a hairline.
+            // A reader had no way to tell which control belonged with which.  Each group
+            // gets a frame in its own section colour now, and the two SHORT ones share a
+            // row, which is where the space for the routing list below comes from.
+            const auto section = [&r] (juce::Label& hdr, int contentH, juce::Rectangle<int>& boxOut)
             {
-                // Widths from the CAPTIONS, not from numbers: "MIDI out (to DAW)" is
-                // "Sortida MIDI (al DAW)" in Catalan and needed 23 px more than the
-                // column it was given, so it shipped condensed.
-                auto tg = r.removeFromTop (46);
-                auto p1 = tg.removeFromLeft (juce::jmax (118, fgfit::labelWidth (outLbl)));
-                onT.setBounds (p1.removeFromTop (26).withSizeKeepingCentre (84, 24));
-                outLbl.setBounds (p1);
-                tg.removeFromLeft (14);
-                auto p2 = tg.removeFromLeft (juce::jmax (140, fgfit::labelWidth (selfLbl)));
-                selfT.setBounds (p2.removeFromTop (26).withSizeKeepingCentre (96, 24));
-                selfLbl.setBounds (p2);
-                tg.removeFromLeft (16);
-                droneT.setBounds (tg.withSizeKeepingCentre (tg.getWidth(), 24)); // "note under pulses"
-            }
-            r.removeFromTop (6);
-            // Internal feedback loop + its volume slope.
+                auto box = r.removeFromTop (13 + 3 + contentH + 8);
+                boxOut = box;
+                auto in = box.reduced (8, 4);
+                hdr.setBounds (in.removeFromTop (13));
+                in.removeFromTop (3);
+                return in.removeFromTop (contentH);
+            };
+
+            // PLAYBACK: where the pulses go, and what comes back. The two pills carry
+            // their caption ABOVE them now - a pill that says "OFF" over the words "MIDI
+            // out (to DAW)" reads as an answer before its question, and every other
+            // caption in this build sits above the control it names.
             {
-                auto fr = r.removeFromTop (24);
-                feedbackT.setBounds (fr.removeFromLeft (160));
+                auto in = section (secPlay, 13 + 26 + 4 + 24, playBox);
+                auto capRow = in.removeFromTop (13);
+                auto pills  = in.removeFromTop (26);
+                const int w1 = juce::jmax (118, fgfit::labelWidth (outLbl));
+                const int w2 = juce::jmax (140, fgfit::labelWidth (selfLbl));
+                outLbl.setBounds (capRow.removeFromLeft (w1));
+                capRow.removeFromLeft (14);
+                selfLbl.setBounds (capRow.removeFromLeft (w2));
+                onT.setBounds (pills.removeFromLeft (w1).withSizeKeepingCentre (juce::jmin (w1, 96), 24));
+                pills.removeFromLeft (14);
+                selfT.setBounds (pills.removeFromLeft (w2).withSizeKeepingCentre (juce::jmin (w2, 108), 24));
+                pills.removeFromLeft (16);
+                droneT.setBounds (pills.withSizeKeepingCentre (pills.getWidth(), 24));
+                in.removeFromTop (4);
+                auto fr = in.removeFromTop (24);
+                feedbackT.setBounds (fr.removeFromLeft (juce::jmax (160, fgfit::toggleWidth (feedbackT))));
                 fr.removeFromLeft (8);
                 feedbackLbl.setBounds (fr.removeFromLeft (juce::jmax (54, fgfit::labelWidth (feedbackLbl))));
                 fr.removeFromLeft (6);
                 feedbackS.setBounds (fr.removeFromLeft (juce::jmin (240, fr.getWidth())).reduced (0, 1));
             }
-            r.removeFromTop (8);
+            r.removeFromTop (5);
 
-            // PULSE RATE group, wrapped in its own framed box (header + divide row).
+            // PULSE RATE, unchanged in content: its header comes from the shared helper
+            // now so all five boxes measure the same.
             {
-                auto box = r.removeFromTop (13 + 3 + 24 + 8);
-                rateBox = box; // stored for paint()'s frame
-                auto ra = box.reduced (8, 4);
-                secRate.setBounds (ra.removeFromTop (13));
-                ra.removeFromTop (3);
-                auto g1 = ra.removeFromTop (24);
+                auto g1 = section (secRate, 24, rateBox);
                 divLbl.setBounds (g1.removeFromLeft (juce::jmax (50, fgfit::labelWidth (divLbl))));
                 g1.removeFromLeft (4);
                 nDn.setBounds (g1.removeFromLeft (20).reduced (0, 2));
@@ -2614,12 +2630,12 @@ private:
                 xVal.setBounds (g1.removeFromLeft (26));
                 xUp.setBounds (g1.removeFromLeft (20).reduced (0, 2));
             }
-            r.removeFromTop (6);
+            r.removeFromTop (5);
 
-            // OUTPUT and DAW TEMPO groups.
-            auto grpRow = [&r] (juce::Label& sec) { sec.setBounds (r.removeFromTop (13)); return r.removeFromTop (24); };
+            // OUTPUT keeps a row of its own: its widest state is the mode box + MPE +
+            // JI + an octave stepper + a steps fader, which is more than half a panel.
             {
-                auto g2 = grpRow (secOut);
+                auto g2 = section (secOut, 24, outBox);
                 modeBox.setBounds (g2.removeFromLeft (128).reduced (0, 1));
                 g2.removeFromLeft (8);
                 mpeT.setBounds (g2.removeFromLeft (86));
@@ -2638,25 +2654,78 @@ private:
                 stepsAllLbl.setBounds (g2.removeFromLeft (juce::jmax (44, fgfit::labelWidth (stepsAllLbl))));
                 stepsAllS.setBounds (g2.removeFromLeft (juce::jmin (120, g2.getWidth())).reduced (0, 3));
             }
-            r.removeFromTop (4);
+            r.removeFromTop (5);
+
+            // DAW TEMPO and NOTE START, side by side WHEN THE ROW CAN PAY FOR IT.
+            //
+            // Both boxes state what they need, including the read-out at the end of the
+            // tempo row - the first version of this sized the box and let "= ... BPM"
+            // take the leftovers, which is how a 52 px label ended up in 44 and then in
+            // 24, and it dragged the whole window's fully-legible size from 780x550 to
+            // 1600x900. A label that gets what is left over is a label that disappears.
+            //
+            // When the row cannot hold both, they stack instead of squeezing. Two boxes
+            // one above the other cost 41 px of height; a crushed read-out costs the
+            // number it exists to show.
             {
-                auto g3 = grpRow (secTempo);
-                tempoT.setBounds (g3.removeFromLeft (juce::jmax (150, fgfit::toggleWidth (tempoT))));
-                g3.removeFromLeft (4);
-                tempoX2.setBounds (g3.removeFromLeft (32).reduced (0, 1));
-                g3.removeFromLeft (4);
-                tempoD2.setBounds (g3.removeFromLeft (32).reduced (0, 1));
-                g3.removeFromLeft (6);
-                bpmLbl.setBounds (g3);
-            }
-            r.removeFromTop (4);
-            {
-                auto g4 = grpRow (secGate); // NOTE START: quantize/mono toggles
-                qTempoT.setBounds (g4.removeFromLeft (juce::jmax (218, fgfit::toggleWidth (qTempoT))));
-                g4.removeFromLeft (6);
-                monoT.setBounds (g4.removeFromLeft (juce::jmax (76, fgfit::toggleWidth (monoT))));
-                g4.removeFromLeft (6);
-                qPulseT.setBounds (g4);
+                const int tempoNeed = juce::jmax (150, fgfit::toggleWidth (tempoT))
+                                    + 4 + 32 + 4 + 32 + 6
+                                    // ...and room for the read-out's WIDEST text, not its current one. This
+                                    // label says "= ... BPM" until a tempo arrives and "= 120.0 BPM" after,
+                                    // and resized() runs while it still holds the short one - so measuring
+                                    // what it happens to say reserved 13 px for a string that needs 52. Same
+                                    // lesson as a ComboBox and its widest item: measure what it CAN hold.
+                                    + (int) std::ceil (juce::GlyphArrangement::getStringWidth (
+                                                           fgfit::labelFont (bpmLbl), "= 199.9 BPM"))
+                                    + bpmLbl.getBorderSize().getLeftAndRight() + 3 + 16;
+                const int gateNeed  = juce::jmax (218, fgfit::toggleWidth (qTempoT))
+                                    + 6 + juce::jmax (76, fgfit::toggleWidth (monoT))
+                                    + 6 + juce::jmax (96, fgfit::toggleWidth (qPulseT)) + 16;
+                const int boxH = 13 + 3 + 24 + 8;
+                const bool sideBySide = r.getWidth() >= tempoNeed + 6 + gateNeed;
+
+                auto layTempo = [&] (juce::Rectangle<int> box)
+                {
+                    tempoBox = box;
+                    auto in = box.reduced (8, 4);
+                    secTempo.setBounds (in.removeFromTop (13));
+                    in.removeFromTop (3);
+                    auto g3 = in.removeFromTop (24);
+                    tempoT.setBounds (g3.removeFromLeft (juce::jmax (150, fgfit::toggleWidth (tempoT))));
+                    g3.removeFromLeft (4);
+                    tempoX2.setBounds (g3.removeFromLeft (32).reduced (0, 1));
+                    g3.removeFromLeft (4);
+                    tempoD2.setBounds (g3.removeFromLeft (32).reduced (0, 1));
+                    g3.removeFromLeft (6);
+                    bpmLbl.setBounds (g3);
+                };
+                auto layGate = [&] (juce::Rectangle<int> box)
+                {
+                    gateBox = box;
+                    auto in = box.reduced (8, 4);
+                    secGate.setBounds (in.removeFromTop (13));
+                    in.removeFromTop (3);
+                    auto g4 = in.removeFromTop (24);
+                    qTempoT.setBounds (g4.removeFromLeft (juce::jmax (218, fgfit::toggleWidth (qTempoT))));
+                    g4.removeFromLeft (6);
+                    monoT.setBounds (g4.removeFromLeft (juce::jmax (76, fgfit::toggleWidth (monoT))));
+                    g4.removeFromLeft (6);
+                    qPulseT.setBounds (g4);
+                };
+
+                if (sideBySide)
+                {
+                    auto both = r.removeFromTop (boxH);
+                    layTempo (both.removeFromLeft (tempoNeed));
+                    both.removeFromLeft (6);
+                    layGate (both);
+                }
+                else
+                {
+                    layTempo (r.removeFromTop (boxH));
+                    r.removeFromTop (5);
+                    layGate (r.removeFromTop (boxH));
+                }
             }
             r.removeFromTop (8);
 
@@ -2724,13 +2793,25 @@ private:
             g.fillRoundedRectangle (r, 10.0f);
             g.setColour (juce::Colour (0xff5cb8ff));
             g.drawRoundedRectangle (r.reduced (1.5f), 10.0f, 3.0f);
-            // Frame around the PULSE RATE group (drawn behind its controls).
-            if (! rateBox.isEmpty())
+
+            // ONE FRAME PER GROUP, each in its own section colour - the same wash and
+            // outline PULSE RATE already had, now given to all five. A frame is what
+            // says "these controls belong together", and four of the five groups were
+            // making that claim with nothing but a coloured word above a hairline.
+            const struct { const juce::Rectangle<int>* box; juce::uint32 rgb; } frames[] = {
+                { &playBox,  0x8fd0ff },   // pale blue - PLAYBACK
+                { &rateBox,  0x4fe6ff },   // cyan      - PULSE RATE
+                { &outBox,   0xff77c8 },   // pink      - OUTPUT
+                { &tempoBox, 0xffc95c },   // yellow    - DAW TEMPO
+                { &gateBox,  0x7ff59a },   // green     - NOTE START
+            };
+            for (const auto& f : frames)
             {
-                auto rb = rateBox.toFloat();
-                g.setColour (juce::Colour (0x224fe6ff)); // faint cyan wash (matches secRate)
+                if (f.box->isEmpty()) continue;
+                const auto rb = f.box->toFloat();
+                g.setColour (juce::Colour (f.rgb).withAlpha (0.13f));
                 g.fillRoundedRectangle (rb, 7.0f);
-                g.setColour (juce::Colour (0x664fe6ff));
+                g.setColour (juce::Colour (f.rgb).withAlpha (0.40f));
                 g.drawRoundedRectangle (rb.reduced (0.5f), 7.0f, 1.2f);
             }
         }
