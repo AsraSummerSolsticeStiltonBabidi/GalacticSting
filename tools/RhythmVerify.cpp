@@ -3453,6 +3453,116 @@ int main (int argc, char** argv)
             std::printf ("    worst disagreement %.4f dB at %s\n", worst, worstWhere.toRawUTF8());
     }
 
+    // --- run 12p: a chord releases at the same rate as a single note -----------------
+    //
+    // "EL RELEASE PARECE BUGEADO, CUANDO TOCO UN ACORDE AVECES EL RELEASE ES MUCHO MAS
+    // CORTO QUE SI TOCO UNA NOTA SOLA, ESTO ES GRAVE."
+    //
+    // IT IS NOT THE ENVELOPE, and the two numbers below are why. Measured as a RATE, not
+    // as a level - a chord is louder when the keys come up, so a fixed threshold would
+    // flatter the single note - each render is timed from key-up to a tenth of its OWN
+    // level at that moment.
+    //
+    //   * on an INSTANT meter: 0.99 s for one note, 0.73 for a triad, 0.61 for six. That
+    //     is the complaint, and it is real to the ear.
+    //   * on the SAME renders, smoothed over 160 ms: 1.22, 1.14, 1.20. Seven per cent.
+    //
+    // The envelope is identical. What is shorter is the first deep TROUGH: the partials
+    // of different notes beat against each other, and the more notes are held the sooner
+    // some trough goes far enough down to sound like the tail has ended. An instantaneous
+    // threshold crosses on that trough; the ear hears it as a short release.
+    //
+    // So this run asserts the thing that is actually a contract - the release RATE does
+    // not depend on how many keys are down - and PRINTS the instantaneous number beside
+    // it, because that is the one that changes and somebody reading this later needs to
+    // see both to know which was measured.
+    {
+        using Proc = FractalAdditiveAudioProcessor;
+        const double sr = 48000.0;
+        const int    blk = 256;
+
+        struct Tail { double instant = 0.0, smoothed = 0.0; float level = 0.0f; };
+        const auto tailOf = [&] (const std::vector<int>& notes) -> Tail
+        {
+            auto up = std::make_unique<Proc>();
+            auto& p = *up;
+            p.prepareToPlay (sr, blk);
+            const auto sp = [&] (const char* id, float v)
+            {
+                if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+                p.pollParametersForTests();
+            };
+            // A release long enough to time, and a sustain that is really held, so the
+            // level at key-up is the sustain and not some point on a decay.
+            sp ("ampAttack", 0.005f); sp ("ampDecay", 0.100f);
+            sp ("ampSustain", 0.8f);  sp ("ampRelease", 1.500f);
+
+            juce::AudioBuffer<float> b (2, blk);
+            const auto block = [&] (const juce::MidiBuffer& m) { auto mm = m; b.clear(); p.processBlock (b, mm); };
+            const auto rms = [&b, blk]
+            {
+                double s = 0.0;
+                for (int i = 0; i < blk; ++i) { const double v = b.getSample (0, i); s += v * v; }
+                return std::sqrt (s / blk);
+            };
+
+            { juce::MidiBuffer m;
+              for (int n : notes) m.addEvent (juce::MidiMessage::noteOn (1, n, 0.8f), 0);
+              block (m); }
+            for (int i = 0; i < 120; ++i) { juce::MidiBuffer e; block (e); }   // ~0.64 s: settled
+
+            double held = 0.0;
+            for (int i = 0; i < 8; ++i) { juce::MidiBuffer e; block (e); held = juce::jmax (held, rms()); }
+
+            { juce::MidiBuffer m;
+              for (int n : notes) m.addEvent (juce::MidiMessage::noteOff (1, n), 0);
+              block (m); }
+
+            Tail t;
+            t.level = (float) held;
+            const double target = held * 0.1;             // -20 dB
+            std::vector<double> recent (30, 1.0e9);       // ~0.16 s of history
+            int hitInstant = 0;
+            for (int blocks = 1; blocks < 1200; ++blocks) // up to ~6.4 s
+            {
+                juce::MidiBuffer e; block (e);
+                const double now = rms();
+                if (hitInstant == 0 && now <= target) hitInstant = blocks;
+                recent[(size_t) (blocks % 30)] = now;
+                double sm = 0.0; for (double v : recent) sm = juce::jmax (sm, v);
+                if (blocks > 30 && sm <= target)
+                {
+                    t.smoothed = (double) blocks * blk / sr;
+                    t.instant  = (double) (hitInstant > 0 ? hitInstant : blocks) * blk / sr;
+                    return t;
+                }
+            }
+            t.smoothed = t.instant = 1200.0 * blk / sr;
+            return t;
+        };
+
+        const Tail one   = tailOf ({ 60 });
+        const Tail three = tailOf ({ 60, 64, 67 });
+        const Tail six   = tailOf ({ 55, 59, 62, 65, 69, 72 });
+        std::printf ("    one note   %.3f s smoothed, %.3f s on an instant meter (level %.4f)\n",
+                     one.smoothed, one.instant, one.level);
+        std::printf ("    triad      %.3f s smoothed, %.3f s on an instant meter (level %.4f)\n",
+                     three.smoothed, three.instant, three.level);
+        std::printf ("    six notes  %.3f s smoothed, %.3f s on an instant meter (level %.4f)\n",
+                     six.smoothed, six.instant, six.level);
+
+        check (one.level > 1.0e-3f && three.level > 1.0e-3f && six.level > 1.0e-3f,
+               "all three chords are actually sounding before the keys come up");
+        const double worst = juce::jmax (std::abs (three.smoothed - one.smoothed),
+                                         std::abs (six.smoothed   - one.smoothed));
+        check (worst < 0.20 * one.smoothed,
+               "the release RATE does not depend on how many keys are down (within 20%)");
+        std::printf ("    worst difference in the envelope itself: %.3f s (%.1f%%); on the "
+                     "instant meter the six-note tail dips %.0f%% sooner, which is the beating\n",
+                     worst, 100.0 * worst / juce::jmax (1.0e-6, one.smoothed),
+                     100.0 * (1.0 - six.instant / juce::jmax (1.0e-6, one.instant)));
+    }
+
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
     // The editor draws value = shape(t, curve); this checks the engine agrees, that
     // the sustain node really sets the level, and that a second key retriggers from
