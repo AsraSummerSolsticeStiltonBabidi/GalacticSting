@@ -4719,6 +4719,10 @@ private:
     juce::String presetTextBeforeCornerEdit;
     juce::Rectangle<int> titleClickArea; // the title squares; clicking them plays the jingle
     juce::ToggleButton primeToggle[9];
+    // The PRIME CONTROL master switch. OFF by default and OFF means no prime filter of
+    // any kind - see prepareSettings, which writes the neutral settings rather than
+    // teaching the generator about a switch.
+    juce::ToggleButton primeOnToggle;
     // THE TRANSITION MODE - Off / Morph / Dry/Wet - as ONE dropdown where Morph and
     // Dry/Wet used to be two cells with two ON/OFF pills. It owns NO parameter: it is a
     // view of the "morph" and "dryWet" booleans, which are unchanged (see the constructor
@@ -5136,7 +5140,7 @@ private:
     std::unique_ptr<SliderAttachment>   ampAdsrAtt[4], filtAdsrAtt[4], pitchAdsrAtt[4];
     std::unique_ptr<ComboBoxAttachment> basePitchAtt,
                                         primeModeAtt, tuningAtt, bendAtt, tuningBankAtt;
-    std::unique_ptr<ButtonAttachment>   primeToggleAtt[9];
+    std::unique_ptr<ButtonAttachment>   primeToggleAtt[9], primeOnAtt;
     std::unique_ptr<SliderAttachment>   morphTimeAtt, dryWetTimeAtt;
 
     //== MONOPHONIC GLIDE (the PITCH tab of the shared envelope box) ============

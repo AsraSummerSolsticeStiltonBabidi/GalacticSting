@@ -1290,6 +1290,17 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     }
     // (octVal's and sprVal's hovers are written by applyLanguage() too - same reason.)
 
+    // THE PRIME CONTROL SWITCH. It sits on the mode row, to the right of Limit/Whitelist,
+    // in space that row was already wasting. Same colours as the nine tick boxes it
+    // governs, because it is the same control at a higher level.
+    primeOnToggle.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
+    primeOnToggle.setColour (juce::ToggleButton::tickColourId, cHarmonic);
+    primeOnToggle.setColour (juce::ToggleButton::tickDisabledColourId, cHarmonic.withAlpha (0.4f));
+    primeOnToggle.setMouseClickGrabsKeyboardFocus (false);
+    primeOnToggle.onClick = [this] { refocus(); resized(); };
+    addAndMakeVisible (primeOnToggle);
+    primeOnAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "primeOn", primeOnToggle);
+    addMapListener (primeOnToggle, "primeOn");
     configCombo (primeModeBox,  "primeMode",  primeModeAtt,  cHarmonic, "Limit = drop harmonics with a prime factor above the value.  Whitelist = only the ticked primes.");
     // Prime LIMIT as a FADER (so it can be driven by the modulators). The value is
     // the index into {Off, 2, 3, 5, 7, 11, 13, 17, 19, 23}, shown by name.
@@ -1328,6 +1339,20 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         primeToggleAtt[i] = std::make_unique<ButtonAttachment> (processorRef.apvts, "primeWL" + juce::String (i), primeToggle[i]);
         addMapListener (primeToggle[i], "primeWL" + juce::String (i));
         makeLabel (primeLbl[i], cHarmonic); primeLbl[i].setText (pn[i], juce::dontSendNotification);
+        // A 2 px border each side is right for a caption sitting in open panel space and
+        // wrong for these: nine of them share one cell width, so 4 px of border is 4 px
+        // the DIGITS do not get, and "11" was the string the whole window's legibility
+        // measurement stopped on - needing 14.6 px in the 14.0 the border left it. The
+        // cells are adjacent and each holds one short token under its own tick, so 1 px
+        // is enough to keep two neighbours from touching.
+        primeLbl[i].setBorderSize (juce::BorderSize<int> (0, 1, 0, 1));
+        // ...and out of the 12.5 px BOLD floor GalacticLnF::getLabelFont puts under every
+        // Label. That floor is right for a caption in open space and wrong for nine
+        // numbers sharing one cell width: "17" needs 14.6 px at 12.5 Bold and the cell is
+        // often 16, which is what the whole window's legibility measurement kept stopping
+        // on. Named "small" (the opt-out the LnF already documents), resized() then picks
+        // the size from the width the cell really has.
+        primeLbl[i].setName ("small");
     }
 
     configGroup (gFilter, cFilter);
@@ -1837,6 +1862,12 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             m.addItem (3, label, true, noteNamesOn);
             m.addItem (4, tr ("Note names: credits", "Noms de nota: cr\xc3\xa8" "dits"));
         }
+        // WHERE THE PRESETS ACTUALLY ARE. The Save dialog names the folder once and then
+        // it is gone; every other way of finding it means guessing at a path under
+        // Documents. This opens it in the file manager - and creates it first, because
+        // before the first save it does not exist and Explorer would answer a nonexistent
+        // path with an error box instead of a folder.
+        m.addItem (5, tr ("Open preset folder", "Obre la carpeta de presets"));
         m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (menuButton),
             [this] (int r)
             {
@@ -1916,6 +1947,17 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                                 "and drawing them would give empty boxes.\n\n"
                                 "Full licence texts: assets/fonts/NOTATION-LICENSES.txt"),
                         this);
+                }
+                else if (r == 5)
+                {
+                    // createDirectory() on a folder that already exists is a no-op that
+                    // returns ok, so there is no "does it exist" branch to get wrong -
+                    // and it is the SAME getPresetFolder() the save and load paths use,
+                    // so a test rig that redirected the folder opens the redirected one
+                    // rather than the user's.
+                    const auto dir = FractalAdditiveAudioProcessor::getPresetFolder();
+                    dir.createDirectory();
+                    dir.revealToUser();
                 }
                 refocus();
             });
@@ -3736,6 +3778,13 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         octVal.setTooltip (octTip);
         sprVal.setTooltip (sprTip);
     }
+    // The switch says ON because that is the state you are asking for when you click it,
+    // and the tooltip carries the part that is not obvious: OFF is not "limit 0" or "all
+    // primes ticked", it is no filter at all.
+    primeOnToggle.setButtonText (tr ("On", "Actiu"));
+    primeOnToggle.setTooltip (tr (
+        "Turns the whole prime filter on and off. OFF passes every harmonic, whichever mode and ticks are showing - it is not the same as ticking all nine primes, because a harmonic like 29 has a prime factor no tick can allow.",
+        "Activa i desactiva tot el filtre de primers. Desactivat deixa passar tots els harm\xc3\xb2nics, sigui quin sigui el mode i les caselles - no \xc3\xa9s el mateix que marcar els nou primers, perqu\xc3\xa8 un harm\xc3\xb2nic com el 29 t\xc3\xa9 un factor primer que cap casella pot permetre."));
     primeModeBox.setTooltip (tr (
         "How prime numbers filter the harmonics. 'Limit': a harmonic passes only if its largest prime factor is at most the chosen limit. 'Whitelist': it passes only if EVERY prime factor is ticked below.",
         "Com filtren els primers els harm\xc3\xb2nics. 'L\xc3\xadmit': un harm\xc3\xb2nic passa nom\xc3\xa9s si el seu factor primer m\xc3\xa9s gran \xc3\xa9s com a molt el l\xc3\xadmit triat. 'Llista': passa nom\xc3\xa9s si TOTS els seus factors primers estan marcats a sota."));
@@ -6180,8 +6229,13 @@ void FractalAdditiveAudioProcessorEditor::updateWarning (int templatePartials)
     // the old "selection" id returned NULLPTR and crashed the host on this very path.
     const float selAx    = ap.getRawParameterValue ("harmonics")->load();
     const bool  isPrime  = selAx > 2.5f;
-    const bool wl        = ap.getRawParameterValue ("primeMode")->load() > 0.5f;
-    const int  limitIdx  = (int) ap.getRawParameterValue ("primeLimit")->load();
+    // The switch first: with PRIME CONTROL off there is no prime filter acting, so a
+    // diagnosis that blames the whitelist or the limit is telling the user to go and
+    // change a control that is not doing anything. Read through the same gate the audio
+    // path uses (see prepareSettings) and the branches below stay true by construction.
+    const bool pon       = ap.getRawParameterValue ("primeOn")->load() > 0.5f;
+    const bool wl        = pon && ap.getRawParameterValue ("primeMode")->load() > 0.5f;
+    const int  limitIdx  = pon ? (int) ap.getRawParameterValue ("primeLimit")->load() : 0;
     unsigned mask = 0;
     for (int i = 0; i < 9; ++i)
         if (ap.getRawParameterValue ("primeWL" + juce::String (i))->load() > 0.5f)
@@ -6200,6 +6254,9 @@ void FractalAdditiveAudioProcessorEditor::updateWarning (int templatePartials)
     else if (isPrime && ! wl && limitIdx > 0)
         why = tr ("'Harmonics = Prime' keeps only prime harmonics, but the Prime Limit then removes every prime bigger than the limit - and your Base N starts the series above it.\n\nFix: raise the Prime Limit (or set it to Off), or lower Base N.",
                   "'Harm\xc3\xb2nics = Primers' nom\xc3\xa9s deixa harm\xc3\xb2nics primers, per\xc3\xb2 el L\xc3\xadmit de primers treu tot primer m\xc3\xa9s gran que el l\xc3\xadmit - i la teva Base N comen\xc3\xa7""a la s\xc3\xa8rie per sobre.\n\nSoluci\xc3\xb3: puja el L\xc3\xadmit de primers (o posa'l en No), o abaixa la Base N.");
+    else if (! pon)
+        why = tr ("Prime Control is OFF, so nothing is being filtered by primes - the Harmonics setting alone is removing every harmonic of the current Base N.\n\nFix: set Harmonics to 'All', or change Base N.",
+                  "El Control de primers est\xc3\xa0 desactivat, o sigui que els primers no filtren res - \xc3\xa9s nom\xc3\xa9s el filtre d'Harm\xc3\xb2nics el que treu tots els harm\xc3\xb2nics de la Base N actual.\n\nSoluci\xc3\xb3: posa Harm\xc3\xb2nics en 'Tots', o canvia la Base N.");
     else
         why = tr ("The Harmonics filter and the Prime Control filter, applied together, remove every harmonic of the current Base N.\n\nFix: relax either filter (Harmonics = All, or Prime Control = Off), or change Base N.",
                   "El filtre d'Harm\xc3\xb2nics i el de Control de primers, aplicats alhora, treuen tots els harm\xc3\xb2nics de la Base N actual.\n\nSoluci\xc3\xb3: relaxa qualsevol dels dos (Harm\xc3\xb2nics = Tots, o Control de primers = No), o canvia la Base N.");
@@ -6824,6 +6881,7 @@ void FractalAdditiveAudioProcessorEditor::recolourSpectrumControls (juce::Colour
     for (auto* l : { &lblBaseN, &lblBasePitch, &lblPrimeLimit, &lblTimbreRepeats, &lblTransTime })
         label (*l);
     for (int i = 0; i < 9; ++i) { tick (primeToggle[i]); label (primeLbl[i]); }
+    tick (primeOnToggle); // the same panel, one level up
     // TEMPER's tick used to be forced to the harmonic blue "because that is the engine it
     // hands the spectrum to" - which was the whole point when the two engines were two
     // boxes, and is now just one control refusing to join the panel it lives in.
@@ -7279,6 +7337,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("harm.basePitch",   basePitchBox);    add ("harm.pitchLbl",  lblBasePitch);
     add ("harm.harmonics",   harmonicsFader);
     add ("harm.primeMode",   primeModeBox);    add ("harm.primeLimit", primeLimitFader);
+    add ("harm.primeOn",     primeOnToggle);
     add ("harm.primeLimitLbl", lblPrimeLimit);
     add ("harm.prime0",      primeToggle[0]);  add ("harm.prime8",    primeToggle[8]);
     add ("harm.prime0Lbl",   primeLbl[0]);     add ("harm.prime8Lbl", primeLbl[8]);
@@ -8577,6 +8636,14 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // prime cell has to hold a mode box, nine tick boxes with their labels AND
             // that row, and the ticks came out 8 px tall - present, laid out, inside
             // their box, and far too small to hit.
+            //
+            // The half-and-half cap is NOT the thing to tune when the column is short.
+            // Serving prime first instead - it has four rows to harmonics' one - reads
+            // like the obvious improvement and measured 50 px WORSE (floor 590 -> 640):
+            // harmonics cannot shrink at all, because under its caption sits a fader
+            // whose own value label goes to negative height the moment the cell drops
+            // below label + 24 + inset. Tried, measured, reverted; the note is here so
+            // the next person does not spend the same hour.
             const int harmH = juce::jmin (midCol.getHeight() / 2, lblH + 24 + 6); // label + fader + its 3 px inset
             hcHarm      = midCol.withHeight (harmH);
             hcPrime     = midCol.withTrimmedTop (harmH);
@@ -8609,6 +8676,18 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 primeLimitFader.setVisible (! wl); lblPrimeLimit.setVisible (! wl);
                 for (int i = 0; i < 9; ++i) { primeToggle[i].setVisible (wl); primeLbl[i].setVisible (wl); }
 
+                // With the switch OFF the controls it governs are DIMMED, not removed.
+                // Hiding them would make the panel jump every time the switch is clicked
+                // and would leave the user with no idea what turning it on would do; a
+                // greyed control says both "this exists" and "it is not acting on your
+                // sound right now", which is exactly the state OFF describes.
+                {
+                    const bool pon = processorRef.apvts.getRawParameterValue ("primeOn")->load() > 0.5f;
+                    primeModeBox.setEnabled (pon);
+                    primeLimitFader.setEnabled (pon); lblPrimeLimit.setEnabled (pon);
+                    for (int i = 0; i < 9; ++i) { primeToggle[i].setEnabled (pon); primeLbl[i].setEnabled (pon); }
+                }
+
                 auto pi = hcPrime.reduced (5, 3); pi.removeFromTop (lblH);
                 // TEMPER, at the FOOT of the prime cell - reserved BEFORE the mode row
                 // and the primes, so the row that must never vanish cannot inherit the
@@ -8616,7 +8695,18 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // taller of them). Sized to its own words, like every other control in
                 // this pass: a tick box the width of a whole cell is not a tick box.
                 {
-                    auto tr2 = pi.removeFromBottom (20);
+                    // ...and it yields on HEIGHT by the same rule it already yields on
+                    // width. It used to take its 23 px unconditionally, which was free
+                    // while the cell below it held one Limit fader and stopped being free
+                    // the moment nine tick boxes with their numbers became the default:
+                    // the row under it then reached zero height, and a control with no
+                    // pixels is the structural fault that sets the whole window's minimum
+                    // size. Reserved only when what is left still holds the mode row and
+                    // a usable tick row - which is not a reversal of "reserved first", it
+                    // is the same promise: TEMPER is never the row that gets squashed.
+                    const int needBelow = 22 + 2 + (wl ? 24 : 22);
+                    const bool temperRoom = pi.getHeight() - 23 >= needBelow;
+                    auto tr2 = temperRoom ? pi.removeFromBottom (20) : juce::Rectangle<int>();
                     // Same rule as the tuning panel's fork buttons: a control that cannot
                     // show its word is HIDDEN, not squashed. A ToggleButton squeezed below
                     // its tick box has NEGATIVE room for its text - at 710x550 this one had
@@ -8625,27 +8715,74 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     // is still reachable everywhere the panel is wide enough to say what
                     // it does.
                     const int tw = fgfit::snugToggleWidth (temperToggle, 20);
-                    const bool temperFits = tw <= tr2.getWidth();
+                    const bool temperFits = temperRoom && tw <= tr2.getWidth();
                     temperToggle.setVisible (temperFits);
                     if (temperFits) temperToggle.setBounds (tr2.removeFromLeft (tw));
-                    pi.removeFromBottom (3);
+                    if (temperRoom) pi.removeFromBottom (3);
                 }
                 // Limit / Whitelist, at the width those two words need - not the whole
-                // cell. It held a 247 px box for a six-letter mode name.
+                // cell. It held a 247 px box for a six-letter mode name. The ON switch
+                // takes the space to its right, which that row was already wasting.
                 {
                     auto pmr = pi.removeFromTop (22);
                     compact (primeModeBox, pmr.removeFromLeft (
                                  juce::jmin (fgfit::snugComboWidth (primeModeBox, 22), pmr.getWidth())));
+                    // Hidden rather than squashed, by the same rule as TEMPER above: a
+                    // ToggleButton with no room for its word is an unlabelled tick that
+                    // silently filters the whole spectrum. When it will not fit, the
+                    // panel is too narrow to be operated anyway - and OFF, its default,
+                    // is the state in which nothing is being hidden from the user.
+                    pmr.removeFromLeft (6);
+                    const int ow = fgfit::snugToggleWidth (primeOnToggle, 20);
+                    const bool onFits = ow <= pmr.getWidth();
+                    primeOnToggle.setVisible (onFits);
+                    if (onFits)
+                        primeOnToggle.setBounds (pmr.removeFromRight (ow).withSizeKeepingCentre (ow, 20));
                 }
                 pi.removeFromTop (2);
                 if (wl)
                 {
-                    const int tw = pi.getWidth() / 9;
+                    // Nine cells out of a width that is almost never a multiple of nine.
+                    // The integer division threw the remainder away - up to 8 px, which
+                    // is more than half a digit at the size these labels are drawn - so
+                    // the first (w % 9) cells take one pixel more and the row ends flush
+                    // with the panel instead of short of it.
+                    const int wAll = pi.getWidth();
+                    const int tw   = wAll / 9;
+                    const int extra = wAll - tw * 9;
+                    // ...and the two of them SHARE the height instead of one taking a
+                    // fixed 13 and the other whatever is left. That subtraction went
+                    // negative in a short window and handed the tick box a height of
+                    // ZERO - a visible control with no pixels, which is the structural
+                    // fault the rig refuses to floor on, and it cost the whole window
+                    // 60 px of minimum height the moment Whitelist became the default
+                    // mode. Now the tick keeps 10 px before the number gives any back,
+                    // and neither ever reaches zero.
+                    const int rowH = juce::jmax (1, pi.getHeight());
+                    const int lblRowH = juce::jlimit (1, 13, rowH - 10);
+                    // The number SHRINKS TO ITS CELL rather than stepping through sizes
+                    // somebody picked by eye. Measured at a reference size and scaled:
+                    // two digits at 12.5 Bold need 14.6 px, the cell is often 16 and was
+                    // 13 at the width where the window's legibility measurement stopped -
+                    // first on "11", then on "17", then on "19", which is the signature of
+                    // a fixed size meeting a variable box. Floored at 8 so it never
+                    // becomes decoration, capped at 12.5 so a roomy panel looks exactly
+                    // as it did.
+                    const juce::Font ref (juce::FontOptions (10.0f).withStyle ("Bold"));
+                    float widest = 1.0f;
+                    for (int i = 0; i < 9; ++i)
+                        widest = juce::jmax (widest, juce::GlyphArrangement::getStringWidth (
+                                                         ref, primeLbl[i].getText()));
+                    const float pf = juce::jlimit (8.0f, 12.5f,
+                                                   10.0f * (float) juce::jmax (1, tw - 2) / widest);
                     for (int i = 0; i < 9; ++i)
                     {
-                        auto cell = pi.removeFromLeft (tw);
-                        primeLbl[i].setBounds (cell.removeFromBottom (13));
-                        primeToggle[i].setBounds (cell.withSizeKeepingCentre (juce::jmin (22, tw), juce::jmin (22, cell.getHeight())));
+                        const int cw = tw + (i < extra ? 1 : 0);
+                        auto cell = pi.removeFromLeft (cw);
+                        primeLbl[i].setFont (juce::Font (juce::FontOptions (pf).withStyle ("Bold")));
+                        primeLbl[i].setBounds (cell.removeFromBottom (lblRowH));
+                        primeToggle[i].setBounds (cell.withSizeKeepingCentre (
+                            juce::jmin (22, cw), juce::jmax (1, juce::jmin (22, cell.getHeight()))));
                     }
                 }
                 else
@@ -8666,6 +8803,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // as "draw no harmonic dividers or sub-labels".
             hcBase = hcHarm = hcPrime = {};
             primeLimitFader.setVisible (false); lblPrimeLimit.setVisible (false);
+            primeOnToggle.setVisible (false); // the switch belongs to the harmonic view too
             for (int i = 0; i < 9; ++i) { primeToggle[i].setVisible (false); primeLbl[i].setVisible (false); }
 
             auto ci = engineBoxBounds.reduced (6, 0);
@@ -10662,7 +10800,12 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     if (packed != lastResetOffState) { lastResetOffState = packed; resized(); }
     refreshSpectrumTuningButton(); // cheap (sig-guarded): keeps word/enabled honest per tick
 
-    const int mode = (int) (processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f);
+    // Both halves of PRIME CONTROL change what resized() lays out - the mode picks which
+    // sub-controls exist, the switch dims them - and NEITHER change arrives through a
+    // click when it comes from host automation, a preset load or an undo. Packed into
+    // one int and compared, which is what the mode alone already did.
+    const int mode = (int) (processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f)
+                   | (processorRef.apvts.getRawParameterValue ("primeOn")->load() > 0.5f ? 2 : 0);
     if (mode != lastPrimeMode) { lastPrimeMode = mode; resized(); }
 
     if (processorRef.getDissGeneration() != lastDissGeneration)

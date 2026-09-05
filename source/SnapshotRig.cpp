@@ -881,12 +881,28 @@ namespace
         return false;
     }
 
+    // WHAT STOPPED IT, not just that something did.
+    //
+    // The legibility probe below has named its blocker since the day it was written, and
+    // this one - the STRUCTURAL floor, the number the whole photograph matrix is sized
+    // from - answered a bare true/false. When the floor moved 60 px on a one-line change
+    // of default there was nothing to read: the only way to attribute it was to rebuild
+    // with the old default and difference two numbers. It says so now.
+    juce::String gWhyNotLaidOut;
+
     bool laysOut (Ed& ed, bool catalan)
     {
+        const auto note = [] (const juce::String& s) { gWhyNotLaidOut = s; return false; };
+        const auto rectStr = [] (juce::Rectangle<int> r)
+        {
+            return juce::String (r.getX()) + "," + juce::String (r.getY()) + " "
+                 + juce::String (r.getWidth()) + "x" + juce::String (r.getHeight());
+        };
         const auto win = ed.getLocalBounds();
         const auto L   = ed.layoutProbe();
         for (const auto& c : L.controls)
-            if (c.second.getWidth() <= 0 || c.second.getHeight() <= 0) return false;
+            if (c.second.getWidth() <= 0 || c.second.getHeight() <= 0)
+                return note ("control \"" + c.first + "\" has no pixels (" + rectStr (c.second) + ")");
         // ...AND NO CONTROL IS SMALLER THAN ITS OWN CHROME.
         //
         // The predicate used to ask only whether a rectangle was positive, which is a
@@ -901,13 +917,21 @@ namespace
         // ...in the language the search is currently walking: measuring English widths
         // during the Catalan pass would certify a size Catalan does not lay out at.
         for (const auto& f : ed.textFitProbeForTests (catalan))
-            if (f.avail < 0.0f || f.availH < 0.0f) return false;
+            if (f.avail < 0.0f || f.availH < 0.0f)
+                return note (f.path + " (" + f.kind + ") \"" + f.text + "\" has negative room: "
+                             + juce::String (f.avail, 1) + " wide by "
+                             + juce::String (f.availH, 1) + " tall");
         const juce::Rectangle<int> boxes[] = { L.spectrum, L.essentials, L.tuning,
                                                L.envelopes, L.specColumn };
-        for (const auto& b : boxes)
-            if (b.isEmpty() || ! win.contains (b)) return false;
-        if (L.spectrum.intersects (L.essentials) || L.spectrum.intersects (L.tuning)) return false;
-        if (L.keysDrawn.isEmpty()) return false;
+        const char* boxNames[] = { "spectrum", "essentials", "tuning", "envelopes", "specColumn" };
+        for (int i = 0; i < 5; ++i)
+            if (boxes[i].isEmpty() || ! win.contains (boxes[i]))
+                return note (juce::String ("panel ") + boxNames[i]
+                             + (boxes[i].isEmpty() ? " is empty" : " is outside the window")
+                             + " (" + rectStr (boxes[i]) + " in " + rectStr (win) + ")");
+        if (L.spectrum.intersects (L.essentials)) return note ("the spectrum panel overlaps Essentials");
+        if (L.spectrum.intersects (L.tuning))     return note ("the spectrum panel overlaps Tuning");
+        if (L.keysDrawn.isEmpty())                return note ("no keyboard is drawn");
         return true;
     }
 
@@ -922,21 +946,24 @@ namespace
             // A full 2-D search would be more thorough and is not what this number is for:
             // it names ONE small size worth photographing, and it has to be reproducible.
             int w = start.w;
+            juce::String whyW, whyH;
             for (int trial = start.w; trial >= 640; trial -= 10)
             {
                 ed.setSize (trial, start.h);
-                if (! laysOut (ed, lang == 1)) break;
+                if (! laysOut (ed, lang == 1)) { whyW = gWhyNotLaidOut; break; }
                 w = trial;
             }
             int h = start.h;
             for (int trial = start.h; trial >= 360; trial -= 10)
             {
                 ed.setSize (w, trial);
-                if (! laysOut (ed, lang == 1)) break;
+                if (! laysOut (ed, lang == 1)) { whyH = gWhyNotLaidOut; break; }
                 h = trial;
             }
             say (juce::String ("  smallest laid-out size (") + (lang == 1 ? "ca" : "en") + "): "
                  + juce::String (w) + " x " + juce::String (h));
+            if (whyW.isNotEmpty()) say ("    width stops there because: " + whyW);
+            if (whyH.isNotEmpty()) say ("    height stops there because: " + whyH);
             // The LARGER of the two languages is the product's floor: a size English lays
             // out and Catalan does not is not a size this instrument can be shown at.
             best.w = juce::jmax (best.w, w);

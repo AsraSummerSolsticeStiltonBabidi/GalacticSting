@@ -1122,6 +1122,7 @@ static const char* kParamBaseline[] = {
     "pgY",
     "pgMode",
     "pgVoices",
+    "primeOn",
 };
 
 int main (int argc, char** argv)
@@ -15990,6 +15991,79 @@ int main (int argc, char** argv)
                          rep->crestChosen, rep->crestHash);
             }
         }
+    }
+
+    //-- run 57: PRIME CONTROL'S ON/OFF SWITCH ---------------------------------------
+    //
+    // "PON UN BOTON DE ON/OFF, Y QUE POR DEFECTO ESTE EN MODO WHITELIST Y APAGADO."
+    //
+    // The switch has to mean something stronger than "the neutral position of the
+    // controls below it", because there ISN'T one for the whitelist: ticking all nine
+    // primes still drops harmonic 29, whose prime factor no tick can allow. So OFF is
+    // its own state, and this measures it the only way that cannot be faked - by
+    // counting the partials the engine actually built.
+    //
+    // The setup is deliberately the CRUELLEST one: whitelist mode with every prime
+    // UNTICKED. On, that keeps only harmonic 1; off, it must keep the whole spectrum.
+    // Sabotage-checked: deleting the bypass in prepareSettings makes the two counts
+    // equal (1 and 1) and this run fails on its first check.
+    {
+        std::printf ("\nrun 57: PRIME CONTROL off means no prime filter at all:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 256);
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            p->pollParametersForTests();
+        };
+
+        // The DEFAULTS the user asked for, read from the plugin rather than assumed.
+        check (p->apvts.getRawParameterValue ("primeOn")->load() < 0.5f,
+               "  it ships OFF");
+        check (p->apvts.getRawParameterValue ("primeMode")->load() > 0.5f,
+               "  ...and in Whitelist mode");
+
+        awaitSpectrumIdle (*p, "run 57: the default template");
+        const int nDefault = p->getTemplatePartialCount();
+
+        for (int i = 0; i < 9; ++i) sp (("primeWL" + juce::String (i)).toRawUTF8(), 0.0f);
+        awaitSpectrumIdle (*p, "run 57: whitelist emptied, switch still off");
+        const int nOffEmptyWl = p->getTemplatePartialCount();
+
+        sp ("primeOn", 1.0f);
+        awaitSpectrumIdle (*p, "run 57: switch on, whitelist empty");
+        const int nOnEmptyWl = p->getTemplatePartialCount();
+
+        std::printf ("    partials: default %d, switch OFF with no prime ticked %d,"
+                     " switch ON with no prime ticked %d\n",
+                     nDefault, nOffEmptyWl, nOnEmptyWl);
+
+        check (nOffEmptyWl == nDefault && nDefault > 100,
+               "  untick every prime with the switch OFF and NOTHING is filtered");
+        check (nOnEmptyWl < nDefault / 10,
+               "  ...turn the switch ON and the same ticks bite hard");
+
+        // The switch is a switch, not a latch: back OFF restores the spectrum. Without
+        // this the two checks above would pass on a build where turning it on was
+        // irreversible until the next preset load.
+        sp ("primeOn", 0.0f);
+        awaitSpectrumIdle (*p, "run 57: switch off again");
+        check (p->getTemplatePartialCount() == nDefault,
+               "  ...and OFF again gives the whole spectrum back");
+
+        // The LIMIT half of the panel, through the same switch. Limit 2 is the harshest
+        // stop on that fader and it must be just as inert while the panel is off - the
+        // bypass zeroes the limit and its blend, not only the whitelist flag.
+        sp ("primeMode", 0.0f);          // Limit
+        sp ("primeLimit", 9.0f);         // the "2" stop: only powers of two survive
+        awaitSpectrumIdle (*p, "run 57: limit 2, switch off");
+        const int nOffLimit = p->getTemplatePartialCount();
+        sp ("primeOn", 1.0f);
+        awaitSpectrumIdle (*p, "run 57: limit 2, switch on");
+        const int nOnLimit = p->getTemplatePartialCount();
+        std::printf ("    limit-2 mode: switch OFF %d partials, switch ON %d\n", nOffLimit, nOnLimit);
+        check (nOffLimit == nDefault, "  the LIMIT fader is inert too while the panel is off");
+        check (nOnLimit < nDefault / 4, "  ...and bites when it is on");
     }
 
 

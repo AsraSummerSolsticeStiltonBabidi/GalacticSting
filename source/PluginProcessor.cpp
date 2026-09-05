@@ -136,9 +136,14 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "primeLimit", 1 }, "Prime Limit",
         NormalisableRange<float> (0.0f, 9.0f, 0.01f), 0.0f));
+    // Default WHITELIST, not Limit ("por defecto que este en modo whitelist"). It is the
+    // mode that SHOWS what it is doing - nine ticks you can read at a glance - where
+    // Limit is a single number whose meaning ("largest prime factor allowed") has to be
+    // known in advance. It costs nothing to default to: primeOn ships OFF, so neither
+    // mode filters anything until the user turns the panel on.
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "primeMode", 1 }, "Prime Mode",
-        StringArray { "Limit", "Whitelist" }, 0));
+        StringArray { "Limit", "Whitelist" }, 1));
     {
         const char* pn[] = { "2","3","5","7","11","13","17","19","23" };
         for (int i = 0; i < spectrum::primeListSize; ++i)
@@ -620,6 +625,22 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "pgVoices", 1 }, "Mix Voices per Corner", 1, 32, 8));
 
+    // PRIME CONTROL, ON AND OFF. "PON UN BOTON DE ON/OFF... POR DEFECTO WHITELIST Y
+    // APAGADO."
+    //
+    // Until now the only way to have no prime filtering was to know that the LIMIT
+    // fader's leftmost stop is called "Off" - which does nothing at all for the OTHER
+    // mode, because a whitelist with every prime ticked is still a filter: harmonic 29
+    // has a prime factor nobody can tick, and it was being dropped by a control the user
+    // never touched. So the panel gets its own switch, and OFF means the spectrum sees
+    // no prime filter of any kind (see prepareSettings, where it forces the neutral
+    // state rather than relying on any particular fader position).
+    //
+    // Appended at the END of the list on purpose: a host's automation lanes are indexed,
+    // and inserting this next to its neighbours would renumber every parameter after it.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "primeOn", 1 }, "Prime Control On", false));
+
     return { params.begin(), params.end() };
 }
 
@@ -688,6 +709,20 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::settingsFromValues (
         if (get (("primeWL" + juce::String (i)).toRawUTF8()) > 0.5f)
             mask |= (1u << i);
     s.primeWhitelistMask = mask;
+
+    // OFF MEANS OFF, in both modes and whatever the fader and the ticks happen to say.
+    // Written as the NEUTRAL SETTINGS rather than as a branch inside the generator, so
+    // exactly one place decides what "no prime filter" is: limit 0 (which primeLimitOk()
+    // passes unconditionally), no blend towards a next stop, and the whitelist path not
+    // taken. Nothing downstream has to know the switch exists.
+    if (get ("primeOn") <= 0.5f)
+    {
+        s.primeUseWhitelist  = false;
+        s.primeLimit         = 0;
+        s.primeLimitNext     = 0;
+        s.primeLimitPos      = 0.0f;
+        s.primeWhitelistMask = 0xFFFFFFFFu;
+    }
 
     s.fractalLevel   = get ("fractalLevel");
     s.spectrumRangeOct = (int) get ("spectrumRange");
