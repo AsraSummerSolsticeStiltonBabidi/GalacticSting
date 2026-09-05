@@ -1123,6 +1123,36 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // unreachable, which is what made it feel coarse and jumpy.
     harmonicsFader.normalSensitivity = 480;
     harmonicsFader.snapWindow = 0.06;
+    // THE NUMBER UNDER BASE SAYS WHAT IT IS. It used to read "1", "2", "7" - a bare
+    // number under a bare "N", which tells a reader nothing about what it selects. It is
+    // the harmonic the spectrum is built from, so it says so: "1st harmonic", "7th
+    // harmonic", and in Catalan the noun first with the ordinal on the number.
+    //
+    // Through tr(), not through juce::String(const char*): the Catalan needs an accent,
+    // and a raw literal is read as Latin-1 and comes out "harmA-2nic". The mojibake gate
+    // caught exactly that, 22 times.
+    baseNFader.textFromValueFunction = [this] (double v)
+    {
+        const int n = juce::jmax (1, (int) std::lround (v));
+        if (catalan)
+        {
+            // The ordinal letters are not translations - they are Catalan spelling. Wrapping
+            // each one in a translation pair just to get the ACCENT decoded invented three
+            // pairs whose two halves were identical, and the source audit rightly called
+            // them out. Only the two pieces that actually carry an accent are decoded, and
+            // this comment deliberately avoids spelling the call out: the audit greps the
+            // SOURCE, so an example in a comment is a finding.
+            const char* plain = n == 1 ? "r" : n == 2 ? "n" : n == 3 ? "r" : n == 4 ? "t" : nullptr;
+            return tr ("harmonic ", "harm\xc3\xb2nic ") + juce::String (n)
+                 + (plain != nullptr ? juce::String (plain)
+                                     : juce::String::fromUTF8 ("\xc3\xa8"));
+        }
+        const int t = n % 10, h = n % 100;
+        const char* suf = (t == 1 && h != 11) ? "st"
+                        : (t == 2 && h != 12) ? "nd"
+                        : (t == 3 && h != 13) ? "rd" : "th";
+        return juce::String (n) + suf + " harmonic";
+    };
     harmonicsFader.textFromValueFunction = [this] (double v)
     {
         const juce::String names[] = { tr ("Even", "Parells"), tr ("All", "Tots"),
@@ -1429,7 +1459,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         }
         makeLabel (lblLfoDiv, cCustom);   lblLfoDiv.setText ("Div", juce::dontSendNotification);
         makeLabel (lblLfoHz, cCustom);    lblLfoHz.setText ("Hz", juce::dontSendNotification);
-        makeLabel (lblLfoPhase, cCustom); lblLfoPhase.setText ("Ph", juce::dontSendNotification);
+        makeLabel (lblLfoPhase, cCustom); lblLfoPhase.setText ("Phase", juce::dontSendNotification);
 
         modSelBox.addItem ("Env 1", 1); modSelBox.addItem ("Env 2", 2); modSelBox.addItem ("Env 3", 3);
         modSelBox.addItem ("LFO 1", 4); modSelBox.addItem ("LFO 2", 5); modSelBox.addItem ("LFO 3", 6);
@@ -2181,7 +2211,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // the segment picker.
     specModeBox.addItem ("Find tunings based on beating", 1);
     specModeBox.addItem ("Adapt spectrum to tuning based on beating", 2);
-    specModeBox.addItem ("From spectrum's segment", 3);
+    specModeBox.addItem ("Find tunings from spectrum's segment", 3);
     tuneSourceBox.addItem ("From current tuning", 1);
     // "all tunings", not "all possible tunings": see applyLanguage() for why the word
     // this box could not afford is the one that was adding nothing.
@@ -3250,6 +3280,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // ...AND THE FOUR IN THE MODULATORS PANEL, which the same sweep found in the custom
     // view: the box that says WHICH modulator you are editing, and the three that shape
     // an LFO. A phrase like "Fundamental / 2^n" names a rule without saying what it does.
+    lblLfoPhase.setText (tr ("Phase", "Fase"), dontSendNotification);
     modSelBox.setTooltip (tr (
         "WHICH modulator these controls edit. Env 1-3 are envelopes (they follow a note); "
         "LFO 1-3 run continuously. Each keeps its own targets and settings.",
@@ -3631,7 +3662,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // tuning Load, so the pair reads as two destinations for one kind of file.
     refreshCustomEngineButtons();
     savePresetButton.setButtonText (tr ("Save", "Desa"));
-    playgroundButton.setButtonText (tr ("Open Preset Playground", "Obre el Laboratori de Presets"));
+    playgroundButton.setButtonText (tr ("Preset Playground", "Laboratori de Presets"));
     playgroundButton.setTooltip (tr (
         "Put up to four presets on the corners of a rectangle and drag a point between them: everything you hear morphs, including !across engines! (a custom scale on one corner and the harmonic engine on another blend their compiled PARTIALS, because their knobs have nothing in common to average).\nThe point is two automatable parameters, so a move recorded in the DAW plays back with the window shut.\n!The tuning is never touched! - mode, scale, reference A, octave and bend range all stay exactly as you left them.",
         "Posa fins a quatre presets a les cantonades d'un rectangle i arrossega un punt entre ells: tot el que sents es transforma, !fins i tot entre motors! (una escala pr\xc3\xb2pia a una cantonada i el motor harm\xc3\xb2nic a una altra barregen els seus PARCIALS compilats, perqu\xc3\xa8 els seus controls no tenen res en com\xc3\xba per promitjar).\nEl punt s\xc3\xb3n dos par\xc3\xa0metres automatitzables, o sigui que un moviment gravat al DAW es reprodueix amb la finestra tancada.\n!L'afinaci\xc3\xb3 no es toca mai! - mode, escala, refer\xc3\xa8ncia A, octava i rang de bend queden exactament com els tenies."));
@@ -3898,7 +3929,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         specModeBox.changeItemText (1, tr ("Find tunings based on beating", "Troba afinacions pel batec"));
         specModeBox.changeItemText (2, tr ("Adapt spectrum to tuning based on beating",
                                            "Adapta l'espectre a l'afinaci\xc3\xb3 pel batec"));
-        specModeBox.changeItemText (3, tr ("From spectrum's segment", "Del segment de l'espectre"));
+        specModeBox.changeItemText (3, tr ("Find tunings from spectrum's segment",
+                                         "Troba afinacions del segment de l'espectre"));
         specModeBox.setSelectedId (keepMode, juce::dontSendNotification);
     }
     // THE SOURCE, IN THE WORDS THE BOX CAN AFFORD.
@@ -6961,7 +6993,7 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
             add ("eng.base",  tr ("BASE", "BASE"),                     band (hcBase),  cPanel);
             add ("eng.harm",  tr ("HARMONICS", "HARM\xc3\x92NICS"),    band (hcHarm),  cPanel);
             // PRIME sits right under the shared divider -> nudge it down for air.
-            add ("eng.prime", tr ("PRIME", "PRIMERS"), band (hcPrime.translated (0, 5)), cPanel);
+            add ("eng.prime", tr ("PRIME CONTROL", "CONTROL DE PRIMERS"), band (hcPrime.translated (0, 5)), cPanel);
         }
         if (! bothEnginesBounds.isEmpty())
         {
