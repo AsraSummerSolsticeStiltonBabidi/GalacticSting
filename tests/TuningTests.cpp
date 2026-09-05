@@ -1145,6 +1145,69 @@ int main()
         }
     }
 
+    //== THE CENTS PRINTED ON A KEY ARE THE SCALE'S, NOT 12-TET'S ==================
+    //
+    // "ESTOY USANDO 31ED2 Y LOS VALORES EN CENTS QUE ME SALEN EN LAS TECLAS NO TIENEN
+    //  SENTIDO, ME DICE VALORES DE 100 EN 100 EN LAS PRIMERAS TECLAS, CUANDO DEBERIAN
+    //  AUMENTAR DE 30 Y PICO EN 30 Y PICO... EL SONIDO ESTABA BIEN, ERA LA REPRESENTACION
+    //  EN CENTS, EL NUMERO DE TECLAS POR PERIODO ERA CORRECTO, 31."
+    //
+    // The key labels come from degreeRatio(), the same call the chord search, the
+    // dissonance lists and the .scl export all read - so if it answers 12-TET while the
+    // sound is right, four separate readouts are lying at once and only the loudest one
+    // got noticed. Measured here on BOTH ways a 31ed2 can arrive: as a .scl (a real
+    // degree list) and as an AnaMark .tun (128 absolute keys, no degree list at all),
+    // because those take different branches inside degreeRatio().
+    {
+        std::printf ("\ndegree cents for 31ed2, both ways it can be loaded:\n");
+        const double step = 1200.0 / 31.0;
+
+        const auto degreeCents = [] (const TuningManager& t, int d)
+        { return 1200.0 * std::log2 (juce::jmax (1.0e-12, t.degreeRatio (d))); };
+
+        const auto report = [&] (TuningManager& t, const char* how)
+        {
+            std::printf ("  %-22s %d degrees/period, first six:", how, t.degreesPerPeriod());
+            for (int d = 0; d < 6; ++d) std::printf (" %.1f", degreeCents (t, d));
+            std::printf ("  (a step is %.1f)\n", step);
+            check (t.degreesPerPeriod() == 31, (juce::String (how) + ": 31 degrees per period").toRawUTF8());
+            double worst = 0.0; int worstD = 0;
+            for (int d = 1; d <= 31; ++d)
+            {
+                const double err = std::abs (degreeCents (t, d) - step * (double) d);
+                if (err > worst) { worst = err; worstD = d; }
+            }
+            std::printf ("    worst degree error: %.4f cents at degree %d\n", worst, worstD);
+            check (worst < 0.05,
+                   (juce::String (how) + ": every degree's cents are the scale's own, "
+                    "not a 12-TET semitone grid").toRawUTF8());
+        };
+
+        juce::String err;
+        {
+            // As a .scl: 31 cents values, written the way Scala Workshop writes them.
+            juce::String scl ("! 31ed2.scl\n!\n31 equal divisions of the octave\n 31\n!\n");
+            for (int d = 1; d <= 31; ++d) scl << " " << juce::String (step * (double) d, 6) << "\n";
+            TuningManager t;
+            check (t.loadScalaString (scl, "31ed2.scl", err), "a 31ed2 .scl loads");
+            t.setMode (TuningManager::Mode::Scala);
+            report (t, ".scl degree list");
+        }
+        {
+            // As a .tun: 128 absolute keys and no degree list. degreeRatio() takes its
+            // OTHER branch here - it reads the key the degree lands on - and that branch
+            // is the one a 12-TET answer would come out of.
+            juce::String tun ("[Tuning]\n");
+            for (int k = 0; k < 128; ++k)
+                tun << "note " << k << "=" << juce::String (step * (double) (k - 60), 6) << "\n";
+            TuningManager t;
+            check (t.loadTunString (tun, "31ed2.tun", err), "a 31ed2 .tun loads");
+            t.setMode (TuningManager::Mode::Scala);
+            std::printf ("  (.tun held as an absolute table: %d)\n", (int) t.usesAbsoluteTable());
+            report (t, ".tun absolute table");
+        }
+    }
+
     std::printf ("\n%s (%d failure%s)\n", failures == 0 ? "ALL PASSED" : "FAILURES",
                  failures, failures == 1 ? "" : "s");
     return failures == 0 ? 0 : 1;

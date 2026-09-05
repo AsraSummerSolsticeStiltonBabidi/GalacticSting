@@ -575,6 +575,10 @@ public:
         bool equalStep = false;       // rows shown as "any +n" offsets rather than degrees
     };
     NadShownProbe nadShownProbeForTests() const;
+    // ...and whether that list is ON SCREEN at all. The recompute behind it is gated on
+    // exactly this ("nadView.isVisible()"), so a test that reads the rows without
+    // reading this cannot tell a list that is right from a list nobody can see.
+    bool degreeListShownForTests() const { return nadView.isVisible(); }
 
     // Test hooks (RhythmVerify): drive the Spectrum-vs-Tuning panel the way a hand does -
     // pick a mode, pick the adaptation's target, press REALTIME - and read back what the
@@ -655,6 +659,7 @@ public:
     // Find/REALTIME pair, and the adaptation's "between lo hi" row). Both exist only in
     // one branch of resized(), so a layout sweep cannot reach them any other way.
     void setTuneSourceForTests (int id);
+    void setChordNotesForTests (int n);
     void setAdaptGoalForTests (int id);
     void setPeriodTextForTests (const juce::String& t);
     void pressAdaptRealtimeForTests();
@@ -1563,7 +1568,6 @@ private:
     {
         struct Row { std::vector<juce::String> notes; double value = 0.0; };
         std::vector<Row> rows;
-        juce::String tip;
         juce::String emptyText { "Press Find to search.\nhover a row to hear it\ndouble-click loads it as the scale" };
         std::function<void (int)> onPlay, onLoad, onHover; // onHover(-1) = pointer left
         // No play column any more (hover sounds it), so the notes get that space.
@@ -1591,7 +1595,30 @@ private:
             for (const int w : columnWidths()) total += w + kGapW;
             return total + 2;
         }
-        juce::String getTooltip() override { return tip; }
+        // THE HOVER OVER A FOUND TUNING SAYS TWO THINGS. "AL PASAR EL RATON POR ENCIMA
+        // DE UN TUNING ENCONTRADO QUE SOLO PONGA DOBLE CLIC PARA CARGAR Y EL VALOR DE
+        // DISONANCIA TOTAL DEL CONJUNTO, NO TODO LO DEMAS."
+        //
+        // The list used to answer with the panel's paragraph - how the search works, what
+        // Sethares is, what Play does - which is the right text for the button that
+        // STARTS a search and the wrong one for the twelfth row of its results. Over a
+        // row it is now what you can do with that row and what that row scored; off the
+        // rows (the empty area under a short list) it is still the panel's explanation,
+        // because there the question really is "what is this list".
+        juce::String tip;
+        juce::String rowTipLoad, rowTipValue;   // written by applyLanguage()
+        juce::String getTooltip() override
+        {
+            const auto p = getMouseXYRelative();
+            const int row = p.y / kRowH;
+            if (! getLocalBounds().contains (p) || row < 0 || row >= (int) rows.size())
+                return tip;
+            // Four decimals: the values this search separates differ in the third and
+            // fourth, and a rounded read-out would show two neighbouring results as the
+            // same number - which is exactly the comparison the hover exists to serve.
+            return rowTipLoad + "\n" + rowTipValue + " "
+                 + juce::String (rows[(size_t) row].value, 4);
+        }
         static juce::Colour noteColour (int k)
         {
             static const juce::uint32 pal[] = { 0xffe0453f, 0xffffc95c, 0xff4fe09a, 0xff4fe6ff,
@@ -2582,9 +2609,23 @@ private:
             // A reader had no way to tell which control belonged with which.  Each group
             // gets a frame in its own section colour now, and the two SHORT ones share a
             // row, which is where the space for the routing list below comes from.
-            const auto section = [&r] (juce::Label& hdr, int contentH, juce::Rectangle<int>& boxOut)
+            // A BOX ENDS WHERE ITS CONTENTS END. "LAS DOS PRIMERAS CAJAS TIENEN ESPACIO
+            // VACIO A LA DERECHA, RELLENALO COMO DAW TEMPO / NOTE START, O ACORTALAS."
+            //
+            // Every section used to take the full row whatever it held, so PULSE RATE -
+            // two captions and six stepper buttons, 272 px of controls - was drawn as a
+            // framed box a thousand pixels wide with seven hundred of nothing in it. A
+            // frame is a claim about what belongs together; a frame around empty space
+            // claims there is something there. contentW is what the caller's own controls
+            // measure to, and the box is trimmed to it - floored so a narrow panel never
+            // produces a sliver, and capped at the row so it can only ever shrink.
+            const auto section = [&r] (juce::Label& hdr, int contentH,
+                                       juce::Rectangle<int>& boxOut, int contentW = 0)
             {
                 auto box = r.removeFromTop (13 + 3 + contentH + 8);
+                if (contentW > 0)
+                    box = box.withWidth (juce::jlimit (juce::jmin (200, box.getWidth()),
+                                                       box.getWidth(), contentW + 16));
                 boxOut = box;
                 auto in = box.reduced (8, 4);
                 hdr.setBounds (in.removeFromTop (13));
@@ -2597,11 +2638,19 @@ private:
             // out (to DAW)" reads as an answer before its question, and every other
             // caption in this build sits above the control it names.
             {
-                auto in = section (secPlay, 13 + 26 + 4 + 24, playBox);
-                auto capRow = in.removeFromTop (13);
-                auto pills  = in.removeFromTop (26);
+                // Both rows measured, and the box takes the WIDER of them: the pills row
+                // (two captioned pills and the drone toggle) and the feedback row (its
+                // toggle, its caption and a 240 px fader). Whichever is longer is what
+                // this section actually occupies.
                 const int w1 = juce::jmax (118, fgfit::labelWidth (outLbl));
                 const int w2 = juce::jmax (140, fgfit::labelWidth (selfLbl));
+                const int pillsNeed = w1 + 14 + w2 + 16 + fgfit::toggleWidth (droneT);
+                const int fbNeed    = juce::jmax (160, fgfit::toggleWidth (feedbackT))
+                                    + 8 + juce::jmax (54, fgfit::labelWidth (feedbackLbl)) + 6 + 240;
+                auto in = section (secPlay, 13 + 26 + 4 + 24, playBox,
+                                   juce::jmax (pillsNeed, fbNeed));
+                auto capRow = in.removeFromTop (13);
+                auto pills  = in.removeFromTop (26);
                 outLbl.setBounds (capRow.removeFromLeft (w1));
                 capRow.removeFromLeft (14);
                 selfLbl.setBounds (capRow.removeFromLeft (w2));
@@ -2623,13 +2672,17 @@ private:
             // PULSE RATE, unchanged in content: its header comes from the shared helper
             // now so all five boxes measure the same.
             {
-                auto g1 = section (secRate, 24, rateBox);
-                divLbl.setBounds (g1.removeFromLeft (juce::jmax (50, fgfit::labelWidth (divLbl))));
+                // Two captions and six stepper buttons. That is the whole section, and
+                // it is what the frame is now drawn around.
+                const int dw = juce::jmax (50, fgfit::labelWidth (divLbl));
+                const int tw2 = juce::jmax (66, fgfit::labelWidth (timesLbl));
+                auto g1 = section (secRate, 24, rateBox, dw + 4 + 66 + tw2 + 4 + 66);
+                divLbl.setBounds (g1.removeFromLeft (dw));
                 g1.removeFromLeft (4);
                 nDn.setBounds (g1.removeFromLeft (20).reduced (0, 2));
                 nVal.setBounds (g1.removeFromLeft (26));
                 nUp.setBounds (g1.removeFromLeft (20).reduced (0, 2));
-                timesLbl.setBounds (g1.removeFromLeft (juce::jmax (66, fgfit::labelWidth (timesLbl))));
+                timesLbl.setBounds (g1.removeFromLeft (tw2));
                 g1.removeFromLeft (4);
                 xDn.setBounds (g1.removeFromLeft (20).reduced (0, 2));
                 xVal.setBounds (g1.removeFromLeft (26));
@@ -2715,9 +2768,24 @@ private:
                     secGate.setBounds (in.removeFromTop (13));
                     in.removeFromTop (3);
                     auto g4 = in.removeFromTop (24);
-                    qTempoT.setBounds (g4.removeFromLeft (fgfit::toggleWidth (qTempoT)));
+                    // THE SPARE IS SHARED, NOT INHERITED BY WHOEVER IS LAST.
+                    //
+                    // "LAS CASILLAS DE NOTE START AHORA SE VEN CORTADAS." Measured, and
+                    // they were: fgfit::toggleWidth returns the LookAndFeel's exact
+                    // drawing budget, which leaves 2 px at the right and nothing more, so
+                    // "Quantize to project tempo" got 165 px for the 162.88 it needs and
+                    // "Mono" 36 for 33.19 - while the third toggle, taking the remainder,
+                    // sat in 139 for 108.47. Nothing overflowed and nothing was clipped;
+                    // two words simply ended flush against their own edge, which is what
+                    // being cut looks like. Whatever the box has over the three needs is
+                    // now split three ways.
+                    const int n1 = fgfit::toggleWidth (qTempoT);
+                    const int n2 = fgfit::toggleWidth (monoT);
+                    const int n3 = fgfit::toggleWidth (qPulseT);
+                    const int pad = juce::jmax (0, g4.getWidth() - (n1 + 6 + n2 + 6 + n3)) / 3;
+                    qTempoT.setBounds (g4.removeFromLeft (n1 + pad));
                     g4.removeFromLeft (6);
-                    monoT.setBounds (g4.removeFromLeft (fgfit::toggleWidth (monoT)));
+                    monoT.setBounds (g4.removeFromLeft (n2 + pad));
                     g4.removeFromLeft (6);
                     qPulseT.setBounds (g4);
                 };
@@ -3585,7 +3653,7 @@ private:
         // Its own TooltipWindow, PARENTED to this panel. The editor's is parented to the
         // editor, and a tooltip window only serves its own parent's subtree - so in a
         // separate top-level window every hover read-out here was simply invisible.
-        juce::TooltipWindow tooltips { this, 350 };
+        juce::TooltipWindow tooltips { this, 600 }; // the editor's own number - see tooltipWindow
 
         // Edits that bound to no partial of the CURRENT spectrum. Kept verbatim and
         // merged back on every write - see partialamp::mergedGains.
@@ -4154,7 +4222,7 @@ private:
         // Its own TooltipWindow, parented HERE: the editor's serves only its own
         // subtree, so in a separate desktop window every hover read-out is invisible
         // without this (the same trap PartialAmpPanel documents).
-        juce::TooltipWindow tooltips { this, 350 };
+        juce::TooltipWindow tooltips { this, 600 }; // the editor's own number - see tooltipWindow
         float lastX = -1.0f, lastY = -1.0f;
         int   lastAssigned = -1, lastWinner = -2, lastMode = -1;
         // Adaptive-corner state the status line reports: count + whether a refusal is
@@ -4692,7 +4760,13 @@ private:
     FractalAdditiveAudioProcessor& processorRef;
 
     std::unique_ptr<juce::LookAndFeel_V4> lnf;
-    juce::TooltipWindow tooltipWindow { this, 350 }; // subtly quicker hover read-outs
+    // 600 ms, which is 350 plus the 250 the user asked for: "que tarden 0.25 s MAS en
+    // aparecer". At 350 a card fired while the pointer was still travelling towards the
+    // control it was aimed at, so crossing the panel flashed hovers nobody had asked to
+    // read. Still under JUCE's own 700 default - quicker than stock, no longer twitchy.
+    // The two floating windows (PartialAmpPanel, PlaygroundPanel) carry the SAME number:
+    // a hover that behaves differently in a sub-window is a bug nobody can name.
+    juce::TooltipWindow tooltipWindow { this, 600 };
     ScaleKeyboard keyboard;
 
     SteppedSlider baseNFader, timbreRepeatsFader;

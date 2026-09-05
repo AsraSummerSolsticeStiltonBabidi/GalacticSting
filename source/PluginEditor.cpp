@@ -15,6 +15,38 @@ namespace
         return tf;
     }
 
+    // THE TITLE'S OWN GEOMETRY, asked once and answered for both callers. paint() draws
+    // the squares from it and resized() centres the credit line under it. Two hand-copies
+    // of these six lines is exactly how the credit drifts off the title the first time
+    // the free zone moves - the class of mistake the whole of fgfit exists to prevent.
+    inline juce::String titleWord()
+    { return juce::String::fromUTF8 ("Fibl\xc3\xb3 Gal\xc3\xa0" "ctic"); }
+
+    struct TitleBand
+    {
+        float side, total, x;                            // square edge, row width, left edge
+        float centreX() const { return x + total * 0.5f; }
+        float bottom()  const { return 8.0f + side; }    // cy + side/2, with cy = 8 + side/2
+    };
+
+    inline TitleBand titleBandFor (int windowWidth)
+    {
+        const auto title = titleWord();
+        int squaresN = 0, spaces = 0;
+        for (int i = 0; i < title.length(); ++i) (title[i] == ' ' ? spaces : squaresN)++;
+        TitleBand t;
+        t.side = 52.0f;
+        const float gap = 4.0f;
+        t.total = (float) squaresN * (t.side + gap) + (float) spaces * (t.side * 0.5f);
+        const float freeLeft  = 214.0f;                       // clears Playground/Menu/Presets/Save
+        const float freeRight = (float) windowWidth - 186.0f; // clears the Spectrum-to-Rhythm button
+        const float freeW     = juce::jmax (120.0f, freeRight - freeLeft);
+        if (t.total > freeW) { t.side *= freeW / t.total; t.total = freeW; }
+        t.x = juce::jmax (((float) windowWidth - t.total) * 0.5f, freeLeft);
+        if (t.x + t.total > freeRight) t.x = freeRight - t.total;
+        return t;
+    }
+
     // The microtonal accidental face (notes.otf by Sintel, from tessera - MIT; see
     // assets/fonts/NOTATION-LICENSES.txt). Loaded once, like the title face.
     //
@@ -795,24 +827,75 @@ namespace
         //     `value`  -> BOLD + blue:  a literal value, unit or example you can type
         //     !warn!   -> BOLD + red:   a consequence worth noticing before you act
         // Anything unmarked stays plain white; a "from the partial" line stays orange.
-        static juce::TextLayout layoutFor (const juce::String& text, float maxW)
+        //
+        // ...AND THREE RULES THAT NEED NO MARKUP AT ALL, because the strings already
+        // follow them and nothing was reading them. "QUE TENGAN FORMATO DE VERDAD
+        // (ESPACIADO, COLOR, NEGRITA, SUBRAYADO) EN VEZ DE UN PARRAFAZO":
+        //     - a FIRST line that reads like a title - all capitals, or ending in a
+        //       colon - is drawn bold, brighter, and UNDERLINED. Dozens of these strings
+        //       open with one and every one of them was body text;
+        //     - a BLANK line (the paragraph break, used in the longest hovers) becomes a
+        //       HALF line of air instead of a whole empty one, so paragraphs separate
+        //       without the card growing a hole;
+        //     - a (parenthetical) inside otherwise unmarked text is dimmed. There are
+        //       hundreds; they are asides by construction, and at full white they
+        //       compete with the sentence they qualify.
+        // The heading test is on the WHOLE line and refuses anything ending in . ! ?,
+        // because capitals are also used INSIDE sentences here for emphasis - "How a
+        // combination is SCORED." is a sentence, not a title - and it needs a letter in
+        // it, or "1200c" would be promoted for having no lower case to lose.
+        //
+        // headingLines is an out-param rather than part of the return value because the
+        // underline cannot be expressed in an AttributedString at all: its Attribute is
+        // {range, font, colour} and nothing more, in JUCE 8.0.14. It is stroked from the
+        // TextLayout's own line geometry in drawTooltip, the only place with a Graphics.
+        // Measurement (getTooltipBounds) passes nullptr and is unchanged - and because
+        // both paths call THIS function, the card still sizes itself to what is painted.
+        static juce::TextLayout layoutFor (const juce::String& text, float maxW,
+                                           int* headingLines = nullptr)
         {
             const juce::Font plain (juce::FontOptions (13.5f));
             const juce::Font bold  (juce::FontOptions (13.5f).withStyle ("Bold"));
+            const juce::Font gapF  (juce::FontOptions (6.5f));   // the half-line of air
             const juce::Colour cPlain  { juce::Colours::white };
             const juce::Colour cTerm   { 0xffffc95c }; // amber - concepts
             const juce::Colour cValue  { 0xff7fd4ff }; // blue  - literals you can type
             const juce::Colour cWarn   { 0xffff8a7a }; // red   - consequences
             const juce::Colour cSource { 0xffff9a3c }; // orange - "from the partial"
+            const juce::Colour cHead   { 0xffffffff }; // the title line
+            const juce::Colour cAside  { 0xffa2a8b8 }; // (parentheticals)
+
+            if (headingLines != nullptr) *headingLines = 0;
 
             juce::AttributedString as;
             juce::StringArray lines;
             lines.addLines (text);
+
+            const auto readsAsHeading = [] (const juce::String& l)
+            {
+                const auto t = l.trim();
+                if (t.isEmpty()) return false;
+                if (juce::String (".!?").containsChar (t.getLastCharacter())) return false;
+                bool hasLetter = false;
+                for (int k = 0; k < t.length(); ++k)
+                    if (juce::CharacterFunctions::isLetter (t[k])) { hasLetter = true; break; }
+                if (! hasLetter) return false;
+                return t.endsWithChar (':') || t == t.toUpperCase();
+            };
+
             for (int i = 0; i < lines.size(); ++i)
             {
                 const auto& line = lines[i];
                 const auto tail = (i < lines.size() - 1 ? juce::String ("\n") : juce::String());
                 if (isSourceLine (line)) { as.append (line + tail, plain, cSource); continue; }
+                if (line.trim().isEmpty() && tail.isNotEmpty())
+                { as.append (tail, gapF, cPlain); continue; }
+                if (i == 0 && lines.size() > 1 && readsAsHeading (line))
+                {
+                    as.append (line + tail, bold, cHead);
+                    if (headingLines != nullptr) *headingLines = 1;
+                    continue;
+                }
 
                 // Walk the line, splitting on the three delimiters. An unmatched
                 // delimiter is treated as ordinary text, so a stray * never eats
@@ -823,30 +906,47 @@ namespace
                 // highlighted "7) and 25 (5" - which is exactly where the meaningless
                 // coloured runs in the prime tooltip came from. Arithmetic in a tooltip
                 // is ordinary text and has to stay that way.
-                const auto opensHere = [&line] (int i)
+                const auto opensHere = [&line] (int k)
                 {
-                    if (i + 1 >= line.length()) return false;
-                    const auto prev = i > 0 ? line[i - 1] : (juce::juce_wchar) ' ';
+                    if (k + 1 >= line.length()) return false;
+                    const auto prev = k > 0 ? line[k - 1] : (juce::juce_wchar) ' ';
                     return ! juce::CharacterFunctions::isLetterOrDigit (prev)
-                        && ! juce::CharacterFunctions::isWhitespace (line[i + 1]);
+                        && ! juce::CharacterFunctions::isWhitespace (line[k + 1]);
+                };
+
+                // Unmarked text, with its parentheses dimmed. Only balanced pairs on the
+                // same line, and only OUTSIDE a marked span - a colour somebody chose
+                // deliberately is never overridden by this.
+                const auto plainRun = [&] (const juce::String& s)
+                {
+                    int p = 0;
+                    while (p < s.length())
+                    {
+                        const int open = s.indexOfChar (p, '(');
+                        const int shut = open < 0 ? -1 : s.indexOfChar (open + 1, ')');
+                        if (open < 0 || shut < 0) { as.append (s.substring (p), plain, cPlain); break; }
+                        if (open > p) as.append (s.substring (p, open), plain, cPlain);
+                        as.append (s.substring (open, shut + 1), plain, cAside);
+                        p = shut + 1;
+                    }
                 };
 
                 int pos = 0;
                 while (pos < line.length())
                 {
                     int at = -1; juce::juce_wchar delim = 0;
-                    for (int i = pos; i < line.length(); ++i)
+                    for (int k = pos; k < line.length(); ++k)
                     {
-                        const auto ch = line[i];
-                        if ((ch == '*' || ch == '`' || ch == '!') && opensHere (i))
-                        { at = i; delim = ch; break; }
+                        const auto ch = line[k];
+                        if ((ch == '*' || ch == '`' || ch == '!') && opensHere (k))
+                        { at = k; delim = ch; break; }
                     }
 
-                    if (at < 0) { as.append (line.substring (pos), plain, cPlain); break; }
+                    if (at < 0) { plainRun (line.substring (pos)); break; }
                     const int close = line.indexOfChar (at + 1, delim);
-                    if (close < 0) { as.append (line.substring (pos), plain, cPlain); break; }
+                    if (close < 0) { plainRun (line.substring (pos)); break; }
 
-                    if (at > pos) as.append (line.substring (pos, at), plain, cPlain);
+                    if (at > pos) plainRun (line.substring (pos, at));
                     const auto inner = line.substring (at + 1, close);
                     as.append (inner, bold, delim == '*' ? cTerm : delim == '`' ? cValue : cWarn);
                     pos = close + 1;
@@ -922,8 +1022,26 @@ namespace
             g.fillRoundedRectangle (body, 6.0f);
             g.setColour (juce::Colour (0xff5cb8ff).withAlpha (0.8f));
             g.drawRoundedRectangle (body.reduced (0.8f), 6.0f, 1.4f);
-            layoutFor (text, (float) width - 18.0f)
-                .draw (g, body.reduced (9.0f, 5.0f));
+            // The heading's rule, stroked by hand. juce::AttributedString carries no
+            // underline attribute in JUCE 8, so the only way to get one is to draw it
+            // from the laid-out line's own geometry - and TextLayout::Line gives exactly
+            // what that needs: the baseline origin, the descent, and the line's real
+            // horizontal extent. Drawn INSIDE the descent, so it costs the card no
+            // height and getTooltipBounds needs no adjustment. Same precedent as the
+            // fraction bar under a ratio on the keyboard: the rule is exactly as long as
+            // the glyphs, never as long as the box.
+            const auto area = body.reduced (9.0f, 5.0f);
+            int heads = 0;
+            const auto tl = layoutFor (text, (float) width - 18.0f, &heads);
+            tl.draw (g, area);
+            for (int i = 0; i < juce::jmin (heads, tl.getNumLines()); ++i)
+            {
+                const auto& ln = tl.getLine (i);
+                const auto xs  = ln.getLineBoundsX();
+                const float y  = area.getY() + ln.lineOrigin.y + ln.descent * 0.45f;
+                g.setColour (juce::Colours::white.withAlpha (0.75f));
+                g.fillRect (area.getX() + xs.getStart(), y, xs.getLength(), 1.0f);
+            }
         }
 
         // Text FIELDS (combo boxes + text editors) are as rounded as possible - a
@@ -1497,7 +1615,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         // added here (an empty combo was why the LFO menus showed nothing).
         lfoWaveBox.addItem ("Sine", 1);        lfoWaveBox.addItem ("Triangle", 2);
         lfoWaveBox.addItem ("Saw up", 3);      lfoWaveBox.addItem ("Saw down", 4);
-        lfoWaveBox.addItem ("Square", 5);      lfoWaveBox.addItem ("Custom (draw)", 6);
+        lfoWaveBox.addItem ("Square", 5);      lfoWaveBox.addItem ("Custom", 6);
         lfoWaveBox.addItem ("Random", 7);
         lfoRateModeBox.addItem ("BPM / 2^n", 1);
         lfoRateModeBox.addItem ("Fundamental / 2^n", 2);
@@ -2446,7 +2564,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 
     // --- Chord search (mode 3): n notes, period, min/max, list count, Transmute ---
     for (int n = 2; n <= 8; ++n) chordNotesBox.addItem (juce::String (n), n);
-    chordNotesBox.setSelectedId (3, juce::dontSendNotification);
+    // FIVE, not three ("que por defecto sean 5 notas"). Three notes is a triad and the
+    // search is for TUNINGS: five is where the result starts being a scale you can play
+    // rather than one chord, and it is still well inside what the search does quickly.
+    chordNotesBox.setSelectedId (5, juce::dontSendNotification);
     for (const int c : { 4, 8, 12, 16, 24 }) chordCountBox.addItem (juce::String (c), c);
     chordCountBox.setSelectedId (12, juce::dontSendNotification);
     chordMinMaxBox.addItem ("Min", 1); // most consonant
@@ -3329,9 +3450,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "QUIN modulador editen aquests controls. Env 1-3 s\xc3\xb3n envolupants (segueixen una "
         "nota); LFO 1-3 van cont\xc3\xad" "nuament. Cadascun mant\xc3\xa9 els seus destins."));
     lfoWaveBox.setTooltip (tr (
-        "The LFO's shape. 'Custom (draw)' opens an editor beside this box where you draw "
+        "The LFO's shape. 'Custom' opens an editor beside this box where you draw "
         "the wave yourself, point by point.",
-        "La forma de l'LFO. 'Personalitzada (dibuixa)' obre un editor al costat d'aquesta "
+        "La forma de l'LFO. 'Pr\xc3\xb2pia' obre un editor al costat d'aquesta "
         "caixa on dibuixes l'ona tu mateix, punt a punt."));
     lfoRateModeBox.setTooltip (tr (
         "WHAT SETS THE SPEED. BPM / 2^n locks to the project tempo, halving or doubling. "
@@ -3937,7 +4058,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (modSelBox,      { "Env 1", "Env 2", "Env 3", "LFO 1", "LFO 2", "LFO 3" });
     localise (lfoWaveBox,     { tr ("Sine", "Sinus"), tr ("Triangle", "Triangle"),
                                 tr ("Saw up", "Serra amunt"), tr ("Saw down", "Serra avall"),
-                                tr ("Square", "Quadrada"), tr ("Custom (draw)", "Pr\xc3\xb2pia (dibuixa)"),
+                                tr ("Square", "Quadrada"), tr ("Custom", "Pr\xc3\xb2pia"),
                                 tr ("Random", "Aleat\xc3\xb2ria") });
     localise (lfoRateModeBox, { tr ("BPM / 2^n", "BPM / 2^n"),
                                 tr ("Fundamental / 2^n", "Fonamental / 2^n"),
@@ -4066,6 +4187,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Ordena totes les combinacions de n notes per la seva disson\xc3\xa0ncia sensorial de Sethares contra l'espectre ACTUAL (cerca en graella + refinament exacte, en segon pla). Play pre-escolta un acord; doble clic el carrega com a escala activa (.scl)."));
     chordList.tip = tr ("Each note in its own colour.\n*Hover* a row to hear it (all together, then an ascending strum).\n*Double-click* it to LOAD the chord as the active scale.",
                         "Cada nota amb el seu color.\n*Passa-hi el cursor* per escoltar-lo (tot alhora i despr\xc3\xa9s un strum ascendent).\n*Doble clic* per CARREGAR l'acord com a escala activa.");
+    chordList.rowTipLoad  = tr ("*Double-click to load*", "*Doble clic per carregar*");
+    chordList.rowTipValue = tr ("total dissonance:", "disson\xc3\xa0ncia total:");
 
     //== "Adapt spectrum to tuning based on beating" + the two REALTIME buttons =====
     localise (adaptTargetBox, { tr ("To the loaded tuning", "A l'afinaci\xc3\xb3 carregada"),
@@ -5566,6 +5689,16 @@ void FractalAdditiveAudioProcessorEditor::setAdaptTargetForTests (int id)
 void FractalAdditiveAudioProcessorEditor::setTuneSourceForTests (int id)
 {
     tuneSourceBox.setSelectedId (id, juce::sendNotificationSync);
+}
+
+// How many notes a searched combination has - the shared "Notes" box. A test that
+// reads the degree list has to be able to set this: the list is combinations of N
+// scale degrees, so N against a scale SMALLER than N is legitimately empty, and a
+// check that cannot tell "empty because there is nothing to find" from "empty
+// because it broke" is not a check.
+void FractalAdditiveAudioProcessorEditor::setChordNotesForTests (int n)
+{
+    chordNotesBox.setSelectedId (juce::jlimit (2, 8, n), juce::sendNotificationSync);
 }
 
 void FractalAdditiveAudioProcessorEditor::setAdaptGoalForTests (int id)
@@ -7883,18 +8016,16 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     // squares are DRAWN LAST, so the connector lines can tuck their ends under the
     // letters. Each letter is an equal square, keyboard-hue coloured (first/last
     // red), the glyph stretched to fill it.
-    const auto title  = juce::String::fromUTF8 ("Fibl\xc3\xb3 Gal\xc3\xa0" "ctic");
+    //
+    // The six lines that decide side/total/x now live in titleBandFor(), above, because
+    // resized() has to place the credit under this row and a second hand-copy of them is
+    // how the two drift apart.
+    const auto title  = titleWord();
     const int  L      = title.length();
     const int  period = juce::jmax (1, L - 1);
-    float       side  = 52.0f;
+    const auto band   = titleBandFor (getWidth());
+    const float side  = band.side;
     const float gap   = 4.0f;
-    int squaresN = 0, spaces = 0;
-    for (int i = 0; i < L; ++i) (title[i] == ' ' ? spaces : squaresN)++;
-    float total = (float) squaresN * (side + gap) + (float) spaces * (side * 0.5f);
-    const float freeLeft  = 214.0f;                      // clears credit/Menu/Presets/Save
-    const float freeRight = (float) getWidth() - 186.0f; // clears the Spectrum-to-Rhythm button
-    const float freeW     = juce::jmax (120.0f, freeRight - freeLeft);
-    if (total > freeW) { side *= freeW / total; total = freeW; }
     const float margin = side * 0.10f;
     const juce::Font glyphFont = titleTypeface() != nullptr
         ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (64.0f))
@@ -7903,11 +8034,9 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     struct Sq { juce::Rectangle<float> rect; juce::Colour col; juce::Path glyph; juce::Colour glyphCol; };
     std::vector<Sq> squares;
     {
-        // Centre the title on the FULL window width (clamped to the free zone), so
-        // "Fibló Galàctic" sits truly centred rather than centred-between-buttons.
-        float x = ((float) getWidth() - total) * 0.5f;
-        x = juce::jmax (x, freeLeft);
-        if (x + total > freeRight) x = freeRight - total;
+        // Centred on the FULL window width and clamped to the free zone - decided in
+        // titleBandFor(), which resized() reads too so the credit lands under it.
+        float x = band.x;
         // Anchored near the TOP of the title band, so the extra height becomes
         // breathing room between the title and the UI below it.
         const float cy = (float) titleArea.getY() + 8.0f + side * 0.5f;
@@ -8071,39 +8200,61 @@ void FractalAdditiveAudioProcessorEditor::resized()
     auto titleBar = full.removeFromTop (78); // matches paint()'s titleArea
     langButton.setVisible (false); // language now lives inside the Menu popup
     {
-        // Left cluster, two rows: the credit at the very top-left (just above the
-        // preset selector) with Menu after it, then [Presets][Save] - Save directly
-        // BELOW Menu, the preset selector directly LEFT of Save.
+        // Left cluster, two rows: PRESET PLAYGROUND at the very top-left with Menu after
+        // it, then [Presets][Save] - Save directly BELOW Menu, the preset selector
+        // directly LEFT of Save.
+        //
+        // "PON 'VIBE CODED BY ASRA3' CENTRADO DEBAJO DEL TITULO, Y QUE 'PRESET
+        // PLAYGROUND' OCUPE SU SITIO." The credit sat in the corner and the playground
+        // button had a private third row under the preset selector, which is what pushed
+        // the left cluster to 77 of the band's 78 px. Swapping them costs nothing and
+        // frees that row outright: the credit needs no row of its own down here, because
+        // under the title there is already empty band.
         auto lc = titleBar.removeFromLeft (208).withTrimmedLeft (8);
         auto r1 = lc.removeFromTop (30).withTrimmedTop (8);
-        {
-            auto credit = r1.removeFromLeft (150).withHeight (18);
-            vibeLabel.setJustificationType (juce::Justification::centredLeft);
-            // Sized from its own words, floor 92, capped so the link beside it keeps at
-            // least 48 px for "Asra3". "Vibe coded per" is 4 px wider than "Vibe coded
-            // by" and was drawn condensed the moment this line started translating.
-            vibeLabel.setBounds (credit.removeFromLeft (
-                juce::jlimit (92, 100, fgfit::labelWidth (vibeLabel))));
-            credit.removeFromLeft (2);
-            vibeLink.setBounds (credit);
-        }
+        // 150 x 20. The HEIGHT is the one it has always had, and it is the height the
+        // verifier measures its word at - jmin (15, h * 0.6) - so keeping 20 keeps the
+        // measurement that says "Laboratori de Presets" fits. 20 and not the row's 22 on
+        // purpose: at 22 its bottom edge lands exactly on presetDirtyMark's top edge.
+        playgroundButton.setBounds (r1.removeFromLeft (150).withHeight (20));
         r1.removeFromLeft (4);
-        menuButton.setBounds (r1.removeFromLeft (46).withHeight (22));
+        menuButton.setBounds (r1.removeFromLeft (46).withHeight (20));
         auto r2 = lc.withTrimmedTop (2).withHeight (22);
         presetBox.setBounds (r2.removeFromLeft (150));
         presetDirtyMark.setBounds (presetBox.getRight() - 15, presetBox.getY() - 3, 14, 14);
         r2.removeFromLeft (4);
         savePresetButton.setBounds (r2.removeFromLeft (46));
-        // A third row, the full width of the cluster: the button's word is the whole
-        // feature and it is the longer language that decides how wide it has to be, so
-        // it gets the lot rather than a leftover slice (see the probe check in
-        // RhythmVerify - "Obre el Laboratori de Presets" is 8 characters longer than the
-        // English and clipped at 150 px).
-        playgroundButton.setBounds (lc.getX(), presetBox.getBottom() + 3, 200, 20);
     }
-    // Spectrum-to-Rhythm: top right, high-contrast.
-    rhythmBtn.setBounds (titleBar.removeFromRight (178).withSizeKeepingCentre (168, 26));
+    // Spectrum-to-Rhythm: top right, high-contrast - and on the SAME LINE as the
+    // playground button at the other end of the bar ("que Spectrum vs Rhythm quede
+    // alineado con Preset Playground"). It takes its y and its height FROM that button
+    // rather than centring itself in the band, so the two cannot drift apart: aligning
+    // two buttons by writing the same number twice is aligning them until somebody
+    // changes one of the numbers.
+    rhythmBtn.setBounds (titleBar.removeFromRight (178)
+                             .withSizeKeepingCentre (168, playgroundButton.getHeight())
+                             .withY (playgroundButton.getY()));
 
+    // The credit, centred UNDER the title, from the same geometry paint() draws the
+    // squares with. Sized to its own two words: the Label is capped so the link beside
+    // it keeps room for "Asra3", exactly as it was in the corner. "Vibe coded per" is
+    // 4 px wider than "Vibe coded by" and was drawn condensed the moment this line
+    // started translating, which is why the floor and the cap are both measured.
+    {
+        const auto tband = titleBandFor (getWidth());
+        const int labelW = juce::jlimit (92, 100, fgfit::labelWidth (vibeLabel));
+        const int linkW  = (int) std::ceil (juce::GlyphArrangement::getStringWidth (
+                               juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")),
+                               vibeLink.getButtonText())) + 6;
+        const int creditH = 16;
+        auto credit = juce::Rectangle<int> (0, 0, labelW + 2 + linkW, creditH)
+                          .withCentre ({ juce::roundToInt (tband.centreX()),
+                                         juce::roundToInt (tband.bottom()) + 1 + creditH / 2 });
+        vibeLabel.setJustificationType (juce::Justification::centredRight);
+        vibeLabel.setBounds (credit.removeFromLeft (labelW));
+        credit.removeFromLeft (2);
+        vibeLink.setBounds (credit);
+    }
     auto area = full.reduced (6, 4);
 
     {
@@ -8323,9 +8474,21 @@ void FractalAdditiveAudioProcessorEditor::resized()
         chordProgLbl.setVisible (chord);   // the adaptation's progress lives in its read-out
         nadBox.setVisible (false); // the note count is the shared "Notes" box now
 
-        const bool fromChord = processorRef.getGeneratedSclName().startsWith ("chord-");
-        chordViewBack.setVisible (chord && fromChord);
-        chordViewFwd.setVisible  (chord && fromChord);
+        // "QUITA EL TUNING INFO EN EL MODO DE ENCONTRAR TUNINGS A PARTIR DE BATIDOS."
+        //
+        // The Results / Tuning info pair was a two-state view switch over the list below
+        // it, and in THIS mode the list is the whole point: you are reading found tunings
+        // to pick one. The second view showed the degrees of whichever one you had
+        // already loaded - a different question, answered by the Tuning panel, and its
+        // button sat over the results permanently offering to hide them. Both halves go:
+        // a lone "Results" button that is always the current view is not a control.
+        //
+        // chordDegView is forced back to false rather than left at whatever it was, or a
+        // user who had switched to the degree view before this build would open the panel
+        // to a list that is no longer reachable.
+        chordDegView = false;
+        chordViewBack.setVisible (false);
+        chordViewFwd.setVisible  (false);
 
         if (seg)
         {
@@ -8470,17 +8633,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // while a run is going, the progress IS this line.
                 adaptInfoLbl.setBounds (si.removeFromTop (28));
             }
-            if (chord && fromChord) // labelled view switch: all results vs the loaded chord's degrees
-            {
-                si.removeFromTop (3);
-                auto r5 = si.removeFromTop (22);
-                chordViewBack.setColour (juce::TextButton::buttonColourId,
-                    ! chordDegView ? cSpecScale.withAlpha (0.85f) : juce::Colour (0xff44445e));
-                chordViewFwd.setColour (juce::TextButton::buttonColourId,
-                    chordDegView ? cSpecScale.withAlpha (0.85f) : juce::Colour (0xff44445e));
-                chordViewBack.setBounds (r5.removeFromLeft (r5.getWidth() / 2).withTrimmedRight (1));
-                chordViewFwd.setBounds  (r5.withTrimmedLeft (1));
-            }
+            // (the Results / Tuning info switch used to be laid out here - see the note
+            // where it is hidden, above: in this mode the results list is the answer, and
+            // a button offering to replace it with something the Tuning panel already
+            // says was clutter over the thing you came to read. The 25 px it took go to
+            // the list.)
             // The chord search keeps its own progress line. The adaptation does NOT: its
             // read-out above carries the progress, and a second line that was blank most
             // of the time and said "realtime: 37 updates" the rest of it was one of the
@@ -8494,7 +8651,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
         // The result list fills the REST of this same box.
         si.removeFromTop (4);
-        const bool showDeg = (dy) || (chord && fromChord && chordDegView);
+        const bool showDeg = dy; // the chord-degree view went with its switch (see above)
         // The SCOPE selector only decides how a combination is RANKED (against 0, or
         // over every pair); how many notes it has is the shared "Notes" box above.
         dissHeader.setVisible (false);
@@ -9396,32 +9553,61 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 }
                 else
                 {
-                    // ONE BOX PER ROW WHEN TWO WILL NOT FIT ONE, which here is always.
+                    // ONE BOX PER ROW WHEN TWO WILL NOT FIT ONE - AND TWO WHEN THEY DO.
                     //
                     // These were side by side, splitting the row in proportion to what
                     // each asked for. Measured with a probe that no longer lies about it,
-                    // both are squeezed at the shipped size: "Fundamental / 2^n" needs
-                    // 99.6 px of the 92 it gets and "Pròpia (dibuixa)" 83.1 of 77. Nor is
-                    // it close - together they want 239 px of a 218 px row - and no
-                    // pairing of the three boxes fits either, because the phase box wants
-                    // 95 and the smallest partner wants 111.
+                    // both were squeezed at the shipped size: "Fundamental / 2^n" needed
+                    // 99.6 px of the 92 it got and "Pròpia (dibuixa)" 83.1 of 77 - so
+                    // each took a row at its own width, and that cost the tab 22 px of
+                    // fader height.
                     //
-                    // So each takes a row at its own width. It costs the tab 22 px of
-                    // fader height, which the faders have and the words did not.
-                    const int waveNeed = fgfit::snugComboWidth (lfoWaveBox, 20);
-                    const int rateNeed = fgfit::snugComboWidth (lfoRateModeBox, 20);
+                    // "HAZ MAS ESTRECHO EL DESPLEGABLE DE LA FORMA DE ONDA... PARA QUE
+                    // QUEPA EL DE MODO BPM A SU DERECHA" and "LOS KNOBS DE LA LFO CUSTOM
+                    // AHORA SON MUY PEQUENOS, HAZLOS MAS GRANDES CON EL ESPACIO GANADO" -
+                    // which are one complaint: a stacked pair leaves the rest of both rows
+                    // empty and takes the height out of the knobs underneath. The pairing
+                    // is back, but as a MEASURED condition rather than an assumption: the
+                    // two go on one row only where their own snug widths both fit, and
+                    // fall back to a row each where they do not. Neither is ever squashed,
+                    // and every pixel the pairing saves lands on the faders below, which
+                    // is where the 22 px came from in the first place.
+                    // ...and when they share a row they get exactly what their widest
+                    // item needs, without the 12 px of breathing room fgfit::kSnugPad
+                    // adds. Measured: the column is 219 px, the two boxes want 93 and 140
+                    // with the pad and 81 and 128 without, so the pad alone is the
+                    // difference between one row and two. A box sized to its own widest
+                    // item is not cramped - it is exact; the pad is a comfort, and a
+                    // comfort is what you spend when the alternative is a whole row of
+                    // dead space above a set of knobs that then lose 22 px of height.
+                    const int waveRoomy = fgfit::snugComboWidth (lfoWaveBox, 20);
+                    const int rateRoomy = fgfit::snugComboWidth (lfoRateModeBox, 20);
+                    const int waveTight = waveRoomy - fgfit::kSnugPad;
+                    const int rateTight = rateRoomy - fgfit::kSnugPad;
+                    const bool pairRoomy = waveRoomy + 4 + rateRoomy <= in.getWidth();
+                    const bool pairTop   = pairRoomy
+                                        || waveTight + 4 + rateTight <= in.getWidth();
+                    const int waveNeed = pairTop && ! pairRoomy ? waveTight : waveRoomy;
+                    const int rateNeed = pairTop && ! pairRoomy ? rateTight : rateRoomy;
                     {
                         auto r = in.removeFromTop (20);
                         lfoWaveBox.setBounds (r.removeFromLeft (juce::jmin (juce::jmax (24, waveNeed),
                                                                             r.getWidth())).reduced (1, 0));
+                        if (pairTop)
+                        {
+                            r.removeFromLeft (2);
+                            lfoRateModeBox.setBounds (r.removeFromLeft (
+                                juce::jmin (juce::jmax (24, rateNeed), r.getWidth())).reduced (1, 0));
+                        }
                     }
                     in.removeFromTop (2);
+                    if (! pairTop)
                     {
                         auto r = in.removeFromTop (20);
                         lfoRateModeBox.setBounds (r.removeFromLeft (juce::jmin (juce::jmax (24, rateNeed),
                                                                                 r.getWidth())).reduced (1, 0));
+                        in.removeFromTop (2);
                     }
-                    in.removeFromTop (2);
                     lfoPhaseModeBox.setBounds (in.removeFromTop (20).reduced (1, 0));
                     in.removeFromTop (2);
                     // Three columns, not four: whichever of Div/Hz applies, plus
@@ -10298,14 +10484,28 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             lastNadOpts = opts;
             processorRef.startNadCompute (lastNadSel, rootOnly, maxMode, periodRatio, minGap);
         }
+        // THE STAMP IS CHECKED EVERY TICK, not only when a new generation lands.
+        //
+        // A row's chips are degree INDICES into the scale the worker ran over, so once
+        // the tuning moves they name degrees the scale in force does not have - "en una
+        // pentatonica me dice 7 y 11". That check used to live INSIDE the generation
+        // gate, which meant the stale rows stayed on screen for as long as no new result
+        // arrived. That was invisible while every view of this list recomputed
+        // continuously; it stopped being invisible the moment one of those views was
+        // removed, and the verifier caught it as 12-TET's chip 11 under a five-note
+        // scale. Clearing here costs one integer compare a tick and cannot go stale.
+        if (processorRef.getNadResultDegrees() != processorRef.getScaleDegrees()
+            && ! nadList.rows.empty())
+        {
+            nadList.rows.clear();
+            nadList.setSize (nadList.getWidth(), 0);
+            nadList.repaint();
+        }
         if (processorRef.getNadGeneration() != lastNadGen)
         {
             lastNadGen = processorRef.getNadGeneration();
-            // A row's chips are degree INDICES into the scale the worker ran over. If the
-            // tuning has moved on since, those indices name degrees the scale in force
-            // does not have, and printing them is the whole complaint. Belt and braces
-            // behind the gate above: the list shows nothing rather than something wrong,
-            // and the pending recompute fills it a tick later.
+            // Belt and braces behind the gate above: the list shows nothing rather than
+            // something wrong, and the pending recompute fills it a tick later.
             const bool sameScale = processorRef.getNadResultDegrees() == processorRef.getScaleDegrees();
             const auto res = sameScale ? processorRef.getNadResults()
                                        : std::vector<FractalAdditiveAudioProcessor::NadRow>();
@@ -10852,6 +11052,40 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         if (! processorRef.tuningStatesPeriod())
             per += tr ("  (no repeat)", "  (no repeteix)");
         tuningPeriodLbl.setText (tr ("Period  ", "Per\xc3\xado" "de  ") + per, juce::dontSendNotification);
+    }
+
+    // WHAT THE MTS MASTER ACTUALLY SAID ABOUT ITS KEYBOARD MAPPING.
+    //
+    // "ESTOY USANDO 31ED2 Y LOS VALORES EN CENTS QUE ME SALEN EN LAS TECLAS NO TIENEN
+    //  SENTIDO... EL SONIDO ESTABA BIEN, ERA LA REPRESENTACION EN CENTS, EL NUMERO DE
+    //  TECLAS POR PERIODO ERA CORRECTO, 31."
+    //
+    // Sound right, key count right, cents wrong is a signature: the pitches come from
+    // MTS_NoteToFrequency (which is right, or nothing would sound right) while the
+    // DEGREE readouts assume degree d lives on MIDI key 60 + d. MTS-ESP does not promise
+    // that - it has MTS_GetMapStartKey and MTS_GetRefKey precisely because a master says
+    // where its mapping starts and which key is its 1/1 - and this plugin was calling
+    // neither. This line prints what the master reports, so the assumption can be
+    // checked against it instead of argued about.
+    if (processorRef.getTuningMode() == 1)
+    {
+        const auto m = processorRef.mtsMapInfo();
+        // "MTS" is a standard's name and "?" is punctuation - neither is a translation,
+        // and wrapping them in a tr pair would invent two whose sides are identical,
+        // which the source audit rightly refuses.
+        const juce::String unknown ("?");
+        juce::String s ("MTS  ");
+        if (! m.hasMaster) s << tr ("no master", "sense m\xc3\xa0" "ster");
+        else
+        {
+            s << (m.mapSize  > 0 ? juce::String (m.mapSize)  : unknown)
+              << tr (" keys/period", " tecles/per\xc3\xado" "de")
+              << tr (", from key ", ", des de la tecla ")
+              << (m.mapStart >= 0 ? juce::String (m.mapStart) : unknown)
+              << tr (", 1/1 on key ", ", 1/1 a la tecla ")
+              << (m.refKey   >= 0 ? juce::String (m.refKey)   : unknown);
+        }
+        tuningPeriodLbl.setText (s, juce::dontSendNotification);
     }
 
     // The tuning-mode box is wired by hand (12ED2 is not in the list), so it has to be

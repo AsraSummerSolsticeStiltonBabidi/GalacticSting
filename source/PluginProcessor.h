@@ -261,6 +261,9 @@ public:
     juce::String makeRandomSpectrumText();
 
     // Degrees per period of the active tuning (for the colour keyboard).
+    // The MTS master's own keyboard-mapping report, straight through (see
+    // TuningManager::mtsMapInfo for why it exists and what -1 means).
+    TuningManager::MtsMapInfo mtsMapInfo() const { return tuning.mtsMapInfo(); }
     int getScaleDegrees() const noexcept { return tuning.degreesPerPeriod(); }
     // How many EQUAL steps the active tuning cuts the OCTAVE into, or 0 when it does not
     // cut the octave into equal steps at all. The keyboard's note-name option hangs off

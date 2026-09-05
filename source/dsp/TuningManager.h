@@ -146,6 +146,34 @@ public:
     // (or 12) in MTS mode. In TABLE mode there are no degrees in the file, so this is
     // the number of MIDI keys that best spans the period in force - the answer the
     // period-dependent features need, derived from the period and nothing else.
+    // WHAT THE MTS MASTER SAYS ABOUT ITS KEYBOARD MAPPING, asked once and reported
+    // honestly. MTS-ESP's own header warns that every one of these returns -1 when the
+    // master has not supplied it, so the caller must check before using the value - and
+    // this plugin used to call none of them, hardcoding "degree d is MIDI key 60 + d"
+    // instead. That is only true for a master whose mapping happens to start on key 60,
+    // and when it is false the sound stays right (it comes from NoteToFrequency) while
+    // every DEGREE readout - the cents on the keys, the ratios, the .scl export - reads
+    // the wrong key. Message thread.
+    struct MtsMapInfo
+    {
+        bool hasMaster = false;
+        int  mapSize = -1;      // keys per repeat of the mapping
+        int  mapStart = -1;     // first key of the mapping
+        int  refKey = -1;       // the key the master calls 1/1
+        double periodRatio = 0.0;
+    };
+    MtsMapInfo mtsMapInfo() const
+    {
+        MtsMapInfo m;
+        if (client == nullptr || ! MTS_HasMaster (client)) return m;
+        m.hasMaster = true;
+        m.mapSize   = (int) MTS_GetMapSize (client);
+        m.mapStart  = (int) MTS_GetMapStartKey (client);
+        m.refKey    = (int) MTS_GetRefKey (client);
+        m.periodRatio = (double) MTS_GetPeriodRatio (client);
+        return m;
+    }
+
     int degreesPerPeriod() const noexcept
     {
         switch (mode.load (std::memory_order_relaxed))

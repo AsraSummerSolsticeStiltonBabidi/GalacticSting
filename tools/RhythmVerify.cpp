@@ -10585,15 +10585,28 @@ int main (int argc, char** argv)
             check (a.maxDegree <= a.degreesPerPeriod - 1,
                    "...and every chip is a degree 12-TET really has (0..11)");
 
-            // (b) Now the free chord search, a five-note chord LOADED as the scale, and
-            //     the "Tuning info" view it flips to - the user's exact path.
+            // (b) The free chord search, a five-note chord LOADED as the scale - the
+            //     user's exact path, with the destination removed from under it.
+            //
+            //     "QUITA EL TUNING INFO EN EL MODO DE ENCONTRAR TUNINGS A PARTIR DE
+            //     BATIDOS." That button is what flipped this source to the degree list,
+            //     and it is gone. This half of the run used to double-click a result,
+            //     land in that view, and assert the chips were degrees of the new scale.
+            //
+            //     It asserts the STRONGER thing now. The stale chips could only ever be
+            //     read because a view showed them; with no view there is nothing to be
+            //     stale. So: after loading a five-note chord as the scale, the degree
+            //     list must not be on screen in this source at all - which is also
+            //     exactly the condition the recompute is gated on (nadView.isVisible()),
+            //     so a future change that brings the view back without bringing the
+            //     recompute back fails HERE rather than in a screenshot.
             ed->setTuneSourceForTests (2);   // ...from all tunings (free search)
             juce::String err;
             check (p2->startChordSearch (5, 2.0, "2/1", 8, false, 30.0, true, err),
                    "a five-note chord search starts");
             for (int i = 0; i < 4000 && p2->isChordSearchRunning(); ++i) juce::Thread::sleep (5);
             ed->tickTimerForTests();         // the results reach the list
-            ed->loadChordResultForTests (0); // double-click row 1: load it AND jump to Tuning info
+            ed->loadChordResultForTests (0); // double-click row 1: load it as the scale
             std::printf ("  loaded \"%s\" -> %d degrees\n",
                          p2->getGeneratedSclName().toRawUTF8(), p2->getScaleDegrees());
             check (p2->getScaleDegrees() == 5,
@@ -10601,16 +10614,43 @@ int main (int argc, char** argv)
             ed->tickTimerForTests();
             settle();
             const auto b = ed->nadShownProbeForTests();
-            std::printf ("  Tuning info: %d rows, biggest chip %d, scale has %d degrees%s\n",
-                         b.rows, b.maxDegree, b.degreesPerPeriod, b.equalStep ? " (offsets)" : "");
-            check (b.maxDegree <= b.degreesPerPeriod - 1,
-                   "every number \"Tuning info\" shows is a degree THIS scale has - no 7 or 11 "
-                   "in a five-note tuning");
-            check (b.rows > 0, "...and it really did recompute, rather than going blank");
-            // The stamp the display gate reads. A worker publishes on its own thread, so
-            // rows CAN land after the tuning has moved; the editor refuses to show rows
-            // whose stamp does not match the scale in force rather than print indices
-            // into a scale that is gone.
+            std::printf ("  degree list in the free-search source: shown=%d, %d rows held\n",
+                         (int) ed->degreeListShownForTests(), b.rows);
+            check (! ed->degreeListShownForTests(),
+                   "the degree list is NOT on screen in the free-search source - the view "
+                   "the user asked to remove is gone, so no stale degree can be read from it");
+
+            // ...and the list the OTHER source shows is still live. Without this, deleting
+            // the whole feature would pass the check above.
+            ed->setTuneSourceForTests (1);
+            // THREE notes, deliberately. The panel now defaults to five ("que por
+            // defecto sean 5 notas") and the scale just loaded has exactly five degrees,
+            // so five-note combinations of it are ONE combination - and with a 30-cent
+            // minimum gap, none. An empty list would then pass every "no bad degree"
+            // check below without proving anything, which is the vacuous pass this run
+            // exists to refuse. Three of five is ten combinations and cannot be empty.
+            ed->setChordNotesForTests (3);
+            // POLLED, and polled for the RIGHT thing. The timer tick is what starts the
+            // recompute, so a fixed number of rounds is a race - and "rows are not empty"
+            // is the wrong condition too: on entry the list still holds 12-TET's forty
+            // rows from part (a), so that test would pass instantly on exactly the stale
+            // content this run exists to refuse. What is waited for is rows published
+            // under the scale in force. Bounded at a second; the checks run regardless.
+            for (int round = 0; round < 40; ++round)
+            {
+                ed->tickTimerForTests();
+                juce::Thread::sleep (25);
+                if (ed->nadShownProbeForTests().rows > 0
+                    && p2->getNadResultDegrees() == p2->getScaleDegrees()) break;
+            }
+            const auto c = ed->nadShownProbeForTests();
+            std::printf ("  back in \"from current tuning\": shown=%d, %d rows, biggest chip %d,"
+                         " scale has %d degrees\n",
+                         (int) ed->degreeListShownForTests(), c.rows, c.maxDegree, c.degreesPerPeriod);
+            check (ed->degreeListShownForTests() && c.rows > 0,
+                   "...and the SAME list is still shown, and still filled, from the current tuning");
+            check (c.maxDegree <= c.degreesPerPeriod - 1,
+                   "every chip it shows is a degree THIS scale has - no 7 or 11 in a five-note tuning");
             check (p2->getNadResultDegrees() == p2->getScaleDegrees(),
                    "the published rows carry the degree count they index into");
         }
