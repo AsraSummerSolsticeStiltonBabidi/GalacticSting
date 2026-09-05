@@ -3346,6 +3346,113 @@ int main (int argc, char** argv)
                "...and they are the values the edit put there, not the ones it started with");
     }
 
+    // --- run 12o: the blend is BILINEAR, and all four corners are fixed points --------
+    //
+    // Every blend measurement in this file is taken on the y = 0 edge with only corners 0
+    // and 1 assigned. C and D are assigned exactly once, inside run 44's CPU benchmark,
+    // where nothing but ms/block is asserted. So the pad's whole second dimension - the
+    // one the user drags every time they use it - has never been checked against
+    // anything, and "a corner is a fixed point of its own blend" has only ever been
+    // proved for two of the four.
+    //
+    // Measured on a PARAMETER the blend must average, not on audio: the four corners get
+    // four clearly different values of the same continuous control, and what the blend
+    // publishes at a point is compared with the bilinear weights that point implies.
+    // Audio would fold the answer through an envelope and a spectrum compile; this asks
+    // the question directly.
+    {
+        using Proc = FractalAdditiveAudioProcessor;
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run12o-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        struct ScratchFolder
+        {
+            explicit ScratchFolder (const juce::File& d)
+                : dir (d), prev (Proc::getPresetFolder()) { Proc::setPresetFolderForTests (d); }
+            ~ScratchFolder() { Proc::setPresetFolderForTests (prev); dir.deleteRecursively(); }
+            juce::File dir, prev;
+        } guard (scratch);
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+        juce::AudioBuffer<float> ab (2, 256);
+        const auto sp = [&] (const char* id, float plain)
+        {
+            if (auto* q = p->apvts.getParameter (id))
+                q->setValueNotifyingHost (q->convertTo0to1 (plain));
+            p->pollParametersForTests();
+        };
+        const auto frame = [&]
+        {
+            p->pollParametersForTests();
+            juce::MidiBuffer m; ab.clear(); p->processBlock (ab, m);
+        };
+        const auto park = [&] (float x, float y, int frames = 10)
+        {
+            sp ("pgX", x); sp ("pgY", y);
+            for (int i = 0; i < frames; ++i) frame();
+        };
+
+        // FOUR CORNERS, four values of one continuous control, far enough apart that any
+        // mix-up between them is unmistakable. masterGain is linear in dB and is averaged
+        // linearly, so the arithmetic below is the blend's own arithmetic.
+        const float gains[4] = { -24.0f, -18.0f, -12.0f, -6.0f };
+        const char* names[4] = { "zzz12o-A", "zzz12o-B", "zzz12o-C", "zzz12o-D" };
+        for (int i = 0; i < 4; ++i)
+        {
+            sp ("masterGain", gains[i]);
+            Proc::PresetWriteRefusal why {}; int blocked = -1;
+            check (p->savePreset (names[i], why, blocked).isNotEmpty(),
+                   (juce::String ("corner preset ") + (char) ('A' + i) + " saved").toRawUTF8());
+        }
+        juce::String err;
+        for (int i = 0; i < 4; ++i)
+            check (p->assignPlaygroundCorner (i, names[i], err),
+                   (juce::String ("...and hangs on corner ") + (char) ('A' + i)).toRawUTF8());
+
+        // A is (0,0), B is (1,0), C is (0,1), D is (1,1) - the pad's own corner order.
+        const auto expected = [&] (float x, float y)
+        {
+            const double w[4] = { (1.0 - x) * (1.0 - y), x * (1.0 - y),
+                                  (1.0 - x) * y,         x * y };
+            double g = 0.0;
+            for (int i = 0; i < 4; ++i) g += w[i] * gains[i];
+            return g;
+        };
+
+        // EVERY CORNER IS A FIXED POINT, not just A and B. At each of the four the blend
+        // has to publish that corner's own value, or the pad is lying about what you are
+        // hearing when you park on it.
+        struct Pt { float x, y; const char* what; };
+        const Pt pts[] = {
+            { 0.0f, 0.0f, "corner A (0,0)" },
+            { 1.0f, 0.0f, "corner B (1,0)" },
+            { 0.0f, 1.0f, "corner C (0,1)" },
+            { 1.0f, 1.0f, "corner D (1,1)" },
+            { 0.5f, 0.0f, "the A-B edge, halfway" },
+            { 0.0f, 0.5f, "the A-C edge, halfway - the axis nothing had ever measured" },
+            { 1.0f, 0.5f, "the B-D edge, halfway" },
+            { 0.5f, 1.0f, "the C-D edge, halfway" },
+            { 0.5f, 0.5f, "the centre - all four at once" },
+            { 0.25f, 0.75f, "an interior point with four unequal weights" },
+        };
+        double worst = 0.0; juce::String worstWhere;
+        for (const auto& pt : pts)
+        {
+            park (pt.x, pt.y);
+            const double want = expected (pt.x, pt.y);
+            const double got  = (double) p->apvts.getRawParameterValue ("masterGain")->load();
+            const double d    = std::abs (got - want);
+            if (d > worst) { worst = d; worstWhere = pt.what; }
+            std::printf ("    %-58s want %+7.3f dB, got %+7.3f\n", pt.what, want, got);
+        }
+        check (worst < 0.05,
+               "the blend is bilinear in BOTH axes, and every one of the four corners is a "
+               "fixed point of it");
+        if (worst >= 0.05)
+            std::printf ("    worst disagreement %.4f dB at %s\n", worst, worstWhere.toRawUTF8());
+    }
+
     // --- run 12b: the envelope CURVE is what the modulator actually sends ----------
     // The editor draws value = shape(t, curve); this checks the engine agrees, that
     // the sustain node really sets the level, and that a second key retriggers from
