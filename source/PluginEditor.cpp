@@ -6711,8 +6711,17 @@ void FractalAdditiveAudioProcessorEditor::openScalaChooser()
 {
     // .tun is offered first because it is what the Save button writes by default:
     // a tuning exported from here has to be reloadable from here.
+    //
+    // WHERE IT OPENS. It used to be juce::File(), which means "wherever the OS last
+    // left this process" - in practice the host's own folder, or the last place ANY
+    // dialog in the session went, which for Fibló is the preset folder. A synth that
+    // ships six tunings inside itself and then opens its tuning dialog somewhere else
+    // is hiding them. So: the bundled folder on a first run (getTuningChooserFolder
+    // extracts it on the way past), and after that the folder the user last actually
+    // loaded a tuning FROM - see the callback.
     fileChooser = std::make_unique<juce::FileChooser> (tr (fgdlg::openTuning.en, fgdlg::openTuning.ca),
-                                                       juce::File(), "*.tun;*.scl;*.ascl");
+                                                       processorRef.getTuningChooserFolder(),
+                                                       "*.tun;*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
         {
@@ -6721,6 +6730,13 @@ void FractalAdditiveAudioProcessorEditor::openScalaChooser()
                 juce::String err;
                 if (! processorRef.loadScalaFile (fc.getResult(), err))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr (fgdlg::loadScale.en, fgdlg::loadScale.ca), err, this);
+                else
+                    // REMEMBERED ONLY ON A SUCCESSFUL LOAD. The user asked for the
+                    // folder they LOAD from ("si el usuario carga desde otra carpeta"),
+                    // and browsing into a folder to click a file that turns out to be
+                    // unreadable is not loading from it - remembering that one would
+                    // send them back to a dead end next time.
+                    processorRef.setTuningChooserFolder (fc.getResult().getParentDirectory());
             }
             refocus();
         });

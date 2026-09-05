@@ -3,3 +3,8 @@
 
 # Scala scale files are plain text.
 *.scl text
+
+# ...and so are AnaMark tuning files. They are GENERATED (tools/MakeTunings.ps1) and
+# then compiled into the binary, so a CRLF checkout would make every regeneration look
+# like a 260-line diff and would change the embedded bytes with it.
+*.tun text

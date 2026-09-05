@@ -76,10 +76,27 @@ juce_add_plugin(FractalAdditive
 # spelled in - they ride on ordinary ASCII letters, so without this face embedded the
 # names would not be missing, they would be WRONG (C sharp reading as the letters "Cc").
 # Licence and credits: assets/fonts/NOTATION-LICENSES.txt.
+#
+# THE SIX FACTORY TUNINGS RIDE IN THE SAME TARGET.
+#
+# "mete archivos .tun DENTRO del VST". They have to be INSIDE the binary because a VST3
+# is one file a host copies wherever it likes, and a tuning that shipped beside it as a
+# loose file is gone the first time somebody drags the plugin into another folder. So
+# they are compiled in, exactly like the fonts, and written out to disk on first use -
+# a file chooser cannot browse BinaryData (see getTuningsFolder in PluginProcessor.cpp).
+#
+# Generated, not hand-written: tools/MakeTunings.ps1 regenerates all six from four
+# lines of arithmetic each. Editing the .tun files directly is editing the output.
 juce_add_binary_data(GalacticAssets SOURCES
     assets/fonts/Kablammo.ttf
     assets/fonts/notes.otf
-    assets/audio/jingle.wav)
+    assets/audio/jingle.wav
+    assets/tunings/harmonic-series-8-16.tun
+    assets/tunings/7ed2.tun
+    assets/tunings/12ed2.tun
+    assets/tunings/24ed2.tun
+    assets/tunings/31ed2.tun
+    assets/tunings/bohlen-pierce.tun)
 
 target_sources(FractalAdditive PRIVATE
     source/PluginProcessor.cpp

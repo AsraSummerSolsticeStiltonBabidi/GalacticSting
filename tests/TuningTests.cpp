@@ -1208,6 +1208,113 @@ int main()
         }
     }
 
+    //== THE SAME 31ED2, ARRIVING THROUGH MTS ======================================
+    //
+    // The two probes above load 31ed2 as a FILE. The user's 31ed2 arrived through an
+    // MTS-ESP master, and that is the path that was broken - so this one reproduces the
+    // actual sequence: a fresh object stocked with a 12ED2 .scl exactly as prepareToPlay
+    // stocks it, then MTS-ESP selected, then a 31-EDO tuning arriving from outside.
+    //
+    // NO MASTER IS NEEDED. libMTSClient serves its LOCAL table from MTS_NoteToFrequency
+    // whenever it is offline, and MTS SysEx is what fills that table - the same read
+    // frequencyForNote() makes. What a live master would additionally supply is the MAP
+    // SIZE, so degreesPerPeriod() answers 12 here rather than 31; this test therefore
+    // asserts the INVARIANT rather than the number 31, and the invariant is the point:
+    //
+    //     the cents printed for degree d must be the cents of the key degree d lands on.
+    //
+    // Under the bug, degrees 0..11 came out of the dead 12ED2 at 0, 100, 200 ... and the
+    // worst disagreement was 61.3 cents at degree 1.
+    {
+        std::printf ("\n31ed2 arriving as MTS SysEx, with a 12ED2 .scl still in the object:\n");
+        const double step = 1200.0 / 31.0;
+
+        TuningManager t;
+        juce::String err, twelve ("! 12ED2.scl\n!\n12 equal divisions of the octave\n 12\n!\n");
+        for (int i = 1; i <= 12; ++i) twelve << " " << juce::String (i * 100.0, 6) << "\n";
+        check (t.loadScalaString (twelve, "12ED2", err),
+               "12ED2 loads, exactly as prepareToPlay does on every instance");
+
+        // MTS bulk dump, non-real-time: F0 7E 7F 08 01 <prog> <16 ASCII> <128 x 3> <sum> F7.
+        // Each note is a semitone byte plus a 14-bit fraction of a semitone. No byte may
+        // exceed 0x7F - the client silently DROPS one that does, so a bad builder would
+        // desync rather than fail, and the gate below is what catches that.
+        std::vector<unsigned char> sx { 0xF0, 0x7E, 0x7F, 0x08, 0x01, 0x00 };
+        {
+            const char* nm = "Fiblo 31ed2 test";       // exactly 16 bytes
+            for (int i = 0; i < 16; ++i) sx.push_back ((unsigned char) nm[i]);
+        }
+        for (int n = 0; n < 128; ++n)
+        {
+            const double f     = 261.6255653005986 * std::pow (2.0, (double) (n - 60) / 31.0);
+            const double semis = 69.0 + 12.0 * std::log2 (f / 440.0);
+            int semi = (int) std::floor (semis);
+            int frac = (int) std::lround ((semis - (double) semi) * 16383.0);
+            if (frac >= 16384) { frac = 0; ++semi; }   // rounding must never carry silently
+            semi = juce::jlimit (0, 127, semi);
+            sx.push_back ((unsigned char) (semi & 0x7F));
+            sx.push_back ((unsigned char) ((frac >> 7) & 0x7F));
+            sx.push_back ((unsigned char) (frac & 0x7F));
+        }
+        sx.push_back (0x00);                            // checksum: parsed and discarded
+        sx.push_back (0xF7);
+
+        t.parseMtsSysEx (sx.data(), (int) sx.size());
+        t.setMode (TuningManager::Mode::MtsEsp);
+
+        // TWO GATES BEFORE ANY ASSERTION. Without them the checks below would be
+        // comparing 12-TET against 12-TET and would pass while proving nothing - which
+        // is the exact shape of the vacuous pass this suite exists to refuse.
+        check (t.hasMtsSysEx(), "the client accepted the bulk dump");
+        const double sounding = 1200.0 * std::log2 (t.frequencyForNote (61) / t.frequencyForNote (60));
+        std::printf ("  key 60 -> 61 sounds %.4f cents apart (a 31ed2 step is %.4f)\n", sounding, step);
+        check (std::abs (sounding - step) < 0.05,
+               "the SOUND is 31ed2 - which is what the user said was the one thing right");
+
+        const int D = juce::jmax (1, t.degreesPerPeriod());
+        std::printf ("  %d degrees/period (offline, so no master reports a map size); first six:", D);
+        for (int d = 0; d < 6; ++d)
+            std::printf (" %.1f", 1200.0 * std::log2 (juce::jmax (1.0e-12, t.degreeRatio (d))));
+        std::printf ("\n");
+
+        double worst = 0.0; int worstD = 0;
+        for (int d = 0; d < D; ++d)
+        {
+            const double got  = 1200.0 * std::log2 (juce::jmax (1.0e-12, t.degreeRatio (d)));
+            const double want = 1200.0 * std::log2 (t.frequencyForNote (60 + d) / t.frequencyForNote (60));
+            if (std::abs (got - want) > worst) { worst = std::abs (got - want); worstD = d; }
+        }
+        std::printf ("  worst degree-vs-key disagreement: %.4f cents at degree %d\n", worst, worstD);
+        check (worst < 0.05,
+               "every degree's cents are the cents of the key it lands on, not a leftover 12ED2 grid");
+    }
+
+    //== ...AND THE GUARD IS A NO-OP EVERYWHERE ELSE ================================
+    // The fix refuses the loaded scale outside Scala mode. In EQUAL mode the answer has
+    // to be numerically identical, because the branch it now falls through to reads
+    // equalFreq - which IS 12ED2. Asserted rather than assumed: a "fix" that quietly
+    // changed 12-TET's own degree labels would be a far bigger regression than the bug.
+    // And the scale must SURVIVE the trip: refusing to answer is not the same as
+    // forgetting, which is why the guard is a read-time test and not a clear().
+    {
+        std::printf ("\nthe mode guard changes nothing it should not:\n");
+        TuningManager t;
+        juce::String err, twelve ("! 12ED2.scl\n!\n12 equal divisions of the octave\n 12\n!\n");
+        for (int i = 1; i <= 12; ++i) twelve << " " << juce::String (i * 100.0, 6) << "\n";
+        t.loadScalaString (twelve, "12ED2", err);
+        t.setMode (TuningManager::Mode::Equal);
+        double worst = 0.0;
+        for (int d = 0; d < 12; ++d)
+            worst = juce::jmax (worst, std::abs (1200.0 * std::log2 (t.degreeRatio (d)) - 100.0 * (double) d));
+        std::printf ("  Equal mode, worst deviation from a semitone grid: %.6f cents\n", worst);
+        check (worst < 1.0e-6, "Equal mode still reads 0, 100, 200 ... 1100");
+
+        t.setMode (TuningManager::Mode::MtsEsp);
+        t.setMode (TuningManager::Mode::Scala);
+        check (std::abs (1200.0 * std::log2 (t.degreeRatio (1)) - 100.0) < 1.0e-6,
+               "...and the loaded scale is still there after a round trip through another mode");
+    }
+
     std::printf ("\n%s (%d failure%s)\n", failures == 0 ? "ALL PASSED" : "FAILURES",
                  failures, failures == 1 ? "" : "s");
     return failures == 0 ? 0 : 1;

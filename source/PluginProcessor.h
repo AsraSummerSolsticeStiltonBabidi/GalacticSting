@@ -828,6 +828,38 @@ public:
     static juce::File presetFile (const juce::String& name)
     { return getPresetFolder().getChildFile (name + kPresetExt); }
     juce::StringArray getPresetNames();
+
+    //==========================================================================
+    // THE FACTORY TUNINGS, AND THE FOLDER "Load tuning" OPENS IN.
+    //
+    // "mete archivos .tun DENTRO del VST ... que 'Load tuning' abra esa carpeta por
+    // defecto; y si el usuario carga desde otra carpeta, que recuerde ESA."
+    //
+    // Six .tun files are compiled into the binary (see juce_add_binary_data in
+    // CMakeLists.txt): the harmonic series 8..16, 7/12/24/31 equal divisions of the
+    // octave, and Bohlen-Pierce. A FILE CHOOSER CANNOT BROWSE BinaryData, so they are
+    // written out to a real folder the first time anything asks for it.
+    //
+    // Documents/Galactic Sting/Tunings - the same idiom and the same parent as
+    // getPresetFolder(), because these are the user's files once they exist: they can
+    // be edited, renamed, deleted and added to, and nothing here ever writes over one
+    // again (see getTuningsFolder). It is NOT the preset folder and never touches it.
+    static juce::File getTuningsFolder();
+    // TESTS ONLY, and for the same reason setPresetFolderForTests exists: a verifier
+    // that called getTuningsFolder() would extract six files into the USER'S Documents
+    // on every run. An empty File restores the real folder.
+    static void setTuningsFolderForTests (const juce::File& dir);
+
+    // Where the tuning chooser should open: the folder the user last LOADED a tuning
+    // from, or the bundled folder above when there is none (a first run, or a
+    // remembered folder that has since been moved or unplugged).
+    //
+    // Stored in appProps beside recentScl / keyboardNoteNames, NOT in the patch state:
+    // "the folder I keep my scales in" is a fact about this person's disk, and a patch
+    // travels to other machines and into every preset. Saved there it would follow a
+    // .gsting file onto a computer where that path is somebody else's folder or none.
+    juce::File getTuningChooserFolder() const;
+    void setTuningChooserFolder (const juce::File& dir);
     // Why a preset write was refused. The PROCESSOR decides the rule; the EDITOR writes
     // the sentence, because the sentence has to be in the user's language and the
     // processor has no tr(). CornerFixedPoint carries the corner it was refused for.

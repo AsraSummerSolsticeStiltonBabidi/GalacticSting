@@ -4681,6 +4681,102 @@ juce::File FractalAdditiveAudioProcessor::getPresetFolder()
     return dir;
 }
 
+//==============================================================================
+// THE BUNDLED TUNINGS, UNPACKED ONTO REAL DISK.
+//
+// Same shape as presetFolderOverrideForTests above, and for the identical reason: the
+// production value of this is a folder in the user's Documents, and a verifier that
+// used it would write six files into it on every run. RhythmVerify redirects it before
+// it builds anything.
+static juce::File tuningsFolderOverrideForTests;
+
+void FractalAdditiveAudioProcessor::setTuningsFolderForTests (const juce::File& dir)
+{
+    tuningsFolderOverrideForTests = dir;
+    if (dir != juce::File()) dir.createDirectory();
+}
+
+juce::File FractalAdditiveAudioProcessor::getTuningsFolder()
+{
+    auto dir = tuningsFolderOverrideForTests != juce::File()
+                 ? tuningsFolderOverrideForTests
+                 : juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                       .getChildFile ("Galactic Sting").getChildFile ("Tunings");
+    dir.createDirectory(); // a no-op that returns ok when it is already there
+
+    // WRITE ONLY WHAT IS NOT THERE. This runs every single time the chooser opens, so
+    // it has to be idempotent, and it has to be idempotent in the STRONG sense: a user
+    // who edited 31ed2.tun - retuned one degree, changed the reference, deleted a file
+    // they never use - must find their own version next time, not ours. So the only
+    // write here is a CREATE. "Restore the factory tunings" is a thing a menu item
+    // could offer later; it is not something the file chooser gets to do behind them.
+    //
+    // The resources are found by walking namedResourceList and asking each one for its
+    // ORIGINAL filename, rather than by naming the generated symbols. Those names are
+    // not guessable and not stable: JUCE builds an identifier out of the filename by
+    // DROPPING the characters that cannot appear in one and turning the dot into an
+    // underscore, then prefixes "_" when the result starts with a digit. Measured on
+    // this build - "harmonic-series-8-16.tun" becomes harmonicseries816_tun (the hyphens
+    // vanish, they do not become underscores) and "7ed2.tun" becomes _7ed2_tun. Six
+    // hand-copied spellings of that would rot one at a time; this way, adding a .tun to
+    // the CMake list is the whole change.
+    for (int i = 0; i < BinaryData::namedResourceListSize; ++i)
+    {
+        const auto* resource = BinaryData::namedResourceList[i];
+        const auto* original = BinaryData::getNamedResourceOriginalFilename (resource);
+        if (original == nullptr)
+            continue;
+
+        // "= juce::String (...)", not "juce::String fileName (...)": the parenthesised
+        // form is a function DECLARATION to the compiler (most vexing parse) and the
+        // next line then fails with "left operand of .endsWithIgnoreCase must have
+        // class/struct/union type", which names everything except what is wrong.
+        const auto fileName = juce::String (juce::CharPointer_UTF8 (original));
+        if (! fileName.endsWithIgnoreCase (".tun"))
+            continue; // the fonts and the jingle live in the same target
+
+        const auto out = dir.getChildFile (fileName);
+        if (out.exists())
+            continue; // theirs now, whatever it says
+
+        int size = 0;
+        if (const auto* data = BinaryData::getNamedResource (resource, size))
+            if (size > 0)
+                out.replaceWithData (data, (size_t) size);
+    }
+    return dir;
+}
+
+juce::File FractalAdditiveAudioProcessor::getTuningChooserFolder() const
+{
+    if (appProps != nullptr)
+    {
+        // isAbsolutePath FIRST: constructing a juce::File from a relative or empty
+        // string asserts in debug builds, and this string comes off disk, where a
+        // half-written settings file can leave anything at all.
+        const auto path = appProps->getValue ("tuningFolder");
+        if (path.isNotEmpty() && juce::File::isAbsolutePath (path))
+        {
+            const juce::File last (path);
+            // Not "did we store one" but "is it still there": a folder on a USB stick
+            // that is not plugged in, or one the user has since deleted, would open the
+            // chooser on nothing at all. Falling back to the bundled folder is the one
+            // answer that always exists.
+            if (last.isDirectory())
+                return last;
+        }
+    }
+    return getTuningsFolder();
+}
+
+void FractalAdditiveAudioProcessor::setTuningChooserFolder (const juce::File& dir)
+{
+    if (appProps == nullptr || ! dir.isDirectory())
+        return;
+    appProps->setValue ("tuningFolder", dir.getFullPathName());
+    appProps->saveIfNeeded(); // written NOW: a host that is killed rather than closed
+}                            // never runs a destructor to flush it (see keyboardNoteNames)
+
 juce::StringArray FractalAdditiveAudioProcessor::getPresetNames()
 {
     juce::StringArray names;

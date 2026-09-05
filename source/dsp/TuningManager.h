@@ -162,6 +162,20 @@ public:
         int  refKey = -1;       // the key the master calls 1/1
         double periodRatio = 0.0;
     };
+    // MTS SysEx: the MIDI Tuning Standard's own messages, which retune libMTSClient's
+    // LOCAL table - the one it serves whenever no MTS-ESP master is connected. Fibló has
+    // never fed these, so a host sending a bulk dump was simply ignored; this is step 8
+    // of the vendor's own integration list and it was missing.
+    //
+    // It is also the ONLY way to put a real tuning behind MTS_NoteToFrequency without a
+    // live master, which is what makes the MTS branch of degreeRatio() testable at all -
+    // and that branch is where the "cents de 100 en 100" bug lived. A path with no test
+    // is a path that gets this wrong again.
+    void parseMtsSysEx (const unsigned char* data, int len) noexcept
+    { if (client != nullptr && data != nullptr && len > 0) MTS_ParseMIDIDataU (client, data, len); }
+    bool hasMtsSysEx() const noexcept
+    { return client != nullptr && MTS_HasReceivedMTSSysEx (client); }
+
     MtsMapInfo mtsMapInfo() const
     {
         MtsMapInfo m;
@@ -1133,6 +1147,44 @@ public:
     // key the degree actually lands on - the file's own pitch - which is honest.
     bool scalaDegreeRatio (int step, double& ratioOut) const
     {
+        // THE MODE DECIDES WHETHER THERE IS A SCALE TO ASK, AND IT WAS NEVER ASKED.
+        //
+        // "ESTOY USANDO 31ED2 Y LOS VALORES EN CENTS QUE ME SALEN EN LAS TECLAS NO
+        //  TIENEN SENTIDO, ME DICE VALORES DE 100 EN 100 EN LAS PRIMERAS TECLAS, CUANDO
+        //  DEBERIAN AUMENTAR DE 30 Y PICO EN 30 Y PICO... EL SONIDO ESTABA BIEN, ERA LA
+        //  REPRESENTACION EN CENTS, EL NUMERO DE TECLAS POR PERIODO ERA CORRECTO, 31."
+        //
+        // All three of those facts are one bug, and the third one names it. prepareToPlay
+        // loads a 12ED2 .scl into this object on EVERY instance ("if (! tuning.hasScala())"
+        // in PluginProcessor.cpp), so scalaPerDegree holds twelve exact 100-cent steps
+        // from the moment the plugin opens, and nothing clears it when the mode changes -
+        // setMode only stores an enum. This function then answered out of that dead scale
+        // in MTS-ESP mode, where the scale is not what is sounding.
+        //
+        // MEASURED, with a 31-EDO master: degreesPerPeriod() = 31 (MTS_GetMapSize, right,
+        // which is why the key count looked right), frequencyForNote = MTS_NoteToFrequency
+        // (right, which is why it SOUNDED right), and degreeRatio(0..11) = 0, 100, 200 ...
+        // 1100 out of the dead 12ED2 while degreeRatio(12..30) fell through to the key
+        // branch below and read 464.5, 503.2, 541.9 ... Twelve semitones and then a jump -
+        // "de 100 en 100 EN LAS PRIMERAS TECLAS", exactly, and the reason it was only the
+        // first keys is that the leftover scale is twelve degrees long.
+        //
+        // The sibling scalaDegreeRational() is already guarded this way, but by its CALLER
+        // (PluginProcessor::getDegreeIsRational tests the mode before asking). That split
+        // is the whole defect in one line: the "is this a just interval?" answer knew the
+        // mode and the "what interval is it?" answer did not, so the labels showed a
+        // tempered 100.0 cents with an approximation asterisk on it - confidently wrong in
+        // two different ways at once. The guard belongs with the data, not with whoever
+        // remembers to ask, so it is here now and on the sibling too.
+        //
+        // REJECTED: clearing scalaValid on a mode change. It would fix this and lose the
+        // loaded scale on the way back to Scala mode, which is a worse bug and a silent
+        // one. The scale is still there and still correct; it simply is not in force.
+        //
+        // NOT AN MTS FIX - a fix for every non-Scala mode. In Equal mode the answer is
+        // numerically identical either way, because the key branch reads equalFreq, which
+        // IS 12ED2; the test asserts that no-op rather than assuming it.
+        if (mode.load (std::memory_order_relaxed) != Mode::Scala) return false;
         if (tableMode.load (std::memory_order_relaxed)) return false;
         if (! scalaValid.load (std::memory_order_acquire)) return false;
         if (! juce::isPositiveAndBelow (step, (int) scalaPerDegree.size())) return false;
@@ -1148,6 +1200,13 @@ public:
     // answer, and it keeps the UI from printing an exact ratio for a stretched interval.
     bool scalaDegreeRational (int degree, long long& p, long long& q) const
     {
+        // Guarded on the MODE here, not only by whoever calls it. Its caller
+        // (PluginProcessor::getDegreeIsRational) already tests the mode, and its sibling
+        // above did NOT - which is how the labels came to show a tempered value with an
+        // approximation mark on it while the interval underneath came from a scale that
+        // was not in force. One of the two knowing the mode is worse than neither: it
+        // makes the two halves of the same answer disagree.
+        if (mode.load (std::memory_order_relaxed) != Mode::Scala) return false;
         if (tableMode.load (std::memory_order_relaxed)) return false;
         if (! scalaValid.load (std::memory_order_acquire) || degree < 0)
             return false;

@@ -1205,6 +1205,16 @@ int main (int argc, char** argv)
                                               + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
     FractalAdditiveAudioProcessor::setPresetFolderForTests (scratchPresets);
 
+    // ...and the same protection for the BUNDLED TUNINGS folder, which is a sibling of
+    // the preset folder inside the user's Documents and would otherwise have six .tun
+    // files unpacked into it by run 58 on every run of this suite. Same placement, for
+    // the same reason: before the first processor exists, so nothing can reach the real
+    // one by accident.
+    const juce::File scratchTunings = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                          .getChildFile ("fiblo-verify-tunings-"
+                                              + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+    FractalAdditiveAudioProcessor::setTuningsFolderForTests (scratchTunings);
+
     constexpr double sr = 48000.0;
     constexpr int    blk = 256;
 
@@ -16106,6 +16116,164 @@ int main (int argc, char** argv)
         check (nOnLimit < nDefault / 4, "  ...and bites when it is on");
     }
 
+    //-- run 58: THE SIX TUNINGS THAT SHIP INSIDE THE BINARY --------------------------
+    //
+    // "mete archivos .tun DENTRO del VST: serie armonica 8-16, 7ed2, 12ed2, 24ed2,
+    // 31ed2, bohlen pierce."
+    //
+    // A bundled file is worth exactly as much as the loader's opinion of it, and a .tun
+    // has three separate ways to be almost right:
+    //
+    //   1. parseTun REFUSES a file that specifies fewer than all 128 MIDI notes.
+    //   2. A file that parses can still fail to REPEAT, in which case loadTunString
+    //      holds it as an anonymous absolute 128-key table - the pitches sound, and
+    //      every structural question (how many degrees? what period?) is then answered
+    //      by an ESTIMATE instead of by the file. Bohlen-Pierce estimated as 2/1 would
+    //      still play, and the keyboard, the snapping grid and the dissonance lists
+    //      would all quietly be about an octave that is not in the tuning.
+    //   3. A file that repeats can still be sliced at the WRONG period: the search in
+    //      tunToScala takes the SMALLEST exact repeat, and 31ED2 repeats perfectly well
+    //      at one key - "1 degree per 38.7097 cents". Same pitches, a structure nobody
+    //      wrote. These six survive that on their own (the search overrides the smallest
+    //      repeat whenever a canonical period also repeats, and 2/1 and 3/1 are both
+    //      canonical), which is precisely why the check has to be here and not in the
+    //      generator: what protects them is the LOADER's tie-break, so it is the loader
+    //      that has to be asked.
+    //
+    // None of the three is audible on a held note, which is why this is a test and not
+    // something a listen would have caught. Each file is loaded through the plugin's
+    // real loadScalaFile - the same call the Load tuning button makes - and then asked
+    // for the degree count and the period, which are cross-checked BOTH against the
+    // expectations written here AND against the file's own [Scale Begin] declaration.
+    // Two sources that have to agree: a generator bug that wrote a consistent-but-wrong
+    // file would satisfy either one alone.
+    {
+        std::printf ("\nrun 58: the bundled .tun tunings, through the plugin's own loader:\n");
+
+        // The folder was redirected to a scratch directory at the top of main(). Say so
+        // out loud, because the one way this run could go wrong is by unpacking six
+        // files into the user's Documents, and "it printed a temp path" is the evidence.
+        const auto dir = FractalAdditiveAudioProcessor::getTuningsFolder();
+        std::printf ("    unpacked into %s\n", dir.getFullPathName().toRawUTF8());
+        check (dir.isDirectory() && ! dir.getFullPathName().containsIgnoreCase ("Documents"),
+               "  the extraction went to the redirected scratch folder, NOT the user's Documents");
+
+        struct Bundled { const char* file; int degrees; double period; };
+        static const Bundled expected[] = {
+            { "harmonic-series-8-16.tun",  8, 2.0 },
+            { "7ed2.tun",                  7, 2.0 },
+            { "12ed2.tun",                12, 2.0 },
+            { "24ed2.tun",                24, 2.0 },
+            { "31ed2.tun",                31, 2.0 },
+            { "bohlen-pierce.tun",        13, 3.0 },
+        };
+
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 256);
+
+        for (const auto& b : expected)
+        {
+            const juce::String tag (b.file);
+            const auto f = dir.getChildFile (b.file);
+            check (f.existsAsFile(), (tag + " was extracted from the binary").toRawUTF8());
+            if (! f.existsAsFile())
+                continue;
+
+            juce::String err;
+            const bool ok = p->loadScalaFile (f, err);
+            check (ok, (tag + " loads through loadScalaFile (" + err + ")").toRawUTF8());
+            if (! ok)
+                continue;
+
+            const int    gotDeg    = p->getScaleDegrees();
+            const double gotPeriod = p->getTuningPeriodRatio();
+            const double periodOff = 1200.0 * std::log2 (gotPeriod / b.period);
+            std::printf ("    %-26s %2d degrees, period %.6f (%.4f c off %d/1), %s\n",
+                         b.file, gotDeg, gotPeriod, periodOff, (int) b.period,
+                         p->getTuningStatus().toRawUTF8());
+
+            // A TABLE IS THE FAILURE MODE THAT STILL SOUNDS RIGHT. Ask first, because
+            // in table mode the two numbers below come from an estimate and could
+            // accidentally be correct for the octave files while meaning nothing.
+            check (! p->tuningIsAbsoluteTable(),
+                   (tag + " is held as a SCALE, not as an anonymous 128-key table").toRawUTF8());
+            check (gotDeg == b.degrees,
+                   (tag + " has " + juce::String (b.degrees) + " degrees per period").toRawUTF8());
+            check (std::abs (periodOff) < 0.01,
+                   (tag + " repeats at " + juce::String ((int) b.period) + "/1").toRawUTF8());
+
+            // ...and the same two numbers as the FILE ITSELF declares them, read back
+            // with the parser's own block reader. This is what makes the table above a
+            // check on the generator rather than a second copy of its assumptions.
+            int declDeg = 0; double declPeriodCents = 0.0;
+            const bool declared = TuningManager::readTunScaleBlock (f.loadFileAsString(),
+                                                                    declDeg, declPeriodCents);
+            check (declared, (tag + " declares its own [Scale Begin] structure").toRawUTF8());
+            check (declared && declDeg == gotDeg
+                   && std::abs (declPeriodCents - 1200.0 * std::log2 (gotPeriod)) < 0.01,
+                   (tag + " loaded as exactly the structure it claims").toRawUTF8());
+        }
+
+        // THE HARMONIC SERIES, DEGREE BY DEGREE. The equal divisions above are proved by
+        // their period and their count alone - N equal steps of period^(1/N) leaves
+        // nothing else to be wrong about. This one is the only unequal scale here, so
+        // its degrees are the only place a transcription error could hide, and 9/8 is
+        // the first thing anyone would notice missing.
+        {
+            juce::String err;
+            const auto f = dir.getChildFile ("harmonic-series-8-16.tun");
+            if (p->loadScalaFile (f, err))
+            {
+                static const double want[] = { 1.0, 9.0/8.0, 10.0/8.0, 11.0/8.0,
+                                              12.0/8.0, 13.0/8.0, 14.0/8.0, 15.0/8.0, 2.0 };
+                double worst = 0.0; int worstD = -1;
+                for (int d = 0; d <= 8; ++d)
+                {
+                    const double off = std::abs (1200.0 * std::log2 (p->getDegreeRatio (d) / want[d]));
+                    if (off > worst) { worst = off; worstD = d; }
+                }
+                std::printf ("    harmonic 8..16: degree 1 = %.9f (9/8 is %.9f);"
+                             " worst degree error %.6f cents (degree %d)\n",
+                             p->getDegreeRatio (1), 9.0/8.0, worst, worstD);
+                check (std::abs (1200.0 * std::log2 (p->getDegreeRatio (1) / (9.0/8.0))) < 0.01,
+                       "  the harmonic scale's FIRST degree is 9/8");
+                check (worst < 0.01,
+                       "  ...and every degree up to the 2/1 is the harmonic it is named after");
+            }
+        }
+
+        // IDEMPOTENT, AND IT NEVER WRITES OVER THE USER. The extraction runs on every
+        // single press of Load tuning, so "only creates what is missing" is not a nicety
+        // - it is the difference between a folder the user owns and a folder that
+        // reverts their edits behind their back every time they open the dialog.
+        {
+            const auto edited = dir.getChildFile ("12ed2.tun");
+            edited.replaceWithText (edited.loadFileAsString() + "\n; the user edited this\n");
+            // READ BACK WHAT LANDED, and compare against THAT. juce::File::replaceWithText
+            // takes a lineEndings parameter that DEFAULTS TO "\r\n", so the string handed
+            // to it is not the string that reaches the disk: the .tun files are written LF
+            // by the generator, and comparing the LF original against the CRLF file failed
+            // this check on the first run for a reason that had nothing to do with the
+            // extraction it is supposed to be measuring.
+            const auto mine = edited.loadFileAsString();
+            check (mine.contains ("the user edited this"),
+                   "  (precondition: the user's edit really is on disk)");
+            const auto again = FractalAdditiveAudioProcessor::getTuningsFolder();
+            check (again.getChildFile ("12ed2.tun").loadFileAsString() == mine,
+                   "  re-extracting does NOT overwrite a tuning the user has edited");
+
+            // ...and the other half of idempotent: a file that is GONE comes back, so a
+            // user who deleted one by accident is not stuck with a hole until reinstall.
+            const auto deleted = dir.getChildFile ("7ed2.tun");
+            deleted.deleteFile();
+            check (! deleted.existsAsFile(), "  (precondition: 7ed2.tun really was deleted)");
+            FractalAdditiveAudioProcessor::getTuningsFolder();
+            check (deleted.existsAsFile(), "  ...while a DELETED one is put back");
+
+            edited.deleteFile();                                    // undo the edit above so
+            FractalAdditiveAudioProcessor::getTuningsFolder();      // the folder is factory again
+        }
+    }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
