@@ -815,6 +815,13 @@ private:
     // ESSENTIALS could not fit its sub-label beside its control, so the label is drawn
     // above it instead. Set by resized(), read by paintedSubLabels() - the two must agree.
     bool essStacked = false;
+    // The nine prime whitelist ticks could not be given a tick box anyone can aim at, so
+    // resized() hid the whole row. Read by paintedSubLabels(), which then paints the tag
+    // that says the row is missing and what brings it back - the same "one flag, two
+    // places that must agree" arrangement as essStacked above. It is the ONLY thing on
+    // screen that says so, which is why it is a member and not a local: a row that
+    // vanishes with nothing beside it is exactly the silent hiding this build refuses.
+    bool primeTicksHidden = false;
     void refreshModWatch();
     void configCombo (juce::ComboBox&, const juce::String& paramID,
                       std::unique_ptr<ComboBoxAttachment>&, juce::Colour, const juce::String& tooltip);

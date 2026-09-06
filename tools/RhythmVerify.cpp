@@ -966,6 +966,13 @@ namespace traudit
             " cents", " cents.", "cents", "+ .scl", "AMP", "BASE", "BPM / 2^n", "Env", "FRACTAL",
             "GATE", "Glide", "Mono", "Notes", "OK", "Original", "Pitch bend", "Presets...",
             "Reps", "St", "Triangle", "VEL", "est.", "intervals: 3/2 2 700c ...",
+            // The SPECTRUM panel's octave-span title. Catalan writes the plural of
+            // "octava" as "octaves", which is the English word letter for letter - the
+            // pair it replaced ("OCTAVE RANGE" / "ABAST OCTAVES") was two words long
+            // because of the "RANGE" half, and that half is what the cell had no room
+            // for. The Essentials transpose cell keeps its own OCTAVE / OCTAVA pair,
+            // which is a different word and still differs.
+            "OCTAVES",
             // The tuning mode box's first three items: a name, a standard and a file
             // format. Only its fourth has words that Catalan writes differently.
             "12ED2", "MTS-ESP", "Scala (.scl)",

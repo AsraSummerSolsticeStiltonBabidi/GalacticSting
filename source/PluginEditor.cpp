@@ -7689,7 +7689,53 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
             add ("eng.base",  tr ("BASE", "BASE"),                     band (hcBase),  cPanel);
             add ("eng.harm",  tr ("HARMONICS", "HARM\xc3\x92NICS"),    band (hcHarm),  cPanel);
             // PRIME sits right under the shared divider -> nudge it down for air.
-            add ("eng.prime", tr ("PRIME CONTROL", "CONTROL DE PRIMERS"), band (hcPrime.translated (0, 5)), cPanel);
+            //
+            // ONE WORD, NOT TWO, AND IT IS A DECISION RATHER THAN A CUT. This cell is the
+            // narrowest in the panel - its title band is 86 px at a 690 px window - and
+            // the pair it used to carry does not fit it even at the 9 px floor these
+            // labels shrink to. Measured by putting the old pair back and re-running the
+            // rig: "PRIME CONTROL" needs 70 px in the 67 it has at 780, and "CONTROL DE
+            // PRIMERS" 95 px in the 94 it has at 910. paint() draws them with useEllipsis
+            // false, so below those widths what was on the glass was "CONTROL DE PRIMER"
+            // with nothing saying the last letters were gone - and the two of them alone
+            // held this window's floor at 920x550 after the tick row was dealt with.
+            //
+            // A shorter word is a decision; a cut word is a bug. The mode box directly
+            // under it says Limit or Whitelist, so the compartment loses nothing by naming
+            // the thing it filters rather than restating that it is a control.
+            const auto primeTitle = tr ("PRIMES", "PRIMERS");
+            auto       primeBand  = band (hcPrime.translated (0, 5));
+            // ...AND THE TAG THAT SAYS THE NINE TICKS ARE MISSING, in the same band, laid
+            // out exactly like FROZEN beside AMP DECAY below: a cell of its own, so the
+            // two can never print over each other and each is measured against the room it
+            // really has.
+            //
+            // MEASURED, PLUS A GAP THAT IS ALSO NOT GUESSED. The first version reserved a
+            // flat 38 px and no gap, and the two words came out of the Catalan photograph
+            // touching - "PRIMERSAMPLIA", which passes the overprint check (their ink
+            // rectangles do not intersect) and reads as one nonsense word. So the tag is
+            // measured at the 9 px floor these labels shrink to, and 6 px of air is taken
+            // off the TITLE's cell rather than the tag's: the tag is the shorter of the
+            // two and the one that must stay whole, and the title has a shrink loop that
+            // gives ground gracefully. Photographed at 690x550: a 35 px tag, a 6 px gap
+            // and a 45 px title, with "PRIMERS" shrunk to exactly the 45 it is given.
+            //
+            // Kept in the PANEL's colour, not the amber the inertness marks wear: the
+            // whitelist is not inert, it is off screen, and "one box, one colour" has
+            // exactly two stated exceptions (see the check in RhythmVerify) - both of them
+            // saying a control cannot affect the sound. This one says where a control
+            // went, which is a different sentence.
+            const auto primeTag = tr ("RESIZE", "AMPLIA");
+            const int  primeTagW = primeTicksHidden
+                                 ? juce::GlyphArrangement::getStringWidthInt (
+                                       juce::Font (juce::FontOptions (9.0f).withStyle ("Bold")),
+                                       primeTag) + 2
+                                 : 0;
+            const int  primeGap  = primeTicksHidden ? 6 : 0;
+            add ("eng.prime", primeTitle, primeBand.withTrimmedRight (primeTagW + primeGap), cPanel);
+            if (primeTicksHidden)
+                add ("eng.primeHidden", primeTag,
+                     primeBand.removeFromRight (primeTagW), cPanel, 10.0f);
         }
         if (! bothEnginesBounds.isEmpty())
         {
@@ -7724,8 +7770,24 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
             // explain away, and the state it warned about - both flags on at once - is not
             // reachable from this panel any more.
             add ("both.transition", tr ("TRANSITION", "TRANSICI\xc3\x93"), band (beTrans), cPanel);
-            add ("both.range",   tr ("OCTAVE RANGE", "ABAST OCTAVES"), band (beRange.translated (0, 3)), cPanel);
-            // PHASE shares OCTAVE RANGE's row, to its right, and is titled in the same
+            // ONE WORD AGAIN, AND THE SAME REASON. This compartment's share of its column
+            // is what is LEFT after PHASE keeps the 40 px its own title needs, which is a
+            // 58 px band at a 690 px window. Measured the same way as the prime title
+            // above - old pair back in, rig re-run: "OCTAVE RANGE" needs 65 px in the 63
+            // it has at 710 and "ABAST OCTAVES" 69 in 68 at 730, so both were being CUT,
+            // in both languages, by a drawText with no ellipsis. This is the "OCTAVE
+            // RANGE" that read "OCTAVE RAN" on the glass, and on its own it held the
+            // floor at 740x550.
+            //
+            // Widening the cell is not available: at 690 the column is 108 px, the old
+            // RANGE title wanted 78 of them (69 + the 6 px insets, rounded to the cell)
+            // and PHASE's own title 38 - which is 116 - so the word is the thing that has
+            // to give. "OCTAVES" and not "RANGE": what the stepper under it shows IS a
+            // number of octaves, so the unit is the half of the old pair that carries the
+            // meaning. It is the same word in Catalan, declared in traudit::allowed,
+            // which is that list's whole purpose. 50 px at the floor, in both languages.
+            add ("both.range",   tr ("OCTAVES", "OCTAVES"), band (beRange.translated (0, 3)), cPanel);
+            // PHASE shares the OCTAVES row, to its right, and is titled in the same
             // style as every other sub-section here - that title IS its name, which is why
             // the fader carries no label component of its own.
             add ("both.phase",   tr ("PHASE", "FASE"),                 band (bePhase.translated (0, 3)), cPanel);
@@ -9614,6 +9676,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                         primeOnToggle.setBounds (pmr.removeFromRight (ow).withSizeKeepingCentre (ow, 20));
                 }
                 pi.removeFromTop (2);
+                primeTicksHidden = false;
                 if (wl)
                 {
                     // Nine cells out of a width that is almost never a multiple of nine.
@@ -9634,6 +9697,76 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     // and neither ever reaches zero.
                     const int rowH = juce::jmax (1, pi.getHeight());
                     const int lblRowH = juce::jlimit (1, 13, rowH - 10);
+                    const int tickH   = juce::jmax (1, juce::jmin (22, rowH - lblRowH));
+
+                    //-- NINE TICK BOXES, OR NONE OF THEM --------------------------------
+                    //
+                    // The clamps above stop the row COLLAPSING; they never stopped it
+                    // being useless. Measured off the rig's own photographs, with the
+                    // shipped 1200x650 as the reference: there the row is 199 px wide and
+                    // 34 px tall - nine cells of 22 px around a 21 px tick box, with 13 px
+                    // of number under it, so it clears by a single pixel. Ten pixels of
+                    // window narrower than 1120 and the cell is 19 px against a tick box
+                    // that needs 20, which is the refusal that held this window's floor at
+                    // 1120. At 690x550 the same row is 86 px wide - nine cells of 9 px
+                    // around a tick box that wants 20 - and what is left of the cell's
+                    // height under the title and mode rows is single figures, so the clamp
+                    // above holds the number row at its 1 px minimum. What reaches the
+                    // glass there is a 2 px sliver of a box and a line of ink where the
+                    // primes should be, and the row that decides which primes the whole
+                    // spectrum is allowed cannot be read or aimed at.
+                    //
+                    // So it is HIDDEN, whole, by this decision - the same rule TEMPER and
+                    // the ON switch above already follow in this very cell, and for the
+                    // same reason: a control that cannot be operated is worse than absent,
+                    // because absent is honest and a sliver is not. Never a squashed row,
+                    // never eight ticks instead of nine.
+                    //
+                    // THE THREE NUMBERS. The width test is the RIG's own predicate, not a
+                    // second opinion: fgfit::toggleTickWidth is exactly what the snapshot
+                    // gate measures a tick box against, so the layout can never certify a
+                    // row the gate refuses. 16 px of tick height is where the box itself
+                    // (jmin(15, h*0.75) * 1.1) falls to 13.2 px, which is the smallest
+                    // square anything in this window asks a mouse to hit - the +/- steppers
+                    // are 17 px - and below it the tick is decoration. 10 px of number row
+                    // is the least that shows the 8 px Bold digit the floor below draws
+                    // whole; at 1 px it is a smear.
+                    //
+                    // WRAPPING ONTO TWO ROWS, TRIED ON PAPER AND REJECTED. Five per row
+                    // needs 5 x 21 = 105 px of width and this cell has 86 at 690; three
+                    // rows of three need 63, which does fit - and then three times
+                    // (16 tick + 10 number + 2) = 84 px of HEIGHT, where the whole cell is
+                    // 52 px tall at 550 and the row under its title and mode box is single
+                    // figures. Wrapping trades a width the cell has not got for a height it
+                    // has far less of, because this cell is starved vertically long before
+                    // it is starved horizontally.
+                    //
+                    // GIVING PRIME THE WHOLE ENGINE BOX'S WIDTH (BASE | HARMONICS above,
+                    // PRIME across the foot), ALSO REJECTED. It does solve the width - the
+                    // full inner box is 190 px at 690, which is the nine at 21 - but BASE
+                    // needs 58 px of height and HARMONICS 45 (below that its fader's own
+                    // value label goes to negative height, see the note on harmH above), so
+                    // the stacked arrangement wants 58 + 63 = 121 px where the engine box
+                    // has 97 at 550: it moves the block from width to height and buys the
+                    // ticks nothing under about 610 px of window. And it would make the
+                    // BASE | HARMONICS wall stop in mid-box, which is the exact fault - "la
+                    // linea de la pared izquierda de la subcaja de prime esta incompleta,
+                    // tiene un hueco abajo" - that had spectrumDividers() rewritten so
+                    // every vertical divider in this panel runs top to bottom.
+                    //
+                    // NOT UNREACHABLE. The row comes back the moment the window is big
+                    // enough, and paintedSubLabels() paints a tag beside the cell's title
+                    // saying so while it is gone (primeTicksHidden). The parameters
+                    // themselves are untouched either way: they stay automatable, MIDI
+                    // mappable and preset-visible with the row off screen.
+                    const bool ticksFit = tw >= fgfit::toggleTickWidth (tickH)
+                                       && tickH >= 16 && lblRowH >= 10;
+                    primeTicksHidden = ! ticksFit;
+                    for (int i = 0; i < 9; ++i)
+                    {
+                        primeToggle[i].setVisible (ticksFit);
+                        primeLbl[i].setVisible (ticksFit);
+                    }
                     // The number SHRINKS TO ITS CELL rather than stepping through sizes
                     // somebody picked by eye. Measured at a reference size and scaled:
                     // two digits at 12.5 Bold need 14.6 px, the cell is often 16 and was
@@ -9649,7 +9782,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                                                          ref, primeLbl[i].getText()));
                     const float pf = juce::jlimit (8.0f, 12.5f,
                                                    10.0f * (float) juce::jmax (1, tw - 2) / widest);
-                    for (int i = 0; i < 9; ++i)
+                    for (int i = 0; ticksFit && i < 9; ++i)
                     {
                         const int cw = tw + (i < extra ? 1 : 0);
                         auto cell = pi.removeFromLeft (cw);
@@ -9679,6 +9812,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
             primeLimitFader.setVisible (false); lblPrimeLimit.setVisible (false);
             primeOnToggle.setVisible (false); // the switch belongs to the harmonic view too
             for (int i = 0; i < 9; ++i) { primeToggle[i].setVisible (false); primeLbl[i].setVisible (false); }
+            // ...and the flag with them. The ticks are absent here because this is the
+            // CUSTOM view and the whole prime compartment belongs to the harmonic one -
+            // not because the panel ran out of room - so the "resize me" tag must not be
+            // left armed for the next harmonic layout to inherit.
+            primeTicksHidden = false;
 
             auto ci = engineBoxBounds.reduced (6, 0);
             ci.removeFromTop (chipH + 2); ci.removeFromBottom (4);
@@ -9841,7 +9979,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
             {
                 // RANGE: the spectrum's octave span, as the same [value][+][-] stepper it
-                // had in Essentials. Its name is the painted OCTAVE RANGE sub-label now,
+                // had in Essentials. Its name is the painted OCTAVES sub-label now,
                 // so the row's own "Spectrum" label was deleted rather than hidden - a
                 // member hidden on every single layout pass is a member nothing can ever
                 // show, and it kept a dead entry alive in the layout probe.
@@ -9859,13 +9997,17 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // 155 px, so RANGE keeps 104 and PHASE gets 51 - a 41 px painted title
                 // band ("PHASE" 33 px, "FASE" 27) and a 39 px fader, which is exactly
                 // what the SLOPE fader beside it already ships at. The binding constraint
-                // was never the fader, it was the Catalan "ABAST OCTAVES" at 88 px: RANGE
-                // keeping 104 leaves its band 94 px, so the title still clears by 6 px.
+                // was never the fader, it was the Catalan "ABAST OCTAVES" at 88 px - and
+                // that is why the title is one word now: at 690 this column is 108 px, and
+                // the old pair wanted 78 of them for RANGE while PHASE's own title wanted
+                // 38, which is 116. "OCTAVES" needs 38 in both languages, so the split
+                // this code already made (68 / 40) holds both titles whole instead of
+                // cutting one of them in silence.
                 //
                 // Neither side may reach zero width: the layout probe FAILS a control
                 // collapsed to nothing, which would raise the window's minimum size
                 // instead of merely looking cramped. Hence the clamp, and the cap at half
-                // the row so OCTAVE RANGE always reads as the row's primary control.
+                // the row so OCTAVES always reads as the row's primary control.
                 // THE VALUE BOX IS SIZED TO THE WIDEST NUMBER IT CAN EVER SHOW, and the
                 // room that frees is what pays for the row's two real problems: the "-"
                 // button had ONE pixel of glyph room at the floor, and PHASE's own title
@@ -10284,17 +10426,60 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // could not be reached, sized, clicked or photographed, still carrying a
                 // tr() pair the language audits had to keep stepping over.
                 auto selRow = in.removeFromTop (20);
-                const int nCell = 3;
-                const int cw3 = juce::jmax (30, selRow.getWidth() / nCell - 3);
-                modSelBox.setBounds (selRow.removeFromLeft (cw3));
-                selRow.removeFromLeft (3);
-                modOnT.setBounds (selRow.removeFromLeft (juce::jmin (46, cw3)));
-                selRow.removeFromLeft (3);
+                // EACH OF THE THREE SIZED TO ITS OWN WORDS, AND THE AIR GOES FIRST.
+                //
+                // The selector used to take a THIRD of the row with a floor of 30 px, and
+                // 30 px is a ComboBox with NEGATIVE room for its own item: at h = 20 the
+                // box spends 6 px on the label's left inset, 18 on the chevron gutter and
+                // 10 on the Label's own border, so 30 leaves MINUS FOUR for "Env 1" - a
+                // chevron drawn where a word should be. That is what the rig photographed
+                // the moment this window's floor came down to 690x550 and the Modulators
+                // box became 107 px wide: a structural fault, not a cramped string, and
+                // the kind a hard-coded floor guarantees rather than prevents.
+                //
+                // THREE WIDTHS, TWO SIZES EACH. Every control here is sized by an fgfit
+                // snug...Width, which is the painter's own minimum PLUS kSnugPad - 12 px
+                // of air, stated once for the whole window. Air is the first thing to
+                // give: when the row cannot seat all three with it, all three lose it
+                // together, which keeps them looking like one row rather than one padded
+                // control and two starved ones.
+                //
+                // Measured, and this is the case that decided it: at the shipped 1200x650
+                // the row is 199 px and the three want 91 + 3 + 36 + 3 + 63 = 196 in
+                // English - it fits with air. In Catalan "Desassigna" wants 85 instead of
+                // "Unmap"'s 63, which is 218, and the FIRST version of this fix hid the
+                // button outright at the size the instrument actually ships at. Without
+                // the padding the same three need 79 + 3 + 24 + 3 + 73 = 182 and every one
+                // of them is whole. (Before any of this the button simply took what was
+                // left and drew "Desassigna" squashed into 66 px.)
+                //
+                // ...AND WHAT STILL DOES NOT FIT IS HIDDEN, NOT SQUASHED - the rule TEMPER
+                // and the prime ON switch follow in the SPECTRUM panel. At 690x550 this
+                // row is 97 px, which is the selector and nothing else: a pill with no
+                // word on it is a switch whose state cannot be read, and an Unmap button a
+                // few pixels wide is a click that silently drops every mapping on the
+                // instrument. Both come back the moment the box is wide enough, and the
+                // modulator's On parameter stays automatable and MIDI-mappable throughout.
+                const int selSnug = fgfit::snugComboWidth (modSelBox, 20);
+                const int onSnug  = fgfit::snugToggleWidth (modOnT, 20);
+                const int unSnug  = fgfit::snugTextButtonWidth (modUnmapBtn, 20);
+                const bool roomy  = selSnug + 3 + onSnug + 3 + unSnug <= selRow.getWidth();
+                const int pad     = roomy ? 0 : fgfit::kSnugPad;
+                const int selW = juce::jmax (1, juce::jmin (selSnug - pad, selRow.getWidth()));
+                modSelBox.setBounds (selRow.removeFromLeft (selW));
+                selRow.removeFromLeft (juce::jmin (3, selRow.getWidth()));
+                const bool onFits = onSnug - pad <= selRow.getWidth();
+                modOnT.setVisible (cust && onFits);
+                if (onFits)
+                {
+                    modOnT.setBounds (selRow.removeFromLeft (onSnug - pad));
+                    selRow.removeFromLeft (juce::jmin (3, selRow.getWidth()));
+                }
                 // Unmap is sized to the word "Unmap" / "Desassigna", not to whatever the
                 // row had left over - which was a third of the box for six letters.
-                modUnmapBtn.setBounds (selRow.removeFromLeft (
-                    juce::jmin (fgfit::snugTextButtonWidth (modUnmapBtn, selRow.getHeight()),
-                                selRow.getWidth())));
+                const bool unFits = unSnug - pad <= selRow.getWidth();
+                modUnmapBtn.setVisible (cust && unFits);
+                if (unFits) modUnmapBtn.setBounds (selRow.removeFromLeft (unSnug - pad));
                 in.removeFromTop (3);
                 if (isEnv)
                 {
