@@ -5058,6 +5058,80 @@ private:
         }
     };
 
+    // THE SPECTRUM-vs-TUNING COLUMN'S SECTION BANDS.
+    //
+    // "esta mal delimitado": the column was one unbroken ladder of rows. A mode selector,
+    // then WHAT is being compared, then HOW the search is set up, then the buttons that
+    // run it - eleven controls in the widest mode with nothing on screen saying where one
+    // group ended and the next began. RhythmPanel answers exactly this question with one
+    // rounded frame per group; this is the same claim ("these belong together") made in
+    // the one shape this column can afford.
+    //
+    // WHY ONE RULED GROUND, AND NOT RhythmPanel'S SEPARATE BOXES. Measured, not chosen:
+    // RhythmVerify holds the adapted-partial list to three unscrolled rows (54 px) and in
+    // the goal-Range shape it had 56 - two pixels of slack in the whole column.
+    // A RhythmPanel-style box costs 13 px of header + 3 + 8 of padding = 24 px over its
+    // bare content, and three of those is 72 px this column does not have; even stripped
+    // of its header, a box needs padding inside its own outline AND air outside it, so two
+    // stacked boxes need ~9 px between their last and first rows where 4 px sits today.
+    // ONE tinted ground under the whole stack, ruled at each internal boundary, needs
+    // padding only at the very top and bottom, and its rules live inside the 4 px gap
+    // that already separates two sections - so the delimitation costs the list NOTHING.
+    // (It in fact gains: see the gap normalisation in resized(). The list went 56 -> 60
+    // in the tightest shape and 81 -> 84 in the ordinary one.)
+    //
+    // WHAT IS NOT HERE, and why: coloured section HEADERS, the other half of RhythmPanel's
+    // idiom. A juce::Label may not be laid out under 12 px (the snapshot rig fails any
+    // visible control smaller than its own chrome), so three named sections cost at least
+    // 3 x 12 = 36 px minus the 12 px of gaps they would replace. The normalisation below
+    // frees 4. They are affordable in this column only if something else leaves it, and
+    // nothing in it is spare - so the sections are drawn, and named nowhere, rather than
+    // named at the price of the results the panel exists to show.
+    //
+    // Mouse-transparent (the WarningOverlay pattern) and constructed immediately after
+    // gSpecScale so it sits ABOVE the group's opaque interior fill - drawGroupComponentOutline
+    // FILLS its rect, so a frame painted in the editor's own paint() would be buried - and
+    // BELOW every control, which are all added after it.
+    struct SpecSections : juce::Component
+    {
+        // Section boundaries in this component's own coordinates: the y of each rule.
+        // Empty = one section, no rules.
+        std::vector<int> rules;
+        juce::Colour     col { 0xff808080 };
+        SpecSections() { setInterceptsMouseClicks (false, false); }
+        void paint (juce::Graphics& g) override
+        {
+            auto r = getLocalBounds().toFloat();
+            if (r.getWidth() < 4.0f || r.getHeight() < 4.0f) return;
+            // RhythmPanel's wash, RhythmPanel's line weight - and NO VERTICAL SIDES.
+            //
+            // The first version drew the whole rounded outline, RhythmPanel's frame
+            // exactly. Photographed at 5x it is the doubled border this build refuses
+            // everywhere else: gSpecScale's own 2.6 px stroke runs down the column and
+            // this one landed 2 px inside it, a thin dark sliver between two parallel
+            // orange lines. There is no width to fix that with - the whole distance from
+            // the group's inner border to the content is under 7 px - so the sides are
+            // simply not drawn. The COLUMN's border is this stack's left and right edge,
+            // which is true: the stack is as wide as the column's content.
+            //
+            // What is left says the same thing without repeating a line that is already
+            // on screen: a tinted ground under the whole stack, ruled off at both ends
+            // and once at every section boundary.
+            juce::Path body;
+            body.addRoundedRectangle (r, 7.0f);
+            g.setColour (col.withAlpha (0.15f));
+            g.fillPath (body);
+            g.setColour (col.withAlpha (0.34f));
+            // The two ends stop 7 px short at each side - where the rounded corners are,
+            // so a horizontal line never runs out past the ground it belongs to.
+            g.fillRect (juce::Rectangle<float> (7.0f, 0.0f, r.getWidth() - 14.0f, 1.0f));
+            g.fillRect (juce::Rectangle<float> (7.0f, r.getHeight() - 1.0f, r.getWidth() - 14.0f, 1.0f));
+            for (const int y : rules)
+                g.fillRect (juce::Rectangle<float> (3.0f, (float) y - 0.5f,
+                                                    r.getWidth() - 6.0f, 1.0f));
+        }
+    };
+
     FractalAdditiveAudioProcessor& processorRef;
 
     std::unique_ptr<juce::LookAndFeel_V4> lnf;
@@ -5300,6 +5374,9 @@ private:
     juce::Rectangle<int> intervalEditHome; // its laid-out bounds (kept for the focus hook)
     juce::TextEditor refAEdit;     // Reference A: type the Hz directly ("Hz" shown to its right)
     WarningOverlay warningOverlay;
+    // Declared with the other overlays; CONSTRUCTED (added to the editor) with gSpecScale,
+    // which is what puts it in the right z-order - see the struct's own comment.
+    SpecSections   specSections;
     NoticeOverlay  noticeOverlay;
     RecentOverlay  recentOverlay;   // floating list of every scale file loaded
     DissDegreeList degreeList;   // active-scale dissonance list (lives inside dissView)

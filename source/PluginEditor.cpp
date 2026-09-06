@@ -2364,6 +2364,11 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // "Spectrum to Scale" (Sethares): generate + count + reverse + period + save,
     // plus the sorted degree/height list.
     configGroup (gSpecScale, cSpecScale);
+    // ...and IMMEDIATELY after it, before a single control of this column: the section
+    // frame has to sit ABOVE the group's interior fill and BELOW everything clickable,
+    // and in JUCE that is decided by the order these two lines run in. See SpecSections.
+    specSections.col = cSpecScale;
+    addChildComponent (specSections);   // shown by resized(), per mode
     dissBtn.setColour (juce::TextButton::buttonColourId, cSpecScale.withAlpha (0.35f));
     dissBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
     dissBtn.setMouseClickGrabsKeyboardFocus (false);
@@ -2424,9 +2429,13 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuneSourceBox.addItem ("From all tunings", 2);
     tuneSourceBox.setSelectedId (1, juce::dontSendNotification);
     tuneScopeBox.addItem ("0 vs all", 1);
-    tuneScopeBox.addItem ("all vs all", 2);
+    // Sentence case, like every other item and caption in this column. It used to be
+    // "all vs all", and beside "0 vs all" - which opens on a digit and so reads as
+    // capitalised whatever you do - that lower-case "a" was the only lower-case opening
+    // letter in the whole box. See applyLanguage() for the pair this is translated to.
+    tuneScopeBox.addItem ("All vs all", 2);
     // (its hover is written by applyLanguage(); set once here it stayed English for ever)
-    tuneScopeBox.setSelectedId (2, juce::dontSendNotification); // "all vs all" by default
+    tuneScopeBox.setSelectedId (2, juce::dontSendNotification); // "All vs all" by default
     for (auto* b : { &tuneSourceBox, &tuneScopeBox })
     {
         b->setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
@@ -2725,6 +2734,22 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     segView.setScrollBarsShown (true, false);
     addAndMakeVisible (segView);
     makeLabel (segPeriodLbl, cSpecScale);
+    // EVERY LEFT-HAND CAPTION IN THE SPECTRUM-vs-TUNING COLUMN, JUSTIFIED ONCE.
+    //
+    // makeLabel's default is CENTRED, and these seven are captions: each names the
+    // control immediately to its right, so a centred one floats away from what it names
+    // by however much its cell exceeds its word - which differs per language. Four of
+    // them were re-justified inside resized() instead, on every layout pass, and the
+    // other three only got it because they happen to go through the `caption` helper.
+    // That is one decision written in three different places, and it drifted: the two
+    // rows that did NOT set it were the two that had never been touched since.
+    //
+    // Set here, where the labels are made, it is a property of the label - so a row that
+    // stops using `caption` cannot silently lose it, and `caption` setting it again is a
+    // no-op rather than the only thing holding it up.
+    for (auto* l : { &chordNotesLbl, &chordPerLbl, &chordMinLbl, &segPeriodLbl,
+                     &adaptPartialsLbl, &adaptRangeLbl, &adaptRegLbl })
+        l->setJustificationType (juce::Justification::centredLeft);
     segPeriodEdit.setText (processorRef.getSegmentPeriodText(), juce::dontSendNotification); // restored
     segPeriodEdit.setJustification (juce::Justification::centred);
     segPeriodEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
@@ -3768,7 +3793,11 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     intervalEdit.setTextToShowWhenEmpty (tr ("intervals: 3/2 2 700c ...", "intervals: 3/2 2 700c ..."),
                                          juce::Colour (0xff8f96a8));
     gSpecScale.setText     (tr ("Spectrum vs Tuning", "Espectre vs afinaci\xc3\xb3"));
-    gScaleDiss.setText     (tr ("Scale Dissonance", "Dissonancia de l'escala"));
+    // "Disson\xc3\xa0ncia", with its accent: every other Catalan use of the word in this file
+    // carries it, and this one - a GROUP TITLE, drawn upper-cased in a chip - was the one
+    // that did not. Neither language gate can see it: it is spelled the same either way
+    // to a byte-compare, and a missing accent is not a missing translation.
+    gScaleDiss.setText     (tr ("Scale Dissonance", "Disson\xc3\xa0ncia de l'escala"));
     segPeriodLbl.setText   (tr ("Period", "Per\xc3\xado" "de"), juce::dontSendNotification);
     segTopToggle.setButtonText (tr ("= top", "= sup"));
     segTopToggle.setTooltip (tr ("Use the highest selected partial as the period (instead of the typed value).",
@@ -4224,7 +4253,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // switch.
     localise (tuneSourceBox, { tr ("From current tuning", "De l'afinaci\xc3\xb3 actual"),
                                tr ("From all tunings", "De totes les afinacions") });
-    localise (tuneScopeBox,  { tr ("0 vs all", "0 vs tot"), tr ("all vs all", "tot vs tot") });
+    localise (tuneScopeBox,  { tr ("0 vs all", "0 vs tot"), tr ("All vs all", "Tot vs tot") });
     // TWO BOXES THAT WERE NEVER ON THIS LIST AT ALL. Both are populated with English at
     // construction, like every other box here, and both were missing their line - so they
     // stayed English in the Catalan window. "Min" was on screen in 41 of the rig's Catalan
@@ -4242,17 +4271,21 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     tuneScopeBox.setTooltip (tr (
         "How a combination is SCORED.\n"
         "*0 vs all* - each note is judged only by its beating against the root (0).\n"
-        "*all vs all* - every pair of notes in the combination counts.",
+        "*All vs all* - every pair of notes in the combination counts.",
         "Com es PUNTUA una combinaci\xc3\xb3.\n"
         "*0 vs tot* - cada nota es jutja nom\xc3\xa9s pel seu batec contra la fonamental (0).\n"
-        "*tot vs tot* - hi compta cada parella de notes de la combinaci\xc3\xb3."));
+        "*Tot vs tot* - hi compta cada parella de notes de la combinaci\xc3\xb3."));
     lastNadD = 0; // force the n-ad selector's items to rebuild in the new language
 
     // Chord-search mode texts.
     chordNotesLbl.setText (tr ("Notes", "Notes"), dontSendNotification);
     chordPerLbl.setText   (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
-    dissMinLbl.setText    (tr ("smallest interval (c)", "interval m\xc3\xa9s petit (c)"), dontSendNotification);
-    chordMinLbl.setText   (tr ("smallest interval (c)", "interval m\xc3\xa9s petit (c)"), dontSendNotification);
+    // Capitalised like "Notes" and "Period" above them: these three are the SAME kind of
+    // thing - a caption over a value in one stack - and two of them opened on a capital
+    // while the third did not. The extra letter costs nothing: a capital S is 1 px wider
+    // than a lower-case one at this face and the caption is sized to its own words.
+    dissMinLbl.setText    (tr ("Smallest interval (c)", "Interval m\xc3\xa9s petit (c)"), dontSendNotification);
+    chordMinLbl.setText   (tr ("Smallest interval (c)", "Interval m\xc3\xa9s petit (c)"), dontSendNotification);
     // The two minimum-interval boxes. Their tr() pair was correct and sat in the
     // constructor, where applyLanguage() could never reach it - the four-word caption
     // above each box changed language and the sentence explaining it did not.
@@ -4296,7 +4329,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
                                 tr ("To the chord held now", "A l'acord que sona ara") });
     localise (adaptGoalBox,   { tr ("Min", "M\xc3\xadn"), tr ("Max", "M\xc3\xa0x"), tr ("Range", "Rang") });
     adaptPartialsLbl.setText (tr ("Partials", "Parcials"), dontSendNotification);
-    adaptRangeLbl.setText    (tr ("between", "entre"), dontSendNotification);
+    adaptRangeLbl.setText    (tr ("Between", "Entre"), dontSendNotification);
     // "Periods", bare: the DIRECTIONS are in the line underneath, which has room to print
     // them as numbers ("+-1.0 per around 3:0 = 2:0..4:0"). A caption that tried to say
     // "Periods each way" would need more than this row can spare, and juce::Label answers
@@ -4324,9 +4357,21 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // on; the "+" was a second copy of the tick, in the row's most expensive pixels. Both
     // languages drop it, so the two still say the same thing, and the noun each keeps is
     // its own real word rather than an abbreviation shared out of desperation.
-    adaptAmpsToggle.setButtonText (tr ("amps", "amplituds"));
-    chordRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
-    adaptRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
+    adaptAmpsToggle.setButtonText (tr ("Amps", "Amplituds"));
+    // SENTENCE CASE, NOT SHOUTING. These two were the only ALL-CAPS words among the
+    // column's controls - every caption, item and button around them is sentence case -
+    // so the caps read as emphasis this pair has not earned over the action beside it.
+    // The hierarchy inside the pair is carried by ORDER and COLOUR (see actionPair), and
+    // neither of those changes here.
+    //
+    // It is also the one capitalisation change that BUYS room rather than spending it.
+    // actionPair measures the follower's word and gives the action what is left, and the
+    // comment there records what the all-caps pair cost: "REALTIME" wanted 79 px of the
+    // 76 the old 2/5 split gave it and "TEMPS REAL" wanted 96. Lower-case letters are
+    // narrower than capitals in this face, so both words shrink and the action - whose
+    // text GROWS when a run would take more than a second - gets the difference.
+    chordRtBtn.setButtonText (tr ("Realtime", "Temps real"));
+    adaptRtBtn.setButtonText (tr ("Realtime", "Temps real"));
     adaptTargetBox.setTooltip (tr (
         "WHICH NOTES the spectrum is adapted to.\n*The loaded tuning* - its degrees.\n*The chord held now* - literally the notes under your fingers, at the pitch they are really sounding.\nONE note counts as a target too: with nothing else sounding, what is minimised is the partials' beating against EACH OTHER, at that note's own pitch.\nREALTIME always follows the held chord, so this box shows that and waits while the link is on.",
         "QUINES NOTES fan d'objectiu.\n*L'afinaci\xc3\xb3 carregada* - els seus graus.\n*L'acord que sona ara* - literalment les notes sota els dits, a l'al\xc3\xa7""ada real.\nUNA sola nota tamb\xc3\xa9 val com a objectiu: si no sona res m\xc3\xa9s, el que es minimitza \xc3\xa9s el batec dels parcials ENTRE ELLS, a l'al\xc3\xa7""ada d'aquella nota.\nTEMPS REAL sempre segueix l'acord que mantens, per aix\xc3\xb2 aquesta casella ho mostra i espera mentre el v\xc3\xadncle est\xc3\xa0 actiu."));
@@ -6095,20 +6140,28 @@ void FractalAdditiveAudioProcessorEditor::paintRealtimeButtons()
     // change really took to reach the spectrum, on this machine, at these settings. The
     // budget is a fixed 250 ms and heavy adapt settings (16 or 24 partials against a wide
     // chord) can outgrow it - so the alternative to printing this number was a lookahead
-    // that quietly stopped being early and never said so. "LATE" is the whole point of
+    // that quietly stopped being early and never said so. "late" is the whole point of
     // the read-out; it is not decoration.
+    //
+    // SENTENCE CASE, for the same reason as the two Realtime buttons above and with the
+    // same benefit: this button sits directly under the follower it belongs to, on the
+    // column's own full width, and it is the longest string in the stack - "ANTICIPACIO
+    // 250 ms | darrer 310 ms TARD" in caps is the widest thing this 192 px column is ever
+    // asked to draw. Lower-case letters are narrower, so the state that has the most to
+    // say is the state that gains the most room to say it. The WARNING still reads as one:
+    // it is the only word in the line that is not a number or a unit.
     juce::String txt;
     if (active)
     {
         const double budMs = (double) processorRef.getLookaheadSamples() * 1000.0
                            / juce::jmax (1.0, processorRef.getSampleRate());
-        txt = tr ("LOOKAHEAD ", "ANTICIPACI\xc3\x93 ") + juce::String ((int) std::lround (budMs)) + " ms";
+        txt = tr ("Lookahead ", "Anticipaci\xc3\xb3 ") + juce::String ((int) std::lround (budMs)) + " ms";
         if (const double land = processorRef.getLastRealtimeLandingMs(); land >= 0.0)
             txt << tr (" | last ", " | darrer ") << juce::String ((int) std::lround (land)) << " ms"
-                << (land <= budMs ? juce::String() : tr (" LATE", " TARD"));
+                << (land <= budMs ? juce::String() : tr (" late", " tard"));
     }
-    else if (armed) txt = tr ("LOOKAHEAD (idle)", "ANTICIPACI\xc3\x93 (en espera)");
-    else            txt = tr ("LOOKAHEAD", "ANTICIPACI\xc3\x93");
+    else if (armed) txt = tr ("Lookahead (idle)", "Anticipaci\xc3\xb3 (en espera)");
+    else            txt = tr ("Lookahead", "Anticipaci\xc3\xb3");
     lookaheadBtn.setButtonText (txt);
 }
 
@@ -8562,8 +8615,63 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
         gSpecScale.setBounds (sp.reduced (3, 2)); // same top/bottom lines as rows 1-2
         auto si = sp.reduced (3).reduced (8, 5); si.removeFromTop (20);
+
+        //== THE THREE NUMBERS THIS WHOLE COLUMN IS SPACED BY ====================
+        //
+        // "esta mal alineado". It was spaced by eleven different ad-hoc gaps - 1, 2, 3
+        // and 4 px, in no pattern - and by two different row heights (22 everywhere and
+        // 24 for the scope box and the action pair), and its values were four different
+        // widths (32, 44, 44, 48) anchored to three different edges. Three constants
+        // replace all of that, and every row below is laid out from them.
+        //
+        //   kRowH   one row height, so the tops and bottoms of a column of controls
+        //           line up whatever kind of control each one is. A ComboBox already
+        //           filled its row and a TextEditor was inset by 1 px top and bottom, so
+        //           the two were 22 and 20 in the same stack: a 1 px step that reads as
+        //           a wobble down the value column and as nothing you can name.
+        //   kGapIn  between two rows of the SAME section.
+        //   kGapSec between sections, and around the framed stack as a whole. It is
+        //           double kGapIn on purpose - that is the only thing separating the two
+        //           kinds of gap once the frame's rules are drawn inside kGapSec - and
+        //           the section rule sits at its centre, 2 px clear of a row either side.
+        //
+        // MEASURED, because this column has no room to be generous with: at 1200x650 the
+        // goal-Range shape had 56 px of adapted-partial list against RhythmVerify's 54 px
+        // floor. Normalising costs 5 px of gaps in that shape and gives back 2 px on the
+        // scope row, 2 px on the action pair and 1 px on a stray one-pixel gap that
+        // belonged to nothing - so it is 4 px cheaper than what it replaces, and the
+        // frames drawn on top of it are free. Every other shape gains far more: the
+        // search from the current tuning gains 39 px, because it was reserving a row for
+        // a progress label that mode never shows (see below).
+        const int kRowH   = 22;
+        const int kGapIn  = 2;
+        const int kGapSec = 4;
+        // ONE VALUE WIDTH for the whole stack, so the values line up on BOTH edges and
+        // not just on the right one. 44, not the 48 the smallest-interval field had: 48
+        // would take four pixels off the amplitudes toggle, which is the one control in
+        // this column that is already measured to the pixel in Catalan (see the
+        // applyLanguage note on why it lost its "+"), and 44 holds five digits with the
+        // 4 px indents these editors are built with.
+        const int kValW   = 44;
+        // The top of each section, in si's coordinates, as the stack is laid out; the
+        // frame and its rules are derived from these at the end (see specSections).
+        int bandTop = si.getY();
+        std::vector<int> bandRules;
+        // Close the section that is open and start a new one. `si.getY()` at this moment
+        // is the first pixel AFTER the section just finished, so the rule goes at the
+        // centre of the kGapSec that follows - which is why sections may only ever be
+        // separated by kGapSec, never by kGapIn.
+        const auto endSection = [&si, &bandRules, kGapSec]
+        {
+            bandRules.push_back (si.getY() + kGapSec / 2);
+            si.removeFromTop (kGapSec);
+        };
+
         specModeBox.setBounds (si.removeFromTop (34));     // two lines: full mode names fit
-        si.removeFromTop (3);
+        // The mode selector is the column's SUBJECT, not one of its settings, so it sits
+        // outside the framed stack - which starts here.
+        si.removeFromTop (kGapSec);
+        bandTop = si.getY();
         tuneSourceBox.setVisible (beat);
         // The SCOPE means the same thing in both directions - judge every note against the
         // root, or every pair - so the adaptation shares the control rather than growing a
@@ -8571,30 +8679,31 @@ void FractalAdditiveAudioProcessorEditor::resized()
         tuneScopeBox.setVisible (beat || adapt);
         if (beat)
         {
-            tuneSourceBox.setBounds (si.removeFromTop (22));
-            si.removeFromTop (2);
+            tuneSourceBox.setBounds (si.removeFromTop (kRowH));
+            si.removeFromTop (kGapIn);
         }
         if (adapt)
         {
-            adaptTargetBox.setBounds (si.removeFromTop (22));
-            si.removeFromTop (2);
+            adaptTargetBox.setBounds (si.removeFromTop (kRowH));
+            si.removeFromTop (kGapIn);
         }
         if (beat || adapt)
         {
-            // 24, not 30. It was sized for two lines of a name it no longer has ("0 vs all"
-            // and "all vs all" are one short line in both languages), and in the adaptation
-            // those six pixels are the difference between four adapted partials on screen
-            // and five - the list is the leftover of this column and pays for every row.
-            // ...and only as wide as "all vs all" / "tot vs tot" needs. It used to take
+            // It was 24, and before that 30 - sized for two lines of a name it no longer
+            // has ("0 vs all" and "All vs all" are one short line in both languages). It
+            // is the stack's own row height now, which is what puts it on the same rhythm
+            // as everything under it, and the two pixels go where every pixel in this
+            // column goes: to the results list.
+            // ...and only as wide as "All vs all" / "Tot vs tot" needs. It used to take
             // the column's whole width for two three-word items.
             {
-                auto scr = si.removeFromTop (24);
+                auto scr = si.removeFromTop (kRowH);
                 tuneScopeBox.setBounds (scr.removeFromLeft (
-                             juce::jmin (fgfit::snugComboWidth (tuneScopeBox, 24), scr.getWidth())));
+                             juce::jmin (fgfit::snugComboWidth (tuneScopeBox, kRowH), scr.getWidth())));
             }
-            si.removeFromTop (3);
+            // WHAT is compared, above; HOW the search is set up, below.
+            endSection();
         }
-        si.removeFromTop (1);
 
         // Mode-gated visibility. BOTH beating sources now share ONE set of controls
         // - Notes, Min/Max, Period, smallest interval - so the two submenus differ
@@ -8645,13 +8754,16 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
         if (seg)
         {
-            auto pr = si.removeFromTop (22);
-            segPeriodLbl.setJustificationType (juce::Justification::centredLeft);
+            auto pr = si.removeFromTop (kRowH);
+            // (its centredLeft justification is set once, where the label is made - see
+            // the specCaptions loop in the constructor. Four rows in this block used to
+            // re-decide it on every layout pass, which is four copies of one decision
+            // that nothing kept in step.)
             segPeriodLbl.setBounds (pr.removeFromLeft (48));
-            segPeriodEdit.setBounds (pr.removeFromLeft (40).reduced (0, 1));
+            segPeriodEdit.setBounds (pr.removeFromLeft (40));
             pr.removeFromLeft (5);
             segTopToggle.setBounds (pr);          // "= top partial"
-            si.removeFromTop (2);
+            si.removeFromTop (kGapIn);
             segHelpLbl.setBounds (si.removeFromTop (26));
         }
         else if (beat || adapt) // the SAME stacked rows for the search and its inverse
@@ -8671,10 +8783,17 @@ void FractalAdditiveAudioProcessorEditor::resized()
                                              juce::dontSendNotification);
             }
 
-            auto r1 = si.removeFromTop (22);
+            auto r1 = si.removeFromTop (kRowH);
             if (beat)
             {
-                chordNotesLbl.setJustificationType (juce::Justification::centredLeft);
+                // Fixed widths, NOT `caption`, and deliberately: these two rows carry a
+                // second control after the value (Min/Max, and the goal box), so a caption
+                // sized to its own words takes those pixels off a ComboBox - and a
+                // ComboBox does not report the loss, it just draws less of its item.
+                // Measured: routing "Partials" through `caption` takes 61 px instead of
+                // 52 and leaves the goal box 79, where "Range" has 3 px to spare. The
+                // captions here fit their cells in both languages (RhythmVerify's
+                // condensed count is 0), so there is nothing to buy with that risk.
                 chordNotesLbl.setBounds (r1.removeFromLeft (44));
                 compact (chordNotesBox, r1.removeFromLeft (48));
                 r1.removeFromLeft (6);
@@ -8682,31 +8801,41 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
             else
             {
-                adaptPartialsLbl.setJustificationType (juce::Justification::centredLeft);
                 adaptPartialsLbl.setBounds (r1.removeFromLeft (52)); // "Partials"
                 compact (adaptPartialsBox, r1.removeFromLeft (46));
                 r1.removeFromLeft (6);
                 compact (adaptGoalBox, r1);
             }
-            si.removeFromTop (3);
-            auto r2 = si.removeFromTop (22);
+            si.removeFromTop (kGapIn);
+            auto r2 = si.removeFromTop (kRowH);
             // 44 was measured for "Period"; "Per\xc3\xado" "de" needs 4 more and was condensed.
-            caption (chordPerLbl, r2, 44, 50);
-            // ONE RIGHT EDGE for the values in this stack. Every row here is
-            // [caption][value], and the captions are wildly different lengths - "Notes"
-            // against "smallest interval (c)" - so left-placing each value put the three
-            // of them at three different x (1035 / 1036 / 1116 in the shipped window):
-            // a stack that reads as one column but is not one. Their captions cannot be
-            // made one width (the longest is 125 px inside a 192 px column, which would
-            // leave the Notes row's Min/Max box 13 px), so the alignment is taken on the
-            // side that CAN hold: the values end where the row ends, which is also where
-            // the Notes row's Min/Max box and the buttons under them end.
+            caption (chordPerLbl, r2, 44, kValW + 6);
+            // ONE RIGHT EDGE - AND, NOW, ONE WIDTH - for the values in this stack. Every
+            // row here is [caption][value], and the captions are wildly different lengths
+            // - "Notes" against "Smallest interval (c)" - so left-placing each value put
+            // the three of them at three different x (1035 / 1036 / 1116 in the shipped
+            // window): a stack that reads as one column but is not one. Their captions
+            // cannot be made one width (the longest is 125 px inside a 192 px column,
+            // which would leave the Notes row's Min/Max box 13 px), so the alignment is
+            // taken on the side that CAN hold: the values end where the row ends, which
+            // is also where the Notes row's Min/Max box and the buttons under them end.
+            //
+            // The right edge alone was not enough. Two right-anchored fields 44 and 48 px
+            // wide have their LEFT edges 4 px apart, so the column this comment claimed
+            // to be building had a step in it that only showed on the side nobody had
+            // measured. kValW is that width, and it is now the width of EVERY value in
+            // the stack - the two range fields and the register-band field included, and
+            // those two used to be 44 and 32 starting at the same x.
+            //
             // In the adaptation the period is not the last thing on its row - the
             // amplitudes toggle follows it - so there it stays left, beside the
-            // caption it belongs to.
+            // caption it belongs to. That is the one value in the stack that cannot take
+            // the shared right edge, and it is not a choice: the toggle needs every
+            // remaining pixel of that row in Catalan (see below), so moving the field
+            // right would either overlap it or condense its word.
             if (adapt)
             {
-                chordPeriodEdit.setBounds (r2.removeFromLeft (44).reduced (0, 1));
+                chordPeriodEdit.setBounds (r2.removeFromLeft (kValW));
                 // ...and the toggle takes EVERY remaining pixel of the row. The 6 px gap
                 // that used to be spent here bought nothing: LookAndFeel_V4 draws the tick
                 // box 4 px in from the button's own left edge, so the air was already
@@ -8716,26 +8845,30 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 adaptAmpsToggle.setBounds (r2);
             }
             else
-                chordPeriodEdit.setBounds (r2.removeFromRight (juce::jmin (44, r2.getWidth()))
-                                             .reduced (0, 1));
+                chordPeriodEdit.setBounds (r2.removeFromRight (juce::jmin (kValW, r2.getWidth())));
             // The result count is fixed at 16 - one control less to think about.
             chordCountLbl.setVisible (false); chordCountBox.setVisible (false);
-            si.removeFromTop (3);
-            auto r3 = si.removeFromTop (22);
-            caption (chordMinLbl, r3, 112, 48); // "smallest interval (c)" / "interval mes petit (c)"
+            si.removeFromTop (kGapIn);
+            auto r3 = si.removeFromTop (kRowH);
+            caption (chordMinLbl, r3, 112, kValW); // "Smallest interval (c)" / "Interval mes petit (c)"
             // ...and this is the value whose caption is the long one, so it is the row
             // that was 80 px out of line with the two above it. Nothing follows it in
             // either mode, so it takes the shared right edge unconditionally.
-            chordMinEdit.setBounds (r3.removeFromRight (juce::jmin (48, r3.getWidth())).reduced (0, 1));
+            chordMinEdit.setBounds (r3.removeFromRight (juce::jmin (kValW, r3.getWidth())));
             if (adapt && adaptGoalBox.getSelectedId() == 3)
             {
-                si.removeFromTop (3);
-                auto rr = si.removeFromTop (22);
-                adaptRangeLbl.setJustificationType (juce::Justification::centredLeft);
-                adaptRangeLbl.setBounds (rr.removeFromLeft (58)); // "between"
-                adaptLoEdit.setBounds (rr.removeFromLeft (44).reduced (0, 1));
-                rr.removeFromLeft (4);
-                adaptHiEdit.setBounds (rr.removeFromLeft (44).reduced (0, 1));
+                si.removeFromTop (kGapIn);
+                auto rr = si.removeFromTop (kRowH);
+                // The PAIR takes the shared right edge, so the high end of the range lands
+                // on the same line as every other value in the stack and the low end one
+                // field-width in from it. Laid out right to left for exactly that reason:
+                // anchoring the pair on the LEFT (which is what it did) put its right edge
+                // wherever the caption's length in the current language happened to leave
+                // it, so the row moved when the language did.
+                caption (adaptRangeLbl, rr, 58, kValW + 4 + kValW); // "Between"
+                adaptHiEdit.setBounds (rr.removeFromRight (juce::jmin (kValW, rr.getWidth())));
+                rr.removeFromRight (4);
+                adaptLoEdit.setBounds (rr.removeFromRight (juce::jmin (kValW, rr.getWidth())));
             }
             if (adapt)
             {
@@ -8743,41 +8876,58 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // the answer genuinely differs per register and the user must be able to
                 // see, and change, what was optimised for rather than infer it from the
                 // note they happened to be holding.
-                si.removeFromTop (2);
-                auto rg = si.removeFromTop (22);
-                // ONE control on this row: the caption and a width like "1.5" (32 px - the
-                // same field the step count had, and a decimal point is narrower than the
-                // third digit it replaces). The aggregate box that used to sit beside it is
-                // gone - it could not change the result - and so are the two lines of
-                // sentence under it that explained the choice; both are now one paragraph
-                // in this field's own hover. The 36 px kept back is the field plus its gap,
-                // so the caption may still grow into the rest of the row rather than
-                // condensing to 70% in a language with a longer word - which is what the
-                // Catalan "Periodes" would do at the 46 px the shorter caption needed.
-                caption (adaptRegLbl, rg, 58, 36);
-                adaptRegPeriodsEdit.setBounds (rg.removeFromLeft (32).reduced (0, 1));
+                si.removeFromTop (kGapIn);
+                auto rg = si.removeFromTop (kRowH);
+                // ONE control on this row: the caption and a value like "1.5". The
+                // aggregate box that used to sit beside it is gone - it could not change
+                // the result - and so are the two lines of sentence under it that explained
+                // the choice; both are now one paragraph in this field's own hover. The
+                // field was 32 px and left-anchored, which put it at the same x as the
+                // range row's low field one row up and made the two look like a column
+                // they were not; it is kValW and right-anchored now, like every other
+                // value here. The caption may still grow into the rest of the row rather
+                // than condensing to 70% in a language with a longer word - which is what
+                // the Catalan "Periodes" would do at the 46 px the shorter caption needed.
+                caption (adaptRegLbl, rg, 58, kValW);
+                adaptRegPeriodsEdit.setBounds (rg.removeFromRight (juce::jmin (kValW, rg.getWidth())));
                 // WHAT N COMES TO, and WHICH NOTE it hangs off. One line at 10 pt, and it is
                 // paid for out of the gaps around it rather than out of the result list:
                 // without this line N is a magic number and the anchor is invisible, which
-                // is the whole failure mode of a range that follows the hands.
+                // is the whole failure mode of a range that follows the hands. Glued
+                // directly under the field it explains - no gap at all - because it is
+                // that field's read-out, not a row of its own.
                 adaptRegSpanLbl.setBounds (si.removeFromTop (12));
             }
+            // HOW the search is set up, above; the buttons that RUN it, below.
+            if (chord || adapt) endSection();
             if (chord)
             {
-                si.removeFromTop (4);
-                actionPair (chordGoBtn, chordRtBtn, si.removeFromTop (24));
+                actionPair (chordGoBtn, chordRtBtn, si.removeFromTop (kRowH));
+                // The chord search keeps its own progress line, and it keeps it INSIDE
+                // this section - it is what the two buttons above it are doing. The
+                // adaptation does NOT have one: its read-out below carries the progress,
+                // and a second line that was blank most of the time and said
+                // "Realtime: 37 retunes" the rest of it was one of the two lines nobody
+                // could explain.
+                //
+                // It used to be laid out for BOTH beating sources - the row was taken off
+                // `si` whenever the mode was not the adaptation - while the label itself
+                // is only ever VISIBLE in the free search. So combining the current
+                // tuning reserved 16 px for a label nobody can see, every time, and the
+                // results list under it paid for them.
+                si.removeFromTop (kGapIn);
+                chordProgLbl.setBounds (si.removeFromTop (14)); // search progress only
             }
             if (adapt)
             {
-                si.removeFromTop (3);
-                // Same pair, same shared edges as the search's Find / REALTIME above.
-                actionPair (adaptGoBtn, adaptRtBtn, si.removeFromTop (24));
-                // LOOKAHEAD on its own row UNDER the follower it belongs to: it is the
+                // Same pair, same shared edges as the search's Find / Realtime above.
+                actionPair (adaptGoBtn, adaptRtBtn, si.removeFromTop (kRowH));
+                // Lookahead on its own row UNDER the follower it belongs to: it is the
                 // follower's latency trade and means nothing without it, so it must not
                 // sit where it could be mistaken for a third action.
-                si.removeFromTop (2);
-                lookaheadBtn.setBounds (si.removeFromTop (22));   // the column's own edges
-                si.removeFromTop (1);
+                si.removeFromTop (kGapIn);
+                lookaheadBtn.setBounds (si.removeFromTop (kRowH));   // the column's own edges
+                si.removeFromTop (kGapIn);
                 // THE one read-out (see adaptReadoutText). 28 px is two lines at 10.5 pt,
                 // and every sentence it can print is written to fit two - RhythmVerify
                 // measures all five of them, in both languages, because only one is ever on
@@ -8791,19 +8941,42 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // a button offering to replace it with something the Tuning panel already
             // says was clutter over the thing you came to read. The 25 px it took go to
             // the list.)
-            // The chord search keeps its own progress line. The adaptation does NOT: its
-            // read-out above carries the progress, and a second line that was blank most
-            // of the time and said "realtime: 37 updates" the rest of it was one of the
-            // two lines nobody could explain.
-            if (! adapt)
+        }
+
+        //== THE FRAME AROUND THE SECTIONS ======================================
+        // The stack ends here, so this is where the frame that encloses it can be
+        // measured. It reaches kGapSec/2 above the first section's first row and the
+        // same below the last section's last row - i.e. it lives in the two gaps that
+        // already separated the stack from the mode box above and the results list
+        // below, and takes not one pixel from either.
+        //
+        // FOUR pixels wider than the content on each side, and that number is the whole
+        // width there is: si is inset 11 px from the column and gSpecScale's own 2.6 px
+        // border sits about 5.6 px in, so the ground can be 4 px wider than the content
+        // and still leave a pixel and a half of dark between itself and that border.
+        // (The first version was 6 px and painted over the border's inner edge.)
+        {
+            const int frameBot = si.getY() + kGapSec / 2;
+            auto frame = juce::Rectangle<int> (si.getX() - 4, bandTop - kGapSec / 2,
+                                               si.getWidth() + 8, frameBot - (bandTop - kGapSec / 2));
+            // Nothing to enclose is nothing to draw. It cannot happen in any of the three
+            // modes as they stand - each lays out at least one row - but a frame around
+            // nothing is the exact claim RhythmPanel's comment warns about, so it is
+            // stated here rather than left to the modes to keep true.
+            const bool haveSections = frame.getHeight() > kGapSec && frame.getWidth() > 8;
+            specSections.setVisible (haveSections);
+            if (haveSections)
             {
-                si.removeFromTop (2);
-                chordProgLbl.setBounds (si.removeFromTop (14)); // search progress only
+                specSections.setBounds (frame);
+                specSections.rules.clear();
+                for (const int y : bandRules)
+                    specSections.rules.push_back (y - frame.getY());
+                specSections.repaint();
             }
         }
 
         // The result list fills the REST of this same box.
-        si.removeFromTop (4);
+        si.removeFromTop (kGapSec);
         const bool showDeg = dy; // the chord-degree view went with its switch (see above)
         // The SCOPE selector only decides how a combination is RANKED (against 0, or
         // over every pair); how many notes it has is the shared "Notes" box above.
@@ -10919,7 +11092,10 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         chordProgLbl.setText (processorRef.isChordSearchRunning()
                                   ? tr ("Searching... ", "Cercant... ")
                                     + juce::String ((int) std::lround (processorRef.getChordSearchProgress() * 100.0f)) + "%"
-                                  : chordRtOn ? tr ("realtime: ", "temps real: ")
+                                  // Capitalised to match "Searching..." - the other half
+                                  // of this same one-line read-out, which a reader sees
+                                  // in the same place a second earlier.
+                                  : chordRtOn ? tr ("Realtime: ", "Temps real: ")
                                                 + juce::String (processorRef.getRealtimeApplies())
                                                 + tr (" retunes", " reafinacions")
                                               : juce::String(),
