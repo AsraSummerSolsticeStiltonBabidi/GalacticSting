@@ -111,6 +111,52 @@ namespace
     // would pass while the two lines sat side by side.
     constexpr float kFrameLine = 1.3f;
 
+    // ONE DECIMAL POLICY FOR EVERY FADER READ-OUT.
+    //
+    // The SPECTRUM panel alone showed four different precisions at once - "1.000" (amp
+    // decay), "1.00" (fractal), "0.3000" (transition time), "0.000" (phase) - with "0.00"
+    // (gain) in ESSENTIALS beside it and "0.500" (a modulator Range) in MODULATORS. Six
+    // ways of writing the same kind of number in one window, and not one of them was a
+    // decision: juce::AudioParameterFloat derives its decimals from the parameter's own
+    // INTERVAL (0.001 -> three, 0.0001 -> four), so the read-out was reporting the
+    // automation grid rather than the value, and two faders that happen to step
+    // differently printed differently for no reason a user can see.
+    //
+    // Capped, never extended: a fader whose step already gives it fewer digits keeps them
+    // (the glide time stays "120.0 ms", shepTime stays whole milliseconds), so this adds a
+    // ceiling and never a trailing zero. What is left on screen is two policies - whole
+    // numbers where the step is whole, and at most two decimals everywhere else.
+    //
+    // It is a DISPLAY cap and nothing else: the parameter, the automation lane, the
+    // modulation and the saved state are all untouched, and the fader still moves in its
+    // own steps. (The one place two decimals would have been a lie is the REFERENCE field
+    // in ESSENTIALS, which is a text box the user types into and which is READ BACK on
+    // focus loss - rounding 261.6255653 to 261.626 there would retune the instrument by
+    // 0.0006 Hz the next time the field lost focus. It is deliberately not touched here;
+    // it is not a fader read-out.)
+    inline constexpr int kFaderMaxDecimals = 2;
+
+    // Re-render a bare decimal number with at most `dp` decimals. Anything that is NOT a
+    // bare number - a note name, "Even-All 50%", "7th harmonic", a unit word - is somebody
+    // else's wording and comes back untouched, so this can never mangle a fader that
+    // writes its own text.
+    juce::String capDecimals (const juce::String& text, int dp)
+    {
+        const auto s = text.trim();
+        if (s.isEmpty()) return text;
+        int i = (s[0] == '-' || s[0] == '+') ? 1 : 0;
+        if (i >= s.length()) return text;
+        int dot = -1;
+        for (int k = i; k < s.length(); ++k)
+        {
+            const auto c = s[k];
+            if (c == '.') { if (dot >= 0) return text; dot = k; }
+            else if (! juce::CharacterFunctions::isDigit (c)) return text;
+        }
+        if (dot < 0 || s.length() - dot - 1 <= dp) return text;   // already short enough
+        return juce::String (s.getDoubleValue(), dp);             // rounds, never truncates
+    }
+
     // UI wrapper over the (unit-tested, pure-C++) label logic in Dissonance.h.
     juce::String justName (double ratio)
     {
@@ -504,6 +550,37 @@ namespace
             g.setColour (txt);
             g.setFont (getTextButtonFont (b, b.getHeight()));
 
+            // A STEPPER'S + AND - ARE DRAWN, NOT TYPED.
+            //
+            // As glyphs they are not a pair at all: in this face the hyphen is a ~5 px bar
+            // about 1 px thick sitting on the x-height, while the plus is a ~10 px cross of
+            // two ~2 px strokes on the maths axis. Side by side in two 20 px circles - the
+            // OCTAVE pair in ESSENTIALS, OCTAVE RANGE in SPECTRUM, and the rhythm panel's
+            // PULSE RATE and Octave (all) - the minus reads as optically half the weight of
+            // the plus and 5 px higher, so one half of a symmetrical control looks disabled.
+            // No font choice fixes that; the two characters are simply not designed as a
+            // set. Two rectangles are: same length, same pen, same centre, and the plus is
+            // the minus with one more bar across it.
+            //
+            // Sized from the circle GalacticLnF::drawButtonBackground really fills (the
+            // SHORTER side of the button), so a stepper laid out in a rect that is not
+            // square still gets a glyph centred in its own circle rather than in the rect.
+            if (b.getName() == "round")
+            {
+                const auto t = b.getButtonText();
+                if (t == "+" || t == "-")
+                {
+                    const auto r  = b.getLocalBounds().toFloat();
+                    const float d = juce::jmin (r.getWidth(), r.getHeight());
+                    const float arm = std::round (d * 0.46f);                    // bar length
+                    const float pen = juce::jmax (1.6f, std::round (d * 0.14f)); // bar weight
+                    const float cx = r.getCentreX(), cy = r.getCentreY();
+                    g.fillRect (cx - arm * 0.5f, cy - pen * 0.5f, arm, pen);
+                    if (t == "+") g.fillRect (cx - pen * 0.5f, cy - arm * 0.5f, pen, arm);
+                    return;
+                }
+            }
+
             auto area = b.getLocalBounds().reduced (4, 0);
             // A button flagged "fork" gets a real tuning fork drawn at its left edge.
             // There is no tuning-fork character in any font we can rely on - the nearest
@@ -805,28 +882,93 @@ namespace
                 g.drawText (on ? "ON" : "OFF", b.getLocalBounds(), juce::Justification::centred, false);
                 return;
             }
-            // A DISABLED TICK BOX HAS TO LOOK DISABLED, and JUCE's own painter does not
-            // manage it: LookAndFeel_V4::drawToggleButton dims the TEXT (setOpacity 0.5)
-            // and hands drawTickBox an isEnabled flag that drawTickBox then uses only for
-            // the BORDER - the tick itself is filled in full tickColourId whatever the
-            // state. So the nine PRIME CONTROL boxes sat at full olive saturation under a
-            // greyed "Whitelist" the moment that panel's switch went off, which is the
-            // one state where they are not acting on the sound at all. Caught by reading
-            // the rig's own photographs, not by any gate: nothing overflowed, nothing was
-            // clipped, it was simply the wrong colour.
+            // EVERY OTHER TICK BOX IS THE SAME BOX, WITH THE SAME GAP TO ITS WORD.
             //
-            // A transparency layer rather than a hand-copy of JUCE's painter: the layer
-            // costs one small offscreen buffer per disabled box per repaint (these are
-            // 15x15) and it cannot drift out of step with the base class the way a copy
-            // would. 0.45 is the same order as the 0.5 JUCE already uses on the text.
+            // LookAndFeel_V4 derives the box from the BUTTON'S HEIGHT
+            // (jmin (15, h * 0.75) * 1.1) and starts the text at roundToInt (that) + 10,
+            // so a 215 x 106 block of one PRIME CONTROL panel drew three different tick
+            // boxes - 15x15 for the nine prime toggles, 18x18 for "Temper to tuning", and
+            // 18x16 for "On" (not even square, because the rounding of a fractional height
+            // lands the outline between pixels) - with 6 px after one word and 9 after
+            // another. Nothing was wrong with any single control; they simply had three
+            // different heights, and V4 turned that into three different SIZES.
+            //
+            // A tick box is not a scaled part of its row: it is a fixed 16 px square glyph
+            // that says on or off, and the word beside it always sits the same distance
+            // away. fgfit::kTickBox / kTickGap / kTickX are those three numbers, and
+            // fgfit::toggleRoom / toggleWidth are computed FROM them - so the sweep that
+            // checks a toggle's word fits and the resized() that sizes it to its word both
+            // measure the geometry this function really draws.
+            //
+            // ...AND A DISABLED ONE LOOKS DISABLED. drawTickBox is handed an isEnabled flag
+            // and uses it only for the BORDER - the tick itself is filled in full
+            // tickColourId whatever the state - so the nine prime boxes sat at full olive
+            // saturation under a greyed "Whitelist" the moment that panel's switch went
+            // off, which is the one state where they are not acting on the sound at all.
+            // Caught by reading the rig's own photographs; no gate could see it, because
+            // nothing overflowed and nothing was clipped - it was simply the wrong colour.
+            //
+            // A transparency layer rather than a hand-copy of the tick path: it costs one
+            // small offscreen buffer per disabled box per repaint (these are 16x16) and it
+            // covers the box, the word and anything added here later. 0.45 is the same
+            // order as the 0.5 the text already used on its own.
+            const auto paintToggle = [&]
+            {
+                const float box = (float) fgfit::kTickBox;
+                drawTickBox (g, b, (float) fgfit::kTickX, ((float) b.getHeight() - box) * 0.5f,
+                             box, box, b.getToggleState(), b.isEnabled(), over, down);
+                g.setColour (b.findColour (juce::ToggleButton::textColourId));
+                g.setFont (fgfit::toggleFont (b.getHeight()));
+                g.drawFittedText (b.getButtonText(),
+                                  b.getLocalBounds()
+                                      .withTrimmedLeft (fgfit::kTickX + fgfit::kTickBox + fgfit::kTickGap)
+                                      .withTrimmedRight (2),
+                                  juce::Justification::centredLeft, 10);
+            };
             if (! b.isEnabled())
             {
                 g.beginTransparencyLayer (0.45f);
-                juce::LookAndFeel_V4::drawToggleButton (g, b, over, down);
+                paintToggle();
                 g.endTransparencyLayer();
-                return;
             }
-            juce::LookAndFeel_V4::drawToggleButton (g, b, over, down);
+            else paintToggle();
+        }
+
+        // A SCROLLBAR THAT BELONGS TO THIS WINDOW.
+        //
+        // There was no drawScrollbar here at all, so the five result lists inside the
+        // salmon Spectrum-vs-Tuning column - and the per-partial window's grid - drew
+        // LookAndFeel_V4's default thumb, which is its colour scheme's `highlightedFill`:
+        // a #42a2c8 cyan that appears nowhere else in this product's chrome. On the zebra
+        // rows of a salmon panel it read as an unstyled system control that had escaped
+        // the theme, and it had no track at all, so it floated on the stripes with nothing
+        // to say how far the list ran.
+        //
+        // Neutral on purpose, and not one more identity colour: this is a mechanism, not a
+        // section. It is the same 0x14ffffff wash the zebra rows themselves are drawn in,
+        // one step up for the thumb, so the bar reads as part of the LIST rather than as a
+        // thing sitting on top of it - and it stays out of the way of every panel hue it
+        // has to appear in, which is what stopped the cyan from working.
+        void drawScrollbar (juce::Graphics& g, juce::ScrollBar& bar, int x, int y, int w, int h,
+                            bool vertical, int thumbStart, int thumbSize,
+                            bool over, bool down) override
+        {
+            juce::ignoreUnused (bar);
+            const auto full = juce::Rectangle<int> (x, y, w, h).toFloat();
+            const float rad = (vertical ? full.getWidth() : full.getHeight()) * 0.5f;
+            // The track: the whole travel, so the bar says how much list there is even
+            // when the thumb is short.
+            g.setColour (juce::Colour (0x14ffffff));
+            g.fillRoundedRectangle (full.reduced (vertical ? 2.0f : 0.0f, vertical ? 0.0f : 2.0f), rad);
+            if (thumbSize <= 0) return;
+            auto thumb = vertical ? juce::Rectangle<float> (full.getX(), (float) thumbStart,
+                                                            full.getWidth(), (float) thumbSize)
+                                  : juce::Rectangle<float> ((float) thumbStart, full.getY(),
+                                                            (float) thumbSize, full.getHeight());
+            thumb = thumb.reduced (vertical ? 1.5f : 1.0f, vertical ? 1.0f : 1.5f);
+            g.setColour (juce::Colour (down ? 0xffc4ccda : (over ? 0xffa2a8b8 : 0xff70768a)));
+            g.fillRoundedRectangle (thumb, juce::jmin (rad, thumb.getWidth() * 0.5f,
+                                                       thumb.getHeight() * 0.5f));
         }
 
         // Custom tooltip rendering: line-based, so the "from the partial: n/1" line of
@@ -1426,23 +1568,38 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // That is exactly cause (a) of commit 2b51e2f ("strings set once in the constructor")
     // and the same fix applies - the words live in applyLanguage() now (search octTip
     // there), which is the only place a language switch can reach.
-    auto configStep = [&] (juce::TextButton& b, const char* txt, const char* id, int delta)
+    // A STEPPER PAIR IS ONE CONTROL, AND IT WEARS ITS PANEL'S COLOUR.
+    //
+    // "-" used to be cReset (red) and "+" cLoad (green) - the semantic pair that means
+    // DESTROY and LOAD everywhere else in this window. Stepping a transpose by one octave
+    // is neither: it is the most ordinary, most reversible edit there is, and painting it
+    // in the two loudest colours the product owns put the same red on the octave minus
+    // that is on the X which deletes a bank slot. Red then meant five different things at
+    // once (destructive, off, decrement, un-map, and a neutral read-out) and therefore
+    // meant nothing.
+    //
+    // Both halves now take the colour of the panel they sit in, at the same alpha, so the
+    // pair reads as one control belonging to one box - and the direction is carried by the
+    // glyph, which is what the glyph is for. `col` is passed in rather than assumed:
+    // OCTAVE lives in ESSENTIALS and OCTAVE RANGE in SPECTRUM, and a stepper wearing the
+    // wrong panel's hue is exactly the kind of drift this parameter prevents.
+    auto configStep = [&] (juce::TextButton& b, const char* txt, const char* id, int delta,
+                           juce::Colour col)
     {
         b.setButtonText (txt);
-        b.setName ("round"); // circular body (see GalacticLnF::drawButtonBackground)
-        b.setColour (juce::TextButton::buttonColourId, cEssentials.withAlpha (0.30f));
+        b.setName ("round"); // circular body + drawn glyph (see GalacticLnF)
+        b.setColour (juce::TextButton::buttonColourId, col.withAlpha (0.45f));
         b.setMouseClickGrabsKeyboardFocus (false);
         b.onClick = [stepParam, id, delta] { stepParam (id, delta); };
         addAndMakeVisible (b);
     };
-    configStep (octDn, "-", "octaveShift", -1);
-    configStep (octUp, "+", "octaveShift",  1);
-    configStep (sprDn, "-", "spectrumRange", -1);
-    configStep (sprUp, "+", "spectrumRange",  1);
-    octDn.setColour (juce::TextButton::buttonColourId, cReset.withAlpha (0.85f)); // "-" red
-    sprDn.setColour (juce::TextButton::buttonColourId, cReset.withAlpha (0.85f));
-    octUp.setColour (juce::TextButton::buttonColourId, cLoad.withAlpha (0.95f));  // "+" green
-    sprUp.setColour (juce::TextButton::buttonColourId, cLoad.withAlpha (0.95f));
+    configStep (octDn, "-", "octaveShift", -1, cEssentials);
+    configStep (octUp, "+", "octaveShift",  1, cEssentials);
+    // The SPECTRUM panel re-colours itself with the selected engine (see
+    // recolourSpectrumControls), so this pair is seeded with the "both engines" hue and
+    // repainted from there like every other control in that panel.
+    configStep (sprDn, "-", "spectrumRange", -1, cSlope);
+    configStep (sprUp, "+", "spectrumRange",  1, cSlope);
     for (auto* v : { &octVal, &sprVal })
     {
         v->setJustificationType (juce::Justification::centred);
@@ -1765,10 +1922,30 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuningNameLabel.setJustificationType (juce::Justification::centredLeft);
     tuningNameLabel.setColour (juce::Label::textColourId, cTuning); // the loaded scale's file name
     tuningNameLabel.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
-    // Period of the active scale, in RED, clearly labelled.
+    tuningNameLabel.setBorderSize (juce::BorderSize<int> (0, 2, 0, 2)); // one inset - see tuningPeriodLbl
+    // Period of the active scale, in the TUNING PANEL'S OWN COLOUR, clearly labelled.
+    //
+    // IT WAS RED, AND RED WAS SAYING NOTHING. This read-out is not a warning, not an
+    // off-state and not a button: it is a neutral fact about the loaded scale, printed
+    // ALWAYS - "Period 2" in the shipped state, "Period 3" for a tritave, "Period 1 (no
+    // repeat)" for a scale that declares none. A colour that is on screen in every single
+    // state carries no information by definition, and this one was the same red as the X
+    // that deletes a bank slot, the Reset buttons and the OFF pills. Four jobs for one
+    // hue teaches the eye to stop reading it, which costs the red where it MATTERS.
+    //
+    // cTuning is what the rest of this panel is already wearing (its border, its title
+    // chip, its captions, the scale name directly above this line), so the period now
+    // reads as one more field of the TUNING box instead of as an alarm inside it. Red is
+    // left to mean exactly one thing in this window: this control destroys something.
     tuningPeriodLbl.setJustificationType (juce::Justification::centredLeft);
-    tuningPeriodLbl.setColour (juce::Label::textColourId, juce::Colour (0xffe0453f));
+    tuningPeriodLbl.setColour (juce::Label::textColourId, cTuning.brighter (0.15f));
     tuningPeriodLbl.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
+    // The same 2 px inline-caption border every makeLabel() caption in this panel keeps
+    // (see makeLabel), instead of juce::Label's default 5. Four stacked text items in this
+    // box started their ink at 537 / 536 / 533 / 533 px because the two read-outs kept the
+    // default border and the captions did not - a 3 px stagger down one column with every
+    // component rect on the same x. One inset, so the column is a column.
+    tuningPeriodLbl.setBorderSize (juce::BorderSize<int> (0, 2, 0, 2));
     addAndMakeVisible (tuningPeriodLbl);
     addAndMakeVisible (tuningNameLabel);
 
@@ -1778,7 +1955,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // dissonance lists. Applied on Return, so a half-typed "3/" is never read as a period.
     tablePeriodEdit.setJustification (juce::Justification::centred);
     tablePeriodEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
-    tablePeriodEdit.setColour (juce::TextEditor::outlineColourId, juce::Colour (0xffe0453f).withAlpha (0.7f));
+    // Outlined in the panel's own colour, like every other field in it - it was the same
+    // red as the period read-out beside it, and for the same wrong reason (see
+    // tuningPeriodLbl above): typing a period is not a destructive act.
+    tablePeriodEdit.setColour (juce::TextEditor::outlineColourId, cTuning.withAlpha (0.7f));
     tablePeriodEdit.setIndents (6, 2);
     tablePeriodEdit.setSelectAllWhenFocused (true);
     tablePeriodEdit.onReturnKey = [this]
@@ -2169,9 +2349,23 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     };
     addAndMakeVisible (saveTuningBtn);
 
-    // Spectrum -> rhythm MIDI panel (top-bar button toggles it). WHITE: maximum
-    // contrast against the dark bar and the rainbow title squares beside it.
-    rhythmBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xfff2f2f2));
+    // Spectrum -> rhythm MIDI panel (top-bar button toggles it), IN THE COLOUR OF THE
+    // PANEL IT OPENS.
+    //
+    // It was 0xfff2f2f2 - "WHITE: maximum contrast against the dark bar" - and that was
+    // the problem, not the intention. On a 0x0c0c12 page it was the only near-white
+    // element in the entire window, so it was the first thing the eye landed on, ahead of
+    // the title, the preset selector and every panel: maximum contrast spent on a
+    // SECONDARY view toggle. Nothing else in this product is painted white, either, so it
+    // read as an unstyled system control that had escaped the theme.
+    //
+    // 0xff5cb8ff is the exact colour the panel's own SPECTRUM VS RHYTHM heading is drawn
+    // in (see RhythmPanel::heading), which is the only relationship this button has to
+    // express: press it and that heading appears. Still light enough for
+    // GalacticLnF::drawButtonText to put BLACK letters on it (perceived brightness ~0.66,
+    // well over the 0.52 threshold), so it loses none of its legibility - only its
+    // undeserved first place in the reading order.
+    rhythmBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff5cb8ff));
     rhythmBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::black);
     rhythmBtn.setMouseClickGrabsKeyboardFocus (false);
     // (tooltip in applyLanguage)
@@ -4178,7 +4372,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     rhythmPanel.helpB.setButtonText (tr ("How to route", "Com encaminar"));
     // The unit on every routed row's steps field. Set here rather than at the call site
     // because stepsText is static - see the comment on stepWord.
-    RhythmPanel::stepWord = tr ("step", "pas");
+    rhythmPanel.stepWord = tr ("step", "pas");
     rhythmPanel.refreshSlots();
     chordList.emptyText = tr ("Press Find to search.\nhover a row to hear it\ndouble-click loads it as the scale",
                               "Prem Troba per cercar.\npassa-hi el cursor per escoltar-lo\ndoble clic el carrega com a escala");
@@ -7273,10 +7467,17 @@ void FractalAdditiveAudioProcessorEditor::refreshShepardRiseState()
 // mint "both engines" with a magenta Fractal), and after the frames became plain divider
 // lines those leftover hues were the only thing still drawing the boundaries.
 //
-// Deliberately NOT recoloured: the +/- steppers (green = up, red = down, the same pair
-// as Essentials' OCTAVE) and the Load/Remove button (green loads, red deletes). Those
-// colours mean an ACTION, not a compartment, and washing them into the panel hue would
-// erase the one warning that says which of the two the button is about to do.
+// THE OCTAVE RANGE STEPPERS ARE IN THE LIST NOW, and this comment used to be the reason
+// they were not: "green = up, red = down ... those colours mean an ACTION". They did not.
+// Green and red mean LOAD and DESTROY everywhere else in this window, and a stepper that
+// adds one octave to a range does neither - it is the most reversible edit the panel has.
+// Wearing the two loudest colours the product owns, it put the delete-a-bank-slot red on
+// an increment, which is how red came to carry five unrelated jobs at once. The pair now
+// takes the panel hue like everything else here and lets its GLYPH carry the direction
+// (see configStep, and GalacticLnF's drawn +/-, which finally weigh the same).
+//
+// Still deliberately NOT recoloured: the Load/Remove button (green loads, red DELETES a
+// loaded spectrum). That one really is destructive, which is the one job red keeps.
 void FractalAdditiveAudioProcessorEditor::recolourSpectrumControls (juce::Colour col)
 {
     auto fader = [&col] (juce::Slider& s)
@@ -7320,6 +7521,9 @@ void FractalAdditiveAudioProcessorEditor::recolourSpectrumControls (juce::Colour
     // hands the spectrum to" - which was the whole point when the two engines were two
     // boxes, and is now just one control refusing to join the panel it lives in.
     tick (temperToggle);
+    // OCTAVE RANGE's stepper pair - one control, one colour, the panel's own.
+    for (auto* b : { &sprDn, &sprUp })
+        b->setColour (juce::TextButton::buttonColourId, col.withAlpha (0.45f));
     partialEditBtn.col = col;
     randomSpectrumBtn.setColour (juce::TextButton::buttonColourId, col);
 }
@@ -7725,9 +7929,30 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
         const int bh = c.getHeight(), bw = c.getWidth();
         if (const auto* tb = dynamic_cast<const juce::TextButton*> (&c);
             tb != nullptr && tb->getButtonText().isNotEmpty())
-            p.buttonFits.push_back ({ name, tb->getButtonText(),
-                (float) juce::GlyphArrangement::getStringWidth (fgfit::textButtonFont (bh), tb->getButtonText()),
-                (int) std::floor (fgfit::textButtonRoom (bw, bh, tb->getProperties().contains ("fork"))) });
+        {
+            // A STEPPER IS MEASURED AGAINST ITS GLYPH, BECAUSE ITS GLYPH IS NOT ITS TEXT.
+            //
+            // GalacticLnF::drawButtonText draws a "round" +/- as two rectangles sized from
+            // the button's own circle - it never lays out the character at all - so
+            // measuring the string "-" in the button font measures something nothing
+            // draws. That mismatch was not academic: the rig's width floor was pinned at
+            // 690 px by "/round#19 (Button) \"-\" has negative room: -1.0 wide", i.e. by a
+            // hyphen the painter had stopped using.
+            //
+            // The check stays, against what is really drawn: the bar is 0.46 of the
+            // circle's diameter, centred, so what it needs of the BUTTON is that plus the
+            // painter's 4 px a side. A stepper squeezed to nothing still fails; one that
+            // has its circle passes, which is the truth.
+            const bool stepper = tb->getName() == "round"
+                              && (tb->getButtonText() == "+" || tb->getButtonText() == "-");
+            if (stepper)
+                p.buttonFits.push_back ({ name, tb->getButtonText(),
+                    std::round ((float) juce::jmin (bw, bh) * 0.46f), juce::jmax (0, bw - 8) });
+            else
+                p.buttonFits.push_back ({ name, tb->getButtonText(),
+                    (float) juce::GlyphArrangement::getStringWidth (fgfit::textButtonFont (bh), tb->getButtonText()),
+                    (int) std::floor (fgfit::textButtonRoom (bw, bh, tb->getProperties().contains ("fork"))) });
+        }
         else if (const auto* tg = dynamic_cast<const juce::ToggleButton*> (&c); tg != nullptr)
         {
             // The "onled" pill prints ON / OFF itself, centred in the whole button, and
@@ -8214,6 +8439,20 @@ void FractalAdditiveAudioProcessorEditor::configFader (juce::Slider& s, const ju
     s.onDragEnd = [this] { refocus(); };
     addAndMakeVisible (s);
     att = std::make_unique<SliderAttachment> (processorRef.apvts, paramID, s);
+    // ...and the ONE decimal policy, wrapped around whatever the attachment just
+    // installed (see kFaderMaxDecimals / capDecimals above for why).
+    //
+    // WRAPPED, not replaced, and that is the whole safety of it. The attachment's function
+    // is the parameter's own getText, and juce::Slider's numDecimalPlaces is derived from
+    // the range the attachment set - so the cap is read LAZILY, inside the lambda, and a
+    // caller that later says setNumDecimalPlacesToDisplay (0) still gets 0 (shepTime does,
+    // and until now that call did nothing at all: the attachment's textFromValueFunction
+    // wins over numDecimalPlaces, so its 0 was silently ignored). A caller that installs
+    // its OWN textFromValueFunction after this line - baseN, harmonics, primeLimit - still
+    // wins outright, because it simply overwrites this one.
+    if (s.textFromValueFunction != nullptr)
+        s.textFromValueFunction = [prev = std::move (s.textFromValueFunction), &s] (double v)
+        { return capDecimals (prev (v), juce::jmin (kFaderMaxDecimals, s.getNumDecimalPlacesToDisplay())); };
     // Remembered so the value boxes can be sized ONCE, later, when every fader's text is
     // final: the suffix (" ms", " c", " %") is set by the caller AFTER this function
     // returns, and the parameter's own text function arrives with the attachment on the
@@ -8570,9 +8809,19 @@ void FractalAdditiveAudioProcessorEditor::resized()
     // rather than centring itself in the band, so the two cannot drift apart: aligning
     // two buttons by writing the same number twice is aligning them until somebody
     // changes one of the numbers.
-    rhythmBtn.setBounds (titleBar.removeFromRight (178)
-                             .withSizeKeepingCentre (168, playgroundButton.getHeight())
-                             .withY (playgroundButton.getY()));
+    //
+    // ...AND IT ENDS ON THE WINDOW'S RIGHT WALL, not 4 px past it. `titleBar` is the full
+    // window width, so removeFromRight (178) + withSizeKeepingCentre (168) put its right
+    // edge on getWidth() - 5, while every panel below it stops at getWidth() - 9: the page
+    // margin (`area` = getLocalBounds().reduced (6, 4)) plus the 3 px each macro box keeps
+    // inside it (see gSpecScale's `sp.reduced (3, 2)`). One button breaking a wall that
+    // eight boxes hold is exactly the kind of near-miss that reads as sloppiness rather
+    // than as a decision, so the number is DERIVED from the same two insets instead of
+    // being a third hand-picked margin.
+    const int kPanelRight = getWidth() - 6 - 3;
+    rhythmBtn.setBounds (juce::Rectangle<int> (kPanelRight - 168, playgroundButton.getY(),
+                                               168, playgroundButton.getHeight()));
+    titleBar.removeFromRight (178);   // the band the title must not run into (see titleBandFor)
 
     // The credit, centred UNDER the title, from the same geometry paint() draws the
     // squares with. Sized to its own two words: the Label is capped so the link beside
@@ -9885,10 +10134,32 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     shareOut (fgfit::chip::centreInRow (in.removeFromTop (fgfit::chip::kRowHeight)), row * 2, 2);
                 }
             }
+            // ONE NEUTRAL FOR THE THREE TABS YOU ARE NOT ON; THE PANEL'S HUE FOR THE ONE
+            // YOU ARE.
+            //
+            // Each unselected chip used to be its OWN identity colour at 20% alpha, and
+            // that arithmetic produced four accidents rather than four colours. Over the
+            // panel fill the results were AMP #4EDF98 (selected), PITCH #463E2F, FILTER
+            // #2D4C50 and CUSTOM #2B4150 - PITCH a warm brown that matches nothing else in
+            // the product (and looks like a rendering fault once the panel turns blue on
+            // the CUSTOM tab), and FILTER and CUSTOM eleven units apart in ONE channel:
+            // two chips side by side that nobody can tell apart. The identity colours were
+            // chosen to be maximally separated at FULL strength (GalacticPalette.h); at
+            // 20% over a dark fill that separation is simply gone, so the dimming was
+            // destroying the very property it was borrowing.
+            //
+            // A tab strip only has to answer one question - which one am I on - and it
+            // answers it with the CONTRAST between the lit chip and the rest, not with
+            // four hues. So the three unselected chips share ONE neutral - a white wash of
+            // the panel fill, the same family as the 0x14ffffff the zebra rows use, at
+            // 0x2e so a chip still reads as a chip rather than as a hole - and the selected
+            // chip keeps its full identity colour, which is the hue the whole box beside it
+            // is already wearing.
+            const juce::Colour unlit (0x2effffff);
             for (int k = 0; k < 4; ++k)
             {
                 envTabB[k].setColour (juce::TextButton::buttonColourId,
-                                      envTab == k ? tabCols[k] : tabCols[k].withAlpha (0.20f));
+                                      envTab == k ? tabCols[k] : unlit);
                 envTabB[k].setColour (juce::TextButton::textColourOffId,
                                       envTab == k ? juce::Colours::black : juce::Colour (0xffb9c0d0));
                 envTabB[k].setBounds (chipRect[k].reduced (fgfit::chip::kInsetX, 0));
@@ -9943,7 +10214,15 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 if (on)
                 {
                     voiceEnv.setVisible (true);
-                    voiceEnv.setBounds (area2.withTrimmedLeft (4));
+                    // THE GRAPH LINES UP WITH THE TAB STRIP ABOVE IT.
+                    //
+                    // It was `withTrimmedLeft (4)` and nothing on the right, while the chip
+                    // row is inset by fgfit::chip::kInsetX (1) on BOTH sides of the same
+                    // `in` rectangle - so the two stacked elements of one panel started 3 px
+                    // apart (292 against 295) and ended 1 px apart (508 against 509). Two
+                    // vertical lines that are almost the same line read as a mistake where
+                    // one line reads as a decision. Same inset, same constant, both edges.
+                    voiceEnv.setBounds (area2.reduced (fgfit::chip::kInsetX, 0));
                     voiceEnvTab = t;
                     voiceEnv.col = tabCols[t];
                     voiceEnv.refresh();
@@ -10246,6 +10525,18 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // any language - Catalan's wider buttons only cross the threshold first.
             // So the name stays inline only while the leftover genuinely holds it, and
             // takes a row of its own the moment it does not.
+            // ONE GAP BETWEEN THE ROWS OF THIS PANEL.
+            //
+            // Every row here is taken off the top with its own leading, and two of the five
+            // said 2 while the other three said 3 - which, once the panel's spare height is
+            // shared out over the gaps (see `lead` below), photographed as 2, 6, 7, 7, 9 px
+            // down one narrow column. Nothing was wrong with any single number; there were
+            // simply two of them, plus the remainder of an integer division landing in the
+            // last gap. The three places that state the ladder's arithmetic (`fixed`,
+            // `wants` and the row placements themselves) now all read this, so the gap can
+            // never be two different sizes again - and the same value in all three is what
+            // keeps the affordability ladder honest about what it is reserving.
+            const int kTunRowGap = 3;
             const int nameNeed = tuningNameLabel.getText().isEmpty()
                                ? 0 : fgfit::labelWidth (tuningNameLabel);
             // WHEN THE PANEL IS SHORT, THE NAME AND THE PERIOD SHARE ONE ROW.
@@ -10285,7 +10576,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                                        && ti.getHeight() - 22 < need;
             if (nameOwnRow && ! mergeNamePeriod)
             {
-                ti.removeFromTop (2);
+                ti.removeFromTop (kTunRowGap);
                 tuningNameLabel.setBounds (ti.removeFromTop (20));
             }
             else if (! mergeNamePeriod)
@@ -10336,16 +10627,17 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // Period and the optional "load from..." rows are not on the ladder: the
                 // period read-out is what the panel is FOR, and each snug row exists only
                 // because the state it describes is live right now.
-                const int fixed = 2 + 18 + nSnug * (3 + 22);
-                int over = fixed + (3 + bendH) + (3 + bankH) - ti.getHeight();
+                const int fixed = kTunRowGap + 18 + nSnug * (kTunRowGap + 22);
+                int over = fixed + (kTunRowGap + bendH) + (kTunRowGap + bankH) - ti.getHeight();
                 if (over > 0) { const int g = juce::jmin (over, bankH - kRowMin); bankH -= g; over -= g; }
-                if (over > 0) { bankRow = false; over -= 3 + bankH; }
+                if (over > 0) { bankRow = false; over -= kTunRowGap + bankH; }
                 if (over > 0) { const int g = juce::jmin (over, bendH - kRowMin); bendH -= g; over -= g; }
                 if (over > 0) { bendRow = false; }
             }
             // What the surviving rows will actually occupy...
-            const int  wants = 2 + 18 + nSnug * (3 + 22)
-                             + (bendRow ? 3 + bendH : 0) + (bankRow ? 3 + bankH : 0);
+            const int  wants = kTunRowGap + 18 + nSnug * (kTunRowGap + 22)
+                             + (bendRow ? kTunRowGap + bendH : 0)
+                             + (bankRow ? kTunRowGap + bankH : 0);
             // ...over the gaps that can carry the rest: one before each row that survived,
             // plus the one left between the last of them and the Shepard block. A dropped
             // row hands its space back here, which is the whole point of `lead` and what a
@@ -10353,11 +10645,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
             const int  gapCount = 1 + nSnug + (bendRow ? 1 : 0) + (bankRow ? 1 : 0) + 1;
             const int  lead  = juce::jmax (0, ti.getHeight() - wants) / gapCount;
 
-            // Period of the active scale, in red, always visible. For an absolute 128-key
+            // Period of the active scale, in the panel's own lilac, always visible. For an
+            // absolute 128-key
             // table it is Fibló's ESTIMATE, so the same row also carries the field that
             // overrides it (and a reset back to the estimate) - the readout alone would
             // state a guess as if the tuning had declared it.
-            ti.removeFromTop (2 + lead);
+            ti.removeFromTop (kTunRowGap + lead);
             {
                 auto prow = ti.removeFromTop (18);
                 // The name rides on the LEFT of this row when the two were merged (see
@@ -10399,9 +10692,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // width. "Load spectrum's tuning" was a 420 px slab for 22 characters. Same
             // padding rule as every other narrowed control (fgfit::kSnugPad), and all
             // three share ONE helper so a rename cannot widen one and not its neighbours.
-            auto snugRow = [this, lead] (juce::Rectangle<int>& ti, juce::TextButton& b)
+            auto snugRow = [this, lead, kTunRowGap] (juce::Rectangle<int>& ti, juce::TextButton& b)
             {
-                ti.removeFromTop (3 + lead);   // its share of the panel's spare height
+                ti.removeFromTop (kTunRowGap + lead);   // its share of the panel's spare height
                 auto row = ti.removeFromTop (22).reduced (2, 0);
                 b.setBounds (row.removeFromLeft (
                     juce::jmin (fgfit::snugTextButtonWidth (b, 22), row.getWidth())));
@@ -10465,7 +10758,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             bool recentFits  = true;
             if (bendRow)
             {
-                ti.removeFromTop (3 + lead);   // its share of the panel's spare height
+                ti.removeFromTop (kTunRowGap + lead);   // its share of the panel's spare height
                 auto bendRowRect = ti.removeFromTop (bendH);
                 if (bendVis)
                 {
@@ -10516,7 +10809,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             tuningBankClearBtn.setVisible (bankUi);
             if (bankUi)
             {
-                ti.removeFromTop (3 + lead);   // its share of the panel's spare height
+                ti.removeFromTop (kTunRowGap + lead);   // its share of the panel's spare height
                 // Bank row: the label rides on the LEFT of the row (a separate label
                 // row no longer fits) - [BANK][combo (flex)][+ .scl][X remove].
                 // Whatever is still under it - one share of the slack, by construction -
@@ -10527,7 +10820,14 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // check below stays as belt and braces, not as the decision)
                 lblTuningBank.setJustificationType (juce::Justification::centredLeft);
                 lblTuningBank.setBounds (bkrow.removeFromLeft (tunLblW));
-                tuningBankClearBtn.setBounds (bkrow.removeFromRight (24).reduced (1, 1));
+                // TWO BUTTONS IN ONE ROW ARE ONE HEIGHT. This was `.reduced (1, 1)` while
+                // "+ .scl" beside it kept `.reduced (1, 0)`, so the row ended with a 24 px
+                // button and a 22 px one whose top edge sat 1 px lower - x 902-949 y
+                // 416-439 against x 955-976 y 417-438. Nothing was clipped and no check
+                // could see it; it just reads as two buttons that were placed on different
+                // days. The 1 px sideways stays (it is the air between them); the vertical
+                // inset goes, so both fill the row.
+                tuningBankClearBtn.setBounds (bkrow.removeFromRight (24).reduced (1, 0));
                 bkrow.removeFromRight (3);
                 tuningBankLoadBtn.setBounds (bkrow.removeFromRight (juce::jmax (46,
                                                  fgfit::textButtonWidth (tuningBankLoadBtn.getButtonText(), 24, false) + 2))
@@ -11544,7 +11844,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // Live active-scale dissonance list (recomputes only when timbre/tuning change).
     updateScaleDissonance();
 
-    // Period of the active scale (red readout in the Tuning box).
+    // Period of the active scale (the lilac read-out in the Tuning box).
     if (processorRef.tuningIsAbsoluteTable())
     {
         // An absolute table declares no period, so the readout must not claim one: it says

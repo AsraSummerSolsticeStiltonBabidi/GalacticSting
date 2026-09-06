@@ -417,8 +417,27 @@ public:
                     // Transport-locked. Cycles elapsed since the timeline start:
                     //   BPM mode : beats / 2^div
                     //   free Hz  : seconds * Hz  (seconds = ppq * 60 / bpm)
-                    const double cycles = rateMode == 0 ? ppq / std::exp2 ((double) divN)
-                                                        : ppq * (60.0 / bpm) * rate;
+                    //
+                    // EVALUATED AT THE END OF THE BLOCK, like the other branch, and that
+                    // matters now. The host reports ppq for the block's FIRST sample, so
+                    // this branch used to return the modulator's value at the START while
+                    // the note-restart branch below advances by dt and returns the value
+                    // at the END. One array, two different instants, and nothing noticed
+                    // while every consumer simply HELD the number across the block.
+                    //
+                    // The pitch path stopped holding it: it ramps from the previous
+                    // block's value to this one's, which is only the right pair of ends if
+                    // the value IS this block's end. Left as it was, a transport-locked
+                    // LFO on pitch would have come out smooth and one whole buffer late -
+                    // 5.8 ms at 256 samples and 44.1 kHz, 21 at 1024 and 48. Found by
+                    // reading, not by hearing, and the comment that justified the ramp
+                    // cited THIS branch's neighbour rather than this branch.
+                    //
+                    // One block of beats, not a second formula: both dresses are a
+                    // function of ppq, so advancing ppq is the whole correction.
+                    const double ppqEnd = ppq + dt * bpm / 60.0;
+                    const double cycles = rateMode == 0 ? ppqEnd / std::exp2 ((double) divN)
+                                                        : ppqEnd * (60.0 / bpm) * rate;
                     l.phase = std::fmod (cycles + phOff, 1.0);
                 }
                 else

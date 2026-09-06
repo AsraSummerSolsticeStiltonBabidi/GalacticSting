@@ -2623,10 +2623,32 @@ private:
         // OPPOSITE ways on u - which is why the two bounds are not the same. A move
         // bigger than this finishes over the next few plans; 4.42 octaves takes a handful
         // of 256-sample blocks, and every one of them is smooth.
-        const double riseDrift = juce::jmax (0.0, gEnd - gStart);
-        const double budget    = juce::jmax (1.0, (double) shepard::kSlots - W / P - 1.0);
-        const double upMax   = P * (budget + riseDrift);   // edge rising: cancels the rise
-        const double downMax = P * juce::jmax (0.0, budget - riseDrift); // edge falling: adds to it
+        // THE BUDGET IS SIGNED, because the grid can now walk either way.
+        //
+        // The invariant the plan needs is |(loEnd - loStart)/P - (gEnd - gStart)| <= budget:
+        // the bottom edge's travel measured in intervals, minus the grid's, is exactly the
+        // number of extra slots the plan will ask for, and kSlots is what there is.
+        //
+        // Written with jmax (0, gEnd - gStart), which is the rise and nothing else, that
+        // clamp maps the quantity onto [-budget, +budget] going UP and onto
+        // [-budget + d, budget + d] going DOWN - over budget by the whole of d. The
+        // consequence is not cosmetic: `planned` reaches kSlots + 1, shepEvDropped fires,
+        // and a copy whose window is NOT zero is deleted - a partial dropped in silence
+        // plus a step, which is the one thing this engine is not allowed to do and the
+        // reason maxPlanSamples exists at all.
+        //
+        // It needs the whole coincidence to bite - descending, the band at full width so
+        // the budget is 1, the bottom edge saturating its bound, and a buffer past
+        // maxPlanSamples (an offline bounce) - which is why no test caught it: the descend
+        // run measures grid-phase drift, and the two runs that DO stress the plan both use
+        // the default direction.
+        //
+        // Signed, the two bounds are mirror images and the arithmetic is the same one
+        // sentence in both directions.
+        const double drift   = gEnd - gStart;            // signed: + rising, - falling
+        const double budget  = juce::jmax (1.0, (double) shepard::kSlots - W / P - 1.0);
+        const double upMax   = P * juce::jmax (0.0, budget + drift);   // edge rising: cancels the grid
+        const double downMax = P * juce::jmax (0.0, budget - drift);   // edge falling: adds to it
         const double loEnd   = juce::jlimit (loStart - downMax, loStart + upMax, loWant);
         shepLo = loEnd;
 

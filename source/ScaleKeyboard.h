@@ -743,18 +743,36 @@ public:
                     // MIDI C3 = the tuning's C3 reference itself: Essentials green +
                     // bold, with REFERENCE spelled out above the number.
                     const bool isRef = note == kRefKey;
+                    // THE WORD'S BAND IS RESERVED ON EVERY PERIOD KEY, DRAWN ON ONE.
+                    //
+                    // This band used to be taken off `sc` only when the key WAS the
+                    // reference, so the three frequency markers above the keyboard sat on
+                    // two different baselines: the two ordinary ones centred in the whole
+                    // strip (y 544-551) and the middle one, pushed down by REFERENCE's 11 px
+                    // minus the 3 px pull-up, centred in what was left (y 547-555). Four
+                    // pixels of stagger across three numbers that are the same read-out - and
+                    // the cause was that the caption above ONE of them was allowed to move
+                    // the number under it.
+                    //
+                    // Reserving the band unconditionally costs the two ordinary markers 8 px
+                    // of vertical room they were only using to sit higher than their
+                    // neighbour, and it puts all three on one baseline for good: the word can
+                    // now appear or disappear (a tuning change moves kRefKey) without any
+                    // number moving at all.
                     auto hzArea = sc;
-                    if (isRef)
                     {
                         // Sits DIRECTLY above its Hz number (tight band, no gap) and is
                         // allowed to spill over the neighbouring key widths instead of
                         // being squeezed horizontally into unreadable letters.
                         auto band = hzArea.removeFromTop (11.0f);
-                        band = band.withSizeKeepingCentre (juce::jmax (band.getWidth(), kReferenceBandMinWidth), band.getHeight());
-                        g.setColour (juce::Colour (0xff4fe09a));
-                        g.setFont (juce::Font (juce::FontOptions (kReferenceFontHeight).withStyle ("Bold")));
-                        g.drawText (referenceWord, band.toNearestInt(), juce::Justification::centred, false);
                         hzArea.setTop (hzArea.getY() - 3.0f); // pull the number up to the word
+                        if (isRef)
+                        {
+                            band = band.withSizeKeepingCentre (juce::jmax (band.getWidth(), kReferenceBandMinWidth), band.getHeight());
+                            g.setColour (juce::Colour (0xff4fe09a));
+                            g.setFont (juce::Font (juce::FontOptions (kReferenceFontHeight).withStyle ("Bold")));
+                            g.drawText (referenceWord, band.toNearestInt(), juce::Justification::centred, false);
+                        }
                     }
                     g.setColour (isRef ? juce::Colour (0xff4fe09a) : juce::Colour (0xffc4ccda));
                     g.setFont (isRef

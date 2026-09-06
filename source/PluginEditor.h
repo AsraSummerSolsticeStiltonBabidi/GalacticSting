@@ -92,16 +92,30 @@ namespace fgfit
     inline int textButtonWidth (const juce::Button& b)
     { return textButtonWidth (b.getButtonText(), b.getHeight(), b.getProperties().contains ("fork")); }
 
-    // LookAndFeel_V4::drawToggleButton: a tick box of fontSize*1.1 at x=4, the text
-    // starting 10 px after it, 2 px spare at the right.
+    // GalacticLnF::drawToggleButton: ONE tick box size and ONE gap to the word, for every
+    // ordinary toggle in the window.
+    //
+    // These three numbers replace LookAndFeel_V4's formula, which derived the box from the
+    // BUTTON'S HEIGHT - jmin (15, h * 0.75) * 1.1, with the text at roundToInt (that) + 10.
+    // A block 215 px wide inside PRIME CONTROL therefore drew three different tick boxes
+    // (15x15, 18x18 and a NON-SQUARE 18x16, that last one because a fractional height puts
+    // the outline between pixels) and two different label gaps, purely because its three
+    // toggles were laid out in rows of three different heights. A tick box is a glyph, not
+    // a scaled part of its row.
+    //
+    // The painter reads these, and so do toggleRoom / toggleWidth below - which is what
+    // stops the sweep that checks a word fits from measuring a geometry nothing draws.
+    inline constexpr int kTickX   = 4;   // the box's left inset (V4's own, kept)
+    inline constexpr int kTickBox = 16;  // the box itself, square, at every button height
+    inline constexpr int kTickGap = 8;   // box right edge -> the word's cell
     inline juce::Font toggleFont (int h)
     { return juce::Font (juce::FontOptions (juce::jmin (15.0f, (float) h * 0.75f))); }
     inline float toggleRoom (int w, int h)
-    { return (float) w - (float) juce::roundToInt (juce::jmin (15.0f, (float) h * 0.75f) * 1.1f) - 12.0f; }
+    { juce::ignoreUnused (h); return (float) w - (float) (kTickX + kTickBox + kTickGap) - 2.0f; }
     inline int toggleWidth (const juce::String& text, int h)
     {
         return (int) std::ceil (juce::GlyphArrangement::getStringWidth (toggleFont (h), text))
-             + juce::roundToInt (juce::jmin (15.0f, (float) h * 0.75f) * 1.1f) + 12 + 2;
+             + kTickX + kTickBox + kTickGap + 2 + 2; // + the painter's right margin, + rounding
     }
     inline int toggleWidth (const juce::ToggleButton& b)
     { return toggleWidth (b.getButtonText(), b.getHeight()); }
@@ -1587,16 +1601,75 @@ private:
         { if (hoverRow != -1) { hoverRow = -1; if (onHover) onHover (-1); repaint(); } }
         int contentHeight() const { return (int) rows.size() * kRowH + (emptyText.isNotEmpty() ? kRowH : 0); }
         juce::String getTooltip() override { return tip; }
+        // THE SCORE IS A COLUMN, NOT WHATEVER IS LEFT AFTER THE CHIPS.
+        //
+        // It used to be drawn at `x + 4`, where x was wherever the row's variable-width
+        // degree chips happened to end - so the one number in this list a user actually
+        // COMPARES down the column started at 1134 on a row of single-digit chips and at
+        // 1139 on a row containing a "+10", and ended at 1164 against 1170. Every row was
+        // internally consistent and the column was ragged, which is the worst of both: the
+        // eye cannot scan it and nothing looks broken enough to report.
+        //
+        // The width is measured from the WIDEST value in the list, in the font it is drawn
+        // in, so the column is as narrow as it can be while still holding every row - and
+        // it is RIGHT-aligned, because these are magnitudes and the digits that matter line
+        // up under each other.
+        //
+        // AND ITS LEFT EDGE CLEARS THE WIDEST ROW OF CHIPS, not just this row's. Pinning
+        // the column to the right edge alone would be a column that a long combination
+        // draws THROUGH - the chips are laid out left to right with no bound at all - so
+        // the x is the further right of "flush with the list's right margin" and "past the
+        // longest chip run in the list". Nothing is squashed or dropped either way: when
+        // the chips are wider than the list, the value moves out with them exactly as it
+        // did before, and the list is still the thing that has to be made wider.
+        static juce::Font chipFont() { return juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")); }
+        static juce::Font valueFont() { return juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")); }
+        // The chip a degree is drawn in, as a width - the ONE copy of this arithmetic, so
+        // the reservation and the drawing cannot disagree about where a row ends.
+        static juce::String chipText (const Row& row, size_t k, bool equal)
+        {
+            return equal ? (k == 0 ? juce::String ("any")
+                                   : "+" + juce::String (row.degs[k] - row.degs[0]))
+                         : juce::String (row.degs[k]);
+        }
+        static int chipWidth (const juce::String& txt)
+        {
+            return juce::jmax (18, (int) std::ceil (
+                       juce::GlyphArrangement::getStringWidth (chipFont(), txt)) + 8);
+        }
+        int valueColumnWidth() const
+        {
+            float w = 0.0f;
+            const auto f = valueFont();
+            for (const auto& row : rows)
+                w = juce::jmax (w, juce::GlyphArrangement::getStringWidth (f, row.value));
+            return (int) std::ceil (w);
+        }
+        int widestChipRun() const
+        {
+            int widest = 0;
+            for (const auto& row : rows)
+            {
+                int x = 4;
+                for (size_t k = 0; k < row.degs.size(); ++k)
+                    x += chipWidth (chipText (row, k, equalStep)) + 2;
+                widest = juce::jmax (widest, x);
+            }
+            return widest;
+        }
+
         void paint (juce::Graphics& g) override
         {
             int y = 0, r = 0;
             const int D = juce::jmax (1, degreesPerPeriod);
+            // One column for the whole list, decided before the first row is drawn.
+            const int valW = valueColumnWidth();
+            const int valX = juce::jmax (widestChipRun() + 4, getWidth() - 6 - valW);
             for (const auto& row : rows)
             {
                 if (r % 2 == 1) { g.setColour (juce::Colour (0x14ffffff)); g.fillRect (0, y, getWidth(), kRowH); }
                 if (r == hoverRow) { g.setColour (juce::Colour (0x332fb155)); g.fillRect (0, y, getWidth(), kRowH); }
                 int x = 4;   // no rank number: the beating value already orders them
-                const juce::Font chipFont (juce::FontOptions (11.0f).withStyle ("Bold"));
                 for (size_t k = 0; k < row.degs.size(); ++k)
                 {
                     const int d = row.degs[k];
@@ -1604,26 +1677,22 @@ private:
                     // "any" and the rest are OFFSETS from it, all in neutral grey.
                     // Otherwise each chip is the actual degree, in its keyboard colour.
                     const bool grey = equalStep;
-                    const juce::String txt = grey
-                        ? (k == 0 ? juce::String ("any")
-                                  : "+" + juce::String (d - row.degs[0]))
-                        : juce::String (d);
+                    const juce::String txt = chipText (row, k, grey);
                     const auto col = grey
                         ? juce::Colour (0xff6b6b78)
                         : juce::Colour::fromHSV (0.82f * (float) (d % D) / (float) D, 0.62f, 0.9f, 1.0f);
-                    const int w = juce::jmax (18, (int) std::ceil (
-                        juce::GlyphArrangement::getStringWidth (chipFont, txt)) + 8);
+                    const int w = chipWidth (txt);
                     auto chip = juce::Rectangle<int> (x, y + 2, w, kRowH - 4);
                     g.setColour (col);
                     g.fillRoundedRectangle (chip.toFloat(), 3.0f);
                     g.setColour (col.getPerceivedBrightness() > 0.55f ? juce::Colours::black : juce::Colours::white);
-                    g.setFont (chipFont);
+                    g.setFont (chipFont());
                     g.drawText (txt, chip, juce::Justification::centred, false);
                     x += w + 2;
                 }
                 g.setColour (row.valCol);
-                g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
-                g.drawText (row.value, x + 4, y, getWidth() - x - 6, kRowH, juce::Justification::centredLeft, false);
+                g.setFont (valueFont());
+                g.drawText (row.value, valX, y, valW, kRowH, juce::Justification::centredRight, false);
                 y += kRowH; ++r;
             }
             if (emptyText.isNotEmpty()) // status line: computing / over budget / coverage
@@ -2113,15 +2182,19 @@ private:
         // TextEditor's own text: a routed row's steps field is a control the user types
         // into, so its CONTENT is a user-visible string like any caption.
         //
-        // A static rather than a tr() at the call site because stepsText is static too -
-        // it is called from the row painter, from the list model and from the field's own
-        // commit path, none of which has the editor's language flag to hand. Set once from
-        // applyLanguage, exactly like the keyboard's row captions.
+        // PER PANEL, NOT PER PROCESS. This was an inline static, and a static is shared by
+        // every plugin instance in the host: two instances of Fibló in one set, one
+        // switched to Catalan, and the OTHER one's steps fields turned into "7pas" inside
+        // an otherwise English window the next time anything refreshed them - and
+        // symmetrically, opening a new English editor flipped a Catalan sibling's back.
+        // The language is a property of an EDITOR (each has its own flag and its own LANG
+        // button), so anything derived from it has to live no wider than one.
         //
-        // parseSteps accepts BOTH languages' words whatever is being shown (see it above),
-        // so a project typed in one language still reads in the other - the suffix is a
-        // label, not a key.
-        inline static juce::String stepWord { "step" };
+        // Not a data race - every reader and the writer are on the message thread - and
+        // nothing was ever lost, because parseSteps accepts both languages' words whatever
+        // is being shown. It was purely the wrong word on screen, in the one language the
+        // user did not choose.
+        juce::String stepWord { "step" };
         // Scale steps FROM the played note: "7step" = 7 steps up, "7step-" (or
         // "-7step") = 7 down. Accepts "step"/"steps"/"st". INT_MIN if not a steps spec.
         static int parseSteps (juce::String t)
@@ -2140,7 +2213,7 @@ private:
             const int v = juce::jlimit (0, 127, t.getIntValue());
             return down ? -v : v;
         }
-        static juce::String stepsText (int steps)
+        juce::String stepsText (int steps) const
         {
             // SHOWN with the minus in front, which is where a reader expects it.
             // "12step-" is what this used to draw, and a trailing minus reads as a typo
@@ -2291,12 +2364,18 @@ private:
                 v->setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
                 addAndMakeVisible (*v);
             }
-            auto miniStep = [this] (juce::TextButton& b, const char* txt, const char* id, int delta)
+            // A STEPPER PAIR IS ONE CONTROL, IN ITS SECTION'S COLOUR - the same rule the
+            // editor's OCTAVE and OCTAVE RANGE pairs follow (see configStep in
+            // PluginEditor.cpp). These were green for "+" and red for "-", which are this
+            // product's LOAD and DESTROY colours: an increment painted in the colour of the
+            // X that deletes a routed slot, two rows below it. `col` is the section heading
+            // the pair belongs to, so the three pairs in this panel cannot drift apart.
+            auto miniStep = [this] (juce::TextButton& b, const char* txt, const char* id,
+                                    int delta, juce::Colour col)
             {
                 b.setButtonText (txt);
                 b.setName ("round");
-                b.setColour (juce::TextButton::buttonColourId,
-                             juce::Colour (txt[0] == '+' ? 0xff2fb155 : 0xffe0453f).withAlpha (0.85f));
+                b.setColour (juce::TextButton::buttonColourId, col.withAlpha (0.45f));
                 b.onClick = [this, id, delta]
                 {
                     if (proc == nullptr) return;
@@ -2309,10 +2388,11 @@ private:
                 };
                 addAndMakeVisible (b);
             };
-            miniStep (nUp, "+", "rhythmDivN",  1);
-            miniStep (nDn, "-", "rhythmDivN", -1);
-            miniStep (xUp, "+", "rhythmDivX",  1);
-            miniStep (xDn, "-", "rhythmDivX", -1);
+            // "divide n times by x" lives under the PULSE RATE heading, so it wears its cyan.
+            miniStep (nUp, "+", "rhythmDivN",  1, juce::Colour (0xff4fe6ff));
+            miniStep (nDn, "-", "rhythmDivN", -1, juce::Colour (0xff4fe6ff));
+            miniStep (xUp, "+", "rhythmDivX",  1, juce::Colour (0xff4fe6ff));
+            miniStep (xDn, "-", "rhythmDivX", -1, juce::Colour (0xff4fe6ff));
 
             // "How to route" ON A SATURATED AMBER FILL WAS THE BRIGHTEST THING IN THE
             // DIALOG - louder than the panel's own name, louder than the two switches
@@ -2453,8 +2533,9 @@ private:
             octAllVal.setColour (juce::Label::textColourId, ink());
             octAllVal.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
             addAndMakeVisible (octAllVal);
-            miniStep (octAllUp, "+", "rhythmOctAll",  1);
-            miniStep (octAllDn, "-", "rhythmOctAll", -1);
+            // "Octave (all)" sits in the OUTPUT row, so it wears that heading's pink.
+            miniStep (octAllUp, "+", "rhythmOctAll",  1, juce::Colour (0xffff77c8));
+            miniStep (octAllDn, "-", "rhythmOctAll", -1, juce::Colour (0xffff77c8));
 
             for (int i = 0; i < RhythmEngine::kSlots; ++i)
             {
