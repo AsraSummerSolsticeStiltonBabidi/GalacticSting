@@ -105,6 +105,18 @@ namespace fgfit
     }
     inline int toggleWidth (const juce::ToggleButton& b)
     { return toggleWidth (b.getButtonText(), b.getHeight()); }
+    // ...AND THE TICK BOX ON ITS OWN, before a single letter of text.
+    //
+    // drawToggleButton puts the box at x = 4 with a side of jmin(15, h*0.75) * 1.1, so a
+    // ToggleButton needs 4 + that much width just to CONTAIN its own tick. The nine prime
+    // checkboxes have no button text at all - their numbers are separate Labels under
+    // them - so every width measurement in this file reads them as empty strings and none
+    // of the three text checks could ever fire on them. At 690x550 they are laid out
+    // 6 px wide against a 20.5 px tick: what is drawn is a 2 px sliver of a box, nothing
+    // can be aimed at, and the state of the whole prime filter is unreadable. This is the
+    // number that says so.
+    inline int toggleTickWidth (int h) noexcept
+    { return 4 + juce::roundToInt (juce::jmin (15.0f, (float) h * 0.75f) * 1.1f); }
 
     // GalacticLnF::drawToggleButton's "onled" pill: the word ON / OFF drawn centred in
     // the WHOLE button, bold, at h * 0.62. The pill has no juce::Button text at all
@@ -115,18 +127,40 @@ namespace fgfit
     inline int onLedWidth (int h)  // "OFF" is the longer of the two words
     { return (int) std::ceil (juce::GlyphArrangement::getStringWidth (onLedFont (h), "OFF")) + 2; }
 
+    // THE GUTTER THE CHEVRON REALLY OCCUPIES, taken off the very path that draws it.
+    //
+    // GalacticLnF::drawComboBox strokes the chevron centred at x = width - h*0.55, with a
+    // half-width of h*0.15 and a 1.6 px round cap, so its LEFT ink edge sits at
+    // width - h*0.70 - 0.8. Everything below used to reserve h/2 instead - h*0.20 + 0.8
+    // px SHORT of it - and the difference was not theoretical: at h = 24 the label's text
+    // area ended 17 px from the right edge while the chevron's ink began at 16.8, so the
+    // two ranges overlapped by 0.2 px. Photographed at 1200x650, the final "g" of "Find
+    // tunings based on beating" TOUCHED the chevron with zero gap, in English and in
+    // Catalan, and "Whitelist" did the same at 690x550 - while the chevron had 9.6 px of
+    // clear pill to its RIGHT and none at all to its left. Nothing went red, because the
+    // probe that checks the fit read this same understated formula.
+    //
+    // + 3 px, so the word and the arrow are separated rather than merely not overlapping.
+    // TRIED AND REJECTED: moving the chevron right instead (cx = width - h*0.45) would
+    // give 6 of those 9 px back to the text, but the pill's right end is a semicircle of
+    // radius h/2 and the glyph then sits inside the curve, which reads as a chevron
+    // falling off the box. The gutter is the honest 21 px at h = 24, and snugComboWidth
+    // below asks for it, so a box sized to its own words simply gets 9 px wider.
+    inline int comboArrowGutter (int boxHeight) noexcept
+    { return (int) std::ceil ((float) boxHeight * 0.70f + 0.8f) + 3; }
+
     // GalacticLnF::positionComboBoxText: the label is inset by height/3 on the left and
-    // has to stop clear of the chevron, which drawComboBox puts height/2 in from the
-    // right end. Three places need this number and they have to agree: the painter, the
-    // resized() that sizes a box to the words it holds, and the probe that checks it. A
-    // ComboBox neither clips visibly nor resizes - it draws as much of the item as the
-    // cell happens to hold - so a formula copied out by hand let "Sync Project Tempo"
-    // appear on screen as "Sync Project Te" with every check in the build still green.
+    // has to stop clear of the chevron (comboArrowGutter above). Three places need this
+    // number and they have to agree: the painter, the resized() that sizes a box to the
+    // words it holds, and the probe that checks it. A ComboBox neither clips visibly nor
+    // resizes - it draws as much of the item as the cell happens to hold - so a formula
+    // copied out by hand let "Sync Project Tempo" appear on screen as "Sync Project Te"
+    // with every check in the build still green.
     inline int comboTextWidth (int boxWidth, int boxHeight) noexcept
-    { return boxWidth - boxHeight / 3 - boxHeight / 2; }
+    { return boxWidth - boxHeight / 3 - comboArrowGutter (boxHeight); }
     // ...and the inverse: the box width a word of `textWidth` needs.
     inline int comboWidthForText (int textWidth, int boxHeight) noexcept
-    { return textWidth + boxHeight / 3 + boxHeight / 2 + 2; } // +2: the label's own rounding
+    { return textWidth + boxHeight / 3 + comboArrowGutter (boxHeight) + 2; } // +2: the label's own rounding
 
     // ...and two more things stand between that room and the ITEM the user reads, both
     // of which a width check has to know about or it certifies boxes that truncate:
@@ -295,6 +329,64 @@ namespace fgfit
         tl.createLayout (as, (float) juce::jmax (1, boxWidth - l.getBorderSize().getLeftAndRight()));
         return (int) std::ceil (tl.getHeight()) + l.getBorderSize().getTopAndBottom() + 2;
     }
+
+    // THE ROOM AND THE FACE A CLOSED COMBO'S ITEM IS REALLY DRAWN IN, read off the child
+    // juce::Label the box draws it through rather than reconstructed from a model of it.
+    //
+    // Two probes ask this question - the fit sweep (walkTextFits) and the layout probe's
+    // combo() - and while each carried its own answer they disagreed. The sweep measured
+    // comboTextWidth in getComboBoxFont's LIGHTER face and never took off the Label's own
+    // {1,5,1,5} border, so it certified 10 px more room than the word gets AND measured
+    // the word in a narrower face than GalacticLnF::getLabelFont draws it in. Both misses
+    // ran the same way - towards "it fits" - which is how a combo whose last glyph
+    // touches its chevron was reported as having ZERO fit problems in three separate
+    // scenarios. The layout probe had already been corrected, twice, by hand; this is
+    // that correction with one body instead of two.
+    //
+    // The label's bounds come from positionComboBoxText, which is where the arrow gutter
+    // is taken off, so a change to comboArrowGutter moves the painter and BOTH probes in
+    // one step and they cannot drift apart again. The fallbacks are for a box that has
+    // not been laid out yet (no label): the same numbers, modelled.
+    inline const juce::Label* comboItemLabel (const juce::ComboBox& c)
+    {
+        for (int i = 0; i < c.getNumChildComponents(); ++i)
+            if (auto* l = dynamic_cast<const juce::Label*> (c.getChildComponent (i))) return l;
+        return nullptr;
+    }
+    inline juce::Font comboDrawnFont (const juce::ComboBox& c)
+    {
+        if (auto* l = comboItemLabel (c)) return labelFont (*l);
+        return comboItemFont (c, c.getHeight());
+    }
+    inline int comboDrawnRoom (const juce::ComboBox& c)
+    {
+        if (auto* l = comboItemLabel (c))
+            return l->getBorderSize().subtractedFrom (l->getLocalBounds()).getWidth();
+        return comboItemRoom (c.getWidth(), c.getHeight());
+    }
+    inline int comboDrawnRoomH (const juce::ComboBox& c)
+    {
+        if (auto* l = comboItemLabel (c))
+            return l->getBorderSize().subtractedFrom (l->getLocalBounds()).getHeight();
+        return juce::jmax (1, c.getHeight() - 4);
+    }
+
+    // A SINGLE-LINE juce::TextEditor's text room, mirroring TextEditor::getMaximumTextWidth
+    // (viewport width - leftIndent - the 2 px it keeps for the caret at the right edge),
+    // with its border taken off first.
+    //
+    // Here because NOTHING in this build measured a TextEditor's text at all. A Label
+    // condenses and a ComboBox draws what fits, but a TextEditor SCROLLS: when setText
+    // leaves the caret at the end, a value too wide for the field is truncated from the
+    // LEFT with no ellipsis, and there is no wrong-looking pixel to notice. That is how
+    // the reference-pitch field displayed "55653" for 261.6255653 Hz at 690x550 - a
+    // number that is not cut, it is a different, perfectly plausible number.
+    inline constexpr int kTextEditorCaretSpace = 2;   // TextEditor's own rightEdgeSpace
+    inline int textEditorRoom (const juce::TextEditor& te)
+    {
+        return juce::jmax (1, te.getBorder().subtractedFrom (te.getLocalBounds()).getWidth()
+                                - te.getLeftIndent() - kTextEditorCaretSpace);
+    }
 }
 
 class FractalAdditiveAudioProcessorEditor : public juce::AudioProcessorEditor,
@@ -370,6 +462,15 @@ public:
             // mint/magenta scheme of the Fractal-Morph-Range compartment laid out
             // perfectly and simply looked like a different box.
             juce::Colour colour;
+            // WHICH WAY THIS ONE FAILS when it does not fit, because the two are not the
+            // same defect and only one of them is a cut. paint() draws a `fitted` label
+            // with drawFittedText (condensed to 80%, all of it there) and every other one
+            // with drawText and useEllipsis = false (the tail simply gone). The rig's
+            // structural floor refuses the second kind - a word that is not all there is
+            // not a cramped word - so it has to be able to tell them apart. Defaulted, so
+            // the componentLabels entries below, which are juce::Labels and condense, keep
+            // their five-element construction.
+            bool fitted = false;
         };
         std::vector<PaintedLabel> paintedLabels;
         // The same measurement for every juce::Label COMPONENT laid out in those boxes,
@@ -2005,6 +2106,22 @@ private:
         // editor (text boxes commit + collapse; the play keys work again).
         void mouseDown (const juce::MouseEvent&) override { if (onEdited) onEdited(); }
 
+        // THE UNIT ON A STEPS FIELD, IN THE LANGUAGE ON SCREEN.
+        //
+        // "0step", "7step" and "-12step" were drawn identically in both languages, and the
+        // rig's translation gate could not see them until the fit sweep learned to walk a
+        // TextEditor's own text: a routed row's steps field is a control the user types
+        // into, so its CONTENT is a user-visible string like any caption.
+        //
+        // A static rather than a tr() at the call site because stepsText is static too -
+        // it is called from the row painter, from the list model and from the field's own
+        // commit path, none of which has the editor's language flag to hand. Set once from
+        // applyLanguage, exactly like the keyboard's row captions.
+        //
+        // parseSteps accepts BOTH languages' words whatever is being shown (see it above),
+        // so a project typed in one language still reads in the other - the suffix is a
+        // label, not a key.
+        inline static juce::String stepWord { "step" };
         // Scale steps FROM the played note: "7step" = 7 steps up, "7step-" (or
         // "-7step") = 7 down. Accepts "step"/"steps"/"st". INT_MIN if not a steps spec.
         static int parseSteps (juce::String t)
@@ -2015,6 +2132,8 @@ private:
             if (t.startsWith ("-")) { down = true; t = t.substring (1); }
             if      (t.endsWith ("steps")) t = t.dropLastCharacters (5);
             else if (t.endsWith ("step"))  t = t.dropLastCharacters (4);
+            else if (t.endsWith ("passos")) t = t.dropLastCharacters (6);
+            else if (t.endsWith ("pas"))    t = t.dropLastCharacters (3);
             else if (t.endsWith ("st"))    t = t.dropLastCharacters (2);
             else return std::numeric_limits<int>::min();
             if (t.isEmpty() || ! t.containsOnly ("0123456789")) return std::numeric_limits<int>::min();
@@ -2028,7 +2147,7 @@ private:
             // or as a range rather than as a direction. parseSteps accepts BOTH forms
             // (see it above), so what the user may TYPE is unchanged - only what they are
             // shown. It round-trips: "-12step" parses back to -12.
-            return (steps < 0 ? "-" + juce::String (-steps) : juce::String (steps)) + "step";
+            return (steps < 0 ? "-" + juce::String (-steps) : juce::String (steps)) + stepWord;
         }
 
         // Best small fraction p/q ~ v (continued fractions, den <= 16) for the
@@ -2918,7 +3037,13 @@ private:
             // other boxes' shared right edge is measured against.
             {
                 auto g2 = sectionIn (r.removeFromTop (kShortH), secOut, outBox, 24);
-                modeBox.setBounds (g2.removeFromLeft (128).reduced (0, 1));
+                // MEASURED, NOT 128. Its widest item is "Totes les notes", which needs 112
+                // px of text room and had 91 once the chevron gutter came off a flat 128 -
+                // so the Catalan panel drew a condensed mode name while the English one
+                // ("All notes", 62 px) sat comfortably. Floored at the old 128 so no window
+                // that fits today gets narrower.
+                modeBox.setBounds (g2.removeFromLeft (
+                                       juce::jmax (128, fgfit::snugComboWidth (modeBox, 22))).reduced (0, 1));
                 g2.removeFromLeft (8);
                 mpeT.setBounds (g2.removeFromLeft (86));
                 g2.removeFromLeft (8);
@@ -5697,6 +5822,9 @@ private:
     void rebuildScaleDissList();   // (re)build + sort degreeList.rows from the cached activeDiss
     void commitRefA();       // parse the Reference-A text box -> set the refA parameter
     void refreshRefAText();  // set the Reference-A text box from the current parameter
+    // ...and the ONE formatter it and the constructor share: the value at the most
+    // decimals `room` px of the field's own font can hold, integer part never dropped.
+    juce::String refATextForRoom (double c3, int room) const;
     // NOTE NAMES. `noteNamesOn` mirrors the persisted preference (the processor owns it);
     // the cache is the spelling of the CURRENT tuning, keyed on its EDO so it is rebuilt
     // only when the answer can have changed. See refreshDegreeNames().

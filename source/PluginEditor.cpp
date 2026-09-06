@@ -1077,7 +1077,10 @@ namespace
             g.setColour (box.findColour (juce::ComboBox::outlineColourId));
             g.drawRoundedRectangle (r.reduced (0.75f), rad, 1.4f);
 
-            // Chevron on the right.
+            // Chevron on the right. THESE THREE NUMBERS ARE WHERE fgfit::comboArrowGutter
+            // comes from - left ink edge = width - h*0.55 - h*0.15 - half the 1.6 px cap -
+            // so moving any of them without moving that function puts the item's last
+            // glyph back under the arrow, which is exactly the defect it was written for.
             const float cx = (float) width - (float) height * 0.55f;
             const float cy = (float) height * 0.5f;
             const float s  = (float) height * 0.15f;
@@ -1098,6 +1101,26 @@ namespace
             const int inset = box.getHeight() / 3;
             label.setBounds (inset, 1, fgfit::comboTextWidth (box.getWidth(), box.getHeight()), box.getHeight() - 2);
             label.setFont (getComboBoxFont (box));
+            // AN ITEM THAT DOES NOT FIT IS SHORTENED, NEVER SQUEEZED.
+            //
+            // juce::Label leaves minimumHorizontalScale at 0, which drawFittedText reads as
+            // Font::getDefaultMinimumHorizontalScaleFactor() (0.7) and spends BEFORE it
+            // considers cutting anything: the glyphs are stretched to 70% of their width
+            // and the string is drawn in full, narrower than the same face two boxes away.
+            // Photographed in the Preset Playground at every window size: a corner's
+            // preset name needed 404 px and was drawn condensed into 174, while the pad's
+            // own corner read-out - 25 px above it, same string, same font - ellipsised.
+            // Two policies on one string, side by side.
+            //
+            // 1.0f is the whole fix: GlyphArrangement::fitLineIntoSpace skips
+            // stretchRangeOfGlyphs entirely at that scale and goes straight to dropping
+            // glyphs and appending an ellipsis, which is this project's rule ("nothing is
+            // silently squashed") and what the neighbour already did. Set for EVERY combo,
+            // not just the preset pickers: every other box in this window is sized by
+            // fgfit::snugComboWidth to hold its own widest item, so this can only ever
+            // fire where the box was ALREADY too small - and there it is the difference
+            // between a word you cannot read and one that says it was cut.
+            label.setMinimumHorizontalScale (1.0f);
             // ...and let getLabelFont keep it. drawLabel does not use the font set here:
             // it asks getLabelFont, which puts a 12.5 px BOLD floor under everything. For
             // a small-item box that floor is the whole thing being opted out of, so the
@@ -2853,10 +2876,13 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     refAEdit.setColour (juce::TextEditor::textColourId, juce::Colours::white);
     refAEdit.setIndents (8, 2); // clear the rounded (pill) ends
     refAEdit.setSelectAllWhenFocused (true);
-    refAEdit.setText (juce::String ((double) processorRef.apvts.getRawParameterValue ("refA")->load()
-                                    * 0.59460355750136051, 7) // shown as C3 (= A * 2^(-9/12)), unrounded
-                          .trimCharactersAtEnd ("0").trimCharactersAtEnd ("."),
-                      juce::dontSendNotification);
+    // ...and the first value through the ONE formatter (see refreshRefAText), rather than
+    // a second copy of the format string here. The copy is how this field came to show a
+    // number that was not the value: it wrote all seven decimals unconditionally, and a
+    // juce::TextEditor does not clip a string it cannot hold - it SCROLLS, with the caret
+    // parked at the end after setText. At 690x550 "261.6255653" was drawn as "55653": no
+    // ellipsis, no cut glyph, just a plausible and entirely wrong 55653 Hz.
+    refreshRefAText();
     refAEdit.onReturnKey  = [this] { commitRefA(); refocus(); };
     refAEdit.onFocusLost  = [this] { commitRefA(); };
     refAEdit.onEscapeKey  = [this] { refreshRefAText(); refocus(); };
@@ -4150,6 +4176,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
                                 tr ("Project transport", "Transport del projecte") });
     modUnmapBtn.setButtonText  (tr ("Unmap", "Desassigna"));
     rhythmPanel.helpB.setButtonText (tr ("How to route", "Com encaminar"));
+    // The unit on every routed row's steps field. Set here rather than at the call site
+    // because stepsText is static - see the comment on stepWord.
+    RhythmPanel::stepWord = tr ("step", "pas");
+    rhythmPanel.refreshSlots();
     chordList.emptyText = tr ("Press Find to search.\nhover a row to hear it\ndouble-click loads it as the scale",
                               "Prem Troba per cercar.\npassa-hi el cursor per escoltar-lo\ndoble clic el carrega com a escala");
     // The adaptation's read-out is one plain sentence with ONE job at a time; every number
@@ -4786,12 +4816,22 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
             const auto txt = box->getText();
             if (txt.isNotEmpty())
             {
-                auto& lnf = box->getLookAndFeel();
-                const auto font = lnf.getComboBoxFont (const_cast<juce::ComboBox&> (*box));
-                // comboTextWidth is the very function positionComboBoxText lays the
-                // label out with, so a renamed item cannot fit here and clip on screen.
-                const float w = (float) fgfit::comboTextWidth (box->getWidth(), box->getHeight());
-                const float h = (float) box->getHeight() - 2.0f;
+                // MEASURED OFF THE LABEL THE BOX REALLY DRAWS IN, through the same three
+                // fgfit helpers the layout probe's combo() uses - one body, so the two
+                // can never again disagree about the same box.
+                //
+                // What this used to be: getComboBoxFont's LIGHTER face measured against
+                // fgfit::comboTextWidth, with the Label's own {1,5,1,5} border not taken
+                // off and the arrow gutter understated by h*0.20 + 0.8 px (see
+                // fgfit::comboArrowGutter). Three misses, all of them running towards "it
+                // fits", which is why three photographed collisions between an item and
+                // its own chevron - "Find tunings based on beating" at 1200x650 in both
+                // languages, "Whitelist" at 690x550 - came back from this sweep as ZERO
+                // fit problems. avail now subtracts the very gutter positionComboBoxText
+                // reserves, because it IS the rectangle positionComboBoxText produced.
+                const auto  font = fgfit::comboDrawnFont (*box);
+                const float w    = (float) fgfit::comboDrawnRoom (*box);
+                const float h    = (float) fgfit::comboDrawnRoomH (*box);
                 // The label inside a ComboBox is a juce::Label, so a TALL box really does
                 // get a second line - that is how the mode selector shows its full names.
                 const int lines = juce::jmax (1, (int) (h / font.getHeight()));
@@ -4829,6 +4869,33 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
             }
             continue;   // its label is the box's own; do not measure it twice
         }
+        // A SINGLE-LINE TEXT FIELD, which nothing in this build had ever measured.
+        //
+        // This sweep walked Labels, Buttons and ComboBoxes, and each of those fails
+        // VISIBLY: a Label condenses, a button's word is cut, a combo draws what fits.
+        // A juce::TextEditor does none of those - it SCROLLS. setText leaves the caret at
+        // the end of the string (cursorWasAtEnd is true on an empty editor, so the very
+        // first setText scrolls to the end), and a value wider than the field is then
+        // truncated from the LEFT with no ellipsis and no clipped glyph. That is not a
+        // cut number, it is a DIFFERENT number: the reference-pitch field displayed
+        // "55653" for 261.6255653 Hz at 690x550, which reads as a perfectly plausible
+        // 55653 Hz. Nothing was out of bounds, nothing overflowed, nothing went red.
+        //
+        // SINGLE-LINE ONLY. A multi-line editor (the custom engine's typed ratios) is a
+        // scrolling document by design and holds however much the user types; asking it
+        // to fit its content would report a problem on every keystroke and mean nothing.
+        // The room is TextEditor::getMaximumTextWidth's own formula (see
+        // fgfit::textEditorRoom), so this measures the width the text is really given.
+        if (const auto* te = dynamic_cast<const juce::TextEditor*> (c))
+        {
+            const auto txt = te->getText();
+            if (txt.isNotEmpty() && ! te->isMultiLine())
+                record (here, "TextEditor", txt, te->getFont(),
+                        (float) fgfit::textEditorRoom (*te),
+                        (float) te->getBorder().subtractedFrom (te->getLocalBounds()).getHeight(),
+                        1, juce::Justification::centred);
+            continue;   // its viewport and text holder are plumbing, not our text
+        }
         if (const auto* b = dynamic_cast<const juce::Button*> (c))
         {
             const auto txt = b->getButtonText();
@@ -4836,6 +4903,34 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
             if (txt.isNotEmpty() && buttonTextRoom (*b, font, avail, lines))
                 record (here, dynamic_cast<const juce::ToggleButton*> (b) != nullptr ? "ToggleButton" : "Button",
                         txt, font, avail, (float) b->getHeight(), lines, juce::Justification::centred);
+            // A TICK BOX IS A CONTROL EVEN WITH NO WORD BESIDE IT.
+            //
+            // Everything above this line is a question about TEXT, so a ToggleButton whose
+            // label lives in a separate juce::Label - the nine prime checkboxes - was read
+            // as an empty string and skipped by every check in the build. At 690x550 they
+            // are 6 px wide against a 20.5 px tick box that drawToggleButton starts at
+            // x = 4: what reaches the glass is a 2 px sliver, and the row that decides
+            // which primes the whole spectrum is allowed cannot be read or aimed at.
+            //
+            // Its own kind, not "ToggleButton": the no-tooltip gate keys on the kinds that
+            // name controls, and this row is a SECOND measurement of a control that may
+            // already have one - the same reason "#widest" rows are skipped there. `need`
+            // is the tick's own right edge and `avail` the button's width, so over() reads
+            // as "this many pixels of tick box are drawn outside the button".
+            //
+            // The "onled" pill has no tick at all (GalacticLnF draws it as a coloured
+            // capsule with ON / OFF centred in the whole button) so it is not asked.
+            if (const auto* t = dynamic_cast<const juce::ToggleButton*> (b);
+                t != nullptr && t->getName() != "onled")
+            {
+                TextFit f;
+                f.path = here + "#tick"; f.kind = "TickBox"; f.text = txt;
+                f.bounds = getLocalArea (c, c->getLocalBounds());
+                f.need   = (float) fgfit::toggleTickWidth (t->getHeight());
+                f.avail  = (float) t->getWidth();
+                f.availH = (float) t->getHeight();
+                out.push_back (f);
+            }
             continue;
         }
         if (const auto* l = dynamic_cast<const juce::Label*> (c))
@@ -7841,26 +7936,20 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
             // 1200x650 while the probe reported it needing 153.86 of the 154 it had. The
             // second measured the string honestly but kept the modelled room, and reported
             // "+-48 st (MPE)" as truncated when it is drawn in full.
-            const auto* lbl = [&c]() -> const juce::Label*
-            {
-                for (int i = 0; i < c.getNumChildComponents(); ++i)
-                    if (auto* l = dynamic_cast<const juce::Label*> (c.getChildComponent (i))) return l;
-                return nullptr;
-            }();
-            const auto  f      = lbl != nullptr ? fgfit::labelFont (*lbl)
-                                                : fgfit::comboItemFont (c, c.getHeight());
-            const int   availW = lbl != nullptr
-                                   ? lbl->getBorderSize().subtractedFrom (lbl->getLocalBounds()).getWidth()
-                                   : fgfit::comboItemRoom (c.getWidth(), c.getHeight());
+            // ...and it is the SAME three lines the fit sweep (walkTextFits) uses, because
+            // they are the same question and they were being answered twice. Lifted into
+            // fgfit so the correction above cannot be made here and forgotten there - it
+            // was: this probe took the label's border off and the sweep did not, so the
+            // sweep certified an item that touched its own chevron.
+            const auto  f      = fgfit::comboDrawnFont (c);
+            const int   availW = fgfit::comboDrawnRoom (c);
             juce::String widest; float need = 0.0f;
             // HOW MANY LINES THE PAINTER IS ALLOWED, from the label's own area and font -
             // the same jmax(1, height/fontHeight) juce::Label::paint uses. Most of these
             // boxes get one; the 34 px SPECTRUM mode box was BUILT to get two, and the
             // whole point of measuring it here is to say whether it really does.
             const float fh    = f.getHeight();
-            const int   availH2 = lbl != nullptr
-                                    ? lbl->getBorderSize().subtractedFrom (lbl->getLocalBounds()).getHeight()
-                                    : juce::jmax (1, c.getHeight() - 4);
+            const int   availH2 = fgfit::comboDrawnRoomH (c);
             const int   rows  = juce::jmax (1, (int) ((float) availH2 / juce::jmax (1.0f, fh)));
             for (int i = 0; i < c.getNumItems(); ++i)
             {
@@ -7908,7 +7997,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
         p.paintedLabels.push_back ({ s.name, s.text, s.cell,
             (float) juce::GlyphArrangement::getStringWidthInt (
                 juce::Font (juce::FontOptions (s.fontHeight).withStyle ("Bold")), s.text),
-            s.col });
+            s.col, s.fitted });
 
     // The words that ARE the feature (see LayoutProbe::buttonTexts).
     p.buttonTexts.push_back ({ "cust.load",  loadTimbreButton.getButtonText() });
@@ -7964,12 +8053,56 @@ void FractalAdditiveAudioProcessorEditor::commitRefA()
     refreshRefAText();
 }
 
+// THE REFERENCE PITCH, AT THE PRECISION THE FIELD CAN ACTUALLY SHOW.
+//
+// A juce::TextEditor is the one text control in this window that neither clips nor
+// condenses when its string is too wide: it scrolls, and TextEditor::setText leaves the
+// caret at the END (cursorWasAtEnd is true for an empty editor, so this is true from the
+// very first call). The field is 8 px indented a side and 13 pt, so at 690x550 it holds
+// ~46 px of text while "261.6255653" needs ~65 - and what the user read was "55653".
+// Not a truncated number with a visible cut: a DIFFERENT number, well-formed, plausible,
+// and off by a factor of 213. It is the one failure mode in this file where the wrong
+// pixels look exactly like right ones.
+//
+// So the decimals are dropped one at a time until the number fits, and the INTEGER PART
+// IS NEVER DROPPED - 261.6255653 -> 261.626 -> 261.63 -> 262, and 262 even in a field too
+// narrow for it, where the (now existing) TextEditor row in walkTextFits reports it as a
+// fit problem instead of the field quietly inventing a value. Left-truncation is not one
+// of the options at any width.
+//
+// Measured in the field's OWN font against TextEditor::getMaximumTextWidth's own formula
+// (fgfit::textEditorRoom), not against the box: the 8 px indents and the 2 px the caret
+// keeps at the right edge are 18 of the ~64 px this cell has at the floor.
+juce::String FractalAdditiveAudioProcessorEditor::refATextForRoom (double c3, int room) const
+{
+    // trimCharactersAtEnd only where there IS a point to trim to: at 0 decimals the string
+    // is "262" and stripping "0" from its end would make it "26".
+    const auto trim = [] (juce::String s)
+    { return s.containsChar ('.') ? s.trimCharactersAtEnd ("0").trimCharactersAtEnd (".") : s; };
+    const auto font = refAEdit.getFont();
+    juce::String s;
+    for (int dp = 7; dp >= 0; --dp)   // 7: C3 at A=440 is 261.6255653 exactly
+    {
+        s = trim (juce::String (c3, dp));
+        if (juce::GlyphArrangement::getStringWidth (font, s) <= (float) room) break;
+    }
+    return s;
+}
+
 void FractalAdditiveAudioProcessorEditor::refreshRefAText()
 {
     const double a  = (double) processorRef.apvts.getRawParameterValue ("refA")->load();
-    const auto txt = juce::String (a * kC3overA, 7).trimCharactersAtEnd ("0").trimCharactersAtEnd (".");
+    const auto txt = refATextForRoom (a * kC3overA, fgfit::textEditorRoom (refAEdit));
     if (refAEdit.getText() != txt && ! refAEdit.hasKeyboardFocus (false))
+    {
         refAEdit.setText (txt, juce::dontSendNotification);
+        // ...and the caret HOME. setText scrolls to wherever the caret lands, and the
+        // whole defect above was that landing at the end scrolls the significant digits
+        // off the left of a field that never says so. With the value now sized to the
+        // room this is belt and braces - and it is the line that makes "never truncated
+        // from the left" true for any string this field is ever handed.
+        refAEdit.setCaretPosition (0);
+    }
 }
 
 void FractalAdditiveAudioProcessorEditor::makeLabel (juce::Label& l, juce::Colour c)
@@ -8779,7 +8912,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 const int keep = chordNotesBox.getSelectedId();
                 chordNotesBox.clear (juce::dontSendNotification);
                 for (int n = 2; n <= maxN; ++n) chordNotesBox.addItem (juce::String (n), n);
-                chordNotesBox.setSelectedId (juce::jlimit (2, maxN, keep < 2 ? 3 : keep),
+                // 5, matching the shipped default - this fallback still said 3, which is
+                // what the box defaulted to before "que por defecto sean 5 notas".
+                chordNotesBox.setSelectedId (juce::jlimit (2, maxN, keep < 2 ? 5 : keep),
                                              juce::dontSendNotification);
             }
 
@@ -8795,7 +8930,14 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // captions here fit their cells in both languages (RhythmVerify's
                 // condensed count is 0), so there is nothing to buy with that risk.
                 chordNotesLbl.setBounds (r1.removeFromLeft (44));
-                compact (chordNotesBox, r1.removeFromLeft (48));
+                // MEASURED, NOT 48. This box is REBUILT above: from the current tuning it
+                // runs 2..12, so on a scale with ten or more degrees its widest item is two
+                // digits - and a flat 48 px leaves 11 px of text room once the chevron
+                // gutter is taken off, against the 19 that "12" needs. Nothing saw it while
+                // the fit sweep measured a combo against its full box; it is the first
+                // thing the sweep named once it started subtracting the gutter.
+                compact (chordNotesBox, r1.removeFromLeft (
+                             juce::jmax (48, fgfit::snugComboWidth (chordNotesBox, kRowH))));
                 r1.removeFromLeft (6);
                 compact (chordMinMaxBox, r1);
             }
@@ -9630,7 +9772,14 @@ void FractalAdditiveAudioProcessorEditor::resized()
                           .withWidth (juce::jmin (c.getWidth(), 158));
               caption (lblRefA, rr, 34, 70);
               lblRefHz.setBounds (rr.removeFromRight (juce::jmax (22, fgfit::labelWidth (lblRefHz))));
-              refAEdit.setBounds (rr); }
+              refAEdit.setBounds (rr);
+              // THE PRECISION FOLLOWS THE WIDTH, and it can only be decided here because
+              // this is where the width is decided. Called from the 30 Hz timer as well,
+              // but a probe or a photograph can be taken between a resize and the next
+              // tick, and at 690x550 that is the difference between "261.626" and the
+              // field scrolling itself to "55653". Cheap: refreshRefAText compares the
+              // string it built with the one on screen and does nothing when they match.
+              refreshRefAText(); }
             { auto c = essCell (ecOct);
               // Same shape as PHASE / GAIN / REFERENCE: the stepper sits RIGHT of the
               // painted OCTAVE label (see paintedSubLabels()), not below it - it was the

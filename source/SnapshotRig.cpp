@@ -924,11 +924,47 @@ namespace
         // photographed everything at was a size the editor does not lay out at all.
         // ...in the language the search is currently walking: measuring English widths
         // during the Catalan pass would certify a size Catalan does not lay out at.
+        //
+        // ...AND CHROME IS NOT ONLY TEXT. Two things this predicate certified at 690x550 -
+        // the size it then called the product's floor and photographed 42 pictures at -
+        // are in the loop below now, because both were plainly broken on the glass and
+        // invisible to every question asked above:
+        //
+        //   1. A TICK BOX DRAWN OUTSIDE ITS OWN BUTTON. The nine prime checkboxes carry no
+        //      button text (their numbers are separate Labels), so all three text checks
+        //      read them as empty strings and skipped them. They were laid out 6 px wide
+        //      against a 20.5 px tick that starts 4 px in: a 2 px sliver of a box, with
+        //      the "On" switch and "Temper to tuning" beside them already hidden by the
+        //      layout's own explicit decision. The whole prime row was decoration.
+        //
+        //   2. A PAINTED SUB-LABEL WIDER THAN THE CELL IT IS DRAWN INTO. paint() calls
+        //      drawText with useEllipsis = false, so the word is CUT at the cell edge with
+        //      nothing on screen saying so - "OCTAVE RANGE" reading "OCTAVE RAN". These
+        //      labels already shrink themselves to fit down to a 9 px floor
+        //      (paintedSubLabels), and the comment there says a cell that still cannot
+        //      hold its title at 9 px is a LAYOUT problem: this is the line that finally
+        //      treats it as one instead of logging it among the fit problems. Measured off
+        //      the very list paint() draws from, in the font it draws with.
+        //
+        // Both are refusals, not new fit rows: a fit problem is a count that is meant to
+        // come down, and neither of these is a cramped string - they are a control that
+        // cannot be operated and a word that is not all there.
         for (const auto& f : ed.textFitProbeForTests (catalan))
+        {
             if (f.avail < 0.0f || f.availH < 0.0f)
                 return note (f.path + " (" + f.kind + ") \"" + f.text + "\" has negative room: "
                              + juce::String (f.avail, 1) + " wide by "
                              + juce::String (f.availH, 1) + " tall");
+            if (f.kind == "TickBox" && f.over() > 0.5f)
+                return note (f.path + " is " + juce::String (f.avail, 1)
+                             + " px wide and its tick box needs " + juce::String (f.need, 1));
+        }
+        for (const auto& l : L.paintedLabels)
+            if (! l.fitted && l.textWidth > (float) l.cell.getWidth() + 0.5f)
+                return note ("painted \"" + l.text + "\" (" + l.name + ") needs "
+                             + juce::String (l.textWidth, 1) + " px in the "
+                             + juce::String (l.cell.getWidth())
+                             + " its cell has, and is drawn without an ellipsis");
         const juce::Rectangle<int> boxes[] = { L.spectrum, L.essentials, L.tuning,
                                                L.envelopes, L.specColumn };
         const char* boxNames[] = { "spectrum", "essentials", "tuning", "envelopes", "specColumn" };
