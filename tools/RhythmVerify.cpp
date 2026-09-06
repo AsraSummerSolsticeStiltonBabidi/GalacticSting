@@ -1131,6 +1131,7 @@ static const char* kParamBaseline[] = {
     "pgMode",
     "pgVoices",
     "primeOn",
+    "shepDown",
 };
 
 // --- run 59: THE PITCH MODULATOR BENDS; IT DOES NOT CLIMB STAIRS --------------
@@ -12974,6 +12975,84 @@ int main (int argc, char** argv)
             juce::Thread::sleep (250);
             pump (0.6);
         }
+
+        // -- 9b. THE ARROW -------------------------------------------------------
+        // Placed AFTER the CPU run and before the panel checks, because it needs the mode
+        // ON and a note held and the runs around it each set their own state - an earlier
+        // draft sat in the middle of the sequence and left shepOn at 0, which broke two
+        // later checks that had every right to expect what the block above them left.
+        set ("shepOn", 1.0f);
+        set ("shepDiv", 9.0f);   // "4" beats -> 2.0000 s per rise interval at 120 BPM
+        set ("phaseMode", 0.0f);
+
+        // -- THE ARROW: THE SAME STACK, WALKING THE OTHER WAY ---------------------
+        //
+        // "Haz que el shepard pueda ser ascending o descending pulsando un boton con
+        //  flecha que al pulsarlo pasa de hacia arriba a hacia abajo."
+        //
+        // Measured on the GRID PHASE - where the copies sit between one rise interval and
+        // the next, which is log2(ratio) modulo 1 and is the same number for every copy.
+        //
+        // NOT on the band's weighted centre, which is what I reached for first and is
+        // exactly wrong: the band is a FIXED window in absolute frequency and the whole
+        // illusion is that it does not move. Measured, it drifts 0.006 octaves a second
+        // against a rise of 0.5 - so that quantity is the ripple, not the motion, and a
+        // test built on it would have been asserting the sign of a rounding error.
+        //
+        // The phase wraps, so successive samples are differenced into (-0.5, +0.5]. At 2 s
+        // per interval and a 0.2 s sample the true step is 0.1, comfortably inside that
+        // window and comfortably away from its edge, which is what makes the unwrap
+        // unambiguous rather than merely usually right.
+        {
+            const auto phaseDrift = [&] (bool down)
+            {
+                set ("shepDown", down ? 1.0f : 0.0f);
+                keyDown (60);
+                pump (0.5);              // past the rate smoother, which decelerates through zero
+                const double f0 = p->getNoteFrequency (60);
+                double prev = 0.0, sum = 0.0;
+                int taken = 0;
+                for (int i = 0; i < 7; ++i)
+                {
+                    const int n = probe();
+                    double ph = 0.0;
+                    if (n > 0) { const double st = std::log2 (pr[0] / f0); ph = st - std::floor (st); }
+                    if (i > 0)
+                    {
+                        double d = ph - prev;
+                        while (d >  0.5) d -= 1.0;
+                        while (d <= -0.5) d += 1.0;
+                        sum += d; ++taken;
+                    }
+                    prev = ph;
+                    pump (0.2);
+                }
+                keyUp (60); pump (1.5);
+                return taken > 0 ? sum / (double) taken : 0.0;
+            };
+
+            const double dUp   = phaseDrift (false);
+            const double dDown = phaseDrift (true);
+            std::printf ("  grid phase per 0.2 s: rising %+.4f intervals, falling %+.4f"
+                         " (2 s per interval predicts %+.4f)\n", dUp, dDown, 0.1);
+
+            // GATE FIRST: a stack that never moved would give two zeros and satisfy any
+            // "one is the negative of the other" test by being nothing at all.
+            check (std::abs (dUp) > 0.02, "the rising stack actually moves");
+            check (dUp > 0.0,   "UP really rises");
+            check (dDown < 0.0, "and the arrow makes it FALL");
+            // Symmetric to within the rate smoother: the two are one negation in the
+            // engine, so anything worse than a few percent would mean a second code path
+            // had crept in.
+            check (std::abs (dUp + dDown) < 0.08 * std::abs (dUp),
+                   "...at the same speed, because it is one sign and not a second path");
+            // ...and the speed is the one the rate control asked for, so this cannot pass
+            // on a stack that moves for some unrelated reason.
+            check (std::abs (std::abs (dUp) - 0.1) < 0.02,
+                   "...and both are the 2 s per interval the beats box asked for");
+            set ("shepDown", 0.0f);
+        }
+        set ("shepOn", 0.0f); pump (0.4);
 
         // -- 10. the TUNING panel with the new row, in its DENSEST reachable shape --
         // The Shepard row is unchanged in height, but its right-hand slot now holds the

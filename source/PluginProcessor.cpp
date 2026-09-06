@@ -641,6 +641,22 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterBool>(
         ParameterID { "primeOn", 1 }, "Prime Control On", false));
 
+    // WHICH WAY IT GOES. "Haz que el shepard pueda ser ascending o descending pulsando un
+    // boton con flecha que al pulsarlo pasa de hacia arriba a hacia abajo."
+    //
+    // A Shepard tone that FALLS for ever is the same illusion run backwards and it is the
+    // half of the effect this synth could not make: the classic demonstration is a pair,
+    // and a descending one is what a riser is answered with. It is one sign on the rise
+    // rate - the grid, the window and the band are all symmetric, and the copies leave
+    // through the zero at whichever edge they reach - so this costs the engine a negation
+    // and nothing else.
+    //
+    // Appended at the END of the parameter list, like every addition here: a host's
+    // automation lanes are indexed, and inserting it beside its four Shepard neighbours
+    // would renumber every parameter after it in projects people have already saved.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "shepDown", 1 }, "Shepard Descending", false));
+
     return { params.begin(), params.end() };
 }
 

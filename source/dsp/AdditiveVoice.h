@@ -109,6 +109,7 @@ public:
         shepTimeParam = src.raw ("shepTime");
         shepDivParam  = src.raw ("shepDiv");
         shepRiseParam = src.raw ("shepRise");
+        shepDownParam = src.raw ("shepDown");
 
         // MONOPHONIC GLIDE. These two are read from the LIVE state, NOT through `src`,
         // and that is deliberate: mono is a rule about the NOTE STREAM, and there is
@@ -2534,7 +2535,21 @@ private:
         // the free ms value takes over; the panel says so from the processor's flag.
         // ...read through the SAME function renderNextBlock's block splitter uses, so the
         // two can never disagree about how fast the stack is moving.
-        const double rateTarget = 1.0 / juce::jmax (shepard::kMinRiseSec, shepardRiseSeconds());
+        // ...AND WHICH WAY. A descending Shepard is the same illusion with the sign of the
+        // rise flipped: the grid walks down instead of up, the raised-cosine window slides
+        // the other way, and copies leave through the zero at the BOTTOM edge exactly as
+        // they left through the top. Everything downstream is already symmetric - du is a
+        // signed per-sample advance, taperWidth takes the absolute value of the block's
+        // travel, and the band is centred rather than anchored to either end - so this is
+        // one negation and not a second code path.
+        //
+        // Applied to the SMOOTHING TARGET rather than to shepG, so flipping the arrow while
+        // a note is sounding decelerates through zero and accelerates the other way over
+        // the same ~one-block smoothing the rate already has. Flipping shepG's increment
+        // directly would reverse the stack in a single sample - a click, and the one thing
+        // this engine exists to avoid.
+        const double rateTarget = (shepDownParam != nullptr && shepDownParam->load() > 0.5f ? -1.0 : 1.0)
+                                / juce::jmax (shepard::kMinRiseSec, shepardRiseSeconds());
 
         // THE DENSITY FLOOR. A copy below the played pitch has MORE partials under
         // Nyquist than the key does, and each copy's oscillators live in one kStride
@@ -2726,7 +2741,14 @@ private:
         // Advance the rise. Whole steps are renumbered away in multiples of kSlots so
         // the slot hash is untouched (the same trick v1 used on its sine grid).
         shepG = gEnd;
-        if (shepG >= 4096.0)
+        // ...IN EITHER DIRECTION. The renumbering only ever looked UP, because shepG only
+        // ever grew. A descending voice walks it negative instead, and left alone it would
+        // run to -1e15 over a long note and lose its low bits - the same precision loss
+        // this guard exists to prevent, reached from the other side. Symmetric now, and
+        // the two branches share one line of arithmetic: the truncation toward zero that
+        // (long long) does is exactly what both want, because the multiple of kSlots is
+        // subtracted rather than floored.
+        if (shepG >= 4096.0 || shepG <= -4096.0)
         {
             const long long d = (long long) shepard::kSlots
                               * (long long) (shepG / (double) shepard::kSlots);
@@ -3128,7 +3150,7 @@ private:
     //== SHEPARD MODE state (see ShepardEngine.h and planShepard) ==============
     std::atomic<float>* shepOnParam   = nullptr, * shepModeParam = nullptr;
     std::atomic<float>* shepTimeParam = nullptr, * shepDivParam  = nullptr;
-    std::atomic<float>* shepRiseParam = nullptr;
+    std::atomic<float>* shepRiseParam = nullptr, * shepDownParam = nullptr;
     bool   shepActive = false;   // LATCHED at note-on: this note either is a Shepard or is not
     bool   shepFresh  = true;    // adopt band/rate instantly (a cold note, not a glide)
     double shepG      = 0.0;     // the rising grid phase, in rise intervals

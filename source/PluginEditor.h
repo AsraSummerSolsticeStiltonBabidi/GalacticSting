@@ -5538,9 +5538,14 @@ private:
     // control could do - stop the window reaching zero at its edges - would break the
     // silent wrap that makes the whole illusion click-free.
     juce::ToggleButton shepOnT;
+    // WHICH WAY THE TONE GOES, as one arrow you press. A TextButton in toggle mode rather
+    // than a two-item ComboBox: there are exactly two states, the glyph IS the answer in
+    // both languages, and it costs the row 24 px against a dropdown's ~90. Its parameter
+    // is shepDown, so an automation lane can sweep the direction like anything else.
+    juce::TextButton   shepDirBtn;
     juce::ComboBox     shepModeBox, shepDivBox, shepRiseBox;
     juce::Slider       shepTimeFader;
-    std::unique_ptr<ButtonAttachment>   shepOnAtt;
+    std::unique_ptr<ButtonAttachment>   shepOnAtt, shepDirAtt;
     std::unique_ptr<ComboBoxAttachment> shepModeAtt, shepDivAtt, shepRiseAtt;
     std::unique_ptr<SliderAttachment>   shepTimeAtt;
     // (Whether the rise-interval box is on screen rides in the timer's `packed`

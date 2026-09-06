@@ -2307,6 +2307,31 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     shepOnT.setMouseClickGrabsKeyboardFocus (false);
     addAndMakeVisible (shepOnT);
     shepOnAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "shepOn", shepOnT);
+    // THE DIRECTION ARROW. One press flips a rising Shepard into a falling one.
+    //
+    // The glyph carries the whole meaning, so it is the same in both languages and only
+    // the hover needs translating - which is also why this is a button and not a two-item
+    // dropdown: a dropdown would cost the row about 90 px to say what an arrow says in 24,
+    // on the tightest row in the tuning panel.
+    //
+    // setClickingTogglesState so a plain ButtonAttachment drives it, exactly like the
+    // Shepard switch beside it; onStateChange (not onClick) keeps the glyph honest when
+    // the parameter moves from somewhere else - host automation, a preset load, an undo.
+    shepDirBtn.setClickingTogglesState (true);
+    shepDirBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff33334a));
+    shepDirBtn.setColour (juce::TextButton::buttonOnColourId, cTuning.withAlpha (0.85f));
+    shepDirBtn.setColour (juce::TextButton::textColourOffId, cTuning.brighter (0.35f));
+    shepDirBtn.setColour (juce::TextButton::textColourOnId, juce::Colours::black);
+    shepDirBtn.setMouseClickGrabsKeyboardFocus (false);
+    shepDirBtn.onStateChange = [this]
+    {
+        shepDirBtn.setButtonText (shepDirBtn.getToggleState()
+                                      ? juce::String::fromUTF8 ("\xe2\x86\x93")   // down
+                                      : juce::String::fromUTF8 ("\xe2\x86\x91")); // up
+    };
+    shepDirBtn.onStateChange();
+    shepDirAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "shepDown", shepDirBtn);
+    addAndMakeVisible (shepDirBtn);
     configCombo (shepModeBox, "shepMode", shepModeAtt, cTuning, {});
     // SMALL-ITEM BOXES, for the same reason the LFO row's three are: these hold PHRASES
     // ("Sync Project Tempo", "Bend de periode"), not one-word modes, and the row's
@@ -7087,6 +7112,11 @@ void FractalAdditiveAudioProcessorEditor::refreshShepardRiseState()
         tip += tr ("\n!This scale states no period! (it descends, or its period is 1/1), so there is no scale period to rise by and the rise-interval choice is not offered: one step is an octave, 2/1. Nothing about your tuning is changed - the pitches are still the file's own.",
                    "\n!Aquesta escala no declara cap per\xc3\xado" "de! (baixa, o el seu per\xc3\xado" "de \xc3\xa9s 1/1), o sigui que no hi ha per\xc3\xado" "de d'escala per pujar i no s'ofereix l'opci\xc3\xb3 d'interval de pujada: un pas \xc3\xa9s una octava, 2/1. La teva afinaci\xc3\xb3 no canvia gens - els tons segueixen sent els del fitxer.");
     shepOnT.setTooltip (tip);
+    // The arrow's own hover. Its glyph says WHICH way; this says what the other way is
+    // for, and that the switch is safe to hit while a note is sounding.
+    shepDirBtn.setTooltip (tr (
+        "*Which way the tone goes.* Up is the endless rise; down is the same illusion falling for ever - the classic demonstration is a pair of them. Press it while a note is sounding and the stack decelerates through zero and comes back the other way over about one buffer, so there is nothing to hear but the turn.",
+        "*Cap on va el to.* Amunt \xc3\xa9s la pujada infinita; avall \xc3\xa9s la mateixa il\xc2\xb7lusi\xc3\xb3 baixant per sempre - la demostraci\xc3\xb3 cl\xc3\xa0ssica \xc3\xa9s una parella. Prem-lo amb una nota sonant i la pila frena fins a zero i torna cap a l'altre cant\xc3\xb3 en aproximadament un buffer, o sigui que nom\xc3\xa9s se sent el gir."));
 }
 
 // ONE PANEL, ONE COLOUR. Every control inside SPECTRUM takes the selected engine's hue,
@@ -7655,7 +7685,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     // `add`'s visibility gate records exactly what is really on screen.
     add ("tun.shepOn",       shepOnT);         add ("tun.shepMode",   shepModeBox);
     add ("tun.shepTime",     shepTimeFader);   add ("tun.shepDiv",    shepDivBox);
-    add ("tun.shepRise",     shepRiseBox);
+    add ("tun.shepRise",     shepRiseBox);   add ("tun.shepDir",    shepDirBtn);
 
     add ("spec.mode",        specModeBox);     add ("spec.source",    tuneSourceBox);
     add ("spec.scope",       tuneScopeBox);    add ("spec.notesLbl",  chordNotesLbl);
@@ -10246,11 +10276,31 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // affordability ladder the TUNING panel and the fork buttons use: a
                 // control gives up its comfort before another gives up its meaning.
                 const int roomyToggle = 86;
+                // 24 px square: the arrow's own size, on the tightest row in this panel.
+                // 24 px square when the row can pay for it, 18 when it cannot - the arrow
+                // gives up its comfort before the mode box gives up its word, which is the
+                // ladder this row already runs on. Measured: the arrow and its gap cost the
+                // mode box 28 px, and at the tight end that took "Project Tempo" from the
+                // 73.8 px it needs down to 69 - the rig's fully-legible width went 780 to
+                // 840 in one commit. Six pixels back off the arrow is all it took, and an
+                // 18 px square is still a comfortable target for a single glyph.
+                const int roomyDirW = 24, tightDirW = 18;
                 const int wordToggle  = fgfit::toggleWidth (shepOnT.getButtonText(), shepH);
-                const int rowCanPay   = roomyToggle + 4 + needFor (shepModeBox, 94) + 6 + kRateMin;
-                shepOnT.setBounds (sh.removeFromLeft (sh.getWidth() >= rowCanPay
+                const int rowCanPay   = roomyToggle + 4 + roomyDirW + 4 + needFor (shepModeBox, 94) + 6 + kRateMin;
+                const bool roomy      = sh.getWidth() >= rowCanPay;
+                const int kDirW       = roomy ? roomyDirW : tightDirW;
+                shepOnT.setBounds (sh.removeFromLeft (roomy
                                                           ? roomyToggle
                                                           : juce::jmax (wordToggle, 1)));
+                sh.removeFromLeft (4);
+                // THE DIRECTION ARROW, RESERVED BEFORE THE MODE BOX like the rate control
+                // below it, and for the same reason: it is 24 px and it is the difference
+                // between a Shepard that rises and one that falls, so it must not be what
+                // the row spends last. Square, because the glyph is - and because a row
+                // this tightly measured has no pixels for a button that is wider than the
+                // thing inside it.
+                shepDirBtn.setBounds (sh.removeFromLeft (juce::jmin (kDirW, sh.getWidth()))
+                                          .withSizeKeepingCentre (juce::jmin (kDirW, sh.getWidth()), shepH));
                 sh.removeFromLeft (4);
                 // THE RATE CONTROL'S MINIMUM IS RESERVED BEFORE THE MODE BOX IS SIZED.
                 //
