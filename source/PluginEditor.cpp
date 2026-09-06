@@ -805,6 +805,27 @@ namespace
                 g.drawText (on ? "ON" : "OFF", b.getLocalBounds(), juce::Justification::centred, false);
                 return;
             }
+            // A DISABLED TICK BOX HAS TO LOOK DISABLED, and JUCE's own painter does not
+            // manage it: LookAndFeel_V4::drawToggleButton dims the TEXT (setOpacity 0.5)
+            // and hands drawTickBox an isEnabled flag that drawTickBox then uses only for
+            // the BORDER - the tick itself is filled in full tickColourId whatever the
+            // state. So the nine PRIME CONTROL boxes sat at full olive saturation under a
+            // greyed "Whitelist" the moment that panel's switch went off, which is the
+            // one state where they are not acting on the sound at all. Caught by reading
+            // the rig's own photographs, not by any gate: nothing overflowed, nothing was
+            // clipped, it was simply the wrong colour.
+            //
+            // A transparency layer rather than a hand-copy of JUCE's painter: the layer
+            // costs one small offscreen buffer per disabled box per repaint (these are
+            // 15x15) and it cannot drift out of step with the base class the way a copy
+            // would. 0.45 is the same order as the 0.5 JUCE already uses on the text.
+            if (! b.isEnabled())
+            {
+                g.beginTransparencyLayer (0.45f);
+                juce::LookAndFeel_V4::drawToggleButton (g, b, over, down);
+                g.endTransparencyLayer();
+                return;
+            }
             juce::LookAndFeel_V4::drawToggleButton (g, b, over, down);
         }
 
@@ -2773,7 +2794,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     }
 
     // Master reference A = <hz> (transposes everything, all tuning modes). A text
-    // box you type the Hz into (with "hz" shown to its right), not a fader.
+    // box you type the Hz into (with "Hz" shown to its right), not a fader.
     refAEdit.setJustification (juce::Justification::centred);
     refAEdit.setFont (juce::Font (juce::FontOptions (13.0f))); // fits the slim cell, no clipped descenders
     refAEdit.setInputRestrictions (11, "0123456789."); // fits C3's unrounded 261.6255653
@@ -2791,7 +2812,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     refAEdit.onEscapeKey  = [this] { refreshRefAText(); refocus(); };
     addAndMakeVisible (refAEdit);
     makeLabel (lblRefA, cEssentials);
-    lblRefHz.setText ("hz", juce::dontSendNotification);
+    lblRefHz.setText ("Hz", juce::dontSendNotification); // the SI capital - see ScaleKeyboard
     lblRefHz.setJustificationType (juce::Justification::centredLeft);
     lblRefHz.setColour (juce::Label::textColourId, cEssentials.brighter (0.15f));
     lblRefHz.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
@@ -4091,7 +4112,54 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         tuningBox.changeItemText (1, tr ("12ED2", "12ED2"));
         tuningBox.changeItemText (2, tr ("MTS-ESP", "MTS-ESP"));
         tuningBox.changeItemText (3, tr ("Scala (.scl)", "Scala (.scl)"));
-        tuningBox.changeItemText (4, tr ("MPE (bend input)", "MPE (entrada de bend)"));
+        // THE CATALAN GLOSS IS SHORTER THAN THE ENGLISH ONE ON PURPOSE, and this is the
+        // one string in the window where that is a LAYOUT decision rather than a
+        // translation one. This box is sized to its WIDEST item, this is that item, and
+        // it shares the TUNING panel's 24 px mode row with three fork buttons that each
+        // measure their own word. Measured at the shipped 1200x650, where that row is
+        // 447 px wide (the row's own comment already states the four controls want ~466
+        // of it):
+        //
+        //   english   box 174 + 5 + Load 57 + 4 + Save 58 + 4 + the bank word 107 = 409
+        //   catalan   box 215 + 5 + Obrir 60 + 4 + Desa 58 + 4 + the bank word 134 = 480
+        //
+        // The Catalan gloss is 41 px wider than the English one and the Catalan bank word
+        // 27 px wider, so the Catalan row was 33 px over and the LAST control on it paid:
+        // the button that puts the playing tuning into the bank measured 134 against the
+        // 101 it was left, hid itself by this row's stated rule - a word that cannot be
+        // read is hidden, never smeared - and so never got bounds at all. It is also not
+        // reachable any other way: it is the only route into the bank that does not go
+        // through a file. A FEATURE THAT EXISTS IN ONE LANGUAGE AND NOT THE OTHER is not
+        // an outcome that rule may produce, so the row has to fit.
+        //
+        // And nothing saw it, by construction: layoutProbe and the text sweep both skip
+        // invisible children, so hiding a control REMOVES its measurements and every
+        // bounds, overlap and fit check stays green. Only the word survived, in
+        // buttonTexts - a word present with no control under it, which is exactly the
+        // fingerprint a human found by looking at the rendered picture.
+        //
+        // Dropping the gloss to the one word that names the mechanism takes the box to
+        // 122, so the row asks 151 + 5 + 260 = 416 of 447 - 31 px spare against English's
+        // 38, with all four controls laid out in both languages from about a 1090 px
+        // window up. The mechanism is not lost: this box's own hover says the host sends
+        // the tuning as per-note bend, in both languages, and "bend" is the word an MPE
+        // user already has for it. English is not touched by a pixel.
+        //
+        // TRIED AND REJECTED, both measured:
+        //   - sizing the box to its SELECTED item and reserving all three buttons. It
+        //     does fix the row, and it moves the rig's smallest fully legible size from
+        //     780x550 to about 1190x550: the text sweep measures every combo against its
+        //     WIDEST item, this box is already the control that walk names as binding for
+        //     the whole window, and it starts clipping below about 174 px.
+        //   - shortening the bank button's word instead. That word is the FEATURE'S NAME;
+        //     a lone plus sign was replaced by a sentence precisely because it named
+        //     neither what it added nor where, and there is a standing check that it
+        //     still says so.
+        //   - wrapping the three buttons onto a row of their own, which resized() already
+        //     does when it can. It cannot here: the panel has 112 px under the mode row
+        //     and the wrap wants 123, and the 27 px would come off the tuning BANK row -
+        //     trading the panel's whole bank UI for the one button that reaches it.
+        tuningBox.changeItemText (4, tr ("MPE (bend input)", "MPE (bend)"));
         if (keepTuning > 0) tuningBox.setSelectedId (keepTuning, juce::dontSendNotification);
     }
     {
@@ -10952,12 +11020,41 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                     "0 parcials \xe2\x80\x94 els filtres d'Harm\xc3\xb2nics / de primers no deixen sonar res");
         meterLabel.setColour (juce::Label::textColourId, juce::Colours::orange);
     }
+    else if (! processorRef.hasSoundedYet())
+    {
+        // THREE STATES, NOT TWO, AND THE COLOUR IS THE DIAGNOSIS.
+        //
+        // This line had one green and one amber. "0 partials audible" came out GREEN in
+        // the one state where the instrument is mute - and in the SAME green on a
+        // perfectly healthy cold instrument, photographed at 1600x900, because
+        // renderedCount is only ever written by a sounding voice, so before the first
+        // note the number is not a measurement at all (see SpectrumEngine::reportRendered).
+        // One string and one colour cannot be right for both.
+        //
+        // So the cold state says what is true - nothing has sounded yet - in the grey this
+        // window uses for "no information", and stops claiming a count it does not have.
+        meter = tr ("not sounded yet", "encara no ha sonat")
+              + "   \xe2\x80\x94   " + juce::String (templ) + tr (" in the full timbre", " al timbre complet");
+        meterLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
+    }
     else
     {
         meter = juce::String (rendered) + tr (" partials audible", " parcials audibles")
               + "   \xe2\x80\x94   " + juce::String (templ) + tr (" in the full timbre", " al timbre complet");
-        if (truncated) meter += tr ("   (safety cap)", "   (l\xc3\xadmit de seguretat)");
-        meterLabel.setColour (juce::Label::textColourId, truncated ? juce::Colours::orange : juce::Colour (0xff7ff59a));
+        // ...and once it HAS sounded, a count of zero is a real diagnosis and wears the
+        // colour of one. Amber and not red: red in this plugin means TRUNCATED - the
+        // engine removed something you asked for. This is "nothing is reaching your ears",
+        // which one control puts right, and it wears the same amber as the overlay that
+        // explains it. Two words and not a sentence: measured at the 690x550 floor the
+        // Catalan line already comes to about 555 px in a 678 px label, and a juce::Label
+        // that runs short does not clip, it CONDENSES - so the honest way to say more here
+        // was to say less.
+        if (truncated)          meter += tr ("   (safety cap)", "   (l\xc3\xadmit de seguretat)");
+        else if (rendered == 0) meter += tr ("   \xe2\x80\x94   SILENT", "   \xe2\x80\x94   EN SILENCI");
+        meterLabel.setColour (juce::Label::textColourId,
+                              truncated     ? juce::Colours::orange
+                            : rendered == 0 ? juce::Colour (0xffffb020)
+                                            : juce::Colour (0xff7ff59a));
     }
     meterLabel.setText (meter, juce::dontSendNotification);
 

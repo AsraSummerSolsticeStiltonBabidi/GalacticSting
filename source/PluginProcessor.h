@@ -78,6 +78,10 @@ public:
     //==========================================================================
     // For the editor's partial/CPU meter.
     int  getPartialCount() const noexcept { return spectrumEngine.getRenderedCount(); }
+    // ...and whether that count is an ANSWER or still its initial value - see
+    // SpectrumEngine::reportRendered. The meter must not print "0 partials audible" as a
+    // diagnosis when the honest statement is "nothing has been played yet".
+    bool hasSoundedYet() const noexcept   { return spectrumEngine.hasEverRendered(); }
     int  getTemplatePartialCount() const noexcept { return spectrumEngine.getPartialCount(); }
     int  getRawPartialCount() const noexcept { return spectrumEngine.getRawCount(); }
     bool isSpectrumTruncated() const noexcept { return spectrumEngine.isTruncated(); }

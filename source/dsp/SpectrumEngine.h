@@ -293,8 +293,32 @@ namespace spectrum
         // Audio thread: a voice reports how many partials it actually renders (after the
         // per-pitch Nyquist cull) so the meter can show the audible count, not the
         // (much larger, pitch-independent) template size.
-        void reportRendered (int n) const noexcept { renderedCount.store (n, std::memory_order_relaxed); }
+        // WRITTEN ONLY BY A SOUNDING VOICE, WHICH IS WHY THE COUNT ALONE IS NOT A FACT.
+        //
+        // renderedCount is 0 in two states that could not be further apart: a cold
+        // instrument nobody has played yet, and an instrument that is playing and
+        // producing nothing. The editor's meter read the number without that distinction
+        // and printed "0 partials audible" in the healthy green in BOTH - photographed on
+        // a cold instrument at 1600x900, where the synth is completely fine, and again in
+        // the silent-warning state, where it is not. One string and one colour cannot be
+        // right for both.
+        //
+        // One more relaxed store of a bool is the whole cost on the audio thread: no
+        // allocation, no lock, and no ordering imposed on anything, because both values
+        // are advisory read-outs that the DSP never reads back. Never cleared: the
+        // question is "has this instrument made a sound since it was built", and letting
+        // go of a note must not turn the meter back into a question mark.
+        //
+        // REJECTED: a -1 sentinel inside renderedCount. The verifier reads
+        // getRenderedCount() as a plain count in two places, and a negative would have to
+        // be understood at both, off screen, by whoever edits them next.
+        void reportRendered (int n) const noexcept
+        {
+            renderedCount.store (n, std::memory_order_relaxed);
+            everRendered.store (true, std::memory_order_relaxed);
+        }
         int  getRenderedCount() const noexcept     { return renderedCount.load (std::memory_order_relaxed); }
+        bool hasEverRendered()  const noexcept     { return everRendered.load (std::memory_order_relaxed); }
 
         // MEASURE THE LIVE SLOT'S PLAN, AFTER IT IS ALREADY SOUNDING.
         //
@@ -588,6 +612,7 @@ namespace spectrum
         std::atomic<bool> truncated  { false };
         std::atomic<bool> abortBuild { false };
         mutable std::atomic<int> renderedCount { 0 };
+        mutable std::atomic<bool> everRendered { false }; // see reportRendered: 0 is not a diagnosis
 
         mutable std::mutex requestMutex;
         std::mutex        buildMutex;

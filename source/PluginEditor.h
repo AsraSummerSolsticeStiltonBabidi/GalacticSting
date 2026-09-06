@@ -3942,7 +3942,20 @@ private:
             // fixed 52 px was 23 short of both, so the last line was cut off inside the
             // panel with nothing to say it had been.
             factsLbl.setBounds (r.removeFromTop (juce::jmax (52, fgfit::labelHeight (factsLbl, r.getWidth()))));
-            warnLbl.setBounds (r.removeFromTop (warnLbl.getText().isEmpty() ? 0 : 32));
+            // MEASURED, NOT 32. This is the same fault the line above it already fixed,
+            // left behind on the one label in this window that must never be cut: the
+            // manual-amplitudes banner and, worse, the TRUNCATED banner. At the shipped
+            // 1100x740 the banner is one line and 32 was enough, so no size anyone looks
+            // at ever showed it - but 320x240 is this window's OWN resize floor, it is
+            // reachable, and there the text wraps to four lines, juce::Label ellipsises
+            // it, and what survives on screen is "...is FROZEN where it stood. Switch
+            // manual" with the half of the sentence that says HOW TO UNDO IT simply gone.
+            // No gate saw it, because nothing overflowed its bounds.
+            //
+            // No floor of 32 to go with it: an empty banner still takes 0, and a one-line
+            // banner should cost one line rather than a seventh of a small window.
+            warnLbl.setBounds (r.removeFromTop (warnLbl.getText().isEmpty()
+                                                    ? 0 : fgfit::labelHeight (warnLbl, r.getWidth())));
             r.removeFromTop (4);
             view.setBounds (r);
             layoutGrid();
@@ -4556,8 +4569,22 @@ private:
             // reason would have had to grow, and this row has no width to give.)
             const bool monoNow = proc != nullptr
                               && proc->apvts.getRawParameterValue ("monoGlide")->load() > 0.5f;
-            voicesSlider.setEnabled (mode == 1 && ! monoNow);
-            voicesLbl.setAlpha (mode == 1 && ! monoNow ? 1.0f : 0.45f);
+            // ONE STATE, ONE APPEARANCE. setEnabled dims the two stepper buttons - JUCE's
+            // TextButton honours it - but NOT the value box: that box is a juce::Label fed
+            // from Slider::textBoxTextColourId, and nothing changes that colour on disable.
+            // Measured off the rendered window in MORPH mode, where this control is off:
+            // the caption's brightest ink is #2F333D, the +/- glyphs are #4E5459 and THE
+            // NUMBER is #8E989B - three brightnesses for one disabled control, with the
+            // read-out the brightest of the three. A number at full ink beside a greyed
+            // caption reads as live, and this one is not.
+            //
+            // setAlpha on the whole slider rather than a second colour: it covers the box,
+            // both buttons and anything added to this control later, and it is driven by
+            // the same expression as the caption beside it, so the two cannot drift apart.
+            const bool voicesLive = mode == 1 && ! monoNow;
+            voicesSlider.setEnabled (voicesLive);
+            voicesSlider.setAlpha (voicesLive ? 1.0f : 0.45f);
+            voicesLbl.setAlpha (voicesLive ? 1.0f : 0.45f);
             // ...and SAY WHICH NUMBER IS IN FORCE. Greying the control tells the user it is
             // not theirs to move; it does not stop the box reading 8 while every corner
             // engine is actually running ONE voice, which is a control displaying a number
@@ -4997,7 +5024,7 @@ private:
     juce::TextButton tablePeriodResetBtn;
     ExpandingEditor  intervalEdit; // Custom Engine: typed intervals -> partials (multi-line)
     juce::Rectangle<int> intervalEditHome; // its laid-out bounds (kept for the focus hook)
-    juce::TextEditor refAEdit;     // Reference A: type the Hz directly ("hz" shown to its right)
+    juce::TextEditor refAEdit;     // Reference A: type the Hz directly ("Hz" shown to its right)
     WarningOverlay warningOverlay;
     NoticeOverlay  noticeOverlay;
     RecentOverlay  recentOverlay;   // floating list of every scale file loaded

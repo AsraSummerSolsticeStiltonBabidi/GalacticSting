@@ -760,9 +760,14 @@ public:
                     g.setFont (isRef
                         ? juce::Font (juce::FontOptions (juce::jmin (12.0f, w * 0.36f)).withStyle ("Bold"))
                         : juce::Font (juce::FontOptions (juce::jmin (11.0f, w * 0.34f))));
+                    // Hz and kHz with the capital the SI unit actually has: it is named
+                    // after Heinrich Hertz, so the H is a person's initial and "hz" is
+                    // simply wrong. The adapt panel across the window has always written
+                    // it correctly ("131..523 Hz"), so until now one window spelled one
+                    // unit two ways. The space before it is the SI rule too.
                     const juce::String t = juce::String::fromUTF8 ("\xe2\x89\x88 ")
-                        + (hz >= 1000.0 ? juce::String (hz / 1000.0, 2) + "khz"
-                                        : juce::String ((int) std::lround (hz)) + "hz");
+                        + (hz >= 1000.0 ? juce::String (hz / 1000.0, 2) + " kHz"
+                                        : juce::String ((int) std::lround (hz)) + " Hz");
                     g.drawFittedText (t, hzArea.toNearestInt(), juce::Justification::centred, 1, 0.4f);
                 }
             }
@@ -860,9 +865,62 @@ public:
         }
         else
         {
-            g.setFont (juce::Font (juce::FontOptions (juce::jmin (12.0f, w * 0.4f)).withStyle ("Bold")));
-            g.drawFittedText (label, area.reduced (1.0f, 0.0f).toNearestInt(),
-                              juce::Justification::centred, 1, 0.4f);
+            // NOT CONDENSED, AND NOT TOUCHING ITS BORDERS.
+            //
+            // The old call passed minimumHorizontalScale = 0.4, which is a licence for
+            // drawFittedText to SQUEEZE THE GLYPHS to 40% of their width rather than pick
+            // a smaller font. Measured at the SHIPPED 1200x650 with 53-EDO: the cell is
+            // 32 px, the box after the old 1 px inset is 30, and "1042" plus the cent sign
+            // plus the "*" measures 38.2 px at 12 px Bold - so every cents label on that
+            // keyboard was drawn at 79% of its own typeface. Invisible to every gate in
+            // this build, because nothing overflowed: the text fits, it is just the wrong
+            // shape. This project refuses condensed text everywhere else and this was the
+            // one place still doing it.
+            //
+            // Three px of inset, not one. Measured on screen at 1200x650: the "800c"
+            // cell's drawn borders are at x 747 and x 779 and the label's first ink pixel
+            // is at x 749 - one pixel - which reads as text spilling out of its key rather
+            // than sitting in it.
+            //
+            // The font comes DOWN to fit and the horizontal scale is pinned at 1.0, which
+            // is the trade the degree number above it already makes. Measured in the BOLD
+            // face this label is really drawn in: the shared shrink helper measures in the
+            // degree number's face, and borrowing it here would under-measure by about 7%
+            // and put the squeeze straight back.
+            //
+            // THE CENT SIGN GOES when the cell cannot hold it, and that is a decision
+            // rather than a squeeze: "1042" at a readable size says more than "1042c" at
+            // 79% of its width. 34 px is measured, not chosen - it is the narrowest cell
+            // in which the widest label this keyboard produces still fits at 12 px Bold
+            // WITH the sign and the 3 px insets. The unit is not lost: the key's hover
+            // card spells "cents" out in full, and the "*" - the part carrying meaning the
+            // number does not - is always kept.
+            //
+            // REJECTED: shrinking the font alone and keeping the sign. At a 32 px cell
+            // that lands the six-glyph labels at 8.4 px, under the 9 px the rest of this
+            // keyboard treats as the smallest readable size.
+            constexpr float kCentSignMinCellW = 34.0f;
+            juce::String shown = label;
+            if (w < kCentSignMinCellW)
+                shown = shown.replace (juce::String::fromUTF8 ("\xc2\xa2"), juce::String());
+            auto box = area.reduced (3.0f, 0.0f);
+            const float maxW = juce::jmax (4.0f, box.getWidth());
+            const auto boldW = [] (const juce::String& t, float h)
+            { return juce::GlyphArrangement::getStringWidth (
+                         juce::Font (juce::FontOptions (h).withStyle ("Bold")), t); };
+            float fh = juce::jmin (12.0f, w * 0.4f);
+            // One division then 0.96 steps, the same shape the shrink helper uses and for
+            // the same reason: glyph advances are quantised, so a single scale by
+            // maxW / measured lands a hair over the line often enough to matter. One or
+            // two iterations in practice, on the message thread, once per key per repaint.
+            {
+                const float w0 = boldW (shown, fh);
+                if (w0 > maxW && w0 > 0.0f) fh = fh * maxW / w0;
+                for (int i = 0; i < 24 && fh > 1.0f && boldW (shown, fh) > maxW; ++i) fh *= 0.96f;
+            }
+            g.setFont (juce::Font (juce::FontOptions (fh).withStyle ("Bold")));
+            g.drawFittedText (shown, box.getSmallestIntegerContainer(),
+                              juce::Justification::centred, 1, 1.0f);
         }
     }
 
