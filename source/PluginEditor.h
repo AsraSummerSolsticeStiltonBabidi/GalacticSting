@@ -1857,11 +1857,25 @@ private:
 
     // Darkens everything behind the Spectrum-to-Rhythm panel so it does not
     // distract; clicking it (= clicking outside the panel) closes the panel.
+    //
+    // 0xa8 (66% black) WAS NOT A SCRIM, IT WAS A TINT. Photographed at 1200x650 with the
+    // panel open, the keyboard's rainbow along y 575-641 kept about a third of its
+    // luminance and every one of its hues, so the two brightest, most saturated bands in
+    // the whole window sat in the corners of a picture whose subject is a dialog in the
+    // middle - the eye went to the corners. The main window's "TRANSITION" cell was still
+    // legible THROUGH it as well, at x 1100-1250: a scrim you can read a word through is
+    // not separating anything.
+    //
+    // 0xd9 is 85% black: what is behind stays visible as shape and position (this is a
+    // modal over a window the user is still working in, not a curtain), but the rainbow
+    // drops to 15% of its luminance, which puts it below every element of the dialog in
+    // front of it. The 0x000008 is the page's own blue cast, kept so the darkened window
+    // reads as the same window rather than as a grey photograph of one.
     struct Scrim : juce::Component
     {
         std::function<void()> onClick;
         void mouseDown (const juce::MouseEvent&) override { if (onClick) onClick(); }
-        void paint (juce::Graphics& g) override { g.fillAll (juce::Colour (0xa8000008)); }
+        void paint (juce::Graphics& g) override { g.fillAll (juce::Colour (0xd9000008)); }
     };
 
     // Timbre -> rhythm (MIDI out) panel: pick partials of the CURRENT patch (shown
@@ -1875,6 +1889,54 @@ private:
         // "+12" measures 26 in the font a 22 px button draws in, so both were squashed
         // on every row of the panel at once.
         static constexpr int kStepBtnW = 36;
+
+        //== THE PANEL WEARS ONE HUE, AND IT IS THE SPECTRUM'S =====================
+        //
+        // "EIGHT ACCENT HUES IN ONE 816x637 DIALOG". Counted from the render: a blue
+        // frame and title (0x5cb8ff), a pale blue PLAYBACK, a cyan PULSE RATE that was
+        // ALSO the Steps fader, a pink OUTPUT that was also three sliders' tracks, an
+        // amber DAW TEMPO that was also the BPM read-out and the loudest button on
+        // screen, a green NOTE START that was also the read-out and the empty-state
+        // hint, plus the grey text ramp. Four framed boxes in four different colours, of
+        // which two had tinted fills and two did not. Meanwhile every other panel in the
+        // product wears exactly ONE identity colour on its tab, its border, its captions,
+        // its slider thumbs and its read-outs. This one was the only place that opted out.
+        //
+        // WHY IT DOES NOT GET A COLOUR OF ITS OWN, which was the first thing tried.
+        // galactic::palette holds twelve identity colours chosen by search under two hard
+        // constraints (SpectrumTests asserts both): no two closer than 15 units of OKLab,
+        // and every one at 5.9:1 or better on the panel surface it is drawn on. A brute
+        // scan of the whole RGB cube for a THIRTEENTH that clears those - and stays >= 5
+        // units apart under deuteranopia and protanopia - tops out at #00a0ff, 12.70
+        // units from its nearest neighbour. There is no room left: the set is full, and
+        // adding a colour at 12.7 would quietly make the palette worse for every panel to
+        // buy a hue for this one.
+        //
+        // So it WEARS one instead of inventing one, and the rule that lets it is this
+        // panel's own: rule (b) is about telling two things apart AT THE SAME TIME, and
+        // this is a modal over an opaque scrim - while it is open, nothing else in the
+        // window is on screen to be confused with. Nothing here is ever seen beside the
+        // Spectrum panel.
+        //
+        // It wears the SPECTRUM's, because that is what it is made of: every row of its
+        // list is a partial of the spectrum loaded right now, the routed trains are named
+        // "P3", "P7" after those partials, and the title says SPECTRUM VS RHYTHM. The
+        // panel is the spectrum's rhythm face.
+        //
+        // WHAT KEEPS ITS OWN COLOUR, and why that is not a ninth hue: the ON/OFF pills,
+        // the JI switch, the +/- steppers and the row delete are SEMANTIC green and red
+        // (galactic green 0x2fb155 / red 0xe0453f) used identically everywhere else in
+        // the product - green is on, red is off or destroys. The palette header makes the
+        // same exception in as many words ("Load is green, Reset is red... because of
+        // what they MEAN"). A state colour is not an identity colour.
+        static constexpr juce::uint32 kHueRgb = galactic::palette::kHarmonic;   // 0xa6a816
+        static juce::Colour hue (float alpha = 1.0f)
+        { return juce::Colour (0xff000000u | kHueRgb).withAlpha (alpha); }
+        // The neutral text ramp the whole product uses, named so the panel stops spelling
+        // the same three greys out in fourteen places.
+        static juce::Colour ink()    { return juce::Colour (0xffe6e9f0); }   // primary text
+        static juce::Colour inkDim() { return juce::Colour (0xffb9c0d0); }   // captions
+        static juce::Colour inkFaint(){ return juce::Colour (0xff8f96a8); }  // column heads
         FractalAdditiveAudioProcessor* proc = nullptr;
         std::function<juce::String (double)> ratioName;                       // 3/2 or 702c
         std::function<juce::String (const char*, const char*)> trF;           // EN/CA
@@ -1935,6 +1997,9 @@ private:
         juce::Slider       stepsAllS;                  // global scale-step offset (modulatable)
         juce::TextButton   octAllUp, octAllDn;
         int numRows = 0;
+        // Which of the two arrangements of the routing pane is currently laid out - see
+        // the flip check at the end of refreshSlots().
+        bool lastAnyRouted = false;
 
         // Clicking any empty spot of the panel gives keyboard focus back to the
         // editor (text boxes commit + collapse; the play keys work again).
@@ -2003,17 +2068,34 @@ private:
 
         void init()
         {
+            // THE TITLE IS THE LOUDEST THING IN THE PANEL NOW, WHICH IT WAS NOT.
+            //
+            // "SPECTRUM VS RHYTHM" used to be drawn in 0xff5cb8ff - the same blue as the
+            // frame two pixels away from it - so the panel's name had the contrast of a
+            // border, while "How to route" sat beside it on a saturated amber fill and
+            // was the brightest object in the whole dialog. The hierarchy was upside
+            // down: the loudest thing was a help button.
+            //
+            // It is a TITLE CHIP now, the same one every macro panel in the main window
+            // wears: a filled rectangle in the panel's hue with the letters knocked out
+            // of it in black (the fill is painted in paint(), which runs before the
+            // children, so the Label's own text lands on top of it). A filled chip is the
+            // highest-contrast object the palette can make, so the name of the panel is
+            // now measurably the first thing in it - and it is the same idiom, in the
+            // same place, as the titles of the panels behind it.
             heading.setJustificationType (juce::Justification::centredLeft);
-            heading.setColour (juce::Label::textColourId, juce::Colour (0xff5cb8ff));
+            heading.setColour (juce::Label::textColourId, juce::Colours::black);
             heading.setFont (juce::Font (juce::FontOptions (21.0f).withStyle ("Bold")));
             addAndMakeVisible (heading);
             listHead.setJustificationType (juce::Justification::centredLeft);
-            listHead.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
+            listHead.setColour (juce::Label::textColourId, inkFaint());
             listHead.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
             addAndMakeVisible (listHead);
-            // Points at the partial list when On is on but nothing is routed yet.
+            // Points at the partial list when On is on but nothing is routed yet. It used
+            // to be the ON pill's green, which made it read as a state read-out rather
+            // than as an instruction; it is the panel's hue, like every other caption.
             pickHint.setJustificationType (juce::Justification::centred);
-            pickHint.setColour (juce::Label::textColourId, juce::Colour (0xff2fb155)); // green (matches ON)
+            pickHint.setColour (juce::Label::textColourId, hue());
             pickHint.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
             addChildComponent (pickHint);
             list.setRowHeight (20);
@@ -2027,17 +2109,17 @@ private:
             for (auto* l : { &outLbl, &selfLbl })
             {
                 l->setJustificationType (juce::Justification::centred);
-                l->setColour (juce::Label::textColourId, juce::Colour (0xffb9c0d0));
+                l->setColour (juce::Label::textColourId, inkDim());
                 l->setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
                 addAndMakeVisible (*l);
             }
-            droneT.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
+            droneT.setColour (juce::ToggleButton::textColourId, inkDim());
             addAndMakeVisible (droneT);
             // Internal feedback loop + its volume slope (only meaningful with self-play).
-            feedbackT.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
+            feedbackT.setColour (juce::ToggleButton::textColourId, inkDim());
             addAndMakeVisible (feedbackT);
             feedbackLbl.setJustificationType (juce::Justification::centredRight);
-            feedbackLbl.setColour (juce::Label::textColourId, juce::Colour (0xffb9c0d0));
+            feedbackLbl.setColour (juce::Label::textColourId, inkDim());
             feedbackLbl.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
             addAndMakeVisible (feedbackLbl);
             feedbackS.setSliderStyle (juce::Slider::LinearHorizontal);
@@ -2045,36 +2127,39 @@ private:
             feedbackS.setDoubleClickReturnValue (true, 0.5); // double-click = default
             feedbackS.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 16);
             feedbackS.textFromValueFunction = [] (double v) { return juce::String ((int) std::lround (v * 100.0)) + " %"; };
-            feedbackS.setColour (juce::Slider::trackColourId, juce::Colour (0xffff77c8));
+            // Track and thumb in the panel's hue - the three faders in this window used to
+            // be pink, pink and cyan for no reason a reader could name.
+            feedbackS.setColour (juce::Slider::trackColourId, hue());
+            feedbackS.setColour (juce::Slider::thumbColourId, hue());
             addAndMakeVisible (feedbackS);
             addAndMakeVisible (mpeT);
             modeBox.addItem ("Lowest note", 1); // idx-mapped to the rhythmMode parameter
             modeBox.addItem ("All notes",   2);
             addAndMakeVisible (modeBox);
 
-            // Coloured group headers so each zone reads at a glance.
-            auto sec = [this] (juce::Label& l, juce::Colour c)
+            // FIVE GROUP HEADERS, ONE COLOUR. They were five different hues, which is
+            // what "PULSE RATE and NOTE START are unrelated but share cyan" was really a
+            // symptom of: with five colours and no rule saying what a colour MEANS, any
+            // two of them landing near each other is an accident that reads as a claim.
+            // What tells the groups apart is their words and their frames, which is how
+            // every other panel in the product does it.
+            for (auto* l : { &secPlay, &secRate, &secOut, &secTempo, &secGate })
             {
-                l.setJustificationType (juce::Justification::centredLeft);
-                l.setColour (juce::Label::textColourId, c);
-                l.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
-                addAndMakeVisible (l);
-            };
-            sec (secPlay,  juce::Colour (0xff8fd0ff)); // pale blue - PLAYBACK (the two pills)
-            sec (secRate,  juce::Colour (0xff4fe6ff)); // cyan   - PULSE RATE
-            sec (secOut,   juce::Colour (0xffff77c8)); // pink   - OUTPUT
-            sec (secTempo, juce::Colour (0xffffc95c)); // yellow - DAW TEMPO
-            sec (secGate,  juce::Colour (0xff7ff59a)); // green  - NOTE START (quantize/mono)
+                l->setJustificationType (juce::Justification::centredLeft);
+                l->setColour (juce::Label::textColourId, hue());
+                l->setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
+                addAndMakeVisible (*l);
+            }
             for (auto* t : { &qTempoT, &monoT, &qPulseT })
             {
-                t->setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
+                t->setColour (juce::ToggleButton::textColourId, inkDim());
                 addAndMakeVisible (*t);
             }
 
             // "divide [n] times by [x]": two tiny +/- steppers driving the params.
             for (auto* l : { &divLbl, &timesLbl })
             {
-                l->setColour (juce::Label::textColourId, juce::Colour (0xffb9c0d0));
+                l->setColour (juce::Label::textColourId, inkDim());
                 l->setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
                 addAndMakeVisible (*l);
             }
@@ -2083,7 +2168,7 @@ private:
             for (auto* v : { &nVal, &xVal })
             {
                 v->setJustificationType (juce::Justification::centred);
-                v->setColour (juce::Label::textColourId, juce::Colours::white);
+                v->setColour (juce::Label::textColourId, ink());
                 v->setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
                 addAndMakeVisible (*v);
             }
@@ -2110,8 +2195,18 @@ private:
             miniStep (xUp, "+", "rhythmDivX",  1);
             miniStep (xDn, "-", "rhythmDivX", -1);
 
+            // "How to route" ON A SATURATED AMBER FILL WAS THE BRIGHTEST THING IN THE
+            // DIALOG - louder than the panel's own name, louder than the two switches
+            // that decide whether it does anything at all. A help button is the least
+            // urgent control in any window: it is what you reach for when you are stuck,
+            // and it only has to be findable. It is the same quiet slate as the X beside
+            // it now (they are the same kind of thing - window furniture, not content),
+            // and its word comes out white, so it is perfectly legible and no longer
+            // shouting. (White is not set here: GalacticLnF::drawButtonText derives the
+            // letter colour from the fill's own brightness - which is exactly why the
+            // amber version had BLACK letters on a shouting yellow slab.)
             helpB.setButtonText ("How to route");
-            helpB.setColour (juce::TextButton::buttonColourId, juce::Colour (0xffffc95c));
+            helpB.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
             helpB.onClick = [this]
             {
                 juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon,
@@ -2163,7 +2258,7 @@ private:
             // CC20 whenever the target BPM changes (see the editor's timerCallback) -
             // a MIDI-mapped host tempo then FOLLOWS pulse 1 continuously.
             bpmLbl.setJustificationType (juce::Justification::centredLeft);
-            bpmLbl.setColour (juce::Label::textColourId, juce::Colour (0xffffc95c));
+            bpmLbl.setColour (juce::Label::textColourId, hue());
             bpmLbl.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
             addAndMakeVisible (bpmLbl);
             addAndMakeVisible (tempoT);
@@ -2179,13 +2274,13 @@ private:
             tempoX2.onClick = [this] { nudgeTempoOct (+1); };
             tempoD2.onClick = [this] { nudgeTempoOct (-1); };
             info.setJustificationType (juce::Justification::topLeft);
-            info.setColour (juce::Label::textColourId, juce::Colour (0xff7ff59a));
+            info.setColour (juce::Label::textColourId, hue());
             info.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
-            addAndMakeVisible (info);
+            addChildComponent (info);   // hidden while nothing is routed - see resized()
             for (auto* h : { &noteHead, &durHead, &velHead })
             {
                 h->setJustificationType (juce::Justification::centredLeft);
-                h->setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
+                h->setColour (juce::Label::textColourId, inkFaint());
                 h->setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
                 addAndMakeVisible (*h);
             }
@@ -2194,19 +2289,30 @@ private:
             // at the top of its travel the ramp is vertical and nothing is left.
             velSlopeS.setSliderStyle (juce::Slider::LinearHorizontal);
             velSlopeS.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
-            velSlopeS.setColour (juce::Slider::trackColourId, juce::Colour (0xffff77c8));
-            velSlopeS.setColour (juce::Slider::thumbColourId, juce::Colour (0xffff77c8));
+            velSlopeS.setColour (juce::Slider::trackColourId, hue());
+            velSlopeS.setColour (juce::Slider::thumbColourId, hue());
+            velSlopeS.setDoubleClickReturnValue (true, 0.0); // flat: the centre of its travel
             velSlopeS.setMouseClickGrabsKeyboardFocus (false);
             addAndMakeVisible (velSlopeS);
             // Global STEPS offset for step-pitched pulses (ratio/JI slots ignore it).
+            //
+            // IT IS A CENTRE-DETENT FADER, AND ITS THUMB SITTING MID-TRACK WHILE THE
+            // READ-OUT SAYS 0 IS CORRECT - which is worth writing down, because it looks
+            // exactly like a value/paint mismatch and was reported as one. The parameter
+            // is rhythmStepsAll, NormalisableRange<float> (-24, +24, 1) with a default of
+            // 0 (PluginProcessor.cpp), so 0 is the MIDDLE of the range, not the bottom:
+            // the fader shifts every step-pitched pulse up OR down. The double-click
+            // return makes that explicit and gives the centre back in one gesture -
+            // without it the detent was real but invisible and unreachable.
             stepsAllS.setSliderStyle (juce::Slider::LinearHorizontal);
             stepsAllS.setTextBoxStyle (juce::Slider::TextBoxRight, false, 34, 15);
-            stepsAllS.setColour (juce::Slider::trackColourId, juce::Colour (0xff4fe6ff));
-            stepsAllS.setColour (juce::Slider::thumbColourId, juce::Colour (0xff4fe6ff));
+            stepsAllS.setColour (juce::Slider::trackColourId, hue());
+            stepsAllS.setColour (juce::Slider::thumbColourId, hue());
+            stepsAllS.setDoubleClickReturnValue (true, 0.0);
             stepsAllS.setMouseClickGrabsKeyboardFocus (false);
             addAndMakeVisible (stepsAllS);
             stepsAllLbl.setJustificationType (juce::Justification::centredRight);
-            stepsAllLbl.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
+            stepsAllLbl.setColour (juce::Label::textColourId, inkFaint());
             stepsAllLbl.setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
             addAndMakeVisible (stepsAllLbl);
 
@@ -2221,11 +2327,11 @@ private:
 
             // Global octave stepper: shifts ALL pulses together (+-4 octaves).
             octLbl.setJustificationType (juce::Justification::centredRight);
-            octLbl.setColour (juce::Label::textColourId, juce::Colour (0xffb9c0d0));
+            octLbl.setColour (juce::Label::textColourId, inkDim());
             octLbl.setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
             addAndMakeVisible (octLbl);
             octAllVal.setJustificationType (juce::Justification::centred);
-            octAllVal.setColour (juce::Label::textColourId, juce::Colours::white);
+            octAllVal.setColour (juce::Label::textColourId, ink());
             octAllVal.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
             addAndMakeVisible (octAllVal);
             miniStep (octAllUp, "+", "rhythmOctAll",  1);
@@ -2234,13 +2340,13 @@ private:
             for (int i = 0; i < RhythmEngine::kSlots; ++i)
             {
                 slotLbl[i].setJustificationType (juce::Justification::centredLeft);
-                slotLbl[i].setColour (juce::Label::textColourId, juce::Colours::white);
+                slotLbl[i].setColour (juce::Label::textColourId, ink());
                 slotLbl[i].setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
                 slotRows.addChildComponent (slotLbl[i]);
 
                 pitchE[i].setJustification (juce::Justification::centred);
                 pitchE[i].setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
-                pitchE[i].setColour (juce::TextEditor::outlineColourId, juce::Colour (0xff5cb8ff).withAlpha (0.6f));
+                pitchE[i].setColour (juce::TextEditor::outlineColourId, hue (0.55f));
                 pitchE[i].setColour (juce::TextEditor::textColourId, juce::Colours::white);
                 pitchE[i].setSelectAllWhenFocused (true);
                 pitchE[i].onReturnKey = [this, i] { commitPitch (i); if (onEdited) onEdited(); };
@@ -2273,6 +2379,11 @@ private:
                 durS[i].setSkewFactorFromMidPoint (80.0);
                 durS[i].setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 16);
                 durS[i].textFromValueFunction = [] (double v) { return juce::String ((int) v) + " ms"; };
+                // GATE and VEL are two columns of the same table, so they are one colour.
+                // GATE used to take the LookAndFeel's default steel and VEL was pink,
+                // which said the two columns were different kinds of thing.
+                durS[i].setColour (juce::Slider::trackColourId, hue());
+                durS[i].setColour (juce::Slider::thumbColourId, hue());
                 durS[i].onValueChange = [this, i]
                 { if (proc) proc->getRhythm().slots[i].durMs = (float) durS[i].getValue(); };
                 slotRows.addChildComponent (durS[i]);
@@ -2282,7 +2393,8 @@ private:
                 velS[i].setRange (1.0, 127.0, 1.0);
                 velS[i].setDoubleClickReturnValue (true, 100.0); // double-click = default
                 velS[i].setTextBoxStyle (juce::Slider::TextBoxRight, false, 32, 16);
-                velS[i].setColour (juce::Slider::trackColourId, juce::Colour (0xffff77c8)); // pink = output
+                velS[i].setColour (juce::Slider::trackColourId, hue());
+                velS[i].setColour (juce::Slider::thumbColourId, hue());
                 velS[i].onValueChange = [this, i]
                 { if (proc) proc->getRhythm().slots[i].vel = (int) velS[i].getValue(); };
                 slotRows.addChildComponent (velS[i]);
@@ -2308,11 +2420,16 @@ private:
             const auto* t = proc != nullptr ? proc->getLiveTemplate() : nullptr;
             if (t == nullptr || row >= (int) t->partials.size()) return;
             const bool assigned = slotOfPartial (row) >= 0;
-            if (assigned) { g.setColour (juce::Colour (0xff2a4a6a)); g.fillRect (0, 0, w, h); }
-            g.setColour (juce::Colour (0xff8f96a8));
+            // The "this one is routed" wash was a flat blue that belonged to nothing.
+            // A routed partial is the panel's subject, so it is washed in the panel's own
+            // hue over the list's ground - the same 0.22 the frames use for their fills,
+            // which is what makes a routed row read as part of this panel and not as a
+            // selection borrowed from a file browser.
+            if (assigned) { g.setColour (hue (0.22f)); g.fillRect (0, 0, w, h); }
+            g.setColour (inkFaint());
             g.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
             g.drawText ("P" + juce::String (row + 1), 6, 0, 40, h, juce::Justification::centredLeft);
-            g.setColour (assigned ? juce::Colours::white : juce::Colour (0xffb9c0d0));
+            g.setColour (assigned ? juce::Colours::white : inkDim());
             g.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
             g.drawText (ratioName ? ratioName ((double) t->partials[(size_t) row].ratio) : juce::String(),
                         50, 0, w - 56, h, juce::Justification::centredLeft);
@@ -2454,6 +2571,22 @@ private:
                 p->setValueNotifyingHost (p->convertTo0to1 ((float) juce::jlimit (-6, 6, tempoOctValue() + d)));
             refreshLive();
         }
+        // WHAT THE TEMPO READ-OUT SAYS BEFORE THERE IS A TEMPO.
+        //
+        // "= ... BPM" was a literal ellipsis standing in for a number, which reads as a
+        // value that failed to arrive - the same thing a hung read-out looks like. There
+        // is nothing broken here: this label reports the rate of pulse 1, and until a
+        // note is held there IS no pulse 1, so the honest text is the reason and not a
+        // gap. It says so, in words, in both languages.
+        //
+        // Read by resized() as well as by refreshLive(), because the box that holds this
+        // label is sized to the WIDEST thing the label can ever say - and that is now
+        // this sentence in Catalan, not "= 199.9 BPM". A placeholder nobody measured is
+        // how the previous one got 13 px for a 52 px string.
+        juce::String bpmIdleText() const
+        {
+            return trF ? trF ("no pulse yet", "cap pols encara") : juce::String ("no pulse yet");
+        }
         double tempoBpm() const // pulse 1 (first enabled slot) in BPM, times 2^octave
         {
             if (proc == nullptr) return 0.0;
@@ -2496,8 +2629,10 @@ private:
                         // product. One red word says the same thing and fits; the
                         // sentence is in the row's hover.
                         rl = trF ? " - " + trF ("missing", "no hi \xc3\xa9s") : juce::String (" - missing");
+                    // Red stays red: "missing" is a fault, and red-means-broken is the
+                    // product's semantic, not this panel's identity.
                     slotLbl[i].setColour (juce::Label::textColourId,
-                                          missing ? juce::Colour (0xffe0453f) : juce::Colour (0xffc4ccda));
+                                          missing ? juce::Colour (0xffe0453f) : ink());
                     slotLbl[i].setText ("P" + juce::String (p + 1) + rl, juce::dontSendNotification);
                     slotLbl[i].setTooltip (missing && trF
                         ? trF ("This train is routed to a partial the CURRENT spectrum does not have, so it "
@@ -2521,6 +2656,26 @@ private:
                  || proc->apvts.getRawParameterValue ("rhythmSelfPlay")->load() > 0.5f);
             const bool none = readSlots().empty();
             pickHint.setVisible (on && none);
+
+            // ROUTING THE FIRST PARTIAL CHANGES THE LAYOUT, NOT JUST THE ROWS.
+            //
+            // The empty state and the routed state are two different arrangements of this
+            // pane - one centred hint, or four column headers plus the velocity-slope
+            // fader plus the read-out - and which components exist at all is decided in
+            // resized(). Clicking a partial only ever called this function, so the
+            // headers and the slope fader stayed hidden (and unpositioned) until
+            // something else happened to resize the panel: a language switch, or the host
+            // resizing the editor. It was invisible while the read-out was always on,
+            // because the read-out filled the space the headers should have been in; with
+            // the read-out now part of the routed arrangement it would have been the
+            // whole bottom of the pane going missing. One layout pass on the flip, and
+            // only on the flip - this runs on every timer tick.
+            if (const bool anyRouted = ! none; anyRouted != lastAnyRouted)
+            {
+                lastAnyRouted = anyRouted;
+                resized();
+                return;           // resized() has just called layoutSlotRows() itself
+            }
             layoutSlotRows(); // the used-row count may have changed
         }
 
@@ -2586,7 +2741,7 @@ private:
 
             const double bpm = tempoBpm();
             bpmLbl.setText (bpm > 0.0 ? "= " + juce::String (bpm, 1) + " BPM"
-                                      : juce::String ("= ... BPM"),
+                                      : bpmIdleText(),
                             juce::dontSendNotification);
         }
 
@@ -2606,49 +2761,100 @@ private:
             // FIVE FRAMED SECTIONS, all treated alike. This panel used to be a stack:
             // two big pills with no group at all, a feedback row, then ONE framed box
             // (PULSE RATE) and three sections that were a coloured word over a hairline.
-            // A reader had no way to tell which control belonged with which.  Each group
-            // gets a frame in its own section colour now, and the two SHORT ones share a
-            // row, which is where the space for the routing list below comes from.
-            // A BOX ENDS WHERE ITS CONTENTS END. "LAS DOS PRIMERAS CAJAS TIENEN ESPACIO
-            // VACIO A LA DERECHA, RELLENALO COMO DAW TEMPO / NOTE START, O ACORTALAS."
+            // A reader had no way to tell which control belonged with which. Each group
+            // gets a frame now - all five in the panel's one colour (see kHueRgb).
             //
             // Every section used to take the full row whatever it held, so PULSE RATE -
             // two captions and six stepper buttons, 272 px of controls - was drawn as a
             // framed box a thousand pixels wide with seven hundred of nothing in it. A
             // frame is a claim about what belongs together; a frame around empty space
-            // claims there is something there. contentW is what the caller's own controls
-            // measure to, and the box is trimmed to it - floored so a narrow panel never
-            // produces a sliver, and capped at the row so it can only ever shrink.
-            const auto section = [&r] (juce::Label& hdr, int contentH,
-                                       juce::Rectangle<int>& boxOut, int contentW = 0)
+            // claims there is something there. So each box is trimmed to what its own
+            // controls measure to... which is where the NEXT problem came from:
+            //
+            // A BOX ENDS WHERE ITS CONTENTS END - SO THE ROW HAS TO END SOMEWHERE ELSE.
+            //
+            // "THE LEFT COLUMN'S THREE RIGHT EDGES ARE 687 / 478 / 535 - A STAIRCASE."
+            // Measured from the render and true: PLAYBACK stopped at 687, PULSE RATE at
+            // 478, DAW TEMPO at 535, and OUTPUT ran the full width to 996. Four different
+            // right-hand edges down one stack, in no order, none of them explained.
+            //
+            // The staircase is not a bug in the trimming - it is what trimming ALONE
+            // produces. Every box measures to a different width because every box holds
+            // different controls, so trimming each to its own contents guarantees as many
+            // edges as there are boxes. The two ways out were named by the user when the
+            // first version of this was reviewed: "RELLENALO COMO DAW TEMPO / NOTE START,
+            // O ACORTALAS" - fill it the way that pair does, or shorten them. Shortening
+            // is what produced the staircase, so this takes the other one.
+            //
+            // PLAYBACK and PULSE RATE now SHARE A ROW, exactly as DAW TEMPO and NOTE
+            // START already do: the first is trimmed to its own contents, the second
+            // takes the remainder, and the row ends flush with the panel. With OUTPUT and
+            // the DAW TEMPO / NOTE START row already reaching that same edge, the stack
+            // has ONE right edge instead of four. The old middle row disappears with it,
+            // which hands 53 px (a 48 px box and its 5 px gap) straight down to the
+            // routed-partials list - about two more rows of it, permanently.
+            //
+            // WHEN IT CANNOT PAY FOR THE PAIR IT STACKS, which is the same rule the
+            // DAW TEMPO / NOTE START pair below already lives by, and for the same reason:
+            // in Catalan "Feedback fractal" + "Decaiment" + the fader measure ~505 and
+            // "divideix ... vegades per" measures ~310, and 505 + 6 + 310 is over the 792
+            // this panel has to give. Two boxes one above the other cost 53 px of height;
+            // a squeezed box costs a word. The English render is flush; the Catalan one
+            // keeps the arrangement it shipped with rather than crushing anything.
+            //
+            // The other half of the same finding - "OUTPUT is about 5 px taller than its
+            // siblings" - is a measurement error in the audit, not in the layout: every
+            // short box here is 13 + 3 + 24 + 8 = 48 px by construction (kShortH below),
+            // OUTPUT included, and they are all built by the same helper from the same
+            // constant. What differs is the INK: OUTPUT is the only short box holding a
+            // ComboBox, which draws its own 1 px outline hard against the 24 px content
+            // row where a ToggleButton leaves its edges bare, so the box reads a couple
+            // of pixels deeper than the identical box above it.
+            constexpr int kBoxPad = 16;                          // the 8 px a side of `reduced (8, 4)`
+            constexpr int kShortH = 13 + 3 + 24 + 8;             // header + one 24 px control row
+            constexpr int kPlayH  = 13 + 3 + (13 + 26 + 4 + 24) + 8;
+            const auto sectionIn = [] (juce::Rectangle<int> box, juce::Label& hdr,
+                                       juce::Rectangle<int>& boxOut, int contentH)
             {
-                auto box = r.removeFromTop (13 + 3 + contentH + 8);
-                if (contentW > 0)
-                    box = box.withWidth (juce::jlimit (juce::jmin (200, box.getWidth()),
-                                                       box.getWidth(), contentW + 16));
                 boxOut = box;
                 auto in = box.reduced (8, 4);
                 hdr.setBounds (in.removeFromTop (13));
                 in.removeFromTop (3);
                 return in.removeFromTop (contentH);
             };
+            // Trimmed to its contents - floored so a narrow panel never produces a
+            // sliver, and capped at the row so it can only ever shrink.
+            const auto trim = [&] (juce::Rectangle<int> row, int contentW)
+            {
+                return row.withWidth (juce::jlimit (juce::jmin (200, row.getWidth()),
+                                                    row.getWidth(), contentW + kBoxPad));
+            };
+
+            // WHAT THE TWO TOP GROUPS MEASURE TO, both up front: the packing below is one
+            // decision about both of them, so neither can be measured after the other has
+            // already been given a rectangle.
+            const int w1 = juce::jmax (118, fgfit::labelWidth (outLbl));
+            const int w2 = juce::jmax (140, fgfit::labelWidth (selfLbl));
+            // PLAYBACK holds two rows and takes the WIDER of them: the pills row (two
+            // captioned pills and the drone toggle) and the feedback row (its toggle, its
+            // caption and a 240 px fader).
+            const int playNeed = juce::jmax (w1 + 14 + w2 + 16 + fgfit::toggleWidth (droneT),
+                                             juce::jmax (160, fgfit::toggleWidth (feedbackT))
+                                                 + 8 + juce::jmax (54, fgfit::labelWidth (feedbackLbl))
+                                                 + 6 + 240);
+            // PULSE RATE is two captions and six stepper buttons. That is the whole section.
+            const int dw  = juce::jmax (50, fgfit::labelWidth (divLbl));
+            const int tw2 = juce::jmax (66, fgfit::labelWidth (timesLbl));
+            const int rateNeed = dw + 4 + 66 + tw2 + 4 + 66;
+            const bool pairTop = r.getWidth() >= playNeed + kBoxPad + 6 + rateNeed + kBoxPad;
 
             // PLAYBACK: where the pulses go, and what comes back. The two pills carry
             // their caption ABOVE them now - a pill that says "OFF" over the words "MIDI
             // out (to DAW)" reads as an answer before its question, and every other
             // caption in this build sits above the control it names.
+            const auto layPlay = [&] (juce::Rectangle<int> box)
             {
-                // Both rows measured, and the box takes the WIDER of them: the pills row
-                // (two captioned pills and the drone toggle) and the feedback row (its
-                // toggle, its caption and a 240 px fader). Whichever is longer is what
-                // this section actually occupies.
-                const int w1 = juce::jmax (118, fgfit::labelWidth (outLbl));
-                const int w2 = juce::jmax (140, fgfit::labelWidth (selfLbl));
-                const int pillsNeed = w1 + 14 + w2 + 16 + fgfit::toggleWidth (droneT);
-                const int fbNeed    = juce::jmax (160, fgfit::toggleWidth (feedbackT))
-                                    + 8 + juce::jmax (54, fgfit::labelWidth (feedbackLbl)) + 6 + 240;
-                auto in = section (secPlay, 13 + 26 + 4 + 24, playBox,
-                                   juce::jmax (pillsNeed, fbNeed));
+                auto in = sectionIn (box, secPlay, playBox, 13 + 26 + 4 + 24);
                 auto capRow = in.removeFromTop (13);
                 auto pills  = in.removeFromTop (26);
                 outLbl.setBounds (capRow.removeFromLeft (w1));
@@ -2666,17 +2872,10 @@ private:
                 feedbackLbl.setBounds (fr.removeFromLeft (juce::jmax (54, fgfit::labelWidth (feedbackLbl))));
                 fr.removeFromLeft (6);
                 feedbackS.setBounds (fr.removeFromLeft (juce::jmin (240, fr.getWidth())).reduced (0, 1));
-            }
-            r.removeFromTop (5);
-
-            // PULSE RATE, unchanged in content: its header comes from the shared helper
-            // now so all five boxes measure the same.
+            };
+            const auto layRate = [&] (juce::Rectangle<int> box)
             {
-                // Two captions and six stepper buttons. That is the whole section, and
-                // it is what the frame is now drawn around.
-                const int dw = juce::jmax (50, fgfit::labelWidth (divLbl));
-                const int tw2 = juce::jmax (66, fgfit::labelWidth (timesLbl));
-                auto g1 = section (secRate, 24, rateBox, dw + 4 + 66 + tw2 + 4 + 66);
+                auto g1 = sectionIn (box, secRate, rateBox, 24);
                 divLbl.setBounds (g1.removeFromLeft (dw));
                 g1.removeFromLeft (4);
                 nDn.setBounds (g1.removeFromLeft (20).reduced (0, 2));
@@ -2687,13 +2886,38 @@ private:
                 xDn.setBounds (g1.removeFromLeft (20).reduced (0, 2));
                 xVal.setBounds (g1.removeFromLeft (26));
                 xUp.setBounds (g1.removeFromLeft (20).reduced (0, 2));
+            };
+
+            {
+                auto row = r.removeFromTop (kPlayH);
+                if (pairTop)
+                {
+                    layPlay (row.removeFromLeft (playNeed + kBoxPad));
+                    row.removeFromLeft (6);
+                    // TOP-ALIGNED, AT ITS OWN HEIGHT, not stretched to the row. PLAYBACK
+                    // is 91 px because it has two control rows and PULSE RATE has one; a
+                    // 48 px group blown up to 91 would be a frame around 43 px of nothing,
+                    // which is the thing this whole section is arranged to avoid. Sharing
+                    // the row's TOP edge puts the two group captions on one baseline,
+                    // which is the alignment a reader actually sees.
+                    layRate (row.withHeight (kShortH));
+                }
+                else
+                    layPlay (trim (row, playNeed));
             }
             r.removeFromTop (5);
+            if (! pairTop)
+            {
+                layRate (trim (r.removeFromTop (kShortH), rateNeed));
+                r.removeFromTop (5);
+            }
 
             // OUTPUT keeps a row of its own: its widest state is the mode box + MPE +
-            // JI + an octave stepper + a steps fader, which is more than half a panel.
+            // JI + an octave stepper + a steps fader, which is more than half a panel -
+            // and it is the one box that fills the row it is given, so it is what the
+            // other boxes' shared right edge is measured against.
             {
-                auto g2 = section (secOut, 24, outBox);
+                auto g2 = sectionIn (r.removeFromTop (kShortH), secOut, outBox, 24);
                 modeBox.setBounds (g2.removeFromLeft (128).reduced (0, 1));
                 g2.removeFromLeft (8);
                 mpeT.setBounds (g2.removeFromLeft (86));
@@ -2729,12 +2953,18 @@ private:
                 const int tempoNeed = juce::jmax (150, fgfit::toggleWidth (tempoT))
                                     + 4 + 32 + 4 + 32 + 6
                                     // ...and room for the read-out's WIDEST text, not its current one. This
-                                    // label says "= ... BPM" until a tempo arrives and "= 120.0 BPM" after,
-                                    // and resized() runs while it still holds the short one - so measuring
-                                    // what it happens to say reserved 13 px for a string that needs 52. Same
-                                    // lesson as a ComboBox and its widest item: measure what it CAN hold.
-                                    + (int) std::ceil (juce::GlyphArrangement::getStringWidth (
-                                                           fgfit::labelFont (bpmLbl), "= 199.9 BPM"))
+                                    // label says "no pulse yet" until a tempo arrives and "= 120.0 BPM"
+                                    // after, and resized() runs while it holds whichever is true at that
+                                    // moment - so measuring what it happens to say reserved 13 px for a
+                                    // string that needs 52. Same lesson as a ComboBox and its widest item:
+                                    // measure what it CAN hold. BOTH strings, now that the placeholder is a
+                                    // sentence rather than an ellipsis: in Catalan "cap pols encara" is the
+                                    // longer of the two, so a box measured on the number alone would cut
+                                    // the words that replace it.
+                                    + juce::jmax ((int) std::ceil (juce::GlyphArrangement::getStringWidth (
+                                                      fgfit::labelFont (bpmLbl), "= 199.9 BPM")),
+                                                  (int) std::ceil (juce::GlyphArrangement::getStringWidth (
+                                                      fgfit::labelFont (bpmLbl), bpmIdleText())))
                                     + bpmLbl.getBorderSize().getLeftAndRight() + 3 + 16;
                 // MEASURED, not floored. The 218 and the 76 were hand-picked and carried
                 // 34 px more than the words need, which is exactly what pushed this row
@@ -2846,9 +3076,26 @@ private:
             // The headers appear when there is a row to head. The hint gets the middle of
             // the pane it is talking about, centred, at the size of something meant to be
             // read rather than noticed.
+            //
+            // ...AND THE SECOND HINT IS GONE, which the first pass at this state left
+            // behind. The pane still carried TWO strings: the centred "click a partial to
+            // route it", and, 76 px below it in the read-out's box, a separate green
+            // "(hold a note to pulse)" at a different x, a different weight and a
+            // different size. Two hints, misaligned, saying different things about the
+            // same emptiness - which is what the audit photographed and called "two hint
+            // lines at different x, in different colours, at different weights".
+            //
+            // The read-out is a read-out OF THE ROUTED TRAINS: their rates in Hz, their
+            // periods in ms, and the integer polyrhythm they make. With nothing routed
+            // there are no trains, so every line it can print is empty and the only thing
+            // left in it is a note about a note - advice, in the box where numbers live.
+            // It is hidden until there is something to read out, and the empty state has
+            // exactly one voice: the hint, in the middle of the pane it is about.
             const bool anyRouted = ! readSlots().empty();
+            lastAnyRouted = anyRouted;   // this IS the arrangement that is now laid out
             for (auto* h : { &noteHead, &durHead, &velHead }) h->setVisible (anyRouted);
             velSlopeS.setVisible (anyRouted);
+            info.setVisible (anyRouted);
 
             if (anyRouted)
             {
@@ -2911,29 +3158,56 @@ private:
         void paint (juce::Graphics& g) override
         {
             auto r = getLocalBounds().toFloat();
-            g.setColour (juce::Colour (0xf2101018));
+
+            // OPAQUE. THIS WAS A BUG, NOT A STYLE.
+            //
+            // The fill was 0xf2101018 - alpha 242/255, so 5% of whatever was behind came
+            // through the panel. That is invisible over dark ground and glaring over
+            // bright ground, and the main window has plenty of the latter: photographed
+            // at 1200x650 the title bar's logo tiles were legible THROUGH the panel at
+            // x 440-810, y 10-45, right beside the panel's own title, and the word
+            // "TRANSITION" showed through at y 235. A modal you can read the window
+            // through is not a modal - the reader cannot tell which layer a word is on.
+            //
+            // The opaque fill is the product's own panel interior: kPanelFill tinted 5%
+            // towards this panel's colour, which is exactly what every macro panel in the
+            // main window sits on (palette::panelSurface, the same function the contrast
+            // checks measure against). So it is not just opaque, it is the SAME surface -
+            // the panel now looks like it came out of the same window it is floating over.
+            g.setColour (juce::Colour (0xff000000u | galactic::palette::panelSurface (kHueRgb)));
             g.fillRoundedRectangle (r, 10.0f);
-            g.setColour (juce::Colour (0xff5cb8ff));
+            g.setColour (hue());
             g.drawRoundedRectangle (r.reduced (1.5f), 10.0f, 3.0f);
 
-            // ONE FRAME PER GROUP, each in its own section colour - the same wash and
-            // outline PULSE RATE already had, now given to all five. A frame is what
-            // says "these controls belong together", and four of the five groups were
-            // making that claim with nothing but a coloured word above a hairline.
-            const struct { const juce::Rectangle<int>* box; juce::uint32 rgb; } frames[] = {
-                { &playBox,  0x8fd0ff },   // pale blue - PLAYBACK
-                { &rateBox,  0x4fe6ff },   // cyan      - PULSE RATE
-                { &outBox,   0xff77c8 },   // pink      - OUTPUT
-                { &tempoBox, 0xffc95c },   // yellow    - DAW TEMPO
-                { &gateBox,  0x7ff59a },   // green     - NOTE START
-            };
-            for (const auto& f : frames)
+            // THE TITLE CHIP, painted under the heading Label (children paint after this).
+            // The same object the main window's macro panels wear: a filled rectangle in
+            // the panel's colour with the title knocked out of it in black. Bounded to the
+            // text - a chip that runs to the edge of its row is a banner, not a chip - and
+            // measured through fgfit like every other width in this file, so the Catalan
+            // "ESPECTRE VS RITME" gets its own size rather than the English one's.
+            if (! heading.getText().isEmpty() && ! heading.getBounds().isEmpty())
             {
-                if (f.box->isEmpty()) continue;
-                const auto rb = f.box->toFloat();
-                g.setColour (juce::Colour (f.rgb).withAlpha (0.13f));
+                auto chip = heading.getBounds().toFloat()
+                                .withWidth ((float) juce::jmin (heading.getWidth(),
+                                                                fgfit::labelWidth (heading) + 6));
+                g.setColour (hue());
+                g.fillRoundedRectangle (chip, 4.0f);
+            }
+
+            // ONE FRAME PER GROUP - and now ONE COLOUR for all five, the panel's own.
+            // They were five different hues (pale blue / cyan / pink / yellow / green),
+            // which is four accent colours this window did not need and no reader could
+            // decode: nothing said what pink MEANT, so PULSE RATE and NOTE START sharing
+            // a cyan looked like a claim that they were related. The frame is what groups
+            // the controls; the caption is what names the group. Neither needs a hue of
+            // its own, and the panel reads as one thing now instead of five.
+            for (const auto* box : { &playBox, &rateBox, &outBox, &tempoBox, &gateBox })
+            {
+                if (box->isEmpty()) continue;
+                const auto rb = box->toFloat();
+                g.setColour (hue (0.10f));
                 g.fillRoundedRectangle (rb, 7.0f);
-                g.setColour (juce::Colour (f.rgb).withAlpha (0.40f));
+                g.setColour (hue (0.45f));
                 g.drawRoundedRectangle (rb.reduced (0.5f), 7.0f, 1.2f);
             }
         }

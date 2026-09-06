@@ -872,7 +872,14 @@ namespace
             { "19edo",   "the loaded scale's own name" },
             { "tritave", "the loaded scale's own name" },
             { "53edo",   "the loaded scale's own name" },
-            { "= ... BPM", "BPM, and dots standing in for a tempo the host has not given" },
+            // ("= ... BPM" used to be declared here - "BPM, and dots standing in for a
+            //  tempo the host has not given". It is gone because the string is gone: an
+            //  ellipsis where a number belongs reads as a value that failed to arrive,
+            //  so the tempo read-out says what is actually true now - "no pulse yet" /
+            //  "cap pols encara" - which is a translated pair and needs no exemption.
+            //  Written down rather than deleted in silence: a declaration that
+            //  disappears is a decision somebody made, and this list is the record of
+            //  those decisions.)
             // Not a sentence: the credit link's hover IS the address it opens, and an
             // address does not have a Catalan spelling.
             { "https://www.instagram.com/asra3333333/", "a URL - the author's own link, shown so the hover says where the click goes" },

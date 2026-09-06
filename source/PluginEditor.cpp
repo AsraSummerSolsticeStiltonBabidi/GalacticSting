@@ -3589,6 +3589,14 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
                                       ? "\xe2\x9f\xb5 Clica un parcial per encaminar-lo"
                                       : "\xe2\x9f\xb5 Click a partial to route it"), dontSendNotification);
     rhythmPanel.onT.setButtonText (tr ("On", "Actiu"));
+    // THE ONE GROUP THAT HAD NO NAME. secPlay existed - it was constructed, coloured,
+    // given a font and laid out at the top of its box - and no line ever put a word in
+    // it, so the first frame in the panel was a bordered rectangle with a blank caption
+    // strip while the four below it were captioned. That is why the audit reported "a
+    // bordered box with NO CAPTION AT ALL": not a missing frame, a missing string. It is
+    // invisible from inside the code (an empty Label draws nothing and reports no fault)
+    // and obvious in a photograph, which is what the photographs are for.
+    rhythmPanel.secPlay.setText  (tr ("PLAYBACK", "REPRODUCCI\xc3\x93"), dontSendNotification);
     rhythmPanel.secRate.setText  (tr ("PULSE RATE", "VELOCITAT DELS POLSOS"), dontSendNotification);
     rhythmPanel.secOut.setText   (tr ("OUTPUT", "SORTIDA"), dontSendNotification);
     rhythmPanel.secTempo.setText (tr ("DAW TEMPO", "TEMPO DEL DAW"), dontSendNotification);
