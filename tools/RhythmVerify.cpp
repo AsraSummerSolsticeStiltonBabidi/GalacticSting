@@ -15,6 +15,14 @@
 
 #include <juce_dsp/juce_dsp.h>
 
+// TEMPORARY (CPU bench only): measured in CPU CYCLES rather than wall clock, because
+// this machine is running a dozen other builds and verifiers and the wall clock measures
+// the scheduler. Declared by hand rather than including <windows.h>, which drags in
+// hundreds of macros that collide with this file's own identifiers.
+extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread (void);
+extern "C" __declspec(dllimport) int   __stdcall QueryThreadCycleTime (void*, unsigned long long*);
+
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -1125,6 +1133,709 @@ static const char* kParamBaseline[] = {
     "primeOn",
 };
 
+// --- run 59: THE PITCH MODULATOR BENDS; IT DOES NOT CLIMB STAIRS --------------
+//
+// "SEGUN COMO SE MODULA ALMENOS AVECES QUIZAS SIEMPRE, EL CAMBIO DE TONO DEL PITCH
+//  MODULATOR ES ESCALONADO NO CONTINUO. ARREGLA ESE"
+//
+// The suite had ZERO audio-level coverage of the pitch envelope or of anything
+// modulating it: the only other hits for "pitchEnvAmount" in tools/ and tests/ are a
+// pinned parameter-name list, run 48 setting it OUT of the way, and a morph-space
+// classification. No run mapped any modulator to any pitch target.
+//
+// WHAT WAS WRONG, in one line of arithmetic. The played frequency was computed ONCE
+// per renderNextBlock and baked into every oscillator increment; nothing in the
+// per-sample loop revisited it except the portamento. So the pitch was a zero-order
+// hold at the HOST's block rate, and for a sine modulator of peak-to-peak span D
+// semitones at f Hz the tread of the staircase was
+//        step = 100 * pi * D * f * B / SR   cents
+// - 87.5 cents at the SHIPPED DEFAULT Range of 0.5 (D = 48 st), f = 1 Hz, B = 256,
+// SR = 44100, and 350 cents at B = 1024. Buffer-dependent, which is exactly "a veces,
+// quizás siempre". AdditiveVoice now re-aims the pitch on the 32-sample grid the
+// filter cutoff already uses, so the same patch steps 10.9 cents and steps the same
+// 10.9 cents at every buffer size.
+//
+// THE INSTRUMENT is the amplitude-normalised two-tap estimator, NOT an FFT and NOT run
+// 48's f0At. For x[n] = A sin(wn + phi) the identity x[n-1] + x[n+1] = 2 cos(w) x[n]
+// is EXACT, so cos(w) = sum(x[n](x[n-1]+x[n+1])) / (2 sum(x[n]^2)). 64-sample frames,
+// non-overlapping - four inside a 256-sample block, which is what resolves a tread
+// from a riser. run 12m's measureHz is 32768 points (683 ms, longer than the LFO
+// period) and run 48's f0At averages 30 ms = 5.6 blocks at B = 256; either would
+// smooth the very staircase under test into a ramp and pass a broken build.
+//
+// The patch is tuned so the estimator is exact rather than merely good: refA 750 puts
+// note 105 at 750 * 2^3 = 6000 Hz = SR/8, so a 64-sample frame is exactly 8 whole
+// periods and any residual overtone's cross-terms sum to zero over it. Harmonics is
+// set to ODD and Spectrum Range to one octave, which leaves the fundamental alone in
+// the band - the precondition below measures how alone and says so.
+//
+// GUARDED DENOMINATOR, because this file has been bitten by exactly that before: run
+// 12m's parabolic refinement divided by a flat spectral top and reported 9e11 Hz,
+// which briefly looked like the plugin's fault. Here `den` is the frame energy and the
+// arccosine's argument is clamped inside (-1, 1); a silent frame is refused rather
+// than answered, and the RMS precondition below is what turns that refusal into a
+// named failure instead of a flat line that passes every continuity check.
+static void runPitchContinuityChecks()
+{
+    std::printf ("\npitch modulation is a continuous bend, not a staircase:\n");
+    using Proc = FractalAdditiveAudioProcessor;
+    constexpr double sr9   = 48000.0;
+    constexpr int    kNote = 105;      // with refA 750: 750 * 2^3 = 6000 Hz exactly
+    constexpr double kF0   = 6000.0;   // = SR/8
+    constexpr int    kFrm  = 64;       // = 8 whole periods of kF0
+
+    struct Arm
+    {
+        std::vector<double> cents;      // one instantaneous pitch per 64-sample frame
+        size_t at0 = 0;                 // sample index (since note-on) of frame 0
+        double minRms = 1.0e9;
+        double lo = 1.0e9, hi = -1.0e9;
+        int    partials = 0;
+        double worstOvertone = 0.0;     // loudest non-fundamental / the fundamental
+        bool   rateLimited = false;
+        bool   sounded = false;
+    };
+
+    // One arm: build a processor, play ONE note, and read the pitch back frame by
+    // frame from `skipSec` onwards. MIDI is sent on the first block ONLY - every later
+    // block gets an EMPTY MidiBuffer, because MPESynthesiser splits the buffer at
+    // every event and the voice re-evaluates its modulators per SUB-block, so a stray
+    // event makes the modulation finer and would let a broken build pass.
+    auto renderArm = [&] (int B, float range, float lfoHz, bool lfoOn, float envAmt,
+                          float pDecay, float pSustain, float pCurveD,
+                          double skipSec, double takeSec) -> Arm
+    {
+        Arm a;
+        auto up = std::make_unique<Proc>();
+        auto& p = *up;
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p.apvts.getParameter (id))
+                q->setValueNotifyingHost (q->convertTo0to1 (v));
+        };
+        // EVERY parameter BEFORE prepareToPlay, then an explicit poll: prepareToPlay
+        // builds the spectrum from the parameters as they stand and outside a host
+        // there is no message loop to run the poll (FftVerify.cpp says the same).
+        sp ("refA", 750.0f);
+        sp ("morph", 0.0f);   sp ("dryWet", 0.0f);       // no transition in flight
+        sp ("ampAttack", 0.001f); sp ("ampDecay", 0.001f);
+        sp ("ampSustain", 1.0f);  sp ("ampRelease", 0.010f);
+        sp ("ampCurveA", 0.0f);   sp ("ampCurveD", 0.0f); sp ("ampCurveR", 0.0f);
+        sp ("pitchAttack", 0.001f); sp ("pitchDecay", pDecay);
+        sp ("pitchSustain", pSustain); sp ("pitchRelease", 0.010f);
+        sp ("pitchCurveA", 0.0f); sp ("pitchCurveD", pCurveD); sp ("pitchCurveR", 0.0f);
+        sp ("pitchEnvAmount", envAmt);
+        sp ("baseN", 1.0f);
+        sp ("harmonics", 2.0f);        // ODD: with one octave of range, the fundamental alone
+        sp ("spectrumRange", 1.0f);
+        sp ("curveSlope", 4.0f);
+        sp ("fractalLevel", 1.0f);
+        sp ("primeOn", 0.0f); sp ("partialManual", 0.0f); sp ("specRandom", 0.0f);
+        sp ("timbreOn", 0.0f);
+        sp ("filterCutoff", 9600.0f);  // wide open in cents: the filter must not colour f0
+        sp ("filterEnvAmount", 0.0f);
+        sp ("phaseMode", 0.0f);
+        sp ("monoGlide", 0.0f);        // a glide would smooth the very step under test
+        sp ("shepOn", 0.0f);           // Shepard splits the block itself (finer for the wrong reason)
+        sp ("rhythmOn", 0.0f); sp ("rhythmSelfPlay", 0.0f);
+        sp ("modL1Wave", 0.0f);        // Sine. Square is 1/0 by design and would "fail" honestly
+        sp ("modL1RateMode", 2.0f);    // Free Hz. The DEFAULT is Fundamental/2^n, whose rate
+        sp ("modL1Hz", lfoHz);         // follows the played note - a moving target for a test
+        sp ("modL1PhaseMode", 0.0f);   // note-restart at phase 0, so the legs are where we say
+        sp ("modL1Phase", 0.0f);
+        sp ("modL1Range", range);
+        sp ("modL1On", lfoOn ? 1.0f : 0.0f);
+        p.pollParametersForTests();
+        p.prepareToPlay (sr9, B);
+        for (int m = 0; m < ModEngine::kMods; ++m) p.getModEngine().unmapAll (m);
+        if (lfoOn) p.getModEngine().addTarget (3, "pitchEnvAmount");   // LFO 1 is index 3
+        p.pollParametersForTests();
+        // NO awaitSpectrumIdle HERE, and that is deliberate. The spectrum is compiled on a
+        // Priority::low worker; measured on a machine running fifteen other builds and
+        // verifiers, that wait timed out at 15 s on two arms of three and then on five,
+        // non-deterministically - a failure about the MACHINE, not about the pitch, and
+        // the worst kind because it is loud and means nothing. What the wait was standing
+        // in for is a claim, so make the claim instead: every arm asserts below that the
+        // LIVE template it actually rendered is the single partial this estimator needs.
+        // A stale template here is the DEFAULT patch, which is hundreds of partials, so it
+        // cannot slip past that. Twenty silent blocks first, to give the worker its chance.
+        {
+            juce::AudioBuffer<float> warm (2, B);
+            for (int i = 0; i < 20; ++i)
+            { juce::MidiBuffer m; warm.clear(); p.processBlock (warm, m); }
+        }
+
+        if (const auto* t = p.getLiveTemplate())
+        {
+            a.partials = (int) t->partials.size();
+            double fund = 0.0, over = 0.0;
+            for (size_t i = 0; i < t->partials.size(); ++i)
+            {
+                const double amp = (double) t->partials[i].amp;
+                if (i == 0) fund = amp;
+                else        over = std::max (over, amp);
+            }
+            a.worstOvertone = fund > 0.0 ? over / fund : 1.0;
+        }
+
+        juce::AudioBuffer<float> ab (2, B);
+        std::vector<float> x;
+        const int total = (int) std::ceil ((skipSec + takeSec) * sr9) + B;
+        bool first = true;
+        for (int done = 0; done < total; done += B)
+        {
+            juce::MidiBuffer m;
+            if (first) { m.addEvent (juce::MidiMessage::noteOn (1, kNote, (juce::uint8) 100), 0);
+                         first = false; }
+            ab.clear();
+            p.processBlock (ab, m);
+            const float* r = ab.getReadPointer (0);
+            for (int k = 0; k < B; ++k) x.push_back (r[k]);
+        }
+        a.rateLimited = p.getModEngine().isRateLimited (0);
+
+        a.at0 = (size_t) ((int) (skipSec * sr9) / kFrm) * (size_t) kFrm;
+        const size_t last = (size_t) std::min ((double) x.size(),
+                                               (skipSec + takeSec) * sr9);
+        for (size_t at = a.at0; at + (size_t) kFrm + 1 < last; at += (size_t) kFrm)
+        {
+            double num = 0.0, den = 0.0;
+            for (int i = 1; i <= kFrm; ++i)
+            {
+                const double c = (double) x[at + (size_t) i];
+                num += c * ((double) x[at + (size_t) (i - 1)] + (double) x[at + (size_t) (i + 1)]);
+                den += c * c;
+            }
+            a.minRms = std::min (a.minRms, std::sqrt (den / (double) kFrm));
+            if (den < 1.0e-18) { a.cents.push_back (0.0); continue; }  // refuse, do not invent
+            const double cw = juce::jlimit (-0.999999, 0.999999, 0.5 * num / den);
+            const double hz = std::acos (cw) * sr9 / juce::MathConstants<double>::twoPi;
+            const double ct = 1200.0 * std::log2 (hz / kF0);
+            a.cents.push_back (ct);
+            a.lo = std::min (a.lo, ct); a.hi = std::max (a.hi, ct);
+        }
+        a.sounded = ! a.cents.empty();
+        return a;
+    };
+
+    // FRAME-TO-FRAME STATISTICS. `flat` is counted ONLY over the middle of each rising
+    // and falling leg (|cos| > 0.5 of the LFO's own phase, which is known exactly
+    // because the phase mode is note-restart at 0), so the sine's own turning points -
+    // where a perfectly continuous wave really does stand still - are excluded and
+    // cannot dilute the count.
+    struct Stat { double maxJump = 0.0, medJump = 0.0, flat = 0.0, pp = 0.0; int legs = 0; };
+    auto statOf = [&] (const Arm& a, double lfoHz, double eps) -> Stat
+    {
+        Stat s;
+        std::vector<double> jumps;
+        int flat = 0;
+        for (size_t i = 1; i < a.cents.size(); ++i)
+        {
+            const double d = std::abs (a.cents[i] - a.cents[i - 1]);
+            jumps.push_back (d);
+            s.maxJump = std::max (s.maxJump, d);
+            const double t = (double) (a.at0 + i * (size_t) kFrm) / sr9;
+            if (std::abs (std::cos (juce::MathConstants<double>::twoPi * lfoHz * t)) > 0.5)
+            { ++s.legs; if (d < eps) ++flat; }
+        }
+        std::sort (jumps.begin(), jumps.end());
+        s.medJump = jumps.empty() ? 0.0 : jumps[jumps.size() / 2];
+        s.flat    = s.legs > 0 ? (double) flat / (double) s.legs : 1.0;
+        s.pp      = a.sounded ? a.hi - a.lo : 0.0;
+        return s;
+    };
+
+    //-- P3 / N1: THE CONTROL. No modulator, no pitch envelope --------------------
+    // This is two things at once: the estimator's own noise floor N (printed and
+    // asserted, so a future patch that blunts the instrument fails loudly instead of
+    // passing silently), and the neighbour check that a note with NO pitch modulation
+    // is exactly as steady as it was before this change.
+    const Arm ctl = renderArm (256, 0.0f, 2.0f, false, 0.0f, 0.001f, 1.0f, 0.0f, 0.20, 0.50);
+    const Stat cs = statOf (ctl, 2.0, 1.0e9);
+    std::printf ("    control (no modulation): %d partials, loudest overtone %.4f of f0,"
+                 " %d frames, pitch %+.3f cents, drift %.4f, worst frame jump %.4f cents\n",
+                 ctl.partials, ctl.worstOvertone, (int) ctl.cents.size(),
+                 ctl.sounded ? 0.5 * (ctl.lo + ctl.hi) : 0.0, cs.pp, cs.maxJump);
+    check (ctl.minRms > 1.0e-4, "  (P1) the control note actually sounds");
+    check (ctl.partials >= 1 && ctl.worstOvertone < 0.02,
+           "  (precondition) the test patch is one partial, so the estimator is exact");
+    // The instrument's noise floor. Everything below is a difference of two frames, so
+    // this is the number every threshold has to clear. Asserted at 0.05 cents: the
+    // smallest movement any assertion below relies on is half of 0.804 cents.
+    const double N = cs.maxJump;
+    check (N < 0.05, "  (P3) the estimator's noise floor is under 0.05 cents");
+    // ...and the neighbour: an unmodulated note does not move at all.
+    check (cs.pp < 0.20, "an UNMODULATED note is still dead steady - no drift added");
+
+    //-- THE THREE BLOCK SIZES ---------------------------------------------------
+    // modL1Range 0.010 on a +-48 st parameter sitting at 0 gives a normalised offset
+    // of 0..0.010 (the sine is unipolar), i.e. an amount of 0..0.96 st = 96 cents
+    // peak-to-peak. At 2 Hz the steepest movement is pi * 96 * 2 = 603.2 cents/second,
+    // so per 64-sample frame the CONTINUOUS answer is 603.2 * 64/48000 = 0.804 cents.
+    // A block-rate hold puts the same movement on one frame in four at B = 256
+    // (3.217 cents) and one in sixteen at B = 1024 (12.87 cents).
+    constexpr double kCont = 0.804;    // cents per frame, continuous
+    const Arm a64  = renderArm (64,   0.010f, 2.0f, true, 0.0f, 0.001f, 1.0f, 0.0f, 0.20, 1.50);
+    const Arm a256 = renderArm (256,  0.010f, 2.0f, true, 0.0f, 0.001f, 1.0f, 0.0f, 0.20, 1.50);
+    const Arm a1k  = renderArm (1024, 0.010f, 2.0f, true, 0.0f, 0.001f, 1.0f, 0.0f, 0.20, 1.50);
+    const Stat s64  = statOf (a64,  2.0, 0.10);
+    const Stat s256 = statOf (a256, 2.0, 0.10);
+    const Stat s1k  = statOf (a1k,  2.0, 0.10);
+    const struct { const char* n; const Arm* a; const Stat* s; } arms[] =
+        { { "B=64", &a64, &s64 }, { "B=256", &a256, &s256 }, { "B=1024", &a1k, &s1k } };
+    for (const auto& r : arms)
+        std::printf ("    %-7s swept %.2f cents pk-pk, worst frame jump %.3f cents,"
+                     " median %.3f, %.1f%% of steep-leg frames repeat (%d legs)\n",
+                     r.n, r.s->pp, r.s->maxJump, r.s->medJump, 100.0 * r.s->flat, r.s->legs);
+
+    for (const auto& r : arms)
+    {
+        check (r.a->minRms > 1.0e-4,
+               (juce::String ("  (P1) ") + r.n + " sounds in every frame").toRawUTF8());
+        // The spectrum this arm REALLY rendered, not the one it asked for: a stale
+        // template would be the default patch's hundreds of partials and the two-tap
+        // estimator would be reading something else entirely.
+        check (r.a->partials == 1 && r.a->worstOvertone < 0.02,
+               (juce::String ("  (precondition) ") + r.n + " rendered the one-partial patch").toRawUTF8());
+        // Without this an LFO that is off, unmapped or clamped to nothing draws a
+        // perfectly flat, perfectly continuous line and passes every check below.
+        check (r.s->pp > 76.8 && r.s->pp < 115.2,
+               (juce::String ("  (P2) ") + r.n + " really sweeps the 96 cents asked for (+-20%)").toRawUTF8());
+        // The LFO phase steps once per block, so the honest ceiling is 0.5*SR/B: 375 Hz
+        // at B=64 but 23.4 Hz at B=1024. An arm that crossed it would be measuring a
+        // different LFO from the other two and A4 would be comparing nothing.
+        check (! r.a->rateLimited,
+               (juce::String ("  (P4) ") + r.n + " is not rate-limited").toRawUTF8());
+    }
+
+    // A1. 1.5 cents is 1.85x the continuous maximum of 0.804 (headroom for the
+    // estimator's noise floor N and for the 32-sample grid's own residual) and 2.1x
+    // BELOW the 3.217 cents a block-rate hold produces at B = 256.
+    check (s256.maxJump < 1.5,
+           "no single 64-sample frame moves more than 1.5 cents (continuous max is 0.804)");
+    // A2. Scale-free, so it survives someone later changing the depth, the rate, the
+    // buffer or the sample rate: for a uniformly sampled sine the jump is proportional
+    // to |cos| and the median of |cos| is 0.707 of its maximum, so max/median = 1.41.
+    // A staircase has a median of exactly 0 and the ratio diverges.
+    check (s256.medJump > 0.0 && s256.maxJump < 2.0 * s256.medJump,
+           "...and the largest frame jump is under 2x the median one - no tread, no riser");
+    // A3. THE FLAT-RUN COUNT, pointed at PITCH. Same technique as run 12q ("an LFO at
+    // full range is a whole wave, not a wave with a flat top"), which measures what
+    // fraction of a cycle repeats its previous value; there it read a modulated
+    // PARAMETER, here it reads the rendered pitch. 0.10 cents is a quarter of the
+    // smallest continuous per-frame move on a steep leg (0.402) and twice the asserted
+    // noise floor. Continuous gives 0%; a block-rate hold at B = 256 gives exactly 75%.
+    check (s256.flat < 0.05,
+           "...and under 5% of steep-leg frames repeat the previous pitch (a hold gives 75%)");
+    // A4. THE ASSERTION THAT NAMES THE MECHANISM. A block-rate hold predicts
+    // 0.80 / 3.22 / 12.87 cents at B = 64 / 256 / 1024 - a ratio of 16 across the
+    // three - because the tread IS the buffer. Re-aimed on the 32-sample grid the
+    // three are the same number, and the sound stops depending on the host.
+    std::printf ("    worst jump B=1024 / B=64 = %.3f / %.3f = %.2f"
+                 " (a block-rate hold predicts 16)\n",
+                 s1k.maxJump, s64.maxJump, s64.maxJump > 0.0 ? s1k.maxJump / s64.maxJump : 0.0);
+    check (s64.maxJump > 0.0 && s1k.maxJump < 1.5 * s64.maxJump,
+           "the step no longer depends on the host's buffer size (1024 vs 64)");
+    check (s1k.flat < 0.05 && s64.flat < 0.05,
+           "...and neither the smallest nor the largest buffer holds the pitch still");
+    // NOT ASSERTED HERE, on purpose: the second difference. The agreed fix IS a
+    // per-block straight line between two exactly-known endpoints (evaluateMods
+    // advances the LFO phase and evaluates AFTER the advance, so the previous block's
+    // value is this block's first sample), which concentrates what curvature error
+    // there is at the block boundaries. An assertion penalising that would be
+    // asserting against the fix. The residual is a 47 Hz-and-up corner on a trajectory
+    // whose own content is 2 Hz. Also NOT covered here: the shared 0.4999 Nyquist
+    // clamp, because no partial in this one-partial patch is anywhere near Nyquist.
+
+    //-- A6: THE ENVELOPE-ONLY ARM, the half of the bug that needs no mod matrix ----
+    // pitchEnvAmount -12 st with the SHIPPED decay (150 ms, curve 0.55, sustain 0),
+    // no modulator mapped at all. The note starts an octave down and rises. Before the
+    // fix the whole first buffer was ONE pitch, because pitchEnvValue was sampled once
+    // per block however fast it was moving; four 64-sample frames therefore read four
+    // identical values and the entire envelope arrived in 256-sample jumps. A linear
+    // 150 ms decay covers 3.55% of its travel in the first 256 samples at 48 kHz,
+    // which is 0.0355 * 12 st = 42.6 cents - so a working build moves tens of cents
+    // inside the block the broken one held still for.
+    {
+        const Arm env = renderArm (256, 0.0f, 2.0f, false, -12.0f, 0.150f, 0.0f, 0.55f,
+                                   0.0, 0.20);
+        double lo = 1.0e9, hi = -1.0e9;
+        int distinct = 0;
+        for (size_t i = 1; i < 4 && i < env.cents.size(); ++i)
+            if (std::abs (env.cents[i] - env.cents[i - 1]) > 1.0) ++distinct;
+        for (size_t i = 1; i < 4 && i < env.cents.size(); ++i)
+        { lo = std::min (lo, env.cents[i]); hi = std::max (hi, env.cents[i]); }
+        std::printf ("    pitch ENVELOPE alone, first 256 samples: %d of 3 frame gaps move,"
+                     " span %.1f cents\n", distinct, env.sounded ? hi - lo : 0.0);
+        check (env.minRms > 1.0e-4, "  (P1) the envelope-only arm sounds");
+        check (env.partials == 1, "  (precondition) the envelope-only arm is one partial too");
+        check (distinct >= 2,
+               "the pitch ENVELOPE moves INSIDE the first block, with no modulator at all");
+        // 50 cents. A LINEAR 150 ms decay covers 3.55% of its travel in 256 samples at
+        // 48 kHz, which is 0.0355 * 1200 = 42.6 cents of the 12-semitone amount; the
+        // shipped convex curve (pitchCurveD 0.55, pinned by this arm) is steeper at the
+        // top and measures 146.5. Sabotaged back to a block-held pitch the same three
+        // frames span 21.6 cents - not zero, because the note-on splits the buffer and the
+        // 1 ms attack lands inside frame 0 - so 50 sits above that and well below both.
+        check (env.sounded && hi - lo > 50.0,
+               "...by more than 50 cents, where a block-held envelope manages 21.6");
+    }
+
+    //-- A7: THE SHALLOW ARM, the only one that reaches the value grid -------------
+    // modL1Range 0.001 is the smallest detent the fader has: 0.001 * 96 st = 9.6 cents
+    // peak-to-peak. modded() used to convert through RangedAudioParameter, which ends
+    // in snapToLegalValue and rounds to pitchEnvAmount's declared 0.01-semitone
+    // interval - so this whole sweep had about ten reachable pitches in it and the
+    // rendered line stood still between them. At 20 Hz the continuous movement is the
+    // same 0.804 cents per frame as the arms above (the depth fell 10x, the rate rose
+    // 10x), so the SAME 0.10-cent flatness epsilon applies and the only thing that can
+    // make this arm flat is the value grid. 20 Hz is under the B=256 ceiling of 93.75.
+    {
+        const Arm sh = renderArm (256, 0.001f, 20.0f, true, 0.0f, 0.001f, 1.0f, 0.0f,
+                                  0.20, 0.50);
+        const Stat ss = statOf (sh, 20.0, 0.10);
+        std::printf ("    shallow (9.6 cents at 20 Hz): swept %.2f cents pk-pk,"
+                     " %.1f%% of steep-leg frames repeat (%d legs)\n",
+                     ss.pp, 100.0 * ss.flat, ss.legs);
+        check (sh.minRms > 1.0e-4, "  (P1) the shallow arm sounds");
+        check (sh.partials == 1,   "  (precondition) the shallow arm is one partial too");
+        check (! sh.rateLimited,   "  (P4) the shallow arm's 20 Hz is not rate-limited");
+        check (ss.pp > 7.7 && ss.pp < 11.5,
+               "  (P2) the shallow arm really sweeps its 9.6 cents (+-20%)");
+        check (ss.flat < 0.20,
+               "a SHALLOW pitch modulation is continuous too - it is not quantised to cents");
+    }
+    // ...and the arithmetic in the comments above depends on one declared number, so
+    // pin it: if pitchEnvAmount's interval ever changes, the paragraph about a
+    // 1.000-cent maximum tread stops being true and this says so.
+    {
+        auto probe = std::make_unique<Proc>();
+        auto* q = dynamic_cast<juce::RangedAudioParameter*> (probe->apvts.getParameter ("pitchEnvAmount"));
+        const double iv = q != nullptr ? (double) q->getNormalisableRange().interval : -1.0;
+        std::printf ("    pitchEnvAmount declares interval %.4f st over %+.0f..%+.0f\n",
+                     iv, q != nullptr ? (double) q->getNormalisableRange().start : 0.0,
+                     q != nullptr ? (double) q->getNormalisableRange().end : 0.0);
+        check (std::abs (iv - 0.01) < 1.0e-6,
+               "  (pinned) pitchEnvAmount's interval is still the 0.01 st the comments do arithmetic on");
+    }
+
+    //-- A8: A NEW NOTE STARTS FLAT, and the portamento still glides ---------------
+    // The ramp's left-hand end is a per-voice member, so without the reset in
+    // noteStarted a re-used voice would spend its first block gliding from the
+    // PREVIOUS note's modulated amount to this one's - at the shipped default Range
+    // that is 48 semitones over one buffer, on every single note-on. Monophonic Glide
+    // is on here for one reason only: it drops the synth to ONE voice, so the second
+    // note-on is GUARANTEED to land on the voice the first note used. Both notes are
+    // the same key, so the portamento itself has nothing to do (offset 0) and cannot
+    // colour the reading.
+    //
+    // Range 0.05 gives 480 cents of sweep; the LFO restarts at phase 0 on each
+    // note-on, where a unipolar sine reads 0.5, so the new note starts at 240 cents
+    // while the old note ended wherever its phase had got to - a jump of up to 240
+    // cents for one block if the reset is missing. At 8 Hz the modulator's own
+    // movement is pi*480*8*(256/48000) = 64 cents per block, so the SECOND block is
+    // the control that proves the modulator is live rather than stuck.
+    {
+        auto up = std::make_unique<Proc>();
+        auto& p = *up;
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p.apvts.getParameter (id))
+                q->setValueNotifyingHost (q->convertTo0to1 (v));
+        };
+        sp ("refA", 750.0f);
+        sp ("morph", 0.0f); sp ("dryWet", 0.0f);
+        sp ("ampAttack", 0.001f); sp ("ampDecay", 0.001f);
+        sp ("ampSustain", 1.0f);  sp ("ampRelease", 0.010f);
+        sp ("pitchAttack", 0.001f); sp ("pitchDecay", 0.001f);
+        sp ("pitchSustain", 1.0f);  sp ("pitchCurveA", 0.0f); sp ("pitchCurveD", 0.0f);
+        sp ("pitchEnvAmount", 0.0f);
+        sp ("baseN", 1.0f); sp ("harmonics", 2.0f); sp ("spectrumRange", 1.0f);
+        sp ("curveSlope", 4.0f); sp ("fractalLevel", 1.0f);
+        sp ("primeOn", 0.0f); sp ("partialManual", 0.0f); sp ("timbreOn", 0.0f);
+        sp ("filterCutoff", 9600.0f); sp ("filterEnvAmount", 0.0f); sp ("phaseMode", 0.0f);
+        sp ("shepOn", 0.0f); sp ("rhythmOn", 0.0f); sp ("rhythmSelfPlay", 0.0f);
+        sp ("monoGlide", 1.0f); sp ("glideTime", 120.0f);
+        sp ("modL1Wave", 0.0f); sp ("modL1RateMode", 2.0f); sp ("modL1Hz", 8.0f);
+        sp ("modL1PhaseMode", 0.0f); sp ("modL1Phase", 0.0f);
+        sp ("modL1Range", 0.05f); sp ("modL1On", 1.0f);
+        p.pollParametersForTests();
+        p.prepareToPlay (sr9, 256);
+        for (int m = 0; m < ModEngine::kMods; ++m) p.getModEngine().unmapAll (m);
+        p.getModEngine().addTarget (3, "pitchEnvAmount");
+        p.pollParametersForTests();
+        {   // see the "no awaitSpectrumIdle here" note in renderArm
+            juce::AudioBuffer<float> warm (2, 256);
+            for (int i = 0; i < 20; ++i)
+            { juce::MidiBuffer m; warm.clear(); p.processBlock (warm, m); }
+        }
+        check (p.getLiveTemplate() != nullptr && p.getLiveTemplate()->partials.size() == 1,
+               "  (precondition) the re-attack arm renders the same one-partial patch");
+
+        juce::AudioBuffer<float> ab (2, 256);
+        std::vector<float> x;
+        size_t reNoteAt = 0;
+        const auto pump = [&] (int blocks, const juce::MidiBuffer& first)
+        {
+            for (int i = 0; i < blocks; ++i)
+            {
+                juce::MidiBuffer m;
+                if (i == 0) m = first;
+                ab.clear();
+                p.processBlock (ab, m);
+                const float* r = ab.getReadPointer (0);
+                for (int k = 0; k < 256; ++k) x.push_back (r[k]);
+            }
+        };
+        juce::MidiBuffer on1;  on1.addEvent (juce::MidiMessage::noteOn (1, kNote, (juce::uint8) 100), 0);
+        juce::MidiBuffer off1; off1.addEvent (juce::MidiMessage::noteOff (1, kNote), 0);
+        juce::MidiBuffer on2 = on1;
+        pump (56, on1);          // ~300 ms held
+        pump (12, off1);         // ~64 ms of silence: the voice is free but remembers
+        reNoteAt = x.size();
+        pump (8, on2);           // the SECOND note-on, on the same (mono) voice
+        // Frame the two blocks after the re-attack. The frames are read straight out
+        // of the same estimator; the first block's four frames should be one value.
+        const auto frameAt = [&] (size_t at) -> double
+        {
+            double num = 0.0, den = 0.0;
+            for (int i = 1; i <= kFrm; ++i)
+            {
+                const double c = (double) x[at + (size_t) i];
+                num += c * ((double) x[at + (size_t) (i - 1)] + (double) x[at + (size_t) (i + 1)]);
+                den += c * c;
+            }
+            if (den < 1.0e-18) return 0.0;
+            const double cw = juce::jlimit (-0.999999, 0.999999, 0.5 * num / den);
+            return 1200.0 * std::log2 (std::acos (cw) * sr9
+                                       / juce::MathConstants<double>::twoPi / kF0);
+        };
+        // Frame 0 straddles the 1 ms amplitude attack, and a two-tap estimator on a
+        // ramping amplitude is not the same instrument as one on a steady tone, so the
+        // first block is read from frames 1..3 (samples 64..256 of it). The claim -
+        // "this block does not sweep" - is unaffected: the ramp under test would run
+        // for the WHOLE block.
+        double lo1 = 1.0e9, hi1 = -1.0e9, lo2 = 1.0e9, hi2 = -1.0e9;
+        for (int f = 1; f < 4; ++f)
+        { const double c = frameAt (reNoteAt + (size_t) (f * kFrm)); lo1 = std::min (lo1, c); hi1 = std::max (hi1, c); }
+        for (int f = 4; f < 8; ++f)
+        { const double c = frameAt (reNoteAt + (size_t) (f * kFrm)); lo2 = std::min (lo2, c); hi2 = std::max (hi2, c); }
+        std::printf ("    re-attack on a re-used voice: first block spans %.1f cents,"
+                     " second block spans %.1f cents\n", hi1 - lo1, hi2 - lo2);
+        check (hi1 - lo1 < 20.0,
+               "a note-on on a RE-USED voice starts flat - no swoop out of the last note");
+        check (hi2 - lo2 > 20.0,
+               "...and the block after it is already moving, so the modulator is live");
+    }
+
+    //-- N2: THE PORTAMENTO STILL GLIDES ------------------------------------------
+    // The fix split advanceGlide into "compute the ratio" and "apply it", so that the
+    // glide and the pitch modulator share ONE pass over the oscillators and meet the
+    // 0.4999 Nyquist clamp once. run 48 is the full regression gate on that (twelve
+    // lettered blocks, the log2-linear halfway assertion, the 31-sample sub-block that
+    // once left a note 700 cents flat); this is the cheap arm that keeps the claim
+    // beside the change it belongs to. Note 105 -> note 93 is exactly one octave down,
+    // so a 120 ms glide passes through -600 cents at 60 ms.
+    {
+        auto up = std::make_unique<Proc>();
+        auto& p = *up;
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p.apvts.getParameter (id))
+                q->setValueNotifyingHost (q->convertTo0to1 (v));
+        };
+        sp ("refA", 750.0f);
+        sp ("morph", 0.0f); sp ("dryWet", 0.0f);
+        sp ("ampAttack", 0.001f); sp ("ampDecay", 0.001f); sp ("ampSustain", 1.0f);
+        sp ("pitchEnvAmount", 0.0f);
+        sp ("baseN", 1.0f); sp ("harmonics", 2.0f); sp ("spectrumRange", 1.0f);
+        sp ("curveSlope", 4.0f); sp ("filterCutoff", 9600.0f); sp ("filterEnvAmount", 0.0f);
+        sp ("phaseMode", 0.0f); sp ("shepOn", 0.0f);
+        sp ("rhythmOn", 0.0f); sp ("rhythmSelfPlay", 0.0f); sp ("timbreOn", 0.0f);
+        sp ("monoGlide", 1.0f); sp ("glideTime", 120.0f);
+        sp ("modL1On", 0.0f);
+        p.pollParametersForTests();
+        p.prepareToPlay (sr9, 256);
+        for (int m = 0; m < ModEngine::kMods; ++m) p.getModEngine().unmapAll (m);
+        p.pollParametersForTests();
+        {   // see the "no awaitSpectrumIdle here" note in renderArm
+            juce::AudioBuffer<float> warm (2, 256);
+            for (int i = 0; i < 20; ++i)
+            { juce::MidiBuffer m; warm.clear(); p.processBlock (warm, m); }
+        }
+        check (p.getLiveTemplate() != nullptr && p.getLiveTemplate()->partials.size() == 1,
+               "  (precondition) the glide arm renders the same one-partial patch");
+
+        juce::AudioBuffer<float> ab (2, 256);
+        std::vector<float> x;
+        const auto pump = [&] (int blocks, const juce::MidiBuffer& first)
+        {
+            for (int i = 0; i < blocks; ++i)
+            {
+                juce::MidiBuffer m;
+                if (i == 0) m = first;
+                ab.clear();
+                p.processBlock (ab, m);
+                const float* r = ab.getReadPointer (0);
+                for (int k = 0; k < 256; ++k) x.push_back (r[k]);
+            }
+        };
+        juce::MidiBuffer on1; on1.addEvent (juce::MidiMessage::noteOn (1, kNote, (juce::uint8) 100), 0);
+        juce::MidiBuffer on2; on2.addEvent (juce::MidiMessage::noteOn (1, kNote - 12, (juce::uint8) 100), 0);
+        pump (40, on1);                 // ~213 ms of the first note
+        const size_t glideAt = x.size();
+        pump (80, on2);                 // ~427 ms: the 120 ms glide plus room to read 300 ms in
+        const auto centsAt = [&] (size_t at) -> double
+        {
+            double num = 0.0, den = 0.0;
+            for (int i = 1; i <= kFrm; ++i)
+            {
+                const double c = (double) x[at + (size_t) i];
+                num += c * ((double) x[at + (size_t) (i - 1)] + (double) x[at + (size_t) (i + 1)]);
+                den += c * c;
+            }
+            if (den < 1.0e-18) return 0.0;
+            const double cw = juce::jlimit (-0.999999, 0.999999, 0.5 * num / den);
+            return 1200.0 * std::log2 (std::acos (cw) * sr9
+                                       / juce::MathConstants<double>::twoPi / kF0);
+        };
+        const double c10  = centsAt (glideAt + (size_t) (0.010 * sr9));
+        const double c60  = centsAt (glideAt + (size_t) (0.060 * sr9));
+        const double cEnd = centsAt (glideAt + (size_t) (0.300 * sr9));
+        std::printf ("    portamento: %+.1f cents at 10 ms, %+.1f at 60 ms, %+.1f at 300 ms"
+                     " (an octave down is -1200)\n", c10, c60, cEnd);
+        check (c10 < -20.0 && c10 > -400.0,
+               "the portamento is genuinely under way 10 ms in (not stuck, not jumped)");
+        check (c60 < c10 && c60 > -1100.0,
+               "...still descending at 60 ms, and not there yet");
+        check (std::abs (cEnd + 1200.0) < 25.0,
+               "...and it lands exactly one octave down");
+    }
+}
+
+// === TEMPORARY CPU BENCH - NOT PART OF THE SUITE, REMOVED BEFORE DELIVERY =====
+static void runCpuBenchTemporary()
+{
+    using Proc = FractalAdditiveAudioProcessor;
+    const auto bench = [&] (bool modOn)
+    {
+        auto up = std::make_unique<Proc>();
+        auto& p = *up;
+        const auto sp = [&] (const char* id, float v)
+        { if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
+        // Spectrum Range 10 on note 12 puts the TOP partial at 16.35 * 1024 = 16742 Hz, so
+        // nothing is Nyquist-limited and a +-96 cent pitch move does NOT change how many
+        // partials the render loop walks. That is what makes ON vs OFF a measurement of
+        // the rescale work rather than of the partial count.
+        sp ("baseN", 1.0f); sp ("harmonics", 1.0f); sp ("spectrumRange", 10.0f);
+        sp ("curveSlope", 1.0f); sp ("fractalLevel", 4.0f);
+        sp ("ampAttack", 0.001f); sp ("ampDecay", 0.001f); sp ("ampSustain", 1.0f);
+        sp ("pitchEnvAmount", 0.0f); sp ("pitchSustain", 1.0f); sp ("pitchDecay", 0.001f);
+        sp ("modL1Wave", 0.0f); sp ("modL1RateMode", 2.0f); sp ("modL1Hz", 2.0f);
+        sp ("modL1Range", 0.010f); sp ("modL1On", modOn ? 1.0f : 0.0f);
+        p.pollParametersForTests();
+        p.prepareToPlay (48000.0, 256);
+        for (int m = 0; m < ModEngine::kMods; ++m) p.getModEngine().unmapAll (m);
+        if (modOn) p.getModEngine().addTarget (3, "pitchEnvAmount");
+        p.pollParametersForTests();
+        juce::AudioBuffer<float> ab (2, 256);
+        juce::MidiBuffer on; on.addEvent (juce::MidiMessage::noteOn (1, 12, (juce::uint8) 100), 0);
+        for (int i = 0; i < 200; ++i)
+        { juce::MidiBuffer m; if (i == 0) m = on; ab.clear(); p.processBlock (ab, m); }
+        const int parts = p.getLiveTemplate() ? (int) p.getLiveTemplate()->partials.size() : 0;
+        // MIN of many short reps, not the mean of one long one: this machine is running a
+        // dozen other builds and verifiers, and under contention the mean measures the
+        // scheduler while the minimum measures the code.
+        // ONE BLOCK AT A TIME, and keep the MINIMUM over thousands of them. The minimum
+        // single-block cycle count is the uncontended cost of the code; every larger
+        // reading is this machine's dozen other builds. The median is printed beside it so
+        // a run where the whole distribution moved is visible rather than hidden.
+        const int N = 4000;
+        std::vector<double> cyc;
+        cyc.reserve ((size_t) N);
+        for (int i = 0; i < N; ++i)
+        {
+            unsigned long long c0 = 0, c1 = 0;
+            juce::MidiBuffer m;
+            ab.clear();
+            QueryThreadCycleTime (GetCurrentThread(), &c0);
+            p.processBlock (ab, m);
+            QueryThreadCycleTime (GetCurrentThread(), &c1);
+            cyc.push_back ((double) (c1 - c0));
+        }
+        std::sort (cyc.begin(), cyc.end());
+        const double lo = cyc.front(), med = cyc[cyc.size() / 2];
+        std::printf ("    CPU %-14s %4d partials   min %9.0f   median %9.0f cycles/block"
+                     "   (min = %.4f ms and %.2f%% of real time at 3.2 GHz)\n",
+                     modOn ? "pitch mod ON" : "pitch mod OFF", parts, lo, med,
+                     lo / 3.2e6, 100.0 * (lo / 3.2e6) / (256.0 / 48.0));
+    };
+    std::printf ("\nCPU bench (temporary):\n");
+    bench (false); bench (true); bench (false); bench (true); bench (false); bench (true);
+
+    // PAIRED, INTERLEAVED, BLOCK BY BLOCK. Two identical processors, both with the
+    // modulator mapped to Pitch Env Amount and running; the only difference is that A's
+    // Range is 0 (so the pitch does not move, exp2 returns exactly 1.0 and rescaleIncs
+    // early-outs) and B's is 0.010 (so every 32-sample chunk rescales 1024 increments).
+    // Their blocks are timed alternately, so the machine's other twelve processes hit
+    // both arms equally and the DIFFERENCE is the rescale work and nothing else. Nothing
+    // is Nyquist-limited at note 12 with Spectrum Range 10, so both arms walk the same
+    // number of partials.
+    {
+        using Proc = FractalAdditiveAudioProcessor;
+        auto make = [] (float range)
+        {
+            auto up = std::make_unique<Proc>();
+            auto& p = *up;
+            const auto sp = [&] (const char* id, float v)
+            { if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v)); };
+            sp ("baseN", 1.0f); sp ("harmonics", 1.0f); sp ("spectrumRange", 10.0f);
+            sp ("curveSlope", 1.0f); sp ("fractalLevel", 4.0f);
+            sp ("ampAttack", 0.001f); sp ("ampDecay", 0.001f); sp ("ampSustain", 1.0f);
+            sp ("pitchEnvAmount", 0.0f); sp ("pitchSustain", 1.0f); sp ("pitchDecay", 0.001f);
+            sp ("modL1Wave", 0.0f); sp ("modL1RateMode", 2.0f); sp ("modL1Hz", 2.0f);
+            sp ("modL1Range", range); sp ("modL1On", 1.0f);
+            p.pollParametersForTests();
+            p.prepareToPlay (48000.0, 256);
+            for (int m = 0; m < ModEngine::kMods; ++m) p.getModEngine().unmapAll (m);
+            p.getModEngine().addTarget (3, "pitchEnvAmount");
+            p.pollParametersForTests();
+            juce::AudioBuffer<float> ab (2, 256);
+            juce::MidiBuffer on; on.addEvent (juce::MidiMessage::noteOn (1, 12, (juce::uint8) 100), 0);
+            for (int i = 0; i < 200; ++i)
+            { juce::MidiBuffer m; if (i == 0) m = on; ab.clear(); p.processBlock (ab, m); }
+            return up;
+        };
+        auto A = make (0.0f), B = make (0.010f);
+        juce::AudioBuffer<float> ab (2, 256);
+        std::vector<double> ca, cb;
+        const int N = 4000;
+        ca.reserve ((size_t) N); cb.reserve ((size_t) N);
+        for (int i = 0; i < N; ++i)
+        {
+            unsigned long long c0 = 0, c1 = 0, c2 = 0;
+            juce::MidiBuffer m;
+            ab.clear();
+            QueryThreadCycleTime (GetCurrentThread(), &c0);
+            A->processBlock (ab, m);
+            QueryThreadCycleTime (GetCurrentThread(), &c1);
+            ab.clear();
+            B->processBlock (ab, m);
+            QueryThreadCycleTime (GetCurrentThread(), &c2);
+            ca.push_back ((double) (c1 - c0));
+            cb.push_back ((double) (c2 - c1));
+        }
+        std::sort (ca.begin(), ca.end());
+        std::sort (cb.begin(), cb.end());
+        const double a0 = ca.front(), b0 = cb.front();
+        const double am = ca[ca.size() / 2], bm = cb[cb.size() / 2];
+        std::printf ("    PAIRED  pitch STILL (Range 0)  min %9.0f  median %9.0f cycles/block\n", a0, am);
+        std::printf ("    PAIRED  pitch MOVING (0.010)   min %9.0f  median %9.0f cycles/block\n", b0, bm);
+        std::printf ("    PAIRED  the rescale costs %+.2f%% (min) / %+.2f%% (median) of a whole block\n",
+                     100.0 * (b0 - a0) / a0, 100.0 * (bm - am) / am);
+    }
+}
+
 int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI juceInit;
@@ -1153,6 +1864,19 @@ int main (int argc, char** argv)
         std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
         return failures == 0 ? 0 : 1;
     }
+
+    // ONE BLOCK, ON DEMAND: only run 59, the pitch-continuity checks. Same shape as
+    // --phase above, and it exists for the same reason: this run is the one that has to
+    // be re-run under SABOTAGE (break the fix in one line, watch these fail, restore),
+    // and a twenty-minute full suite per sabotage is how sabotage stops being done.
+    if (argc > 1 && std::strcmp (argv[1], "--pitch") == 0)
+    {
+        runPitchContinuityChecks();
+        std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
+        return failures == 0 ? 0 : 1;
+    }
+
+    if (argc > 1 && std::strcmp (argv[1], "--cpu") == 0) { runCpuBenchTemporary(); return 0; }
 
     const juce::File realPresets = FractalAdditiveAudioProcessor::getPresetFolder();
 
@@ -16274,6 +16998,8 @@ int main (int argc, char** argv)
             FractalAdditiveAudioProcessor::getTuningsFolder();      // the folder is factory again
         }
     }
+
+    runPitchContinuityChecks();
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
