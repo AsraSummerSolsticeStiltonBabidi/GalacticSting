@@ -20089,4 +20089,94 @@ static void runProcessorAuditChecks()
         Proc::presetFile ("zzz73-junk").deleteFile();
         Proc::presetFile ("zzz73-foreign").deleteFile();
     }
+
+    //-- run 74: THE 129th TUNING DOES NOT OVERWRITE THE FIRST ------------------------
+    //
+    // firstEmptyBankSlot() used to answer 0 with every slot taken - "all full -> reuse the
+    // first" - and its one caller hands that answer straight to setTuningBankFile. So the
+    // 129th tuning added to the bank silently replaced the user's own first one: the slot
+    // still listed a name, the name was the new file's, and the scale that had been there
+    // was gone. The panel says the bank "just keeps growing" while it does that.
+    //
+    // The limit itself is legitimate (tuningBankSlot is an automatable parameter and a
+    // parameter needs a bounded range). What was not legitimate was the limit being
+    // silent, so it is STATED now, through the same bankSlotError the editor's timer
+    // already drains onto the notice overlay.
+    {
+        std::printf ("\nrun 74: a full tuning bank is stated, never written over:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        // Every slot filled, through the state - which is how a bank this size actually
+        // arrives: a project the user has been adding scales to for a year.
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        if (auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+        {
+            xml->removeChildElement (xml->getChildByName ("BANK"), true);
+            auto* bank = xml->createNewChildElement ("BANK");
+            for (int i = 0; i < Proc::kBankSlots; ++i)
+            {
+                auto* slot = bank->createNewChildElement ("SLOT");
+                slot->setAttribute ("i", i);
+                slot->setAttribute ("name", "zzz74-mine-" + juce::String (i));
+                slot->setAttribute ("source", "! slot " + juce::String (i)
+                                              + "\nzzz74\n 1\n " + juce::String (1200 + i) + ".\n");
+            }
+            juce::MemoryBlock withBank;
+            juce::AudioProcessor::copyXmlToBinary (*xml, withBank);
+            p->setStateInformation (withBank.getData(), (int) withBank.getSize());
+        }
+        for (int i = 0; i < 2; ++i) p->pollParametersForTests();
+        p->takeBankSlotError();   // drain anything the restore itself parked
+
+        const auto slot0Was = p->getTuningBankName (0);
+        std::printf ("    bank full: slot 0 holds \"%s\", firstEmptyBankSlot() = %d\n",
+                     slot0Was.toRawUTF8(), p->firstEmptyBankSlot());
+        check (slot0Was == "zzz74-mine-0", "  (precondition) the bank is full of the user's own scales");
+        check (p->firstEmptyBankSlot() < 0,
+               "  a full bank has NO first empty slot - it never nominates slot 0 as a victim");
+
+        // The 129th file, offered exactly as the bank's Load button offers it.
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run74-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        scratch.createDirectory();
+        const auto newFile = scratch.getChildFile ("zzz74-the-129th.scl");
+        newFile.replaceWithText ("! the 129th\nzzz74-the-129th\n 1\n 1200.\n");
+        p->setTuningBankFile (p->firstEmptyBankSlot(), newFile);
+        const auto fullMsg = p->takeBankSlotError();
+        std::printf ("    after offering the 129th: slot 0 holds \"%s\", message \"%s\"\n",
+                     p->getTuningBankName (0).toRawUTF8(), fullMsg.toRawUTF8());
+        check (p->getTuningBankName (0) == slot0Was,
+               "  ...and the user's first scale is still in slot 0 - nothing was overwritten");
+        check (fullMsg.containsIgnoreCase ("full"),
+               "  ...while the refusal is STATED, naming the file that did not go in");
+        check (fullMsg.contains ("zzz74-the-129th"),
+               "  ...and it is about the file the user just picked");
+
+        // The other door into the bank: every loaded tuning joins it automatically, and a
+        // full bank used to drop those on the floor without a word.
+        const int auto0 = p->bankAutoAdd ("zzz74-auto", "! auto\nzzz74-auto\n 1\n 1300.\n");
+        const auto autoMsg = p->takeBankSlotError();
+        std::printf ("    bankAutoAdd into a full bank: slot %d, message \"%s\"\n", auto0,
+                     autoMsg.toRawUTF8());
+        check (auto0 < 0, "  a tuning cannot join a full bank");
+        check (autoMsg.containsIgnoreCase ("full"),
+               "  ...and that is said too, instead of the tuning quietly not being there later");
+
+        // THE CONTROL: make room, and the bank works exactly as before. The fix is a
+        // refusal with a reason, not a bank that stopped accepting anything.
+        p->bankClearSlot (5);
+        std::printf ("    after clearing slot 5: firstEmptyBankSlot() = %d\n", p->firstEmptyBankSlot());
+        check (p->firstEmptyBankSlot() == 5, "  clearing a slot makes it the first empty one again");
+        const int back = p->bankAutoAdd ("zzz74-auto", "! auto\nzzz74-auto\n 1\n 1300.\n");
+        check (back == 5 && p->getTuningBankName (5) == "zzz74-auto",
+               "  ...and the tuning that was refused a moment ago lands in it");
+        check (p->takeBankSlotError().isEmpty(),
+               "  ...with nothing to say about it, because nothing went wrong");
+
+        scratch.deleteRecursively();
+    }
 }

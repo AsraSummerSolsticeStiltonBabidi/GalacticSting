@@ -1096,6 +1096,15 @@ int FractalAdditiveAudioProcessor::bankAutoAdd (const juce::String& name, const 
             bankName[(size_t) i]   = name.isNotEmpty() ? name : juce::String ("scale");
             return i;
         }
+    // BANK FULL, AND SAID SO. Returning -1 was already the safe half - nothing is
+    // overwritten - but it was also the silent half: every path that loads a tuning calls
+    // this, so a full bank meant scales quietly stopped joining it while the panel went on
+    // describing a bank that "just keeps growing". The tuning IS loaded and sounding; what
+    // did not happen is the one-click way back to it, and that is worth a sentence.
+    bankSlotError = (name.isNotEmpty() ? name : juce::String ("This tuning"))
+                  + " \xe2\x80\x94 the tuning bank is full (" + juce::String (kBankSlots)
+                  + " slots), so it did not join the bank. It IS loaded and sounding; remove "
+                    "a tuning from the bank with its X to make room for it.";
     return -1; // bank full - the user curates it with the X
 }
 
@@ -1176,13 +1185,32 @@ int FractalAdditiveAudioProcessor::firstEmptyBankSlot() const noexcept
     for (int i = 0; i < kBankSlots; ++i)
         if (bankSource[(size_t) i].isEmpty())
             return i;
-    return 0; // all full -> reuse the first
+    // -1, NOT 0. This used to answer "all full -> reuse the first", and its one caller
+    // hands the answer straight to setTuningBankFile - so the 129th tuning added to the
+    // bank OVERWROTE the user's own first one, with nothing on screen either before or
+    // after. A silently destroyed scale is the worst outcome this bank has available: the
+    // slot still lists a name, the name is the new file's, and the scale that was there is
+    // gone from a plugin that promises the bank "just keeps growing".
+    return -1; // the bank is full - the caller must say so, never pick a victim
 }
 
 void FractalAdditiveAudioProcessor::setTuningBankFile (int slot0, const juce::File& f)
 {
-    if (! juce::isPositiveAndBelow (slot0, kBankSlots) || ! f.existsAsFile())
+    if (! f.existsAsFile())
+        return;                       // nothing to store, and nothing to say about it
+
+    // THE LIMIT IS STATED WHERE THE USER CAN SEE IT, WHICH IS THE ONLY WAY IT IS ALLOWED
+    // TO EXIST. kBankSlots is 128 because "tuningBankSlot" is an automatable parameter and
+    // a parameter needs a bounded range; the panel calls the bank effectively unlimited,
+    // which is true right up until it is not. Parked on bankSlotError so it reaches the
+    // notice overlay the editor already drains on its timer - see takeBankSlotError.
+    if (! juce::isPositiveAndBelow (slot0, kBankSlots))
+    {
+        bankSlotError = f.getFileNameWithoutExtension() + " \xe2\x80\x94 the tuning bank is full ("
+                      + juce::String (kBankSlots) + " slots). Nothing was stored and nothing was "
+                        "overwritten - remove a tuning from the bank with its X to make room.";
         return;
+    }
 
     auto text = f.loadFileAsString();
     // The bank stores tuning SOURCE text and re-parses it on every slot switch and on

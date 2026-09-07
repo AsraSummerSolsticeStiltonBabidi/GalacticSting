@@ -811,18 +811,26 @@ public:
     bool isSpectrumBuildPending() const { return spectrumEngine.isBuildPending(); }
 
     //==========================================================================
-    // Tuning bank: load as many .scl files as you like (effectively unlimited - the
-    // automatable "tuningBankSlot" parameter just needs a bounded range, so the ceiling
-    // is a generous 128). 0 = none, 1..N = slot; the switch is picked up on the message
-    // thread (timerCallback) and loaded there. The UI only ever shows the loaded slots.
+    // Tuning bank: 128 slots. The ceiling exists because "tuningBankSlot" is an
+    // automatable parameter and a parameter needs a bounded range - it is generous, not
+    // unlimited, and the difference matters: this used to be described as "effectively
+    // unlimited" everywhere while firstEmptyBankSlot() answered 0 with the bank full, so
+    // the 129th tuning silently overwrote the user's own first one. A limit is allowed to
+    // exist here only because it is now STATED when it bites (see setTuningBankFile and
+    // bankAutoAdd, which park the sentence on bankSlotError).
+    // 0 = none, 1..N = slot; the switch is picked up on the message thread
+    // (timerCallback) and loaded there. The UI only ever shows the loaded slots.
     static constexpr int kBankSlots = 128;
     void setTuningBankFile (int slot0, const juce::File& f);       // load a .scl into a slot + activate it
     juce::String getTuningBankName (int slot0) const { return juce::isPositiveAndBelow (slot0, kBankSlots) ? bankName[(size_t) slot0] : juce::String(); }
     int  getTuningBankSlotParam() const noexcept { return (int) apvts.getRawParameterValue ("tuningBankSlot")->load(); }
     void setTuningBankSlotParam (int slot);                        // 0 = none, 1..N = slot (drives automation + load)
+    // The first free slot, or -1 when there is none. NEVER 0-as-a-fallback: the caller
+    // passes this straight to setTuningBankFile, and a fallback slot is somebody's scale.
     int  firstEmptyBankSlot() const noexcept;
     // Every loaded tuning joins the bank. Returns the 0-based slot it landed in (or
-    // an existing duplicate's), -1 if the bank is full.
+    // an existing duplicate's), -1 if the bank is full - and a full bank parks a sentence
+    // on bankSlotError rather than dropping the tuning out of the bank in silence.
     int  bankAutoAdd (const juce::String& name, const juce::String& source);
     void syncBankSelector (int slot0); // point the selector at a slot without re-loading it
     void bankClearSlot (int slot0);                                          // the bank's X button
@@ -1869,11 +1877,13 @@ private:
     // failure is parked here rather than raised there. Consumed by takeTuningRestoreError,
     // which clears it: this is a one-shot message about one load, not a state.
     juce::String tuningRestoreError;
-    // THE BANK SLOT THAT DID NOT LOAD, for the editor to show once, on the same one-shot
+    // WHAT THE BANK COULD NOT DO, for the editor to show once, on the same one-shot
     // pattern and for the same reason: the load runs on the processor's timer (host
     // automation can move that parameter with no window open at all), so the parser's
     // message is parked here rather than raised from a place that may have no editor.
-    // Consumed by takeBankSlotError, which clears it - one message about one switch.
+    // Consumed by takeBankSlotError, which clears it - one message about one event.
+    // Two events use it: a slot whose stored text will not load, and a bank that is FULL
+    // (setTuningBankFile / bankAutoAdd) - the second used to overwrite slot 0 in silence.
     juce::String bankSlotError;
     // THE PRESET THAT DID NOT LOAD, on the same one-shot pattern and for the same reason
     // as the two above. loadPreset returns false from three places - the file is not in
