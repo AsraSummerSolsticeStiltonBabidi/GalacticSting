@@ -15720,9 +15720,12 @@ int main (int argc, char** argv)
             std::printf ("  discontinuity (jump/peak), control = both off: %.3f (%.3f at the hand-over)\n",
                          ctrl, ctrlEnd);
             int clicks = 0, endClicks = 0;
+            int startedRight = 0, startedTotal = 0;   // see the gate under this loop
             for (const auto& r : rows)
             {
                 const auto tk = take (r.morph, r.dw, r.t, r.t > 1.0f ? 2.6 : 0.60);
+                ++startedTotal;
+                if (tk.oldN == 2) ++startedRight;
                 std::printf ("    %-26s %.3f  (%.3f at the hand-over)\n", r.label, tk.jumpPeak, tk.endJump);
                 // The same generous bound run 26 uses: what this catches is a full-scale
                 // coherent impulse (jump/peak near 1), not a few percent of extra slope.
@@ -15733,6 +15736,27 @@ int main (int argc, char** argv)
                 if (tk.endJump > ctrlEnd * 1.6 + 0.01) ++endClicks;
             }
             check (ctrl > 0.0, "the control take made sound");
+            // ...AND EVERY TAKE STARTED FROM THE SPECTRUM IT ASKED FOR.
+            //
+            // This block sets up a TWO-partial spectrum and then swaps it, so every take
+            // should print "2->2 partials". One run printed "1024->2" for a single take and
+            // the click count went to 0.388 against 0.045 everywhere else - not a click in
+            // the transition at all, but a note that began on the 1024-partial default
+            // because the compile worker was still behind under CPU contention. A 1024 ->
+            // 2 partial hand-over SHOULD step; the defect was that the check reported it as
+            // a transition click and sent a reader looking at the crossfade.
+            //
+            // The measurement was fine and the PRECONDITION was missing, which is this
+            // file's own third way a check passes with nothing behind it, arriving in
+            // reverse: a check that FAILS with nothing behind it sends someone to fix code
+            // that was already right. Counted rather than asserted per take so the message
+            // can say how many and what they saw.
+            std::printf ("    takes that began on the spectrum they set up: %d of %d\n",
+                         (int) startedRight, (int) startedTotal);
+            check (startedRight == startedTotal,
+                   "  (gate) every take really began on the 2-partial spectrum it set up -"
+                   " a take that starts on the 1024-partial default measures the compile"
+                   " worker, not the crossfade");
             check (clicks == 0,
                    "no transition time clicks - 1 ms, 50 ms and 2 s, with Morph off and with Morph on");
             check (endClicks == 0,

@@ -7782,8 +7782,18 @@ void FractalAdditiveAudioProcessorEditor::refreshShepardRiseState()
     // apart by the FACT, and the fallback collapses two of them into one.
     const int state = ! processorRef.tuningStatesPeriod() ? 2
                     : shepardRiseChoiceExists()           ? 1 : 0;
-    if (state == lastShepRiseState) return;
-    lastShepRiseState = state;
+    // ...AND A FOURTH FACT ON TOP OF THE THREE, because the paragraph below ends with the
+    // words "the bounds are stated, never silent" and then lists TWO of them. The third
+    // was the rise step's own ceiling: a period above 16/1 is served at half what the file
+    // says, and until ShepardEngine grew riseRatioIsLimited() nothing could even ask.
+    // A sentence that advertises its own honesty and leaves out a bound is worse than one
+    // that says nothing, so this rides in the same memo and re-renders with it.
+    const double periodNow = processorRef.getStatedTuningPeriodRatio();
+    const bool riseCapped  = shepard::riseRatioIsLimited (
+                                 (int) processorRef.apvts.getRawParameterValue ("shepRise")->load(), periodNow);
+    const int stateKey = state * 2 + (riseCapped ? 1 : 0);
+    if (stateKey == lastShepRiseState) return;
+    lastShepRiseState = stateKey;
 
     juce::String tip = tr (
         "The key you press becomes the root of a tone that rises for ever without ever getting higher - built from THIS synth's spectrum, not from sine waves. The voice sounds its whole spectrum at up to 8 transpositions AT ONCE, one rise interval apart, anchored on the pressed key's own tuned pitch, all climbing together under a FIXED spectral window whose edges reach exactly zero, so copies leave the top and enter underneath in silence - no click, nothing to hide. Everything else about the note is untouched - the three envelopes, the filter, the modulators, morph, manual amplitudes - and letting go of the key releases it like any other note. Latched PER NOTE: flipping this changes the notes you play NEXT, never the ones already sounding. The bounds are stated, never silent: at most 8 copies (the band narrows, centred, rather than losing one) and up to 1638 partials each; a spectrum dense enough to need more lifts the window's bottom edge instead of dropping a single partial.",
@@ -7791,6 +7801,9 @@ void FractalAdditiveAudioProcessorEditor::refreshShepardRiseState()
     if (state == 2)
         tip += tr ("\n!This scale states no period! (it descends, or its period is 1/1), so there is no scale period to rise by and the rise-interval choice is not offered: one step is an octave, 2/1. Nothing about your tuning is changed - the pitches are still the file's own.",
                    "\n!Aquesta escala no declara cap per\xc3\xado" "de! (baixa, o el seu per\xc3\xado" "de \xc3\xa9s 1/1), o sigui que no hi ha per\xc3\xado" "de d'escala per pujar i no s'ofereix l'opci\xc3\xb3 d'interval de pujada: un pas \xc3\xa9s una octava, 2/1. La teva afinaci\xc3\xb3 no canvia gens - els tons segueixen sent els del fitxer.");
+    if (riseCapped)
+        tip += tr ("\n!This scale's period is wider than the widest rise step there is!, so one step is 16/1 rather than the whole period: past that the copies are too far apart for the illusion to close and what is left is an arpeggio. Nothing is dropped and your tuning is untouched - the step is what is capped.",
+                   "\n!El per\xc3\xado" "de d'aquesta escala \xc3\xa9s m\xc3\xa9s ample que el pas de pujada m\xc3\xa9s gran que hi ha!, o sigui que un pas \xc3\xa9s 16/1 i no tot el per\xc3\xado" "de: passat d'aqu\xc3\xad les c\xc3\xb2pies queden massa separades perqu\xc3\xa8 la il\xc2\xb7lusi\xc3\xb3 tanqui i el que queda \xc3\xa9s un arpegi. No es perd res i la teva afinaci\xc3\xb3 no canvia - el que es limita \xc3\xa9s el pas.");
     shepOnT.setTooltip (tip);
     // The arrow's own hover. Its glyph says WHICH way; this says what the other way is
     // for, and that the switch is safe to hit while a note is sounding.
@@ -8460,6 +8473,32 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
                 p.buttonFits.push_back ({ name, tg->getButtonText(),
                     (float) juce::GlyphArrangement::getStringWidth (fgfit::toggleFont (bh), tg->getButtonText()),
                     (int) std::floor (fgfit::toggleRoom (bw, bh)) });
+
+            // ...AND THE TICK BOX ITSELF HAS TO FIT ITS BUTTON, which nothing measured.
+            //
+            // "la casilla de temper se ve semicortada" - and every gate in this build was
+            // green while it was. The whole sweep above is about WIDTH and about TEXT: a
+            // word that does not fit, a control that overlaps another, a cell that escaped
+            // its box. A tick box is neither. GalacticLnF draws it as a FIXED kTickBox
+            // square at y = (height - kTickBox) / 2 - deliberately fixed, so that one panel
+            // cannot show three different sizes - so a button SHORTER than that square gets
+            // a negative y and JUCE clips the outline top and bottom. Nothing overflows,
+            // nothing overlaps, no letter is lost: it simply looks broken, and only an eye
+            // could see it.
+            //
+            // Recorded here as an ordinary fit - what is needed against the room there is -
+            // so the existing sweep reports it in the same sentence as every other one, in
+            // every scenario and at every size, rather than in a rule of its own that only
+            // runs where somebody thought to put it.
+            //
+            // The label is WORDS and not a box glyph. The first version passed U+25A1 so
+            // the report would show a little square, and the report is printed to a console
+            // that is not UTF-8: it came out as "Ã¢Â¡", which is the exact mojibake this
+            // project has a whole gate against - in the message that is supposed to explain
+            // a defect. "tick box height" says more and survives every terminal.
+            if (tg->getName() != "onled" && bw > 0 && bh > 0)
+                p.buttonFits.push_back ({ juce::String (name) + ".tick", "tick box height",
+                                          (float) fgfit::kTickBox, bh });
         }
     };
     // A read-out that is MEANT to wrap. Its cell is the text area drawLabel really uses
@@ -10093,7 +10132,29 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 compact (basePitchBox, bi.removeFromTop (24));
             }
             {
-                auto hi = hcHarm.reduced (5, 3); auto htop = hi.removeFromTop (lblH);
+                auto hi = hcHarm.reduced (5, 3);
+                // THE TITLE ROW IS AS TALL AS A TICK BOX, NOT AS TALL AS A CAPTION.
+                //
+                // "la casilla de temper se ve semicortada" - and it was, by exactly half a
+                // pixel at each end. GalacticLnF draws every tick box as a FIXED 16 px
+                // square (fgfit::kTickBox) at y = (height - 16) / 2, which is the whole
+                // point of that constant: LookAndFeel_V4 derived the box from the button's
+                // HEIGHT and produced three different sizes in one panel, and this
+                // LookAndFeel exists partly to stop that. In a 15 px row that fixed glyph
+                // lands at y = -0.5 and JUCE clips it top and bottom. I gave the row the
+                // caption's 15 and read the V4 formula out of a comment that was there to
+                // say it is no longer used.
+                //
+                // So the row asks for kTickBox + 1 - the glyph plus a pixel of air - and
+                // takes it from the fader below, which is elastic in a way a fixed glyph is
+                // not: the harmonics fader is LinearHorizontal and loses 2 px of track,
+                // while a tick box loses its outline. Only when what is left still holds a
+                // usable fader; below that the toggle is hidden and the RESIZE tag beside
+                // the title says so, which is the rule this row already followed for width.
+                const int kTickRow = fgfit::kTickBox + 1;
+                const int titleH   = (hi.getHeight() - kTickRow >= 20)
+                                   ? juce::jmax (lblH, kTickRow) : lblH;
+                auto htop = hi.removeFromTop (titleH);
 
                 //-- TEMPER TO TUNING, IN THE HARMONICS TITLE ROW --------------------
                 //
@@ -10123,7 +10184,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // unreachable - only unreachable FROM HERE, at widths where this panel
                 // cannot be operated anyway.
                 {
-                    const int th = juce::jmax (1, juce::jmin (lblH, htop.getHeight()));
+                    const int th = juce::jmax (1, htop.getHeight());
                     const int tw = fgfit::snugToggleWidth (temperToggle, th);
                     // The word it must not tread on, measured in the font paint() really
                     // uses for it (see paintedSubLabels + the probe that reads them: 11.5
@@ -10132,7 +10193,12 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     const int titleW = juce::GlyphArrangement::getStringWidthInt (
                                            juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")),
                                            tr ("HARMONICS", "HARM\xc3\x92NICS"));
-                    const bool fits = tw <= htop.getWidth() - titleW - 8;
+                    // ...AND THE GLYPH HAS TO BE WHOLE, not only the word. A tick box drawn
+                    // half outside its button is a control that looks broken rather than
+                    // one that looks small, and the row only gets its kTickRow when the
+                    // fader below can spare it - so this is the case where it could not.
+                    const bool fits = th >= fgfit::kTickBox
+                                   && tw <= htop.getWidth() - titleW - 8;
                     temperToggle.setVisible (fits);
                     // Read by paintedSubLabels(), which shortens HARMONICS' cell by it.
                     harmTemperW = fits ? tw + 8 : 0;
