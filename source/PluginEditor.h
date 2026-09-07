@@ -23,6 +23,15 @@
 //
 // Both the call sites and the probe read THESE pairs, so the check cannot go stale by
 // copying: a title that drifts here drifts in the report on the same build.
+//
+// EVERY ACCENT IN HERE IS AN ESCAPE, and the two that were not are why this paragraph
+// exists. The two "afinacio" titles carried their accented o as raw source bytes, which is
+// correct today only because CMakeLists passes /utf-8: without it MSVC reads a BOM-less
+// file in the system codepage and one character becomes two. That is exactly the accident
+// documented further down this file - a name drawing with an extra capital A-tilde in all
+// 42 main-editor snapshots - and a title bar is the one place in this plugin where nobody
+// could photograph it, because Windows draws it. Latent, not live; latent in the one
+// string no gate can see.
 namespace fgdlg
 {
     struct Pair { const char* en; const char* ca; };
@@ -36,7 +45,7 @@ namespace fgdlg
     // The FILE CHOOSER titles are the same hole one ring out: a chooser is an OS window
     // too, and three of these five were English while the other two already used tr.
     inline constexpr Pair openTuning { "Load a tuning (.tun / .scl / .ascl)",
-                                       "Carrega una afinació (.tun / .scl / .ascl)" };
+                                       "Carrega una afinaci\xc3\xb3 (.tun / .scl / .ascl)" };
     inline constexpr Pair openBank   { "Load a scale into the tuning bank (.tun / .scl / .ascl)",
                                        "Carrega una escala al banc d'afinacions (.tun / .scl / .ascl)" };
     inline constexpr Pair openTimbre { "Load a scale file as timbre (.tun / .scl / .ascl)",
@@ -45,7 +54,7 @@ namespace fgdlg
     // These two were already correct. They join the table anyway: the gate is only worth
     // anything if it holds the whole set, and a title that is right today is exactly the
     // one nobody re-reads.
-    inline constexpr Pair saveTuning { "Save tuning", "Desa l'afinació" };
+    inline constexpr Pair saveTuning { "Save tuning", "Desa l'afinaci\xc3\xb3" };
     inline constexpr Pair saveGen    { "Save the generated scale (.scl)",
                                        "Desa l'escala generada (.scl)" };
 
@@ -953,6 +962,12 @@ public:
     // Press, move to the normalised point, release - the whole gesture, through the very
     // handlers a mouse reaches.
     void playgroundDragForTests (float nx, float ny);
+    // TESTS: put a preset name on a corner through the corner box's REAL onChange - the
+    // one path a user has, and the one that used to drop the processor's refusal on the
+    // floor. A name the folder does not hold is the case life produces: the box lists a
+    // snapshot of the preset folder and the file can be gone by the time it is picked.
+    void playgroundAssignForTests (int corner, const juce::String& name)
+    { playgroundPanel.assignForTests (corner, name); }
     // The floating windows' OS ownership, read BACK from the OS. The Z-order behaviour
     // itself (clicking the editor no longer buries the floating window) is enforced by
     // Windows from this one recorded relationship, so the honest automated check is
@@ -1062,6 +1077,13 @@ public:
     // What pressing the overlay's X does, so a test can ask the question that matters
     // after it: does the next tick put the notice straight back?
     void dismissNoticeForTests() { noticeOverlay.setVisible (false); }
+    // TESTS: what this window would SHOW for a refusal the processor handed it. The two
+    // feedback-loop refusals are English sentences built in PluginProcessor.cpp, which has
+    // no tr(); this is where they become the window's language, and a check that feeds it
+    // the processor's OWN literals is what stops a rewording there from quietly shipping
+    // English here.
+    juce::String realtimeRefusalTextForTests (const juce::String& raw) const
+    { return realtimeRefusalText (raw); }
 
     // TESTS: WHAT HAPPENS TO AN EDIT THAT HAS NOT BEEN APPLIED YET.
     //
@@ -5025,7 +5047,7 @@ private:
                     // it ends any edit of it (and throws the unsaved edits away - the one
                     // explicit act that does, see rule 4). Tell the main window.
                     const bool wasEditing = proc->getPlaygroundEditCorner() == i;
-                    proc->assignPlaygroundCorner (i, name, err);
+                    noteAssign (i, proc->assignPlaygroundCorner (i, name, err), err);
                     refresh (true);
                     if (wasEditing && onEditModeChanged) onEditModeChanged();
                 };
@@ -5055,7 +5077,7 @@ private:
                     // be told, or it would keep showing a frozen preset field for a
                     // corner that no longer exists.
                     const bool wasEditing = proc->getPlaygroundEditCorner() == i;
-                    proc->assignPlaygroundCorner (i, {}, err);
+                    noteAssign (i, proc->assignPlaygroundCorner (i, {}, err), err);
                     cornerBox[i].setSelectedId (1, juce::dontSendNotification);
                     refresh (true);
                     if (wasEditing && onEditModeChanged) onEditModeChanged();
@@ -5093,6 +5115,32 @@ private:
             pad.onMoved = [this] { refresh (false); };
             addAndMakeVisible (pad);
             startTimerHz (30);
+        }
+
+        // PUTTING A PRESET ON A CORNER CAN FAIL, AND IT USED TO FAIL IN SILENCE.
+        //
+        // Both call sites declared a `juce::String err`, handed it to
+        // assignPlaygroundCorner, and then threw away the error AND the bool - so the
+        // three ways the processor refuses ("that preset no longer exists", "could not be
+        // read", "not a Fibl\xc3\xb3 preset", see PluginProcessor.cpp) reached nobody. From
+        // the chair it is the worst shape a failure can have: the drop-down keeps showing
+        // the name you picked, because the box's text is the box's own, while the corner
+        // behind it was CLEARED - assignPlaygroundCorner empties the corner before it
+        // reads the file. The pad then blends three corners instead of four and the panel
+        // is telling you it has four. That is not a rare state either: the list is the
+        // preset FOLDER, so anything that moves a file behind the plugin's back - a
+        // rename, a sync client, a second instance saving - produces exactly this.
+        //
+        // Kept as (corner, reason) rather than as a finished sentence so refresh() builds
+        // it in whatever language is on screen at the time; a message parked in the words
+        // of the language it happened in is the same defect one level down. The reason
+        // itself is the PROCESSOR's, and the processor has no tr() - so it arrives in
+        // English and is passed through verbatim rather than paraphrased: half a truth in
+        // the right language is worse than the loader's own words.
+        void noteAssign (int corner, bool ok, const juce::String& why)
+        {
+            assignFailedCorner = ok ? -1 : corner;
+            assignFailedWhy    = ok ? juce::String() : why;
         }
 
         void refillCorner (int i)
@@ -5433,9 +5481,30 @@ private:
                               : juce::String());
                 }
             }
+            // ...AND THE ASSIGNMENT THAT DID NOT HAPPEN, last, where the eye ends up.
+            // Built here rather than stored as a sentence so it is in the language the
+            // panel is in NOW (see noteAssign), and it names the corner: with four boxes
+            // in a row, "it did not work" is not an answer to "which one".
+            if (assignFailedCorner >= 0)
+                s << "\n" << (trF ? trF ("Corner ", "Cantonada ") : juce::String ("Corner "))
+                  << (char) ('A' + assignFailedCorner) << ": " << assignFailedWhy;
             statLbl.setText (s, juce::dontSendNotification);
             pad.repaint();
         }
+
+        // TESTS: drop a name on a corner THROUGH the box's own onChange, which is the only
+        // path a user has and the only one that can swallow anything. A name that is not
+        // in the folder is exactly the case life produces - the list is a snapshot of the
+        // preset folder and the file can be gone by the time it is picked.
+        void assignForTests (int corner, const juce::String& name)
+        {
+            cornerBox[corner].clear (juce::dontSendNotification);
+            cornerBox[corner].addItem (name, 2);
+            cornerBox[corner].setSelectedId (2, juce::sendNotificationSync);
+        }
+
+        int          assignFailedCorner = -1;   // -1 = the last assignment worked
+        juce::String assignFailedWhy;           // the PROCESSOR's own words, verbatim
     };
 
     // Its own desktop window, like the partial-amplitude editor: the pad wants to be as
@@ -5785,6 +5854,19 @@ private:
     int        lastDrawLfo = -1;                    // which LFO the docked wave editor is on
     void attachCustomTab();                         // rebind attachments to the selected modulator
     void showEnvMapMenu (const juce::String& paramID);
+    static const char* modName (int mod);            // "Env 1".."LFO 3" - same in both languages
+public:
+    // TESTS: WHAT ONE ITEM OF THE RIGHT-CLICK MAP MENU SAYS.
+    //
+    // The menu is a juce::PopupMenu, drawn in a window of its own by the OS's popup
+    // machinery, so it is outside every sweep this editor can run over its own children:
+    // the fit sweep, the untranslated-text gate and the mojibake gate all walk Components,
+    // and a menu item is not one. That is how " (8/8 full)" - an English literal and a
+    // hand-typed copy of ModEngine::kMaxTargets - sat in a translated menu unseen. The
+    // menu and this probe call the SAME builder, so what a test reads is what a user gets.
+    juce::String modMapItemTextForTests (int mod) const { return modMapItemText (mod); }
+private:
+    juce::String modMapItemText (int mod) const;
     juce::String currentModParamId (const juce::String& templateId) const; // modE1A -> modE2A...
     void addMapListener (juce::Component& c, const juce::String& paramID, bool dynamicMod = false);
     struct ParamMapListener : juce::MouseListener
@@ -5844,6 +5926,26 @@ private:
     // which is what puts it in the right z-order - see the struct's own comment.
     SpecSections   specSections;
     NoticeOverlay  noticeOverlay;
+    // HOW A NOTICE IS PUT ON SCREEN, AND WHY IT IS A LAMBDA AND NOT TWO STRINGS.
+    //
+    // NoticeOverlay::title and ::body are plain juce::Strings. Five places wrote their
+    // tr() pairs straight into them and nothing ever wrote them again - so the language
+    // button, which re-runs applyLanguage() over every label, button, tooltip and combo
+    // in the window, walked straight past the one panel in the middle of the screen that
+    // was TELLING THE USER SOMETHING HAD GONE WRONG. A project whose scale would not load
+    // said so in English, the user switched the window to Catalan to read it, and the
+    // notice was the single thing that did not follow.
+    //
+    // The fix cannot be "translate it again", because a notice carries data as well as
+    // words - a corner letter, a count, a parser's own message - and only the site that
+    // raised it knows those. So the site hands over the RECIPE instead: a callable that
+    // writes title and body through tr(). Raising it runs it once; applyLanguage runs it
+    // again while the panel is up, and every notice in this window follows the language
+    // for the same reason and by the same line.
+    std::function<void()> noticeRender;
+    void raiseNotice (std::function<void()> render);
+    // The processor's realtime refusals in the window's language (see the definition).
+    juce::String realtimeRefusalText (const juce::String& raw) const;
     RecentOverlay  recentOverlay;   // floating list of every scale file loaded
     DissDegreeList degreeList;   // active-scale dissonance list (lives inside dissView)
     DissHeader     dissHeader;   // Step / Sethares-dissonance column header

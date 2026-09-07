@@ -2426,8 +2426,13 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         // dies with the editor - and destroying a juce::FileChooser cancels its pending
         // callback, which is exactly the protection this one opted out of. It was the odd
         // one out for no reason; it is not any more.
+        // THE TITLE COMES OUT OF fgdlg, like the other nine. This one was written out
+        // here instead - the same two words, a second time - and a table whose whole job
+        // is to be the ONE place an OS-window title is written has exactly one failure
+        // mode: a second copy. The gate at fgdlg::all walks the TABLE, so the copy was
+        // invisible to it; only the copy could go stale, and it was the copy the user saw.
         fileChooser = std::make_unique<juce::FileChooser> (
-            tr ("Save tuning", "Desa l'afinaci\xc3\xb3"),
+            tr (fgdlg::saveTuning.en, fgdlg::saveTuning.ca),
             juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
                 .getChildFile ("tuning.tun"),
             "*.tun;*.scl");
@@ -2444,7 +2449,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                 if (! (asScl ? processorRef.saveCurrentTuningScl (f, err)
                              : processorRef.saveCurrentTuningTun (f, err)))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        tr ("Save tuning", "Desa l'afinaci\xc3\xb3"), err, this);
+                        tr (fgdlg::saveTuning.en, fgdlg::saveTuning.ca), err, this);
                 refocus();
             });
     };
@@ -4085,9 +4090,14 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Lowest note: only the lowest held note drives the pulses. All notes: every held note drives its own copy of the trains, transposed by its interval from the lowest.",
         "Nota m\xc3\xa9s greu: nom\xc3\xa9s la nota m\xc3\xa9s greu mant\xc3\xa9 els polsos. Totes les notes: cada nota mantinguda porta la seva c\xc3\xb2pia dels trens, transposada pel seu interval respecte a la m\xc3\xa9s greu."));
     rhythmPanel.tempoT.setButtonText (tr ("Tempo sync (CC20)", "Sync de tempo (CC20)"));
+    // "el bot\xc3\xb3 \"Com encaminar\"", not the English label. A tooltip that ENDS by
+    // sending the reader to a button is the one string in the window where naming it
+    // wrongly costs something real: there is no button anywhere on screen carrying the
+    // English words, so the instruction reads as a reference to a control that is not
+    // there. The Catalan of that button is set 450 lines down, in this same function.
     rhythmPanel.tempoT.setTooltip (tr (
         "The DAW tempo FOLLOWS pulse 1 (x2 / /2 to scale). NEEDS a one-time setup: in Ableton, drop the free \"Fibló Tempo Sync\" Max for Live device on a MIDI track that receives this plugin's MIDI output. In other DAWs, MIDI-map the tempo to CC20 with a 20-147 BPM range. Full steps: the \"How to route\" button.",
-        "El tempo del DAW SEGUEIX el pols 1 (x2 / /2 per escalar). CAL una configuraci\xc3\xb3 \xc3\xbanica: a Ableton, posa el dispositiu Max for Live gratu\xc3\xaft \"Fibl\xc3\xb3 Tempo Sync\" en una pista MIDI que rebi la sortida MIDI del plugin. En altres DAW, mapeja el tempo al CC20 amb rang 20-147 BPM. Passos complets: el bot\xc3\xb3 \"How to route\"."));
+        "El tempo del DAW SEGUEIX el pols 1 (x2 / /2 per escalar). CAL una configuraci\xc3\xb3 \xc3\xbanica: a Ableton, posa el dispositiu Max for Live gratu\xc3\xaft \"Fibl\xc3\xb3 Tempo Sync\" en una pista MIDI que rebi la sortida MIDI del plugin. En altres DAW, mapeja el tempo al CC20 amb rang 20-147 BPM. Passos complets: el bot\xc3\xb3 \"Com encaminar\"."));
     for (int i = 0; i < RhythmEngine::kSlots; ++i)
     {
         rhythmPanel.pitchE[i].setTooltip (tr (
@@ -4119,9 +4129,14 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     for (auto* b : { &envTabB[0], &envTabB[1], &envTabB[2] })
         b->setTooltip (tr ("The envelopes share this box - click a title to switch.",
                            "Les envolupants comparteixen aquesta caixa - clica un t\xc3\xadtol per canviar."));
+    // SAME FAULT AS THE TEMPO TOOLTIP ABOVE, and one worse: this one named a button that
+    // does not exist in EITHER language. The button is "Unmap" / "Desassigna" (three lines
+    // down, and again in the CUSTOM tab), and both sides of this pair sent the reader
+    // looking for an "Unmap all" that is nowhere in the window. Each side now quotes the
+    // words its own reader can actually see.
     envTabB[3].setTooltip (tr (
-        "6 modulators: 3 note-retriggered envelopes + 3 LFOs. Right-click ANY fader -> \"Map to\" routes a modulator onto it (several parameters per modulator allowed); it rides on the knob's own value over +-Range. Each modulator has On/Off and \"Unmap all\".",
-        "6 moduladors: 3 envolupants redisparades per nota + 3 LFOs. Clic dret a QUALSEVOL fader -> \"Assigna a\" hi encamina un modulador (diversos par\xc3\xa0metres per modulador); cavalca sobre el valor del knob amb +-Range. Cada modulador t\xc3\xa9 On/Off i \"Unmap all\"."));
+        "6 modulators: 3 note-retriggered envelopes + 3 LFOs. Right-click ANY fader -> \"Map to\" routes a modulator onto it (several parameters per modulator allowed); it rides on the knob's own value over +-Range. Each modulator has On/Off and \"Unmap\".",
+        "6 moduladors: 3 envolupants redisparades per nota + 3 LFOs. Clic dret a QUALSEVOL fader -> \"Assigna a\" hi encamina un modulador (diversos par\xc3\xa0metres per modulador); cavalca sobre el valor del knob amb +-Range. Cada modulador t\xc3\xa9 On/Off i \"Desassigna\"."));
     lblCustRange.setText (tr ("Range", "Rang"),  dontSendNotification);
     modUnmapBtn.setButtonText (tr ("Unmap", "Desassigna"));
     modUnmapBtn.setTooltip (tr ("Unmap this modulator from EVERYTHING it modulates.",
@@ -4248,7 +4263,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Quant dura el lliscament, en segons. S'aplica a QUALSEVOL canvi d'espectre, el causi el que el causi (Base, Harm\xc3\xb2nics, Primers, Fractal, canvi de motor, un espectre adaptat, un modulador...) - no nom\xc3\xa9s Base.\nEl Morphing i el Sec/Humit tenen cadascun el seu Temps, o sigui que canviar d'un a l'altre torna a treure el que \xc3\xa9s seu."));
     dryWetTimeFader.setTooltip (tr (
         "How long the crossfade takes, in seconds. Same range and feel as Morph Time, and it applies to EVERY spectrum change whatever caused it. Below about 5 ms the phase hand-over cannot be made click-free, so 5 ms is the floor the transition actually uses.\nMorph and Dry/Wet keep their own Time, so switching between them brings each one's back. With the transition Off this fader is greyed: there is no transition for it to time.",
-        "Quant dura la fosa creuada, en segons. El mateix abast i tacte que el Temps de Morphing, i s'aplica a QUALSEVOL canvi d'espectre, el causi el que el causi. Per sota d'uns 5 ms el relleu de fase no es pot fer sense clic, i 5 ms \xc3\xa9s el m\xc3\xadnim que la transici\xc3\xb3 fa servir de debo.\nEl Morphing i el Sec/Humit tenen cadascun el seu Temps, o sigui que canviar d'un a l'altre torna a treure el que \xc3\xa9s seu. Amb la transici\xc3\xb3 a Cap aquest fader queda apagat: no hi ha cap transici\xc3\xb3 a cronometrar."));
+        "Quant dura la fosa creuada, en segons. El mateix abast i tacte que el Temps de Morphing, i s'aplica a QUALSEVOL canvi d'espectre, el causi el que el causi. Per sota d'uns 5 ms el relleu de fase no es pot fer sense clic, i 5 ms \xc3\xa9s el m\xc3\xadnim que la transici\xc3\xb3 fa servir de deb\xc3\xb2.\nEl Morphing i el Sec/Humit tenen cadascun el seu Temps, o sigui que canviar d'un a l'altre torna a treure el que \xc3\xa9s seu. Amb la transici\xc3\xb3 a Cap aquest fader queda apagat: no hi ha cap transici\xc3\xb3 a cronometrar."));
     lblTimbreRepeats.setText (tr ("Reps", "Reps"), dontSendNotification);
     lblBend.setText      (tr ("Pitch bend", "Pitch bend"), dontSendNotification);
     lblPeriod.setText    (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
@@ -4260,7 +4275,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Cada fila \xc3\xa9s una D\xc3\x8d""ADA: el xip vermell \"0\" (la tecla arrel) m\xc3\xa9s aquell grau, tocats junts. Xip de color = el color del grau al teclat, despr\xc3\xa9s el seu interval des de 0, i el BATEC de Sethares de la d\xc3\xad""ada contra el timbre actual (com d'aspre sonen 0 + aquell grau junts) - m\xc3\xa9s baix = m\xc3\xa9s consonant. Ordenats de m\xc3\xa9s consonant primer. El per\xc3\xado""de \xc3\xa9s la fila vermella.");
     dissHeader.tip = tr (
         "Sethares dissonance: how ROUGH each scale step sounds with the CURRENT timbre. It recomputes live from the synth's actual partials, so editing the timbre (N, fractal, decay, primes, .scl...) changes these values in real time. Lower = more consonant; the rows are ordered most consonant first.",
-        "Dissonancia de Sethares: com d'ASPRE sona cada pas de l'escala amb el timbre ACTUAL. Es recalcula en viu a partir dels parcials reals del sinte, aix\xc3\xad que editar el timbre (N, fractal, caiguda, primers, .scl...) canvia aquests valors en temps real. M\xc3\xa9s baix = m\xc3\xa9s consonant; les files van de m\xc3\xa9s consonant primer.");
+        "Disson\xc3\xa0ncia de Sethares: com d'ASPRE sona cada pas de l'escala amb el timbre ACTUAL. Es recalcula en viu a partir dels parcials reals del sinte, aix\xc3\xad que editar el timbre (N, fractal, caiguda, primers, .scl...) canvia aquests valors en temps real. M\xc3\xa9s baix = m\xc3\xa9s consonant; les files van de m\xc3\xa9s consonant primer.");
     recentLabel.setText  (tr ("Recent", "Recents"), dontSendNotification);
     recentOpenBtn.setButtonText (tr ("Recent...", "Recents..."));
     recentOpenBtn.setTooltip (tr ("Every scale file loaded in this plugin, newest first. Click one to load it.",
@@ -4457,10 +4472,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     refreshCornerEditUi();
     dissBtn.setTooltip (tr (
         "Computes the Sethares sensory-dissonance curve of the CURRENT timbre and builds a scale from its most consonant points (the curve's minima), then loads it as the active tuning. With Max ticked it uses the roughest points (maxima) instead.",
-        "Calcula la corba de dissonancia sensorial de Sethares del timbre ACTUAL i construeix una escala amb els seus punts m\xc3\xa9s consonants (els m\xc3\xadnims de la corba), i la carrega com a afinaci\xc3\xb3 activa. Amb Max marcat fa servir els punts m\xc3\xa9s aspres (m\xc3\xa0xims)."));
+        "Calcula la corba de disson\xc3\xa0ncia sensorial de Sethares del timbre ACTUAL i construeix una escala amb els seus punts m\xc3\xa9s consonants (els m\xc3\xadnims de la corba), i la carrega com a afinaci\xc3\xb3 activa. Amb Max marcat fa servir els punts m\xc3\xa9s aspres (m\xc3\xa0xims)."));
     dissCountBox.setTooltip (tr (
         "How many notes the generated scale gets (curve minima - or maxima in Max mode), plus the period as the final note.",
-        "Quantes notes tindra l'escala generada (m\xc3\xadnims de la corba - o m\xc3\xa0xims en mode Max), m\xc3\xa9s el per\xc3\xado" "de com a nota final."));
+        "Quantes notes tindr\xc3\xa0 l'escala generada (m\xc3\xadnims de la corba - o m\xc3\xa0xims en mode Max), m\xc3\xa9s el per\xc3\xado" "de com a nota final."));
     dissModeBox.setTooltip (tr (
         "Min = pick the curve's minima (the most consonant intervals).  Max = pick the maxima (the most dissonant intervals) instead.",
         "Min = tria els m\xc3\xadnims de la corba (els intervals m\xc3\xa9s consonants).  Max = tria els m\xc3\xa0xims (els m\xc3\xa9s dissonants) en lloc d'aix\xc3\xb2."));
@@ -4778,7 +4793,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "L'OBJECTIU. M\xc3\xadn = els parcials van on aquestes notes baten menys. M\xc3\xa0x = on baten m\xc3\xa9s. Rang = arriba a un valor de batec entre els dos n\xc3\xbameros que escriguis (el marcador de sota mostra l'escala d'aquests n\xc3\xbameros)."));
     adaptRegPeriodsEdit.setTooltip (tr (
         "HOW WIDE a band of registers the spectrum is optimised for, counted in PERIODS of the loaded tuning and reaching that far BOTH ABOVE AND BELOW the note you are playing. 1.0 means one period down and one period up.\nThe anchor is the lowest note you are HOLDING; with nothing down it is the last note you played, and before you have played anything it is the reference key. The line below names it as period:degree - \"3:0\" is that reference key - and prints the two keys the band really reaches, so a band cut short by the end of the keyboard shows as \"-0.4/+1.0\" instead of pretending to be symmetric.\nWhy PERIODS and not steps or octaves: a period is the unit the tuning itself is built from, so one number is the same musical width in every scale (1200 cents in 12-EDO, 1902 in Bohlen-Pierce) and it never has to be re-read when you change tuning. Most of this instrument's tunings have no octave, and a count of scale steps is exact but unreadable: 62 is two periods in 31-EDO and sixty-two in a one-degree scale.\nWhy BOTH WAYS: Sethares' critical band is a width in Hz, not in cents, so the answer really is different up and down the keyboard - the interval that beats worst is about 434 cents low and only 61 cents four octaves up. Measured, one period below the played note costs 1.46x a spectrum optimised there, against 1.27x once the band straddles the note.\nThe default is one period each way, and that is measured rather than guessed: across a symmetric band the coverage average barely separates the widths at all - a 2.4% spread - so the default is decided by what does separate them. It costs the register you are really playing almost nothing, and it is the WIDEST band the REALTIME follower samples exactly: one register per period, three points, which is the follower's own cap. 0 is legal and means the played register alone.\nWITH AN ABSOLUTE .tun TABLE there is no scale behind the pitches and therefore no period; the band is then built on the period Fibló measured for the file, and the line below says so and by how many cents the file strays from it. If the file has nothing ascending to measure at all, that line says so too - it is never presented as a fact.\nHOW THE BAND IS COMBINED: every register in it counts EQUALLY - the spectrum is optimised for the AVERAGE beating across the whole span, so a wider band trades a little at the note under your fingers for the registers around it. That is not a setting: there used to be a *worst case* choice beside this field and it could not change the result. The objective is evaluated at one point per period, capped at 7 for the Adapt button and 3 for the REALTIME follower (the cost is exactly linear in that count). Nothing is degraded silently - the panel prints how many points each path really uses.",
-        "L'AMPLADA de la banda de registres per als quals s'optimitza l'espectre, comptada en PER\xc3\x8dODES de l'afinaci\xc3\xb3 carregada i que arriba fins all\xc3\xa0 tant PER SOBRE com PER SOTA de la nota que toques. 1,0 vol dir un per\xc3\xado" "de avall i un amunt.\nL'\xc3\xa0ncora \xc3\xa9s la nota m\xc3\xa9s greu que MANTENS; si no en mantens cap, l'\xc3\xbaltima que has tocat, i abans de tocar res, la tecla de refer\xc3\xa8ncia. La l\xc3\xadnia de sota l'anomena com a per\xc3\xado" "de:grau - \"3:0\" \xc3\xa9s aquella tecla de refer\xc3\xa8ncia - i escriu les dues tecles a les quals arriba de debo, de manera que una banda escap\xc3\xa7""ada pel final del teclat es veu com a \"-0,4/+1,0\" en comptes de fer veure que \xc3\xa9s sim\xc3\xa8trica.\nPer qu\xc3\xa8 PER\xc3\x8dODES i no passos ni octaves: el per\xc3\xado" "de \xc3\xa9s la unitat amb qu\xc3\xa8 est\xc3\xa0 constru\xc3\xaf" "da l'afinaci\xc3\xb3 mateixa, o sigui que un sol n\xc3\xbamero \xc3\xa9s la mateixa amplada musical a qualsevol escala (1200 cents en 12-EDO, 1902 en Bohlen-Pierce) i no s'ha de rellegir mai en canviar d'afinaci\xc3\xb3. La majoria d'afinacions d'aquest instrument no tenen octava, i un compte de passos \xc3\xa9s exacte per\xc3\xb2 illegible: 62 s\xc3\xb3n dos per\xc3\xado" "des en 31-EDO i seixanta-dos en una escala d'un sol grau.\nPer qu\xc3\xa8 CAP A TOTES DUES BANDES: la banda cr\xc3\xadtica de Sethares \xc3\xa9s una amplada en Hz, no en cents, i per aix\xc3\xb2 la resposta \xc3\xa9s realment diferent amunt i avall del teclat - l'interval que m\xc3\xa9s bat \xc3\xa9s d'uns 434 cents als greus i nom\xc3\xa9s 61 quatre octaves m\xc3\xa9s amunt. Mesurat, un per\xc3\xado" "de per sota de la nota tocada costa 1,46x respecte d'un espectre optimitzat all\xc3\xa0, contra 1,27x quan la banda encavalca la nota.\nPer defecte \xc3\xa9s un per\xc3\xado" "de a cada banda, i aix\xc3\xb2 est\xc3\xa0 mesurat, no suposat: amb una banda sim\xc3\xa8trica la mitjana de cobertura gaireb\xc3\xa9 no separa les amplades - un 2,4% de diferencia - de manera que el valor per defecte el decideix el que s\xc3\xad que les separa. Costa gaireb\xc3\xa9 res al registre que est\xc3\xa0s tocant de debo, i \xc3\xa9s la banda M\xc3\x89S AMPLA que el seguidor en TEMPS REAL mostreja exactament: un registre per per\xc3\xado" "de, tres punts, que \xc3\xa9s el seu propi m\xc3\xa0xim. 0 \xc3\xa9s legal i vol dir nom\xc3\xa9s el registre tocat.\nAMB UNA TAULA .tun ABSOLUTA no hi ha cap escala darrere de les al\xc3\xa7""ades i per tant no hi ha per\xc3\xado" "de; la banda es construeix llavors sobre el per\xc3\xado" "de que Fibl\xc3\xb3 ha mesurat per al fitxer, i la l\xc3\xadnia de sota ho diu i tamb\xc3\xa9 quants cents se n'aparta el fitxer. Si el fitxer no t\xc3\xa9 res ascendent per mesurar, aquella l\xc3\xadnia tamb\xc3\xa9 ho diu - mai no es presenta com un fet.\nCOM ES COMBINA LA BANDA: tots els seus registres compten IGUAL - l'espectre s'optimitza per a la MITJANA del batec de tot el tram, de manera que una banda m\xc3\xa9s ampla cedeix una mica a la nota que tens sota els dits per guanyar als registres del voltant. Aix\xc3\xb2 no \xc3\xa9s cap opci\xc3\xb3: al costat d'aquest camp hi havia un *pitjor cas* i no podia canviar el resultat. L'objectiu s'avalua a un punt per per\xc3\xado" "de, amb un m\xc3\xa0xim de 7 per al bot\xc3\xb3 Adapta i de 3 per al seguidor en TEMPS REAL (el cost \xc3\xa9s exactament lineal amb aquest nombre). No es degrada res en silenci - el panell escriu quants punts fa servir de debo cada cam\xc3\xad."));
+        "L'AMPLADA de la banda de registres per als quals s'optimitza l'espectre, comptada en PER\xc3\x8dODES de l'afinaci\xc3\xb3 carregada i que arriba fins all\xc3\xa0 tant PER SOBRE com PER SOTA de la nota que toques. 1,0 vol dir un per\xc3\xado" "de avall i un amunt.\nL'\xc3\xa0ncora \xc3\xa9s la nota m\xc3\xa9s greu que MANTENS; si no en mantens cap, l'\xc3\xbaltima que has tocat, i abans de tocar res, la tecla de refer\xc3\xa8ncia. La l\xc3\xadnia de sota l'anomena com a per\xc3\xado" "de:grau - \"3:0\" \xc3\xa9s aquella tecla de refer\xc3\xa8ncia - i escriu les dues tecles a les quals arriba de deb\xc3\xb2, de manera que una banda escap\xc3\xa7""ada pel final del teclat es veu com a \"-0,4/+1,0\" en comptes de fer veure que \xc3\xa9s sim\xc3\xa8trica.\nPer qu\xc3\xa8 PER\xc3\x8dODES i no passos ni octaves: el per\xc3\xado" "de \xc3\xa9s la unitat amb qu\xc3\xa8 est\xc3\xa0 constru\xc3\xaf" "da l'afinaci\xc3\xb3 mateixa, o sigui que un sol n\xc3\xbamero \xc3\xa9s la mateixa amplada musical a qualsevol escala (1200 cents en 12-EDO, 1902 en Bohlen-Pierce) i no s'ha de rellegir mai en canviar d'afinaci\xc3\xb3. La majoria d'afinacions d'aquest instrument no tenen octava, i un compte de passos \xc3\xa9s exacte per\xc3\xb2 il\xc2\xb7legible: 62 s\xc3\xb3n dos per\xc3\xado" "des en 31-EDO i seixanta-dos en una escala d'un sol grau.\nPer qu\xc3\xa8 CAP A TOTES DUES BANDES: la banda cr\xc3\xadtica de Sethares \xc3\xa9s una amplada en Hz, no en cents, i per aix\xc3\xb2 la resposta \xc3\xa9s realment diferent amunt i avall del teclat - l'interval que m\xc3\xa9s bat \xc3\xa9s d'uns 434 cents als greus i nom\xc3\xa9s 61 quatre octaves m\xc3\xa9s amunt. Mesurat, un per\xc3\xado" "de per sota de la nota tocada costa 1,46x respecte d'un espectre optimitzat all\xc3\xa0, contra 1,27x quan la banda encavalca la nota.\nPer defecte \xc3\xa9s un per\xc3\xado" "de a cada banda, i aix\xc3\xb2 est\xc3\xa0 mesurat, no suposat: amb una banda sim\xc3\xa8trica la mitjana de cobertura gaireb\xc3\xa9 no separa les amplades - un 2,4% de difer\xc3\xa8ncia - de manera que el valor per defecte el decideix el que s\xc3\xad que les separa. Costa gaireb\xc3\xa9 res al registre que est\xc3\xa0s tocant de deb\xc3\xb2, i \xc3\xa9s la banda M\xc3\x89S AMPLA que el seguidor en TEMPS REAL mostreja exactament: un registre per per\xc3\xado" "de, tres punts, que \xc3\xa9s el seu propi m\xc3\xa0xim. 0 \xc3\xa9s legal i vol dir nom\xc3\xa9s el registre tocat.\nAMB UNA TAULA .tun ABSOLUTA no hi ha cap escala darrere de les al\xc3\xa7""ades i per tant no hi ha per\xc3\xado" "de; la banda es construeix llavors sobre el per\xc3\xado" "de que Fibl\xc3\xb3 ha mesurat per al fitxer, i la l\xc3\xadnia de sota ho diu i tamb\xc3\xa9 quants cents se n'aparta el fitxer. Si el fitxer no t\xc3\xa9 res ascendent per mesurar, aquella l\xc3\xadnia tamb\xc3\xa9 ho diu - mai no es presenta com un fet.\nCOM ES COMBINA LA BANDA: tots els seus registres compten IGUAL - l'espectre s'optimitza per a la MITJANA del batec de tot el tram, de manera que una banda m\xc3\xa9s ampla cedeix una mica a la nota que tens sota els dits per guanyar als registres del voltant. Aix\xc3\xb2 no \xc3\xa9s cap opci\xc3\xb3: al costat d'aquest camp hi havia un *pitjor cas* i no podia canviar el resultat. L'objectiu s'avalua a un punt per per\xc3\xado" "de, amb un m\xc3\xa0xim de 7 per al bot\xc3\xb3 Adapta i de 3 per al seguidor en TEMPS REAL (el cost \xc3\xa9s exactament lineal amb aquest nombre). No es degrada res en silenci - el panell escriu quants punts fa servir de deb\xc3\xb2 cada cam\xc3\xad."));
     // The SAME hover on the caption and on the line under the field: the sentence that
     // explains the aggregate now lives here (the box that used to say it in words is gone),
     // and a user reaching for "what happened to the average/worst choice" is as likely to
@@ -4799,7 +4814,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "TEMPS REAL: l'espectre segueix el QUE TOQUES - es torna a adaptar a l'acord que tens sota els dits, a l'al\xc3\xa7""ada real, cada cop que aquell acord canvia. UNA sola nota ja funciona: si no sona res m\xc3\xa9s, l'objectiu \xc3\xa9s el batec dels parcials entre ells, de manera que una melodia o un baix tamb\xc3\xa9 tenen el seu timbre m\xc3\xa9s llis (o m\xc3\xa9s aspre), i un de diferent a cada registre. Si no mantens res, no fa res; si mantens el mateix acord, es queda quiet. Limitat a ~quatre adaptacions per segon i fusionat. (L'afinaci\xc3\xb3 carregada \xc3\xa9s un objectiu per al bot\xc3\xb3 Adapta, no per a un seguidor: nom\xc3\xa9s escriuria la mateixa escala a l'espectre.) En desactivar-ho queda UN Ctrl+Z per recuperar l'espectre anterior."));
     lookaheadBtn.setTooltip (tr (
         "LOOKAHEAD: the spectrum is ready BEFORE the note sounds, for written MIDI played back by the DAW.\nA plugin cannot see future MIDI - so this makes the plugin ARRIVE LATE on purpose. It reports 250 ms of latency, the host's delay compensation shifts everything back into place, and the incoming MIDI is buffered here by exactly that much. The adaptive search runs on each note as it ARRIVES, so on playback the partials change sample-aligned with the note instead of ~50-200 ms into it.\nWHERE 250 ms COMES FROM (all measured): up to 100 ms of the follower's own throttle before the search may start, one 60 Hz poll to notice the notes, the search itself (11 ms at 8 partials, 33 at 12, ~104-137 at 16), one more poll to apply it and the 50 ms de-click fade.\nSO IT DOES NOT FIT EVERY SETTING: beside the budget the button prints how long the LAST chord change really took on your machine, and marks it LATE when it did not fit. If you see LATE, use fewer partials.\nPLAYING LIVE FEELS THOSE 250 ms: this is for composing, not for performing. The plugin's rhythm MIDI OUT is delayed by the same amount (it is generated from the same shifted stream, which is what keeps the pulses locked to the audio) and hosts differ in whether they compensate a plugin's MIDI output.\nIt only costs latency while a REALTIME spectrum follower is actually running; otherwise it waits and reports zero. A loop or a locator jump flushes what is in flight, so no stale note is replayed.",
-        "ANTICIPACI\xc3\x93: l'espectre est\xc3\xa0 llest ABANS que soni la nota, per a MIDI escrit i reprodu\xc3\xaft pel DAW.\nUn plugin no pot veure el MIDI futur - o sigui que aix\xc3\xb2 fa que el plugin ARRIBI TARD expressament. Declara 250 ms de lat\xc3\xa8ncia, la compensaci\xc3\xb3 de retard de l'amfitri\xc3\xb3 ho torna tot al seu lloc, i el MIDI d'entrada es reserva aqu\xc3\xad exactament aquest temps. La cerca adaptativa s'executa sobre cada nota quan ARRIBA, o sigui que en reproducci\xc3\xb3 els parcials canvien clavats a la mostra amb la nota, en comptes de ~50-200 ms m\xc3\xa9s tard.\nD'ON SURTEN ELS 250 ms (tot mesurat): fins a 100 ms del limitador del seguidor abans que la cerca pugui comen\xc3\xa7""ar, un sondeig de 60 Hz per adonar-se'n, la cerca mateixa (11 ms amb 8 parcials, 33 amb 12, ~104-137 amb 16), un altre sondeig per aplicar-la i els 50 ms d'esvaniment anti-clic.\nAIX\xc3\x92 VOL DIR QUE NO ENCAIXA A TOTES LES CONFIGURACIONS: al costat del pressupost el bot\xc3\xb3 escriu quant ha trigat de debo el darrer canvi d'acord a la teva m\xc3\xa0quina, i el marca TARD quan no hi ha cabut. Si veus TARD, fes servir menys parcials.\nTOCAR EN VIU NOTA aquests 250 ms: aix\xc3\xb2 \xc3\xa9s per compondre, no per tocar. La sortida MIDI de ritme del plugin es retarda igual (es genera del mateix flux despla\xc3\xa7""at, que \xc3\xa9s el que mant\xc3\xa9 els polsos clavats a l'\xc3\xa0udio) i els amfitrions difereixen en si compensen la sortida MIDI d'un plugin.\nNom\xc3\xa9s costa lat\xc3\xa8ncia mentre un seguidor d'espectre en TEMPS REAL est\xc3\xa0 realment en marxa; si no, espera i declara zero. Un bucle o un salt de localitzador buida el que hi ha en vol, o sigui que no es repeteix cap nota vella."));
+        "ANTICIPACI\xc3\x93: l'espectre est\xc3\xa0 llest ABANS que soni la nota, per a MIDI escrit i reprodu\xc3\xaft pel DAW.\nUn plugin no pot veure el MIDI futur - o sigui que aix\xc3\xb2 fa que el plugin ARRIBI TARD expressament. Declara 250 ms de lat\xc3\xa8ncia, la compensaci\xc3\xb3 de retard de l'amfitri\xc3\xb3 ho torna tot al seu lloc, i el MIDI d'entrada es reserva aqu\xc3\xad exactament aquest temps. La cerca adaptativa s'executa sobre cada nota quan ARRIBA, o sigui que en reproducci\xc3\xb3 els parcials canvien clavats a la mostra amb la nota, en comptes de ~50-200 ms m\xc3\xa9s tard.\nD'ON SURTEN ELS 250 ms (tot mesurat): fins a 100 ms del limitador del seguidor abans que la cerca pugui comen\xc3\xa7""ar, un sondeig de 60 Hz per adonar-se'n, la cerca mateixa (11 ms amb 8 parcials, 33 amb 12, ~104-137 amb 16), un altre sondeig per aplicar-la i els 50 ms d'esvaniment anti-clic.\nAIX\xc3\x92 VOL DIR QUE NO ENCAIXA A TOTES LES CONFIGURACIONS: al costat del pressupost el bot\xc3\xb3 escriu quant ha trigat de deb\xc3\xb2 el darrer canvi d'acord a la teva m\xc3\xa0quina, i el marca TARD quan no hi ha cabut. Si veus TARD, fes servir menys parcials.\nTOCAR EN VIU NOTA aquests 250 ms: aix\xc3\xb2 \xc3\xa9s per compondre, no per tocar. La sortida MIDI de ritme del plugin es retarda igual (es genera del mateix flux despla\xc3\xa7""at, que \xc3\xa9s el que mant\xc3\xa9 els polsos clavats a l'\xc3\xa0udio) i els amfitrions difereixen en si compensen la sortida MIDI d'un plugin.\nNom\xc3\xa9s costa lat\xc3\xa8ncia mentre un seguidor d'espectre en TEMPS REAL est\xc3\xa0 realment en marxa; si no, espera i declara zero. Un bucle o un salt de localitzador buida el que hi ha en vol, o sigui que no es repeteix cap nota vella."));
     adaptList.tip = tr ("The adapted spectrum: every partial's interval from the played note, and the amplitude the search gave it. All of them are here - the search moves partials, it never drops them.",
                         "L'espectre adaptat: l'interval de cada parcial respecte a la nota tocada i l'amplitud que li ha donat la cerca. Hi s\xc3\xb3n tots - la cerca mou parcials, no en descarta cap.");
     adaptList.emptyText = tr ("Press Adapt to move the partials to where these notes beat least (or most).",
@@ -4942,6 +4957,17 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         recentOverlay.trF     = hook;
         recentOverlay.list.trF = hook;
         dissHeader.trF        = hook;
+    }
+    // AND THE NOTICE THAT IS ALREADY ON SCREEN, which was the one thing in this window
+    // that this function could not reach. NoticeOverlay holds two plain Strings, written
+    // once by whichever site raised it and never again - so the panel telling the user
+    // their project's tuning would not load stayed in the language it happened in, and
+    // pressing CAT to read it was exactly the gesture that could not work. The site left
+    // its recipe behind (see raiseNotice); run it again and the notice follows.
+    if (noticeOverlay.isVisible() && noticeRender)
+    {
+        noticeRender();
+        noticeOverlay.repaint();
     }
     repaint(); // title uses the language
 }
@@ -6588,6 +6614,55 @@ juce::String FractalAdditiveAudioProcessorEditor::adaptReadoutTip() const
     return t;
 }
 
+// Put something on the notice overlay, and remember HOW it was written so applyLanguage
+// can write it again. See the member's own comment for why this is a callable.
+void FractalAdditiveAudioProcessorEditor::raiseNotice (std::function<void()> render)
+{
+    noticeRender = std::move (render);
+    if (noticeRender) noticeRender();
+    noticeOverlay.setVisible (true);
+    noticeOverlay.toFront (false);
+    noticeOverlay.repaint();
+}
+
+// THE PROCESSOR'S REALTIME REFUSALS, IN THE WINDOW'S LANGUAGE.
+//
+// The feedback guard lives in the processor - it has to, because the link keeps running
+// with this window shut - and the processor has no tr(): it is the audio object, it has no
+// idea which language a window it may not even have is drawing in. Everywhere else that
+// mattered, the answer was an ENUM the editor translates (PresetWriteRefusal is the
+// pattern, and its comment says exactly this). These two refusals were written as English
+// sentences instead, and they are not obscure: they are what a Catalan user gets for
+// pressing REALTIME with temper on, which is the single most likely way to meet them.
+//
+// Recognised by their opening words rather than compared whole, so the processor may fix a
+// typo without this silently falling back to English - and run 75 pins the recognition
+// against the strings the processor really produces, so a REWRITE there goes red here
+// instead of shipping. Anything else - a search that could not start, a bound the engine
+// refused - is passed through untouched: those are the processor's own words about its own
+// numbers, and inventing a translation for a message this function has never seen would be
+// worse than showing the one it was given.
+juce::String FractalAdditiveAudioProcessorEditor::realtimeRefusalText (const juce::String& raw) const
+{
+    if (raw.startsWith ("Temper mode already builds"))
+        return tr ("Temper mode already builds the spectrum FROM the tuning. Running this "
+                   "at the same time would feed each into the other with no end to it, so "
+                   "realtime is off. Switch temper off to use it.",
+                   "El mode Tempera ja construeix l'espectre A PARTIR de l'afinaci\xc3\xb3. "
+                   "Fer-ho anar tot alhora els faria alimentar-se l'un a l'altre sense fi, "
+                   "o sigui que el temps real queda desactivat. Desactiva Tempera per "
+                   "fer-lo servir.");
+    if (raw.startsWith ("\"From spectrum's segment\" already builds"))
+        return tr ("\"From spectrum's segment\" already builds the tuning FROM the spectrum. "
+                   "Adapting the spectrum to that tuning would feed each into the other, so "
+                   "realtime is off.",
+                   "\"Troba afinacions del segment de l'espectre\" ja construeix l'afinaci\xc3\xb3 "
+                   "A PARTIR de l'espectre. Adaptar l'espectre a aquella afinaci\xc3\xb3 els "
+                   "faria alimentar-se l'un a l'altre, o sigui que el temps real queda "
+                   "desactivat.");
+    return raw;
+}
+
 // The two REALTIME buttons' look, plus the one case they must OWN UP to: the processor
 // refused the link (a feedback loop) and switched it off under us. The button has to stop
 // claiming to be on, and the reason has to be said out loud, not swallowed.
@@ -6601,11 +6676,11 @@ void FractalAdditiveAudioProcessorEditor::paintRealtimeButtons()
         if (why.isNotEmpty())
         {
             chordRtOn = adaptRtOn = false;
-            noticeOverlay.title = tr ("Realtime switched off", "Temps real desactivat");
-            noticeOverlay.body  = why;
-            noticeOverlay.setVisible (true);
-            noticeOverlay.toFront (false);
-            noticeOverlay.repaint();
+            raiseNotice ([this, why]
+            {
+                noticeOverlay.title = tr ("Realtime switched off", "Temps real desactivat");
+                noticeOverlay.body  = realtimeRefusalText (why);
+            });
             resized();
         }
     }
@@ -6966,7 +7041,7 @@ juce::String FractalAdditiveAudioProcessorEditor::fewerDegreesBody (int requeste
 {
     return tr ("You asked for ", "N'has demanat ")
         + juce::String (requested)
-        + tr (" but this timbre's dissonance curve only has ", " per\xc3\xb2 la corba de dissonancia d'aquest timbre nom\xc3\xa9s t\xc3\xa9 ")
+        + tr (" but this timbre's dissonance curve only has ", " per\xc3\xb2 la corba de disson\xc3\xa0ncia d'aquest timbre nom\xc3\xa9s t\xc3\xa9 ")
         + juce::String (found)
         + tr (" usable extremes in the chosen period. A curve only forms a notch where partials interact; sparse spectra (few partials, e.g. a near-sine) form few notches - a pure sine forms none. The scale was generated with all the extremes that exist. Add partials (higher N, Fractal, flatter Decay) or widen the period for more.",
               " extrems usables dins del per\xc3\xado" "de triat. La corba nom\xc3\xa9s fa un clot on els parcials interactuen; els espectres escassos (pocs parcials) en fan pocs - un sinus pur no en fa cap. L'escala s'ha generat amb tots els extrems existents. Afegeix parcials (N m\xc3\xa9s alta, Fractal, Caiguda m\xc3\xa9s plana) o eixampla el per\xc3\xado" "de per obtenir-ne m\xc3\xa9s.");
@@ -6985,12 +7060,12 @@ void FractalAdditiveAudioProcessorEditor::refreshDegreeList (bool showNotice)
     }
     else
     {
-        noticeOverlay.title = tr ("Fewer degrees than requested", "Menys graus dels demanats");
-        noticeOverlay.body  = fewerDegreesBody (processorRef.getDissRequested(),
-                                                 processorRef.getDissFound());
-        noticeOverlay.setVisible (true);
-        noticeOverlay.toFront (false);
-        noticeOverlay.repaint();
+        const int want = processorRef.getDissRequested(), got = processorRef.getDissFound();
+        raiseNotice ([this, want, got]
+        {
+            noticeOverlay.title = tr ("Fewer degrees than requested", "Menys graus dels demanats");
+            noticeOverlay.body  = fewerDegreesBody (want, got);
+        });
     }
 }
 
@@ -6999,7 +7074,7 @@ void FractalAdditiveAudioProcessorEditor::saveDissonanceScl()
     if (! processorRef.hasGeneratedScl())
     {
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon,
-            tr ("Save scale", "Desar escala"),
+            tr (fgdlg::saveScale.en, fgdlg::saveScale.ca),   // the table, like line 7026 below
             tr ("Generate a scale first - press 'Find'.",
                 "Primer genera una escala - prem 'Troba'."), this);
         return;
@@ -8899,13 +8974,41 @@ void FractalAdditiveAudioProcessorEditor::attachCustomTab()
     modOnAtt     = std::make_unique<ButtonAttachment> (processorRef.apvts, pfx + "On",    modOnT);
 }
 
+// The six modulators' names, the same in both languages ("Env 1", "LFO 3") and therefore
+// the one part of this menu that does not go through tr.
+const char* FractalAdditiveAudioProcessorEditor::modName (int mod)
+{
+    static const char* names[6] = { "Env 1", "Env 2", "Env 3", "LFO 1", "LFO 2", "LFO 3" };
+    return names[(size_t) juce::jlimit (0, 5, mod)];
+}
+
+// ONE PLACE BUILDS THE MAP MENU'S ITEM TEXT, and the read-out is not typed in.
+//
+// It used to read `names[i] + (full ? " (8/8 full)" : "")`, which was wrong twice over.
+// The word was an English literal glued onto a menu whose own title goes through tr, so a
+// Catalan user right-clicking a fader read "Env 2 (8/8 full)" - the only English left in
+// that menu. And "8/8" was a COPY of ModEngine::kMaxTargets: the count a modulator can
+// hold lives there, one line under the array that is sized by it, and a build that grows
+// a ninth slot would have gone on printing 8 with nothing to notice it. Both numbers now
+// come from the engine that owns them, so the sentence cannot outlive the fact.
+//
+// A menu item is drawn by the OS's own popup, so no sweep of this window's components can
+// see this string; modMapItemTextForTests is how the check reads it.
+juce::String FractalAdditiveAudioProcessorEditor::modMapItemText (int mod) const
+{
+    juce::String label (modName (mod));
+    if (processorRef.getModEngine().isFull (mod))
+        label << " (" << processorRef.getModEngine().numTargets (mod)
+              << "/" << ModEngine::kMaxTargets << tr (" full", " ple") << ")";
+    return label;
+}
+
 // Right-click menu on any fader: route one of the 6 modulators to that parameter
 // (it rides on the knob's own value; set its Range in the Custom tab).
 void FractalAdditiveAudioProcessorEditor::showEnvMapMenu (const juce::String& paramID)
 {
     if (processorRef.apvts.getParameter (paramID) == nullptr) return;
     if (paramID.startsWith ("mod") && paramID.endsWith ("On")) return; // see modOnT
-    static const char* names[6] = { "Env 1", "Env 2", "Env 3", "LFO 1", "LFO 2", "LFO 3" };
     juce::PopupMenu m;
     juce::PopupMenu mapTo;
     for (int i = 0; i < 6; ++i)
@@ -8914,13 +9017,12 @@ void FractalAdditiveAudioProcessorEditor::showEnvMapMenu (const juce::String& pa
         if (processorRef.getModEngine().isMappedTo (paramID, i)
             || paramID.startsWith (ModEngine::ownPrefix (i)))
             continue;
-        const bool full = processorRef.getModEngine().isFull (i);
-        mapTo.addItem (100 + i, juce::String (names[i]) + (full ? " (8/8 full)" : ""), ! full);
+        mapTo.addItem (100 + i, modMapItemText (i), ! processorRef.getModEngine().isFull (i));
     }
     m.addSubMenu (tr ("Map to", "Assigna a"), mapTo);
     for (int i = 0; i < 6; ++i)
         if (processorRef.getModEngine().isMappedTo (paramID, i))
-            m.addItem (200 + i, tr ("Unmap from ", "Desassigna de ") + names[i]);
+            m.addItem (200 + i, tr ("Unmap from ", "Desassigna de ") + modName (i));
     // Guarded like the top-bar menu above: the callback outlives the window when the
     // user closes the plugin with the map menu open, and it ends by touching the editor.
     m.showMenuAsync (juce::PopupMenu::Options(),
@@ -12187,20 +12289,21 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             const int req = processorRef.getChordRequested(), got = processorRef.getChordFound();
             if (req > 0 && got < req)
             {
-                const juce::String gap ((int) std::lround (processorRef.getChordMinGap()));
-                noticeOverlay.title = got == 0
-                    ? tr ("No chord fits that smallest interval", "Cap acord no cap amb aquest interval m\xc3\xadnim")
-                    : tr ("Fewer chords than requested", "Menys acords dels demanats");
-                noticeOverlay.body = got == 0
-                    ? tr ("Every note pair must be at least ", "Cada parella de notes ha d'estar a ") + gap
-                      + tr (" cents apart, and that many gaps do not fit inside the period. Lower 'smallest interval', use fewer notes, or widen the period.",
-                            " cents com a m\xc3\xadnim, i tants espais no caben dins el per\xc3\xado" "de. Abaixa 'interval m\xc3\xa9s petit', posa menys notes o eixampla el per\xc3\xado" "de.")
-                    : tr ("Only ", "Nom\xc3\xa9s ") + juce::String (got) + tr (" of the ", " dels ") + juce::String (req)
-                      + tr (" chords you asked for satisfy a smallest interval of ", " acords demanats compleixen l'interval m\xc3\xadnim de ")
-                      + gap + tr (" cents.", " cents.");
-                noticeOverlay.setVisible (true);
-                noticeOverlay.toFront (false);
-                noticeOverlay.repaint();
+                const int gapC = (int) std::lround (processorRef.getChordMinGap());
+                raiseNotice ([this, req, got, gapC]
+                {
+                    const juce::String gap (gapC);
+                    noticeOverlay.title = got == 0
+                        ? tr ("No chord fits that smallest interval", "Cap acord no cap amb aquest interval m\xc3\xadnim")
+                        : tr ("Fewer chords than requested", "Menys acords dels demanats");
+                    noticeOverlay.body = got == 0
+                        ? tr ("Every note pair must be at least ", "Cada parella de notes ha d'estar a ") + gap
+                          + tr (" cents apart, and that many gaps do not fit inside the period. Lower 'smallest interval', use fewer notes, or widen the period.",
+                                " cents com a m\xc3\xadnim, i tants espais no caben dins el per\xc3\xado" "de. Abaixa 'interval m\xc3\xa9s petit', posa menys notes o eixampla el per\xc3\xado" "de.")
+                        : tr ("Only ", "Nom\xc3\xa9s ") + juce::String (got) + tr (" of the ", " dels ") + juce::String (req)
+                          + tr (" chords you asked for satisfy a smallest interval of ", " acords demanats compleixen l'interval m\xc3\xadnim de ")
+                          + gap + tr (" cents.", " cents.");
+                });
             }
         }
     }
@@ -12211,14 +12314,14 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // the notice appears for the load that failed and not for every tick afterwards.
     if (const auto lost = processorRef.takeTuningRestoreError(); lost.isNotEmpty())
     {
-        noticeOverlay.title = tr ("This project's tuning could not be restored",
-                                  "No s'ha pogut restaurar l'afinaci\xc3\xb3 d'aquest projecte");
-        noticeOverlay.body  = tr ("The scale saved with this project no longer reads, so the instrument is playing 12-tone equal temperament instead. Nothing you play is in the tuning this project was written in.\n\nLoad the scale again if you still have the file.\n\n",
-                                  "L'escala desada amb aquest projecte ja no es pot llegir, o sigui que l'instrument est\xc3\xa0 tocant temperament igual de 12 tons. Res del que toquis est\xc3\xa0 en l'afinaci\xc3\xb3 amb qu\xc3\xa8 es va escriure el projecte.\n\nTorna a carregar l'escala si encara tens el fitxer.\n\n")
-                            + lost;
-        noticeOverlay.setVisible (true);
-        noticeOverlay.toFront (false);
-        noticeOverlay.repaint();
+        raiseNotice ([this, lost]
+        {
+            noticeOverlay.title = tr ("This project's tuning could not be restored",
+                                      "No s'ha pogut restaurar l'afinaci\xc3\xb3 d'aquest projecte");
+            noticeOverlay.body  = tr ("The scale saved with this project no longer reads, so the instrument is playing 12-tone equal temperament instead. Nothing you play is in the tuning this project was written in.\n\nLoad the scale again if you still have the file.\n\n",
+                                      "L'escala desada amb aquest projecte ja no es pot llegir, o sigui que l'instrument est\xc3\xa0 tocant temperament igual de 12 tons. Res del que toquis est\xc3\xa0 en l'afinaci\xc3\xb3 amb qu\xc3\xa8 es va escriure el projecte.\n\nTorna a carregar l'escala si encara tens el fitxer.\n\n")
+                                + lost;
+        });
     }
 
     // ...AND SO DOES A BANK SLOT THAT WOULD NOT LOAD. Same arrangement, one line below,
@@ -12238,14 +12341,14 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // that did not happen.
     if (const auto slotErr = processorRef.takeBankSlotError(); slotErr.isNotEmpty())
     {
-        noticeOverlay.title = tr ("That bank slot could not be loaded",
-                                  "No s'ha pogut carregar aquesta ranura del banc");
-        noticeOverlay.body  = tr ("The scale in the slot you picked no longer reads, so the tuning you were already using is still the one sounding - nothing has changed under you.\n\nPick another slot, or put a working scale back into this one.\n\n",
-                                  "L'escala de la ranura que has triat ja no es pot llegir, o sigui que l'afinaci\xc3\xb3 que ja feies servir segueix sent la que sona - no t'ha canviat res sota els dits.\n\nTria una altra ranura, o torna a posar una escala que funcioni en aquesta.\n\n")
-                            + slotErr;
-        noticeOverlay.setVisible (true);
-        noticeOverlay.toFront (false);
-        noticeOverlay.repaint();
+        raiseNotice ([this, slotErr]
+        {
+            noticeOverlay.title = tr ("That bank slot could not be loaded",
+                                      "No s'ha pogut carregar aquesta ranura del banc");
+            noticeOverlay.body  = tr ("The scale in the slot you picked no longer reads, so the tuning you were already using is still the one sounding - nothing has changed under you.\n\nPick another slot, or put a working scale back into this one.\n\n",
+                                      "L'escala de la ranura que has triat ja no es pot llegir, o sigui que l'afinaci\xc3\xb3 que ja feies servir segueix sent la que sona - no t'ha canviat res sota els dits.\n\nTria una altra ranura, o torna a posar una escala que funcioni en aquesta.\n\n")
+                                + slotErr;
+        });
     }
 
     // OCTAVE stepper read-outs (params can also move via host automation).

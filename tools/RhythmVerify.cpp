@@ -19732,6 +19732,564 @@ static void runProcessorAuditChecks()
                "  the parked 432 survives the preset - a preset changes the sound, not the "
                "reference the user typed");
     }
+
+    //-- run 69: THE CATALAN IN THE EDITOR IS SPELLED CATALAN -------------------------
+    //
+    // Five words went out without their accent or their middle dot, and an accent missing
+    // from a Catalan word is not a typo the reader forgives: one of them is a different
+    // tense of the verb, one is not a Catalan word at all, and one is the spelling another
+    // language uses for the same word. All five are invisible to every gate this project
+    // owns - the tr-pair audit (run 12d) only sees a pair whose two sides are IDENTICAL,
+    // and the snapshot rig only sees mojibake, untranslated text and text that does not
+    // fit. These are well-formed UTF-8 that fits its box and differs from its English
+    // twin, so nothing could ever have caught them. This is the gate that can.
+    //
+    // It reads the SOURCE, exactly as run 12d does, and the needles are assembled from
+    // fragments at run time ON PURPOSE: a check that spelled them out would BE a sixth
+    // occurrence of each, sitting in the repository answering its own grep.
+    //
+    // THE RULE IS "the needle, then a character that is not a letter". Catalan really does
+    // have words that begin with one of these - the difference tone this window names
+    // twice is one - and reporting those would make the gate cry wolf until somebody
+    // switched it off. The five correct spellings all carry a \x escape immediately after
+    // the fragment, so a fixed word can never match its own needle.
+    {
+        std::printf ("\nrun 69: the Catalan in the editor window is spelled Catalan:\n");
+       #ifdef FG_SOURCE_DIR
+        const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
+        const std::string needles[] = { std::string ("tin")    + "dra",
+                                        std::string ("disson") + "ancia",
+                                        std::string ("difer")  + "encia",
+                                        std::string ("il")     + "legible",
+                                        std::string ("de de")  + "bo" };
+        // Plain ASCII, deliberately: juce::CharacterFunctions::toLowerCase takes a code
+        // point, and this walks BYTES - handing it the second byte of an accented letter
+        // would be asking a Unicode question about half a character.
+        const auto lower    = [] (char c) { return (c >= 'A' && c <= 'Z') ? (char) (c + 32) : c; };
+        const auto isLetter = [] (char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+
+        juce::StringArray hits;
+        for (const char* leaf : { "PluginEditor.cpp", "PluginEditor.h" })
+        {
+            const auto held = srcDir.getChildFile ("source").getChildFile (leaf)
+                                    .loadFileAsString().toStdString();
+            const juce::String readable = juce::String ("  the spelling audit can read ") + leaf;
+            check (! held.empty(), readable.toRawUTF8());
+            for (const auto& needle : needles)
+                for (size_t i = 0; i + needle.size() <= held.size(); ++i)
+                {
+                    bool same = true;
+                    for (size_t k = 0; k < needle.size() && same; ++k)
+                        same = lower (held[i + k]) == needle[k];
+                    if (! same) continue;
+                    if (i + needle.size() < held.size() && isLetter (held[i + needle.size()]))
+                        continue;                       // a longer, legitimate word
+                    int line = 1;
+                    for (size_t k = 0; k < i; ++k) if (held[k] == '\n') ++line;
+                    hits.add (juce::String (leaf) + ":" + juce::String (line) + " \""
+                              + juce::String (needle.c_str()) + "\"");
+                }
+        }
+        if (! hits.isEmpty())
+            std::printf ("    %s\n", hits.joinIntoString ("\n    ").toRawUTF8());
+        check (hits.isEmpty(),
+               "  no Catalan word in the editor is missing its accent or its middle dot");
+       #else
+        std::printf ("  [SKIP] spelling audit: FG_SOURCE_DIR not defined\n");
+       #endif
+    }
+
+    //-- run 70: THE TABLE OF OS-WINDOW TITLES IS THE ONLY PLACE THEY ARE WRITTEN ------
+    //
+    // fgdlg exists for one reason: an OS window's title bar is drawn by Windows, not by
+    // this plugin, so no sweep of our own components can ever see it and six of them once
+    // shipped in English under a body that changed language properly. The table is the
+    // answer - the call sites and the gate read the SAME pairs, so a title cannot drift in
+    // one and not the other.
+    //
+    // A table like that has exactly one failure mode, and it is not a typo: it is a SECOND
+    // COPY. Two dialogs wrote their own "Save tuning" pair out by hand and one wrote its
+    // own "Save scale", so fgdlg::saveTuning was read by nothing at all - an entry in the
+    // one true table that no window on the screen was using, while three windows used
+    // copies that only the copies could keep up to date. The old gate walks fgdlg::all, so
+    // the copies were the one thing it could not see.
+    //
+    // Two arms, and both of them are decidable from the source with no exemption list:
+    //   (a) every entry in the table is READ from the table somewhere. This is the arm the
+    //       duplicated saveTuning trips: nothing referred to it by name.
+    //   (b) no OS-dialog call site - a NativeMessageBox or a juce::FileChooser - writes a
+    //       title that is already IN the table as a bare literal. This is the arm the
+    //       saveScale copy trips, and the one that would catch a fourth copy tomorrow.
+    // Arm (b) looks only INSIDE a dialog's own argument list (up to the statement's
+    // semicolon), on purpose: the same words can legitimately be on a BUTTON - the top bar
+    // has one that says "Spectrum vs Rhythm" because that is what it opens - and a gate
+    // that flagged those would be turned off within a week.
+    {
+        std::printf ("\nrun 70: every OS-window title comes from the ONE table (fgdlg):\n");
+       #ifdef FG_SOURCE_DIR
+        const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
+        std::string src;
+        for (const char* leaf : { "PluginEditor.cpp", "PluginEditor.h" })
+            src += srcDir.getChildFile ("source").getChildFile (leaf).loadFileAsString().toStdString();
+        check (src.size() > 100000, "  the dialog-title audit can read the editor's source");
+
+        // The NAMES, spelled here because arm (a) is a question about names; the TEXTS come
+        // from fgdlg::all itself, so no string in this check can go stale against the table.
+        const char* names[] = { "loadScale", "loadTimbre", "saveScale", "rhythmHelp", "mpeOut",
+                                "openTuning", "openBank", "openTimbre", "saveTuning", "saveGen" };
+        const int nNames = (int) (sizeof (names) / sizeof (names[0]));
+        check (nNames == (int) (sizeof (fgdlg::all) / sizeof (fgdlg::all[0])),
+               "  (precondition: this check knows every entry the table holds)");
+
+        juce::StringArray unread;
+        for (const char* nm : names)
+            if (src.find (std::string ("fgdlg::") + nm) == std::string::npos)
+                unread.add (nm);
+        if (! unread.isEmpty())
+            std::printf ("    in the table and read by nothing: %s\n",
+                         unread.joinIntoString (", ").toRawUTF8());
+        check (unread.isEmpty(),
+               "  (a) every title in the table is read FROM the table - an entry nobody "
+               "names is a window using a copy");
+
+        juce::StringArray copies;
+        for (const char* token : { "showMessageBoxAsync", "juce::FileChooser>" })
+            for (size_t at = src.find (token); at != std::string::npos;
+                 at = src.find (token, at + 1))
+            {
+                const size_t semi = src.find (';', at);
+                const size_t end  = std::min (at + 400, semi == std::string::npos ? src.size() : semi);
+                const std::string args = src.substr (at, end - at);
+                for (const auto& d : fgdlg::all)
+                    if (args.find (std::string ("\"") + d.en + "\"") != std::string::npos)
+                    {
+                        int line = 1;                       // both files concatenated, so this
+                        for (size_t k = 0; k < at; ++k)     // is "line n of the pair", enough
+                            if (src[k] == '\n') ++line;     // to find it
+                        copies.add (juce::String ("line ") + juce::String (line) + " writes \""
+                                    + juce::String (d.en) + "\" out by hand");
+                    }
+            }
+        copies.removeDuplicates (false);
+        if (! copies.isEmpty())
+            std::printf ("    %s\n", copies.joinIntoString ("\n    ").toRawUTF8());
+        check (copies.isEmpty(),
+               "  (b) no dialog writes a title the table already holds - the copy is the "
+               "one that goes stale, and it is the one the user sees");
+       #else
+        std::printf ("  [SKIP] dialog-title audit: FG_SOURCE_DIR not defined\n");
+       #endif
+    }
+
+    //-- run 71: A TOOLTIP THAT SENDS YOU TO A BUTTON NAMES THE BUTTON YOU CAN SEE -----
+    //
+    // Several tooltips end by pointing at another control - "Full steps: the X button",
+    // "X on the PITCH tab bends it instead". In Catalan two of them quoted the ENGLISH
+    // label, so the sentence sent the reader looking for a button that is not on the
+    // screen in any language: the window says "Com encaminar" and the tooltip said "How
+    // to route". Nothing could see it. The tr-pair audit passes (the two sides differ),
+    // the snapshot rig's untranslated-text gate passes (the tooltip IS translated - all
+    // but three of its words), and the fit sweep passes (it fits).
+    //
+    // The invariant is small and needs no list: a QUOTED phrase inside a tr() side must be
+    // a phrase THAT SIDE'S READER can see.
+    //   (a) a phrase quoted in the CATALAN half must not be the English half of some tr
+    //       pair that has a different Catalan - that is, verbatim, "the Catalan text names
+    //       a control by its English label";
+    //   (b) if the ENGLISH half quotes a label that IS translated somewhere, the Catalan
+    //       half must quote that label's Catalan. This is the arm that keeps the two
+    //       halves pointing at the SAME button as the window is re-worded.
+    // Both are decided against the pairs the file itself declares, so a renamed control
+    // moves the target of the check with it and nothing here can go stale.
+    {
+        std::printf ("\nrun 71: a tooltip that names a control names the one on screen:\n");
+       #ifdef FG_SOURCE_DIR
+        const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
+        // Every (en, ca) pair in the two editor files, read with the tr-pair audit's own
+        // parser so "adjacent literals are one string" is decided identically in both.
+        std::vector<std::pair<std::string, std::string>> pairs;
+        for (const char* leaf : { "PluginEditor.cpp", "PluginEditor.h" })
+        {
+            const auto held = srcDir.getChildFile ("source").getChildFile (leaf)
+                                    .loadFileAsString().toStdString();
+            const char*  s = held.c_str();
+            const size_t n = held.size();
+            for (size_t i = 0; i + 4 < n; ++i)
+            {
+                if (s[i] != 't' || s[i + 1] != 'r') continue;
+                if (i > 0 && (juce::CharacterFunctions::isLetterOrDigit ((juce::juce_wchar) s[i - 1])
+                              || s[i - 1] == '_')) continue;
+                size_t j = i + 2;
+                if (j < n && s[j] == 'F') ++j;
+                while (j < n && s[j] == ' ') ++j;
+                if (j >= n || s[j] != '(') continue;
+                ++j;
+                std::string en, ca;
+                if (! traudit::readLiteral (s, n, j, en)) continue;
+                while (j < n && (s[j] == ' ' || s[j] == '\t' || s[j] == '\r' || s[j] == '\n')) ++j;
+                if (j >= n || s[j] != ',') continue;
+                ++j;
+                if (! traudit::readLiteral (s, n, j, ca)) continue;
+                pairs.emplace_back (en, ca);
+                i = j;
+            }
+        }
+        check (pairs.size() > 200, "  the label-reference audit can read the editor's pairs");
+
+        // The phrases a literal quotes. Inside a C literal the quote is escaped, so what
+        // is being looked for is the two characters backslash-quote, and an ODD number of
+        // them means an unbalanced sentence rather than a label - those are left alone.
+        const auto quoted = [] (const std::string& lit)
+        {
+            std::vector<std::string> out;
+            for (size_t i = 0; i + 1 < lit.size(); ++i)
+            {
+                if (! (lit[i] == 92 && lit[i + 1] == '"')) continue;      // 92 = backslash
+                const size_t from = i + 2;
+                size_t k = from;
+                while (k + 1 < lit.size() && ! (lit[k] == 92 && lit[k + 1] == '"')) ++k;
+                if (k + 1 >= lit.size()) break;                            // unbalanced
+                out.push_back (lit.substr (from, k - from));
+                i = k + 1;
+            }
+            return out;
+        };
+
+        juce::StringArray wrong;
+        for (const auto& p : pairs)
+        {
+            for (const auto& q : quoted (p.second))          // arm (a)
+                for (const auto& other : pairs)
+                    if (other.first == q && other.second != other.first)
+                    {
+                        wrong.add (juce::String ("Catalan quotes the ENGLISH label \"")
+                                   + juce::String (q.c_str()) + "\" (the window says \""
+                                   + juce::String (other.second.c_str()) + "\")");
+                        break;
+                    }
+
+            for (const auto& q : quoted (p.first))           // arm (b)
+            {
+                bool translated = false, echoed = false;
+                for (const auto& other : pairs)
+                    if (other.first == q && other.second != other.first)
+                    {
+                        translated = true;
+                        if (p.second.find (std::string (1, (char) 92) + "\"" + other.second
+                                           + std::string (1, (char) 92) + "\"") != std::string::npos)
+                            echoed = true;
+                    }
+                if (translated && ! echoed)
+                    wrong.add (juce::String ("English quotes the label \"")
+                               + juce::String (q.c_str())
+                               + "\" and the Catalan half does not quote its Catalan");
+            }
+        }
+        wrong.removeDuplicates (false);
+        if (! wrong.isEmpty())
+            std::printf ("    %s\n", wrong.joinIntoString ("\n    ").toRawUTF8());
+        check (wrong.isEmpty(),
+               "  every control a tooltip quotes is quoted by the name its own reader sees "
+               "on the screen");
+       #else
+        std::printf ("  [SKIP] label-reference audit: FG_SOURCE_DIR not defined\n");
+       #endif
+    }
+
+    //-- run 72: THE MAP MENU SAYS "FULL" IN THE WINDOW'S OWN LANGUAGE, AND COUNTS ----
+    //
+    // A modulator that has all its target slots taken is offered greyed out with the
+    // reason beside it, which is right - the refusal is stated rather than a click that
+    // does nothing. It said it in English in a Catalan window, and it said "8/8" because
+    // both numbers were typed in beside a constant that lives in ModEngine.
+    //
+    // A juce::PopupMenu is drawn by the OS in a window of its own, so it is invisible to
+    // every sweep this editor runs over its own children: the fit sweep, the untranslated
+    // gate and the mojibake gate all walk Components. The menu and modMapItemTextForTests
+    // call the same builder, so this reads the string the user is shown.
+    {
+        std::printf ("\nrun 72: the modulator map menu states its refusal in the right language:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();          // heap: main()'s frame is finite
+        auto& p = *pp;
+        p.prepareToPlay (48000.0, 256);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "  the editor builds");
+        if (ed != nullptr)
+        {
+            ed->setSize (1200, 650);
+            // GATE FIRST: with nothing mapped the item is the bare name, so a builder that
+            // ALWAYS appended the suffix could not pass the checks below by accident.
+            std::printf ("    empty: \"%s\"\n", ed->modMapItemTextForTests (1).toRawUTF8());
+            check (ed->modMapItemTextForTests (1) == "Env 2",
+                   "  a modulator with room says only its name");
+
+            // Fill every slot modulator 1 has. The ids are real parameters and none of them
+            // belongs to modulator 1 itself, which addTarget refuses by design.
+            const char* victims[] = { "baseN", "curveSlope", "fractalLevel", "primeLimit",
+                                      "morphTime", "masterGain", "phaseMode", "timbreRepeats" };
+            for (const char* v : victims) p.getModEngine().addTarget (1, v);
+            check (p.getModEngine().isFull (1),
+                   "  (precondition: the modulator really is full - the checks below are "
+                   "about a refusal that is happening)");
+
+            const auto en = ed->modMapItemTextForTests (1);
+            std::printf ("    full, English: \"%s\"\n", en.toRawUTF8());
+            check (en.contains ("8/8"),
+                   "  a full modulator says how full, and both numbers come from ModEngine");
+            check (en.contains ("full"), "  ...and says it in English in an English window");
+
+            ed->setLanguageForSnapshot (true);
+            const auto ca = ed->modMapItemTextForTests (1);
+            std::printf ("    full, Catalan: \"%s\"\n", ca.toRawUTF8());
+            check (ca.contains ("8/8"), "  the Catalan window counts the same slots");
+            check (! ca.contains ("full"),
+                   "  ...and the last English word in this menu is gone from it");
+            check (ca != en, "  (and the two languages really do differ here)");
+            ed->setLanguageForSnapshot (false);
+        }
+    }
+
+    //-- run 73: A CORNER THAT WOULD NOT TAKE A PRESET SAYS SO --------------------------
+    //
+    // The playground's corner boxes called assignPlaygroundCorner and threw away both the
+    // bool AND the juce::String they had just declared to receive the reason. The three
+    // ways the processor refuses - the preset is gone, it will not read, it is not one of
+    // ours - reached nobody at all.
+    //
+    // It is the worst SHAPE a failure can have, not merely a quiet one. The drop-down goes
+    // on showing the name that was picked, because the box's text is the box's own; the
+    // corner behind it has been CLEARED, because assignPlaygroundCorner empties it before
+    // it reads the file. So the pad blends three corners while the panel says four, and
+    // nothing anywhere connects the two facts. It is not exotic either: the list is a
+    // snapshot of the preset FOLDER, so a rename, a sync client or a second instance
+    // saving is enough.
+    //
+    // Driven through the box's own onChange, which is the only path a user has and the
+    // only one that could swallow anything, and read back off the panel's real status
+    // label through the probe that already existed.
+    {
+        std::printf ("\nrun 73: a corner that would not take a preset says why:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();
+        auto& p = *pp;
+        p.prepareToPlay (48000.0, 256);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "  the editor builds");
+        if (ed != nullptr)
+        {
+            ed->setSize (1200, 650);
+            // GATE FIRST: a panel that always carried a complaint would pass everything
+            // below without the fix.
+            check (! ed->playgroundProbeForTests (520, 560, false).status.contains ("no longer exists"),
+                   "  with nothing wrong, the panel is not complaining");
+
+            ed->playgroundAssignForTests (0, "zzz73-not-a-preset");
+            const auto en = ed->playgroundProbeForTests (520, 560, false).status;
+            std::printf ("    status after the failed drop: \"...%s\"\n",
+                         en.substring (juce::jmax (0, en.length() - 90)).toRawUTF8());
+            check (en.contains ("no longer exists"),
+                   "  the LOADER'S own reason reaches the screen, not a paraphrase of it");
+            check (en.contains ("Corner A") || en.contains ("A:"),
+                   "  ...and it names WHICH of the four boxes refused");
+            check (! p.getPlaygroundCornerName (0).isNotEmpty(),
+                   "  (precondition: the corner really was left empty - the silence hid a "
+                   "cleared corner under a box still showing the name)");
+
+            // ...IN THE LANGUAGE THE PANEL IS IN. The reason is the processor's and stays
+            // its own words, but the sentence around it is rebuilt on every refresh, so a
+            // language switch after the failure does not leave the old one standing.
+            const auto ca = ed->playgroundProbeForTests (520, 560, true).status;
+            check (ca.contains ("no longer exists"),
+                   "  the Catalan panel still carries the loader's own reason");
+            check (ca.contains (juce::String::fromUTF8 ("Cantonada A")),
+                   "  ...under a sentence that switched language with the window");
+        }
+    }
+
+    //-- run 74: THE ONE TABLE NO GATE CAN PHOTOGRAPH SPELLS ITS ACCENTS AS ESCAPES ----
+    //
+    // Two of fgdlg's Catalan titles carried their accented o as RAW SOURCE BYTES. They
+    // render correctly, and only because CMakeLists passes /utf-8 - drop that flag, or let
+    // an editor re-save this BOM-less file in the system codepage, and one character
+    // becomes two. This build has already paid for that once: a name shipped with an extra
+    // capital A-tilde in all 42 main-editor snapshots.
+    //
+    // What makes it worth a gate rather than a tidy-up is WHERE it is. Every other string
+    // in the plugin is drawn by a Component this project can photograph, so the snapshot
+    // rig's mojibake gate would catch it on the next run; an OS dialog's title bar is
+    // drawn by Windows and is the one string in the product no picture can contain. So it
+    // is checked in the source, where it is decidable: nothing inside the fgdlg block may
+    // be a byte above 127.
+    {
+        std::printf ("\nrun 74: the OS-dialog table writes its accents as escapes:\n");
+       #ifdef FG_SOURCE_DIR
+        const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
+        const auto held = srcDir.getChildFile ("source").getChildFile ("PluginEditor.h")
+                                .loadFileAsString().toStdString();
+        const size_t from = held.find ("namespace fgdlg");
+        check (from != std::string::npos, "  the table audit can find the table");
+        if (from != std::string::npos)
+        {
+            const size_t open = held.find ('{', from);
+            const size_t end  = held.find ("\n}", open);       // the namespace's own closer
+            check (open != std::string::npos && end != std::string::npos && end > open,
+                   "  (precondition: the block has a beginning and an end)");
+            juce::StringArray raw;
+            for (size_t i = open; i < end && end != std::string::npos; ++i)
+                if ((unsigned char) held[i] >= 0x80)
+                {
+                    int line = 1;
+                    for (size_t k = 0; k < i; ++k) if (held[k] == '\n') ++line;
+                    raw.add (juce::String ("PluginEditor.h:") + juce::String (line));
+                }
+            raw.removeDuplicates (false);
+            if (! raw.isEmpty())
+                std::printf ("    raw byte where an escape belongs: %s\n",
+                             raw.joinIntoString (", ").toRawUTF8());
+            check (raw.isEmpty(),
+                   "  every accent in the OS-dialog titles is written as an escape - the "
+                   "one set of strings no snapshot can check");
+        }
+       #else
+        std::printf ("  [SKIP] table audit: FG_SOURCE_DIR not defined\n");
+       #endif
+    }
+
+    //-- run 75: THE NOTICE FOLLOWS THE LANGUAGE BUTTON, AND SO DO THE TWO REFUSALS ----
+    //
+    // Two halves of one defect.
+    //
+    // The notice overlay is this window's ONE way of saying that something failed where no
+    // dialog could be raised, and its title and body were plain juce::Strings written once
+    // by whichever site raised them. applyLanguage() re-walks every label, button, tooltip
+    // and combo in the editor and walked straight past the panel in the middle of the
+    // screen that was telling the user something had gone wrong. So a project whose scale
+    // would not load said so in English, and pressing CAT to read it was precisely the
+    // gesture that could not work.
+    //
+    // And the two feedback-loop refusals were English SENTENCES in PluginProcessor.cpp,
+    // which has no tr(). They are not obscure: pressing REALTIME with temper on is the
+    // ordinary way to meet them. The editor translates them at the point of display, and
+    // this pins that translation against the literals the PROCESSOR really holds - so a
+    // rewrite over there goes red here instead of silently shipping English.
+    {
+        std::printf ("\nrun 75: a notice already on screen follows the language button:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();
+        auto& p = *pp;
+        p.prepareToPlay (48000.0, 256);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "  the editor builds");
+        if (ed != nullptr)
+        {
+            ed->setSize (1200, 650);
+            ed->tickTimerForTests();
+            check (! ed->noticeProbeForTests().visible,
+                   "  (gate: with nothing wrong the overlay is not up)");
+
+            // A bank slot that will not load - the same construction the notice-overlay
+            // check above uses, because it is the one that reaches the overlay for real.
+            juce::MemoryBlock st;
+            p.getStateInformation (st);
+            if (auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+            {
+                xml->removeChildElement (xml->getChildByName ("BANK"), true);
+                auto* bank = xml->createNewChildElement ("BANK");
+                auto* slot = bank->createNewChildElement ("SLOT");
+                slot->setAttribute ("i", 0);
+                slot->setAttribute ("name", "zzz-lang-broken");
+                slot->setAttribute ("source", "this is not a scale, and never was");
+                juce::MemoryBlock withBank;
+                juce::AudioProcessor::copyXmlToBinary (*xml, withBank);
+                p.setStateInformation (withBank.getData(), (int) withBank.getSize());
+            }
+            for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+            ed->tickTimerForTests();
+            ed->dismissNoticeForTests();
+            p.setTuningBankSlotParam (1);
+            for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+            ed->tickTimerForTests();
+
+            const auto en = ed->noticeProbeForTests();
+            std::printf ("    English: \"%s\"\n", en.title.toRawUTF8());
+            check (en.visible, "  (precondition: the notice really is on screen)");
+
+            // THE LANGUAGE BUTTON, through the same call the button makes. Nothing raises
+            // the notice again here: take...() cleared the parked message on the tick
+            // above, so anything that changes is the overlay following the language.
+            ed->setLanguageForSnapshot (true);
+            const auto ca = ed->noticeProbeForTests();
+            std::printf ("    Catalan: \"%s\"\n", ca.title.toRawUTF8());
+            check (ca.visible, "  the notice is still up after the switch");
+            check (ca.title != en.title,
+                   "  ...and it is no longer in the language it was raised in");
+            check (ca.body != en.body, "  ...body as well as title");
+            check (ca.body.contains ("zzz-lang-broken"),
+                   "  ...while the loader's own words, and the slot it names, survive it");
+            ed->setLanguageForSnapshot (false);
+            check (ed->noticeProbeForTests().title == en.title,
+                   "  and back again - the recipe is re-run, not translated once");
+
+           #ifdef FG_SOURCE_DIR
+            // THE TWO REFUSALS, read out of the processor's own source so this cannot pass
+            // against a copy of a sentence the processor has stopped producing.
+            const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
+            const auto proc = srcDir.getChildFile ("source").getChildFile ("PluginProcessor.cpp")
+                                    .loadFileAsString().toStdString();
+            std::vector<std::string> refusals;
+            const std::string key = "rtRefusal = ";
+            for (size_t at = proc.find (key); at != std::string::npos; at = proc.find (key, at + 1))
+            {
+                size_t j = at + key.size();
+                std::string lit;
+                if (traudit::readLiteral (proc.c_str(), proc.size(), j, lit))
+                    refusals.push_back (lit);
+            }
+            std::printf ("    the processor holds %d hard-coded refusal sentences\n",
+                         (int) refusals.size());
+            check (refusals.size() == 2,
+                   "  (precondition: the processor still writes exactly the two refusals "
+                   "this window knows how to say)");
+            // The literal still carries its C escapes - one of the two refusals quotes a
+            // control by name - and the editor is handed the DECODED sentence. Undo the
+            // three escapes these two use, so what is fed in is what the compiler built.
+            const auto decode = [] (const std::string& lit)
+            {
+                std::string out;
+                for (size_t i = 0; i < lit.size(); ++i)
+                {
+                    if (lit[i] != (char) 92 || i + 1 >= lit.size()) { out += lit[i]; continue; }
+                    const char n = lit[++i];
+                    out += (n == 'n' ? '\n' : n);      // \" -> " , \\ -> \ , \n -> newline
+                }
+                return out;
+            };
+            for (const auto& r : refusals)
+            {
+                const juce::String raw (decode (r).c_str());
+                ed->setLanguageForSnapshot (false);
+                const auto shown = ed->realtimeRefusalTextForTests (raw);
+                check (shown == raw,
+                       "  in English the window shows the processor's sentence unchanged - "
+                       "which is also how it proves it RECOGNISED it");
+                ed->setLanguageForSnapshot (true);
+                const auto shownCa = ed->realtimeRefusalTextForTests (raw);
+                std::printf ("      \"%s...\" -> \"%s...\"\n",
+                             raw.substring (0, 34).toRawUTF8(),
+                             shownCa.substring (0, 34).toRawUTF8());
+                check (shownCa != raw,
+                       "  ...and in Catalan it is not the English sentence any more");
+                ed->setLanguageForSnapshot (false);
+            }
+           #else
+            std::printf ("  [SKIP] refusal audit: FG_SOURCE_DIR not defined\n");
+           #endif
+        }
+    }
 }
 
 //==============================================================================
