@@ -19399,6 +19399,64 @@ int main (int argc, char** argv)
         }
     }
 
+    //== WHAT MONO GLIDE COSTS WHEN IT LETS GO OF THE VOICES =======================
+    //
+    // An AdditiveVoice carries fourteen std::array<double, 16384> banks - 1.75 MiB each -
+    // because the fidelity promise is that up to kMaxPartials partials render and none is
+    // ever dropped. Switching Mono Glide OFF grows the pool back to kPolyVoices, so it
+    // allocates and zero-fills thirty-one of those, and it does it inside ONE message-thread
+    // tick. On paper that is about 54 MiB in a 16 ms frame.
+    //
+    // MEASURED BEFORE DECIDING ANYTHING, because the fix an audit suggests here - resizing
+    // the banks to the live partial count - is half a day inside a synth's inner loop and
+    // is the one change that can break the fidelity promise. If the hitch is real it is
+    // worth that risk; if it is not, the risk buys nothing. This block is the number.
+    //
+    // Note WHICH thread: this is the message thread, so the failure mode is a window that
+    // stops following the mouse, not an audio dropout. The bound is the one the editor's
+    // own tick check uses - a 30 Hz frame.
+    {
+        std::printf ("\nswitching Mono Glide off, and what the voice pool costs to rebuild:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();
+        auto& p = *pp;
+        p.prepareToPlay (48000.0, 256);
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+        };
+        juce::AudioBuffer<float> b (2, 256);
+        const auto pump = [&] (int blocks)
+        { for (int i = 0; i < blocks; ++i) { juce::MidiBuffer m; b.clear(); p.processBlock (b, m); } };
+
+        // Settle, then go mono - which SHRINKS the pool - and let the shrink complete.
+        sp ("monoGlide", 1.0f);
+        for (int i = 0; i < 40; ++i) { p.pollParametersForTests(); pump (2); }
+        const int voicesMono = p.getNumVoicesForTests();
+
+        // ...and now the expensive direction, timed on the poll that does the work.
+        sp ("monoGlide", 0.0f);
+        double worstMs = 0.0;
+        for (int i = 0; i < 40; ++i)
+        {
+            const auto t0 = juce::Time::getMillisecondCounterHiRes();
+            p.pollParametersForTests();
+            worstMs = std::max (worstMs, juce::Time::getMillisecondCounterHiRes() - t0);
+            pump (2);
+        }
+        const int voicesPoly = p.getNumVoicesForTests();
+        std::printf ("  voices %d (mono) -> %d (poly); worst message-thread poll %.2f ms"
+                     " against a 33.3 ms frame\n", voicesMono, voicesPoly, worstMs);
+
+        // GATE FIRST: if the pool never shrank there was nothing to rebuild and the timing
+        // below is the timing of doing nothing.
+        check (voicesMono < voicesPoly && voicesPoly >= 8,
+               "  (gate) the pool really does shrink for mono and grow back for poly");
+        check (worstMs < 33.3,
+               "and growing it back does not eat a whole frame of the message thread - the"
+               " window keeps following the mouse when Mono Glide is switched off");
+    }
+
     runProcessorAuditChecks();
     runSilentLimitChecks();
 

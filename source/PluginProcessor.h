@@ -1796,6 +1796,13 @@ private:
     // makes chords impossible AND what makes every new note a steal, i.e. a takeover the
     // voice can bend through. Tracked here so switching back restores the real number.
     static constexpr int kPolyVoices = 32;
+public:
+    // TESTS: how many voice objects the pool holds right now. Each carries fourteen
+    // std::array<double, kMaxPartials> banks - 1.75 MiB - so "how many" is also "how much",
+    // and growing the pool back after Mono Glide is the one place that cost lands in a
+    // single message-thread tick.
+    int getNumVoicesForTests() const noexcept { return synth.getNumVoices(); }
+private:
     bool lastMonoGlide = false;           // message thread: last value the voice pool follows
     // The mono shrink is spread over 60 Hz ticks: the notes it has to drop are faded
     // first and the pool follows once they are quiet (see applyMonoVoiceCount). The cap
