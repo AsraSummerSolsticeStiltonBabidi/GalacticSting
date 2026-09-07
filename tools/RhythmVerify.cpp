@@ -19942,4 +19942,59 @@ static void runProcessorAuditChecks()
         std::printf ("  [SKIP] label-reference audit: FG_SOURCE_DIR not defined\n");
        #endif
     }
+
+    //-- run 72: THE MAP MENU SAYS "FULL" IN THE WINDOW'S OWN LANGUAGE, AND COUNTS ----
+    //
+    // A modulator that has all its target slots taken is offered greyed out with the
+    // reason beside it, which is right - the refusal is stated rather than a click that
+    // does nothing. It said it in English in a Catalan window, and it said "8/8" because
+    // both numbers were typed in beside a constant that lives in ModEngine.
+    //
+    // A juce::PopupMenu is drawn by the OS in a window of its own, so it is invisible to
+    // every sweep this editor runs over its own children: the fit sweep, the untranslated
+    // gate and the mojibake gate all walk Components. The menu and modMapItemTextForTests
+    // call the same builder, so this reads the string the user is shown.
+    {
+        std::printf ("\nrun 72: the modulator map menu states its refusal in the right language:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();          // heap: main()'s frame is finite
+        auto& p = *pp;
+        p.prepareToPlay (48000.0, 256);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "  the editor builds");
+        if (ed != nullptr)
+        {
+            ed->setSize (1200, 650);
+            // GATE FIRST: with nothing mapped the item is the bare name, so a builder that
+            // ALWAYS appended the suffix could not pass the checks below by accident.
+            std::printf ("    empty: \"%s\"\n", ed->modMapItemTextForTests (1).toRawUTF8());
+            check (ed->modMapItemTextForTests (1) == "Env 2",
+                   "  a modulator with room says only its name");
+
+            // Fill every slot modulator 1 has. The ids are real parameters and none of them
+            // belongs to modulator 1 itself, which addTarget refuses by design.
+            const char* victims[] = { "baseN", "curveSlope", "fractalLevel", "primeLimit",
+                                      "morphTime", "masterGain", "phaseMode", "timbreRepeats" };
+            for (const char* v : victims) p.getModEngine().addTarget (1, v);
+            check (p.getModEngine().isFull (1),
+                   "  (precondition: the modulator really is full - the checks below are "
+                   "about a refusal that is happening)");
+
+            const auto en = ed->modMapItemTextForTests (1);
+            std::printf ("    full, English: \"%s\"\n", en.toRawUTF8());
+            check (en.contains ("8/8"),
+                   "  a full modulator says how full, and both numbers come from ModEngine");
+            check (en.contains ("full"), "  ...and says it in English in an English window");
+
+            ed->setLanguageForSnapshot (true);
+            const auto ca = ed->modMapItemTextForTests (1);
+            std::printf ("    full, Catalan: \"%s\"\n", ca.toRawUTF8());
+            check (ca.contains ("8/8"), "  the Catalan window counts the same slots");
+            check (! ca.contains ("full"),
+                   "  ...and the last English word in this menu is gone from it");
+            check (ca != en, "  (and the two languages really do differ here)");
+            ed->setLanguageForSnapshot (false);
+        }
+    }
 }

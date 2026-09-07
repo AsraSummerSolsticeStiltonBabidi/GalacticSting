@@ -8914,13 +8914,41 @@ void FractalAdditiveAudioProcessorEditor::attachCustomTab()
     modOnAtt     = std::make_unique<ButtonAttachment> (processorRef.apvts, pfx + "On",    modOnT);
 }
 
+// The six modulators' names, the same in both languages ("Env 1", "LFO 3") and therefore
+// the one part of this menu that does not go through tr.
+const char* FractalAdditiveAudioProcessorEditor::modName (int mod)
+{
+    static const char* names[6] = { "Env 1", "Env 2", "Env 3", "LFO 1", "LFO 2", "LFO 3" };
+    return names[(size_t) juce::jlimit (0, 5, mod)];
+}
+
+// ONE PLACE BUILDS THE MAP MENU'S ITEM TEXT, and the read-out is not typed in.
+//
+// It used to read `names[i] + (full ? " (8/8 full)" : "")`, which was wrong twice over.
+// The word was an English literal glued onto a menu whose own title goes through tr, so a
+// Catalan user right-clicking a fader read "Env 2 (8/8 full)" - the only English left in
+// that menu. And "8/8" was a COPY of ModEngine::kMaxTargets: the count a modulator can
+// hold lives there, one line under the array that is sized by it, and a build that grows
+// a ninth slot would have gone on printing 8 with nothing to notice it. Both numbers now
+// come from the engine that owns them, so the sentence cannot outlive the fact.
+//
+// A menu item is drawn by the OS's own popup, so no sweep of this window's components can
+// see this string; modMapItemTextForTests is how the check reads it.
+juce::String FractalAdditiveAudioProcessorEditor::modMapItemText (int mod) const
+{
+    juce::String label (modName (mod));
+    if (processorRef.getModEngine().isFull (mod))
+        label << " (" << processorRef.getModEngine().numTargets (mod)
+              << "/" << ModEngine::kMaxTargets << tr (" full", " ple") << ")";
+    return label;
+}
+
 // Right-click menu on any fader: route one of the 6 modulators to that parameter
 // (it rides on the knob's own value; set its Range in the Custom tab).
 void FractalAdditiveAudioProcessorEditor::showEnvMapMenu (const juce::String& paramID)
 {
     if (processorRef.apvts.getParameter (paramID) == nullptr) return;
     if (paramID.startsWith ("mod") && paramID.endsWith ("On")) return; // see modOnT
-    static const char* names[6] = { "Env 1", "Env 2", "Env 3", "LFO 1", "LFO 2", "LFO 3" };
     juce::PopupMenu m;
     juce::PopupMenu mapTo;
     for (int i = 0; i < 6; ++i)
@@ -8929,13 +8957,12 @@ void FractalAdditiveAudioProcessorEditor::showEnvMapMenu (const juce::String& pa
         if (processorRef.getModEngine().isMappedTo (paramID, i)
             || paramID.startsWith (ModEngine::ownPrefix (i)))
             continue;
-        const bool full = processorRef.getModEngine().isFull (i);
-        mapTo.addItem (100 + i, juce::String (names[i]) + (full ? " (8/8 full)" : ""), ! full);
+        mapTo.addItem (100 + i, modMapItemText (i), ! processorRef.getModEngine().isFull (i));
     }
     m.addSubMenu (tr ("Map to", "Assigna a"), mapTo);
     for (int i = 0; i < 6; ++i)
         if (processorRef.getModEngine().isMappedTo (paramID, i))
-            m.addItem (200 + i, tr ("Unmap from ", "Desassigna de ") + names[i]);
+            m.addItem (200 + i, tr ("Unmap from ", "Desassigna de ") + modName (i));
     // Guarded like the top-bar menu above: the callback outlives the window when the
     // user closes the plugin with the map menu open, and it ends by touching the editor.
     m.showMenuAsync (juce::PopupMenu::Options(),

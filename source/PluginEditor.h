@@ -5785,6 +5785,19 @@ private:
     int        lastDrawLfo = -1;                    // which LFO the docked wave editor is on
     void attachCustomTab();                         // rebind attachments to the selected modulator
     void showEnvMapMenu (const juce::String& paramID);
+    static const char* modName (int mod);            // "Env 1".."LFO 3" - same in both languages
+public:
+    // TESTS: WHAT ONE ITEM OF THE RIGHT-CLICK MAP MENU SAYS.
+    //
+    // The menu is a juce::PopupMenu, drawn in a window of its own by the OS's popup
+    // machinery, so it is outside every sweep this editor can run over its own children:
+    // the fit sweep, the untranslated-text gate and the mojibake gate all walk Components,
+    // and a menu item is not one. That is how " (8/8 full)" - an English literal and a
+    // hand-typed copy of ModEngine::kMaxTargets - sat in a translated menu unseen. The
+    // menu and this probe call the SAME builder, so what a test reads is what a user gets.
+    juce::String modMapItemTextForTests (int mod) const { return modMapItemText (mod); }
+private:
+    juce::String modMapItemText (int mod) const;
     juce::String currentModParamId (const juce::String& templateId) const; // modE1A -> modE2A...
     void addMapListener (juce::Component& c, const juce::String& paramID, bool dynamicMod = false);
     struct ParamMapListener : juce::MouseListener
