@@ -4451,6 +4451,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // refreshShepardSyncState(); resetting the memo makes it re-render in this language.
     lastShepNoBpm = -1;
     refreshShepardSyncState();
+    // ...and the LFO rate fader's, which names three numbers inside a sentence whose word
+    // order differs between the two languages. Same memo, same reason.
+    lastLfoLimited = -1;
+    refreshLfoRateLimitState();
     // ...and the SHEPARD switch's carries the rise-interval state (see
     // refreshShepardRiseState), for the same reason and by the same rule.
     lastShepRiseState = -1;
@@ -7701,6 +7705,63 @@ void FractalAdditiveAudioProcessorEditor::refreshShepardSyncState()
                        "\n!ARA MATEIX el DAW no d\xc3\xb3na cap BPM!, o sigui que mana el temps LLIURE (ms) - els beats prendran el control quan el DAW ofereixi un tempo.")
                  : juce::String()));
     shepDivBox.repaint();
+}
+
+// THE LFO RATE CAP, SAID OUT LOUD ON THE CONTROL THAT IS BEING CAPPED.
+//
+// A block-stepped LFO cannot represent more than half a cycle per block, so ModEngine
+// clamps the rate at 0.5 * sampleRate / blockSize. That clamp is correct and it is not
+// going away; what was wrong is that it happened in SILENCE. The header's own comment
+// claimed "the limit is reported to the UI (lfoRateLimited)" - there was no such thing,
+// nothing outside that header read isRateLimited(), and the fader went on showing a
+// number the engine was not running at. The user turns a knob to 40 Hz, hears 5.4, and
+// has nowhere to find out why.
+//
+// The engine publishes the four numbers a sentence can be built from now (see
+// ModEngine::rateState); this is the half that says them. Amber on the fader itself,
+// exactly as the beats box goes amber when Sync has no BPM to sync to - a live state
+// belongs on the live control, not in a dialog that would pop on every tick.
+//
+// THE CEILING IS NAMED, not just the fact of the cap, because the ceiling is the whole
+// explanation: it is set by the BUFFER SIZE the user chose in their host, so it is
+// something they can change. "Limited" alone would be a warning light; "your buffer size
+// puts the ceiling at 5.4 Hz" is a thing to act on.
+void FractalAdditiveAudioProcessorEditor::refreshLfoRateLimitState()
+{
+    // Only while an LFO is the selected modulator - modSel is 0..2 for the envelopes and
+    // 3..5 for the LFOs, and rateState indexes the LFOs from 0.
+    const int lfo = modSel - 3;
+    const auto rs = juce::isPositiveAndBelow (lfo, 3)
+                        ? processorRef.getModEngine().rateState (lfo)
+                        : ModEngine::RateState{};
+    const bool lim = juce::isPositiveAndBelow (lfo, 3) && rs.limited;
+    if ((int) lim == lastLfoLimited) return;
+    lastLfoLimited = (int) lim;
+
+    const juce::Colour amber (0xffffb020); // cOverride: "this is being overridden"
+    lfoHzSlider.setColour (juce::Slider::thumbColourId, lim ? amber : cCustomMod);
+    lfoHzSlider.setColour (juce::Slider::trackColourId, (lim ? amber : cCustomMod).withAlpha (0.55f));
+    lfoHzSlider.setTooltip (tr ("Free LFO rate in Hz.", "Velocitat lliure de l'LFO, en Hz.")
+        // PLACEHOLDERS, not concatenation: Catalan and English do not put the numbers in
+        // the same places, and a sentence assembled from fragments in call order is a
+        // sentence one of the two languages gets wrong.
+        + (lim ? tr ("\n!This LFO is running at %1 Hz, not the %2 Hz asked for!: an LFO that "
+                     "steps once per audio block cannot go faster than half a step per block, "
+                     "which is %3 Hz at the buffer size your host is using. A smaller buffer "
+                     "raises the ceiling.",
+                     "\n!Aquest LFO va a %1 Hz, no als %2 Hz demanats!: un LFO que avan\xc3\xa7""a "
+                     "un cop per bloc d'\xc3\xa0udio no pot anar m\xc3\xa9s r\xc3\xa0pid que mig "
+                     // The literal is SPLIT after \xba: the next character is 'f', which C++
+                     // would swallow into the hex escape ("\xbafe" is out of range and the
+                     // build says so). Same trap the accented words elsewhere in this file
+                     // carry, and the same answer - end the literal and start a new one.
+                     "pas per bloc, que s\xc3\xb3n %3 Hz amb la mida de b\xc3\xba" "fer que fa "
+                     "servir el teu amfitri\xc3\xb3. Un b\xc3\xba" "fer m\xc3\xa9s petit puja el sostre.")
+                     .replace ("%1", juce::String (rs.actual,  2))
+                     .replace ("%2", juce::String (rs.asked,   2))
+                     .replace ("%3", juce::String (rs.ceiling, 2))
+             : juce::String()));
+    lfoHzSlider.repaint();
 }
 
 // THE RISE INTERVAL, AND WHY THE CHOICE MAY NOT BE THERE.
@@ -11851,6 +11912,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // driving them, the selector switching modulator, an undo...).
     if (envEditor.isVisible()) envEditor.refresh();
 
+    refreshLfoRateLimitState(); // the LFO rate fader goes amber while the block rate caps it
     refreshModWatch(); // live-modulation marker on every watched fader (see the header)
     refreshSlopeFreeze(); // SLOPE goes grey + "FROZEN" while manual amplitudes are on
     applyTransitionMode();   // the TRANSITION box follows the two booleans, however they moved
@@ -12348,6 +12410,24 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             noticeOverlay.body  = tr ("The scale in the slot you picked no longer reads, so the tuning you were already using is still the one sounding - nothing has changed under you.\n\nPick another slot, or put a working scale back into this one.\n\n",
                                       "L'escala de la ranura que has triat ja no es pot llegir, o sigui que l'afinaci\xc3\xb3 que ja feies servir segueix sent la que sona - no t'ha canviat res sota els dits.\n\nTria una altra ranura, o torna a posar una escala que funcioni en aquesta.\n\n")
                                 + slotErr;
+        });
+    }
+
+    // ...AND A PRESET THAT WOULD NOT LOAD, which is the third of these and the one that
+    // leaves the most wreckage behind it: the preset NAME stays in the box, the old sound
+    // goes on playing, and the previous preset's tuning is still on offer under a button
+    // that now names a patch which never arrived. Every one of those three is a lie the
+    // user has no way to spot, because a preset that half-loads sounds exactly like a
+    // preset that loaded.
+    if (const auto presetErr = processorRef.takePresetLoadError(); presetErr.isNotEmpty())
+    {
+        raiseNotice ([this, presetErr]
+        {
+            noticeOverlay.title = tr ("That preset could not be loaded",
+                                      "No s'ha pogut carregar aquest preset");
+            noticeOverlay.body  = tr ("Nothing has changed: the sound you had is the sound you still have, and the preset name in the box is the one that was there before.\n\nThe file may have been written by a newer build, moved, or edited by hand.\n\n",
+                                      "No ha canviat res: el so que tenies \xc3\xa9s el que segueixes tenint, i el nom del preset de la casella \xc3\xa9s el que ja hi havia.\n\nPot ser que el fitxer l'hagi escrit una versi\xc3\xb3 m\xc3\xa9s nova, que s'hagi mogut, o que l'hagin editat a m\xc3\xa0.\n\n")
+                                + presetErr;
         });
     }
 

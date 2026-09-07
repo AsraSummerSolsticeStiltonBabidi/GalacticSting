@@ -19059,6 +19059,105 @@ int main (int argc, char** argv)
             check (n2.title.containsIgnoreCase ("tuning") || n2.title.containsIgnoreCase ("afinaci"),
                    "...and it is about the project's TUNING, not about a bank slot - the two"
                    " notices say different things because they are different failures");
+
+            //-- AND THE THIRD ONE: A PRESET THAT WOULD NOT LOAD ----------------------
+            //
+            // The processor learned to park this message; without a consumer it was the
+            // bank slot's story over again - recorded, cleared on the first read, never
+            // spoken. This failure leaves the most wreckage of the three: the preset NAME
+            // stays in the box, the old sound goes on playing, and the previous preset's
+            // tuning is still on offer under a button naming a patch that never arrived.
+            // A preset that half-loads sounds exactly like one that loaded.
+            {
+                juce::String perr;
+                p.setPresetFolderForTests (juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                               .getChildFile ("fiblo-notice-presets"));
+                ed->dismissNoticeForTests();
+                ed->tickTimerForTests();
+                const bool loaded = p.loadPreset ("zzz-no-such-preset-at-all");
+                for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+                ed->tickTimerForTests();
+                const auto n3 = ed->noticeProbeForTests();
+                std::printf ("  loading a preset that is not there: loadPreset %s, overlay %s,"
+                             " title \"%s\"\n",
+                             loaded ? "claimed SUCCESS" : "returned false",
+                             n3.visible ? "SHOWN" : "silent", n3.title.toRawUTF8());
+                // GATE: if the load somehow SUCCEEDED there is no failure to report and the
+                // silence below would be correct rather than a defect.
+                check (! loaded, "  (gate) a preset that does not exist really fails to load");
+                check (n3.visible,
+                       "a preset that would not load says so on screen - the third parked"
+                       " message, and the one that leaves the most wreckage behind it");
+                check (n3.title.containsIgnoreCase ("preset"),
+                       "...and the notice is about the PRESET, not about a tuning");
+            }
+        }
+    }
+
+    //== A LIMIT THE ENGINE KNOWS AND THE SCREEN DOES NOT SAY IS STILL A SILENT LIMIT ==
+    //
+    // ModEngine publishes asked/actual/ceiling/limited now, and that is only half a fix:
+    // a number nothing reads is a number nobody is told. The rate fader goes amber and its
+    // hover names all three figures, the way the beats box goes amber when Sync has no BPM.
+    // Driven on the EDITOR, because "the engine knows" and "the user can find out" are two
+    // different claims and only the second one is the promise.
+    {
+        std::printf ("\nthe LFO rate cap reaches the screen, not just the engine:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();               // heap: main()'s frame is finite
+        auto& p = *pp;
+        // A BIG BLOCK is what makes the ceiling low enough to hit from the fader's own
+        // range: 0.5 * 44100 / 8192 = 2.69 Hz, and the knob goes far above that.
+        p.prepareToPlay (44100.0, 8192);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "the editor builds");
+        if (ed != nullptr)
+        {
+            ed->setSize (1200, 650);
+            const auto neutral = ed->lfoRateColourForTests();
+            // Select LFO 1 (modSel 3) and ask it for a rate the block rate cannot carry.
+            ed->selectModulatorForTests (3);
+            const auto sp = [&] (const char* id, float v)
+            {
+                if (auto* q = p.apvts.getParameter (id))
+                    q->setValueNotifyingHost (q->convertTo0to1 (v));
+            };
+            // ...AND THE LFO IS SWITCHED ON, which the first version of this block forgot
+            // (it also set "modL1Rate", an id that does not exist - the real one is
+            // modL1RateMode). The gate below caught both: it printed "asked 0.00" and
+            // refused to let the four checks under it report a panel failure for a
+            // modulator that was never running. That is the gate doing its whole job.
+            sp ("modL1Wave", 0.0f);          // Sine; the wave is not under test
+            sp ("modL1RateMode", 2.0f);      // Free Hz, the dress the fader drives
+            sp ("modL1Hz", 20.0f);           // far over the 2.69 Hz this block size allows
+            sp ("modL1On", 1.0f);
+            p.pollParametersForTests();
+            juce::AudioBuffer<float> b (2, 8192);
+            for (int i = 0; i < 4; ++i) { juce::MidiBuffer m; b.clear(); p.processBlock (b, m); }
+            ed->tickTimerForTests();
+            const auto rs = p.getModEngine().rateState (0);
+            const auto lit = ed->lfoRateColourForTests();
+            const auto tip = ed->lfoRateTooltipForTests();
+            std::printf ("  asked %.2f, running %.2f, ceiling %.2f, limited %d;"
+                         " fader colour %s -> %s\n",
+                         rs.asked, rs.actual, rs.ceiling, (int) rs.limited,
+                         neutral.toDisplayString (false).toRawUTF8(),
+                         lit.toDisplayString (false).toRawUTF8());
+            // GATE FIRST: with nothing capped there is no state to show, and every check
+            // below would be asking whether the panel reports a thing that is not happening.
+            check (rs.limited && rs.asked > rs.ceiling + 0.01f,
+                   "  (gate) the engine really is capping this LFO");
+            check (lit != neutral,
+                   "the rate fader CHANGES COLOUR while it is capped - the state is on the"
+                   " control being capped, not in a dialog that would pop every tick");
+            check (tip.contains (juce::String (rs.ceiling, 2)),
+                   "...and the hover names the CEILING, which is the number the user can do"
+                   " something about (it moves with their buffer size)");
+            check (tip.contains (juce::String (rs.asked, 2)),
+                   "...and the rate they ASKED for, so the two can be compared");
+            check (tip.contains (juce::String (rs.actual, 2)),
+                   "...and the rate really running, which is what they are hearing");
         }
     }
 

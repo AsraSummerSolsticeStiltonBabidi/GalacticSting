@@ -6200,6 +6200,24 @@ private:
     // free ms value is in force, instead of letting it claim a sync that is not
     // happening. See shepardSyncHasNoBpm().
     int lastShepNoBpm = -1;
+    // The LFO rate cap's dressing, cached the same way and for the same reason: the timer
+    // runs at 30 Hz and re-colouring plus re-writing a tooltip on every tick is work
+    // nobody asked for. -1 means "not yet dressed", so the first tick always writes.
+    // Reset by applyLanguage() so the sentence comes back in the new language.
+    int lastLfoLimited = -1;
+    void refreshLfoRateLimitState();
+public:
+    // TESTS: the two things refreshLfoRateLimitState writes, read back.
+    //
+    // "The engine knows it capped the rate" and "the user can find out" are different
+    // claims, and only the second one is the promise this project makes. So the test asks
+    // the CONTROL what colour it is wearing and what its hover says, rather than asking
+    // the engine again what it already published.
+    juce::Colour lfoRateColourForTests() const
+    { return lfoHzSlider.findColour (juce::Slider::thumbColourId); }
+    juce::String lfoRateTooltipForTests() { return lfoHzSlider.getTooltip(); }
+    void selectModulatorForTests (int i) { modSel = juce::jlimit (0, 5, i); resized(); }
+private:
     // 0 = period is the octave (nothing to choose), 1 = a real choice is on screen,
     // 2 = the tuning states no period at all. -1 forces the next refresh to write.
     int lastShepRiseState = -1;
