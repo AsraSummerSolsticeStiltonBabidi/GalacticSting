@@ -1509,6 +1509,32 @@ public:
     juce::String getLfoWavePoints (int lfo) const
     { return juce::isPositiveAndBelow (lfo, 3) ? lfoWavePoints[(size_t) lfo] : juce::String(); }
 
+    // THE SCALE'S OWN ANCHOR, AS ONE LINE, FOR EVERY RENDERER THAT NEEDS IT.
+    //
+    // A .scl states INTERVALS and nothing else, so a tuning rendered to .scl form loses any
+    // absolute reference it had - and the reload that immediately follows re-pins degree 0
+    // to 12-TET middle C. This plugin renders a .scl in FOUR places (export, add a note,
+    // edit a degree, delete a degree) and every one of them is reached by an ordinary edit,
+    // so a scale anchored anywhere else moved the WHOLE INSTRUMENT the first time the user
+    // retyped one key. Measured: an .scl anchored at C = 256 came back at 261.6256 after
+    // editing a degree to the value it already had - 37.63 cents, from an edit that changed
+    // nothing.
+    //
+    // "! @ABL REFERENCE_PITCH <octave> <degree> <freq>" is the Ableton .ascl extension this
+    // plugin's own parser already honours, so it costs nothing in compatibility: any other
+    // Scala host ignores a comment line. Octave 3 degree 0 IS the reference key by that
+    // format's definition, which is the key these renderers count their degrees from.
+    //
+    // Empty when the anchor is already the default, so every .scl this plugin has produced
+    // up to now is written byte-identically.
+    juce::String sclAnchorLine() const
+    {
+        const double refHz = tuning.frequencyForNote (TuningManager::kRefKey);
+        if (! std::isfinite (refHz) || refHz <= 0.0
+            || std::abs (refHz - TuningManager::kRefFreq) <= 1.0e-6)
+            return {};
+        return "! @ABL REFERENCE_PITCH 3 0 " + juce::String (refHz, 6) + "\n";
+    }
     juce::String currentTuningAsScl (const juce::String& name) const; // rationals stay ratios, rest cents
     // What "put the tuning that is playing into the bank" must STORE. For a scale that is
     // the .scl Fibló writes. For an absolute 128-key table there is no .scl to write, so

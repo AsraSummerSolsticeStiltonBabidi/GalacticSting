@@ -1875,7 +1875,10 @@ juce::String FractalAdditiveAudioProcessor::currentTuningAsScl (const juce::Stri
 {
     const int D = juce::jmax (1, tuning.degreesPerPeriod());
     juce::String scl;
-    scl << "! Edited in Fibló Galàctic\n" << name << "\n " << D << "\n!\n";
+    // The scale's own anchor, when it has one - see sclAnchorLine. Without it a .scl
+    // rendered from an anchored tuning re-pins to 12-TET middle C on the reload, and the
+    // whole instrument moves on an edit that changed nothing.
+    scl << "! Edited in Fibló Galàctic\n" << name << "\n " << D << "\n" << sclAnchorLine() << "!\n";
     for (int d = 1; d <= D; ++d)
     {
         long long p = 1, q = 1;
@@ -2043,7 +2046,7 @@ bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce
                                         : juce::String (1200.0 * std::log2 (period), 5);
     juce::String scl;
     const auto name = (tuning.getScalaName().isNotEmpty() ? tuning.getScalaName() : juce::String ("scale")) + "+";
-    scl << "! Edited in Fibló Galàctic (note added)\n" << name << "\n " << (int) degs.size() + 1 << "\n!\n";
+    scl << "! Edited in Fibló Galàctic (note added)\n" << name << "\n " << (int) degs.size() + 1 << "\n" << sclAnchorLine() << "!\n";
     for (const auto& dg : degs) scl << " " << dg.text << "\n";
     scl << " " << periodText << "\n";
 
@@ -2078,7 +2081,7 @@ bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::St
 
     juce::String scl;
     const auto name = (tuning.getScalaName().isNotEmpty() ? tuning.getScalaName() : juce::String ("scale")) + "*";
-    scl << "! Edited in Fibló Galàctic (degree " << degree << " changed)\n" << name << "\n " << D << "\n!\n";
+    scl << "! Edited in Fibló Galàctic (degree " << degree << " changed)\n" << name << "\n " << D << "\n" << sclAnchorLine() << "!\n";
     for (int d = 1; d <= D; ++d)
     {
         if (d == degree)
@@ -2122,7 +2125,7 @@ bool FractalAdditiveAudioProcessor::deleteTuningDegree (int degree, juce::String
 
     juce::String scl;
     const auto name = (tuning.getScalaName().isNotEmpty() ? tuning.getScalaName() : juce::String ("scale")) + "-";
-    scl << "! Edited in Fibló Galàctic (degree " << degree << " deleted)\n" << name << "\n " << D - 1 << "\n!\n";
+    scl << "! Edited in Fibló Galàctic (degree " << degree << " deleted)\n" << name << "\n " << D - 1 << "\n" << sclAnchorLine() << "!\n";
     for (int d = 1; d <= D; ++d)   // d == D is the period line, always kept
     {
         if (d == degree) continue;

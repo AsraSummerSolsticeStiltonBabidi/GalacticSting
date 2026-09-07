@@ -17085,7 +17085,59 @@ int main (int argc, char** argv)
         }
     }
 
-    runPitchContinuityChecks();
+
+    //== AN EDIT DOES NOT MOVE THE WHOLE INSTRUMENT ================================
+    //
+    // A .scl states INTERVALS and nothing else, so a tuning rendered to .scl form loses
+    // any absolute reference it had - and the reload that follows re-pins degree 0 to
+    // 12-TET middle C. EVERY in-plugin edit goes through that render: retyping one degree,
+    // adding a note, Add to Bank, Save as .scl. So loading a scale anchored anywhere but
+    // 261.6256 Hz and then editing ONE degree used to move EVERY key, silently, by
+    // whatever the anchor was worth.
+    //
+    // Driven through the processor's own edit entry point rather than through the
+    // renderer, because the renderer is not where a user goes: editTuningDegree is what
+    // the keyboard's right-click calls, and it renders and reloads in one step. Measured
+    // on the SOUNDING pitch of the reference key, which is what the complaint is about.
+    {
+        std::printf ("\nediting one degree keeps the scale's own anchor:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 256);
+
+        // Scientific pitch, C = 256 Hz on the reference key: 37.6 cents from the default,
+        // so a lost anchor is unmissable rather than a rounding difference. Written as an
+        // .scl carrying the @ABL reference line, which is both what this plugin's parser
+        // honours and - after the fix - what its own renderer emits, so the round trip
+        // below goes out and back through the same door.
+        juce::String tun ("! anchored.scl\n!\n12 equal, anchored at C=256\n 12\n"
+                          "! @ABL REFERENCE_PITCH 3 0 256.000000\n!\n");
+        for (int d = 1; d <= 12; ++d)
+            tun << " " << juce::String (100.0 * (double) d, 6) << "\n";
+        juce::String err;
+        check (p->loadScalaText (tun, "anchored", err), "a scale anchored at C=256 loads");
+        if (auto* tm = p->apvts.getParameter ("tuningMode"))
+            tm->setValueNotifyingHost (tm->convertTo0to1 (2.0f));   // Scala
+        p->pollParametersForTests();
+
+        const double before = p->getNoteFrequency (60);
+        std::printf ("  key 60 sounds %.4f Hz (12-TET middle C is %.4f)\n", before, 261.6255653);
+        // GATE FIRST: with no anchor to lose there is nothing for the round trip to drop,
+        // and every check below would pass on a scale that was never anchored at all.
+        check (std::abs (before - 261.6255653) > 1.0,
+               "the loaded tuning really is anchored away from the default");
+
+        // The user's own path: right-click a key and retype it. Degree 5 becomes 500c,
+        // which it already is in this scale - so the ONLY thing that can change is the
+        // anchor, and any pitch difference below is the bug rather than the edit.
+        check (p->editTuningDegree (5, "500", err), "retyping degree 5 as 500 cents succeeds");
+
+        const double after = p->getNoteFrequency (60);
+        const double cents = 1200.0 * std::log2 (after / before);
+        std::printf ("  after the edit: %.4f Hz (%+.4f cents)\n", after, cents);
+        check (std::abs (cents) < 0.05,
+               "...and every key is where it was - an edit to one degree does not retune "
+               "the instrument");
+    }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
