@@ -17336,6 +17336,124 @@ int main (int argc, char** argv)
         }
     }
 
+    //== THE ENVELOPE'S CURVE EXPONENT IS A PARAMETER, NOT A PER-SAMPLE COST =======
+    //
+    // CurvedEnv::shape used to compute k = 2^(-3c) inside every sample: two std::pow per
+    // sample per envelope where one is the whole job, three envelopes per voice, on every
+    // attack, decay and release the synth plays. The exponent is now worked out where the
+    // parameters arrive.
+    //
+    // A CHANGE TO AN ENVELOPE IS A CHANGE TO THE SOUND, so the reference below is the OLD
+    // spelling - CurvedEnv::shape(pos, curve), which still recomputes k from the curve -
+    // driven through a hand copy of advance(). The two must agree to the LAST BIT at every
+    // sample of every stage.
+    {
+        std::printf ("\nthe envelope's curve exponent moved to setParameters, bit for bit:\n");
+        struct RefEnv     // the old advance(), verbatim, on top of the old shape()
+        {
+            enum Stage { Idle, Attack, Decay, Sustain, Release };
+            Stage  stage = Idle;
+            double sr = 48000.0, pos = 0.0, value = 0.0, from = 0.0;
+            float  a = 0.01f, d = 0.1f, s = 0.8f, r = 0.3f, cA = 0.0f, cD = 0.0f, cR = 0.0f;
+            void setParameters (float A, float D, float S, float R, float ca, float cd, float cr)
+            {
+                a = std::max (1.0e-4f, A); d = std::max (1.0e-4f, D);
+                s = std::min (1.0f, std::max (0.0f, S)); r = std::max (1.0e-4f, R);
+                cA = ca; cD = cd; cR = cr;
+            }
+            void noteOn()  { stage = Attack; pos = 0.0; from = 0.0; value = 0.0; }
+            void noteOff() { if (stage != Idle) { stage = Release; pos = 0.0; from = value; } }
+            float next()
+            {
+                const double dt = 1.0 / sr;
+                switch (stage)
+                {
+                    case Attack:
+                        pos += dt / (double) a;
+                        if (pos >= 1.0) { stage = Decay; pos = 0.0; value = 1.0; }
+                        else value = from + (1.0 - from) * spectrum::CurvedEnv::shape (pos, cA);
+                        break;
+                    case Decay:
+                        pos += dt / (double) d;
+                        if (pos >= 1.0) { stage = Sustain; pos = 0.0; value = s; }
+                        else value = 1.0 + ((double) s - 1.0) * spectrum::CurvedEnv::shape (pos, cD);
+                        break;
+                    case Sustain: value = s; break;
+                    case Release:
+                        pos += dt / (double) r;
+                        if (pos >= 1.0) { stage = Idle; pos = 0.0; value = 0.0; }
+                        else value = from * (1.0 - spectrum::CurvedEnv::shape (pos, cR));
+                        break;
+                    case Idle:
+                    default: value = 0.0; break;
+                }
+                return (float) std::min (1.0, std::max (0.0, value));
+            }
+        };
+
+        const float curves[] = { -1.0f, -0.6f, -0.25f, 0.0f, 0.25f, 0.6f, 1.0f, 2.0f };
+        const double esr = 48000.0;
+        long long compared = 0; int diff = 0; double worst = 0.0;
+        for (float ca : curves)
+            for (float cd : curves)
+            {
+                const float cr = ca;   // release carries its own curve; sweep it with attack
+                spectrum::CurvedEnv env; RefEnv ref;
+                env.setSampleRate (esr); ref.sr = esr;
+                env.setParameters (0.010f, 0.080f, 0.35f, 0.120f, ca, cd, cr);
+                ref.setParameters (0.010f, 0.080f, 0.35f, 0.120f, ca, cd, cr);
+                env.noteOn(); ref.noteOn();
+                const int hold = (int) (0.140 * esr);   // through attack, decay and into sustain
+                for (int i = 0; i < hold; ++i)
+                {
+                    const float x = env.getNextSample(), y = ref.next();
+                    ++compared;
+                    if (x != y) { ++diff; worst = std::max (worst, (double) std::abs (x - y)); }
+                }
+                env.noteOff(); ref.noteOff();
+                for (int i = 0; i < (int) (0.140 * esr); ++i)
+                {
+                    const float x = env.getNextSample(), y = ref.next();
+                    ++compared;
+                    if (x != y) { ++diff; worst = std::max (worst, (double) std::abs (x - y)); }
+                }
+            }
+        std::printf ("    %lld envelope samples over %d curve pairs: %d differ (worst %.3g)\n",
+                     compared, (int) (sizeof (curves) / sizeof (curves[0]))
+                             * (int) (sizeof (curves) / sizeof (curves[0])), diff, worst);
+        check (compared > 800000, "  (precondition) the sweep really rendered the whole A/D/R");
+        check (diff == 0,
+               "  the hoisted exponent renders the SAME BITS the per-sample pow did -"
+               " every stage, every curve, convex and concave");
+
+        // ...and it is cheaper, which is the only reason to have moved it.
+        {
+            spectrum::CurvedEnv env; RefEnv ref;
+            env.setSampleRate (esr); ref.sr = esr;
+            env.setParameters (2.0f, 2.0f, 0.35f, 2.0f, 0.7f, -0.4f, 0.7f);
+            ref.setParameters (2.0f, 2.0f, 0.35f, 2.0f, 0.7f, -0.4f, 0.7f);
+            const int n = 200000;
+            double refMs = 1.0e18, newMs = 1.0e18; volatile float sink = 0.0f;
+            for (int rep = 0; rep < 7; ++rep)
+            {
+                ref.noteOn();
+                double t0 = juce::Time::getMillisecondCounterHiRes();
+                for (int i = 0; i < n; ++i) sink = ref.next();
+                refMs = std::min (refMs, juce::Time::getMillisecondCounterHiRes() - t0);
+                env.noteOn();
+                t0 = juce::Time::getMillisecondCounterHiRes();
+                for (int i = 0; i < n; ++i) sink = env.getNextSample();
+                newMs = std::min (newMs, juce::Time::getMillisecondCounterHiRes() - t0);
+            }
+            (void) sink;
+            std::printf ("    %d attack samples: two pow %.3f ms (%.1f ns/sample),"
+                         " one pow %.3f ms (%.1f ns/sample)\n",
+                         n, refMs, refMs * 1.0e6 / n, newMs, newMs * 1.0e6 / n);
+            check (newMs < refMs,
+                   "  ...and one std::pow per sample really is cheaper than two");
+        }
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }
