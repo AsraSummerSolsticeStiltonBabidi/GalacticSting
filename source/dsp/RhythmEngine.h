@@ -89,17 +89,27 @@ public:
     {
         sr = sampleRate > 0.0 ? sampleRate : 44100.0;
         // Pre-size the output buffer to the worst-case event burst (echo bend+on+off,
-        // main trains, pending flush) so out.addEvent never allocates in processBlock.
-        out.ensureSize ((size_t) (3 * kFbMaxOn + kFbMaxOff + 4 * kSlots * kMaxNotes
-                                  + kSlots * kMaxNotes + kFbMaxOff) * 16);
+        // main trains, pending flush) so out.addEvent does not allocate in processBlock.
+        // It is a FUNCTION and not a line, because process() swaps this buffer away every
+        // block and has to ask for the same number again - see the swap at the end of it.
+        out.ensureSize (outReserveBytes());
         resetState();
+    }
+
+    static constexpr size_t outReserveBytes() noexcept
+    {
+        return (size_t) (3 * kFbMaxOn + kFbMaxOff + 4 * kSlots * kMaxNotes
+                         + kSlots * kMaxNotes + kFbMaxOff) * 16;
     }
 
     // Everything prepare() clears, WITHOUT the one line in it that can allocate.
     // Split out so AudioProcessor::reset() - the host's "stop making sound now", which a
     // bypass and a panic both go through - can be honoured on the AUDIO thread, where
-    // out.ensureSize is not allowed to run. Calling it never changes a buffer size, so
-    // the sizing prepare() did still holds.
+    // an unbounded ensureSize is not wanted. It is still correct to leave it out: process()
+    // re-arms the reserve itself after every swap (see the end of it), so resetState has
+    // nothing to restore and the sizing is never left to a path that only clears state.
+    // (The older wording here said "the sizing prepare() did still holds", which stopped
+    // being true the moment the first swap handed that storage to the caller.)
     void resetState() noexcept
     {
         // Before wiping the gate state, remember any OUTPUT notes that are still
@@ -249,6 +259,14 @@ public:
         engineClock += numSamples; // absolute sample frame (pattern anchor/cycle)
 
         io.swapWith (out); // input events consumed; only our pulses leave the plugin
+        // ...AND THE RESERVE IS RE-ARMED. prepare() sized this buffer for the worst-case
+        // burst and the line above then handed that storage to the caller, taking the
+        // caller's in exchange - so the sizing lasted one block and the promise above it
+        // ("does not allocate in processBlock") had a one-block life. This is the engine
+        // with the largest reserve of the four that do this, and therefore the one where
+        // the difference actually costs something. ensureSize returns immediately when the
+        // capacity is already there, so it is free once the rotation settles.
+        out.ensureSize (outReserveBytes());
     }
 
     // Emit every feedback echo whose time has come this block and carry the rest

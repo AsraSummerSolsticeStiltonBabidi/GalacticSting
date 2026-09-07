@@ -60,9 +60,12 @@ public:
     // More than a hand can hold; a sustain pedal chord cannot realistically pass it.
     static constexpr int kMaxHeld = 32;
 
+    // ONE NUMBER, because process() has to re-arm it every block (see the swap there).
+    static constexpr int kReserveBytes = 4096;
+
     void prepare()
     {
-        out.ensureSize (4096);
+        out.ensureSize (kReserveBytes);
         n = 0;
     }
 
@@ -115,6 +118,13 @@ public:
         }
 
         io.swapWith (out);
+        // ...AND THE RESERVE IS RE-ARMED. The swap hands `out`'s storage to the caller and
+        // takes the caller's in exchange, so prepare()'s sizing survived exactly one
+        // block and "never allocates" stopped being true after it. ensureSize on a buffer
+        // that is already big enough returns immediately, so this is free in steady state
+        // and costs a bounded few growths while the rotation settles. See LookaheadDelay,
+        // where the same swap has the same consequence and the reasoning is written out.
+        out.ensureSize (kReserveBytes);
     }
 
     // Tests only: how many keys the stack believes are down, and the winner.

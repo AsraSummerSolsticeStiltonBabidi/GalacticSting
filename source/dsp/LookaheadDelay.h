@@ -52,11 +52,14 @@ class LookaheadDelay
 public:
     LookaheadDelay() = default;
 
+    // ONE NUMBER, because process() has to re-arm it every block (see the swap there).
+    static constexpr int kReserveBytes = 8192;
+
     void prepare()
     {
-        buf.ensureSize (8192);
-        keep.ensureSize (8192);
-        out.ensureSize (8192);
+        buf.ensureSize (kReserveBytes);
+        keep.ensureSize (kReserveBytes);
+        out.ensureSize (kReserveBytes);
         flush();
     }
 
@@ -122,6 +125,21 @@ public:
 
         buf.swapWith (keep);
         io.swapWith (out);
+        // ...AND THE RESERVE IS RE-ARMED, BECAUSE THE SWAP JUST GAVE IT AWAY.
+        //
+        // `buf.swapWith (keep)` trades two members that prepare() sized alike, so that one
+        // is harmless. `io.swapWith (out)` is not: `out` now holds the buffer the CALLER
+        // brought, whose capacity belongs to the host and is usually smaller. prepare()'s
+        // 8192 therefore lasted exactly one block, and "so addEvent never allocates" was
+        // true only until the first swap - the guarantee rotated out of the object along
+        // with the storage.
+        //
+        // ensureSize on a buffer that is already large enough does nothing (it forwards to
+        // Array::ensureStorageAllocated, which returns immediately when the capacity is
+        // there), so in steady state this line is free. What it costs is a bounded handful
+        // of growths while the rotation settles - which is what the promise was always
+        // worth, now written down and actually kept rather than merely asserted.
+        out.ensureSize (kReserveBytes);
     }
 
 private:
