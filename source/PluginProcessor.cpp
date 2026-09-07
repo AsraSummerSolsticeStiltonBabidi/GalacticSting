@@ -4099,6 +4099,30 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         state.appendChild (scl, nullptr);
     }
 
+    // THE HAND-SET REFERENCE, PARKED - and the promise timerCallback makes about it.
+    //
+    // While MTS-ESP is the mode and a master is up, the master OWNS refA: the parameter is
+    // overwritten with what the master is really doing (display only, so the box does not
+    // lie) and the number the user typed lives in manualRefA, handed straight back the
+    // instant MTS stops being the mode. The comment there states it outright - "MTS can
+    // never permanently overwrite a reference the user typed" - and that held for the
+    // session and not one moment longer: refA is a PARAMETER and rode out in the tree
+    // above, while manualRefA and the flag saying it is parked were plain members that
+    // rode nowhere. Type 432, switch to MTS-ESP, save, reopen: the chunk carries the
+    // master's 440 in refA, manualRefA comes back at its 440 default, and no action can
+    // recover the 432 because it was never written down.
+    //
+    // The FLAG travels too, and it is not optional. Without it a project saved in MTS mode
+    // reopens with mtsHadRef false, so leaving MTS looks like it was never entered and the
+    // parked value is never handed back - the number would be saved and still unreachable.
+    state.removeChild (state.getChildWithName ("REFPARK"), nullptr);
+    {
+        juce::ValueTree rp ("REFPARK");
+        rp.setProperty ("manualA", manualRefA, nullptr);
+        rp.setProperty ("mtsOwns", mtsHadRef,  nullptr);
+        state.appendChild (rp, nullptr);
+    }
+
     state.removeChild (state.getChildWithName ("TIMBRE"), nullptr);
     if (timbreSource.isNotEmpty()) // kept even while switched OFF (On/Off toggle)
     {
@@ -4572,6 +4596,24 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
             }
         }
     lastBankSlot = getTuningBankSlotParam(); // don't re-load on restore; state's SCALA already has it
+
+    // THE PARKED HAND-SET REFERENCE (see captureState for what it is and what was losing
+    // it). Read here, after replaceState so refA below is the RESTORED one, and before the
+    // first timerCallback: that poll hands manualRefA back to refA the moment MTS is not
+    // the mode, so by then it has to hold the user's own number rather than this instance's
+    // 440 default.
+    //
+    // A chunk that predates this carries neither property, and the fallback is the only
+    // reference such a file has: refA itself, which replaceState has just restored. A
+    // project saved OUTSIDE MTS therefore parks its own value (correct, and what leaving a
+    // mode it was never in would hand back anyway); one saved INSIDE MTS parks the master's,
+    // which is exactly what those projects do today - unchanged, not made worse.
+    {
+        const auto rp = tree.getChildWithName ("REFPARK");
+        manualRefA = (float) (double) rp.getProperty ("manualA",
+                         (double) apvts.getRawParameterValue ("refA")->load());
+        mtsHadRef  = (bool) rp.getProperty ("mtsOwns", false);
+    }
 
     if (auto scl = tree.getChildWithName ("SCALA"); scl.isValid())
     {

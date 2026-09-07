@@ -17458,4 +17458,61 @@ static void runProcessorAuditChecks()
         check (p->getPlaygroundEditCorner() < 0,
                "  the corner-edit session is gone with the corners it was editing");
     }
+
+    //-- run 63: MTS CANNOT PERMANENTLY EAT A REFERENCE THE USER TYPED ----------------
+    //
+    // In MTS-ESP mode the master owns refA: the parameter is overwritten with what the
+    // master is really doing and the user's own number is parked in manualRefA, handed back
+    // the moment MTS stops being the mode. timerCallback says so in as many words. But refA
+    // is a parameter and was saved; manualRefA and the flag that says it is parked were
+    // plain members and were not. Type 432, switch to MTS-ESP, save, reopen: the chunk
+    // carries the master's 440, the park comes back at its 440 default, and 432 is gone
+    // beyond any recovery - it was never written down.
+    //
+    // An MTS master cannot be conjured in a verifier, so this drives the OTHER half of the
+    // journey, which is the half that was broken: a chunk that was saved with the reference
+    // parked, reopened on a machine with no master. It first checks that this build's own
+    // captureState really does write that child with both properties, so the fabricated
+    // chunk below is this build's format and not a shape invented by the test.
+    {
+        std::printf ("\nrun 63: a reference typed before MTS survives save and reload:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize());
+        check (xml != nullptr, "  the saved chunk parses back to XML");
+        auto* park = xml != nullptr ? xml->getChildByName ("REFPARK") : nullptr;
+        check (park != nullptr && park->hasAttribute ("manualA") && park->hasAttribute ("mtsOwns"),
+               "  captureState writes the parked reference AND the flag that says it is parked");
+
+        // The state a project saved under an MTS master carries: the master's 440 on the
+        // face of it, the user's 432 parked behind it.
+        if (park != nullptr)
+        {
+            park->setAttribute ("manualA", 432.0);
+            park->setAttribute ("mtsOwns", 1);
+        }
+        if (xml != nullptr)
+        {
+            if (auto* ra = xml->getChildByAttribute ("id", "refA"))   ra->setAttribute ("value", 440.0);
+            if (auto* tm = xml->getChildByAttribute ("id", "tuningMode")) tm->setAttribute ("value", 1.0); // MTS-ESP
+        }
+        juce::MemoryBlock saved;
+        if (xml != nullptr) juce::AudioProcessor::copyXmlToBinary (*xml, saved);
+
+        auto q = std::make_unique<Proc>();
+        q->prepareToPlay (48000.0, 256);
+        check (! q->tuningHasMaster(),
+               "  (precondition: this machine has no MTS-ESP master, so leaving MTS is what "
+               "the reopened project does)");
+        q->setStateInformation (saved.getData(), (int) saved.getSize());
+        for (int i = 0; i < 4; ++i) q->pollParametersForTests();
+        const double back = (double) q->apvts.getRawParameterValue ("refA")->load();
+        std::printf ("    reopened with no master: refA reads %.3f Hz (the chunk's face value was 440)\n", back);
+        check (std::abs (back - 432.0) < 0.05,
+               "  the hand-set 432 comes back - MTS did not permanently overwrite it");
+    }
 }
