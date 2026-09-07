@@ -7836,7 +7836,14 @@ void FractalAdditiveAudioProcessorEditor::refreshShepardRiseState()
     // says, and until ShepardEngine grew riseRatioIsLimited() nothing could even ask.
     // A sentence that advertises its own honesty and leaves out a bound is worse than one
     // that says nothing, so this rides in the same memo and re-renders with it.
-    const double periodNow = processorRef.getStatedTuningPeriodRatio();
+    // periodRatio(), NOT statedPeriodRatio(), and the difference is the whole correctness
+    // of the sentence: AdditiveVoice::planShepard feeds riseRatio() the DISPLAY ratio
+    // (AdditiveVoice.h:2612), so asking the stated one would answer for a number the rise
+    // never sees. The line three above deliberately uses the stated one, because THAT
+    // question is "did the file declare a period at all"; this one is "what is the rise
+    // actually built from". Two questions, two accessors, one line apart - which is
+    // exactly how a wrong one hides.
+    const double periodNow = processorRef.getTuningPeriodRatio();
     const bool riseCapped  = shepard::riseRatioIsLimited (
                                  (int) processorRef.apvts.getRawParameterValue ("shepRise")->load(), periodNow);
     const int stateKey = state * 2 + (riseCapped ? 1 : 0);
