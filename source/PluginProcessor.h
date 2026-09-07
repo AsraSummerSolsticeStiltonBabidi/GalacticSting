@@ -1794,6 +1794,16 @@ private:
     // plus the degree/height data shown in the Spectrum-to-Scale panel.
     juce::String lastDissScl, lastDissName;
     juce::String presetPendingSclSource, presetPendingSclName; // see hasPendingPresetTuning()
+    // THE SCALE A PROJECT COULD NOT GET BACK, for the editor to show once.
+    //
+    // setStateInformation runs on a load thread and there may be no editor at all, so the
+    // failure is parked here rather than raised there. Consumed by takeTuningRestoreError,
+    // which clears it: this is a one-shot message about one load, not a state.
+    juce::String tuningRestoreError;
+public:
+    juce::String takeTuningRestoreError()
+    { auto e = tuningRestoreError; tuningRestoreError.clear(); return e; }
+private:
     juce::String presetPendingTablePeriod;                     // its table period, if it had one
     // Self-play routing as of the last block: a CHANGE strands notes (see processBlock).
     // `known` starts false so the very first block only records the state - flushing

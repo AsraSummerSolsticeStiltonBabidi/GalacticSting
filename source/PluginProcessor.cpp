@@ -4516,9 +4516,27 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
         juce::String err;
         // restoreTuning (not loadScalaString): the source may be .tun text holding an
         // absolute 128-key table, and it carries the table's chosen period with it.
-        tuning.restoreTuning ({ scl.getProperty ("name").toString(),
-                                scl.getProperty ("source").toString(),
-                                scl.getProperty ("tablePeriod").toString() }, err);
+        const auto savedName = scl.getProperty ("name").toString();
+        if (! tuning.restoreTuning ({ savedName,
+                                      scl.getProperty ("source").toString(),
+                                      scl.getProperty ("tablePeriod").toString() }, err))
+        {
+            // A PROJECT THAT LOSES ITS SCALE SAYS SO. `err` was filled in by the parser
+            // and thrown away on the next line, so a project saved in 31-EDO whose stored
+            // scale text no longer parses reopened playing 12-tone equal temperament -
+            // silently, with no dialog and nothing on screen to say the instrument is not
+            // in the tuning the project was written in. For a microtonal instrument that
+            // is the worst possible quiet failure: everything still sounds, and it sounds
+            // wrong.
+            //
+            // Kept on the processor rather than shown from here, because setStateInformation
+            // runs on a load thread with no editor guaranteed to exist. The editor picks it
+            // up on its next tick and puts it in the notice overlay it already has for
+            // exactly this kind of "something did not go as asked" message.
+            tuningRestoreError = savedName.isNotEmpty()
+                               ? savedName + " \xe2\x80\x94 " + err
+                               : err;
+        }
     }
     else
     {

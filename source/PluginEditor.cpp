@@ -11850,6 +11850,22 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         }
     }
 
+    // A PROJECT THAT LOST ITS SCALE SAYS SO, ONCE. setStateInformation parks the parser's
+    // own message on the processor because it runs on a load thread with no editor
+    // guaranteed to exist; this is the first tick after that, and take... clears it, so
+    // the notice appears for the load that failed and not for every tick afterwards.
+    if (const auto lost = processorRef.takeTuningRestoreError(); lost.isNotEmpty())
+    {
+        noticeOverlay.title = tr ("This project's tuning could not be restored",
+                                  "No s'ha pogut restaurar l'afinaci\xc3\xb3 d'aquest projecte");
+        noticeOverlay.body  = tr ("The scale saved with this project no longer reads, so the instrument is playing 12-tone equal temperament instead. Nothing you play is in the tuning this project was written in.\n\nLoad the scale again if you still have the file.\n\n",
+                                  "L'escala desada amb aquest projecte ja no es pot llegir, o sigui que l'instrument est\xc3\xa0 tocant temperament igual de 12 tons. Res del que toquis est\xc3\xa0 en l'afinaci\xc3\xb3 amb qu\xc3\xa8 es va escriure el projecte.\n\nTorna a carregar l'escala si encara tens el fitxer.\n\n")
+                            + lost;
+        noticeOverlay.setVisible (true);
+        noticeOverlay.toFront (false);
+        noticeOverlay.repaint();
+    }
+
     // OCTAVE stepper read-outs (params can also move via host automation).
     octVal.setText (juce::String ((int) processorRef.apvts.getRawParameterValue ("octaveShift")->load()),
                     juce::dontSendNotification);
