@@ -19880,4 +19880,54 @@ static void runSilentLimitChecks()
                "  ...and the two dresses differ by no more than the two knobs themselves do");
     }
 
+    //-- run 71: THE SHEPARD RISE STEP'S 16/1 CEILING IS REACHABLE, AND NOW NAMED -----
+    // shepard::riseRatio clamps a tuning's period at 16/1, and that clamp was missing
+    // from the VISIBLE BOUNDS list the header keeps. The first question was whether it
+    // can fire at all - an unreachable clamp deserves its claim deleted, not a readout
+    // bolted on. It can: an .scl period line is unbounded, so a scale stating a period
+    // wider than four octaves loads and sounds, and the rise step quietly became half of
+    // what the file says.
+    {
+        std::printf ("\nrun 71: the Shepard rise step stops at 16/1, and a tuning can ask for more:\n");
+        auto up = std::make_unique<Proc>();
+        auto& p = *up;
+        juce::String err;
+        check (p.loadScalaText ("! wide32\na period wider than the rise step\n 1\n 32/1\n",
+                                "wide-period-32", err),
+               "  a one-note .scl whose period line reads 32/1 loads");
+        const double per = p.getTuningPeriodRatio();
+        const double R   = shepard::riseRatio (shepard::RisePeriod, per);
+        std::printf ("  the tuning states a period of %.4f; the rise step comes out %.4f\n", per, R);
+        check (std::abs (per - 32.0) < 1.0e-9,
+               "  ...and the tuning really states 32/1, so the clamp is REACHABLE from a "
+               "file a user can write - it is not dead code");
+        check (std::abs (R - shepard::kMaxRiseRatio) < 1.0e-12,
+               "  ...and the rise step comes out 16/1, HALF the interval the file states");
+        check (shepard::riseRatioIsLimited (shepard::RisePeriod, per),
+               "  riseRatioIsLimited() says so, which is the whole fix: the bound is stated "
+               "instead of applied in silence");
+
+        // The ways it must answer NO, so a panel does not cry limit at a tuning that is
+        // being served whole.
+        check (! shepard::riseRatioIsLimited (shepard::RiseOctave, per),
+               "  ...and with the octave chosen there is nothing to report - the octave "
+               "never consults the period");
+        check (std::abs (shepard::riseRatio (shepard::RisePeriod, 16.0) - 16.0) < 1.0e-12
+                 && ! shepard::riseRatioIsLimited (shepard::RisePeriod, 16.0),
+               "  a period of exactly 16/1 is served whole and reported as unlimited");
+        check (std::abs (shepard::riseRatio (shepard::RisePeriod, 3.0) - 3.0) < 1.0e-12
+                 && ! shepard::riseRatioIsLimited (shepard::RisePeriod, 3.0),
+               "  Bohlen-Pierce's 3/1 is served whole and reported as unlimited");
+
+        // The lower guard is a FALLBACK, not a clamp: a period that does not ascend gets
+        // a plain octave (what the dropdown says out loud), never a 1.0001 sliver of one,
+        // and it is not reported as a limited rise because the rise is not what shrank.
+        check (std::abs (shepard::riseRatio (shepard::RisePeriod, 1.0) - 2.0) < 1.0e-12
+                 && ! shepard::riseRatioIsLimited (shepard::RisePeriod, 1.0),
+               "  a degenerate 1/1 period falls back to the octave, not to a 1.0001 sliver");
+        const double nan71 = std::nan ("");
+        check (std::abs (shepard::riseRatio (shepard::RisePeriod, nan71) - 2.0) < 1.0e-12
+                 && ! shepard::riseRatioIsLimited (shepard::RisePeriod, nan71),
+               "  ...and so does a NaN period, on both sides of the answer");
+    }
 }
