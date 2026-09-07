@@ -4647,6 +4647,38 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     // been renamed or deleted comes back EMPTY rather than silently substituting
     // something else - a playground quietly morphing towards a preset the user never
     // chose is worse than one that visibly lost a corner.
+    //
+    // AND THE CORNER-EDIT SESSION GOES WITH THEM, which is not tidiness - it is what stops
+    // the patch that was just loaded from being overwritten about sixteen milliseconds
+    // later. A corner-edit session holds pgEditLiveState: the WHOLE live patch, frozen at
+    // the moment edit mode was entered, to be handed back when it ends (see rule 1 above
+    // beginPlaygroundCornerEdit). restoreState never mentioned it, so with the corner-edit
+    // window open one click on "Load its original spectrum" - or a project reload, or any
+    // other preset load - left the session standing over a patch that no longer existed.
+    // The corners reset on the line below then make pgActive false, drivePlayground's very
+    // next tick takes the "the playground let go" branch and calls endPlaygroundCornerEdit(),
+    // and that writes the PRE-EDIT patch back parameter by parameter. The user loads a
+    // preset, hears it, and it is silently replaced by the one they had before, with no
+    // click of their own in between.
+    //
+    // A PLAIN RESET, deliberately NOT a call to endPlaygroundCornerEdit(). That function's
+    // entire job is to hand the frozen live patch back - which is precisely the write that
+    // must not happen here, because the patch this instrument should be holding is the one
+    // in `tree`, already applied by replaceState above. It also unwinds the undo stack and
+    // mints a corner-edit step, neither of which belongs to a state load. So the session is
+    // simply forgotten: every field back to what a fresh instance has.
+    pgEditCorner         = -1;
+    pgEditLiveState      = {};
+    pgEditLiveX          = 0.0f;
+    pgEditLiveY          = 0.0f;
+    pgEditLivePresetName = {};
+    pgEditLivePresetSnap.clear();
+    pgEditCompilePending = false;
+    pgEditPrimed         = false;
+    pgEditTick           = 0;
+    pgEditCornerBefore   = {};
+    pgEditStackDepth     = 0;
+    pgEditUnwound        = false;
     for (int i = 0; i < kPlaygroundCorners; ++i)
         pgCorner[(size_t) i] = PlaygroundCorner{};
     pgActive = false; pgWinner = -1; pgRtSuspended = false; pgSuspendedRt = RtLink::Off;

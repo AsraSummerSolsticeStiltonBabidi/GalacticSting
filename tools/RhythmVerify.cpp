@@ -17375,4 +17375,87 @@ static void runProcessorAuditChecks()
                "  the instrument is SILENT after the key is released across a self-play flip - "
                "no corner voice is left droning");
     }
+
+    //-- run 62: A CORNER-EDIT SESSION DOES NOT SURVIVE A STATE LOAD ------------------
+    //
+    // While a corner is being edited the main controls are a SCRATCH SURFACE and the real
+    // live patch is frozen in pgEditLiveState, to be written back parameter by parameter
+    // when the session ends (rule 1 above beginPlaygroundCornerEdit). restoreState never
+    // mentioned that session, so it outlived the patch it was frozen from: loading a preset
+    // reset the corners, the reset made pgActive false, and drivePlayground's next tick -
+    // one 60 Hz frame, about 16 ms later - took the "the playground let go" branch and
+    // called endPlaygroundCornerEdit(), which wrote the PRE-EDIT patch over the one that
+    // had just been loaded. One click on "Load its original spectrum" with the corner-edit
+    // window open, and what you hear a frame later is the patch you had before.
+    //
+    // masterGain is the probe: three distinct values, one for the corner, one for the live
+    // patch, one for the preset being loaded, so whichever of the three arrives NAMES what
+    // happened rather than merely failing.
+    {
+        std::printf ("\nrun 62: a corner-edit session does not overwrite a loaded patch:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run62-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        struct ScratchFolder
+        {
+            explicit ScratchFolder (const juce::File& d)
+                : dir (d), prev (Proc::getPresetFolder()) { Proc::setPresetFolderForTests (d); }
+            ~ScratchFolder() { Proc::setPresetFolderForTests (prev); dir.deleteRecursively(); }
+            juce::File dir, prev;
+        } guard (scratch);
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            p->pollParametersForTests();
+        };
+        const auto gain = [&] { return (double) p->apvts.getRawParameterValue ("masterGain")->load(); };
+
+        sp ("masterGain", -3.0f);
+        check (p->savePreset ("zzz62-LOADED").isNotEmpty(), "  the preset that will be loaded is saved (-3 dB)");
+        sp ("masterGain", -30.0f);
+        check (p->savePreset ("zzz62-CORNER").isNotEmpty(), "  the corner being edited is saved (-30 dB)");
+        sp ("masterGain", -20.0f);
+        check (p->savePreset ("zzz62-OTHER").isNotEmpty(), "  the second corner is saved (-20 dB)");
+
+        // TWO corners, because that is what engages the playground (see
+        // refreshPlaygroundActive), and the point parked on the OTHER one - so the patch
+        // frozen on the way into edit mode is -20, the corner under the controls is -30 and
+        // the preset about to be loaded is -3. Three distinct values: whichever arrives
+        // names what happened instead of merely failing.
+        juce::String err;
+        sp ("pgMode", 0.0f);   // morph mode - the corner is pinned under the controls
+        check (p->assignPlaygroundCorner (0, "zzz62-CORNER", err), "  the edited corner is assigned");
+        check (p->assignPlaygroundCorner (1, "zzz62-OTHER",  err), "  and a second corner engages the pad");
+        sp ("pgX", 1.0f); sp ("pgY", 0.0f);
+        for (int i = 0; i < 8; ++i) p->pollParametersForTests();
+        std::printf ("    parked on the second corner: masterGain reads %+.2f dB (this is the "
+                     "patch edit mode freezes)\n", gain());
+        check (std::abs (gain() - (-20.0)) < 0.01,
+               "  (precondition: the live surface really is the second corner's -20 dB)");
+        check (p->beginPlaygroundCornerEdit (0), "  ...and corner 0 goes into corner-edit mode");
+        for (int i = 0; i < 4; ++i) p->pollParametersForTests();
+        std::printf ("    editing corner 0: masterGain reads %+.2f dB\n", gain());
+        check (p->getPlaygroundEditCorner() == 0,
+               "  (precondition: the session really is open on corner 0)");
+
+        // The click. The preset's own state carries no PLAYGROUND child, so restoring it
+        // empties the corners - which is what used to fire endPlaygroundCornerEdit().
+        check (p->loadPreset ("zzz62-LOADED"), "  a preset is loaded while the session is open");
+        const double justAfter = gain();
+        for (int i = 0; i < 12; ++i) p->pollParametersForTests();   // well past the 16 ms
+        const double settled = gain();
+        std::printf ("    after the load: %+.2f dB, and %d ticks later: %+.2f dB"
+                     " (the edited corner is -30, the frozen pre-edit patch -20)\n",
+                     justAfter, 12, settled);
+        check (std::abs (justAfter - (-3.0)) < 0.01, "  the load itself applies the preset");
+        check (std::abs (settled - (-3.0)) < 0.01,
+               "  ...and it is STILL the loaded preset a dozen ticks later - no frozen live "
+               "patch is written back over it");
+        check (p->getPlaygroundEditCorner() < 0,
+               "  the corner-edit session is gone with the corners it was editing");
+    }
 }
