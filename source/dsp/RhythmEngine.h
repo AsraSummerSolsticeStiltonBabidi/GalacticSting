@@ -83,6 +83,13 @@ public:
         modeParam = apvts.getRawParameterValue ("rhythmMode");
         mpeParam  = apvts.getRawParameterValue ("rhythmMpe");
         bendParam = apvts.getRawParameterValue ("bendRange");
+        // ...AND WHICH TUNING MODE IS IN FORCE, because in MPE mode the bend selector is
+        // not what decodes the pulses (see bendRangeSemis).
+        //
+        // From the APVTS and NOT from the TuningManager: the manager is switched to
+        // Mode::Equal while MPE is on - that is the whole point of MPE mode, the host owns
+        // the pitches - so asking it "are we in MPE?" answers no, every time.
+        tuneModeParam = apvts.getRawParameterValue ("tuningMode");
     }
 
     void prepare (double sampleRate)
@@ -817,6 +824,9 @@ private:
     std::atomic<float>* modeParam = nullptr;
     std::atomic<float>* mpeParam  = nullptr;
     std::atomic<float>* bendParam = nullptr;
+    // Which tuning mode is running - index 3 is MPE, where the ZONE fixes the bend range
+    // at +-48 and bendParam above governs nothing (see bendRangeSemis).
+    std::atomic<float>* tuneModeParam = nullptr;
 
     // Encode a fractional-semitone offset as a 14-bit pitch wheel value using the
     // range the SYNTH is actually set to. This used to assume the MPE default of
@@ -830,8 +840,21 @@ private:
         return juce::jlimit (0, 16383, 8192 + (int) std::lround (semitoneOffset / range * 8192.0));
     }
     // Widest detune the current bend range can actually express, for clamping.
+    //
+    // IN MPE MODE THE SELECTOR IS NOT WHAT DECODES THESE PULSES. applyTuningMode installs
+    // a real MPE lower zone with a per-note range of +-48, and a zone's range is what the
+    // receiving instrument honours - the `bendRange` parameter governs the LEGACY layout
+    // and nothing else. So with MPE on and the selector at its +-2 setting, this function
+    // used to encode a pulse's detune as if 8192 units meant 2 semitones while the voice
+    // read them as 48: every rhythm pulse landed twenty-four times further off its key
+    // than it was asked to, which on a microtonal instrument is not a detune, it is a
+    // different note. The panel hides the bend selector in this mode precisely because it
+    // does not govern here; this function had not been told.
     double bendRangeSemis() const noexcept
     {
+        // Index 3 = "MPE (bend input)" - the same number applyTuningMode tests.
+        if (tuneModeParam != nullptr && (int) tuneModeParam->load() == 3)
+            return 48.0;
         static constexpr double bendValues[] = { 2.0, 12.0, 48.0 };
         return bendValues[juce::jlimit (0, 2, bendParam != nullptr ? (int) bendParam->load() : 2)];
     }

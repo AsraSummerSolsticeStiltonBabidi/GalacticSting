@@ -19257,6 +19257,57 @@ int main (int argc, char** argv)
                " hard-coded 100");
     }
 
+    //== IN MPE MODE THE BEND SELECTOR IS NOT WHAT DECODES A PULSE =================
+    //
+    // applyTuningMode installs a real MPE lower zone with a per-note range of +-48, and a
+    // ZONE's range is what the receiving instrument honours - the `bendRange` parameter
+    // governs the legacy layout and nothing else. RhythmEngine encoded every pulse's
+    // detune from `bendRange` regardless, so with MPE on and the selector at +-2 a pulse
+    // asked for 30 cents off its key landed twenty-four times further out. On a
+    // microtonal instrument that is not a detune, it is a different note. The panel hides
+    // the bend selector in this mode precisely because it does not govern; this function
+    // had not been told.
+    //
+    // Worth saying how this got written: the fix went in, the whole suite stayed green,
+    // and SABOTAGING it changed nothing at all - 0 failures with the fix disabled. It was
+    // correct by reasoning and completely unverified, which is the state this project
+    // treats as not done. Hence this block.
+    {
+        std::printf ("\nthe rhythm engine decodes bend at the range that is really in force:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();               // heap: main()'s frame is finite
+        auto& p = *pp;
+        p.prepareToPlay (48000.0, 256);
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            p.pollParametersForTests();
+        };
+
+        // tuningMode 2 = Scala, i.e. the LEGACY layout, where the selector really does
+        // govern. Its three settings are the ones the engine has always honoured.
+        sp ("tuningMode", 2.0f);
+        sp ("bendRange", 0.0f);  const double legacy2  = p.getRhythm().getBendRangeSemis();
+        sp ("bendRange", 1.0f);  const double legacy12 = p.getRhythm().getBendRangeSemis();
+        sp ("bendRange", 2.0f);  const double legacy48 = p.getRhythm().getBendRangeSemis();
+        // ...and mode 3 is MPE, where the zone fixes it at 48 whatever the selector says.
+        sp ("tuningMode", 3.0f);
+        sp ("bendRange", 0.0f);  const double mpeAt2   = p.getRhythm().getBendRangeSemis();
+        sp ("bendRange", 1.0f);  const double mpeAt12  = p.getRhythm().getBendRangeSemis();
+        std::printf ("  legacy: selector +-2 -> %.0f, +-12 -> %.0f, +-48 -> %.0f;"
+                     "   MPE: selector +-2 -> %.0f, +-12 -> %.0f\n",
+                     legacy2, legacy12, legacy48, mpeAt2, mpeAt12);
+
+        // GATE FIRST: if the selector did not move the answer in the legacy mode, this
+        // engine is not reading it at all and the MPE checks below would pass on a
+        // constant rather than on a decision.
+        check (legacy2 == 2.0 && legacy12 == 12.0 && legacy48 == 48.0,
+               "  (gate) outside MPE the selector really is what the engine decodes at");
+        check (mpeAt2 == 48.0 && mpeAt12 == 48.0,
+               "in MPE mode the ZONE's +-48 is what a pulse is encoded against, whatever the"
+               " selector says - the panel hides that control here because it does not govern");
+    }
+
     runProcessorAuditChecks();
     runSilentLimitChecks();
 
