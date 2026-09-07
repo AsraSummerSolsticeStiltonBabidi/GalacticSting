@@ -484,11 +484,16 @@ public:
                     // divided down - which is the rate BEFORE the ceiling above touched
                     // it, so the cap applied to the free-Hz dress and simply did not
                     // exist in BPM mode. The same LFO then ran at two different rates
-                    // depending on which dropdown entry named it. Measured at 44.1 kHz
-                    // on a 4096-sample offline block (ceiling 5.383 Hz) with BPM 900 and
-                    // Div 0, which both ask for 15 Hz: the free dress advanced 0.5 cycle
-                    // per block, the BPM dress advanced 1.394 - 2.79x the ceiling, in the
-                    // one mode where the phase is the host's and cannot be argued with.
+                    // depending on which dropdown entry named it. MEASURED (RhythmVerify
+                    // run 70, which is where these figures come from) at 44.1 kHz on an
+                    // 8192-sample offline-render block - ceiling 2.6917 Hz - with BPM 300
+                    // and Div 0, a pair that asks for 5 Hz just as a free-Hz 5 does: the
+                    // free dress walked 0.50000 0.00000 0.50000 ..., half a cycle a block,
+                    // and the BPM dress walked 0.92880 0.85760 0.78639 ... - 1.86x the
+                    // ceiling, in the one mode whose phase is the host's and cannot be
+                    // argued with. Nothing exotic was needed to reach it: Div only ever
+                    // divides (0..24), so the BPM dress tops out at bpm/60 and the buffer
+                    // is what brings the ceiling down to meet it.
                     //
                     // Seconds * Hz is now the ONE formula, and the BPM dress reaches it
                     // through `rate`, which is the number the ceiling already clamped.
