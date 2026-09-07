@@ -4931,13 +4931,40 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // slider's width, so this is a ceiling and not a promise - but a box that asks for
     // less than its own text needs can never be honest, whatever the column does.
     //
-    // 46 stays the floor, so nothing that fitted before gets narrower, and the style is
-    // only re-set when the number actually changes: setTextBoxStyle rebuilds the label.
-    for (auto* s : configuredFaders)
+    // THE BOX IS WIDENED, NEVER MOVED. This loop used to pass TextBoxBelow to every fader
+    // it touched, and that is not a detail of the sizing - it is a second decision, made
+    // by a function whose job is the language, about a fader eight callers had already
+    // turned horizontal with its value to the RIGHT. configFader pushes onto
+    // configuredFaders BEFORE those callers run, so the list is full of faders whose box
+    // had been moved since; Morph time, Dry/Wet time, Harmonics, Prime limit and Reps were
+    // all put back UNDER a track in a 22-24 px row, leaving the number about 9 px and the
+    // track the rest. Photographed at 1200x650: "0.30" under the Dry/Wet fader and "Tots"
+    // under Harmonics, both of which the caller had sized a right-hand box for.
+    //
+    // Nothing re-set them, and the rig had been reporting the consequence without anyone
+    // reading it as this: at the 690x550 floor the Dry/Wet value label is the control that
+    // pins the window's minimum HEIGHT, at "-1.0 tall" of room.
+    //
+    // So: the position and the height are read LIVE and written back unchanged (resized()
+    // switches phaseFader's box between right and none by how much room its cell has, and
+    // a language pass has no business undoing that), and the floor is the width the CALLER
+    // chose rather than a global 46 - which for every untouched fader IS 46, the width
+    // configFader gives them. Re-set only when the number really changes: setTextBoxStyle
+    // rebuilds the label.
+    if (faderBoxHome.size() != configuredFaders.size())
     {
-        const int want = juce::jmax (46, fgfit::faderValueWidth (*s) + 2);
+        // Captured the first time this runs, which is the constructor's own
+        // applyLanguage() - by then every caller has finished moving the box it wanted.
+        faderBoxHome.clear();
+        for (auto* s : configuredFaders)
+            faderBoxHome.push_back ({ s->getTextBoxWidth() });
+    }
+    for (size_t i = 0; i < configuredFaders.size(); ++i)
+    {
+        auto* s = configuredFaders[i];
+        const int want = juce::jmax (faderBoxHome[i].w, fgfit::faderValueWidth (*s) + 2);
         if (s->getTextBoxWidth() != want)
-            s->setTextBoxStyle (juce::Slider::TextBoxBelow, false, want, 15);
+            s->setTextBoxStyle (s->getTextBoxPosition(), false, want, s->getTextBoxHeight());
     }
     // The one word the KEYBOARD paints for itself, in the language on screen. It used to
     // be a literal inside ScaleKeyboard::paint and so was the only user-visible string in
@@ -5507,6 +5534,27 @@ FractalAdditiveAudioProcessorEditor::textFitProbeForTests (bool useCatalan)
     applyLanguage();
     if (getWidth() > 0) resized();
     return out;
+}
+
+FractalAdditiveAudioProcessorEditor::FaderBoxProbe
+FractalAdditiveAudioProcessorEditor::faderBoxProbeForTests (const juce::String& name) const
+{
+    FaderBoxProbe p;
+    const juce::Slider* s = nullptr;
+    if      (name == "morphTime")     s = &morphTimeFader;
+    else if (name == "dryWetTime")    s = &dryWetTimeFader;
+    else if (name == "harmonics")     s = &harmonicsFader;
+    else if (name == "primeLimit")    s = &primeLimitFader;
+    else if (name == "timbreRepeats") s = &timbreRepeatsFader;
+    else if (name == "slope")         s = &slopeFader;
+    else if (name == "baseN")         s = &baseNFader;
+    if (s == nullptr) return p;
+    p.found = true;
+    p.pos   = (int) s->getTextBoxPosition();
+    p.boxW  = s->getTextBoxWidth();
+    p.boxH  = s->getTextBoxHeight();
+    p.rowH  = s->getHeight();
+    return p;
 }
 
 FractalAdditiveAudioProcessorEditor::DragProbe
