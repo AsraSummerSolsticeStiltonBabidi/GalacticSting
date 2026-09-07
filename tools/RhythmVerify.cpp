@@ -19997,4 +19997,111 @@ static void runProcessorAuditChecks()
             ed->setLanguageForSnapshot (false);
         }
     }
+
+    //-- run 73: A CORNER THAT WOULD NOT TAKE A PRESET SAYS SO --------------------------
+    //
+    // The playground's corner boxes called assignPlaygroundCorner and threw away both the
+    // bool AND the juce::String they had just declared to receive the reason. The three
+    // ways the processor refuses - the preset is gone, it will not read, it is not one of
+    // ours - reached nobody at all.
+    //
+    // It is the worst SHAPE a failure can have, not merely a quiet one. The drop-down goes
+    // on showing the name that was picked, because the box's text is the box's own; the
+    // corner behind it has been CLEARED, because assignPlaygroundCorner empties it before
+    // it reads the file. So the pad blends three corners while the panel says four, and
+    // nothing anywhere connects the two facts. It is not exotic either: the list is a
+    // snapshot of the preset FOLDER, so a rename, a sync client or a second instance
+    // saving is enough.
+    //
+    // Driven through the box's own onChange, which is the only path a user has and the
+    // only one that could swallow anything, and read back off the panel's real status
+    // label through the probe that already existed.
+    {
+        std::printf ("\nrun 73: a corner that would not take a preset says why:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();
+        auto& p = *pp;
+        p.prepareToPlay (48000.0, 256);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "  the editor builds");
+        if (ed != nullptr)
+        {
+            ed->setSize (1200, 650);
+            // GATE FIRST: a panel that always carried a complaint would pass everything
+            // below without the fix.
+            check (! ed->playgroundProbeForTests (520, 560, false).status.contains ("no longer exists"),
+                   "  with nothing wrong, the panel is not complaining");
+
+            ed->playgroundAssignForTests (0, "zzz73-not-a-preset");
+            const auto en = ed->playgroundProbeForTests (520, 560, false).status;
+            std::printf ("    status after the failed drop: \"...%s\"\n",
+                         en.substring (juce::jmax (0, en.length() - 90)).toRawUTF8());
+            check (en.contains ("no longer exists"),
+                   "  the LOADER'S own reason reaches the screen, not a paraphrase of it");
+            check (en.contains ("Corner A") || en.contains ("A:"),
+                   "  ...and it names WHICH of the four boxes refused");
+            check (! p.getPlaygroundCornerName (0).isNotEmpty(),
+                   "  (precondition: the corner really was left empty - the silence hid a "
+                   "cleared corner under a box still showing the name)");
+
+            // ...IN THE LANGUAGE THE PANEL IS IN. The reason is the processor's and stays
+            // its own words, but the sentence around it is rebuilt on every refresh, so a
+            // language switch after the failure does not leave the old one standing.
+            const auto ca = ed->playgroundProbeForTests (520, 560, true).status;
+            check (ca.contains ("no longer exists"),
+                   "  the Catalan panel still carries the loader's own reason");
+            check (ca.contains (juce::String::fromUTF8 ("Cantonada A")),
+                   "  ...under a sentence that switched language with the window");
+        }
+    }
+
+    //-- run 74: THE ONE TABLE NO GATE CAN PHOTOGRAPH SPELLS ITS ACCENTS AS ESCAPES ----
+    //
+    // Two of fgdlg's Catalan titles carried their accented o as RAW SOURCE BYTES. They
+    // render correctly, and only because CMakeLists passes /utf-8 - drop that flag, or let
+    // an editor re-save this BOM-less file in the system codepage, and one character
+    // becomes two. This build has already paid for that once: a name shipped with an extra
+    // capital A-tilde in all 42 main-editor snapshots.
+    //
+    // What makes it worth a gate rather than a tidy-up is WHERE it is. Every other string
+    // in the plugin is drawn by a Component this project can photograph, so the snapshot
+    // rig's mojibake gate would catch it on the next run; an OS dialog's title bar is
+    // drawn by Windows and is the one string in the product no picture can contain. So it
+    // is checked in the source, where it is decidable: nothing inside the fgdlg block may
+    // be a byte above 127.
+    {
+        std::printf ("\nrun 74: the OS-dialog table writes its accents as escapes:\n");
+       #ifdef FG_SOURCE_DIR
+        const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
+        const auto held = srcDir.getChildFile ("source").getChildFile ("PluginEditor.h")
+                                .loadFileAsString().toStdString();
+        const size_t from = held.find ("namespace fgdlg");
+        check (from != std::string::npos, "  the table audit can find the table");
+        if (from != std::string::npos)
+        {
+            const size_t open = held.find ('{', from);
+            const size_t end  = held.find ("\n}", open);       // the namespace's own closer
+            check (open != std::string::npos && end != std::string::npos && end > open,
+                   "  (precondition: the block has a beginning and an end)");
+            juce::StringArray raw;
+            for (size_t i = open; i < end && end != std::string::npos; ++i)
+                if ((unsigned char) held[i] >= 0x80)
+                {
+                    int line = 1;
+                    for (size_t k = 0; k < i; ++k) if (held[k] == '\n') ++line;
+                    raw.add (juce::String ("PluginEditor.h:") + juce::String (line));
+                }
+            raw.removeDuplicates (false);
+            if (! raw.isEmpty())
+                std::printf ("    raw byte where an escape belongs: %s\n",
+                             raw.joinIntoString (", ").toRawUTF8());
+            check (raw.isEmpty(),
+                   "  every accent in the OS-dialog titles is written as an escape - the "
+                   "one set of strings no snapshot can check");
+        }
+       #else
+        std::printf ("  [SKIP] table audit: FG_SOURCE_DIR not defined\n");
+       #endif
+    }
 }
