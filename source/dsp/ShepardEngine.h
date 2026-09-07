@@ -46,6 +46,16 @@
 //   - everything above the copy's own Nyquist is culled exactly as the ordinary
 //     voice culls it, with a taper (kTaperMax partials wide) so a partial leaves
 //     by fading rather than by vanishing between two samples.
+//   - ONE RISE STEP IS AT MOST kMaxRiseRatio (16/1, four octaves), and that bound
+//     was missing from this list while the code enforced it - which is the whole
+//     reason the list exists. A tuning may STATE a wider period than that: an .scl
+//     period line is unbounded and MTS-ESP's MTS_GetPeriodRatio is a float, so this
+//     is not a hypothetical. MEASURED: a one-note .scl whose period line reads 32/1
+//     loads, periodRatio() answers 32, and with "Period pitch bend" chosen the rise
+//     step came out 16 - half of what the file says - with nothing on screen about
+//     it. The bound stays (see kMaxRiseRatio for why 16 is where it stops); what
+//     changed is that riseRatioIsLimited() now answers it, so the panel can say
+//     which interval is actually rising.
 //
 // RT contract: no allocation, no locks, no strings. Every array the voice needs
 // already exists; this header only holds the constants and the pure maths.
@@ -92,13 +102,47 @@ namespace shepard
     // The tuning's own period is offered - and only offered - when it differs.
     enum RiseChoice { RiseOctave = 0, RisePeriod = 1 };
 
+    // THE WIDEST RISE STEP, and the narrowest period that counts as one at all.
+    //
+    // kMinRiseRatio is the same threshold TuningManager::hasUsablePeriod() uses, and it
+    // is a GUARD rather than a clamp here: a period at or below it is not a repeat
+    // interval going up, so the choice falls back to the octave instead of being
+    // stretched up to 1.0001. Written once so the two cannot drift apart.
+    //
+    // kMaxRiseRatio is where a rise step stops. Four octaves is already most of what a
+    // Shepard has to work with: bandFor centres the copies in the audible range, which
+    // is 9.95 octaves wide at 44.1 kHz, so at 16/1 the stack is down to 2.49 copies and
+    // at 32/1 it would be 1.99 - and at two copies the raised-cosine window is no longer
+    // a smooth crossfade between neighbours but two humps taking turns. The bound is a
+    // real one and is NOT to be widened to make a warning go away; it is to be SAID.
+    inline constexpr double kMinRiseRatio = 1.0001;
+    inline constexpr double kMaxRiseRatio = 16.0;
+
     // The ratio one full rise step covers. `tuningPeriod` is only consulted for
     // RisePeriod, and only when it is a usable period.
+    //
+    // jmin, not jlimit: the guard above already demands tuningPeriod > kMinRiseRatio, so
+    // a lower clamp at the same number could never fire. It read as a second bound and
+    // would have made riseRatioIsLimited() below answer for a case that does not exist.
     inline double riseRatio (int choice, double tuningPeriod) noexcept
     {
-        if (choice == RisePeriod && std::isfinite (tuningPeriod) && tuningPeriod > 1.0001)
-            return juce::jlimit (1.0001, 16.0, tuningPeriod);
+        if (choice == RisePeriod && std::isfinite (tuningPeriod) && tuningPeriod > kMinRiseRatio)
+            return juce::jmin (kMaxRiseRatio, tuningPeriod);
         return 2.0;
+    }
+
+    // IS THE STEP THE USER ASKED FOR THE STEP THEY ARE GETTING? The one question a panel
+    // needs in order not to let a four-octave rise pass for the eight-octave one the
+    // loaded scale states. Pure, cheap and lock-free - the caller already holds the
+    // tuning's period (the processor publishes it), so there is no state to keep.
+    //
+    // Only the upper bound can answer yes. RiseOctave never consults the period at all,
+    // and a period that fails the guard is not narrowed to fit - the choice falls back
+    // to a plain octave, which the dropdown already says out loud.
+    inline bool riseRatioIsLimited (int choice, double tuningPeriod) noexcept
+    {
+        return choice == RisePeriod && std::isfinite (tuningPeriod)
+               && tuningPeriod > kMaxRiseRatio;
     }
 
     // Is there anything to choose? (The dropdown is hidden when there is not.)
