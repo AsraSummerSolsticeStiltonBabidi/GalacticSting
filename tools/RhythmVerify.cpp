@@ -2129,6 +2129,8 @@ static void runCpuBenchTemporary()
 // The processor-audit runs (60+). Defined at the very END of this file - see the block
 // there - and declared here because main's run list is above it.
 static void runProcessorAuditChecks();
+// The silent-limit runs (70+), same arrangement and same reason. --limits runs them alone.
+static void runSilentLimitChecks();
 
 int main (int argc, char** argv)
 {
@@ -2187,6 +2189,15 @@ int main (int argc, char** argv)
     if (argc > 1 && std::strcmp (argv[1], "--audit") == 0)
     {
         runProcessorAuditChecks();
+        std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
+        return failures == 0 ? 0 : 1;
+    }
+
+    // ONE BLOCK, ON DEMAND: only the silent-limit runs (70+). Same shape and same
+    // reason as --audit above.
+    if (argc > 1 && std::strcmp (argv[1], "--limits") == 0)
+    {
+        runSilentLimitChecks();
         std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
         return failures == 0 ? 0 : 1;
     }
@@ -19011,6 +19022,7 @@ int main (int argc, char** argv)
     }
 
     runProcessorAuditChecks();
+    runSilentLimitChecks();
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
@@ -19679,4 +19691,193 @@ static void runProcessorAuditChecks()
                "  the parked 432 survives the preset - a preset changes the sound, not the "
                "reference the user typed");
     }
+}
+
+//==============================================================================
+// THE SILENT-LIMIT RUNS (70+). Appended at the end for the same reason the audit runs
+// are, and reachable on their own through --limits: they exist to be re-run under
+// SABOTAGE, and a twelve-minute full suite per sabotage is how sabotage stops being
+// done.
+//
+// The rule they are about is the one this synth cares most about: NOTHING IS EVER
+// SILENTLY CAPPED. Both defects were the same shape - a clamp that fires, a comment
+// claiming somebody was told, and nothing anywhere that told them.
+static void runSilentLimitChecks()
+{
+    using Proc = FractalAdditiveAudioProcessor;
+
+    // Circular distance between two phases in [0,1). Written because the obvious
+    // |a - b| is wrong at exactly the place these tests land on: a phase that should be
+    // 0.0 arrives as 0.999999999999998 once ppq has been accumulated a couple of dozen
+    // times, and a straight subtraction calls that a whole cycle of error.
+    auto phaseGap = [] (double a, double b)
+    {
+        const double d = std::fabs (a - b);
+        return std::min (d, 1.0 - d);
+    };
+
+    //-- run 70: THE LFO RATE CEILING APPLIES IN BOTH DRESSES, AND IS READABLE --------
+    // The LFO's phase steps once per block, so the fastest it can represent is half a
+    // cycle per block - 0.5 * sr / blockSize. Two things were wrong with that ceiling:
+    //
+    //   (a) NOBODY WAS TOLD. isRateLimited() existed and had no consumer outside this
+    //       verifier, so the engine capped the rate and the panel went on showing the
+    //       number the user had asked for.
+    //   (b) IN BPM MODE THE CAP DID NOT EVEN APPLY. The transport-locked branch built
+    //       its BPM dress as ppqEnd / 2^div - straight from the beats, bypassing the
+    //       clamped `rate` the free-Hz dress went through. The same LFO therefore ran
+    //       at two different speeds depending on which dropdown entry named it.
+    //
+    // MEASURED HERE, at settings a project reaches without trying: 44.1 kHz, an
+    // 8192-sample offline-render block (ceiling 2.6917 Hz), BPM 300 with Div 0. Both
+    // dresses ask for 5 Hz. The free dress advanced 0.5 cycle per block; the BPM dress
+    // advanced 0.9288 - 1.86x the ceiling, in the one phase mode whose phase belongs to
+    // the host and cannot be argued with.
+    //
+    // WHY evaluateMods IS CALLED DIRECTLY rather than audio rendered: bpm and ppq are
+    // arguments to it, so the transport is exact instead of mocked, and the phase is
+    // read out of a VoiceState this test owns. No estimator stands in the loop, which
+    // means a failure here is about the rate and can be about nothing else.
+    {
+        std::printf ("\nrun 70: an LFO past its ceiling is capped in BOTH dresses and says so:\n");
+        constexpr double sr70    = 44100.0;
+        constexpr int    blk70   = 8192;              // an offline-render buffer
+        constexpr int    kBlocks = 24;
+        const double dt      = (double) blk70 / sr70;
+        const double ceiling = 0.5 * sr70 / (double) blk70;   // 2.69165... Hz
+        const double bpm     = 300.0;                          // BPM/2^0 asks bpm/60 = 5 Hz
+
+        struct Arm
+        {
+            std::vector<double>  phase;
+            ModEngine::RateState rs;
+        };
+
+        // rateMode: 0 = BPM / 2^n, 2 = Free Hz. `hz` is only read in mode 2 and `div`
+        // only in mode 0, so one lambda covers both dresses with nothing mocked.
+        auto runArm = [&] (int rateMode, int div, float hz, double theBpm) -> Arm
+        {
+            Arm a;
+            auto up = std::make_unique<Proc>();
+            auto& p = *up;
+            const auto sp = [&] (const char* id, float v)
+            {
+                if (auto* q = p.apvts.getParameter (id))
+                    q->setValueNotifyingHost (q->convertTo0to1 (v));
+            };
+            sp ("modL1Wave", 0.0f);                   // Sine (the wave is not under test)
+            sp ("modL1RateMode", (float) rateMode);
+            sp ("modL1Div", (float) div);
+            sp ("modL1Hz", hz);
+            sp ("modL1PhaseMode", 1.0f);              // Project transport - the branch under test
+            sp ("modL1Phase", 0.0f);
+            sp ("modL1On", 1.0f);
+            p.pollParametersForTests();
+            p.prepareToPlay (sr70, blk70);            // this is what hands the engine its sr
+            p.pollParametersForTests();
+
+            ModEngine::VoiceState st;
+            double vals[ModEngine::kMods] = {};
+            bool   act [ModEngine::kMods] = {};
+            double ppq = 0.0;
+            for (int k = 0; k < kBlocks; ++k)
+            {
+                p.getModEngine().evaluateMods (st, blk70, false, true, 0.0, theBpm, ppq,
+                                               vals, act, true);
+                a.phase.push_back (st.lfo[0].phase);
+                ppq += dt * theBpm / 60.0;
+            }
+            a.rs = p.getModEngine().rateState (0);
+            return a;
+        };
+
+        const Arm bpmArm  = runArm (0, 0, 1.0f, bpm);     // BPM 300 / 2^0 = 5 Hz
+        const Arm freeArm = runArm (2, 0, 5.0f, bpm);     // free 5 Hz - the same rate
+
+        std::printf ("  ceiling at %.0f Hz / %d samples = %.4f Hz; both dresses ask for 5 Hz\n",
+                     sr70, blk70, ceiling);
+        std::printf ("  BPM dress : asked %.4f, running %.4f, ceiling %.4f, limited %d\n",
+                     bpmArm.rs.asked, bpmArm.rs.actual, bpmArm.rs.ceiling, (int) bpmArm.rs.limited);
+        std::printf ("  free dress: asked %.4f, running %.4f, ceiling %.4f, limited %d\n",
+                     freeArm.rs.asked, freeArm.rs.actual, freeArm.rs.ceiling, (int) freeArm.rs.limited);
+        // A phase printed as 1.00000 is 0.0 reached from below - see phaseGap above.
+        std::printf ("  phase after blocks 1..6  BPM:");
+        for (int k = 0; k < 6; ++k) std::printf (" %.5f", bpmArm.phase[(size_t) k]);
+        std::printf ("\n                          free:");
+        for (int k = 0; k < 6; ++k) std::printf (" %.5f", freeArm.phase[(size_t) k]);
+        std::printf ("\n");
+
+        // (a) THE STATE IS THERE TO BE READ. Not a flag: the numbers a sentence needs.
+        check (bpmArm.rs.limited && freeArm.rs.limited,
+               "  both dresses report the rate as LIMITED");
+        check (std::abs (bpmArm.rs.asked - 5.0f) < 1.0e-4f
+                 && std::abs (freeArm.rs.asked - 5.0f) < 1.0e-4f,
+               "  ...and both publish the 5 Hz that was ASKED for, not the one they run at");
+        check (std::abs (bpmArm.rs.actual - (float) ceiling) < 1.0e-4f
+                 && std::abs (freeArm.rs.actual - (float) ceiling) < 1.0e-4f,
+               "  ...and both publish the rate they are REALLY running, which is the ceiling");
+        check (std::abs (bpmArm.rs.ceiling - (float) ceiling) < 1.0e-4f,
+               "  ...and the ceiling itself, so the panel can say why (it moves with the buffer)");
+
+        // (b) THE CAP REALLY BIT, IN BOTH. A block-stepped LFO sitting on its ceiling
+        // advances EXACTLY half a cycle per block - that is what the ceiling IS - so the
+        // phase after block k is 0.5*k mod 1 whichever dress asked for it.
+        double worstVsHalf = 0.0, worstCross = 0.0;
+        for (int k = 0; k < kBlocks; ++k)
+        {
+            const double want = std::fmod (0.5 * (double) (k + 1), 1.0);
+            worstVsHalf = std::max (worstVsHalf, phaseGap (bpmArm.phase[(size_t) k], want));
+            worstVsHalf = std::max (worstVsHalf, phaseGap (freeArm.phase[(size_t) k], want));
+            worstCross  = std::max (worstCross,
+                                    phaseGap (bpmArm.phase[(size_t) k], freeArm.phase[(size_t) k]));
+        }
+        std::printf ("  worst gap from half-a-cycle-per-block: %.3e; worst BPM-vs-free gap: %.3e\n",
+                     worstVsHalf, worstCross);
+        check (worstVsHalf < 1.0e-9,
+               "  the phase really advances at the ceiling in BOTH dresses - half a cycle "
+               "per block, which is the ceiling's own definition");
+        check (worstCross < 1.0e-9,
+               "  ...so the two dresses are the SAME LFO: naming a rate in BPM or in Hz "
+               "cannot change how fast it runs");
+
+        // (c) THE CONTROL ARM. Below the ceiling nothing is capped and nothing is claimed,
+        // and the unified formula has to leave the ordinary case exactly where it was.
+        const Arm slowBpm  = runArm (0, 0, 1.0f, 120.0);  // 2 Hz, well under 2.6917
+        const Arm slowFree = runArm (2, 0, 2.0f, 120.0);
+        // EACH ARM AGAINST ITS OWN PUBLISHED RATE, not against a literal 2.0, and that is
+        // not a softened claim - it is a sharper one. The free-Hz knob is a float with a
+        // 0.001 step and a 0.4 skew, so asking it for 2.0 stores 2.0000021: the two arms
+        // really are running at rates that differ in the seventh digit, and holding both
+        // to a hard-coded 2.0 measures the knob's round trip rather than this branch. The
+        // published `asked` IS the double the branch used - it is that same float widened.
+        const double aBpm = (double) slowBpm.rs.asked, aFree = (double) slowFree.rs.asked;
+        double worstSlow = 0.0, worstSlowCross = 0.0;
+        for (int k = 0; k < kBlocks; ++k)
+        {
+            const double t = dt * (double) (k + 1);
+            worstSlow = std::max (worstSlow, phaseGap (slowBpm.phase[(size_t) k],
+                                                       std::fmod (aBpm * t, 1.0)));
+            worstSlow = std::max (worstSlow, phaseGap (slowFree.phase[(size_t) k],
+                                                       std::fmod (aFree * t, 1.0)));
+            worstSlowCross = std::max (worstSlowCross,
+                                       phaseGap (slowBpm.phase[(size_t) k], slowFree.phase[(size_t) k]));
+        }
+        // What the two knobs disagreeing by (aBpm - aFree) is worth after the whole run,
+        // which is the ONLY thing the cross gap is allowed to be made of.
+        const double crossAllowed = std::abs (aBpm - aFree) * dt * (double) kBlocks + 1.0e-9;
+        std::printf ("  under the ceiling: BPM asks %.7f Hz, free asks %.7f Hz; worst gap from"
+                     " each arm's own rate: %.3e; BPM-vs-free %.3e (the knobs alone are worth"
+                     " %.3e); limited %d/%d\n", aBpm, aFree, worstSlow, worstSlowCross,
+                     crossAllowed, (int) slowBpm.rs.limited, (int) slowFree.rs.limited);
+        check (! slowBpm.rs.limited && ! slowFree.rs.limited,
+               "  an LFO under the ceiling is NOT reported as limited");
+        check (std::abs (slowBpm.rs.asked - slowBpm.rs.actual) < 1.0e-6f,
+               "  ...and gets exactly the rate it asked for");
+        check (worstSlow < 1.0e-9,
+               "  ...and both dresses still run at exactly seconds * their own rate - "
+               "expressing the BPM dress through seconds*Hz did not move the uncapped case");
+        check (worstSlowCross <= crossAllowed,
+               "  ...and the two dresses differ by no more than the two knobs themselves do");
+    }
+
 }
