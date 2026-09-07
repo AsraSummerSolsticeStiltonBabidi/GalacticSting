@@ -19679,4 +19679,70 @@ static void runProcessorAuditChecks()
                "  the parked 432 survives the preset - a preset changes the sound, not the "
                "reference the user typed");
     }
+
+    //-- run 69: THE CATALAN IN THE EDITOR IS SPELLED CATALAN -------------------------
+    //
+    // Five words went out without their accent or their middle dot, and an accent missing
+    // from a Catalan word is not a typo the reader forgives: one of them is a different
+    // tense of the verb, one is not a Catalan word at all, and one is the spelling another
+    // language uses for the same word. All five are invisible to every gate this project
+    // owns - the tr-pair audit (run 12d) only sees a pair whose two sides are IDENTICAL,
+    // and the snapshot rig only sees mojibake, untranslated text and text that does not
+    // fit. These are well-formed UTF-8 that fits its box and differs from its English
+    // twin, so nothing could ever have caught them. This is the gate that can.
+    //
+    // It reads the SOURCE, exactly as run 12d does, and the needles are assembled from
+    // fragments at run time ON PURPOSE: a check that spelled them out would BE a sixth
+    // occurrence of each, sitting in the repository answering its own grep.
+    //
+    // THE RULE IS "the needle, then a character that is not a letter". Catalan really does
+    // have words that begin with one of these - the difference tone this window names
+    // twice is one - and reporting those would make the gate cry wolf until somebody
+    // switched it off. The five correct spellings all carry a \x escape immediately after
+    // the fragment, so a fixed word can never match its own needle.
+    {
+        std::printf ("\nrun 69: the Catalan in the editor window is spelled Catalan:\n");
+       #ifdef FG_SOURCE_DIR
+        const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
+        const std::string needles[] = { std::string ("tin")    + "dra",
+                                        std::string ("disson") + "ancia",
+                                        std::string ("difer")  + "encia",
+                                        std::string ("il")     + "legible",
+                                        std::string ("de de")  + "bo" };
+        // Plain ASCII, deliberately: juce::CharacterFunctions::toLowerCase takes a code
+        // point, and this walks BYTES - handing it the second byte of an accented letter
+        // would be asking a Unicode question about half a character.
+        const auto lower    = [] (char c) { return (c >= 'A' && c <= 'Z') ? (char) (c + 32) : c; };
+        const auto isLetter = [] (char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+
+        juce::StringArray hits;
+        for (const char* leaf : { "PluginEditor.cpp", "PluginEditor.h" })
+        {
+            const auto held = srcDir.getChildFile ("source").getChildFile (leaf)
+                                    .loadFileAsString().toStdString();
+            const juce::String readable = juce::String ("  the spelling audit can read ") + leaf;
+            check (! held.empty(), readable.toRawUTF8());
+            for (const auto& needle : needles)
+                for (size_t i = 0; i + needle.size() <= held.size(); ++i)
+                {
+                    bool same = true;
+                    for (size_t k = 0; k < needle.size() && same; ++k)
+                        same = lower (held[i + k]) == needle[k];
+                    if (! same) continue;
+                    if (i + needle.size() < held.size() && isLetter (held[i + needle.size()]))
+                        continue;                       // a longer, legitimate word
+                    int line = 1;
+                    for (size_t k = 0; k < i; ++k) if (held[k] == '\n') ++line;
+                    hits.add (juce::String (leaf) + ":" + juce::String (line) + " \""
+                              + juce::String (needle.c_str()) + "\"");
+                }
+        }
+        if (! hits.isEmpty())
+            std::printf ("    %s\n", hits.joinIntoString ("\n    ").toRawUTF8());
+        check (hits.isEmpty(),
+               "  no Catalan word in the editor is missing its accent or its middle dot");
+       #else
+        std::printf ("  [SKIP] spelling audit: FG_SOURCE_DIR not defined\n");
+       #endif
+    }
 }
