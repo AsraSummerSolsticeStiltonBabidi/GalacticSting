@@ -2426,8 +2426,13 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         // dies with the editor - and destroying a juce::FileChooser cancels its pending
         // callback, which is exactly the protection this one opted out of. It was the odd
         // one out for no reason; it is not any more.
+        // THE TITLE COMES OUT OF fgdlg, like the other nine. This one was written out
+        // here instead - the same two words, a second time - and a table whose whole job
+        // is to be the ONE place an OS-window title is written has exactly one failure
+        // mode: a second copy. The gate at fgdlg::all walks the TABLE, so the copy was
+        // invisible to it; only the copy could go stale, and it was the copy the user saw.
         fileChooser = std::make_unique<juce::FileChooser> (
-            tr ("Save tuning", "Desa l'afinaci\xc3\xb3"),
+            tr (fgdlg::saveTuning.en, fgdlg::saveTuning.ca),
             juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
                 .getChildFile ("tuning.tun"),
             "*.tun;*.scl");
@@ -2444,7 +2449,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                 if (! (asScl ? processorRef.saveCurrentTuningScl (f, err)
                              : processorRef.saveCurrentTuningTun (f, err)))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        tr ("Save tuning", "Desa l'afinaci\xc3\xb3"), err, this);
+                        tr (fgdlg::saveTuning.en, fgdlg::saveTuning.ca), err, this);
                 refocus();
             });
     };
@@ -6999,7 +7004,7 @@ void FractalAdditiveAudioProcessorEditor::saveDissonanceScl()
     if (! processorRef.hasGeneratedScl())
     {
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon,
-            tr ("Save scale", "Desar escala"),
+            tr (fgdlg::saveScale.en, fgdlg::saveScale.ca),   // the table, like line 7026 below
             tr ("Generate a scale first - press 'Find'.",
                 "Primer genera una escala - prem 'Troba'."), this);
         return;

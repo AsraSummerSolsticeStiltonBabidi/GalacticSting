@@ -19745,4 +19745,86 @@ static void runProcessorAuditChecks()
         std::printf ("  [SKIP] spelling audit: FG_SOURCE_DIR not defined\n");
        #endif
     }
+
+    //-- run 70: THE TABLE OF OS-WINDOW TITLES IS THE ONLY PLACE THEY ARE WRITTEN ------
+    //
+    // fgdlg exists for one reason: an OS window's title bar is drawn by Windows, not by
+    // this plugin, so no sweep of our own components can ever see it and six of them once
+    // shipped in English under a body that changed language properly. The table is the
+    // answer - the call sites and the gate read the SAME pairs, so a title cannot drift in
+    // one and not the other.
+    //
+    // A table like that has exactly one failure mode, and it is not a typo: it is a SECOND
+    // COPY. Two dialogs wrote their own "Save tuning" pair out by hand and one wrote its
+    // own "Save scale", so fgdlg::saveTuning was read by nothing at all - an entry in the
+    // one true table that no window on the screen was using, while three windows used
+    // copies that only the copies could keep up to date. The old gate walks fgdlg::all, so
+    // the copies were the one thing it could not see.
+    //
+    // Two arms, and both of them are decidable from the source with no exemption list:
+    //   (a) every entry in the table is READ from the table somewhere. This is the arm the
+    //       duplicated saveTuning trips: nothing referred to it by name.
+    //   (b) no OS-dialog call site - a NativeMessageBox or a juce::FileChooser - writes a
+    //       title that is already IN the table as a bare literal. This is the arm the
+    //       saveScale copy trips, and the one that would catch a fourth copy tomorrow.
+    // Arm (b) looks only INSIDE a dialog's own argument list (up to the statement's
+    // semicolon), on purpose: the same words can legitimately be on a BUTTON - the top bar
+    // has one that says "Spectrum vs Rhythm" because that is what it opens - and a gate
+    // that flagged those would be turned off within a week.
+    {
+        std::printf ("\nrun 70: every OS-window title comes from the ONE table (fgdlg):\n");
+       #ifdef FG_SOURCE_DIR
+        const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
+        std::string src;
+        for (const char* leaf : { "PluginEditor.cpp", "PluginEditor.h" })
+            src += srcDir.getChildFile ("source").getChildFile (leaf).loadFileAsString().toStdString();
+        check (src.size() > 100000, "  the dialog-title audit can read the editor's source");
+
+        // The NAMES, spelled here because arm (a) is a question about names; the TEXTS come
+        // from fgdlg::all itself, so no string in this check can go stale against the table.
+        const char* names[] = { "loadScale", "loadTimbre", "saveScale", "rhythmHelp", "mpeOut",
+                                "openTuning", "openBank", "openTimbre", "saveTuning", "saveGen" };
+        const int nNames = (int) (sizeof (names) / sizeof (names[0]));
+        check (nNames == (int) (sizeof (fgdlg::all) / sizeof (fgdlg::all[0])),
+               "  (precondition: this check knows every entry the table holds)");
+
+        juce::StringArray unread;
+        for (const char* nm : names)
+            if (src.find (std::string ("fgdlg::") + nm) == std::string::npos)
+                unread.add (nm);
+        if (! unread.isEmpty())
+            std::printf ("    in the table and read by nothing: %s\n",
+                         unread.joinIntoString (", ").toRawUTF8());
+        check (unread.isEmpty(),
+               "  (a) every title in the table is read FROM the table - an entry nobody "
+               "names is a window using a copy");
+
+        juce::StringArray copies;
+        for (const char* token : { "showMessageBoxAsync", "juce::FileChooser>" })
+            for (size_t at = src.find (token); at != std::string::npos;
+                 at = src.find (token, at + 1))
+            {
+                const size_t semi = src.find (';', at);
+                const size_t end  = std::min (at + 400, semi == std::string::npos ? src.size() : semi);
+                const std::string args = src.substr (at, end - at);
+                for (const auto& d : fgdlg::all)
+                    if (args.find (std::string ("\"") + d.en + "\"") != std::string::npos)
+                    {
+                        int line = 1;                       // both files concatenated, so this
+                        for (size_t k = 0; k < at; ++k)     // is "line n of the pair", enough
+                            if (src[k] == '\n') ++line;     // to find it
+                        copies.add (juce::String ("line ") + juce::String (line) + " writes \""
+                                    + juce::String (d.en) + "\" out by hand");
+                    }
+            }
+        copies.removeDuplicates (false);
+        if (! copies.isEmpty())
+            std::printf ("    %s\n", copies.joinIntoString ("\n    ").toRawUTF8());
+        check (copies.isEmpty(),
+               "  (b) no dialog writes a title the table already holds - the copy is the "
+               "one that goes stale, and it is the one the user sees");
+       #else
+        std::printf ("  [SKIP] dialog-title audit: FG_SOURCE_DIR not defined\n");
+       #endif
+    }
 }
