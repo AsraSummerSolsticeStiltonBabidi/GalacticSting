@@ -877,7 +877,7 @@ private:
     // height are read live rather than replaced: phaseFader's box is switched between
     // TextBoxRight and NoTextBox by resized() according to how much room its cell has, and
     // a language pass must not undo that decision either.
-    struct FaderBoxHome { int w = 46; };
+    struct FaderBoxHome { juce::Slider::TextEntryBoxPosition pos = juce::Slider::TextBoxBelow; int w = 46; };
     std::vector<FaderBoxHome> faderBoxHome;   // parallel to configuredFaders, filled once
     // ESSENTIALS could not fit its sub-label beside its control, so the label is drawn
     // above it instead. Set by resized(), read by paintedSubLabels() - the two must agree.

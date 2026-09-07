@@ -4957,7 +4957,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         // applyLanguage() - by then every caller has finished moving the box it wanted.
         faderBoxHome.clear();
         for (auto* s : configuredFaders)
-            faderBoxHome.push_back ({ s->getTextBoxWidth() });
+            faderBoxHome.push_back ({ s->getTextBoxPosition(), s->getTextBoxWidth() });
     }
     for (size_t i = 0; i < configuredFaders.size(); ++i)
     {
@@ -11323,13 +11323,30 @@ void FractalAdditiveAudioProcessorEditor::resized()
             const bool mergeNamePeriod = nameOwnRow
                                        && nameNeed + 8 + periodNeed + periodExtra <= ti.getWidth()
                                        && ti.getHeight() - 22 < need;
+            // ...AND WHEN THERE IS NEITHER A LEFTOVER THAT HOLDS IT NOR A ROW TO GIVE IT,
+            // the name is not drawn at all. `mrow` is whatever the mode selector and the
+            // three buttons left, and at a short window that is nothing: a juce::Label
+            // with zero width paints no pixels while every bounds check stays green -
+            // which is the same fault the buttons on that row refuse for themselves three
+            // dozen lines up, and the structural gate calls a control collapsed to
+            // nothing. Reachable only since the window's floor came down to 510 px tall.
+            // The tuning's identity is still stated by the period read-out's row and by
+            // the tuning selector above it; a smear of nothing states nothing.
+            tuningNameLabel.setVisible (true);
             if (nameOwnRow && ! mergeNamePeriod)
             {
                 ti.removeFromTop (kTunRowGap);
                 tuningNameLabel.setBounds (ti.removeFromTop (20));
             }
             else if (! mergeNamePeriod)
-                tuningNameLabel.setBounds (mrow);
+            {
+                // 14 is kRowMin below - this panel's own "still a row" threshold, spelled
+                // out here because that constant is declared further down.
+                if (mrow.getWidth() < 8 || mrow.getHeight() < 14)
+                    tuningNameLabel.setVisible (false);
+                else
+                    tuningNameLabel.setBounds (mrow);
+            }
             // (merged: the name is placed by the period row below, which is the row it
             // now shares - setting bounds here would put it in the 13 px leftover.)
 
@@ -11441,10 +11458,20 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // width. "Load spectrum's tuning" was a 420 px slab for 22 characters. Same
             // padding rule as every other narrowed control (fgfit::kSnugPad), and all
             // three share ONE helper so a rename cannot widen one and not its neighbours.
-            auto snugRow = [this, lead, kTunRowGap] (juce::Rectangle<int>& ti, juce::TextButton& b)
+            auto snugRow = [this, lead, kTunRowGap, kRowMin] (juce::Rectangle<int>& ti, juce::TextButton& b)
             {
                 ti.removeFromTop (kTunRowGap + lead);   // its share of the panel's spare height
-                auto row = ti.removeFromTop (22).reduced (2, 0);
+                // A ROW THE PANEL CANNOT AFFORD IS NOT DRAWN AT ALL. removeFromTop hands
+                // back whatever is left, which can be nothing, and a TextButton with zero
+                // height is a control the user cannot see OR press while every bounds
+                // check stays green - the same "unreadable smear" the three buttons on the
+                // mode row above refuse for width. The ladder that sizes this panel
+                // already drops the bank and bend rows under pressure; these snug rows
+                // exist only because the state they describe is live, so dropping one is
+                // the same trade one rung further down. kRowMin (14) is this panel's own
+                // threshold for "still a row".
+                if (ti.getHeight() < kRowMin) { b.setVisible (false); return; }
+                auto row = ti.removeFromTop (juce::jmin (22, ti.getHeight())).reduced (2, 0);
                 b.setBounds (row.removeFromLeft (
                     juce::jmin (fgfit::snugTextButtonWidth (b, 22), row.getWidth())));
             };
@@ -11724,13 +11751,34 @@ void FractalAdditiveAudioProcessorEditor::resized()
     //
     // Run at the END of resized(), because that is the first moment every fader has its
     // final bounds - and only when the answer CHANGES, since setTextBoxStyle rebuilds the
-    // label. Horizontal faders are left alone: they carry their box to the RIGHT, where
-    // the rule is a different one and its owner already applies it.
-    for (auto* s : configuredFaders)
+    // label. Faders whose caller moved the box to the RIGHT are left alone: the rule there
+    // is a different one and its owner already applies it.
+    for (size_t i = 0; i < configuredFaders.size() && i < faderBoxHome.size(); ++i)
     {
-        if (s->getSliderStyle() != juce::Slider::LinearVertical) continue;
+        auto* s = configuredFaders[i];
+        // WHICH FADERS THIS RULE IS FOR: the ones whose read-out lives BELOW the track,
+        // which is where configFader puts every box and where all but eight of them stay.
+        // It used to ask the SLIDER STYLE instead, and that is not the same question: the
+        // CUSTOM tab's Range fader is horizontal AND keeps the box below, so it was the
+        // one fader with a box below that this loop never looked at - and it is the one
+        // that turned up with a 1 px track and a label of negative height the moment the
+        // window's floor came down. A box to the RIGHT belongs to its own owner's rule
+        // (phaseFader's cell test earlier in this function), and asking the HOME position
+        // rather than the live one is what keeps this loop from undoing that decision.
+        if (faderBoxHome[i].pos != juce::Slider::TextBoxBelow) continue;
         const int  want  = juce::jmax (46, fgfit::faderValueWidth (*s) + 2);
-        const bool fits  = s->getWidth() >= fgfit::faderValueWidth (*s);
+        // ...AND THE SAME RULE IN THE OTHER DIRECTION, which this loop was missing.
+        //
+        // A box below costs the fader 15 px of its own HEIGHT, and a fader shorter than
+        // that hands juce::Slider a label with negative room: the rig classes that as a
+        // control collapsed to nothing, which is a structural fault and not a fit problem.
+        // It was unreachable while the window's floor was 550 px tall and became reachable
+        // the moment the value boxes stopped being pushed under the horizontal faders
+        // (see applyLanguage's sizing pass) and the floor came down to 510. 15 + 8 is the
+        // box plus the least track that is still a track - the same threshold the row
+        // ladder in the tuning panel calls kRowMin, one pixel under.
+        const bool fits  = s->getWidth() >= fgfit::faderValueWidth (*s)
+                        && s->getHeight() >= 15 + 8;
         const auto style = fits ? juce::Slider::TextBoxBelow : juce::Slider::NoTextBox;
         if (s->getTextBoxPosition() != style)
             s->setTextBoxStyle (style, false, want, 15);
