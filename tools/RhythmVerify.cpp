@@ -17510,6 +17510,466 @@ int main (int argc, char** argv)
             check (p.getTimbreSource().trim() == "5/4 3/2 2",
                    "leaving the custom engine and coming back KEEPS the typed spectrum -"
                    " the \"1\" is seeded on a blank slate only");
+    //== A PENCIL DRAG MAY NOT WRAP BACK ONTO ITS OWN PLAN =========================
+    //
+    // SpectrumEngine has kSlots == 8 and every gains-only republish advances the write
+    // slot by one, so the EIGHTH frame of a pencil drag lands on the slot the plan was
+    // measured in. setOverrides copies the source slot WHOLESALE - the generation stamp
+    // included, deliberately, because bumping it would restart every voice's spectral
+    // morph sixty times a second - and it did not zero that slot's planStamp. So on the
+    // eighth frame planStamp[w] still equalled the copied generation, getLivePlan() and
+    // getLivePair() both passed their "measured on the template that is live NOW" test,
+    // and a note started after that frame was seeded from phases measured on the
+    // PRE-EDIT amplitudes. The header opposite planFor() has the number that costs:
+    // 2.13 dB WORSE than today's hash after a single pencil edit. And it did not heal -
+    // planLive() early-returns on exactly the stamp==generation test that was wrongly
+    // passing, so every wrap after the first was stale too until a real recompile.
+    //
+    // THE ONLY CORRECT ANSWER AFTER AN EDIT IS "NO PLAN". Nothing re-measures a plan on
+    // a gains-only republish (that is the 38 ms the engine refuses to spend on a drag
+    // frame), so a voice starting mid-drag gets today's hash - the documented fallback
+    // and the sound this synth already shipped. A plan handed back here is a plan for a
+    // spectrum nobody is playing.
+    {
+        std::printf ("\na pencil drag never hands a voice the plan of the spectrum it just edited:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 256);
+        awaitSpectrumIdle (*p, "the default template before the drag");
+
+        const auto* T   = p->getLiveTemplate();
+        const auto* pl0 = p->getLivePhasePlan();
+        // GATE FIRST. With no plan live before the drag there is nothing to go stale and
+        // every check below would pass on an engine that had stopped planning entirely.
+        check (T != nullptr && ! T->partials.empty() && pl0 != nullptr && pl0->valid(),
+               "  (precondition) a valid plan is live BEFORE the drag, so staleness is possible");
+        if (T != nullptr && ! T->partials.empty() && pl0 != nullptr && pl0->valid())
+        {
+            const std::vector<double> preEdit = pl0->phase;   // the plan on the UNEDITED gains
+            const int  edited = std::min (64, (int) T->partials.size());
+            int  firstHanded = -1;      // the first drag frame that handed back ANY plan
+            int  firstStale  = -1;      // ...and the first that handed back THE OLD ONE
+            for (int frame = 1; frame <= 9; ++frame)
+            {
+                // One drag frame: the same partials, a different depth every frame, so
+                // "the latest gains" is a different number nine times over and a plan
+                // measured on any earlier frame is measurably the wrong one.
+                std::vector<spectrum::PartialGain> ov;
+                ov.reserve ((size_t) edited);
+                for (int i = 0; i < edited; ++i)
+                {
+                    spectrum::PartialGain g;
+                    g.key = spectrum::gainKey ((double) T->partials[(size_t) i].ratio);
+                    g.dB  = -1.5f * (float) frame;
+                    ov.push_back (g);
+                }
+                p->setPartialGains (std::move (ov), true);
+                awaitSpectrumIdle (*p, "a pencil drag frame");
+
+                if (const auto* pl = p->getLivePhasePlan())
+                {
+                    if (firstHanded < 0) firstHanded = frame;
+                    if (firstStale < 0 && pl->phase == preEdit) firstStale = frame;
+                }
+            }
+            std::printf ("    9 drag frames on %d partials: first frame handing back a plan %d,"
+                         " first handing back the PRE-EDIT plan %d (-1 = never)\n",
+                         edited, firstHanded, firstStale);
+            check (firstStale < 0,
+                   "  no drag frame hands back the plan measured before the drag started"
+                   " - the 8-slot wrap does not resurrect it");
+            check (firstHanded < 0,
+                   "  ...and no drag frame hands back a plan at all: a gains-only republish"
+                   " re-measures nothing, so the honest answer is the hash");
+
+            // THE OTHER HALF, or the check above passes on an engine that never plans.
+            // A REAL recompile must still produce a plan.
+            const juce::uint32 gen0 = p->getTemplateGeneration();
+            if (auto* bn = p->apvts.getParameter ("baseN"))
+                bn->setValueNotifyingHost (bn->convertTo0to1 (5.0f));
+            // The rebuild rides the parameter POLL (timerCallback -> requestRebuild), and
+            // this harness has no message loop - without this tick the generation never
+            // moves and the wait below times out on a plugin that is working perfectly.
+            p->pollParametersForTests();
+            awaitTemplateChange (*p, gen0, "the recompile after the drag");
+            awaitSpectrumIdle (*p, "the recompile after the drag");
+            const auto* pl2 = p->getLivePhasePlan();
+            check (pl2 != nullptr && pl2->valid(),
+                   "  ...while a REAL recompile still publishes a plan - the fix suppresses"
+                   " the stale one, not the machinery");
+            check (pl2 == nullptr || pl2->phase != preEdit,
+                   "  ...and that plan is not the pre-drag one wearing a new stamp");
+        }
+    }
+
+    //== seedScattered READS THE TABLE, AND WRITES THE SAME BITS AS THE SINES =======
+    //
+    // seedScattered used to call hashPhaseAt - one std::sin - once per oscillator slot,
+    // on the NOTE-ON path, whenever the Phase fader sat above 0. Both banks, every
+    // Shepard copy: 16384 sines with the mode off, eight copies of 1638 with it on, per
+    // voice, before the note rendered a sample. It now reads phaseset's own scatterDeltas
+    // table, which has existed for exactly this arithmetic since the live re-phase needed
+    // it on the audio thread.
+    //
+    // A CHANGE TO A PHASE SET IS A CHANGE TO THE SOUND, so "same result" is not something
+    // to argue: the old chunked-hash path is written out again here, verbatim, and the
+    // two are compared to the LAST BIT at 21 fader positions across the index range, the
+    // chunk boundary the old code had at 64, and both endpoints of the fader. Anything
+    // less than bit-identity is a different instrument.
+    {
+        std::printf ("\nseedScattered seeds from the table and not from 16k sines:\n");
+        namespace ps = spectrum::phaseset;
+
+        // THE OLD IMPLEMENTATION, kept here as the reference and nowhere else. Copied
+        // from the revision this test was written against; if the shipping one is ever
+        // meant to differ, that is a deliberate act and this check is where it is stated.
+        auto refSeed = [] (int first, int count, double scatter, double* out)
+        {
+            if (count <= 0 || out == nullptr) return;
+            if (! (scatter > 0.0)) { for (int i = 0; i < count; ++i) out[i] = ps::kAlignedPhase; return; }
+            constexpr int kChunk = 64;
+            double buf[kChunk];
+            for (int i = 0; i < count; i += kChunk)
+            {
+                const int m = (count - i) < kChunk ? (count - i) : kChunk;
+                for (int k = 0; k < m; ++k) buf[k] = ps::hashPhaseAt (first + i + k);
+                ps::interpolatePhases (buf, m, scatter, out + i);
+            }
+        };
+
+        ps::warmScatterDeltas();   // the table's 16384 sines belong here, not in a note-on
+
+        // The spans are chosen to straddle everything that could differ: the old chunk
+        // boundary at 64, a Shepard slot (kStride = 1638), the whole bank, and offsets
+        // that put a chunk boundary in the middle of a span.
+        const int firsts[] = { 0, 1, 63, 64, 65, 512, 1638, 3276, 16000 };
+        const int counts[] = { 1, 63, 64, 65, 127, 128, 384, 1638 };
+        std::vector<double> a, b;
+        long long compared = 0; int mismatches = 0;
+        double worstDiff = 0.0; double worstScatter = -1.0; int worstIndex = -1;
+        for (int fi = 0; fi < (int) (sizeof (firsts) / sizeof (firsts[0])); ++fi)
+            for (int ci = 0; ci < (int) (sizeof (counts) / sizeof (counts[0])); ++ci)
+            {
+                const int first = firsts[fi];
+                const int count = std::min (counts[ci], spectrum::kMaxPartials - first);
+                if (count <= 0) continue;
+                a.assign ((size_t) count, -1.0);
+                b.assign ((size_t) count, -2.0);
+                for (int q = 0; q <= 20; ++q)
+                {
+                    // 0 and 1 are both INCLUDED: 0 is the sacred branch and 1 is the
+                    // endpoint the table cannot reach by multiplying a delta.
+                    const double s = (double) q / 20.0;
+                    refSeed (first, count, s, a.data());
+                    ps::seedScattered (first, count, s, b.data());
+                    for (int i = 0; i < count; ++i)
+                    {
+                        ++compared;
+                        if (a[(size_t) i] != b[(size_t) i])
+                        {
+                            ++mismatches;
+                            const double d = std::abs (a[(size_t) i] - b[(size_t) i]);
+                            if (d > worstDiff) { worstDiff = d; worstScatter = s; worstIndex = first + i; }
+                        }
+                    }
+                }
+            }
+        std::printf ("    %lld phases compared across %d spans x 21 fader positions:"
+                     " %d differ (worst %.3g at index %d, fader %.2f)\n",
+                     compared, (int) (sizeof (firsts) / sizeof (firsts[0]))
+                             * (int) (sizeof (counts) / sizeof (counts[0])),
+                     mismatches, worstDiff, worstIndex, worstScatter);
+        check (compared > 100000, "  (precondition) the comparison really covered the bank");
+        check (mismatches == 0,
+               "  the table path writes the SAME BITS the per-slot std::sin path wrote -"
+               " every index, every fader position, both endpoints included");
+
+        // ...AND IT IS ACTUALLY FASTER, or the rewrite bought a risk for nothing. One
+        // cold note-on's worth of seeding: the whole oscillator bank at a fader position
+        // that is neither endpoint, so both paths do their full work.
+        {
+            std::vector<double> out ((size_t) spectrum::kMaxPartials, 0.0);
+            double refMs = 1.0e18, newMs = 1.0e18;
+            for (int rep = 0; rep < 7; ++rep)     // minimum of seven: this box is noisy
+            {
+                double t0 = juce::Time::getMillisecondCounterHiRes();
+                refSeed (0, spectrum::kMaxPartials, 0.37, out.data());
+                refMs = std::min (refMs, juce::Time::getMillisecondCounterHiRes() - t0);
+                t0 = juce::Time::getMillisecondCounterHiRes();
+                ps::seedScattered (0, spectrum::kMaxPartials, 0.37, out.data());
+                newMs = std::min (newMs, juce::Time::getMillisecondCounterHiRes() - t0);
+            }
+            std::printf ("    one full bank (%d slots) at fader 0.37: sines %.3f ms,"
+                         " table %.3f ms (%.1fx)\n",
+                         spectrum::kMaxPartials, refMs, newMs, refMs / std::max (1.0e-6, newMs));
+            check (newMs < refMs,
+                   "  ...and the table path is the faster of the two, which is the whole"
+                   " reason to have taken the risk");
+        }
+    }
+
+    //== THE ENVELOPE'S CURVE EXPONENT IS A PARAMETER, NOT A PER-SAMPLE COST =======
+    //
+    // CurvedEnv::shape used to compute k = 2^(-3c) inside every sample: two std::pow per
+    // sample per envelope where one is the whole job, three envelopes per voice, on every
+    // attack, decay and release the synth plays. The exponent is now worked out where the
+    // parameters arrive.
+    //
+    // A CHANGE TO AN ENVELOPE IS A CHANGE TO THE SOUND, so the reference below is the OLD
+    // spelling - CurvedEnv::shape(pos, curve), which still recomputes k from the curve -
+    // driven through a hand copy of advance(). The two must agree to the LAST BIT at every
+    // sample of every stage.
+    {
+        std::printf ("\nthe envelope's curve exponent moved to setParameters, bit for bit:\n");
+        struct RefEnv     // the old advance(), verbatim, on top of the old shape()
+        {
+            enum Stage { Idle, Attack, Decay, Sustain, Release };
+            Stage  stage = Idle;
+            double sr = 48000.0, pos = 0.0, value = 0.0, from = 0.0;
+            float  a = 0.01f, d = 0.1f, s = 0.8f, r = 0.3f, cA = 0.0f, cD = 0.0f, cR = 0.0f;
+            void setParameters (float A, float D, float S, float R, float ca, float cd, float cr)
+            {
+                a = std::max (1.0e-4f, A); d = std::max (1.0e-4f, D);
+                s = std::min (1.0f, std::max (0.0f, S)); r = std::max (1.0e-4f, R);
+                cA = ca; cD = cd; cR = cr;
+            }
+            void noteOn()  { stage = Attack; pos = 0.0; from = 0.0; value = 0.0; }
+            void noteOff() { if (stage != Idle) { stage = Release; pos = 0.0; from = value; } }
+            float next()
+            {
+                const double dt = 1.0 / sr;
+                switch (stage)
+                {
+                    case Attack:
+                        pos += dt / (double) a;
+                        if (pos >= 1.0) { stage = Decay; pos = 0.0; value = 1.0; }
+                        else value = from + (1.0 - from) * spectrum::CurvedEnv::shape (pos, cA);
+                        break;
+                    case Decay:
+                        pos += dt / (double) d;
+                        if (pos >= 1.0) { stage = Sustain; pos = 0.0; value = s; }
+                        else value = 1.0 + ((double) s - 1.0) * spectrum::CurvedEnv::shape (pos, cD);
+                        break;
+                    case Sustain: value = s; break;
+                    case Release:
+                        pos += dt / (double) r;
+                        if (pos >= 1.0) { stage = Idle; pos = 0.0; value = 0.0; }
+                        else value = from * (1.0 - spectrum::CurvedEnv::shape (pos, cR));
+                        break;
+                    case Idle:
+                    default: value = 0.0; break;
+                }
+                return (float) std::min (1.0, std::max (0.0, value));
+            }
+        };
+
+        const float curves[] = { -1.0f, -0.6f, -0.25f, 0.0f, 0.25f, 0.6f, 1.0f, 2.0f };
+        const double esr = 48000.0;
+        long long compared = 0; int diff = 0; double worst = 0.0;
+        for (float ca : curves)
+            for (float cd : curves)
+            {
+                const float cr = ca;   // release carries its own curve; sweep it with attack
+                spectrum::CurvedEnv env; RefEnv ref;
+                env.setSampleRate (esr); ref.sr = esr;
+                env.setParameters (0.010f, 0.080f, 0.35f, 0.120f, ca, cd, cr);
+                ref.setParameters (0.010f, 0.080f, 0.35f, 0.120f, ca, cd, cr);
+                env.noteOn(); ref.noteOn();
+                const int hold = (int) (0.140 * esr);   // through attack, decay and into sustain
+                for (int i = 0; i < hold; ++i)
+                {
+                    const float x = env.getNextSample(), y = ref.next();
+                    ++compared;
+                    if (x != y) { ++diff; worst = std::max (worst, (double) std::abs (x - y)); }
+                }
+                env.noteOff(); ref.noteOff();
+                for (int i = 0; i < (int) (0.140 * esr); ++i)
+                {
+                    const float x = env.getNextSample(), y = ref.next();
+                    ++compared;
+                    if (x != y) { ++diff; worst = std::max (worst, (double) std::abs (x - y)); }
+                }
+            }
+        std::printf ("    %lld envelope samples over %d curve pairs: %d differ (worst %.3g)\n",
+                     compared, (int) (sizeof (curves) / sizeof (curves[0]))
+                             * (int) (sizeof (curves) / sizeof (curves[0])), diff, worst);
+        check (compared > 800000, "  (precondition) the sweep really rendered the whole A/D/R");
+        check (diff == 0,
+               "  the hoisted exponent renders the SAME BITS the per-sample pow did -"
+               " every stage, every curve, convex and concave");
+
+        // ...and it is cheaper, which is the only reason to have moved it.
+        {
+            spectrum::CurvedEnv env; RefEnv ref;
+            env.setSampleRate (esr); ref.sr = esr;
+            env.setParameters (2.0f, 2.0f, 0.35f, 2.0f, 0.7f, -0.4f, 0.7f);
+            ref.setParameters (2.0f, 2.0f, 0.35f, 2.0f, 0.7f, -0.4f, 0.7f);
+            const int n = 200000;
+            double refMs = 1.0e18, newMs = 1.0e18; volatile float sink = 0.0f;
+            for (int rep = 0; rep < 7; ++rep)
+            {
+                ref.noteOn();
+                double t0 = juce::Time::getMillisecondCounterHiRes();
+                for (int i = 0; i < n; ++i) sink = ref.next();
+                refMs = std::min (refMs, juce::Time::getMillisecondCounterHiRes() - t0);
+                env.noteOn();
+                t0 = juce::Time::getMillisecondCounterHiRes();
+                for (int i = 0; i < n; ++i) sink = env.getNextSample();
+                newMs = std::min (newMs, juce::Time::getMillisecondCounterHiRes() - t0);
+            }
+            (void) sink;
+            std::printf ("    %d attack samples: two pow %.3f ms (%.1f ns/sample),"
+                         " one pow %.3f ms (%.1f ns/sample)\n",
+                         n, refMs, refMs * 1.0e6 / n, newMs, newMs * 1.0e6 / n);
+            check (newMs < refMs,
+                   "  ...and one std::pow per sample really is cheaper than two");
+        }
+    }
+
+    //== THE NEAR-NYQUIST TAPER KEEPS THE PROMISE ITS OWN COMMENT MAKES ============
+    //
+    // "a spectrum dense enough to hit the cap simply gets a narrower (still smooth)
+    // taper" - fillShepardCopies has said that since the taper was written, and until now
+    // the code TRUNCATED the zone instead: the walk stopped after kTaperMax partials but
+    // the weights were still divided by the full T, so the lowest tapered partial started
+    // well below full scale with a full-amplitude partial one step under it. As the copy
+    // rises that partial leaves the zone and jumps straight back to 1.0 in a single
+    // block - the exact tick the taper exists to abolish, at exactly the density it was
+    // capped for.
+    //
+    // Measured on the SHIPPING function (AdditiveVoice::taperZoneFor / taperWeightAt are
+    // what fillShepardCopies itself calls), so this is the arithmetic the ear gets and not
+    // a restatement of it.
+    {
+        std::printf ("\nthe Shepard's near-Nyquist taper narrows instead of truncating:\n");
+        // A harmonic spectrum, and a copy whose Nyquist falls at ratio 400. T saturates at
+        // one octave whenever the rise is faster than ~1.3 s (taperWidth: 24 x the block's
+        // travel), so the zone would be 200 partials wide and the cap cuts it to 64.
+        std::vector<double> ratios ((size_t) 600);
+        for (int i = 0; i < 600; ++i) ratios[(size_t) i] = (double) (i + 1);
+        const double maxR = 400.0, T = 1.0;
+        const int    cnt  = 400;                       // partials at or below maxR
+        const double lMax = std::log2 (maxR);
+
+        const auto z = AdditiveVoice::taperZoneFor (ratios.data(), cnt, maxR, T);
+        check (z.capped, "  (precondition) this spectrum really does hit the kTaperMax cap");
+        check (cnt - z.from == shepard::kTaperMax,
+               "  (precondition) ...and the zone really is kTaperMax partials wide");
+
+        const double wLow = AdditiveVoice::taperWeightAt (lMax, ratios[(size_t) z.from], z.width);
+        const double wLowOld = juce::jlimit (0.0, 1.0,
+            (lMax - std::log2 (ratios[(size_t) z.from])) / T);   // the truncated spelling
+        std::printf ("    zone [%d,%d) of %d, width %.4f octaves (asked for %.4f):"
+                     " lowest tapered partial starts at %.4f, and used to start at %.4f\n",
+                     z.from, cnt, cnt, z.width, T, wLow, wLowOld);
+        check (std::abs (wLow - 1.0) < 1.0e-12,
+               "  the lowest tapered partial starts at FULL amplitude - continuous with the"
+               " untapered partial below it, so leaving the zone is not a step");
+        check (wLowOld < 0.8,
+               "  (evidence) the truncated spelling really did start it well below full"
+               " scale - the step this fix removes was worth measuring");
+
+        // ...and it is still a fade: monotone down, and zero at the copy's own Nyquist.
+        bool monotone = true; double prev = 2.0;
+        for (int i = z.from; i < cnt; ++i)
+        {
+            const double w = AdditiveVoice::taperWeightAt (lMax, ratios[(size_t) i], z.width);
+            if (w > prev + 1.0e-15) monotone = false;
+            prev = w;
+        }
+        check (monotone, "  ...and the weights still fall monotonically across the zone");
+        check (AdditiveVoice::taperWeightAt (lMax, ratios[(size_t) (cnt - 1)], z.width) < 1.0e-9,
+               "  ...reaching zero at the copy's own Nyquist, so nothing vanishes at full level");
+
+        // THE UNCAPPED CASE IS UNTOUCHED, which is what keeps the default octave band the
+        // instrument it was. A sparse zone: 1/32 of an octave below ratio 40 holds one
+        // partial, nowhere near the cap.
+        {
+            const double t2 = 1.0 / 32.0, m2 = 40.0;
+            const auto z2 = AdditiveVoice::taperZoneFor (ratios.data(), 40, m2, t2);
+            check (! z2.capped, "  (precondition) the sparse zone does NOT hit the cap");
+            check (z2.width == t2,
+                   "  ...and an uncapped zone is divided by exactly the T it asked for -"
+                   " bit for bit the taper this file already shipped");
+        }
+    }
+
+    //== A DESCENDING SHEPARD'S DEEPEST COPY GETS THE PARTIALS IT ASKS FOR =========
+    //
+    // The shared base list is sized from sl.lowestRootMul, "the lowest copy root / f0
+    // ANYWHERE IN THIS BLOCK" - and it was read at the block's START, which is only the
+    // lowest grid position while the stack is RISING. Descending, the deepest copy spends
+    // the block getting deeper than the list was cut for, and the partials between the two
+    // are not rendered: not tapered, not faded, and not counted by shepEvCutBlocks either,
+    // which only fires on the kStride cap. A silent drop, which this engine forbids.
+    //
+    // Measured where it can be seen from outside: the probe hands back each copy's ROOT
+    // and its partial COUNT, and the count a root asks for is arithmetic anyone can redo -
+    // the partials of the live template at or below that copy's own Nyquist. The two must
+    // agree, in BOTH directions.
+    {
+        std::printf ("\na descending Shepard's deepest copy carries every partial it can:\n");
+        constexpr double ssr = 48000.0; constexpr int sblk = 256;
+        long long pm[shepard::kSlots]; double pr[shepard::kSlots], pw[shepard::kSlots];
+        int pcn[shepard::kSlots];
+
+        for (int down = 0; down <= 1; ++down)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (ssr, sblk);
+            juce::AudioBuffer<float> b (2, sblk);
+            auto set = [&] (const char* id, float plain)
+            {
+                if (auto* q = p->apvts.getParameter (id))
+                    q->setValueNotifyingHost (q->convertTo0to1 (plain));
+                p->pollParametersForTests();
+            };
+            set ("shepOn", 1.0f);
+            set ("shepMode", 0.0f);       // Free (ms), so the host clock cannot change the rate
+            set ("shepTime", 100.0f);     // the fader's own floor: the fastest rise it offers
+            set ("shepDown", (float) down);
+            awaitSpectrumIdle (*p, "the descending-Shepard patch");
+
+            juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, 0.9f), 0);
+            b.clear(); p->processBlock (b, m);
+            for (int i = 0; i < 40; ++i) { juce::MidiBuffer e; b.clear(); p->processBlock (b, e); }
+
+            const int copies = p->voiceShepardForTests (pm, pr, pw, pcn, shepard::kSlots);
+            const auto* T = p->getLiveTemplate();
+            check (copies > 1 && T != nullptr && ! T->partials.empty(),
+                   down ? "  (precondition) the DESCENDING stack really is rendering copies"
+                        : "  (precondition) the ASCENDING stack really is rendering copies");
+            if (copies > 1 && T != nullptr && ! T->partials.empty())
+            {
+                // The copies are handed over in ascending root order, so [0] is the deepest.
+                int deepest = 0;
+                for (int c = 1; c < copies; ++c) if (pr[c] < pr[deepest]) deepest = c;
+                check (deepest == 0, "  (precondition) copy 0 is the deepest, as the layout says");
+
+                const double maxRatio = (0.5 * ssr) / pr[deepest];
+                int want = 0;
+                for (int i = 0; i < (int) T->partials.size() && i < shepard::kStride; ++i)
+                {
+                    if ((double) T->partials[(size_t) i].ratio > maxRatio) break;
+                    want = i + 1;
+                }
+                std::printf ("    %s: %d copies, deepest root %.3f Hz -> its own Nyquist asks"
+                             " for %d partials, it rendered %d (template %d)\n",
+                             down ? "descending" : "ascending", copies, pr[deepest],
+                             want, pcn[deepest], (int) T->partials.size());
+                // A GATE, or the comparison below passes on a spectrum too small to drop
+                // anything: the deepest copy has to be asking for MORE than the played key
+                // does, which is the whole reason the base list is sized from it.
+                check (want > 0 && want < shepard::kStride,
+                       "  (precondition) the deepest copy's own Nyquist, not the slot width,"
+                       " is what decides its count");
+                check (pcn[deepest] == want,
+                       down ? "  the DESCENDING stack's deepest copy renders every partial"
+                              " under its own Nyquist - none is missing from the shared list"
+                            : "  ...and so does the ASCENDING one, which is the direction that"
+                              " was already right");
+            }
+            juce::MidiBuffer off; off.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+            b.clear(); p->processBlock (b, off);
         }
     }
 

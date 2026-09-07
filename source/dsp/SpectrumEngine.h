@@ -217,6 +217,26 @@ namespace spectrum
             const int w = (cur + 1) % (int) pool.size();
             pool[(size_t) w] = pool[(size_t) cur];     // message thread only - allocation is fine here
             fillGains (pool[(size_t) w]);
+            // THE PLAN IN THE SLOT WE JUST OVERWROTE IS NOT A PLAN FOR WHAT IS IN IT NOW.
+            //
+            // publish() and publishKeepingGeneration() both zero this (see :502 and :529) and
+            // this one did not, which is a different bug BECAUSE the generation is deliberately
+            // carried over verbatim from the source slot. Every other route stamps a slot with a
+            // generation no plan has ever been measured against, so a stale stamp cannot match;
+            // here the copied generation matches whatever the slot was ALREADY stamped with.
+            //
+            // kSlots is 8 and every drag frame advances w by one, so the EIGHTH setOverrides of
+            // a pencil drag lands back on the slot the worker planned before the drag started -
+            // same generation, stamp still equal to it. getLivePlan()/getLivePair() then hand a
+            // voice the plan measured on the PRE-EDIT gains, which the header opposite planFor()
+            // measured at 2.13 dB WORSE than today's hash after a single pencil edit. And it does
+            // not heal: planLive() early-returns on exactly that stamp==generation test, so every
+            // wrap after the first is stale too until something bumps the generation for real.
+            //
+            // Relaxed is enough, exactly as it is in publish(): the release-store of `live` below
+            // is what publishes it, and a reader that acquire-loads `live` cannot see the slot
+            // without seeing this.
+            planStamp[(size_t) w].store (0, std::memory_order_relaxed);
             liveRev.fetch_add (1, std::memory_order_release);
             live.store (w, std::memory_order_release); // same generation: no morph restart
         }

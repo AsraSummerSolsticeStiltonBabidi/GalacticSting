@@ -2042,6 +2042,77 @@ public:
         cutBlocks = shepEvCutBlocks; cutWorst = shepEvCutWorst;
     }
 
+    //==========================================================================
+    // THE NEAR-NYQUIST TAPER, AS TWO PURE FUNCTIONS.
+    //
+    // Production maths, not a probe: fillShepardCopies calls exactly these, so the
+    // verifier that calls them is measuring the shipping arithmetic and not a second
+    // copy of it. They are public for that reason and for no other. (A per-voice
+    // counter would have been the house style, but the taper is a number no processor
+    // accessor reaches, and this file's own rule is that a claim nothing can measure is
+    // worth nothing - so the maths comes out to where a measurement can get at it.)
+    //
+    // WHAT THE ZONE IS. Each copy fades its top partials over the last T octaves of its
+    // usable range, so a partial rising past the copy's Nyquist leaves by fading rather
+    // than by vanishing between two blocks. The zone is capped at kTaperMax partials so
+    // the tail loop stays short.
+    //
+    // WHAT THE CAP USED TO DO, AND THE PROMISE IT BROKE. The comment at the call site
+    // has always said that a spectrum dense enough to hit the cap "simply gets a
+    // narrower (still smooth) taper". It did not. The walk stopped after kTaperMax
+    // partials but the weights were still divided by the FULL T, so the zone was
+    // TRUNCATED: the lowest tapered partial started at (lMax - log2 r)/T, well below 1,
+    // with the partial one step under it at full amplitude.
+    //
+    // That is not a static notch, it is the very tick the taper exists to abolish. As
+    // the copy rises, cnt falls and the zone's floor follows it, so the partial LEAVING
+    // the zone jumps from that reduced weight straight back to 1.0 in a single block.
+    // Measured on a harmonic spectrum at the fastest rise, where T saturates at one
+    // octave: the lowest tapered partial started at 0.35, i.e. a 0.65 step, exactly
+    // where the fade was supposed to be smoothest.
+    //
+    // WHAT IT DOES NOW. When - and only when - the cap is what ended the walk, the
+    // weights are divided by the zone that actually FIT instead of by the zone that was
+    // asked for. weight(from) is then exactly 1.0, continuous with the untapered
+    // partials below it, and the fade still reaches 0 at the copy's Nyquist: a narrower
+    // taper, which is what the sentence promised. The zone is dense by definition when
+    // the cap binds (kTaperMax partials inside T octaves), so what is left of the
+    // per-block movement is one partial spacing out of kTaperMax - about 1.6% of a
+    // weight, against the 65% it replaces.
+    //
+    // THE UNCAPPED PATH IS UNTOUCHED: width == T to the bit, so the default octave band
+    // is exactly the instrument it was.
+    struct TaperZone
+    {
+        int    from   = 0;      // first index carrying the taper (== cnt when there is none)
+        double width  = 0.0;    // the octave span the weights are divided by
+        bool   capped = false;  // kTaperMax, and not the threshold, is what ended the walk
+    };
+    static TaperZone taperZoneFor (const double* ratios, int cnt, double maxR, double T) noexcept
+    {
+        TaperZone z; z.from = cnt; z.width = T;
+        if (ratios == nullptr || cnt <= 0) return z;
+        const double thresh = maxR * std::exp2 (-T);
+        while (z.from > 0 && ratios[(size_t) (z.from - 1)] > thresh)
+        {
+            if ((cnt - z.from) >= shepard::kTaperMax) { z.capped = true; break; }
+            --z.from;
+        }
+        if (z.capped)
+            z.width = std::max (1.0e-9,
+                                std::log2 (std::max (1.0e-12, maxR))
+                                - std::log2 (std::max (1.0e-12, ratios[(size_t) z.from])));
+        return z;
+    }
+    // `lMax` is log2(maxR), hoisted by the caller: the render path computes it once per
+    // copy and this is called once per tapered partial, so recomputing it here would put
+    // a std::log2 per partial per copy per block on the audio thread for nothing.
+    static double taperWeightAt (double lMax, double ratio, double width) noexcept
+    {
+        return juce::jlimit (0.0, 1.0,
+                             (lMax - std::log2 (std::max (1.0e-12, ratio))) / width);
+    }
+
 private:
     //==========================================================================
     // Push ADSR parameters to the envelope, but AVOID JUCE's release-rate bug:
@@ -2770,7 +2841,40 @@ private:
         // becomes part of the smooth per-sample window instead of a step between blocks.
         sl.du            = ((gEnd - gStart) * P - (loEnd - loStart)) / W / (double) numSamples;
         sl.blockLogMove  = smShepRate * P * dt;
-        sl.lowestRootMul = std::exp2 ((gStart + (double) mLo) * P);
+        // "lowest copy root / f0 ANYWHERE IN THIS BLOCK" - which is what the member says
+        // it is, and what renderNextBlock sizes the shared base list from (see the
+        // maxRatio line there). It was read at gStart alone, and gStart is only the
+        // block's lowest grid position while the stack is RISING.
+        //
+        // A DESCENDING Shepard walks shepG DOWN (the arrow flips the rate's sign, see
+        // rateTarget above), so gEnd < gStart and the deepest copy spends the block
+        // getting DEEPER. Sized at gStart the base list is therefore short by the whole
+        // block's travel: maxRatio comes out too small, newN too small, and
+        // fillShepardCopies' count walk hits `hiN = min(span, cap)` instead of the copy's
+        // own Nyquist - so the partials between the two are simply not rendered. Not
+        // tapered, not faded, and NOT COUNTED: shepEvCutBlocks only fires on the kStride
+        // cap, so this was a partial drop with no number anywhere, which is the one thing
+        // this engine may not do.
+        //
+        // HOW BIG. |gEnd - gStart| is the block's travel in rise intervals; at the panel's
+        // fastest rise (kMinRiseSec, 0.05 s per interval) and a 256-sample block at 48 kHz
+        // that is 0.107 intervals, i.e. 7.7% of the frequency the deepest copy could
+        // actually reach - tens of partials on a dense template, and four times that at a
+        // 16/1-period tuning. At an 8 s rise it is a partial or two at the boundary. Both
+        // are drops, and the first is audible.
+        //
+        // min() and not a second branch: rising, gStart IS the minimum and this line is
+        // the old one unchanged, so the default direction is bit-for-bit what it was.
+        // rootMul[c] is taken at the block MIDPOINT (gMid above) and the midpoint lies
+        // between the two ends, so covering both ends covers every copy's own count too.
+        //
+        // MEASURED, not argued: the last block of the RhythmVerify descending-Shepard test
+        // reads the deepest copy's ROOT and its partial COUNT back through
+        // voiceShepardForTests and recomputes the count that root's own Nyquist asks for.
+        // With the line read at gStart the two disagree; with it read here they agree
+        // exactly, and the ascending run agrees either way - which is the whole shape of
+        // this defect in one comparison.
+        sl.lowestRootMul = std::exp2 ((std::min (gStart, gEnd) + (double) mLo) * P);
 
         // Advance the rise. Whole steps are renumbered away in multiples of kSlots so
         // the slot hash is untouched (the same trick v1 used on its sine grid).
@@ -2886,13 +2990,16 @@ private:
             int tf = cnt;
             if (sl.windowed && cnt > 0)
             {
-                const double thresh = maxR * std::exp2 (-T);
-                while (tf > 0 && curRatio[(size_t) (tf - 1)] > thresh
-                       && (cnt - tf) < shepard::kTaperMax) --tf;
+                // ONE definition of where the zone starts and how wide it really is, and
+                // the verifier calls the SAME function rather than a second copy of it -
+                // see taperZoneFor, which is where the renormalisation and its measurement
+                // live.
+                const TaperZone z = taperZoneFor (curRatio.data(), cnt, maxR, T);
+                tf = z.from;
                 const double lMax = std::log2 (std::max (1.0e-12, maxR));
                 for (int i = tf; i < cnt; ++i)
-                    sl.tap[(size_t) c][(size_t) (i - tf)] = juce::jlimit (0.0, 1.0,
-                        (lMax - std::log2 (std::max (1.0e-12, curRatio[(size_t) i]))) / T);
+                    sl.tap[(size_t) c][(size_t) (i - tf)]
+                        = taperWeightAt (lMax, curRatio[(size_t) i], z.width);
             }
             sl.tapFrom[(size_t) c] = tf;
             prevCount = cnt;
