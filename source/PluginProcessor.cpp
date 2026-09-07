@@ -3594,6 +3594,7 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     modNoteOns = 0; // in step with ModEngine::prepare - the first note-on must retrigger
     modHeld = 0;
     for (auto& row : modKeyHeld) row.fill (false);
+    modChanBend.fill (8192); for (auto& row : modKeyVel) row.fill (0); // in step with modKeyHeld
     lastSr = sampleRate;
 
     // MIX mode's scratch buses are sized HERE, on the prepare call, because the audio
@@ -3786,6 +3787,7 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         laDelay.flush(); laPeek.reset();
         modHeld = 0; modNoteOns = 0;
         for (auto& row : modKeyHeld) row.fill (false);
+        modChanBend.fill (8192); for (auto& row : modKeyVel) row.fill (0); // in step with modKeyHeld
     }
 
     // AudioProcessor::reset() raised this (see the header for why the work is not done
@@ -3960,6 +3962,16 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                     ++modNoteOns;
                     auto& f = modKeyHeld[(size_t) ch][(size_t) m.getNoteNumber()];
                     if (! f) { f = true; ++modHeld; }
+                    // Kept so the MIX engage edge can re-strike this note as it really
+                    // arrived, instead of at a hard-coded 100 (see modKeyVel).
+                    modKeyVel[(size_t) ch][(size_t) m.getNoteNumber()] = m.getVelocity();
+                }
+                else if (m.isPitchWheel())
+                {
+                    // The bend this channel is holding. In MPE that is the note's own
+                    // pitch, so a corner engine re-struck without it plays a different
+                    // note - see modChanBend.
+                    modChanBend[(size_t) ch] = m.getPitchWheelValue();
                 }
                 else if (m.isNoteOff())
                 {
@@ -3969,6 +3981,7 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                 else if (m.isAllNotesOff() || m.isAllSoundOff())
                 {
                     for (auto& row : modKeyHeld) row.fill (false);
+                    modChanBend.fill (8192); for (auto& row : modKeyVel) row.fill (0); // in step with modKeyHeld
                     modHeld = 0;
                 }
             }
@@ -4063,6 +4076,7 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         monoGate.reset();
         modHeld = 0;
         for (auto& row : modKeyHeld) row.fill (false);
+        modChanBend.fill (8192); for (auto& row : modKeyVel) row.fill (0); // in step with modKeyHeld
     }
 
     if (selfPlay)
@@ -4246,10 +4260,19 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
     {
         mixInject.clear();
         mixInject.addEvents (midi, 0, nSamp, 0);
-        for (int ch = 0; ch < 16; ++ch)
-            for (int k = 0; k < 128; ++k)
-                if (modKeyHeld[(size_t) ch][(size_t) k])
-                    mixInject.addEvent (juce::MidiMessage::noteOn (ch + 1, k, (juce::uint8) 100), 0);
+        // THE BEND GOES IN FIRST, AND THE NOTE ARRIVES AS IT REALLY ARRIVED.
+        //
+        // This used to inject a bare noteOn at a hard-coded velocity of 100, throwing away
+        // both halves of the note. The bend is the one that matters: in MPE every note
+        // carries its own per-channel bend and in this instrument that bend IS the tuning
+        // for anything a controller retunes - so engaging MIX under a held MPE chord gave
+        // the corners the chord in untuned 12-EDO while the main engine went on playing it
+        // correctly. That is not two spectra blending, it is two different chords.
+        //
+        // The building itself is buildMixRestrike (see the header): lifted out so a test
+        // can ask it what it produces without a playground, corner presets and preset
+        // files behind it. This is its only caller.
+        buildMixRestrike (mixInject, modKeyHeld, modChanBend, modKeyVel);
         cornerFeed = &mixInject;
     }
     mixWasOn = on;

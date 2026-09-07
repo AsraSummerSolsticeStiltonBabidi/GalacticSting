@@ -2517,6 +2517,56 @@ private:
     juce::uint32 modNoteOns = 0;     // running note-on counter (envelope retrigger)
     int          modHeld    = 0;     // notes currently held (audio thread; envelope gate)
     std::array<std::array<bool, 128>, 16> modKeyHeld {}; // which (channel, key) are down
+    // ...AND WHAT THOSE KEYS ARRIVED WITH, for the MIX engage edge.
+    //
+    // Engaging MIX re-strikes every held key into the cold corner engines, and it used to
+    // do that with a bare noteOn at a hard-coded velocity of 100. Both halves of the note
+    // were thrown away. The pitch bend is the serious one: in MPE every note carries its
+    // own per-channel bend, and in this instrument that bend IS the tuning for anything a
+    // controller retunes - so the corners sounded the chord in untuned 12-EDO under a main
+    // engine playing it correctly, which is not a blend of two spectra but two different
+    // chords. Velocity is smaller and just as free to keep right.
+    //
+    // Bend is per CHANNEL (that is what an MPE member channel means) and starts centred;
+    // velocity is per (channel, key), because that is what a note-on carries. 2 KB, and
+    // both are written on the audio thread beside modKeyHeld and read on it.
+    std::array<int, 16> modChanBend { { 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
+                                        8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192 } };
+    std::array<std::array<juce::uint8, 128>, 16> modKeyVel {};
+public:
+    // THE RE-STRIKE, AS A FUNCTION, so the one question that matters can be asked of it.
+    //
+    // Reaching this through the audio path means building a playground with corner presets
+    // - which means preset FILES, and the user's own preset folder is not a thing a test
+    // gets to go near. Lifted out instead: it takes only what it reads, so a test hands it
+    // a held key with a bend and asks what came out. renderSynthMix calls this and nothing
+    // else, so there is no second copy to drift.
+    static void buildMixRestrike (juce::MidiBuffer& out,
+                                  const std::array<std::array<bool, 128>, 16>& held,
+                                  const std::array<int, 16>& bend,
+                                  const std::array<std::array<juce::uint8, 128>, 16>& vel)
+    {
+        for (int ch = 0; ch < 16; ++ch)
+        {
+            const bool anyOnThisChannel =
+                std::any_of (held[(size_t) ch].begin(), held[(size_t) ch].end(),
+                             [] (bool b) { return b; });
+            // The bend goes in BEFORE any note-on on its channel: sent after, the voice is
+            // born untuned and has to glide there. Only for channels that really have a
+            // key down, and only when it is off centre, so an idle wheel does not become
+            // fifteen redundant messages on the audio thread.
+            if (anyOnThisChannel && bend[(size_t) ch] != 8192)
+                out.addEvent (juce::MidiMessage::pitchWheel (ch + 1, bend[(size_t) ch]), 0);
+            for (int k = 0; k < 128; ++k)
+                if (held[(size_t) ch][(size_t) k])
+                {
+                    const auto v = vel[(size_t) ch][(size_t) k];
+                    out.addEvent (juce::MidiMessage::noteOn (ch + 1, k,
+                                      v != 0 ? v : (juce::uint8) 100), 0);
+                }
+        }
+    }
+private:
     std::vector<DissDegreeInfo> dissDegrees;
     double dissGreenH = 0.0, dissRedH = 1.0;
     int    dissRequested = 0, dissFound = 0, dissGeneration = 0;

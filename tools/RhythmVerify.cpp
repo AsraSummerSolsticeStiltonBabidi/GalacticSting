@@ -19185,6 +19185,78 @@ int main (int argc, char** argv)
         }
     }
 
+    //== ENGAGING MIX RE-STRIKES THE NOTE THAT IS PLAYING, NOT A DIFFERENT ONE ======
+    //
+    // The engage edge feeds every held key into the cold corner engines, and it used to do
+    // that with a bare noteOn at a hard-coded velocity of 100 - throwing away both halves
+    // of the note. The bend is the serious one: in MPE every note carries its own
+    // per-channel bend, and in this instrument that bend IS the tuning for anything a
+    // controller retunes. So engaging MIX under a held MPE chord handed the corners that
+    // chord in untuned 12-EDO while the main engine went on playing it correctly - not two
+    // spectra blending, two different chords.
+    //
+    // Asked of the builder directly. Reaching it through the audio path needs a playground
+    // with corner PRESETS, which means preset files, and the user's own preset folder is
+    // not somewhere a test goes. buildMixRestrike takes only what it reads and has exactly
+    // one caller, so there is no second copy to drift from what is tested here.
+    {
+        std::printf ("\nengaging MIX re-strikes the note that is playing:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        std::array<std::array<bool, 128>, 16> held {};
+        std::array<int, 16> bend {}; bend.fill (8192);
+        std::array<std::array<juce::uint8, 128>, 16> vel {};
+
+        // One MPE-shaped note: channel 3, key 60, velocity 42, bent a long way off centre.
+        held[2][60] = true;  vel[2][60] = 42;  bend[2] = 10000;
+        // ...and one ordinary note on a channel whose wheel is centred, so the "only when
+        // it is off centre" half is exercised rather than assumed.
+        held[5][72] = true;  vel[5][72] = 99;
+
+        juce::MidiBuffer out;
+        Proc::buildMixRestrike (out, held, bend, vel);
+
+        int bends = 0, ons = 0, bendCh = -1, bendVal = -1;
+        int firstBendIdx = -1, firstOnIdxSameCh = -1, idx = 0;
+        int velFor60 = -1, velFor72 = -1;
+        for (const auto meta : out)
+        {
+            const auto m = meta.getMessage();
+            if (m.isPitchWheel())
+            {
+                ++bends;
+                if (m.getChannel() == 3) { bendCh = m.getChannel(); bendVal = m.getPitchWheelValue();
+                                           if (firstBendIdx < 0) firstBendIdx = idx; }
+            }
+            else if (m.isNoteOn())
+            {
+                ++ons;
+                if (m.getNoteNumber() == 60) { velFor60 = m.getVelocity();
+                                               if (m.getChannel() == 3 && firstOnIdxSameCh < 0)
+                                                   firstOnIdxSameCh = idx; }
+                if (m.getNoteNumber() == 72) velFor72 = m.getVelocity();
+            }
+            ++idx;
+        }
+        std::printf ("  %d note-on(s), %d bend(s); ch %d bend %d; velocities 60->%d, 72->%d\n",
+                     ons, bends, bendCh, bendVal, velFor60, velFor72);
+
+        // GATE FIRST: with no note re-struck there is nothing for the bend to precede, and
+        // every check below would be asking about an empty buffer.
+        check (ons == 2, "  (gate) both held keys really are re-struck");
+        check (bends == 1,
+               "exactly ONE bend goes in - the bent channel gets it, the centred one does"
+               " not, so an idle wheel is not fifteen redundant messages a block");
+        check (bendVal == 10000,
+               "...and it carries the bend the channel was really holding, which in MPE is"
+               " the note's own pitch");
+        check (firstBendIdx >= 0 && firstOnIdxSameCh > firstBendIdx,
+               "...and it arrives BEFORE the note-on on that channel, so the corner voice is"
+               " born in tune instead of gliding there");
+        check (velFor60 == 42 && velFor72 == 99,
+               "and each note is re-struck at the velocity it really arrived with, not at a"
+               " hard-coded 100");
+    }
+
     runProcessorAuditChecks();
     runSilentLimitChecks();
 
