@@ -19827,4 +19827,119 @@ static void runProcessorAuditChecks()
         std::printf ("  [SKIP] dialog-title audit: FG_SOURCE_DIR not defined\n");
        #endif
     }
+
+    //-- run 71: A TOOLTIP THAT SENDS YOU TO A BUTTON NAMES THE BUTTON YOU CAN SEE -----
+    //
+    // Several tooltips end by pointing at another control - "Full steps: the X button",
+    // "X on the PITCH tab bends it instead". In Catalan two of them quoted the ENGLISH
+    // label, so the sentence sent the reader looking for a button that is not on the
+    // screen in any language: the window says "Com encaminar" and the tooltip said "How
+    // to route". Nothing could see it. The tr-pair audit passes (the two sides differ),
+    // the snapshot rig's untranslated-text gate passes (the tooltip IS translated - all
+    // but three of its words), and the fit sweep passes (it fits).
+    //
+    // The invariant is small and needs no list: a QUOTED phrase inside a tr() side must be
+    // a phrase THAT SIDE'S READER can see.
+    //   (a) a phrase quoted in the CATALAN half must not be the English half of some tr
+    //       pair that has a different Catalan - that is, verbatim, "the Catalan text names
+    //       a control by its English label";
+    //   (b) if the ENGLISH half quotes a label that IS translated somewhere, the Catalan
+    //       half must quote that label's Catalan. This is the arm that keeps the two
+    //       halves pointing at the SAME button as the window is re-worded.
+    // Both are decided against the pairs the file itself declares, so a renamed control
+    // moves the target of the check with it and nothing here can go stale.
+    {
+        std::printf ("\nrun 71: a tooltip that names a control names the one on screen:\n");
+       #ifdef FG_SOURCE_DIR
+        const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
+        // Every (en, ca) pair in the two editor files, read with the tr-pair audit's own
+        // parser so "adjacent literals are one string" is decided identically in both.
+        std::vector<std::pair<std::string, std::string>> pairs;
+        for (const char* leaf : { "PluginEditor.cpp", "PluginEditor.h" })
+        {
+            const auto held = srcDir.getChildFile ("source").getChildFile (leaf)
+                                    .loadFileAsString().toStdString();
+            const char*  s = held.c_str();
+            const size_t n = held.size();
+            for (size_t i = 0; i + 4 < n; ++i)
+            {
+                if (s[i] != 't' || s[i + 1] != 'r') continue;
+                if (i > 0 && (juce::CharacterFunctions::isLetterOrDigit ((juce::juce_wchar) s[i - 1])
+                              || s[i - 1] == '_')) continue;
+                size_t j = i + 2;
+                if (j < n && s[j] == 'F') ++j;
+                while (j < n && s[j] == ' ') ++j;
+                if (j >= n || s[j] != '(') continue;
+                ++j;
+                std::string en, ca;
+                if (! traudit::readLiteral (s, n, j, en)) continue;
+                while (j < n && (s[j] == ' ' || s[j] == '\t' || s[j] == '\r' || s[j] == '\n')) ++j;
+                if (j >= n || s[j] != ',') continue;
+                ++j;
+                if (! traudit::readLiteral (s, n, j, ca)) continue;
+                pairs.emplace_back (en, ca);
+                i = j;
+            }
+        }
+        check (pairs.size() > 200, "  the label-reference audit can read the editor's pairs");
+
+        // The phrases a literal quotes. Inside a C literal the quote is escaped, so what
+        // is being looked for is the two characters backslash-quote, and an ODD number of
+        // them means an unbalanced sentence rather than a label - those are left alone.
+        const auto quoted = [] (const std::string& lit)
+        {
+            std::vector<std::string> out;
+            for (size_t i = 0; i + 1 < lit.size(); ++i)
+            {
+                if (! (lit[i] == 92 && lit[i + 1] == '"')) continue;      // 92 = backslash
+                const size_t from = i + 2;
+                size_t k = from;
+                while (k + 1 < lit.size() && ! (lit[k] == 92 && lit[k + 1] == '"')) ++k;
+                if (k + 1 >= lit.size()) break;                            // unbalanced
+                out.push_back (lit.substr (from, k - from));
+                i = k + 1;
+            }
+            return out;
+        };
+
+        juce::StringArray wrong;
+        for (const auto& p : pairs)
+        {
+            for (const auto& q : quoted (p.second))          // arm (a)
+                for (const auto& other : pairs)
+                    if (other.first == q && other.second != other.first)
+                    {
+                        wrong.add (juce::String ("Catalan quotes the ENGLISH label \"")
+                                   + juce::String (q.c_str()) + "\" (the window says \""
+                                   + juce::String (other.second.c_str()) + "\")");
+                        break;
+                    }
+
+            for (const auto& q : quoted (p.first))           // arm (b)
+            {
+                bool translated = false, echoed = false;
+                for (const auto& other : pairs)
+                    if (other.first == q && other.second != other.first)
+                    {
+                        translated = true;
+                        if (p.second.find (std::string (1, (char) 92) + "\"" + other.second
+                                           + std::string (1, (char) 92) + "\"") != std::string::npos)
+                            echoed = true;
+                    }
+                if (translated && ! echoed)
+                    wrong.add (juce::String ("English quotes the label \"")
+                               + juce::String (q.c_str())
+                               + "\" and the Catalan half does not quote its Catalan");
+            }
+        }
+        wrong.removeDuplicates (false);
+        if (! wrong.isEmpty())
+            std::printf ("    %s\n", wrong.joinIntoString ("\n    ").toRawUTF8());
+        check (wrong.isEmpty(),
+               "  every control a tooltip quotes is quoted by the name its own reader sees "
+               "on the screen");
+       #else
+        std::printf ("  [SKIP] label-reference audit: FG_SOURCE_DIR not defined\n");
+       #endif
+    }
 }

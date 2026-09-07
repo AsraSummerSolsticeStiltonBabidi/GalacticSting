@@ -4090,9 +4090,14 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Lowest note: only the lowest held note drives the pulses. All notes: every held note drives its own copy of the trains, transposed by its interval from the lowest.",
         "Nota m\xc3\xa9s greu: nom\xc3\xa9s la nota m\xc3\xa9s greu mant\xc3\xa9 els polsos. Totes les notes: cada nota mantinguda porta la seva c\xc3\xb2pia dels trens, transposada pel seu interval respecte a la m\xc3\xa9s greu."));
     rhythmPanel.tempoT.setButtonText (tr ("Tempo sync (CC20)", "Sync de tempo (CC20)"));
+    // "el bot\xc3\xb3 \"Com encaminar\"", not the English label. A tooltip that ENDS by
+    // sending the reader to a button is the one string in the window where naming it
+    // wrongly costs something real: there is no button anywhere on screen carrying the
+    // English words, so the instruction reads as a reference to a control that is not
+    // there. The Catalan of that button is set 450 lines down, in this same function.
     rhythmPanel.tempoT.setTooltip (tr (
         "The DAW tempo FOLLOWS pulse 1 (x2 / /2 to scale). NEEDS a one-time setup: in Ableton, drop the free \"Fibló Tempo Sync\" Max for Live device on a MIDI track that receives this plugin's MIDI output. In other DAWs, MIDI-map the tempo to CC20 with a 20-147 BPM range. Full steps: the \"How to route\" button.",
-        "El tempo del DAW SEGUEIX el pols 1 (x2 / /2 per escalar). CAL una configuraci\xc3\xb3 \xc3\xbanica: a Ableton, posa el dispositiu Max for Live gratu\xc3\xaft \"Fibl\xc3\xb3 Tempo Sync\" en una pista MIDI que rebi la sortida MIDI del plugin. En altres DAW, mapeja el tempo al CC20 amb rang 20-147 BPM. Passos complets: el bot\xc3\xb3 \"How to route\"."));
+        "El tempo del DAW SEGUEIX el pols 1 (x2 / /2 per escalar). CAL una configuraci\xc3\xb3 \xc3\xbanica: a Ableton, posa el dispositiu Max for Live gratu\xc3\xaft \"Fibl\xc3\xb3 Tempo Sync\" en una pista MIDI que rebi la sortida MIDI del plugin. En altres DAW, mapeja el tempo al CC20 amb rang 20-147 BPM. Passos complets: el bot\xc3\xb3 \"Com encaminar\"."));
     for (int i = 0; i < RhythmEngine::kSlots; ++i)
     {
         rhythmPanel.pitchE[i].setTooltip (tr (
@@ -4124,9 +4129,14 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     for (auto* b : { &envTabB[0], &envTabB[1], &envTabB[2] })
         b->setTooltip (tr ("The envelopes share this box - click a title to switch.",
                            "Les envolupants comparteixen aquesta caixa - clica un t\xc3\xadtol per canviar."));
+    // SAME FAULT AS THE TEMPO TOOLTIP ABOVE, and one worse: this one named a button that
+    // does not exist in EITHER language. The button is "Unmap" / "Desassigna" (three lines
+    // down, and again in the CUSTOM tab), and both sides of this pair sent the reader
+    // looking for an "Unmap all" that is nowhere in the window. Each side now quotes the
+    // words its own reader can actually see.
     envTabB[3].setTooltip (tr (
-        "6 modulators: 3 note-retriggered envelopes + 3 LFOs. Right-click ANY fader -> \"Map to\" routes a modulator onto it (several parameters per modulator allowed); it rides on the knob's own value over +-Range. Each modulator has On/Off and \"Unmap all\".",
-        "6 moduladors: 3 envolupants redisparades per nota + 3 LFOs. Clic dret a QUALSEVOL fader -> \"Assigna a\" hi encamina un modulador (diversos par\xc3\xa0metres per modulador); cavalca sobre el valor del knob amb +-Range. Cada modulador t\xc3\xa9 On/Off i \"Unmap all\"."));
+        "6 modulators: 3 note-retriggered envelopes + 3 LFOs. Right-click ANY fader -> \"Map to\" routes a modulator onto it (several parameters per modulator allowed); it rides on the knob's own value over +-Range. Each modulator has On/Off and \"Unmap\".",
+        "6 moduladors: 3 envolupants redisparades per nota + 3 LFOs. Clic dret a QUALSEVOL fader -> \"Assigna a\" hi encamina un modulador (diversos par\xc3\xa0metres per modulador); cavalca sobre el valor del knob amb +-Range. Cada modulador t\xc3\xa9 On/Off i \"Desassigna\"."));
     lblCustRange.setText (tr ("Range", "Rang"),  dontSendNotification);
     modUnmapBtn.setButtonText (tr ("Unmap", "Desassigna"));
     modUnmapBtn.setTooltip (tr ("Unmap this modulator from EVERYTHING it modulates.",
