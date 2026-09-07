@@ -12056,6 +12056,33 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         noticeOverlay.repaint();
     }
 
+    // ...AND SO DOES A BANK SLOT THAT WOULD NOT LOAD. Same arrangement, one line below,
+    // because the failure has the same shape: the processor parks the loader's own words
+    // (the switch happens on a parameter change, with no editor guaranteed) and this is
+    // the first tick that can speak them.
+    //
+    // Without this the message was RECORDED AND NEVER SHOWN. The commit that fixed the
+    // switch itself could not add the consumer - the editor was another agent's file at
+    // the time - so the two halves landed apart, and half of "state the failure" is
+    // silence with extra steps: the selector moves to a slot, the tuning does not change,
+    // and nothing on screen says which of those two facts is the real one.
+    //
+    // A DIFFERENT NOTICE from the one above, not a reuse of it: that one's body says the
+    // PROJECT's tuning is gone and the instrument is on 12-TET, which is a lie about a
+    // bank switch - the tuning you had is still the tuning you have, and it is the SWITCH
+    // that did not happen.
+    if (const auto slotErr = processorRef.takeBankSlotError(); slotErr.isNotEmpty())
+    {
+        noticeOverlay.title = tr ("That bank slot could not be loaded",
+                                  "No s'ha pogut carregar aquesta ranura del banc");
+        noticeOverlay.body  = tr ("The scale in the slot you picked no longer reads, so the tuning you were already using is still the one sounding - nothing has changed under you.\n\nPick another slot, or put a working scale back into this one.\n\n",
+                                  "L'escala de la ranura que has triat ja no es pot llegir, o sigui que l'afinaci\xc3\xb3 que ja feies servir segueix sent la que sona - no t'ha canviat res sota els dits.\n\nTria una altra ranura, o torna a posar una escala que funcioni en aquesta.\n\n")
+                            + slotErr;
+        noticeOverlay.setVisible (true);
+        noticeOverlay.toFront (false);
+        noticeOverlay.repaint();
+    }
+
     // OCTAVE stepper read-outs (params can also move via host automation).
     octVal.setText (juce::String ((int) processorRef.apvts.getRawParameterValue ("octaveShift")->load()),
                     juce::dontSendNotification);

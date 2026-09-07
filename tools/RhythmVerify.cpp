@@ -17989,6 +17989,88 @@ int main (int argc, char** argv)
             b.clear(); p->processBlock (b, off);
         }
     }
+    //== A FAILURE THAT IS RECORDED AND NEVER SHOWN IS A SILENT FAILURE ============
+    //
+    // Two things in this plugin fail where no dialog can be raised - a project whose
+    // saved scale no longer parses (setStateInformation runs on a load thread) and a
+    // tuning-bank slot that will not load (a parameter change, with no editor
+    // guaranteed) - so both park their message on the PROCESSOR and the editor's next
+    // timer tick puts it on the notice overlay.
+    //
+    // That is TWO claims, and only the first of them was ever checked. The bank-slot
+    // message shipped for a whole commit with nothing anywhere reading it: the processor
+    // recorded the reason, take...() cleared it on the first call, and the overlay never
+    // said a word. From the chair that is a selector that moves to a slot while the
+    // tuning does not change, with nothing saying which of the two is the real fact -
+    // which is precisely the silence this project refuses. Driven end to end here, on the
+    // EDITOR, and the notice must carry the loader's own words.
+    {
+        std::printf ("\nthe notice overlay really says what failed:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();               // heap: main()'s frame is finite
+        auto& p = *pp;
+        p.prepareToPlay (48000.0, 256);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "the editor builds");
+        if (ed != nullptr)
+        {
+            ed->setSize (1200, 650);
+            // GATE FIRST: nothing has failed yet, so the overlay must be silent. Without
+            // this an overlay that is ALWAYS up would pass every check below.
+            ed->tickTimerForTests();
+            check (! ed->noticeProbeForTests().visible,
+                   "with nothing wrong, the notice overlay is not on screen");
+
+            //-- A BANK SLOT THAT WILL NOT LOAD ---------------------------------------
+            // The slot is filled through the state, which is how it fills in life too: a
+            // project written by an older build, a hand-edited .gsting, a format that has
+            // moved on. Same construction as run 66, which proves the PROCESSOR half.
+            juce::MemoryBlock st;
+            p.getStateInformation (st);
+            if (auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+            {
+                xml->removeChildElement (xml->getChildByName ("BANK"), true);
+                auto* bank = xml->createNewChildElement ("BANK");
+                auto* slot = bank->createNewChildElement ("SLOT");
+                slot->setAttribute ("i", 0);
+                slot->setAttribute ("name", "zzz-notice-broken");
+                slot->setAttribute ("source", "this is not a scale, and never was");
+                juce::MemoryBlock withBank;
+                juce::AudioProcessor::copyXmlToBinary (*xml, withBank);
+                p.setStateInformation (withBank.getData(), (int) withBank.getSize());
+            }
+            for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+            ed->tickTimerForTests();                 // drain whatever the restore itself parked
+            ed->dismissNoticeForTests();
+
+            p.setTuningBankSlotParam (1);        // pick the broken slot
+            for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+            ed->tickTimerForTests();
+            const auto n = ed->noticeProbeForTests();
+            std::printf ("  after picking a broken slot: overlay %s, title \"%s\"\n",
+                         n.visible ? "SHOWN" : "silent", n.title.toRawUTF8());
+            check (n.visible,
+                   "a bank slot that will not load puts the notice ON SCREEN - the message"
+                   " was recorded and never shown before this");
+            check (n.title.containsIgnoreCase ("slot"),
+                   "...and the notice is about the SLOT, not about the project's tuning -"
+                   " the tuning you had is still the one sounding");
+            check (n.body.length() > 40,
+                   "...and it carries the loader's own reason, not a bare title");
+
+            // ONCE, NOT FOREVER. take...() clears the parked message, so a notice that
+            // came back on every 30 Hz tick would be unclosable - the user would press X
+            // and watch it reappear.
+            ed->dismissNoticeForTests();
+            ed->tickTimerForTests();
+            ed->tickTimerForTests();
+            check (! ed->noticeProbeForTests().visible,
+                   "and dismissing it makes it stay dismissed - the message is spoken once,"
+                   " not re-raised by every tick");
+        }
+    }
+
     runProcessorAuditChecks();
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);

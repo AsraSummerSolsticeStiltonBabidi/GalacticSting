@@ -1013,6 +1013,22 @@ public:
     // reached.
     juce::String typeThenBlurForTests (const juce::String& typed);
 
+    // TESTS: WHAT THE NOTICE OVERLAY IS SAYING RIGHT NOW.
+    //
+    // The overlay is this window's ONE way of telling the user that something failed
+    // where no dialog could be raised - a project whose scale no longer reads, a bank
+    // slot that would not load. Both messages are parked on the PROCESSOR by code running
+    // without an editor, and picked up by the next timer tick; so "the failure is
+    // recorded" and "the failure is on screen" are two different claims, and until this
+    // probe existed only the first of them was ever checked. The bank-slot message was
+    // recorded for a whole commit with nothing anywhere reading it.
+    struct NoticeProbe { bool visible = false; juce::String title, body; };
+    NoticeProbe noticeProbeForTests() const
+    { return { noticeOverlay.isVisible(), noticeOverlay.title, noticeOverlay.body }; }
+    // What pressing the overlay's X does, so a test can ask the question that matters
+    // after it: does the next tick put the notice straight back?
+    void dismissNoticeForTests() { noticeOverlay.setVisible (false); }
+
     // TESTS: WHAT HAPPENS TO AN EDIT THAT HAS NOT BEEN APPLIED YET.
     //
     // Typing into the box does not change the sound until Return; until then the box is
