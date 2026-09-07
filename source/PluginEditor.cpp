@@ -890,6 +890,37 @@ namespace
 
         // Toggle buttons named "onled" render as a big filled ON/OFF pill: green
         // when on, red when off (used for the Spectrum-to-Rhythm master switch).
+        //
+        // ...WITH A STATE LED IN FRONT OF THE WORD, BECAUSE HUE IS THE ONE CUE A
+        // COLOURBLIND READER DOES NOT GET.
+        //
+        // These pills - the rhythm dialog's "MIDI out (to DAW)" and "Play in Fibló", and
+        // the manual-amplitudes switch under the pencil in SPECTRUM - carried their state
+        // in a saturated green (0x2fb155) against a saturated red (0xe0453f). Under
+        // deuteranopia and protanopia those two fills converge on the same ochre, which is
+        // about one man in twelve reading a switch that no longer says anything. The pill
+        // has always ALSO printed ON or OFF, so it was never hue-alone in the strict sense
+        // - but a three-letter word at h * 0.62 has to be read, and this is a switch whose
+        // state you want to take in at a glance across a 1200 px window.
+        //
+        // So the shape says it too: a FILLED disc for on, a HOLLOW ring for off. Solid
+        // versus hollow survives every colour deficiency, greyscale, a thumbnail and the
+        // corner of an eye. Three cues - hue, word, shape - all saying one thing, and any
+        // one of them enough on its own.
+        //
+        // NOT a hollow PILL for off - a red outline on the dark ground with red letters
+        // inside it - which is the obvious way to make the whole control change shape and
+        // is the wrong one here. It changes the pill's WEIGHT rather than its shape, and
+        // a thin outline where a filled slab was reads as a control that is disabled or
+        // not there at all. This LookAndFeel already has an appearance that means exactly
+        // that (the 0.45 transparency layer at the foot of this function, for
+        // ! isEnabled), and OFF is emphatically not the same state as unavailable: an off
+        // switch is one you can turn on. The pill stays filled and its word stays white
+        // on a saturated fill; only the LED changes shape.
+        //
+        // The disc and its gap are fgfit::onLedDot / kOnLedGap, and fgfit::onLedInkWidth
+        // is what the fit sweep measures - so the probe that checks this pill is wide
+        // enough for its own contents measures the geometry this function really draws.
         void drawToggleButton (juce::Graphics& g, juce::ToggleButton& b,
                                bool over, bool down) override
         {
@@ -902,9 +933,26 @@ namespace
                 else if (over) col = col.brighter (0.10f);
                 g.setColour (col);
                 g.fillRoundedRectangle (r, 5.0f);
+
+                const juce::String word (on ? "ON" : "OFF");
+                const int   h    = b.getHeight();
+                const float dot  = fgfit::onLedDot (h);
+                const float ink  = fgfit::onLedInkWidth (h, word);
+                // The LED and the word are ONE object, centred together - not a word
+                // centred in the button with a disc hung off its left, which moves the
+                // word by half a disc between the two states and makes the pill twitch as
+                // it is clicked.
+                const float x0   = r.getCentreX() - ink * 0.5f;
+                const float cy   = r.getCentreY();
+                const juce::Rectangle<float> led (x0, cy - dot * 0.5f, dot, dot);
                 g.setColour (juce::Colours::white);
-                g.setFont (juce::Font (juce::FontOptions ((float) b.getHeight() * 0.62f).withStyle ("Bold")));
-                g.drawText (on ? "ON" : "OFF", b.getLocalBounds(), juce::Justification::centred, false);
+                if (on) g.fillEllipse (led);
+                else    g.drawEllipse (led.reduced (0.8f), 1.6f);
+                g.setFont (fgfit::onLedFont (h));
+                g.drawText (word,
+                            juce::Rectangle<float> (x0 + dot + fgfit::kOnLedGap, r.getY(),
+                                                    ink - dot - fgfit::kOnLedGap, r.getHeight()),
+                            juce::Justification::centredLeft, false);
                 return;
             }
             // EVERY OTHER TICK BOX IS THE SAME BOX, WITH THE SAME GAP TO ITS WORD.
@@ -4950,10 +4998,17 @@ namespace
         maxLines = 1;
         if (const auto* t = dynamic_cast<const juce::ToggleButton*> (&b))
         {
-            if (t->getName() == "onled")   // the green/red pill: "ON" / "OFF", centred
+            if (t->getName() == "onled")   // the green/red pill: LED + "ON" / "OFF", centred
             {
-                fontOut  = juce::Font (juce::FontOptions ((float) b.getHeight() * 0.62f).withStyle ("Bold"));
-                availOut = (float) b.getWidth();
+                // THROUGH fgfit, not a hand copy of h * 0.62. This was the second place in
+                // the file spelling the pill's font out for itself, and the moment the
+                // painter grew a state LED in front of the word (see
+                // GalacticLnF::drawToggleButton) the hand copy was measuring a pill that
+                // no longer exists - it would have certified one 9-10 px too narrow. The
+                // room the WORD gets is the button less the disc and its gap.
+                fontOut  = fgfit::onLedFont (b.getHeight());
+                availOut = (float) b.getWidth()
+                         - fgfit::onLedDot (b.getHeight()) - fgfit::kOnLedGap;
                 return true;
             }
             fontOut  = fgfit::toggleFont (b.getHeight());
@@ -8237,9 +8292,14 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
             // The "onled" pill prints ON / OFF itself, centred in the whole button, and
             // has no juce::Button text at all - measured as an empty string it would
             // "fit" any width, including a width too small for the word it draws.
+            //
+            // ...AND IT DRAWS A STATE LED IN FRONT OF THAT WORD, so what has to fit is the
+            // disc, its gap AND the word - fgfit::onLedInkWidth, which is the very
+            // expression GalacticLnF::drawToggleButton centres. Measuring the word alone
+            // would certify a pill 10 px too narrow for what lands on the glass, which is
+            // exactly the class of miss this whole sweep exists to stop.
             if (tg->getName() == "onled")
-                p.buttonFits.push_back ({ name, "OFF",
-                    (float) juce::GlyphArrangement::getStringWidth (fgfit::onLedFont (bh), "OFF"), bw });
+                p.buttonFits.push_back ({ name, "OFF", fgfit::onLedInkWidth (bh, "OFF"), bw });
             else if (tg->getButtonText().isNotEmpty())
                 p.buttonFits.push_back ({ name, tg->getButtonText(),
                     (float) juce::GlyphArrangement::getStringWidth (fgfit::toggleFont (bh), tg->getButtonText()),
@@ -10039,10 +10099,38 @@ void FractalAdditiveAudioProcessorEditor::resized()
                                                          ref, primeLbl[i].getText()));
                     const float pf = juce::jlimit (8.0f, 12.5f,
                                                    10.0f * (float) juce::jmax (1, tw - 2) / widest);
+                    // A TICK AND ITS NUMBER ARE ONE CONTROL, SO THEY GET ONE RECTANGLE -
+                    // AND IT COMES OFF THE TOP OF THE CELL.
+                    //
+                    // The tick used to be centred in whatever the cell had left after the
+                    // number was pinned to the BOTTOM, so the two ends of one control were
+                    // anchored to opposite edges of a box whose height nothing bounds. They
+                    // therefore drifted apart as the window grew, and the drift is the whole
+                    // of the surplus: measured off the rig's own photographs, the gap under
+                    // the tick is 0 px at the shipped 1200x650 (a 34 px row: 21 of tick, 13
+                    // of number, exactly full) and about 80 px at 1600x900, where the same
+                    // row is over 110 px tall and the tick is still capped at 22. What the
+                    // reader saw was a checkbox, a hand's width of nothing, and a number -
+                    // three things, not one, and no way to tell which number was whose.
+                    //
+                    // The pair now takes tickH + lblRowH off the TOP and the surplus stays
+                    // below it as the cell's bottom padding, in one piece. tickH is the same
+                    // number ticksFit above is decided on - jmin (22, rowH - lblRowH) - so
+                    // whenever the row is not taller than the pair needs (rowH - lblRowH
+                    // <= 22, which is every size that fits today, 1200x650 included) the
+                    // pair rectangle IS the whole cell and the layout is pixel-identical to
+                    // what shipped. Only the sizes that had a gap change.
+                    //
+                    // NOT CENTRED IN THE STRIP, which was the first thing tried and looks
+                    // better in isolation: the HARMONICS fader sits directly above this row
+                    // in the same column and the two are read as one stack, so centring the
+                    // block moved the primes ~60 px away from the control they line up
+                    // under and broke the column to tidy the cell. Padding belongs at the
+                    // bottom of a group, not between a control and the word for it.
                     for (int i = 0; ticksFit && i < 9; ++i)
                     {
                         const int cw = tw + (i < extra ? 1 : 0);
-                        auto cell = pi.removeFromLeft (cw);
+                        auto cell = pi.removeFromLeft (cw).removeFromTop (tickH + lblRowH);
                         primeLbl[i].setFont (juce::Font (juce::FontOptions (pf).withStyle ("Bold")));
                         primeLbl[i].setBounds (cell.removeFromBottom (lblRowH));
                         primeToggle[i].setBounds (cell.withSizeKeepingCentre (

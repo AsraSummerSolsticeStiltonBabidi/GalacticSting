@@ -132,14 +132,36 @@ namespace fgfit
     inline int toggleTickWidth (int h) noexcept
     { return 4 + juce::roundToInt (juce::jmin (15.0f, (float) h * 0.75f) * 1.1f); }
 
-    // GalacticLnF::drawToggleButton's "onled" pill: the word ON / OFF drawn centred in
-    // the WHOLE button, bold, at h * 0.62. The pill has no juce::Button text at all
-    // (the painted sub-label above it is its name), so every other measurement in this
-    // file reads it as an empty string and would happily size it to nothing.
+    // GalacticLnF::drawToggleButton's "onled" pill: a state LED and the word ON / OFF,
+    // the pair centred in the WHOLE button, bold, at h * 0.62. The pill has no
+    // juce::Button text at all (the painted sub-label above it is its name), so every
+    // other measurement in this file reads it as an empty string and would happily size
+    // it to nothing.
     inline juce::Font onLedFont (int h)
     { return juce::Font (juce::FontOptions ((float) h * 0.62f).withStyle ("Bold")); }
+    // THE LED ITSELF - a filled disc when on, a hollow ring when off.
+    //
+    // A SECOND CUE THAT IS NOT A HUE. The pill is a saturated green when on and a
+    // saturated red when off, and green-vs-red is the one distinction a deuteranope or a
+    // protanope does not get: to about one man in twelve those two fills are the same
+    // muddy ochre. The word inside it has always said ON or OFF, so the pill was never
+    // colour-ALONE - but a three-letter word at h * 0.62 (15 px in the rhythm panel,
+    // 13 in the SPECTRUM one) has to be READ, and solid-versus-hollow is told apart at a
+    // glance, out of the corner of an eye, and in a thumbnail. Redundant on purpose: hue,
+    // word and shape all say the same thing, and any one of the three is enough.
+    //
+    // Floored at 5 px because a ring needs an inside: below that the 1.6 px pen closes up
+    // and the hollow one is a filled dot in a lighter colour, which is no cue at all.
+    inline float onLedDot (int h)
+    { return juce::jmax (5.0f, std::round ((float) h * 0.26f)); }
+    inline constexpr float kOnLedGap = 4.0f;   // the disc's right edge -> the word
+    // What the painter really lays down, so the fit sweep and the snug widths measure the
+    // pill that is drawn rather than the one it used to draw.
+    inline float onLedInkWidth (int h, const juce::String& word)
+    { return onLedDot (h) + kOnLedGap
+           + juce::GlyphArrangement::getStringWidth (onLedFont (h), word); }
     inline int onLedWidth (int h)  // "OFF" is the longer of the two words
-    { return (int) std::ceil (juce::GlyphArrangement::getStringWidth (onLedFont (h), "OFF")) + 2; }
+    { return (int) std::ceil (onLedInkWidth (h, "OFF")) + 2; }
 
     // THE GUTTER THE CHEVRON REALLY OCCUPIES, taken off the very path that draws it.
     //
@@ -2127,6 +2149,25 @@ private:
         // on every row of the panel at once.
         static constexpr int kStepBtnW = 36;
 
+        // THE GROUP TITLE'S OWN ROW, and why it is 14 px and not the 13 it was.
+        //
+        // The five section titles are drawn at 13.0 px Bold now (see the loop that sets
+        // them, and the note beside outLbl for why anything at or below 12.5 would have
+        // changed nothing at all). A 13 px row held a 12.5 px line with half a pixel to
+        // spare; a 13.0 px line in it sits exactly flush with the component's own top and
+        // bottom edge, which is the state where one rounding step in the wrong direction
+        // shaves the top off a capital. One more pixel of row is the whole cost, and it
+        // is paid out of the routed list at the foot of the panel: three pixels across
+        // the three stacked boxes, an eighth of one of that list's 22 px rows.
+        //
+        // NOT taken out of the 24 px control row inside each box instead, which is the
+        // other place it could come from: a ComboBox's chevron gutter and an "onled"
+        // pill's word are both derived from the row's HEIGHT (fgfit's chevron note and
+        // onLedFont, which is h * 0.62), so a pixel off there does not move those
+        // controls, it re-measures them - and this panel's mode box is already sized to
+        // its widest Catalan item with nothing to spare.
+        static constexpr int kSecHdrH = 14;
+
         //== THE PANEL WEARS ONE HUE, AND IT IS THE SPECTRUM'S =====================
         //
         // "EIGHT ACCENT HUES IN ONE 816x637 DIALOG". Counted from the render: a blue
@@ -2364,12 +2405,48 @@ private:
             addAndMakeVisible (onT);
             selfT.setName ("onled"); // second big pill: "play in Fibló" (interpret internally)
             addAndMakeVisible (selfT);
-            // Captions under the two big pill toggles.
+            // Captions ABOVE the two big pill toggles - and they are CAPTIONS, which is
+            // the whole of this change.
+            //
+            // "TWO WHITE BOLD SUB-LABELS UNDER A SMALL DIM GROUP TITLE, SO THE LESS
+            // IMPORTANT THING IS LOUDER." Measured off the rig's photograph at 1200x650,
+            // and true: "MIDI out (to DAW)" and "Play in Fibló" were inkDim (0xb9c0d0,
+            // near white on this ground) while "PLAYBACK" above them was the panel's olive
+            // - which is darker - and the two were exactly the same SIZE, so nothing but a
+            // dim colour separated the heading of the group from the caption of one switch
+            // inside it. The panel read from the inside out.
+            //
+            // AND THE SIZES IN THIS FILE ARE NOT THE SIZES ON THE GLASS, which is why the
+            // first attempt at this changed nothing at all. GalacticLnF::getLabelFont puts
+            // a floor under every Label - jmax (12.5, the font it was given), Bold - so
+            // the 11.0f here and the 11.5f on these two were BOTH drawn at 12.5 Bold and
+            // moving either of them below the floor moves nothing. Only two things
+            // actually reach the screen: a font ABOVE 12.5 (what the group titles now
+            // ask for), or the "small" escape hatch the LnF documents, which returns the
+            // Label's own font untouched. Both are used here, in opposite directions.
+            //
+            // So these two join the ramp they belong to - 11.0f Bold in inkFaint is what
+            // "VEL", "GATE", "Steps from the note" and "Partials (click to route)" are
+            // already set in a few rows below, and those are the same kind of object: a
+            // word naming the control under it. The order on the glass is now title (13.0
+            // Bold, the panel's identity colour) > caption (11.0 Bold, the faint end of
+            // the text ramp), with the pill itself - a saturated fill with white letters -
+            // the loudest thing in the group, because it is the control.
+            //
+            // NOT SOLVED BY DIMMING ALONE, which was tried: with both drawn at 12.5 the
+            // title wins only on colour, and olive-on-charcoal against grey-on-charcoal is
+            // a difference a reader has to go looking for. Size is the cue that does not
+            // need looking for.
             for (auto* l : { &outLbl, &selfLbl })
             {
                 l->setJustificationType (juce::Justification::centred);
-                l->setColour (juce::Label::textColourId, inkDim());
-                l->setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+                l->setColour (juce::Label::textColourId, inkFaint());
+                // Out of the 12.5 px floor - see the note above. The side effect is that
+                // probeNameFor() reports both of them as "small", which is the same
+                // trade the nine prime-number labels already make; the alternative was a
+                // caption that cannot be made smaller than the title it sits under.
+                l->setName ("small");
+                l->setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
                 addAndMakeVisible (*l);
             }
             droneT.setColour (juce::ToggleButton::textColourId, inkDim());
@@ -2402,11 +2479,21 @@ private:
             // two of them landing near each other is an accident that reads as a claim.
             // What tells the groups apart is their words and their frames, which is how
             // every other panel in the product does it.
+            //
+            // ...AND THEY ARE THE BIGGEST WORDS IN THEIR OWN GROUP NOW. A group title that
+            // is no bigger than the caption of one switch inside it is not a title - see
+            // the long note on outLbl / selfLbl above for what was photographed and for
+            // why 11.0f here used to draw at 12.5.
+            //
+            // 13.0f is the smallest number that actually MOVES: anything at or under the
+            // LnF's 12.5 px floor is the size these were already drawn at. It is half a
+            // point over the floor, not two - a title has to outrank its captions, not
+            // shout at them, and every pixel of it is paid for in kSecHdrH.
             for (auto* l : { &secPlay, &secRate, &secOut, &secTempo, &secGate })
             {
                 l->setJustificationType (juce::Justification::centredLeft);
                 l->setColour (juce::Label::textColourId, hue());
-                l->setFont (juce::Font (juce::FontOptions (11.0f).withStyle ("Bold")));
+                l->setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
                 addAndMakeVisible (*l);
             }
             for (auto* t : { &qTempoT, &monoT, &qPulseT })
@@ -2431,15 +2518,28 @@ private:
                 v->setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
                 addAndMakeVisible (*v);
             }
-            // A STEPPER PAIR IS ONE CONTROL, IN ITS SECTION'S COLOUR - the same rule the
+            // A STEPPER PAIR IS ONE CONTROL, IN THE PANEL'S COLOUR - the same rule the
             // editor's OCTAVE and OCTAVE RANGE pairs follow (see configStep in
             // PluginEditor.cpp). These were green for "+" and red for "-", which are this
             // product's LOAD and DESTROY colours: an increment painted in the colour of the
-            // X that deletes a routed slot, two rows below it. `col` is the section heading
-            // the pair belongs to, so the three pairs in this panel cannot drift apart.
+            // X that deletes a routed slot, two rows below it.
+            //
+            // ...AND THEN THEY WERE TWO COLOURS FOR ONE CONTROL, WHICH IS THE SAME FAULT
+            // ONE STEP ON. The fix above said "its SECTION's colour" and passed a hue in
+            // per call: cyan 0x4fe6ff for the PULSE RATE pair, pink 0xff77c8 for the OUTPUT
+            // one. That was written while this panel still had five section hues. It has
+            // had ONE since (see kHueRgb above - the five headers, the five frames, every
+            // fader track and every read-out are the spectrum's olive), so those two
+            // literals were the last of the old scheme, and what a reader saw was the
+            // IDENTICAL round -/+ pair drawn teal in one group and magenta in another,
+            // 130 px apart in the same dialog. Two colours for one control is a claim that
+            // they are two kinds of control; there was nothing left for the colours to
+            // mean. `col` is gone with them - a per-call hue is exactly the door the drift
+            // came through, so the pairs can no longer disagree even by accident.
             auto miniStep = [this] (juce::TextButton& b, const char* txt, const char* id,
-                                    int delta, juce::Colour col)
+                                    int delta)
             {
+                const auto col = hue();
                 b.setButtonText (txt);
                 b.setName ("round");
                 b.setColour (juce::TextButton::buttonColourId, col.withAlpha (0.45f));
@@ -2455,11 +2555,11 @@ private:
                 };
                 addAndMakeVisible (b);
             };
-            // "divide n times by x" lives under the PULSE RATE heading, so it wears its cyan.
-            miniStep (nUp, "+", "rhythmDivN",  1, juce::Colour (0xff4fe6ff));
-            miniStep (nDn, "-", "rhythmDivN", -1, juce::Colour (0xff4fe6ff));
-            miniStep (xUp, "+", "rhythmDivX",  1, juce::Colour (0xff4fe6ff));
-            miniStep (xDn, "-", "rhythmDivX", -1, juce::Colour (0xff4fe6ff));
+            // "divide n times by x", under the PULSE RATE heading.
+            miniStep (nUp, "+", "rhythmDivN",  1);
+            miniStep (nDn, "-", "rhythmDivN", -1);
+            miniStep (xUp, "+", "rhythmDivX",  1);
+            miniStep (xDn, "-", "rhythmDivX", -1);
 
             // "How to route" ON A SATURATED AMBER FILL WAS THE BRIGHTEST THING IN THE
             // DIALOG - louder than the panel's own name, louder than the two switches
@@ -2600,9 +2700,9 @@ private:
             octAllVal.setColour (juce::Label::textColourId, ink());
             octAllVal.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
             addAndMakeVisible (octAllVal);
-            // "Octave (all)" sits in the OUTPUT row, so it wears that heading's pink.
-            miniStep (octAllUp, "+", "rhythmOctAll",  1, juce::Colour (0xffff77c8));
-            miniStep (octAllDn, "-", "rhythmOctAll", -1, juce::Colour (0xffff77c8));
+            // "Octave (all)" sits in the OUTPUT row - same pair, same colour as the two above.
+            miniStep (octAllUp, "+", "rhythmOctAll",  1);
+            miniStep (octAllDn, "-", "rhythmOctAll", -1);
 
             for (int i = 0; i < RhythmEngine::kSlots; ++i)
             {
@@ -3078,14 +3178,14 @@ private:
             // row where a ToggleButton leaves its edges bare, so the box reads a couple
             // of pixels deeper than the identical box above it.
             constexpr int kBoxPad = 16;                          // the 8 px a side of `reduced (8, 4)`
-            constexpr int kShortH = 13 + 3 + 24 + 8;             // header + one 24 px control row
-            constexpr int kPlayH  = 13 + 3 + (13 + 26 + 4 + 24) + 8;
+            constexpr int kShortH = kSecHdrH + 3 + 24 + 8;       // header + one 24 px control row
+            constexpr int kPlayH  = kSecHdrH + 3 + (13 + 26 + 4 + 24) + 8;
             const auto sectionIn = [] (juce::Rectangle<int> box, juce::Label& hdr,
                                        juce::Rectangle<int>& boxOut, int contentH)
             {
                 boxOut = box;
                 auto in = box.reduced (8, 4);
-                hdr.setBounds (in.removeFromTop (13));
+                hdr.setBounds (in.removeFromTop (kSecHdrH));
                 in.removeFromTop (3);
                 return in.removeFromTop (contentH);
             };
@@ -3246,14 +3346,14 @@ private:
                 const int gateNeed  = fgfit::toggleWidth (qTempoT)
                                     + 6 + fgfit::toggleWidth (monoT)
                                     + 6 + fgfit::toggleWidth (qPulseT) + 16;
-                const int boxH = 13 + 3 + 24 + 8;
+                const int boxH = kSecHdrH + 3 + 24 + 8;
                 const bool sideBySide = r.getWidth() >= tempoNeed + 6 + gateNeed;
 
                 auto layTempo = [&] (juce::Rectangle<int> box)
                 {
                     tempoBox = box;
                     auto in = box.reduced (8, 4);
-                    secTempo.setBounds (in.removeFromTop (13));
+                    secTempo.setBounds (in.removeFromTop (kSecHdrH));
                     in.removeFromTop (3);
                     auto g3 = in.removeFromTop (24);
                     tempoT.setBounds (g3.removeFromLeft (juce::jmax (150, fgfit::toggleWidth (tempoT))));
@@ -3268,7 +3368,7 @@ private:
                 {
                     gateBox = box;
                     auto in = box.reduced (8, 4);
-                    secGate.setBounds (in.removeFromTop (13));
+                    secGate.setBounds (in.removeFromTop (kSecHdrH));
                     in.removeFromTop (3);
                     auto g4 = in.removeFromTop (24);
                     // THE SPARE IS SHARED, NOT INHERITED BY WHOEVER IS LAST.
@@ -3601,17 +3701,88 @@ private:
 
             // Each draggable node IS its letter - bold, a size up from the old dots,
             // with a thin black outline so it reads over the curve and the fill.
+            //
+            // AND THE FOUR OF THEM ARE PLACED AS A ROW, NOT FOUR TIMES INDEPENDENTLY.
+            //
+            // Every letter used to be centred on its own node and nothing else was said,
+            // which is right only while the four nodes happen to be far apart. They are
+            // not: node x is kPad + tToW(time), and tToW of a short time is a couple of
+            // pixels, so the two commonest envelopes in this instrument break it. Read off
+            // the rig's own photographs of the modulators panel:
+            //
+            //   FAST ATTACK. a near 0 puts node 1 at x = kPad = 8, and half of a 15 px
+            //   Bold "A" is about 5 px of ink with 1.2 px of outline on top - so the left
+            //   third of the letter was drawn outside the graph's 1 px border and what
+            //   reached the glass was the A's right leg on its own: a "/".
+            //   SHORT DECAY. d near 0 puts node 2 within a pixel or two of node 1, so the
+            //   D was printed ON TOP of the S. The row read "/D-S" where it should read
+            //   A D S R, and neither half of that is a fit problem any gate can see -
+            //   nothing overflowed a component and nothing was clipped by JUCE.
+            //
+            // Three passes, and the ORDER is the whole fix:
+            //   1. CLAMP each letter inside the drawing area. The border is a hard limit:
+            //      a letter half outside it is not a letter, it is a stroke.
+            //   2. LEFT TO RIGHT, push any letter that still overlaps its predecessor far
+            //      enough right to clear it by kLetterGap.
+            //   3. RIGHT TO LEFT, the same in reverse. Without this pass a fast attack AND
+            //      a short decay accumulate through step 2 and shove R off the RIGHT edge -
+            //      curing the overlap by re-creating the clipping at the other end.
+            // Then the left edge once more, because step 3 can only push left and the edge
+            // outranks the spacing: in a graph too narrow to separate four letters, two
+            // letters touching is legible and one letter half-drawn is not.
+            //
+            // NOT MOVED VERTICALLY, and not clamped there either - tried, and there is
+            // nothing to clamp. Node y is lToY(0..1), which spans kPad = 8 to height - 8,
+            // and these glyphs are ~11 px tall, so the furthest a letter's ink reaches is
+            // ~2.5 px inside the border with its 1.2 px outline on top. The letter keeps
+            // its node's HEIGHT, which is what still says which node it belongs to once x
+            // has been nudged.
+            //
+            // nodeAt() IS DELIBERATELY NOT MOVED WITH THE LETTERS. mouseDrag turns the
+            // ABSOLUTE mouse x into the parameter (wToT (pos.x - node(i-1).x)), so a grab
+            // area sitting on a nudged letter would set the value from a position the node
+            // is not at and the curve would jump on the first drag pixel. The node is the
+            // value; the letter is its label, and only the label moves. (Two nodes that
+            // land on the same pixel were never both grabbable anyway - nodeAt returns the
+            // first match - which is a separate, pre-existing consequence of a zero-length
+            // stage, not something this placement introduces.)
             static const char* letters[5] = { "", "A", "D", "S", "R" };
+            constexpr float kLetterGap = 1.5f;      // ink to ink, so two letters never touch
+            // Inside the 1 px rounded border, plus the half of the 2.4 px black outline
+            // that is drawn outside the glyph's own path bounds.
+            const float xLo = b.getX() + 1.0f + 1.2f, xHi = b.getRight() - 1.0f - 1.2f;
+            juce::Path glyph[5];
+            float cx[5] = {}, halfW[5] = {};
             for (int i : { 1, 2, 3, 4 })
             {
-                const auto n = node (i);
-                const bool hot = i == hover || i == dragNode;
                 juce::GlyphArrangement ga;
                 ga.addLineOfText (juce::Font (juce::FontOptions (15.0f).withStyle ("Bold")), letters[i], 0.0f, 0.0f);
-                juce::Path gp;
-                ga.createPath (gp);
-                const auto gb = gp.getBounds();
-                gp.applyTransform (juce::AffineTransform::translation (n.x - gb.getCentreX(), n.y - gb.getCentreY()));
+                ga.createPath (glyph[i]);
+                halfW[i] = glyph[i].getBounds().getWidth() * 0.5f;
+                cx[i]    = node (i).x;
+                // 1. the edges. Written as a jmin then a jmax rather than a jlimit because
+                // in a graph narrower than one letter the two bounds cross, and jlimit
+                // asserts on that; this way the LEFT edge wins, which is the readable half.
+                cx[i] = juce::jmax (xLo + halfW[i], juce::jmin (xHi - halfW[i], cx[i]));
+            }
+            // 2. left to right.
+            for (int i : { 2, 3, 4 })
+                cx[i] = juce::jmax (cx[i], cx[i - 1] + halfW[i - 1] + kLetterGap + halfW[i]);
+            // 3. right to left, seeded by the right edge.
+            for (int i : { 4, 3, 2 })
+            {
+                cx[i]     = juce::jmin (cx[i], xHi - halfW[i]);
+                cx[i - 1] = juce::jmin (cx[i - 1], cx[i] - halfW[i] - kLetterGap - halfW[i - 1]);
+            }
+            for (int i : { 1, 2, 3, 4 })
+                cx[i] = juce::jmax (cx[i], xLo + halfW[i]);
+            for (int i : { 1, 2, 3, 4 })
+            {
+                const bool hot = i == hover || i == dragNode;
+                const auto gb = glyph[i].getBounds();
+                auto gp = glyph[i];
+                gp.applyTransform (juce::AffineTransform::translation (cx[i] - gb.getCentreX(),
+                                                                      node (i).y - gb.getCentreY()));
                 g.setColour (juce::Colours::black.withAlpha (0.9f));
                 g.strokePath (gp, juce::PathStrokeType (2.4f));
                 g.setColour (hot ? juce::Colours::white : col);
