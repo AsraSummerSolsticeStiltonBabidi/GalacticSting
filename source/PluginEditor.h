@@ -1077,6 +1077,13 @@ public:
     // What pressing the overlay's X does, so a test can ask the question that matters
     // after it: does the next tick put the notice straight back?
     void dismissNoticeForTests() { noticeOverlay.setVisible (false); }
+    // TESTS: what this window would SHOW for a refusal the processor handed it. The two
+    // feedback-loop refusals are English sentences built in PluginProcessor.cpp, which has
+    // no tr(); this is where they become the window's language, and a check that feeds it
+    // the processor's OWN literals is what stops a rewording there from quietly shipping
+    // English here.
+    juce::String realtimeRefusalTextForTests (const juce::String& raw) const
+    { return realtimeRefusalText (raw); }
 
     // TESTS: WHAT HAPPENS TO AN EDIT THAT HAS NOT BEEN APPLIED YET.
     //
@@ -5919,6 +5926,26 @@ private:
     // which is what puts it in the right z-order - see the struct's own comment.
     SpecSections   specSections;
     NoticeOverlay  noticeOverlay;
+    // HOW A NOTICE IS PUT ON SCREEN, AND WHY IT IS A LAMBDA AND NOT TWO STRINGS.
+    //
+    // NoticeOverlay::title and ::body are plain juce::Strings. Five places wrote their
+    // tr() pairs straight into them and nothing ever wrote them again - so the language
+    // button, which re-runs applyLanguage() over every label, button, tooltip and combo
+    // in the window, walked straight past the one panel in the middle of the screen that
+    // was TELLING THE USER SOMETHING HAD GONE WRONG. A project whose scale would not load
+    // said so in English, the user switched the window to Catalan to read it, and the
+    // notice was the single thing that did not follow.
+    //
+    // The fix cannot be "translate it again", because a notice carries data as well as
+    // words - a corner letter, a count, a parser's own message - and only the site that
+    // raised it knows those. So the site hands over the RECIPE instead: a callable that
+    // writes title and body through tr(). Raising it runs it once; applyLanguage runs it
+    // again while the panel is up, and every notice in this window follows the language
+    // for the same reason and by the same line.
+    std::function<void()> noticeRender;
+    void raiseNotice (std::function<void()> render);
+    // The processor's realtime refusals in the window's language (see the definition).
+    juce::String realtimeRefusalText (const juce::String& raw) const;
     RecentOverlay  recentOverlay;   // floating list of every scale file loaded
     DissDegreeList degreeList;   // active-scale dissonance list (lives inside dissView)
     DissHeader     dissHeader;   // Step / Sethares-dissonance column header

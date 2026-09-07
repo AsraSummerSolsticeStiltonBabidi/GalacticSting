@@ -20104,4 +20104,137 @@ static void runProcessorAuditChecks()
         std::printf ("  [SKIP] table audit: FG_SOURCE_DIR not defined\n");
        #endif
     }
+
+    //-- run 75: THE NOTICE FOLLOWS THE LANGUAGE BUTTON, AND SO DO THE TWO REFUSALS ----
+    //
+    // Two halves of one defect.
+    //
+    // The notice overlay is this window's ONE way of saying that something failed where no
+    // dialog could be raised, and its title and body were plain juce::Strings written once
+    // by whichever site raised them. applyLanguage() re-walks every label, button, tooltip
+    // and combo in the editor and walked straight past the panel in the middle of the
+    // screen that was telling the user something had gone wrong. So a project whose scale
+    // would not load said so in English, and pressing CAT to read it was precisely the
+    // gesture that could not work.
+    //
+    // And the two feedback-loop refusals were English SENTENCES in PluginProcessor.cpp,
+    // which has no tr(). They are not obscure: pressing REALTIME with temper on is the
+    // ordinary way to meet them. The editor translates them at the point of display, and
+    // this pins that translation against the literals the PROCESSOR really holds - so a
+    // rewrite over there goes red here instead of silently shipping English.
+    {
+        std::printf ("\nrun 75: a notice already on screen follows the language button:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();
+        auto& p = *pp;
+        p.prepareToPlay (48000.0, 256);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "  the editor builds");
+        if (ed != nullptr)
+        {
+            ed->setSize (1200, 650);
+            ed->tickTimerForTests();
+            check (! ed->noticeProbeForTests().visible,
+                   "  (gate: with nothing wrong the overlay is not up)");
+
+            // A bank slot that will not load - the same construction the notice-overlay
+            // check above uses, because it is the one that reaches the overlay for real.
+            juce::MemoryBlock st;
+            p.getStateInformation (st);
+            if (auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+            {
+                xml->removeChildElement (xml->getChildByName ("BANK"), true);
+                auto* bank = xml->createNewChildElement ("BANK");
+                auto* slot = bank->createNewChildElement ("SLOT");
+                slot->setAttribute ("i", 0);
+                slot->setAttribute ("name", "zzz-lang-broken");
+                slot->setAttribute ("source", "this is not a scale, and never was");
+                juce::MemoryBlock withBank;
+                juce::AudioProcessor::copyXmlToBinary (*xml, withBank);
+                p.setStateInformation (withBank.getData(), (int) withBank.getSize());
+            }
+            for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+            ed->tickTimerForTests();
+            ed->dismissNoticeForTests();
+            p.setTuningBankSlotParam (1);
+            for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+            ed->tickTimerForTests();
+
+            const auto en = ed->noticeProbeForTests();
+            std::printf ("    English: \"%s\"\n", en.title.toRawUTF8());
+            check (en.visible, "  (precondition: the notice really is on screen)");
+
+            // THE LANGUAGE BUTTON, through the same call the button makes. Nothing raises
+            // the notice again here: take...() cleared the parked message on the tick
+            // above, so anything that changes is the overlay following the language.
+            ed->setLanguageForSnapshot (true);
+            const auto ca = ed->noticeProbeForTests();
+            std::printf ("    Catalan: \"%s\"\n", ca.title.toRawUTF8());
+            check (ca.visible, "  the notice is still up after the switch");
+            check (ca.title != en.title,
+                   "  ...and it is no longer in the language it was raised in");
+            check (ca.body != en.body, "  ...body as well as title");
+            check (ca.body.contains ("zzz-lang-broken"),
+                   "  ...while the loader's own words, and the slot it names, survive it");
+            ed->setLanguageForSnapshot (false);
+            check (ed->noticeProbeForTests().title == en.title,
+                   "  and back again - the recipe is re-run, not translated once");
+
+           #ifdef FG_SOURCE_DIR
+            // THE TWO REFUSALS, read out of the processor's own source so this cannot pass
+            // against a copy of a sentence the processor has stopped producing.
+            const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
+            const auto proc = srcDir.getChildFile ("source").getChildFile ("PluginProcessor.cpp")
+                                    .loadFileAsString().toStdString();
+            std::vector<std::string> refusals;
+            const std::string key = "rtRefusal = ";
+            for (size_t at = proc.find (key); at != std::string::npos; at = proc.find (key, at + 1))
+            {
+                size_t j = at + key.size();
+                std::string lit;
+                if (traudit::readLiteral (proc.c_str(), proc.size(), j, lit))
+                    refusals.push_back (lit);
+            }
+            std::printf ("    the processor holds %d hard-coded refusal sentences\n",
+                         (int) refusals.size());
+            check (refusals.size() == 2,
+                   "  (precondition: the processor still writes exactly the two refusals "
+                   "this window knows how to say)");
+            // The literal still carries its C escapes - one of the two refusals quotes a
+            // control by name - and the editor is handed the DECODED sentence. Undo the
+            // three escapes these two use, so what is fed in is what the compiler built.
+            const auto decode = [] (const std::string& lit)
+            {
+                std::string out;
+                for (size_t i = 0; i < lit.size(); ++i)
+                {
+                    if (lit[i] != (char) 92 || i + 1 >= lit.size()) { out += lit[i]; continue; }
+                    const char n = lit[++i];
+                    out += (n == 'n' ? '\n' : n);      // \" -> " , \\ -> \ , \n -> newline
+                }
+                return out;
+            };
+            for (const auto& r : refusals)
+            {
+                const juce::String raw (decode (r).c_str());
+                ed->setLanguageForSnapshot (false);
+                const auto shown = ed->realtimeRefusalTextForTests (raw);
+                check (shown == raw,
+                       "  in English the window shows the processor's sentence unchanged - "
+                       "which is also how it proves it RECOGNISED it");
+                ed->setLanguageForSnapshot (true);
+                const auto shownCa = ed->realtimeRefusalTextForTests (raw);
+                std::printf ("      \"%s...\" -> \"%s...\"\n",
+                             raw.substring (0, 34).toRawUTF8(),
+                             shownCa.substring (0, 34).toRawUTF8());
+                check (shownCa != raw,
+                       "  ...and in Catalan it is not the English sentence any more");
+                ed->setLanguageForSnapshot (false);
+            }
+           #else
+            std::printf ("  [SKIP] refusal audit: FG_SOURCE_DIR not defined\n");
+           #endif
+        }
+    }
 }

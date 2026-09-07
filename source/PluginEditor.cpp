@@ -4958,6 +4958,17 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         recentOverlay.list.trF = hook;
         dissHeader.trF        = hook;
     }
+    // AND THE NOTICE THAT IS ALREADY ON SCREEN, which was the one thing in this window
+    // that this function could not reach. NoticeOverlay holds two plain Strings, written
+    // once by whichever site raised it and never again - so the panel telling the user
+    // their project's tuning would not load stayed in the language it happened in, and
+    // pressing CAT to read it was exactly the gesture that could not work. The site left
+    // its recipe behind (see raiseNotice); run it again and the notice follows.
+    if (noticeOverlay.isVisible() && noticeRender)
+    {
+        noticeRender();
+        noticeOverlay.repaint();
+    }
     repaint(); // title uses the language
 }
 
@@ -6603,6 +6614,55 @@ juce::String FractalAdditiveAudioProcessorEditor::adaptReadoutTip() const
     return t;
 }
 
+// Put something on the notice overlay, and remember HOW it was written so applyLanguage
+// can write it again. See the member's own comment for why this is a callable.
+void FractalAdditiveAudioProcessorEditor::raiseNotice (std::function<void()> render)
+{
+    noticeRender = std::move (render);
+    if (noticeRender) noticeRender();
+    noticeOverlay.setVisible (true);
+    noticeOverlay.toFront (false);
+    noticeOverlay.repaint();
+}
+
+// THE PROCESSOR'S REALTIME REFUSALS, IN THE WINDOW'S LANGUAGE.
+//
+// The feedback guard lives in the processor - it has to, because the link keeps running
+// with this window shut - and the processor has no tr(): it is the audio object, it has no
+// idea which language a window it may not even have is drawing in. Everywhere else that
+// mattered, the answer was an ENUM the editor translates (PresetWriteRefusal is the
+// pattern, and its comment says exactly this). These two refusals were written as English
+// sentences instead, and they are not obscure: they are what a Catalan user gets for
+// pressing REALTIME with temper on, which is the single most likely way to meet them.
+//
+// Recognised by their opening words rather than compared whole, so the processor may fix a
+// typo without this silently falling back to English - and run 75 pins the recognition
+// against the strings the processor really produces, so a REWRITE there goes red here
+// instead of shipping. Anything else - a search that could not start, a bound the engine
+// refused - is passed through untouched: those are the processor's own words about its own
+// numbers, and inventing a translation for a message this function has never seen would be
+// worse than showing the one it was given.
+juce::String FractalAdditiveAudioProcessorEditor::realtimeRefusalText (const juce::String& raw) const
+{
+    if (raw.startsWith ("Temper mode already builds"))
+        return tr ("Temper mode already builds the spectrum FROM the tuning. Running this "
+                   "at the same time would feed each into the other with no end to it, so "
+                   "realtime is off. Switch temper off to use it.",
+                   "El mode Tempera ja construeix l'espectre A PARTIR de l'afinaci\xc3\xb3. "
+                   "Fer-ho anar tot alhora els faria alimentar-se l'un a l'altre sense fi, "
+                   "o sigui que el temps real queda desactivat. Desactiva Tempera per "
+                   "fer-lo servir.");
+    if (raw.startsWith ("\"From spectrum's segment\" already builds"))
+        return tr ("\"From spectrum's segment\" already builds the tuning FROM the spectrum. "
+                   "Adapting the spectrum to that tuning would feed each into the other, so "
+                   "realtime is off.",
+                   "\"Troba afinacions del segment de l'espectre\" ja construeix l'afinaci\xc3\xb3 "
+                   "A PARTIR de l'espectre. Adaptar l'espectre a aquella afinaci\xc3\xb3 els "
+                   "faria alimentar-se l'un a l'altre, o sigui que el temps real queda "
+                   "desactivat.");
+    return raw;
+}
+
 // The two REALTIME buttons' look, plus the one case they must OWN UP to: the processor
 // refused the link (a feedback loop) and switched it off under us. The button has to stop
 // claiming to be on, and the reason has to be said out loud, not swallowed.
@@ -6616,11 +6676,11 @@ void FractalAdditiveAudioProcessorEditor::paintRealtimeButtons()
         if (why.isNotEmpty())
         {
             chordRtOn = adaptRtOn = false;
-            noticeOverlay.title = tr ("Realtime switched off", "Temps real desactivat");
-            noticeOverlay.body  = why;
-            noticeOverlay.setVisible (true);
-            noticeOverlay.toFront (false);
-            noticeOverlay.repaint();
+            raiseNotice ([this, why]
+            {
+                noticeOverlay.title = tr ("Realtime switched off", "Temps real desactivat");
+                noticeOverlay.body  = realtimeRefusalText (why);
+            });
             resized();
         }
     }
@@ -7000,12 +7060,12 @@ void FractalAdditiveAudioProcessorEditor::refreshDegreeList (bool showNotice)
     }
     else
     {
-        noticeOverlay.title = tr ("Fewer degrees than requested", "Menys graus dels demanats");
-        noticeOverlay.body  = fewerDegreesBody (processorRef.getDissRequested(),
-                                                 processorRef.getDissFound());
-        noticeOverlay.setVisible (true);
-        noticeOverlay.toFront (false);
-        noticeOverlay.repaint();
+        const int want = processorRef.getDissRequested(), got = processorRef.getDissFound();
+        raiseNotice ([this, want, got]
+        {
+            noticeOverlay.title = tr ("Fewer degrees than requested", "Menys graus dels demanats");
+            noticeOverlay.body  = fewerDegreesBody (want, got);
+        });
     }
 }
 
@@ -12229,20 +12289,21 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             const int req = processorRef.getChordRequested(), got = processorRef.getChordFound();
             if (req > 0 && got < req)
             {
-                const juce::String gap ((int) std::lround (processorRef.getChordMinGap()));
-                noticeOverlay.title = got == 0
-                    ? tr ("No chord fits that smallest interval", "Cap acord no cap amb aquest interval m\xc3\xadnim")
-                    : tr ("Fewer chords than requested", "Menys acords dels demanats");
-                noticeOverlay.body = got == 0
-                    ? tr ("Every note pair must be at least ", "Cada parella de notes ha d'estar a ") + gap
-                      + tr (" cents apart, and that many gaps do not fit inside the period. Lower 'smallest interval', use fewer notes, or widen the period.",
-                            " cents com a m\xc3\xadnim, i tants espais no caben dins el per\xc3\xado" "de. Abaixa 'interval m\xc3\xa9s petit', posa menys notes o eixampla el per\xc3\xado" "de.")
-                    : tr ("Only ", "Nom\xc3\xa9s ") + juce::String (got) + tr (" of the ", " dels ") + juce::String (req)
-                      + tr (" chords you asked for satisfy a smallest interval of ", " acords demanats compleixen l'interval m\xc3\xadnim de ")
-                      + gap + tr (" cents.", " cents.");
-                noticeOverlay.setVisible (true);
-                noticeOverlay.toFront (false);
-                noticeOverlay.repaint();
+                const int gapC = (int) std::lround (processorRef.getChordMinGap());
+                raiseNotice ([this, req, got, gapC]
+                {
+                    const juce::String gap (gapC);
+                    noticeOverlay.title = got == 0
+                        ? tr ("No chord fits that smallest interval", "Cap acord no cap amb aquest interval m\xc3\xadnim")
+                        : tr ("Fewer chords than requested", "Menys acords dels demanats");
+                    noticeOverlay.body = got == 0
+                        ? tr ("Every note pair must be at least ", "Cada parella de notes ha d'estar a ") + gap
+                          + tr (" cents apart, and that many gaps do not fit inside the period. Lower 'smallest interval', use fewer notes, or widen the period.",
+                                " cents com a m\xc3\xadnim, i tants espais no caben dins el per\xc3\xado" "de. Abaixa 'interval m\xc3\xa9s petit', posa menys notes o eixampla el per\xc3\xado" "de.")
+                        : tr ("Only ", "Nom\xc3\xa9s ") + juce::String (got) + tr (" of the ", " dels ") + juce::String (req)
+                          + tr (" chords you asked for satisfy a smallest interval of ", " acords demanats compleixen l'interval m\xc3\xadnim de ")
+                          + gap + tr (" cents.", " cents.");
+                });
             }
         }
     }
@@ -12253,14 +12314,14 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // the notice appears for the load that failed and not for every tick afterwards.
     if (const auto lost = processorRef.takeTuningRestoreError(); lost.isNotEmpty())
     {
-        noticeOverlay.title = tr ("This project's tuning could not be restored",
-                                  "No s'ha pogut restaurar l'afinaci\xc3\xb3 d'aquest projecte");
-        noticeOverlay.body  = tr ("The scale saved with this project no longer reads, so the instrument is playing 12-tone equal temperament instead. Nothing you play is in the tuning this project was written in.\n\nLoad the scale again if you still have the file.\n\n",
-                                  "L'escala desada amb aquest projecte ja no es pot llegir, o sigui que l'instrument est\xc3\xa0 tocant temperament igual de 12 tons. Res del que toquis est\xc3\xa0 en l'afinaci\xc3\xb3 amb qu\xc3\xa8 es va escriure el projecte.\n\nTorna a carregar l'escala si encara tens el fitxer.\n\n")
-                            + lost;
-        noticeOverlay.setVisible (true);
-        noticeOverlay.toFront (false);
-        noticeOverlay.repaint();
+        raiseNotice ([this, lost]
+        {
+            noticeOverlay.title = tr ("This project's tuning could not be restored",
+                                      "No s'ha pogut restaurar l'afinaci\xc3\xb3 d'aquest projecte");
+            noticeOverlay.body  = tr ("The scale saved with this project no longer reads, so the instrument is playing 12-tone equal temperament instead. Nothing you play is in the tuning this project was written in.\n\nLoad the scale again if you still have the file.\n\n",
+                                      "L'escala desada amb aquest projecte ja no es pot llegir, o sigui que l'instrument est\xc3\xa0 tocant temperament igual de 12 tons. Res del que toquis est\xc3\xa0 en l'afinaci\xc3\xb3 amb qu\xc3\xa8 es va escriure el projecte.\n\nTorna a carregar l'escala si encara tens el fitxer.\n\n")
+                                + lost;
+        });
     }
 
     // ...AND SO DOES A BANK SLOT THAT WOULD NOT LOAD. Same arrangement, one line below,
@@ -12280,14 +12341,14 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // that did not happen.
     if (const auto slotErr = processorRef.takeBankSlotError(); slotErr.isNotEmpty())
     {
-        noticeOverlay.title = tr ("That bank slot could not be loaded",
-                                  "No s'ha pogut carregar aquesta ranura del banc");
-        noticeOverlay.body  = tr ("The scale in the slot you picked no longer reads, so the tuning you were already using is still the one sounding - nothing has changed under you.\n\nPick another slot, or put a working scale back into this one.\n\n",
-                                  "L'escala de la ranura que has triat ja no es pot llegir, o sigui que l'afinaci\xc3\xb3 que ja feies servir segueix sent la que sona - no t'ha canviat res sota els dits.\n\nTria una altra ranura, o torna a posar una escala que funcioni en aquesta.\n\n")
-                            + slotErr;
-        noticeOverlay.setVisible (true);
-        noticeOverlay.toFront (false);
-        noticeOverlay.repaint();
+        raiseNotice ([this, slotErr]
+        {
+            noticeOverlay.title = tr ("That bank slot could not be loaded",
+                                      "No s'ha pogut carregar aquesta ranura del banc");
+            noticeOverlay.body  = tr ("The scale in the slot you picked no longer reads, so the tuning you were already using is still the one sounding - nothing has changed under you.\n\nPick another slot, or put a working scale back into this one.\n\n",
+                                      "L'escala de la ranura que has triat ja no es pot llegir, o sigui que l'afinaci\xc3\xb3 que ja feies servir segueix sent la que sona - no t'ha canviat res sota els dits.\n\nTria una altra ranura, o torna a posar una escala que funcioni en aquesta.\n\n")
+                                + slotErr;
+        });
     }
 
     // OCTAVE stepper read-outs (params can also move via host automation).
