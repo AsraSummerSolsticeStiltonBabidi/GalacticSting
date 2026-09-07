@@ -17454,6 +17454,74 @@ int main (int argc, char** argv)
         }
     }
 
+    //== THE NEAR-NYQUIST TAPER KEEPS THE PROMISE ITS OWN COMMENT MAKES ============
+    //
+    // "a spectrum dense enough to hit the cap simply gets a narrower (still smooth)
+    // taper" - fillShepardCopies has said that since the taper was written, and until now
+    // the code TRUNCATED the zone instead: the walk stopped after kTaperMax partials but
+    // the weights were still divided by the full T, so the lowest tapered partial started
+    // well below full scale with a full-amplitude partial one step under it. As the copy
+    // rises that partial leaves the zone and jumps straight back to 1.0 in a single
+    // block - the exact tick the taper exists to abolish, at exactly the density it was
+    // capped for.
+    //
+    // Measured on the SHIPPING function (AdditiveVoice::taperZoneFor / taperWeightAt are
+    // what fillShepardCopies itself calls), so this is the arithmetic the ear gets and not
+    // a restatement of it.
+    {
+        std::printf ("\nthe Shepard's near-Nyquist taper narrows instead of truncating:\n");
+        // A harmonic spectrum, and a copy whose Nyquist falls at ratio 400. T saturates at
+        // one octave whenever the rise is faster than ~1.3 s (taperWidth: 24 x the block's
+        // travel), so the zone would be 200 partials wide and the cap cuts it to 64.
+        std::vector<double> ratios ((size_t) 600);
+        for (int i = 0; i < 600; ++i) ratios[(size_t) i] = (double) (i + 1);
+        const double maxR = 400.0, T = 1.0;
+        const int    cnt  = 400;                       // partials at or below maxR
+        const double lMax = std::log2 (maxR);
+
+        const auto z = AdditiveVoice::taperZoneFor (ratios.data(), cnt, maxR, T);
+        check (z.capped, "  (precondition) this spectrum really does hit the kTaperMax cap");
+        check (cnt - z.from == shepard::kTaperMax,
+               "  (precondition) ...and the zone really is kTaperMax partials wide");
+
+        const double wLow = AdditiveVoice::taperWeightAt (lMax, ratios[(size_t) z.from], z.width);
+        const double wLowOld = juce::jlimit (0.0, 1.0,
+            (lMax - std::log2 (ratios[(size_t) z.from])) / T);   // the truncated spelling
+        std::printf ("    zone [%d,%d) of %d, width %.4f octaves (asked for %.4f):"
+                     " lowest tapered partial starts at %.4f, and used to start at %.4f\n",
+                     z.from, cnt, cnt, z.width, T, wLow, wLowOld);
+        check (std::abs (wLow - 1.0) < 1.0e-12,
+               "  the lowest tapered partial starts at FULL amplitude - continuous with the"
+               " untapered partial below it, so leaving the zone is not a step");
+        check (wLowOld < 0.8,
+               "  (evidence) the truncated spelling really did start it well below full"
+               " scale - the step this fix removes was worth measuring");
+
+        // ...and it is still a fade: monotone down, and zero at the copy's own Nyquist.
+        bool monotone = true; double prev = 2.0;
+        for (int i = z.from; i < cnt; ++i)
+        {
+            const double w = AdditiveVoice::taperWeightAt (lMax, ratios[(size_t) i], z.width);
+            if (w > prev + 1.0e-15) monotone = false;
+            prev = w;
+        }
+        check (monotone, "  ...and the weights still fall monotonically across the zone");
+        check (AdditiveVoice::taperWeightAt (lMax, ratios[(size_t) (cnt - 1)], z.width) < 1.0e-9,
+               "  ...reaching zero at the copy's own Nyquist, so nothing vanishes at full level");
+
+        // THE UNCAPPED CASE IS UNTOUCHED, which is what keeps the default octave band the
+        // instrument it was. A sparse zone: 1/32 of an octave below ratio 40 holds one
+        // partial, nowhere near the cap.
+        {
+            const double t2 = 1.0 / 32.0, m2 = 40.0;
+            const auto z2 = AdditiveVoice::taperZoneFor (ratios.data(), 40, m2, t2);
+            check (! z2.capped, "  (precondition) the sparse zone does NOT hit the cap");
+            check (z2.width == t2,
+                   "  ...and an uncapped zone is divided by exactly the T it asked for -"
+                   " bit for bit the taper this file already shipped");
+        }
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }
