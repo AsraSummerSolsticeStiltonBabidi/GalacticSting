@@ -105,6 +105,18 @@ namespace spectrum
         {
             const int i = live.load (std::memory_order_acquire);
             if (i < 0) return {};
+            // THE SAME STAMP CHECK getLivePlan MAKES, and it was missing here.
+            //
+            // This handed back &planPool[i] unconditionally, so a caller could take a plan
+            // that had not been measured on the template it was about to be used with -
+            // the exact thing the comment above says the pair exists to prevent - or one
+            // that was mid-publish. getLivePlan has guarded this since it was written;
+            // the pair overload, added later to take the slot index once, dropped it.
+            // The template half is still returned either way, because a live template
+            // with no plan is an ordinary state and the caller falls back to the hash.
+            const juce::uint32 g = pool[(size_t) i].generation;
+            if (g == 0 || planStamp[(size_t) i].load (std::memory_order_acquire) != g)
+                return { &pool[(size_t) i], nullptr };
             return { &pool[(size_t) i], &planPool[(size_t) i] };
         }
 

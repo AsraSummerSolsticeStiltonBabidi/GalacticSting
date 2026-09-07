@@ -316,8 +316,20 @@ public:
                                                                    (int) pair.t->partials.size(),
                                                                    f0Hz, getSampleRate());
                 const int span = shepActive ? shepard::kStride : spectrum::kMaxPartials;
-                notePlanSet  = pair.p->phasesFor (spectrum::phaseset::RenderedPrefix { rp });
                 notePlanHead = std::min (span, pair.p->n);
+                // COPIED, NOT POINTED AT. See notePlanPhases: the pointer phasesFor()
+                // returns aims into a std::vector the worker replaces, and the ring wraps
+                // back to this slot after eight recompiles - which a modulator on any
+                // spectrum control reaches in seconds. One memcpy at note-on and the
+                // voice owns every byte it will read for the life of the note.
+                if (const double* src = pair.p->phasesFor (spectrum::phaseset::RenderedPrefix { rp }))
+                {
+                    const int h = juce::jlimit (0, (int) notePlanPhases.size(), notePlanHead);
+                    std::memcpy (notePlanPhases.data(), src, (size_t) h * sizeof (double));
+                    notePlanSet  = notePlanPhases.data();
+                    notePlanHead = h;
+                }
+                else { notePlanSet = nullptr; notePlanHead = 0; }
             }
             seedRange (phase, 0, spectrum::kMaxPartials, s0);
             // ...AND REMEMBER WHERE ON THE FADER THAT PUT THEM. Everything downstream that
@@ -3026,6 +3038,33 @@ private:
     float filterEnvValue = 0.0f;
     float pitchEnvValue   = 0.0f;
 
+    // THE NOTE'S PHASE PLAN, COPIED - because a pointer into it is a pointer into a
+    // std::vector the WORKER OWNS AND REPLACES.
+    //
+    // noteStarted used to keep the raw pointer phasesFor() returns and read it every
+    // block for the life of the note (see rephaseSlopeAt and seedRange). That pointer
+    // aims into PhasePlan::phase, a std::vector<double>; SpectrumEngine publishes with
+    // `planPool[w] = std::move (plan)`, whose move-assignment FREES the old buffer. The
+    // plan pool is a ring of 8, so eight template recompiles under one held note - which
+    // a modulator on any spectrum control produces in a second or two - wrap the ring
+    // back to that voice's slot and free the array it is still reading. The audio thread
+    // then feeds freed heap to interpolatePhases: partials jump to arbitrary phases, and
+    // on a hardened allocator the host crashes.
+    //
+    // getLivePair() made it reachable sooner than that, because unlike getLivePlan() it
+    // does NOT check planStamp against the template's generation - it hands back
+    // &planPool[i] unconditionally - so a voice could take a pointer into a slot that was
+    // mid-publish. That check is restored in the engine; this copy is what makes the
+    // LIFETIME safe, and the two are separate bugs.
+    //
+    // A copy, not a lock and not a refcount: this is the audio thread, the read is a
+    // straight memcpy of at most the plan's own n doubles at note-on, and after it the
+    // voice owns every byte it will read for the life of the note - which is also exactly
+    // the guarantee the surrounding comment already claims ("re-reading the live plan
+    // mid-gesture could hand a held note the slope of a spectrum it is not playing").
+    // It costs one array the same size as `phase`, which this voice already carries four
+    // of.
+    std::array<double, spectrum::kMaxPartials> notePlanPhases {};
     std::array<double, spectrum::kMaxPartials> phase  {};
     std::array<double, spectrum::kMaxPartials> inc    {}; // frequency (cycles/sample), from curRatio
     std::array<double, spectrum::kMaxPartials> tgtAmp {}; // target amplitude (from template)
