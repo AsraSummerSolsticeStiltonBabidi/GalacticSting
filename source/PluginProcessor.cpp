@@ -891,32 +891,36 @@ void FractalAdditiveAudioProcessor::timerCallback()
         const juce::String src  = inRange ? bankSource[(size_t) (slot - 1)] : juce::String();
         const juce::String name = inRange ? bankName  [(size_t) (slot - 1)] : juce::String();
 
-        // WHAT WAS ACTUALLY APPLIED, not merely which index is selected - and the two are
-        // different in the two cases that matter, which are one sticky index seen from
-        // both sides:
+        // A CHANGE OF SLOT, OR A FAILED SLOT WHOSE TEXT HAS MOVED - and nothing else.
         //
-        //   * THE SLOT WAS MARKED APPLIED BEFORE THE LOAD RAN. `lastBankSlot = slot` used
-        //     to be the first statement in this block, so a slot whose stored text no
-        //     longer parses switched the SELECTOR and not the TUNING: the combo read
-        //     "31-EDO", the instrument went on playing whatever it had, `err` was dropped
-        //     unread on the next line, and nothing anywhere said a word. For a microtonal
-        //     instrument that is the quiet failure that matters - everything still sounds,
-        //     and it sounds wrong.
-        //   * AND THE STICKY INDEX THEN BLOCKED EVERY RETRY. Picking that slot again is not
-        //     a change, so it did nothing. Nor did the obvious repair of dropping a good
-        //     file into the same slot: setTuningBankFile ends with
-        //     setTuningBankSlotParam(slot0 + 1), which is a no-op when that slot is already
-        //     selected, so the replacement text sat in the bank, correct and unloaded.
+        // `lastBankSlot = slot` used to be the first statement in this block, so the slot
+        // was marked applied before the load had run. A slot whose stored text no longer
+        // parses then switched the SELECTOR and not the TUNING: the combo read "31-EDO",
+        // the instrument went on playing whatever it had, `err` was dropped unread on the
+        // next line, and nothing anywhere said a word. For a microtonal instrument that is
+        // the quiet failure that matters - everything still sounds, and it sounds wrong.
         //
-        // Comparing the SOURCE TEXT alongside the index answers both, and it never re-parses
-        // a text that has not moved: a failed load is attempted exactly once, and attempted
-        // again the moment either the selection or that slot's contents change. juce::String
-        // is reference-counted, so the copy above is an atomic increment and the compare is
-        // a memcmp of a few hundred bytes, once per 60 Hz tick, on the message thread.
-        if (slot != lastBankSlot || src != lastBankSource)
+        // The sticky index then blocked every retry, which is the same bug from the other
+        // side. Picking that slot again is not a change, so it did nothing; and neither did
+        // the obvious repair of dropping a good file into it, because setTuningBankFile ends
+        // with setTuningBankSlotParam(slot0 + 1), a no-op when that slot is already
+        // selected. The replacement text sat in the bank, correct and unloaded, with the
+        // broken tuning still under the keys.
+        //
+        // SO THE TEXT IS ONLY CONSULTED FOR A SLOT WHOSE LOAD FAILED, and that narrowness
+        // is measured, not cautious. Testing the text unconditionally re-loads a slot
+        // whenever its stored source changes under the same index - which is exactly what
+        // the plugin itself does when a tuning is edited and re-stored - and that stomps the
+        // mode back to Scala on top of whatever is active. syncBankSelector documents that
+        // very hazard two hundred lines up and sets lastBankSlot FIRST to dodge it; a wider
+        // test here walks straight past that guard. Measured on the full suite: 8 checks in
+        // run 14 and three other runs went red, all of them a tuning coming back after a
+        // clearScala or a mode change.
+        if (slot != lastBankSlot || (lastBankFailed && src != lastBankSource))
         {
             lastBankSlot   = slot;
             lastBankSource = src;
+            lastBankFailed = false;
             if (src.isNotEmpty())
             {
                 juce::String err;
@@ -937,7 +941,8 @@ void FractalAdditiveAudioProcessor::timerCallback()
                     // editor shut), so the editor collects it on its next tick through
                     // takeBankSlotError - the same one-shot route a project that loses its
                     // scale already takes.
-                    bankSlotError = name.isNotEmpty() ? name + " \xe2\x80\x94 " + err : err;
+                    lastBankFailed = true;
+                    bankSlotError  = name.isNotEmpty() ? name + " \xe2\x80\x94 " + err : err;
                 }
             }
         }
@@ -1101,6 +1106,11 @@ void FractalAdditiveAudioProcessor::syncBankSelector (int slot0)
 {
     if (! juce::isPositiveAndBelow (slot0, kBankSlots)) return;
     lastBankSlot = slot0 + 1;
+    // The other two halves of "already applied" go with it. The tuning that is active right
+    // now IS this slot's, so recording its text and clearing the failed flag is simply the
+    // truth - and it keeps the retry test above from ever looking at this slot's text again.
+    lastBankSource = bankSource[(size_t) slot0];
+    lastBankFailed = false;
     if (auto* p = apvts.getParameter ("tuningBankSlot"))
         p->setValueNotifyingHost (p->convertTo0to1 ((float) (slot0 + 1)));
 }
@@ -4723,13 +4733,14 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
                 bankSource[(size_t) i] = slot.getProperty ("source").toString();
             }
         }
-    // Don't re-load on restore; the state's SCALA child already carries the tuning. Both
-    // halves of the "already applied" test are primed, not just the index: leaving
-    // lastBankSource empty would make the very next poll see the selected slot's text as
-    // new and re-load it over the tuning the project actually saved.
+    // Don't re-load on restore; the state's SCALA child already carries the tuning. The
+    // whole "already applied" record is primed, not just the index - a restored instance
+    // has attempted nothing and failed at nothing, so the retry test above must not find a
+    // stale failure from this instance's previous life pointing at the new project's slot.
     lastBankSlot   = getTuningBankSlotParam();
     lastBankSource = (lastBankSlot >= 1 && lastBankSlot <= kBankSlots)
                    ? bankSource[(size_t) (lastBankSlot - 1)] : juce::String();
+    lastBankFailed = false;
 
     // THE PARKED HAND-SET REFERENCE (see captureState for what it is and what was losing
     // it). Read here, after replaceState so refA below is the RESTORED one, and before the

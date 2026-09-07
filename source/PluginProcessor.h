@@ -1821,11 +1821,13 @@ private:
     // Tuning bank: per-instance .scl slots (name + raw source), persisted in state.
     std::array<juce::String, kBankSlots> bankName, bankSource;
     int lastBankSlot = 0; // last applied "tuningBankSlot" value (message thread)
-    // ...and the SOURCE TEXT that slot held when it was applied. The index alone was not
-    // enough to say "this is already loaded": a slot whose text was replaced in place kept
-    // the same index, and a slot whose load FAILED kept it too, so neither could ever be
-    // retried. See the bank block in timerCallback for both failures. Message thread.
+    // ...the SOURCE TEXT of the last load ATTEMPTED for that slot, and whether it failed.
+    // A slot whose load fails keeps its index, so the index alone could never retry it -
+    // not even for the obvious repair of dropping a good file into it. These two let a
+    // FAILED slot be re-attempted when its text changes, and only then. See the bank block
+    // in timerCallback. Message thread.
     juce::String lastBankSource;
+    bool         lastBankFailed = false;
 
     // Last dissonance-generated .scl (text + display name), for saving to disk,
     // plus the degree/height data shown in the Spectrum-to-Scale panel.
