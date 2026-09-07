@@ -1644,13 +1644,27 @@ private:
             return juce::jmax (18, (int) std::ceil (
                        juce::GlyphArrangement::getStringWidth (chipFont(), txt)) + 8);
         }
+        // THE SCORE COLUMN, PLUS THE PIXEL drawText NEEDS TO FINISH A GLYPH.
+        //
+        // This returned ceil(measured) - the column was exactly as wide as its widest
+        // string and not one pixel wider - and drawText into a box that tight clips the
+        // last glyph's right side bearing. Every row of every result list read "47.2" for
+        // 47.28, "47.28" for 47.283: a digit short, in the one number this whole feature
+        // exists to rank by, at every window size. Photographed at 1200x650 and confirmed
+        // at 2x; no gate saw it, because the box a painted string is measured against is
+        // the box it was given, and the string does fit it - by definition, since the box
+        // was measured FROM the string.
+        //
+        // 3 px, which is the same allowance juce::Label's own border makes and enough for
+        // any face at this size. The column is right-aligned, so the pixels land on the
+        // side the clipping was on.
         int valueColumnWidth() const
         {
             float w = 0.0f;
             const auto f = valueFont();
             for (const auto& row : rows)
                 w = juce::jmax (w, juce::GlyphArrangement::getStringWidth (f, row.value));
-            return (int) std::ceil (w);
+            return (int) std::ceil (w) + 3;
         }
         int widestChipRun() const
         {
@@ -3318,9 +3332,24 @@ private:
                 durHead.setBounds (head.removeFromRight (104));
                 head.removeFromRight (4);
                 // The velocity SLOPE knob sits right above the VEL column it tilts.
+                // THE SLOPE KNOB AND THE WORD SHARE THE ROW, side by side.
+                //
+                // The knob took the whole 76 px column and the word was pushed 14 px DOWN
+                // to sit under it - but the header row IS 14 px tall, so "VEL" landed
+                // inside the first data row, drawn on top of that row's velocity slider.
+                // Its two sibling headers sit on the header line and it sat 14 px below
+                // them, with a star thumb through the L, reading "VEI". Photographed in
+                // the routed-rows scenario at 1200x650.
+                //
+                // Side by side instead of a taller header: the rows below are the point of
+                // this list and a second header line costs one of them. The knob keeps
+                // enough width to be grabbed and the word takes what it measures.
                 auto velCol = head.removeFromRight (76);
+                const int velWordW = juce::jmin (velCol.getWidth() - 24,
+                                                 juce::jmax (26, fgfit::labelWidth (velHead)));
+                velHead.setBounds (velCol.removeFromRight (velWordW));
+                velCol.removeFromRight (2);
                 velSlopeS.setBounds (velCol.withY (velCol.getY() - 1).withHeight (15));
-                velHead.setBounds (velCol.withY (velCol.getY() + 14).withHeight (13));
                 head.removeFromRight (4 + kStepBtnW + 3 + kStepBtnW + 6); // over the -12/+12 pair + gaps
                 noteHead.setBounds (head);        // over the pitch box
             }

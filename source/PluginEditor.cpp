@@ -565,6 +565,31 @@ namespace
             // Sized from the circle GalacticLnF::drawButtonBackground really fills (the
             // SHORTER side of the button), so a stepper laid out in a rect that is not
             // square still gets a glyph centred in its own circle rather than in the rect.
+            // ...AND SO IS AN ARROW. Same reason as the stepper pair above: as a glyph the
+            // up and down arrows render about 4 px tall inside a 24 px button at 1x, which
+            // reads as a smudge rather than as a direction - and at that size the two are
+            // told apart by a handful of pixels at the tip. The Shepard's direction is the
+            // whole point of the control, so it is drawn: one shaft, one head, sized from
+            // the button and pointing the way the toggle says.
+            if (b.getName() == "arrow")
+            {
+                const auto  r   = b.getLocalBounds().toFloat();
+                const float d   = juce::jmin (r.getWidth(), r.getHeight());
+                const float pen = juce::jmax (1.6f, std::round (d * 0.11f));
+                const float len = std::round (d * 0.58f);
+                const float hw  = std::round (d * 0.24f);   // head half-width
+                const float hh  = std::round (d * 0.26f);   // head height
+                const float cx  = r.getCentreX(), cy = r.getCentreY();
+                const bool  down = b.getToggleState();
+                const float tipY  = down ? cy + len * 0.5f : cy - len * 0.5f;
+                const float tailY = down ? cy - len * 0.5f : cy + len * 0.5f;
+                const float baseY = down ? tipY - hh : tipY + hh;
+                g.fillRect (cx - pen * 0.5f, juce::jmin (tailY, baseY), pen, std::abs (baseY - tailY));
+                juce::Path head;
+                head.addTriangle (cx, tipY, cx - hw, baseY, cx + hw, baseY);
+                g.fillPath (head);
+                return;
+            }
             if (b.getName() == "round")
             {
                 const auto t = b.getButtonText();
@@ -2535,10 +2560,20 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // Shepard switch beside it; onStateChange (not onClick) keeps the glyph honest when
     // the parameter moves from somewhere else - host automation, a preset load, an undo.
     shepDirBtn.setClickingTogglesState (true);
-    shepDirBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff33334a));
+    // BOTH STATES ARE LIVE, so neither may read as "off". The first version gave the
+    // untoggled state a near-background slate and the toggled state the panel hue, which
+    // is the idiom for a switch that is on or off - but this is a DIRECTION, and "up" is
+    // not less of an answer than "down". Photographed, the arrow was darker with the
+    // Shepard running than with it stopped: it looked disabled exactly when it mattered,
+    // and in a panel of purple pills it read as a hole rather than as a control.
+    //
+    // Both states now carry the panel's hue and differ in FILL rather than in presence -
+    // outlined for up, solid for down - which is the same pair the transition chips use.
+    shepDirBtn.setColour (juce::TextButton::buttonColourId, cTuning.withAlpha (0.22f));
     shepDirBtn.setColour (juce::TextButton::buttonOnColourId, cTuning.withAlpha (0.85f));
-    shepDirBtn.setColour (juce::TextButton::textColourOffId, cTuning.brighter (0.35f));
+    shepDirBtn.setColour (juce::TextButton::textColourOffId, cTuning.brighter (0.55f));
     shepDirBtn.setColour (juce::TextButton::textColourOnId, juce::Colours::black);
+    shepDirBtn.setName ("arrow"); // the painter draws the glyph - see GalacticLnF
     shepDirBtn.setMouseClickGrabsKeyboardFocus (false);
     shepDirBtn.onStateChange = [this]
     {
@@ -9254,8 +9289,20 @@ void FractalAdditiveAudioProcessorEditor::resized()
             }
             else
             {
-                adaptPartialsLbl.setBounds (r1.removeFromLeft (52)); // "Partials"
-                compact (adaptPartialsBox, r1.removeFromLeft (46));
+                // MEASURED, BOTH OF THEM. "Partials" is a wider word than the "Notes" this
+                // row holds in the other mode, and the two hard numbers here - 52 for the
+                // caption, 46 for the box - were chosen when the box was measured against
+                // its whole width. Once the fit sweep started subtracting the chevron
+                // gutter it turned out the value had NINE pixels for a two-digit number,
+                // and the box drew "..." where the partial count should be. The caption
+                // takes what its own word needs and the box what its widest item needs;
+                // the goal box beside them still takes the remainder, which is what it was
+                // always for.
+                adaptPartialsLbl.setBounds (r1.removeFromLeft (
+                        juce::jmax (52, fgfit::labelWidth (adaptPartialsLbl))));
+                compact (adaptPartialsBox, r1.removeFromLeft (
+                        juce::jmin (juce::jmax (46, fgfit::snugComboWidth (adaptPartialsBox, kRowH)),
+                                    juce::jmax (1, r1.getWidth() - 6 - 40))));
                 r1.removeFromLeft (6);
                 compact (adaptGoalBox, r1);
             }
@@ -10465,7 +10512,19 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 const int unSnug  = fgfit::snugTextButtonWidth (modUnmapBtn, 20);
                 const bool roomy  = selSnug + 3 + onSnug + 3 + unSnug <= selRow.getWidth();
                 const int pad     = roomy ? 0 : fgfit::kSnugPad;
-                const int selW = juce::jmax (1, juce::jmin (selSnug - pad, selRow.getWidth()));
+                // ...BUT NEVER BELOW WHAT THE CHOSEN NAME NEEDS. The tight fallback shaved
+                // a flat kSnugPad off the snug width, and the snug width is measured
+                // against the WIDEST item while the closed box only ever draws the SELECTED
+                // one - so the shave came out of the wrong measurement and the box read
+                // "En..." where it should say "Env 1". You could not tell Env 1 from Env 3
+                // from LFO 1, in every modulator scenario and both languages.
+                //
+                // Floored at the selection's own width, which is the same rule the Shepard
+                // row's rate control already uses: a box may give up its comfort, never its
+                // word.
+                const int selFloor = fgfit::snugComboWidthForSelection (modSelBox, 20);
+                const int selW = juce::jmax (1, juce::jmin (juce::jmax (selSnug - pad, selFloor),
+                                                            selRow.getWidth()));
                 modSelBox.setBounds (selRow.removeFromLeft (selW));
                 selRow.removeFromLeft (juce::jmin (3, selRow.getWidth()));
                 const bool onFits = onSnug - pad <= selRow.getWidth();
