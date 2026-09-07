@@ -1721,6 +1721,288 @@ static void runPitchContinuityChecks()
     }
 }
 
+//==============================================================================
+// THE PITCH RAMP AND THE PORTAMENTO, AT THE SAME TIME.
+//
+// WHAT WAS MISSING. AdditiveVoice makes one structural promise about these two: they
+// "share ONE pass over the oscillators and meet the 0.4999 Nyquist clamp ONCE", their
+// results are "multiplied and handed to rescaleIncs together", and the end-of-block
+// flush charges both - the pitch half of it justified by "advancePitchMod is idempotent
+// (asked for the same `done` twice it returns exactly 1.0)". Every one of those sentences
+// is about the two TOGETHER, and every test in this file exercises them APART: the run
+// above sweeps the modulator with monoGlide explicitly OFF ("a glide would smooth the
+// very step under test"), and run 48 glides with pitchEnvAmount explicitly at 0. A patch
+// that does both - a portamento under a vibrato, which is an ordinary thing to play - is
+// covered by nothing.
+//
+// WHAT IS ASSERTED, and why it is arithmetic rather than a threshold somebody liked.
+// Both effects are MULTIPLICATIVE in frequency: the glide rescales every increment by
+// exp2(glideOff - glideBaked) and the modulator by exp2(now - pitchBaked), and the code
+// multiplies the two into one number. Multiplicative in frequency is ADDITIVE IN CENTS,
+// exactly, so for every frame
+//        cents_both  ==  cents_glide + cents_mod - cents_baseline
+// with no fitted constant anywhere in it. That is SUPERPOSITION, and it is the only
+// statement that can distinguish "the two were composed" from "each works on its own":
+// three arms measured separately would all pass on a build that dropped one of them
+// whenever the other was running.
+//
+// PER FRAME AND NOT ON THE MEAN. The modulator is a sine about its own centre, so a
+// defect that charges it one-and-a-half times contributes +d on the rising leg and -d on
+// the falling one and averages to zero across a whole cycle. A mean residual would read
+// 0.00 cents on a build that was 50% wrong at every instant. The residual is therefore
+// taken frame by frame and the WORST one is asserted.
+//
+// THE INSTRUMENT is the run above's, verbatim and deliberately: refA 750 so note 105 is
+// 750 * 2^3 = 6000 Hz = SR/8, ODD harmonics over one octave of Spectrum Range so the
+// patch is ONE partial, 64-sample frames, and the amplitude-normalised two-tap estimator
+// cos(w) = sum(x[n](x[n-1]+x[n+1])) / (2 sum(x[n]^2)), which is EXACT for a single
+// sinusoid. NO FFT, for the same reason that run gives: an FFT long enough to resolve
+// these frequencies is long enough to average the trajectory under test into a ramp, and
+// it would pass a build that had lost a whole leg of the modulation.
+//
+// WHAT IS NOT COVERED, said out loud: the shared 0.4999 Nyquist CLAMP. The one-partial
+// patch this estimator needs sits at SR/8, whose increment is 0.125 - nowhere near the
+// clamp - so "clamping twice would leave a partial pinned by one factor and then scaled
+// by the other" is a claim this run cannot reach. A rig that could reach it would have to
+// put a partial within a few cents of Nyquist, where the two-tap estimator's own
+// arccosine is at its steepest and the instrument stops being exact.
+static void runPitchGlideSuperpositionChecks()
+{
+    std::printf ("\nthe pitch ramp and the portamento AT ONCE - superposition, frame by frame:\n");
+    using Proc = FractalAdditiveAudioProcessor;
+    constexpr double sr9      = 48000.0;
+    constexpr int    kNote    = 105;      // with refA 750: 750 * 2^3 = 6000 Hz exactly
+    constexpr double kF0      = 6000.0;   // = SR/8
+    constexpr int    kFrm     = 64;       // = 8 whole periods of kF0
+    constexpr int    kB       = 256;
+    constexpr double kGlideMs = 400.0;    // 1200 cents (one octave down) in 400 ms
+    constexpr double kTakeMs  = 300.0;    // ...of which 300 ms is read, so every frame is
+                                          //    INSIDE the glide and none after it lands
+    constexpr double kLfoHz   = 2.5;      // 0.75 of a cycle in 300 ms: the modulator's
+                                          //    whole 0 -> 96 -> 0 travel is in the window
+
+    struct Arm
+    {
+        std::vector<double> cents;
+        double minRms = 1.0e9;
+        double lo = 1.0e9, hi = -1.0e9;
+        int    partials = 0;
+        double worstOvertone = 1.0;
+        bool   rateLimited  = false;
+        bool   glidingAtEnd = false;
+    };
+
+    // ONE arm. MONO GLIDE IS ON IN ALL FOUR and only glideTime differs, so the four
+    // renders take the identical code path through noteStarted's legato branch and the
+    // identical MIDI: two note-ons, no note-off, the second one taking the first's voice
+    // over. Switching monoGlide off for the no-glide arms instead would make them
+    // POLYPHONIC - two notes sounding, two partials, and the two-tap estimator, which is
+    // exact for one sinusoid and meaningless for two, would be reading something else.
+    auto renderArm = [&] (bool glideOn, bool lfoOn) -> Arm
+    {
+        Arm a;
+        auto up = std::make_unique<Proc>();
+        auto& p = *up;
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p.apvts.getParameter (id))
+                q->setValueNotifyingHost (q->convertTo0to1 (v));
+        };
+        // EVERY parameter BEFORE prepareToPlay, then an explicit poll - the same rule the
+        // run above states: prepareToPlay builds the spectrum from the parameters as they
+        // stand and there is no message loop out here to run the poll.
+        sp ("refA", 750.0f);
+        sp ("morph", 0.0f);   sp ("dryWet", 0.0f);
+        sp ("ampAttack", 0.001f); sp ("ampDecay", 0.001f);
+        sp ("ampSustain", 1.0f);  sp ("ampRelease", 0.010f);
+        sp ("ampCurveA", 0.0f);   sp ("ampCurveD", 0.0f); sp ("ampCurveR", 0.0f);
+        sp ("pitchAttack", 0.001f); sp ("pitchDecay", 0.001f); sp ("pitchSustain", 1.0f);
+        sp ("pitchRelease", 0.010f);
+        sp ("pitchCurveA", 0.0f); sp ("pitchCurveD", 0.0f); sp ("pitchCurveR", 0.0f);
+        sp ("pitchEnvAmount", 0.0f);   // the modulator's own base: 0, so the LFO IS the offset
+        sp ("baseN", 1.0f);
+        sp ("harmonics", 2.0f);        // ODD: with one octave of range, the fundamental alone
+        sp ("spectrumRange", 1.0f);
+        sp ("curveSlope", 4.0f);
+        sp ("fractalLevel", 1.0f);
+        sp ("primeOn", 0.0f); sp ("partialManual", 0.0f); sp ("specRandom", 0.0f);
+        sp ("timbreOn", 0.0f);
+        sp ("filterCutoff", 9600.0f);  // wide open: the filter must not colour f0
+        sp ("filterEnvAmount", 0.0f);
+        sp ("phaseMode", 0.0f);
+        sp ("shepOn", 0.0f);           // Shepard splits the block itself
+        sp ("rhythmOn", 0.0f); sp ("rhythmSelfPlay", 0.0f);
+        sp ("monoGlide", 1.0f);
+        sp ("glideTime", glideOn ? (float) kGlideMs : 0.0f);
+        sp ("modL1Wave", 0.0f);        // Sine
+        sp ("modL1RateMode", 2.0f);    // Free Hz, not Fundamental/2^n - the played note is
+        sp ("modL1Hz", (float) kLfoHz); //   about to MOVE, and a rate that followed it would
+        sp ("modL1PhaseMode", 0.0f);   //   make the modulator arm and the both arm different
+        sp ("modL1Phase", 0.0f);       //   modulators. Note-restart at phase 0.
+        sp ("modL1Range", 0.010f);     // 0..0.010 of +-48 st = 0..96 cents, unipolar
+        sp ("modL1On", lfoOn ? 1.0f : 0.0f);
+        p.pollParametersForTests();
+        p.prepareToPlay (sr9, kB);
+        for (int m = 0; m < ModEngine::kMods; ++m) p.getModEngine().unmapAll (m);
+        if (lfoOn) p.getModEngine().addTarget (3, "pitchEnvAmount");   // LFO 1 is index 3
+        p.pollParametersForTests();
+        // No awaitSpectrumIdle, for the reason the run above gives at length: the wait
+        // times out non-deterministically on a loaded machine and the claim it stands in
+        // for is asserted directly below instead (a stale template is the DEFAULT patch,
+        // which is hundreds of partials and cannot slip past a "== 1" check).
+        {
+            juce::AudioBuffer<float> warm (2, kB);
+            for (int i = 0; i < 20; ++i)
+            { juce::MidiBuffer m; warm.clear(); p.processBlock (warm, m); }
+        }
+        if (const auto* t = p.getLiveTemplate())
+        {
+            a.partials = (int) t->partials.size();
+            double fund = 0.0, over = 0.0;
+            for (size_t i = 0; i < t->partials.size(); ++i)
+            {
+                const double amp = (double) t->partials[i].amp;
+                if (i == 0) fund = amp; else over = std::max (over, amp);
+            }
+            a.worstOvertone = fund > 0.0 ? over / fund : 1.0;
+        }
+
+        juce::AudioBuffer<float> ab (2, kB);
+        std::vector<float> x;
+        const auto pump = [&] (int blocks, const juce::MidiBuffer& first)
+        {
+            for (int i = 0; i < blocks; ++i)
+            {
+                juce::MidiBuffer m; if (i == 0) m = first;
+                ab.clear(); p.processBlock (ab, m);
+                const float* r = ab.getReadPointer (0);
+                for (int k = 0; k < kB; ++k) x.push_back (r[k]);
+            }
+        };
+        juce::MidiBuffer on1; on1.addEvent (juce::MidiMessage::noteOn (1, kNote,      (juce::uint8) 100), 0);
+        juce::MidiBuffer on2; on2.addEvent (juce::MidiMessage::noteOn (1, kNote - 12, (juce::uint8) 100), 0);
+        pump (40, on1);                    // ~213 ms settling on the first note
+        const size_t at0 = x.size();       // the takeover: t = 0 for every arm
+        pump ((int) std::ceil ((kTakeMs + 40.0) * 0.001 * sr9 / (double) kB), on2);
+        a.glidingAtEnd = p.voiceGlidingForTests();
+        a.rateLimited  = p.getModEngine().isRateLimited (0);
+
+        // Frames start two frames in. Frame 0 straddles the takeover, and a legato
+        // takeover does not re-attack the amplitude envelope, but it DOES split the block
+        // at the event - so the first two frames are the only ones whose sub-block
+        // structure differs from every other frame's, and dropping them costs 2.7 ms of a
+        // 300 ms window rather than arguing about them.
+        const size_t first = at0 + (size_t) (2 * kFrm);
+        const size_t last  = at0 + (size_t) (kTakeMs * 0.001 * sr9);
+        for (size_t at = first; at + (size_t) kFrm + 1 < last; at += (size_t) kFrm)
+        {
+            double num = 0.0, den = 0.0;
+            for (int i = 1; i <= kFrm; ++i)
+            {
+                const double c = (double) x[at + (size_t) i];
+                num += c * ((double) x[at + (size_t) (i - 1)] + (double) x[at + (size_t) (i + 1)]);
+                den += c * c;
+            }
+            a.minRms = std::min (a.minRms, std::sqrt (den / (double) kFrm));
+            if (den < 1.0e-18) { a.cents.push_back (0.0); continue; }  // refuse, do not invent
+            const double cw = juce::jlimit (-0.999999, 0.999999, 0.5 * num / den);
+            const double hz = std::acos (cw) * sr9 / juce::MathConstants<double>::twoPi;
+            const double ct = 1200.0 * std::log2 (hz / kF0);
+            a.cents.push_back (ct);
+            a.lo = std::min (a.lo, ct); a.hi = std::max (a.hi, ct);
+        }
+        return a;
+    };
+
+    // THE FOUR RENDERS. Three arms plus the baseline they are all measured against - the
+    // baseline is not a fourth effect, it is the constant the superposition identity
+    // subtracts, and without it the identity would be asserting that 0 == 0 + 0.
+    const Arm base = renderArm (false, false);
+    const Arm glid = renderArm (true,  false);
+    const Arm modl = renderArm (false, true);
+    const Arm both = renderArm (true,  true);
+    const struct { const char* n; const Arm* a; } arms[] =
+        { { "baseline", &base }, { "glide only", &glid },
+          { "modulator only", &modl }, { "BOTH", &both } };
+    for (const auto& r : arms)
+        std::printf ("    %-15s %3d frames, %d partial(s) (worst overtone %.4f),"
+                     " pitch %+.1f .. %+.1f cents (span %.1f), still gliding at the end: %s\n",
+                     r.n, (int) r.a->cents.size(), r.a->partials, r.a->worstOvertone,
+                     r.a->cents.empty() ? 0.0 : r.a->lo, r.a->cents.empty() ? 0.0 : r.a->hi,
+                     r.a->cents.empty() ? 0.0 : r.a->hi - r.a->lo,
+                     r.a->glidingAtEnd ? "yes" : "no");
+
+    // -- THE GATES ------------------------------------------------------------------
+    for (const auto& r : arms)
+    {
+        check (r.a->minRms > 1.0e-4,
+               (juce::String ("  (gate) the ") + r.n + " arm sounds in every frame").toRawUTF8());
+        // The spectrum this arm REALLY rendered. A stale template is the default patch's
+        // hundreds of partials, and the two-tap estimator would be reading their sum.
+        check (r.a->partials == 1 && r.a->worstOvertone < 0.02,
+               (juce::String ("  (gate) ...and the ") + r.n
+                + " arm really is ONE partial, so the estimator is exact").toRawUTF8());
+        check (! r.a->rateLimited,
+               (juce::String ("  (gate) ...and the ") + r.n + " arm's LFO is not rate-limited").toRawUTF8());
+    }
+    const size_t nF = base.cents.size();
+    check (nF > 100 && glid.cents.size() == nF && modl.cents.size() == nF && both.cents.size() == nF,
+           "  (gate) all four arms produced the same frames, so they can be compared at all");
+    // THE BASELINE IS A BASELINE. Both effects are off in it, so it has to be as steady as
+    // the run above's control (which asserts < 0.20 cents of drift on the same patch); a
+    // baseline that was itself moving would be subtracted from all three arms and the
+    // residual would be measuring whatever it was doing.
+    check (! base.cents.empty() && base.hi - base.lo < 0.50,
+           "  (gate) the BASELINE really is flat - neither effect is running in it");
+    // THE GLIDE REALLY GLIDES. 1200 cents over 400 ms is 3 cents/ms, so 300 ms of it is
+    // 900 cents of travel; 600 is two thirds of that and forty times anything the
+    // modulator could contribute. A glideTime of 0 in the no-glide arms means "no
+    // portamento", and a build that treated 400 ms the same way would land here.
+    check (glid.hi - glid.lo > 600.0 && both.hi - both.lo > 600.0,
+           "  (gate) the glide really GLIDES in the two arms that ask for it");
+    // ...AND THE FRAMES ARE INSIDE IT. A window that ran past the landing would be
+    // comparing a glide arm that had stopped moving with a both arm that had too, and the
+    // superposition identity would be about the modulator alone for most of its length.
+    check (glid.glidingAtEnd && both.glidingAtEnd,
+           "  (gate) ...and it is STILL running at the last frame, so every frame is read"
+           " inside the glide and none after it has landed");
+    // THE MODULATOR REALLY SWEEPS. modL1Range 0.010 on a +-48 st parameter, unipolar sine,
+    // is 0..0.96 st = 96 cents peak-to-peak, and 0.75 of a cycle at 2.5 Hz covers the
+    // whole of it (phase 0 -> 0.5 of full scale, quarter cycle -> 1.0, three quarters ->
+    // 0.0). +-20%, the same band the run above uses for the same quantity.
+    check (modl.hi - modl.lo > 76.8 && modl.hi - modl.lo < 115.2,
+           "  (gate) the modulator really sweeps the 96 cents asked for (+-20%)");
+
+    // -- SUPERPOSITION, FRAME BY FRAME ----------------------------------------------
+    double worst = 0.0, meanR = 0.0;
+    size_t worstAt = 0;
+    if (nF > 0 && glid.cents.size() == nF && modl.cents.size() == nF && both.cents.size() == nF)
+    {
+        for (size_t i = 0; i < nF; ++i)
+        {
+            const double r = both.cents[i] - (glid.cents[i] + modl.cents[i] - base.cents[i]);
+            meanR += r;
+            if (std::abs (r) > worst) { worst = std::abs (r); worstAt = i; }
+        }
+        meanR /= (double) nF;
+    }
+    std::printf ("    superposition residual: worst %.4f cents (frame %d of %d, t = %.1f ms),"
+                 " mean %+.4f cents - against a glide of 900 and a modulation of 96\n",
+                 worst, (int) worstAt, (int) nF,
+                 (double) (2 * kFrm + (int) worstAt * kFrm) * 1000.0 / sr9, meanR);
+    // 0.30 CENTS. The run above pins this same estimator's noise floor at under 0.05 cents
+    // per frame; the residual is a difference of FOUR readings, so 4 * 0.05 = 0.20 is the
+    // instrument's own contribution and 0.30 leaves half of that again as headroom. The
+    // only other term is the estimator's curvature error on a frequency that moves inside
+    // a frame - arccos(<cos w>) = <w> + (sigma^2/2)cot(w), which at the combined 4.8
+    // cents per frame these two arms sweep is 4.4e-4 cents, and its CROSS term (the only
+    // part superposition sees) is 1.2e-4. So 0.30 cents is the instrument and nothing else,
+    // and it is 0.03% of the glide this run is composing the modulation onto.
+    check (nF > 100 && worst < 0.30,
+           "the glide and the pitch modulation SUPERPOSE: the both-arm's pitch is the sum"
+           " of the two single arms minus the baseline, frame by frame, to 0.30 cents");
+}
+
 // === TEMPORARY CPU BENCH - NOT PART OF THE SUITE, REMOVED BEFORE DELIVERY =====
 static void runCpuBenchTemporary()
 {
@@ -1880,6 +2162,7 @@ int main (int argc, char** argv)
     if (argc > 1 && std::strcmp (argv[1], "--pitch") == 0)
     {
         runPitchContinuityChecks();
+        runPitchGlideSuperpositionChecks();
         std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
         return failures == 0 ? 0 : 1;
     }
@@ -5493,6 +5776,358 @@ int main (int argc, char** argv)
                    "precondition: the envelope really is sweeping the filter");
             check (std::abs (bA - bB) < 0.10 * juce::jmax (bA, bB),
                    "a second key does NOT disturb the first note's envelope (per voice)");
+        }
+    }
+
+    // --- run 28b: THE FILTER ITSELF, WHICH HAD NO AUDIO COVERAGE AT ALL --------------
+    //
+    // WHAT WAS MISSING. filterResonance, filterAttack/Decay/Sustain/Release and
+    // filterEnvAmount appeared in exactly one place in this suite: the pinned list of
+    // parameter names, which checks that they EXIST. filterCutoff was exercised only as a
+    // modulation destination (run 28 above, where what is under test is the mod matrix
+    // being per-voice, not the filter). So if the filter envelope stopped being applied
+    // tomorrow, or setResonance stopped being called, every test in this file would stay
+    // green and the plugin would ship with a dead filter section.
+    //
+    // THREE INDEPENDENT CLAIMS, and the independence is the point. One test that happened
+    // to break under all three sabotages would be one test wearing three costumes; these
+    // are arranged so that each defect fails exactly one of them:
+    //
+    //   CUTOFF    knob wide open vs closed, WITH THE ENVELOPE AMOUNT AT ZERO. Zeroing the
+    //             knob term in refreshCutoff kills it. Zeroing the envelope term cannot
+    //             touch it (the amount is already 0) and removing setResonance cannot
+    //             either (both arms sit at 0.7, and JUCE's own default is 1/sqrt2 =
+    //             0.7071 - a 0.1% difference).
+    //   ENVELOPE  two decay times 4x apart, WITH THE CUTOFF KNOB AT ZERO CENTS, so the
+    //             whole sweep is the envelope's doing. Zeroing the envelope term kills it;
+    //             zeroing the KNOB term is a no-op here because the knob is already 0, and
+    //             the resonance is 0.7 again.
+    //   RESONANCE low Q vs high Q, WITH THE KNOB AT ZERO CENTS AND THE AMOUNT AT ZERO, so
+    //             the cutoff is the played pitch itself and neither of the other two
+    //             sabotages can move it. Removing setResonance kills it.
+    //
+    // THE MEASURE for the first two is run 28's brightness proxy, reused as it stands:
+    // mean|x[n]-x[n-1]| / mean|x[n]|, a crude spectral centroid that needs no FFT and
+    // rises with high-frequency content. For a single sinusoid it is exactly 2 sin(pi f/sr)
+    // - which is the analytic floor a fully closed filter has to approach, and the number
+    // the cutoff assertion's factor is measured against. The third needs an FFT, because
+    // "a narrow peak AT the cutoff" is a claim about one frequency and a centroid cannot
+    // tell a peak from a tilt.
+    {
+        std::printf ("\nthe filter, measured in the audio - cutoff, envelope, resonance:\n");
+        constexpr int    ebF = 64;
+        constexpr double srF = 48000.0;
+        constexpr int    kNoteF = 60;              // f0 = 261.6256 Hz in the default tuning
+
+        // run 28's proxy, character for character. Deliberately the same function and not
+        // a second copy of the idea: a brightness measure that disagreed with run 28's
+        // would make the two runs' numbers incomparable for anyone reading the log.
+        auto bright = [] (const std::vector<float>& x, int from, int to)
+        {
+            double sa = 0.0, sd = 0.0; int n = 0;
+            for (int i = juce::jmax (1, from); i < juce::jmin ((int) x.size(), to); ++i)
+            { sa += std::abs ((double) x[(size_t) i]); sd += std::abs ((double) x[(size_t) i] - x[(size_t) i - 1]); ++n; }
+            return n > 0 && sa > 1.0e-12 ? sd / sa : 0.0;
+        };
+        auto rmsF = [] (const std::vector<float>& x, int from, int to)
+        {
+            double s2 = 0.0; int n = 0;
+            for (int i = juce::jmax (0, from); i < juce::jmin ((int) x.size(), to); ++i)
+            { s2 += (double) x[(size_t) i] * x[(size_t) i]; ++n; }
+            return n > 0 ? std::sqrt (s2 / n) : 0.0;
+        };
+
+        // ONE rig for all three arms, so the only difference between any two renders is the
+        // filter setting named in its arguments. The patch is RICH on purpose: with a steep
+        // slope and few partials the output is very nearly a pure fundamental, |dx|/|x|
+        // lands on 2 sin(pi f/sr) whatever the filter does, and there is no brightness for
+        // any of this to move (run 28 says the same thing about its own rig).
+        int lastPartials = 0;
+        auto render = [&] (float cutoffCents, float res, float envAmt, float decay,
+                           double ms) -> std::vector<float>
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (srF, ebF);
+            auto s = [&] (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            s ("rhythmOn", 0.0f); s ("rhythmSelfPlay", 0.0f);
+            s ("morph", 0.0f); s ("dryWet", 0.0f);        // no transition in flight
+            // A FLAT amp envelope: everything measured here is the FILTER, and an amplitude
+            // that was itself decaying would put a second time constant in the envelope
+            // arm's crossing time and make the 4x ratio a ratio of two mixtures.
+            s ("ampAttack", 0.001f); s ("ampDecay", 0.001f); s ("ampSustain", 1.0f);
+            s ("ampRelease", 0.005f);
+            s ("ampCurveA", 0.0f); s ("ampCurveD", 0.0f); s ("ampCurveR", 0.0f);
+            s ("baseN", 1.0f); s ("fractalLevel", 1.0f); s ("curveSlope", 0.5f);
+            s ("partialManual", 0.0f); s ("specRandom", 0.0f); s ("timbreOn", 0.0f);
+            s ("primeOn", 0.0f);
+            s ("shepOn", 0.0f); s ("monoGlide", 0.0f);
+            s ("pitchEnvAmount", 0.0f);
+            s ("filterCutoff", cutoffCents);
+            s ("filterResonance", res);
+            s ("filterEnvAmount", envAmt);
+            s ("filterAttack", 0.001f);        // the sweep starts at the top, not on a ramp
+            s ("filterDecay", decay);
+            s ("filterSustain", 0.0f);         // ...and ends at the knob, so the travel is envAmt
+            s ("filterRelease", 0.300f);
+            s ("filterCurveA", 0.0f); s ("filterCurveD", 0.0f); s ("filterCurveR", 0.0f);
+            for (int m = 0; m < ModEngine::kMods; ++m) p->getModEngine().unmapAll (m);
+            p->pollParametersForTests();
+            awaitSpectrumIdle (*p, "run 28b: the rich filter patch");
+            if (const auto* t = p->getLiveTemplate()) lastPartials = (int) t->partials.size();
+
+            juce::AudioBuffer<float> b (2, ebF);
+            for (int i = 0; i < 40; ++i) { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); }
+
+            std::vector<float> out;
+            const int total = (int) (ms * 0.001 * srF / ebF);
+            { juce::MidiBuffer m;
+              m.addEvent (juce::MidiMessage::noteOn (1, kNoteF, (juce::uint8) 100), 0);
+              b.clear(); p->processBlock (b, m);
+              for (int k = 0; k < ebF; ++k) out.push_back (b.getReadPointer (0)[k]); }
+            for (int i = 1; i < total; ++i)
+            { juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+              for (int k = 0; k < ebF; ++k) out.push_back (b.getReadPointer (0)[k]); }
+            return out;
+        };
+        const auto atF = [&] (double ms) { return (int) (ms * 0.001 * srF); };
+
+        //-- 1. CUTOFF: wide open against closed --------------------------------------
+        // 12000 cents is 10 octaves above the played note - 267 kHz, so jlimit pins it at
+        // 0.49*sr and the filter is genuinely out of the way. 0 cents puts it ON the
+        // fundamental, where every harmonic above the first is at least 12 dB/octave down.
+        // Envelope amount 0 and resonance at its 0.7 default in BOTH arms, so the only
+        // thing that differs is the knob.
+        {
+            const auto open  = render (12000.0f, 0.7f, 0.0f, 0.200f, 400.0);
+            const auto shut  = render (    0.0f, 0.7f, 0.0f, 0.200f, 400.0);
+            const double bO = bright (open, atF (100.0), atF (350.0));
+            const double bS = bright (shut, atF (100.0), atF (350.0));
+            const double rO = rmsF   (open, atF (100.0), atF (350.0));
+            const double rS = rmsF   (shut, atF (100.0), atF (350.0));
+            // The analytic floor: a single sinusoid at f0 has |dx|/|x| = 2 sin(pi f0/sr)
+            // exactly, because x[n]-x[n-1] = 2 sin(w/2) cos(w(n-1/2)) and the two mean
+            // absolute values differ by exactly that factor. At 261.6256 Hz and 48 kHz
+            // that is 0.03424 - what a perfectly closed filter would leave.
+            const double pure = 2.0 * std::sin (juce::MathConstants<double>::pi * 261.6256 / srF);
+            std::printf ("  cutoff  wide open brightness=%.4f (rms %.4f)  closed=%.4f (rms %.4f);"
+                         " a lone fundamental would be %.4f; %d partials compiled\n",
+                         bO, rO, bS, rS, pure, lastPartials);
+            // GATES. Both arms have to SOUND (a silent pair compares two zeros and every
+            // ratio below is 0/0), the patch has to be rich enough that there is anything
+            // above the cutoff to remove (a 4-partial spectrum is closed and open alike),
+            // and the closed arm has to have actually come DOWN near the analytic floor -
+            // which is what says the filter is in the signal path at all.
+            check (rO > 1.0e-4 && rS > 1.0e-4, "  (gate) both filter arms really sound");
+            check (lastPartials > 32,
+                   "  (gate) ...and the patch is rich, so there is energy above the cutoff"
+                   " to remove in the first place");
+            check (bO > 4.0 * pure,
+                   "  (gate) ...and wide open it really is far above what a lone fundamental"
+                   " would measure - the brightness has somewhere to fall from");
+            // 6x. Closed measures 0.0334 against the 0.03424 a LONE fundamental would give
+            // - i.e. the filter has taken the note down to its own floor - and wide open
+            // measures 0.4327, which is 12.6x that floor and 12.95x the closed arm. Half of
+            // the measured ratio is the assertion, which leaves room for a different
+            // machine's spectrum worker publishing a slightly different template while
+            // still being twelve times anything the 0.1% resonance difference between this
+            // patch's 0.7 and JUCE's own 0.7071 default could account for.
+            check (bO > 6.0 * bS,
+                   "the CUTOFF knob changes the timbre by a large factor - wide open is at"
+                   " least 6x brighter than closed (measured 12.95x)");
+        }
+
+        //-- 2. ENVELOPE: two decays, 4x apart, and the RATIO of their crossings -------
+        // The knob is at 0 cents, so the cutoff is the played pitch and the envelope's 6
+        // octaves are the whole sweep: the note opens at f0 * 2^6 = 64 * 261.6 = 16.7 kHz
+        // and closes back onto f0. Sustain 0 so it really does travel the whole way.
+        //
+        // WHY A RATIO. The absolute brightness at any instant depends on the spectrum, the
+        // slope, the machine's floating point and this file's own window length; the RATIO
+        // of two crossing times depends on none of them. CurvedEnv's decay is a shape in
+        // NORMALISED time - env_D(t) = env_1(t/D) for the same curve - so the brightness
+        // trajectory of the 0.8 s arm is the 0.2 s arm's stretched by exactly 4, and the
+        // time at which each crosses ITS OWN halfway point is stretched by exactly 4 too.
+        // Any monotone measure of the sweep gives the same 4; that is what makes this an
+        // assertion about the envelope and not about brightness.
+        {
+            constexpr double kFast = 0.250, kSlow = 1.000;   // 4x, exactly
+            // ONE THRESHOLD FOR BOTH ARMS, and every window scaled to the arm's own decay.
+            //
+            // FOUR WRONG SPELLINGS CAME FIRST, and the numbers they produced are written
+            // down here because the next person to "simplify" this will otherwise make one
+            // of them again. All four were measured on a HEALTHY build:
+            //   each arm chasing ITS OWN halfway point off a fixed 3-13 ms reference: 3.22
+            //   the same, with the reference at the same NORMALISED place (2%-7% of D): 4.51
+            //   ONE shared level, taken from those 2%-7% references:                   4.95
+            //   the shared level moved out to 15%-27% of D, windows still 5% of D:      5.01
+            // Two separate causes, and both had to go:
+            //   - a reference read at 2%-7% of D is contaminated by things whose duration
+            //     is FIXED rather than proportional to the decay (the 1 ms envelope attack,
+            //     the filter's own reset transient), so the fast arm read 0.2024 where the
+            //     slow arm read 0.2255 for the same normalised instant, and a level that is
+            //     not the same level cannot measure TIME at all;
+            //   - a 5%-of-D brightness window is 10 ms in a 200 ms arm, and 10 ms is 2.6
+            //     periods of a 261.6 Hz fundamental. mean|x| over 2.6 periods is not a
+            //     stable denominator: the fast arm's readings went 0.1277, 0.1044, 0.1043,
+            //     0.0838 where the slow arm's fell smoothly, and the crossing landed on
+            //     whichever noisy window dipped first. The decays are now 0.25 and 1.00 s
+            //     and the windows 12% of D, so the fast arm gets 30 ms = 7.9 periods.
+            //
+            // What IS exact needs no assumption about the envelope's curve. Both arms
+            // travel the SAME 6 octaves between the SAME two endpoints; only the clock
+            // differs. So brightness_slow(t) and brightness_fast(t) are the same function
+            // of t/D whatever that function is, and the times at which they cross ONE
+            // COMMON level are in the ratio of the decays exactly. The reference is
+            // therefore read at 15%-25% of each arm's own decay - 30-50 ms and 120-200 ms,
+            // both far past any fixed-duration transient - and the level is the halfway
+            // point between it and the settled end, computed once and applied to both arms.
+            // It is still "its own halfway point": it is the same sweep in both arms.
+            //
+            // The search window and hop are 5% and 1% of D, so each arm is sampled at the
+            // same normalised places and the quantisation cancels in the ratio to first
+            // order rather than favouring the faster arm.
+            auto edges = [&] (const std::vector<float>& x, double D, double& early, double& late)
+            {
+                early = bright (x, atF (150.0 * D), atF (270.0 * D)); // 15%..27% of the decay
+                late  = bright (x, atF (2000.0), atF (2400.0));       // long past both
+            };
+            auto crossing = [&] (const std::vector<float>& x, double D, double half) -> double
+            {
+                const int win = atF (120.0 * D), hop = juce::jmax (1, atF (20.0 * D));
+                for (int at = atF (150.0 * D); at + win < (int) x.size(); at += hop)
+                    if (bright (x, at, at + win) < half)
+                        return (double) (at + win / 2) * 1000.0 / srF;   // window CENTRE
+                return -1.0;
+            };
+            const auto fast = render (0.0f, 0.7f, 6.0f, (float) kFast, 2600.0);
+            const auto slow = render (0.0f, 0.7f, 6.0f, (float) kSlow, 2600.0);
+            double eF = 0.0, lF = 0.0, eS = 0.0, lS = 0.0;
+            edges (fast, kFast, eF, lF);
+            edges (slow, kSlow, eS, lS);
+            const double half = 0.5 * (0.5 * (eF + eS) + 0.5 * (lF + lS));
+            const double tF = crossing (fast, kFast, half);
+            const double tS = crossing (slow, kSlow, half);
+            std::printf ("  envelope  decay %.2f s: brightness %.4f -> %.4f;  decay %.2f s:"
+                         " %.4f -> %.4f;  shared halfway level %.4f crossed at %.1f ms and"
+                         " %.1f ms;  ratio %.2f (4 expected)\n",
+                         kFast, eF, lF, kSlow, eS, lS, half, tF, tS,
+                         tF > 0.0 ? tS / tF : 0.0);
+            // GATES, and the middle one is the whole reason this arm is not noise about
+            // noise: a crossing time computed from an early and a late value that are the
+            // SAME number is the first index at which a flat line dips below its own mean,
+            // which is wherever the dither happened to land. 1.5x is far outside anything
+            // the estimator's own scatter produces on a steady note (run 28 uses 1.15 for
+            // the same kind of claim).
+            check (rmsF (fast, atF (100.0), atF (300.0)) > 1.0e-4
+                   && rmsF (slow, atF (100.0), atF (300.0)) > 1.0e-4,
+                   "  (gate) both envelope arms really sound");
+            check (eF > 1.5 * lF && eS > 1.5 * lS,
+                   "  (gate) ...and each arm's early and late brightness really DIFFER, so"
+                   " there is a halfway point to cross");
+            check (tF > 0.0 && tS > 0.0, "  (gate) ...and both arms really crossed it");
+            // 4x IN, 4x OUT, measured 3.83. The band is +-15%, and the 15% is budgeted
+            // rather than chosen:
+            //   - the brightness proxy over a 12%-of-D window is 30 ms in the fast arm,
+            //     which is 7.9 periods of the 261.6 Hz fundamental, and its readings
+            //     scatter by ~3% at that length (the sequence is monotone in principle and
+            //     measures 0.1408 then 0.1369 in practice). At 5 ms and 240 samples - the
+            //     first spelling, at decays of 0.20/0.80 s - the window was 2.6 periods,
+            //     the scatter was ~5%, and the ratio came out 5.01 on a healthy build;
+            //   - near the crossing the sweep falls about 20% of its level per 10% of D, so
+            //     a 3% level error is a 1.5% time error;
+            //   - the hop is 2% of D, worth up to another 2% in each arm.
+            // Call it 5% per arm, 10% on the ratio; the band is half as tight again. A
+            // filter envelope that had stopped being applied gives no crossing at all and
+            // fails the gate above; one whose TIME was ignored gives a ratio of 1.
+            if (tF > 0.0 && tS > 0.0)
+                check (tS / tF > 3.4 && tS / tF < 4.7,
+                       "the filter ENVELOPE's decay TIME sets the sweep: 4x the decay is 4x"
+                       " the time to the halfway point (measured 3.83)");
+        }
+
+        //-- 3. RESONANCE: a narrow peak AT the cutoff, and nowhere else ---------------
+        // The knob is at 0 cents and the envelope amount is 0, so the cutoff is exactly the
+        // played pitch - placed by the NOTE and not by either of the other two controls,
+        // which is what makes this arm survive their sabotages.
+        //
+        // For a 2-pole lowpass, |H(w0)| = Q exactly, and |H(w)| -> w0^2/w^2 for w >> w0
+        // INDEPENDENTLY of Q. So Q 0.5 -> 8.0 must lift the bin at the cutoff by
+        // 20*log10(8/0.5) = 24.08 dB while the band well above it barely moves - and that
+        // second half is the assertion that makes this about RESONANCE rather than about
+        // some broadband gain that happened to ride along.
+        {
+            constexpr int  fo = 14, fftN = 1 << fo;          // 341 ms, 2.930 Hz per bin
+            constexpr double f0F = 261.6256;
+            const int binCut = (int) std::lround (f0F * (double) fftN / srF);   // 89
+            auto spec = [&] (const std::vector<float>& x, int at)
+            {
+                std::vector<float> buf (2 * (size_t) fftN, 0.0f);
+                for (int i = 0; i < fftN; ++i)
+                    buf[(size_t) i] = (0.5f - 0.5f * std::cos (2.0f * juce::MathConstants<float>::pi
+                                                                * (float) i / (float) (fftN - 1)))
+                                    * x[(size_t) (at + i)];
+                juce::dsp::FFT fft (fo);
+                fft.performFrequencyOnlyForwardTransform (buf.data());
+                return std::vector<float> (buf.begin(), buf.begin() + fftN / 2);
+            };
+            // The cutoff's own neighbourhood: +-2 bins, because 261.6256 Hz is 89.3 bins
+            // and a Hann window puts a sinusoid's energy across three of them wherever it
+            // falls. Summed rather than peak-picked so the answer does not depend on which
+            // side of a bin centre the note happens to land.
+            auto atCut = [&] (const std::vector<float>& m)
+            {
+                double s = 0.0;
+                for (int k = binCut - 2; k <= binCut + 2; ++k)
+                    if (k > 0 && k < (int) m.size()) s += (double) m[(size_t) k];
+                return s;
+            };
+            // ...and the control band: 2.5*f0 up to 0.45*sr. It starts at 2.5 rather than
+            // 2 because the SECOND harmonic is close enough to the cutoff that Q does move
+            // it (+4.4 dB between these two settings, from 1/sqrt(9+4/Q^2)); from the third
+            // up the two responses agree to under 2 dB.
+            auto wide = [&] (const std::vector<float>& m)
+            {
+                const int lo = (int) std::lround (2.5 * f0F * (double) fftN / srF);
+                const int hi = (int) std::lround (0.45 * srF * (double) fftN / srF);
+                double s2 = 0.0; int n = 0;
+                for (int k = lo; k < std::min (hi, (int) m.size()); ++k)
+                { s2 += (double) m[(size_t) k] * m[(size_t) k]; ++n; }
+                return n > 0 ? std::sqrt (s2 / n) : 0.0;
+            };
+            const auto qLo = render (0.0f, 0.5f, 0.0f, 0.200f, 900.0);
+            const auto qHi = render (0.0f, 8.0f, 0.0f, 0.200f, 900.0);
+            const int at = atF (500.0);
+            const auto mLo = spec (qLo, at), mHi = spec (qHi, at);
+            const double nLo = atCut (mLo), nHi = atCut (mHi);
+            const double wLo = wide (mLo),  wHi = wide (mHi);
+            const double dbN = nLo > 1.0e-12 ? 20.0 * std::log10 (nHi / nLo) : 0.0;
+            const double dbW = wLo > 1.0e-12 ? 20.0 * std::log10 (wHi / wLo) : 0.0;
+            double pkLo = 0.0, pkHi = 0.0;
+            for (int i = at; i < at + fftN; ++i)
+            { pkLo = std::max (pkLo, std::abs ((double) qLo[(size_t) i]));
+              pkHi = std::max (pkHi, std::abs ((double) qHi[(size_t) i])); }
+            std::printf ("  resonance  bin at the cutoff: Q 0.5 -> 8.0 lifts it %+.2f dB"
+                         " (24.08 predicted) while the band above 2.5*f0 moves %+.2f dB;"
+                         " peaks %.3f / %.3f\n", dbN, dbW, pkLo, pkHi);
+            // GATES. Both arms sounding, and NEITHER of them clipped: a high-Q arm driven
+            // into a ceiling would report a compressed lift and the 24 dB would be a
+            // measurement of the ceiling instead of of the filter.
+            check (nLo > 1.0e-6 && nHi > 1.0e-6,
+                   "  (gate) both resonance arms really sound, with energy at the cutoff");
+            check (pkLo < 0.99 && pkHi < 0.99,
+                   "  (gate) ...and neither arm clipped, so the dB below is the filter's");
+            // 15 dB of the 24.08 the ideal 2-pole predicts. The shortfall allowance is for
+            // the TPT filter's frequency warping near a cutoff this far below Nyquist
+            // (negligible) and for the +-2 bin sum picking up a little of the skirt; the
+            // number that matters is that 15 dB is more than twice the 6 dB the broadband
+            // check allows, so the two cannot both be satisfied by a plain gain change.
+            check (dbN > 15.0,
+                   "RESONANCE lifts the bin AT the cutoff by more than 15 dB from Q 0.5 to 8");
+            check (std::abs (dbW) < 6.0 && dbN > std::abs (dbW) + 12.0,
+                   "...and it is a NARROW peak: the band above 2.5*f0 moves under 6 dB, at"
+                   " least 12 dB less than the cutoff bin");
         }
     }
 
@@ -16234,6 +16869,15 @@ int main (int argc, char** argv)
     }
 
     runPhaseFaderChecks();
+    // ...AND THE TWO PITCH PATHS TOGETHER. It has an on-demand switch of its own
+    // (--pitch, beside runPitchContinuityChecks, which is where a sabotage run wants it)
+    // but it is called from the full suite as well, because a test only the sabotage
+    // workflow ever runs is a test nobody runs. Four 340 ms renders: it costs about a
+    // second. NOTE for whoever reads this next: runPitchContinuityChecks is NOT called
+    // here and never has been - it exists only under --pitch, so run 59 does not run in
+    // an ordinary suite pass at all. That is a gap in the suite, not a decision this
+    // block is entitled to make on its own, so it is written down rather than fixed.
+    runPitchGlideSuperpositionChecks();
 
 
     // --- run 54: THE SHEPARD'S THREE STATED INVARIANTS, MEASURED --------------------
@@ -16717,6 +17361,287 @@ int main (int argc, char** argv)
                 set ("ampRelease", 0.30f);
                 pump (1.0);
             }
+        }
+
+        //== S4: THE ARROW REVERSED, HELD AGAINST THE COPY PLANNER ====================
+        //
+        // WHAT THIS IS FOR. planShepard's drift budget was written with jmax (0, gEnd -
+        // gStart) - "the rise and nothing else" - which is correct for a stack walking UP
+        // and wrong by the whole of the drift for one walking DOWN. The invariant the plan
+        // needs is
+        //       |(loEnd - loStart)/P - (gEnd - gStart)|  <=  budget,
+        // and clamping the edge's travel to [-budget, +budget] around the GRID's own
+        // movement only maps onto that interval when the grid's movement is zero or
+        // positive. Descending, the same clamp maps the quantity onto [-budget + d,
+        // budget + d] and it is over by d, so `planned` reaches kSlots + 1, shepEvDropped
+        // fires, and a copy whose window is NOT zero is deleted: a partial dropped in
+        // silence AND a step, in one event.
+        //
+        // WHY NOTHING CAUGHT IT. The whole coincidence has to arrive at once - descending,
+        // the band at full width so the budget is the tight 1, the bottom edge saturating
+        // its bound, and a buffer longer than shepard::maxPlanSamples so a chunk covers a
+        // whole interval. "THE ARROW" (run 9b) measures grid-phase drift on a live buffer
+        // and never plans past one interval; S2 and S3 above are the two runs that DO
+        // stress the planner and BOTH run the default direction. Three tests, none of them
+        // standing where the bug is. This is the fourth, and it stands there.
+        //
+        // THE ARITHMETIC, END TO END, so every number below is derived and not chosen:
+        //   rate       Sync, 120 BPM, division 1/16 -> 0.0625 * 60/120 = 0.03125 s per
+        //              octave, floored by shepard::kMinRiseSec to 0.05 s. shepDown negates
+        //              it: -20 intervals per second, the fastest DESCENT there is.
+        //   chunk      maxPlanSamples = (kSlots - kMaxCopies - 1) * 0.05 * 48000 = 2400,
+        //              so the 8192-sample bounce buffer renders as 2400+2400+2400+992 and
+        //              a full chunk is dt = 0.05 s -> drift = -20 * 0.05 = -1.0 EXACTLY.
+        //   before     octave rise, so P = 1 for the note's whole life (smShepP is seeded
+        //              at 1 and its target is log2 2), and the audible band is bandFor's
+        //              own kMaxCopies ceiling of 8 intervals -> budget = max (1, kSlots -
+        //              8 - 1) = 1, the tight value the defect needs.
+        //   the change Base Harmonic N 1 -> 64 under the held key takes the template from
+        //              1024 partials to 16321 and its density floor from ~4.9 to ~10.0
+        //              log2 Hz. bandFor then wants lo = 10.0 and a span of 4.29, so the
+        //              smoothed W falls 8 -> 8 + (1 - exp(-0.05/0.15)) * (4.29 - 8) = 6.95
+        //              on the first chunk and budget rises to 10 - 6.95 - 1 = 2.05.
+        //   the bound  A plan asks for w + q grid indices, where w = W/P is the band in
+        //              intervals and q is the quantity the invariant bounds by budget. So
+        //              w + budget = max (w + 1, kSlots - 1) <= 9 for every w <= kMaxCopies
+        //              - a HEALTHY plan at an octave rise never asks for more than 9 of the
+        //              10 slots, whatever the band is doing, with one always spare.
+        //              Measured: 9, settled and across the whole density change.
+        //   broken     drift is dropped from upMax, the edge spends the |drift| = 1
+        //              interval it does not have, q = budget + 1, and the plan asks for 10.
+        //              Measured: 10.
+        //
+        // WHAT 10 COSTS, and why the assertion is on 9 rather than on kSlots.
+        // ShepardEngine.h defines kSlots as kMaxCopies + 2 and says the two spare slots
+        // "are what let the copy leaving one edge and the copy entering the other hold
+        // different slots for the block they overlap". At 10 both spares are spent: the
+        // header's guarantee is void and the next interval of drift deletes a copy.
+        //
+        // This scenario does NOT reach the deletion itself, and says so rather than
+        // pretending. At an octave rise |drift| cannot exceed 1, because renderNextBlock
+        // sizes its chunk with shepard::maxPlanSamples from the SAME riseSeconds() the plan
+        // advances by - so one chunk is one interval by construction, and the worst the
+        // pre-fix form can do here is spend the margin exactly. An assertion written
+        // against kSlots would therefore have PASSED under the sabotage; that was measured
+        // (widest union 9 -> 10, copies dropped 0 -> 0) before this line was written, which
+        // is why the assertion is on the budget the invariant actually states instead of on
+        // the consequence that budget exists to prevent.
+        //
+        // WHY THE GATES ARE WHAT THEY ARE. Five ways this could pass while measuring
+        // nothing, and one gate each:
+        //   - the code path never entered: the Shepard must really have rendered blocks
+        //     (evidence `bl`), and the voice must really sound - a released or silent note
+        //     plans nothing and drops nothing;
+        //   - the thing under test not connected: shepDown is a switch like any other, and
+        //     a switch that is set and then ignored leaves this run measuring the ASCENDING
+        //     planner a second time - which already passes. So the copy ROOTS are sampled
+        //     before and after and must FALL. Grid phase is read as log2(root) - m, which
+        //     is log2(f0) + g for every copy at P = 1, so the difference between two probes
+        //     is the grid's own movement with f0 divided out;
+        //   - the measured quantity stopped moving: the band's bottom edge must really
+        //     TRAVEL (evidence `ls`). If the density change never lands the clamp never
+        //     binds, `loEnd` is `loStart`, and both the fixed and the broken form return
+        //     the same answer;
+        //   - the assertion about the wrong quantity: the budget must really have been the
+        //     tight 1, which means the band really was at full width before the change -
+        //     measured as the ROOT SPAN of the stack, which is (mHi - mLo) intervals;
+        //   - both sides silent: the step metric refuses a block it cannot calibrate, and
+        //     the sounding gate is what stops a dead voice reporting a clean jump of zero.
+        {
+            TestPlayHead ph;
+            constexpr int blk = 8192;             // a bounce buffer, past maxPlanSamples
+            auto p = makeRig (blk, ph);
+            juce::AudioBuffer<float> b (2, blk);
+            auto set = [&] (const char* id, float plain)
+            {
+                auto* q = p->apvts.getParameter (id);
+                q->setValueNotifyingHost (q->convertTo0to1 (plain));
+                p->pollParametersForTests();
+            };
+            juce::MidiBuffer pending;
+            auto pump = [&] (double seconds)
+            {
+                const int nB = juce::jmax (1, (int) std::lround (seconds * ssr / blk));
+                for (int i = 0; i < nB; ++i)
+                {
+                    juce::MidiBuffer m; if (i == 0) m.swapWith (pending);
+                    b.clear(); p->processBlock (b, m);
+                }
+                return nB;
+            };
+            set ("shepOn", 1.0f);
+            set ("shepMode", 1.0f);      // Sync Project Tempo
+            set ("shepDiv", 0.0f);       // 1/16 at 120 BPM -> the fastest rise there is
+            set ("shepRise", 0.0f);      // Octave, so P = log2(2) = 1 exactly
+            set ("shepDown", 1.0f);      // THE ARROW, POINTING THE OTHER WAY
+            set ("phaseMode", 1.0f);
+            set ("morph", 0.0f);         // no crossfade: the density change lands in ONE
+            set ("dryWet", 0.0f);        // step, which is what makes the edge travel at all
+            set ("ampSustain", 1.0f);
+            set ("ampRelease", 0.30f);
+            set ("baseN", 1.0f);
+            awaitSpectrumIdle (*p, "run 53: the descending offline-block patch");
+            pump (0.2);
+            pending.addEvent (juce::MidiMessage::noteOn (1, 60, 0.9f), 0);
+            // 1.2 s BEFORE anything is measured. smShepRate is a one-pole at ~150 ms and a
+            // cold note adopts its target instantly, but the band and the edge are smoothed
+            // too - 1.2 s is 8 time constants, so everything this scenario reasons about
+            // (W = 8, budget = 1, drift = -1) is the settled value and not a value on its
+            // way somewhere. Measuring during the settle would put the run in a state whose
+            // budget is neither the tight 1 nor the loose one, and the arithmetic above
+            // would be about a stack that was not there.
+            pump (1.2);
+
+            // THE STATE THE ARITHMETIC ASSUMES, read out of the engine rather than assumed.
+            //
+            // TWO instruments, because neither alone says it. The COPY PROBE is a snapshot
+            // of the LAST plan of the last block, and at 8192 samples that is the 992-sample
+            // remainder chunk (8192 = 3*2400 + 992), whose drift is -0.41 rather than the
+            // -1.0 a full chunk carries - so its copy count is 8 where the widest plan of
+            // the block is 9, and reading the width off it would be reading the wrong chunk.
+            // First attempt did exactly that and the gate failed on a perfectly healthy run.
+            // So:
+            //   - shepEvPlanned over ONE block is the WIDEST union any chunk asked for, and
+            //     at a settled band that is W/P + |drift| + 1 = 8 + 1 = 9 grid indices (the
+            //     +1 and the ceil/floor cancel for any bottom edge not exactly on an index).
+            //     9 is the planner sitting on 9 of its 10 slots with one to spare, which is
+            //     what "the budget is 1" looks like from the outside;
+            //   - and bandFor, asked with the LIVE template's own density floor, is where
+            //     the 8 comes from in the first place. Reading the template rather than
+            //     assuming it is the point: a patch that had quietly turned dense already
+            //     would have a narrower band, a looser budget, and none of the arithmetic
+            //     above would be about it.
+            p->shepardEvidenceResetForTests();
+            pump (0.2);
+            const int nBefore = p->voiceShepardForTests (pm, pr, pw, pcn, shepard::kSlots);
+            double loR = 1.0e18, hiR = 0.0, gBefore = 0.0;
+            for (int c = 0; c < nBefore; ++c) { loR = std::min (loR, pr[c]); hiR = std::max (hiR, pr[c]); }
+            if (nBefore > 0) gBefore = std::log2 (pr[0]) - (double) pm[0];
+            const double spanBefore = nBefore > 0 && loR > 0.0 ? std::log2 (hiR / loR) : 0.0;
+            double bandSpan = 0.0;
+            if (const auto* T = p->getLiveTemplate())
+            {
+                const int np = (int) T->partials.size();
+                const double rG = np > shepard::kDensityGuard
+                                ? (double) T->partials[(size_t) shepard::kDensityGuard].ratio : 0.0;
+                const double loD = rG > 1.0e-9 ? std::log2 (0.5 * ssr / rG) : -1.0e9;
+                bandSpan = shepard::bandFor (ssr, 1.0, loD).span;
+            }
+            {
+                double cw0, cx0, dw0, ls0; int pl0, dr0, mc0, bl0, cb0, cwo0;
+                p->shepardEvidenceForTests (cw0, cx0, dw0, ls0, pl0, dr0, mc0, bl0, cb0, cwo0);
+                std::printf ("  descending, %d-sample blocks: band %.3f octaves wide over a"
+                             " 1.000 octave rise -> budget %.2f; widest union %d of %d slots,"
+                             " edge settled to within %.5f oct; last plan held %d copies"
+                             " spanning %.3f oct\n",
+                             blk, bandSpan,
+                             juce::jmax (1.0, (double) shepard::kSlots - bandSpan - 1.0),
+                             pl0, shepard::kSlots, ls0, nBefore, spanBefore);
+                // THE BAND WAS AT FULL WIDTH, which is what makes the budget the tight 1.
+                // kMaxCopies * periodLog = 8 is bandFor's own ceiling, so > 7.9 is that
+                // ceiling and nothing else; the union of 9 is the same fact measured in the
+                // planner, and a settled edge (ls0 ~ 0) is what says the 8 is where the
+                // smoother has ARRIVED rather than somewhere it is passing through.
+                check (bandSpan > 7.9 && pl0 == 9 && ls0 < 0.01,
+                       "  (gate) the band really is at FULL width before the change, so the"
+                       " drift budget really is the tight 1 the defect needs");
+            }
+
+            p->shepardEvidenceResetForTests();
+
+            // THE DENSITY CHANGE, AWAITED. S3 above deliberately does NOT wait, because it
+            // needs the change to land mid-crossfade; here the crossfade is off and the
+            // only thing the wait changes is WHICH of the 30 blocks below sees the new
+            // template. Waiting makes it the first one, so the edge's whole travel is
+            // inside the measured window instead of partly past the end of it - and a
+            // rebuild that never lands fails loudly in awaitTemplateChange rather than
+            // quietly leaving `ls` at zero.
+            {
+                const auto gen0 = p->getTemplateGeneration();
+                set ("baseN", 64.0f);
+                awaitTemplateChange (*p, gen0, "run 53: the descending density change");
+                awaitSpectrumIdle (*p, "run 53: the descending density change");
+            }
+
+            StepMetric sm;
+            double peak = 0.0, gAfter = 0.0;
+            int nAfter = 0;
+            // ~30 blocks = 5.1 s of audio at 8192 samples, which is ~102 intervals of
+            // descent and far more than the handful of chunks the edge takes to travel its
+            // 4.4 octaves. Long enough that a defect firing only on the second or third
+            // plan still lands inside it.
+            for (int k = 0; k < 30; ++k)
+            {
+                juce::MidiBuffer m; b.clear(); p->processBlock (b, m);
+                const int n = p->voiceShepardForTests (pm, pr, pw, pcn, shepard::kSlots);
+                if (n > 0) { nAfter = n; gAfter = std::log2 (pr[0]) - (double) pm[0]; }
+                const auto* T = p->getLiveTemplate();
+                double sumA2 = 0.0, sumB = 0.0;
+                if (T != nullptr)
+                    for (int c = 0; c < n; ++c)
+                    {
+                        const int nc = std::min (pcn[c], (int) T->partials.size());
+                        for (int i = 0; i < nc; ++i)
+                        {
+                            const double a = (double) T->partials[(size_t) i].amp * pw[c];
+                            const double f = std::min ((double) T->partials[(size_t) i].ratio * pr[c], 0.4999 * ssr);
+                            sumA2 += a * a;
+                            sumB  += a * 2.0 * std::sin (juce::MathConstants<double>::pi * f / ssr);
+                        }
+                    }
+                sm.feed (b, blk, sumA2, sumB);
+                peak = std::max (peak, (double) b.getMagnitude (0, blk));
+            }
+            double cw, cx, dw, ls; int pl, dr, mc, bl, cb, cwo;
+            p->shepardEvidenceForTests (cw, cx, dw, ls, pl, dr, mc, bl, cb, cwo);
+            std::printf ("  grid phase %.3f -> %.3f (%+.2f intervals over 30 blocks;"
+                         " descending is negative), peak %.4f, %d copies after\n",
+                         gBefore, gAfter, gAfter - gBefore, peak, nAfter);
+            std::printf ("  widest planned union %d slots (kSlots = %d), %d blocks deleted a copy"
+                         " (loudest deleted window %.4f), worst edge travel in one plan %.4f oct,"
+                         " worst claim window %.6f\n",
+                         pl, shepard::kSlots, dr, dw, ls, cw);
+
+            // -- THE GATES, before the assertions they make meaningful ----------------
+            check (bl > 0, "  (gate) the descending scenario really rendered Shepard blocks");
+            check (peak > 1.0e-4, "  (gate) ...and the voice really sounds while it does it");
+            // THE SWITCH IS REALLY IN FORCE. At 20 intervals per second over 5.1 s the grid
+            // owes about -102 intervals; -20 is a fifth of that and still a hundred times
+            // any rounding. A shepDown that were read and ignored would leave this POSITIVE,
+            // and every assertion below would then be S2 run a second time.
+            check (nAfter > 0 && gAfter - gBefore < -20.0,
+                   "  (gate) the copy roots really DESCEND - shepDown is in force, so this is"
+                   " the planner walking the OTHER way and not the default direction again");
+            // THE CLAMP REALLY BOUND. 0.25 octaves in one plan is a quarter of the 1.05 the
+            // arithmetic above predicts for the first dense chunk and thirty times the
+            // ~0.008 a settled band drifts by; below it the edge never moved, loEnd is
+            // loStart, and the two forms of the budget return the identical answer.
+            check (ls > 0.25,
+                   "  (gate) ...and the band's bottom edge really TRAVELLED, so the clamp"
+                   " that carries the sign really was the thing deciding the answer");
+
+            // -- THE ASSERTIONS -------------------------------------------------------
+            // THE BUDGET, MEASURED. w + budget <= kSlots - 1 for every band bandFor can
+            // produce at an octave rise, so a plan that honours the invariant never asks
+            // for more than kMaxCopies + 1 = 9 of the 10 slots and the overlap margin the
+            // header promises is still there. 10 is the defect, exactly: one interval of
+            // drift spent that the budget did not have.
+            check (pl <= shepard::kMaxCopies + 1,
+                   "a DESCENDING stack at an offline-render block size still spends only the"
+                   " drift budget it has: 9 grid indices of 10, both spare slots intact (the"
+                   " pre-fix form asks for 10 and the overlap margin is gone)");
+            check (dr == 0 && dw < 1.0e-9,
+                   "...so no copy is deleted, and none is deleted mid-window");
+            check (cw < 1.0e-3,
+                   "...and every slot is still claimed where the window is exactly ZERO, with"
+                   " the edge travelling UP while the grid walks DOWN");
+            std::printf ("  click metric (descending offline block): max per-sample jump %.5f,"
+                         " bound %.5f (worst jump/bound %.2f)\n", sm.maxJump, sm.bound, sm.worst);
+            check (sm.worst <= 1.0,
+                   "...and no per-sample step exceeds what these partials can smoothly"
+                   " produce, across the whole descent");
+            pending.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+            pump (2.0);
         }
     }
 
