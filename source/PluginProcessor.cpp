@@ -5237,8 +5237,25 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
 
         const auto keep     = tuning.captureTuning();
         const int  keepMode = getTuningMode();
+        // THE PARKED HAND-SET REFERENCE IS NOT PART OF A PRESET, for the same reason the
+        // active tuning above is not: only the SOUND changes, never what the keys mean.
+        //
+        // It has to be kept EXPLICITLY now that captureState writes it, and this is the one
+        // flow where getting it wrong would lose the very number that fix exists to protect.
+        // While MTS-ESP owns the reference, refA holds the master's display value and the
+        // user's own is parked in manualRefA. Letting a preset's REFPARK land there would
+        // throw the user's number away - and the next poll, seeing the park still in force,
+        // would re-park the preset's value in its place, so leaving MTS would hand back a
+        // reference the user never typed. Kept unconditionally: with no park in force
+        // manualRefA is not read by anything until MTS is next entered, and entering it
+        // overwrites the member from refA anyway.
+        const float keepManualRefA = manualRefA;
+        const bool  keepMtsHadRef  = mtsHadRef;
 
         restoreState (tree);
+
+        manualRefA = keepManualRefA;
+        mtsHadRef  = keepMtsHadRef;
 
         // Put the CURRENTLY ACTIVE tuning back exactly as it was - source, name AND a
         // table's chosen period, which is as much part of "as it was" as the pitches.

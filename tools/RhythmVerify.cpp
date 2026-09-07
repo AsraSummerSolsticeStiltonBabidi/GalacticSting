@@ -17753,4 +17753,73 @@ static void runProcessorAuditChecks()
         check (after == before,
                "  a full 16 x 128 engage fill does not reallocate the MIX injection buffer");
     }
+
+    //-- run 68: A PRESET DOES NOT CARRY OFF THE PARKED REFERENCE ---------------------
+    //
+    // The other half of run 63, and the one that only became possible to get wrong once
+    // captureState started writing the park at all. loadPreset changes the SOUND and never
+    // what the keys mean: it captures the active tuning and the tuning mode around
+    // restoreState and puts them back. The parked hand-set reference belongs to that same
+    // promise - while MTS owns the box, refA is the master's display value and the user's
+    // own number lives in manualRefA - so a preset's REFPARK landing there would throw the
+    // user's number away, and the next poll, seeing the park still in force, would re-park
+    // the PRESET's value in its place. Leaving MTS would then hand back a reference nobody
+    // typed.
+    //
+    // An MTS master cannot be conjured here either, so the park is installed the way run 63
+    // installs it - through a chunk - and the poll that would consume it is deliberately not
+    // run until after the preset load. That is exactly the window the flow has in life: the
+    // user is in MTS with their number parked, and clicks a preset.
+    {
+        std::printf ("\nrun 68: loading a preset does not carry off the parked reference:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run68-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        struct ScratchFolder
+        {
+            explicit ScratchFolder (const juce::File& d)
+                : dir (d), prev (Proc::getPresetFolder()) { Proc::setPresetFolderForTests (d); }
+            ~ScratchFolder() { Proc::setPresetFolderForTests (prev); dir.deleteRecursively(); }
+            juce::File dir, prev;
+        } guard (scratch);
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+        if (auto* ra = p->apvts.getParameter ("refA"))
+            ra->setValueNotifyingHost (ra->convertTo0to1 (440.0f));
+        p->pollParametersForTests();
+        check (p->savePreset ("zzz68-P").isNotEmpty(),
+               "  a preset saved at 440 - its own park is 440, and it must not travel");
+
+        // The chunk of a project saved under a master: 440 on the face of it, 432 parked.
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize());
+        if (auto* park = xml != nullptr ? xml->getChildByName ("REFPARK") : nullptr)
+        {
+            park->setAttribute ("manualA", 432.0);
+            park->setAttribute ("mtsOwns", 1);
+        }
+        if (xml != nullptr)
+        {
+            if (auto* ra = xml->getChildByAttribute ("id", "refA"))       ra->setAttribute ("value", 440.0);
+            if (auto* tm = xml->getChildByAttribute ("id", "tuningMode")) tm->setAttribute ("value", 1.0);
+        }
+        juce::MemoryBlock saved;
+        if (xml != nullptr) juce::AudioProcessor::copyXmlToBinary (*xml, saved);
+
+        auto q = std::make_unique<Proc>();
+        q->prepareToPlay (48000.0, 256);
+        q->setStateInformation (saved.getData(), (int) saved.getSize());
+        // NOT polled: the park is live at this instant, which is the state a player is in
+        // when they click a preset while MTS is driving the reference.
+        check (q->loadPreset ("zzz68-P"), "  ...and a preset is loaded while the park is live");
+        for (int i = 0; i < 4; ++i) q->pollParametersForTests();
+        const double back = (double) q->apvts.getRawParameterValue ("refA")->load();
+        std::printf ("    after the preset load: refA reads %.3f Hz (the preset's own is 440)\n", back);
+        check (std::abs (back - 432.0) < 0.05,
+               "  the parked 432 survives the preset - a preset changes the sound, not the "
+               "reference the user typed");
+    }
 }
