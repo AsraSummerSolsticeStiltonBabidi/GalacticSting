@@ -6063,6 +6063,20 @@ int main (int argc, char** argv)
             // Call it 5% per arm, 10% on the ratio; the band is half as tight again. A
             // filter envelope that had stopped being applied gives no crossing at all and
             // fails the gate above; one whose TIME was ignored gives a ratio of 1.
+            //
+            // MEASURED, so the next person does not have to re-derive the margin: this
+            // reads 3.83 against the 4.00 it predicts - 4% low, with 11% of band left
+            // below it and 23% above. The 4% is systematic and expected rather than
+            // scatter: the two arms are not perfect time-scalings of one another (the
+            // filter's own reset transient and the fixed fundamental are the same absolute
+            // durations in both), which is exactly why the band is 10% per arm and not a
+            // tolerance on a number somebody watched go green once.
+            //
+            // AND IT BITES. Pointed at "filterAttack" instead of "filterDecay" in
+            // AdditiveVoice's parameter binding, both arms decay identically and the GATE
+            // above fires first - "each arm's early and late brightness really DIFFER" -
+            // which is the ordering this file wants: the precondition catches a broken
+            // measurement before the claim can pass or fail on noise.
             if (tF > 0.0 && tS > 0.0)
                 check (tS / tF > 3.4 && tS / tF < 4.7,
                        "the filter ENVELOPE's decay TIME sets the sweep: 4x the decay is 4x"
