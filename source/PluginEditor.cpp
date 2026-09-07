@@ -4325,8 +4325,13 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     dissBtn.setButtonText          (tr ("Find", "Troba"));
     dissSaveBtn.setButtonText      (tr ("Save", "Desa"));
 
-    helpLabel.setText (tr ("Play: A S D F G H J K L = the scale in order, then Q W E R T Y U I O P continue higher.   Z / X = down / up one scale period.",
-                           "Toca: A S D F G H J K L = l'escala en ordre, i Q W E R T Y U I O P segueixen m\xc3\xa9s agudes.   Z / X = avall / amunt un per\xc3\xado" "de."),
+    // TWO SENTENCES, BECAUSE THERE ARE TWO BEHAVIOURS. The letter layout is the
+    // standalone's (see playKeysLive); inside a DAW the keys go to the host and the host's
+    // own computer keyboard is what plays - and what RECORDS, which is the reason. Saying
+    // the first sentence in a plugin would promise a layout that is not there, which is
+    // the one thing this window never does.
+    helpLabel.setText (keyboardHelpText (processorRef.wrapperType
+                                             == juce::AudioProcessor::wrapperType_Standalone),
                        dontSendNotification);
 
     //-- Tooltips: one idea per sentence, no loose ends. ------------------------
@@ -8847,6 +8852,14 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     // translated-check walks this probe: a component that paints its own text is
     // otherwise invisible to it, which is how this one stayed English.
     p.buttonTexts.push_back ({ "keys.reference", keyboard.getReferenceWord() });
+    // BOTH sentences under the keys, not the one this build happens to show. The letter
+    // layout is the standalone's and the rig builds a PLUGIN, so gating the label on the
+    // wrapper would have taken a string that had been under the mojibake and translated
+    // checks for months quietly out of them - a string escaping a gate by living in a
+    // state no scenario reaches, which is this file's oldest blind spot. Read from
+    // keyboardHelpText, the same function applyLanguage uses, so neither can drift.
+    p.buttonTexts.push_back ({ "keys.helpStandalone", keyboardHelpText (true) });
+    p.buttonTexts.push_back ({ "keys.helpPlugin",     keyboardHelpText (false) });
     // Recorded only while it exists (its two words are state-dependent, and probing a
     // hidden button would measure a word resized() never put on screen).
     if (loadSpectrumTuningBtn.isVisible())
@@ -12002,6 +12015,12 @@ bool FractalAdditiveAudioProcessorEditor::keyStateChanged (bool)
 {
     const bool hadHeld = ! heldKeys.empty();
     pollComputerKeyboard();
+    // ...AND IN A PLUGIN WE SWALLOW NOTHING. The letters belong to the host there (see
+    // playKeysLive), so intercepting them would take the keys away from the host's own
+    // computer keyboard while giving nothing back - the worst of both, and exactly the
+    // state that made one set of keys mean two different things depending on focus.
+    if (processorRef.wrapperType != juce::AudioProcessor::wrapperType_Standalone)
+        return false;
     // Swallow the event whenever it involves our play keys (a mapped key is down
     // now, or one was just released) so key-ups can't reach the DAW's computer
     // keyboard either. Unrelated keys (space, digits...) still pass through.
@@ -12020,8 +12039,52 @@ bool FractalAdditiveAudioProcessorEditor::keyStateChanged (bool)
 // keyStateChanged, see openPartialAmpWindow) so the same mapping keeps working there.
 // isActiveWindow() and not hasKeyboardFocus(): nothing inside that window has to want
 // focus for the window to be the one in front.
+// THE LINE UNDER THE KEYS, in ONE place, because two things read it now.
+//
+// applyLanguage puts the right one on screen, and layoutProbe hands BOTH to the language
+// gates - which is the whole reason this is a function. Gating the sentence on the wrapper
+// meant the rig, which builds the editor as a PLUGIN, stopped photographing the standalone
+// one: a string that had been under the mojibake and translated checks for months would
+// have quietly left them, and this file has a whole section about strings that escape a
+// gate by living in a state no scenario reaches. A second copy declared to the probe would
+// go stale the day one of them is reworded, so the probe reads this.
+juce::String FractalAdditiveAudioProcessorEditor::keyboardHelpText (bool standalone) const
+{
+    return standalone
+        ? tr ("Play: A S D F G H J K L = the scale in order, then Q W E R T Y U I O P continue higher.   Z / X = down / up one scale period.",
+              "Toca: A S D F G H J K L = l'escala en ordre, i Q W E R T Y U I O P segueixen m\xc3\xa9s agudes.   Z / X = avall / amunt un per\xc3\xado" "de.")
+        : tr ("Your DAW's own computer keyboard plays this - so what you play is recorded. Fibl\xc3\xb3's letter layout (one key per scale degree) is in the standalone app.",
+              "El teclat d'ordinador del teu DAW \xc3\xa9s el que toca - i aix\xc3\xad el que toques queda gravat. La disposici\xc3\xb3 per lletres de Fibl\xc3\xb3 (una tecla per grau) \xc3\xa9s a l'aplicaci\xc3\xb3 independent.");
+}
+
 bool FractalAdditiveAudioProcessorEditor::playKeysLive() const
 {
+    // THE LETTER KEYBOARD IS A STANDALONE FEATURE, AND ONLY THERE.
+    //
+    // "haz que el teclado solo funcione de la manera guay en modo standalone, y que de
+    //  normal en el daw funcione como el daw manda."
+    //
+    // Fibló's own layout is LINEAR - one letter per scale degree, A..L then Q..P - which
+    // is the only sane arrangement for a scale of N degrees, and it is genuinely nicer to
+    // play. But it lives entirely inside this editor: the notes are injected straight into
+    // the synth's own MIDI stream (see PluginProcessor's keyboardState merge), so the host
+    // NEVER SEES THEM and nothing you play that way can be recorded. Sending them out of
+    // the plugin's MIDI port instead would need the user to hand-route "MIDI From: Fibló"
+    // onto a second track - and a feature that needs a routing lesson before it can record
+    // a note is not a feature, it is a trap.
+    //
+    // Worse, this editor SWALLOWED those keys (see keyStateChanged), so inside a DAW the
+    // same letters meant two different things depending on which window had focus:
+    // Fibló's linear degrees here, the host's piano layout everywhere else. Two layouts
+    // for one set of keys is the confusion the user reported.
+    //
+    // So in a plugin the keys are simply not ours. They travel to the host, whose own
+    // computer keyboard sends REAL, RECORDABLE MIDI - one instrument, one way to play it,
+    // and it is the host's way because the host is the thing that records. The standalone
+    // has no host to defer to, so there it keeps the good layout. The line under the
+    // on-screen keyboard says which of the two you are looking at; see applyLanguage.
+    if (processorRef.wrapperType != juce::AudioProcessor::wrapperType_Standalone)
+        return false;
     if (hasKeyboardFocus (true)) return true;
     // BOTH floating windows count, or their key forwarding is a lie: the playground
     // forwards its key events exactly like the partial window (hearing the morph move

@@ -933,6 +933,16 @@ private:
     FocusReclaimProbe focusReclaimState() const;
     void pollComputerKeyboard(); // reconcile held keys against the real key state
     bool playKeysLive() const;   // may the QWERTY mapping ring notes right now?
+    // The line under the on-screen keys, for either wrapper. ONE source, read by
+    // applyLanguage and by layoutProbe - see its definition for why both.
+    juce::String keyboardHelpText (bool standalone) const;
+public:
+    // TESTS: the two claims the wrapper gate makes - "these keys are not ours here" and
+    // "the window says so". Both read the live objects, not a copy.
+    bool playKeysLiveForTests() const { return playKeysLive(); }
+    bool editorHasFocusForTests() const { return hasKeyboardFocus (true); }
+    juce::String keyboardHelpTextForTests (bool standalone) const { return keyboardHelpText (standalone); }
+private:
     // Repaint the Custom Engine's interval list with one colour per token (see
     // IntervalTokens.h). Called on every edit and after every programmatic setText.
     void recolourIntervalTokens();

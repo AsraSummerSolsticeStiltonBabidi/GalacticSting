@@ -19308,6 +19308,97 @@ int main (int argc, char** argv)
                " selector says - the panel hides that control here because it does not govern");
     }
 
+    //== IN A DAW THE LETTERS BELONG TO THE DAW ====================================
+    //
+    // "haz que el teclado solo funcione de la manera guay en modo standalone, y que de
+    //  normal en el daw funcione como el daw manda."
+    //
+    // Fibló's own layout is LINEAR - one letter per scale degree - and it is the only sane
+    // arrangement for a scale of N degrees. But it lives inside this editor: the notes go
+    // straight into the synth's own MIDI stream, the host never sees them, and NOTHING
+    // played that way can be recorded. Sending them out of the plugin's MIDI port would
+    // need the user to hand-route "MIDI From: Fibló" onto a second track, and a feature
+    // that needs a routing lesson before it can record a note is a trap.
+    //
+    // Worse, the editor SWALLOWED those keys, so inside a DAW one set of letters meant two
+    // different things depending on which window had focus. So in a plugin they are simply
+    // not ours. This suite builds the editor as a PLUGIN, which is exactly the case under
+    // test - and the case the user is in when it matters.
+    {
+        std::printf ("\nin a plugin the letter keys go to the host, not to us:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();               // heap: main()'s frame is finite
+        auto& p = *pp;
+        p.prepareToPlay (48000.0, 256);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "the editor builds");
+        if (ed != nullptr)
+        {
+            ed->setSize (1200, 650);
+            // GATE: this really is the plugin case. If the suite ever ran as a standalone
+            // the checks below would be asserting the opposite of what they mean.
+            std::printf ("  wrapperType is %s\n", p.getWrapperTypeDescription (p.wrapperType));
+            check (p.wrapperType != juce::AudioProcessor::wrapperType_Standalone,
+                   "  (gate) the editor under test really is a PLUGIN, not the standalone");
+
+            // ...AND THE EDITOR REALLY HAS THE KEYBOARD, which is the gate this block was
+            // missing and which made its first version worthless.
+            //
+            // playKeysLive() answers false for TWO reasons - "we are a plugin" and "nobody
+            // is looking at us" - and an editor that was never put on a peer is always the
+            // second. The whole block passed, and passed just as well with the wrapper gate
+            // REMOVED: sabotage changed nothing, which is the only reason this was caught.
+            // A check whose subject is not connected is not a check.
+            //
+            // So the editor goes on a real off-screen peer and takes the keyboard, exactly
+            // as the interval-box probe's live pass does. Now the only thing left standing
+            // between "focused" and "playing the letters" is the wrapper.
+            ed->setTopLeftPosition (-4000, -4000);     // off every real screen
+            ed->setVisible (true);
+            ed->addToDesktop (0);
+            const bool onPeer = ed->getPeer() != nullptr;
+            if (onPeer) ed->grabKeyboardFocus();
+            std::printf ("  editor on a peer: %d, holds the keyboard: %d\n",
+                         (int) onPeer, (int) (onPeer && ed->editorHasFocusForTests()));
+            check (onPeer && ed->editorHasFocusForTests(),
+                   "  (gate) the editor really holds the keyboard, so \"the letters are not"
+                   " ours\" is the wrapper's doing and not just an unfocused window");
+
+            check (! ed->playKeysLiveForTests(),
+                   "the letter mapping does not ring notes in a plugin - the host's own"
+                   " computer keyboard does, and what it plays is recorded");
+            // THE SWALLOW HALF IS NOT ASSERTED HERE, and that is deliberate.
+            //
+            // keyStateChanged only claims an event when a mapped key is PHYSICALLY down,
+            // and it learns that from juce::KeyPress::isKeyCurrentlyDown - GetAsyncKeyState
+            // on Windows, i.e. the real keyboard on the real machine. A test cannot hold
+            // the A key down, so the call returns false whatever the wrapper says. The
+            // first version of this block asserted it anyway and it passed under sabotage,
+            // which is a check that cannot fail dressed as a check that passed.
+            //
+            // What protects it instead: the swallow is gated by the SAME one line as
+            // playKeysLive above, three lines apart in the same file, and that line is
+            // asserted. Saying so is worth more than an assertion that cannot go red.
+
+            // ...AND IT SAYS SO. A window that quietly stopped answering its own documented
+            // keys would be the silent failure this project refuses; the line under the
+            // keyboard names which of the two behaviours you are looking at.
+            const auto shown = ed->keyboardHelpTextForTests (false);
+            const auto alone = ed->keyboardHelpTextForTests (true);
+            std::printf ("  plugin line: \"%s\"\n", shown.toRawUTF8());
+            check (shown != alone,
+                   "the line under the keyboard is a DIFFERENT sentence in a plugin - it does"
+                   " not promise a layout that is not there");
+            check (alone.contains ("A S D F"),
+                   "  (gate) ...and the standalone sentence is still the letter one, so the"
+                   " check above compared the two real strings");
+            check (shown.containsIgnoreCase ("DAW"),
+                   "...and it names what IS playing, rather than only saying what is not");
+            if (ed->isOnDesktop()) ed->removeFromDesktop();
+        }
+    }
+
     runProcessorAuditChecks();
     runSilentLimitChecks();
 
