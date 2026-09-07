@@ -147,6 +147,23 @@ public:
     // the PERIOD is separate metadata, so the Tuning panel offers it as an editable
     // field marked as Fibló's estimate. Nothing here can move a pitch.
     bool tuningIsAbsoluteTable() const noexcept { return tuning.usesAbsoluteTable(); }
+    // ...and the same question asked about WHAT IS SOUNDING. usesAbsoluteTable() answers
+    // for the loaded SOURCE and knows nothing about the mode, which is right for it -
+    // TuningManager::restoreTuning asks it while putting a tuning back, BEFORE the mode
+    // parameter has been restored, so a mode test inside the accessor would break state
+    // restore. The guard therefore belongs with the consumers, and this is it.
+    //
+    // What it cost to be missing: load a non-repeating .tun once, switch the Tuning box
+    // back to 12-TET, and the instrument was in plain 12-tone equal temperament while
+    // ".scl export" refused with "this tuning is a 128-key table" and right-click degree
+    // editing refused the same way. Both were describing a tuning that had not made a
+    // sound since the user changed the mode. Everything that REFUSES, REWRITES or EXPORTS
+    // "the tuning" asks this one; the panel's period FIELD still asks the sibling above,
+    // because that field describes the loaded file rather than the sounding pitches.
+    bool tuningTableIsInForce() const noexcept
+    {
+        return getTuningMode() == (int) TuningManager::Mode::Scala && tuning.usesAbsoluteTable();
+    }
     juce::String tuningTablePeriodSpec() const { return tuning.tablePeriodSpec(); }
     bool   tuningTablePeriodIsUserSet() const noexcept { return tuning.tablePeriodIsUserSet(); }
     double tuningTablePeriodDevCents()  const noexcept { return tuning.tablePeriodDevCents(); }
@@ -368,7 +385,7 @@ public:
     bool getDegreeIsRational (int d, long long& p, long long& q) const
     {
         const int D = juce::jmax (1, tuning.degreesPerPeriod());
-        if (getTuningMode() == (int) TuningManager::Mode::Scala && ! tuning.usesAbsoluteTable())
+        if (getTuningMode() == (int) TuningManager::Mode::Scala && ! tuningTableIsInForce())
             return tuning.scalaDegreeRational (d, p, q);
         if (d <= 0) { p = 1; q = 1; return true; }        // unison
         if (d >= D)                                        // the period/octave
@@ -1546,8 +1563,11 @@ public:
     // the .scl Fibló writes. For an absolute 128-key table there is no .scl to write, so
     // the bank keeps the .tun text itself - currentTuningAsScl() would hand the bank a
     // flattened copy of the user's tuning under the user's own name for it.
+    // ...and IN FORCE, not merely loaded: with a table left over from an earlier load and
+    // the box back on 12-TET, "put the tuning that is playing into the bank" used to bank
+    // the .tun, which is the one tuning that was NOT playing.
     juce::String currentTuningAsBankSource (const juce::String& name) const
-    { return tuning.usesAbsoluteTable() ? tuning.getScalaSource() : currentTuningAsScl (name); }
+    { return tuningTableIsInForce() ? tuning.getScalaSource() : currentTuningAsScl (name); }
     // Scales this synth writes carry the patch they were made with, as Scala
     // comments (invisible to other programs). "Load its original spectrum" reads
     // it back without disturbing the tuning that is loaded.

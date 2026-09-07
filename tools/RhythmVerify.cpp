@@ -19848,4 +19848,99 @@ static void runProcessorAuditChecks()
         check (p->getNoteFrequency (0) > 0.0 && std::isfinite (p->getNoteFrequency (127)),
                "  ...and every one of its keys is a real number");
     }
+
+    //-- run 71: "IS THIS A TABLE" IS ASKED ABOUT WHAT IS SOUNDING --------------------
+    //
+    // TuningManager::usesAbsoluteTable() answers for the loaded SOURCE and knows nothing
+    // about the tuning mode, which is right for it: restoreTuning asks it while putting a
+    // tuning back, BEFORE the mode parameter has been restored, so a mode test inside the
+    // accessor would break state restore. The consumers are what had to ask, and none of
+    // them did. Load a non-repeating .tun once, put the Tuning box back on 12-TET, and the
+    // instrument was in plain 12-tone equal temperament while ".scl export" and right-click
+    // degree editing both refused with "this tuning is a 128-key table" - describing a
+    // tuning that had not made a sound since the mode changed.
+    //
+    // The export half is measured WITHOUT writing anything: the target is a file inside a
+    // directory that does not exist, so a call that gets past the table guard fails one
+    // line later on the write instead. Which of the two messages comes back is the whole
+    // answer, and the rig never touches the user's recent-files list to get it.
+    {
+        std::printf ("\nrun 71: a table that is loaded but NOT in force stops refusing things:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        // A stretched keyboard: 100 cents a key plus a quadratic term, i.e. a Railsback-
+        // shaped map. It repeats at NOTHING exactly (so it cannot become a scale) while
+        // still estimating a 2/1 over 12 keys - an ordinary .tun table, not a freak one.
+        juce::String tun;
+        tun << "; a stretched 128-key map - close to an octave, exact at no interval\n"
+            << "[Exact Tuning]\nbasefreq=440.0\n";
+        for (int n = 0; n < 128; ++n)
+            tun << "note " << n << "="
+                << juce::String (100.0 * (double) n + 0.01 * (double) n * (double) n, 6) << "\n";
+
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        if (auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+        {
+            xml->removeChildElement (xml->getChildByName ("BANK"), true);
+            auto* bank = xml->createNewChildElement ("BANK");
+            auto* slot = bank->createNewChildElement ("SLOT");
+            slot->setAttribute ("i", 0);
+            slot->setAttribute ("name", "zzz71-stretched");
+            slot->setAttribute ("source", tun);
+            juce::MemoryBlock withBank;
+            juce::AudioProcessor::copyXmlToBinary (*xml, withBank);
+            p->setStateInformation (withBank.getData(), (int) withBank.getSize());
+        }
+        p->setTuningBankSlotParam (1);
+        for (int i = 0; i < 3; ++i) p->pollParametersForTests();
+
+        const auto nowhere = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("zzz71-no-such-dir").getChildFile ("out.scl");
+        const auto exportMsg = [&p, &nowhere]
+        {
+            juce::String e;
+            p->saveCurrentTuningScl (nowhere, e);
+            return e;
+        };
+
+        check (p->tuningIsAbsoluteTable(), "  (precondition) a non-repeating .tun is loaded");
+        check (p->tuningTableIsInForce(),  "  (precondition) ...and Scala mode makes it the tuning in force");
+        std::printf ("    in force: export says \"%s\"\n", exportMsg().toRawUTF8());
+        check (exportMsg().contains ("128-key table"),
+               "  the .scl export still refuses a table that really IS the tuning");
+        juce::String editErr;
+        check (! p->editTuningDegree (1, "150.", editErr) && editErr.contains ("128-key table"),
+               "  ...and so does a degree edit - the guard is kept, not removed");
+        check (p->currentTuningAsBankSource ("zzz71").contains ("[Exact Tuning]"),
+               "  ...and banking the tuning that is playing stores the .tun itself");
+
+        // ...and now the mode goes back to plain 12-TET with the table still loaded.
+        if (auto* tm = p->apvts.getParameter ("tuningMode"))
+            tm->setValueNotifyingHost (tm->convertTo0to1 ((float) (int) TuningManager::Mode::Equal));
+        for (int i = 0; i < 3; ++i) p->pollParametersForTests();
+
+        check (p->tuningTableIsInForce() == false,
+               "  on 12-TET the table is loaded but NOT in force");
+        std::printf ("    not in force: export says \"%s\"\n", exportMsg().toRawUTF8());
+        check (! exportMsg().contains ("128-key table"),
+               "  ...so the .scl export no longer refuses 12-TET for being a table");
+        check (exportMsg().contains ("Could not write"),
+               "  ...it got past the guard and failed on the unwritable path instead, which "
+               "is the only reason it failed at all");
+        check (! p->currentTuningAsBankSource ("zzz71").contains ("[Exact Tuning]"),
+               "  ...and \"bank the tuning that is playing\" banks 12-TET, not the .tun that "
+               "is not playing");
+
+        editErr.clear();
+        const bool edited = p->editTuningDegree (1, "150.", editErr);
+        std::printf ("    degree edit on 12-TET: %s (%s), degree 1 now %.4f cents\n",
+                     edited ? "accepted" : "REFUSED", editErr.toRawUTF8(),
+                     1200.0 * std::log2 (std::max (1.0e-9, p->getDegreeRatio (1))));
+        check (edited, "  ...and right-click degree editing works on 12-TET again");
+        check (std::abs (1200.0 * std::log2 (std::max (1.0e-9, p->getDegreeRatio (1))) - 150.0) < 0.01,
+               "  ...and the edit really landed: degree 1 is the 150 cents that was typed");
+    }
 }

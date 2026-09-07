@@ -2066,7 +2066,7 @@ static bool refuseTableEdit (bool isTable, juce::String& errorOut)
 bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce::String& errorOut,
                                                      const juce::String& exactText)
 {
-    if (refuseTableEdit (tuning.usesAbsoluteTable(), errorOut)) return false;
+    if (refuseTableEdit (tuningTableIsInForce(), errorOut)) return false;
     const int    D      = juce::jmax (1, tuning.degreesPerPeriod());
     const double period = getDegreeRatio (D);
     if (! (period > 1.0001) || ! (ratioFromTonic > 0.0) || ! std::isfinite (ratioFromTonic))
@@ -2162,7 +2162,7 @@ bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce
 bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::String& valueText,
                                                       juce::String& errorOut)
 {
-    if (refuseTableEdit (tuning.usesAbsoluteTable(), errorOut)) return false;
+    if (refuseTableEdit (tuningTableIsInForce(), errorOut)) return false;
     const int D = juce::jmax (1, tuning.degreesPerPeriod());
     if (degree < 1 || degree > D)
     {
@@ -2208,7 +2208,7 @@ bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::St
 // EVERY repetition of the period (a scale degree is a pitch class, not one key).
 bool FractalAdditiveAudioProcessor::deleteTuningDegree (int degree, juce::String& errorOut)
 {
-    if (refuseTableEdit (tuning.usesAbsoluteTable(), errorOut)) return false;
+    if (refuseTableEdit (tuningTableIsInForce(), errorOut)) return false;
     const int D = juce::jmax (1, tuning.degreesPerPeriod());
     if (degree < 1 || degree >= D)
     {
@@ -2581,13 +2581,17 @@ FractalAdditiveAudioProcessor::registerPeriodInfo() const
     // the 2/1 display fallback. The band's unit was then an octave the user's file
     // never contained, printed with no qualifier at all, while the .tun that has the
     // very same problem got one. Now the qualifier follows the fact, not the format.
+    // IN FORCE, not merely loaded, in all three tests below. A .tun table left over from
+    // an earlier load with the box back on 12-TET made this print the TABLE's worst
+    // deviation beside a 2/1 that 12-TET states exactly - a qualifier borrowed from a
+    // tuning that is not sounding, on a band whose unit is a plain octave.
     if (! tuning.hasUsablePeriod())
     {
         i.source = RegisterPeriodSource::NoneStated;
-        if (tuning.usesAbsoluteTable()) i.devCents = tuning.tablePeriodDevCents();
+        if (tuningTableIsInForce()) i.devCents = tuning.tablePeriodDevCents();
         return i;
     }
-    if (! tuning.usesAbsoluteTable())
+    if (! tuningTableIsInForce())
         return i;                      // a scale (or MTS master) states its own period
     i.devCents = tuning.tablePeriodDevCents();
     // `found` is false when the file has nothing ascending to measure at all. periodRatio()
@@ -3451,7 +3455,11 @@ bool FractalAdditiveAudioProcessor::saveCurrentTuningScl (const juce::File& f, j
     // A .scl can only say "N degrees repeating at a period" (a per-key map needs a .kbm
     // alongside it), so an absolute table cannot go out this way without being flattened
     // into a scale it is not. .tun holds it exactly - that is why .tun is the default.
-    if (tuning.usesAbsoluteTable())
+    //
+    // IN FORCE, not merely loaded (tuningTableIsInForce, not usesAbsoluteTable): with a
+    // .tun table loaded earlier and the box back on 12-TET, this refused to export 12-TET
+    // as a .scl on the grounds that the tuning is a table - which by then it was not.
+    if (tuningTableIsInForce())
     {
         errorOut = "This tuning is a 128-key table (a .tun that does not repeat), and a .scl "
                    "can only hold degrees repeating at a period. Save it as .tun instead - "
