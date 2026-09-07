@@ -17230,6 +17230,112 @@ int main (int argc, char** argv)
         }
     }
 
+    //== seedScattered READS THE TABLE, AND WRITES THE SAME BITS AS THE SINES =======
+    //
+    // seedScattered used to call hashPhaseAt - one std::sin - once per oscillator slot,
+    // on the NOTE-ON path, whenever the Phase fader sat above 0. Both banks, every
+    // Shepard copy: 16384 sines with the mode off, eight copies of 1638 with it on, per
+    // voice, before the note rendered a sample. It now reads phaseset's own scatterDeltas
+    // table, which has existed for exactly this arithmetic since the live re-phase needed
+    // it on the audio thread.
+    //
+    // A CHANGE TO A PHASE SET IS A CHANGE TO THE SOUND, so "same result" is not something
+    // to argue: the old chunked-hash path is written out again here, verbatim, and the
+    // two are compared to the LAST BIT at 21 fader positions across the index range, the
+    // chunk boundary the old code had at 64, and both endpoints of the fader. Anything
+    // less than bit-identity is a different instrument.
+    {
+        std::printf ("\nseedScattered seeds from the table and not from 16k sines:\n");
+        namespace ps = spectrum::phaseset;
+
+        // THE OLD IMPLEMENTATION, kept here as the reference and nowhere else. Copied
+        // from the revision this test was written against; if the shipping one is ever
+        // meant to differ, that is a deliberate act and this check is where it is stated.
+        auto refSeed = [] (int first, int count, double scatter, double* out)
+        {
+            if (count <= 0 || out == nullptr) return;
+            if (! (scatter > 0.0)) { for (int i = 0; i < count; ++i) out[i] = ps::kAlignedPhase; return; }
+            constexpr int kChunk = 64;
+            double buf[kChunk];
+            for (int i = 0; i < count; i += kChunk)
+            {
+                const int m = (count - i) < kChunk ? (count - i) : kChunk;
+                for (int k = 0; k < m; ++k) buf[k] = ps::hashPhaseAt (first + i + k);
+                ps::interpolatePhases (buf, m, scatter, out + i);
+            }
+        };
+
+        ps::warmScatterDeltas();   // the table's 16384 sines belong here, not in a note-on
+
+        // The spans are chosen to straddle everything that could differ: the old chunk
+        // boundary at 64, a Shepard slot (kStride = 1638), the whole bank, and offsets
+        // that put a chunk boundary in the middle of a span.
+        const int firsts[] = { 0, 1, 63, 64, 65, 512, 1638, 3276, 16000 };
+        const int counts[] = { 1, 63, 64, 65, 127, 128, 384, 1638 };
+        std::vector<double> a, b;
+        long long compared = 0; int mismatches = 0;
+        double worstDiff = 0.0; double worstScatter = -1.0; int worstIndex = -1;
+        for (int fi = 0; fi < (int) (sizeof (firsts) / sizeof (firsts[0])); ++fi)
+            for (int ci = 0; ci < (int) (sizeof (counts) / sizeof (counts[0])); ++ci)
+            {
+                const int first = firsts[fi];
+                const int count = std::min (counts[ci], spectrum::kMaxPartials - first);
+                if (count <= 0) continue;
+                a.assign ((size_t) count, -1.0);
+                b.assign ((size_t) count, -2.0);
+                for (int q = 0; q <= 20; ++q)
+                {
+                    // 0 and 1 are both INCLUDED: 0 is the sacred branch and 1 is the
+                    // endpoint the table cannot reach by multiplying a delta.
+                    const double s = (double) q / 20.0;
+                    refSeed (first, count, s, a.data());
+                    ps::seedScattered (first, count, s, b.data());
+                    for (int i = 0; i < count; ++i)
+                    {
+                        ++compared;
+                        if (a[(size_t) i] != b[(size_t) i])
+                        {
+                            ++mismatches;
+                            const double d = std::abs (a[(size_t) i] - b[(size_t) i]);
+                            if (d > worstDiff) { worstDiff = d; worstScatter = s; worstIndex = first + i; }
+                        }
+                    }
+                }
+            }
+        std::printf ("    %lld phases compared across %d spans x 21 fader positions:"
+                     " %d differ (worst %.3g at index %d, fader %.2f)\n",
+                     compared, (int) (sizeof (firsts) / sizeof (firsts[0]))
+                             * (int) (sizeof (counts) / sizeof (counts[0])),
+                     mismatches, worstDiff, worstIndex, worstScatter);
+        check (compared > 100000, "  (precondition) the comparison really covered the bank");
+        check (mismatches == 0,
+               "  the table path writes the SAME BITS the per-slot std::sin path wrote -"
+               " every index, every fader position, both endpoints included");
+
+        // ...AND IT IS ACTUALLY FASTER, or the rewrite bought a risk for nothing. One
+        // cold note-on's worth of seeding: the whole oscillator bank at a fader position
+        // that is neither endpoint, so both paths do their full work.
+        {
+            std::vector<double> out ((size_t) spectrum::kMaxPartials, 0.0);
+            double refMs = 1.0e18, newMs = 1.0e18;
+            for (int rep = 0; rep < 7; ++rep)     // minimum of seven: this box is noisy
+            {
+                double t0 = juce::Time::getMillisecondCounterHiRes();
+                refSeed (0, spectrum::kMaxPartials, 0.37, out.data());
+                refMs = std::min (refMs, juce::Time::getMillisecondCounterHiRes() - t0);
+                t0 = juce::Time::getMillisecondCounterHiRes();
+                ps::seedScattered (0, spectrum::kMaxPartials, 0.37, out.data());
+                newMs = std::min (newMs, juce::Time::getMillisecondCounterHiRes() - t0);
+            }
+            std::printf ("    one full bank (%d slots) at fader 0.37: sines %.3f ms,"
+                         " table %.3f ms (%.1fx)\n",
+                         spectrum::kMaxPartials, refMs, newMs, refMs / std::max (1.0e-6, newMs));
+            check (newMs < refMs,
+                   "  ...and the table path is the faster of the two, which is the whole"
+                   " reason to have taken the risk");
+        }
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }

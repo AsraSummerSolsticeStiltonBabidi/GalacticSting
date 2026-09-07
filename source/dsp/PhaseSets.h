@@ -2439,35 +2439,6 @@ namespace phaseset
     }
 
     //==========================================================================
-    // TODAY'S SCATTERED MODE, SEEDED FROM AN INDEX INSTEAD OF FROM A PLAN.
-    //
-    // Fills [first, first + count) with hashPhaseAt(index) carried toward
-    // kAlignedPhase by the SAME interpolation the plan gets: it literally calls
-    // interpolatePhases on the hash, in stack-sized chunks, so there is no second
-    // copy of the curve to drift. Allocation-free and noexcept.
-    //
-    // scatter 0  -> kAlignedPhase exactly, so scatter 0 stays sacred here too.
-    // scatter 1  -> hashPhaseAt(index) exactly = AdditiveVoice::seedPhase(index, false).
-    // in between -> the same shortest-signed-delta blend as inside the plan.
-    inline void seedScattered (int first, int count, double scatter, double* out) noexcept
-    {
-        if (count <= 0 || out == nullptr) return;
-        // Scatter 0 needs no hash at all, and it is the default on most patches: skip
-        // `count` std::sin calls that interpolatePhases would only throw away. Same
-        // bits it would have written (its own t <= 0 branch does exactly this), and
-        // testSeedPastThePlan asserts that at every span the traps name.
-        if (! (scatter > 0.0)) { for (int i = 0; i < count; ++i) out[i] = kAlignedPhase; return; }
-        constexpr int kChunk = 64;
-        double buf[kChunk];
-        for (int i = 0; i < count; i += kChunk)
-        {
-            const int m = (count - i) < kChunk ? (count - i) : kChunk;
-            for (int k = 0; k < m; ++k) buf[k] = hashPhaseAt (first + i + k);
-            interpolatePhases (buf, m, scatter, out + i);
-        }
-    }
-
-    //==========================================================================
     // THE FADER'S PER-PARTIAL SLOPE, TABULATED ONCE FOR THE WHOLE PLUGIN.
     //
     // WHAT IT IS. interpolatePhases carries partial `index` from kAlignedPhase toward its
@@ -2488,6 +2459,28 @@ namespace phaseset
     // copies and 32 voices that is 131072 sines in a block, which is not a rounding error
     // on the budget, it IS the budget. Read from here it is one multiply.
     //
+    // ...AND THE NOTE-ON PATH READS IT TOO NOW, which is why the table stands ABOVE
+    // seedScattered instead of below it. seedScattered was the last caller still paying
+    // for the very sines this table exists to abolish; the note inside it has the
+    // measurement.
+    //
+    // WHY THERE ARE TWO COLUMNS. `delta` is the slope. `hash` is hashPhaseAt(index)
+    // ITSELF, which is the fader's TOP END - and interpolatePhases does not compute the
+    // top end, it hands the target back VERBATIM (its t >= 1 branch). seedScattered has to
+    // spell it the same way or it is not the same function, and without this column the
+    // only way to spell it would have been std::sin at exactly the fader position - full
+    // Scattered - that a user is most likely to park on.
+    //
+    // AND NOT BECAUSE THE ROUND TRIP IS KNOWN TO DIFFER. It was written here that
+    // wrap01 (kAlignedPhase + 1.0 * delta[i]) "lands within an ulp of hash[i] rather than
+    // ON it", and that was a guess: sabotaging seedScattered's endpoint into exactly that
+    // spelling and re-running the bit-identity test gave 0 differences in 440496
+    // comparisons, because kAlignedPhase is 0.25 and h - 0.25 is exact for every h in
+    // [0,1). The round trip is not proved across the whole 16384-entry range, though, and
+    // an identity that holds by luck is the kind this header exists to stop relying on.
+    // The column costs nothing to fill - the delta is computed FROM the hash anyway - and
+    // it makes the endpoint true by construction instead of by coincidence.
+    //
     // WHY IT CANNOT DRIFT AWAY FROM THE CURVE. It is built out of hashPhaseAt and
     // kAlignedPhase - the same two things interpolatePhases is built out of - and
     // testScatterDeltaIsTheCurve re-derives interpolatePhases from this table at 41 fader
@@ -2502,24 +2495,104 @@ namespace phaseset
     // guard, because that first call is 16384 sines and a lock.
     inline constexpr int kScatterDeltaCount = spectrum::kMaxPartials;
 
-    inline const double* scatterDeltas() noexcept
+    namespace detail
     {
-        struct Table
+        struct ScatterTable
         {
-            double d[kScatterDeltaCount];
-            Table() noexcept
+            double delta[kScatterDeltaCount];   // scatterDeltaTo (hashPhaseAt (i)): the slope
+            double hash [kScatterDeltaCount];   // hashPhaseAt (i) itself: the fader's top end
+            ScatterTable() noexcept
             {
                 for (int i = 0; i < kScatterDeltaCount; ++i)
                 {
-                    d[i] = scatterDeltaTo (hashPhaseAt (i));
+                    hash[i]  = hashPhaseAt (i);
+                    delta[i] = scatterDeltaTo (hash[i]);
                 }
             }
         };
-        static const Table t;
-        return t.d;
+        inline const ScatterTable& scatterTable() noexcept
+        {
+            static const ScatterTable t;
+            return t;
+        }
     }
+
+    inline const double* scatterDeltas() noexcept { return detail::scatterTable().delta; }
     // Build the table on a thread that is allowed to be slow. Idempotent.
     inline void warmScatterDeltas() noexcept { (void) scatterDeltas(); }
+
+    //==========================================================================
+    // TODAY'S SCATTERED MODE, SEEDED FROM AN INDEX INSTEAD OF FROM A PLAN.
+    //
+    // Fills [first, first + count) with hashPhaseAt(index) carried toward
+    // kAlignedPhase by the SAME interpolation the plan gets - read out of the
+    // scatterDeltas table above, which IS that interpolation with the index's own hash
+    // substituted in, so there is still no second copy of the curve to drift.
+    // Allocation-free and noexcept.
+    //
+    // scatter 0  -> kAlignedPhase exactly, so scatter 0 stays sacred here too.
+    // scatter 1  -> hashPhaseAt(index) exactly = AdditiveVoice::seedPhase(index, false).
+    // in between -> the same shortest-signed-delta blend as inside the plan.
+    inline void seedScattered (int first, int count, double scatter, double* out) noexcept
+    {
+        if (count <= 0 || out == nullptr) return;
+        // Scatter 0 needs no hash at all, and it is the default on most patches: skip
+        // `count` std::sin calls that interpolatePhases would only throw away. Same
+        // bits it would have written (its own t <= 0 branch does exactly this), and
+        // testSeedPastThePlan asserts that at every span the traps name.
+        if (! (scatter > 0.0)) { for (int i = 0; i < count; ++i) out[i] = kAlignedPhase; return; }
+
+        // ...AND SCATTER ABOVE 0 NEEDS NO std::sin EITHER, WHICH IS THE WHOLE POINT OF
+        // THE TABLE ABOVE AND IT WAS NOT BEING USED HERE.
+        //
+        // The chunked hash loop this replaces called hashPhaseAt - one std::sin - for
+        // every slot of every copy of every voice, ON THE NOTE-ON PATH. With the Phase
+        // fader anywhere above 0 a cold note-on seeds both banks over oscCap() slots:
+        // 16384 sines with Shepard off, and with it on eight copies of 1638. A six-note
+        // chord therefore spent 0.6-1.4 ms in std::sin before it rendered its first
+        // sample, which lands on the ear as a click on the attack - the one place a
+        // synth may not be late.
+        //
+        // Nothing about the SOUND changes, and the identity that says so is the table's
+        // own reason for existing (see scatterDeltas() above):
+        //     phase (index, s) == wrap01 (kAlignedPhase + s * scatterDeltas()[index])
+        // which is interpolatePhases' middle branch with `target` = hashPhaseAt(index),
+        // spelled with the same three operations in the same order. The two ENDPOINTS are
+        // spelled the way interpolatePhases spells them rather than derived from that
+        // identity: t <= 0 writes kAlignedPhase, and t >= 1 hands back hashPhaseAt(index)
+        // ITSELF, out of the table's second column. Bit-identity is asserted rather than
+        // argued - the seedScattered test at the end of RhythmVerify re-derives this whole
+        // function from the old chunked hash path at 21 fader positions across 72 spans
+        // and demands agreement to the LAST BIT.
+        const double t = scatter > 1.0 ? 1.0 : scatter;
+        if (first >= 0 && count <= kScatterDeltaCount && first <= kScatterDeltaCount - count)
+        {
+            const auto& tab = detail::scatterTable();
+            if (t >= 1.0)
+            {
+                for (int i = 0; i < count; ++i) out[i] = tab.hash[(size_t) (first + i)];
+                return;
+            }
+            for (int i = 0; i < count; ++i)
+                out[i] = detail::wrap01 (kAlignedPhase + t * tab.delta[(size_t) (first + i)]);
+            return;
+        }
+
+        // PAST THE TABLE, which is sized kMaxPartials and is therefore as long as any
+        // oscillator bank in this synth: seedRange clamps first+count to kMaxPartials and
+        // seedFromPlan's span is an oscCap(). So this branch is unreachable from the
+        // shipping call sites - but it is kept, and kept EXACT, because the alternative
+        // to a slow answer here is a wrong one, and "the index was past a table nobody
+        // told you about" is precisely the kind of silent cut this file forbids.
+        constexpr int kChunk = 64;
+        double buf[kChunk];
+        for (int i = 0; i < count; i += kChunk)
+        {
+            const int m = (count - i) < kChunk ? (count - i) : kChunk;
+            for (int k = 0; k < m; ++k) buf[k] = hashPhaseAt (first + i + k);
+            interpolatePhases (buf, m, scatter, out + i);
+        }
+    }
 
     //==========================================================================
     // NOTE-ON, in one call. Allocation-free: everything expensive is already in the
