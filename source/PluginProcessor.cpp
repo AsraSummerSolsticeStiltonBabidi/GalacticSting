@@ -1281,7 +1281,24 @@ bool FractalAdditiveAudioProcessor::parseTimbreIntervals (const juce::String& te
         }
         else { errorOut = "Not an interval: \"" + tk + "\""; return false; }
 
-        if (std::isfinite (r) && r > 1.0000001) // above the (implicit) 1/1 fundamental
+        // THE FUNDAMENTAL IS A TOKEN YOU CAN TYPE, and it used to be thrown away.
+        //
+        // "1" (and "1/1", and "0c") was silently dropped by a `> 1.0000001` test, so the
+        // one thing a user naturally types first was rejected with "type at least one
+        // interval above 1/1" - and the whole Custom Engine looked broken to anyone who
+        // did not already know that the box wants intervals ABOVE the fundamental and
+        // that its highest entry becomes the PERIOD rather than a partial.
+        //
+        // "QUE POR DEFECTO SOLO HAYA 1 ESCRITO EN LA CASILLA, Y ENTONCES SUENE UN SINE,
+        // Y QUE AL ANADIR O QUITAR MAS COSAS TENGA EFECTO... QUE SE PUEDA QUITAR EL 1
+        // PERO QUE DE NORMAL SIEMPRE ESTE AHI POR DEFECTO."
+        //
+        // So the fundamental is accepted, deduplicated with the implicit one below, and a
+        // list that holds nothing else is a SINE rather than an error - one partial at
+        // ratio 1, period 2. Everything above it behaves exactly as before: the highest
+        // entry is still the period and the rest are still the partials, so every
+        // spectrum ever typed or saved reads back identically.
+        if (std::isfinite (r) && r > 0.9999999)
             ratios.push_back (r);
     }
 
@@ -1291,8 +1308,20 @@ bool FractalAdditiveAudioProcessor::parseTimbreIntervals (const juce::String& te
                   ratios.end());
     if (ratios.empty())
     {
-        errorOut = "Type at least one interval above 1/1 (e.g. \"3/2 2\" or \"700c 1200c\").";
+        errorOut = "Type at least one interval - \"1\" on its own is a sine, and "
+                   "\"1 3/2 2\" is a fundamental, a fifth and an octave period.";
         return false;
+    }
+
+    // JUST THE FUNDAMENTAL IS A SINE. The period cannot come from the list here - the
+    // list IS the fundamental and a period of 1/1 is degenerate, every "period" landing
+    // on the same pitch - so it falls back to the octave, which is what an unspecified
+    // period means everywhere else in this plugin.
+    if (ratios.size() == 1 && ratios.front() < 1.0000001)
+    {
+        degOut    = { 1.0f };
+        periodOut = 2.0f;
+        return true;
     }
 
     // Highest interval = the period; the rest (plus the implicit 1/1) are the partials.
@@ -1301,7 +1330,8 @@ bool FractalAdditiveAudioProcessor::parseTimbreIntervals (const juce::String& te
     deg.reserve (ratios.size());
     deg.push_back (1.0f);
     for (size_t i = 0; i + 1 < ratios.size(); ++i)
-        deg.push_back ((float) ratios[i]);
+        if (ratios[i] > 1.0000001)      // the fundamental is already in, typed or not
+            deg.push_back ((float) ratios[i]);
 
     degOut    = deg;
     periodOut = (float) period;
@@ -3379,6 +3409,14 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     // a lock, in a render callback, exactly once, which is a dropout nobody could ever
     // reproduce. Idempotent, so calling it on every prepare costs nothing.
     spectrum::phaseset::warmScatterDeltas();
+    // ...and the same argument for the three MIDI buffers the self-play and preview paths
+    // fill. juce::MidiBuffer allocates on its first addEvent, so reserving here means the
+    // FIRST block after a prepare does not allocate either - not just the ones after it.
+    // A generous 4096 bytes each: a pulse train at the fastest rate over a large buffer is
+    // a few hundred events, and this is message-thread memory bought once.
+    previewMidi.ensureSize (4096);
+    rtHeld     .ensureSize (4096);
+    rtSynthMidi.ensureSize (4096);
 
     synth.setCurrentPlaybackSampleRate (sampleRate);
     previewCollector.reset (sampleRate);
@@ -3512,6 +3550,30 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         jingleActive  = jingleOut.getNumSamples() > 0;
     }
     if (jingleActive) playJingleInto (buffer);
+
+    // A HOST'S PANIC IS A HARD SILENCE REQUEST, and it was not being treated as one.
+    //
+    // All Notes Off (CC123) and All Sound Off (CC120) are the two commands a host is
+    // entitled to assume work - they are what a transport stop, a panic button and a
+    // plugin-window close send. The synth acted on them only as far as MPEInstrument
+    // does, which leaves the rhythm engine's pulse trains running, the drone voice on its
+    // reserved channel sounding, and the MIX corner engines untouched. Measured with
+    // self-play and the drone on: All Notes Off took the output from 1.6e-1 to 5.3e-2 and
+    // All Sound Off changed it by nothing at all. A stuck note the user has no way to
+    // stop is the worst thing a synth can do.
+    //
+    // The kill below is exactly the right answer and already exists - it drains the main
+    // synth AND every corner engine, resets the note gates and the mono gate, and flushes
+    // the lookahead - so a panic simply asks for it. Scanned here, immediately before the
+    // consumer, so the silence lands in the SAME block the message arrived in rather than
+    // the next one. It is a read of the incoming buffer and one atomic store: nothing is
+    // allocated and nothing is locked.
+    for (const auto meta : midiMessages)
+    {
+        const auto m = meta.getMessage();
+        if (m.isAllNotesOff() || m.isAllSoundOff())
+        { pendingHardSilence.store (true, std::memory_order_release); break; }
+    }
 
     // A full state swap (preset load, project reload, "load its original spectrum")
     // was seen leaving a note stuck sounding forever: it rewrites every DSP
@@ -3801,17 +3863,37 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         // the same channel+note would otherwise kill the drone voice with its gate
         // note-off. Note-offs are forwarded ALWAYS (so switching the drone off with a
         // note sounding can never strand its voice); note-ons/bends only while on.
-        juce::MidiBuffer held;
+        rtHeld.clear();   // a member, pre-reserved: see its declaration
+        auto& held = rtHeld;
         for (const auto meta : midiMessages)
         {
             auto m = meta.getMessage();
-            if (m.isNoteOff())                       { m.setChannel (16); held.addEvent (m, meta.samplePosition); }
+            // EVERYTHING THAT CAN STOP A NOTE IS FORWARDED, ALWAYS. Note-offs already
+            // were - "so switching the drone off with a note sounding can never strand
+            // its voice" - but that reasoning covers the pedal and the panic messages
+            // exactly as well, and they were being dropped on the floor. A drone voice
+            // lives on reserved channel 16 and is the only thing that hears this buffer,
+            // so with self-play engaged the sustain pedal did nothing and the host's own
+            // All Notes Off could not stop a drone: the note hung until the plugin was
+            // removed. A stuck note the user has no way to stop is the worst thing a
+            // synth can do, and a panic message is the one command a host is entitled to
+            // assume works.
+            //
+            // The pedals go through unconditionally too, and not only while the drone is
+            // on: a pedal DOWN captured before the drone was switched off has to be
+            // releasable afterwards, which is the same argument the note-off line makes.
+            const bool stopper = m.isNoteOff()
+                              || m.isAllNotesOff() || m.isAllSoundOff() || m.isResetAllControllers()
+                              || m.isSustainPedalOn()   || m.isSustainPedalOff()
+                              || m.isSostenutoPedalOn() || m.isSostenutoPedalOff();
+            if (stopper)                             { m.setChannel (16); held.addEvent (m, meta.samplePosition); }
             else if (drone && (m.isNoteOn() || m.isPitchWheel() || m.isAftertouch() || m.isChannelPressure()))
                                                      { m.setChannel (16); held.addEvent (m, meta.samplePosition); }
         }
         rhythm.process (midiMessages, nSamp);              // midiMessages := pulse MIDI
 
-        juce::MidiBuffer synthMidi;
+        rtSynthMidi.clear();
+        auto& synthMidi = rtSynthMidi;
         synthMidi.addEvents (midiMessages, 0, nSamp, 0);   // synth plays the pulses...
         synthMidi.addEvents (held, 0, nSamp, 0);           // ...and the drone channel (ch 16)
         synthMidi.addEvents (previewMidi, 0, nSamp, 0);    // chord preview always audible AS a chord
@@ -3823,7 +3905,8 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
     {
         // Preview active: the synth hears played notes + the preview; the rhythm
         // engine still sees ONLY the played notes.
-        juce::MidiBuffer synthMidi;
+        rtSynthMidi.clear();
+        auto& synthMidi = rtSynthMidi;
         synthMidi.addEvents (midiMessages, 0, nSamp, 0);
         synthMidi.addEvents (previewMidi, 0, nSamp, 0);
         renderSynthMix (buffer, synthMidi, nSamp);

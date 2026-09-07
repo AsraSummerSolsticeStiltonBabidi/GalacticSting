@@ -1846,6 +1846,14 @@ static void runCpuBenchTemporary()
 
 int main (int argc, char** argv)
 {
+    // A RIG THAT DIES MUST SAY WHERE. stdout is fully buffered the moment this is run
+    // into a pipe or a file - which is how every automated run of it happens - so a crash
+    // takes the last few thousand characters with it and the report is a SILENT executable
+    // that exited 0xC00000FD. That happened: a stack overflow inside a new check printed
+    // nothing at all, and the only fact left on screen was an exit code. Unbuffered, the
+    // last line printed is the line the rig died on.
+    std::setvbuf (stdout, nullptr, _IONBF, 0);
+
     juce::ScopedJuceInitialiser_GUI juceInit;
 
     // ONE BLOCK, ON DEMAND: the ordered list of parameter IDs, printed one per line.
@@ -6388,12 +6396,26 @@ int main (int argc, char** argv)
             // in BOTH views (it must never vanish under the user's own click) and in
             // each it is the row that silently absorbs any pixel its neighbours take:
             // it is asserted at its nominal 20 px, the height a readable tick box needs.
+            //
+            // TWO ROWS, TWO SIZES, and the numbers are the painter's own rather than one
+            // nominal figure asserted everywhere. In the CUSTOM view TEMPER still has a
+            // full 20 px row of its own under the ratios box. In the HARMONIC view it now
+            // shares the HARMONICS TITLE ROW - 15 px, beside the painted word - because
+            // the row it used to have was taken off the foot of the prime cell and prime
+            // is the cell that could not spare it ("todo lo de primes se ve mal por estar
+            // chafado"). GalacticLnF draws the tick at jmin(15, h*0.75)*1.1, so 15 px of
+            // row is a 12 px tick and a word beside it, in a click target the width of the
+            // whole toggle - and the check says 15 here rather than 20 because 20 is not
+            // what that row is any more, not because 15 is good enough.
             for (const auto& c : L.controls)
                 if (c.first == "cust.temper")
                 {
-                    std::printf ("  cust.temper %d x %d\n", c.second.getWidth(), c.second.getHeight());
-                    check (c.second.getHeight() >= 20 && c.second.getWidth() >= 100,
-                           "the temper tick box got its whole row inside the Custom Engine");
+                    const int minH = pass == 2 ? 20 : 15;
+                    std::printf ("  cust.temper %d x %d (%s view, needs >= %d tall)\n",
+                                 c.second.getWidth(), c.second.getHeight(),
+                                 pass == 2 ? "custom" : "harmonic", minH);
+                    check (c.second.getHeight() >= minH && c.second.getWidth() >= 60,
+                           "the temper tick box got a whole row, and a word's worth of it");
                 }
 
             // ...AND WHERE IT SITS, which is a different claim in each view.
@@ -6434,18 +6456,29 @@ int main (int argc, char** argv)
                 }
                 else             // HARMONIC view
                 {
-                    std::printf ("  harmonic view: prime cell %d..%d | temper %d..%d\n",
+                    // IT MOVED, AND THIS BLOCK MOVED WITH IT. Until now these lines pinned
+                    // TEMPER to the FOOT OF THE PRIME CELL - "haz que el boton temper to
+                    // tuning este debajo de todo dentro de la seccion prime" - and that is
+                    // exactly the placement the user has since asked to undo: "me gustaria
+                    // que la casilla temper to tuning este a la derecha de harmonics para
+                    // que en primes haya mas espacio, que ahora todo lo de primes se ve mal
+                    // por estar chafado". The 23 px row it held was the 23 px prime needed
+                    // for its nine ticks. The claim is now the opposite one, asserted just
+                    // as hard: in HARMONICS, and nowhere near PRIME.
+                    juce::Rectangle<int> harmCell;
+                    for (const auto& c : L.cells) if (c.first == "eng.harm") harmCell = c.second;
+                    std::printf ("  harmonic view: harmonics cell %d..%d | prime cell %d..%d | temper %d..%d\n",
+                                 harmCell.getY(), harmCell.getBottom(),
                                  primeCell.getY(), primeCell.getBottom(),
                                  temper.getY(), temper.getBottom());
-                    check (! primeCell.isEmpty() && primeCell.contains (temper),
-                           "TEMPER is inside the PRIME cell, not spanning the whole box under it");
-                    // "debajo de todo": nothing in that cell may be below it. 6 px of
-                    // slack is the cell's own bottom inset, no more.
-                    check (temper.getBottom() >= primeCell.getBottom() - 6,
-                           "and it is at the very bottom of that cell");
-                    for (const auto& c : L.controls)
-                        if (c.first.startsWith ("harm.") && c.second.getY() >= temper.getBottom())
-                            check (false, "nothing in the prime section is laid out below TEMPER");
+                    check (! harmCell.isEmpty() && harmCell.contains (temper),
+                           "TEMPER is inside the HARMONICS cell now");
+                    check (! primeCell.isEmpty() && ! temper.intersects (primeCell),
+                           "...and not one pixel of it is left in the PRIME cell");
+                    // "a la derecha": in the title row, at the right end of the cell.
+                    // 6 px of slack is the cell's own inset, no more.
+                    check (temper.getRight() >= harmCell.getRight() - 6,
+                           "and it is at the RIGHT edge of that cell, which is where it was asked for");
                 }
             }
 
@@ -6975,8 +7008,20 @@ int main (int argc, char** argv)
             check (hasControl ("cust.intervals") && hasControl ("cust.load")
                    && ! hasControl ("harm.baseN"),
                    "clicking CUSTOM with nothing loaded still opens its view (Load + intervals reachable)");
-            check (p.engineInForce() == E::Harmonic,
-                   "while the SOUND honestly stays harmonic (there is no scale to sound)");
+            // ...AND IT NOW SOUNDS, which is the opposite of what this line used to say.
+            //
+            // "al cargar custom engine me gustaria que por defecto solo haya 1 escrito en
+            //  la casilla, y entonces suene un sine... sino esa seccion es un engano."
+            //
+            // Engaging the engine with nothing loaded used to leave an empty partial list
+            // and an honestly harmonic sound - honest, and from the chair indistinguishable
+            // from a section that does nothing. It now seeds a lone fundamental, which is
+            // the smallest honest spectrum there is, so the custom engine really is the one
+            // generating and the first thing the user does has something to change.
+            check (p.engineInForce() == E::CustomScale,
+                   "and the CUSTOM engine really is the one sounding now");
+            check (p.getTimbreSource().trim() == "1" && p.getTimbreNoteCount() == 1,
+                   "...on the fundamental it seeded, which is a sine");
             ed->clickEngineChipForTests (0);
             check (hasControl ("harm.baseN") && ! hasControl ("cust.intervals"),
                    "and HARMONIC brings its view back");
@@ -6987,7 +7032,20 @@ int main (int argc, char** argv)
             // over a harmonic sound, with no click anywhere to blame. The pin may only
             // ever hold an EMPTY workspace open, so any real non-harmonic engine state
             // has to supersede it the moment it is observed.
-            ed->clickEngineChipForTests (1);            // pin the custom view (nothing loaded)
+            // THE EMPTY WORKSPACE IS NOW REACHED BY REMOVING, NOT BY ARRIVING. Clicking
+            // CUSTOM seeds a fundamental (see above), so the state this pin exists for -
+            // the view held open over NOTHING - is the one the Remove button leaves
+            // behind ("and leaves the workspace open, so loading or randomising another is
+            // one click"). And it is pressed here rather than simulated with clearTimbre():
+            // applyEngineState() drops the pin the moment a non-harmonic engine is in
+            // force, so a chip click that seeds a spectrum clears the pin on its way in,
+            // and only Remove - which clears the spectrum and THEN pins - can leave the
+            // workspace standing open over nothing. Clearing the processor by hand
+            // reaches a state the user cannot, and would have tested the pin by not
+            // creating it.
+            ed->clickEngineChipForTests (1);            // open the custom view (seeds a fundamental)
+            ed->clickCustomLoadRemoveForTests();        // Remove: the ONE route to an empty workspace
+            ed->refreshEngineDressing();
             check (hasControl ("cust.intervals"), "precondition: the empty workspace is pinned open");
             p.apvts.getParameter ("timbreTemper")->setValueNotifyingHost (1.0f); // automation
             ed->refreshEngineDressing();                // what the 30 Hz timer does
@@ -7035,8 +7093,10 @@ int main (int argc, char** argv)
                 return false;
             };
 
-            p.clearTimbre();
-            ed->clickEngineChipForTests (1);   // open the (empty) custom workspace
+            // Opened FIRST and emptied second: the chip click seeds a fundamental now, so
+            // "nothing loaded" is a state you arrive at by removing, not by switching in.
+            ed->clickEngineChipForTests (1);   // open the custom workspace
+            p.clearTimbre();                   // and empty it, the way Remove does
             ed->refreshEngineDressing();
             std::printf ("  nothing loaded: the button reads \"%s\"\n", word ("cust.load").toRawUTF8());
             check (word ("cust.load") == "Load", "with no spectrum loaded the button loads");
@@ -15879,6 +15939,16 @@ int main (int argc, char** argv)
         if (ed != nullptr)
         {
             ed->clickEngineChipForTests (1);   // the CUSTOM view: where the box lives
+            // REPS IS STATED HERE, because this block's claims are about the BOX and not
+            // about how many periods are stacked on top of what it says. Engaging the
+            // custom engine on a blank instrument seeds a lone fundamental and takes Reps
+            // to 1 with it (a "sine" at the shipped default of 3 would be partials at 1, 2
+            // and 4), so the 1200c this block looks for - the first repeat of the 2/1
+            // period - only exists when something asks for a repeat. A test that inherited
+            // that value from another feature's default was measuring two things at once.
+            if (auto* rp = p.apvts.getParameter ("timbreRepeats"))
+                rp->setValueNotifyingHost (rp->convertTo0to1 (3.0f));
+            p.pollParametersForTests();
 
             // The ratios the live template really carries inside one period, rounded to
             // the cent - the sound, read back, rather than the settings that asked for it.
@@ -17137,6 +17207,310 @@ int main (int argc, char** argv)
         check (std::abs (cents) < 0.05,
                "...and every key is where it was - an edit to one degree does not retune "
                "the instrument");
+    }
+
+    //== A PANIC MESSAGE STOPS A DRONE, AND SO DOES THE PEDAL =======================
+    //
+    // "Play in Fibló" reserves channel 16 for the drone ("note under pulses") and hands
+    // that channel a FILTERED copy of the played MIDI - note-offs always, note-ons only
+    // while the drone is on. Everything else was dropped, which meant the sustain pedal
+    // did nothing and the host's own All Notes Off could not stop a drone voice: the note
+    // hung until the plugin was removed. A stuck note the user cannot stop is the worst
+    // thing a synth can do, and a panic message is the one command a host is entitled to
+    // assume works.
+    //
+    // Measured on the OUTPUT, not on a flag: the only question that matters is whether the
+    // instrument is still making a sound.
+    {
+        std::printf ("\na drone stops when the host says stop:\n");
+        const double sr2 = 48000.0; const int blk2 = 256;
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (sr2, blk2);
+        juce::AudioBuffer<float> b (2, blk2);
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            p->pollParametersForTests();
+        };
+        const auto pump = [&] (double secs)
+        {
+            float peak = 0.0f;
+            for (int i = 0, n = (int) (secs * sr2 / blk2); i < n; ++i)
+            { juce::MidiBuffer m; b.clear(); p->processBlock (b, m); peak = std::max (peak, b.getMagnitude (0, blk2)); }
+            return peak;
+        };
+        const auto send = [&] (const juce::MidiMessage& msg)
+        {
+            juce::MidiBuffer m; m.addEvent (msg, 0); b.clear(); p->processBlock (b, m);
+        };
+
+        sp ("rhythmOn", 1.0f); sp ("rhythmSelfPlay", 1.0f); sp ("rhythmDrone", 1.0f);
+        sp ("ampSustain", 1.0f); sp ("ampRelease", 0.02f);
+        p->pollParametersForTests();
+
+        for (const auto& stop : { std::pair<const char*, juce::MidiMessage> {
+                                      "All Notes Off",  juce::MidiMessage::allNotesOff (1) },
+                                  { "All Sound Off",    juce::MidiMessage::allSoundOff (1) } })
+        {
+            send (juce::MidiMessage::noteOn (1, 60, 0.9f));
+            const float sounding = pump (0.30);
+            // GATE FIRST. If the drone never sounded there is nothing for the panic to
+            // stop, and the silence below would be the silence of a note that never was.
+            check (sounding > 1.0e-4f,
+                   (juce::String ("the drone sounds before the ") + stop.first).toRawUTF8());
+            send (stop.second);
+            const float after = pump (0.60);   // past the 20 ms release, with room to spare
+            std::printf ("  %-14s: %.2e sounding -> %.2e after\n", stop.first, sounding, after);
+            check (after < 1.0e-5f,
+                   (juce::String ("...and ") + stop.first + " stops it").toRawUTF8());
+            pump (0.2);
+        }
+
+        // The pedal, which is the same filter and the same omission. Down, note off, and
+        // the note must still sound; up, and it must stop.
+        send (juce::MidiMessage::noteOn (1, 62, 0.9f));
+        const float held = pump (0.25);
+        check (held > 1.0e-4f, "the drone sounds before the pedal test");
+        send (juce::MidiMessage::controllerEvent (1, 64, 127));   // sustain down
+        send (juce::MidiMessage::noteOff (1, 62));
+        const float pedalled = pump (0.30);
+        std::printf ("  sustain      : %.2e held over the note-off\n", pedalled);
+        check (pedalled > 1.0e-4f, "the sustain pedal HOLDS the drone over its note-off");
+        send (juce::MidiMessage::controllerEvent (1, 64, 0));     // sustain up
+        // PAST THE RELEASE FIRST, then measure. pump() returns the PEAK of the window it
+        // pumps, so measuring from the instant the pedal comes up measures the release
+        // RAMP - the note correctly on its way out - and calls it a note that did not
+        // stop. It read 3.31e-02 against a held 1.58e-01, which is exactly a fifth of the
+        // way down a 20 ms decay. The two panic messages above hard-silence instantly and
+        // so never showed it. 100 ms is five times the release this test sets.
+        pump (0.10);
+        const float released = pump (0.50);
+        std::printf ("  sustain up   : %.2e once the 20 ms release has run\n", released);
+        check (released < 1.0e-5f, "...and letting it up releases the note");
+    }
+
+    //== TEMPER TO TUNING LEFT THE PRIME CELL ======================================
+    //
+    // "me gustaria que la casilla temper to tuning este a la derecha de harmonics para
+    //  que en primes haya mas espacio, que ahora todo lo de primes se ve mal por estar
+    //  chafado."
+    //
+    // It used to be reserved off the FOOT of the prime cell, which is the cell that
+    // cannot spare a row: title, mode box, ON switch, nine tick boxes and nine numbers
+    // under them all live there. Checked as a RECTANGLE relationship rather than as "the
+    // toggle exists", because the complaint is entirely about where the pixels went - and
+    // in BOTH languages, since the Catalan "Tempera a l'afinacio" is the wider of the two
+    // and is what decides whether it fits at all.
+    {
+        std::printf ("\nTEMPER shares the HARMONICS row, and prime gets its pixels back:\n");
+        // ON THE HEAP, and every processor in this file is: main() reserves the whole of
+        // its frame in its prologue, and one FractalAdditiveAudioProcessor carries the
+        // voices' oscillator banks - megabytes of std::array. Two of them by value here
+        // overflowed the stack in main's prologue, before a single line was printed.
+        auto pp = std::make_unique<FractalAdditiveAudioProcessor>(); auto& p = *pp;
+        p.prepareToPlay (44100.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "the editor builds");
+        if (ed != nullptr)
+        {
+            ed->clickEngineChipForTests (0);         // the HARMONIC view: where the cells are
+            ed->setSize (1200, 650);
+
+            for (int lang = 0; lang < 2; ++lang)
+            {
+                const auto P = ed->layoutProbeInLanguage (lang == 1);
+                const char* langName = lang == 1 ? "Catalan" : "English";
+                auto rect = [&P] (const char* n) -> juce::Rectangle<int>
+                {
+                    for (const auto& c : P.controls) if (c.first == n) return c.second;
+                    return {};
+                };
+                auto cell = [&P] (const char* n) -> juce::Rectangle<int>
+                {
+                    for (const auto& c : P.cells) if (c.first == n) return c.second;
+                    return {};
+                };
+                const auto temper = rect ("cust.temper");
+                const auto harm   = cell ("eng.harm");
+                const auto prime  = cell ("eng.prime");
+                const auto fader  = rect ("harm.harmonics");
+                const auto tick0  = rect ("harm.prime0");
+                const auto tick8  = rect ("harm.prime8");
+                std::printf ("  %-7s TEMPER %d,%d %dx%d | HARMONICS cell %d,%d %dx%d | PRIME cell %d,%d %dx%d"
+                             " | tick0 %dx%d\n",
+                             langName, temper.getX(), temper.getY(), temper.getWidth(), temper.getHeight(),
+                             harm.getX(), harm.getY(), harm.getWidth(), harm.getHeight(),
+                             prime.getX(), prime.getY(), prime.getWidth(), prime.getHeight(),
+                             tick0.getWidth(), tick0.getHeight());
+
+                // GATE FIRST: with no toggle on screen every containment check below is
+                // vacuously true, and "it is not in the prime cell" would pass on a
+                // feature that had simply been deleted.
+                check (! temper.isEmpty(),
+                       (juce::String ("TEMPER is on screen at 1200x650 (") + langName + ")").toRawUTF8());
+                check (! harm.isEmpty() && ! prime.isEmpty(),
+                       (juce::String ("...and both engine cells are laid out (") + langName + ")").toRawUTF8());
+
+                check (harm.contains (temper),
+                       (juce::String ("TEMPER sits INSIDE the harmonics cell (") + langName + ")").toRawUTF8());
+                check (! temper.intersects (prime),
+                       (juce::String ("...and nowhere inside the prime cell, which is the ")
+                        + "point of moving it (" + langName + ")").toRawUTF8());
+                // To the RIGHT of the word, not on top of the fader under it: the row it
+                // shares carries the painted title, and the fader owns the row below.
+                check (! temper.intersects (fader),
+                       (juce::String ("...and it does not overlap the harmonics fader (") + langName + ")").toRawUTF8());
+
+                // THE WORD IT SHARES ITS ROW WITH still fits the cell it was left. This is
+                // the check that makes the move honest rather than merely tidy: shortening
+                // HARMONICS' painted cell without measuring is how a title starts being cut
+                // with nothing on screen saying so.
+                for (const auto& l : P.paintedLabels)
+                    if (l.name == "eng.harm")
+                    {
+                        std::printf ("  %-7s painted \"%s\" needs %.0f px in the %d it has\n",
+                                     langName, l.text.toRawUTF8(), l.textWidth, l.cell.getWidth());
+                        check (l.textWidth <= (float) l.cell.getWidth() + 0.5f,
+                               (juce::String ("HARMONICS still fits the cell TEMPER left it (")
+                                + langName + ")").toRawUTF8());
+                        check (! l.cell.intersects (temper),
+                               (juce::String ("...and that cell and the toggle do not overlap (")
+                                + langName + ")").toRawUTF8());
+                    }
+
+                // AND THE ROW THAT WAS BEING CRUSHED. The nine ticks are what the user
+                // photographed; a tick box is 16 px square by fgfit's one constant, and
+                // the cell has to hold it plus the number under it.
+                check (tick0.getHeight() >= 16 && tick8.getHeight() >= 16,
+                       (juce::String ("the nine prime ticks are at least a tick box tall (")
+                        + langName + ")").toRawUTF8());
+                check (tick0.getWidth() >= 16,
+                       (juce::String ("...and at least a tick box wide (") + langName + ")").toRawUTF8());
+            }
+        }
+    }
+
+    //== THE CUSTOM ENGINE STARTS AT ONE PARTIAL, AND THE BOX REALLY DRIVES IT =======
+    //
+    // "al cargar custom engine me gustaria que por defecto solo haya 1 escrito en la
+    //  casilla, y entonces suene un sine, y que al anadir o quitar mas cosas tenga
+    //  efecto, evidentemente, sino esa seccion es un engano."
+    //
+    // Two separate faults met here. "1" was thrown away by a `> 1.0000001` test, so the
+    // one token a person naturally types first was rejected; and engaging the engine with
+    // nothing loaded left an empty partial list, so the section went silent before
+    // anything had been typed. Measured on the COMPILED TEMPLATE - the partials that
+    // sound - not on the settings that asked for them.
+    {
+        std::printf ("\nthe Custom Engine opens on a fundamental, and it sounds:\n");
+        auto pp = std::make_unique<FractalAdditiveAudioProcessor>(); auto& p = *pp;   // heap: see above
+        p.prepareToPlay (44100.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "the editor builds");
+        if (ed != nullptr)
+        {
+            // GATE FIRST: a processor that already held a spectrum would make the seed
+            // below untestable - it only fires on a blank slate, by design.
+            check (p.getTimbreNoteCount() == 0 && p.getTimbreSource().trim().isEmpty(),
+                   "a fresh instrument has no custom spectrum at all");
+
+            ed->clickEngineChipForTests (1);            // engage the CUSTOM engine
+            p.pollParametersForTests();
+            awaitSpectrumIdle (p, "custom engine seed");
+
+            const auto reps = (int) p.apvts.getRawParameterValue ("timbreRepeats")->load();
+            std::printf ("  after clicking CUSTOM: source \"%s\", %d degree(s), Reps %d\n",
+                         p.getTimbreSource().toRawUTF8(), p.getTimbreNoteCount(), reps);
+            check (p.getTimbreSource().trim() == "1",
+                   "engaging the custom engine with nothing loaded seeds a \"1\"");
+            check (p.getTimbreNoteCount() == 1, "...which is exactly one degree");
+            check (reps == 1,
+                   "...and Reps goes to 1, or the \"sine\" would arrive as 1, 2 and 4");
+
+            // A SINE IS ONE PARTIAL. Reps stacks the period, so this is the check that
+            // catches a seed that technically loaded and audibly did not.
+            if (const auto* t = p.getLiveTemplate())
+            {
+                std::printf ("  the compiled template holds %d partial(s), first ratio %.4f\n",
+                             (int) t->partials.size(),
+                             t->partials.empty() ? 0.0 : (double) t->partials.front().ratio);
+                check (t->partials.size() == 1,
+                       "and the SOUND is a single partial - a sine, which is what was asked for");
+                check (! t->partials.empty()
+                           && std::abs ((double) t->partials.front().ratio - 1.0) < 1.0e-4,
+                       "...at ratio 1/1, the fundamental itself");
+            }
+            else
+                check (false, "the custom engine compiled a template at all");
+
+            // TYPING "1" ON ITS OWN, through the real keys. This is the token the old
+            // parser silently discarded, and the discard is what made the whole section
+            // read as a lie.
+            const auto one = ed->typeIntervalsProbeForTests ("1", 0, false);
+            std::printf ("  typed \"1\" -> processor \"%s\", %d degree(s)\n",
+                         one.timbreSource.toRawUTF8(), one.timbreNotes);
+            check (one.timbreSource == "1", "typing \"1\" is accepted, not refused");
+            check (one.timbreNotes == 1, "...and reads as one degree");
+
+            // THE FUNDAMENTAL TYPED EXPLICITLY IS NOT A DUPLICATE. "1 3/2 2" and "3/2 2"
+            // are the same spectrum: the 1/1 is always there, typed or not, and a parser
+            // that counted it twice would put two partials on the same pitch.
+            const auto withOne    = ed->typeIntervalsProbeForTests ("1 3/2 2", 0, false);
+            const int  notesWith  = withOne.timbreNotes;
+            const auto withoutOne = ed->typeIntervalsProbeForTests ("3/2 2", 0, false);
+            const int  notesPlain = withoutOne.timbreNotes;
+            std::printf ("  \"1 3/2 2\" -> %d degrees; \"3/2 2\" -> %d degrees\n", notesWith, notesPlain);
+            check (notesWith == 2, "\"1 3/2 2\" is a fundamental and a fifth inside an octave period");
+            check (notesWith == notesPlain,
+                   "...and typing the 1/1 out loud changes nothing: it was never optional");
+
+            // ADDING AND REMOVING REALLY TAKES EFFECT, read off the template.
+            auto ratios = [&p] ()
+            {
+                p.pollParametersForTests();
+                awaitSpectrumIdle (p, "custom engine edit");
+                juce::StringArray s;
+                if (const auto* t = p.getLiveTemplate())
+                    for (const auto& q : t->partials)
+                        s.add (juce::String ((double) q.ratio, 3));
+                return s.joinIntoString (" ");
+            };
+            ed->typeIntervalsProbeForTests ("1", 0, false);
+            const auto sine = ratios();
+            ed->typeIntervalsProbeForTests ("1 5/4 3/2 2", 0, false);
+            const auto three = ratios();
+            std::printf ("  \"1\" sounds [%s]; \"1 5/4 3/2 2\" sounds [%s]\n",
+                         sine.toRawUTF8(), three.toRawUTF8());
+            check (sine != three,
+                   "adding intervals to the box changes the partials that sound - the box"
+                   " is the control, not a note pad");
+            check (juce::StringArray::fromTokens (three, " ", "").size()
+                       > juce::StringArray::fromTokens (sine, " ", "").size(),
+                   "...and adding MORE of them makes MORE partials");
+
+            // CLICKING AWAY COMMITS IT. No Return anywhere in this probe: most people
+            // type a list and then reach for a fader, and that used to discard it.
+            const auto blurred = ed->typeThenBlurForTests ("5/4 3/2 2");
+            std::printf ("  typed \"5/4 3/2 2\" and clicked away -> processor \"%s\"\n",
+                         blurred.toRawUTF8());
+            check (blurred.trim() == "5/4 3/2 2",
+                   "typing and then clicking away APPLIES the spectrum - a list is not lost"
+                   " because the user reached for a fader instead of the Return key");
+
+            // ...AND THE SEED NEVER OVERWRITES A SPECTRUM THAT EXISTS. Switching to the
+            // harmonic engine and back is the way BACK, and it must not hand the user a
+            // fundamental in place of the list they just typed.
+            ed->clickEngineChipForTests (0);
+            ed->clickEngineChipForTests (1);
+            p.pollParametersForTests();
+            std::printf ("  after HARMONIC -> CUSTOM again: processor \"%s\"\n",
+                         p.getTimbreSource().toRawUTF8());
+            check (p.getTimbreSource().trim() == "5/4 3/2 2",
+                   "leaving the custom engine and coming back KEEPS the typed spectrum -"
+                   " the \"1\" is seeded on a blank slate only");
+        }
     }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);

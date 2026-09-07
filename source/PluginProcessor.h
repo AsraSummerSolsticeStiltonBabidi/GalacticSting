@@ -1666,6 +1666,16 @@ public:
     // never the MIDI out). MidiMessageCollector is thread-safe by design.
     juce::MidiMessageCollector previewCollector;
     juce::MidiBuffer           previewMidi; // reused per block (audio thread)
+    // ...AND SO ARE THESE TWO, for the same reason previewMidi is a member and not a
+    // local. juce::MidiBuffer holds a juce::Array that ALLOCATES on its first addEvent,
+    // so the "held" and "synthMidi" buffers the self-play and preview paths used to build
+    // as locals were three heap allocations per block on the audio thread, every block,
+    // whenever either path was active - which is the hardest rule this project has, and
+    // the one a dropout comes from. Members cleared per block instead: MidiBuffer::clear
+    // keeps the capacity, so after the first few blocks nothing allocates at all.
+    //
+    // One synthMidi for both paths: they are mutually exclusive branches of the same if.
+    juce::MidiBuffer           rtHeld, rtSynthMidi;
 
 public:
     // The jingle is ON DEMAND only: clicking the title asks for it. It never plays

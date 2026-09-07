@@ -3104,6 +3104,30 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         refocus();
     };
     intervalEdit.onEscapeKey = [this] { refocus(); };
+    // ...AND CLICKING AWAY COMMITS IT TOO. There was only a Return handler, so a user who
+    // typed a spectrum and then clicked anywhere else lost it silently - which is most of
+    // "escribo algo en la caja de texto de intervalos y no se aplica". Every other text
+    // field in this window commits on blur (the reference-A box, the period boxes, the
+    // smallest-interval boxes); this one was the exception, in the section where it is
+    // least forgivable, because the box IS the feature.
+    //
+    // Guarded on the text having actually changed, so a blur that follows a Return - or a
+    // blur with nothing typed - does not re-run the load, push a second undo step, and
+    // re-seed every sounding voice's phases for no reason.
+    intervalEdit.onFocusLost = [this]
+    {
+        const auto typed = intervalEdit.getText().trim();
+        // An EMPTY box is an unfinished edit, not an instruction to throw the spectrum
+        // away: "que se pueda quitar el 1" is about being able to delete it and type
+        // something else, and the Remove button is the one control that means "drop it".
+        // Committing empty would also pop an error dialog on every click away.
+        if (intervalCommitting || typed.isEmpty()
+            || typed == processorRef.getTimbreSource().trim()
+            || intervalEdit.onReturnKey == nullptr)
+            return;
+        const juce::ScopedValueSetter<bool> oneAtATime (intervalCommitting, true);
+        intervalEdit.onReturnKey();
+    };
     // Every value in its own colour, re-done on each edit. See recolourIntervalTokens().
     intervalEdit.onTextChange = [this] { recolourIntervalTokens(); };
     // No focus-grow any more (the box is already big); on blur just show the start,
@@ -3304,19 +3328,37 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         // EVERY period, not just the one that was right-clicked.
         w->addButton (tr ("Delete", "Esborra"), 2);
         w->addButton (tr ("Cancel", "Cancel\xc2\xb7la"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+        activePrompt = w; // so the destructor can dismiss an orphaned dialog
+        // NAMED, because this dialog is built inside onEditKey - a lambda - and MSVC
+        // resolves a bare `this` in a NESTED lambda's init-capture to the enclosing
+        // CLOSURE rather than to the object. SafePointer<Editor>(this) then does not
+        // compile, and the shape that does compile is not the one that is wanted.
+        FractalAdditiveAudioProcessorEditor* const selfEd = this;
+        // THE EDITOR IS THE THING THAT DIES, NOT THE WINDOW.
+        //
+        // This callback used to guard a SafePointer to the AlertWindow and capture `this`
+        // RAW - which is exactly backwards. ModalComponentManager invokes the callback
+        // BEFORE deleting the window, so that pointer is the one that cannot be null;
+        // the editor is a plugin UI the host may close at any moment, and an AlertWindow
+        // is a TopLevelWindow that outlives it. Right-click a key, close the plugin
+        // window, press OK: processorRef, tr() and refocus() all read freed memory, and
+        // the tuning is rewritten from it. savePresetFlow states the correct pattern in
+        // as many words; this is that pattern, plus the activePrompt registration that
+        // lets ~Editor dismiss the dialog instead of leaving it orphaned on screen.
         w->enterModalState (true, juce::ModalCallbackFunction::create (
-            [this, safe = juce::Component::SafePointer<juce::AlertWindow> (w), deg] (int r)
+            [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (selfEd),
+             win  = juce::Component::SafePointer<juce::AlertWindow> (w), deg] (int r)
             {
-                if (safe == nullptr) return;
-                const auto txt = safe->getTextEditorContents ("v");
+                if (safe == nullptr || win == nullptr) return;
+                const auto txt = win->getTextEditorContents ("v");
                 juce::String err;
-                if (r == 1 && ! processorRef.editTuningDegree (deg, txt, err))
+                if (r == 1 && ! safe->processorRef.editTuningDegree (deg, txt, err))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        tr ("Edit degree", "Edita el grau"), err, this);
-                if (r == 2 && ! processorRef.deleteTuningDegree (deg, err))
+                        safe->tr ("Edit degree", "Edita el grau"), err, safe);
+                if (r == 2 && ! safe->processorRef.deleteTuningDegree (deg, err))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        tr ("Delete degree", "Esborra el grau"), err, this);
-                refocus();
+                        safe->tr ("Delete degree", "Esborra el grau"), err, safe);
+                safe->refocus();
             }), true);
     };
     // Ctrl+click anywhere on the keys: add a note at that exact spot - it joins every
@@ -3339,26 +3381,32 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         w->addTextEditor ("v", pre);
         w->addButton (tr ("OK", "OK"), 1, juce::KeyPress (juce::KeyPress::returnKey));
         w->addButton (tr ("Cancel", "Cancel\xc2\xb7la"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+        activePrompt = w; // so the destructor can dismiss an orphaned dialog
+        // Same fix as Edit degree above, for the same reason: the EDITOR is what can die
+        // under an open dialog, so it is the editor that is held by SafePointer - and the
+        // same named local, for the same MSVC nested-lambda reason stated there.
+        FractalAdditiveAudioProcessorEditor* const selfEd = this;
         w->enterModalState (true, juce::ModalCallbackFunction::create (
-            [this, safe = juce::Component::SafePointer<juce::AlertWindow> (w)] (int r)
+            [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (selfEd),
+             win  = juce::Component::SafePointer<juce::AlertWindow> (w)] (int r)
             {
-                if (safe == nullptr) return;
-                const auto txt = safe->getTextEditorContents ("v").trim();
+                if (safe == nullptr || win == nullptr) return;
+                const auto txt = win->getTextEditorContents ("v").trim();
                 if (r == 1)
                 {
                     double ratio = 0.0;
                     TuningManager::DegreeSrc src;
                     juce::String err;
                     if (! TuningManager::parsePitchSpec (txt, ratio, src) || ! (ratio > 0.0))
-                        err = tr ("Invalid value. Use cents with a decimal point (\"702.0\") or a ratio (\"3/2\").",
-                                  "Valor inv\xc3\xa0lid. Fes servir cents amb punt decimal (\"702.0\") o un ratio (\"3/2\").");
+                        err = safe->tr ("Invalid value. Use cents with a decimal point (\"702.0\") or a ratio (\"3/2\").",
+                                        "Valor inv\xc3\xa0lid. Fes servir cents amb punt decimal (\"702.0\") o un ratio (\"3/2\").");
                     else
-                        processorRef.addNoteToTuning (ratio, err, txt);
+                        safe->processorRef.addNoteToTuning (ratio, err, txt);
                     if (err.isNotEmpty())
                         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                            tr ("Add note", "Afegeix nota"), err, this);
+                            safe->tr ("Add note", "Afegeix nota"), err, safe);
                 }
-                refocus();
+                safe->refocus();
             }), true);
     };
     // Hover dissonance: every other key shows its Sethares roughness AGAINST the
@@ -4057,7 +4105,19 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lfoPhaseSlider.setTooltip (tr (
         "Phase offset: where in the wave the oscillation starts.",
         "Despla\xc3\xa7""ament de fase: en quin punt de l'ona comen\xc3\xa7""a l'oscil\xc2\xb7laci\xc3\xb3."));
-    temperToggle.setButtonText (tr ("Temper to tuning", "Tempera a l'afinaci\xc3\xb3"));
+    // ONE WORD, AND IT IS A DECISION RATHER THAN A CUT - the same trade "PRIME CONTROL"
+    // made to become "PRIMES" and "OCTAVE RANGE" to become "OCTAVES", and the same one
+    // this very control already made when " - no period" was dropped from its disabled
+    // state (see applyEngineState). It now shares the HARMONICS title row, which is 199 px
+    // wide at the shipped 1200x650 and has to hold the painted word too: "Temper to
+    // tuning" measured 124 px there and just fitted, while the Catalan "Tempera a
+    // l'afinacio" needed about 150 and the toggle was HIDDEN OUTRIGHT in Catalan at the
+    // size the plugin ships at. Caught by the rig, in the language nobody was looking at.
+    //
+    // The verb is the half that carries the meaning - it sits inside the HARMONICS
+    // compartment, so what it tempers is not in doubt - and the tooltip below states the
+    // whole of it, including what happens to the other engine.
+    temperToggle.setButtonText (tr ("Temper", "Tempera"));
     temperToggle.setTooltip (tr (
         "ON: the HARMONIC ENGINE keeps generating partials, each snapped to the nearest pitch of the ACTIVE TUNING in the Tuning box (degree x period^k) and following it live - both engines work TOGETHER and the Custom Engine's own scale is bypassed. In MPE input mode the host hands the plugin no scale, so the grid there is plain 12-TET. OFF: no snapping (the Custom Engine's .scl, if loaded and ON, is the spectrum by itself).",
         "ON: el MOTOR HARM\xc3\x92NIC segueix generant parcials, cadascun ajustat al to m\xc3\xa9s proper de l'AFINACI\xc3\x93 ACTIVA de la caixa Tuning (grau x per\xc3\xado" "de^k) i seguint-la en viu - els dos motors treballen JUNTS i l'escala del Motor propi queda de banda. En mode d'entrada MPE l'amfitri\xc3\xb3 no d\xc3\xb3na cap escala al plugin, aix\xc3\xad que all\xc3\xa0 la graella \xc3\xa9s 12-TET. OFF: sense ajust (l'.scl del Motor propi, si est\xc3\xa0 carregat i actiu, \xc3\xa9s l'espectre per si mateix)."));
@@ -5511,6 +5571,30 @@ FractalAdditiveAudioProcessorEditor::typeIntervalsProbeForTests (const juce::Str
     r.timbreSource = processorRef.getTimbreSource();
     r.timbreNotes  = processorRef.getTimbreNoteCount();
     return r;
+}
+
+juce::String FractalAdditiveAudioProcessorEditor::typeThenBlurForTests (const juce::String& typed)
+{
+    setIntervalText ({});                       // an empty box, through the one seeding helper
+    intervalEdit.grabKeyboardFocus();
+    for (auto p = typed.getCharPointer(); ! p.isEmpty(); ++p)
+    {
+        intervalEdit.keyPressed (juce::KeyPress (0, juce::ModifierKeys(), *p));
+        recolourIntervalTokens();               // the posted onTextChange, delivered by hand
+    }
+    // NO RETURN. The keyboard simply goes somewhere else, which is what happens when the
+    // user reaches for a fader - and it is juce::TextEditor::focusLost that has to be the
+    // thing that starts the commit. Called on the COMPONENT, so a build that never wired
+    // the handler to focusLost at all is caught here rather than assumed away.
+    intervalEdit.focusLost (juce::Component::focusChangedByMouseClick);
+    // ...and then the message that focusLost POSTS, delivered by hand. JUCE routes the
+    // blur through postCommandMessage (TextEditorDefs::focusLossMessageId) and this
+    // binary has no message loop to deliver it - JUCE_MODAL_LOOPS_PERMITTED is 0 - which
+    // is the same reason this file's other interval probes deliver onTextChange and
+    // onReturnKey themselves. The claim under test is that a blur commits the typing, not
+    // that JUCE's queue works.
+    if (intervalEdit.onFocusLost != nullptr) intervalEdit.onFocusLost();
+    return processorRef.getTimbreSource();
 }
 
 FractalAdditiveAudioProcessorEditor::IntervalDraftProbe
@@ -7620,6 +7704,47 @@ void FractalAdditiveAudioProcessorEditor::selectEngineView (bool custom)
     }
     customViewPinned = custom;
     processorRef.setTimbreEnabled (custom);
+    // A CUSTOM ENGINE WITH NOTHING IN IT NOW HOLDS A FUNDAMENTAL, AND SOUNDS.
+    //
+    // "AL CARGAR CUSTOM ENGINE ME GUSTARIA QUE POR DEFECTO SOLO HAYA 1 ESCRITO EN LA
+    // CASILLA, Y ENTONCES SUENE UN SINE."
+    //
+    // Switching to the custom engine with no spectrum loaded used to engage an engine
+    // with an empty partial list: the panel changed colour, the chip lit, and the
+    // instrument went silent - so the section read as broken before the user had typed
+    // anything. A lone fundamental is the smallest honest spectrum there is, it is what
+    // the box's own placeholder always implied, and it is a starting point you can hear.
+    //
+    // Only when there is nothing loaded: a switch back to a spectrum the user typed, or
+    // adapted, or loaded from a file must not overwrite it. And it goes through the same
+    // undoable load every other edit uses, so one Ctrl+Z removes it - which is the other
+    // half of what was asked ("que se pueda quitar el 1").
+    if (custom && processorRef.getTimbreSource().trim().isEmpty()
+              && processorRef.getTimbreNoteCount() == 0)
+    {
+        juce::String err;
+        if (processorRef.loadTimbreTextUndoable ("1", err))
+        {
+            intervalEdit.setText ("1", juce::dontSendNotification);
+            recolourIntervalTokens();
+            // ...AND REPS GOES TO 1, OR IT IS NOT A SINE. Reps stacks the PERIOD, and a
+            // lone fundamental states no period - the parser falls back to the octave,
+            // which is what an unstated period means everywhere else in this plugin - so
+            // at the shipped default of 3 the "sine" would arrive as partials at 1, 2 and
+            // 4. Three octaves is a perfectly good sound and a terrible blank canvas.
+            //
+            // Written through the PARAMETER, so the fader moves under the user's eye, the
+            // host sees it, and Ctrl+Z takes it back: this is a control being set, not a
+            // value being smuggled. It happens only on the blank slate that seeds the "1"
+            // in the first place, so a Reps the user chose is never overwritten.
+            if (auto* rp = processorRef.apvts.getParameter ("timbreRepeats"))
+            {
+                rp->beginChangeGesture();
+                rp->setValueNotifyingHost (rp->convertTo0to1 (1.0f));
+                rp->endChangeGesture();
+            }
+        }
+    }
     applyEngineState();
 }
 
@@ -7653,7 +7778,7 @@ void FractalAdditiveAudioProcessorEditor::applyEngineState()
         // BOTH the word and the tooltip go back. Setting only the word left a control
         // that worked while still explaining, on hover, that it was unavailable - the
         // stale half of a two-part message is its own lie.
-        temperToggle.setButtonText (tr ("Temper to tuning", "Tempera a l'afinaci\xc3\xb3"));
+        temperToggle.setButtonText (tr ("Temper", "Tempera"));
         temperToggle.setTooltip (tr (
             "ON: the HARMONIC ENGINE keeps generating partials and each one is snapped to the nearest pitch of the ACTIVE TUNING loaded in the Tuning box (degree x period^k), following it live - both engines work TOGETHER and the Custom Engine's own scale is bypassed. In MPE input mode the host does not hand the plugin a scale, so the grid there is plain 12-TET. OFF: no snapping (the Custom Engine's .scl, if loaded and ON, is the spectrum by itself).",
             "ON: el MOTOR HARM\xc3\x92NIC segueix generant parcials i cadascun s'ajusta al to m\xc3\xa9s proper de l'AFINACI\xc3\x93 ACTIVA carregada a la caixa Tuning (grau x per\xc3\xado" "de^k), seguint-la en viu - els dos motors treballen JUNTS i l'escala del Motor propi queda de banda. En mode d'entrada MPE l'amfitri\xc3\xb3 no d\xc3\xb3na cap escala al plugin, aix\xc3\xad que all\xc3\xa0 la graella \xc3\xa9s 12-TET. OFF: sense ajust (l'.scl del Motor propi, si est\xc3\xa0 carregat i actiu, \xc3\xa9s l'espectre per si mateix)."));
@@ -7673,7 +7798,7 @@ void FractalAdditiveAudioProcessorEditor::applyEngineState()
         // So the suffix goes, the same trade the source selector and the Shepard row
         // made. The toggle is already disabled here (setEnabled (canTemper) above), and
         // the tooltip below says the whole of it.
-        temperToggle.setButtonText (tr ("Temper to tuning", "Tempera a l'afinaci\xc3\xb3"));
+        temperToggle.setButtonText (tr ("Temper", "Tempera"));
         temperToggle.setTooltip (tr (
             "UNAVAILABLE: this tuning states no period that ascends (a descending scale, or a period of 1/1), so there is no \"degree x period^k\" grid to snap partials onto. Fibl\xc3\xb3 will NOT invent an octave here - the harmonic engine keeps running untempered and your tuning is left exactly as you wrote it. Load a tuning whose last interval rises above 1/1 to use this.",
             "NO DISPONIBLE: aquesta afinaci\xc3\xb3 no declara cap per\xc3\xado" "de que pugi (una escala descendent, o un per\xc3\xado" "de d'1/1), aix\xc3\xad que no hi ha cap graella \"grau x per\xc3\xado" "de^k\" on ajustar els parcials. Fibl\xc3\xb3 NO s'inventar\xc3\xa0 cap octava aqu\xc3\xad - el motor harm\xc3\xb2nic segueix sonant sense temperar i la teva afinaci\xc3\xb3 queda exactament com l'has escrita. Carrega una afinaci\xc3\xb3 amb l'\xc3\xbaltim interval per sobre d'1/1 per fer-lo servir."));
@@ -7750,7 +7875,13 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
         if (! engineBoxBounds.isEmpty() && ! customViewShown() && ! hcBase.isEmpty())
         {
             add ("eng.base",  tr ("BASE", "BASE"),                     band (hcBase),  cPanel);
-            add ("eng.harm",  tr ("HARMONICS", "HARM\xc3\x92NICS"),    band (hcHarm),  cPanel);
+            // ...and HARMONICS gets a SHORTER cell, because TEMPER TO TUNING now sits at
+            // the right end of its row (see resized()). Exactly the arrangement the prime
+            // title has with its RESIZE tag below: the cell the fit sweep measures the
+            // word against is the room the word really has, never the room a control is
+            // already standing in. harmTemperW is 0 whenever resized() hid the toggle.
+            add ("eng.harm",  tr ("HARMONICS", "HARM\xc3\x92NICS"),
+                 band (hcHarm).withTrimmedRight (harmTemperW), cPanel);
             // PRIME sits right under the shared divider -> nudge it down for air.
             //
             // ONE WORD, NOT TWO, AND IT IS A DECISION RATHER THAN A CUT. This cell is the
@@ -9684,7 +9815,52 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 compact (basePitchBox, bi.removeFromTop (24));
             }
             {
-                auto hi = hcHarm.reduced (5, 3); hi.removeFromTop (lblH);
+                auto hi = hcHarm.reduced (5, 3); auto htop = hi.removeFromTop (lblH);
+
+                //-- TEMPER TO TUNING, IN THE HARMONICS TITLE ROW --------------------
+                //
+                // "me gustaria que la casilla temper to tuning este a la derecha de
+                //  harmonics para que en primes haya mas espacio, que ahora todo lo de
+                //  primes se ve mal por estar chafado."
+                //
+                // It used to take 23 px off the FOOT of the prime cell, and prime is the
+                // cell that cannot spare them: it holds a title, a mode box, an ON switch,
+                // nine tick boxes and nine numbers under them, and what was left for the
+                // tick row was single figures at anything under a wide window. Moving the
+                // toggle hands all 23 px back to the row that was being crushed.
+                //
+                // The TITLE ROW and not beside the fader, and that is arithmetic rather
+                // than taste. This cell is ~245 px wide at the shipped 1200x650; the
+                // harmonics fader is LinearHorizontal with an 86 px value box ("Even-All
+                // 50%") plus a track, and the toggle measures ~142 px in English and ~168
+                // in Catalan - so side by side one of the two would be a sliver. The
+                // painted word "HARMONICS" needs about 62 of those 245 and nothing else
+                // shares its row, which is the only place in this cell with room to spare.
+                //
+                // Hidden rather than squashed when it does not fit, by the same rule the
+                // prime mode switch and this very toggle already followed: a ToggleButton
+                // with no room for its word is an unlabelled tick that silently re-tunes
+                // the whole spectrum, and that is worse than absent. TEMPER is reachable
+                // from the custom view too (see the ctor comment), so it never becomes
+                // unreachable - only unreachable FROM HERE, at widths where this panel
+                // cannot be operated anyway.
+                {
+                    const int th = juce::jmax (1, juce::jmin (lblH, htop.getHeight()));
+                    const int tw = fgfit::snugToggleWidth (temperToggle, th);
+                    // The word it must not tread on, measured in the font paint() really
+                    // uses for it (see paintedSubLabels + the probe that reads them: 11.5
+                    // Bold), in BOTH languages via tr - the Catalan HARMONICS is the wider
+                    // of the two and is what decides at the narrow end.
+                    const int titleW = juce::GlyphArrangement::getStringWidthInt (
+                                           juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")),
+                                           tr ("HARMONICS", "HARM\xc3\x92NICS"));
+                    const bool fits = tw <= htop.getWidth() - titleW - 8;
+                    temperToggle.setVisible (fits);
+                    // Read by paintedSubLabels(), which shortens HARMONICS' cell by it.
+                    harmTemperW = fits ? tw + 8 : 0;
+                    if (fits)
+                        temperToggle.setBounds (htop.removeFromRight (tw).withSizeKeepingCentre (tw, th));
+                }
                 harmonicsFader.setBounds (hi.withSizeKeepingCentre (hi.getWidth(), juce::jmin (24, hi.getHeight())));
 
                 const bool wl = processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f;
@@ -9704,37 +9880,15 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 }
 
                 auto pi = hcPrime.reduced (5, 3); pi.removeFromTop (lblH);
-                // TEMPER, at the FOOT of the prime cell - reserved BEFORE the mode row
-                // and the primes, so the row that must never vanish cannot inherit the
-                // leftovers of the two states above it (the nine whitelist ticks are the
-                // taller of them). Sized to its own words, like every other control in
-                // this pass: a tick box the width of a whole cell is not a tick box.
-                {
-                    // ...and it yields on HEIGHT by the same rule it already yields on
-                    // width. It used to take its 23 px unconditionally, which was free
-                    // while the cell below it held one Limit fader and stopped being free
-                    // the moment nine tick boxes with their numbers became the default:
-                    // the row under it then reached zero height, and a control with no
-                    // pixels is the structural fault that sets the whole window's minimum
-                    // size. Reserved only when what is left still holds the mode row and
-                    // a usable tick row - which is not a reversal of "reserved first", it
-                    // is the same promise: TEMPER is never the row that gets squashed.
-                    const int needBelow = 22 + 2 + (wl ? 24 : 22);
-                    const bool temperRoom = pi.getHeight() - 23 >= needBelow;
-                    auto tr2 = temperRoom ? pi.removeFromBottom (20) : juce::Rectangle<int>();
-                    // Same rule as the tuning panel's fork buttons: a control that cannot
-                    // show its word is HIDDEN, not squashed. A ToggleButton squeezed below
-                    // its tick box has NEGATIVE room for its text - at 710x550 this one had
-                    // -8 px - and what is left on screen is an unlabelled tick that
-                    // re-tunes the whole spectrum. That is worse than absent: the feature
-                    // is still reachable everywhere the panel is wide enough to say what
-                    // it does.
-                    const int tw = fgfit::snugToggleWidth (temperToggle, 20);
-                    const bool temperFits = temperRoom && tw <= tr2.getWidth();
-                    temperToggle.setVisible (temperFits);
-                    if (temperFits) temperToggle.setBounds (tr2.removeFromLeft (tw));
-                    if (temperRoom) pi.removeFromBottom (3);
-                }
+                // TEMPER TO TUNING IS NOT IN THIS CELL ANY MORE. It used to be reserved off
+                // the FOOT of prime, before the mode row and the primes, and the 23 px it
+                // took were the 23 px this cell most needed: a title, a mode box, an ON
+                // switch, nine tick boxes and nine numbers under them all live here, and
+                // what was left for the tick row was single figures of height at anything
+                // short of a wide window - which is the "todo lo de primes se ve mal por
+                // estar chafado" the user photographed. It now shares the HARMONICS title
+                // row, the one row in this box with width to spare, and every pixel it
+                // used to hold comes back to the ticks. See the harmonics block above.
                 // Limit / Whitelist, at the width those two words need - not the whole
                 // cell. It held a 247 px box for a six-letter mode name. The ON switch
                 // takes the space to its right, which that row was already wasting.
@@ -9888,6 +10042,10 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // The prime controls are the harmonic view's; paint() reads empty hc* rects
             // as "draw no harmonic dividers or sub-labels".
             hcBase = hcHarm = hcPrime = {};
+            // ...and with them the width TEMPER was holding in the harmonics title row:
+            // the custom view lays that toggle out somewhere else entirely, and a stale
+            // reservation here would shorten a cell that no longer exists.
+            harmTemperW = 0;
             primeLimitFader.setVisible (false); lblPrimeLimit.setVisible (false);
             primeOnToggle.setVisible (false); // the switch belongs to the harmonic view too
             for (int i = 0; i < 9; ++i) { primeToggle[i].setVisible (false); primeLbl[i].setVisible (false); }

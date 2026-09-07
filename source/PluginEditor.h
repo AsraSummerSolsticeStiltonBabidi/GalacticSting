@@ -822,6 +822,20 @@ private:
     // screen that says so, which is why it is a member and not a local: a row that
     // vanishes with nothing beside it is exactly the silent hiding this build refuses.
     bool primeTicksHidden = false;
+    // TEMPER TO TUNING shares the HARMONICS title row, to the right of the word itself,
+    // so paintedSubLabels() has to give that word a SHORTER cell - exactly as the prime
+    // title does for its RESIZE tag. Set by resized() to the toggle's width plus its gap
+    // (0 when the toggle did not fit and is hidden), read by paintedSubLabels(): the same
+    // "one flag, two places that must agree" arrangement as the two flags above. Without
+    // it the fit sweep measures HARMONICS against a cell the toggle is sitting in, and
+    // the first thing that goes wrong is a window floor measured on a lie.
+    int harmTemperW = 0;
+    // ONE COMMIT AT A TIME. The blur handler runs onReturnKey, and onReturnKey ends in
+    // refocus() -> grabKeyboardFocus(), which is itself a focus change: if the box still
+    // holds focus at that instant the whole handler re-enters, and a spectrum the parser
+    // refuses (so the text never matches what the processor holds) would re-enter forever.
+    // A commit is not a thing that can be inside itself.
+    bool intervalCommitting = false;
     void refreshModWatch();
     void configCombo (juce::ComboBox&, const juce::String& paramID,
                       std::unique_ptr<ComboBoxAttachment>&, juce::Colour, const juce::String& tooltip);
@@ -987,6 +1001,17 @@ public:
     // there and the box holds REAL keyboard focus; otherwise they go straight to it.
     IntervalBoxProbe typeIntervalsProbeForTests (const juce::String& typed, int backspaces,
                                                  bool tickTimer = false);
+
+    // TESTS: TYPED, THEN CLICKED AWAY - never a Return anywhere.
+    //
+    // The other half of "escribo algo en la caja de texto de intervalos y no se aplica":
+    // most people type a list and then reach for a fader, and until now that threw the
+    // list away without a word. Returns what the PROCESSOR ended up holding, because the
+    // only interesting question is whether the sound followed the typing. Drives the real
+    // focusLost path (juce::TextEditor::focusLost is what fires onFocusLost), not the
+    // callback by hand: a probe that calls the handler cannot see a handler that is never
+    // reached.
+    juce::String typeThenBlurForTests (const juce::String& typed);
 
     // TESTS: WHAT HAPPENS TO AN EDIT THAT HAS NOT BEEN APPLIED YET.
     //

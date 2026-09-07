@@ -786,7 +786,27 @@ public:
                     const juce::String t = juce::String::fromUTF8 ("\xe2\x89\x88 ")
                         + (hz >= 1000.0 ? juce::String (hz / 1000.0, 2) + " kHz"
                                         : juce::String ((int) std::lround (hz)) + " Hz");
-                    g.drawFittedText (t, hzArea.toNearestInt(), juce::Justification::centred, 1, 0.4f);
+                    // ...AND IT IS NOT CONDENSED. This was drawn with drawFittedText's
+                    // minimum horizontal scale set to 0.4 - a licence to squeeze the
+                    // glyphs to 40% of their width - and at the SHIPPED 1200x650, with
+                    // nothing hovered, that is what it did: "= 262 Hz" at about 11 px into
+                    // a 29 px key cell. Not an edge case, the default state.
+                    //
+                    // The REFERENCE word one line above solved this years ago and the
+                    // number never inherited the answer: a marker that is wider than its
+                    // key SPILLS over the neighbouring key widths instead of being
+                    // squeezed, because these markers only ever appear on PERIOD keys
+                    // (degree == 0, see the branch condition) and those are a whole period
+                    // apart - 31 keys in 31ED2 - so there is nothing beside them to
+                    // collide with. Measured in the font just set rather than reserved by
+                    // a constant, so "= 20.00 kHz" is as safe as "= 262 Hz", and clamped
+                    // to the component so the first and last markers cannot run off the
+                    // edge instead.
+                    const float need = (float) juce::GlyphArrangement::getStringWidth (g.getCurrentFont(), t) + 4.0f;
+                    const auto hzBand = hzArea
+                        .withSizeKeepingCentre (juce::jmax (hzArea.getWidth(), need), hzArea.getHeight())
+                        .constrainedWithin (getLocalBounds().toFloat());
+                    g.drawFittedText (t, hzBand.toNearestInt(), juce::Justification::centred, 1, 1.0f);
                 }
             }
         }
