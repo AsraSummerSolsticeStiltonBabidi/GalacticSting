@@ -1208,9 +1208,30 @@ bool FractalAdditiveAudioProcessor::loadTimbreFile (const juce::File& f, juce::S
     // the timbre.
     if (f.hasFileExtension ("tun") || TuningManager::looksLikeTun (text))
     {
+        // ASK WHETHER IT IS A READABLE .tun BEFORE BLAMING ITS STRUCTURE. tunToScala fails
+        // for two entirely different reasons and its `errorOut` is what tells them apart:
+        // the file is unreadable (parseTun's own message - a missing [Exact Tuning] block,
+        // a note line that is not a number, fewer than 128 keys), or it reads perfectly and
+        // simply does not repeat. The line below used to overwrite `errorOut` for BOTH, so
+        // a malformed .tun was told the one thing that was not wrong with it - and the
+        // remedy that message offers, "Load it as a TUNING instead", then fails too, because
+        // loadTunString starts with the same parseTun. The user is handed a wrong diagnosis
+        // and a next step that cannot work.
+        //
+        // readTunTable IS parseTun (TuningManager exposes it under that name for exactly
+        // this kind of caller - proving a text will still load without loading it), so this
+        // probe and the conversion below agree by construction rather than by resemblance.
+        // It costs one extra parse of a file the user just picked, on the message thread.
+        std::array<double, 128> probe {};
+        if (! TuningManager::readTunTable (text, probe, errorOut))
+            return false;   // parseTun's own reason, kept verbatim - it is the true one
+
         juce::String scl;
         if (! TuningManager::tunToScala (text, f.getFileNameWithoutExtension(), scl, errorOut))
         {
+            // It reads; it just does not repeat. NOW the structural message is the truth,
+            // and the remedy it offers really does work - loadTunString holds a
+            // non-repeating .tun as an absolute 128-key table.
             errorOut = "This .tun does not repeat at any interval, so it states no degrees "
                        "for the Custom Engine to use. Load it as a TUNING instead - it will "
                        "sound exactly as written.";

@@ -17571,4 +17571,60 @@ static void runProcessorAuditChecks()
                "  a manual-amplitude patch compiles at ITS OWN frozen slope, not at the one "
                "the last patch left behind");
     }
+
+    //-- run 65: A MALFORMED .tun IS TOLD WHAT IS ACTUALLY WRONG WITH IT --------------
+    //
+    // loadTimbreFile overwrote tunToScala's errorOut unconditionally, so a .tun that does
+    // not PARSE was told the one thing that was not wrong with it - that it does not repeat
+    // - and then offered a remedy ("Load it as a TUNING instead") that fails for the same
+    // reason the conversion did. Wrong diagnosis, useless next step.
+    //
+    // Both halves are measured here, because a fix that simply stopped overwriting would
+    // ALSO destroy the structural message that is correct for a non-repeating file.
+    {
+        std::printf ("\nrun 65: a .tun loaded as a spectrum is told the real reason it failed:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                             .getChildFile ("fiblo-run65-"
+                                 + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        dir.createDirectory();
+
+        // (a) A .tun that SNIFFS as one (its section header is decisive) and does not parse:
+        //     it states two of the 128 keys, and the rest would have to be invented.
+        const auto broken = dir.getChildFile ("zzz65-broken.tun");
+        broken.replaceWithText ("[Exact Tuning]\nnote 0 = 0.0\nnote 1 = 100.0\n");
+
+        // (b) A .tun that parses perfectly and genuinely does not repeat: a stretched curve,
+        //     so no key distance anywhere spans the same interval twice.
+        juce::String stretched ("[Exact Tuning]\nbasefreq = 8.1757989156\n");
+        for (int n = 0; n < 128; ++n)
+            stretched << "note " << n << " = "
+                      << juce::String (100.0 * n + 0.05 * n * n, 6) << "\n";
+        const auto nonRepeating = dir.getChildFile ("zzz65-stretched.tun");
+        nonRepeating.replaceWithText (stretched);
+
+        juce::String errBroken, errStretched, errRemedy;
+        check (! p->loadTimbreFile (broken, errBroken), "  the malformed .tun is refused");
+        std::printf ("    malformed: \"%s\"\n", errBroken.toRawUTF8());
+        check (errBroken.contains ("128"),
+               "  ...and the reason it is given is the PARSER'S - the keys it never states");
+        check (! errBroken.contains ("does not repeat"),
+               "  ...not the structural message, which is about a file it never managed to read");
+        check (! p->loadScalaFile (broken, errRemedy),
+               "  (and the remedy the structural message offers really would have failed too)");
+
+        check (! p->loadTimbreFile (nonRepeating, errStretched),
+               "  the non-repeating .tun is refused as a SPECTRUM");
+        std::printf ("    non-repeating: \"%s\"\n", errStretched.toRawUTF8());
+        check (errStretched.contains ("does not repeat"),
+               "  ...and THAT one still gets the structural message, which is true of it");
+        juce::String errTuning;
+        check (p->loadScalaFile (nonRepeating, errTuning),
+               "  ...and the remedy it offers works: the same file loads as a TUNING");
+
+        dir.deleteRecursively();
+    }
 }
