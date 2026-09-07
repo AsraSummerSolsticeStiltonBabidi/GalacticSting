@@ -887,20 +887,62 @@ void FractalAdditiveAudioProcessor::timerCallback()
     // Runs on the message thread (timerCallback), so the parse/load is safe here.
     {
         const int slot = getTuningBankSlotParam();
-        if (slot != lastBankSlot)
+        const bool inRange = slot >= 1 && slot <= kBankSlots;
+        const juce::String src  = inRange ? bankSource[(size_t) (slot - 1)] : juce::String();
+        const juce::String name = inRange ? bankName  [(size_t) (slot - 1)] : juce::String();
+
+        // A CHANGE OF SLOT, OR A FAILED SLOT WHOSE TEXT HAS MOVED - and nothing else.
+        //
+        // `lastBankSlot = slot` used to be the first statement in this block, so the slot
+        // was marked applied before the load had run. A slot whose stored text no longer
+        // parses then switched the SELECTOR and not the TUNING: the combo read "31-EDO",
+        // the instrument went on playing whatever it had, `err` was dropped unread on the
+        // next line, and nothing anywhere said a word. For a microtonal instrument that is
+        // the quiet failure that matters - everything still sounds, and it sounds wrong.
+        //
+        // The sticky index then blocked every retry, which is the same bug from the other
+        // side. Picking that slot again is not a change, so it did nothing; and neither did
+        // the obvious repair of dropping a good file into it, because setTuningBankFile ends
+        // with setTuningBankSlotParam(slot0 + 1), a no-op when that slot is already
+        // selected. The replacement text sat in the bank, correct and unloaded, with the
+        // broken tuning still under the keys.
+        //
+        // SO THE TEXT IS ONLY CONSULTED FOR A SLOT WHOSE LOAD FAILED, and that narrowness
+        // is measured, not cautious. Testing the text unconditionally re-loads a slot
+        // whenever its stored source changes under the same index - which is exactly what
+        // the plugin itself does when a tuning is edited and re-stored - and that stomps the
+        // mode back to Scala on top of whatever is active. syncBankSelector documents that
+        // very hazard two hundred lines up and sets lastBankSlot FIRST to dodge it; a wider
+        // test here walks straight past that guard. Measured on the full suite: 8 checks in
+        // run 14 and three other runs went red, all of them a tuning coming back after a
+        // clearScala or a mode change.
+        if (slot != lastBankSlot || (lastBankFailed && src != lastBankSource))
         {
-            lastBankSlot = slot;
-            if (slot >= 1 && slot <= kBankSlots && bankSource[(size_t) (slot - 1)].isNotEmpty())
+            lastBankSlot   = slot;
+            lastBankSource = src;
+            lastBankFailed = false;
+            if (src.isNotEmpty())
             {
                 juce::String err;
                 // loadTuningString, not loadScalaString: a bank slot may hold .tun text
                 // (a non-repeating .tun has no .scl form), and the .scl parser would
                 // reject it and leave the previous tuning sounding under the new name.
-                if (tuning.loadTuningString (bankSource[(size_t) (slot - 1)], bankName[(size_t) (slot - 1)], err))
+                if (tuning.loadTuningString (src, name, err))
                 {
                     if (auto* pm = apvts.getParameter ("tuningMode"))
                         pm->setValueNotifyingHost (pm->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
                     clearSegmentSource(); // a bank .scl replaces any segment scale
+                }
+                else
+                {
+                    // A SLOT THAT DOES NOT LOAD SAYS SO, and says the parser's own reason.
+                    // Parked rather than shown from here: this poll runs whether or not a
+                    // window exists (host automation moves the slot parameter with the
+                    // editor shut), so the editor collects it on its next tick through
+                    // takeBankSlotError - the same one-shot route a project that loses its
+                    // scale already takes.
+                    lastBankFailed = true;
+                    bankSlotError  = name.isNotEmpty() ? name + " \xe2\x80\x94 " + err : err;
                 }
             }
         }
@@ -1064,6 +1106,11 @@ void FractalAdditiveAudioProcessor::syncBankSelector (int slot0)
 {
     if (! juce::isPositiveAndBelow (slot0, kBankSlots)) return;
     lastBankSlot = slot0 + 1;
+    // The other two halves of "already applied" go with it. The tuning that is active right
+    // now IS this slot's, so recording its text and clearing the failed flag is simply the
+    // truth - and it keeps the retry test above from ever looking at this slot's text again.
+    lastBankSource = bankSource[(size_t) slot0];
+    lastBankFailed = false;
     if (auto* p = apvts.getParameter ("tuningBankSlot"))
         p->setValueNotifyingHost (p->convertTo0to1 ((float) (slot0 + 1)));
 }
@@ -1208,9 +1255,30 @@ bool FractalAdditiveAudioProcessor::loadTimbreFile (const juce::File& f, juce::S
     // the timbre.
     if (f.hasFileExtension ("tun") || TuningManager::looksLikeTun (text))
     {
+        // ASK WHETHER IT IS A READABLE .tun BEFORE BLAMING ITS STRUCTURE. tunToScala fails
+        // for two entirely different reasons and its `errorOut` is what tells them apart:
+        // the file is unreadable (parseTun's own message - a missing [Exact Tuning] block,
+        // a note line that is not a number, fewer than 128 keys), or it reads perfectly and
+        // simply does not repeat. The line below used to overwrite `errorOut` for BOTH, so
+        // a malformed .tun was told the one thing that was not wrong with it - and the
+        // remedy that message offers, "Load it as a TUNING instead", then fails too, because
+        // loadTunString starts with the same parseTun. The user is handed a wrong diagnosis
+        // and a next step that cannot work.
+        //
+        // readTunTable IS parseTun (TuningManager exposes it under that name for exactly
+        // this kind of caller - proving a text will still load without loading it), so this
+        // probe and the conversion below agree by construction rather than by resemblance.
+        // It costs one extra parse of a file the user just picked, on the message thread.
+        std::array<double, 128> probe {};
+        if (! TuningManager::readTunTable (text, probe, errorOut))
+            return false;   // parseTun's own reason, kept verbatim - it is the true one
+
         juce::String scl;
         if (! TuningManager::tunToScala (text, f.getFileNameWithoutExtension(), scl, errorOut))
         {
+            // It reads; it just does not repeat. NOW the structural message is the truth,
+            // and the remedy it offers really does work - loadTunString holds a
+            // non-repeating .tun as an absolute 128-key table.
             errorOut = "This .tun does not repeat at any interval, so it states no degrees "
                        "for the Custom Engine to use. Load it as a TUNING instead - it will "
                        "sound exactly as written.";
@@ -3435,7 +3503,29 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     // single-engine render (defensive - hosts honour their own samplesPerBlock).
     lastBlockSize = juce::jmax (16, samplesPerBlock);
     mixScratch.setSize (2, juce::jmax (512, lastBlockSize));
-    mixInject.ensureSize (512);
+    // THE UNIT IS BYTES, AND THAT IS THE WHOLE DEFECT. MidiBuffer::ensureSize takes BYTES,
+    // not events, and JUCE stores each event as its data plus a 4-byte sample position and a
+    // 2-byte length (juce_MidiBuffer.cpp: getEventTotalSize) - 9 bytes for a note-on. This
+    // buffer used to reserve 512 of them, which is 56 events, and it is filled on the MIX
+    // engage edge with the ENTIRE incoming block PLUS one note-on for every key held at that
+    // instant (see renderSynthMix). Past 56, MidiBuffer reallocates: on the audio thread, in
+    // a render callback, which is the one thing that must never happen here. It was the last
+    // buffer in the plugin still at the old number - NoteGate and MonoGlide reserve 4096, the
+    // lookahead ring 8192.
+    //
+    // SIZED TO THE FILL'S OWN BOUND rather than to a comfortable guess. That fill is a
+    // 16-channel x 128-key loop, so it can emit at most 2048 note-ons = 18,432 bytes; the
+    // rest of this reservation is ~14 kB, about 1,500 more events, for the copy of the
+    // incoming block that goes in beside them. 32 kB, once per prepareToPlay, next to four
+    // sub-engines each holding their own audio buffers.
+    //
+    // WHAT IT STILL DOES NOT COVER, said out loud rather than papered over: the incoming
+    // block is not bounded by anything this plugin owns, so a host block carrying more than
+    // ~1,500 events on top of a full hold would grow the buffer anyway. When that happens
+    // MidiBuffer GROWS - it never drops an event - so the cost is one allocation and never a
+    // lost note. RhythmVerify run 67 measures the bound that IS ours: the 2048-event fill,
+    // against this exact constant.
+    mixInject.ensureSize ((size_t) kMixInjectBytes);
     for (auto& e : mixEng)
         if (e != nullptr)
         {
@@ -3845,6 +3935,30 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         wasSelfPlay = selfPlay;
         keyboardState.allNotesOff (0);
         synth.turnOffAllVoices (false);
+        // THE MIX SUB-ENGINES TOO, and this is not symmetry for its own sake - it is the
+        // same stuck note, one engine over. With MIX engaged a held key is sounding in the
+        // corner engines as well (renderSynthMix feeds them the same stream, and the engage
+        // edge deliberately re-strikes every held key into them), and from the next block on
+        // self-play rewrites every note-OFF onto channel 16. That rewritten off matches
+        // nothing a corner voice is holding, so the corner DRONES FOR EVER: the key is up,
+        // the main engine is silent, and the sound continues with no key to release and no
+        // panic that can reach it - the host's all-notes-off goes to keyboardState and the
+        // main synth, which are already quiet. Routing a partial auto-enables self-play, so
+        // the flip that strands them is one click in the rhythm panel while a note is held.
+        //
+        // MEASURED, and it took a corrected measurement to see it: with the pulses routed to
+        // the SAME note and channel as the held key, the pulse's own gate note-off happened
+        // to release the stranded voice and the whole thing looked fine (that collision is
+        // the hazard the drone's reserved channel 16 exists for, see below). Route them
+        // anywhere else and the corner holds a steady 0.0255 RMS for as long as anyone cares
+        // to render, a full second after the key came up. run 61 does exactly that.
+        //
+        // The two siblings of this kill - the hard-silence backstop at the top of
+        // processBlock and the lookahead flush above - have carried this loop from the day
+        // they were written; this one was missed.
+        for (auto& pe : mixEngLive)
+            if (auto* ce = pe.load (std::memory_order_acquire))
+                ce->synth.turnOffAllVoices (false);
         rhythm.flushOpenGates();
         rhythm.flushEchoes();
         noteGate.prepare (lastSr > 0.0 ? lastSr : getSampleRate());
@@ -4158,6 +4272,30 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         state.appendChild (scl, nullptr);
     }
 
+    // THE HAND-SET REFERENCE, PARKED - and the promise timerCallback makes about it.
+    //
+    // While MTS-ESP is the mode and a master is up, the master OWNS refA: the parameter is
+    // overwritten with what the master is really doing (display only, so the box does not
+    // lie) and the number the user typed lives in manualRefA, handed straight back the
+    // instant MTS stops being the mode. The comment there states it outright - "MTS can
+    // never permanently overwrite a reference the user typed" - and that held for the
+    // session and not one moment longer: refA is a PARAMETER and rode out in the tree
+    // above, while manualRefA and the flag saying it is parked were plain members that
+    // rode nowhere. Type 432, switch to MTS-ESP, save, reopen: the chunk carries the
+    // master's 440 in refA, manualRefA comes back at its 440 default, and no action can
+    // recover the 432 because it was never written down.
+    //
+    // The FLAG travels too, and it is not optional. Without it a project saved in MTS mode
+    // reopens with mtsHadRef false, so leaving MTS looks like it was never entered and the
+    // parked value is never handed back - the number would be saved and still unreachable.
+    state.removeChild (state.getChildWithName ("REFPARK"), nullptr);
+    {
+        juce::ValueTree rp ("REFPARK");
+        rp.setProperty ("manualA", manualRefA, nullptr);
+        rp.setProperty ("mtsOwns", mtsHadRef,  nullptr);
+        state.appendChild (rp, nullptr);
+    }
+
     state.removeChild (state.getChildWithName ("TIMBRE"), nullptr);
     if (timbreSource.isNotEmpty()) // kept even while switched OFF (On/Off toggle)
     {
@@ -4194,6 +4332,31 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         juce::ValueTree pg ("PGAINS");
         pg.setProperty ("v", packed.trim(), nullptr);
         state.appendChild (pg, nullptr);
+    }
+
+    // THE FROZEN SLOPE, which belongs to the drawing above and was travelling nowhere.
+    //
+    // While manual per-partial amplitudes are on, currentSettings() compiles the template at
+    // manualSlopeFrozen instead of at the fader - the amplitudes are the user's drawing, and
+    // the slope the drawing started from is what makes switching manual on inaudible. It is
+    // refreshed on exactly ONE event, the moment manual goes on (timerCallback, and the two
+    // paths that arm manual themselves). Nothing refreshes it on a state load, so a patch
+    // that arrives with manual ALREADY on compiled at whatever the PREVIOUS patch happened
+    // to leave here - this instance's 1.0 default on a fresh instrument, or the last thing
+    // anyone drew in this session.
+    //
+    // That is not cosmetic. The amplitude floor culls by an amplitude that depends on slope:
+    // at -120 dB it removes everything above ratio 10^(6/s), which is nothing at slope 1 and
+    // everything above ratio ~32 at slope 4 (see currentSettings). Load a slope-4 patch and
+    // the template physically lacks the partials the drawing was made on, so the user's own
+    // edits up there stop applying - their work dropped, silently, by a number that came
+    // from a different patch. That is this project's cardinal sin, so the number rides with
+    // the patch.
+    state.removeChild (state.getChildWithName ("MANUALAMP"), nullptr);
+    {
+        juce::ValueTree ma ("MANUALAMP");
+        ma.setProperty ("slope", manualSlopeFrozen, nullptr);
+        state.appendChild (ma, nullptr);
     }
 
     state.removeChild (state.getChildWithName ("BANK"), nullptr);
@@ -4390,6 +4553,11 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     // survives exactly until replaceState runs.
     const bool chunkHasNoDryWet = ! tree.getChildWithProperty ("id", "dryWet").isValid();
 
+    // THE SAME TRAP, ONE PARAMETER YOUNGER: the PRIME CONTROL switch (ce29433). Read on
+    // this line and not below for exactly the reason written above - the absence of the
+    // child is the whole evidence, and replaceState is what manufactures the child.
+    const bool chunkHasNoPrimeOn = ! tree.getChildWithProperty ("id", "primeOn").isValid();
+
     // THE SAME TRAP, ONE PARAMETER OLDER - and the reason this block had to move up here.
     // A state saved before the Harmonics fader existed (98a66ed) is recognised ONLY by the
     // absence of a "harmonics" child, and that evidence dies on the replaceState line below
@@ -4495,6 +4663,36 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
         if (auto* p = apvts.getParameter ("dryWet"))
             p->setValueNotifyingHost (0.0f);
 
+    // AND THE PRIME CONTROL SWITCH, which is the same migration pointing the other way.
+    // "primeOn" shipped in ce29433 and DEFAULTS TO OFF, on purpose and with a measurement
+    // behind it: whitelist mode has no neutral position (ticking all nine primes still
+    // drops harmonic 29, whose factor nobody can tick), and with the bypass removed the
+    // DEFAULT patch built 375 partials instead of 1024. Off is therefore the only honest
+    // default for a patch that never had the control.
+    //
+    // It is the WRONG value for every project written before the switch existed. There,
+    // prime filtering was UNCONDITIONAL - whatever the Limit fader and the nine ticks said
+    // is exactly what the spectrum was, and it is what the user tuned the sound to. Absent
+    // this line those projects reopen with the panel OFF, which PUTS BACK every harmonic
+    // the user deliberately removed: a 5-limit patch comes back with its 7ths, 11ths and
+    // 13ths audible, on a spectrum nobody re-edited, with no dialog and nothing on screen
+    // to say the filter the patch was built around is no longer running. The dryWet line
+    // above and the prime-limit reorder above that are the same failure; this one differs
+    // only in direction - it ADDS partials rather than removing them, so it is heard as a
+    // timbre that has grown teeth rather than as one that went quiet.
+    //
+    // The missing child IS the evidence, and it is decisive: a build that had no switch
+    // could only filter, so filtering is what it must come back as.
+    //
+    // primeMode gets no line of its own, and that is checked rather than assumed. It has
+    // existed since a7eaa51 (the initial commit), so every chunk this migration can ever
+    // see carries its own <PARAM> for it and replaceState applies the saved choice
+    // verbatim. The 0 -> 1 default flip that rode along in ce29433 can only reach a chunk
+    // that predates the PARAMETER, and there is no such chunk.
+    if (chunkHasNoPrimeOn)
+        if (auto* p = apvts.getParameter ("primeOn"))
+            p->setValueNotifyingHost (1.0f);
+
     if (auto ms = tree.getChildWithName ("MODS"); ms.isValid())
     {
         for (int m = 0; m < ModEngine::kMods; ++m)
@@ -4575,6 +4773,29 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
                        [] (const spectrum::PartialGain& a, const spectrum::PartialGain& b)
                        { return a.key < b.key; });
         }
+        // THE SLOPE THE DRAWING WAS MADE AT comes back with it (see captureState for what
+        // was being dropped without this). Restored HERE, beside the edits it belongs to
+        // and before the rebuild request below, so the first template this project compiles
+        // is already the right one rather than a corrected second attempt.
+        //
+        // lastManualMode is put in step in the same breath, and that is load-bearing rather
+        // than tidy: leaving it stale makes timerCallback see a mode TRANSITION on its very
+        // next tick and re-freeze the slope at the fader's current value - which is exactly
+        // the number this line is restoring away from, arriving 16 ms later and undoing it.
+        // Nothing is lost by pre-empting that branch: its other half, the setPartialGains
+        // push that tells the engine whether the edits are in force, is the statement below.
+        //
+        // A chunk that predates this child falls back to the patch's OWN curveSlope, which
+        // replaceState has just restored. That is what the fader reads, it is what the patch
+        // was drawn against, and it is the only slope the file contains - the previous
+        // patch's is not a candidate under any reading.
+        {
+            const auto ma = tree.getChildWithName ("MANUALAMP");
+            manualSlopeFrozen = (float) (double) ma.getProperty ("slope",
+                                    (double) apvts.getRawParameterValue ("curveSlope")->load());
+            lastManualMode = apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+        }
+
         // Through setPartialGains, not the engine directly, so the revision counter is
         // bumped: an open amplitude window would otherwise keep showing the PREVIOUS
         // project's knob positions after a reload (its resync watches that counter).
@@ -4595,7 +4816,32 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
                 bankSource[(size_t) i] = slot.getProperty ("source").toString();
             }
         }
-    lastBankSlot = getTuningBankSlotParam(); // don't re-load on restore; state's SCALA already has it
+    // Don't re-load on restore; the state's SCALA child already carries the tuning. The
+    // whole "already applied" record is primed, not just the index - a restored instance
+    // has attempted nothing and failed at nothing, so the retry test above must not find a
+    // stale failure from this instance's previous life pointing at the new project's slot.
+    lastBankSlot   = getTuningBankSlotParam();
+    lastBankSource = (lastBankSlot >= 1 && lastBankSlot <= kBankSlots)
+                   ? bankSource[(size_t) (lastBankSlot - 1)] : juce::String();
+    lastBankFailed = false;
+
+    // THE PARKED HAND-SET REFERENCE (see captureState for what it is and what was losing
+    // it). Read here, after replaceState so refA below is the RESTORED one, and before the
+    // first timerCallback: that poll hands manualRefA back to refA the moment MTS is not
+    // the mode, so by then it has to hold the user's own number rather than this instance's
+    // 440 default.
+    //
+    // A chunk that predates this carries neither property, and the fallback is the only
+    // reference such a file has: refA itself, which replaceState has just restored. A
+    // project saved OUTSIDE MTS therefore parks its own value (correct, and what leaving a
+    // mode it was never in would hand back anyway); one saved INSIDE MTS parks the master's,
+    // which is exactly what those projects do today - unchanged, not made worse.
+    {
+        const auto rp = tree.getChildWithName ("REFPARK");
+        manualRefA = (float) (double) rp.getProperty ("manualA",
+                         (double) apvts.getRawParameterValue ("refA")->load());
+        mtsHadRef  = (bool) rp.getProperty ("mtsOwns", false);
+    }
 
     if (auto scl = tree.getChildWithName ("SCALA"); scl.isValid())
     {
@@ -4671,6 +4917,38 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     // been renamed or deleted comes back EMPTY rather than silently substituting
     // something else - a playground quietly morphing towards a preset the user never
     // chose is worse than one that visibly lost a corner.
+    //
+    // AND THE CORNER-EDIT SESSION GOES WITH THEM, which is not tidiness - it is what stops
+    // the patch that was just loaded from being overwritten about sixteen milliseconds
+    // later. A corner-edit session holds pgEditLiveState: the WHOLE live patch, frozen at
+    // the moment edit mode was entered, to be handed back when it ends (see rule 1 above
+    // beginPlaygroundCornerEdit). restoreState never mentioned it, so with the corner-edit
+    // window open one click on "Load its original spectrum" - or a project reload, or any
+    // other preset load - left the session standing over a patch that no longer existed.
+    // The corners reset on the line below then make pgActive false, drivePlayground's very
+    // next tick takes the "the playground let go" branch and calls endPlaygroundCornerEdit(),
+    // and that writes the PRE-EDIT patch back parameter by parameter. The user loads a
+    // preset, hears it, and it is silently replaced by the one they had before, with no
+    // click of their own in between.
+    //
+    // A PLAIN RESET, deliberately NOT a call to endPlaygroundCornerEdit(). That function's
+    // entire job is to hand the frozen live patch back - which is precisely the write that
+    // must not happen here, because the patch this instrument should be holding is the one
+    // in `tree`, already applied by replaceState above. It also unwinds the undo stack and
+    // mints a corner-edit step, neither of which belongs to a state load. So the session is
+    // simply forgotten: every field back to what a fresh instance has.
+    pgEditCorner         = -1;
+    pgEditLiveState      = {};
+    pgEditLiveX          = 0.0f;
+    pgEditLiveY          = 0.0f;
+    pgEditLivePresetName = {};
+    pgEditLivePresetSnap.clear();
+    pgEditCompilePending = false;
+    pgEditPrimed         = false;
+    pgEditTick           = 0;
+    pgEditCornerBefore   = {};
+    pgEditStackDepth     = 0;
+    pgEditUnwound        = false;
     for (int i = 0; i < kPlaygroundCorners; ++i)
         pgCorner[(size_t) i] = PlaygroundCorner{};
     pgActive = false; pgWinner = -1; pgRtSuspended = false; pgSuspendedRt = RtLink::Off;
@@ -5042,8 +5320,25 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
 
         const auto keep     = tuning.captureTuning();
         const int  keepMode = getTuningMode();
+        // THE PARKED HAND-SET REFERENCE IS NOT PART OF A PRESET, for the same reason the
+        // active tuning above is not: only the SOUND changes, never what the keys mean.
+        //
+        // It has to be kept EXPLICITLY now that captureState writes it, and this is the one
+        // flow where getting it wrong would lose the very number that fix exists to protect.
+        // While MTS-ESP owns the reference, refA holds the master's display value and the
+        // user's own is parked in manualRefA. Letting a preset's REFPARK land there would
+        // throw the user's number away - and the next poll, seeing the park still in force,
+        // would re-park the preset's value in its place, so leaving MTS would hand back a
+        // reference the user never typed. Kept unconditionally: with no park in force
+        // manualRefA is not read by anything until MTS is next entered, and entering it
+        // overwrites the member from refA anyway.
+        const float keepManualRefA = manualRefA;
+        const bool  keepMtsHadRef  = mtsHadRef;
 
         restoreState (tree);
+
+        manualRefA = keepManualRefA;
+        mtsHadRef  = keepMtsHadRef;
 
         // Put the CURRENTLY ACTIVE tuning back exactly as it was - source, name AND a
         // table's chosen period, which is as much part of "as it was" as the pitches.

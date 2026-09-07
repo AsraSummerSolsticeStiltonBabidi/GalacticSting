@@ -906,6 +906,12 @@ public:
     // the SOUND, not what the keys mean. Same promise loadPreset() already makes.
     static constexpr int kPlaygroundCorners = presetmorph::kCorners;
 
+    // BYTES reserved for the MIX engage-edge injection buffer, sized here (and named, so a
+    // verifier can measure the real number rather than a copy of it) and reserved once in
+    // prepareToPlay. The arithmetic is written out at that call: the unit is BYTES, not
+    // events, and the fill's own bound is the 16 x 128 loop in renderSynthMix.
+    static constexpr int kMixInjectBytes = 32768;
+
     // Put a preset on a corner (empty name clears it). Compiles that preset's spectrum
     // there and then - synchronously, on the message thread, exactly as prepareToPlay's
     // buildNow does - because a corner has to have a template before the very first
@@ -1825,6 +1831,13 @@ private:
     // Tuning bank: per-instance .scl slots (name + raw source), persisted in state.
     std::array<juce::String, kBankSlots> bankName, bankSource;
     int lastBankSlot = 0; // last applied "tuningBankSlot" value (message thread)
+    // ...the SOURCE TEXT of the last load ATTEMPTED for that slot, and whether it failed.
+    // A slot whose load fails keeps its index, so the index alone could never retry it -
+    // not even for the obvious repair of dropping a good file into it. These two let a
+    // FAILED slot be re-attempted when its text changes, and only then. See the bank block
+    // in timerCallback. Message thread.
+    juce::String lastBankSource;
+    bool         lastBankFailed = false;
 
     // Last dissonance-generated .scl (text + display name), for saving to disk,
     // plus the degree/height data shown in the Spectrum-to-Scale panel.
@@ -1836,9 +1849,17 @@ private:
     // failure is parked here rather than raised there. Consumed by takeTuningRestoreError,
     // which clears it: this is a one-shot message about one load, not a state.
     juce::String tuningRestoreError;
+    // THE BANK SLOT THAT DID NOT LOAD, for the editor to show once, on the same one-shot
+    // pattern and for the same reason: the load runs on the processor's timer (host
+    // automation can move that parameter with no window open at all), so the parser's
+    // message is parked here rather than raised from a place that may have no editor.
+    // Consumed by takeBankSlotError, which clears it - one message about one switch.
+    juce::String bankSlotError;
 public:
     juce::String takeTuningRestoreError()
     { auto e = tuningRestoreError; tuningRestoreError.clear(); return e; }
+    juce::String takeBankSlotError()
+    { auto e = bankSlotError; bankSlotError.clear(); return e; }
 private:
     juce::String presetPendingTablePeriod;                     // its table period, if it had one
     // Self-play routing as of the last block: a CHANGE strands notes (see processBlock).

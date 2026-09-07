@@ -1844,6 +1844,10 @@ static void runCpuBenchTemporary()
     }
 }
 
+// The processor-audit runs (60+). Defined at the very END of this file - see the block
+// there - and declared here because main's run list is above it.
+static void runProcessorAuditChecks();
+
 int main (int argc, char** argv)
 {
     // A RIG THAT DIES MUST SAY WHERE. stdout is fully buffered the moment this is run
@@ -1893,6 +1897,16 @@ int main (int argc, char** argv)
     }
 
     if (argc > 1 && std::strcmp (argv[1], "--cpu") == 0) { runCpuBenchTemporary(); return 0; }
+
+    // ONE BLOCK, ON DEMAND: only the processor-audit runs (60+). Same shape and same
+    // reason as --pitch above - these are the runs that have to be re-run under sabotage,
+    // one broken line at a time.
+    if (argc > 1 && std::strcmp (argv[1], "--audit") == 0)
+    {
+        runProcessorAuditChecks();
+        std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
+        return failures == 0 ? 0 : 1;
+    }
 
     const juce::File realPresets = FractalAdditiveAudioProcessor::getPresetFolder();
 
@@ -17510,6 +17524,9 @@ int main (int argc, char** argv)
             check (p.getTimbreSource().trim() == "5/4 3/2 2",
                    "leaving the custom engine and coming back KEEPS the typed spectrum -"
                    " the \"1\" is seeded on a blank slate only");
+        }
+    }
+
     //== A PENCIL DRAG MAY NOT WRAP BACK ONTO ITS OWN PLAN =========================
     //
     // SpectrumEngine has kSlots == 8 and every gains-only republish advances the write
@@ -17972,7 +17989,673 @@ int main (int argc, char** argv)
             b.clear(); p->processBlock (b, off);
         }
     }
+    runProcessorAuditChecks();
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
+}
+
+//==============================================================================
+// THE PROCESSOR AUDIT RUNS (60+). Defined AFTER main and reached through the forward
+// declaration above, so the block sits at the end of the file where it was appended and
+// the run list in main stays a run list.
+//
+// They also have their own switch, `--audit`, for the same reason run 59 has `--pitch`:
+// every one of them has to be re-run under SABOTAGE - break the fix in one line, watch
+// the check go red, restore - and a twenty-minute full suite per sabotage is how sabotage
+// stops being done.
+static void runProcessorAuditChecks()
+{
+    //-- run 60: A PROJECT OLDER THAN THE PRIME SWITCH REOPENS STILL FILTERED ---------
+    //
+    // "primeOn" shipped OFF (ce29433), and OFF is the right default for a patch that never
+    // had the control: the whitelist has no neutral position, and with the bypass removed
+    // the DEFAULT patch built 375 partials instead of 1024. It is the WRONG value for a
+    // project written before the switch existed, where prime filtering was unconditional -
+    // reopening one with the panel off puts back every harmonic the user deliberately
+    // removed, with nothing on screen to say so.
+    //
+    // Measured on the PARTIAL COUNT the engine really built, never on the flag alone: the
+    // flag is the thing the migration writes, so a check on it proves the migration ran
+    // and nothing about whether the spectrum came back filtered.
+    //
+    // The old chunk is made the way the trap makes it - a state saved by THIS build with
+    // its <PARAM id="primeOn"> child deleted, which is exactly what a pre-ce29433 project
+    // carries and exactly what restoreState has to recognise.
+    {
+        std::printf ("\nrun 60: a project older than the PRIME switch reopens still filtered:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            p->pollParametersForTests();
+        };
+
+        awaitSpectrumIdle (*p, "run 60: the unfiltered default");
+        const int nUnfiltered = p->getTemplatePartialCount();
+
+        // Limit mode at the "2" stop - only the powers of two survive - so the filtered and
+        // unfiltered counts are far apart and no rounding or race can make one look like
+        // the other.
+        sp ("primeMode",  0.0f);
+        sp ("primeLimit", 9.0f);
+        sp ("primeOn",    1.0f);
+        awaitSpectrumIdle (*p, "run 60: limit 2 in force");
+        const int nFiltered = p->getTemplatePartialCount();
+        std::printf ("    limit 2 in force: %d partials (unfiltered is %d)\n", nFiltered, nUnfiltered);
+        check (nFiltered > 0 && nFiltered < nUnfiltered / 4,
+               "  (precondition: the saved patch's prime filter really does bite)");
+
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize());
+        check (xml != nullptr, "  the saved chunk parses back to XML");
+
+        juce::XmlElement* victim = nullptr;
+        if (xml != nullptr)
+            for (auto* e : xml->getChildIterator())
+                if (e->getStringAttribute ("id") == "primeOn") { victim = e; break; }
+        if (victim != nullptr) xml->removeChildElement (victim, true);
+        check (victim != nullptr,
+               "  ...and its primeOn child is removed, which is what makes it a pre-ce29433 project");
+
+        juce::MemoryBlock old;
+        if (xml != nullptr) juce::AudioProcessor::copyXmlToBinary (*xml, old);
+
+        auto q = std::make_unique<Proc>();
+        q->prepareToPlay (48000.0, 256);
+        check (q->apvts.getRawParameterValue ("primeOn")->load() < 0.5f,
+               "  (precondition: a fresh instance really does start with the switch OFF)");
+        q->setStateInformation (old.getData(), (int) old.getSize());
+        for (int i = 0; i < 4; ++i) q->pollParametersForTests();
+        awaitSpectrumIdle (*q, "run 60: the old project, restored");
+        const int nBack = q->getTemplatePartialCount();
+        std::printf ("    reopened: primeOn = %.0f, %d partials\n",
+                     q->apvts.getRawParameterValue ("primeOn")->load(), nBack);
+        check (q->apvts.getRawParameterValue ("primeOn")->load() > 0.5f,
+               "  a chunk with no primeOn child comes back with the panel ON");
+        check (nBack == nFiltered,
+               "  ...and the spectrum is the filtered one the project was written with, not "
+               "the whole harmonic series");
+    }
+
+    //-- run 61: A SELF-PLAY FLIP LEAVES NO MIX CORNER DRONING ------------------------
+    //
+    // Self-play rewrites every note-OFF onto channel 16. A note that started before it
+    // engaged is sounding on the channel it was PLAYED on, and MPE legacy matching is by
+    // (channel, note), so its note-off never reaches that voice. processBlock has always
+    // known this - it kills the main engine's voices on the flip and says so in a comment
+    // headed "THE stuck-note bug" - but it killed only the MAIN engine, and with MIX
+    // engaged the corners are holding the same key (the engage edge deliberately re-strikes
+    // every held key into them). The corner then drones for ever: key up, main engine
+    // silent, sound continuing, and the host's panic cannot reach it because that goes to
+    // keyboardState and the main synth, which are already quiet. Routing a partial
+    // auto-enables self-play, so the flip is one click while a note is held.
+    //
+    // MEASURED ON THE OUTPUT, not on a flag: "is this instrument still making a sound"
+    // is the entire complaint, and no flag can answer it. By the time of the flip the
+    // engage crossfade has run to completion (50 ms time constant, 0.8 s of render), so
+    // the main engine's own bus is at sqrt(1-x) ~ 0 and every sample left in the buffer
+    // is a corner's.
+    {
+        std::printf ("\nrun 61: a self-play flip strands no MIX corner voice:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        // The user's preset folder is not a scratch directory (see the top of this file).
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run61-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        struct ScratchFolder
+        {
+            explicit ScratchFolder (const juce::File& d)
+                : dir (d), prev (Proc::getPresetFolder()) { Proc::setPresetFolderForTests (d); }
+            ~ScratchFolder() { Proc::setPresetFolderForTests (prev); dir.deleteRecursively(); }
+            juce::File dir, prev;
+        } guard (scratch);
+
+        const double sr = 48000.0;
+        const int    blk = 256;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (sr, blk);
+        juce::AudioBuffer<float> buf (2, blk);
+
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            p->pollParametersForTests();
+        };
+        const auto blockRms = [&buf, blk]
+        {
+            double s = 0.0;
+            const int ch = juce::jmax (1, buf.getNumChannels());
+            for (int c = 0; c < ch; ++c)
+                for (int i = 0; i < blk; ++i) { const double v = buf.getSample (c, i); s += v * v; }
+            return std::sqrt (s / (double) (blk * ch));
+        };
+        // The LOUDEST block of the stretch, never the mean: a drone that is averaged
+        // against the silence around it stops looking like a drone.
+        const auto render = [&] (double seconds, juce::MidiBuffer first)
+        {
+            double peak = 0.0;
+            const int blocks = juce::jmax (1, (int) (seconds * sr / (double) blk));
+            for (int i = 0; i < blocks; ++i)
+            {
+                juce::MidiBuffer m;
+                if (i == 0) m = std::move (first);
+                buf.clear();
+                p->processBlock (buf, m);
+                peak = juce::jmax (peak, blockRms());
+                p->pollParametersForTests();
+            }
+            return peak;
+        };
+
+        // A release short enough that "the tail has finished" is unambiguous, and a
+        // sustain high enough that a stranded voice is loud rather than marginal.
+        sp ("ampAttack", 0.005f); sp ("ampDecay", 0.050f);
+        sp ("ampSustain", 0.9f);  sp ("ampRelease", 0.050f);
+        sp ("dryWet", 0.0f); sp ("morph", 0.0f);   // nothing else crossfading under the measurement
+        check (p->savePreset ("zzz61-A").isNotEmpty(), "  corner preset A saved");
+        check (p->savePreset ("zzz61-B").isNotEmpty(), "  corner preset B saved");
+
+        juce::String err;
+        sp ("pgMode", 1.0f); sp ("pgX", 0.0f); sp ("pgY", 0.0f);
+        check (p->assignPlaygroundCorner (0, "zzz61-A", err), "  A hangs on corner 0");
+        check (p->assignPlaygroundCorner (1, "zzz61-B", err), "  B hangs on corner 1");
+        render (0.3, {});
+        check (p->isPlaygroundMixMode() && p->isPlaygroundMixEngaged(),
+               "  two corners + mix mode = the mix is engaged and sounding");
+
+        juce::MidiBuffer on;
+        on.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+        const double held = render (0.8, on);     // engage crossfade fully settled
+        std::printf ("    key held under the mix: loudest block %.6f\n", held);
+        check (held > 1.0e-3,
+               "  (precondition: the held key really is sounding through the corner engines)");
+
+        // THE FLIP. Routing a partial is what a user does in the rhythm panel, and it is
+        // what auto-enables self-play - the exact gesture that strands the voice.
+        //
+        // THE PULSE IS ROUTED AWAY FROM THE HELD KEY ON PURPOSE, and the first version of
+        // this run got that wrong in a way worth writing down. With the default routing the
+        // pulses came out as note 60 on channel 1 - the SAME (channel, note) as the key
+        // being held - so the pulse's own gate note-off released the stranded corner voice
+        // and the whole run passed with the fix removed. That is the hazard the drone's
+        // reserved channel 16 exists for, quoted in processBlock: "a pulse landing on the
+        // same channel+note would otherwise kill the drone voice with its gate note-off".
+        // It masks the bug rather than fixing it - change the routed partial, the tuning or
+        // the octave and the collision is gone - so the pulses are put on 3/1, which lands
+        // near note 79 and can never close a gate on note 60.
+        p->getRhythm().slots[0].partial  = 1;
+        p->getRhythm().slots[0].useRatio = true;
+        p->getRhythm().slots[0].ratio    = 3.0;
+        p->getRhythm().slots[0].steps    = 0;
+        p->getRhythm().slots[0].durMs    = 20.0f;
+        p->getRhythm().slots[0].vel      = 100;
+        p->getRhythm().slots[0].enabled  = true;
+        sp ("rhythmSelfPlay", 1.0f);
+        const double atFlip = render (0.1, {});    // the flip happens on the first block here
+        std::printf ("    the 100 ms across the flip: loudest block %.6f (mix still engaged: %d)\n",
+                     atFlip, (int) p->isPlaygroundMixEngaged());
+
+        // ...and the key comes up. Self-play rewrites this onto channel 16, which is the
+        // whole point: it matches nothing the corner is holding.
+        juce::MidiBuffer off;
+        off.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+        render (1.0, off);                         // pulses stop, every tail runs out
+        const double after = render (0.5, {});     // ...and THIS stretch must be silence
+        std::printf ("    a second after the key came up: loudest block %.6f (was %.6f)\n",
+                     after, held);
+        check (after < held * 0.02,
+               "  the instrument is SILENT after the key is released across a self-play flip - "
+               "no corner voice is left droning");
+    }
+
+    //-- run 62: A CORNER-EDIT SESSION DOES NOT SURVIVE A STATE LOAD ------------------
+    //
+    // While a corner is being edited the main controls are a SCRATCH SURFACE and the real
+    // live patch is frozen in pgEditLiveState, to be written back parameter by parameter
+    // when the session ends (rule 1 above beginPlaygroundCornerEdit). restoreState never
+    // mentioned that session, so it outlived the patch it was frozen from: loading a preset
+    // reset the corners, the reset made pgActive false, and drivePlayground's next tick -
+    // one 60 Hz frame, about 16 ms later - took the "the playground let go" branch and
+    // called endPlaygroundCornerEdit(), which wrote the PRE-EDIT patch over the one that
+    // had just been loaded. One click on "Load its original spectrum" with the corner-edit
+    // window open, and what you hear a frame later is the patch you had before.
+    //
+    // masterGain is the probe: three distinct values, one for the corner, one for the live
+    // patch, one for the preset being loaded, so whichever of the three arrives NAMES what
+    // happened rather than merely failing.
+    {
+        std::printf ("\nrun 62: a corner-edit session does not overwrite a loaded patch:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run62-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        struct ScratchFolder
+        {
+            explicit ScratchFolder (const juce::File& d)
+                : dir (d), prev (Proc::getPresetFolder()) { Proc::setPresetFolderForTests (d); }
+            ~ScratchFolder() { Proc::setPresetFolderForTests (prev); dir.deleteRecursively(); }
+            juce::File dir, prev;
+        } guard (scratch);
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            p->pollParametersForTests();
+        };
+        const auto gain = [&] { return (double) p->apvts.getRawParameterValue ("masterGain")->load(); };
+
+        sp ("masterGain", -3.0f);
+        check (p->savePreset ("zzz62-LOADED").isNotEmpty(), "  the preset that will be loaded is saved (-3 dB)");
+        sp ("masterGain", -30.0f);
+        check (p->savePreset ("zzz62-CORNER").isNotEmpty(), "  the corner being edited is saved (-30 dB)");
+        sp ("masterGain", -20.0f);
+        check (p->savePreset ("zzz62-OTHER").isNotEmpty(), "  the second corner is saved (-20 dB)");
+
+        // TWO corners, because that is what engages the playground (see
+        // refreshPlaygroundActive), and the point parked on the OTHER one - so the patch
+        // frozen on the way into edit mode is -20, the corner under the controls is -30 and
+        // the preset about to be loaded is -3. Three distinct values: whichever arrives
+        // names what happened instead of merely failing.
+        juce::String err;
+        sp ("pgMode", 0.0f);   // morph mode - the corner is pinned under the controls
+        check (p->assignPlaygroundCorner (0, "zzz62-CORNER", err), "  the edited corner is assigned");
+        check (p->assignPlaygroundCorner (1, "zzz62-OTHER",  err), "  and a second corner engages the pad");
+        sp ("pgX", 1.0f); sp ("pgY", 0.0f);
+        for (int i = 0; i < 8; ++i) p->pollParametersForTests();
+        std::printf ("    parked on the second corner: masterGain reads %+.2f dB (this is the "
+                     "patch edit mode freezes)\n", gain());
+        check (std::abs (gain() - (-20.0)) < 0.01,
+               "  (precondition: the live surface really is the second corner's -20 dB)");
+        check (p->beginPlaygroundCornerEdit (0), "  ...and corner 0 goes into corner-edit mode");
+        for (int i = 0; i < 4; ++i) p->pollParametersForTests();
+        std::printf ("    editing corner 0: masterGain reads %+.2f dB\n", gain());
+        check (p->getPlaygroundEditCorner() == 0,
+               "  (precondition: the session really is open on corner 0)");
+
+        // The click. The preset's own state carries no PLAYGROUND child, so restoring it
+        // empties the corners - which is what used to fire endPlaygroundCornerEdit().
+        check (p->loadPreset ("zzz62-LOADED"), "  a preset is loaded while the session is open");
+        const double justAfter = gain();
+        for (int i = 0; i < 12; ++i) p->pollParametersForTests();   // well past the 16 ms
+        const double settled = gain();
+        std::printf ("    after the load: %+.2f dB, and %d ticks later: %+.2f dB"
+                     " (the edited corner is -30, the frozen pre-edit patch -20)\n",
+                     justAfter, 12, settled);
+        check (std::abs (justAfter - (-3.0)) < 0.01, "  the load itself applies the preset");
+        check (std::abs (settled - (-3.0)) < 0.01,
+               "  ...and it is STILL the loaded preset a dozen ticks later - no frozen live "
+               "patch is written back over it");
+        check (p->getPlaygroundEditCorner() < 0,
+               "  the corner-edit session is gone with the corners it was editing");
+    }
+
+    //-- run 63: MTS CANNOT PERMANENTLY EAT A REFERENCE THE USER TYPED ----------------
+    //
+    // In MTS-ESP mode the master owns refA: the parameter is overwritten with what the
+    // master is really doing and the user's own number is parked in manualRefA, handed back
+    // the moment MTS stops being the mode. timerCallback says so in as many words. But refA
+    // is a parameter and was saved; manualRefA and the flag that says it is parked were
+    // plain members and were not. Type 432, switch to MTS-ESP, save, reopen: the chunk
+    // carries the master's 440, the park comes back at its 440 default, and 432 is gone
+    // beyond any recovery - it was never written down.
+    //
+    // An MTS master cannot be conjured in a verifier, so this drives the OTHER half of the
+    // journey, which is the half that was broken: a chunk that was saved with the reference
+    // parked, reopened on a machine with no master. It first checks that this build's own
+    // captureState really does write that child with both properties, so the fabricated
+    // chunk below is this build's format and not a shape invented by the test.
+    {
+        std::printf ("\nrun 63: a reference typed before MTS survives save and reload:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize());
+        check (xml != nullptr, "  the saved chunk parses back to XML");
+        auto* park = xml != nullptr ? xml->getChildByName ("REFPARK") : nullptr;
+        check (park != nullptr && park->hasAttribute ("manualA") && park->hasAttribute ("mtsOwns"),
+               "  captureState writes the parked reference AND the flag that says it is parked");
+
+        // The state a project saved under an MTS master carries: the master's 440 on the
+        // face of it, the user's 432 parked behind it.
+        if (park != nullptr)
+        {
+            park->setAttribute ("manualA", 432.0);
+            park->setAttribute ("mtsOwns", 1);
+        }
+        if (xml != nullptr)
+        {
+            if (auto* ra = xml->getChildByAttribute ("id", "refA"))   ra->setAttribute ("value", 440.0);
+            if (auto* tm = xml->getChildByAttribute ("id", "tuningMode")) tm->setAttribute ("value", 1.0); // MTS-ESP
+        }
+        juce::MemoryBlock saved;
+        if (xml != nullptr) juce::AudioProcessor::copyXmlToBinary (*xml, saved);
+
+        auto q = std::make_unique<Proc>();
+        q->prepareToPlay (48000.0, 256);
+        check (! q->tuningHasMaster(),
+               "  (precondition: this machine has no MTS-ESP master, so leaving MTS is what "
+               "the reopened project does)");
+        q->setStateInformation (saved.getData(), (int) saved.getSize());
+        for (int i = 0; i < 4; ++i) q->pollParametersForTests();
+        const double back = (double) q->apvts.getRawParameterValue ("refA")->load();
+        std::printf ("    reopened with no master: refA reads %.3f Hz (the chunk's face value was 440)\n", back);
+        check (std::abs (back - 432.0) < 0.05,
+               "  the hand-set 432 comes back - MTS did not permanently overwrite it");
+    }
+
+    //-- run 64: A PATCH LOADED WITH MANUAL AMPLITUDES ON COMPILES AT ITS OWN SLOPE ---
+    //
+    // With manual per-partial amplitudes on, the template is compiled at manualSlopeFrozen
+    // rather than at the fader. That member was refreshed on exactly one event - the moment
+    // manual goes ON - and was saved nowhere, so a patch that ARRIVES with manual already on
+    // compiled at whatever the previous patch left behind.
+    //
+    // It is measured on the partial COUNT because that is where it hurts: the amplitude
+    // floor culls by an amplitude that depends on slope, so at slope 4 the template
+    // physically lacks everything above ratio ~32. Load a slope-1 drawing into an instrument
+    // whose stale frozen slope is 4 and most of the spectrum the drawing was made on is not
+    // in the template at all - the user's own edits up there stop applying, silently.
+    {
+        std::printf ("\nrun 64: a manual-amplitude patch reopens at the slope it was drawn at:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto writer = std::make_unique<Proc>();
+        writer->prepareToPlay (48000.0, 256);
+        const auto spw = [&] (const char* id, float v)
+        {
+            if (auto* q = writer->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            writer->pollParametersForTests();
+        };
+        spw ("curveSlope", 1.0f);
+        spw ("partialManual", 1.0f);          // freezes the slope at 1.0
+        awaitSpectrumIdle (*writer, "run 64: the shallow patch");
+        const int nShallow = writer->getTemplatePartialCount();
+        juce::MemoryBlock st;
+        writer->getStateInformation (st);
+
+        // The reader is an instrument that has just been drawing at slope 4 - which is all
+        // it takes for the stale number to be wrong.
+        auto reader = std::make_unique<Proc>();
+        reader->prepareToPlay (48000.0, 256);
+        const auto spr = [&] (const char* id, float v)
+        {
+            if (auto* q = reader->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            reader->pollParametersForTests();
+        };
+        spr ("curveSlope", 4.0f);
+        spr ("partialManual", 1.0f);          // freezes the slope at 4.0
+        awaitSpectrumIdle (*reader, "run 64: the steep patch");
+        const int nSteep = reader->getTemplatePartialCount();
+        std::printf ("    slope 1 builds %d partials, slope 4 builds %d\n", nShallow, nSteep);
+        check (nSteep > 0 && nSteep < nShallow / 4,
+               "  (precondition: the compile slope really does decide how much spectrum exists)");
+
+        reader->setStateInformation (st.getData(), (int) st.getSize());
+        for (int i = 0; i < 4; ++i) reader->pollParametersForTests();
+        awaitSpectrumIdle (*reader, "run 64: the shallow patch, reopened on the steep instrument");
+        const int nBack = reader->getTemplatePartialCount();
+        std::printf ("    the slope-1 patch reopened on the slope-4 instrument: %d partials\n", nBack);
+        check (nBack == nShallow,
+               "  a manual-amplitude patch compiles at ITS OWN frozen slope, not at the one "
+               "the last patch left behind");
+    }
+
+    //-- run 65: A MALFORMED .tun IS TOLD WHAT IS ACTUALLY WRONG WITH IT --------------
+    //
+    // loadTimbreFile overwrote tunToScala's errorOut unconditionally, so a .tun that does
+    // not PARSE was told the one thing that was not wrong with it - that it does not repeat
+    // - and then offered a remedy ("Load it as a TUNING instead") that fails for the same
+    // reason the conversion did. Wrong diagnosis, useless next step.
+    //
+    // Both halves are measured here, because a fix that simply stopped overwriting would
+    // ALSO destroy the structural message that is correct for a non-repeating file.
+    {
+        std::printf ("\nrun 65: a .tun loaded as a spectrum is told the real reason it failed:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                             .getChildFile ("fiblo-run65-"
+                                 + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        dir.createDirectory();
+
+        // (a) A .tun that SNIFFS as one (its section header is decisive) and does not parse:
+        //     it states two of the 128 keys, and the rest would have to be invented.
+        const auto broken = dir.getChildFile ("zzz65-broken.tun");
+        broken.replaceWithText ("[Exact Tuning]\nnote 0 = 0.0\nnote 1 = 100.0\n");
+
+        // (b) A .tun that parses perfectly and genuinely does not repeat: a stretched curve,
+        //     so no key distance anywhere spans the same interval twice.
+        juce::String stretched ("[Exact Tuning]\nbasefreq = 8.1757989156\n");
+        for (int n = 0; n < 128; ++n)
+            stretched << "note " << n << " = "
+                      << juce::String (100.0 * n + 0.05 * n * n, 6) << "\n";
+        const auto nonRepeating = dir.getChildFile ("zzz65-stretched.tun");
+        nonRepeating.replaceWithText (stretched);
+
+        juce::String errBroken, errStretched, errRemedy;
+        check (! p->loadTimbreFile (broken, errBroken), "  the malformed .tun is refused");
+        std::printf ("    malformed: \"%s\"\n", errBroken.toRawUTF8());
+        check (errBroken.contains ("128"),
+               "  ...and the reason it is given is the PARSER'S - the keys it never states");
+        check (! errBroken.contains ("does not repeat"),
+               "  ...not the structural message, which is about a file it never managed to read");
+        check (! p->loadScalaFile (broken, errRemedy),
+               "  (and the remedy the structural message offers really would have failed too)");
+
+        check (! p->loadTimbreFile (nonRepeating, errStretched),
+               "  the non-repeating .tun is refused as a SPECTRUM");
+        std::printf ("    non-repeating: \"%s\"\n", errStretched.toRawUTF8());
+        check (errStretched.contains ("does not repeat"),
+               "  ...and THAT one still gets the structural message, which is true of it");
+        juce::String errTuning;
+        check (p->loadScalaFile (nonRepeating, errTuning),
+               "  ...and the remedy it offers works: the same file loads as a TUNING");
+
+        dir.deleteRecursively();
+    }
+
+    //-- run 66: A BANK SLOT THAT DOES NOT LOAD SAYS SO, AND CAN BE REPAIRED ----------
+    //
+    // The slot was marked applied BEFORE the load ran, so a slot whose stored text no longer
+    // parses moved the SELECTOR and not the TUNING - and `err` was dropped unread, so the
+    // combo said one thing, the instrument played another, and nothing said a word. The
+    // sticky index then blocked every retry, including the obvious repair: setTuningBankFile
+    // ends with setTuningBankSlotParam(slot + 1), which is a no-op when that slot is already
+    // selected, so a good file dropped into the broken slot sat there unloaded.
+    {
+        std::printf ("\nrun 66: a bank slot that cannot be loaded is stated, and repairable:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        // A slot holding text that does not parse. It gets there through the state, which is
+        // how it gets there in life too - a project written by an older build, a hand-edited
+        // .gsting, a format that has moved on.
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize());
+        check (xml != nullptr, "  the saved chunk parses back to XML");
+        if (xml != nullptr)
+        {
+            xml->removeChildElement (xml->getChildByName ("BANK"), true);
+            auto* bank = xml->createNewChildElement ("BANK");
+            auto* slot = bank->createNewChildElement ("SLOT");
+            slot->setAttribute ("i", 0);
+            slot->setAttribute ("name", "zzz66-broken");
+            slot->setAttribute ("source", "this is not a scale, and never was");
+        }
+        juce::MemoryBlock withBank;
+        if (xml != nullptr) juce::AudioProcessor::copyXmlToBinary (*xml, withBank);
+
+        auto q = std::make_unique<Proc>();
+        q->prepareToPlay (48000.0, 256);
+        q->setStateInformation (withBank.getData(), (int) withBank.getSize());
+        for (int i = 0; i < 3; ++i) q->pollParametersForTests();
+        q->takeBankSlotError();                       // anything the restore itself parked
+        const int    degBefore = q->getScaleDegrees();
+        const double hzBefore  = q->getNoteFrequency (61);
+
+        q->setTuningBankSlotParam (1);                // pick the broken slot
+        for (int i = 0; i < 3; ++i) q->pollParametersForTests();
+        const auto stated = q->takeBankSlotError();
+        std::printf ("    selecting the broken slot: degrees %d -> %d, key 61 %.4f -> %.4f Hz,"
+                     " message \"%s\"\n",
+                     degBefore, q->getScaleDegrees(), hzBefore, q->getNoteFrequency (61),
+                     stated.toRawUTF8());
+        check (q->getScaleDegrees() == degBefore
+               && std::abs (q->getNoteFrequency (61) - hzBefore) < 1.0e-6,
+               "  the tuning does not change under a slot that could not be loaded");
+        check (stated.isNotEmpty(),
+               "  ...and the failure is STATED, with the parser's own reason, instead of dropped");
+
+        // THE REPAIR, into the slot that is already selected - the case the sticky index
+        // made impossible.
+        const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                             .getChildFile ("fiblo-run66-"
+                                 + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        dir.createDirectory();
+        const auto good = dir.getChildFile ("zzz66-good.scl");
+        good.replaceWithText ("! zzz66-good.scl\n5 equal steps of the octave\n 5\n"
+                              " 240.0\n 480.0\n 720.0\n 960.0\n 1200.0\n");
+        check (q->getTuningBankSlotParam() == 1,
+               "  (precondition: the broken slot is still the selected one)");
+        p->takeBankSlotError();
+        q->setTuningBankFile (0, good);
+        for (int i = 0; i < 3; ++i) q->pollParametersForTests();
+        std::printf ("    after dropping a 5-degree scale into the SAME slot: degrees %d\n",
+                     q->getScaleDegrees());
+        check (q->getScaleDegrees() == 5,
+               "  a good file dropped into the broken slot loads, even though that slot was "
+               "already selected");
+
+        dir.deleteRecursively();
+    }
+
+    //-- run 67: THE MIX INJECTION BUFFER DOES NOT REALLOCATE ON THE AUDIO THREAD -----
+    //
+    // MidiBuffer::ensureSize takes BYTES and this one used to reserve 512 of them - 56
+    // events at 9 bytes each - for a fill whose own bound is a 16 x 128 loop plus a copy of
+    // the incoming block. Past 56 it reallocates inside processBlock, which is the one thing
+    // that must not happen there.
+    //
+    // MEASURED AS A REALLOCATION, not as a number compared with itself: the buffer's storage
+    // pointer is taken after the reservation and again after the worst-case fill, and a
+    // pointer that moved IS the allocation. The reservation read here is the processor's own
+    // constant, so putting 512 back into kMixInjectBytes turns this check red.
+    //
+    // The control below is what stops it from being vacuous: the same fill through a 512-byte
+    // reservation must MOVE the pointer, or the fill is too small to be proving anything.
+    {
+        std::printf ("\nrun 67: the MIX engage-edge buffer is reserved in bytes, not in hope:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+
+        // renderSynthMix's engage fill, exactly: every (channel, key) the held-key table can
+        // hold. 16 x 128 = 2048 note-ons is the loop's own ceiling, not a guess at a chord.
+        const auto fill = [] (juce::MidiBuffer& b)
+        {
+            for (int ch = 0; ch < 16; ++ch)
+                for (int k = 0; k < 128; ++k)
+                    b.addEvent (juce::MidiMessage::noteOn (ch + 1, k, (juce::uint8) 100), 0);
+        };
+
+        juce::MidiBuffer sized;
+        sized.ensureSize ((size_t) Proc::kMixInjectBytes);
+        const auto* before = sized.data.getRawDataPointer();
+        fill (sized);
+        const auto* after = sized.data.getRawDataPointer();
+
+        juce::MidiBuffer old;
+        old.ensureSize (512);                       // what it used to reserve
+        const auto* oldBefore = old.data.getRawDataPointer();
+        fill (old);
+        const bool oldMoved = old.data.getRawDataPointer() != oldBefore;
+
+        std::printf ("    2048 note-ons = %d bytes; reserved %d, moved = %d"
+                     " (at the old 512: moved = %d)\n",
+                     sized.data.size(), Proc::kMixInjectBytes, (int) (after != before), (int) oldMoved);
+        check (oldMoved,
+               "  (precondition: the engage fill really is bigger than the old 512-byte "
+               "reservation)");
+        check (after == before,
+               "  a full 16 x 128 engage fill does not reallocate the MIX injection buffer");
+    }
+
+    //-- run 68: A PRESET DOES NOT CARRY OFF THE PARKED REFERENCE ---------------------
+    //
+    // The other half of run 63, and the one that only became possible to get wrong once
+    // captureState started writing the park at all. loadPreset changes the SOUND and never
+    // what the keys mean: it captures the active tuning and the tuning mode around
+    // restoreState and puts them back. The parked hand-set reference belongs to that same
+    // promise - while MTS owns the box, refA is the master's display value and the user's
+    // own number lives in manualRefA - so a preset's REFPARK landing there would throw the
+    // user's number away, and the next poll, seeing the park still in force, would re-park
+    // the PRESET's value in its place. Leaving MTS would then hand back a reference nobody
+    // typed.
+    //
+    // An MTS master cannot be conjured here either, so the park is installed the way run 63
+    // installs it - through a chunk - and the poll that would consume it is deliberately not
+    // run until after the preset load. That is exactly the window the flow has in life: the
+    // user is in MTS with their number parked, and clicks a preset.
+    {
+        std::printf ("\nrun 68: loading a preset does not carry off the parked reference:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run68-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        struct ScratchFolder
+        {
+            explicit ScratchFolder (const juce::File& d)
+                : dir (d), prev (Proc::getPresetFolder()) { Proc::setPresetFolderForTests (d); }
+            ~ScratchFolder() { Proc::setPresetFolderForTests (prev); dir.deleteRecursively(); }
+            juce::File dir, prev;
+        } guard (scratch);
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+        if (auto* ra = p->apvts.getParameter ("refA"))
+            ra->setValueNotifyingHost (ra->convertTo0to1 (440.0f));
+        p->pollParametersForTests();
+        check (p->savePreset ("zzz68-P").isNotEmpty(),
+               "  a preset saved at 440 - its own park is 440, and it must not travel");
+
+        // The chunk of a project saved under a master: 440 on the face of it, 432 parked.
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize());
+        if (auto* park = xml != nullptr ? xml->getChildByName ("REFPARK") : nullptr)
+        {
+            park->setAttribute ("manualA", 432.0);
+            park->setAttribute ("mtsOwns", 1);
+        }
+        if (xml != nullptr)
+        {
+            if (auto* ra = xml->getChildByAttribute ("id", "refA"))       ra->setAttribute ("value", 440.0);
+            if (auto* tm = xml->getChildByAttribute ("id", "tuningMode")) tm->setAttribute ("value", 1.0);
+        }
+        juce::MemoryBlock saved;
+        if (xml != nullptr) juce::AudioProcessor::copyXmlToBinary (*xml, saved);
+
+        auto q = std::make_unique<Proc>();
+        q->prepareToPlay (48000.0, 256);
+        q->setStateInformation (saved.getData(), (int) saved.getSize());
+        // NOT polled: the park is live at this instant, which is the state a player is in
+        // when they click a preset while MTS is driving the reference.
+        check (q->loadPreset ("zzz68-P"), "  ...and a preset is loaded while the park is live");
+        for (int i = 0; i < 4; ++i) q->pollParametersForTests();
+        const double back = (double) q->apvts.getRawParameterValue ("refA")->load();
+        std::printf ("    after the preset load: refA reads %.3f Hz (the preset's own is 440)\n", back);
+        check (std::abs (back - 432.0) < 0.05,
+               "  the parked 432 survives the preset - a preset changes the sound, not the "
+               "reference the user typed");
+    }
 }
