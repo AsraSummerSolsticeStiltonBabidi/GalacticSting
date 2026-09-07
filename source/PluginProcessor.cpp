@@ -5314,9 +5314,23 @@ juce::String FractalAdditiveAudioProcessor::savePreset (const juce::String& name
 
 bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
 {
+    // A FAILED PRESET LOAD IS STATED. Every `return false` below used to be silent, and
+    // the one caller drops the bool: the name stayed in the box, the PREVIOUS preset went
+    // on sounding, and the Tuning panel went on offering the previous preset's scale. The
+    // player is told they loaded something they did not. Parked rather than shown from
+    // here for the same reason tuningRestoreError is - the editor may not exist (the
+    // playground assigns corners with the window shut) - and consumed the same way.
+    presetLoadError.clear();
+    const auto refuse = [this, &name] (const juce::String& why)
+    {
+        presetLoadError = name.isNotEmpty() ? name + " \xe2\x80\x94 " + why : why;
+        return false;
+    };
+
     auto file = presetFile (name);
     if (! file.existsAsFile())
-        return false;
+        return refuse ("there is no preset by that name in the preset folder. Nothing was "
+                       "loaded - the patch you were playing is untouched.");
     if (auto xml = juce::XmlDocument::parse (file))
     {
         // .gsting files are user-editable: only apply a tree of OUR type, or a
@@ -5324,7 +5338,8 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
         // while reporting success.
         auto tree = juce::ValueTree::fromXml (*xml);
         if (! tree.hasType (apvts.state.getType()))
-            return false;
+            return refuse ("this file is XML, but it is not a Fibl\xc3\xb3 Gal\xc3\xa0" "ctic preset. "
+                           "Nothing was loaded - the patch you were playing is untouched.");
 
         const auto keep     = tuning.captureTuning();
         const int  keepMode = getTuningMode();
@@ -5387,7 +5402,10 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
         snapshotLoadedPreset (name); // AFTER the tuning revert - that is the real final state
         return true;
     }
-    return false;
+    // XmlDocument::parse returned nothing: the file is there and is not XML at all
+    // (truncated by a crash mid-save, edited by hand, or simply something else).
+    return refuse ("this preset file could not be read - it is not valid XML. Nothing was "
+                   "loaded - the patch you were playing is untouched.");
 }
 
 //==============================================================================

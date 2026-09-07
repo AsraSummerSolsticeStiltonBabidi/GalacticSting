@@ -20014,4 +20014,79 @@ static void runProcessorAuditChecks()
                "  ...and a preset loaded AFTER all that still offers its own tuning - the "
                "clear did not disable the feature");
     }
+
+    //-- run 73: A PRESET THAT DID NOT LOAD SAYS SO ----------------------------------
+    //
+    // loadPreset returns false from three places - no such file, the XML will not parse,
+    // the tree is not one of ours - and its only caller drops the bool
+    // ("if (name.isNotEmpty() && loadPreset (name))"). So the name stayed in the box, the
+    // PREVIOUS preset went on sounding, and the Tuning panel went on offering the previous
+    // preset's scale, with nothing anywhere saying the load had not happened.
+    //
+    // Parked on the processor exactly like tuningRestoreError and bankSlotError, because
+    // the editor may not exist at all (the playground assigns corners with the window
+    // shut). All three failures are provoked here, and the last block proves that nothing
+    // moved while they happened - a load that failed must be a load that did nothing.
+    {
+        std::printf ("\nrun 73: a preset that did not load says so:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run73-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        struct ScratchFolder
+        {
+            explicit ScratchFolder (const juce::File& d)
+                : dir (d), prev (Proc::getPresetFolder()) { Proc::setPresetFolderForTests (d); }
+            ~ScratchFolder() { Proc::setPresetFolderForTests (prev); dir.deleteRecursively(); }
+            juce::File dir, prev;
+        } guard (scratch);
+        scratch.createDirectory();
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+        const auto setSlope = [&p] (float v)
+        {
+            if (auto* s = p->apvts.getParameter ("curveSlope")) s->setValueNotifyingHost (s->convertTo0to1 (v));
+            p->pollParametersForTests();
+        };
+        setSlope (1.0f);
+        check (p->savePreset ("zzz73-A").isNotEmpty(), "  (precondition) one real preset exists");
+        check (p->loadPreset ("zzz73-A"), "  (precondition) ...and it loads");
+        setSlope (1.4f);   // the patch the player is holding when they click the wrong name
+        const float held = p->apvts.getRawParameterValue ("curveSlope")->load();
+
+        check (! p->loadPreset ("zzz73-nothing-here"), "  a name with no file behind it fails");
+        const auto missMsg = p->takePresetLoadError();
+        std::printf ("    missing file: \"%s\"\n", missMsg.toRawUTF8());
+        check (missMsg.contains ("zzz73-nothing-here"),
+               "  ...and SAYS so, naming the preset that did not load");
+        check (p->takePresetLoadError().isEmpty(),
+               "  ...once, not forever - taking it clears it, like the other two");
+
+        Proc::presetFile ("zzz73-junk").replaceWithText ("this is not xml, it never was");
+        check (! p->loadPreset ("zzz73-junk"), "  a file that is not XML fails");
+        const auto junkMsg = p->takePresetLoadError();
+        std::printf ("    unreadable file: \"%s\"\n", junkMsg.toRawUTF8());
+        check (junkMsg.contains ("XML"), "  ...and says it could not be read, with the reason");
+
+        Proc::presetFile ("zzz73-foreign").replaceWithText ("<SomeOtherProgram a=\"1\"/>");
+        check (! p->loadPreset ("zzz73-foreign"), "  valid XML that is not one of our trees fails");
+        const auto foreignMsg = p->takePresetLoadError();
+        std::printf ("    foreign XML: \"%s\"\n", foreignMsg.toRawUTF8());
+        check (foreignMsg.contains ("preset"),
+               "  ...and says THAT, rather than resetting every parameter and reporting success");
+
+        // NOTHING MOVED. The refusals are all before any state is touched, and that is the
+        // other half of the promise: the patch under the player's hands is untouched.
+        std::printf ("    after three failed loads: slope %.4f (was %.4f), preset name \"%s\"\n",
+                     (double) p->apvts.getRawParameterValue ("curveSlope")->load(), (double) held,
+                     p->getLoadedPresetName().toRawUTF8());
+        check (std::abs (p->apvts.getRawParameterValue ("curveSlope")->load() - held) < 1.0e-6,
+               "  ...and the patch the player was holding is still there");
+        check (p->getLoadedPresetName() == "zzz73-A",
+               "  ...and the preset that IS loaded is still the one that loaded");
+
+        Proc::presetFile ("zzz73-junk").deleteFile();
+        Proc::presetFile ("zzz73-foreign").deleteFile();
+    }
 }

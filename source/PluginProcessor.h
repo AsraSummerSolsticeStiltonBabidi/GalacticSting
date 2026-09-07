@@ -1875,11 +1875,24 @@ private:
     // message is parked here rather than raised from a place that may have no editor.
     // Consumed by takeBankSlotError, which clears it - one message about one switch.
     juce::String bankSlotError;
+    // THE PRESET THAT DID NOT LOAD, on the same one-shot pattern and for the same reason
+    // as the two above. loadPreset returns false from three places - the file is not in
+    // the folder, the XML will not parse, the tree is not one of ours - and its only
+    // caller drops that bool on the floor ("if (name.isNotEmpty() && loadPreset (name))").
+    // So a preset that failed left the NAME in the box, the PREVIOUS preset's sound in the
+    // instrument, and the previous preset's tuning on offer in the Tuning panel, with
+    // nothing anywhere saying the load had not happened. Three lies for the price of one
+    // dropped return value.
+    juce::String presetLoadError;
 public:
     juce::String takeTuningRestoreError()
     { auto e = tuningRestoreError; tuningRestoreError.clear(); return e; }
     juce::String takeBankSlotError()
     { auto e = bankSlotError; bankSlotError.clear(); return e; }
+    // Consumed exactly like the two above - the editor's timer already takes those two
+    // and puts them on the notice overlay; this one belongs beside them.
+    juce::String takePresetLoadError()
+    { auto e = presetLoadError; presetLoadError.clear(); return e; }
 private:
     juce::String presetPendingTablePeriod;                     // its table period, if it had one
     // Self-play routing as of the last block: a CHANGE strands notes (see processBlock).
