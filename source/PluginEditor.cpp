@@ -2212,6 +2212,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     menuButton.setMouseClickGrabsKeyboardFocus (false);
     menuButton.onClick = [this]
     {
+        // MSVC resolves a bare pointer-to-self inside a NESTED lambda init-capture to the
+        // closure rather than to the editor, so the editor is named here and captured by
+        // that name below.
+        juce::Component* const selfComp = this;
         juce::PopupMenu m;
         m.addItem (1, tr ("Reset all parameters", "Reinicia tots els par\xc3\xa0metres"));
         m.addItem (2, catalan ? juce::String ("Language: English")
@@ -2235,9 +2239,19 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         // before the first save it does not exist and Explorer would answer a nonexistent
         // path with an error box instead of a folder.
         m.addItem (5, tr ("Open preset folder", "Obre la carpeta de presets"));
+        // A MENU OUTLIVES THE WINDOW IT WAS OPENED FROM. showMenuAsync returns
+        // immediately and its callback fires whenever the user gets round to choosing -
+        // or when the menu is dismissed, with r = 0 - and the plugin window can be closed
+        // in between. This captured `this` raw and ended with an unconditional refocus(),
+        // so a dismissed menu was enough to call grabKeyboardFocus() on a destroyed
+        // Component. SafePointer is JUCE's own answer and it nulls itself on destruction.
         m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (menuButton),
-            [this] (int r)
+            [this, safe = juce::Component::SafePointer<juce::Component> (selfComp)] (int r)
             {
+                // The guard decides; `this` only serves the body once the guard has said
+                // the editor is still there. Capturing both keeps the body unchanged,
+                // which on a callback this long is worth more than the tidier capture.
+                if (safe == nullptr) return;
                 if (r == 1)
                 {
                     processorRef.requestHardSilence(); // never leave a note stuck sounding through Init
@@ -2350,13 +2364,27 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         // .tun is the default: it carries the reference frequency, which .scl cannot, so
         // an exported scale reopens at the same absolute pitch. .scl stays available in
         // the file-type dropdown for anything that only speaks Scala.
-        auto ch = std::make_shared<juce::FileChooser> (
+        //
+        // THE CHOOSER IS THE EDITOR'S, LIKE THE OTHER FOUR. This one was a shared_ptr
+        // captured by its own callback - self-owning, so it outlived the editor - while
+        // the callback captured `this` raw. Open SAVE TUNING, close the plugin window
+        // while the Windows dialog is still up, then pick a file, and the callback runs
+        // against a destroyed editor: refocus() calls grabKeyboardFocus() on a dead
+        // Component, tr() reads the freed language flag to choose which words to show, and
+        // the message box is parented to rubble. The host goes down, or the tuning is
+        // written from garbage.
+        //
+        // The plugin's other four choosers all assign to the `fileChooser` member, which
+        // dies with the editor - and destroying a juce::FileChooser cancels its pending
+        // callback, which is exactly the protection this one opted out of. It was the odd
+        // one out for no reason; it is not any more.
+        fileChooser = std::make_unique<juce::FileChooser> (
             tr ("Save tuning", "Desa l'afinaci\xc3\xb3"),
             juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
                 .getChildFile ("tuning.tun"),
             "*.tun;*.scl");
-        ch->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
-            [this, ch] (const juce::FileChooser& fc)
+        fileChooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
+            [this] (const juce::FileChooser& fc)
             {
                 auto f = fc.getResult();
                 if (f == juce::File()) { refocus(); return; }
@@ -8647,8 +8675,12 @@ void FractalAdditiveAudioProcessorEditor::showEnvMapMenu (const juce::String& pa
     for (int i = 0; i < 6; ++i)
         if (processorRef.getModEngine().isMappedTo (paramID, i))
             m.addItem (200 + i, tr ("Unmap from ", "Desassigna de ") + names[i]);
-    m.showMenuAsync (juce::PopupMenu::Options(), [this, paramID] (int r)
+    // Guarded like the top-bar menu above: the callback outlives the window when the
+    // user closes the plugin with the map menu open, and it ends by touching the editor.
+    m.showMenuAsync (juce::PopupMenu::Options(),
+        [this, paramID, safe = juce::Component::SafePointer<juce::Component> (this)] (int r)
     {
+        if (safe == nullptr) return;
         if (r >= 200)      processorRef.getModEngine().removeTarget (r - 200, paramID);
         else if (r >= 100)
         {
