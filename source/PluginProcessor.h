@@ -906,6 +906,12 @@ public:
     // the SOUND, not what the keys mean. Same promise loadPreset() already makes.
     static constexpr int kPlaygroundCorners = presetmorph::kCorners;
 
+    // BYTES reserved for the MIX engage-edge injection buffer, sized here (and named, so a
+    // verifier can measure the real number rather than a copy of it) and reserved once in
+    // prepareToPlay. The arithmetic is written out at that call: the unit is BYTES, not
+    // events, and the fill's own bound is the 16 x 128 loop in renderSynthMix.
+    static constexpr int kMixInjectBytes = 32768;
+
     // Put a preset on a corner (empty name clears it). Compiles that preset's spectrum
     // there and then - synchronously, on the message thread, exactly as prepareToPlay's
     // buildNow does - because a corner has to have a template before the very first

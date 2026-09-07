@@ -17704,4 +17704,53 @@ static void runProcessorAuditChecks()
 
         dir.deleteRecursively();
     }
+
+    //-- run 67: THE MIX INJECTION BUFFER DOES NOT REALLOCATE ON THE AUDIO THREAD -----
+    //
+    // MidiBuffer::ensureSize takes BYTES and this one used to reserve 512 of them - 56
+    // events at 9 bytes each - for a fill whose own bound is a 16 x 128 loop plus a copy of
+    // the incoming block. Past 56 it reallocates inside processBlock, which is the one thing
+    // that must not happen there.
+    //
+    // MEASURED AS A REALLOCATION, not as a number compared with itself: the buffer's storage
+    // pointer is taken after the reservation and again after the worst-case fill, and a
+    // pointer that moved IS the allocation. The reservation read here is the processor's own
+    // constant, so putting 512 back into kMixInjectBytes turns this check red.
+    //
+    // The control below is what stops it from being vacuous: the same fill through a 512-byte
+    // reservation must MOVE the pointer, or the fill is too small to be proving anything.
+    {
+        std::printf ("\nrun 67: the MIX engage-edge buffer is reserved in bytes, not in hope:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+
+        // renderSynthMix's engage fill, exactly: every (channel, key) the held-key table can
+        // hold. 16 x 128 = 2048 note-ons is the loop's own ceiling, not a guess at a chord.
+        const auto fill = [] (juce::MidiBuffer& b)
+        {
+            for (int ch = 0; ch < 16; ++ch)
+                for (int k = 0; k < 128; ++k)
+                    b.addEvent (juce::MidiMessage::noteOn (ch + 1, k, (juce::uint8) 100), 0);
+        };
+
+        juce::MidiBuffer sized;
+        sized.ensureSize ((size_t) Proc::kMixInjectBytes);
+        const auto* before = sized.data.getRawDataPointer();
+        fill (sized);
+        const auto* after = sized.data.getRawDataPointer();
+
+        juce::MidiBuffer old;
+        old.ensureSize (512);                       // what it used to reserve
+        const auto* oldBefore = old.data.getRawDataPointer();
+        fill (old);
+        const bool oldMoved = old.data.getRawDataPointer() != oldBefore;
+
+        std::printf ("    2048 note-ons = %d bytes; reserved %d, moved = %d"
+                     " (at the old 512: moved = %d)\n",
+                     sized.data.size(), Proc::kMixInjectBytes, (int) (after != before), (int) oldMoved);
+        check (oldMoved,
+               "  (precondition: the engage fill really is bigger than the old 512-byte "
+               "reservation)");
+        check (after == before,
+               "  a full 16 x 128 engage fill does not reallocate the MIX injection buffer");
+    }
 }

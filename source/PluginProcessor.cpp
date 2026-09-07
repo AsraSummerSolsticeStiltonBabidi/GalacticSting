@@ -3455,7 +3455,29 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     // single-engine render (defensive - hosts honour their own samplesPerBlock).
     lastBlockSize = juce::jmax (16, samplesPerBlock);
     mixScratch.setSize (2, juce::jmax (512, lastBlockSize));
-    mixInject.ensureSize (512);
+    // THE UNIT IS BYTES, AND THAT IS THE WHOLE DEFECT. MidiBuffer::ensureSize takes BYTES,
+    // not events, and JUCE stores each event as its data plus a 4-byte sample position and a
+    // 2-byte length (juce_MidiBuffer.cpp: getEventTotalSize) - 9 bytes for a note-on. This
+    // buffer used to reserve 512 of them, which is 56 events, and it is filled on the MIX
+    // engage edge with the ENTIRE incoming block PLUS one note-on for every key held at that
+    // instant (see renderSynthMix). Past 56, MidiBuffer reallocates: on the audio thread, in
+    // a render callback, which is the one thing that must never happen here. It was the last
+    // buffer in the plugin still at the old number - NoteGate and MonoGlide reserve 4096, the
+    // lookahead ring 8192.
+    //
+    // SIZED TO THE FILL'S OWN BOUND rather than to a comfortable guess. That fill is a
+    // 16-channel x 128-key loop, so it can emit at most 2048 note-ons = 18,432 bytes; the
+    // rest of this reservation is ~14 kB, about 1,500 more events, for the copy of the
+    // incoming block that goes in beside them. 32 kB, once per prepareToPlay, next to four
+    // sub-engines each holding their own audio buffers.
+    //
+    // WHAT IT STILL DOES NOT COVER, said out loud rather than papered over: the incoming
+    // block is not bounded by anything this plugin owns, so a host block carrying more than
+    // ~1,500 events on top of a full hold would grow the buffer anyway. When that happens
+    // MidiBuffer GROWS - it never drops an event - so the cost is one allocation and never a
+    // lost note. RhythmVerify run 67 measures the bound that IS ours: the 2048-event fill,
+    // against this exact constant.
+    mixInject.ensureSize ((size_t) kMixInjectBytes);
     for (auto& e : mixEng)
         if (e != nullptr)
         {
