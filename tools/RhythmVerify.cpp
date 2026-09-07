@@ -19679,4 +19679,111 @@ static void runProcessorAuditChecks()
                "  the parked 432 survives the preset - a preset changes the sound, not the "
                "reference the user typed");
     }
+
+    //-- run 69: A TABLE WHOSE PERIOD WAS NEVER FOUND STATES NONE ---------------------
+    //
+    // PeriodEstimate carries `ratio = 2.0` as its DEFAULT, and `found = false` alongside it
+    // to say the 2.0 means nothing. loadAbsoluteTable published the ratio and dropped the
+    // flag, so statedPeriodRatio() handed a 2/1 back as a fact and hasUsablePeriod() said
+    // yes - for a file in which nothing ascends at all. Temper then snapped every partial
+    // onto an octave grid that appears NOWHERE in the user's tuning, silently, which is the
+    // one substitution this plugin's stated/fallback split exists to refuse.
+    //
+    // It needs a .tun that never ascends, so it is built here rather than found: 128 keys
+    // running DOWN 10 cents each. That is legal .tun content (an inverted keyboard), it
+    // cannot convert to a scale (a period must ascend), and the estimate's canonical pass
+    // and its raw pass both come back empty - `found = false`, ratio left at its 2.0 default.
+    //
+    // Measured on WHAT THE SPECTRUM DOES, not only on the flag: the partial ratios with
+    // temper ON must be the ones temper OFF produced. Putting the 2.0 back into
+    // statedPeriodRatio moves them onto "degree x 2^k" and this goes red twice over.
+    {
+        std::printf ("\nrun 69: a tuning table with no period found does not invent a 2/1:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        juce::String tun;
+        tun << "; a descending 128-key map: nothing in it ascends, so nothing in it repeats\n"
+            << "[Exact Tuning]\nbasefreq=440.0\n";
+        for (int n = 0; n < 128; ++n)
+            tun << "note " << n << "=" << juce::String (-10.0 * (double) n, 6) << "\n";
+
+        // In through a BANK SLOT, which is the one route that takes .tun TEXT (a file would
+        // also write the user's recent-files list, and this rig does not touch that).
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        if (auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+        {
+            xml->removeChildElement (xml->getChildByName ("BANK"), true);
+            auto* bank = xml->createNewChildElement ("BANK");
+            auto* slot = bank->createNewChildElement ("SLOT");
+            slot->setAttribute ("i", 0);
+            slot->setAttribute ("name", "zzz69-descending");
+            slot->setAttribute ("source", tun);
+            juce::MemoryBlock withBank;
+            juce::AudioProcessor::copyXmlToBinary (*xml, withBank);
+            p->setStateInformation (withBank.getData(), (int) withBank.getSize());
+        }
+        p->setTuningBankSlotParam (1);
+        for (int i = 0; i < 3; ++i) p->pollParametersForTests();
+
+        check (p->tuningIsAbsoluteTable(),
+               "  (precondition) a .tun that never repeats loads as a 128-key table");
+        check (! p->tuningTablePeriodWasFound(),
+               "  (precondition) ...and the period estimate found nothing to measure in it");
+        std::printf ("    stated period %.6f, display fallback %.6f, temper possible = %d\n",
+                     p->getStatedTuningPeriodRatio(), p->getTuningPeriodRatio(),
+                     (int) p->temperIsPossible());
+        check (p->getStatedTuningPeriodRatio() == 0.0,
+               "  the table STATES no period - PeriodEstimate's 2.0 is a default, never a "
+               "measurement");
+        check (! p->tuningStatesPeriod(), "  ...so hasUsablePeriod() answers no");
+        check (! p->temperIsPossible(),
+               "  ...and temper refuses instead of snapping the spectrum to an octave the "
+               "file never contained");
+        check (p->getTuningPeriodRatio() == 2.0,
+               "  ...while the DISPLAY fallback still hands the keyboard a finite number");
+
+        // WHAT THE PLAYER HEARS. The ratios temper OFF builds, then the ratios temper ON
+        // builds: refusing means they are the same list.
+        const auto ratios = [&p]
+        {
+            std::vector<double> r;
+            if (const auto* t = p->getLiveTemplate())
+                for (const auto& q : t->partials) r.push_back ((double) q.ratio);
+            return r;
+        };
+        awaitSpectrumIdle (*p, "run 69: the untempered spectrum");
+        const auto before = ratios();
+        if (auto* tp = p->apvts.getParameter ("timbreTemper"))
+            tp->setValueNotifyingHost (1.0f);
+        for (int i = 0; i < 40; ++i) { p->pollParametersForTests(); juce::Thread::sleep (2); }
+        awaitSpectrumIdle (*p, "run 69: the spectrum after temper was switched on");
+        const auto after = ratios();
+        double worst = 0.0;
+        for (size_t i = 0; i < std::min (before.size(), after.size()); ++i)
+            worst = std::max (worst, std::abs (1200.0 * std::log2 (std::max (1.0e-9, after[i])
+                                                                / std::max (1.0e-9, before[i]))));
+        std::printf ("    %d partials before, %d after; worst move %.4f cents\n",
+                     (int) before.size(), (int) after.size(), worst);
+        check (! before.empty(), "  (precondition) there is a spectrum to compare at all");
+        check (before.size() == after.size() && worst < 1.0e-4,
+               "  switching temper ON moves no partial at all - the refusal is what the "
+               "voices actually get, not just what a flag says");
+
+        // ...AND THE USER CAN STILL SUPPLY ONE. The fix must not disable the feature: a
+        // period typed into the panel's own field is somebody stating one, which is exactly
+        // the visible control the honesty rule asks for.
+        juce::String perErr;
+        check (p->setTuningTablePeriod ("3/2", perErr),
+               "  a period typed by hand is accepted on a table that measured none");
+        std::printf ("    after typing 3/2: stated %.6f, temper possible = %d\n",
+                     p->getStatedTuningPeriodRatio(), (int) p->temperIsPossible());
+        check (std::abs (p->getStatedTuningPeriodRatio() - 1.5) < 1.0e-9,
+               "  ...and THAT period is stated - the refusal was about nobody having supplied "
+               "one, not about tables");
+        check (p->temperIsPossible(),
+               "  ...so temper works again the moment the user says what the period is");
+    }
 }
