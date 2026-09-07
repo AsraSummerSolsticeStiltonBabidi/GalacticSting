@@ -7880,8 +7880,31 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
             // title has with its RESIZE tag below: the cell the fit sweep measures the
             // word against is the room the word really has, never the room a control is
             // already standing in. harmTemperW is 0 whenever resized() hid the toggle.
+            //
+            // ...AND WHEN IT DID NOT FIT, THE ROW SAYS SO. A toggle that re-tunes the whole
+            // spectrum cannot simply be absent with nothing in its place: "nothing is ever
+            // silently hidden" is the rule, and this is the same tag, in the same band, in
+            // the same words as the one that says the nine prime ticks are off screen -
+            // one instruction, RESIZE, because widening the window is what brings both of
+            // them back. (TEMPER is still reachable from the custom view at every size, so
+            // what is off screen is this way IN to it, not the feature.)
+            //
+            // Measured and painted at the SAME height, unlike the prime tag below, which
+            // reserves at 9 and draws at 10 - a reservation smaller than the ink is a cut
+            // word waiting for a longer translation.
+            const auto harmTag  = tr ("RESIZE", "AMPLIA");
+            const int  harmTagW = harmTemperHidden
+                                ? juce::GlyphArrangement::getStringWidthInt (
+                                      juce::Font (juce::FontOptions (10.0f).withStyle ("Bold")),
+                                      harmTag) + 2
+                                : 0;
+            const int  harmGap  = harmTemperHidden ? 6 : 0;
+            auto       harmBand = band (hcHarm);
             add ("eng.harm",  tr ("HARMONICS", "HARM\xc3\x92NICS"),
-                 band (hcHarm).withTrimmedRight (harmTemperW), cPanel);
+                 harmBand.withTrimmedRight (harmTemperW + harmTagW + harmGap), cPanel);
+            if (harmTemperHidden)
+                add ("eng.harmHidden", harmTag,
+                     harmBand.removeFromRight (harmTagW), cPanel, 10.0f);
             // PRIME sits right under the shared divider -> nudge it down for air.
             //
             // ONE WORD, NOT TWO, AND IT IS A DECISION RATHER THAN A CUT. This cell is the
@@ -9858,6 +9881,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     temperToggle.setVisible (fits);
                     // Read by paintedSubLabels(), which shortens HARMONICS' cell by it.
                     harmTemperW = fits ? tw + 8 : 0;
+                    harmTemperHidden = ! fits;   // paintedSubLabels says so on the glass
                     if (fits)
                         temperToggle.setBounds (htop.removeFromRight (tw).withSizeKeepingCentre (tw, th));
                 }
@@ -10046,6 +10070,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // the custom view lays that toggle out somewhere else entirely, and a stale
             // reservation here would shorten a cell that no longer exists.
             harmTemperW = 0;
+            harmTemperHidden = false;
             primeLimitFader.setVisible (false); lblPrimeLimit.setVisible (false);
             primeOnToggle.setVisible (false); // the switch belongs to the harmonic view too
             for (int i = 0; i < 9; ++i) { primeToggle[i].setVisible (false); primeLbl[i].setVisible (false); }

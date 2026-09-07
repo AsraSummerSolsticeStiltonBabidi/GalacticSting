@@ -830,6 +830,11 @@ private:
     // it the fit sweep measures HARMONICS against a cell the toggle is sitting in, and
     // the first thing that goes wrong is a window floor measured on a lie.
     int harmTemperW = 0;
+    // ...and whether resized() HID it, because a control that vanishes with nothing beside
+    // it is the silent hiding this build refuses. Exactly the primeTicksHidden arrangement
+    // above: paintedSubLabels() reads this and paints the tag that says the toggle is off
+    // screen and what brings it back.
+    bool harmTemperHidden = false;
     // ONE COMMIT AT A TIME. The blur handler runs onReturnKey, and onReturnKey ends in
     // refocus() -> grabKeyboardFocus(), which is itself a focus change: if the box still
     // holds focus at that instant the whole handler re-enters, and a spectrum the parser
