@@ -2841,7 +2841,40 @@ private:
         // becomes part of the smooth per-sample window instead of a step between blocks.
         sl.du            = ((gEnd - gStart) * P - (loEnd - loStart)) / W / (double) numSamples;
         sl.blockLogMove  = smShepRate * P * dt;
-        sl.lowestRootMul = std::exp2 ((gStart + (double) mLo) * P);
+        // "lowest copy root / f0 ANYWHERE IN THIS BLOCK" - which is what the member says
+        // it is, and what renderNextBlock sizes the shared base list from (see the
+        // maxRatio line there). It was read at gStart alone, and gStart is only the
+        // block's lowest grid position while the stack is RISING.
+        //
+        // A DESCENDING Shepard walks shepG DOWN (the arrow flips the rate's sign, see
+        // rateTarget above), so gEnd < gStart and the deepest copy spends the block
+        // getting DEEPER. Sized at gStart the base list is therefore short by the whole
+        // block's travel: maxRatio comes out too small, newN too small, and
+        // fillShepardCopies' count walk hits `hiN = min(span, cap)` instead of the copy's
+        // own Nyquist - so the partials between the two are simply not rendered. Not
+        // tapered, not faded, and NOT COUNTED: shepEvCutBlocks only fires on the kStride
+        // cap, so this was a partial drop with no number anywhere, which is the one thing
+        // this engine may not do.
+        //
+        // HOW BIG. |gEnd - gStart| is the block's travel in rise intervals; at the panel's
+        // fastest rise (kMinRiseSec, 0.05 s per interval) and a 256-sample block at 48 kHz
+        // that is 0.107 intervals, i.e. 7.7% of the frequency the deepest copy could
+        // actually reach - tens of partials on a dense template, and four times that at a
+        // 16/1-period tuning. At an 8 s rise it is a partial or two at the boundary. Both
+        // are drops, and the first is audible.
+        //
+        // min() and not a second branch: rising, gStart IS the minimum and this line is
+        // the old one unchanged, so the default direction is bit-for-bit what it was.
+        // rootMul[c] is taken at the block MIDPOINT (gMid above) and the midpoint lies
+        // between the two ends, so covering both ends covers every copy's own count too.
+        //
+        // MEASURED, not argued: the last block of the RhythmVerify descending-Shepard test
+        // reads the deepest copy's ROOT and its partial COUNT back through
+        // voiceShepardForTests and recomputes the count that root's own Nyquist asks for.
+        // With the line read at gStart the two disagree; with it read here they agree
+        // exactly, and the ascending run agrees either way - which is the whole shape of
+        // this defect in one comparison.
+        sl.lowestRootMul = std::exp2 ((std::min (gStart, gEnd) + (double) mLo) * P);
 
         // Advance the rise. Whole steps are renumbered away in multiples of kSlots so
         // the slot hash is untouched (the same trick v1 used on its sine grid).

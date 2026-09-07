@@ -17522,6 +17522,86 @@ int main (int argc, char** argv)
         }
     }
 
+    //== A DESCENDING SHEPARD'S DEEPEST COPY GETS THE PARTIALS IT ASKS FOR =========
+    //
+    // The shared base list is sized from sl.lowestRootMul, "the lowest copy root / f0
+    // ANYWHERE IN THIS BLOCK" - and it was read at the block's START, which is only the
+    // lowest grid position while the stack is RISING. Descending, the deepest copy spends
+    // the block getting deeper than the list was cut for, and the partials between the two
+    // are not rendered: not tapered, not faded, and not counted by shepEvCutBlocks either,
+    // which only fires on the kStride cap. A silent drop, which this engine forbids.
+    //
+    // Measured where it can be seen from outside: the probe hands back each copy's ROOT
+    // and its partial COUNT, and the count a root asks for is arithmetic anyone can redo -
+    // the partials of the live template at or below that copy's own Nyquist. The two must
+    // agree, in BOTH directions.
+    {
+        std::printf ("\na descending Shepard's deepest copy carries every partial it can:\n");
+        constexpr double ssr = 48000.0; constexpr int sblk = 256;
+        long long pm[shepard::kSlots]; double pr[shepard::kSlots], pw[shepard::kSlots];
+        int pcn[shepard::kSlots];
+
+        for (int down = 0; down <= 1; ++down)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->prepareToPlay (ssr, sblk);
+            juce::AudioBuffer<float> b (2, sblk);
+            auto set = [&] (const char* id, float plain)
+            {
+                if (auto* q = p->apvts.getParameter (id))
+                    q->setValueNotifyingHost (q->convertTo0to1 (plain));
+                p->pollParametersForTests();
+            };
+            set ("shepOn", 1.0f);
+            set ("shepMode", 0.0f);       // Free (ms), so the host clock cannot change the rate
+            set ("shepTime", 100.0f);     // the fader's own floor: the fastest rise it offers
+            set ("shepDown", (float) down);
+            awaitSpectrumIdle (*p, "the descending-Shepard patch");
+
+            juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 60, 0.9f), 0);
+            b.clear(); p->processBlock (b, m);
+            for (int i = 0; i < 40; ++i) { juce::MidiBuffer e; b.clear(); p->processBlock (b, e); }
+
+            const int copies = p->voiceShepardForTests (pm, pr, pw, pcn, shepard::kSlots);
+            const auto* T = p->getLiveTemplate();
+            check (copies > 1 && T != nullptr && ! T->partials.empty(),
+                   down ? "  (precondition) the DESCENDING stack really is rendering copies"
+                        : "  (precondition) the ASCENDING stack really is rendering copies");
+            if (copies > 1 && T != nullptr && ! T->partials.empty())
+            {
+                // The copies are handed over in ascending root order, so [0] is the deepest.
+                int deepest = 0;
+                for (int c = 1; c < copies; ++c) if (pr[c] < pr[deepest]) deepest = c;
+                check (deepest == 0, "  (precondition) copy 0 is the deepest, as the layout says");
+
+                const double maxRatio = (0.5 * ssr) / pr[deepest];
+                int want = 0;
+                for (int i = 0; i < (int) T->partials.size() && i < shepard::kStride; ++i)
+                {
+                    if ((double) T->partials[(size_t) i].ratio > maxRatio) break;
+                    want = i + 1;
+                }
+                std::printf ("    %s: %d copies, deepest root %.3f Hz -> its own Nyquist asks"
+                             " for %d partials, it rendered %d (template %d)\n",
+                             down ? "descending" : "ascending", copies, pr[deepest],
+                             want, pcn[deepest], (int) T->partials.size());
+                // A GATE, or the comparison below passes on a spectrum too small to drop
+                // anything: the deepest copy has to be asking for MORE than the played key
+                // does, which is the whole reason the base list is sized from it.
+                check (want > 0 && want < shepard::kStride,
+                       "  (precondition) the deepest copy's own Nyquist, not the slot width,"
+                       " is what decides its count");
+                check (pcn[deepest] == want,
+                       down ? "  the DESCENDING stack's deepest copy renders every partial"
+                              " under its own Nyquist - none is missing from the shared list"
+                            : "  ...and so does the ASCENDING one, which is the direction that"
+                              " was already right");
+            }
+            juce::MidiBuffer off; off.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+            b.clear(); p->processBlock (b, off);
+        }
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }
