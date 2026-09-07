@@ -17627,4 +17627,81 @@ static void runProcessorAuditChecks()
 
         dir.deleteRecursively();
     }
+
+    //-- run 66: A BANK SLOT THAT DOES NOT LOAD SAYS SO, AND CAN BE REPAIRED ----------
+    //
+    // The slot was marked applied BEFORE the load ran, so a slot whose stored text no longer
+    // parses moved the SELECTOR and not the TUNING - and `err` was dropped unread, so the
+    // combo said one thing, the instrument played another, and nothing said a word. The
+    // sticky index then blocked every retry, including the obvious repair: setTuningBankFile
+    // ends with setTuningBankSlotParam(slot + 1), which is a no-op when that slot is already
+    // selected, so a good file dropped into the broken slot sat there unloaded.
+    {
+        std::printf ("\nrun 66: a bank slot that cannot be loaded is stated, and repairable:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        // A slot holding text that does not parse. It gets there through the state, which is
+        // how it gets there in life too - a project written by an older build, a hand-edited
+        // .gsting, a format that has moved on.
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize());
+        check (xml != nullptr, "  the saved chunk parses back to XML");
+        if (xml != nullptr)
+        {
+            xml->removeChildElement (xml->getChildByName ("BANK"), true);
+            auto* bank = xml->createNewChildElement ("BANK");
+            auto* slot = bank->createNewChildElement ("SLOT");
+            slot->setAttribute ("i", 0);
+            slot->setAttribute ("name", "zzz66-broken");
+            slot->setAttribute ("source", "this is not a scale, and never was");
+        }
+        juce::MemoryBlock withBank;
+        if (xml != nullptr) juce::AudioProcessor::copyXmlToBinary (*xml, withBank);
+
+        auto q = std::make_unique<Proc>();
+        q->prepareToPlay (48000.0, 256);
+        q->setStateInformation (withBank.getData(), (int) withBank.getSize());
+        for (int i = 0; i < 3; ++i) q->pollParametersForTests();
+        q->takeBankSlotError();                       // anything the restore itself parked
+        const int    degBefore = q->getScaleDegrees();
+        const double hzBefore  = q->getNoteFrequency (61);
+
+        q->setTuningBankSlotParam (1);                // pick the broken slot
+        for (int i = 0; i < 3; ++i) q->pollParametersForTests();
+        const auto stated = q->takeBankSlotError();
+        std::printf ("    selecting the broken slot: degrees %d -> %d, key 61 %.4f -> %.4f Hz,"
+                     " message \"%s\"\n",
+                     degBefore, q->getScaleDegrees(), hzBefore, q->getNoteFrequency (61),
+                     stated.toRawUTF8());
+        check (q->getScaleDegrees() == degBefore
+               && std::abs (q->getNoteFrequency (61) - hzBefore) < 1.0e-6,
+               "  the tuning does not change under a slot that could not be loaded");
+        check (stated.isNotEmpty(),
+               "  ...and the failure is STATED, with the parser's own reason, instead of dropped");
+
+        // THE REPAIR, into the slot that is already selected - the case the sticky index
+        // made impossible.
+        const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                             .getChildFile ("fiblo-run66-"
+                                 + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        dir.createDirectory();
+        const auto good = dir.getChildFile ("zzz66-good.scl");
+        good.replaceWithText ("! zzz66-good.scl\n5 equal steps of the octave\n 5\n"
+                              " 240.0\n 480.0\n 720.0\n 960.0\n 1200.0\n");
+        check (q->getTuningBankSlotParam() == 1,
+               "  (precondition: the broken slot is still the selected one)");
+        p->takeBankSlotError();
+        q->setTuningBankFile (0, good);
+        for (int i = 0; i < 3; ++i) q->pollParametersForTests();
+        std::printf ("    after dropping a 5-degree scale into the SAME slot: degrees %d\n",
+                     q->getScaleDegrees());
+        check (q->getScaleDegrees() == 5,
+               "  a good file dropped into the broken slot loads, even though that slot was "
+               "already selected");
+
+        dir.deleteRecursively();
+    }
 }

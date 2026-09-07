@@ -1815,6 +1815,11 @@ private:
     // Tuning bank: per-instance .scl slots (name + raw source), persisted in state.
     std::array<juce::String, kBankSlots> bankName, bankSource;
     int lastBankSlot = 0; // last applied "tuningBankSlot" value (message thread)
+    // ...and the SOURCE TEXT that slot held when it was applied. The index alone was not
+    // enough to say "this is already loaded": a slot whose text was replaced in place kept
+    // the same index, and a slot whose load FAILED kept it too, so neither could ever be
+    // retried. See the bank block in timerCallback for both failures. Message thread.
+    juce::String lastBankSource;
 
     // Last dissonance-generated .scl (text + display name), for saving to disk,
     // plus the degree/height data shown in the Spectrum-to-Scale panel.
@@ -1826,9 +1831,17 @@ private:
     // failure is parked here rather than raised there. Consumed by takeTuningRestoreError,
     // which clears it: this is a one-shot message about one load, not a state.
     juce::String tuningRestoreError;
+    // THE BANK SLOT THAT DID NOT LOAD, for the editor to show once, on the same one-shot
+    // pattern and for the same reason: the load runs on the processor's timer (host
+    // automation can move that parameter with no window open at all), so the parser's
+    // message is parked here rather than raised from a place that may have no editor.
+    // Consumed by takeBankSlotError, which clears it - one message about one switch.
+    juce::String bankSlotError;
 public:
     juce::String takeTuningRestoreError()
     { auto e = tuningRestoreError; tuningRestoreError.clear(); return e; }
+    juce::String takeBankSlotError()
+    { auto e = bankSlotError; bankSlotError.clear(); return e; }
 private:
     juce::String presetPendingTablePeriod;                     // its table period, if it had one
     // Self-play routing as of the last block: a CHANGE strands notes (see processBlock).
