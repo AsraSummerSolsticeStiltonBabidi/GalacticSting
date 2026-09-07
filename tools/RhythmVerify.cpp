@@ -17139,6 +17139,97 @@ int main (int argc, char** argv)
                "the instrument");
     }
 
+    //== A PENCIL DRAG MAY NOT WRAP BACK ONTO ITS OWN PLAN =========================
+    //
+    // SpectrumEngine has kSlots == 8 and every gains-only republish advances the write
+    // slot by one, so the EIGHTH frame of a pencil drag lands on the slot the plan was
+    // measured in. setOverrides copies the source slot WHOLESALE - the generation stamp
+    // included, deliberately, because bumping it would restart every voice's spectral
+    // morph sixty times a second - and it did not zero that slot's planStamp. So on the
+    // eighth frame planStamp[w] still equalled the copied generation, getLivePlan() and
+    // getLivePair() both passed their "measured on the template that is live NOW" test,
+    // and a note started after that frame was seeded from phases measured on the
+    // PRE-EDIT amplitudes. The header opposite planFor() has the number that costs:
+    // 2.13 dB WORSE than today's hash after a single pencil edit. And it did not heal -
+    // planLive() early-returns on exactly the stamp==generation test that was wrongly
+    // passing, so every wrap after the first was stale too until a real recompile.
+    //
+    // THE ONLY CORRECT ANSWER AFTER AN EDIT IS "NO PLAN". Nothing re-measures a plan on
+    // a gains-only republish (that is the 38 ms the engine refuses to spend on a drag
+    // frame), so a voice starting mid-drag gets today's hash - the documented fallback
+    // and the sound this synth already shipped. A plan handed back here is a plan for a
+    // spectrum nobody is playing.
+    {
+        std::printf ("\na pencil drag never hands a voice the plan of the spectrum it just edited:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 256);
+        awaitSpectrumIdle (*p, "the default template before the drag");
+
+        const auto* T   = p->getLiveTemplate();
+        const auto* pl0 = p->getLivePhasePlan();
+        // GATE FIRST. With no plan live before the drag there is nothing to go stale and
+        // every check below would pass on an engine that had stopped planning entirely.
+        check (T != nullptr && ! T->partials.empty() && pl0 != nullptr && pl0->valid(),
+               "  (precondition) a valid plan is live BEFORE the drag, so staleness is possible");
+        if (T != nullptr && ! T->partials.empty() && pl0 != nullptr && pl0->valid())
+        {
+            const std::vector<double> preEdit = pl0->phase;   // the plan on the UNEDITED gains
+            const int  edited = std::min (64, (int) T->partials.size());
+            int  firstHanded = -1;      // the first drag frame that handed back ANY plan
+            int  firstStale  = -1;      // ...and the first that handed back THE OLD ONE
+            for (int frame = 1; frame <= 9; ++frame)
+            {
+                // One drag frame: the same partials, a different depth every frame, so
+                // "the latest gains" is a different number nine times over and a plan
+                // measured on any earlier frame is measurably the wrong one.
+                std::vector<spectrum::PartialGain> ov;
+                ov.reserve ((size_t) edited);
+                for (int i = 0; i < edited; ++i)
+                {
+                    spectrum::PartialGain g;
+                    g.key = spectrum::gainKey ((double) T->partials[(size_t) i].ratio);
+                    g.dB  = -1.5f * (float) frame;
+                    ov.push_back (g);
+                }
+                p->setPartialGains (std::move (ov), true);
+                awaitSpectrumIdle (*p, "a pencil drag frame");
+
+                if (const auto* pl = p->getLivePhasePlan())
+                {
+                    if (firstHanded < 0) firstHanded = frame;
+                    if (firstStale < 0 && pl->phase == preEdit) firstStale = frame;
+                }
+            }
+            std::printf ("    9 drag frames on %d partials: first frame handing back a plan %d,"
+                         " first handing back the PRE-EDIT plan %d (-1 = never)\n",
+                         edited, firstHanded, firstStale);
+            check (firstStale < 0,
+                   "  no drag frame hands back the plan measured before the drag started"
+                   " - the 8-slot wrap does not resurrect it");
+            check (firstHanded < 0,
+                   "  ...and no drag frame hands back a plan at all: a gains-only republish"
+                   " re-measures nothing, so the honest answer is the hash");
+
+            // THE OTHER HALF, or the check above passes on an engine that never plans.
+            // A REAL recompile must still produce a plan.
+            const juce::uint32 gen0 = p->getTemplateGeneration();
+            if (auto* bn = p->apvts.getParameter ("baseN"))
+                bn->setValueNotifyingHost (bn->convertTo0to1 (5.0f));
+            // The rebuild rides the parameter POLL (timerCallback -> requestRebuild), and
+            // this harness has no message loop - without this tick the generation never
+            // moves and the wait below times out on a plugin that is working perfectly.
+            p->pollParametersForTests();
+            awaitTemplateChange (*p, gen0, "the recompile after the drag");
+            awaitSpectrumIdle (*p, "the recompile after the drag");
+            const auto* pl2 = p->getLivePhasePlan();
+            check (pl2 != nullptr && pl2->valid(),
+                   "  ...while a REAL recompile still publishes a plan - the fix suppresses"
+                   " the stale one, not the machinery");
+            check (pl2 == nullptr || pl2->phase != preEdit,
+                   "  ...and that plan is not the pre-drag one wearing a new stamp");
+        }
+    }
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
 }
