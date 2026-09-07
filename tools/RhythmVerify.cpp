@@ -20413,6 +20413,78 @@ static void runProcessorAuditChecks()
            #endif
         }
     }
+
+    //-- run 76: THE LANGUAGE PASS WIDENS A VALUE BOX, IT DOES NOT MOVE IT --------------
+    //
+    // configFader gives every fader a 46 px value box BELOW the track and then adds it to
+    // the list applyLanguage() re-sizes at the end. Eight callers immediately turn their
+    // fader horizontal with the value to its RIGHT, in a row 22-24 px tall - and the
+    // sizing pass wrote TextBoxBelow back over all of them, because it passed the position
+    // as well as the width. Nothing re-set them afterwards, so Morph time, Dry/Wet time,
+    // Harmonics, Prime limit and Reps shipped with the number under about 9 px of track.
+    //
+    // No check in this build could state that. The fit sweep asks whether text fits the
+    // room it was given, and 9 px of room for "0.30" is room it fits; the untranslated and
+    // mojibake gates are about words, not places. The snapshot rig photographs it - and a
+    // picture is evidence only if somebody looks. This is the fact a build can fail on.
+    //
+    // Both directions are checked. Five faders that MUST keep their right-hand box, and
+    // two that must keep the box BELOW - otherwise "make everything TextBoxRight" would
+    // pass, and that would be the same bug pointing the other way.
+    {
+        std::printf ("\nrun 76: applyLanguage widens a fader's value box without moving it:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        using Ed   = FractalAdditiveAudioProcessorEditor;
+        auto pp = std::make_unique<Proc>();
+        auto& p = *pp;
+        p.prepareToPlay (48000.0, 256);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<Ed*> (base.get());
+        check (ed != nullptr, "  the editor builds");
+        if (ed != nullptr)
+        {
+            ed->setSize (1200, 650);
+            const char* horizontal[] = { "morphTime", "dryWetTime", "harmonics",
+                                         "primeLimit", "timbreRepeats" };
+            const char* below[]      = { "slope", "baseN" };
+            for (const bool ca : { false, true })
+            {
+                ed->setLanguageForSnapshot (ca);
+                for (const char* n : horizontal)
+                {
+                    const auto b = ed->faderBoxProbeForTests (n);
+                    const juce::String what = juce::String ("  ") + n + " keeps the value box "
+                                            + "beside its track, in " + (ca ? "Catalan" : "English");
+                    std::printf ("    %-14s %s pos=%d box=%dx%d row=%d\n", n, ca ? "ca" : "en",
+                                 b.pos, b.boxW, b.boxH, b.rowH);
+                    check (b.found, "  (the probe knows this fader)");
+                    check (b.pos == (int) juce::Slider::TextBoxRight, what.toRawUTF8());
+                    // A box BELOW eats the row: the track is left rowH - boxH. This is the
+                    // consequence the picture showed, stated as a number.
+                    const juce::String room = juce::String ("  ...so the track keeps the whole ")
+                                            + juce::String (b.rowH) + " px row, not "
+                                            + juce::String (b.rowH - b.boxH);
+                    check (b.rowH == 0 || b.boxH < b.rowH, room.toRawUTF8());
+                }
+                for (const char* n : below)
+                {
+                    const auto b = ed->faderBoxProbeForTests (n);
+                    std::printf ("    %-14s %s pos=%d box=%dx%d row=%d\n", n, ca ? "ca" : "en",
+                                 b.pos, b.boxW, b.boxH, b.rowH);
+                    // BELOW or nothing at all: the end of resized() drops a vertical
+                    // fader's read-out entirely when its column is too narrow to fill the
+                    // box, and that decision is as much this loop's business to leave
+                    // alone as the horizontal ones' right-hand box is.
+                    const juce::String what = juce::String ("  ") + n
+                                            + " keeps the box its own column gave it (the fix "
+                                              "is not \"move them all the other way\")";
+                    check (b.pos == (int) juce::Slider::TextBoxBelow
+                           || b.pos == (int) juce::Slider::NoTextBox, what.toRawUTF8());
+                }
+            }
+            ed->setLanguageForSnapshot (false);
+        }
+    }
 }
 
 //==============================================================================

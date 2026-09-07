@@ -707,6 +707,17 @@ public:
     // drag downwards.  `settleTicks`: timer ticks to run afterwards, to catch a value
     // that moves and is then written back.
     DragProbe dragFaderForTests (const juce::String& name, int dy, int settleTicks);
+
+    // TESTS: WHERE A FADER'S VALUE BOX ENDED UP, after every pass that has an opinion.
+    //
+    // A box in the wrong PLACE is not something any existing check can state. The fit
+    // sweep asks whether a control's text fits the room it was given, and a number moved
+    // under a horizontal track in a 24 px row is given room - about 9 px of it - and fits.
+    // The snapshot rig photographs the result, and a picture is only evidence if somebody
+    // looks. This is the fact in a form a build can fail on: the position juce::Slider
+    // really holds, plus the height left for the track under it.
+    struct FaderBoxProbe { bool found = false; int pos = -1, boxW = 0, boxH = 0, rowH = 0; };
+    FaderBoxProbe faderBoxProbeForTests (const juce::String& name) const;
     void clickCustomLoadRemoveForTests() { if (loadTimbreButton.onClick) loadTimbreButton.onClick(); }
     void clickRandomSpectrumForTests()   { if (randomSpectrumBtn.onClick) randomSpectrumBtn.onClick(); }
     // Test hook (RhythmVerify): double-click a row of the chord-search results, which is
@@ -850,6 +861,24 @@ private:
     // Every fader configFader() built, so their value boxes can be sized to the text they
     // really show - which is only knowable after the suffixes are set. See applyLanguage().
     std::vector<juce::Slider*> configuredFaders;
+    // ...AND THE BOX EACH OF THEM WAS BUILT WITH, because the sizing pass must widen a box
+    // without MOVING it.
+    //
+    // configFader gives every fader a 46 px box BELOW the track and then pushes it onto
+    // configuredFaders - and eight callers immediately turn their fader horizontal with the
+    // value to its RIGHT, in a row 22-24 px tall where a box below has nowhere to go. The
+    // sizing pass then wrote TextBoxBelow back over all of them, and nothing re-set it: the
+    // Morph and Dry/Wet times, Harmonics, Prime limit and Reps all drew their number under
+    // a 9 px sliver of track. The snapshot rig had been saying so for a while without
+    // anybody reading it as this - at the 690x550 floor the Dry/Wet value label is what
+    // pins the window's minimum HEIGHT, with "-1.0 tall" of room.
+    //
+    // So the width the CALLER chose is the floor, not a global 46, and the position and
+    // height are read live rather than replaced: phaseFader's box is switched between
+    // TextBoxRight and NoTextBox by resized() according to how much room its cell has, and
+    // a language pass must not undo that decision either.
+    struct FaderBoxHome { juce::Slider::TextEntryBoxPosition pos = juce::Slider::TextBoxBelow; int w = 46; };
+    std::vector<FaderBoxHome> faderBoxHome;   // parallel to configuredFaders, filled once
     // ESSENTIALS could not fit its sub-label beside its control, so the label is drawn
     // above it instead. Set by resized(), read by paintedSubLabels() - the two must agree.
     bool essStacked = false;
