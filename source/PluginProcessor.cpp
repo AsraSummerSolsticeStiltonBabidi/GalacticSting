@@ -1096,6 +1096,15 @@ int FractalAdditiveAudioProcessor::bankAutoAdd (const juce::String& name, const 
             bankName[(size_t) i]   = name.isNotEmpty() ? name : juce::String ("scale");
             return i;
         }
+    // BANK FULL, AND SAID SO. Returning -1 was already the safe half - nothing is
+    // overwritten - but it was also the silent half: every path that loads a tuning calls
+    // this, so a full bank meant scales quietly stopped joining it while the panel went on
+    // describing a bank that "just keeps growing". The tuning IS loaded and sounding; what
+    // did not happen is the one-click way back to it, and that is worth a sentence.
+    bankSlotError = (name.isNotEmpty() ? name : juce::String ("This tuning"))
+                  + " \xe2\x80\x94 the tuning bank is full (" + juce::String (kBankSlots)
+                  + " slots), so it did not join the bank. It IS loaded and sounding; remove "
+                    "a tuning from the bank with its X to make room for it.";
     return -1; // bank full - the user curates it with the X
 }
 
@@ -1176,13 +1185,32 @@ int FractalAdditiveAudioProcessor::firstEmptyBankSlot() const noexcept
     for (int i = 0; i < kBankSlots; ++i)
         if (bankSource[(size_t) i].isEmpty())
             return i;
-    return 0; // all full -> reuse the first
+    // -1, NOT 0. This used to answer "all full -> reuse the first", and its one caller
+    // hands the answer straight to setTuningBankFile - so the 129th tuning added to the
+    // bank OVERWROTE the user's own first one, with nothing on screen either before or
+    // after. A silently destroyed scale is the worst outcome this bank has available: the
+    // slot still lists a name, the name is the new file's, and the scale that was there is
+    // gone from a plugin that promises the bank "just keeps growing".
+    return -1; // the bank is full - the caller must say so, never pick a victim
 }
 
 void FractalAdditiveAudioProcessor::setTuningBankFile (int slot0, const juce::File& f)
 {
-    if (! juce::isPositiveAndBelow (slot0, kBankSlots) || ! f.existsAsFile())
+    if (! f.existsAsFile())
+        return;                       // nothing to store, and nothing to say about it
+
+    // THE LIMIT IS STATED WHERE THE USER CAN SEE IT, WHICH IS THE ONLY WAY IT IS ALLOWED
+    // TO EXIST. kBankSlots is 128 because "tuningBankSlot" is an automatable parameter and
+    // a parameter needs a bounded range; the panel calls the bank effectively unlimited,
+    // which is true right up until it is not. Parked on bankSlotError so it reaches the
+    // notice overlay the editor already drains on its timer - see takeBankSlotError.
+    if (! juce::isPositiveAndBelow (slot0, kBankSlots))
+    {
+        bankSlotError = f.getFileNameWithoutExtension() + " \xe2\x80\x94 the tuning bank is full ("
+                      + juce::String (kBankSlots) + " slots). Nothing was stored and nothing was "
+                        "overwritten - remove a tuning from the bank with its X to make room.";
         return;
+    }
 
     auto text = f.loadFileAsString();
     // The bank stores tuning SOURCE text and re-parses it on every slot switch and on
@@ -2066,7 +2094,7 @@ static bool refuseTableEdit (bool isTable, juce::String& errorOut)
 bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce::String& errorOut,
                                                      const juce::String& exactText)
 {
-    if (refuseTableEdit (tuning.usesAbsoluteTable(), errorOut)) return false;
+    if (refuseTableEdit (tuningTableIsInForce(), errorOut)) return false;
     const int    D      = juce::jmax (1, tuning.degreesPerPeriod());
     const double period = getDegreeRatio (D);
     if (! (period > 1.0001) || ! (ratioFromTonic > 0.0) || ! std::isfinite (ratioFromTonic))
@@ -2162,7 +2190,7 @@ bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce
 bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::String& valueText,
                                                       juce::String& errorOut)
 {
-    if (refuseTableEdit (tuning.usesAbsoluteTable(), errorOut)) return false;
+    if (refuseTableEdit (tuningTableIsInForce(), errorOut)) return false;
     const int D = juce::jmax (1, tuning.degreesPerPeriod());
     if (degree < 1 || degree > D)
     {
@@ -2208,7 +2236,7 @@ bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::St
 // EVERY repetition of the period (a scale degree is a pitch class, not one key).
 bool FractalAdditiveAudioProcessor::deleteTuningDegree (int degree, juce::String& errorOut)
 {
-    if (refuseTableEdit (tuning.usesAbsoluteTable(), errorOut)) return false;
+    if (refuseTableEdit (tuningTableIsInForce(), errorOut)) return false;
     const int D = juce::jmax (1, tuning.degreesPerPeriod());
     if (degree < 1 || degree >= D)
     {
@@ -2581,13 +2609,17 @@ FractalAdditiveAudioProcessor::registerPeriodInfo() const
     // the 2/1 display fallback. The band's unit was then an octave the user's file
     // never contained, printed with no qualifier at all, while the .tun that has the
     // very same problem got one. Now the qualifier follows the fact, not the format.
+    // IN FORCE, not merely loaded, in all three tests below. A .tun table left over from
+    // an earlier load with the box back on 12-TET made this print the TABLE's worst
+    // deviation beside a 2/1 that 12-TET states exactly - a qualifier borrowed from a
+    // tuning that is not sounding, on a band whose unit is a plain octave.
     if (! tuning.hasUsablePeriod())
     {
         i.source = RegisterPeriodSource::NoneStated;
-        if (tuning.usesAbsoluteTable()) i.devCents = tuning.tablePeriodDevCents();
+        if (tuningTableIsInForce()) i.devCents = tuning.tablePeriodDevCents();
         return i;
     }
-    if (! tuning.usesAbsoluteTable())
+    if (! tuningTableIsInForce())
         return i;                      // a scale (or MTS master) states its own period
     i.devCents = tuning.tablePeriodDevCents();
     // `found` is false when the file has nothing ascending to measure at all. periodRatio()
@@ -2998,7 +3030,7 @@ void FractalAdditiveAudioProcessor::applySpecSnapshot (const SpecSnapshot& s)
         p->setValueNotifyingHost (s.timbreOn ? 1.0f : 0.0f);
 }
 
-void FractalAdditiveAudioProcessor::takeRealtimeBaseline (RtLink mode)
+void FractalAdditiveAudioProcessor::takeRealtimeBaseline (RtLink mode, bool addToBank)
 {
     // BOTH trackers are cleared first. commitRealtimeBaseline returns early when the link
     // never applied anything, leaving its tracker set - so engaging the tuning link, leaving
@@ -3014,7 +3046,12 @@ void FractalAdditiveAudioProcessor::takeRealtimeBaseline (RtLink mode)
         // ...and into the bank ONCE, so the tuning the follower is about to replace is a
         // single click away even without touching the undo history. bankAutoAdd skips
         // exact duplicates, so re-engaging does not add a second copy.
-        if (rtTuneBase.source.isNotEmpty())
+        //
+        // NOT on a state load. There the baseline is the project's OWN tuning, which the
+        // project's own BANK child already describes - and a load that goes on writing
+        // into the bank it has just restored hands the host a different state than the one
+        // it opened, before the user has touched anything.
+        if (addToBank && rtTuneBase.source.isNotEmpty())
             bankAutoAdd (tuning.getScalaName().isNotEmpty() ? tuning.getScalaName()
                                                             : juce::String ("before realtime"),
                          rtTuneBase.source);
@@ -3045,10 +3082,50 @@ void FractalAdditiveAudioProcessor::commitRealtimeBaseline()
 
 void FractalAdditiveAudioProcessor::setRealtimeLink (RtLink mode, const RtSettings& s)
 {
-    rtSet = s;
-    if (mode == rtLink) return;
+    setRealtimeLinkImpl (mode, s, false);
+}
 
-    if (rtLink != RtLink::Off)
+// THE LINK AS A PROJECT LOAD INSTALLS IT, and it is a different job from pressing the
+// button, in both directions.
+//
+// LEAVING: apvts.replaceState calls undoManager->clearUndoHistory(), and restoreState
+// reaches this a few hundred lines later. So the undo step setRealtimeLink mints on the
+// way out - "one Ctrl+Z back to the tuning the follower displaced" - was landing on a
+// history that had just been emptied, describing a patch that no longer exists. The FIRST
+// Ctrl+Z after opening a project therefore installed the PREVIOUS patch's tuning, out of
+// nowhere, in an instrument whose whole promise is that its tuning does not change under
+// the player.
+//
+// ARRIVING, which is the half a naive fix misses: setRealtimeLink returns early when the
+// mode has not changed, so a project that saves the SAME link the instance already had
+// left a still-engaged follower carrying the PREVIOUS patch's baseline. It would then
+// commit that on the way out - the very same wrong tuning, one step later. Dropping the
+// commit alone swaps a wrong undo step for no undo step at all.
+//
+// So the arming is RE-RUN rather than skipped: the stale baseline is dropped without
+// being committed, and a fresh one is taken against the tuning the project just restored.
+// Everything else the engage path resets is exactly right here too - the held target, the
+// tuning signature, the landing time and the adopted generations all belong to the patch
+// that is gone.
+void FractalAdditiveAudioProcessor::restoreRealtimeLink (RtLink mode, const RtSettings& s)
+{
+    setRealtimeLinkImpl (mode, s, true);
+}
+
+void FractalAdditiveAudioProcessor::setRealtimeLinkImpl (RtLink mode, const RtSettings& s,
+                                                         bool fromStateLoad)
+{
+    rtSet = s;
+    if (mode == rtLink && ! fromStateLoad) return;
+
+    if (fromStateLoad)
+    {
+        // Dropped, never committed: see the block above. Both trackers, because either
+        // one of them would have been enough to mint the step.
+        rtTuneBaseTaken = false;
+        rtSpecBase      = {};
+    }
+    else if (rtLink != RtLink::Off)
         commitRealtimeBaseline();      // leaving: one undo step back to what it displaced
 
     rtLink    = mode;
@@ -3071,7 +3148,7 @@ void FractalAdditiveAudioProcessor::setRealtimeLink (RtLink mode, const RtSettin
     rtMovedAtMs = -1.0;
     rtLandingMs = -1.0;
     if (mode != RtLink::Off)
-        takeRealtimeBaseline (mode);
+        takeRealtimeBaseline (mode, ! fromStateLoad);
     // The budget is only armed while a spectrum-side follower is running, so the link
     // changing is exactly when it has to be re-decided (and the host re-told).
     applyLookahead();
@@ -3451,7 +3528,11 @@ bool FractalAdditiveAudioProcessor::saveCurrentTuningScl (const juce::File& f, j
     // A .scl can only say "N degrees repeating at a period" (a per-key map needs a .kbm
     // alongside it), so an absolute table cannot go out this way without being flattened
     // into a scale it is not. .tun holds it exactly - that is why .tun is the default.
-    if (tuning.usesAbsoluteTable())
+    //
+    // IN FORCE, not merely loaded (tuningTableIsInForce, not usesAbsoluteTable): with a
+    // .tun table loaded earlier and the box back on 12-TET, this refused to export 12-TET
+    // as a .scl on the grounds that the tuning is a table - which by then it was not.
+    if (tuningTableIsInForce())
     {
         errorOut = "This tuning is a 128-key table (a .tun that does not repeat), and a .scl "
                    "can only hold degrees repeating at a period. Save it as .tun instead - "
@@ -4543,6 +4624,21 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     // The one-shot MTS adoption must not second-guess it.
     mtsCheckPending = false;
 
+    // THE PRESET'S TUNING ON OFFER BELONGS TO THE PRESET THAT IS LOADED, and after this
+    // line that is no longer the one it came from. Nothing ever cleared these three
+    // fields, so "Load preset's tuning" went on offering the LAST preset's scale across a
+    // project load, a host reopening the session, and every state change after it - a
+    // button naming a scale from a preset this instrument is no longer playing, which on
+    // a press would replace the reopened project's own tuning with it.
+    //
+    // The ORDER is the whole trick, and the obvious version of this fix is backwards:
+    // loadPreset used to fill these fields and THEN call this function, so clearing here
+    // would have disabled the offer outright, for every preset, for ever. loadPreset now
+    // reads the preset's SCALA child AFTER restoreState instead - see the note there.
+    presetPendingSclName.clear();
+    presetPendingSclSource.clear();
+    presetPendingTablePeriod.clear();
+
     // WHICH <PARAM> CHILDREN THE CHUNK ITSELF CARRIES, asked HERE and not one line later.
     // apvts.replaceState does `state = newState`, and a juce::ValueTree assignment shares
     // the same reference-counted object rather than copying it - so from the next line on,
@@ -4968,9 +5064,12 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     refreshPlaygroundActive();
 
     // The realtime/adaptive link travels with the patch (see captureState). Restored
-    // through setRealtimeLink so it takes its own undo baseline exactly as pressing the
-    // button would - a follower armed by a preset must be as reversible as one armed by
-    // hand. An absent child means the state predates this and the follower stays off.
+    // through restoreRealtimeLink so it takes its own undo baseline exactly as pressing
+    // the button would - a follower armed by a preset must be as reversible as one armed
+    // by hand - but WITHOUT minting the leaving-step onto the undo history replaceState
+    // has just cleared, and re-arming even when the mode has not changed. Both halves are
+    // written out at that function. An absent child means the state predates this and the
+    // follower stays off.
     {
         const auto rtTree = tree.getChildWithName ("REALTIME");
         const auto s = realtimeSettingsFromTree (rtTree);
@@ -4982,11 +5081,11 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
             rtSet = s;
             pgSuspendedRt = want;
             pgRtSuspended = true;
-            setRealtimeLink (RtLink::Off, s);
+            restoreRealtimeLink (RtLink::Off, s);
         }
         else
         {
-            setRealtimeLink (want, s);
+            restoreRealtimeLink (want, s);
         }
     }
 
@@ -5291,9 +5390,23 @@ juce::String FractalAdditiveAudioProcessor::savePreset (const juce::String& name
 
 bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
 {
+    // A FAILED PRESET LOAD IS STATED. Every `return false` below used to be silent, and
+    // the one caller drops the bool: the name stayed in the box, the PREVIOUS preset went
+    // on sounding, and the Tuning panel went on offering the previous preset's scale. The
+    // player is told they loaded something they did not. Parked rather than shown from
+    // here for the same reason tuningRestoreError is - the editor may not exist (the
+    // playground assigns corners with the window shut) - and consumed the same way.
+    presetLoadError.clear();
+    const auto refuse = [this, &name] (const juce::String& why)
+    {
+        presetLoadError = name.isNotEmpty() ? name + " \xe2\x80\x94 " + why : why;
+        return false;
+    };
+
     auto file = presetFile (name);
     if (! file.existsAsFile())
-        return false;
+        return refuse ("there is no preset by that name in the preset folder. Nothing was "
+                       "loaded - the patch you were playing is untouched.");
     if (auto xml = juce::XmlDocument::parse (file))
     {
         // .gsting files are user-editable: only apply a tree of OUR type, or a
@@ -5301,22 +5414,8 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
         // while reporting success.
         auto tree = juce::ValueTree::fromXml (*xml);
         if (! tree.hasType (apvts.state.getType()))
-            return false;
-
-        // The preset's OWN tuning travels IN the file (so it is never lost) but is
-        // never applied by loading the preset: only the SOUND changes, never the
-        // scale under whatever is already loaded or being played on. It is offered
-        // separately - see hasPendingPresetTuning() / loadPendingPresetTuning() -
-        // the Tuning panel shows a button for it only when the two actually differ.
-        if (auto scl = tree.getChildWithName ("SCALA"); scl.isValid())
-        {
-            presetPendingSclName   = scl.getProperty ("name").toString();
-            presetPendingSclSource = scl.getProperty ("source").toString();
-            // A preset saved on an absolute table carries its period too, so accepting the
-            // preset's tuning later reproduces what the preset's author was hearing.
-            presetPendingTablePeriod = scl.getProperty ("tablePeriod").toString();
-        }
-        else { presetPendingSclName.clear(); presetPendingSclSource.clear(); presetPendingTablePeriod.clear(); }
+            return refuse ("this file is XML, but it is not a Fibl\xc3\xb3 Gal\xc3\xa0" "ctic preset. "
+                           "Nothing was loaded - the patch you were playing is untouched.");
 
         const auto keep     = tuning.captureTuning();
         const int  keepMode = getTuningMode();
@@ -5340,6 +5439,30 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
         manualRefA = keepManualRefA;
         mtsHadRef  = keepMtsHadRef;
 
+        // The preset's OWN tuning travels IN the file (so it is never lost) but is
+        // never applied by loading the preset: only the SOUND changes, never the
+        // scale under whatever is already loaded or being played on. It is offered
+        // separately - see hasPendingPresetTuning() / loadPendingPresetTuning() -
+        // the Tuning panel shows a button for it only when the two actually differ.
+        //
+        // AFTER restoreState, not before it, and that is not tidiness. restoreState now
+        // clears the offer, because an offer belongs to the preset that is loaded and a
+        // state load replaces the patch (see the clear there for what it was costing).
+        // Read into these fields first, as this used to, and the clear one line later
+        // would wipe every offer this function has ever made.
+        //
+        // `tree` still carries the child at this point: apvts.replaceState makes `tree`
+        // and apvts.state the same object and APPENDS the <PARAM> children the chunk was
+        // missing, but it removes nothing, so SCALA is exactly where the file put it.
+        if (auto scl = tree.getChildWithName ("SCALA"); scl.isValid())
+        {
+            presetPendingSclName   = scl.getProperty ("name").toString();
+            presetPendingSclSource = scl.getProperty ("source").toString();
+            // A preset saved on an absolute table carries its period too, so accepting the
+            // preset's tuning later reproduces what the preset's author was hearing.
+            presetPendingTablePeriod = scl.getProperty ("tablePeriod").toString();
+        }
+
         // Put the CURRENTLY ACTIVE tuning back exactly as it was - source, name AND a
         // table's chosen period, which is as much part of "as it was" as the pitches.
         if (keep.source.isNotEmpty())
@@ -5355,7 +5478,10 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
         snapshotLoadedPreset (name); // AFTER the tuning revert - that is the real final state
         return true;
     }
-    return false;
+    // XmlDocument::parse returned nothing: the file is there and is not XML at all
+    // (truncated by a crash mid-save, edited by hand, or simply something else).
+    return refuse ("this preset file could not be read - it is not valid XML. Nothing was "
+                   "loaded - the patch you were playing is untouched.");
 }
 
 //==============================================================================

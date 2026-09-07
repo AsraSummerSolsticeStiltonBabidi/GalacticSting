@@ -20529,4 +20529,641 @@ static void runSilentLimitChecks()
                  && ! shepard::riseRatioIsLimited (shepard::RisePeriod, nan71),
                "  ...and so does a NaN period, on both sides of the answer");
     }
+
+    //-- run 69: A TABLE WHOSE PERIOD WAS NEVER FOUND STATES NONE ---------------------
+    //
+    // PeriodEstimate carries `ratio = 2.0` as its DEFAULT, and `found = false` alongside it
+    // to say the 2.0 means nothing. loadAbsoluteTable published the ratio and dropped the
+    // flag, so statedPeriodRatio() handed a 2/1 back as a fact and hasUsablePeriod() said
+    // yes - for a file in which nothing ascends at all. Temper then snapped every partial
+    // onto an octave grid that appears NOWHERE in the user's tuning, silently, which is the
+    // one substitution this plugin's stated/fallback split exists to refuse.
+    //
+    // It needs a .tun that never ascends, so it is built here rather than found: 128 keys
+    // running DOWN 10 cents each. That is legal .tun content (an inverted keyboard), it
+    // cannot convert to a scale (a period must ascend), and the estimate's canonical pass
+    // and its raw pass both come back empty - `found = false`, ratio left at its 2.0 default.
+    //
+    // Measured on WHAT THE SPECTRUM DOES, not only on the flag: the partial ratios with
+    // temper ON must be the ones temper OFF produced. Putting the 2.0 back into
+    // statedPeriodRatio moves them onto "degree x 2^k" and this goes red twice over.
+    {
+        std::printf ("\nrun 69: a tuning table with no period found does not invent a 2/1:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        juce::String tun;
+        tun << "; a descending 128-key map: nothing in it ascends, so nothing in it repeats\n"
+            << "[Exact Tuning]\nbasefreq=440.0\n";
+        for (int n = 0; n < 128; ++n)
+            tun << "note " << n << "=" << juce::String (-10.0 * (double) n, 6) << "\n";
+
+        // In through a BANK SLOT, which is the one route that takes .tun TEXT (a file would
+        // also write the user's recent-files list, and this rig does not touch that).
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        if (auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+        {
+            xml->removeChildElement (xml->getChildByName ("BANK"), true);
+            auto* bank = xml->createNewChildElement ("BANK");
+            auto* slot = bank->createNewChildElement ("SLOT");
+            slot->setAttribute ("i", 0);
+            slot->setAttribute ("name", "zzz69-descending");
+            slot->setAttribute ("source", tun);
+            juce::MemoryBlock withBank;
+            juce::AudioProcessor::copyXmlToBinary (*xml, withBank);
+            p->setStateInformation (withBank.getData(), (int) withBank.getSize());
+        }
+        p->setTuningBankSlotParam (1);
+        for (int i = 0; i < 3; ++i) p->pollParametersForTests();
+
+        check (p->tuningIsAbsoluteTable(),
+               "  (precondition) a .tun that never repeats loads as a 128-key table");
+        check (! p->tuningTablePeriodWasFound(),
+               "  (precondition) ...and the period estimate found nothing to measure in it");
+        std::printf ("    stated period %.6f, display fallback %.6f, temper possible = %d\n",
+                     p->getStatedTuningPeriodRatio(), p->getTuningPeriodRatio(),
+                     (int) p->temperIsPossible());
+        check (p->getStatedTuningPeriodRatio() == 0.0,
+               "  the table STATES no period - PeriodEstimate's 2.0 is a default, never a "
+               "measurement");
+        check (! p->tuningStatesPeriod(), "  ...so hasUsablePeriod() answers no");
+        check (! p->temperIsPossible(),
+               "  ...and temper refuses instead of snapping the spectrum to an octave the "
+               "file never contained");
+        check (p->getTuningPeriodRatio() == 2.0,
+               "  ...while the DISPLAY fallback still hands the keyboard a finite number");
+
+        // WHAT THE PLAYER HEARS. The ratios temper OFF builds, then the ratios temper ON
+        // builds: refusing means they are the same list.
+        const auto ratios = [&p]
+        {
+            std::vector<double> r;
+            if (const auto* t = p->getLiveTemplate())
+                for (const auto& q : t->partials) r.push_back ((double) q.ratio);
+            return r;
+        };
+        awaitSpectrumIdle (*p, "run 69: the untempered spectrum");
+        const auto before = ratios();
+        if (auto* tp = p->apvts.getParameter ("timbreTemper"))
+            tp->setValueNotifyingHost (1.0f);
+        for (int i = 0; i < 40; ++i) { p->pollParametersForTests(); juce::Thread::sleep (2); }
+        awaitSpectrumIdle (*p, "run 69: the spectrum after temper was switched on");
+        const auto after = ratios();
+        double worst = 0.0;
+        for (size_t i = 0; i < std::min (before.size(), after.size()); ++i)
+            worst = std::max (worst, std::abs (1200.0 * std::log2 (std::max (1.0e-9, after[i])
+                                                                / std::max (1.0e-9, before[i]))));
+        std::printf ("    %d partials before, %d after; worst move %.4f cents\n",
+                     (int) before.size(), (int) after.size(), worst);
+        check (! before.empty(), "  (precondition) there is a spectrum to compare at all");
+        check (before.size() == after.size() && worst < 1.0e-4,
+               "  switching temper ON moves no partial at all - the refusal is what the "
+               "voices actually get, not just what a flag says");
+
+        // ...AND THE USER CAN STILL SUPPLY ONE. The fix must not disable the feature: a
+        // period typed into the panel's own field is somebody stating one, which is exactly
+        // the visible control the honesty rule asks for.
+        juce::String perErr;
+        check (p->setTuningTablePeriod ("3/2", perErr),
+               "  a period typed by hand is accepted on a table that measured none");
+        std::printf ("    after typing 3/2: stated %.6f, temper possible = %d\n",
+                     p->getStatedTuningPeriodRatio(), (int) p->temperIsPossible());
+        check (std::abs (p->getStatedTuningPeriodRatio() - 1.5) < 1.0e-9,
+               "  ...and THAT period is stated - the refusal was about nobody having supplied "
+               "one, not about tables");
+        check (p->temperIsPossible(),
+               "  ...so temper works again the moment the user says what the period is");
+    }
+
+    //-- run 70: A .scl WHOSE KEYS OVERFLOW IS REFUSED, NOT PUBLISHED -----------------
+    //
+    // loadAbsoluteTable sweeps all 128 frequencies for finite-and-positive BEFORE it
+    // publishes one of them, so a bad table leaves the previous tuning sounding.
+    // loadScalaString had no such sweep: it checked the DEGREES (parsePitchSrc does), and
+    // a key is not a degree - it is degree x period^octave, and the exponent is what goes.
+    //
+    // The file below is one degree per period of 400000 cents. Every line of it is legal
+    // and the parser is right to accept it; it is the 128-key BUILD that overflows, +inf at
+    // the top of the keyboard and a flat 0.0 at the bottom. frequencyForNote is a plain
+    // atomic load on the audio thread and cannot check anything, so those went straight
+    // into the voices, where an inf ratio is a NaN partial.
+    //
+    // The second half is the control: a scale that is merely EXTREME - two octaves per
+    // degree, key 0 down at ~2e-34 Hz - is representable, so it still loads. Nothing here
+    // is refused for being big, only for not fitting in a double.
+    {
+        std::printf ("\nrun 70: a .scl whose keys overflow is refused, not published:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        const juce::String good = "! a plain 5-degree scale\nzzz70-good\n 5\n 240.\n 480.\n 720.\n 960.\n 1200.\n";
+        juce::String err;
+        check (p->loadScalaText (good, "zzz70-good", err),
+               "  (precondition) a plain scale is loaded and sounding");
+        const double keep60 = p->getNoteFrequency (60), keep72 = p->getNoteFrequency (72);
+
+        const juce::String huge = "! one degree per period of 400000 cents\nzzz70-overflow\n 1\n 400000.\n";
+        err.clear();
+        const bool took = p->loadScalaText (huge, "zzz70-overflow", err);
+        std::printf ("    loading it: %s, message \"%s\"\n", took ? "ACCEPTED" : "refused",
+                     err.toRawUTF8());
+        check (! took, "  the load is REFUSED - a key that is not a number is not a pitch");
+        check (err.isNotEmpty(), "  ...and it says which key and why, instead of failing mute");
+
+        double worstKey = 0.0; int bad = 0;
+        for (int n = 0; n < 128; ++n)
+        {
+            const double f = p->getNoteFrequency (n);
+            if (! (f > 0.0) || ! std::isfinite (f)) ++bad;
+            else worstKey = std::max (worstKey, f);
+        }
+        std::printf ("    after the refusal: %d unusable keys, highest %.4f Hz, key 60 %.4f Hz\n",
+                     bad, worstKey, p->getNoteFrequency (60));
+        check (bad == 0,
+               "  ...and NOTHING was published: no key is inf, NaN or zero after a refused load");
+        check (std::abs (p->getNoteFrequency (60) - keep60) < 1.0e-9
+               && std::abs (p->getNoteFrequency (72) - keep72) < 1.0e-9,
+               "  ...the scale that WAS loaded is still the one under the keys");
+
+        // The control: extreme but representable still loads, so the sweep refuses
+        // overflow and not ambition.
+        err.clear();
+        check (p->loadScalaText ("! two octaves per degree\nzzz70-wide\n 1\n 2400.\n", "zzz70-wide", err),
+               "  a scale of two octaves per degree - key 0 near 2e-34 Hz - still loads");
+        std::printf ("    the wide scale: key 0 %.4g Hz, key 127 %.4g Hz\n",
+                     p->getNoteFrequency (0), p->getNoteFrequency (127));
+        check (p->getNoteFrequency (0) > 0.0 && std::isfinite (p->getNoteFrequency (127)),
+               "  ...and every one of its keys is a real number");
+    }
+
+    //-- run 71: "IS THIS A TABLE" IS ASKED ABOUT WHAT IS SOUNDING --------------------
+    //
+    // TuningManager::usesAbsoluteTable() answers for the loaded SOURCE and knows nothing
+    // about the tuning mode, which is right for it: restoreTuning asks it while putting a
+    // tuning back, BEFORE the mode parameter has been restored, so a mode test inside the
+    // accessor would break state restore. The consumers are what had to ask, and none of
+    // them did. Load a non-repeating .tun once, put the Tuning box back on 12-TET, and the
+    // instrument was in plain 12-tone equal temperament while ".scl export" and right-click
+    // degree editing both refused with "this tuning is a 128-key table" - describing a
+    // tuning that had not made a sound since the mode changed.
+    //
+    // The export half is measured WITHOUT writing anything: the target is a file inside a
+    // directory that does not exist, so a call that gets past the table guard fails one
+    // line later on the write instead. Which of the two messages comes back is the whole
+    // answer, and the rig never touches the user's recent-files list to get it.
+    {
+        std::printf ("\nrun 71: a table that is loaded but NOT in force stops refusing things:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        // A stretched keyboard: 100 cents a key plus a quadratic term, i.e. a Railsback-
+        // shaped map. It repeats at NOTHING exactly (so it cannot become a scale) while
+        // still estimating a 2/1 over 12 keys - an ordinary .tun table, not a freak one.
+        juce::String tun;
+        tun << "; a stretched 128-key map - close to an octave, exact at no interval\n"
+            << "[Exact Tuning]\nbasefreq=440.0\n";
+        for (int n = 0; n < 128; ++n)
+            tun << "note " << n << "="
+                << juce::String (100.0 * (double) n + 0.01 * (double) n * (double) n, 6) << "\n";
+
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        if (auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+        {
+            xml->removeChildElement (xml->getChildByName ("BANK"), true);
+            auto* bank = xml->createNewChildElement ("BANK");
+            auto* slot = bank->createNewChildElement ("SLOT");
+            slot->setAttribute ("i", 0);
+            slot->setAttribute ("name", "zzz71-stretched");
+            slot->setAttribute ("source", tun);
+            juce::MemoryBlock withBank;
+            juce::AudioProcessor::copyXmlToBinary (*xml, withBank);
+            p->setStateInformation (withBank.getData(), (int) withBank.getSize());
+        }
+        p->setTuningBankSlotParam (1);
+        for (int i = 0; i < 3; ++i) p->pollParametersForTests();
+
+        const auto nowhere = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("zzz71-no-such-dir").getChildFile ("out.scl");
+        const auto exportMsg = [&p, &nowhere]
+        {
+            juce::String e;
+            p->saveCurrentTuningScl (nowhere, e);
+            return e;
+        };
+
+        check (p->tuningIsAbsoluteTable(), "  (precondition) a non-repeating .tun is loaded");
+        check (p->tuningTableIsInForce(),  "  (precondition) ...and Scala mode makes it the tuning in force");
+        std::printf ("    in force: export says \"%s\"\n", exportMsg().toRawUTF8());
+        check (exportMsg().contains ("128-key table"),
+               "  the .scl export still refuses a table that really IS the tuning");
+        juce::String editErr;
+        check (! p->editTuningDegree (1, "150.", editErr) && editErr.contains ("128-key table"),
+               "  ...and so does a degree edit - the guard is kept, not removed");
+        check (p->currentTuningAsBankSource ("zzz71").contains ("[Exact Tuning]"),
+               "  ...and banking the tuning that is playing stores the .tun itself");
+
+        // ...and now the mode goes back to plain 12-TET with the table still loaded.
+        if (auto* tm = p->apvts.getParameter ("tuningMode"))
+            tm->setValueNotifyingHost (tm->convertTo0to1 ((float) (int) TuningManager::Mode::Equal));
+        for (int i = 0; i < 3; ++i) p->pollParametersForTests();
+
+        check (p->tuningTableIsInForce() == false,
+               "  on 12-TET the table is loaded but NOT in force");
+        std::printf ("    not in force: export says \"%s\"\n", exportMsg().toRawUTF8());
+        check (! exportMsg().contains ("128-key table"),
+               "  ...so the .scl export no longer refuses 12-TET for being a table");
+        check (exportMsg().contains ("Could not write"),
+               "  ...it got past the guard and failed on the unwritable path instead, which "
+               "is the only reason it failed at all");
+        check (! p->currentTuningAsBankSource ("zzz71").contains ("[Exact Tuning]"),
+               "  ...and \"bank the tuning that is playing\" banks 12-TET, not the .tun that "
+               "is not playing");
+
+        editErr.clear();
+        const bool edited = p->editTuningDegree (1, "150.", editErr);
+        std::printf ("    degree edit on 12-TET: %s (%s), degree 1 now %.4f cents\n",
+                     edited ? "accepted" : "REFUSED", editErr.toRawUTF8(),
+                     1200.0 * std::log2 (std::max (1.0e-9, p->getDegreeRatio (1))));
+        check (edited, "  ...and right-click degree editing works on 12-TET again");
+        check (std::abs (1200.0 * std::log2 (std::max (1.0e-9, p->getDegreeRatio (1))) - 150.0) < 0.01,
+               "  ...and the edit really landed: degree 1 is the 150 cents that was typed");
+    }
+
+    //-- run 72: "LOAD PRESET'S TUNING" STOPS OFFERING A PRESET THAT IS NOT LOADED ----
+    //
+    // The offer is three strings on the processor and nothing ever cleared them. Load a
+    // preset, then reopen a project - the button went on naming the PREVIOUS preset's
+    // scale, and pressing it would have replaced the reopened project's own tuning with
+    // a scale from a preset this instrument is no longer playing.
+    //
+    // The obvious fix is backwards, and the second half of this run is what catches it:
+    // loadPreset used to fill those fields and THEN call restoreState, so a clear at the
+    // top of restoreState disables the offer for every preset for ever. The fields are
+    // read AFTER the restore now, and the control below proves the feature survived.
+    {
+        std::printf ("\nrun 72: the preset tuning on offer belongs to the preset that is loaded:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run72-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        struct ScratchFolder
+        {
+            explicit ScratchFolder (const juce::File& d)
+                : dir (d), prev (Proc::getPresetFolder()) { Proc::setPresetFolderForTests (d); }
+            ~ScratchFolder() { Proc::setPresetFolderForTests (prev); dir.deleteRecursively(); }
+            juce::File dir, prev;
+        } guard (scratch);
+
+        const juce::String s1 = "! five equal degrees\nzzz72-S1\n 5\n 240.\n 480.\n 720.\n 960.\n 1200.\n";
+        const juce::String s2 = "! seven degrees\nzzz72-S2\n 7\n 200.\n 400.\n 500.\n 700.\n 900.\n 1100.\n 1200.\n";
+        const juce::String s3 = "! three degrees\nzzz72-S3\n 3\n 400.\n 800.\n 1200.\n";
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+        juce::String err;
+        check (p->loadScalaText (s1, "zzz72-S1", err), "  (precondition) S1 is loaded");
+        check (p->savePreset ("zzz72-A").isNotEmpty(),
+               "  ...and a preset saved on it carries S1 in its own SCALA child");
+        check (p->loadScalaText (s2, "zzz72-S2", err), "  (precondition) S2 is now under the keys");
+        check (p->loadPreset ("zzz72-A"), "  the preset loads (the sound changes, the tuning does not)");
+        std::printf ("    after the preset: offer = \"%s\", active scale has %d degrees\n",
+                     p->getPendingPresetTuningName().toRawUTF8(), p->getScaleDegrees());
+        check (p->hasPendingPresetTuning() && p->getPendingPresetTuningName() == "zzz72-S1",
+               "  ...and offers ITS tuning, S1, because it differs from what is playing");
+        check (p->getScaleDegrees() == 7, "  ...while S2 is still the tuning that is playing");
+
+        // ...and now a PROJECT arrives, with a tuning of its own and no connection at all
+        // to the preset that was loaded a moment ago.
+        auto q = std::make_unique<Proc>();
+        q->prepareToPlay (48000.0, 256);
+        check (q->loadScalaText (s3, "zzz72-S3", err), "  (precondition) another instance holds S3");
+        juce::MemoryBlock st;
+        q->getStateInformation (st);
+        p->setStateInformation (st.getData(), (int) st.getSize());
+        std::printf ("    after the project load: offer = \"%s\", active scale has %d degrees\n",
+                     p->getPendingPresetTuningName().toRawUTF8(), p->getScaleDegrees());
+        check (p->getScaleDegrees() == 3, "  (precondition) the project's own tuning S3 is in force");
+        check (! p->hasPendingPresetTuning(),
+               "  a project load takes the offer with it - no button naming a preset that is "
+               "not loaded");
+        check (p->getPendingPresetTuningName().isEmpty(),
+               "  ...and the name goes too, not just the comparison");
+
+        // THE CONTROL, and the reason the fix is a reorder rather than a clear: loading a
+        // preset must still offer its tuning. Clearing at the top of restoreState passes
+        // every check above and turns this one red.
+        check (p->loadPreset ("zzz72-A"), "  (precondition) the preset loads again");
+        std::printf ("    loaded again: offer = \"%s\"\n",
+                     p->getPendingPresetTuningName().toRawUTF8());
+        check (p->hasPendingPresetTuning() && p->getPendingPresetTuningName() == "zzz72-S1",
+               "  ...and a preset loaded AFTER all that still offers its own tuning - the "
+               "clear did not disable the feature");
+    }
+
+    //-- run 73: A PRESET THAT DID NOT LOAD SAYS SO ----------------------------------
+    //
+    // loadPreset returns false from three places - no such file, the XML will not parse,
+    // the tree is not one of ours - and its only caller drops the bool
+    // ("if (name.isNotEmpty() && loadPreset (name))"). So the name stayed in the box, the
+    // PREVIOUS preset went on sounding, and the Tuning panel went on offering the previous
+    // preset's scale, with nothing anywhere saying the load had not happened.
+    //
+    // Parked on the processor exactly like tuningRestoreError and bankSlotError, because
+    // the editor may not exist at all (the playground assigns corners with the window
+    // shut). All three failures are provoked here, and the last block proves that nothing
+    // moved while they happened - a load that failed must be a load that did nothing.
+    {
+        std::printf ("\nrun 73: a preset that did not load says so:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run73-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        struct ScratchFolder
+        {
+            explicit ScratchFolder (const juce::File& d)
+                : dir (d), prev (Proc::getPresetFolder()) { Proc::setPresetFolderForTests (d); }
+            ~ScratchFolder() { Proc::setPresetFolderForTests (prev); dir.deleteRecursively(); }
+            juce::File dir, prev;
+        } guard (scratch);
+        scratch.createDirectory();
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+        const auto setSlope = [&p] (float v)
+        {
+            if (auto* s = p->apvts.getParameter ("curveSlope")) s->setValueNotifyingHost (s->convertTo0to1 (v));
+            p->pollParametersForTests();
+        };
+        setSlope (1.0f);
+        check (p->savePreset ("zzz73-A").isNotEmpty(), "  (precondition) one real preset exists");
+        check (p->loadPreset ("zzz73-A"), "  (precondition) ...and it loads");
+        setSlope (1.4f);   // the patch the player is holding when they click the wrong name
+        const float held = p->apvts.getRawParameterValue ("curveSlope")->load();
+
+        check (! p->loadPreset ("zzz73-nothing-here"), "  a name with no file behind it fails");
+        const auto missMsg = p->takePresetLoadError();
+        std::printf ("    missing file: \"%s\"\n", missMsg.toRawUTF8());
+        check (missMsg.contains ("zzz73-nothing-here"),
+               "  ...and SAYS so, naming the preset that did not load");
+        check (p->takePresetLoadError().isEmpty(),
+               "  ...once, not forever - taking it clears it, like the other two");
+
+        Proc::presetFile ("zzz73-junk").replaceWithText ("this is not xml, it never was");
+        check (! p->loadPreset ("zzz73-junk"), "  a file that is not XML fails");
+        const auto junkMsg = p->takePresetLoadError();
+        std::printf ("    unreadable file: \"%s\"\n", junkMsg.toRawUTF8());
+        check (junkMsg.contains ("XML"), "  ...and says it could not be read, with the reason");
+
+        Proc::presetFile ("zzz73-foreign").replaceWithText ("<SomeOtherProgram a=\"1\"/>");
+        check (! p->loadPreset ("zzz73-foreign"), "  valid XML that is not one of our trees fails");
+        const auto foreignMsg = p->takePresetLoadError();
+        std::printf ("    foreign XML: \"%s\"\n", foreignMsg.toRawUTF8());
+        check (foreignMsg.contains ("preset"),
+               "  ...and says THAT, rather than resetting every parameter and reporting success");
+
+        // NOTHING MOVED. The refusals are all before any state is touched, and that is the
+        // other half of the promise: the patch under the player's hands is untouched.
+        std::printf ("    after three failed loads: slope %.4f (was %.4f), preset name \"%s\"\n",
+                     (double) p->apvts.getRawParameterValue ("curveSlope")->load(), (double) held,
+                     p->getLoadedPresetName().toRawUTF8());
+        check (std::abs (p->apvts.getRawParameterValue ("curveSlope")->load() - held) < 1.0e-6,
+               "  ...and the patch the player was holding is still there");
+        check (p->getLoadedPresetName() == "zzz73-A",
+               "  ...and the preset that IS loaded is still the one that loaded");
+
+        Proc::presetFile ("zzz73-junk").deleteFile();
+        Proc::presetFile ("zzz73-foreign").deleteFile();
+    }
+
+    //-- run 74: THE 129th TUNING DOES NOT OVERWRITE THE FIRST ------------------------
+    //
+    // firstEmptyBankSlot() used to answer 0 with every slot taken - "all full -> reuse the
+    // first" - and its one caller hands that answer straight to setTuningBankFile. So the
+    // 129th tuning added to the bank silently replaced the user's own first one: the slot
+    // still listed a name, the name was the new file's, and the scale that had been there
+    // was gone. The panel says the bank "just keeps growing" while it does that.
+    //
+    // The limit itself is legitimate (tuningBankSlot is an automatable parameter and a
+    // parameter needs a bounded range). What was not legitimate was the limit being
+    // silent, so it is STATED now, through the same bankSlotError the editor's timer
+    // already drains onto the notice overlay.
+    {
+        std::printf ("\nrun 74: a full tuning bank is stated, never written over:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        // Every slot filled, through the state - which is how a bank this size actually
+        // arrives: a project the user has been adding scales to for a year.
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        if (auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+        {
+            xml->removeChildElement (xml->getChildByName ("BANK"), true);
+            auto* bank = xml->createNewChildElement ("BANK");
+            for (int i = 0; i < Proc::kBankSlots; ++i)
+            {
+                auto* slot = bank->createNewChildElement ("SLOT");
+                slot->setAttribute ("i", i);
+                slot->setAttribute ("name", "zzz74-mine-" + juce::String (i));
+                slot->setAttribute ("source", "! slot " + juce::String (i)
+                                              + "\nzzz74\n 1\n " + juce::String (1200 + i) + ".\n");
+            }
+            juce::MemoryBlock withBank;
+            juce::AudioProcessor::copyXmlToBinary (*xml, withBank);
+            p->setStateInformation (withBank.getData(), (int) withBank.getSize());
+        }
+        for (int i = 0; i < 2; ++i) p->pollParametersForTests();
+        p->takeBankSlotError();   // drain anything the restore itself parked
+
+        const auto slot0Was = p->getTuningBankName (0);
+        std::printf ("    bank full: slot 0 holds \"%s\", firstEmptyBankSlot() = %d\n",
+                     slot0Was.toRawUTF8(), p->firstEmptyBankSlot());
+        check (slot0Was == "zzz74-mine-0", "  (precondition) the bank is full of the user's own scales");
+        check (p->firstEmptyBankSlot() < 0,
+               "  a full bank has NO first empty slot - it never nominates slot 0 as a victim");
+
+        // The 129th file, offered exactly as the bank's Load button offers it.
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run74-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        scratch.createDirectory();
+        const auto newFile = scratch.getChildFile ("zzz74-the-129th.scl");
+        newFile.replaceWithText ("! the 129th\nzzz74-the-129th\n 1\n 1200.\n");
+        p->setTuningBankFile (p->firstEmptyBankSlot(), newFile);
+        const auto fullMsg = p->takeBankSlotError();
+        std::printf ("    after offering the 129th: slot 0 holds \"%s\", message \"%s\"\n",
+                     p->getTuningBankName (0).toRawUTF8(), fullMsg.toRawUTF8());
+        check (p->getTuningBankName (0) == slot0Was,
+               "  ...and the user's first scale is still in slot 0 - nothing was overwritten");
+        check (fullMsg.containsIgnoreCase ("full"),
+               "  ...while the refusal is STATED, naming the file that did not go in");
+        check (fullMsg.contains ("zzz74-the-129th"),
+               "  ...and it is about the file the user just picked");
+
+        // The other door into the bank: every loaded tuning joins it automatically, and a
+        // full bank used to drop those on the floor without a word.
+        const int auto0 = p->bankAutoAdd ("zzz74-auto", "! auto\nzzz74-auto\n 1\n 1300.\n");
+        const auto autoMsg = p->takeBankSlotError();
+        std::printf ("    bankAutoAdd into a full bank: slot %d, message \"%s\"\n", auto0,
+                     autoMsg.toRawUTF8());
+        check (auto0 < 0, "  a tuning cannot join a full bank");
+        check (autoMsg.containsIgnoreCase ("full"),
+               "  ...and that is said too, instead of the tuning quietly not being there later");
+
+        // THE CONTROL: make room, and the bank works exactly as before. The fix is a
+        // refusal with a reason, not a bank that stopped accepting anything.
+        p->bankClearSlot (5);
+        std::printf ("    after clearing slot 5: firstEmptyBankSlot() = %d\n", p->firstEmptyBankSlot());
+        check (p->firstEmptyBankSlot() == 5, "  clearing a slot makes it the first empty one again");
+        const int back = p->bankAutoAdd ("zzz74-auto", "! auto\nzzz74-auto\n 1\n 1300.\n");
+        check (back == 5 && p->getTuningBankName (5) == "zzz74-auto",
+               "  ...and the tuning that was refused a moment ago lands in it");
+        check (p->takeBankSlotError().isEmpty(),
+               "  ...with nothing to say about it, because nothing went wrong");
+
+        scratch.deleteRecursively();
+    }
+
+    //-- run 75: A PROJECT LOAD DOES NOT LEAVE THE PREVIOUS PATCH'S TUNING ON Ctrl+Z --
+    //
+    // apvts.replaceState calls undoManager->clearUndoHistory(), and restoreState reaches
+    // the realtime block a few hundred lines later. setRealtimeLink's leaving-step - "one
+    // Ctrl+Z back to the tuning the follower displaced" - was therefore minted onto a
+    // history that had just been emptied, describing a patch that no longer exists. The
+    // FIRST Ctrl+Z after opening a project installed the PREVIOUS patch's tuning, out of
+    // nowhere, in an instrument whose whole promise is that its tuning does not move under
+    // the player.
+    //
+    // The second half is the one a naive fix misses, and part (B) below is what catches
+    // it: setRealtimeLink returns early when the mode has not changed, so a project that
+    // saves the SAME link the instance already had left a still-engaged follower carrying
+    // the PREVIOUS patch's baseline - which it would commit on the way out, the very same
+    // wrong tuning one step later. Dropping the commit alone swaps a wrong undo step for
+    // no undo step at all. The arming is re-run instead.
+    {
+        std::printf ("\nrun 75: a project load leaves no undo step from the patch before it:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+
+        // A tiny spectrum so each follower search is instant - this run measures undo
+        // bookkeeping, not the throttle (run (c) above already measures that).
+        const auto engage = [] (Proc& p, Proc::RtLink link)
+        {
+            const auto sp = [&p] (const char* id, float v)
+            {
+                if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+                p.pollParametersForTests();
+            };
+            sp ("timbreOn", 0.0f);
+            sp ("spectrumRange", 1.0f);
+            sp ("partialManual", 0.0f);
+            awaitSpectrumIdle (p, "run 75: the small spectrum the follower runs on");
+            Proc::RtSettings rs;
+            rs.notes = 3; rs.periodRatio = 2.0; rs.periodLine = "2/1"; rs.minGapCents = 50.0;
+            p.setRealtimeLink (link, rs);
+            return rs;
+        };
+        // Sweep the spectrum until the follower has actually retuned at least once.
+        const auto sweepUntilApplied = [] (Proc& p, int wasApplies)
+        {
+            for (int i = 0; i < 300 && p.getRealtimeApplies() <= wasApplies; ++i)
+            {
+                if (auto* sl = p.apvts.getParameter ("curveSlope"))
+                    sl->setValueNotifyingHost (sl->convertTo0to1 (i % 2 == 0 ? 1.0f : 1.4f));
+                p.pollParametersForTests();
+                juce::Thread::sleep (2);
+            }
+            return p.getRealtimeApplies() > wasApplies;
+        };
+
+        const juce::String sP = "! the patch that was open\nzzz75-P\n 5\n 240.\n 480.\n 720.\n 960.\n 1200.\n";
+        const juce::String sQ = "! the project being opened\nzzz75-Q\n 7\n 150.\n 300.\n 450.\n 600.\n 750.\n 900.\n 1200.\n";
+
+        //-- (A) the project turns the follower OFF ----------------------------------
+        {
+            auto p = std::make_unique<Proc>();
+            p->prepareToPlay (48000.0, 256);
+            juce::String err;
+            check (p->loadScalaText (sP, "zzz75-P", err), "  (A precondition) the open patch holds zzz75-P");
+            auto rs = engage (*p, Proc::RtLink::TuningFromSpectrum);
+            check (sweepUntilApplied (*p, 0), "  (A precondition) the follower really retuned something");
+
+            auto q = std::make_unique<Proc>();
+            q->prepareToPlay (48000.0, 256);
+            check (q->loadScalaText (sQ, "zzz75-Q", err), "  (A precondition) the project holds zzz75-Q, link off");
+            juce::MemoryBlock st;
+            q->getStateInformation (st);
+            p->setStateInformation (st.getData(), (int) st.getSize());
+
+            const auto afterLoad = p->activeSclSource();
+            std::printf ("    (A) after the load: undo depth %d, scale %s\n",
+                         p->undoStackDepthForTests(),
+                         afterLoad.contains ("zzz75-Q") ? "zzz75-Q" : "SOMETHING ELSE");
+            check (afterLoad.contains ("zzz75-Q"), "  (A precondition) the project's own tuning is in force");
+            check (p->undoStackDepthForTests() == 0,
+                   "  (A) a freshly loaded project has an EMPTY undo history - the link's "
+                   "leaving-step is not minted onto it");
+            p->undoManager.undo();
+            std::printf ("    (A) after one Ctrl+Z: scale %s\n",
+                         p->activeSclSource().contains ("zzz75-Q") ? "still zzz75-Q"
+                                                                   : "CHANGED");
+            check (p->activeSclSource() == afterLoad,
+                   "  (A) ...so the first Ctrl+Z does not install the previous patch's tuning");
+            p->setRealtimeLink (Proc::RtLink::Off, rs);
+        }
+
+        //-- (B) the project has the SAME link armed, so setRealtimeLink returns early --
+        {
+            auto p = std::make_unique<Proc>();
+            p->prepareToPlay (48000.0, 256);
+            juce::String err;
+            check (p->loadScalaText (sP, "zzz75-P", err), "  (B precondition) the open patch holds zzz75-P");
+            auto rs = engage (*p, Proc::RtLink::TuningFromSpectrum);
+            check (sweepUntilApplied (*p, 0), "  (B precondition) the follower retuned before the load");
+
+            auto q = std::make_unique<Proc>();
+            q->prepareToPlay (48000.0, 256);
+            check (q->loadScalaText (sQ, "zzz75-Q", err), "  (B precondition) the project holds zzz75-Q");
+            engage (*q, Proc::RtLink::TuningFromSpectrum);   // ...and the SAME link armed
+            juce::MemoryBlock st;
+            q->getStateInformation (st);
+            q->setRealtimeLink (Proc::RtLink::Off, rs);      // q is done; do not leave it running
+
+            p->setStateInformation (st.getData(), (int) st.getSize());
+            const auto afterLoad = p->activeSclSource();
+            std::printf ("    (B) after the load: link %s, undo depth %d, scale %s\n",
+                         p->getRealtimeLink() == Proc::RtLink::TuningFromSpectrum ? "STILL ARMED" : "off",
+                         p->undoStackDepthForTests(),
+                         afterLoad.contains ("zzz75-Q") ? "zzz75-Q" : "SOMETHING ELSE");
+            check (p->getRealtimeLink() == Proc::RtLink::TuningFromSpectrum,
+                   "  (B precondition) the follower is still armed across the load - this is the "
+                   "case setRealtimeLink used to return early on");
+            check (afterLoad.contains ("zzz75-Q"), "  (B precondition) the project's own tuning is in force");
+            check (p->undoStackDepthForTests() == 0,
+                   "  (B) ...and the load minted no undo step here either");
+
+            // Now let the still-armed follower do its job and switch it off by hand. The
+            // ONE step that leaves must go back to the tuning the PROJECT restored.
+            check (sweepUntilApplied (*p, 0),
+                   "  (B precondition) the re-armed follower retunes again after the load");
+            p->setRealtimeLink (Proc::RtLink::Off, rs);
+            p->undoManager.undo();
+            const auto undone = p->activeSclSource();
+            std::printf ("    (B) after switching off and one Ctrl+Z: scale %s\n",
+                         undone.contains ("zzz75-Q") ? "zzz75-Q (the project's)"
+                                                     : (undone.contains ("zzz75-P")
+                                                            ? "zzz75-P - THE PATCH BEFORE THE LOAD"
+                                                            : "neither"));
+            check (undone.contains ("zzz75-Q"),
+                   "  (B) one Ctrl+Z after the follower stops brings back the tuning THIS "
+                   "project was opened with");
+            check (! undone.contains ("zzz75-P"),
+                   "  (B) ...and never the tuning of the patch that was open before it");
+        }
+    }
 }

@@ -147,6 +147,23 @@ public:
     // the PERIOD is separate metadata, so the Tuning panel offers it as an editable
     // field marked as Fibló's estimate. Nothing here can move a pitch.
     bool tuningIsAbsoluteTable() const noexcept { return tuning.usesAbsoluteTable(); }
+    // ...and the same question asked about WHAT IS SOUNDING. usesAbsoluteTable() answers
+    // for the loaded SOURCE and knows nothing about the mode, which is right for it -
+    // TuningManager::restoreTuning asks it while putting a tuning back, BEFORE the mode
+    // parameter has been restored, so a mode test inside the accessor would break state
+    // restore. The guard therefore belongs with the consumers, and this is it.
+    //
+    // What it cost to be missing: load a non-repeating .tun once, switch the Tuning box
+    // back to 12-TET, and the instrument was in plain 12-tone equal temperament while
+    // ".scl export" refused with "this tuning is a 128-key table" and right-click degree
+    // editing refused the same way. Both were describing a tuning that had not made a
+    // sound since the user changed the mode. Everything that REFUSES, REWRITES or EXPORTS
+    // "the tuning" asks this one; the panel's period FIELD still asks the sibling above,
+    // because that field describes the loaded file rather than the sounding pitches.
+    bool tuningTableIsInForce() const noexcept
+    {
+        return getTuningMode() == (int) TuningManager::Mode::Scala && tuning.usesAbsoluteTable();
+    }
     juce::String tuningTablePeriodSpec() const { return tuning.tablePeriodSpec(); }
     bool   tuningTablePeriodIsUserSet() const noexcept { return tuning.tablePeriodIsUserSet(); }
     double tuningTablePeriodDevCents()  const noexcept { return tuning.tablePeriodDevCents(); }
@@ -368,7 +385,7 @@ public:
     bool getDegreeIsRational (int d, long long& p, long long& q) const
     {
         const int D = juce::jmax (1, tuning.degreesPerPeriod());
-        if (getTuningMode() == (int) TuningManager::Mode::Scala && ! tuning.usesAbsoluteTable())
+        if (getTuningMode() == (int) TuningManager::Mode::Scala && ! tuningTableIsInForce())
             return tuning.scalaDegreeRational (d, p, q);
         if (d <= 0) { p = 1; q = 1; return true; }        // unison
         if (d >= D)                                        // the period/octave
@@ -794,18 +811,26 @@ public:
     bool isSpectrumBuildPending() const { return spectrumEngine.isBuildPending(); }
 
     //==========================================================================
-    // Tuning bank: load as many .scl files as you like (effectively unlimited - the
-    // automatable "tuningBankSlot" parameter just needs a bounded range, so the ceiling
-    // is a generous 128). 0 = none, 1..N = slot; the switch is picked up on the message
-    // thread (timerCallback) and loaded there. The UI only ever shows the loaded slots.
+    // Tuning bank: 128 slots. The ceiling exists because "tuningBankSlot" is an
+    // automatable parameter and a parameter needs a bounded range - it is generous, not
+    // unlimited, and the difference matters: this used to be described as "effectively
+    // unlimited" everywhere while firstEmptyBankSlot() answered 0 with the bank full, so
+    // the 129th tuning silently overwrote the user's own first one. A limit is allowed to
+    // exist here only because it is now STATED when it bites (see setTuningBankFile and
+    // bankAutoAdd, which park the sentence on bankSlotError).
+    // 0 = none, 1..N = slot; the switch is picked up on the message thread
+    // (timerCallback) and loaded there. The UI only ever shows the loaded slots.
     static constexpr int kBankSlots = 128;
     void setTuningBankFile (int slot0, const juce::File& f);       // load a .scl into a slot + activate it
     juce::String getTuningBankName (int slot0) const { return juce::isPositiveAndBelow (slot0, kBankSlots) ? bankName[(size_t) slot0] : juce::String(); }
     int  getTuningBankSlotParam() const noexcept { return (int) apvts.getRawParameterValue ("tuningBankSlot")->load(); }
     void setTuningBankSlotParam (int slot);                        // 0 = none, 1..N = slot (drives automation + load)
+    // The first free slot, or -1 when there is none. NEVER 0-as-a-fallback: the caller
+    // passes this straight to setTuningBankFile, and a fallback slot is somebody's scale.
     int  firstEmptyBankSlot() const noexcept;
     // Every loaded tuning joins the bank. Returns the 0-based slot it landed in (or
-    // an existing duplicate's), -1 if the bank is full.
+    // an existing duplicate's), -1 if the bank is full - and a full bank parks a sentence
+    // on bankSlotError rather than dropping the tuning out of the bank in silence.
     int  bankAutoAdd (const juce::String& name, const juce::String& source);
     void syncBankSelector (int slot0); // point the selector at a slot without re-loading it
     void bankClearSlot (int slot0);                                          // the bank's X button
@@ -1361,6 +1386,12 @@ public:
         bool lookahead = false;
     };
     void setRealtimeLink (RtLink mode, const RtSettings& s);
+    // The link as a STATE LOAD installs it. Not the same call: replaceState clears the
+    // undo history, so the step setRealtimeLink would mint on the way out belongs to a
+    // patch that no longer exists and to a history that no longer has room for it - the
+    // FIRST Ctrl+Z after a project load installed the PREVIOUS patch's tuning. See the
+    // .cpp for why dropping that step is only half the fix.
+    void restoreRealtimeLink (RtLink mode, const RtSettings& s);
     // The panel pushes its settings here on every touch, so this is also where a change
     // to the LOOKAHEAD toggle is noticed. applyLookahead() is a no-op when nothing moved.
     void updateRealtimeSettings (const RtSettings& s) { rtSet = s; applyLookahead(); }
@@ -1546,8 +1577,11 @@ public:
     // the .scl Fibló writes. For an absolute 128-key table there is no .scl to write, so
     // the bank keeps the .tun text itself - currentTuningAsScl() would hand the bank a
     // flattened copy of the user's tuning under the user's own name for it.
+    // ...and IN FORCE, not merely loaded: with a table left over from an earlier load and
+    // the box back on 12-TET, "put the tuning that is playing into the bank" used to bank
+    // the .tun, which is the one tuning that was NOT playing.
     juce::String currentTuningAsBankSource (const juce::String& name) const
-    { return tuning.usesAbsoluteTable() ? tuning.getScalaSource() : currentTuningAsScl (name); }
+    { return tuningTableIsInForce() ? tuning.getScalaSource() : currentTuningAsScl (name); }
     // Scales this synth writes carry the patch they were made with, as Scala
     // comments (invisible to other programs). "Load its original spectrum" reads
     // it back without disturbing the tuning that is loaded.
@@ -1849,17 +1883,32 @@ private:
     // failure is parked here rather than raised there. Consumed by takeTuningRestoreError,
     // which clears it: this is a one-shot message about one load, not a state.
     juce::String tuningRestoreError;
-    // THE BANK SLOT THAT DID NOT LOAD, for the editor to show once, on the same one-shot
+    // WHAT THE BANK COULD NOT DO, for the editor to show once, on the same one-shot
     // pattern and for the same reason: the load runs on the processor's timer (host
     // automation can move that parameter with no window open at all), so the parser's
     // message is parked here rather than raised from a place that may have no editor.
-    // Consumed by takeBankSlotError, which clears it - one message about one switch.
+    // Consumed by takeBankSlotError, which clears it - one message about one event.
+    // Two events use it: a slot whose stored text will not load, and a bank that is FULL
+    // (setTuningBankFile / bankAutoAdd) - the second used to overwrite slot 0 in silence.
     juce::String bankSlotError;
+    // THE PRESET THAT DID NOT LOAD, on the same one-shot pattern and for the same reason
+    // as the two above. loadPreset returns false from three places - the file is not in
+    // the folder, the XML will not parse, the tree is not one of ours - and its only
+    // caller drops that bool on the floor ("if (name.isNotEmpty() && loadPreset (name))").
+    // So a preset that failed left the NAME in the box, the PREVIOUS preset's sound in the
+    // instrument, and the previous preset's tuning on offer in the Tuning panel, with
+    // nothing anywhere saying the load had not happened. Three lies for the price of one
+    // dropped return value.
+    juce::String presetLoadError;
 public:
     juce::String takeTuningRestoreError()
     { auto e = tuningRestoreError; tuningRestoreError.clear(); return e; }
     juce::String takeBankSlotError()
     { auto e = bankSlotError; bankSlotError.clear(); return e; }
+    // Consumed exactly like the two above - the editor's timer already takes those two
+    // and puts them on the notice overlay; this one belongs beside them.
+    juce::String takePresetLoadError()
+    { auto e = presetLoadError; presetLoadError.clear(); return e; }
 private:
     juce::String presetPendingTablePeriod;                     // its table period, if it had one
     // Self-play routing as of the last block: a CHANGE strands notes (see processBlock).
@@ -1965,8 +2014,13 @@ private:
     int  rtTuneBaseMode = 0;
     bool rtTuneBaseTaken = false;
     SpecSnapshot rtSpecBase;
-    void takeRealtimeBaseline (RtLink mode);
+    // `addToBank` is false for a STATE LOAD only: the baseline it takes is the project's
+    // own tuning, which the project's own BANK child already describes, and a load must
+    // not go on mutating the bank it just restored.
+    void takeRealtimeBaseline (RtLink mode, bool addToBank = true);
     void commitRealtimeBaseline();
+    // The one body behind setRealtimeLink and restoreRealtimeLink - see the .cpp.
+    void setRealtimeLinkImpl (RtLink mode, const RtSettings& s, bool fromStateLoad);
     void applySpecSnapshot (const SpecSnapshot& s);
     SpecSnapshot captureSpecSnapshot() const;
     void driveRealtimeLink();

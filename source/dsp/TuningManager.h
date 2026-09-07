@@ -233,6 +233,24 @@ public:
             case Mode::Scala:
                 if (scalaValid.load (std::memory_order_relaxed))
                 {
+                    // A TABLE WHOSE PERIOD WAS NEVER FOUND STATES NONE, and this used to be
+                    // the one shape of "no period" that could not be seen from here.
+                    // estimatePeriod() returns `found = false` for a mapping with nothing
+                    // ascending in it (a descending .tun, a flat one), and a PeriodEstimate
+                    // carries ratio = 2.0 as its DEFAULT - so applyTablePeriod stored a 2/1
+                    // that no measurement ever produced, this function handed it back as a
+                    // stated fact, and hasUsablePeriod() below said yes. Temper then snapped
+                    // every harmonic-engine partial onto an octave grid that appears nowhere
+                    // in the user's file, which is the exact substitution the whole
+                    // stated/fallback split exists to refuse (see hasUsablePeriod).
+                    //
+                    // tablePeriodKnown is the answer to "did anybody supply this number" -
+                    // Fibló's estimate when it found one, or the user when they typed one.
+                    // It is NOT "is it 2.0": a table that genuinely repeats at 2/1 is a
+                    // found estimate and states its period like any other.
+                    if (tableMode.load (std::memory_order_relaxed)
+                        && ! tablePeriodKnown.load (std::memory_order_relaxed))
+                        return 0.0;
                     const double p = tableMode.load (std::memory_order_relaxed)
                                        ? tablePeriod.load (std::memory_order_relaxed)
                                        : scalaPeriod.load (std::memory_order_relaxed);
@@ -451,6 +469,32 @@ public:
             }
         }
 
+        // THE SIBLING'S SWEEP, and it belongs here for the sibling's own reason.
+        // loadAbsoluteTable refuses a table with a single unusable frequency BEFORE it
+        // publishes anything, so the tuning that was sounding goes on sounding; this
+        // function published all 128 unchecked, and the checks it does have are per
+        // DEGREE, upstream, where the trouble is not.
+        //
+        // What gets through: the degrees are each finite and positive (parsePitchSrc
+        // proves that), but a key's pitch is degree x period^octave, and the exponent is
+        // what overflows. A one-degree .scl whose period line reads "400000." is 2^333 per
+        // period - legal cents, parsed without complaint - and key 127 is that to the 67th,
+        // i.e. +inf. The audio thread then reads +inf out of the table (frequencyForNote is
+        // a plain atomic load; it cannot check anything at 60 Hz per voice) and every
+        // partial built on it is a NaN. Underflow is the same story downwards: pow() lands
+        // on 0.0 and the key has no pitch at all.
+        //
+        // Refused rather than clamped: a clamped key is a pitch the user's file does not
+        // contain, which is the same lie by a quieter route.
+        for (int n = 0; n < 128; ++n)
+            if (! (freqs[(size_t) n] > 0.0) || ! std::isfinite (freqs[(size_t) n]))
+            {
+                errorOut = "Key " + juce::String (n) + " of this scale is not a usable "
+                           "frequency - its degrees or its period run off the end of what a "
+                           "number can hold. Nothing was loaded.";
+                return false; // nothing published: the old tuning is still the one sounding
+            }
+
         for (int n = 0; n < 128; ++n)
             table[(size_t) n].store (freqs[(size_t) n], std::memory_order_relaxed);
 
@@ -509,7 +553,7 @@ public:
         scalaPeriod.store (2.0, std::memory_order_relaxed);   // unused in table mode; kept sane
         tablePeriodSpecText.clear();                          // the estimate owns the field until
         tablePeriodUser.store (false, std::memory_order_relaxed); // the user types over it
-        applyTablePeriod (tableEst.ratio, tableEst.keys);
+        applyTablePeriod (tableEst.ratio, tableEst.keys, tableEst.found);
         tableMode.store (true, std::memory_order_relaxed);
         // release: publishes all the table writes above to the audio thread.
         scalaValid.store (true, std::memory_order_release);
@@ -699,7 +743,10 @@ public:
         }
         tablePeriodSpecText = spec.trim();
         tablePeriodUser.store (true, std::memory_order_relaxed);
-        applyTablePeriod (ratio, keysForPeriod (tableStats, 1200.0 * std::log2 (ratio)));
+        // STATED, because the user just stated it. A table whose estimate found nothing
+        // has no period until somebody supplies one - and this is somebody supplying one,
+        // in a visible field, which is precisely the control the honesty rule asks for.
+        applyTablePeriod (ratio, keysForPeriod (tableStats, 1200.0 * std::log2 (ratio)), true);
         return true;
     }
 
@@ -709,7 +756,7 @@ public:
         if (! usesAbsoluteTable()) return;
         tablePeriodSpecText.clear();
         tablePeriodUser.store (false, std::memory_order_relaxed);
-        applyTablePeriod (tableEst.ratio, tableEst.keys);
+        applyTablePeriod (tableEst.ratio, tableEst.keys, tableEst.found);
     }
 
     //== Whole-tuning snapshot ================================================
@@ -1315,6 +1362,7 @@ public:
         scalaValid.store (false, std::memory_order_relaxed);
         tableMode.store (false, std::memory_order_relaxed);
         tablePeriodUser.store (false, std::memory_order_relaxed);
+        tablePeriodKnown.store (false, std::memory_order_relaxed);
         tablePeriodSpecText.clear();
         tableStats = {};
         tableEst   = {};
@@ -1376,9 +1424,14 @@ private:
     // Publish the period IN FORCE for a table (estimated or typed) to the atomics the
     // audio thread reads. Pitches are never touched here - that is the whole point of
     // the table: this only moves what degreesPerPeriod()/periodRatio() answer.
-    void applyTablePeriod (double ratio, int keys)
+    // `stated` says whether this number came from ANYWHERE - a period the estimate
+    // actually measured, or one the user typed. False means the fallback below is all
+    // there is, and statedPeriodRatio() must then answer "no period" rather than hand
+    // out a 2/1 nobody supplied (see the block there for what that cost).
+    void applyTablePeriod (double ratio, int keys, bool stated)
     {
-        if (! (ratio > 1.0001) || ! std::isfinite (ratio)) { ratio = 2.0; keys = 12; }
+        if (! (ratio > 1.0001) || ! std::isfinite (ratio)) { ratio = 2.0; keys = 12; stated = false; }
+        tablePeriodKnown.store (stated, std::memory_order_relaxed);
         tablePeriod.store (ratio, std::memory_order_relaxed);
         tableKeysPerPeriod.store (juce::jmax (1, keys), std::memory_order_relaxed);
         tablePeriodDev.store (worstDeviation (tableStats, juce::jmax (1, keys),
@@ -1727,6 +1780,11 @@ private:
     std::atomic<int>    tableKeysPerPeriod { 12 };
     std::atomic<double> tablePeriodDev { 0.0 };  // worst cents the file strays from it
     std::atomic<bool>   tablePeriodUser { false };
+    // Did ANYBODY supply the period in force - the estimate by finding one, or the user by
+    // typing one? False is the honest "this table states no period", and it is what keeps
+    // PeriodEstimate's ratio = 2.0 DEFAULT from being read back as a measurement
+    // (statedPeriodRatio). Audio thread reads it through degreesPerPeriod's neighbours.
+    std::atomic<bool>   tablePeriodKnown { false };
 
     juce::String scalaName, scalaSource; // message-thread only
     std::vector<DegreeSrc> scalaDegSrc;  // per-degree ratio-vs-cents source (message-thread only)
