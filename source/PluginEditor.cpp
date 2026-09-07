@@ -5138,6 +5138,21 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
                 f.bounds = getLocalArea (c, c->getLocalBounds());
                 out.push_back (f);
             }
+        }   // <- THE TOOLTIP BRANCH ENDS HERE, and it did not.
+
+    // A REGISTRY OF FIXED STRINGS RAN ONCE PER CONTROL IN THE WINDOW.
+    //
+    // This block was inside the `if (auto* tc = ...)` above - one missing brace - and
+    // every juce::Label, Slider, Button and ComboBox derives from SettableTooltipClient,
+    // so the dynamic_cast succeeded on nearly every leaf the walk touched. The list below
+    // does not depend on `c` at all: it names a fixed set of self-painted strings. So the
+    // same rows were appended again for every control, hundreds of times per walk - and
+    // the walk itself runs inside two size searches, in two languages, in every scenario.
+    //
+    // Nothing was WRONG in the output: duplicate rows say the same thing, and a fit that
+    // passes passes as often as you ask it. It was pure cost, in the one place that makes
+    // this suite's wall-clock checks flaky, and it made the tables unreadable.
+    //
     // ...and the same for every other component that paints its own words. Each entry
     // carries no geometry: it is here for the language checks, not for a fit measurement
     // it has not made. Keep this list in step with the trF hooks in applyLanguage - a
@@ -5213,7 +5228,6 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
         overlayText ("noticeOverlay/worstBody", fewerDegreesBody (24, 23),
                      noticeOverlay, true, 24, 17.0f, 13.5f);
     }
-        }
 
         // A string that fits on ONE line needs no wrapping test; one that does not may
         // still be fine if its box is tall enough for the extra lines the painter is

@@ -1759,7 +1759,21 @@ private:
     // per-note bends from an MPE controller/host are honoured; other modes run the
     // legacy single-channel layout. Message thread; switching releases held notes.
     void applyTuningMode (int paramIndex);
-    bool lastZoneMpe = false;
+    // ATOMIC, because two threads read it and one of them is the audio thread.
+    //
+    // applyTuningMode writes it on the MESSAGE thread; processBlock reads it every block
+    // to decide whether to re-assert the MPE zone, and applyZoneTo reads it when a MIX
+    // corner engine is built. As a plain bool that is a data race - undefined behaviour by
+    // the standard, and on real hardware a read that can see a stale value for an
+    // unbounded time, which here means an instrument that has been switched INTO MPE mode
+    // and goes on running the legacy single-channel layout until something else happens to
+    // touch the flag.
+    //
+    // Relaxed on both sides is enough and is deliberate: nothing else is published
+    // alongside it. The zone layout it guards is written through MPESynthesiser's own
+    // setZoneLayout, which does its own synchronisation, and the flag's only job is to say
+    // which branch runs. No acquire/release pairing to get wrong, and no cost.
+    std::atomic<bool> lastZoneMpe { false };
 
     // THE ONLY PLACE A .gsting IS WRITTEN, and where the fixed-point rule that closes
     // case #88 is enforced - one gate rather than one check per call site, because
@@ -2401,7 +2415,7 @@ private:
     // LIVE tuning plumbing - the tuning is global, exactly as the morph promises).
     void applyZoneTo (juce::MPESynthesiser& s) const
     {
-        if (lastZoneMpe)
+        if (lastZoneMpe.load (std::memory_order_relaxed))
         {
             juce::MPEZoneLayout zone;
             zone.setLowerZone (15, 48, 48);   // same numbers as applyTuningMode, same reason
@@ -2409,7 +2423,24 @@ private:
         }
         else
         {
+            // ...AND THE RANGE THROUGH THE SETTER, because enableLegacyMode DOES NOT SET IT
+            // on a synth that is already in legacy mode.
+            //
+            // juce_MPEInstrument.cpp opens with `if (legacyMode.isEnabled) return;` - and
+            // it must, since the rest of that function releases every sounding note. Every
+            // corner engine is built with enableLegacyMode(48) in its constructor
+            // (buildMixEngine, ~line 2311, which this function was written to correct), so
+            // by the time we get here legacy mode is already on and this call has always
+            // been a no-op. The corner therefore kept +-48 while the main engine ran at
+            // whatever the Pitch bend box says: at the +-2 st setting the wheel swept a MIX
+            // corner TWENTY-FOUR TIMES further than the voice it is supposed to be blended
+            // with, which is not a subtle mistune - it is a different note.
+            //
+            // enableLegacyMode stays, for the case where the synth is NOT yet in legacy
+            // mode (a corner rebuilt after the zone layout was set), and the setter goes
+            // after it because that is the call that works in both states.
             s.enableLegacyMode (lastBendApplied);
+            s.setLegacyModePitchbendRange (lastBendApplied);
         }
     }
     // Where a parameter sits in getParameters(). -1 if there is no such parameter.

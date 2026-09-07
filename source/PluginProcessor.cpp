@@ -1051,12 +1051,29 @@ void FractalAdditiveAudioProcessor::timerCallback()
     if (bendValues[bendIdx] != lastBendApplied)
     {
         lastBendApplied = bendValues[bendIdx];
-        synth.setLegacyModePitchbendRange (lastBendApplied);
-        // The MIX sub-engines bend by the same range - one MIDI-to-pitch mapping for
-        // the whole instrument (in MPE zone mode the zone already fixes it at +-48).
-        for (auto& e : mixEng)
-            if (e != nullptr && ! lastZoneMpe)
-                e->synth.setLegacyModePitchbendRange (lastBendApplied);
+        // ...AND IN MPE ZONE MODE IT IS NOT PUSHED AT ALL, only remembered.
+        //
+        // juce::MPEInstrument::setLegacyModePitchbendRange calls releaseAllNotes() FIRST,
+        // unconditionally, and only then looks at legacyMode.pitchbendRange - which in
+        // zone mode nothing reads, because the zone's own +-48 governs. So touching the
+        // Pitch bend selector while an MPE controller was playing cut every sounding note
+        // and changed nothing: the loudest possible way to do nothing. The MIX corners
+        // were already guarded against exactly this (the `! lastZoneMpe` below has been
+        // there); the main synth, which is the one the user is actually playing, was not.
+        //
+        // The choice is still RECORDED, so it is not lost: leaving MPE mode runs
+        // applyTuningMode's else branch, and enableLegacyMode (lastBendApplied) sets the
+        // range there - on a synth that is not yet in legacy mode, which is the one state
+        // where that call does take effect (see applyZoneTo for the other half of that).
+        if (! lastZoneMpe.load (std::memory_order_relaxed))
+        {
+            synth.setLegacyModePitchbendRange (lastBendApplied);
+            // The MIX sub-engines bend by the same range - one MIDI-to-pitch mapping for
+            // the whole instrument.
+            for (auto& e : mixEng)
+                if (e != nullptr)
+                    e->synth.setLegacyModePitchbendRange (lastBendApplied);
+        }
     }
 }
 
@@ -1148,9 +1165,9 @@ void FractalAdditiveAudioProcessor::applyTuningMode (int paramIndex)
     const bool mpe = paramIndex == 3;
     tuning.setMode (mpe ? TuningManager::Mode::Equal          // MPE: no internal tuning
                         : (TuningManager::Mode) paramIndex);
-    if (mpe != lastZoneMpe)
+    if (mpe != lastZoneMpe.load (std::memory_order_relaxed))
     {
-        lastZoneMpe = mpe;
+        lastZoneMpe.store (mpe, std::memory_order_relaxed);
         if (mpe)
         {
             juce::MPEZoneLayout zone;
@@ -4188,7 +4205,7 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
     // Only when it has actually drifted: MPEInstrument::setZoneLayout releases every
     // sounding note, so re-asserting a zone that is already right would cut notes off on
     // every block.
-    if (lastZoneMpe)
+    if (lastZoneMpe.load (std::memory_order_relaxed))
     {
         auto layout = synth.getZoneLayout();
         const auto lower = layout.getLowerZone();
