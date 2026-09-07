@@ -19943,4 +19943,75 @@ static void runProcessorAuditChecks()
         check (std::abs (1200.0 * std::log2 (std::max (1.0e-9, p->getDegreeRatio (1))) - 150.0) < 0.01,
                "  ...and the edit really landed: degree 1 is the 150 cents that was typed");
     }
+
+    //-- run 72: "LOAD PRESET'S TUNING" STOPS OFFERING A PRESET THAT IS NOT LOADED ----
+    //
+    // The offer is three strings on the processor and nothing ever cleared them. Load a
+    // preset, then reopen a project - the button went on naming the PREVIOUS preset's
+    // scale, and pressing it would have replaced the reopened project's own tuning with
+    // a scale from a preset this instrument is no longer playing.
+    //
+    // The obvious fix is backwards, and the second half of this run is what catches it:
+    // loadPreset used to fill those fields and THEN call restoreState, so a clear at the
+    // top of restoreState disables the offer for every preset for ever. The fields are
+    // read AFTER the restore now, and the control below proves the feature survived.
+    {
+        std::printf ("\nrun 72: the preset tuning on offer belongs to the preset that is loaded:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run72-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        struct ScratchFolder
+        {
+            explicit ScratchFolder (const juce::File& d)
+                : dir (d), prev (Proc::getPresetFolder()) { Proc::setPresetFolderForTests (d); }
+            ~ScratchFolder() { Proc::setPresetFolderForTests (prev); dir.deleteRecursively(); }
+            juce::File dir, prev;
+        } guard (scratch);
+
+        const juce::String s1 = "! five equal degrees\nzzz72-S1\n 5\n 240.\n 480.\n 720.\n 960.\n 1200.\n";
+        const juce::String s2 = "! seven degrees\nzzz72-S2\n 7\n 200.\n 400.\n 500.\n 700.\n 900.\n 1100.\n 1200.\n";
+        const juce::String s3 = "! three degrees\nzzz72-S3\n 3\n 400.\n 800.\n 1200.\n";
+
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+        juce::String err;
+        check (p->loadScalaText (s1, "zzz72-S1", err), "  (precondition) S1 is loaded");
+        check (p->savePreset ("zzz72-A").isNotEmpty(),
+               "  ...and a preset saved on it carries S1 in its own SCALA child");
+        check (p->loadScalaText (s2, "zzz72-S2", err), "  (precondition) S2 is now under the keys");
+        check (p->loadPreset ("zzz72-A"), "  the preset loads (the sound changes, the tuning does not)");
+        std::printf ("    after the preset: offer = \"%s\", active scale has %d degrees\n",
+                     p->getPendingPresetTuningName().toRawUTF8(), p->getScaleDegrees());
+        check (p->hasPendingPresetTuning() && p->getPendingPresetTuningName() == "zzz72-S1",
+               "  ...and offers ITS tuning, S1, because it differs from what is playing");
+        check (p->getScaleDegrees() == 7, "  ...while S2 is still the tuning that is playing");
+
+        // ...and now a PROJECT arrives, with a tuning of its own and no connection at all
+        // to the preset that was loaded a moment ago.
+        auto q = std::make_unique<Proc>();
+        q->prepareToPlay (48000.0, 256);
+        check (q->loadScalaText (s3, "zzz72-S3", err), "  (precondition) another instance holds S3");
+        juce::MemoryBlock st;
+        q->getStateInformation (st);
+        p->setStateInformation (st.getData(), (int) st.getSize());
+        std::printf ("    after the project load: offer = \"%s\", active scale has %d degrees\n",
+                     p->getPendingPresetTuningName().toRawUTF8(), p->getScaleDegrees());
+        check (p->getScaleDegrees() == 3, "  (precondition) the project's own tuning S3 is in force");
+        check (! p->hasPendingPresetTuning(),
+               "  a project load takes the offer with it - no button naming a preset that is "
+               "not loaded");
+        check (p->getPendingPresetTuningName().isEmpty(),
+               "  ...and the name goes too, not just the comparison");
+
+        // THE CONTROL, and the reason the fix is a reorder rather than a clear: loading a
+        // preset must still offer its tuning. Clearing at the top of restoreState passes
+        // every check above and turns this one red.
+        check (p->loadPreset ("zzz72-A"), "  (precondition) the preset loads again");
+        std::printf ("    loaded again: offer = \"%s\"\n",
+                     p->getPendingPresetTuningName().toRawUTF8());
+        check (p->hasPendingPresetTuning() && p->getPendingPresetTuningName() == "zzz72-S1",
+               "  ...and a preset loaded AFTER all that still offers its own tuning - the "
+               "clear did not disable the feature");
+    }
 }

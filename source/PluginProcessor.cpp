@@ -4551,6 +4551,21 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     // The one-shot MTS adoption must not second-guess it.
     mtsCheckPending = false;
 
+    // THE PRESET'S TUNING ON OFFER BELONGS TO THE PRESET THAT IS LOADED, and after this
+    // line that is no longer the one it came from. Nothing ever cleared these three
+    // fields, so "Load preset's tuning" went on offering the LAST preset's scale across a
+    // project load, a host reopening the session, and every state change after it - a
+    // button naming a scale from a preset this instrument is no longer playing, which on
+    // a press would replace the reopened project's own tuning with it.
+    //
+    // The ORDER is the whole trick, and the obvious version of this fix is backwards:
+    // loadPreset used to fill these fields and THEN call this function, so clearing here
+    // would have disabled the offer outright, for every preset, for ever. loadPreset now
+    // reads the preset's SCALA child AFTER restoreState instead - see the note there.
+    presetPendingSclName.clear();
+    presetPendingSclSource.clear();
+    presetPendingTablePeriod.clear();
+
     // WHICH <PARAM> CHILDREN THE CHUNK ITSELF CARRIES, asked HERE and not one line later.
     // apvts.replaceState does `state = newState`, and a juce::ValueTree assignment shares
     // the same reference-counted object rather than copying it - so from the next line on,
@@ -5311,21 +5326,6 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
         if (! tree.hasType (apvts.state.getType()))
             return false;
 
-        // The preset's OWN tuning travels IN the file (so it is never lost) but is
-        // never applied by loading the preset: only the SOUND changes, never the
-        // scale under whatever is already loaded or being played on. It is offered
-        // separately - see hasPendingPresetTuning() / loadPendingPresetTuning() -
-        // the Tuning panel shows a button for it only when the two actually differ.
-        if (auto scl = tree.getChildWithName ("SCALA"); scl.isValid())
-        {
-            presetPendingSclName   = scl.getProperty ("name").toString();
-            presetPendingSclSource = scl.getProperty ("source").toString();
-            // A preset saved on an absolute table carries its period too, so accepting the
-            // preset's tuning later reproduces what the preset's author was hearing.
-            presetPendingTablePeriod = scl.getProperty ("tablePeriod").toString();
-        }
-        else { presetPendingSclName.clear(); presetPendingSclSource.clear(); presetPendingTablePeriod.clear(); }
-
         const auto keep     = tuning.captureTuning();
         const int  keepMode = getTuningMode();
         // THE PARKED HAND-SET REFERENCE IS NOT PART OF A PRESET, for the same reason the
@@ -5347,6 +5347,30 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
 
         manualRefA = keepManualRefA;
         mtsHadRef  = keepMtsHadRef;
+
+        // The preset's OWN tuning travels IN the file (so it is never lost) but is
+        // never applied by loading the preset: only the SOUND changes, never the
+        // scale under whatever is already loaded or being played on. It is offered
+        // separately - see hasPendingPresetTuning() / loadPendingPresetTuning() -
+        // the Tuning panel shows a button for it only when the two actually differ.
+        //
+        // AFTER restoreState, not before it, and that is not tidiness. restoreState now
+        // clears the offer, because an offer belongs to the preset that is loaded and a
+        // state load replaces the patch (see the clear there for what it was costing).
+        // Read into these fields first, as this used to, and the clear one line later
+        // would wipe every offer this function has ever made.
+        //
+        // `tree` still carries the child at this point: apvts.replaceState makes `tree`
+        // and apvts.state the same object and APPENDS the <PARAM> children the chunk was
+        // missing, but it removes nothing, so SCALA is exactly where the file put it.
+        if (auto scl = tree.getChildWithName ("SCALA"); scl.isValid())
+        {
+            presetPendingSclName   = scl.getProperty ("name").toString();
+            presetPendingSclSource = scl.getProperty ("source").toString();
+            // A preset saved on an absolute table carries its period too, so accepting the
+            // preset's tuning later reproduces what the preset's author was hearing.
+            presetPendingTablePeriod = scl.getProperty ("tablePeriod").toString();
+        }
 
         // Put the CURRENTLY ACTIVE tuning back exactly as it was - source, name AND a
         // table's chosen period, which is as much part of "as it was" as the pitches.
