@@ -1844,6 +1844,10 @@ static void runCpuBenchTemporary()
     }
 }
 
+// The processor-audit runs (60+). Defined at the very END of this file - see the block
+// there - and declared here because main's run list is above it.
+static void runProcessorAuditChecks();
+
 int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI juceInit;
@@ -1885,6 +1889,16 @@ int main (int argc, char** argv)
     }
 
     if (argc > 1 && std::strcmp (argv[1], "--cpu") == 0) { runCpuBenchTemporary(); return 0; }
+
+    // ONE BLOCK, ON DEMAND: only the processor-audit runs (60+). Same shape and same
+    // reason as --pitch above - these are the runs that have to be re-run under sabotage,
+    // one broken line at a time.
+    if (argc > 1 && std::strcmp (argv[1], "--audit") == 0)
+    {
+        runProcessorAuditChecks();
+        std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
+        return failures == 0 ? 0 : 1;
+    }
 
     const juce::File realPresets = FractalAdditiveAudioProcessor::getPresetFolder();
 
@@ -17139,6 +17153,95 @@ int main (int argc, char** argv)
                "the instrument");
     }
 
+    runProcessorAuditChecks();
+
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;
+}
+
+//==============================================================================
+// THE PROCESSOR AUDIT RUNS (60+). Defined AFTER main and reached through the forward
+// declaration above, so the block sits at the end of the file where it was appended and
+// the run list in main stays a run list.
+//
+// They also have their own switch, `--audit`, for the same reason run 59 has `--pitch`:
+// every one of them has to be re-run under SABOTAGE - break the fix in one line, watch
+// the check go red, restore - and a twenty-minute full suite per sabotage is how sabotage
+// stops being done.
+static void runProcessorAuditChecks()
+{
+    //-- run 60: A PROJECT OLDER THAN THE PRIME SWITCH REOPENS STILL FILTERED ---------
+    //
+    // "primeOn" shipped OFF (ce29433), and OFF is the right default for a patch that never
+    // had the control: the whitelist has no neutral position, and with the bypass removed
+    // the DEFAULT patch built 375 partials instead of 1024. It is the WRONG value for a
+    // project written before the switch existed, where prime filtering was unconditional -
+    // reopening one with the panel off puts back every harmonic the user deliberately
+    // removed, with nothing on screen to say so.
+    //
+    // Measured on the PARTIAL COUNT the engine really built, never on the flag alone: the
+    // flag is the thing the migration writes, so a check on it proves the migration ran
+    // and nothing about whether the spectrum came back filtered.
+    //
+    // The old chunk is made the way the trap makes it - a state saved by THIS build with
+    // its <PARAM id="primeOn"> child deleted, which is exactly what a pre-ce29433 project
+    // carries and exactly what restoreState has to recognise.
+    {
+        std::printf ("\nrun 60: a project older than the PRIME switch reopens still filtered:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            p->pollParametersForTests();
+        };
+
+        awaitSpectrumIdle (*p, "run 60: the unfiltered default");
+        const int nUnfiltered = p->getTemplatePartialCount();
+
+        // Limit mode at the "2" stop - only the powers of two survive - so the filtered and
+        // unfiltered counts are far apart and no rounding or race can make one look like
+        // the other.
+        sp ("primeMode",  0.0f);
+        sp ("primeLimit", 9.0f);
+        sp ("primeOn",    1.0f);
+        awaitSpectrumIdle (*p, "run 60: limit 2 in force");
+        const int nFiltered = p->getTemplatePartialCount();
+        std::printf ("    limit 2 in force: %d partials (unfiltered is %d)\n", nFiltered, nUnfiltered);
+        check (nFiltered > 0 && nFiltered < nUnfiltered / 4,
+               "  (precondition: the saved patch's prime filter really does bite)");
+
+        juce::MemoryBlock st;
+        p->getStateInformation (st);
+        auto xml = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize());
+        check (xml != nullptr, "  the saved chunk parses back to XML");
+
+        juce::XmlElement* victim = nullptr;
+        if (xml != nullptr)
+            for (auto* e : xml->getChildIterator())
+                if (e->getStringAttribute ("id") == "primeOn") { victim = e; break; }
+        if (victim != nullptr) xml->removeChildElement (victim, true);
+        check (victim != nullptr,
+               "  ...and its primeOn child is removed, which is what makes it a pre-ce29433 project");
+
+        juce::MemoryBlock old;
+        if (xml != nullptr) juce::AudioProcessor::copyXmlToBinary (*xml, old);
+
+        auto q = std::make_unique<Proc>();
+        q->prepareToPlay (48000.0, 256);
+        check (q->apvts.getRawParameterValue ("primeOn")->load() < 0.5f,
+               "  (precondition: a fresh instance really does start with the switch OFF)");
+        q->setStateInformation (old.getData(), (int) old.getSize());
+        for (int i = 0; i < 4; ++i) q->pollParametersForTests();
+        awaitSpectrumIdle (*q, "run 60: the old project, restored");
+        const int nBack = q->getTemplatePartialCount();
+        std::printf ("    reopened: primeOn = %.0f, %d partials\n",
+                     q->apvts.getRawParameterValue ("primeOn")->load(), nBack);
+        check (q->apvts.getRawParameterValue ("primeOn")->load() > 0.5f,
+               "  a chunk with no primeOn child comes back with the panel ON");
+        check (nBack == nFiltered,
+               "  ...and the spectrum is the filtered one the project was written with, not "
+               "the whole harmonic series");
+    }
 }

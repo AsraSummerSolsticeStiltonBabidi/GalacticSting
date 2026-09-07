@@ -4307,6 +4307,11 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     // survives exactly until replaceState runs.
     const bool chunkHasNoDryWet = ! tree.getChildWithProperty ("id", "dryWet").isValid();
 
+    // THE SAME TRAP, ONE PARAMETER YOUNGER: the PRIME CONTROL switch (ce29433). Read on
+    // this line and not below for exactly the reason written above - the absence of the
+    // child is the whole evidence, and replaceState is what manufactures the child.
+    const bool chunkHasNoPrimeOn = ! tree.getChildWithProperty ("id", "primeOn").isValid();
+
     // THE SAME TRAP, ONE PARAMETER OLDER - and the reason this block had to move up here.
     // A state saved before the Harmonics fader existed (98a66ed) is recognised ONLY by the
     // absence of a "harmonics" child, and that evidence dies on the replaceState line below
@@ -4411,6 +4416,36 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     if (chunkHasNoDryWet)
         if (auto* p = apvts.getParameter ("dryWet"))
             p->setValueNotifyingHost (0.0f);
+
+    // AND THE PRIME CONTROL SWITCH, which is the same migration pointing the other way.
+    // "primeOn" shipped in ce29433 and DEFAULTS TO OFF, on purpose and with a measurement
+    // behind it: whitelist mode has no neutral position (ticking all nine primes still
+    // drops harmonic 29, whose factor nobody can tick), and with the bypass removed the
+    // DEFAULT patch built 375 partials instead of 1024. Off is therefore the only honest
+    // default for a patch that never had the control.
+    //
+    // It is the WRONG value for every project written before the switch existed. There,
+    // prime filtering was UNCONDITIONAL - whatever the Limit fader and the nine ticks said
+    // is exactly what the spectrum was, and it is what the user tuned the sound to. Absent
+    // this line those projects reopen with the panel OFF, which PUTS BACK every harmonic
+    // the user deliberately removed: a 5-limit patch comes back with its 7ths, 11ths and
+    // 13ths audible, on a spectrum nobody re-edited, with no dialog and nothing on screen
+    // to say the filter the patch was built around is no longer running. The dryWet line
+    // above and the prime-limit reorder above that are the same failure; this one differs
+    // only in direction - it ADDS partials rather than removing them, so it is heard as a
+    // timbre that has grown teeth rather than as one that went quiet.
+    //
+    // The missing child IS the evidence, and it is decisive: a build that had no switch
+    // could only filter, so filtering is what it must come back as.
+    //
+    // primeMode gets no line of its own, and that is checked rather than assumed. It has
+    // existed since a7eaa51 (the initial commit), so every chunk this migration can ever
+    // see carries its own <PARAM> for it and replaceState applies the saved choice
+    // verbatim. The 0 -> 1 default flip that rode along in ce29433 can only reach a chunk
+    // that predates the PARAMETER, and there is no such chunk.
+    if (chunkHasNoPrimeOn)
+        if (auto* p = apvts.getParameter ("primeOn"))
+            p->setValueNotifyingHost (1.0f);
 
     if (auto ms = tree.getChildWithName ("MODS"); ms.isValid())
     {
