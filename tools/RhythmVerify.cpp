@@ -19786,4 +19786,66 @@ static void runProcessorAuditChecks()
         check (p->temperIsPossible(),
                "  ...so temper works again the moment the user says what the period is");
     }
+
+    //-- run 70: A .scl WHOSE KEYS OVERFLOW IS REFUSED, NOT PUBLISHED -----------------
+    //
+    // loadAbsoluteTable sweeps all 128 frequencies for finite-and-positive BEFORE it
+    // publishes one of them, so a bad table leaves the previous tuning sounding.
+    // loadScalaString had no such sweep: it checked the DEGREES (parsePitchSrc does), and
+    // a key is not a degree - it is degree x period^octave, and the exponent is what goes.
+    //
+    // The file below is one degree per period of 400000 cents. Every line of it is legal
+    // and the parser is right to accept it; it is the 128-key BUILD that overflows, +inf at
+    // the top of the keyboard and a flat 0.0 at the bottom. frequencyForNote is a plain
+    // atomic load on the audio thread and cannot check anything, so those went straight
+    // into the voices, where an inf ratio is a NaN partial.
+    //
+    // The second half is the control: a scale that is merely EXTREME - two octaves per
+    // degree, key 0 down at ~2e-34 Hz - is representable, so it still loads. Nothing here
+    // is refused for being big, only for not fitting in a double.
+    {
+        std::printf ("\nrun 70: a .scl whose keys overflow is refused, not published:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (48000.0, 256);
+
+        const juce::String good = "! a plain 5-degree scale\nzzz70-good\n 5\n 240.\n 480.\n 720.\n 960.\n 1200.\n";
+        juce::String err;
+        check (p->loadScalaText (good, "zzz70-good", err),
+               "  (precondition) a plain scale is loaded and sounding");
+        const double keep60 = p->getNoteFrequency (60), keep72 = p->getNoteFrequency (72);
+
+        const juce::String huge = "! one degree per period of 400000 cents\nzzz70-overflow\n 1\n 400000.\n";
+        err.clear();
+        const bool took = p->loadScalaText (huge, "zzz70-overflow", err);
+        std::printf ("    loading it: %s, message \"%s\"\n", took ? "ACCEPTED" : "refused",
+                     err.toRawUTF8());
+        check (! took, "  the load is REFUSED - a key that is not a number is not a pitch");
+        check (err.isNotEmpty(), "  ...and it says which key and why, instead of failing mute");
+
+        double worstKey = 0.0; int bad = 0;
+        for (int n = 0; n < 128; ++n)
+        {
+            const double f = p->getNoteFrequency (n);
+            if (! (f > 0.0) || ! std::isfinite (f)) ++bad;
+            else worstKey = std::max (worstKey, f);
+        }
+        std::printf ("    after the refusal: %d unusable keys, highest %.4f Hz, key 60 %.4f Hz\n",
+                     bad, worstKey, p->getNoteFrequency (60));
+        check (bad == 0,
+               "  ...and NOTHING was published: no key is inf, NaN or zero after a refused load");
+        check (std::abs (p->getNoteFrequency (60) - keep60) < 1.0e-9
+               && std::abs (p->getNoteFrequency (72) - keep72) < 1.0e-9,
+               "  ...the scale that WAS loaded is still the one under the keys");
+
+        // The control: extreme but representable still loads, so the sweep refuses
+        // overflow and not ambition.
+        err.clear();
+        check (p->loadScalaText ("! two octaves per degree\nzzz70-wide\n 1\n 2400.\n", "zzz70-wide", err),
+               "  a scale of two octaves per degree - key 0 near 2e-34 Hz - still loads");
+        std::printf ("    the wide scale: key 0 %.4g Hz, key 127 %.4g Hz\n",
+                     p->getNoteFrequency (0), p->getNoteFrequency (127));
+        check (p->getNoteFrequency (0) > 0.0 && std::isfinite (p->getNoteFrequency (127)),
+               "  ...and every one of its keys is a real number");
+    }
 }

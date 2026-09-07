@@ -469,6 +469,32 @@ public:
             }
         }
 
+        // THE SIBLING'S SWEEP, and it belongs here for the sibling's own reason.
+        // loadAbsoluteTable refuses a table with a single unusable frequency BEFORE it
+        // publishes anything, so the tuning that was sounding goes on sounding; this
+        // function published all 128 unchecked, and the checks it does have are per
+        // DEGREE, upstream, where the trouble is not.
+        //
+        // What gets through: the degrees are each finite and positive (parsePitchSrc
+        // proves that), but a key's pitch is degree x period^octave, and the exponent is
+        // what overflows. A one-degree .scl whose period line reads "400000." is 2^333 per
+        // period - legal cents, parsed without complaint - and key 127 is that to the 67th,
+        // i.e. +inf. The audio thread then reads +inf out of the table (frequencyForNote is
+        // a plain atomic load; it cannot check anything at 60 Hz per voice) and every
+        // partial built on it is a NaN. Underflow is the same story downwards: pow() lands
+        // on 0.0 and the key has no pitch at all.
+        //
+        // Refused rather than clamped: a clamped key is a pitch the user's file does not
+        // contain, which is the same lie by a quieter route.
+        for (int n = 0; n < 128; ++n)
+            if (! (freqs[(size_t) n] > 0.0) || ! std::isfinite (freqs[(size_t) n]))
+            {
+                errorOut = "Key " + juce::String (n) + " of this scale is not a usable "
+                           "frequency - its degrees or its period run off the end of what a "
+                           "number can hold. Nothing was loaded.";
+                return false; // nothing published: the old tuning is still the one sounding
+            }
+
         for (int n = 0; n < 128; ++n)
             table[(size_t) n].store (freqs[(size_t) n], std::memory_order_relaxed);
 
