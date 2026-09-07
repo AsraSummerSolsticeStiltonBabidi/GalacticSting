@@ -7947,17 +7947,37 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
             // Measured and painted at the SAME height, unlike the prime tag below, which
             // reserves at 9 and draws at 10 - a reservation smaller than the ink is a cut
             // word waiting for a longer translation.
-            const auto harmTag  = tr ("RESIZE", "AMPLIA");
-            const int  harmTagW = harmTemperHidden
-                                ? juce::GlyphArrangement::getStringWidthInt (
-                                      juce::Font (juce::FontOptions (10.0f).withStyle ("Bold")),
-                                      harmTag) + 2
-                                : 0;
-            const int  harmGap  = harmTemperHidden ? 6 : 0;
-            auto       harmBand = band (hcHarm);
-            add ("eng.harm",  tr ("HARMONICS", "HARM\xc3\x92NICS"),
+            const auto harmTitle = tr ("HARMONICS", "HARM\xc3\x92NICS");
+            const auto harmTag   = tr ("RESIZE", "AMPLIA");
+            auto       harmBand  = band (hcHarm);
+            // THE TITLE OUTRANKS THE TAG, and that is measured rather than assumed.
+            //
+            // Reserving the tag unconditionally cost this window FIFTY PIXELS of minimum
+            // width - the rig's floor went 690 -> 740 in Catalan, where "HARMÒNICS" then
+            // needed 52 px in the 50 its shortened cell had, and these titles are drawn
+            // with no ellipsis so what was left on the glass would have been a cut word.
+            // A tag that says "make the window wider" must not itself be the reason the
+            // window cannot get narrower.
+            //
+            // So the tag takes what is LEFT after the title's own measured need, and is
+            // dropped below that - the same rule FROZEN follows beside AMP DECAY. What is
+            // lost by dropping it is small and bounded: TEMPER goes off screen at about
+            // 900 px, the tag fits with room to spare from there down to ~740, and below
+            // 740 every compartment in this box is degraded and the PRIMES row two lines
+            // under it is already printing the same word for the same reason.
+            const int  harmTitleW = juce::GlyphArrangement::getStringWidthInt (
+                                        juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")),
+                                        harmTitle);
+            const int  harmTagInk = juce::GlyphArrangement::getStringWidthInt (
+                                        juce::Font (juce::FontOptions (10.0f).withStyle ("Bold")),
+                                        harmTag) + 2;
+            const bool tagFits    = harmTemperHidden
+                                 && harmTitleW + 6 + harmTagInk <= harmBand.getWidth() - harmTemperW;
+            const int  harmTagW   = tagFits ? harmTagInk : 0;
+            const int  harmGap    = tagFits ? 6 : 0;
+            add ("eng.harm",  harmTitle,   // the same string the width above was measured from
                  harmBand.withTrimmedRight (harmTemperW + harmTagW + harmGap), cPanel);
-            if (harmTemperHidden)
+            if (tagFits)
                 add ("eng.harmHidden", harmTag,
                      harmBand.removeFromRight (harmTagW), cPanel, 10.0f);
             // PRIME sits right under the shared divider -> nudge it down for air.
@@ -8351,6 +8371,18 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("eng.chipHarmonic", engineChip[0]);   add ("eng.chipCustom", engineChip[1]);
     add ("mod.tabAmp",       envTabB[0]);      add ("mod.tabPitch",   envTabB[1]);
     add ("mod.tabFilter",    envTabB[2]);      add ("mod.tabCustom",  envTabB[3]);
+    // THE CUSTOM MODULATOR'S SELECTOR ROW, which nothing measured until now.
+    //
+    // Three controls share a 199 px row at the shipped size and each is sized to its own
+    // words, so it is exactly the row a longer translation or a wider control breaks -
+    // and none of the three was in this list. The proof is that adding a state LED to the
+    // ON/OFF pill pushed the row six pixels over its budget at 1200x650, flipped all
+    // three into their starved fallback, and every gate in the build passed: the fit
+    // sweep only ever saw the OTHER onled pill, the one with room to spare. A control the
+    // probe cannot see is a control no measurement in this project protects.
+    add ("mod.selector",     modSelBox);
+    add ("mod.on",           modOnT);
+    add ("mod.unmap",        modUnmapBtn);
 
     add ("both.slope",       slopeFader);      add ("both.pencil",    partialEditBtn);
     add ("both.manual",      partialManualT);  add ("both.fractal",   fractalFader);
@@ -10813,7 +10845,27 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 const int selSnug = fgfit::snugComboWidth (modSelBox, 20);
                 const int onSnug  = fgfit::snugToggleWidth (modOnT, 20);
                 const int unSnug  = fgfit::snugTextButtonWidth (modUnmapBtn, 20);
-                const bool roomy  = selSnug + 3 + onSnug + 3 + unSnug <= selRow.getWidth();
+                const int selFloor = fgfit::snugComboWidthForSelection (modSelBox, 20);
+                // THE COMBO GIVES WAY FIRST, and it is the only one of the three that can.
+                //
+                // The numbers above stopped being true the moment the ON/OFF pill grew a
+                // state LED (see GalacticLnF::drawToggleButton): onSnug went 36 -> 45, so
+                // the three want 205 px in the 199 this row has AT THE SHIPPED 1200x650,
+                // and the all-or-nothing test below flipped the WHOLE row into its
+                // pad-less fallback - which left the pill with about a quarter of a pixel
+                // of clear capsule each side of its word. A row that only knows "everyone
+                // comfortable" and "everyone starved" starves everyone over six pixels.
+                //
+                // The combo is the elastic member and this file already says why: it is
+                // sized to its WIDEST item while it only ever draws the SELECTED one, and
+                // it has a floor of its own for exactly this. The pill and the button have
+                // no such slack - their whole width IS their word. So the overflow comes
+                // out of the combo's surplus first, down to its floor, and only what is
+                // still over after that falls back on the old flat shave.
+                const int need    = selSnug + 3 + onSnug + 3 + unSnug;
+                const int over    = juce::jmax (0, need - selRow.getWidth());
+                const int selGive = juce::jmin (over, juce::jmax (0, selSnug - selFloor));
+                const bool roomy  = need - selGive <= selRow.getWidth();
                 const int pad     = roomy ? 0 : fgfit::kSnugPad;
                 // ...BUT NEVER BELOW WHAT THE CHOSEN NAME NEEDS. The tight fallback shaved
                 // a flat kSnugPad off the snug width, and the snug width is measured
@@ -10825,8 +10877,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // Floored at the selection's own width, which is the same rule the Shepard
                 // row's rate control already uses: a box may give up its comfort, never its
                 // word.
-                const int selFloor = fgfit::snugComboWidthForSelection (modSelBox, 20);
-                const int selW = juce::jmax (1, juce::jmin (juce::jmax (selSnug - pad, selFloor),
+                // (selFloor is measured above, where the give is decided.)
+                const int selW = juce::jmax (1, juce::jmin (juce::jmax (selSnug - selGive - pad, selFloor),
                                                             selRow.getWidth()));
                 modSelBox.setBounds (selRow.removeFromLeft (selW));
                 selRow.removeFromLeft (juce::jmin (3, selRow.getWidth()));

@@ -157,9 +157,16 @@ namespace fgfit
     inline constexpr float kOnLedGap = 4.0f;   // the disc's right edge -> the word
     // What the painter really lays down, so the fit sweep and the snug widths measure the
     // pill that is drawn rather than the one it used to draw.
+    //
+    // ...AND A PIXEL OF SLACK ON THE WORD, because the painter and this function measure
+    // it by two different routes. drawToggleButton hands drawText a rect exactly this
+    // wide, and juce::Graphics::drawText curtails against its OWN measurement of the same
+    // string - GlyphArrangement::addCurtailedLineOfText, not getStringWidth - so a float
+    // difference of a fraction of a pixel is enough to drop the last glyph of "OFF". A
+    // switch reading "OF" is worse than one reading nothing, because it looks deliberate.
     inline float onLedInkWidth (int h, const juce::String& word)
     { return onLedDot (h) + kOnLedGap
-           + juce::GlyphArrangement::getStringWidth (onLedFont (h), word); }
+           + juce::GlyphArrangement::getStringWidth (onLedFont (h), word) + 1.0f; }
     inline int onLedWidth (int h)  // "OFF" is the longer of the two words
     { return (int) std::ceil (onLedInkWidth (h, "OFF")) + 2; }
 
