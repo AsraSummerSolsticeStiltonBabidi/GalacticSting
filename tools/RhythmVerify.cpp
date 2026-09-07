@@ -19018,6 +19018,47 @@ int main (int argc, char** argv)
             check (! ed->noticeProbeForTests().visible,
                    "and dismissing it makes it stay dismissed - the message is spoken once,"
                    " not re-raised by every tick");
+
+            //-- ...AND THE OTHER MESSAGE, WHICH HAS NEVER BEEN TESTED EITHER ---------
+            //
+            // A project whose saved scale no longer parses. This is the older of the two
+            // notices and the more serious: for a microtonal instrument, reopening in
+            // 12-TET while everything still sounds is the worst quiet failure available -
+            // it plays, and it plays wrong. It was written, shipped, and never once
+            // checked from the editor's side; the probe that made the bank-slot half
+            // reachable makes this half reachable too, so it is covered here rather than
+            // left as the untested twin of a thing I did test.
+            //
+            // The state is broken the way life breaks it: a project written by an older
+            // build, or a hand-edited .gsting, whose SCL child no longer reads.
+            juce::MemoryBlock st2;
+            p.getStateInformation (st2);
+            if (auto xml2 = juce::AudioProcessor::getXmlFromBinary (st2.getData(), (int) st2.getSize()))
+            {
+                xml2->removeChildElement (xml2->getChildByName ("SCALA"), true);   // the child is SCALA, not SCL
+                auto* scl = xml2->createNewChildElement ("SCALA");
+                scl->setAttribute ("name", "zzz-notice-lost-scale");
+                scl->setAttribute ("source", "this was a scale once, and is not one now");
+                juce::MemoryBlock broken;
+                juce::AudioProcessor::copyXmlToBinary (*xml2, broken);
+                p.setStateInformation (broken.getData(), (int) broken.getSize());
+            }
+            for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+            ed->dismissNoticeForTests();
+            ed->tickTimerForTests();
+            const auto n2 = ed->noticeProbeForTests();
+            std::printf ("  after loading a project whose scale no longer parses: overlay %s,"
+                         " title \"%s\"\n",
+                         n2.visible ? "SHOWN" : "silent", n2.title.toRawUTF8());
+            check (n2.visible,
+                   "a project that lost its scale puts its notice ON SCREEN too - the older"
+                   " of the two messages, and until now the untested one");
+            check (n2.body.contains ("zzz-notice-lost-scale"),
+                   "...and it NAMES the scale that failed, so the user knows which file to"
+                   " go and find");
+            check (n2.title.containsIgnoreCase ("tuning") || n2.title.containsIgnoreCase ("afinaci"),
+                   "...and it is about the project's TUNING, not about a bank slot - the two"
+                   " notices say different things because they are different failures");
         }
     }
 
