@@ -1536,9 +1536,46 @@ namespace
                    " there is no acceptable count of them.");
             for (const auto& l : gStructural) say (l);
         }
+        // A RIG THAT PHOTOGRAPHED NOTHING HAS NOT PASSED.
+        //
+        // The verdict was `failed == 0` and four empty lists, with no floor under
+        // `written`. Every one of those is trivially true when the walk never ran, so a
+        // run that took no picture at all printed "SNAPSHOT OK: 0 scenario file pair(s)
+        // written" - the two words a reader takes away, in front of the number that says
+        // they are worthless. That is not a hypothetical: it happened in this project's own
+        // development, from a `--only` filter naming a scenario that does not exist. The
+        // filter was a typo, the rig said OK, and the run was believed.
+        //
+        // "Nothing is ever silently hidden" covers the verifier too. A gate that cannot
+        // fail is not a gate, and the most common way a gate stops being able to fail is
+        // that it stops having anything to look at.
+        const bool photographedSomething = written > 0;
+        if (! photographedSomething)
+        {
+            say ("");
+            say (only.isNotEmpty()
+                     ? "NOTHING WAS PHOTOGRAPHED: --only \"" + only + "\" matched no scenario,"
+                       " so every check below passed by having nothing to check. Fix the"
+                       " filter - the ids are the stems the rig writes, e.g. \"02-harmonic\"."
+                     : juce::String ("NOTHING WAS PHOTOGRAPHED: the walk wrote no file pair"
+                                     " at all, so every check below passed vacuously."));
+        }
+        // ...AND THE TWO SIZES IT REPORTS HAVE TO BE REAL. They are the numbers every
+        // layout decision in this project is argued from, and an unset one reads as a
+        // triumph: "floor 0x0" is a smaller floor than any window ever measured.
+        const bool sizesMeasured = gEditorMin.w > 0 && gEditorMin.h > 0
+                                && gLegible.w  > 0 && gLegible.h  > 0;
+        if (photographedSomething && ! sizesMeasured)
+        {
+            say ("");
+            say ("THE MEASURED SIZES ARE NOT REAL: the floor and/or the fully-legible size"
+                 " came back at zero, so the search never ran. The numbers printed below"
+                 " are placeholders, not measurements.");
+        }
         const bool allOk = failed == 0 && gMojibake.isEmpty() && gUntranslated.isEmpty()
                         && gNoTooltip.isEmpty()
-                        && gStructural.isEmpty();
+                        && gStructural.isEmpty()
+                        && photographedSomething && sizesMeasured;
         say (juce::String ("SNAPSHOT ") + (allOk ? "OK" : "FAILED")
                   + ": " + juce::String (written) + " scenario file pair(s) written, "
                   + juce::String (failed) + " failure(s), "
