@@ -4161,6 +4161,31 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         state.appendChild (pg, nullptr);
     }
 
+    // THE FROZEN SLOPE, which belongs to the drawing above and was travelling nowhere.
+    //
+    // While manual per-partial amplitudes are on, currentSettings() compiles the template at
+    // manualSlopeFrozen instead of at the fader - the amplitudes are the user's drawing, and
+    // the slope the drawing started from is what makes switching manual on inaudible. It is
+    // refreshed on exactly ONE event, the moment manual goes on (timerCallback, and the two
+    // paths that arm manual themselves). Nothing refreshes it on a state load, so a patch
+    // that arrives with manual ALREADY on compiled at whatever the PREVIOUS patch happened
+    // to leave here - this instance's 1.0 default on a fresh instrument, or the last thing
+    // anyone drew in this session.
+    //
+    // That is not cosmetic. The amplitude floor culls by an amplitude that depends on slope:
+    // at -120 dB it removes everything above ratio 10^(6/s), which is nothing at slope 1 and
+    // everything above ratio ~32 at slope 4 (see currentSettings). Load a slope-4 patch and
+    // the template physically lacks the partials the drawing was made on, so the user's own
+    // edits up there stop applying - their work dropped, silently, by a number that came
+    // from a different patch. That is this project's cardinal sin, so the number rides with
+    // the patch.
+    state.removeChild (state.getChildWithName ("MANUALAMP"), nullptr);
+    {
+        juce::ValueTree ma ("MANUALAMP");
+        ma.setProperty ("slope", manualSlopeFrozen, nullptr);
+        state.appendChild (ma, nullptr);
+    }
+
     state.removeChild (state.getChildWithName ("BANK"), nullptr);
     {
         juce::ValueTree bank ("BANK");
@@ -4575,6 +4600,29 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
                        [] (const spectrum::PartialGain& a, const spectrum::PartialGain& b)
                        { return a.key < b.key; });
         }
+        // THE SLOPE THE DRAWING WAS MADE AT comes back with it (see captureState for what
+        // was being dropped without this). Restored HERE, beside the edits it belongs to
+        // and before the rebuild request below, so the first template this project compiles
+        // is already the right one rather than a corrected second attempt.
+        //
+        // lastManualMode is put in step in the same breath, and that is load-bearing rather
+        // than tidy: leaving it stale makes timerCallback see a mode TRANSITION on its very
+        // next tick and re-freeze the slope at the fader's current value - which is exactly
+        // the number this line is restoring away from, arriving 16 ms later and undoing it.
+        // Nothing is lost by pre-empting that branch: its other half, the setPartialGains
+        // push that tells the engine whether the edits are in force, is the statement below.
+        //
+        // A chunk that predates this child falls back to the patch's OWN curveSlope, which
+        // replaceState has just restored. That is what the fader reads, it is what the patch
+        // was drawn against, and it is the only slope the file contains - the previous
+        // patch's is not a candidate under any reading.
+        {
+            const auto ma = tree.getChildWithName ("MANUALAMP");
+            manualSlopeFrozen = (float) (double) ma.getProperty ("slope",
+                                    (double) apvts.getRawParameterValue ("curveSlope")->load());
+            lastManualMode = apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+        }
+
         // Through setPartialGains, not the engine directly, so the revision counter is
         // bumped: an open amplitude window would otherwise keep showing the PREVIOUS
         // project's knob positions after a reload (its resync watches that counter).

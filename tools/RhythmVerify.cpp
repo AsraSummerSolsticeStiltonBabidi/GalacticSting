@@ -17515,4 +17515,60 @@ static void runProcessorAuditChecks()
         check (std::abs (back - 432.0) < 0.05,
                "  the hand-set 432 comes back - MTS did not permanently overwrite it");
     }
+
+    //-- run 64: A PATCH LOADED WITH MANUAL AMPLITUDES ON COMPILES AT ITS OWN SLOPE ---
+    //
+    // With manual per-partial amplitudes on, the template is compiled at manualSlopeFrozen
+    // rather than at the fader. That member was refreshed on exactly one event - the moment
+    // manual goes ON - and was saved nowhere, so a patch that ARRIVES with manual already on
+    // compiled at whatever the previous patch left behind.
+    //
+    // It is measured on the partial COUNT because that is where it hurts: the amplitude
+    // floor culls by an amplitude that depends on slope, so at slope 4 the template
+    // physically lacks everything above ratio ~32. Load a slope-1 drawing into an instrument
+    // whose stale frozen slope is 4 and most of the spectrum the drawing was made on is not
+    // in the template at all - the user's own edits up there stop applying, silently.
+    {
+        std::printf ("\nrun 64: a manual-amplitude patch reopens at the slope it was drawn at:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto writer = std::make_unique<Proc>();
+        writer->prepareToPlay (48000.0, 256);
+        const auto spw = [&] (const char* id, float v)
+        {
+            if (auto* q = writer->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            writer->pollParametersForTests();
+        };
+        spw ("curveSlope", 1.0f);
+        spw ("partialManual", 1.0f);          // freezes the slope at 1.0
+        awaitSpectrumIdle (*writer, "run 64: the shallow patch");
+        const int nShallow = writer->getTemplatePartialCount();
+        juce::MemoryBlock st;
+        writer->getStateInformation (st);
+
+        // The reader is an instrument that has just been drawing at slope 4 - which is all
+        // it takes for the stale number to be wrong.
+        auto reader = std::make_unique<Proc>();
+        reader->prepareToPlay (48000.0, 256);
+        const auto spr = [&] (const char* id, float v)
+        {
+            if (auto* q = reader->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            reader->pollParametersForTests();
+        };
+        spr ("curveSlope", 4.0f);
+        spr ("partialManual", 1.0f);          // freezes the slope at 4.0
+        awaitSpectrumIdle (*reader, "run 64: the steep patch");
+        const int nSteep = reader->getTemplatePartialCount();
+        std::printf ("    slope 1 builds %d partials, slope 4 builds %d\n", nShallow, nSteep);
+        check (nSteep > 0 && nSteep < nShallow / 4,
+               "  (precondition: the compile slope really does decide how much spectrum exists)");
+
+        reader->setStateInformation (st.getData(), (int) st.getSize());
+        for (int i = 0; i < 4; ++i) reader->pollParametersForTests();
+        awaitSpectrumIdle (*reader, "run 64: the shallow patch, reopened on the steep instrument");
+        const int nBack = reader->getTemplatePartialCount();
+        std::printf ("    the slope-1 patch reopened on the slope-4 instrument: %d partials\n", nBack);
+        check (nBack == nShallow,
+               "  a manual-amplitude patch compiles at ITS OWN frozen slope, not at the one "
+               "the last patch left behind");
+    }
 }
