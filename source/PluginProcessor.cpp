@@ -3783,6 +3783,30 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         wasSelfPlay = selfPlay;
         keyboardState.allNotesOff (0);
         synth.turnOffAllVoices (false);
+        // THE MIX SUB-ENGINES TOO, and this is not symmetry for its own sake - it is the
+        // same stuck note, one engine over. With MIX engaged a held key is sounding in the
+        // corner engines as well (renderSynthMix feeds them the same stream, and the engage
+        // edge deliberately re-strikes every held key into them), and from the next block on
+        // self-play rewrites every note-OFF onto channel 16. That rewritten off matches
+        // nothing a corner voice is holding, so the corner DRONES FOR EVER: the key is up,
+        // the main engine is silent, and the sound continues with no key to release and no
+        // panic that can reach it - the host's all-notes-off goes to keyboardState and the
+        // main synth, which are already quiet. Routing a partial auto-enables self-play, so
+        // the flip that strands them is one click in the rhythm panel while a note is held.
+        //
+        // MEASURED, and it took a corrected measurement to see it: with the pulses routed to
+        // the SAME note and channel as the held key, the pulse's own gate note-off happened
+        // to release the stranded voice and the whole thing looked fine (that collision is
+        // the hazard the drone's reserved channel 16 exists for, see below). Route them
+        // anywhere else and the corner holds a steady 0.0255 RMS for as long as anyone cares
+        // to render, a full second after the key came up. run 61 does exactly that.
+        //
+        // The two siblings of this kill - the hard-silence backstop at the top of
+        // processBlock and the lookahead flush above - have carried this loop from the day
+        // they were written; this one was missed.
+        for (auto& pe : mixEngLive)
+            if (auto* ce = pe.load (std::memory_order_acquire))
+                ce->synth.turnOffAllVoices (false);
         rhythm.flushOpenGates();
         rhythm.flushEchoes();
         noteGate.prepare (lastSr > 0.0 ? lastSr : getSampleRate());

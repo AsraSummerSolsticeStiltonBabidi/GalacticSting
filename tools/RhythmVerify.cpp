@@ -17244,4 +17244,135 @@ static void runProcessorAuditChecks()
                "  ...and the spectrum is the filtered one the project was written with, not "
                "the whole harmonic series");
     }
+
+    //-- run 61: A SELF-PLAY FLIP LEAVES NO MIX CORNER DRONING ------------------------
+    //
+    // Self-play rewrites every note-OFF onto channel 16. A note that started before it
+    // engaged is sounding on the channel it was PLAYED on, and MPE legacy matching is by
+    // (channel, note), so its note-off never reaches that voice. processBlock has always
+    // known this - it kills the main engine's voices on the flip and says so in a comment
+    // headed "THE stuck-note bug" - but it killed only the MAIN engine, and with MIX
+    // engaged the corners are holding the same key (the engage edge deliberately re-strikes
+    // every held key into them). The corner then drones for ever: key up, main engine
+    // silent, sound continuing, and the host's panic cannot reach it because that goes to
+    // keyboardState and the main synth, which are already quiet. Routing a partial
+    // auto-enables self-play, so the flip is one click while a note is held.
+    //
+    // MEASURED ON THE OUTPUT, not on a flag: "is this instrument still making a sound"
+    // is the entire complaint, and no flag can answer it. By the time of the flip the
+    // engage crossfade has run to completion (50 ms time constant, 0.8 s of render), so
+    // the main engine's own bus is at sqrt(1-x) ~ 0 and every sample left in the buffer
+    // is a corner's.
+    {
+        std::printf ("\nrun 61: a self-play flip strands no MIX corner voice:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        // The user's preset folder is not a scratch directory (see the top of this file).
+        const auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                 .getChildFile ("fiblo-run61-"
+                                     + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        struct ScratchFolder
+        {
+            explicit ScratchFolder (const juce::File& d)
+                : dir (d), prev (Proc::getPresetFolder()) { Proc::setPresetFolderForTests (d); }
+            ~ScratchFolder() { Proc::setPresetFolderForTests (prev); dir.deleteRecursively(); }
+            juce::File dir, prev;
+        } guard (scratch);
+
+        const double sr = 48000.0;
+        const int    blk = 256;
+        auto p = std::make_unique<Proc>();
+        p->prepareToPlay (sr, blk);
+        juce::AudioBuffer<float> buf (2, blk);
+
+        const auto sp = [&] (const char* id, float v)
+        {
+            if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            p->pollParametersForTests();
+        };
+        const auto blockRms = [&buf, blk]
+        {
+            double s = 0.0;
+            const int ch = juce::jmax (1, buf.getNumChannels());
+            for (int c = 0; c < ch; ++c)
+                for (int i = 0; i < blk; ++i) { const double v = buf.getSample (c, i); s += v * v; }
+            return std::sqrt (s / (double) (blk * ch));
+        };
+        // The LOUDEST block of the stretch, never the mean: a drone that is averaged
+        // against the silence around it stops looking like a drone.
+        const auto render = [&] (double seconds, juce::MidiBuffer first)
+        {
+            double peak = 0.0;
+            const int blocks = juce::jmax (1, (int) (seconds * sr / (double) blk));
+            for (int i = 0; i < blocks; ++i)
+            {
+                juce::MidiBuffer m;
+                if (i == 0) m = std::move (first);
+                buf.clear();
+                p->processBlock (buf, m);
+                peak = juce::jmax (peak, blockRms());
+                p->pollParametersForTests();
+            }
+            return peak;
+        };
+
+        // A release short enough that "the tail has finished" is unambiguous, and a
+        // sustain high enough that a stranded voice is loud rather than marginal.
+        sp ("ampAttack", 0.005f); sp ("ampDecay", 0.050f);
+        sp ("ampSustain", 0.9f);  sp ("ampRelease", 0.050f);
+        sp ("dryWet", 0.0f); sp ("morph", 0.0f);   // nothing else crossfading under the measurement
+        check (p->savePreset ("zzz61-A").isNotEmpty(), "  corner preset A saved");
+        check (p->savePreset ("zzz61-B").isNotEmpty(), "  corner preset B saved");
+
+        juce::String err;
+        sp ("pgMode", 1.0f); sp ("pgX", 0.0f); sp ("pgY", 0.0f);
+        check (p->assignPlaygroundCorner (0, "zzz61-A", err), "  A hangs on corner 0");
+        check (p->assignPlaygroundCorner (1, "zzz61-B", err), "  B hangs on corner 1");
+        render (0.3, {});
+        check (p->isPlaygroundMixMode() && p->isPlaygroundMixEngaged(),
+               "  two corners + mix mode = the mix is engaged and sounding");
+
+        juce::MidiBuffer on;
+        on.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+        const double held = render (0.8, on);     // engage crossfade fully settled
+        std::printf ("    key held under the mix: loudest block %.6f\n", held);
+        check (held > 1.0e-3,
+               "  (precondition: the held key really is sounding through the corner engines)");
+
+        // THE FLIP. Routing a partial is what a user does in the rhythm panel, and it is
+        // what auto-enables self-play - the exact gesture that strands the voice.
+        //
+        // THE PULSE IS ROUTED AWAY FROM THE HELD KEY ON PURPOSE, and the first version of
+        // this run got that wrong in a way worth writing down. With the default routing the
+        // pulses came out as note 60 on channel 1 - the SAME (channel, note) as the key
+        // being held - so the pulse's own gate note-off released the stranded corner voice
+        // and the whole run passed with the fix removed. That is the hazard the drone's
+        // reserved channel 16 exists for, quoted in processBlock: "a pulse landing on the
+        // same channel+note would otherwise kill the drone voice with its gate note-off".
+        // It masks the bug rather than fixing it - change the routed partial, the tuning or
+        // the octave and the collision is gone - so the pulses are put on 3/1, which lands
+        // near note 79 and can never close a gate on note 60.
+        p->getRhythm().slots[0].partial  = 1;
+        p->getRhythm().slots[0].useRatio = true;
+        p->getRhythm().slots[0].ratio    = 3.0;
+        p->getRhythm().slots[0].steps    = 0;
+        p->getRhythm().slots[0].durMs    = 20.0f;
+        p->getRhythm().slots[0].vel      = 100;
+        p->getRhythm().slots[0].enabled  = true;
+        sp ("rhythmSelfPlay", 1.0f);
+        const double atFlip = render (0.1, {});    // the flip happens on the first block here
+        std::printf ("    the 100 ms across the flip: loudest block %.6f (mix still engaged: %d)\n",
+                     atFlip, (int) p->isPlaygroundMixEngaged());
+
+        // ...and the key comes up. Self-play rewrites this onto channel 16, which is the
+        // whole point: it matches nothing the corner is holding.
+        juce::MidiBuffer off;
+        off.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+        render (1.0, off);                         // pulses stop, every tail runs out
+        const double after = render (0.5, {});     // ...and THIS stretch must be silence
+        std::printf ("    a second after the key came up: loudest block %.6f (was %.6f)\n",
+                     after, held);
+        check (after < held * 0.02,
+               "  the instrument is SILENT after the key is released across a self-play flip - "
+               "no corner voice is left droning");
+    }
 }
