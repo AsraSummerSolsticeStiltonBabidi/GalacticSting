@@ -20179,4 +20179,141 @@ static void runProcessorAuditChecks()
 
         scratch.deleteRecursively();
     }
+
+    //-- run 75: A PROJECT LOAD DOES NOT LEAVE THE PREVIOUS PATCH'S TUNING ON Ctrl+Z --
+    //
+    // apvts.replaceState calls undoManager->clearUndoHistory(), and restoreState reaches
+    // the realtime block a few hundred lines later. setRealtimeLink's leaving-step - "one
+    // Ctrl+Z back to the tuning the follower displaced" - was therefore minted onto a
+    // history that had just been emptied, describing a patch that no longer exists. The
+    // FIRST Ctrl+Z after opening a project installed the PREVIOUS patch's tuning, out of
+    // nowhere, in an instrument whose whole promise is that its tuning does not move under
+    // the player.
+    //
+    // The second half is the one a naive fix misses, and part (B) below is what catches
+    // it: setRealtimeLink returns early when the mode has not changed, so a project that
+    // saves the SAME link the instance already had left a still-engaged follower carrying
+    // the PREVIOUS patch's baseline - which it would commit on the way out, the very same
+    // wrong tuning one step later. Dropping the commit alone swaps a wrong undo step for
+    // no undo step at all. The arming is re-run instead.
+    {
+        std::printf ("\nrun 75: a project load leaves no undo step from the patch before it:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+
+        // A tiny spectrum so each follower search is instant - this run measures undo
+        // bookkeeping, not the throttle (run (c) above already measures that).
+        const auto engage = [] (Proc& p, Proc::RtLink link)
+        {
+            const auto sp = [&p] (const char* id, float v)
+            {
+                if (auto* q = p.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+                p.pollParametersForTests();
+            };
+            sp ("timbreOn", 0.0f);
+            sp ("spectrumRange", 1.0f);
+            sp ("partialManual", 0.0f);
+            awaitSpectrumIdle (p, "run 75: the small spectrum the follower runs on");
+            Proc::RtSettings rs;
+            rs.notes = 3; rs.periodRatio = 2.0; rs.periodLine = "2/1"; rs.minGapCents = 50.0;
+            p.setRealtimeLink (link, rs);
+            return rs;
+        };
+        // Sweep the spectrum until the follower has actually retuned at least once.
+        const auto sweepUntilApplied = [] (Proc& p, int wasApplies)
+        {
+            for (int i = 0; i < 300 && p.getRealtimeApplies() <= wasApplies; ++i)
+            {
+                if (auto* sl = p.apvts.getParameter ("curveSlope"))
+                    sl->setValueNotifyingHost (sl->convertTo0to1 (i % 2 == 0 ? 1.0f : 1.4f));
+                p.pollParametersForTests();
+                juce::Thread::sleep (2);
+            }
+            return p.getRealtimeApplies() > wasApplies;
+        };
+
+        const juce::String sP = "! the patch that was open\nzzz75-P\n 5\n 240.\n 480.\n 720.\n 960.\n 1200.\n";
+        const juce::String sQ = "! the project being opened\nzzz75-Q\n 7\n 150.\n 300.\n 450.\n 600.\n 750.\n 900.\n 1200.\n";
+
+        //-- (A) the project turns the follower OFF ----------------------------------
+        {
+            auto p = std::make_unique<Proc>();
+            p->prepareToPlay (48000.0, 256);
+            juce::String err;
+            check (p->loadScalaText (sP, "zzz75-P", err), "  (A precondition) the open patch holds zzz75-P");
+            auto rs = engage (*p, Proc::RtLink::TuningFromSpectrum);
+            check (sweepUntilApplied (*p, 0), "  (A precondition) the follower really retuned something");
+
+            auto q = std::make_unique<Proc>();
+            q->prepareToPlay (48000.0, 256);
+            check (q->loadScalaText (sQ, "zzz75-Q", err), "  (A precondition) the project holds zzz75-Q, link off");
+            juce::MemoryBlock st;
+            q->getStateInformation (st);
+            p->setStateInformation (st.getData(), (int) st.getSize());
+
+            const auto afterLoad = p->activeSclSource();
+            std::printf ("    (A) after the load: undo depth %d, scale %s\n",
+                         p->undoStackDepthForTests(),
+                         afterLoad.contains ("zzz75-Q") ? "zzz75-Q" : "SOMETHING ELSE");
+            check (afterLoad.contains ("zzz75-Q"), "  (A precondition) the project's own tuning is in force");
+            check (p->undoStackDepthForTests() == 0,
+                   "  (A) a freshly loaded project has an EMPTY undo history - the link's "
+                   "leaving-step is not minted onto it");
+            p->undoManager.undo();
+            std::printf ("    (A) after one Ctrl+Z: scale %s\n",
+                         p->activeSclSource().contains ("zzz75-Q") ? "still zzz75-Q"
+                                                                   : "CHANGED");
+            check (p->activeSclSource() == afterLoad,
+                   "  (A) ...so the first Ctrl+Z does not install the previous patch's tuning");
+            p->setRealtimeLink (Proc::RtLink::Off, rs);
+        }
+
+        //-- (B) the project has the SAME link armed, so setRealtimeLink returns early --
+        {
+            auto p = std::make_unique<Proc>();
+            p->prepareToPlay (48000.0, 256);
+            juce::String err;
+            check (p->loadScalaText (sP, "zzz75-P", err), "  (B precondition) the open patch holds zzz75-P");
+            auto rs = engage (*p, Proc::RtLink::TuningFromSpectrum);
+            check (sweepUntilApplied (*p, 0), "  (B precondition) the follower retuned before the load");
+
+            auto q = std::make_unique<Proc>();
+            q->prepareToPlay (48000.0, 256);
+            check (q->loadScalaText (sQ, "zzz75-Q", err), "  (B precondition) the project holds zzz75-Q");
+            engage (*q, Proc::RtLink::TuningFromSpectrum);   // ...and the SAME link armed
+            juce::MemoryBlock st;
+            q->getStateInformation (st);
+            q->setRealtimeLink (Proc::RtLink::Off, rs);      // q is done; do not leave it running
+
+            p->setStateInformation (st.getData(), (int) st.getSize());
+            const auto afterLoad = p->activeSclSource();
+            std::printf ("    (B) after the load: link %s, undo depth %d, scale %s\n",
+                         p->getRealtimeLink() == Proc::RtLink::TuningFromSpectrum ? "STILL ARMED" : "off",
+                         p->undoStackDepthForTests(),
+                         afterLoad.contains ("zzz75-Q") ? "zzz75-Q" : "SOMETHING ELSE");
+            check (p->getRealtimeLink() == Proc::RtLink::TuningFromSpectrum,
+                   "  (B precondition) the follower is still armed across the load - this is the "
+                   "case setRealtimeLink used to return early on");
+            check (afterLoad.contains ("zzz75-Q"), "  (B precondition) the project's own tuning is in force");
+            check (p->undoStackDepthForTests() == 0,
+                   "  (B) ...and the load minted no undo step here either");
+
+            // Now let the still-armed follower do its job and switch it off by hand. The
+            // ONE step that leaves must go back to the tuning the PROJECT restored.
+            check (sweepUntilApplied (*p, 0),
+                   "  (B precondition) the re-armed follower retunes again after the load");
+            p->setRealtimeLink (Proc::RtLink::Off, rs);
+            p->undoManager.undo();
+            const auto undone = p->activeSclSource();
+            std::printf ("    (B) after switching off and one Ctrl+Z: scale %s\n",
+                         undone.contains ("zzz75-Q") ? "zzz75-Q (the project's)"
+                                                     : (undone.contains ("zzz75-P")
+                                                            ? "zzz75-P - THE PATCH BEFORE THE LOAD"
+                                                            : "neither"));
+            check (undone.contains ("zzz75-Q"),
+                   "  (B) one Ctrl+Z after the follower stops brings back the tuning THIS "
+                   "project was opened with");
+            check (! undone.contains ("zzz75-P"),
+                   "  (B) ...and never the tuning of the patch that was open before it");
+        }
+    }
 }

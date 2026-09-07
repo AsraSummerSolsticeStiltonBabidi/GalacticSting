@@ -3030,7 +3030,7 @@ void FractalAdditiveAudioProcessor::applySpecSnapshot (const SpecSnapshot& s)
         p->setValueNotifyingHost (s.timbreOn ? 1.0f : 0.0f);
 }
 
-void FractalAdditiveAudioProcessor::takeRealtimeBaseline (RtLink mode)
+void FractalAdditiveAudioProcessor::takeRealtimeBaseline (RtLink mode, bool addToBank)
 {
     // BOTH trackers are cleared first. commitRealtimeBaseline returns early when the link
     // never applied anything, leaving its tracker set - so engaging the tuning link, leaving
@@ -3046,7 +3046,12 @@ void FractalAdditiveAudioProcessor::takeRealtimeBaseline (RtLink mode)
         // ...and into the bank ONCE, so the tuning the follower is about to replace is a
         // single click away even without touching the undo history. bankAutoAdd skips
         // exact duplicates, so re-engaging does not add a second copy.
-        if (rtTuneBase.source.isNotEmpty())
+        //
+        // NOT on a state load. There the baseline is the project's OWN tuning, which the
+        // project's own BANK child already describes - and a load that goes on writing
+        // into the bank it has just restored hands the host a different state than the one
+        // it opened, before the user has touched anything.
+        if (addToBank && rtTuneBase.source.isNotEmpty())
             bankAutoAdd (tuning.getScalaName().isNotEmpty() ? tuning.getScalaName()
                                                             : juce::String ("before realtime"),
                          rtTuneBase.source);
@@ -3077,10 +3082,50 @@ void FractalAdditiveAudioProcessor::commitRealtimeBaseline()
 
 void FractalAdditiveAudioProcessor::setRealtimeLink (RtLink mode, const RtSettings& s)
 {
-    rtSet = s;
-    if (mode == rtLink) return;
+    setRealtimeLinkImpl (mode, s, false);
+}
 
-    if (rtLink != RtLink::Off)
+// THE LINK AS A PROJECT LOAD INSTALLS IT, and it is a different job from pressing the
+// button, in both directions.
+//
+// LEAVING: apvts.replaceState calls undoManager->clearUndoHistory(), and restoreState
+// reaches this a few hundred lines later. So the undo step setRealtimeLink mints on the
+// way out - "one Ctrl+Z back to the tuning the follower displaced" - was landing on a
+// history that had just been emptied, describing a patch that no longer exists. The FIRST
+// Ctrl+Z after opening a project therefore installed the PREVIOUS patch's tuning, out of
+// nowhere, in an instrument whose whole promise is that its tuning does not change under
+// the player.
+//
+// ARRIVING, which is the half a naive fix misses: setRealtimeLink returns early when the
+// mode has not changed, so a project that saves the SAME link the instance already had
+// left a still-engaged follower carrying the PREVIOUS patch's baseline. It would then
+// commit that on the way out - the very same wrong tuning, one step later. Dropping the
+// commit alone swaps a wrong undo step for no undo step at all.
+//
+// So the arming is RE-RUN rather than skipped: the stale baseline is dropped without
+// being committed, and a fresh one is taken against the tuning the project just restored.
+// Everything else the engage path resets is exactly right here too - the held target, the
+// tuning signature, the landing time and the adopted generations all belong to the patch
+// that is gone.
+void FractalAdditiveAudioProcessor::restoreRealtimeLink (RtLink mode, const RtSettings& s)
+{
+    setRealtimeLinkImpl (mode, s, true);
+}
+
+void FractalAdditiveAudioProcessor::setRealtimeLinkImpl (RtLink mode, const RtSettings& s,
+                                                         bool fromStateLoad)
+{
+    rtSet = s;
+    if (mode == rtLink && ! fromStateLoad) return;
+
+    if (fromStateLoad)
+    {
+        // Dropped, never committed: see the block above. Both trackers, because either
+        // one of them would have been enough to mint the step.
+        rtTuneBaseTaken = false;
+        rtSpecBase      = {};
+    }
+    else if (rtLink != RtLink::Off)
         commitRealtimeBaseline();      // leaving: one undo step back to what it displaced
 
     rtLink    = mode;
@@ -3103,7 +3148,7 @@ void FractalAdditiveAudioProcessor::setRealtimeLink (RtLink mode, const RtSettin
     rtMovedAtMs = -1.0;
     rtLandingMs = -1.0;
     if (mode != RtLink::Off)
-        takeRealtimeBaseline (mode);
+        takeRealtimeBaseline (mode, ! fromStateLoad);
     // The budget is only armed while a spectrum-side follower is running, so the link
     // changing is exactly when it has to be re-decided (and the host re-told).
     applyLookahead();
@@ -5019,9 +5064,12 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     refreshPlaygroundActive();
 
     // The realtime/adaptive link travels with the patch (see captureState). Restored
-    // through setRealtimeLink so it takes its own undo baseline exactly as pressing the
-    // button would - a follower armed by a preset must be as reversible as one armed by
-    // hand. An absent child means the state predates this and the follower stays off.
+    // through restoreRealtimeLink so it takes its own undo baseline exactly as pressing
+    // the button would - a follower armed by a preset must be as reversible as one armed
+    // by hand - but WITHOUT minting the leaving-step onto the undo history replaceState
+    // has just cleared, and re-arming even when the mode has not changed. Both halves are
+    // written out at that function. An absent child means the state predates this and the
+    // follower stays off.
     {
         const auto rtTree = tree.getChildWithName ("REALTIME");
         const auto s = realtimeSettingsFromTree (rtTree);
@@ -5033,11 +5081,11 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
             rtSet = s;
             pgSuspendedRt = want;
             pgRtSuspended = true;
-            setRealtimeLink (RtLink::Off, s);
+            restoreRealtimeLink (RtLink::Off, s);
         }
         else
         {
-            setRealtimeLink (want, s);
+            restoreRealtimeLink (want, s);
         }
     }
 

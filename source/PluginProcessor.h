@@ -1386,6 +1386,12 @@ public:
         bool lookahead = false;
     };
     void setRealtimeLink (RtLink mode, const RtSettings& s);
+    // The link as a STATE LOAD installs it. Not the same call: replaceState clears the
+    // undo history, so the step setRealtimeLink would mint on the way out belongs to a
+    // patch that no longer exists and to a history that no longer has room for it - the
+    // FIRST Ctrl+Z after a project load installed the PREVIOUS patch's tuning. See the
+    // .cpp for why dropping that step is only half the fix.
+    void restoreRealtimeLink (RtLink mode, const RtSettings& s);
     // The panel pushes its settings here on every touch, so this is also where a change
     // to the LOOKAHEAD toggle is noticed. applyLookahead() is a no-op when nothing moved.
     void updateRealtimeSettings (const RtSettings& s) { rtSet = s; applyLookahead(); }
@@ -2008,8 +2014,13 @@ private:
     int  rtTuneBaseMode = 0;
     bool rtTuneBaseTaken = false;
     SpecSnapshot rtSpecBase;
-    void takeRealtimeBaseline (RtLink mode);
+    // `addToBank` is false for a STATE LOAD only: the baseline it takes is the project's
+    // own tuning, which the project's own BANK child already describes, and a load must
+    // not go on mutating the bank it just restored.
+    void takeRealtimeBaseline (RtLink mode, bool addToBank = true);
     void commitRealtimeBaseline();
+    // The one body behind setRealtimeLink and restoreRealtimeLink - see the .cpp.
+    void setRealtimeLinkImpl (RtLink mode, const RtSettings& s, bool fromStateLoad);
     void applySpecSnapshot (const SpecSnapshot& s);
     SpecSnapshot captureSpecSnapshot() const;
     void driveRealtimeLink();
