@@ -132,9 +132,9 @@ namespace shepard
     }
 
     // IS THE STEP THE USER ASKED FOR THE STEP THEY ARE GETTING? The one question a panel
-    // needs in order not to let a four-octave rise pass for the eight-octave one the
-    // loaded scale states. Pure, cheap and lock-free - the caller already holds the
-    // tuning's period (the processor publishes it), so there is no state to keep.
+    // needs in order not to let a four-octave rise pass for the five-octave one a 32/1
+    // scale states. Pure, cheap and lock-free - the caller already holds the tuning's
+    // period (the processor publishes it), so there is no state to keep.
     //
     // Only the upper bound can answer yes. RiseOctave never consults the period at all,
     // and a period that fails the guard is not narrowed to fit - the choice falls back
