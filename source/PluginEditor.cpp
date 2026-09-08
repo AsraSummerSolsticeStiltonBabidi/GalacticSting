@@ -487,6 +487,15 @@ namespace
             l->setFont (juce::Font (juce::FontOptions (10.0f))); // small: fits the squeezed fader value boxes
             l->setMinimumHorizontalScale (0.35f); // shrink-to-fit rather than ellipsize
             l->setJustificationType (juce::Justification::centred);
+            // AND GIVE THE WORD THE WHOLE BOX. A juce::Label reserves 5 px of padding at
+            // EACH end by default, so a 37 px value box only ever had 27 px of text in
+            // it - which is how BINAURAL's "Centred" came back from the snapshot rig
+            // needing 32.6 in 27 while the box it sits in was plenty wide enough. The box
+            // is drawn with no fill and no outline here, so that padding was buying
+            // nothing at all; 1 px keeps the glyphs off the edge. Nothing moves - this
+            // widens the text INSIDE boxes whose bounds are decided elsewhere - so every
+            // read-out in the window gets 8 px it was already occupying.
+            l->setBorderSize (juce::BorderSize<int> (1, 1, 1, 1));
             return l;
         }
 
@@ -1617,6 +1626,32 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // sounding notes, and how long it takes, both come from the SPECTRUM panel's
     // Morph / Dry-Wet transition now (see the phaseGlide note in createParameterLayout).
     configFader (gainFader, "masterGain", gainAtt, cEssentials, "Master output gain");
+    // BINAURAL, beside OCTAVE. Horizontal like GAIN above it, because this row is a row.
+    configFader (binauralFader, "binaural", binauralAtt, cEssentials, {});
+    binauralFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    // THE VALUE GOES UNDER THE TRACK, which is the only reason this fader can be aimed.
+    // Beside it (TextBoxRight, the shape GAIN uses) the read-out ate 37 of the cell's 67
+    // px and JUCE reserves the thumb's width at BOTH ends of what is left, so the
+    // photograph came back with an 8 px track under a 24 px star: legible, measured, and
+    // impossible to drag. Underneath, the track keeps the full width - 39 px of travel at
+    // the size the plugin opens at - and the box gets 60, which is nearly twice what its
+    // widest word needs. See the ecBin block in resized() for the room this asks for.
+    binauralFader.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 60, 13);
+    binauralFader.textFromValueFunction = [this] (double v)
+    {
+        // "Centred" and not "0%": the number a fader shows should say what you HEAR, and
+        // at the bottom of this one you hear exactly what the instrument always sounded
+        // like. A percentage would invite the reading that 0 is a setting rather than off.
+        //
+        // Through tr(), like every word on the glass - the snapshot rig's translation
+        // audit caught this one drawn identically in both languages the first time it
+        // was photographed. applyLanguage()'s updateSliderValueTexts() sweep is what
+        // makes it re-render: a Slider only rebuilds its value box when the VALUE moves,
+        // so a read-out that is a WORD would otherwise survive a switch in English.
+        return v <= 0.0005 ? tr ("Centred", "Centrat")
+                           : juce::String ((int) std::lround (v * 100.0)) + "%";
+    };
+    binauralFader.updateText();
     gainFader.setSliderStyle (juce::Slider::LinearHorizontal);
     gainFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 46, 14);
     // Two +1/-1 stepper rows (no faders), each now titled by its cell's painted
@@ -4375,6 +4410,9 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "\nWHILE NOTES ARE SOUNDING: a Phase move changes their LEVEL at once, and their PHASES only from the next note on - this build does not re-phase a held note. When live re-phasing lands it will take BOTH its mode and its duration from the SPECTRUM panel's TRANSITION, because re-phasing IS a spectrum change. Transition Morph: by pitchbend, over its Time. Transition Dry/Wet: by crossfade, over its Time. Transition Off: no live re-phasing at all.",
         "\nMENTRE SONEN LES NOTES: moure la Fase els canvia el VOLUM a l'instant, i les FASES nom\xc3\xa9s a partir de la nota seg\xc3\xbc""ent - aquesta versi\xc3\xb3 no refasa una nota que ja sona. Quan arribi el refasat en directe, en prendr\xc3\xa0 el mode I la durada de la transici\xc3\xb3 del plaf\xc3\xb3 ESPECTRE, perqu\xc3\xa8 refasar \xc3\x89S un canvi d'espectre. Transici\xc3\xb3 a Morphing: per pitchbend, durant el seu Temps. Transici\xc3\xb3 a Sec/Humit: per fosa creuada, durant el seu Temps. Transici\xc3\xb3 a Cap: cap refasat en directe."));
     gainFader.setTooltip (tr ("Final output volume, in dB.", "Volum final de sortida, en dB."));
+    binauralFader.setTooltip (tr (
+        "Spreads the SPECTRUM across the ears: from 100 Hz up, every partial goes to the opposite ear from the one before it - one right, the next left, all the way to the highest. Down is *Centred*, which is exactly what this instrument sounded like before this control existed; at the top the partials are panned to the extremes. Everything below 100 Hz stays in the middle, because that is where the ear stops placing a sound by level - putting a fundamental in one ear would move the NOTE rather than open the spectrum out. Nothing is lost on a mono bus: the two halves add back up.",
+        "Reparteix l'ESPECTRE entre les orelles: a partir de 100 Hz, cada parcial va a l'orella contr\xc3\xa0ria que l'anterior - un a la dreta, el seg\xc3\xbc" "ent a l'esquerra, fins al m\xc3\xa9s agut. A baix \xc3\xa9s *Centrat*, que \xc3\xa9s exactament com sonava aquest instrument abans que existeixi aquest control; a dalt els parcials es paneen fins als extrems. Tot el que hi ha per sota de 100 Hz es queda al mig, perqu\xc3\xa8 \xc3\xa9s on l'orella deixa de situar un so pel nivell - posar un fonamental en una sola orella mouria la NOTA en comptes d'obrir l'espectre. En una sortida mono no es perd res: les dues meitats se sumen."));
     // THE TWO STEPPER ROWS' HOVERS. They were built in the constructor as plain English
     // juce::Strings and never re-set, so OCTAVE's and RANGE's only explanation stayed
     // English in Catalan - and neither the fit sweep nor the "translated?" check could
@@ -8325,6 +8363,14 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
         // OCTAVE reads like the three rows above it now: label LEFT of the stepper,
         // not above it - it was the one cell in the box laid out the other way round.
         add ("ess.oct",   tr ("OCTAVE", "OCTAVA"),                 left (ecOct),   cEssentials);
+        // BINAURAL names itself only when resized() found room for it (see ecBin), and
+        // it is the one cell here whose word goes ABOVE its control whatever essStacked
+        // says: it is a leftover strip behind a divider, and the 78 px side band this
+        // row has was already spent on OCTAVE. Same 13 px, from the same constant
+        // resized() removed from the top of the cell before placing the fader.
+        if (! ecBin.isEmpty())
+            add ("ess.bin", tr ("BINAURAL", "BINAURAL"),
+                 ecBin.reduced (2, 0).withHeight (fgfit::kBinTitleH), cEssentials);
     }
     // EVERY PAINTED SUB-LABEL IS SHRUNK UNTIL ITS WORD FITS, before anyone draws or
     // measures it.
@@ -8388,8 +8434,8 @@ FractalAdditiveAudioProcessorEditor::spectrumDividers() const
     const float top = (float) spectrumBounds.getY() + 17.5f;
     const float bot = (float) spectrumBounds.getBottom() - 4.0f;
 
-    // EVERY VERTICAL DIVIDER IN THIS PANEL RUNS THE WHOLE HEIGHT, top to bot. That is
-    // the rule, not a coincidence, and it is why this helper is the only place allowed
+    // EVERY VERTICAL DIVIDER BETWEEN TWO COLUMNS RUNS THE WHOLE HEIGHT, top to bot. That
+    // is the rule, not a coincidence, and it is why this helper is the only place allowed
     // to build one: the BASE | HARMONICS wall used to stop at hcPrime's bottom instead,
     // 23 px above the floor, because the full-width TEMPER row sits under both columns.
     // A ToggleButton paints nothing but a tick and its text, so the rest of that row is
@@ -8398,6 +8444,15 @@ FractalAdditiveAudioProcessorEditor::spectrumDividers() const
     // far to the left of that wall, so the line passes through empty button.
     auto vert = [&out, top, bot] (const char* name, float x)
     { out.push_back ({ name, juce::Line<float> (x, top, x, bot) }); };
+    // A WALL INSIDE ONE ROW STARTS AT THAT ROW, and it is the only kind that may. The
+    // rule above is about COLUMNS: run one of those short and it ends in mid-air over
+    // bare panel. OCTAVES | PHASE divides two sub-sections of the bottom row alone, so
+    // the full-height version of it ran up THROUGH the TRANSITION compartment above and
+    // cut its Dry/Wet row in two - "la linea que pedi entre octave y phase sube arriba se
+    // pasa de largo". It starts at the transition|range line it meets, which is where
+    // the row it belongs to begins, and there is nothing above that for it to divide.
+    auto vertFrom = [&out, bot] (const char* name, float x, float y0)
+    { out.push_back ({ name, juce::Line<float> (x, y0, x, bot) }); };
     auto horiz = [&out] (const char* name, const juce::Rectangle<int>& r)
     { out.push_back ({ name, juce::Line<float> ((float) r.getX(),     (float) r.getY(),
                                                 (float) r.getRight(), (float) r.getY()) }); };
@@ -8431,7 +8486,14 @@ FractalAdditiveAudioProcessorEditor::spectrumDividers() const
         // line above them must span the whole column. Drawn from beRange alone it would
         // stop where the stepper's share ends and leave the fader hanging off an
         // unfinished divider.
-        horiz ("transition|range", beRange.getUnion (bePhase));
+        const auto rangeRow = beRange.getUnion (bePhase);
+        horiz ("transition|range", rangeRow);
+        // ...AND THE ONE BETWEEN THEM. OCTAVES and PHASE share that row and had nothing
+        // dividing them, so a stepper and a fader sat in one undivided space while every
+        // other pair of sub-sections in this window is separated by a line. "falta una
+        // linea vertical que separe phase de octave en spectrum." From the row's own top
+        // edge, not the panel's - see vertFrom.
+        vertFrom ("octaves|phase", (float) bePhase.getX(), (float) rangeRow.getY());
     }
     return out;
 }
@@ -8742,7 +8804,16 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     cell ("both.transition", beTrans);
     cell ("both.range",  beRange);   cell ("both.phase",  bePhase);
     cell ("ess.gain",    ecGain);
-    cell ("ess.ref",     ecRef);     cell ("ess.oct",     ecOct);
+    cell ("ess.ref",     ecRef);
+    // ess.oct is registered CLIPPED to the left of the BINAURAL wall. The member rect is
+    // the whole row - paint() draws the cell's top edge right across it, and the wall
+    // takes its height from it - but as a CELL the stepper's territory ends where the
+    // line is and ecBin's begins. Registered whole, the two overlapped by construction
+    // and the neighbour check said so the moment BINAURAL became visible at 1200x650:
+    // "12 cells probed, 1 escaped or overlap (first: ess.oct / ess.bin)". They are
+    // siblings on one row, exactly like both.range and both.phase above.
+    cell ("ess.oct", ecBin.isEmpty() ? ecOct : ecOct.withRight (ecBin.getX() - 5));
+    cell ("ess.bin", ecBin);
 
     // Every combo applyLanguage() re-words, and what it currently has selected.
     auto combo = [&p] (const char* name, const juce::ComboBox& c)
@@ -9400,6 +9471,14 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         // ecPhase; with PHASE moved to the SPECTRUM panel it is ecGain.
         for (auto* cell : { &ecRef, &ecOct })
             g.drawLine (lx, (float) cell->getY(), rx, (float) cell->getY(), 1.0f);
+        // ...AND THE ONE STANDING UP, between OCTAVE and BINAURAL. It is the only vertical
+        // divider in this box because it is the only row that holds two sub-sections -
+        // which is exactly the structure that was asked for ("a su derecha, separado por
+        // una linea"). Drawn from ecBin's left edge, so it is absent by construction at the
+        // widths where resized() found no room and left that cell empty.
+        if (! ecBin.isEmpty())
+            g.drawLine ((float) ecBin.getX() - 5.0f, (float) ecOct.getY() + 3.0f,
+                        (float) ecBin.getX() - 5.0f, (float) ecOct.getBottom() - 3.0f, 1.0f);
     }
 
     // Every inline sub-label of every macro box, from the one shared list.
@@ -10876,7 +10955,50 @@ void FractalAdditiveAudioProcessorEditor::resized()
               octVal.setBounds (rr.removeFromLeft (40));
               octUp.setBounds  (rr.removeFromLeft (24).reduced (0, 1));
               rr.removeFromLeft (4);
-              octDn.setBounds  (rr.removeFromLeft (24).reduced (0, 1)); }
+              octDn.setBounds  (rr.removeFromLeft (24).reduced (0, 1));
+              // BINAURAL TAKES WHAT THE STEPPER LEAVES, behind its own divider.
+              //
+              // The stepper needs 92 px and never more, so the rest of this row was empty
+              // - which is why the new control goes here rather than into a fourth cell
+              // that would have squeezed the three above it.
+              //
+              // IT SPENDS HEIGHT, NOT WIDTH, and that is the whole reason this control is
+              // on screen at the size the plugin actually opens at. Laid out like GAIN -
+              // [78 title][40 value][46 track] side by side - it wanted 164 px of a row
+              // that has 77 left at 1200x650, so the first photograph of it came back
+              // with the cell EMPTY at 1200x650 AND at the 690x510 floor, visible only at
+              // 1600x900. The second, squeezed into 67, came back with an 8 px track
+              // under a 24 px star.
+              //
+              // So the compartment stacks, the way OCTAVES and PHASE do in the SPECTRUM
+              // panel: title, track, value. It costs 13 + 40 px of a cell 53 tall and
+              // nothing at all in width beyond the track itself, and the width it does
+              // ask for is set by the TRACK - 60 px, of which the star's own width takes
+              // about 24, leaving travel you can aim at. The value box that used to set
+              // this number is no longer in the way.
+              //
+              // Below either figure the whole cell is left EMPTY: paintedSubLabels then
+              // draws no title and resized() hides the fader, the same "hidden, not
+              // squashed" rule TEMPER follows in the SPECTRUM panel. Nothing here is ever
+              // shown at a size that cuts it.
+              const int binNeed = 60;               // the track, with travel left over
+              auto full = c.withLeft (rr.getX() + 10);
+              if (full.getWidth() >= binNeed && full.getHeight() >= fgfit::kBinTitleH + 28)
+              {
+                  // From `c`, not `rr`: the stack needs the cell's full height, and rr is
+                  // the 22 px band the stepper was centred into. The group is CENTRED in
+                  // the cell so it sits level with the stepper beside it, and ecBin IS
+                  // that group - one rect, so paintedSubLabels cannot draw the word
+                  // anywhere but the 13 px this reserved for it.
+                  ecBin = full.withSizeKeepingCentre (full.getWidth(),
+                                                      juce::jmin (full.getHeight(),
+                                                                  fgfit::kBinTitleH + 40));
+                  binauralFader.setVisible (true);
+                  auto bf = ecBin;
+                  bf.removeFromTop (fgfit::kBinTitleH);
+                  binauralFader.setBounds (bf);
+              }
+              else { ecBin = {}; binauralFader.setVisible (false); } }
         }
 
         // ONE shared envelope box with three colour-chip tabs (Volume / Pitch /

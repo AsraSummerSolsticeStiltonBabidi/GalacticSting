@@ -973,6 +973,9 @@ namespace traudit
             // for. The Essentials transpose cell keeps its own OCTAVE / OCTAVA pair,
             // which is a different word and still differs.
             "OCTAVES",
+            // Catalan spells it the same - it is the Greek-Latin word in both, like OCTAVES
+            // above. Declared, not sneaked past: the audit exists to make that a decision.
+            "BINAURAL",
             // The tuning mode box's first three items: a name, a standard and a file
             // format. Only its fourth has words that Catalan writes differently.
             "12ED2", "MTS-ESP", "Scala (.scl)",
@@ -1102,6 +1105,10 @@ static const char* kParamBaseline[] = {
     "bendRange",
     "refA",
     "octaveShift",
+    // Added 2026-09-08 with the BINAURAL fader (see the parameter, and the render split in
+    // AdditiveVoice). Re-baked from RhythmVerify.exe --params, which is the only way this
+    // list is allowed to change: by a hand that then reads the diff.
+    "binaural",
     "tuningBankSlot",
     "monoGlide",
     "glideTime",
@@ -7564,32 +7571,70 @@ int main (int argc, char** argv)
             std::printf ("  harmonic view: %s\n", names (harm).toRawUTF8());
 
             const auto hv = verticals (harm);
-            check (hv.size() == 4,
-                   "the harmonic view draws four vertical walls (engine|both, base|harmonics, "
-                   "slope|fractal, fractal|transition)");
+            // FIVE now, not four: OCTAVES and PHASE share a row in the shared-controls
+            // compartment and had nothing between them, while every other pair of
+            // sub-sections in this window is divided by a line - "falta una linea vertical
+            // que separe phase de octave en spectrum". This number is a contract, so it
+            // moves by a hand that reads the diff, never by itself.
+            check (hv.size() == 5,
+                   "the harmonic view draws five vertical walls (engine|both, base|harmonics, "
+                   "slope|fractal, fractal|transition, octaves|phase)");
+            // TWO KINDS OF WALL, AND THEY ARE HELD TO DIFFERENT RULES.
+            //
+            // A wall between two COLUMNS runs the whole panel, top to bottom: stop one
+            // short and it ends in mid-air over bare panel, which is the defect the
+            // BASE | HARMONICS line was fixed for. A wall inside ONE ROW must NOT, and
+            // OCTAVES | PHASE is the only one of those: drawn full height it climbed
+            // through the TRANSITION compartment above and cut its Dry/Wet row in half -
+            // "la linea que pedi entre octave y phase sube arriba se pasa de largo". So
+            // it is checked against the horizontal line above its own row instead, and
+            // excluded from the same-span sweep rather than quietly weakening it.
             bool sameSpan = true;
             juce::String odd;
+            std::vector<std::pair<juce::String, juce::Line<float>>> cols;
+            const juce::Line<float>* rowWall = nullptr;
             for (const auto& d : hv)
             {
                 std::printf ("    %-16s x=%.1f  y %.1f..%.1f\n", d.first.toRawUTF8(),
                              d.second.getStartX(), d.second.getStartY(), d.second.getEndY());
-                if (! hv.empty()
-                     && (std::abs (d.second.getStartY() - hv[0].second.getStartY()) > 0.01f
-                      || std::abs (d.second.getEndY()   - hv[0].second.getEndY())   > 0.01f))
-                { sameSpan = false; odd = d.first; }
+                if (d.first == "octaves|phase") rowWall = &d.second;
+                else                            cols.push_back (d);
             }
+            for (const auto& d : cols)
+                if (! cols.empty()
+                     && (std::abs (d.second.getStartY() - cols[0].second.getStartY()) > 0.01f
+                      || std::abs (d.second.getEndY()   - cols[0].second.getEndY())   > 0.01f))
+                { sameSpan = false; odd = d.first; }
             check (sameSpan,
-                   "every vertical wall runs the SAME full height of the panel - none stops "
-                   "short and leaves a hole under it");
+                   "every vertical wall BETWEEN TWO COLUMNS runs the SAME full height of the "
+                   "panel - none stops short and leaves a hole under it");
             if (! sameSpan)
                 std::printf ("    the odd one out is \"%s\"\n", odd.toRawUTF8());
+
+            float rowTop = -1.0f, colBot = cols.empty() ? -2.0f : cols[0].second.getEndY();
+            for (const auto& d : harm.dividers)
+                if (d.first == "transition|range") rowTop = d.second.getStartY();
+            std::printf ("    the row it divides starts at y=%.1f, the columns at y=%.1f\n",
+                         rowTop, cols.empty() ? -1.0f : cols[0].second.getStartY());
+            check (rowWall != nullptr && rowTop > 0.0f
+                    && std::abs (rowWall->getStartY() - rowTop) < 0.01f,
+                   "...and OCTAVES | PHASE, which divides ONE row, starts at the line above "
+                   "that row - not at the top of the panel, where it sliced the TRANSITION "
+                   "compartment in two on its way up");
+            check (rowWall != nullptr && std::abs (rowWall->getEndY() - colBot) < 0.01f,
+                   "...and still reaches the same floor as the columns, so it does not stop "
+                   "short at the bottom either");
 
             // ...and the CUSTOM view draws NOTHING inside the engine box.
             p.setTimbreEnabled (true);
             ed->refreshEngineDressing();
             const auto cust = ed->layoutProbe();
             std::printf ("  custom view:   %s\n", names (cust).toRawUTF8());
-            check (names (cust) == "engine|both, slope|fractal, fractal|transition, transition|range",
+            // octaves|phase is in BOTH lists on purpose: it divides two sub-sections of the
+            // SHARED-controls compartment, which is outside the engine box and therefore
+            // the same in either view. What this check is about is the engine box adding
+            // nothing of its own, and it still adds nothing.
+            check (names (cust) == "engine|both, slope|fractal, fractal|transition, transition|range, octaves|phase",
                    "the custom view adds no divider of its own - the thin line between the "
                    "Remove button and the ratios box is gone");
 
@@ -19719,6 +19764,132 @@ int main (int argc, char** argv)
    #else
     std::printf ("\n  [SKIP] refusal-table audit: FG_SOURCE_DIR not defined\n");
    #endif
+
+    //== BINAURAL: EVERY PARTIAL FROM 100 Hz UP GOES TO THE OTHER EAR ===============
+    //
+    // "cada parcial a partir de los 100 hz se panea a un oido distinto, de manera
+    //  alternada... el fader al maximo significa paneo hasta los extremos" - and
+    //  "revisa que se esta haciendo de todos los parciales de manera correcta en
+    //  distintos tipos de espectro."
+    //
+    // So it is measured on the RENDERED AUDIO, in three different spectra, and the first
+    // question is the one a new control most often gets wrong: does its zero position
+    // leave the instrument exactly as it was?
+    {
+        std::printf ("\nbinaural: alternating ears above 100 Hz, and silent at zero:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        const double sr = 48000.0; const int blk = 512;
+
+        // Three spectra with very different partial counts and spacings, because "all the
+        // partials" is the claim: a dense harmonic default, a two-partial custom scale
+        // (where a single mis-stepped index is unmissable), and a fractal patch.
+        struct Take { const char* name; float bin; double l, r, corr; };
+        const auto render = [&] (const char* which, float bin) -> Take
+        {
+            auto p = std::make_unique<Proc>();
+            p->prepareToPlay (sr, blk);
+            const auto sp = [&] (const char* id, float v)
+            { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+              p->pollParametersForTests(); };
+            if (juce::String (which) == "custom")
+            {
+                juce::String err; p->loadTimbreText ("5/4 3/2 2", err);
+            }
+            else if (juce::String (which) == "fractal")
+                sp ("fractalLevel", 3.0f);
+            sp ("binaural", bin);
+            awaitSpectrumIdle (*p, "binaural setup");
+
+            juce::AudioBuffer<float> b (2, blk);
+            juce::MidiBuffer m; m.addEvent (juce::MidiMessage::noteOn (1, 69, 0.9f), 0);
+            b.clear(); p->processBlock (b, m);
+            double sl = 0.0, sR = 0.0, sx = 0.0;
+            for (int i = 0; i < 12; ++i)
+            {
+                juce::MidiBuffer e; b.clear(); p->processBlock (b, e);
+                for (int n = 0; n < blk; ++n)
+                {
+                    const double L = b.getSample (0, n), R = b.getSample (1, n);
+                    sl += L * L; sR += R * R; sx += L * R;
+                }
+            }
+            const double denom = std::sqrt (sl * sR);
+            return { which, bin, std::sqrt (sl), std::sqrt (sR), denom > 0.0 ? sx / denom : 1.0 };
+        };
+
+        for (const char* which : { "harmonic", "custom", "fractal" })
+        {
+            const auto off = render (which, 0.0f);
+            const auto mid = render (which, 0.5f);
+            const auto max = render (which, 1.0f);
+            std::printf ("  %-9s  L/R rms  off %.4f/%.4f (corr %+.3f)   half (corr %+.3f)"
+                         "   max (corr %+.3f)\n",
+                         which, off.l, off.r, off.corr, mid.corr, max.corr);
+
+            // GATE FIRST: a take that made no sound would give corr = 1 and pass every
+            // check below by having nothing in it.
+            check (off.l > 1.0e-4 && off.r > 1.0e-4,
+                   (juce::String ("  (gate) the ") + which + " patch really sounds").toRawUTF8());
+            // ZERO IS ZERO. The two channels must be the SAME signal, which is what the
+            // instrument did before this control existed.
+            check (off.corr > 0.9999 && std::abs (off.l - off.r) < 1.0e-6,
+                   (juce::String ("with the fader down, ") + which
+                    + " is exactly what it was - both ears the same signal").toRawUTF8());
+            // ...AND OPENING IT REALLY DECORRELATES. Alternating partials between two ears
+            // makes the channels differ; the more spread, the less alike.
+            check (max.corr < mid.corr && mid.corr < off.corr,
+                   (juce::String ("...and the ears come apart as the fader rises (")
+                    + which + ")").toRawUTF8());
+            check (max.corr < 0.5,
+                   (juce::String ("...to genuinely different signals at the top, not a hint"
+                                  " of width (") + which + ")").toRawUTF8());
+            // BOTH EARS KEEP THEIR SHARE. A rule that panned everything one way, or that
+            // lost the partials it sent to a side, would show up here.
+            check (max.l > 0.3 * off.l && max.r > 0.3 * off.r,
+                   (juce::String ("...and neither ear is emptied - the alternation really"
+                                  " alternates (") + which + ")").toRawUTF8());
+        }
+    }
+
+    //== ...AND THE FADER THAT DRIVES IT CAN ACTUALLY BE DRAGGED ====================
+    //
+    // Measured as TRAVEL - the distance between where 0.0 sits and where 1.0 sits -
+    // because every geometric check in this file was green over a version of this
+    // control that could not be used. Laid out beside its value box, in a cell 67 px
+    // wide, the read-out took 37 of them and JUCE reserves the star's own width at both
+    // ends of what is left: an 8 px track under a 24 px thumb. Inside its cell, nothing
+    // collapsed to zero, no word clipped, panel audit clean. It was found by looking at
+    // the photograph.
+    //
+    // So: at the size the plugin opens at it is ON SCREEN and it has travel worth
+    // aiming at, and at the window floor it is HIDDEN - not squashed, not clipped, the
+    // same rule TEMPER follows. -1 means resized() hid it.
+    {
+        std::printf ("\nthe BINAURAL fader can be aimed at the size the plugin opens at:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
+        if (auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get()))
+        {
+            ed->setSize (1200, 650);
+            const int open = ed->binauralTravelForTests();
+            ed->setSize (690, 510);
+            const int floorT = ed->binauralTravelForTests();
+            ed->setSize (1600, 900);
+            const int big = ed->binauralTravelForTests();
+            std::printf ("    travel: 1200x650 = %d px   690x510 = %d   1600x900 = %d\n",
+                         open, floorT, big);
+            check (open >= 25,
+                   "at 1200x650 the BINAURAL fader has at least 25 px of travel - it is a"
+                   " control, not a star sitting on a stub of track");
+            check (big >= open,
+                   "...and a bigger window gives it more, never less");
+            check (floorT == -1,
+                   "...while at the 690x510 floor it is HIDDEN rather than squashed into a"
+                   " cell that cannot hold it - the TEMPER rule, applied here too");
+        }
+        else check (false, "(gate) the editor for the BINAURAL fader probe exists");
+    }
 
     runProcessorAuditChecks();
     runSilentLimitChecks();

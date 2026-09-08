@@ -278,6 +278,11 @@ namespace fgfit
     inline constexpr int kTickX   = 4;   // the box's left inset (V4's own, kept)
     inline constexpr int kTickBox = 16;  // the box itself, square, at every button height
     inline constexpr int kTickGap = 8;   // box right edge -> the word's cell
+    // The BINAURAL compartment stacks its painted title over its fader (see the ecBin
+    // block in resized(), and paintedSubLabels()). Same 13 px the essentials cells use
+    // when they stack, in ONE place, because two of them have to agree about where the
+    // word is drawn and where the room for it was reserved.
+    inline constexpr int kBinTitleH = 13;
     inline juce::Font toggleFont (int h)
     { return juce::Font (juce::FontOptions (juce::jmin (15.0f, (float) h * 0.75f))); }
     inline float toggleRoom (int w, int h)
@@ -839,6 +844,21 @@ public:
     bool morphTimeFaderShownForTests() const { return morphTimeFader.isVisible(); }
     bool transitionTimeFaderLiveForTests() const
     { return (morphTimeFader.isVisible() ? morphTimeFader : dryWetTimeFader).isEnabled(); }
+    // THE BINAURAL FADER'S USABLE TRAVEL, in pixels, or -1 when the cell was too small
+    // and resized() hid the control instead of squashing it.
+    //
+    // Not its width. Every geometric check in the build was green over a version of this
+    // fader whose track was 8 px long under a 24 px star: the bounds were inside the
+    // cell, nothing had collapsed to zero, the value box read cleanly - and the thing
+    // could not be dragged. The distance between where 0.0 sits and where 1.0 sits is
+    // the only number that says whether a fader can be aimed, so that is what this
+    // returns and what RhythmVerify holds a floor under.
+    int binauralTravelForTests() const
+    {
+        if (! binauralFader.isVisible()) return -1;
+        return (int) std::lround (binauralFader.getPositionOfValue (1.0)
+                                - binauralFader.getPositionOfValue (0.0));
+    }
     // Test hook (RhythmVerify): click an engine chip the way a hand does. Exists for
     // the one behaviour a probe of engineInForce cannot reach: with NO scale loaded,
     // clicking CUSTOM must still open that view (it is the only place the Load button
@@ -6538,6 +6558,12 @@ private:
     // its 3 sub-cells (dividers/labels in paint). PHASE used to be a fourth and is now a
     // sub-section of the SPECTRUM panel, beside OCTAVE RANGE.
     juce::Rectangle<int> ecGain, ecRef, ecOct;
+    // BINAURAL shares the OCTAVE row, to its right, behind its own divider - the same
+    // shape the user asked for and the same shape TEMPER has beside HARMONICS. Empty when
+    // the row cannot hold both, which is what hides the fader and its painted title.
+    juce::Rectangle<int> ecBin;
+    juce::Slider binauralFader;
+    std::unique_ptr<SliderAttachment> binauralAtt;
     juce::Rectangle<int> lBarBounds, lFootBounds; // the inverted-L Tuning box: dissonance BAR (right) + controls FOOT (bottom-left)
     void refreshDegreeList (bool showNotice = true); // generated-scale shortfall notice
     void updateScaleDissonance();  // recompute the active-scale dissonance when timbre/tuning change

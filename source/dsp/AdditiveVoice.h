@@ -72,6 +72,7 @@ public:
 
         fCutoffParam = src.raw ("filterCutoff");
         fResParam    = src.raw ("filterResonance");
+        binParam     = src.raw ("binaural");
         fEnvAmtParam = src.raw ("filterEnvAmount");
         fAttackParam = src.raw ("filterAttack");
         fDecayParam  = src.raw ("filterDecay");
@@ -502,7 +503,7 @@ public:
             adsr.setSampleRate (sr);
             filterAdsr.setSampleRate (sr);
             pitchAdsr.setSampleRate (sr);
-            filter.prepare ({ sr, 8192, 1 });
+            filter.prepare ({ sr, 8192, 2 });   // two, for the binaural split (see renderChunk)
             // CurvedEnv works in SECONDS, so a sample-rate change needs no re-apply
             // dance: the times are already right, only its sample rate had to change.
         }
@@ -1563,6 +1564,28 @@ private:
         // start and rotated per sample, which is smooth to machine precision. Updating
         // the window once per block instead would put a ~5% amplitude kink on every
         // buffer boundary at the fastest rise rate - a 94 Hz buzz, not a Shepard.
+        // BINAURAL, decided ONCE per block: the gains, and where the alternation starts.
+        //
+        // 100 Hz in this bank's own units is inc = 100 / sampleRate, and a copy's partials
+        // are ascending in inc - so the first qualifying partial is a lower_bound, and
+        // every partial after it alternates. Per copy, because a Shepard copy is the same
+        // ratios TRANSPOSED and therefore crosses 100 Hz somewhere else entirely; asking
+        // the untransposed bank would pan a copy's sub-100 Hz partials and leave its high
+        // ones centred, which is the rule backwards.
+        const double binAmt = binParam != nullptr
+                                ? juce::jlimit (0.0, 1.0, (double) binParam->load()) : 0.0;
+        const double binOn  = std::sqrt (1.0 + binAmt);
+        const double binOff = std::sqrt (1.0 - binAmt);
+        const double binMid = 1.0;                 // under 100 Hz: both ears, as before
+        const double binMinInc = 100.0 / (currentSampleRate > 0.0 ? currentSampleRate : 44100.0);
+        int binQ0[shepard::kSlots] {};
+        for (int c = 0; c < sl.numCopies; ++c)
+        {
+            const int off = sl.off[(size_t) c], nc = sl.count[(size_t) c];
+            const auto* first = inc.data() + off;
+            binQ0[(size_t) c] = off + (int) (std::lower_bound (first, first + nc, binMinInc) - first);
+        }
+
         double wc[shepard::kSlots], cx[shepard::kSlots], sx[shepard::kSlots], uu[shepard::kSlots];
         double cd = 1.0, sd = 0.0;
         if (sl.windowed)
@@ -1783,7 +1806,26 @@ private:
                 return curAmp[(size_t) i] * s;
             };
 
-            double acc = 0.0;
+            // BINAURAL: FROM 100 Hz UP, EVERY PARTIAL TO THE OTHER EAR.
+            //
+            // The partials of a copy are ascending in frequency, so "the n-th partial at or
+            // above 100 Hz" is just its distance from the first one that qualifies - binQ0,
+            // found once per block per copy. No per-partial state, no array, nothing added
+            // to a voice that is already 1.75 MiB.
+            //
+            // THE GAIN LAW IS sqrt(1 +- b), AND THE FIRST VERSION OF IT WAS WRONG.
+            //
+            // sqrt((1 +- b)/2) is the textbook equal-power pan, and it puts 1/sqrt(2) on
+            // both sides at b = 0 - which is 3 dB QUIETER than this instrument has always
+            // been, because the old code wrote the whole mono sum to both channels. A new
+            // control whose zero position changes the sound is not a zero position.
+            //
+            // sqrt(1 +- b) gives 1 and 1 at b = 0, so a patch made before this existed
+            // renders exactly as it did, and sqrt(2) and 0 at b = 1 - panned to the
+            // extremes as asked. gOn^2 + gOff^2 = 2 for every b, so the total power a
+            // partial contributes never moves; and since the partials alternate, each
+            // channel keeps about half of them at any spread.
+            double accL = 0.0, accR = 0.0;
             for (int c = 0; c < sl.numCopies; ++c)
             {
                 const double w = wc[c];
@@ -1791,15 +1833,28 @@ private:
                 const int off = sl.off[(size_t) c];
                 const int nf  = sl.tapFrom[(size_t) c];
                 const int nc  = sl.count[(size_t) c];
-                double accC = 0.0;
+                const int q0  = binQ0[(size_t) c];
+                double accCL = 0.0, accCR = 0.0;
+                // The two gains, and which of them a partial gets. An EVEN step from the
+                // first qualifying partial goes right, the next left, and so on - "uno a la
+                // derecha, el siguiente a la izquierda".
+                const auto spread = [&] (int j, double v, double& l, double& r)
+                {
+                    if (j < q0) { l += v * binMid; r += v * binMid; return; }   // below 100 Hz: centred
+                    const bool right = (((j - q0) & 1) == 0);
+                    l += v * (right ? binOff : binOn);
+                    r += v * (right ? binOn  : binOff);
+                };
                 for (int i = 0; i < nf; ++i)
-                    accC += advance (off + i, i);
+                    spread (off + i, advance (off + i, i), accCL, accCR);
                 // The copy's own near-Nyquist taper (see fillShepardCopies): partials
                 // leave a rising copy by FADING through it, never by disappearing
                 // between two blocks.
                 for (int i = nf; i < nc; ++i)
-                    accC += sl.tap[(size_t) c][(size_t) (i - nf)] * advance (off + i, i);
-                acc += w * accC;
+                    spread (off + i, sl.tap[(size_t) c][(size_t) (i - nf)] * advance (off + i, i),
+                            accCL, accCR);
+                accL += w * accCL;
+                accR += w * accCR;
             }
 
             // Velocity / pressure / the fast-kill recovery glide with their own fixed
@@ -1813,12 +1868,28 @@ private:
             const float env    = adsr.getNextSample();
             const float killG  = fastKillGain; // 1 normally; fading out, or ramping back after a steal
             const float gain   = env * killG * velocityLevel * (0.35f + 0.65f * pressure) * normGain;
-            const float s      = filter.processSample (0, (float) acc * gain);
+            // TWO CHANNELS THROUGH THE FILTER, not one filtered sum split afterwards. The
+            // filter is linear, so splitting after it would be equivalent ONLY if the split
+            // were one constant gain - and here every partial has its own. Channel 1 is why
+            // prepare() asks for two.
+            const float sL     = filter.processSample (0, (float) accL * gain);
+            const float sR     = filter.processSample (1, (float) accR * gain);
             filterEnvValue     = filterAdsr.getNextSample();
             pitchEnvValue      = pitchAdsr.getNextSample();
 
-            for (int ch = 0; ch < numChannels; ++ch)
-                output.addSample (ch, startSample, s);
+            // A MONO OUTPUT STILL HEARS EVERY PARTIAL. Summing the two halves is what the
+            // instrument did before this existed, so a mono bus loses the placement and
+            // nothing else - no partial is dropped for being panned somewhere there is no
+            // speaker, which would be exactly the silent loss this synth refuses.
+            if (numChannels >= 2)
+            {
+                output.addSample (0, startSample, sL);
+                output.addSample (1, startSample, sR);
+                for (int ch = 2; ch < numChannels; ++ch)
+                    output.addSample (ch, startSample, 0.5f * (sL + sR));
+            }
+            else if (numChannels == 1)
+                output.addSample (0, startSample, sL + sR);
 
             ++startSample;
 
@@ -3319,6 +3390,8 @@ private:
     std::atomic<float>* shepOnParam   = nullptr, * shepModeParam = nullptr;
     std::atomic<float>* shepTimeParam = nullptr, * shepDivParam  = nullptr;
     std::atomic<float>* shepRiseParam = nullptr, * shepDownParam = nullptr;
+    // Binaural spread: 0 = dead centre and bit-identical to the instrument without it.
+    std::atomic<float>* binParam = nullptr;
     bool   shepActive = false;   // LATCHED at note-on: this note either is a Shepard or is not
     bool   shepFresh  = true;    // adopt band/rate instantly (a cold note, not a glide)
     double shepG      = 0.0;     // the rising grid phase, in rise intervals

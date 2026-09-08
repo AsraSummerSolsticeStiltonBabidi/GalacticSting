@@ -429,6 +429,20 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     // Whole-instrument octave transpose (+-5 octaves), on top of the A reference.
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "octaveShift", 1 }, "Octave Transpose", -5, 5, 0));
+    // BINAURAL: every partial from 100 Hz up goes to alternating ears.
+    //
+    // "cada parcial a partir de los 100 hz se panea a un oido distinto, de manera
+    //  alternada, uno a la derecha, el siguiente a la izquierda etc, hasta el mas agudo de
+    //  ellos, el fader al maximo significa paneo hasta los extremos."
+    //
+    // Zero by default, which is dead centre and bit-identical to the instrument without
+    // it: every patch and project made before this parameter existed sounds exactly as it
+    // did. The floor of 100 Hz is the point below which the ear stops localising by
+    // level - putting the fundamental of a low note in one ear would move the NOTE, not
+    // open the spectrum out - so everything under it stays where it was.
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "binaural", 1 }, "Binaural Spread",
+        NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.0f));
     // Tuning bank slot (0 = none, 1..N = load that bank .scl). Automatable.
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "tuningBankSlot", 1 }, "Tuning Bank Slot", 0, kBankSlots, 0));
