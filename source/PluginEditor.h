@@ -148,6 +148,28 @@ namespace fgerr
           "Aquest preset no porta cap afinaci\xc3\xb3 pr\xc3\xb2pia." },
         { "This spectrum does not come from a tuning.",
           "Aquest espectre no prov\xc3\xa9 de cap afinaci\xc3\xb3." },
+
+        // The long ones. They are wrapped across several source lines for the column rule,
+        // which is not the same thing as being composed - the audit's first pass counted
+        // nineteen of these as impossible to translate for that reason alone.
+        { "This .tun does not repeat at any interval, so it states no degrees for the Custom Engine to use. Load it as a TUNING instead - it will sound exactly as written.",
+          "Aquest .tun no es repeteix a cap interval, o sigui que no declara cap grau que el Motor propi pugui fer servir. Carrega'l com a AFINACI\xc3\x93 - sonar\xc3\xa0 exactament com est\xc3\xa0 escrit." },
+        { "Type at least one interval - \"1\" on its own is a sine, and \"1 3/2 2\" is a fundamental, a fifth and an octave period.",
+          "Escriu com a m\xc3\xadnim un interval - \"1\" tot sol \xc3\xa9s un sinus, i \"1 3/2 2\" s\xc3\xb3n un fonamental, una quinta i un per\xc3\xado" "de d'octava." },
+        { "This tuning is a 128-key table (a .tun that does not repeat), not a scale, so its degrees cannot be edited - an edit would have to throw the table away. Save it as .tun and edit the keys there.",
+          "Aquesta afinaci\xc3\xb3 \xc3\xa9s una taula de 128 tecles (un .tun que no es repeteix), no una escala, o sigui que els seus graus no es poden editar - editar-los obligaria a llen\xc3\xa7""ar la taula. Desa-la com a .tun i edita-hi les tecles." },
+        { "Temper mode is on, so the harmonic engine's partials are snapped to the tuning and a Custom-Engine spectrum is bypassed entirely - the adapted spectrum would be written and never heard. Switch temper off first.",
+          "El mode temperat est\xc3\xa0 actiu, o sigui que els parcials del motor harm\xc3\xb2nic s'ajusten a l'afinaci\xc3\xb3 i un espectre del Motor propi queda completament de banda - l'espectre adaptat s'escriuria i no se sentiria mai. Apaga primer el temperat." },
+        { "This tuning is a 128-key table (a .tun that does not repeat), and a .scl can only hold degrees repeating at a period. Save it as .tun instead - that keeps every key exactly.",
+          "Aquesta afinaci\xc3\xb3 \xc3\xa9s una taula de 128 tecles (un .tun que no es repeteix), i un .scl nom\xc3\xa9s pot contenir graus que es repeteixin a un per\xc3\xado" "de. Desa-la com a .tun - aix\xc3\xad es mant\xc3\xa9 cada tecla exactament." },
+        { "This preset was saved with temper mode on, which builds its spectrum from the tuning - an adapted spectrum would never be heard.",
+          "Aquest preset es va desar amb el mode temperat actiu, que constru\xc3\xaf""x el seu espectre a partir de l'afinaci\xc3\xb3 - un espectre adaptat no se sentiria mai." },
+        { "This tuning has no repeating scale behind it (an MTS-ESP master can supply an arbitrary 128-key table, and a descending or period-1 scale repeats at nothing), so it cannot be written as a scale. Nothing was saved.",
+          "Aquesta afinaci\xc3\xb3 no t\xc3\xa9 cap escala repetitiva al darrere (un mestre MTS-ESP pot donar una taula arbitr\xc3\xa0ria de 128 tecles, i una escala descendent o de per\xc3\xado" "de 1 no es repeteix mai), o sigui que no es pot escriure com a escala. No s'ha desat res." },
+        { "The period can only be set by hand for a 128-key tuning table; a scale's period comes from the scale itself.",
+          "El per\xc3\xado" "de nom\xc3\xa9s es pot posar a m\xc3\xa0 en una taula d'afinaci\xc3\xb3 de 128 tecles; el per\xc3\xado" "de d'una escala surt de l'escala mateixa." },
+        { "This .tun does not repeat at any interval, so it cannot be held as a scale (degrees + period).",
+          "Aquest .tun no es repeteix a cap interval, o sigui que no es pot guardar com a escala (graus + per\xc3\xado" "de)." },
     };
 }
 

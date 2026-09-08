@@ -19483,11 +19483,28 @@ int main (int argc, char** argv)
         for (const char* rel : { "PluginProcessor.cpp", "dsp/TuningManager.h" })
         {
             const auto txt = srcDir.getChildFile ("source").getChildFile (rel).loadFileAsString();
+            // JOINED ACROSS LINES FIRST, because a message wrapped for the eighty-column
+            // rule is still ONE fixed message. The first classifier read line by line and
+            // called nineteen of them composed - "This tuning has no repeating scale
+            // behind it (an MTS-ESP master can " is not a message with a value in it, it
+            // is a sentence that ran out of room - so they were counted as impossible to
+            // translate when they are the easiest kind. Adjacent string literals separated
+            // by nothing but whitespace ARE one literal in C++, so they are one here too.
             auto lines = juce::StringArray::fromLines (txt);
-            for (const auto& ln : lines)
+            for (int li = 0; li < lines.size(); ++li)
             {
-                const int at = ln.indexOf ("errorOut = \"");
+                const int at = lines[li].indexOf ("errorOut = \"");
                 if (at < 0) continue;
+                juce::String ln = lines[li];
+                for (int j = li + 1; j < lines.size() && ! ln.trim().endsWithChar (';'); ++j)
+                {
+                    const auto nxt = lines[j].trim();
+                    // Only a continuation that is itself a string literal (or the tail of
+                    // the statement) may be joined; a line starting with '+' means a value
+                    // is being pasted in and the message really is composed.
+                    if (! nxt.startsWithChar ('"')) { ln += " " + nxt; break; }
+                    ln = ln.trimEnd().dropLastCharacters (1) + nxt.substring (1);
+                }
                 const auto rest = ln.substring (at + 11);          // from the opening quote
                 // WHERE THE LITERAL REALLY ENDS, not where the line does. Two earlier
                 // versions of this got it wrong in two different ways and the gate caught
@@ -19563,7 +19580,7 @@ int main (int argc, char** argv)
         }
         std::printf ("  %d fixed messages in the source, %d composed; %d fixed ones not in"
                      " the table\n", fixed.size(), composed.size(), missing.size());
-        for (int i = 0; i < juce::jmin (6, missing.size()); ++i)
+        for (int i = 0; i < juce::jmin (12, missing.size()); ++i)
             std::printf ("    missing: \"%s\"\n", missing[i].toRawUTF8());
         // GATE FIRST: a walk that found no messages proves nothing about the table.
         check (fixed.size() >= 20,
