@@ -495,7 +495,11 @@ namespace
             // nothing at all; 1 px keeps the glyphs off the edge. Nothing moves - this
             // widens the text INSIDE boxes whose bounds are decided elsewhere - so every
             // read-out in the window gets 8 px it was already occupying.
-            l->setBorderSize (juce::BorderSize<int> (1, 1, 1, 1));
+            // THE SAME CONSTANT fgfit::faderValueWidth adds, so the two cannot drift. The
+            // first version of this wrote 1 here and left a hard-coded 10 there, and every
+            // fader within 8 px of its column's width silently lost its number.
+            l->setBorderSize (juce::BorderSize<int> (1, fgfit::kSliderValueBorderX,
+                                                     1, fgfit::kSliderValueBorderX));
             return l;
         }
 
@@ -1915,7 +1919,26 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             k->setSliderStyle (juce::Slider::RotaryVerticalDrag);
             k->setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
                                     juce::MathConstants<float>::pi * 2.75f, true);
-            k->setTextBoxStyle (juce::Slider::TextBoxBelow, false, 44, 13);
+            // THE NUMBER GOES TO THE RIGHT, so the knob can have the whole height of its
+            // column. A rotary is drawn as a SQUARE inside whatever the text box leaves,
+            // so a box BELOW took 13 px straight off the diameter of controls that are
+            // small to begin with - "los knobs de lfo siguen siendo enanos... molaria que
+            // tuviesen el numero blanco a su derecha y no debajo, asi podrian crecer hacia
+            // abajo, que es lo que les impide crecer".
+            //
+            // Set HERE, in the constructor, which is what keeps it: applyLanguage()
+            // captures each fader's box position as its HOME the first time it runs -
+            // after every caller has moved the box it wanted - and the sweep at the end of
+            // resized() skips any fader whose home is not TextBoxBelow. So this decision
+            // is not undone by either of them.
+            //
+            // AND THE BOX ASKS FOR ALMOST NOTHING, on purpose. applyLanguage's sizing pass
+            // widens every box to jmax (the width asked for here, faderValueWidth + 2), so
+            // asking for 4 means the box ends up exactly as wide as the widest number it
+            // can show and not one pixel more. Asking for 44 - which is what it used to -
+            // spent 43 px of a 73 px column writing "8" and "0.000", and the knob got what
+            // was left. The measurement decides the split now.
+            k->setTextBoxStyle (juce::Slider::TextBoxRight, false, 4, 13);
         }
         makeLabel (lblLfoDiv, cCustom);   lblLfoDiv.setText ("Div", juce::dontSendNotification);
         makeLabel (lblLfoHz, cCustom);    lblLfoHz.setText ("Hz", juce::dontSendNotification);
@@ -5981,6 +6004,72 @@ void FractalAdditiveAudioProcessorEditor::saveCornerFlow (int corner)
         }), true);
 }
 
+// CAN THIS PANEL REACH THE SOUND RIGHT NOW? While the PLAYGROUND is engaged in morph
+// mode, no. The spectrum is the blend of the corners' compiled partial lists, and
+// PluginProcessor::timerCallback deliberately does not compile the live settings over it
+// (see the comment at the requestRebuild call). Worse, drivePlayground WRITES the morphed
+// values into the parameters every tick, so an edit made here is overwritten 16 ms later:
+// it is not merely ignored, it is erased.
+//
+// All of which was invisible. Every control in the panel stayed enabled, lit, correctly
+// coloured and answering the mouse while nothing any of them did could be heard:
+//
+//   "esta como bloqueado en un estado del custom parece, y como que cambiar de harmonic a
+//    custom no produce ningun cambio en el espectro que se escucha sonar, y cambiar el
+//    texto de la caja de texto de ratios del menu custom tampoco afecta. esto es grave."
+//
+// He is right that it is grave: an entire panel of an instrument, silently inert. This is
+// the largest silent limit this synth had, and the rule here has always been that limits
+// are STATED. So the panel goes visibly dead and says why, and says the two ways out -
+// edit a corner (the controls then BELONG to that corner: see refreshCornerEditUi), or
+// take a corner off the pad.
+void FractalAdditiveAudioProcessorEditor::refreshPlaygroundDrivingUi()
+{
+    // Not while a corner is being EDITED: there the controls do reach something real -
+    // that corner - and refreshCornerEditUi already says whose they are. And not in MIX
+    // mode, where the live patch keeps its own spectrum and keeps rebuilding it.
+    const bool driving = processorRef.isPlaygroundActive()
+                      && ! processorRef.isPlaygroundMixEngaged()
+                      && processorRef.getPlaygroundEditCorner() < 0;
+    if ((int) driving == lastPgDrivingSeen)
+        return;
+    lastPgDrivingSeen = (int) driving;
+    pgDrivingUi       = driving;
+
+    setSpectrumControlsEnabled (! driving);
+    // The three controls that already have exactly ONE owner of their enabled state read
+    // the lock from inside that owner, so nothing here writes over them. Poke each owner
+    // instead, which is what makes the lock arrive without a second writer appearing.
+    applyTransitionMode();
+    refreshSlopeFreeze();
+    applyEngineState();
+    resized();
+    repaint();
+}
+
+// The controls whose edits the blend discards - the same members recolourSpectrumControls
+// dresses, from one list, so a control cannot be dressed by one and forgotten by the
+// other. Disabled rather than merely greyed: a control that cannot act must not answer
+// the mouse either, or the greying is decoration.
+void FractalAdditiveAudioProcessorEditor::setSpectrumControlsEnabled (bool on)
+{
+    for (juce::Slider* s : { (juce::Slider*) &baseNFader, (juce::Slider*) &harmonicsFader,
+                             (juce::Slider*) &primeLimitFader, (juce::Slider*) &timbreRepeatsFader,
+                             (juce::Slider*) &fractalFader, (juce::Slider*) &slopeFader,
+                             (juce::Slider*) &phaseFader })
+        s->setEnabled (on);
+    for (juce::ComboBox* b : { &basePitchBox, &primeModeBox })
+        b->setEnabled (on);
+    for (int i = 0; i < 9; ++i) primeToggle[i].setEnabled (on);
+    primeOnToggle.setEnabled (on);
+    temperToggle.setEnabled (on && processorRef.temperIsPossible());
+    for (auto* b : { &sprDn, &sprUp, &engineChip[0], &engineChip[1],
+                     &loadTimbreButton, &randomSpectrumBtn })
+        b->setEnabled (on);
+    intervalEdit.setEnabled (on);
+    intervalEdit.setReadOnly (! on);
+}
+
 // WHOSE PATCH ARE THESE CONTROLS? While a playground corner is being edited the answer
 // is "not yours", and the preset field is the only place the main window ever said
 // whose it was - so it says THAT instead, and stops being a way to load anything.
@@ -7492,8 +7581,14 @@ void FractalAdditiveAudioProcessorEditor::applyTransitionMode()
     const bool morphOn = processorRef.apvts.getRawParameterValue ("morph")->load()  > 0.5f;
     const bool dwOn    = processorRef.apvts.getRawParameterValue ("dryWet")->load() > 0.5f;
     const int  item    = morphOn ? 2 : (dwOn ? 3 : 1);
-    if (item == lastTransitionShown) return;    // timer rate: everything below repaints
-    lastTransitionShown = item;
+    // THE LOCK RIDES IN THE SIGNATURE. This detector used to watch the MODE alone, so a
+    // playground lock arriving with the mode unchanged was skipped entirely and the two
+    // Time faders stayed live under a panel that says nothing in it can be heard - the
+    // gate caught exactly one fader still enabled, named it, and this is why. Same shape
+    // as canTemper riding in applyEngineState's signature, and for the same reason.
+    const int sig = item * 2 + (pgDrivingUi ? 1 : 0);
+    if (sig == lastTransitionShown) return;     // timer rate: everything below repaints
+    lastTransitionShown = sig;
     transitionBox.setSelectedId (item, juce::dontSendNotification);
 
     // WHICH Time fader is on screen. Morph shows its own; Dry/Wet and Off both show the
@@ -7510,8 +7605,12 @@ void FractalAdditiveAudioProcessorEditor::applyTransitionMode()
     // runs, so a live fader here would be the panel offering to time something that is
     // not happening - the same failure the AMP DECAY / FROZEN pair exists to prevent, and
     // answered the same way.
-    morphTimeFader.setEnabled (item != 1);
-    dryWetTimeFader.setEnabled (item != 1);
+    // ...AND THE PLAYGROUND LOCK, read here rather than written over these two from
+    // outside. They already have exactly one owner of their enabled state, which is what
+    // stopped the AMP DECAY / FROZEN pair fighting; a second writer for the lock would
+    // have put that back. See refreshPlaygroundDrivingUi.
+    morphTimeFader.setEnabled (item != 1 && ! pgDrivingUi);
+    dryWetTimeFader.setEnabled (item != 1 && ! pgDrivingUi);
     applyTransitionFaderColour();
     resized();                     // the fader that just appeared has to be given the row
     repaint (bothEnginesBounds);
@@ -7559,7 +7658,7 @@ void FractalAdditiveAudioProcessorEditor::refreshSlopeFreeze()
     const bool frozen = processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
     if ((frozen ? 1 : 0) == lastManualFrozenShown) return;
     lastManualFrozenShown = frozen ? 1 : 0;
-    slopeFader.setEnabled (! frozen);
+    slopeFader.setEnabled (! frozen && ! pgDrivingUi);   // one writer, the lock included
     applySlopeFaderColour();
     slopeFader.setTooltip (frozen
         // Names the CAUSE, because the commonest way to arrive here is not the pill: it
@@ -8103,7 +8202,7 @@ void FractalAdditiveAudioProcessorEditor::applyEngineState()
     // spectrum to an octave the user never wrote, invisibly. It now does nothing at all -
     // and this is where it SAYS so, on the control itself, so the refusal is never
     // something the user has to deduce from the sound.
-    temperToggle.setEnabled (canTemper);
+    temperToggle.setEnabled (canTemper && ! pgDrivingUi);   // one writer, the lock included
     if (canTemper)
     {
         // BOTH the word and the tooltip go back. Setting only the word left a control
@@ -9467,6 +9566,40 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
             // panel floor passed every check in the build.
             for (const auto& d : spectrumDividers())
                 g.drawLine (d.second, 1.0f);
+        }
+
+        // THE PANEL SAYS WHEN IT CANNOT BE HEARD. Drawn over the whole box, dimmed, with
+        // the two ways out - because a disabled panel with no explanation is the same
+        // defect one step quieter. See refreshPlaygroundDrivingUi.
+        if (pgDrivingUi)
+        {
+            auto box = spectrumBounds.toFloat().reduced (6.0f, 6.0f);
+            g.setColour (juce::Colour (0xd0101318));
+            g.fillRoundedRectangle (box, 8.0f);
+            g.setColour (spectrumPanelColour.withAlpha (0.85f));
+            g.drawRoundedRectangle (box, 8.0f, 1.5f);
+            auto text = box.reduced (18.0f, 10.0f);
+            g.setFont (juce::Font (juce::FontOptions (juce::jmin (17.0f, text.getHeight() * 0.16f))
+                                       .withStyle ("Bold")));
+            const auto head = tr ("THE PLAYGROUND IS MAKING THIS SOUND",
+                                  "EL PLAYGROUND \xc3\x89S QUI FA AQUEST SO");
+            g.drawFittedText (head, text.removeFromTop (text.getHeight() * 0.32f).toNearestInt(),
+                              juce::Justification::centred, 2, 1.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.82f));
+            g.setFont (juce::Font (juce::FontOptions (juce::jmin (13.0f, text.getHeight() * 0.13f))));
+            g.drawFittedText (
+                tr ("The spectrum you hear is the blend of the assigned corners, so nothing in this"
+                    " panel can change it - an edit made here is overwritten by the next blend."
+                    "\n\nTo change a corner: press EDIT on it in the Preset Playground, and these"
+                    " controls become that corner's own.\nTo get this panel back: take a corner off"
+                    " the pad, so fewer than two are assigned.",
+                    "L'espectre que sents \xc3\xa9s la barreja de les cantonades assignades, aix\xc3\xad"
+                    " que res d'aquest tauler el pot canviar - una edici\xc3\xb3 feta aqu\xc3\xad la"
+                    " sobreescriu la barreja seg\xc3\xbc" "ent.\n\nPer canviar una cantonada: prem"
+                    " EDIT a la seva fitxa del Preset Playground, i aquests controls passen a ser"
+                    " els seus.\nPer recuperar aquest tauler: treu una cantonada del pad, de manera"
+                    " que en quedin menys de dues assignades."),
+                text.toNearestInt(), juce::Justification::centredTop, 8, 1.0f);
         }
     }
 
@@ -12312,6 +12445,10 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // a corner edit on its own (the playground disengaging, a corner cleared by
     // automation), and the "*" appears the moment any control moves.
     refreshCornerEditUi();
+    // ...and whether the SPECTRUM panel can reach the sound at all right now. Polled for
+    // the same reason: two corners becoming assigned is what turns the playground on, and
+    // that can happen from the playground window, a preset, automation or an undo.
+    refreshPlaygroundDrivingUi();
     // Keep the Spectrum-Builder box showing the typed spectrum that is actually
     // loaded - it can change under us (a preset, an undo, "load its original
     // spectrum"). Never while it has focus: that would overwrite what is being typed.

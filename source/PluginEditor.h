@@ -531,6 +531,17 @@ namespace fgfit
     // no column; it is here so that the next fader whose middle reads wider than its ends
     // does not have to be found on the glass. Stated plainly because it earns nothing
     // right now: removing it and measuring the ends alone leaves the rig at zero.
+    // THE BORDER A SLIDER'S VALUE BOX REALLY KEEPS, in ONE place.
+    //
+    // juce::Label defaults to BorderSize (1, 5, 1, 5) and this function used to add a
+    // hard-coded 10 for it. GalacticLnF::createSliderTextBox now sets 1 px a side - the
+    // boxes are drawn with no fill and no outline, so 5 was buying nothing and "Centred"
+    // needed the room - and the moment it did, this 10 was a SECOND COPY OF THE GEOMETRY
+    // AND IT WAS WRONG. It demanded 8 px more width than the box needs, and the sizing
+    // sweep in resized() reads it to choose between TextBoxBelow and NoTextBox: any fader
+    // whose column sat within those 8 px lost its number ENTIRELY. "ahora no aparece el
+    // numero de base bajo el control de base." Both sides read this constant now.
+    inline constexpr int kSliderValueBorderX = 1;
     inline int faderValueWidth (const juce::Slider& s)
     {
         const juce::Font f (juce::FontOptions (10.0f));
@@ -539,7 +550,7 @@ namespace fgfit
         for (int i = 0; i <= 32; ++i)
             w = juce::jmax (w, juce::GlyphArrangement::getStringWidth (
                                    f, sl.getTextFromValue (sl.proportionOfLengthToValue ((double) i / 32.0))));
-        return (int) std::ceil (w) + 10;   // the label's own left+right border
+        return (int) std::ceil (w) + 2 * kSliderValueBorderX;
     }
     // juce::Label: drawLabel works inside getBorderSize(), in getLabelFont()'s face.
     inline juce::Font labelFont (const juce::Label& l)
@@ -1507,6 +1518,18 @@ private:
     // Called whenever edit mode may have changed, and once per UI tick (automation and
     // the processor itself can end it - a corner cleared, the playground disengaging).
     void refreshCornerEditUi();
+    // The SPECTRUM panel while the playground drives the sound: see the comment at the
+    // definition. pgDrivingUi is read by paint() (the band) and by the layout.
+    void refreshPlaygroundDrivingUi();
+    void setSpectrumControlsEnabled (bool on);
+    bool pgDrivingUi = false;
+    int  lastPgDrivingSeen = -1;
+public:
+    // TESTS: is the SPECTRUM panel currently telling the user it cannot be heard? Reads
+    // the same flag paint() draws from, so the check cannot pass over a band that is not
+    // on the glass.
+    bool playgroundBandShownForTests() const { return pgDrivingUi; }
+private:
     void updateWarning (int templatePartials);
     // The longest sentence in the plugin, in one place so the probe can measure it
     // without the dissonance search that raises it. See the definition.

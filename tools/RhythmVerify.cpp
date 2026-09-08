@@ -21035,21 +21035,211 @@ int main (int argc, char** argv)
             bool       stated = false;
             if (inert)
             {
-                const auto n = ed->noticeProbeForTests();
                 const auto q = ed->layoutProbe();
                 int lit = 0;
+                juce::StringArray litNames;
                 for (auto* c : ed->getChildren())
                     if (auto* s = dynamic_cast<juce::Slider*> (c))
                         if (s->isVisible() && q.spectrum.contains (c->getBounds()) && s->isEnabled())
+                        {
                             ++lit;
-                stated = n.visible || lit == 0;
-                std::printf ("  the panel is INERT. notice on screen: %d   faders still"
-                             " enabled in it: %d\n", (int) n.visible, lit);
+                            auto nm = juce::String (typeid (*c).name());
+                            litNames.add (nm.fromLastOccurrenceOf ("::", false, false).replace ("class ", "")
+                                          + " @" + juce::String (c->getX()) + "," + juce::String (c->getY()));
+                        }
+                // BOTH, not either: the panel goes visibly dead AND says why. A dead
+                // panel with no explanation is the same defect one step quieter, and a
+                // sentence over controls that still answer the mouse is a sentence
+                // nobody believes.
+                const bool says = ed->playgroundBandShownForTests();
+                stated = says && lit == 0;
+                std::printf ("  the panel is INERT. it says so: %d   faders still enabled"
+                             " in it: %d  %s\n", (int) says, lit,
+                             litNames.joinIntoString (", ").toRawUTF8());
             }
             check (! inert || stated,
                    "with the PLAYGROUND driving the spectrum, the panel that no longer reaches"
                    " the sound SAYS so - it does not sit there enabled and lit while every"
                    " edit is discarded");
+
+            // AND THE WAY OUT, measured rather than assumed. pgActive is
+            // getPlaygroundAssignedCount() >= 2, so clearing ONE corner should hand the
+            // spectrum back. This is the sentence the user gets told to try, so it is not
+            // going out on reasoning alone.
+            juce::String ce;
+            const bool cleared = p->assignPlaygroundCorner (1, {}, ce);
+            settle (24); awaitSpectrumIdle (*p, "corner cleared"); settle (8);
+            const auto afterClear = take();
+            // BACK TO THE HARMONIC ENGINE FIRST. The switch above left this instrument in
+            // the CUSTOM view, where baseN is not one of the controls that do anything -
+            // so the first version of this leg moved baseN in the custom engine, measured
+            // no change, and reported that the way out did not work. Fifth probe bug of
+            // the day, same shape as the other four: the measurement was of something
+            // that was never going to move.
+            ed->clickEngineChipForTests (0);
+            settle (24); awaitSpectrumIdle (*p, "harmonic after clearing"); settle (8);
+            const auto afterClearHarm = take();
+            sp ("baseN", 5.0f);
+            settle (24); awaitSpectrumIdle (*p, "baseN after clearing"); settle (8);
+            const auto afterClearBase = take();
+            const double dSwitchBack = diff (afterClear, afterClearHarm);
+            const double dBack = diff (afterClearHarm, afterClearBase);
+            std::printf ("  after clearing: engine switch moved %.6f\n", dSwitchBack);
+            std::printf ("  cleared a corner (ok=%d, err \"%s\"): playground active %d,"
+                         "  BASE N now moves the audio by %.6f\n",
+                         (int) cleared, ce.toRawUTF8(), (int) p->isPlaygroundActive(), dBack);
+            check (! p->isPlaygroundActive(),
+                   "clearing one corner takes the playground back off - fewer than two"
+                   " assigned is what turns it off, as it is what turned it on");
+            check (dBack > 1.0e-6,
+                   "...and the SPECTRUM panel reaches the sound again the moment it does -"
+                   " which is the way out a user can actually take");
+        }
+    }
+
+    //== NO FADER LOSES ITS NUMBER, AND THE TWO BORDERS CANNOT DRIFT ================
+    //
+    // "ahora no aparece el numero de base bajo el control de base."
+    //
+    // resized() chooses between TextBoxBelow and NoTextBox by asking
+    // fgfit::faderValueWidth whether the column is wide enough - and that function used to
+    // add a hard-coded 10 for "the label's own left+right border" while
+    // GalacticLnF::createSliderTextBox had been changed to set 1 px a side. Eight pixels
+    // of phantom demand, and every fader whose column sat inside them dropped its value
+    // box ENTIRELY: not clipped, not squashed, gone, which no fit check can see because
+    // there is nothing left to measure.
+    //
+    // Two checks, because there are two ways for it to come back: the constant drifting
+    // again, and a fader quietly losing its box for any other reason.
+    {
+        std::printf ("\nevery fader keeps its value box at the size the plugin opens at:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        if (ed == nullptr) { check (false, "(gate) the editor for the value-box sweep exists"); }
+        else
+        {
+            ed->setVisible (true);
+            ed->setSize (1200, 650);
+            ed->resized();
+
+            // THE BORDER THE PAINTER REALLY KEEPS, read off a live value box rather than
+            // trusted. If createSliderTextBox and faderValueWidth ever disagree again,
+            // this is where it says so - before any fader has to lose a number to prove it.
+            int measuredBorder = -1;
+            int boxed = 0, noBox = 0;
+            juce::StringArray without;
+            for (auto* c : ed->getChildren())
+            {
+                auto* s = dynamic_cast<juce::Slider*> (c);
+                if (s == nullptr || ! s->isVisible() || s->getWidth() <= 0) continue;
+                if (s->getTextBoxPosition() == juce::Slider::NoTextBox)
+                {
+                    ++noBox;
+                    auto nm = juce::String (typeid (*c).name());
+                    without.add (nm.fromLastOccurrenceOf ("::", false, false).replace ("class ", "")
+                                 + " @" + juce::String (c->getX()) + "," + juce::String (c->getY()));
+                    continue;
+                }
+                ++boxed;
+                for (auto* k : s->getChildren())
+                    if (auto* l = dynamic_cast<juce::Label*> (k))
+                        measuredBorder = l->getBorderSize().getLeftAndRight();
+            }
+            std::printf ("  %d faders carry a value box, %d do not.  border on a live box: %d px"
+                         "  (faderValueWidth assumes %d)\n",
+                         boxed, noBox, measuredBorder, 2 * fgfit::kSliderValueBorderX);
+            for (const auto& w : without) std::printf ("      no value box: %s\n", w.toRawUTF8());
+            check (boxed >= 6, "(gate) the sweep really found the window's faders");
+            check (measuredBorder == 2 * fgfit::kSliderValueBorderX,
+                   "the border a value box really keeps is the one faderValueWidth budgets for -"
+                   " the width sweep and the painter read ONE constant, not two copies");
+            // The number itself: BASE is the one that was reported, so it is named.
+            const auto probe = ed->faderBoxProbeForTests ("baseN");
+            std::printf ("  BASE N: found=%d  box position %d  box %dx%d  in a %d px row\n",
+                         (int) probe.found, probe.pos, probe.boxW, probe.boxH, probe.rowH);
+            check (probe.found, "(gate) the BASE fader probe answers");
+            check (probe.pos != (int) juce::Slider::NoTextBox,
+                   "BASE shows the number under its fader at 1200x650 - the size this plugin"
+                   " always opens at, since the editor is not resizable");
+        }
+    }
+
+    //== THE LFO KNOBS ARE NOT DOTS ================================================
+    //
+    // "los knobs de lfo siguen siendo enanos, molaria que tuviesen el numero blanco a su
+    //  derecha y no debajo, asi podrian crecer hacia abajo que es lo que les impide crecer."
+    //
+    // A juce rotary is drawn as a SQUARE inside whatever the value box leaves, so its
+    // diameter is min(width, height) of that remainder - and a box BELOW spends 13 px of
+    // the height, a box to the RIGHT spends jmin(44, w - 30) of the width. Which of the
+    // two is bigger is a question about the column, not a matter of taste, so this
+    // measures BOTH from the same laid-out rect and says so. If moving the number to the
+    // right ever made these smaller, this is where it would be caught rather than shipped.
+    {
+        std::printf ("\nthe LFO knobs, and where their number costs least:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        if (ed == nullptr) { check (false, "(gate) the editor for the LFO knob sweep exists"); }
+        else
+        {
+            ed->setVisible (true);
+            ed->setSize (1200, 650);
+            // THE CUSTOM TAB AS WELL, and the modulator index the rig uses. Selecting the
+            // modulator alone left the LFO page unbuilt and the sweep found ZERO knobs -
+            // which its own gate said, instead of the two checks below passing over an
+            // empty list and reading as a clean result.
+            ed->clickEnvTabForSnapshot (3);
+            ed->setModSelForSnapshot (4);             // LFO 1, the same numbering the rig uses
+            ed->resized();
+
+            int smallest = 9999, worseIfBelow = 0, knobs = 0;
+            // RECURSIVE: these knobs are not direct children of the editor.
+            std::function<void (juce::Component*, std::vector<juce::Slider*>&)> gatherKnobs =
+                [&gatherKnobs] (juce::Component* root, std::vector<juce::Slider*>& out)
+            {
+                for (auto* k : root->getChildren())
+                {
+                    if (! k->isVisible()) continue;
+                    if (auto* s = dynamic_cast<juce::Slider*> (k))
+                        if (s->getSliderStyle() == juce::Slider::RotaryVerticalDrag) out.push_back (s);
+                    gatherKnobs (k, out);
+                }
+            };
+            std::vector<juce::Slider*> found;
+            gatherKnobs (ed, found);
+            for (auto* s : found)
+            {
+                auto* c = s;
+                const int w = s->getWidth(), h = s->getHeight();
+                if (w <= 0 || h <= 0) continue;
+                ++knobs;
+                // What JUCE's own layout leaves the rotary, each way round.
+                const int boxR   = juce::jmax (0, juce::jmin (s->getTextBoxWidth(), w - 30));
+                const int dRight = juce::jmin (w - boxR, h);
+                const int boxB   = juce::jmax (0, juce::jmin (13, h - 15));
+                const int dBelow = juce::jmin (w, h - boxB);
+                std::printf ("    knob %dx%d @%d,%d   box RIGHT -> %d px across,"
+                             "  box BELOW -> %d px   (now: %s)\n",
+                             w, h, s->getX(), s->getY(), dRight, dBelow,
+                             s->getTextBoxPosition() == juce::Slider::TextBoxRight ? "right"
+                             : s->getTextBoxPosition() == juce::Slider::TextBoxBelow ? "below" : "none");
+                smallest = juce::jmin (smallest, dRight);
+                if (dBelow > dRight) ++worseIfBelow;
+            }
+            std::printf ("  %d knobs, smallest %d px across, %d would be bigger with the number below\n",
+                         knobs, knobs > 0 ? smallest : 0, worseIfBelow);
+            check (knobs >= 3, "(gate) the LFO page really shows its knobs");
+            check (worseIfBelow == 0,
+                   "the number sits on the side that costs the knob least - moving it to the"
+                   " RIGHT gives every one of them at least as much diameter as putting it"
+                   " BELOW did");
+            check (smallest >= 26,
+                   "...and no LFO knob is a dot: every one is at least 26 px across at the"
+                   " size this plugin opens at");
         }
     }
 
