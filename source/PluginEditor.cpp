@@ -9428,6 +9428,51 @@ void FractalAdditiveAudioProcessorEditor::configCombo (juce::ComboBox& b, const 
 }
 
 //==============================================================================
+
+// PAINTED OVER THE CHILDREN, not under them.
+//
+// JUCE draws a component's own paint() FIRST and its children on top, so the first
+// version of this band was covered by the very controls it is there to cross out: the
+// photograph came back with the sentence woven between a fader, a chip and the PRIMES
+// ticks, unreadable, and the dimming layer nowhere. paintOverChildren is the one place
+// that can put a lid on a panel.
+void FractalAdditiveAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
+{
+    if (! pgDrivingUi || spectrumBounds.isEmpty())
+        return;
+    auto box = spectrumBounds.toFloat().reduced (6.0f, 6.0f);
+    g.setColour (juce::Colour (0xd0101318));
+    g.fillRoundedRectangle (box, 8.0f);
+    g.setColour (spectrumPanelColour.withAlpha (0.85f));
+    g.drawRoundedRectangle (box, 8.0f, 1.5f);
+    // The block is CENTRED in the panel, not hung from its top: the first photograph had
+    // the sentence in the upper third with half the box empty under it.
+    auto text = box.reduced (18.0f, 10.0f).withSizeKeepingCentre (box.getWidth() - 36.0f,
+                                                                  juce::jmin (box.getHeight() - 20.0f,
+                                                                              132.0f));
+    g.setFont (juce::Font (juce::FontOptions (juce::jmin (17.0f, text.getHeight() * 0.16f))
+                               .withStyle ("Bold")));
+    const auto head = tr ("THE PLAYGROUND IS MAKING THIS SOUND",
+                          "EL PLAYGROUND \xc3\x89S QUI FA AQUEST SO");
+    g.drawFittedText (head, text.removeFromTop (text.getHeight() * 0.32f).toNearestInt(),
+                      juce::Justification::centred, 2, 1.0f);
+    g.setColour (juce::Colours::white.withAlpha (0.82f));
+    g.setFont (juce::Font (juce::FontOptions (juce::jmin (13.0f, text.getHeight() * 0.13f))));
+    g.drawFittedText (
+        tr ("The spectrum you hear is the blend of the assigned corners, so nothing in this"
+            " panel can change it - an edit made here is overwritten by the next blend."
+            "\n\nTo change a corner: press EDIT on it in the Preset Playground, and these"
+            " controls become that corner's own.\nTo get this panel back: take a corner off"
+            " the pad, so fewer than two are assigned.",
+            "L'espectre que sents \xc3\xa9s la barreja de les cantonades assignades, aix\xc3\xad"
+            " que res d'aquest tauler el pot canviar - una edici\xc3\xb3 feta aqu\xc3\xad la"
+            " sobreescriu la barreja seg\xc3\xbc" "ent.\n\nPer canviar una cantonada: prem"
+            " EDIT a la seva fitxa del Preset Playground, i aquests controls passen a ser"
+            " els seus.\nPer recuperar aquest tauler: treu una cantonada del pad, de manera"
+            " que en quedin menys de dues assignades."),
+        text.toNearestInt(), juce::Justification::centred, 8, 1.0f);
+}
+
 void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colour (0xff0c0c12));
@@ -9568,39 +9613,6 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
                 g.drawLine (d.second, 1.0f);
         }
 
-        // THE PANEL SAYS WHEN IT CANNOT BE HEARD. Drawn over the whole box, dimmed, with
-        // the two ways out - because a disabled panel with no explanation is the same
-        // defect one step quieter. See refreshPlaygroundDrivingUi.
-        if (pgDrivingUi)
-        {
-            auto box = spectrumBounds.toFloat().reduced (6.0f, 6.0f);
-            g.setColour (juce::Colour (0xd0101318));
-            g.fillRoundedRectangle (box, 8.0f);
-            g.setColour (spectrumPanelColour.withAlpha (0.85f));
-            g.drawRoundedRectangle (box, 8.0f, 1.5f);
-            auto text = box.reduced (18.0f, 10.0f);
-            g.setFont (juce::Font (juce::FontOptions (juce::jmin (17.0f, text.getHeight() * 0.16f))
-                                       .withStyle ("Bold")));
-            const auto head = tr ("THE PLAYGROUND IS MAKING THIS SOUND",
-                                  "EL PLAYGROUND \xc3\x89S QUI FA AQUEST SO");
-            g.drawFittedText (head, text.removeFromTop (text.getHeight() * 0.32f).toNearestInt(),
-                              juce::Justification::centred, 2, 1.0f);
-            g.setColour (juce::Colours::white.withAlpha (0.82f));
-            g.setFont (juce::Font (juce::FontOptions (juce::jmin (13.0f, text.getHeight() * 0.13f))));
-            g.drawFittedText (
-                tr ("The spectrum you hear is the blend of the assigned corners, so nothing in this"
-                    " panel can change it - an edit made here is overwritten by the next blend."
-                    "\n\nTo change a corner: press EDIT on it in the Preset Playground, and these"
-                    " controls become that corner's own.\nTo get this panel back: take a corner off"
-                    " the pad, so fewer than two are assigned.",
-                    "L'espectre que sents \xc3\xa9s la barreja de les cantonades assignades, aix\xc3\xad"
-                    " que res d'aquest tauler el pot canviar - una edici\xc3\xb3 feta aqu\xc3\xad la"
-                    " sobreescriu la barreja seg\xc3\xbc" "ent.\n\nPer canviar una cantonada: prem"
-                    " EDIT a la seva fitxa del Preset Playground, i aquests controls passen a ser"
-                    " els seus.\nPer recuperar aquest tauler: treu una cantonada del pad, de manera"
-                    " que en quedin menys de dues assignades."),
-                text.toNearestInt(), juce::Justification::centredTop, 8, 1.0f);
-        }
     }
 
     // Essentials macro-group: one framed box, one colour, PHASE / GAIN / REFERENCE /

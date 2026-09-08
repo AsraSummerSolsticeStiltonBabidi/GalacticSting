@@ -697,6 +697,36 @@ namespace
                   setParam (p, "pgY", 0.31f);
                   e.tickTimerForTests();
               } },
+            // THE MAIN WINDOW while the playground drives it - the state the whole panel
+            // goes inert in, which until now NO scenario reached. 52 above assigns the
+            // same four corners but photographs the playground WINDOW, so the band that
+            // says "this panel cannot be heard" had never been in a picture: it is
+            // painted, not a component, so walkTextFits cannot see it either. Exactly the
+            // blind spot this file exists to close - a string that lives in a state no
+            // scenario visits.
+            { "54-playground-driving", "the SPECTRUM panel while the playground makes the sound",
+              tEditor, fSizes,
+              [] (Proc& p, Ed& e)
+              {
+                  auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                     .getChildFile ("fiblo-rig-pgdriving");
+                  scratch.deleteRecursively();
+                  Proc::setPresetFolderForTests (scratch);
+                  const char* names[2] = { "rig-drive-A", "rig-drive-B" };
+                  for (int i = 0; i < 2; ++i)
+                  {
+                      setParam (p, "baseN", (float) (1 + i * 8));
+                      setParam (p, "curveSlope", 0.5f + 0.6f * (float) i);
+                      Proc::PresetWriteRefusal why {};
+                      int corner = -1;
+                      p.savePreset (names[i], why, corner);
+                  }
+                  juce::String err;
+                  for (int i = 0; i < 2; ++i) p.assignPlaygroundCorner (i, names[i], err);
+                  setParam (p, "pgX", 0.45f);
+                  p.pollParametersForTests();
+                  e.tickTimerForTests();
+              } },
         };
         return v;
     }
