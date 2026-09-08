@@ -19457,6 +19457,127 @@ int main (int argc, char** argv)
                " window keeps following the mouse when Mono Glide is switched off");
     }
 
+    //== EVERY FIXED REFUSAL THE PROCESSOR WRITES HAS A CATALAN SIDE ================
+    //
+    // tr() is an editor member, so the processor - where every parser and loader lives -
+    // cannot translate its own failures. They arrived in English and were shown that way,
+    // under a title this window had carefully translated: the half-finished sentence the
+    // rules here forbid.
+    //
+    // fgerr::table is the editor's lookup on the way to the screen (see trErr). It only
+    // covers the FIXED messages; the composed ones ("Key " + n, "File declares " + count)
+    // have no literal to match and need the typed-code design the audit describes. This
+    // gate is what keeps the covered half honest: it reads THE SOURCE for every
+    // `errorOut = "…";` literal and asserts each is in the table - the same trick fgdlg
+    // uses for window titles, and for the same reason, because a second copy of a string
+    // goes stale the moment somebody rewords the first. A message added tomorrow fails
+    // this until it is translated.
+    //
+    // It also PRINTS what is left, so the composed half is a number somebody can act on
+    // rather than a silence.
+   #ifdef FG_SOURCE_DIR
+    {
+        std::printf ("\nevery fixed refusal the processor writes can be read in Catalan:\n");
+        const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
+        juce::StringArray fixed, composed, missing;
+        for (const char* rel : { "PluginProcessor.cpp", "dsp/TuningManager.h" })
+        {
+            const auto txt = srcDir.getChildFile ("source").getChildFile (rel).loadFileAsString();
+            auto lines = juce::StringArray::fromLines (txt);
+            for (const auto& ln : lines)
+            {
+                const int at = ln.indexOf ("errorOut = \"");
+                if (at < 0) continue;
+                const auto rest = ln.substring (at + 11);          // from the opening quote
+                // WHERE THE LITERAL REALLY ENDS, not where the line does. Two earlier
+                // versions of this got it wrong in two different ways and the gate caught
+                // both: `endsWith("\";")` called `"Note " + String (n) + "…"` fixed,
+                // because that LINE does end that way while the literal is only its first
+                // fragment. Scanned properly, honouring backslash escapes, so a message
+                // that quotes a value back at the user is not mistaken for a whole one.
+                int close = -1;
+                for (int i = 1; i < rest.length(); ++i)
+                {
+                    if (rest[i] == '\\') { ++i; continue; }
+                    if (rest[i] == '"')  { close = i; break; }
+                }
+                const auto lit  = close < 0 ? rest : rest.substring (1, close);
+                const auto tail = close < 0 ? juce::String() : rest.substring (close + 1).trim();
+                // A line whose assignment ENDS on it is a fixed message; one that runs on
+                // is composed with a runtime value and cannot be looked up at all.
+                //
+                // ...AND A LITERAL CARRYING AN ESCAPED QUOTE IS COMPOSED WHATEVER THE LINE
+                // ENDS WITH. The first version of this classifier called eight of them
+                // fixed and then reported them as untranslated: they are the messages that
+                // QUOTE the offending value back at the user - `Use a ratio (\"` continues
+                // on the next line with the text the user typed - so the extraction stopped
+                // at the escaped quote and produced a fragment that is in no table and
+                // never will be. Counting them as missing would have been a permanent red
+                // for work that cannot be done this way.
+                // FIXED means the statement ends the moment the literal does: anything
+                // after the closing quote - a `+`, a String(), a concatenated value - makes
+                // it composed, whatever the rest of the line looks like.
+                if (close >= 0 && tail == ";") fixed.addIfNotAlreadyThere (lit);
+                else                           composed.addIfNotAlreadyThere (lit);
+            }
+        }
+        // THE SOURCE TEXT IS DECODED BEFORE IT IS COMPARED, and the earlier version of
+        // this line did not do it: it held `That file is not a Fibl\xc3\xb3 preset.` -
+        // fifteen literal characters of backslash-x escape - against the table's `p.en`,
+        // which the COMPILER has already turned into the two UTF-8 bytes of "ó". Every
+        // pure-ASCII message matched anyway, so the audit looked healthy while the one
+        // accented message in it could never have been found. Decoded here, so the
+        // comparison is between two of the same thing.
+        const auto decodeEscapes = [] (const juce::String& raw)
+        {
+            juce::MemoryOutputStream bytes;
+            for (int i = 0; i < raw.length(); ++i)
+            {
+                // \xNN for the accented bytes, and the ORDINARY escapes too - the first
+                // version handled only \x, so the two messages that quote their own
+                // examples (`(\"702.0\")`) still could not match: their source text keeps
+                // the backslashes the compiler removes. A decoder that handles one escape
+                // and not the others is a decoder that works on the easy half.
+                if (raw[i] == '\\' && i + 3 < raw.length() && raw[i + 1] == 'x')
+                {
+                    bytes.writeByte ((char) raw.substring (i + 2, i + 4).getHexValue32());
+                    i += 3;
+                }
+                else if (raw[i] == '\\' && i + 1 < raw.length())
+                {
+                    const auto c = raw[i + 1];
+                    bytes.writeByte ((char) (c == 'n' ? '\n' : c == 't' ? '\t' : c));
+                    ++i;
+                }
+                else bytes.writeByte ((char) raw[i]);
+            }
+            return juce::String::fromUTF8 ((const char*) bytes.getData(), (int) bytes.getDataSize());
+        };
+        for (const auto& f : fixed)
+        {
+            const auto want = decodeEscapes (f);
+            bool found = false;
+            for (const auto& p : fgerr::table)
+                if (want == juce::String::fromUTF8 (p.en)) { found = true; break; }
+            if (! found) missing.add (f);
+        }
+        std::printf ("  %d fixed messages in the source, %d composed; %d fixed ones not in"
+                     " the table\n", fixed.size(), composed.size(), missing.size());
+        for (int i = 0; i < juce::jmin (6, missing.size()); ++i)
+            std::printf ("    missing: \"%s\"\n", missing[i].toRawUTF8());
+        // GATE FIRST: a walk that found no messages proves nothing about the table.
+        check (fixed.size() >= 20,
+               "  (gate) the source really was read and holds the fixed refusals");
+        check (missing.isEmpty(),
+               "every FIXED refusal the processor writes has a Catalan side in fgerr::table -"
+               " a new one fails this until it is translated");
+        std::printf ("  still English, because they are composed with a runtime value and"
+                     " need the typed-code design: %d\n", composed.size());
+    }
+   #else
+    std::printf ("\n  [SKIP] refusal-table audit: FG_SOURCE_DIR not defined\n");
+   #endif
+
     runProcessorAuditChecks();
     runSilentLimitChecks();
 

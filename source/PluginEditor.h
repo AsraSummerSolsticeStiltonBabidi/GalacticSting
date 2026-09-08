@@ -62,6 +62,95 @@ namespace fgdlg
                                     openTuning, openBank, openTimbre, saveTuning, saveGen };
 }
 
+//==============================================================================
+// THE PROCESSOR'S REFUSALS, IN THE USER'S LANGUAGE.
+//
+// tr() is an EDITOR member, so the processor cannot call it - and the processor is where
+// every parser and loader lives. The result is a Catalan window whose failures answer in
+// English: a translated title over an English body, which is the half-finished sentence
+// this project's own rules forbid.
+//
+// The audit's fix is to make every refusal a typed code the editor turns into words. That
+// is the right end state and it is 74 call sites, many of them composing the message with
+// a runtime value ("Key " + n, "File declares " + count), so it cannot be done as a table
+// at all. Counted here rather than guessed: 61 messages, of which 30 are composed.
+//
+// THE OTHER 31 ARE FIXED STRINGS, and those need no design change: the editor already has
+// them in its hand by the time it shows them, so it can simply look them up. That is this
+// table. It is deliberately NOT a translation layer for everything - a composed message
+// falls through unchanged, exactly as today, so nothing can regress and this can stop at
+// any point without leaving the product in a worse state than it started.
+//
+// The gate is the important half. RhythmVerify reads THE SOURCE for every `errorOut = "…";`
+// literal and asserts each one is in this table - the same trick fgdlg above uses for
+// window titles, and for the same reason: a second copy of a string goes stale the moment
+// somebody rewords the first. A message added tomorrow fails the suite until it is here.
+namespace fgerr
+{
+    struct Pair { const char* en; const char* ca; };
+
+    inline constexpr Pair table[] =
+    {
+        { "A scale needs at least one degree per period.",
+          "Una escala necessita com a m\xc3\xadnim un grau per per\xc3\xado" "de." },
+        { "Could not write the file.",
+          "No s'ha pogut escriure el fitxer." },
+        { "File not found.",
+          "No s'ha trobat el fitxer." },
+        { "Invalid period.",
+          "Per\xc3\xado" "de inv\xc3\xa0lid." },
+        // These two carry escaped quotes and are still WHOLE messages - the examples are
+        // part of the sentence, not a value pasted in. The audit's first classifier called
+        // them composed for the backslashes alone and would have left them English for ever.
+        { "Invalid value. Use cents with a decimal point (\"702.0\") or a ratio (\"3/2\").",
+          "Valor inv\xc3\xa0lid. Fes servir cents amb punt decimal (\"702.0\") o un ratio (\"3/2\")." },
+        { "Invalid period. Use a ratio (\"2\", \"3/2\") or cents (\"1200c\").",
+          "Per\xc3\xado" "de inv\xc3\xa0lid. Fes servir un ratio (\"2\", \"3/2\") o cents (\"1200c\")." },
+        { "Invalid pitch.",
+          "To inv\xc3\xa0lid." },
+        { "Invalid scale period.",
+          "Per\xc3\xado" "de d'escala inv\xc3\xa0lid." },
+        { "No generated scale to save yet.",
+          "Encara no hi ha cap escala generada per desar." },
+        { "No such chord.",
+          "Aquest acord no existeix." },
+        { "No target notes to adapt to.",
+          "No hi ha notes objectiu a les quals adaptar-se." },
+        { "Not a valid .scl file (too short).",
+          "No \xc3\xa9s un fitxer .scl v\xc3\xa0lid (massa curt)." },
+        { "Not a valid .tun file: no [Exact Tuning] or [Tuning] notes found.",
+          "No \xc3\xa9s un fitxer .tun v\xc3\xa0lid: no s'hi ha trobat cap nota [Exact Tuning] ni [Tuning]." },
+        { "Nothing adapted yet.",
+          "Encara no s'ha adaptat res." },
+        { "Nothing to restore.",
+          "No hi ha res a restaurar." },
+        { "That file is not a Fibl\xc3\xb3 preset.",
+          "Aquest fitxer no \xc3\xa9s un preset de Fibl\xc3\xb3." },
+        { "That pitch is already a degree of the scale.",
+          "Aquest to ja \xc3\xa9s un grau de l'escala." },
+        { "That preset could not be read.",
+          "No s'ha pogut llegir aquest preset." },
+        { "That preset no longer exists.",
+          "Aquest preset ja no existeix." },
+        { "That tuning is already the active one.",
+          "Aquesta afinaci\xc3\xb3 ja \xc3\xa9s l'activa." },
+        { "The current settings produce no partials - nothing to analyse.",
+          "Els ajustos actuals no produeixen cap parcial - no hi ha res a analitzar." },
+        { "The current tuning has no usable pitch for MIDI note 0.",
+          "L'afinaci\xc3\xb3 actual no t\xc3\xa9 cap to utilitzable per a la nota MIDI 0." },
+        { "The tonic and the period cannot be deleted - delete any degree between them.",
+          "La t\xc3\xb2nica i el per\xc3\xado" "de no es poden esborrar - esborra qualsevol grau que hi hagi entre mig." },
+        { "The tonic is fixed at 1/1 - edit any other degree.",
+          "La t\xc3\xb2nica \xc3\xa9s fixa a 1/1 - edita qualsevol altre grau." },
+        { "This .tun has an unusable basefreq.",
+          "Aquest .tun t\xc3\xa9 una basefreq inservible." },
+        { "This preset carries no tuning of its own.",
+          "Aquest preset no porta cap afinaci\xc3\xb3 pr\xc3\xb2pia." },
+        { "This spectrum does not come from a tuning.",
+          "Aquest espectre no prov\xc3\xa9 de cap afinaci\xc3\xb3." },
+    };
+}
+
 
 //==============================================================================
 // HOW MUCH ROOM A CONTROL LEAVES FOR ITS OWN WORD, AND HOW WIDE IT MUST BE TO HOLD IT.
@@ -1333,6 +1422,28 @@ private:
     // String still needs String::fromUTF8 of its own.
     juce::String tr (const char* en, const char* ca) const
     { return juce::String::fromUTF8 (catalan ? ca : en); }
+
+    // A REFUSAL THE PROCESSOR WROTE, PUT INTO THE READER'S LANGUAGE.
+    //
+    // The processor cannot call tr() - tr is an editor member and every parser lives on
+    // the other side - so its `err` strings arrive in English and used to be shown that
+    // way, under a title this window had carefully translated. This looks each one up in
+    // fgerr::table on the way to the screen.
+    //
+    // A message that is NOT in the table falls through UNCHANGED, which is exactly today's
+    // behaviour: the thirty composed messages ("Key " + n, "File declares " + count) have
+    // no fixed literal to match and need the typed-code design the audit describes. So
+    // this can never make anything worse, and it stops cleanly wherever it has got to.
+    // Compared as UTF-8 against the table's English side, so the one accented message in
+    // it ("...not a Fibló preset") matches like any other.
+    juce::String trErr (const juce::String& fromProcessor) const
+    {
+        if (! catalan || fromProcessor.isEmpty()) return fromProcessor;
+        for (const auto& p : fgerr::table)
+            if (fromProcessor == juce::String::fromUTF8 (p.en))
+                return juce::String::fromUTF8 (p.ca);
+        return fromProcessor;
+    }
     void timerCallback() override;
 
     // ComboBox that refreshes its item list just before its popup opens (so the

@@ -2117,7 +2117,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         juce::String err;
         if (! processorRef.loadPendingPresetTuning (err))
             juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                tr ("Load preset's tuning", "Carrega l'afinaci\xc3\xb3 del preset"), err, this);
+                tr ("Load preset's tuning", "Carrega l'afinaci\xc3\xb3 del preset"), trErr (err), this);
         resized(); repaint(); refocus();
     };
     addChildComponent (loadPresetTuningBtn);
@@ -2132,7 +2132,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         juce::String err;
         if (! processorRef.loadSpectrumProvenanceTuning (err))
             juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                tr ("Load spectrum's tuning", "Carrega l'afinaci\xc3\xb3 de l'espectre"), err, this);
+                tr ("Load spectrum's tuning", "Carrega l'afinaci\xc3\xb3 de l'espectre"), trErr (err), this);
         resized(); repaint(); refocus();
     };
     addChildComponent (loadSpectrumTuningBtn);
@@ -2449,7 +2449,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                 if (! (asScl ? processorRef.saveCurrentTuningScl (f, err)
                              : processorRef.saveCurrentTuningTun (f, err)))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        tr (fgdlg::saveTuning.en, fgdlg::saveTuning.ca), err, this);
+                        tr (fgdlg::saveTuning.en, fgdlg::saveTuning.ca), trErr (err), this);
                 refocus();
             });
     };
@@ -3040,7 +3040,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         juce::String err;
         if (! processorRef.loadChordAsScale (row, err))
             juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                tr ("Chords based on beating", "Acords basats en batec"), err, this);
+                tr ("Chords based on beating", "Acords basats en batec"), trErr (err), this);
         else { chordDegView = true; resized(); } // jump to the loaded chord's ranked degrees
         refocus();
     };
@@ -3152,7 +3152,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             }
             else
                 juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                    tr ("Spectrum Builder", "Constructor d'espectre"), err, this);
+                    tr ("Spectrum Builder", "Constructor d'espectre"), trErr (err), this);
         }
         refocus();
     };
@@ -3407,10 +3407,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                 juce::String err;
                 if (r == 1 && ! safe->processorRef.editTuningDegree (deg, txt, err))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        safe->tr ("Edit degree", "Edita el grau"), err, safe);
+                        safe->tr ("Edit degree", "Edita el grau"), safe->trErr (err), safe);
                 if (r == 2 && ! safe->processorRef.deleteTuningDegree (deg, err))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        safe->tr ("Delete degree", "Esborra el grau"), err, safe);
+                        safe->tr ("Delete degree", "Esborra el grau"), safe->trErr (err), safe);
                 safe->refocus();
             }), true);
     };
@@ -3457,7 +3457,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                         safe->processorRef.addNoteToTuning (ratio, err, txt);
                     if (err.isNotEmpty())
                         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                            safe->tr ("Add note", "Afegeix nota"), err, safe);
+                            safe->tr ("Add note", "Afegeix nota"), safe->trErr (err), safe);
                 }
                 safe->refocus();
             }), true);
@@ -3632,7 +3632,7 @@ void FractalAdditiveAudioProcessorEditor::loadRecent (int index)
     {
         juce::String err;
         if (! processorRef.loadScalaFile (juce::File (paths[index]), err))
-            juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr (fgdlg::loadScale.en, fgdlg::loadScale.ca), err, this);
+            juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr (fgdlg::loadScale.en, fgdlg::loadScale.ca), trErr (err), this);
     }
     refocus();
 }
@@ -6115,7 +6115,7 @@ void FractalAdditiveAudioProcessorEditor::runDissonanceTune()
     juce::String err;
     if (! processorRef.generateDissonanceScale (n, maxima, periodRatio, periodLine, minGap, err))
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-            tr ("Spectrum to Scale", "Espectre a escala"), err, this);
+            tr ("Spectrum to Scale", "Espectre a escala"), trErr (err), this);
     refocus();
 }
 
@@ -6146,7 +6146,7 @@ void FractalAdditiveAudioProcessorEditor::runChordSearch()
                                          tuneScopeBox.getSelectedId() != 2, // SCOPE: 0 vs all
                                          err))
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-            tr ("Chords based on beating", "Acords basats en batec"), err, this);
+            tr ("Chords based on beating", "Acords basats en batec"), trErr (err), this);
     refocus();
 }
 
@@ -6834,7 +6834,7 @@ void FractalAdditiveAudioProcessorEditor::runSpectrumAdapt()
                                          /*targetIsTuning*/ ! toChord);
     if (err.isNotEmpty())
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-            tr ("Adapt spectrum to tuning", "Adapta l'espectre a l'afinaci\xc3\xb3"), err, this);
+            tr ("Adapt spectrum to tuning", "Adapta l'espectre a l'afinaci\xc3\xb3"), trErr (err), this);
     refreshAdaptButtonText();
     refocus();
 }
@@ -7164,7 +7164,7 @@ void FractalAdditiveAudioProcessorEditor::saveDissonanceScl()
                 juce::String err;
                 if (! processorRef.saveGeneratedScl (fc.getResult(), err))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        tr (fgdlg::saveScale.en, fgdlg::saveScale.ca), err, this);
+                        tr (fgdlg::saveScale.en, fgdlg::saveScale.ca), trErr (err), this);
             }
             refocus();
         });
@@ -7551,7 +7551,7 @@ void FractalAdditiveAudioProcessorEditor::openScalaChooser()
             {
                 juce::String err;
                 if (! processorRef.loadScalaFile (fc.getResult(), err))
-                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr (fgdlg::loadScale.en, fgdlg::loadScale.ca), err, this);
+                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr (fgdlg::loadScale.en, fgdlg::loadScale.ca), trErr (err), this);
                 else
                     // REMEMBERED ONLY ON A SUCCESSFUL LOAD. The user asked for the
                     // folder they LOAD from ("si el usuario carga desde otra carpeta"),
@@ -7610,7 +7610,7 @@ void FractalAdditiveAudioProcessorEditor::openTimbreChooser()
             {
                 juce::String err;
                 if (! processorRef.loadTimbreFile (fc.getResult(), err))
-                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr (fgdlg::loadTimbre.en, fgdlg::loadTimbre.ca), err, this);
+                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr (fgdlg::loadTimbre.en, fgdlg::loadTimbre.ca), trErr (err), this);
             }
             refocus();
         });
@@ -12628,7 +12628,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                                       "No s'ha pogut restaurar l'afinaci\xc3\xb3 d'aquest projecte");
             noticeOverlay.body  = tr ("The scale saved with this project no longer reads, so the instrument is playing 12-tone equal temperament instead. Nothing you play is in the tuning this project was written in.\n\nLoad the scale again if you still have the file.\n\n",
                                       "L'escala desada amb aquest projecte ja no es pot llegir, o sigui que l'instrument est\xc3\xa0 tocant temperament igual de 12 tons. Res del que toquis est\xc3\xa0 en l'afinaci\xc3\xb3 amb qu\xc3\xa8 es va escriure el projecte.\n\nTorna a carregar l'escala si encara tens el fitxer.\n\n")
-                                + lost;
+                                + trErr (lost);
         });
     }
 
@@ -12655,7 +12655,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                                       "No s'ha pogut carregar aquesta ranura del banc");
             noticeOverlay.body  = tr ("The scale in the slot you picked no longer reads, so the tuning you were already using is still the one sounding - nothing has changed under you.\n\nPick another slot, or put a working scale back into this one.\n\n",
                                       "L'escala de la ranura que has triat ja no es pot llegir, o sigui que l'afinaci\xc3\xb3 que ja feies servir segueix sent la que sona - no t'ha canviat res sota els dits.\n\nTria una altra ranura, o torna a posar una escala que funcioni en aquesta.\n\n")
-                                + slotErr;
+                                + trErr (slotErr);
         });
     }
 
@@ -12673,7 +12673,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                                       "No s'ha pogut carregar aquest preset");
             noticeOverlay.body  = tr ("Nothing has changed: the sound you had is the sound you still have, and the preset name in the box is the one that was there before.\n\nThe file may have been written by a newer build, moved, or edited by hand.\n\n",
                                       "No ha canviat res: el so que tenies \xc3\xa9s el que segueixes tenint, i el nom del preset de la casella \xc3\xa9s el que ja hi havia.\n\nPot ser que el fitxer l'hagi escrit una versi\xc3\xb3 m\xc3\xa9s nova, que s'hagi mogut, o que l'hagin editat a m\xc3\xa0.\n\n")
-                                + presetErr;
+                                + trErr (presetErr);
         });
     }
 
