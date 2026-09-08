@@ -171,6 +171,56 @@ namespace fgerr
         { "This .tun does not repeat at any interval, so it cannot be held as a scale (degrees + period).",
           "Aquest .tun no es repeteix a cap interval, o sigui que no es pot guardar com a escala (graus + per\xc3\xado" "de)." },
     };
+
+    // ...AND THE ONES THAT CARRY A VALUE, AS TEMPLATES.
+    //
+    // A composed refusal is a fixed sentence with the user's own text or a number dropped
+    // into it - `"Bad ratio: \"" + whatTheyTyped + "\""`. There is no whole string to look
+    // up, but there IS a template: every string literal in the statement is a fixed chunk
+    // and every gap between them is a value, so joining the literals with '%' reconstructs
+    // it exactly. RhythmVerify builds these templates FROM THE SOURCE and asserts each is
+    // here, so this list cannot drift from the code and cannot quietly miss a new one.
+    //
+    // The Catalan side uses the same number of '%' in the order the sentence needs them -
+    // which is the reason this is a template and not two half-sentences glued together:
+    // Catalan does not put the value where English does, and a concatenation cannot move it.
+    inline constexpr Pair patterns[] =
+    {
+        { "Bad cents value: \"%\"",
+          "Valor en cents incorrecte: \"%\"" },
+        { "Bad ratio: \"%\"",
+          "Ratio incorrecte: \"%\"" },
+        { "Not an interval: \"%\"",
+          "Aix\xc3\xb2 no \xc3\xa9s un interval: \"%\"" },
+        { "Those % partials cannot all keep % cents of air inside a ",
+          "Aquests % parcials no poden mantenir tots % cents d'aire dins d'una " },
+        { "This search is % notes x % partials",
+          "Aquesta cerca \xc3\xa9s de % notes x % parcials" },
+        { "The adaptation came back with % partials instead of the number asked for. Nothing was written.",
+          "L'adaptaci\xc3\xb3 ha tornat amb % parcials en comptes dels demanats. No s'ha escrit res." },
+        { "This corner's adaptation is estimated at % minutes per search - it cannot follow anything at that price.",
+          "L'adaptaci\xc3\xb3 d'aquesta cantonada s'estima en % minuts per cerca - a aquest preu no pot seguir res." },
+        { "Key % of this scale is not a usable frequency - its degrees or its period run off the end of what a number can hold. Nothing was loaded.",
+          "La tecla % d'aquesta escala no \xc3\xa9s una freq\xc3\xbc\xc3\xa8ncia utilitzable - els seus graus o el seu per\xc3\xado" "de se surten del que un n\xc3\xbamero pot contenir. No s'ha carregat res." },
+        { "Key % of this tuning table is not a usable frequency. Nothing was loaded.",
+          "La tecla % d'aquesta taula d'afinaci\xc3\xb3 no \xc3\xa9s una freq\xc3\xbc\xc3\xa8ncia utilitzable. No s'ha carregat res." },
+        { "Bad basefreq in .tun: \"%\".",
+          "basefreq incorrecta al .tun: \"%\"." },
+        { "Bad value for note % in .tun: \"%\".",
+          "Valor incorrecte per a la nota % del .tun: \"%\"." },
+        { "Note % in this .tun is not a finite pitch.",
+          "La nota % d'aquest .tun no \xc3\xa9s un to finit." },
+        { "Note % in this .tun is not a usable frequency.",
+          "La nota % d'aquest .tun no \xc3\xa9s una freq\xc3\xbc\xc3\xa8ncia utilitzable." },
+        { "This .tun only specifies % of the 128 MIDI notes. Nothing was loaded - the rest would have to be invented.",
+          "Aquest .tun nom\xc3\xa9s especifica % de les 128 notes MIDI. No s'ha carregat res - la resta s'hauria d'inventar." },
+        { "Invalid note count (%).",
+          "Nombre de notes inv\xc3\xa0lid (%)." },
+        { "File declares % notes but has fewer.",
+          "El fitxer declara % notes per\xc3\xb2 en t\xc3\xa9 menys." },
+        { "Bad pitch on line %: \"%\"",
+          "To incorrecte a la l\xc3\xadnia %: \"%\"" },
+    };
 }
 
 
@@ -1464,6 +1514,39 @@ private:
         for (const auto& p : fgerr::table)
             if (fromProcessor == juce::String::fromUTF8 (p.en))
                 return juce::String::fromUTF8 (p.ca);
+
+        // ...THEN THE ONES THAT CARRY A VALUE. The English template's literal chunks are
+        // consumed in order and whatever sits between them is a value; if every chunk is
+        // found, the Catalan template is rebuilt with those values put back. The chunks
+        // must be consumed IN ORDER and the first must sit at the very start, or a short
+        // stub like `"Bad ratio: \""` would match halfway through an unrelated sentence.
+        for (const auto& p : fgerr::patterns)
+        {
+            const auto en = juce::StringArray::fromTokens (juce::String::fromUTF8 (p.en), "%", "");
+            juce::StringArray vals;
+            int at = 0; bool ok = true;
+            for (int i = 0; i < en.size() && ok; ++i)
+            {
+                if (en[i].isEmpty()) continue;                 // a value at either end
+                const int f = fromProcessor.indexOf (at, en[i]);
+                if (f < 0 || (i == 0 && f != 0)) { ok = false; break; }
+                if (i > 0) vals.add (fromProcessor.substring (at, f));
+                at = f + en[i].length();
+            }
+            // A trailing value (the template ends with '%') is whatever is left over.
+            if (ok && juce::String::fromUTF8 (p.en).endsWithChar ('%')) vals.add (fromProcessor.substring (at));
+            else if (ok && at != fromProcessor.length())        ok = false;
+            if (! ok) continue;
+
+            const auto ca = juce::StringArray::fromTokens (juce::String::fromUTF8 (p.ca), "%", "");
+            juce::String out;
+            for (int i = 0; i < ca.size(); ++i)
+            {
+                out += ca[i];
+                if (i < ca.size() - 1 && i < vals.size()) out += vals[i];
+            }
+            return out;
+        }
         return fromProcessor;
     }
     void timerCallback() override;
@@ -6400,6 +6483,12 @@ private:
     juce::Label meterLabel, helpLabel;
 
     bool catalan = false;
+public:
+    // TESTS: trErr answers its input unchanged in English by design, so a test of the
+    // TRANSLATION has to say which language it is asking in.
+    void setLanguageForTests (bool ca) { catalan = ca; }
+    juce::String trErrForTests (const juce::String& s) const { return trErr (s); }
+private:
     // Guards for the read-out refresh applyLanguage() ends with (see its tail).
     // `editorConstructed` keeps the constructor's own applyLanguage() from running a
     // timer tick before setSize() and applyEngineState() have happened; `inLanguageRefresh`

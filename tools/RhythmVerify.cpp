@@ -19534,8 +19534,30 @@ int main (int argc, char** argv)
                 // FIXED means the statement ends the moment the literal does: anything
                 // after the closing quote - a `+`, a String(), a concatenated value - makes
                 // it composed, whatever the rest of the line looks like.
-                if (close >= 0 && tail == ";") fixed.addIfNotAlreadyThere (lit);
-                else                           composed.addIfNotAlreadyThere (lit);
+                // startsWith, not equals: a statement may be followed by more code on the
+                // same line (`; refreshPlaygroundActive(); return false; }`), and four fixed
+                // messages were being called composed for that alone.
+                if (close >= 0 && tail.startsWithChar (';')) { fixed.addIfNotAlreadyThere (lit); continue; }
+
+                // A COMPOSED MESSAGE IS ITS OWN TEMPLATE. Every string literal left in the
+                // statement is a fixed chunk, and every gap between them is where a value
+                // goes - so joining the literals with '%' reconstructs exactly the template
+                // the editor needs to translate it. Read from the source rather than typed
+                // out a second time, for the reason fgdlg exists: a copy goes stale.
+                juce::String tmpl;
+                for (int i = 0; i < ln.length(); ++i)
+                {
+                    if (ln[i] != '"') continue;
+                    juce::String chunk;
+                    for (++i; i < ln.length(); ++i)
+                    {
+                        if (ln[i] == '\\' && i + 1 < ln.length()) { chunk += ln[i]; chunk += ln[i + 1]; ++i; continue; }
+                        if (ln[i] == '"') break;
+                        chunk += ln[i];
+                    }
+                    tmpl += (tmpl.isEmpty() ? "" : "%") + chunk;
+                }
+                composed.addIfNotAlreadyThere (tmpl);
             }
         }
         // THE SOURCE TEXT IS DECODED BEFORE IT IS COMPARED, and the earlier version of
@@ -19588,8 +19610,71 @@ int main (int argc, char** argv)
         check (missing.isEmpty(),
                "every FIXED refusal the processor writes has a Catalan side in fgerr::table -"
                " a new one fails this until it is translated");
-        std::printf ("  still English, because they are composed with a runtime value and"
-                     " need the typed-code design: %d\n", composed.size());
+        // ...AND EVERY COMPOSED ONE HAS A TEMPLATE. Same rule as the fixed half: the
+        // template is rebuilt FROM THE SOURCE, so a message reworded tomorrow fails this
+        // until fgerr::patterns is reworded with it.
+        juce::StringArray noPattern;
+        for (const auto& c : composed)
+        {
+            const auto want = decodeEscapes (c);
+            bool found = false;
+            for (const auto& p : fgerr::patterns)
+                if (want == juce::String::fromUTF8 (p.en)) { found = true; break; }
+            if (! found) noPattern.add (c);
+        }
+        std::printf ("  composed with a runtime value, translated by TEMPLATE: %d;"
+                     " %d without one\n", composed.size(), noPattern.size());
+        for (int i = 0; i < juce::jmin (12, noPattern.size()); ++i)
+            std::printf ("    no template: \"%s\"\n", noPattern[i].toRawUTF8());
+        check (composed.size() >= 10,
+               "  (gate) the walk really found the composed refusals too");
+        check (noPattern.isEmpty(),
+               "...and every COMPOSED refusal has a Catalan template, so a value dropped into"
+               " a sentence does not drag the sentence back into English");
+    }
+
+    //== THE TEMPLATE MATCHER PUTS THE VALUES WHERE CATALAN WANTS THEM ==============
+    //
+    // Having a template is not the same as filling it correctly, and this is where the
+    // whole idea can fail silently: a matcher that quietly returns the English, or one
+    // that gets two values the wrong way round, still "translates" and still looks fine
+    // in a table. Driven through the editor's own trErr, in Catalan, on the real strings
+    // the processor writes.
+    {
+        std::printf ("\nthe refusal templates are filled, not just matched:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();
+        auto& p = *pp;
+        p.prepareToPlay (48000.0, 256);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "the editor builds");
+        if (ed != nullptr)
+        {
+            ed->setLanguageForTests (true);   // Catalan, or trErr returns its input by design
+            const auto one = ed->trErrForTests ("Bad ratio: \"7/0\"");
+            const auto two = ed->trErrForTests ("Bad value for note 61 in .tun: \"xyz\".");
+            const auto fix = ed->trErrForTests ("File not found.");
+            const auto non = ed->trErrForTests ("Something nobody ever wrote.");
+            std::printf ("  one value : %s\n  two values: %s\n  fixed     : %s\n  unknown   : %s\n",
+                         one.toRawUTF8(), two.toRawUTF8(), fix.toRawUTF8(), non.toRawUTF8());
+
+            check (one != "Bad ratio: \"7/0\"" && one.contains ("7/0"),
+                   "a one-value refusal is translated AND keeps the value the user typed");
+            // The two-value case is the one that catches an off-by-one in the matcher:
+            // both values must come back, in their own places, not swapped or merged.
+            check (two.contains ("61") && two.contains ("xyz") && two != "Bad value for note 61 in .tun: \"xyz\".",
+                   "...and a two-value one keeps BOTH, which is where a matcher goes wrong");
+            check (two.indexOf ("61") < two.indexOf ("xyz"),
+                   "...in the right order - the note number before the bad text, as the"
+                   " sentence reads");
+            check (fix != "File not found." && fix.isNotEmpty(),
+                   "  (gate) the fixed table still answers, so the pattern pass did not"
+                   " swallow the exact matches");
+            check (non == "Something nobody ever wrote.",
+                   "and a message in neither list falls through UNCHANGED - which is what"
+                   " makes this safe to leave half-finished");
+        }
     }
    #else
     std::printf ("\n  [SKIP] refusal-table audit: FG_SOURCE_DIR not defined\n");
