@@ -19397,6 +19397,46 @@ int main (int argc, char** argv)
                    "...and it names what IS playing, rather than only saying what is not");
             if (ed->isOnDesktop()) ed->removeFromDesktop();
         }
+
+        //-- ...AND THE OTHER BRANCH, WHICH I HAD WRITTEN OFF AS UNTESTABLE -----------
+        //
+        // I told the user the letter layout could only be checked by hand, because this
+        // suite builds the editor as a plugin. That was wrong: JUCE lets a caller DECLARE
+        // the wrapper of the next processor it constructs (setTypeOfNextNewPlugin, used by
+        // every wrapper JUCE ships), so the standalone branch is one line away and the
+        // half of the feature the user actually asked for was going out unverified.
+        //
+        // The two branches are now checked against each other in one place, which is the
+        // only way to be sure the gate is a FORK and not a constant.
+        juce::AudioProcessor::setTypeOfNextNewPlugin (juce::AudioProcessor::wrapperType_Standalone);
+        auto sp = std::make_unique<Proc>();
+        juce::AudioProcessor::setTypeOfNextNewPlugin (juce::AudioProcessor::wrapperType_Undefined);
+        sp->prepareToPlay (48000.0, 256);
+        std::unique_ptr<juce::AudioProcessorEditor> sbase (sp->createEditor());
+        auto* sed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (sbase.get());
+        if (sed != nullptr)
+        {
+            sed->setSize (1200, 650);
+            sed->setTopLeftPosition (-4000, -4000);
+            sed->setVisible (true);
+            sed->addToDesktop (0);
+            const bool peer = sed->getPeer() != nullptr;
+            if (peer) sed->grabKeyboardFocus();
+            std::printf ("  standalone: wrapperType %s, on a peer %d, holds the keyboard %d\n",
+                         sp->getWrapperTypeDescription (sp->wrapperType), (int) peer,
+                         (int) (peer && sed->editorHasFocusForTests()));
+            check (sp->wrapperType == juce::AudioProcessor::wrapperType_Standalone,
+                   "  (gate) a processor really can be built as the STANDALONE here");
+            check (peer && sed->editorHasFocusForTests(),
+                   "  (gate) ...and that editor holds the keyboard too, so the two branches"
+                   " differ by the wrapper and by nothing else");
+            check (sed->playKeysLiveForTests(),
+                   "IN THE STANDALONE the letter layout DOES play - the half of this the user"
+                   " asked for, and the half I had written off as unverifiable");
+            check (sed->keyboardHelpTextForTests (true).contains ("A S D F"),
+                   "...and the line under the keys is the letter one there");
+            if (sed->isOnDesktop()) sed->removeFromDesktop();
+        }
     }
 
     //== WHAT MONO GLIDE COSTS WHEN IT LETS GO OF THE VOICES =======================
