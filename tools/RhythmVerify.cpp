@@ -20681,6 +20681,260 @@ int main (int argc, char** argv)
                      "        gains - sabotaged, it still passes. See the comment above it.\n");
     }
 
+    //== EVERY FADER IN THE SPECTRUM PANEL REACHES THE SOUND ========================
+    //
+    // "todos los controles de harmonic engine no funcionan ni los de custom engine
+    //  tampoco."
+    //
+    // THE THIRD THING NOTHING HERE EVER CHECKED, and the one that matches the complaint
+    // exactly. The reachability sweep asks whether a click lands on the control. The
+    // attachment sweep asks whether a parameter moves. NEITHER asks the only question a
+    // player asks: does the sound change. A fader can be on screen, hit-testable,
+    // enabled, wired to the right parameter id - and still change nothing audible,
+    // because the engine that reads that parameter never recompiles.
+    //
+    // Measured end to end: a fresh note, the same window, sample-by-sample compared.
+    // Everything the real app does between the move and the sound is done here -
+    // pollParametersForTests (the PROCESSOR's own 60 Hz timer, where the rebuild test
+    // lives; a console app has no message loop, so without it nothing ever recompiles and
+    // every control reads as dead), then the worker, then blocks.
+    {
+        std::printf ("\nevery fader in the spectrum panel reaches the sound:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->setPlayConfigDetails (0, 2, 48000.0, 512);
+        p->prepareToPlay (48000.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        if (ed == nullptr) { check (false, "(gate) the editor for the reaches-the-sound sweep exists"); }
+        else
+        {
+            ed->setVisible (true);
+            ed->setSize (1200, 650);
+            juce::AudioBuffer<float> buf (2, 512);
+            juce::MidiBuffer mid;
+            auto settle = [&] (int n)
+            {
+                for (int i = 0; i < n; ++i)
+                { p->pollParametersForTests(); buf.clear(); p->processBlock (buf, mid); ed->tickTimerForTests(); }
+            };
+            auto take = [&]
+            {
+                juce::AudioBuffer<float> acc (2, 512 * 10);
+                acc.clear();
+                mid.clear();
+                mid.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+                for (int i = 0; i < 40; ++i) { buf.clear(); p->processBlock (buf, mid); mid.clear(); }
+                mid.addEvent (juce::MidiMessage::noteOn (1, 60, 0.9f), 0);
+                for (int b = 0; b < 10; ++b)
+                {
+                    buf.clear(); p->processBlock (buf, mid); mid.clear();
+                    for (int ch = 0; ch < 2; ++ch) acc.copyFrom (ch, b * 512, buf, ch, 0, 512);
+                }
+                return acc;
+            };
+            auto diff = [] (const juce::AudioBuffer<float>& a, const juce::AudioBuffer<float>& b)
+            {
+                double d = 0.0;
+                for (int ch = 0; ch < a.getNumChannels(); ++ch)
+                    for (int i = 0; i < a.getNumSamples(); ++i)
+                        d = juce::jmax (d, std::abs ((double) a.getSample (ch, i) - b.getSample (ch, i)));
+                return d;
+            };
+
+            settle (40);
+            int moved = 0, inert = 0, exempt = 0;
+            juce::StringArray dead;
+            const auto panel = ed->layoutProbe().spectrum;
+            for (auto* c : ed->getChildren())
+            {
+                auto* s = dynamic_cast<juce::Slider*> (c);
+                if (s == nullptr || ! s->isVisible() || ! s->isEnabled()) continue;
+                if (! panel.contains (c->getBounds())) continue;
+                const double lo = s->getMinimum(), hi = s->getMaximum();
+                if (! (hi > lo)) continue;
+
+                const double was  = s->getValue();
+                const double want = (was - lo) > (hi - was) ? lo + (hi - lo) * 0.15
+                                                            : lo + (hi - lo) * 0.85;
+                const auto before = take();
+                std::vector<float> pv0;
+                for (auto* ap : p->getParameters()) pv0.push_back (ap->getValue());
+                s->setValue (want, juce::sendNotificationSync);
+                settle (16);
+                awaitSpectrumIdle (*p, "spectrum fader reaches the sound");
+                settle (8);
+                const auto after = take();
+                const double d = diff (before, after);
+
+                juce::String id;
+                const auto& all = p->getParameters();
+                for (int i = 0; i < all.size() && i < (int) pv0.size(); ++i)
+                    if (std::abs (all[i]->getValue() - pv0[(size_t) i]) > 1.0e-6f)
+                        if (auto* w = dynamic_cast<juce::AudioProcessorParameterWithID*> (all[i]))
+                        { id = w->paramID; break; }
+
+                // TRANSITION's Time fader is inert while the transition is OFF, which is
+                // its shipped default and is what the greyed colour says. Exempt BY NAME
+                // and printed, never by loosening the rule - an exemption nobody can see
+                // is how the next dead control hides.
+                const bool isTransTime = id == "dryWetTime" || id == "morphTime";
+                std::printf ("  %-14s %.4f -> %.4f   audio changed by %.6f%s\n",
+                             id.isEmpty() ? "(no param)" : id.toRawUTF8(), was, s->getValue(), d,
+                             d > 1.0e-6 ? "" : (isTransTime ? "   (inert: the transition is OFF)"
+                                                            : "   <-- INERT"));
+                if (d > 1.0e-6)      ++moved;
+                else if (isTransTime) ++exempt;
+                else { ++inert; dead.add (id.isEmpty() ? juce::String ("(no param)") : id); }
+
+                s->setValue (was, juce::sendNotificationSync);
+                settle (16);
+                awaitSpectrumIdle (*p, "spectrum fader restore");
+                settle (8);
+            }
+            std::printf ("  %d faders reach the sound, %d do not, %d exempt\n", moved, inert, exempt);
+            check (moved >= 4, "(gate) the sweep really drove the panel's faders");
+            check (inert == 0,
+                   (juce::String ("every fader in the SPECTRUM panel changes the rendered audio"
+                                  " when it moves") + (dead.isEmpty() ? juce::String()
+                                    : " - dead: " + dead.joinIntoString (", "))).toRawUTF8());
+        }
+    }
+
+    //== SWITCHING ENGINE, AND RETYPING THE RATIOS, REACH THE SOUND =================
+    //
+    // "esta como bloqueado en un estado del custom parece, y como que cambiar de harmonic
+    //  a custom no produce ningun cambio en el espectro que se escucha sonar, y cambiar el
+    //  texto de la caja de texto de ratios del menu custom tampoco afecta."
+    //
+    // The fader sweep above covers the CONTROLS in that panel. It does not cover the two
+    // things actually reported: the engine CHOICE, and the typed spectrum. Both change
+    // the compiled template through a different path from a fader - selectEngineView
+    // writes parameters, loadTimbreText parses text and republishes - and neither had a
+    // check that the SOUND follows.
+    //
+    // Four takes, each a fresh note over the same window, compared sample by sample:
+    // harmonic, then custom, then custom with DIFFERENT ratios, then harmonic again.
+    {
+        std::printf ("\nthe engine switch and the typed ratios reach the sound:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->setPlayConfigDetails (0, 2, 48000.0, 512);
+        p->prepareToPlay (48000.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        if (ed == nullptr) { check (false, "(gate) the editor for the engine-switch sweep exists"); }
+        else
+        {
+            ed->setVisible (true);
+            ed->setSize (1200, 650);
+            juce::AudioBuffer<float> buf (2, 512);
+            juce::MidiBuffer mid;
+            auto settle = [&] (int n)
+            {
+                for (int i = 0; i < n; ++i)
+                { p->pollParametersForTests(); buf.clear(); p->processBlock (buf, mid); ed->tickTimerForTests(); }
+            };
+            auto rest = [&] (const char* what)
+            {
+                settle (16); awaitSpectrumIdle (*p, what); settle (8);
+            };
+            auto take = [&]
+            {
+                juce::AudioBuffer<float> acc (2, 512 * 10);
+                acc.clear();
+                mid.clear();
+                mid.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+                for (int i = 0; i < 40; ++i) { buf.clear(); p->processBlock (buf, mid); mid.clear(); }
+                mid.addEvent (juce::MidiMessage::noteOn (1, 60, 0.9f), 0);
+                for (int b = 0; b < 10; ++b)
+                {
+                    buf.clear(); p->processBlock (buf, mid); mid.clear();
+                    for (int ch = 0; ch < 2; ++ch) acc.copyFrom (ch, b * 512, buf, ch, 0, 512);
+                }
+                return acc;
+            };
+            auto diff = [] (const juce::AudioBuffer<float>& a, const juce::AudioBuffer<float>& b)
+            {
+                double d = 0.0;
+                for (int ch = 0; ch < a.getNumChannels(); ++ch)
+                    for (int i = 0; i < a.getNumSamples(); ++i)
+                        d = juce::jmax (d, std::abs ((double) a.getSample (ch, i) - b.getSample (ch, i)));
+                return d;
+            };
+
+            juce::String err;
+            const bool loadedA = p->loadTimbreText ("1\n3/2\n7/4\n", err);
+            rest ("timbre A loaded");
+            check (loadedA, "(gate) a typed spectrum really loads");
+
+            ed->clickEngineChipForTests (0);          // HARMONIC
+            rest ("harmonic");
+            const auto harm  = take();
+            const int  nHarm = p->getPartialCount();
+
+            ed->clickEngineChipForTests (1);          // CUSTOM
+            rest ("custom");
+            const auto cust  = take();
+            const int  nCust = p->getPartialCount();
+
+            const bool loadedB = p->loadTimbreText ("1\n5/4\n11/8\n13/8\n19/8\n", err);
+            rest ("timbre B loaded");
+            const auto cust2  = take();
+            const int  nCust2 = p->getPartialCount();
+
+            ed->clickEngineChipForTests (0);          // back to HARMONIC
+            rest ("harmonic again");
+            const auto harm2  = take();
+            const int  nHarm2 = p->getPartialCount();
+
+            std::printf ("  partials: harmonic %d  ->  custom %d  ->  custom retyped %d"
+                         "  ->  harmonic %d\n", nHarm, nCust, nCust2, nHarm2);
+            std::printf ("  audio differs: harmonic->custom %.6f   retype %.6f   custom->harmonic %.6f"
+                         "   (harmonic vs harmonic again %.6f)\n",
+                         diff (harm, cust), diff (cust, cust2), diff (cust2, harm2), diff (harm, harm2));
+            check (loadedB, "(gate) the second typed spectrum really loads");
+            check (diff (harm, harm) < 1.0e-9,
+                   "(gate) two takes of the SAME state are identical, so a difference means something");
+            check (diff (harm, cust) > 1.0e-6,
+                   "switching HARMONIC -> CUSTOM changes the spectrum you hear");
+            check (diff (cust, cust2) > 1.0e-6,
+                   "...and retyping the ratios in the custom box changes it again");
+            check (diff (cust2, harm2) > 1.0e-6,
+                   "...and switching back to HARMONIC changes it once more");
+            check (diff (harm, harm2) < 1.0e-6,
+                   "...and HARMONIC sounds the same as it did before the detour - the custom"
+                   " spectrum is left behind, not stuck on");
+
+            // ...AND THE SAME THING TYPED BY A HAND. Everything above drove the processor
+            // API. The report is about the BOX: "cambiar el texto de la caja de texto de
+            // ratios del menu custom tampoco afecta". The two typing probes that already
+            // exist return what the PROCESSOR ended up holding - they have never asked
+            // whether the SOUND followed, which is the whole of the complaint.
+            ed->clickEngineChipForTests (1);
+            rest ("custom, for typing");
+            const auto beforeTyping = take();
+            // SPACES, NOT NEWLINES. juce::TextEditor does not insert '\n' arriving as a
+            // KeyPress character, so a list typed with newlines came out as one mangled
+            // token, the commit refused it, the processor kept the previous list and the
+            // audio did not move - which read exactly like the reported defect. Every
+            // other interval probe in this file types space-separated for the same reason.
+            const auto held = ed->typeThenBlurForTests ("1 7/6 5/3");
+            rest ("typed and blurred");
+            const auto afterTyping = take();
+            std::printf ("  typed into the box, then clicked away: processor holds \"%s\","
+                         " partials %d, audio moved %.6f\n",
+                         held.replace ("\n", " ").toRawUTF8(), p->getPartialCount(),
+                         diff (beforeTyping, afterTyping));
+            // NOT "isNotEmpty": the processor is holding a list either way, and the first
+            // version of this gate passed while the box's typing had been thrown away and
+            // the OLD list was what came back. It has to contain what was TYPED.
+            check (held.contains ("7/6"),
+                   "(gate) the list typed into the box is the one the processor ends up holding");
+            check (diff (beforeTyping, afterTyping) > 1.0e-6,
+                   "typing a new list into the ratios box and clicking away changes the"
+                   " spectrum you HEAR, not only the string the processor stores");
+        }
+    }
+
     runProcessorAuditChecks();
     runSilentLimitChecks();
 
