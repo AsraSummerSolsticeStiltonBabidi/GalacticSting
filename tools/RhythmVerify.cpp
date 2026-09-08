@@ -20935,6 +20935,124 @@ int main (int argc, char** argv)
         }
     }
 
+    //== WITH THE PLAYGROUND ENGAGED, DOES THE SPECTRUM PANEL STILL DO ANYTHING? ====
+    //
+    // "esta como bloqueado en un estado del custom parece, y como que cambiar de harmonic
+    //  a custom no produce ningun cambio en el espectro que se escucha sonar."
+    //
+    // timerCallback: `if (! pgActive || pgMixDriving) spectrumEngine.requestRebuild (s);`
+    //
+    // pgActive is NOT a switch the user throws. It becomes true on its own the moment TWO
+    // playground corners are assigned (getPlaygroundAssignedCount() >= 2). From that
+    // instant, in morph mode, no edit to the spectrum is ever compiled: BASE, HARMONICS,
+    // FRACTAL, the engine chips and the ratios box all stop reaching the sound, and what
+    // is heard is the blend of the corners - which is very often somebody's custom
+    // spectrum. Every one of those controls stays enabled, lit, and answering the mouse.
+    //
+    // The DSP reason for skipping is sound (compiling here would publish over the blend a
+    // moment later). What this asks is the other half: whether the instrument SAYS so.
+    {
+        std::printf ("\nthe spectrum panel while the PLAYGROUND drives the sound:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->setPlayConfigDetails (0, 2, 48000.0, 512);
+        p->prepareToPlay (48000.0, 512);
+        auto sp = [&] (const char* id, float plain)
+        { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (plain)); };
+
+        sp ("timbreOn", 0.0f); sp ("baseN", 1.0f); sp ("curveSlope", 1.0f);
+        p->pollParametersForTests();
+        const bool savedA = p->savePreset ("zzz-verify-pgdead-A").isNotEmpty();
+        juce::String err;
+        p->loadTimbreText ("5/4 3/2 2", err);
+        sp ("timbreOn", 1.0f); sp ("baseN", 9.0f); sp ("curveSlope", 2.5f);
+        p->pollParametersForTests();
+        const bool savedB = p->savePreset ("zzz-verify-pgdead-B").isNotEmpty();
+        check (savedA && savedB, "(gate) two corner presets really saved (scratch folder)");
+
+        juce::String e1, e2;
+        const bool a0 = p->assignPlaygroundCorner (0, "zzz-verify-pgdead-A", e1);
+        const bool a1 = p->assignPlaygroundCorner (1, "zzz-verify-pgdead-B", e2);
+        p->pollParametersForTests();
+        std::printf ("  corners assigned: %d %d   playground active: %d   mix engaged: %d\n",
+                     (int) a0, (int) a1, (int) p->isPlaygroundActive(),
+                     (int) p->isPlaygroundMixEngaged());
+        check (a0 && a1, "(gate) both corners were accepted");
+        check (p->isPlaygroundActive(),
+               "(gate) TWO assigned corners turn the playground on by themselves - no switch"
+               " is thrown, which is the whole point");
+
+        std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        if (ed == nullptr) { check (false, "(gate) the editor for the playground sweep exists"); }
+        else
+        {
+            ed->setVisible (true);
+            ed->setSize (1200, 650);
+            juce::AudioBuffer<float> buf (2, 512);
+            juce::MidiBuffer mid;
+            auto settle = [&] (int n)
+            { for (int i = 0; i < n; ++i)
+              { p->pollParametersForTests(); buf.clear(); p->processBlock (buf, mid); ed->tickTimerForTests(); } };
+            auto take = [&]
+            {
+                juce::AudioBuffer<float> acc (2, 512 * 10);
+                acc.clear(); mid.clear();
+                mid.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+                for (int i = 0; i < 40; ++i) { buf.clear(); p->processBlock (buf, mid); mid.clear(); }
+                mid.addEvent (juce::MidiMessage::noteOn (1, 60, 0.9f), 0);
+                for (int b = 0; b < 10; ++b)
+                { buf.clear(); p->processBlock (buf, mid); mid.clear();
+                  for (int ch = 0; ch < 2; ++ch) acc.copyFrom (ch, b * 512, buf, ch, 0, 512); }
+                return acc;
+            };
+            auto diff = [] (const juce::AudioBuffer<float>& a, const juce::AudioBuffer<float>& b)
+            {
+                double d = 0.0;
+                for (int ch = 0; ch < a.getNumChannels(); ++ch)
+                    for (int i = 0; i < a.getNumSamples(); ++i)
+                        d = juce::jmax (d, std::abs ((double) a.getSample (ch, i) - b.getSample (ch, i)));
+                return d;
+            };
+
+            settle (60);
+            const auto before = take();
+            sp ("baseN", 33.0f);
+            settle (24); awaitSpectrumIdle (*p, "playground baseN"); settle (8);
+            const auto afterBase = take();
+            ed->clickEngineChipForTests (1);
+            settle (24); awaitSpectrumIdle (*p, "playground engine switch"); settle (8);
+            const auto afterSwitch = take();
+
+            const double dBase = diff (before, afterBase);
+            const double dSwit = diff (afterBase, afterSwitch);
+            std::printf ("  audio moved: BASE N %.6f   HARMONIC->CUSTOM %.6f\n", dBase, dSwit);
+
+            // WHETHER THE CONTROLS ACT IS NOT WHAT THIS ASSERTS - the blend is allowed to
+            // own the spectrum. What it asserts is that the panel does not sit there
+            // enabled and lit while none of it reaches the sound. Either the controls act,
+            // or the window says they cannot.
+            const bool inert  = dBase < 1.0e-6 && dSwit < 1.0e-6;
+            bool       stated = false;
+            if (inert)
+            {
+                const auto n = ed->noticeProbeForTests();
+                const auto q = ed->layoutProbe();
+                int lit = 0;
+                for (auto* c : ed->getChildren())
+                    if (auto* s = dynamic_cast<juce::Slider*> (c))
+                        if (s->isVisible() && q.spectrum.contains (c->getBounds()) && s->isEnabled())
+                            ++lit;
+                stated = n.visible || lit == 0;
+                std::printf ("  the panel is INERT. notice on screen: %d   faders still"
+                             " enabled in it: %d\n", (int) n.visible, lit);
+            }
+            check (! inert || stated,
+                   "with the PLAYGROUND driving the spectrum, the panel that no longer reaches"
+                   " the sound SAYS so - it does not sit there enabled and lit while every"
+                   " edit is discarded");
+        }
+    }
+
     runProcessorAuditChecks();
     runSilentLimitChecks();
 
