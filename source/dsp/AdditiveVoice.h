@@ -1889,7 +1889,16 @@ private:
                     output.addSample (ch, startSample, 0.5f * (sL + sR));
             }
             else if (numChannels == 1)
-                output.addSample (0, startSample, sL + sR);
+                // THE 0.5 THAT WAS NOT HERE. Two lines up, the 3+-channel branch folds
+                // with it; this one summed raw, so with BINAURAL at its default of zero -
+                // where sL and sR are each the whole signal, because binOn and binOff are
+                // both 1 - a mono instance came out SIX DECIBELS louder than the same
+                // patch before this control existed. Written the day the control shipped,
+                // green through every check in the build, because nothing in the suite
+                // ever rendered this synth into a mono bus. Mono is a layout this plugin
+                // says yes to (isBusesLayoutSupported), so it is a layout it has to be
+                // right in.
+                output.addSample (0, startSample, 0.5f * (sL + sR));
 
             ++startSample;
 

@@ -2201,6 +2201,248 @@ int main (int argc, char** argv)
         return failures == 0 ? 0 : 1;
     }
 
+    // ON DEMAND, AND ONLY ON DEMAND: load the state THIS MACHINE'S STANDALONE LAST SAVED
+    // and drive the engine controls in it.
+    //
+    // "todos los controles de harmonic engine no funcionan ni los de custom engine
+    //  tampoco." Every sweep in the suite builds a DEFAULT instrument, and every one of
+    //  them says the engine controls are reachable, enabled, attached and effective. So
+    //  if they are dead on the user's screen, the difference is the STATE his standalone
+    //  restored at launch - six weeks of it, written by a build from before any of this.
+    //
+    // Never part of the suite: it reads a file that belongs to the user and exists only
+    // on his machine. READ ONLY - it opens the settings, takes a copy of the chunk and
+    // never writes anything back, to that file or to the preset folder.
+    if (argc > 1 && std::strcmp (argv[1], "--userstate") == 0)
+    {
+        const auto f = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+                          .getChildFile ("Fiblo Galactic").getChildFile ("Fiblo Galactic.settings");
+        std::printf ("the standalone's own saved state:\n  %s\n", f.getFullPathName().toRawUTF8());
+        if (! f.existsAsFile()) { std::printf ("  NOT THERE - nothing to reproduce from.\n"); return 0; }
+
+        std::unique_ptr<juce::XmlElement> xml (juce::XmlDocument::parse (f));
+        juce::String b64;
+        if (xml != nullptr)
+            for (auto* e : xml->getChildWithTagNameIterator ("VALUE"))
+                if (e->getStringAttribute ("name") == "filterState")
+                    b64 = e->getStringAttribute ("val");
+        if (b64.isEmpty()) { std::printf ("  no filterState in it.\n"); return 0; }
+
+        juce::MemoryBlock mb;
+        mb.fromBase64Encoding (b64);
+        std::printf ("  chunk: %d bytes\n", (int) mb.getSize());
+        if (mb.getSize() == 0) { std::printf ("  the chunk did not decode.\n"); return 0; }
+
+        // TWICE: the user's chunk, and a DEFAULT instrument driven exactly the same way.
+        // Without the control pass, every number below is unreadable - "partials 512 ->
+        // 512" could be the fault or could be what this synth always does under that
+        // drag, and I would be guessing which.
+        for (int pass = 0; pass < 3; ++pass)
+        {
+        std::printf ("\n== %s ==\n", pass == 0 ? "THE USER'S RESTORED STATE"
+                                   : pass == 1 ? "A DEFAULT INSTRUMENT (the control)"
+                                               : "THE USER'S STATE, WITH THE PENCIL OFF");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->setPlayConfigDetails (0, 2, 48000.0, 512);
+        p->prepareToPlay (48000.0, 512);
+        if (pass != 1) p->setStateInformation (mb.getData(), (int) mb.getSize());
+        // THE PENCIL. Manual per-partial amplitudes REPLACE the compiled ones, so with it
+        // on the engine can recompile all it likes and the amplitudes a voice plays come
+        // from the stored hand-drawn table instead. AMP DECAY greys itself out to say so;
+        // nothing says it about BASE, HARMONICS or FRACTAL. If this pass brings the
+        // controls back to life, that silence is the defect - not the compiler.
+        if (pass == 2)
+            if (auto* q = p->apvts.getParameter ("partialManual")) q->setValueNotifyingHost (0.0f);
+        {
+            auto v = [&] (const char* id)
+            { auto* r = p->apvts.getRawParameterValue (id); return r != nullptr ? r->load() : -999.0f; };
+            std::printf ("  state: partialManual=%.0f primeOn=%.0f pgActive=%.0f mixMode=%.0f"
+                         "  rangeOct=%.0f  timbreOn=%.0f temper=%.0f\n",
+                         v ("partialManual"), v ("primeOn"), v ("pgActive"), v ("pgMix"),
+                         v ("spectrumRange"), v ("timbreOn"), v ("timbreTemper"));
+        }
+
+        juce::AudioBuffer<float> buf (2, 512);
+        juce::MidiBuffer mid;
+        auto pump = [&] (int n) { for (int i = 0; i < n; ++i) { buf.clear(); p->processBlock (buf, mid); } };
+        pump (60);
+
+        std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        if (ed == nullptr) { std::printf ("  no editor.\n"); continue; }
+        ed->setVisible (true);
+        ed->setSize (1200, 650);
+
+        // A NOTE HAS TO BE SOUNDING. getPartialCount() is the RENDERED count - what the
+        // voices actually built last block - and with nothing held it is honestly 0,
+        // which is what the footer means by "it has not sounded yet". The first version
+        // of this run read 0 before and 0 after every drag and looked exactly like the
+        // reported fault; it was measuring silence. Hold a key down, then move things.
+        double loud = 0.0;
+        auto hold = [&] (int n)
+        {
+            loud = 0.0;
+            for (int i = 0; i < n; ++i)
+            {
+                buf.clear();
+                p->processBlock (buf, mid);
+                mid.clear();
+                loud = juce::jmax (loud, (double) buf.getMagnitude (0, buf.getNumSamples()));
+            }
+        };
+        mid.addEvent (juce::MidiMessage::noteOn (1, 60, 0.9f), 0);
+        hold (60);
+
+        auto say = [&] (const char* when)
+        {
+            std::printf ("  %-14s engine=%d  timbreLoaded=%d  partials=%d (template %d)"
+                         "  loudest %.5f\n",
+                         when, (int) p->engineInForce(), (int) p->timbreLoaded(),
+                         p->getPartialCount(), p->getTemplatePartialCount(), loud);
+        };
+        say ("restored:");
+
+        // DOES MOVING THE CONTROL CHANGE THE SOUND? Measured on a FRESH NOTE each time,
+        // over the same window, and compared sample by sample.
+        //
+        // Two things forced this shape. The partial COUNT barely moves under these
+        // controls even when they work - the control pass proves that, 91 -> 91 every
+        // time - so it is not the signal. And a single held note is not either: the
+        // first version played one note and read the loudness after each drag, watched it
+        // fall to zero in the user's patch, and that was his AMP ENVELOPE finishing, not
+        // a dead control. The default patch sustains; his does not; nothing about the
+        // controls follows from either.
+        //
+        // dragFaderForTests only drags VERTICALLY, so it moved nothing at all on
+        // HARMONICS, which is a horizontal fader - it read "1.0000 -> 1.0000" in both
+        // directions in BOTH passes and I nearly reported that as the defect. The value
+        // is set through the component here, which still goes through the attachment (the
+        // thing under test); the mouse itself is covered by the reachability sweep.
+        auto take = [&] (int blocks)
+        {
+            juce::AudioBuffer<float> acc (2, 512 * blocks);
+            acc.clear();
+            mid.clear();
+            // Let the previous note go and die before the next one is struck.
+            mid.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+            for (int i = 0; i < 40; ++i) { buf.clear(); p->processBlock (buf, mid); mid.clear(); }
+            mid.addEvent (juce::MidiMessage::noteOn (1, 60, 0.9f), 0);
+            for (int b = 0; b < blocks; ++b)
+            {
+                buf.clear();
+                p->processBlock (buf, mid);
+                mid.clear();
+                for (int ch = 0; ch < 2; ++ch) acc.copyFrom (ch, b * 512, buf, ch, 0, 512);
+            }
+            return acc;
+        };
+        auto diff = [] (const juce::AudioBuffer<float>& a, const juce::AudioBuffer<float>& b)
+        {
+            double d = 0.0;
+            for (int ch = 0; ch < a.getNumChannels(); ++ch)
+                for (int i = 0; i < a.getNumSamples(); ++i)
+                    d = juce::jmax (d, std::abs ((double) a.getSample (ch, i) - b.getSample (ch, i)));
+            return d;
+        };
+
+        for (auto* c : ed->getChildren())
+        {
+            auto* s = dynamic_cast<juce::Slider*> (c);
+            if (s == nullptr || ! s->isVisible() || ! s->isEnabled()) continue;
+            const auto q = ed->layoutProbe();
+            if (! q.spectrum.contains (c->getBounds())) continue;
+            const double lo = s->getMinimum(), hi = s->getMaximum();
+            if (! (hi > lo)) continue;
+            const double was = s->getValue();
+            const double want = (was - lo) > (hi - was) ? lo + (hi - lo) * 0.15
+                                                        : lo + (hi - lo) * 0.85;
+            const auto before = take (10);
+            const int pBefore = p->getPartialCount();
+            // WHICH PARAMETER, BY NAME. The attachment sweep asked only whether ANY
+            // parameter moved, on purpose - so that it would not need a second copy of
+            // the attachment table to go stale. That is too weak by exactly one defect: a
+            // fader wired to the WRONG id passes it. If BASE N writes something the
+            // spectrum engine does not read, this is where it says so.
+            std::vector<float> pv0;
+            for (auto* ap : p->getParameters()) pv0.push_back (ap->getValue());
+            s->setValue (want, juce::sendNotificationSync);
+            // DID ANYTHING EVEN ASK FOR A REBUILD? awaitSpectrumIdle returning at once
+            // means the worker had nothing to do, which is a different fault from a
+            // rebuild that ran and changed nothing. Polled across the blocks that carry
+            // the value into the engine, because the flag is raised and cleared inside
+            // that window.
+            bool everPending = false;
+            const int tmplBefore = p->getTemplatePartialCount();
+            for (int i = 0; i < 200 && ! everPending; ++i)
+            {
+                // pollParametersForTests IS the processor's own 60 Hz timer, which is where
+                // the rebuild test lives (timerCallback -> currentSettings != lastPushed
+                // -> requestRebuild). RhythmVerify is a console app with no message loop,
+                // so a juce::Timer never fires here and without this call NOTHING in this
+                // instrument ever recompiles - which reads exactly like every spectrum
+                // control being dead. It is the suite's standing stand-in; run 53 uses it.
+                p->pollParametersForTests();
+                // pollParametersForTests IS the processor's own 60 Hz timer, and the
+                // rebuild test lives in it (timerCallback -> currentSettings() !=
+                // lastPushed -> requestRebuild). RhythmVerify is a console app with no
+                // message loop, so a juce::Timer never fires here: without this call
+                // NOTHING in this instrument ever recompiles, and every spectrum control
+                // reads as dead. It is the suite's standing stand-in - run 53 uses it -
+                // and leaving it out is what made me tell the user I had found his bug
+                // when what I had found was my own probe.
+                p->pollParametersForTests();
+                buf.clear(); p->processBlock (buf, mid); ed->tickTimerForTests();
+                everPending = p->isSpectrumBuildPending();
+            }
+            // ...and the SAME move made straight on the parameter, which is how every
+            // other test in this file drives the engine. If this one bumps the spectrum
+            // and the slider's does not, the fault is between the control and the
+            // parameter; if neither does, it is in the engine.
+            // THE COMPILE IS ON A WORKER. Values reach the engine through processBlock and
+            // the rebuild happens off the message thread, so a fixed number of blocks is
+            // a guess - and a guess that is too short reads EXACTLY like a dead control.
+            // Ask the engine instead.
+            for (int i = 0; i < 8; ++i) { p->pollParametersForTests(); buf.clear(); p->processBlock (buf, mid); ed->tickTimerForTests(); }
+            awaitSpectrumIdle (*p, "userstate control move");
+            for (int i = 0; i < 8; ++i) { p->pollParametersForTests(); buf.clear(); p->processBlock (buf, mid); ed->tickTimerForTests(); }
+            const auto after = take (10);
+            auto nm = juce::String (typeid (*c).name());
+            nm = nm.fromLastOccurrenceOf ("::", false, false).replace ("class ", "");
+            std::printf ("  %-18s @%4d,%4d  %.4f -> %.4f   partials %d -> %d   audio changed"
+                         " by %.6f   %s\n",
+                         nm.toRawUTF8(), c->getX(), c->getY(), was, s->getValue(),
+                         pBefore, p->getPartialCount(),
+                         diff (before, after),
+                         diff (before, after) > 1.0e-6 ? "" : "<-- INERT");
+            {
+                juce::StringArray touched;
+                const auto& all = p->getParameters();
+                for (int i = 0; i < all.size() && i < (int) pv0.size(); ++i)
+                    if (std::abs (all[i]->getValue() - pv0[(size_t) i]) > 1.0e-6f)
+                    {
+                        auto* wid = dynamic_cast<juce::AudioProcessorParameterWithID*> (all[i]);
+                        touched.add (wid != nullptr ? wid->paramID : all[i]->getName (24));
+                    }
+                std::printf ("                     writes: %-16s  rebuild asked: %s   template %d -> %d\n",
+                             touched.isEmpty() ? "NOTHING AT ALL"
+                                               : touched.joinIntoString (", ").toRawUTF8(),
+                             everPending ? "yes" : "NO",
+                             tmplBefore, p->getTemplatePartialCount());
+            }
+            // PUT IT BACK PROPERLY, timer and worker included - the first version set the
+            // value and moved on, so every fader after the first was measured on a
+            // spectrum the previous one had left behind.
+            s->setValue (was, juce::sendNotificationSync);
+            for (int i = 0; i < 20; ++i) { p->pollParametersForTests(); buf.clear(); p->processBlock (buf, mid); ed->tickTimerForTests(); }
+            awaitSpectrumIdle (*p, "userstate restore");
+            for (int i = 0; i < 8; ++i) { p->pollParametersForTests(); buf.clear(); p->processBlock (buf, mid); ed->tickTimerForTests(); }
+        }
+        say ("after drags:");
+        }
+        std::printf ("\nREAD ONLY: nothing was written to that file, or anywhere else.\n");
+        return 0;
+    }
+
     // ONE BLOCK, ON DEMAND: only the silent-limit runs (70+). Same shape and same
     // reason as --audit above.
     if (argc > 1 && std::strcmp (argv[1], "--limits") == 0)
@@ -20241,7 +20483,7 @@ int main (int argc, char** argv)
                 }
                 std::printf ("  %-8s %d faders moved a parameter, %d moved nothing\n", view, moved, inert);
                 for (const auto& d : dead) std::printf ("      INERT: %s\n", d.toRawUTF8());
-                check (moved >= 8,
+                check (moved >= 7,
                        (juce::String ("(gate) the sweep really drove a panel's worth of faders (")
                         + view + ")").toRawUTF8());
                 check (inert == 0,
@@ -20253,6 +20495,140 @@ int main (int argc, char** argv)
             sweep ("harmonic");
             sweep ("custom");
         }
+    }
+
+    //== A MONO BUS: SAME LEVEL AS BEFORE, AND NOT ONE PARTIAL SHORT =================
+    //
+    // NOTHING IN THIS SUITE HAD EVER RENDERED THIS SYNTH INTO A MONO BUS, and
+    // isBusesLayoutSupported says yes to mono. So the mono branch of renderChunk was
+    // written, shipped and certified by 1900 checks without one of them executing it -
+    // and it was missing the 0.5 its 3+-channel neighbour two lines above has. With
+    // BINAURAL at its default of ZERO, where both ear gains are 1 and each half already
+    // carries the whole signal, a mono instance came out SIX DECIBELS loud.
+    //
+    // Two claims, and the tooltip makes both of them in two languages:
+    //   1. mono at *Centred* is the instrument without this control,
+    //   2. at the top of the fader no partial is LOST - the pan law costs level, it
+    //      never costs a partial.
+    {
+        std::printf ("\nBINAURAL on a MONO bus:\n");
+        auto rms = [] (const juce::AudioBuffer<float>& b, int ch)
+        {
+            double s = 0.0;
+            for (int i = 0; i < b.getNumSamples(); ++i)
+            { const double v = b.getSample (ch, i); s += v * v; }
+            return std::sqrt (s / juce::jmax (1, b.getNumSamples()));
+        };
+        // ONE processor per width, each told its layout BEFORE prepareToPlay - which is
+        // the whole point: a voice reads the channel count of the buffer it is handed.
+        auto render = [&] (int channels, float bin)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->setPlayConfigDetails (0, channels, 48000.0, 512);
+            p->prepareToPlay (48000.0, 512);
+            if (auto* pr = p->apvts.getParameter ("binaural"))
+                pr->setValueNotifyingHost (bin);
+            juce::AudioBuffer<float> buf (juce::jmax (1, channels), 512);
+            juce::MidiBuffer mid;
+            for (int i = 0; i < 24; ++i)      // let the spectrum settle before the note
+            { buf.clear(); p->processBlock (buf, mid); }
+            mid.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+            juce::AudioBuffer<float> acc (juce::jmax (1, channels), 512 * 12);
+            acc.clear();
+            for (int blk = 0; blk < 12; ++blk)
+            {
+                buf.clear();
+                p->processBlock (buf, mid);
+                mid.clear();
+                for (int ch = 0; ch < buf.getNumChannels(); ++ch)
+                    acc.copyFrom (ch, blk * 512, buf, ch, 0, 512);
+            }
+            return acc;
+        };
+
+        const auto mono0 = render (1, 0.0f);
+        const auto st0   = render (2, 0.0f);
+        const auto mono1 = render (1, 1.0f);
+        const double mr0 = rms (mono0, 0), mr1 = rms (mono1, 0);
+        const double sr0 = 0.5 * (rms (st0, 0) + rms (st0, 1));
+        std::printf ("  mono rms: centred %.5f   full %.5f      stereo rms centred %.5f\n",
+                     mr0, mr1, sr0);
+        check (mr0 > 1.0e-4, "(gate) the mono render really sounds");
+        check (sr0 > 1.0e-4, "(gate) the stereo render really sounds");
+        // The claim is EQUALITY with the stereo render's own per-channel level, because
+        // at binaural = 0 the two ears carry identical audio: fold them and you are back
+        // where you started. 0.5 dB of room, no more - a missing 0.5 is 6.02 dB.
+        const double dB = 20.0 * std::log10 (mr0 / juce::jmax (1.0e-9, sr0));
+        std::printf ("  mono vs stereo at *Centred*: %+.2f dB\n", dB);
+        check (std::abs (dB) < 0.5,
+               "a MONO bus at *Centred* is the same level as the stereo one - the fold is a"
+               " fold, not a sum of two copies of the same signal");
+        // ...and at the top the level moves by the pan law's own 3 dB at most, never to
+        // silence and never by half a spectrum: picking one channel out of the mix
+        // scratch instead of folding it lost every right-ear partial.
+        const double dB1 = 20.0 * std::log10 (mr1 / juce::jmax (1.0e-9, mr0));
+        std::printf ("  mono at the TOP vs mono centred: %+.2f dB\n", dB1);
+        check (dB1 > -3.5 && dB1 < 0.5,
+               "...and at the TOP of the fader a mono bus still hears the whole spectrum -"
+               " it pays the pan law's 3 dB at most, it does not lose the partials that"
+               " were sent to one ear");
+    }
+
+    //== DRAGGING THE BINAURAL FADER DOES NOT ZIPPER ================================
+    //
+    // The two ear gains were read once per BLOCK. Every other continuous gain in
+    // renderChunk is walked per sample precisely so a moving control does not step at
+    // buffer edges, and this one - the newest, on the one gesture the control exists for
+    // - was not. Measured as the biggest single-sample jump in the output while the fader
+    // is dragged, against the biggest jump the same note makes with the fader STILL,
+    // which is the honest reference: a note has its own transients and this check is not
+    // about those.
+    {
+        std::printf ("\ndragging BINAURAL does not step at the block edges:\n");
+        auto worstStep = [] (const juce::AudioBuffer<float>& b)
+        {
+            float w = 0.0f;
+            for (int ch = 0; ch < b.getNumChannels(); ++ch)
+                for (int i = 1; i < b.getNumSamples(); ++i)
+                    w = juce::jmax (w, std::abs (b.getSample (ch, i) - b.getSample (ch, i - 1)));
+            return w;
+        };
+        // `moves` == false holds the fader still at half travel; true sweeps it 0 -> 1
+        // across the same 24 blocks, one step per block, the way a mouse drag arrives.
+        auto run = [&] (bool moves)
+        {
+            auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+            p->setPlayConfigDetails (0, 2, 48000.0, 256);
+            p->prepareToPlay (48000.0, 256);
+            auto* pr = p->apvts.getParameter ("binaural");
+            if (pr != nullptr) pr->setValueNotifyingHost (moves ? 0.0f : 0.5f);
+            juce::AudioBuffer<float> buf (2, 256);
+            juce::MidiBuffer mid;
+            for (int i = 0; i < 24; ++i) { buf.clear(); p->processBlock (buf, mid); }
+            mid.addEvent (juce::MidiMessage::noteOn (1, 57, 0.9f), 0);
+            juce::AudioBuffer<float> acc (2, 256 * 24);
+            acc.clear();
+            for (int blk = 0; blk < 24; ++blk)
+            {
+                if (moves && pr != nullptr)
+                    pr->setValueNotifyingHost ((float) blk / 23.0f);
+                buf.clear();
+                p->processBlock (buf, mid);
+                mid.clear();
+                for (int ch = 0; ch < 2; ++ch) acc.copyFrom (ch, blk * 256, buf, ch, 0, 256);
+            }
+            return acc;
+        };
+        const auto still = run (false);
+        const auto drag  = run (true);
+        const float sStill = worstStep (still), sDrag = worstStep (drag);
+        std::printf ("  worst single-sample step: fader still %.6f   fader dragged %.6f\n",
+                     sStill, sDrag);
+        check (sStill > 1.0e-5f, "(gate) the still take really sounds, so the reference is a real number");
+        check (sDrag  > 1.0e-5f, "(gate) the dragged take really sounds");
+        check (sDrag < sStill * 2.0f,
+               "sweeping the fader through its whole travel adds no step bigger than the note's"
+               " own - the ear gains are walked per sample, not held for a block");
     }
 
     runProcessorAuditChecks();

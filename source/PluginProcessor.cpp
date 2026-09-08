@@ -4299,9 +4299,29 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
         mixScratch.clear();
         synth.renderNextBlock (mixScratch, midi, 0, nSamp);
         mixScratch.applyGainRamp (0, nSamp, mixMainApplied, mainNow);
+        // A NARROWER BUS FOLDS THE SCRATCH DOWN, IT DOES NOT PICK A CHANNEL OUT OF IT.
+        //
+        // This read jmin (ch, srcCh - 1), so a MONO output took channel 0 of a stereo
+        // scratch and threw channel 1 away. That was harmless while the two channels
+        // carried identical audio - and stopped being harmless the moment BINAURAL could
+        // put different partials in each: at the top of that fader every partial assigned
+        // to the right ear vanished from a mono bus, silently, which is the exact loss
+        // this instrument refuses to make. The scratch is summed now, at 1/srcCh, so a
+        // mono listener hears every partial and the level is unchanged.
         const int srcCh = mixScratch.getNumChannels();
-        for (int ch = 0; ch < out.getNumChannels(); ++ch)
-            out.addFrom (ch, 0, mixScratch, juce::jmin (ch, srcCh - 1), 0, nSamp);
+        const int outCh = out.getNumChannels();
+        if (outCh >= srcCh)
+        {
+            for (int ch = 0; ch < outCh; ++ch)
+                out.addFrom (ch, 0, mixScratch, juce::jmin (ch, srcCh - 1), 0, nSamp);
+        }
+        else
+        {
+            const float fold = 1.0f / (float) juce::jmax (1, srcCh);
+            for (int ch = 0; ch < outCh; ++ch)
+                for (int s = ch; s < srcCh; s += outCh)
+                    out.addFrom (ch, 0, mixScratch, s, 0, nSamp, fold);
+        }
     }
     else
     {
