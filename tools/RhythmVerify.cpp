@@ -20585,6 +20585,34 @@ int main (int argc, char** argv)
     // about those.
     {
         std::printf ("\ndragging BINAURAL does not step at the block edges:\n");
+        // THE ZIPPER LIVES AT THE BLOCK BOUNDARY, so that is where it has to be measured.
+        //
+        // The first version of this compared the worst step ANYWHERE in a dragged take
+        // against the worst step in a still one, and it passed over the unfixed code:
+        // 0.053327 against 0.051570. A gain that steps 5% once every 256 samples is
+        // nowhere near the biggest sample-to-sample delta a note with harmonics makes, so
+        // the note's own waveform hid it completely. It was not a test, it was a number
+        // that happened to be green - and the sabotage that would have said so silently
+        // failed to apply, which is the other half of the same lesson.
+        //
+        // Measured as a RATIO instead: the step across each buffer edge against the median
+        // step inside the buffers. A per-block gain jump lands on the edges and nowhere
+        // else, so it shows up here however loud the note is.
+        auto edgeVsInside = [] (const juce::AudioBuffer<float>& b, int blockLen)
+        {
+            std::vector<float> edge, inside;
+            for (int ch = 0; ch < b.getNumChannels(); ++ch)
+                for (int i = 1; i < b.getNumSamples(); ++i)
+                {
+                    const float d = std::abs (b.getSample (ch, i) - b.getSample (ch, i - 1));
+                    (i % blockLen == 0 ? edge : inside).push_back (d);
+                }
+            if (edge.empty() || inside.empty()) return -1.0f;
+            std::sort (inside.begin(), inside.end());
+            const float med = inside[inside.size() / 2];
+            const float worstEdge = *std::max_element (edge.begin(), edge.end());
+            return med > 0.0f ? worstEdge / med : -1.0f;
+        };
         auto worstStep = [] (const juce::AudioBuffer<float>& b)
         {
             float w = 0.0f;
@@ -20622,13 +20650,35 @@ int main (int argc, char** argv)
         const auto still = run (false);
         const auto drag  = run (true);
         const float sStill = worstStep (still), sDrag = worstStep (drag);
+        const float rStill = edgeVsInside (still, 256), rDrag = edgeVsInside (drag, 256);
         std::printf ("  worst single-sample step: fader still %.6f   fader dragged %.6f\n",
                      sStill, sDrag);
+        std::printf ("  worst BLOCK-EDGE step / median step inside a block:"
+                     "  still %.2fx   dragged %.2fx\n", rStill, rDrag);
         check (sStill > 1.0e-5f, "(gate) the still take really sounds, so the reference is a real number");
         check (sDrag  > 1.0e-5f, "(gate) the dragged take really sounds");
-        check (sDrag < sStill * 2.0f,
-               "sweeping the fader through its whole travel adds no step bigger than the note's"
-               " own - the ear gains are walked per sample, not held for a block");
+        check (rStill > 0.0f && rDrag > 0.0f, "(gate) both takes have edges and insides to compare");
+        // Against the STILL take's own ratio, not a constant: a note's transient makes
+        // buffer edges a bit spikier than its steady state whatever the fader does, and
+        // that is the baseline this control must not add to.
+        check (rDrag < rStill * 1.6f + 0.5f,
+               "sweeping the fader adds no GROSS discontinuity at the block edges");
+        // AND HERE IS WHAT THIS CHECK CANNOT DO, stated rather than implied by a green
+        // tick. SABOTAGED - the ear gains put back to once per block, the line verified in
+        // the file before building - it read 13.20x against 15.49x and PASSED. Its first
+        // form passed too (0.053343 against 0.051570). A 5% gain step once every 256
+        // samples is far below the sample-to-sample deltas a note with a thousand
+        // harmonics makes, and normalising by the median inside the block does not
+        // separate them either.
+        //
+        // So the per-sample ramp in AdditiveVoice is NOT a verified fix. It stays because
+        // it is what every other continuous gain in that loop does and because a gain
+        // that steps at buffer edges is wrong on principle - not because anything here
+        // has shown it audible. Isolating it needs a different measurement: the L/R
+        // envelope RATIO, which is a staircase under per-block gains and a straight line
+        // under a ramp. Until that exists, this block proves no zipper claim.
+        std::printf ("  NOTE: this check does NOT distinguish per-block from per-sample ear\n"
+                     "        gains - sabotaged, it still passes. See the comment above it.\n");
     }
 
     runProcessorAuditChecks();

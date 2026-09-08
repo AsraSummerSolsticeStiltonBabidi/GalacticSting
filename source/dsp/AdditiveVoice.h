@@ -250,6 +250,13 @@ public:
         }
         shepActive = wantShep;
 
+        // A NOTE IS BORN WHERE THE FADER IS. The ear gains glide within a note (see
+        // binOnCur), and a voice taken from the pool carries the pair the LAST note left
+        // in it - so without this a note struck with BINAURAL up would open from centred
+        // over its first buffer. Same reason shepFresh exists a few lines up: a fresh note
+        // adopts, it does not glide from a stale value.
+        binPrimed = false;
+
         // Deterministic note-on (same note twice = identical). ONE CONTINUOUS AXIS now,
         // not two modes:
         //   Phase 0  - every partial starts at its peak (cosine), so they form a coherent
@@ -1574,8 +1581,16 @@ private:
         // ones centred, which is the rule backwards.
         const double binAmt = binParam != nullptr
                                 ? juce::jlimit (0.0, 1.0, (double) binParam->load()) : 0.0;
-        const double binOn  = std::sqrt (1.0 + binAmt);
-        const double binOff = std::sqrt (1.0 - binAmt);
+        // WALKED PER SAMPLE, not held for a block. Ramped from wherever the last chunk
+        // ended, so a sweep is continuous across block boundaries too. Clamped because
+        // renderChunk can render fewer samples than it was asked for (a note finishing
+        // mid-chunk): an overshoot would take binOff negative, and a negative gain is not
+        // a quiet partial, it is an inverted one.
+        const double binOnTgt  = std::sqrt (1.0 + binAmt);
+        const double binOffTgt = std::sqrt (1.0 - binAmt);
+        if (! binPrimed) { binOnCur = binOnTgt; binOffCur = binOffTgt; binPrimed = true; }
+        const double binOnStep  = (binOnTgt  - binOnCur)  / (double) juce::jmax (1, numSamples);
+        const double binOffStep = (binOffTgt - binOffCur) / (double) juce::jmax (1, numSamples);
         const double binMid = 1.0;                 // under 100 Hz: both ears, as before
         const double binMinInc = 100.0 / (currentSampleRate > 0.0 ? currentSampleRate : 44100.0);
         int binQ0[shepard::kSlots] {};
@@ -1838,12 +1853,24 @@ private:
                 // The two gains, and which of them a partial gets. An EVEN step from the
                 // first qualifying partial goes right, the next left, and so on - "uno a la
                 // derecha, el siguiente a la izquierda".
+                // THE EAR IS ANCHORED TO THE COPY, NOT TO q0. Anchored to q0 - the first
+                // partial above 100 Hz - a single step of that index inverts the parity of
+                // EVERY partial in the copy, so all of them change ears between two
+                // adjacent samples: at the top of the fader that is sqrt(2) <-> 0 in one
+                // sample, through a filter whose state carries on. And q0 moves for the
+                // most ordinary reasons - a portamento, vibrato, or a Shepard copy, which
+                // rises across 100 Hz continuously BY DESIGN and would do it over and
+                // over. Anchored to the copy's own first partial the index cannot move,
+                // so q0 sliding changes ONE partial (the one crossing 100 Hz) instead of
+                // all of them. Which ear the first spread partial lands in is whatever
+                // (q0 - off) makes it: the alternation is symmetric, so that choice
+                // carries no meaning, and being STABLE does.
                 const auto spread = [&] (int j, double v, double& l, double& r)
                 {
                     if (j < q0) { l += v * binMid; r += v * binMid; return; }   // below 100 Hz: centred
-                    const bool right = (((j - q0) & 1) == 0);
-                    l += v * (right ? binOff : binOn);
-                    r += v * (right ? binOn  : binOff);
+                    const bool right = (((j - off) & 1) == 0);
+                    l += v * (right ? binOffCur : binOnCur);
+                    r += v * (right ? binOnCur  : binOffCur);
                 };
                 for (int i = 0; i < nf; ++i)
                     spread (off + i, advance (off + i, i), accCL, accCR);
@@ -1856,6 +1883,10 @@ private:
                 accL += w * accCL;
                 accR += w * accCR;
             }
+            // One step of the ear gains, once per SAMPLE and after every copy has used the
+            // same pair - so the two ears never disagree about where the fader is.
+            binOnCur  = juce::jlimit (0.0, 1.4142135623730951, binOnCur  + binOnStep);
+            binOffCur = juce::jlimit (0.0, 1.4142135623730951, binOffCur + binOffStep);
 
             // Velocity / pressure / the fast-kill recovery glide with their own fixed
             // ~7 ms constant (gainSlew), so a stolen voice hands over without a step
@@ -3401,6 +3432,14 @@ private:
     std::atomic<float>* shepRiseParam = nullptr, * shepDownParam = nullptr;
     // Binaural spread: 0 = dead centre and bit-identical to the instrument without it.
     std::atomic<float>* binParam = nullptr;
+    // ...and the two ear gains it turns into, WALKED PER SAMPLE. Read once per block they
+    // step at buffer edges while the fader moves, which is a zipper on exactly the
+    // gesture this control exists for - every other continuous gain in renderChunk is
+    // stepped for that reason (see sndBase / sndStep). Primed from the parameter at
+    // note-on so a note born with the fader up does not open from centred, and so a voice
+    // taken from the pool does not carry the last note's pair.
+    double binOnCur = 1.0, binOffCur = 1.0;
+    bool   binPrimed = false;
     bool   shepActive = false;   // LATCHED at note-on: this note either is a Shepard or is not
     bool   shepFresh  = true;    // adopt band/rate instantly (a cold note, not a glide)
     double shepG      = 0.0;     // the rising grid phase, in rise intervals
