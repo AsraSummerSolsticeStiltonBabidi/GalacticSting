@@ -953,14 +953,22 @@ namespace
                 // it is clicked.
                 const float x0   = r.getCentreX() - ink * 0.5f;
                 const float cy   = r.getCentreY();
-                const juce::Rectangle<float> led (x0, cy - dot * 0.5f, dot, dot);
-                g.setColour (juce::Colours::white);
-                if (on) g.fillEllipse (led);
-                else    g.drawEllipse (led.reduced (0.8f), 1.6f);
+                const float lead = fgfit::onLedLead (h);
+                // Guarded, not just sized to zero: drawEllipse on a rect shrunk by 0.8 px
+                // from nothing is a NEGATIVE rect, and that is a different kind of bug
+                // from an invisible one.
+                if (dot > 0.0f)
+                {
+                    const juce::Rectangle<float> led (x0, cy - dot * 0.5f, dot, dot);
+                    g.setColour (juce::Colours::white);
+                    if (on) g.fillEllipse (led);
+                    else    g.drawEllipse (led.reduced (0.8f), 1.6f);
+                }
                 g.setFont (fgfit::onLedFont (h));
+                g.setColour (juce::Colours::white);
                 g.drawText (word,
-                            juce::Rectangle<float> (x0 + dot + fgfit::kOnLedGap, r.getY(),
-                                                    ink - dot - fgfit::kOnLedGap, r.getHeight()),
+                            juce::Rectangle<float> (x0 + lead, r.getY(),
+                                                    ink - lead, r.getHeight()),
                             juce::Justification::centredLeft, false);
                 return;
             }
@@ -5107,8 +5115,7 @@ namespace
                 // no longer exists - it would have certified one 9-10 px too narrow. The
                 // room the WORD gets is the button less the disc and its gap.
                 fontOut  = fgfit::onLedFont (b.getHeight());
-                availOut = (float) b.getWidth()
-                         - fgfit::onLedDot (b.getHeight()) - fgfit::kOnLedGap;
+                availOut = (float) b.getWidth() - fgfit::onLedLead (b.getHeight());
                 return true;
             }
             fontOut  = fgfit::toggleFont (b.getHeight());
@@ -7962,9 +7969,17 @@ void FractalAdditiveAudioProcessorEditor::recolourSpectrumControls (juce::Colour
 
     // Spelled as juce::Slider* because these are four different Slider SUBCLASSES
     // (stepped, magnetic, plain) and a deduced initializer-list has no common type.
+    // PHASE was the sixth and it was not here. "el knob de phase no cambia de color al
+    // cambiar de menu custom a harmonic" - the fader was added to this panel and this
+    // hand-written list was not touched, so it kept whatever hue it was built with while
+    // every control beside it changed. A list of members is exactly the kind of thing
+    // that goes stale silently, so the gate in RhythmVerify no longer trusts it: it
+    // sweeps every control whose bounds are INSIDE the panel and asks the colour it is
+    // actually wearing. Adding a control to this panel and forgetting this line is a
+    // failing check now, not a thing someone has to notice on the glass.
     for (juce::Slider* s : { (juce::Slider*) &baseNFader, (juce::Slider*) &harmonicsFader,
                              (juce::Slider*) &primeLimitFader, (juce::Slider*) &timbreRepeatsFader,
-                             (juce::Slider*) &fractalFader })
+                             (juce::Slider*) &fractalFader, (juce::Slider*) &phaseFader })
         fader (*s);
     // slopeFader is deliberately NOT in that list: it has a SECOND state (frozen by manual
     // per-partial amplitudes) and exactly one function is allowed to write its colour.

@@ -27,6 +27,7 @@ extern "C" __declspec(dllimport) int   __stdcall QueryThreadCycleTime (void*, un
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <set>
 #include <vector>
@@ -19889,6 +19890,369 @@ int main (int argc, char** argv)
                    " cell that cannot hold it - the TEMPER rule, applied here too");
         }
         else check (false, "(gate) the editor for the BINAURAL fader probe exists");
+    }
+
+    //== EVERY CONTROL A HAND CAN SEE, A HAND CAN ALSO HIT =========================
+    //
+    // "todos los controles de harmonic engine no funcionan ni los de custom engine
+    //  tampoco. esto es tremendamente grave."
+    //
+    // NOTHING IN THIS BUILD HAS EVER ASKED WHETHER A CONTROL IS REACHABLE. Every
+    // geometric check in the snapshot rig measures where a control IS - inside its box,
+    // not overlapping, wide enough for its word - and every behaviour check in this file
+    // reaches past the mouse entirely: it calls onClick(), or sets a parameter, or pushes
+    // a MouseEvent straight INTO the slider (dragFaderForTests does exactly that, on the
+    // component pointer). A component sitting ON TOP of another and swallowing the mouse
+    // is invisible to all of it. The controls are in their boxes, the right size, the
+    // right colour, correctly labelled in two languages - and dead under the pointer.
+    //
+    // So this asks JUCE the question the user asked: click the middle of every control,
+    // and see what actually receives it.
+    {
+        std::printf ("\nevery control is reachable by the mouse at 1200x650:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        if (ed == nullptr) { check (false, "(gate) the editor for the reachability sweep exists"); }
+        else
+        {
+            // A name a human can act on. getName() is usually empty, so the TYPE carries
+            // it, exactly as walkTextFits reports paths.
+            std::function<juce::String (juce::Component*)> pathOf =
+                [&pathOf, ed] (juce::Component* c) -> juce::String
+            {
+                if (c == nullptr) return "(nothing)";
+                if (c == ed)      return "/";
+                auto own = juce::String (typeid (*c).name());
+                own = own.fromLastOccurrenceOf ("::", false, false)
+                         .replace ("class ", "").replace ("struct ", "");
+                if (c->getName().isNotEmpty()) own += " \"" + c->getName() + "\"";
+                return pathOf (c->getParentComponent()) + "/" + own;
+            };
+
+            std::function<void (juce::Component*, std::vector<juce::Component*>&)> gather =
+                [&gather] (juce::Component* c, std::vector<juce::Component*>& out)
+            {
+                for (auto* k : c->getChildren())
+                {
+                    if (! k->isVisible()) continue;      // hidden is not a defect - it is the rule
+                    out.push_back (k);
+                    gather (k, out);
+                }
+            };
+
+            auto sweep = [&] (const char* what)
+            {
+                ed->resized();
+                std::vector<juce::Component*> all;
+                gather (ed, all);
+
+                int probed = 0, covered = 0, unhittable = 0, disabled = 0;
+                juce::StringArray deadList;
+                juce::String firstBad, firstBadBy;
+                for (auto* c : all)
+                {
+                    // Only the things a user aims at. A Label or a painter is allowed to
+                    // be under something; a control is not.
+                    const bool isControl = dynamic_cast<juce::Slider*>   (c) != nullptr
+                                        || dynamic_cast<juce::Button*>   (c) != nullptr
+                                        || dynamic_cast<juce::ComboBox*> (c) != nullptr
+                                        || dynamic_cast<juce::TextEditor*> (c) != nullptr;
+                    if (! isControl) continue;
+                    if (c->getWidth() <= 0 || c->getHeight() <= 0) continue;
+                    bool self = false, kids = false;
+                    c->getInterceptsMouseClicks (self, kids);
+                    if (! self) continue;                // deliberately click-through
+                    // NAMED, never counted. "10 disabled" is the shape a silent
+                    // greying-out hides in, and a control that is dead because someone
+                    // called setEnabled(false) looks exactly like a control that is dead
+                    // because it is covered - from the user's side of the glass they are
+                    // the same complaint.
+                    if (! c->isEnabled()) { ++disabled; deadList.add (pathOf (c)); continue; }
+
+                    ++probed;
+                    const auto pt  = ed->getLocalPoint (c, c->getLocalBounds().getCentre());
+                    auto*      hit = ed->getComponentAt (pt);
+                    const bool ok  = hit == c || c->isParentOf (hit);
+                    if (ok) continue;
+
+                    // Two different faults, and they are NOT the same bug.
+                    const bool byAncestor = hit != nullptr && hit->isParentOf (c);
+                    if (byAncestor) ++unhittable; else ++covered;
+                    if (firstBad.isEmpty())
+                    {
+                        firstBad   = pathOf (c);
+                        firstBadBy = pathOf (hit);
+                    }
+                }
+                std::printf ("  %-22s %d controls probed, %d covered by a sibling, %d not hit at"
+                             " their own centre, %d disabled (skipped)\n",
+                             what, probed, covered, unhittable, disabled);
+                if (firstBad.isNotEmpty())
+                    std::printf ("      first: %s\n        is reached by: %s\n",
+                                 firstBad.toRawUTF8(), firstBadBy.toRawUTF8());
+                for (const auto& d : deadList) std::printf ("      disabled: %s\n", d.toRawUTF8());
+                check (probed > 40,
+                       (juce::String ("(gate) the sweep found controls to probe (") + what + ")").toRawUTF8());
+                check (covered == 0,
+                       (juce::String ("no control is COVERED by something on top of it - a click at its"
+                                      " centre reaches the control itself (") + what + ")").toRawUTF8());
+                check (unhittable == 0,
+                       (juce::String ("...and none refuses the click at its own centre (") + what + ")").toRawUTF8());
+            };
+
+            // WITHOUT THIS THE SWEEP MEASURES NOTHING. Component::getComponentAt returns
+            // nullptr unless the component it is asked on is itself visible, and a
+            // top-level editor built by a test has never been shown: the first run came
+            // back "51 controls probed, 51 covered", every one of them "reached by
+            // (nothing)". That is a test failing, not a plugin failing, and the only
+            // reason it was not read as a real defect is that the printout names the
+            // component the click lands on instead of just counting.
+            ed->setVisible (true);
+            ed->setSize (1200, 650);
+            p->setTimbreEnabled (false);
+            ed->refreshEngineDressing();
+            sweep ("harmonic engine");
+
+            p->setTimbreEnabled (true);
+            ed->refreshEngineDressing();
+            sweep ("custom engine");
+
+            p->setTimbreEnabled (false);
+            ed->refreshEngineDressing();
+            ed->setSize (1600, 900);
+            sweep ("harmonic @1600x900");
+        }
+    }
+
+    //== EVERY CONTROL IN THE SPECTRUM PANEL WEARS THE PANEL'S COLOUR ==============
+    //
+    // "el knob de phase no cambia de color al cambiar de menu custom a harmonic."
+    //
+    // recolourSpectrumControls() is a HAND-WRITTEN LIST OF MEMBERS. PHASE was added to
+    // this panel and the list was not, so one fader kept its build-time hue while every
+    // control beside it changed engine colour - and nothing in the build could see it:
+    // the snapshot rig photographs colour but has no rule saying which colour is right,
+    // and every other check here reads geometry or behaviour.
+    //
+    // So this does not read the list. It sweeps every control whose bounds are INSIDE the
+    // spectrum panel and asks what colour it is actually wearing, in BOTH engine views.
+    // A control added to this panel and left out of that function fails here.
+    {
+        std::printf ("\nevery control in the spectrum panel wears the engine's colour:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        if (ed == nullptr) { check (false, "(gate) the editor for the panel-colour sweep exists"); }
+        else
+        {
+            ed->setVisible (true);
+            ed->setSize (1200, 650);
+
+            // The three with a SECOND state, each documented at its own writer in
+            // recolourSpectrumControls: AMP DECAY goes inert while manual per-partial
+            // amplitudes are frozen, and the two TRANSITION Time faders grey out when the
+            // transition is Off. They are exempt from WHICH colour, never from the sweep.
+            const juce::StringArray twoState { "slope", "morphTime", "dryWetTime" };
+
+            auto snap = [&] (bool custom)
+            {
+                // The CHIP, not setTimbreEnabled: with no spectrum loaded the engine in
+                // force honestly stays Harmonic, so flipping the parameter alone left both
+                // snapshots the same colour and the gate said so.
+                ed->clickEngineChipForTests (custom ? 1 : 0);
+                ed->refreshEngineDressing();
+                const auto q = ed->layoutProbe();
+                std::map<juce::Component*, std::pair<juce::String, juce::uint32>> out;
+                for (auto* c : ed->getChildren())
+                {
+                    if (! c->isVisible() || c->getWidth() <= 0) continue;
+                    if (! q.spectrum.contains (c->getBounds())) continue;
+                    // The big ON/OFF pills carry their own STATE colour (green on, red off,
+                    // drawn by GalacticLnF) and never wear the panel hue - they do not use
+                    // tickColourId at all. Skipped by name, with the reason, rather than by
+                    // loosening the rule for every toggle in the panel.
+                    if (c->getName() == "onled") continue;
+                    juce::String kind;
+                    juce::Colour col;
+                    if      (auto* s = dynamic_cast<juce::Slider*>   (c))
+                    { kind = "slider"; col = s->findColour (juce::Slider::thumbColourId); }
+                    else if (auto* b = dynamic_cast<juce::ComboBox*> (c))
+                    { kind = "combo";  col = b->findColour (juce::ComboBox::arrowColourId); }
+                    else if (auto* t = dynamic_cast<juce::ToggleButton*> (c))
+                    { kind = "tick";   col = t->findColour (juce::ToggleButton::tickColourId); }
+                    else continue;
+                    auto nm = juce::String (typeid (*c).name());
+                    nm = nm.fromLastOccurrenceOf ("::", false, false)
+                           .replace ("class ", "").replace ("struct ", "");
+                    out[c] = { kind + " " + nm + " @" + juce::String (c->getX())
+                                    + "," + juce::String (c->getY()),
+                               col.getARGB() };
+                }
+                return std::make_pair (q.panelColour.getARGB(), out);
+            };
+
+            const auto harm = snap (false);
+            const auto cust = snap (true);
+            // MATCHED BY IDENTITY, NOT BY POSITION IN A LIST. The two views do not show
+            // the same controls - that is the entire point of a view - so the first
+            // version of this compared BASE against Load and said the sweep was broken.
+            int both = 0;
+            for (const auto& h : harm.second) if (cust.second.count (h.first)) ++both;
+            std::printf ("  panel colour: harmonic %06X   custom %06X   (%d + %d controls, %d in both)\n",
+                         harm.first & 0xffffff, cust.first & 0xffffff,
+                         (int) harm.second.size(), (int) cust.second.size(), both);
+            check (harm.first != cust.first,
+                   "(gate) the two engine views really are different colours");
+            check (harm.second.size() >= 10 && both >= 5,
+                   "(gate) the sweep sees the panel's controls, and enough of them survive the switch");
+
+            int wrongHarm = 0, stuck = 0;
+            juce::String firstWrong, firstStuck;
+            auto wearsPanel = [&] (const std::pair<juce::uint32,
+                                       std::map<juce::Component*, std::pair<juce::String, juce::uint32>>>& snapshot,
+                                   const char* view)
+            {
+                for (const auto& e : snapshot.second)
+                {
+                    bool exempt = false;
+                    for (const auto& t : twoState) if (e.second.first.contains (t)) exempt = true;
+                    if (exempt || e.second.second == snapshot.first) continue;
+                    ++wrongHarm;
+                    if (firstWrong.isEmpty())
+                        firstWrong = juce::String (view) + ": " + e.second.first
+                                   + juce::String::formatted (" wears %06X, the panel is %06X",
+                                                              e.second.second & 0xffffff,
+                                                              snapshot.first & 0xffffff);
+                }
+            };
+            wearsPanel (harm, "harmonic");
+            wearsPanel (cust, "custom");
+
+            for (const auto& h : harm.second)
+            {
+                auto it = cust.second.find (h.first);
+                if (it == cust.second.end()) continue;      // not in the other view: nothing to compare
+                if (it->second.second != h.second.second) continue;
+                ++stuck;
+                if (firstStuck.isEmpty())
+                    firstStuck = h.second.first
+                               + juce::String::formatted (" stays %06X through the switch",
+                                                          h.second.second & 0xffffff);
+            }
+            if (firstWrong.isNotEmpty()) std::printf ("    wrong colour: %s\n", firstWrong.toRawUTF8());
+            if (firstStuck.isNotEmpty()) std::printf ("    never moved:  %s\n", firstStuck.toRawUTF8());
+            check (wrongHarm == 0,
+                   "every control inside the spectrum panel wears the panel's own colour - the"
+                   " hand-written list in recolourSpectrumControls reaches all of them");
+            check (stuck == 0,
+                   "...and not one of them keeps the same colour across an engine switch, which"
+                   " is how PHASE shipped wearing a hue nothing else in the panel was wearing");
+        }
+    }
+
+    //== MOVING A CONTROL REALLY MOVES SOMETHING IN THE PROCESSOR ==================
+    //
+    // "todos los controles de harmonic engine no funcionan ni los de custom engine
+    //  tampoco."
+    //
+    // THE SECOND THING NOTHING HERE EVER CHECKED. Every behaviour test in this file
+    // reaches the processor by WRITING THE PARAMETER - setValueNotifyingHost, or the
+    // processor's own setters. Not one of them moves the CONTROL. So an attachment that
+    // was never constructed, or destroyed, or built against a parameter id that no longer
+    // exists, is invisible to the entire suite: the fader slides under the mouse, the
+    // value box counts up, and the sound never changes. That is precisely the shape of
+    // "the controls do not work", and it is the one shape the 1900 checks above cannot
+    // see.
+    //
+    // So: move each control the way a hand does, and ask whether ANY parameter in the
+    // processor noticed. Not which one - a control that changes nothing is the defect,
+    // and naming the parameter would mean duplicating the attachment table here, which is
+    // the sort of second copy that goes stale and starts lying.
+    //
+    // TextButtons are excluded on purpose: several of them open file choosers, and this
+    // rig must never open an OS dialog.
+    {
+        std::printf ("\nmoving a control moves a parameter (the attachments are really attached):\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        if (ed == nullptr) { check (false, "(gate) the editor for the attachment sweep exists"); }
+        else
+        {
+            ed->setVisible (true);
+            ed->setSize (1200, 650);
+
+            auto allValues = [&p]
+            {
+                std::vector<float> v;
+                for (auto* ap : p->getParameters()) v.push_back (ap->getValue());
+                return v;
+            };
+            auto settle = [&]
+            {
+                juce::AudioBuffer<float> buf (2, 512);
+                juce::MidiBuffer mid;
+                for (int i = 0; i < 4; ++i)
+                { buf.clear(); p->processBlock (buf, mid); ed->tickTimerForTests(); }
+            };
+
+            auto sweep = [&] (const char* view)
+            {
+                ed->clickEngineChipForTests (juce::String (view) == "custom" ? 1 : 0);
+                ed->refreshEngineDressing();
+                settle();
+
+                int moved = 0, inert = 0;
+                juce::StringArray dead;
+                for (auto* c : ed->getChildren())
+                {
+                    if (! c->isVisible() || ! c->isEnabled() || c->getWidth() <= 0) continue;
+                    auto* s = dynamic_cast<juce::Slider*> (c);
+                    if (s == nullptr) continue;               // faders first: BASE, HARMONICS, PRIME, FRACTAL, PHASE...
+                    const double lo = s->getMinimum(), hi = s->getMaximum();
+                    if (! (hi > lo)) continue;
+                    const double was = s->getValue();
+                    // A DIFFERENT value, always: nudging a fader to where it already is
+                    // proves nothing, and "the quantity had stopped moving" is one of the
+                    // three documented ways a check passes with nothing behind it.
+                    const double want = (was - lo) > (hi - was) ? lo + (hi - lo) * 0.15
+                                                                : lo + (hi - lo) * 0.85;
+                    const auto before = allValues();
+                    s->setValue (want, juce::sendNotificationSync);
+                    settle();
+                    const auto after = allValues();
+                    bool any = after.size() != before.size();
+                    for (size_t i = 0; ! any && i < after.size(); ++i)
+                        if (std::abs (after[i] - before[i]) > 1.0e-6f) any = true;
+
+                    auto nm = juce::String (typeid (*c).name());
+                    nm = nm.fromLastOccurrenceOf ("::", false, false)
+                           .replace ("class ", "").replace ("struct ", "");
+                    if (any) ++moved;
+                    else { ++inert; dead.add (nm + " @" + juce::String (c->getX()) + ","
+                                              + juce::String (c->getY())
+                                              + juce::String::formatted (" (%.3f -> %.3f)", was, s->getValue())); }
+                    s->setValue (was, juce::sendNotificationSync);
+                    settle();
+                }
+                std::printf ("  %-8s %d faders moved a parameter, %d moved nothing\n", view, moved, inert);
+                for (const auto& d : dead) std::printf ("      INERT: %s\n", d.toRawUTF8());
+                check (moved >= 8,
+                       (juce::String ("(gate) the sweep really drove a panel's worth of faders (")
+                        + view + ")").toRawUTF8());
+                check (inert == 0,
+                       (juce::String ("every fader on screen changes something in the processor when it"
+                                      " is MOVED, not merely when its parameter is written (") + view
+                        + ")").toRawUTF8());
+            };
+
+            sweep ("harmonic");
+            sweep ("custom");
+        }
     }
 
     runProcessorAuditChecks();

@@ -327,9 +327,24 @@ namespace fgfit
     //
     // Floored at 5 px because a ring needs an inside: below that the 1.6 px pen closes up
     // and the hollow one is a filled dot in a lighter colour, which is no cue at all.
+    //
+    // TURNED OFF BY THE USER, 2026-09-08: "aparecio un circulo en el boton on/off del
+    // lapis para editar la amplitud de parciales, quitalo." Their instrument, their call -
+    // and the reasoning above is left standing rather than deleted, because it is the
+    // argument for putting it back and it should not have to be re-derived. Flipping this
+    // one flag restores the disc everywhere, at the right width, in every measurement:
+    // the painter, the fit sweep and the snug widths all read onLedLead() below, so
+    // nothing has a hand copy of the geometry to go stale. It was on EVERY ON/OFF pill,
+    // not only the pencil's, so it goes from all of them - one pill with a dot and three
+    // without is a worse answer than either.
+    inline constexpr bool kOnLedDotShown = false;
     inline float onLedDot (int h)
-    { return juce::jmax (5.0f, std::round ((float) h * 0.26f)); }
+    { return kOnLedDotShown ? juce::jmax (5.0f, std::round ((float) h * 0.26f)) : 0.0f; }
     inline constexpr float kOnLedGap = 4.0f;   // the disc's right edge -> the word
+    // The whole lead-in the word sits behind: the disc and its gap, or nothing at all.
+    // ONE expression, so "no disc" cannot mean "no disc but still paying for its gap".
+    inline float onLedLead (int h)
+    { return kOnLedDotShown ? onLedDot (h) + kOnLedGap : 0.0f; }
     // What the painter really lays down, so the fit sweep and the snug widths measure the
     // pill that is drawn rather than the one it used to draw.
     //
@@ -340,7 +355,7 @@ namespace fgfit
     // difference of a fraction of a pixel is enough to drop the last glyph of "OFF". A
     // switch reading "OF" is worse than one reading nothing, because it looks deliberate.
     inline float onLedInkWidth (int h, const juce::String& word)
-    { return onLedDot (h) + kOnLedGap
+    { return onLedLead (h)
            + juce::GlyphArrangement::getStringWidth (onLedFont (h), word) + 1.0f; }
     inline int onLedWidth (int h)  // "OFF" is the longer of the two words
     { return (int) std::ceil (onLedInkWidth (h, "OFF")) + 2; }
