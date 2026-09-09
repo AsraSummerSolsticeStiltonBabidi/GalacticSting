@@ -4551,10 +4551,16 @@ int main (int argc, char** argv)
         // this proves the split did not break it).
         {
             const double want = plain * std::pow (2.0, 3.5 / 12.0);
-            struct Same { int noteSample; int noteBlock; const char* how; };
+            // lsbSample >= 0 also sends the data-entry LSB (CC 38 = 0) at that sample -
+            // the 14-bit form of the same message. JUCE's RPN detector fires on the LSB
+            // too, rebuilding the value as (0 << 7) + 0, so a split that keyed on CC 6
+            // alone repaired the zone and then handed JUCE the byte that killed it again.
+            // The review of the first version found that; this is the case it asked for.
+            struct Same { int noteSample; int noteBlock; int lsbSample; const char* how; };
             const Same sames[] = {
-                { 8,  0, "0-member MCM at sample 0, note at sample 8 of the SAME block" },
-                { 0,  1, "0-member MCM at sample 0, note at the top of the NEXT block" },
+                { 8,  0, -1, "0-member MCM at sample 0, note at sample 8 of the SAME block" },
+                { 0,  1, -1, "0-member MCM at sample 0, note at the top of the NEXT block" },
+                { 8,  0,  3, "...the same, sent as the 14-bit pair (CC 38 = 0 at sample 3)" },
             };
             for (const auto& s2 : sames)
             {
@@ -4574,6 +4580,8 @@ int main (int argc, char** argv)
                         m.addEvent (juce::MidiMessage::controllerEvent (1, 101, 0), 0);
                         m.addEvent (juce::MidiMessage::controllerEvent (1, 100, 6), 1);
                         m.addEvent (juce::MidiMessage::controllerEvent (1, 6, 0), 2);
+                        if (s2.lsbSample >= 0)
+                            m.addEvent (juce::MidiMessage::controllerEvent (1, 38, 0), s2.lsbSample);
                     }
                     if (n == s2.noteBlock)
                     {
@@ -19686,6 +19694,66 @@ int main (int argc, char** argv)
         check (std::abs (pitchBack - 72.5) < 0.01,
                "...and a target pitch round-trips through encodePitch at that range, key and"
                " residual together");
+
+        // AND THE OTHER SIDE, or the three checks above are one-sided: they run only in
+        // MPE mode, where 48 is the right answer, so a decode or encode HARD-WIRED to 48
+        // passes every one of them. The review of this block said so. In the legacy
+        // layout the selector governs, so with it on +-2 the same wheel must decode to
+        // a twenty-fourth of what it did, and +3.5 st must encode past the top of the
+        // wheel (2 st is all it can say) - which is what a hard 48 cannot produce.
+        sp ("tuningMode", 2.0f);
+        sp ("bendRange", 0.0f);
+        const double decL = p.getRhythm().decodeWheelForTests (w35);
+        const int    encL = p.getRhythm().encodeBendForTests (3.5);
+        std::printf ("  LEGACY, selector on +-2: the same wheel decodes to %+.4f st (want %+.4f);"
+                     " +3.5 st encodes to %d (want 16383, the wheel's top)\n",
+                     decL, 3.5 / 24.0, encL);
+        check (std::abs (decL - 3.5 / 24.0) < 0.001,
+               "outside MPE the same wheel decodes at the SELECTOR's 2 - so the decode really"
+               " reads the range in force, and is not a 48 written into it");
+        check (encL == 16383,
+               "...and +3.5 st encodes to the wheel's top at a +-2 range - the encode reads it too");
+
+        // THE FOURTH SITE, the one nothing above touches: the lookahead's copy of the held
+        // chord (heldChordEarlyAsTargetAlphas), which retunes each held key by its channel's
+        // wheel before handing the chord to the realtime follower. It read the selector;
+        // now it asks the engine. Sabotaging it back left every check in this block green,
+        // because none of them goes through the processor. This one does: the link is
+        // armed so the lookahead peek observes the block's MIDI, a wheel of +3.5 st (at
+        // the zone's 48) and a note go in on channel 2, and the chord that comes back out
+        // must sit 3.5 st above the key - at the selector's 2 it would sit 0.146 st above.
+        sp ("tuningMode", 3.0f);
+        sp ("bendRange", 0.0f);
+        {
+            FractalAdditiveAudioProcessor::RtSettings rs {};
+            rs.lookahead = true;
+            p.setRealtimeLink (FractalAdditiveAudioProcessor::RtLink::SpectrumFromChord, rs);
+            p.setLookaheadForTests (true);
+            juce::AudioBuffer<float> b (2, 256);
+            juce::MidiBuffer m;
+            m.addEvent (juce::MidiMessage::pitchWheel (2, w35), 0);
+            m.addEvent (juce::MidiMessage::noteOn (2, 60, 0.8f), 1);
+            for (int n = 0; n < 8; ++n) { b.clear(); p.processBlock (b, m); m.clear(); }
+            // The function returns RATIOS to the lowest note and puts the lowest note's
+            // absolute pitch in f0Out - so the first read of hz[0] here was 1.000, the
+            // ratio of the one note to itself, and this arm went red against the code it
+            // was written to protect. Sixth probe bug of the session, same shape as the
+            // others: a number that was right, read as a different number.
+            double f0 = 0.0;
+            const auto hz = p.heldChordEarlyAsTargetAlphas (f0);
+            const double key = p.getNoteFrequency (60);
+            const double st  = (hz.size() == 1 && key > 0.0 && f0 > 0.0)
+                             ? 12.0 * std::log2 (f0 / key) : -999.0;
+            std::printf ("  lookahead chord copy: %d held, key %.3f Hz, chord f0 %.3f Hz = %+.3f st"
+                         " above it (want +3.500; the selector would give +0.146)\n",
+                         (int) hz.size(), key, f0, st);
+            check (hz.size() == 1, "(gate) the lookahead peek really observed the held note");
+            check (std::abs (st - 3.5) < 0.02,
+                   "the lookahead's copy of the chord retunes at the range the ENGINE decodes at,"
+                   " so the chord seen ahead of time is the chord that will sound");
+            p.setLookaheadForTests (false);
+            p.setRealtimeLink (FractalAdditiveAudioProcessor::RtLink::Off, rs);
+        }
     }
 
     //== IN A DAW THE LETTERS BELONG TO THE DAW ====================================
@@ -19988,6 +20056,18 @@ int main (int argc, char** argv)
                         chunk += ln[i];
                     }
                     tmpl += (tmpl.isEmpty() ? "" : "%") + chunk;
+                }
+                // A VALUE AFTER THE LAST LITERAL IS A GAP TOO. '%' was only ever put
+                // BETWEEN two literals, so "Could not write " + path came out as a
+                // template with no gap at all, matched nothing exactly, and slipped
+                // through the loose arm on its first sixteen characters. If the statement
+                // goes on past the last closing quote with a '+' before its semicolon,
+                // the message ends in a value and the template ends in '%'.
+                {
+                    const int lastQuote = ln.lastIndexOfChar ('"');
+                    const auto after = lastQuote >= 0 ? ln.substring (lastQuote + 1) : juce::String();
+                    if (after.upToFirstOccurrenceOf (";", false, false).containsChar ('+'))
+                        tmpl += "%";
                 }
                 composed.addIfNotAlreadyThere (tmpl);
             }

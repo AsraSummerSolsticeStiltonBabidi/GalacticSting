@@ -4232,19 +4232,35 @@ void FractalAdditiveAudioProcessor::repairMpeZoneOf (juce::MPESynthesiser& s)
 // where JUCE's MPEInstrument rewrites its zone - a member count of zero deactivates it.
 // Whole-block rendering then handed JUCE the message and the note behind it in one call,
 // and the note arrived at a dead zone. So the block is rendered up to and INCLUDING the
-// sample of each channel-1 CC 6, the zone is put back, and the rest follows; the samples
-// come out identical, only the moment the repair runs has moved.
+// sample of each channel-1 data-entry byte (CC 6, and CC 38 - see below), the zone is
+// put back, and the rest follows.
+//
+// WHAT MOVES AND WHAT DOES NOT, said precisely because the first version of this comment
+// said "the samples come out identical" and that is false. What is unchanged: the
+// events each render call consumes, and the audio of a block with no channel-1 data
+// entry in it (the one plain call it always took). What changes when a split happens:
+// JUCE restarts its 32-sample sub-block coalescing at every renderNextBlock call, so the
+// chunk boundaries handed to the voices move, and a voice evaluates its per-chunk
+// modulators at different sample offsets - an LSB-level difference whenever a modulator
+// is live, not a click and not a wrong note. And a dense stream of channel-1 data entry
+// costs one render call per message; no host sends one, and a repair that finds no
+// drift is a layout copy and two compares.
 //
 // This is not an RPN scan: it does not decode 101/100/6, it does not decide what the
 // message means, and it never calls the zone setter on its own account - the repair
 // does that, guarded by drift, exactly as it always has. It only chooses where to pause.
-// A channel-1 CC 6 that is NOT an MCM costs one extra split and a repair that finds
-// nothing drifted and does nothing.
+// Which also means a channel-1 CC 6 that completes RPN 0 (the MASTER bend range, which
+// the MPE spec resets to +-2) DOES drift the zone and DOES fire the repair, and the
+// repair's setZoneLayout releases every sounding note - at that sample now, where the
+// old top-of-render repair did the same one block later. Same policy, moved; not new.
 //
-// Not covered, and said: a note at the SAME sample as the MCM. JUCE processes events at
-// one timestamp in buffer order inside one render call, and there is no split between
-// two events at one sample. Hosts put the MCM at the top of a block and the note some
-// samples in; the test uses eight.
+// Not covered, and said: a note at the SAME sample as the data entry, on either side of
+// it. JUCE walks every event at one timestamp inside one render call, so a note AFTER
+// the byte in buffer order meets a dead zone and is dropped; a note BEFORE it is born,
+// the byte kills the zone under it, and the repair that follows releases it with
+// everything else. Lost either way, and no seam this function could split at. Hosts
+// put the message at the top of a block and the first note some samples in; the test
+// uses eight.
 //
 // A buffer with no channel-1 CC 6 in it - every ordinary block - takes the one plain
 // call it always took, byte for byte.
@@ -4262,7 +4278,15 @@ void FractalAdditiveAudioProcessor::renderSplitAtMcm (juce::MPESynthesiser& s,
             const int pos = meta.samplePosition;
             if (pos < cur || pos >= end) continue;
             const auto msg = meta.getMessage();
-            if (! (msg.isController() && msg.getChannel() == 1 && msg.getControllerNumber() == 6))
+            // CC 6 AND CC 38. Data entry is a 14-bit pair - MSB on 6, LSB on 38 - and
+            // JUCE's RPN detector fires on EITHER (juce_MidiRPN.cpp: both call
+            // sendIfReady). A host that sends the MCM as the full pair delivers CC 38 = 0
+            // after CC 6 = 0; splitting on the MSB alone repaired the zone and then handed
+            // JUCE the LSB, which rebuilt the RPN with value (0 << 7) + 0 and killed the
+            // zone AGAIN - the same-block note was lost exactly as before, one message
+            // later. Found by the adversarial review of the first version of this.
+            if (! (msg.isController() && msg.getChannel() == 1
+                    && (msg.getControllerNumber() == 6 || msg.getControllerNumber() == 38)))
                 continue;
             // Up to and including this sample, so JUCE has seen the message...
             const int upto = juce::jmin (end, pos + 1);
@@ -4312,9 +4336,34 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
     // the first note eight samples behind it. That note hit noteOn's early return and
     // was gone: not late, not detuned, gone. The four renders below split at each such
     // message and repair between the halves.
-    repairMpeZoneOf (synth);
-    for (auto& e : mixEng)
-        if (e != nullptr) repairMpeZoneOf (e->synth);
+    //
+    // THE CORNERS FOLLOW THE MAIN, as they did before the split. The first version of
+    // this repaired each corner on its OWN drift, which is not the same thing: with the
+    // mix off a corner never consumes the block's MIDI, so it never sees the host's
+    // member count or per-note range and kept applyZoneTo's (15, 48, 48) for good. The
+    // old code pushed the main's repaired layout to every corner whenever the main had
+    // drifted; that is what happens again here - and, as before, only inside the MPE
+    // flag, so a legacy-mode block does not touch the message thread's engine slots.
+    if (lastZoneMpe.load (std::memory_order_relaxed))
+    {
+        repairMpeZoneOf (synth);
+        // PER CORNER, NOT PER REPAIR. The first version of this only pushed the layout
+        // when the repair had changed the main's - which misses the case that matters
+        // most: an RPN 0 on a MEMBER channel moves the main's per-note range without
+        // ever tripping the drift test (that watches the master range and the zone being
+        // alive), so main and corners would decode the same wheel bytes at different
+        // ranges and the mix would blend two different chords.
+        //
+        // mixEngLive, acquire-loaded, because this is the audio thread: mixEng is the
+        // message thread's own array and the render loop below already reads the live
+        // view. The old code read mixEng here; that was the audio thread touching a
+        // message-thread unique_ptr, every block.
+        const auto layout = synth.getZoneLayout();
+        for (auto& slot : mixEngLive)
+            if (auto* e = slot.load (std::memory_order_acquire))
+                if (e->synth.getZoneLayout() != layout)
+                    e->synth.setZoneLayout (layout);
+    }
 
     const bool   on = mixEngaged.load (std::memory_order_acquire);
     const double sr = lastSr > 0.0 ? lastSr : 44100.0;

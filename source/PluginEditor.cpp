@@ -7087,10 +7087,10 @@ void FractalAdditiveAudioProcessorEditor::playChordPreview (int row)
 
     // Bend range of the receiver: the MPE-input mode's zone is hard-wired to +-48;
     // the legacy modes follow the bendRange parameter.
-    static constexpr int bendValues[] = { 2, 12, 48 };
-    const int bendRange = processorRef.getTuningMode() == 3 ? 48
-        : bendValues[juce::jlimit (0, 2,
-              (int) processorRef.apvts.getRawParameterValue ("bendRange")->load())];
+    // THE ENGINE'S OWN ANSWER, not a private copy of its rule. This held the last two
+    // bendValues[] tables in the editor; they agreed with RhythmEngine::bendRangeSemis
+    // by coincidence of being written the same day, which is not the same as reading it.
+    const int bendRange = (int) processorRef.getRhythm().getBendRangeSemis();
     const double f60 = processorRef.getNoteFrequency (60);
     if (! (f60 > 0.0)) return;
 
@@ -7148,9 +7148,7 @@ void FractalAdditiveAudioProcessorEditor::hoverPreview (const std::vector<double
     // Heard as before: the whole chord together, then an ascending arpeggio - and
     // it stops the moment the pointer leaves the row (stopChordPreview above).
 
-    static constexpr int bendValues[] = { 2, 12, 48 };
-    const int bendRange = processorRef.getTuningMode() == 3 ? 48
-        : bendValues[juce::jlimit (0, 2, (int) processorRef.apvts.getRawParameterValue ("bendRange")->load())];
+    const int bendRange = (int) processorRef.getRhythm().getBendRangeSemis();   // one rule, one reader
     const double f60 = processorRef.getNoteFrequency (60);
     if (! (f60 > 0.0)) return;
 
