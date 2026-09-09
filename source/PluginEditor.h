@@ -678,6 +678,7 @@ public:
     void paintOverChildren (juce::Graphics&) override;
     // A knob too narrow for its number shows no number - see the definition.
     void fitKnobValueBox (juce::Slider& k);
+    void layoutPlaygroundBandButton();
     void resized() override;
     void mouseDown (const juce::MouseEvent&) override;
     void mouseEnter (const juce::MouseEvent&) override; // reclaim keyboard focus so play works after a window switch
@@ -1559,6 +1560,10 @@ private:
     // definition. pgDrivingUi is read by paint() (the band) and by the layout.
     void refreshPlaygroundDrivingUi();
     void setSpectrumControlsEnabled (bool on);
+    // The band's own way out: one click enters EDIT on the corner the pad is nearest to,
+    // so the user does not have to open another window to act on what the band says.
+    juce::TextButton pgEditNearestBtn;
+    int  pgNearestCorner = 0;
     bool pgDrivingUi = false;
     int  lastPgDrivingSeen = -1;
 public:
@@ -1566,6 +1571,11 @@ public:
     // the same flag paint() draws from, so the check cannot pass over a band that is not
     // on the glass.
     bool playgroundBandShownForTests() const { return pgDrivingUi; }
+    // TESTS: the band's own way out - is it offered, and does pressing it act?
+    bool playgroundBandButtonShownForTests() const
+    { return pgEditNearestBtn.isVisible() && pgEditNearestBtn.getWidth() > 0; }
+    int  playgroundBandButtonCornerForTests() const { return pgNearestCorner; }
+    void clickPlaygroundBandButtonForTests() { if (pgEditNearestBtn.onClick) pgEditNearestBtn.onClick(); }
 private:
     void updateWarning (int templatePartials);
     // The longest sentence in the plugin, in one place so the probe can measure it

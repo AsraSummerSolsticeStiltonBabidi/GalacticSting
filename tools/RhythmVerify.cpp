@@ -21094,6 +21094,39 @@ int main (int argc, char** argv)
                    " the sound SAYS so - it does not sit there enabled and lit while every"
                    " edit is discarded");
 
+            // THE BAND'S OWN WAY OUT, and whether it actually leads anywhere. Telling the
+            // user to go and press EDIT in another window is a true instruction and a poor
+            // one, so the band carries the button - on the corner the pad is NEAREST to,
+            // which is the corner whose sound is being heard (the largest blend weight,
+            // the product's own definition). Pressing it must hand the panel back, because
+            // the controls then belong to that corner: that is the whole promise.
+            ed->resized();
+            const bool offered = ed->playgroundBandButtonShownForTests();
+            const int  target  = ed->playgroundBandButtonCornerForTests();
+            std::printf ("  the band offers \"edit corner %c\": %d\n", (char) ('A' + target), (int) offered);
+            check (offered, "the band offers a one-click way out, on the corner the pad is nearest to");
+            ed->clickPlaygroundBandButtonForTests();
+            settle (16);
+            std::printf ("  after pressing it: edit corner %d, band still up %d, faders live %d\n",
+                         p->getPlaygroundEditCorner(), (int) ed->playgroundBandShownForTests(),
+                         (int) ed->faderBoxProbeForTests ("baseN").found);
+            check (p->getPlaygroundEditCorner() == target,
+                   "...and pressing it really enters EDIT on that corner");
+            check (! ed->playgroundBandShownForTests(),
+                   "...which takes the band down, because the controls now belong to something"
+                   " real and refreshCornerEditUi says whose they are");
+            {
+                bool anyLive = false;
+                for (auto* c : ed->getChildren())
+                    if (auto* s = dynamic_cast<juce::Slider*> (c))
+                        if (s->isVisible() && ed->layoutProbe().spectrum.contains (c->getBounds())
+                             && s->isEnabled())
+                            anyLive = true;
+                check (anyLive, "...and the SPECTRUM panel is usable again");
+            }
+            p->endPlaygroundCornerEdit();
+            settle (16);
+
             // AND THE WAY OUT, measured rather than assumed. pgActive is
             // getPlaygroundAssignedCount() >= 2, so clearing ONE corner should hand the
             // spectrum back. This is the sentence the user gets told to try, so it is not

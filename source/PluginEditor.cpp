@@ -2665,6 +2665,25 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     playgroundPanel.pad.proc = &processorRef;
     playgroundPanel.trF     = [this] (const char* en, const char* ca) { return tr (en, ca); };
     playgroundPanel.trErrF  = [this] (const juce::String& e) { return trErr (e); };
+    // The lock band's button. addChildComponent, not addAndMakeVisible: it exists only
+    // while the playground is driving, and refreshPlaygroundDrivingUi decides that.
+    pgEditNearestBtn.setMouseClickGrabsKeyboardFocus (false);
+    // THE PANEL'S OWN COLOUR, at full strength. The first version wore a dimmed hue and
+    // sat on a dimmed band looking like part of the slab: the one thing on that band that
+    // can be pressed has to be the one thing that is not faded.
+    pgEditNearestBtn.setColour (juce::TextButton::buttonColourId, spectrumPanelColour);
+    pgEditNearestBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::black);
+    pgEditNearestBtn.onClick = [this]
+    {
+        // Entering EDIT is what makes these controls MEAN something again: they become
+        // that corner's own, its name takes the "*" the moment one of them moves, and
+        // saving it is the ordinary preset save. refreshCornerEditUi says whose they are.
+        processorRef.beginPlaygroundCornerEdit (pgNearestCorner);
+        refreshPlaygroundDrivingUi();
+        refreshCornerEditUi();
+        playgroundPanel.refresh (true);
+    };
+    addChildComponent (pgEditNearestBtn);
     playgroundPanel.pad.trF = [this] (const char* en, const char* ca) { return tr (en, ca); };
     playgroundPanel.attachVoices();   // needs proc: the pgVoices attachment
     // CORNER EDIT: the panel owns the Edit buttons, the MAIN window owns the preset field
@@ -3953,6 +3972,23 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lastTransitionShown = -1;     // ...and the TRANSITION cell, so the re-worded item is re-selected
     lastManualFrozenShown = -1;   // re-apply the slope fader's tooltip in the new language
     lastEngineShown       = -1;   // and re-light the engine chips with the new words
+    // ...and the playground lock, whose BUTTON carries a translated word ("Edit corner A").
+    // Its refresh is guarded by a change detector, and a language switch is not a change
+    // of state - so without this the button kept its English text in the Catalan window,
+    // which is exactly what the snapshot rig reported the first time it photographed it.
+    pgEditNearestBtn.setTooltip (tr (
+        "Takes you straight into editing that corner, without opening the playground window: "
+        "these controls become ITS controls, its name takes a * the moment one of them moves, "
+        "and you can then save it under the same name to replace it, or under a new one to keep "
+        "both. The corner offered is the one the pad is nearest to - the one you are mostly "
+        "hearing. Your own patch is kept and comes back when you leave edit mode.",
+        "Et porta directament a editar aquella cantonada, sense obrir la finestra del laboratori: "
+        "aquests controls passen a ser ELS SEUS, el seu nom agafa un * en el moment que en mous "
+        "un, i despr\xc3\xa9s la pots desar amb el mateix nom per substituir-la, o amb un de nou "
+        "per conservar totes dues. La cantonada oferta \xc3\xa9s la m\xc3\xa9s propera al punt del "
+        "tauler - la que est\xc3\xa0s sentint sobretot. El teu patch es guarda i torna quan surts "
+        "del mode edici\xc3\xb3."));
+    lastPgDrivingSeen     = -1;
     rhythmPanel.heading.setText (tr ("SPECTRUM VS RHYTHM", "ESPECTRE VS RITME"), dontSendNotification);
     rhythmPanel.outLbl.setText  (tr ("MIDI out (to DAW)", "Sortida MIDI (al DAW)"), dontSendNotification);
     rhythmPanel.selfLbl.setText (juce::String::fromUTF8 (catalan ? "Sona al Fibl\xc3\xb3" : "Play in Fibl\xc3\xb3"), dontSendNotification);
@@ -6038,6 +6074,27 @@ void FractalAdditiveAudioProcessorEditor::refreshPlaygroundDrivingUi()
     pgDrivingUi       = driving;
 
     setSpectrumControlsEnabled (! driving);
+    // The panel colour follows the engine, so the button is re-dressed with the lock.
+    pgEditNearestBtn.setColour (juce::TextButton::buttonColourId, spectrumPanelColour);
+    // THE WAY OUT, ON THE BAND ITSELF. Telling the user to go and press EDIT in another
+    // window is a true instruction and a poor one: the button is here, on the corner the
+    // pad is actually nearest to, which is the corner whose sound he is listening to.
+    // "Nearest" is not invented here either - it is the largest BLEND WEIGHT, the
+    // product's own definition of which corner this point mostly is.
+    pgEditNearestBtn.setVisible (driving);
+    if (driving)
+    {
+        double w[FractalAdditiveAudioProcessor::kPlaygroundCorners] {};
+        processorRef.getPlaygroundWeights (w);
+        pgNearestCorner = 0;
+        for (int i = 1; i < FractalAdditiveAudioProcessor::kPlaygroundCorners; ++i)
+            if (w[i] > w[pgNearestCorner]) pgNearestCorner = i;
+        const auto nm = processorRef.getPlaygroundCornerName (pgNearestCorner);
+        pgEditNearestBtn.setButtonText (
+            tr ("Edit corner %C%", "Edita la cantonada %C%")
+                .replace ("%C%", juce::String::charToString ((juce::juce_wchar) ('A' + pgNearestCorner))
+                                     + (nm.isNotEmpty() ? " (" + nm + ")" : juce::String())));
+    }
     // The three controls that already have exactly ONE owner of their enabled state read
     // the lock from inside that owner, so nothing here writes over them. Poke each owner
     // instead, which is what makes the lock arrive without a second writer appearing.
@@ -9489,6 +9546,20 @@ void FractalAdditiveAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
         text.toNearestInt(), juce::Justification::centred, 8, 1.0f);
 }
 
+// The band's button, placed from the same rect the band is drawn in - under the text,
+// centred, and sized to its own word so a long corner name does not crush it.
+void FractalAdditiveAudioProcessorEditor::layoutPlaygroundBandButton()
+{
+    if (! pgDrivingUi || spectrumBounds.isEmpty()) return;
+    const auto box  = spectrumBounds.reduced (6, 6);
+    const int  w    = juce::jlimit (120, juce::jmax (120, box.getWidth() - 40),
+                                    fgfit::snugTextButtonWidth (pgEditNearestBtn, 24));
+    pgEditNearestBtn.setBounds (juce::Rectangle<int> (w, 24)
+                                   .withCentre ({ box.getCentreX(),
+                                                  box.getBottom() - 24 }));
+    pgEditNearestBtn.toFront (false);
+}
+
 void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colour (0xff0c0c12));
@@ -12270,6 +12341,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
     rhythmPanel.setBounds (getLocalBounds().withSizeKeepingCentre (820, 640));
     rhythmScrim.toFront (false);
     rhythmPanel.toFront (false);
+    // Last, so it sits over the band that explains it.
+    layoutPlaygroundBandButton();
 }
 
 void FractalAdditiveAudioProcessorEditor::mouseDown (const juce::MouseEvent& e)
