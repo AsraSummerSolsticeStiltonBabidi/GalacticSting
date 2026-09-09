@@ -9664,6 +9664,25 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     }
 }
 
+// A KNOB TOO NARROW FOR ITS NUMBER SHOWS NO NUMBER - the same rule the faders follow at
+// the end of resized(), for the four controls that rule cannot reach.
+//
+// That sweep only looks at faders whose box is BELOW the track (a box to the RIGHT
+// belongs to its own owner), so when the LFO knobs moved their number to the right they
+// left its protection with it - and the rig found the consequence at once: the Range
+// knob's label "0.500" needed 23.9 px in the 14 it had, which is a STRUCTURAL fault, not
+// a fit problem. juce clamps a right-hand box to width - 30, so that is the test; below
+// it the number goes and the knob keeps the whole column, which is the trade every
+// hidden-not-squashed control in this window makes.
+void FractalAdditiveAudioProcessorEditor::fitKnobValueBox (juce::Slider& k)
+{
+    const int  need = fgfit::faderValueWidth (k);
+    const bool room = k.getWidth() - 30 >= need;
+    const auto want = room ? juce::Slider::TextBoxRight : juce::Slider::NoTextBox;
+    if (k.getTextBoxPosition() != want || (room && k.getTextBoxWidth() != need))
+        k.setTextBoxStyle (want, false, room ? need : 0, 13);
+}
+
 void FractalAdditiveAudioProcessorEditor::resized()
 {
     // Re-spell the keys if the tuning moved. The timer does this too, but the timer is
@@ -11495,7 +11514,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     auto rangeCol = a2.removeFromRight (46);
                     envEditor.setBounds (a2.withTrimmedRight (4));
                     lblCustRange.setBounds (rangeCol.removeFromTop (13));
-                    custRangeFader.setBounds (rangeCol);
+                    custRangeFader.setBounds (rangeCol); fitKnobValueBox (custRangeFader);
                 }
                 else
                 {
@@ -11561,11 +11580,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     const int cw = in.getWidth() / 3;
                     auto a2 = in;
                     if (showDiv)
-                    { auto c = a2.removeFromLeft (cw); lblLfoDiv.setBounds (c.removeFromTop (12)); lfoDivSlider.setBounds (c); }
+                    { auto c = a2.removeFromLeft (cw); lblLfoDiv.setBounds (c.removeFromTop (12)); lfoDivSlider.setBounds (c); fitKnobValueBox (lfoDivSlider); }
                     if (showHz)
-                    { auto c = a2.removeFromLeft (cw); lblLfoHz.setBounds (c.removeFromTop (12));  lfoHzSlider.setBounds (c); }
-                    { auto c = a2.removeFromLeft (cw); lblLfoPhase.setBounds (c.removeFromTop (12)); lfoPhaseSlider.setBounds (c); }
-                    { auto c = a2;                     lblCustRange.setBounds (c.removeFromTop (12)); custRangeFader.setBounds (c); }
+                    { auto c = a2.removeFromLeft (cw); lblLfoHz.setBounds (c.removeFromTop (12));  lfoHzSlider.setBounds (c); fitKnobValueBox (lfoHzSlider); }
+                    { auto c = a2.removeFromLeft (cw); lblLfoPhase.setBounds (c.removeFromTop (12)); lfoPhaseSlider.setBounds (c); fitKnobValueBox (lfoPhaseSlider); }
+                    { auto c = a2;                     lblCustRange.setBounds (c.removeFromTop (12)); custRangeFader.setBounds (c); fitKnobValueBox (custRangeFader); }
                 }
             }
         }

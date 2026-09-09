@@ -644,6 +644,8 @@ public:
     // The playground lock's band: over the children, because the controls it crosses
     // out are children and JUCE draws those on top of paint(). See the definition.
     void paintOverChildren (juce::Graphics&) override;
+    // A knob too narrow for its number shows no number - see the definition.
+    void fitKnobValueBox (juce::Slider& k);
     void resized() override;
     void mouseDown (const juce::MouseEvent&) override;
     void mouseEnter (const juce::MouseEvent&) override; // reclaim keyboard focus so play works after a window switch
