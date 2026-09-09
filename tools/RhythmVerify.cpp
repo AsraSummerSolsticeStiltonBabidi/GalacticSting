@@ -4537,6 +4537,67 @@ int main (int argc, char** argv)
                        (juce::String ("the bend still retunes ") + in.how).toRawUTF8());
             }
         }
+        // ...AND THE MCM AND THE NOTE IN THE SAME BUFFER, which is how a real host does
+        // it: the configuration message at the top of the block, the first note a few
+        // samples in. Every case above puts them two blocks apart on purpose, and the
+        // zone repair runs once, at the top of the render, BEFORE the block's MIDI is
+        // consumed - so a zero-member MCM at sample 0 deactivated the zone inside JUCE
+        // mid-render and the note at sample 8 hit MPEInstrument::noteOn's early return.
+        // Silent. Not clipped, not detuned - gone, with nothing said.
+        //
+        // Two placements, because they are two different failures: the note a few
+        // samples AFTER the message (the render has to be split there), and the note
+        // in the NEXT block (the top-of-render repair alone should cover that one, and
+        // this proves the split did not break it).
+        {
+            const double want = plain * std::pow (2.0, 3.5 / 12.0);
+            struct Same { int noteSample; int noteBlock; const char* how; };
+            const Same sames[] = {
+                { 8,  0, "0-member MCM at sample 0, note at sample 8 of the SAME block" },
+                { 0,  1, "0-member MCM at sample 0, note at the top of the NEXT block" },
+            };
+            for (const auto& s2 : sames)
+            {
+                auto up = std::make_unique<FractalAdditiveAudioProcessor>();
+                auto& p = *up;
+                if (auto* q = p.apvts.getParameter ("tuningMode"))
+                    q->setValueNotifyingHost (q->convertTo0to1 (3.0f));
+                p.pollParametersForTests();
+                p.prepareToPlay (sr, blk);
+                std::vector<float> mono;
+                juce::AudioBuffer<float> b (2, blk);
+                for (int n = 0; n < 100; ++n)
+                {
+                    juce::MidiBuffer m;
+                    if (n == 0)
+                    {
+                        m.addEvent (juce::MidiMessage::controllerEvent (1, 101, 0), 0);
+                        m.addEvent (juce::MidiMessage::controllerEvent (1, 100, 6), 1);
+                        m.addEvent (juce::MidiMessage::controllerEvent (1, 6, 0), 2);
+                    }
+                    if (n == s2.noteBlock)
+                    {
+                        m.addEvent (juce::MidiMessage::pitchWheel (2, bendFor (3.5)), s2.noteSample);
+                        m.addEvent (juce::MidiMessage::noteOn (2, 60, 0.8f), s2.noteSample + 1);
+                    }
+                    b.clear();
+                    p.processBlock (b, m);
+                    for (int i = 0; i < blk; ++i) mono.push_back (b.getSample (0, i));
+                }
+                const double got = measureHz (mono);
+                if (got < 0.0)
+                {
+                    std::printf ("    %-62s SILENT - the note was lost\n", s2.how);
+                    check (false, (juce::String ("a note still sounds: ") + s2.how).toRawUTF8());
+                    continue;
+                }
+                const double cents = 1200.0 * std::log2 (got / want);
+                std::printf ("    %-62s want %.3f Hz, got %.3f Hz  (%+.2f cents)\n",
+                             s2.how, want, got, cents);
+                check (std::abs (cents) < 10.0,
+                       (juce::String ("...and it is in tune: ") + s2.how).toRawUTF8());
+            }
+        }
         // ...and the same introduction, with the note on the MASTER channel. The comment
         // in applyTuningMode says both ranges are +-48 precisely so a host that puts
         // notes on channel 1 still retunes; JUCE's own MCM handler calls setLowerZone
@@ -19595,6 +19656,36 @@ int main (int argc, char** argv)
         check (mpeAt2 == 48.0 && mpeAt12 == 48.0,
                "in MPE mode the ZONE's +-48 is what a pulse is encoded against, whatever the"
                " selector says - the panel hides that control here because it does not govern");
+
+        // ...AND WHAT THE ENGINE DOES, NOT ONLY WHAT IT BELIEVES. Everything above reads
+        // getBendRangeSemis, the clamp. 9f92d77 fixed that clamp and left three callers
+        // holding their own copy of the selector table - the incoming wheel decode, the
+        // outgoing encode, and the lookahead's chord copy in the processor - and this
+        // block stayed green while sabotaging all three, because it never asked them.
+        // So: MPE mode, selector parked on +-2 (the setting the panel hides here), and
+        // the question put to each half is the number it produces.
+        sp ("tuningMode", 3.0f);
+        sp ("bendRange", 0.0f);
+        const int    w35   = 8192 + (int) std::lround (3.5 / 48.0 * 8192.0);   // +3.5 st at the zone's 48
+        const double dec   = p.getRhythm().decodeWheelForTests (w35);
+        const int    enc   = p.getRhythm().encodeBendForTests (3.5);
+        int note = -1, bend = -1; double produced = 0.0;
+        p.getRhythm().encodePitchForTests (440.0 * std::pow (2.0, 3.5 / 12.0), false, note, bend, produced);
+        const double encBack = ((double) enc - 8192.0) / 8192.0 * 48.0;
+        const double pitchBack = (double) note + ((double) bend - 8192.0) / 8192.0 * 48.0;
+        std::printf ("  MPE, selector on +-2: wheel %d decodes to %+.3f st (want +3.500);"
+                     " +3.5 st encodes to %d (want %d, i.e. %+.3f st at 48);"
+                     " 440 Hz +3.5 st -> note %d bend %d = %.3f (want 72.500)\n",
+                     w35, dec, enc, w35, encBack, note, bend, pitchBack);
+        check (std::abs (dec - 3.5) < 0.01,
+               "an incoming wheel on an MPE channel is DECODED at the zone's 48, not the hidden"
+               " selector's 2 - a held note's f0 is where the controller put it");
+        check (std::abs (encBack - 3.5) < 0.01,
+               "...and a pulse's detune is ENCODED at 48 - not 16383, which the voice reads as"
+               " four octaves up");
+        check (std::abs (pitchBack - 72.5) < 0.01,
+               "...and a target pitch round-trips through encodePitch at that range, key and"
+               " residual together");
     }
 
     //== IN A DAW THE LETTERS BELONG TO THE DAW ====================================
@@ -19809,7 +19900,10 @@ int main (int argc, char** argv)
         std::printf ("\nevery fixed refusal the processor writes can be read in Catalan:\n");
         const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
         juce::StringArray fixed, composed, missing;
-        for (const char* rel : { "PluginProcessor.cpp", "dsp/TuningManager.h" })
+        // PluginProcessor.h TOO: it holds inline refusals of its own - "Could not write "
+        // + path, in saveCurrentTuningTun - and a file outside this list is a file whose
+        // refusals no gate has ever read. The audit found that one by hand.
+        for (const char* rel : { "PluginProcessor.cpp", "PluginProcessor.h", "dsp/TuningManager.h" })
         {
             const auto txt = srcDir.getChildFile ("source").getChildFile (rel).loadFileAsString();
             // JOINED ACROSS LINES FIRST, because a message wrapped for the eighty-column

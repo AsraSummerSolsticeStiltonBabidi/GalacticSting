@@ -2546,9 +2546,11 @@ std::vector<double> FractalAdditiveAudioProcessor::heldChordEarlyAsTargetAlphas 
     const int n = laPeek.getHeld (keys, chans, LookaheadPeek::kMaxHeld);
     if (n <= 0) return {};
 
-    static constexpr double bendValues[] = { 2.0, 12.0, 48.0 };
-    const double range = bendValues[juce::jlimit (0, 2,
-        (int) apvts.getRawParameterValue ("bendRange")->load())];
+    // The range the ENGINE decodes at, not a fourth copy of the selector table. In MPE
+    // mode the zone fixes it at +-48 and the selector is hidden; this copy still read
+    // the selector, so the chord seen ahead of time by the lookahead was retuned at a
+    // different range from the one the notes would actually sound at.
+    const double range = rhythm.getBendRangeSemis();
 
     std::vector<double> hz;
     hz.reserve ((size_t) n);
@@ -4204,6 +4206,75 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 // voices are fast-killed and given a few muted blocks to actually finish -
 // stopping cold would leave fastKill armed on voices nothing ever renders again,
 // the exact trap beginFastKill documents.
+// The zone repair, per synth. Only when it has actually drifted: MPEInstrument::
+// setZoneLayout releases every sounding note, so re-asserting a zone that is already
+// right would cut notes off on every block. Follows the host where following costs
+// nothing (member count, per-note range) and refuses where it costs the feature (an
+// inactive zone, a master range other than 48) - see the comment in renderSynthMix.
+void FractalAdditiveAudioProcessor::repairMpeZoneOf (juce::MPESynthesiser& s)
+{
+    if (! lastZoneMpe.load (std::memory_order_relaxed)) return;
+    auto layout = s.getZoneLayout();
+    const auto lower = layout.getLowerZone();
+    const bool dead  = ! lower.isActive();
+    if (dead || lower.masterPitchbendRange != 48)
+    {
+        layout.setLowerZone (dead ? 15 : lower.numMemberChannels,
+                             dead ? 48 : lower.perNotePitchbendRange,
+                             48);
+        s.setZoneLayout (layout);
+    }
+}
+
+// RENDER, SPLIT AT EVERY MCM IN THE BUFFER, with the zone repaired between the pieces.
+//
+// An MPE Configuration Message is RPN 6 on channel 1, and its data-entry byte (CC 6) is
+// where JUCE's MPEInstrument rewrites its zone - a member count of zero deactivates it.
+// Whole-block rendering then handed JUCE the message and the note behind it in one call,
+// and the note arrived at a dead zone. So the block is rendered up to and INCLUDING the
+// sample of each channel-1 CC 6, the zone is put back, and the rest follows; the samples
+// come out identical, only the moment the repair runs has moved.
+//
+// This is not an RPN scan: it does not decode 101/100/6, it does not decide what the
+// message means, and it never calls the zone setter on its own account - the repair
+// does that, guarded by drift, exactly as it always has. It only chooses where to pause.
+// A channel-1 CC 6 that is NOT an MCM costs one extra split and a repair that finds
+// nothing drifted and does nothing.
+//
+// Not covered, and said: a note at the SAME sample as the MCM. JUCE processes events at
+// one timestamp in buffer order inside one render call, and there is no split between
+// two events at one sample. Hosts put the MCM at the top of a block and the note some
+// samples in; the test uses eight.
+//
+// A buffer with no channel-1 CC 6 in it - every ordinary block - takes the one plain
+// call it always took, byte for byte.
+void FractalAdditiveAudioProcessor::renderSplitAtMcm (juce::MPESynthesiser& s,
+                                                      juce::AudioBuffer<float>& buf,
+                                                      const juce::MidiBuffer& midi,
+                                                      int start, int len)
+{
+    const int end = start + len;
+    int cur = start;
+    if (lastZoneMpe.load (std::memory_order_relaxed))
+    {
+        for (const auto meta : midi)
+        {
+            const int pos = meta.samplePosition;
+            if (pos < cur || pos >= end) continue;
+            const auto msg = meta.getMessage();
+            if (! (msg.isController() && msg.getChannel() == 1 && msg.getControllerNumber() == 6))
+                continue;
+            // Up to and including this sample, so JUCE has seen the message...
+            const int upto = juce::jmin (end, pos + 1);
+            if (upto > cur) s.renderNextBlock (buf, midi, cur, upto - cur);
+            cur = upto;
+            // ...and the zone it just wrote is put right before anything else is heard.
+            repairMpeZoneOf (s);
+        }
+    }
+    if (end > cur) s.renderNextBlock (buf, midi, cur, end - cur);
+}
+
 void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& out,
                                                     const juce::MidiBuffer& midi, int nSamp)
 {
@@ -4233,21 +4304,17 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
     // Only when it has actually drifted: MPEInstrument::setZoneLayout releases every
     // sounding note, so re-asserting a zone that is already right would cut notes off on
     // every block.
-    if (lastZoneMpe.load (std::memory_order_relaxed))
-    {
-        auto layout = synth.getZoneLayout();
-        const auto lower = layout.getLowerZone();
-        const bool dead  = ! lower.isActive();
-        if (dead || lower.masterPitchbendRange != 48)
-        {
-            layout.setLowerZone (dead ? 15 : lower.numMemberChannels,
-                                 dead ? 48 : lower.perNotePitchbendRange,
-                                 48);
-            synth.setZoneLayout (layout);
-            for (auto& e : mixEng)
-                if (e != nullptr) e->synth.setZoneLayout (layout);
-        }
-    }
+    //
+    // ...AND ONCE MORE INSIDE THE BLOCK, at every MCM in it - see renderSplitAtMcm. This
+    // top-of-render pass catches a message that arrived in an EARLIER block; it cannot
+    // catch one in THIS block, because the block's MIDI has not been consumed yet when
+    // it runs, and a zero-member MCM at sample 0 deactivated the zone inside JUCE with
+    // the first note eight samples behind it. That note hit noteOn's early return and
+    // was gone: not late, not detuned, gone. The four renders below split at each such
+    // message and repair between the halves.
+    repairMpeZoneOf (synth);
+    for (auto& e : mixEng)
+        if (e != nullptr) repairMpeZoneOf (e->synth);
 
     const bool   on = mixEngaged.load (std::memory_order_acquire);
     const double sr = lastSr > 0.0 ? lastSr : 44100.0;
@@ -4264,7 +4331,7 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
         mixWasOn       = on;
         mixMainApplied = 1.0f;
         for (auto& a : mixApplied) a = 0.0f;   // the next engage ramps in from silence
-        synth.renderNextBlock (out, midi, 0, nSamp);
+        renderSplitAtMcm (synth, out, midi, 0, nSamp);
         return;
     }
 
@@ -4297,7 +4364,7 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
     if (mixScratch.getNumSamples() >= nSamp && mixScratch.getNumChannels() > 0)
     {
         mixScratch.clear();
-        synth.renderNextBlock (mixScratch, midi, 0, nSamp);
+        renderSplitAtMcm (synth, mixScratch, midi, 0, nSamp);
         mixScratch.applyGainRamp (0, nSamp, mixMainApplied, mainNow);
         // A NARROWER BUS FOLDS THE SCRATCH DOWN, IT DOES NOT PICK A CHANNEL OUT OF IT.
         //
@@ -4327,7 +4394,7 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
     {
         // Defensive: a block larger than prepareToPlay promised. The main engine must
         // sound whatever happens; the mix sits this block out.
-        synth.renderNextBlock (out, midi, 0, nSamp);
+        renderSplitAtMcm (synth, out, midi, 0, nSamp);
     }
     mixMainApplied = mainNow;
 
@@ -4352,7 +4419,7 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
         const float now = mixGainCur[i] * xAmp;
         if (e->buf.getNumSamples() < nSamp) { mixApplied[i] = now; continue; }  // defensive, as above
         e->buf.clear();
-        e->synth.renderNextBlock (e->buf, *cornerFeed, 0, nSamp);
+        renderSplitAtMcm (e->synth, e->buf, *cornerFeed, 0, nSamp);
         e->buf.applyGainRamp (0, nSamp, mixApplied[i], now);
         mixApplied[i] = now;
         const int srcCh = e->buf.getNumChannels();

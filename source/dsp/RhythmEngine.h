@@ -437,10 +437,13 @@ private:
         }
         else if (msg.isPitchWheel())
         {
-            static constexpr int bendValues[] = { 2, 12, 48 };
-            const int idx = juce::jlimit (0, 2, bendParam != nullptr ? (int) bendParam->load() : 2);
+            // AT THE RANGE THAT IS REALLY IN FORCE - bendRangeSemis(), the one function
+            // that knows the zone fixes it at +-48 in MPE mode. This site read the selector
+            // directly, so 9f92d77 fixed the CLAMP and left the decode behind: an incoming
+            // wheel on an MPE channel was still scaled by a +-2 selector the panel hides
+            // in that mode, and a held note's f0 came out twenty-four times too close.
             const double semis = ((double) msg.getPitchWheelValue() - 8192.0) / 8192.0
-                               * (double) bendValues[idx];
+                               * bendRangeSemis();
             channelBend[(size_t) juce::jlimit (0, 15, msg.getChannel() - 1)] = semis;
             for (auto& h : heldCol)
                 if (h.active && h.ch == msg.getChannel())
@@ -489,6 +492,23 @@ public:
              ? lastSendBend[(size_t) slot][(size_t) col].load (std::memory_order_relaxed) : 8192;
     }
     double getBendRangeSemis() const noexcept { return bendRangeSemis(); }
+    // TESTS: the two halves the range test above could not reach. getBendRangeSemis says
+    // what the engine BELIEVES the range is; these say what it DOES with a wheel value
+    // coming in and a detune going out. The first version of that test called only the
+    // belief, four times, and sabotaging both of these left it green.
+    // THROUGH THE REAL HANDLER, not a formula of its own. The first version of this
+    // computed the answer itself from bendRangeSemis() - the belief - and stayed green
+    // with the decode site sabotaged to a hard 2.0, which is precisely the probe defect
+    // the old range test had. It now feeds the engine a pitch-wheel message the way the
+    // MIDI input does and reads back what the engine STORED for that channel.
+    double decodeWheelForTests (int wheel14, int channel = 2) noexcept
+    {
+        handleEvent (juce::MidiMessage::pitchWheel (channel, wheel14), 0, true);
+        return channelBend[(size_t) juce::jlimit (0, 15, channel - 1)];
+    }
+    int    encodeBendForTests (double semis) const noexcept { return encodeBend (semis); }
+    void   encodePitchForTests (double hz, bool forSynth, int& note, int& bend, double& produced) noexcept
+    { encodePitch (hz, forSynth, note, bend, produced); }
 
     //==========================================================================
     // THE CHORD BEING HELD RIGHT NOW, with each note's EXACT sounding frequency
@@ -832,11 +852,15 @@ private:
     // range the SYNTH is actually set to. This used to assume the MPE default of
     // +-48 unconditionally, so with the range on +-2 or +-12 every JI pulse landed
     // at 1/24 or 1/4 of its intended detune - the "JI breaks the sound" report.
+    //
+    // ...and it now asks bendRangeSemis(), like the clamp two callers up. It kept its own
+    // copy of the selector table after that function learned about MPE, so in MPE mode
+    // the clamp was computed at 48 and the encode at 2: a pulse asked for +3.5 semitones
+    // went out as 16383, which the voice - reading the zone's 48 - played 48 semitones up.
+    // One rule, one function, every caller.
     int encodeBend (double semitoneOffset) const noexcept
     {
-        static constexpr double bendValues[] = { 2.0, 12.0, 48.0 };
-        const int idx = juce::jlimit (0, 2, bendParam != nullptr ? (int) bendParam->load() : 2);
-        const double range = bendValues[idx];
+        const double range = bendRangeSemis();
         return juce::jlimit (0, 16383, 8192 + (int) std::lround (semitoneOffset / range * 8192.0));
     }
     // Widest detune the current bend range can actually express, for clamping.

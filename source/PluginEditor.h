@@ -238,6 +238,10 @@ namespace fgerr
           "La tecla % d'aquesta taula d'afinaci\xc3\xb3 no \xc3\xa9s una freq\xc3\xbc\xc3\xa8ncia utilitzable. No s'ha carregat res." },
         { "Bad basefreq in .tun: \"%\".",
           "basefreq incorrecta al .tun: \"%\"." },
+        // saveCurrentTuningTun, in PluginProcessor.h - a file the refusal walk did not
+        // read until 2026-09-09, so this one had no translation and nothing said so.
+        { "Could not write %",
+          "No s'ha pogut escriure %" },
         { "Bad value for note % in .tun: \"%\".",
           "Valor incorrecte per a la nota % del .tun: \"%\"." },
         { "Note % in this .tun is not a finite pitch.",

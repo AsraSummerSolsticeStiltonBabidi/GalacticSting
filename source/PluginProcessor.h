@@ -2420,6 +2420,13 @@ private:
     void renderSynthMix (juce::AudioBuffer<float>& out, const juce::MidiBuffer& midi, int nSamp);
     // Mirror the live zone layout / bend range onto a sub-synth (corners follow the
     // LIVE tuning plumbing - the tuning is global, exactly as the morph promises).
+    // The MPE zone, put back after the host's own configuration message has been through
+    // JUCE's handler - and the render that splits at each such message so a note in the
+    // SAME buffer is not lost to a zone that was inactive for the width of one block.
+    // Both defined beside renderSynthMix, which is where the reasoning lives.
+    void repairMpeZoneOf (juce::MPESynthesiser& s);
+    void renderSplitAtMcm (juce::MPESynthesiser& s, juce::AudioBuffer<float>& buf,
+                           const juce::MidiBuffer& midi, int start, int len);
     void applyZoneTo (juce::MPESynthesiser& s) const
     {
         if (lastZoneMpe.load (std::memory_order_relaxed))
