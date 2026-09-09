@@ -276,6 +276,74 @@ namespace fgerr
 // truncation waiting for a language switch.
 //
 // Each function mirrors exactly the painter named beside it. Nothing here guesses.
+// THE "NEAREST JUST INTERVAL" NAMER, out here where a test can call it.
+//
+// It used to live in an anonymous namespace inside PluginEditor.cpp, which is why it had
+// no test and why both of these shipped:
+//
+//   * 1000 cents was named "~ 7/4", which is 31.2 cents away, while 9/5 is 17.6 and 16/9
+//     is 3.9. The near-field pick claimed in its own comment to be "the closest thing"
+//     and was in fact the SIMPLEST within 35 cents, which is a different question.
+//   * 100 cents was named "~ 14/13" at -28 cents. 17/16 is 5.0 away and 18/17 is 1.0,
+//     and BOTH were excluded by a `simp <= 200` cap - while the comment beside it claimed
+//     the last tier "catches 17/16 (100c is only ~1c away from it)". It does not catch
+//     it, and ~1c is 18/17, not 17/16. Two wrong statements in one sentence.
+//
+// The rule now: a ratio may be CLAIMED as an approximation when its error fits a window
+// that shrinks with its complexity - 90/sqrt(p*q), capped at 18 cents - and among those
+// the SIMPLEST wins, so 700c is 3/2 and not some closer obscurity. Separately, the
+// nearest neighbour is exactly that: smallest error, ties to the simpler ratio, which is
+// what its comment always said it was.
+namespace fgjust
+{
+    struct JustHint
+    {
+        bool      has     = false;  long long p  = 1, q  = 1; double err     = 0.0;
+        bool      hasNear = false;  long long np = 1, nq = 1; double nearErr = 0.0;
+    };
+    inline JustHint nearestJust (double cents)
+    {
+        JustHint h;
+        if (! std::isfinite (cents)) return h;
+        const double ratio = std::exp2 (cents / 1200.0);
+        if (! (ratio > 0.0) || ! std::isfinite (ratio)) return h;
+
+        double bestSimp = 1.0e18, nearBest = 1.0e18, nearSimp = 1.0e18;
+        for (long long q2 = 1; q2 <= 17; ++q2)
+        {
+            const long long p2 = (long long) std::llround (ratio * (double) q2);
+            if (p2 <= 0 || std::gcd (p2, q2) != 1) continue;
+            const double err  = cents - 1200.0 * std::log2 ((double) p2 / (double) q2);
+            const double simp = (double) (p2 * q2);
+            const double aerr = std::abs (err);
+            // CLAIMED: close enough for how complex it is, and of those the simplest.
+            // TWO WAYS TO EARN THE NAME, because one law cannot do both jobs. A single
+            // window of the form K/sqrt(p*q) has to pass 8/5 at 13.7 cents (800c, a
+            // documented case), and that forces K >= 87 - which then hands every complex
+            // ratio a window wide enough to cover 83% of the octave. Measured: the "*"
+            // stopped meaning anything. So:
+            //   * a SIMPLE ratio may be named loosely - it is the one a player would name
+            //     anyway, and 12-EDO's thirds and sixths are 14 cents off theirs;
+            //   * a complex one only when it is close in ABSOLUTE terms, where "17/16"
+            //     is a real statement about a 5-cent interval and not a shrug.
+            // Among everything that qualifies, the simplest wins, so 700c stays 3/2.
+            const double tol = juce::jmin (18.0, 90.0 / std::sqrt (simp));
+            const bool   ok  = (simp <= 100.0 && aerr <= tol)      // simple, loosely
+                            || (simp <= 306.0 && aerr <= 6.0);     // complex, but really there
+            if (ok && simp < bestSimp)
+            { bestSimp = simp; h.has = true; h.p = p2; h.q = q2; h.err = err; }
+            // NEAREST: the closest, full stop - ties broken towards the simpler ratio.
+            // Capped at 300 so it names something a musician recognises: at 1000c that is
+            // 16/9 at -3.9c, where a cap of 400 let in 25/14 at -3.8c, which is nearer by
+            // a tenth of a cent and tells nobody anything.
+            if (simp <= 300.0 && aerr <= 45.0
+                 && (aerr < nearBest - 1.0e-9 || (aerr < nearBest + 1.0e-9 && simp < nearSimp)))
+            { nearBest = aerr; nearSimp = simp; h.hasNear = true; h.np = p2; h.nq = q2; h.nearErr = err; }
+        }
+        return h;
+    }
+}
+
 namespace fgfit
 {
     // GalacticLnF::getTextButtonFont.

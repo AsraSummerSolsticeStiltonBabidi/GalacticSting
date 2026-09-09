@@ -18146,9 +18146,17 @@ int main (int argc, char** argv)
     // 19-EDO I could not tell whether the 379-cent degree carried it.
     //
     // 19-EDO, because its degrees straddle the rule in both directions:
-    //   degree 6 = 378.9c is 7.4c under 5/4, whose simplicity (20) buys a 17c window -> "*"
-    //   degree 3 = 189.5c has nothing simple within its window at all               -> none
+    //   degree 6 = 378.9c is 7.4c under 5/4, whose simplicity (20) buys a wide window -> "*"
+    //   degree 3 = 189.5c is 7.1c over 10/9, which its window now covers              -> "*"
+    //   degree 1 =  63.2c has nothing within 35c of it in either direction            -> none
     //   degree 5 = 315.8c IS 6/5 to within a cent, so it is named as the ratio, not cents
+    //
+    // Degree 3 used to be the "nothing" case here, and that was a fact about the old
+    // WINDOW, not about music: 10/9 sits 7.1 cents away and the old tier gave a ratio of
+    // that complexity only 2.5 cents. When the windows were corrected (see
+    // fgjust::nearestJust) this check went red for naming a true interval, so the case it
+    // guards - that the "*" is a promise and not decoration - moved to degree 1, where
+    // the nearest thing at all is 18/17, 36 cents away.
     {
         std::printf ("\nrun 56: the \"*\" that promises a nearby just interval:\n");
         auto p = std::make_unique<FractalAdditiveAudioProcessor>();
@@ -18164,15 +18172,20 @@ int main (int argc, char** argv)
         if (ed != nullptr)
         {
             ed->setSize (1200, 650);
+            const auto l1 = ed->degreeKeyLabelForTests (1);
             const auto l3 = ed->degreeKeyLabelForTests (3);
             const auto l5 = ed->degreeKeyLabelForTests (5);
             const auto l6 = ed->degreeKeyLabelForTests (6);
-            std::printf ("    degree 3 \"%s\"   degree 5 \"%s\"   degree 6 \"%s\"\n",
-                         l3.toRawUTF8(), l5.toRawUTF8(), l6.toRawUTF8());
+            std::printf ("    degree 1 \"%s\"   degree 3 \"%s\"   degree 5 \"%s\"   degree 6 \"%s\"\n",
+                         l1.toRawUTF8(), l3.toRawUTF8(), l5.toRawUTF8(), l6.toRawUTF8());
             check (l6.endsWithChar ('*'),
                    "  378.9c is 7.4c under 5/4 and says so with the asterisk");
-            check (! l3.endsWithChar ('*'),
-                   "  ...189.5c has no simple neighbour in its window, and does not claim one");
+            check (l3.endsWithChar ('*'),
+                   "  ...189.5c is 7.1c over 10/9 and says so too - it used to stay silent, which"
+                   " was the old window's doing and not the music's");
+            check (! l1.endsWithChar ('*'),
+                   "  ...while 63.2c has nothing within 35c and claims nothing - the \"*\" is a"
+                   " promise, not decoration");
             check (l5 == "6/5",
                    "  ...and 315.8c is named as the ratio it is, not as cents");
         }
@@ -21657,6 +21670,108 @@ int main (int argc, char** argv)
             std::printf ("  [SKIP] (b) needs FG_SOURCE_DIR\n");
            #endif
             ed->setLanguageForTests (false);
+        }
+    }
+
+    //== THE "NEAREST JUST INTERVAL" HINT NAMES THE INTERVAL THAT IS ACTUALLY THERE ==
+    //
+    // "1000 cents no deberia ser aproximacion a 7/4 si no a 9/5 no? y 100 cents no
+    //  deberia ser 17/16 como el mas cercano?"
+    //
+    // Both reported by ear, both real, and neither could be caught by anything here: the
+    // namer lived in an anonymous namespace inside PluginEditor.cpp, so no test could
+    // call it. 1000c was named 7/4, which is 31.2 cents away; 100c was named 14/13, which
+    // is 28 away, while 17/16 sits 5.0 away and 18/17 1.0 - both excluded by a
+    // complexity cap. It is a pure function of cents now, and this asks it directly.
+    {
+        std::printf ("\nthe nearest-just hint names what is really nearest:\n");
+        auto cents = [] (long long p, long long q)
+        { return 1200.0 * std::log2 ((double) p / (double) q); };
+
+        struct Want { double c; long long p, q; const char* what; };
+        const Want claims[] = {
+            // The two the user reported.
+            { 1000.0, 16,  9, "1000c: 16/9 is 3.9c away, 9/5 is 17.6, 7/4 is 31.2" },
+            {  100.0, 17, 16, "100c: 17/16 is 5.0c away - the simplest that close" },
+            // ...and the four the old comment claimed already worked, so the new rule is
+            // not bought by breaking them.
+            {  700.0,  3,  2, "700c -> 3/2" },
+            {  697.0,  3,  2, "697c -> 3/2 too (a tempered fifth still names it)" },
+            {  400.0,  5,  4, "400c -> 5/4" },
+            {  800.0,  8,  5, "800c -> 8/5" },
+            {  200.0,  9,  8, "200c -> 9/8" },
+        };
+        for (const auto& w : claims)
+        {
+            const auto h = fgjust::nearestJust (w.c);
+            std::printf ("  %-58s got %s%lld/%lld (%+.1fc)\n", w.what,
+                         h.has ? "" : "NOTHING - nearest is ",
+                         h.has ? h.p : h.np, h.has ? h.q : h.nq,
+                         h.has ? h.err : h.nearErr);
+            check (h.has && h.p == w.p && h.q == w.q,
+                   (juce::String ("the hint names ") + juce::String (w.p) + "/" + juce::String (w.q)
+                    + " for " + juce::String ((int) w.c) + "c").toRawUTF8());
+        }
+
+        // AND THE ONES IT MUST NOT CLAIM. An exact just interval is handled before the
+        // hint ever runs, but the hint must not invent a name for something that has no
+        // near neighbour, and must never claim a ratio further off than its own window.
+        for (const auto& w : claims)
+        {
+            const auto h = fgjust::nearestJust (w.c);
+            const double simp = (double) (h.p * h.q);
+            const double tol  = simp <= 100.0 ? juce::jmin (18.0, 90.0 / std::sqrt (simp)) : 6.0;
+            check (! h.has || std::abs (h.err) <= tol + 1.0e-9,
+                   "...and never claims a ratio further away than the rule it was named under");
+        }
+        // HOW OFTEN THE "*" APPEARS, measured against the rule it replaced.
+        //
+        // I wrote a band here first - "between a tenth and two thirds of the octave" -
+        // and it failed at 82%. The band was a guess made before measuring, and the
+        // measurement is the thing that is true: in 12-EDO nearly every degree IS within
+        // ~15 cents of a simple just interval, which is the reason 12-EDO works at all.
+        // A high hit rate is a fact about music, not a fault in the rule, so the number
+        // is PRINTED beside the old rule's for comparison and the gate asserts only what
+        // can actually be wrong: that the hint is not universal. The case that carries
+        // that guarantee properly is run 56's 63.2 cents, which has nothing within 35c
+        // and says nothing.
+        {
+            auto oldRule = [] (double cents)
+            {
+                const double ratio = std::exp2 (cents / 1200.0);
+                for (long long q2 = 1; q2 <= 17; ++q2)
+                {
+                    const long long p2 = (long long) std::llround (ratio * (double) q2);
+                    if (p2 <= 0 || std::gcd (p2, q2) != 1) continue;
+                    const double err  = cents - 1200.0 * std::log2 ((double) p2 / (double) q2);
+                    const double simp = (double) (p2 * q2);
+                    const double tol  = simp <= 40.0 ? 17.0 : (simp <= 80.0 ? 8.0 : (simp <= 300.0 ? 2.5 : 0.0));
+                    if (std::abs (err) <= tol) return true;
+                }
+                return false;
+            };
+            int now = 0, before = 0;
+            for (int c = 0; c < 1200; ++c)
+            {
+                if (fgjust::nearestJust ((double) c).has) ++now;
+                if (oldRule ((double) c)) ++before;
+            }
+            std::printf ("  the \"*\" appears on %d of 1200 cent values (%.0f%%);"
+                         " the rule it replaced fired on %d (%.0f%%)\n",
+                         now, 100.0 * now / 1200.0, before, 100.0 * before / 1200.0);
+            check (now < 1150,
+                   "the hint is not universal - a degree with nothing near it still says nothing"
+                   " (run 56 holds the case that proves it: 63.2c, whose nearest is 36c away)");
+        }
+        // The NEAREST field is the nearest, not the simplest: at 1000c that is 16/9 and
+        // not 7/4, which is the whole of the first report.
+        {
+            const auto h = fgjust::nearestJust (1000.0);
+            std::printf ("  nearest-neighbour field at 1000c: %lld/%lld (%+.1fc)"
+                         "   [7/4 would be +31.2, 9/5 -17.6]\n", h.np, h.nq, h.nearErr);
+            check (h.hasNear && std::abs (h.nearErr) <= 4.0,
+                   "the nearest-neighbour field really is the nearest - it used to answer the"
+                   " SIMPLEST within 35c, which is a different question and gave 7/4 at +31c");
         }
     }
 

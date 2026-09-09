@@ -202,34 +202,14 @@ namespace
         if (p * q <= 150 && std::abs (d.cents - 1200.0 * std::log2 ((double) p / (double) q)) < 0.3)
         { d.genuine = true; d.p = p; d.q = q; return d; } // float-exact (e.g. a dissonance-curve pick)
 
-        // The "≈ p/q" hint: scan the SIMPLE fractions directly (denominators 1..12)
-        // and prefer the SIMPLEST one whose distance fits its simplicity window - very
-        // simple ratios get ~17c (697c AND 700c -> "≈ 3/2"; 400c -> "≈ 5/4 (+14c)";
-        // 800c -> "≈ 8/5 (-14c)"), moderately simple ones ~8c (200c -> "≈ 9/8"),
-        // complex ones only a hair. A continued-fraction "best" pick would prefer
-        // obscure closer fractions (800c is nearer 19/12 than 8/5) - not helpful.
-        long long bestP = 0, bestQ = 1; double bestErr = 0.0; double bestSimp = 1.0e18;
-        long long nearP = 0, nearQ = 1; double nearErr = 0.0, nearSimp = 1.0e18;
-        for (long long q2 = 1; q2 <= 17; ++q2)
-        {
-            const long long p2 = (long long) std::llround (ratio * (double) q2);
-            if (p2 <= 0 || std::gcd (p2, q2) != 1) continue;
-            const double err  = d.cents - 1200.0 * std::log2 ((double) p2 / (double) q2);
-            const double simp = (double) (p2 * q2);
-            // Simplicity-tiered windows; the last tier catches VERY close but less
-            // simple ratios like 17/16 (100c is only ~1c away from it).
-            const double tol  = simp <= 40.0 ? 17.0 : (simp <= 80.0 ? 8.0 : (simp <= 300.0 ? 2.5 : 0.0));
-            if (std::abs (err) <= tol && simp < bestSimp)
-            { bestSimp = simp; bestP = p2; bestQ = q2; bestErr = err; }
-            // ...and, separately, the simplest ratio within earshot at all (35c), so
-            // an interval like 600c can still name its closest just neighbour.
-            if (std::abs (err) <= 35.0 && simp <= 200.0 && simp < nearSimp)
-            { nearSimp = simp; nearP = p2; nearQ = q2; nearErr = err; }
-        }
-        if (bestP > 0)
-        { d.hasApprox = true; d.ap = bestP; d.aq = bestQ; d.approxErr = (int) std::llround (bestErr); }
-        if (nearP > 0)
-        { d.hasNear = true; d.np = nearP; d.nq = nearQ; d.nearErr = (int) std::llround (nearErr); }
+        // The "≈ p/q" hint and the nearest neighbour - ONE rule, in fgjust::nearestJust,
+        // where a test can reach it. See the comment on that function for what the two
+        // answers mean and for the two intervals this used to get wrong.
+        const auto h = fgjust::nearestJust (d.cents);
+        if (h.has)
+        { d.hasApprox = true; d.ap = h.p; d.aq = h.q; d.approxErr = (int) std::llround (h.err); }
+        if (h.hasNear)
+        { d.hasNear = true; d.np = h.np; d.nq = h.nq; d.nearErr = (int) std::llround (h.nearErr); }
         return d;
     }
     // Compact scale-degree label: the exact ratio when genuine, else its cents (with a
