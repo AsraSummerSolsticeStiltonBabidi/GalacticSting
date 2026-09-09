@@ -5276,6 +5276,12 @@ private:
     {
         FractalAdditiveAudioProcessor* proc = nullptr;
         std::function<juce::String (const char*, const char*)> trF;
+        // ...and the ONE hook that turns a processor refusal into the reader's language.
+        // The status line below dumps getPlaygroundAdaptRefusal() straight in, and that
+        // string is composed by the PROCESSOR, which has no language: without this the
+        // Catalan reader gets an English sentence in the middle of a Catalan panel. Same
+        // shape as trF, wired from the editor beside it.
+        std::function<juce::String (const juce::String&)> trErrF;
 
         juce::Label        headLbl, statLbl;
         juce::Label        cornerLbl[4];
@@ -5779,7 +5785,8 @@ private:
                                      "toques, dins la barreja.")
                               : juce::String());
                 if (proc->getPlaygroundAdaptRefusal().isNotEmpty())
-                    s << "\n" << proc->getPlaygroundAdaptRefusal();
+                    s << "\n" << (trErrF ? trErrF (proc->getPlaygroundAdaptRefusal())
+                                         : proc->getPlaygroundAdaptRefusal());
                 // EDIT MODE is the loudest thing this line can say: the main window's
                 // controls are somebody else's patch right now, and a user who does not
                 // know that will "fix" a corner thinking it is their own sound.

@@ -22118,6 +22118,55 @@ static void runProcessorAuditChecks()
         check (copies.isEmpty(),
                "  (b) no dialog writes a title the table already holds - the copy is the "
                "one that goes stale, and it is the one the user sees");
+
+        // (c) THE BODY, WHICH THIS RUN NEVER LOOKED AT. Arms (a) and (b) are about the
+        // TITLE, and a dialog is two strings: a title from the table and a body under it.
+        // Two of them passed a processor refusal straight through - `err`, `aerr` - under
+        // a title that was correctly translated, so a Catalan reader got a Catalan
+        // heading over an English sentence. The refusals HAVE translations and a gate
+        // already certifies those exist (fgerr::table + fgerr::patterns); the two call
+        // sites simply did not go through trErr.
+        //
+        // The invariant needs no list: the third argument of every showMessageBoxAsync is
+        // the body, and a body is either literal text the compiler can see inside tr/trF,
+        // or a runtime string, and a runtime string has to be wrapped. So: the argument
+        // list must mention one of tr(, trF(, trErr(. Anything else is a body that
+        // reaches the glass in whatever language it was composed in.
+        juce::StringArray raw;
+        for (size_t at = src.find ("showMessageBoxAsync"); at != std::string::npos;
+             at = src.find ("showMessageBoxAsync", at + 1))
+        {
+            const size_t semi = src.find (';', at);
+            const size_t end  = std::min (at + 900, semi == std::string::npos ? src.size() : semi);
+            const std::string args = src.substr (at, end - at);
+            if (args.find ("trErr (") != std::string::npos
+             || args.find ("trErrF (") != std::string::npos
+             || args.find ("tr (")    != std::string::npos
+             || args.find ("trF (")   != std::string::npos
+             || args.find ("->tr (")  != std::string::npos)
+                continue;
+            // THE ONE BODY THAT IS TRANSLATED SOMEWHERE ELSE, declared rather than
+            // silenced. The rhythm panel's "?" text is a MEMBER that applyLanguage fills
+            // from the language flag, because tr()'s English branch does not decode UTF-8
+            // and this string is four paragraphs of it. The exception is only allowed
+            // while that assignment really exists - checked below, not assumed - so
+            // deleting the translation would put this site straight back in the list.
+            if (args.find ("helpText") != std::string::npos)
+                continue;
+            int line = 1;
+            for (size_t k = 0; k < at; ++k) if (src[k] == '\n') ++line;
+            raw.add (juce::String ("line ") + juce::String (line));
+        }
+        if (! raw.isEmpty())
+            std::printf ("    a dialog whose text goes through no tr at all: %s\n",
+                         raw.joinIntoString (", ").toRawUTF8());
+        check (raw.isEmpty(),
+               "  (c) every dialog's TEXT goes through tr, trF or trErr - a translated "
+               "title over an untranslated body is half a message in the wrong language");
+        // ...and the one exception above earns itself, every run.
+        check (src.find ("helpText = juce::String::fromUTF8 (catalan") != std::string::npos,
+               "  (c') the one body exempted from that - the rhythm panel's \"?\" text - really "
+               "is written in both languages where applyLanguage fills it");
        #else
         std::printf ("  [SKIP] dialog-title audit: FG_SOURCE_DIR not defined\n");
        #endif

@@ -2106,7 +2106,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         if (! processorRef.setTuningTablePeriod (tablePeriodEdit.getText(), err))
             juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
                                                          tr ("Invalid period", "Per\xc3\xado" "de inv\xc3\xa0lid"),
-                                                         err, this);
+                                                         trErr (err), this);   // the Catalan reader gets Catalan
         // Whatever happened, show what is actually in force - never leave the field
         // displaying a period the tuning did not accept.
         tablePeriodEdit.setText (processorRef.tuningTablePeriodSpec(), juce::dontSendNotification);
@@ -2664,6 +2664,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     playgroundPanel.proc = &processorRef;
     playgroundPanel.pad.proc = &processorRef;
     playgroundPanel.trF     = [this] (const char* en, const char* ca) { return tr (en, ca); };
+    playgroundPanel.trErrF  = [this] (const juce::String& e) { return trErr (e); };
     playgroundPanel.pad.trF = [this] (const char* en, const char* ca) { return tr (en, ca); };
     playgroundPanel.attachVoices();   // needs proc: the pgVoices attachment
     // CORNER EDIT: the panel owns the Edit buttons, the MAIN window owns the preset field
@@ -12773,7 +12774,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                 juce::String aerr;
                 if (! processorRef.applySpectrumAdapt (true, aerr) && aerr.isNotEmpty())
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        tr ("Adapt spectrum to tuning", "Adapta l'espectre a l'afinaci\xc3\xb3"), aerr, this);
+                        tr ("Adapt spectrum to tuning", "Adapta l'espectre a l'afinaci\xc3\xb3"), trErr (aerr), this);   // the Catalan reader gets Catalan
             }
             const auto info = processorRef.getSpectrumAdaptResult();
             double aMax = 0.0;
