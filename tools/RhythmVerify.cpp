@@ -21243,6 +21243,67 @@ int main (int argc, char** argv)
         }
     }
 
+    //== A PRESET CANNOT OVERWRITE A PLAYGROUND CORNER BY CHANGING ITS CASE =========
+    //
+    // writePresetFile refuses a save that would land on an assigned corner's file - that
+    // is the fixed point the whole playground rests on. It used to ask whether two NAMES
+    // matched, while the write goes to a FILE, and on Windows "Bell" and "bell" are two
+    // names and one file. The refusal never fired, the corner's .gsting was overwritten
+    // by the live patch, and captureState kept the corner's original spelling - so the
+    // same door stood open on every later save and the corner drained a little each time.
+    //
+    // Checked on the FILE's bytes, not on the return value: a refusal that returns false
+    // and writes anyway is the failure this is for.
+    {
+        std::printf ("\na save cannot overwrite a playground corner by changing its case:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 512);
+        auto sp = [&] (const char* id, float plain)
+        { if (auto* q = p->apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (plain)); };
+
+        sp ("ampSustain", 0.9f); sp ("masterGain", 0.0f);
+        p->pollParametersForTests();
+        FractalAdditiveAudioProcessor::PresetWriteRefusal why {};
+        int corner = -1;
+        const bool sA = p->savePreset ("zzz-Case-Corner", why, corner).isNotEmpty();
+        sp ("baseN", 7.0f);
+        p->pollParametersForTests();
+        const bool sB = p->savePreset ("zzz-Case-Other", why, corner).isNotEmpty();
+        check (sA && sB, "(gate) two presets saved into the scratch folder");
+
+        juce::String e1, e2;
+        check (p->assignPlaygroundCorner (0, "zzz-Case-Corner", e1)
+             && p->assignPlaygroundCorner (1, "zzz-Case-Other", e2)
+             && p->isPlaygroundActive(),
+               "(gate) both corners assigned, so the playground is driving");
+
+        const auto f = FractalAdditiveAudioProcessor::getPresetFolder()
+                          .getChildFile ("zzz-Case-Corner.gsting");
+        check (f.existsAsFile(), "(gate) the corner's file is on disk to be protected");
+        const auto before = f.loadFileAsString();
+
+        // The SAME name in a different case, which is the whole of the bug.
+        sp ("ampSustain", 0.05f); sp ("masterGain", -18.0f);
+        p->pollParametersForTests();
+        why = FractalAdditiveAudioProcessor::PresetWriteRefusal::None;
+        corner = -1;
+        const auto got = p->savePreset ("ZZZ-case-CORNER", why, corner);
+        const auto after = f.loadFileAsString();
+        std::printf ("  saving \"ZZZ-case-CORNER\" over corner \"zzz-Case-Corner\":"
+                     " returned \"%s\", refusal %d, corner %d, file %s\n",
+                     got.toRawUTF8(), (int) why, corner,
+                     after == before ? "UNCHANGED" : "OVERWRITTEN");
+        check (got.isEmpty(),
+               "the save is refused - a name that differs only in case is the same file on"
+               " this filesystem, and that file belongs to an assigned corner");
+        check (why == FractalAdditiveAudioProcessor::PresetWriteRefusal::CornerFixedPoint
+             && corner == 0,
+               "...and it says WHICH corner it would have landed on, so the message can name it");
+        check (after == before,
+               "...and the corner's file on disk is byte-for-byte what it was - the refusal"
+               " is a refusal, not a return value with a write behind it");
+    }
+
     runProcessorAuditChecks();
     runSilentLimitChecks();
 

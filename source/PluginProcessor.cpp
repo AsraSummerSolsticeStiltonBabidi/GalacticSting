@@ -5427,9 +5427,20 @@ bool FractalAdditiveAudioProcessor::writePresetFile (const juce::String& safeNam
     if (safeName.isEmpty())
     { why = PresetWriteRefusal::BadName; return false; }
 
+    // COMPARED AS FILES, NOT AS NAMES. The guard asked whether two STRINGS matched while
+    // the line below writes to a FILE - and on Windows "Bell" and "bell" are two strings
+    // and one file. Saving a patch under a different capitalisation from a corner's own
+    // name walked straight past this and overwrote that corner's .gsting, and because
+    // captureState keeps the corner's original spelling it never healed: the same door
+    // opened on every later save. Measured as a drain over twenty cycles - ampSustain
+    // 0.9000 -> 0.0501, masterGain 0.00 -> -17.99 dB.
+    //
+    // juce::File::operator== knows what the filesystem is case-sensitive about, which is
+    // the question actually being asked here: would this write land on that corner's file?
     if (! isCornerOwnSave && pgActive)
         for (int i = 0; i < kPlaygroundCorners; ++i)
-            if (pgCorner[(size_t) i].assigned() && pgCorner[(size_t) i].name == safeName)
+            if (pgCorner[(size_t) i].assigned()
+                 && presetFile (pgCorner[(size_t) i].name) == presetFile (safeName))
             {
                 why = PresetWriteRefusal::CornerFixedPoint;
                 corner = i;

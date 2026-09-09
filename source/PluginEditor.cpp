@@ -6204,6 +6204,21 @@ void FractalAdditiveAudioProcessorEditor::savePresetFlow()
                     // drain itself (case #88). Any other failure keeps the old wording.
                     const auto letter = juce::String::charToString (
                         (juce::juce_wchar) ('A' + juce::jmax (0, blockedCorner)));
+                    // THE CORNER'S OWN SPELLING, not the one that was typed. The two can
+                    // now differ - the fixed-point rule compares FILES, so "bell" is
+                    // refused against a corner called "Bell" on this filesystem - and a
+                    // message that quotes what the user typed sends them looking on the
+                    // pad for a name that is not written there. When they differ, the
+                    // message says both, because "these are the same file" is exactly the
+                    // thing that is not obvious.
+                    const auto stored = safe->processorRef.getPlaygroundCornerName (
+                                            juce::jmax (0, blockedCorner));
+                    const auto shown  = stored.isNotEmpty() ? stored : name;
+                    const auto also   = (stored.isNotEmpty() && stored != name)
+                        ? safe->tr (" You typed \"%T%\", which on this system is the same file.",
+                                    " Has escrit \"%T%\", que en aquest sistema \xc3\xa9s el mateix fitxer.")
+                              .replace ("%T%", name)
+                        : juce::String();
                     const auto msg =
                         why == FractalAdditiveAudioProcessor::PresetWriteRefusal::CornerFixedPoint
                           ? safe->tr ("\"%N%\" is on playground corner %C%, and these controls are "
@@ -6217,7 +6232,7 @@ void FractalAdditiveAudioProcessorEditor::savePresetFlow()
                                       "mateixa, i s'allunyaria una mica m\xc3\xa9s cada cop que "
                                       "obr\xc3\xadssiu el projecte. Deseu-lo amb un altre nom, o feu "
                                       "servir el bot\xc3\xb3 Edit d'aquella cantonada.")
-                                .replace ("%N%", name).replace ("%C%", letter)
+                                .replace ("%N%", shown).replace ("%C%", letter) + also
                           : safe->tr ("Could not save the preset. Try a different name.",
                                       "No s'ha pogut desar el preset. Prova un altre nom.");
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
