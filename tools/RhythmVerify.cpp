@@ -26,6 +26,7 @@ extern "C" __declspec(dllimport) int   __stdcall QueryThreadCycleTime (void*, un
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cctype>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -19830,7 +19831,16 @@ int main (int argc, char** argv)
                     // Only a continuation that is itself a string literal (or the tail of
                     // the statement) may be joined; a line starting with '+' means a value
                     // is being pasted in and the message really is composed.
-                    if (! nxt.startsWithChar ('"')) { ln += " " + nxt; break; }
+                    // CONTINUE, NOT BREAK. This stopped at the first continuation that
+                    // pastes in a value, so a statement spread over five lines was
+                    // reconstructed from its first two and the template came out as a
+                    // PREFIX - "Those % partials cannot all keep % cents of air inside a ".
+                    // Two of those prefixes were then copied into fgerr::patterns, where
+                    // they could never match anything and the refusal reached a Catalan
+                    // reader in English with this very gate green. The loop's own
+                    // condition - the statement ends at its semicolon - is the only thing
+                    // that should stop it.
+                    if (! nxt.startsWithChar ('"')) { ln += " " + nxt; continue; }
                     ln = ln.trimEnd().dropLastCharacters (1) + nxt.substring (1);
                 }
                 const auto rest = ln.substring (at + 11);          // from the opening quote
@@ -19941,15 +19951,37 @@ int main (int argc, char** argv)
         // ...AND EVERY COMPOSED ONE HAS A TEMPLATE. Same rule as the fixed half: the
         // template is rebuilt FROM THE SOURCE, so a message reworded tomorrow fails this
         // until fgerr::patterns is reworded with it.
-        juce::StringArray noPattern;
+        juce::StringArray noPattern, loose;
         for (const auto& c : composed)
         {
             const auto want = decodeEscapes (c);
             bool found = false;
             for (const auto& p : fgerr::patterns)
                 if (want == juce::String::fromUTF8 (p.en)) { found = true; break; }
-            if (! found) noPattern.add (c);
+            if (found) continue;
+
+            // A STATEMENT WITH A TERNARY IN IT CANNOT BE ONE TEMPLATE, and this
+            // reconstruction cannot represent two. The chord-search refusal picks its
+            // scope with `rootOnly ? ", 0 vs all" : ", all vs all"`, so both branches end
+            // up in the rebuilt string and it matches neither of the two REAL templates -
+            // which are in the table, one per branch, because a branch is a literal and
+            // would otherwise be captured as a value and re-emitted in English.
+            //
+            // Checked loosely and SAID SO, rather than dropped: some template must open
+            // with the same first chunk, so a message reworded at the front still fails.
+            const auto head = want.upToFirstOccurrenceOf ("%", false, false);
+            if (head.length() >= 12)
+            {
+                bool anyHead = false;
+                for (const auto& p : fgerr::patterns)
+                    if (juce::String::fromUTF8 (p.en).startsWith (head)) { anyHead = true; break; }
+                if (anyHead) { loose.add (head + "..."); continue; }
+            }
+            noPattern.add (c);
         }
+        for (const auto& l : loose)
+            std::printf ("    checked LOOSELY (its statement branches, so it is two templates,"
+                         " one per branch): \"%s\"\n", l.toRawUTF8());
         std::printf ("  composed with a runtime value, translated by TEMPLATE: %d;"
                      " %d without one\n", composed.size(), noPattern.size());
         for (int i = 0; i < juce::jmin (12, noPattern.size()); ++i)
@@ -21302,6 +21334,123 @@ int main (int argc, char** argv)
         check (after == before,
                "...and the corner's file on disk is byte-for-byte what it was - the refusal"
                " is a refusal, not a return value with a write behind it");
+    }
+
+    //== EVERY REFUSAL TEMPLATE CAN ACTUALLY FIRE ==================================
+    //
+    // A pattern that never matches is not a pattern that fails - it is a pattern that is
+    // silent, and the gate counting untranslated refusals reports nothing wrong. Two of
+    // them held only the OPENING CLAUSE of their message ("...cents of air inside a ",
+    // "...% notes x % partials"), so trErr - which matches a template against the WHOLE
+    // string - could never reach them, and those two refusals went to a Catalan reader in
+    // English with every check in the build green.
+    //
+    // So: build each template's English side back into a real message by filling its gaps
+    // with sample values, hand THAT to trErr, and require the answer to be the Catalan
+    // side with the same values in it. Nothing here knows the messages - it reads the
+    // table, which is the only way this cannot go stale.
+    {
+        std::printf ("\nevery refusal TEMPLATE can fire, and comes back in Catalan:\n");
+        auto p = std::make_unique<FractalAdditiveAudioProcessor>();
+        p->prepareToPlay (48000.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p->createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        if (ed == nullptr) { check (false, "(gate) the editor for the template sweep exists"); }
+        else
+        {
+            ed->setLanguageForTests (true);        // Catalan
+            const int n = (int) (sizeof (fgerr::patterns) / sizeof (fgerr::patterns[0]));
+            std::printf ("  %d templates in the table\n", n);
+            check (n >= 15, "(gate) the pattern table is the one this sweep thinks it is");
+
+            juce::StringArray dead;
+            for (int i = 0; i < n; ++i)
+            {
+                const auto en = juce::String::fromUTF8 (fgerr::patterns[i].en);
+                // Distinct values, so a template that drops one or swaps two is caught as
+                // well as one that never matches at all.
+                const juce::StringArray parts = juce::StringArray::fromTokens (en, "%", "");
+                juce::String filled = parts[0];
+                for (int k = 1; k < parts.size(); ++k)
+                    filled << juce::String (41 + k * 7) << parts[k];
+
+                const auto out = ed->trErrForTests (filled);
+                bool ok = out != filled;                       // it matched something
+                for (int k = 1; k < parts.size() && ok; ++k)
+                    if (! out.contains (juce::String (41 + k * 7)))
+                        ok = false;                            // ...and kept every value
+                if (! ok)
+                    dead.add (juce::String (i) + ": \"" + en.substring (0, 56) + "...\"");
+            }
+            for (const auto& d : dead) std::printf ("      NEVER FIRES: %s\n", d.toRawUTF8());
+            check (dead.isEmpty(),
+                   "(a) every template in fgerr::patterns matches a message built from its own "
+                   "English side, and hands back the Catalan with all of its values");
+
+            // (b) AND THE TEMPLATE ENDS WHERE THE MESSAGE ENDS. Arm (a) builds its test
+            // message OUT OF the template, so a truncated template matches itself and
+            // sails through - it would NOT have caught the two that shipped. What
+            // separates a whole template from a prefix of one is where it stops: the tail
+            // of a complete template is the tail of a string literal in the processor, so
+            // the source has it immediately before a closing quote and semicolon. A
+            // prefix stops in the middle of a sentence, and nothing there closes.
+           #ifdef FG_SOURCE_DIR
+            const juce::File srcDir { juce::String (FG_SOURCE_DIR) };
+            // EVERY FILE THAT COMPOSES A REFUSAL, not just the processor: "Note % in this
+            // .tun is not a finite pitch." is written in TuningManager.h, and reading one
+            // file flagged six perfectly good templates. Everything under source/ except
+            // PluginEditor.h, which holds the TABLE - include it and each template would
+            // match its own entry and this arm would prove nothing.
+            juce::String rawJ;
+            for (const auto& f : srcDir.getChildFile ("source")
+                                       .findChildFiles (juce::File::findFiles, true, "*.cpp;*.h"))
+                if (f.getFileName() != "PluginEditor.h")
+                    rawJ += f.loadFileAsString();
+            auto rawSrc = rawJ.toStdString();
+            // ADJACENT LITERALS JOINED FIRST. A long refusal is written as several string
+            // pieces over several lines - "...can" "\n" "hold.";  - so a tail taken from
+            // the table crosses a break that exists only in the SOURCE. Six complete
+            // templates were flagged before this, every one of them a fault of the search
+            // and not of the table. Only whitespace and '+' may sit between the two
+            // quotes, so an argument list ("a", "b") is never joined: the comma stops it.
+            std::string procSrc;
+            procSrc.reserve (rawSrc.size());
+            for (size_t i = 0; i < rawSrc.size(); ++i)
+            {
+                if (rawSrc[i] == '"')
+                {
+                    size_t j = i + 1;
+                    while (j < rawSrc.size() && (std::isspace ((unsigned char) rawSrc[j]) || rawSrc[j] == '+'))
+                        ++j;
+                    if (j < rawSrc.size() && rawSrc[j] == '"' && j > i + 1)
+                    { i = j; continue; }        // drop the closing quote, the gap and the reopening one
+                }
+                procSrc += rawSrc[i];
+            }
+            check (procSrc.size() > 100000, "(gate) the template audit can read the processor");
+            juce::StringArray unclosed;
+            for (int i = 0; i < n; ++i)
+            {
+                const auto en   = juce::String::fromUTF8 (fgerr::patterns[i].en);
+                const auto tail = en.fromLastOccurrenceOf ("%", false, false);
+                // Short tails are not evidence either way - "Bad ratio: \"%\"" ends in one
+                // character - so they are counted and named rather than judged.
+                if (tail.length() < 12) continue;
+                auto last = tail.getLastCharacters (28).replace ("\"", "\\\"");
+                if (procSrc.find ((last + "\";").toStdString()) == std::string::npos)
+                    unclosed.add (juce::String (i) + ": ...\"" + tail.getLastCharacters (28) + "\"");
+            }
+            for (const auto& u : unclosed) std::printf ("      DOES NOT CLOSE A MESSAGE: %s\n",
+                                                        u.toRawUTF8());
+            check (unclosed.isEmpty(),
+                   "(b) every template long enough to check ENDS where the processor's own "
+                   "sentence ends - a template that stops mid-sentence can never match, and "
+                   "matching itself is not evidence that it can");
+           #else
+            std::printf ("  [SKIP] (b) needs FG_SOURCE_DIR\n");
+           #endif
+            ed->setLanguageForTests (false);
+        }
     }
 
     runProcessorAuditChecks();

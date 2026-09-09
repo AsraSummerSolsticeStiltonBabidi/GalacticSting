@@ -192,10 +192,42 @@ namespace fgerr
           "Ratio incorrecte: \"%\"" },
         { "Not an interval: \"%\"",
           "Aix\xc3\xb2 no \xc3\xa9s un interval: \"%\"" },
-        { "Those % partials cannot all keep % cents of air inside a ",
-          "Aquests % parcials no poden mantenir tots % cents d'aire dins d'una " },
-        { "This search is % notes x % partials",
-          "Aquesta cerca \xc3\xa9s de % notes x % parcials" },
+        // THE WHOLE SENTENCE, not a prefix of it. These two held only their opening
+        // clause - "...inside a " and "...% partials" - and trErr matches a template
+        // against the COMPLETE message, so neither could ever fire: the Catalan reader got
+        // the English sentence, and the gate that counts untranslated refusals reported
+        // none, because a pattern that never matches is not a pattern that failed.
+        // TWO OF THEM, and they are two messages. The realtime follower's version stops
+        // at the period; the one the user asks for by hand goes on to explain what to do
+        // about it. Only the long one was in the table, so the short one - which is the
+        // one a REALTIME corner produces, the more frequent of the two - reached a Catalan
+        // reader in English.
+        { "Those % partials cannot all keep % cents of air inside a %-cent period.",
+          "Aquests % parcials no poden mantenir tots % cents d'aire dins d'un per\xc3\xado" "de "
+          "de % cents." },
+        { "Those % partials cannot all keep % cents of air inside a %-cent period (the period "
+          "itself counts: the spectrum repeats there). Use fewer partials, a smaller smallest "
+          "interval, or a wider period.",
+          "Aquests % parcials no poden mantenir tots % cents d'aire dins d'un per\xc3\xado" "de "
+          "de % cents (el per\xc3\xado" "de mateix hi compta: l'espectre s'hi repeteix). Fes "
+          "servir menys parcials, un interval m\xc3\xadnim m\xc3\xa9s petit, o un per\xc3\xado" "de "
+          "m\xc3\xa9s ample." },
+        // TWO ENTRIES FOR ONE MESSAGE, because the scope is a LITERAL chosen at runtime
+        // (", 0 vs all" or ", all vs all"), not a value. Captured as a value it would be
+        // re-emitted verbatim - an English fragment inside a Catalan sentence - so each
+        // branch is its own template with its own translation.
+        { "This search is % notes x % partials, 0 vs all, % registers - past the hard cap "
+          "(about % minutes of computation; on this machine an estimated %). Fewer partials, "
+          "fewer registers, or the \"0 vs all\" scope will bring it inside.",
+          "Aquesta cerca \xc3\xa9s de % notes x % parcials, 0 contra tots, % registres - per "
+          "sobre del l\xc3\xadmit dur (uns % minuts de c\xc3\xa0lcul; en aquesta m\xc3\xa0quina, "
+          "uns %). Amb menys parcials, menys registres, o l'abast \"0 contra tots\" hi cabr\xc3\xa0." },
+        { "This search is % notes x % partials, all vs all, % registers - past the hard cap "
+          "(about % minutes of computation; on this machine an estimated %). Fewer partials, "
+          "fewer registers, or the \"0 vs all\" scope will bring it inside.",
+          "Aquesta cerca \xc3\xa9s de % notes x % parcials, tots contra tots, % registres - per "
+          "sobre del l\xc3\xadmit dur (uns % minuts de c\xc3\xa0lcul; en aquesta m\xc3\xa0quina, "
+          "uns %). Amb menys parcials, menys registres, o l'abast \"0 contra tots\" hi cabr\xc3\xa0." },
         { "The adaptation came back with % partials instead of the number asked for. Nothing was written.",
           "L'adaptaci\xc3\xb3 ha tornat amb % parcials en comptes dels demanats. No s'ha escrit res." },
         { "This corner's adaptation is estimated at % minutes per search - it cannot follow anything at that price.",
