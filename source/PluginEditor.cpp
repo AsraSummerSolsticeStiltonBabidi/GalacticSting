@@ -6009,6 +6009,27 @@ juce::String FractalAdditiveAudioProcessorEditor::recycleBinName() const
    #endif
 }
 
+juce::String FractalAdditiveAudioProcessorEditor::presetDeletedMessage (const juce::String& name, bool wentToBin,
+                                                                       int keptOnCorner) const
+{
+    const auto q = "\"" + name + "\"";
+    auto msg = wentToBin
+        ? tr ("Moved to ", "S'ha mogut a ") + recycleBinName() + ": " + q
+          + tr (". It can be restored from there.", ". Es pot recuperar d'all\xc3\xad.")
+        // No REASON claimed: a drive with no bin and the suite's own outright delete both
+        // land here, and only what happened is true for both.
+        : tr ("Deleted: ", "S'ha esborrat: ") + q
+          + tr (". It did not go to ", ". No ha anat a ") + recycleBinName()
+          + tr (", so it cannot be restored from there.", ", o sigui que no es pot recuperar d'all\xc3\xa0.");
+    if (keptOnCorner >= 0)
+        msg += tr (" Playground corner ", " La cantonada ")
+             + juce::String::charToString ((juce::juce_wchar) ('A' + juce::jlimit (0, 3, keptOnCorner)))
+             + tr (" keeps its own copy of it, so it still sounds and still saves with your presets and projects.",
+                   " del laboratori en guarda la seva pr\xc3\xb2pia c\xc3\xb2pia, o sigui que segueix sonant i es "
+                   "segueix desant amb els teus presets i projectes.");
+    return msg;
+}
+
 std::unique_ptr<FractalAdditiveAudioProcessorEditor::PresetSearchPanel>
 FractalAdditiveAudioProcessorEditor::makePresetSearchPanel (const juce::StringArray& names)
 {
@@ -6074,8 +6095,8 @@ FractalAdditiveAudioProcessorEditor::makePresetSearchPanel (const juce::StringAr
     panel->deleteBtn.setButtonText (tr ("Delete", "Esborra"));
     panel->deleteBtn.setTooltip (tr ("Moves this preset's file to ", "Mou el fitxer d'aquest preset a ")
                                  + recycleBinName()
-                                 + tr (". Refused, with the reason, if the preset is on a playground corner.",
-                                       ". Si el preset \xc3\xa9s en una cantonada del laboratori, no ho fa i diu per qu\xc3\xa8."));
+                                 + tr (". A playground corner holding this preset keeps its own copy of it.",
+                                       ". Una cantonada del laboratori que tingui aquest preset en guarda la seva pr\xc3\xb2pia c\xc3\xb2pia."));
     panel->hintText = tr ("Click a preset to load it and hear it - the list stays open, with a Delete button for it. "
                           "Double-click or Enter loads it and closes.",
                           "Fes clic en un preset per carregar-lo i escoltar-lo - la llista es queda oberta, amb un bot\xc3\xb3 "
@@ -6103,26 +6124,11 @@ FractalAdditiveAudioProcessorEditor::makePresetSearchPanel (const juce::StringAr
             case R::None:
                 ed.refreshPresetList();
                 ed.refreshPresetDirtyMark();
+                ed.lastDeleteWentToBin = wentToBin;
+                ed.lastDeleteCorner    = corner;
                 out.removeFromList = true;
                 out.isError = false;
-                out.message = wentToBin
-                    ? ed.tr ("Moved to ", "S'ha mogut a ") + ed.recycleBinName() + ": " + q
-                      + ed.tr (". It can be restored from there.", ". Es pot recuperar d'all\xc3\xad.")
-                    // No REASON claimed: a drive with no bin and the suite's own outright delete both
-                    // land here, and only what happened is true for both.
-                    : ed.tr ("Deleted: ", "S'ha esborrat: ") + q
-                      + ed.tr (". It did not go to ", ". No ha anat a ") + ed.recycleBinName()
-                      + ed.tr (", so it cannot be restored from there.", ", o sigui que no es pot recuperar d'all\xc3\xa0.");
-                break;
-            case R::OnPlaygroundCorner:
-                out.message = q + ed.tr (" was not deleted: it is on playground corner ",
-                                         " no s'ha esborrat: \xc3\xa9s a la cantonada ")
-                            + juce::String::charToString ((juce::juce_wchar) ('A' + juce::jlimit (0, 3, corner)))
-                            + ed.tr (". Take it off the pad first - a corner reads its preset from disk every "
-                                     "time a project opens, so deleting the file would leave that corner empty.",
-                                     " del laboratori. Treu-lo primer del pad - una cantonada llegeix el seu preset "
-                                     "del disc cada cop que s'obre un projecte, i esborrar el fitxer deixaria aquella "
-                                     "cantonada buida.");
+                out.message = ed.presetDeletedMessage (n, wentToBin, corner);
                 break;
             case R::NoSuchPreset:
                 // Gone already (deleted or renamed outside the synth): the list stops
@@ -13322,23 +13328,28 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         });
     }
 
-    // ...AND PLAYGROUND CORNERS THAT CAME BACK EMPTY. A corner is stored as a preset NAME
-    // and re-reads that file on every project or preset load; a file deleted, renamed or
-    // broken since then used to leave the corner empty with nothing saying so. Presets
-    // can be deleted from the drop-down now, so this is the day that path got common.
+    // ...AND PLAYGROUND CORNERS THAT CAME BACK EMPTY. A state saved by this build carries a
+    // copy of every corner's preset, so this now fires only for a state from an OLDER build
+    // (names only, read from the folder) whose preset is not there, or for a carried copy that
+    // is damaged. It used to be the everyday path: every corner re-read its file by name.
     if (auto lost = processorRef.takePlaygroundRestoreLoss(); ! lost.empty())
     {
         raiseNotice ([this, lost]
         {
             noticeOverlay.title = tr ("Playground corners left empty",
                                       "Cantonades del laboratori buides");
-            auto body = tr ("A corner is saved as the NAME of a preset, and reads that preset from the preset folder every time a project or a preset carrying it opens. These could not be read, so these corners are EMPTY now:\n\n",
-                            "Una cantonada es desa com el NOM d'un preset, i llegeix aquest preset de la carpeta de presets cada cop que s'obre un projecte o un preset que la porta. Aquests no s'han pogut llegir, o sigui que aquestes cantonades ara estan BUIDES:\n\n");
+            auto body = tr ("These corners could not be restored, so they are EMPTY now:\n\n",
+                            "Aquestes cantonades no s'han pogut restaurar, o sigui que ara estan BUIDES:\n\n");
             for (const auto& l : lost)
                 body += tr ("Corner ", "Cantonada ")
                       + juce::String::charToString ((juce::juce_wchar) ('A' + juce::jlimit (0, 3, l.corner)))
                       + ": \"" + l.name + "\" \xe2\x80\x94 " + trErr (l.why) + "\n";
-            body += tr ("\nPut the preset back (from ", "\nTorna a posar el preset (des de ") + recycleBinName()
+            body += tr ("\nA pad saved by this version carries its own copy of every corner's preset. One saved by an older "
+                        "version holds only each preset's NAME and reads it from the preset folder - put that preset back (from ",
+                        "\nUn pad desat amb aquesta versi\xc3\xb3 porta la seva pr\xc3\xb2pia c\xc3\xb2pia del preset de cada "
+                        "cantonada. Un de desat amb una versi\xc3\xb3 anterior nom\xc3\xa9s en t\xc3\xa9 el NOM i el llegeix de "
+                        "la carpeta de presets - torna a posar aquell preset (des de ")
+                  + recycleBinName()
                   + tr (", if it was deleted) and open this again, or put another preset on the corner.",
                         ", si s'havia esborrat) i torna a obrir aix\xc3\xb2, o posa un altre preset a la cantonada.");
             noticeOverlay.body = body;

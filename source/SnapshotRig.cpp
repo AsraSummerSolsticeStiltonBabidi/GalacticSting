@@ -750,7 +750,9 @@ namespace
                   e.showPresetSearchForSnapshot (false);
                   e.tickTimerForTests();
               } },
-            { "56-preset-delete-refused", "the same Delete refused: the preset is on playground corner A",
+            // (2026-09-15) no longer a refusal: the preset is on corner A, Delete goes through, and
+            // the strip says the corner keeps its own copy - the sentence polypresets made true.
+            { "56-preset-delete-on-corner", "Delete on a preset that is on playground corner A: the corner keeps its copy",
               tEditor, fNone,
               [] (Proc& p, Ed& e)
               {

@@ -916,16 +916,17 @@ public:
     // (Windows' own rule applies underneath: a folder with no Recycle Bin - a network
     // share - deletes for good. Documents is not one of those.)
     //
-    // REFUSED, out loud, when the preset is on a playground corner: a corner is stored as
-    // a NAME and re-reads its file every time a project or a preset carrying it opens, so
-    // the delete would empty that corner the next time the project opens. The editor says
-    // which corner, and the way out (take it off the pad). As with PresetWriteRefusal,
-    // the processor decides and the editor writes the sentence.
+    // A PRESET ON A PLAYGROUND CORNER DELETES LIKE ANY OTHER (since 2026-09-15). It used to be
+    // refused, because a corner was stored as a NAME and re-read its file on every load, so
+    // the delete would have emptied it. A corner now carries its own copy of the preset and is
+    // saved WITH it (see PlaygroundCorner::source), so the file is no longer what the corner
+    // stands on: `cornerOut` names the first corner that keeps a copy, so the editor can SAY
+    // the corner is unaffected, and nothing is refused for it.
     //
     // Deleting the preset that is LOADED leaves the sound exactly as it is - it is in
     // memory - but stops tracking it as a preset: there is no file left for the "*" to
     // mean "differs from", so the patch is simply unsaved from then on.
-    enum class PresetDeleteRefusal { None, NoSuchPreset, OnPlaygroundCorner, CouldNotDelete };
+    enum class PresetDeleteRefusal { None, NoSuchPreset, CouldNotDelete };
     // `wentToBinOut` (optional): whether the file went to a place it can be restored from -
     // false for a drive Windows keeps no Recycle Bin on, where FOF_ALLOWUNDO deletes for good.
     PresetDeleteRefusal deletePreset (const juce::String& name, int& cornerOut, bool* wentToBinOut = nullptr);
@@ -977,6 +978,12 @@ public:
     // buildNow does - because a corner has to have a template before the very first
     // blend, and the alternative is a first drag that silently does nothing.
     bool assignPlaygroundCorner (int corner, const juce::String& presetName, juce::String& errorOut);
+    // THE SAME, AS ONE UNDO STEP - what the playground window's corner box and X use. A pick
+    // and a clear used to be invisible to Ctrl+Z, so the first Ctrl+Z after one jumped over it
+    // to an older corner-edit step and put back a corner the user had since replaced or cleared
+    // - including one whose preset had been DELETED in between (the night review, 2026-09-15).
+    // Restores and tests keep the plain call: a state load is not something to undo.
+    bool assignPlaygroundCornerUndoable (int corner, const juce::String& presetName, juce::String& errorOut);
     juce::String getPlaygroundCornerName (int corner) const;
     int  getPlaygroundAssignedCount() const;
     // The morph only DRIVES anything with two or more corners assigned. One preset has
@@ -2167,6 +2174,18 @@ private:
         // inaudible until something else happened to recompile the spectrum.
         bool edited = false;
         int  rev    = 0;
+        // THE PRESET THIS CORNER WAS BUILT FROM, WHOLE - a deep copy of its .gsting tree with
+        // that preset's own PLAYGROUND child removed (so corners never nest). Every field above
+        // is extracted from it, and it is what captureState SAVES for the corner: a preset or a
+        // project made with the pad carries all of its corners' presets and opens the same on
+        // a computer that has none of them ("polypresets", asked 2026-09-15). Before, only the
+        // NAME was saved and each corner re-read its file on load - a moved project came back
+        // with empty corners, and editing a preset silently changed every project using it.
+        //
+        // IMMUTABLE ONCE SET: the undo steps copy whole corners, and a juce::ValueTree copy
+        // SHARES its object, so a change made in place would rewrite history. Replace it,
+        // never modify it (cornerTreeForSaving works on a createCopy()).
+        juce::ValueTree source;
         bool assigned() const noexcept { return name.isNotEmpty(); }
         // THIS CORNER'S value for parameter #i. Always succeeds for a corner that has
         // been assigned (the store is total - see `params`); false only for an index
@@ -2279,7 +2298,12 @@ private:
         bool perform() override { return applyOne (after); }
         bool undo()    override { return applyOne (before); }
         int  getSizeInUnits() override
-        { return (int) ((before.params.size() + after.params.size()) * sizeof (float)) + 512; }
+        {
+            // ~16 KB per carried preset copy (a .gsting is 12-16 KB of XML, most of it drawn
+            // LFO waves), so the undo limit counts what these steps really hold.
+            return (int) ((before.params.size() + after.params.size()) * sizeof (float)) + 512
+                 + (before.source.isValid() ? 16000 : 0) + (after.source.isValid() ? 16000 : 0);
+        }
         bool applyOne (const PlaygroundCorner& c)
         {
             auto& dst = proc.pgCorner[(size_t) corner];
@@ -2315,6 +2339,19 @@ private:
     // Every parameter at its DEFAULT - the base every corner store is built on, and the
     // one answer to "what does this corner mean for a parameter its preset predates?".
     void fillCornerDefaults (PlaygroundCorner& c) const;
+    // Build a corner from a preset TREE - the file's (assignPlaygroundCorner) or the copy a
+    // saved state carries (restoreState). `readError` non-empty = the tree could not be had,
+    // and the corner is left empty with that reason, exactly as a missing file always did.
+    bool assignPlaygroundCornerFromTree (int corner, const juce::String& name, const juce::ValueTree& tree,
+                                         const juce::String& readError, juce::String& errorOut);
+    // The modulator routing and realtime link, read from a preset tree into a corner.
+    void readCornerRouting (PlaygroundCorner& c, const juce::ValueTree& tree) const;
+    // The preset tree SAVED for a corner: its source copy, with an unsaved edit ("*") written
+    // over it so a saved pad sounds as it was heard.
+    juce::ValueTree cornerTreeForSaving (const PlaygroundCorner& c);
+    // The PLAYGROUND child a state carries: corner names (c0..c3, which older builds read)
+    // plus a CORNER child per assigned corner holding its preset copy.
+    juce::ValueTree playgroundChildForState();
 
     //== ADAPTIVE CORNERS (see the public block). Message thread except where noted. ==
     // One finished corner search. It carries its OWN identity (corner + preset name) and

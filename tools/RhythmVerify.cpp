@@ -11743,10 +11743,31 @@ int main (int argc, char** argv)
             auto r = std::make_unique<Proc>();
             r->prepareToPlay (48000.0, 64);
             r->setStateInformation (blob.getData(), (int) blob.getSize());
+            // POLYPRESETS (2026-09-15): the project carries a copy of every corner's preset, so a
+            // deleted file no longer empties the corner. This check used to expect it EMPTY.
             check (r->getPlaygroundCornerName (0) == "zzz-verify-pg-A"
-                   && r->getPlaygroundCornerName (1).isEmpty()
-                   && ! r->isPlaygroundActive(),
-                   "a corner whose preset is gone comes back EMPTY - it never substitutes another one");
+                   && r->getPlaygroundCornerName (1) == "zzz-verify-pg-B"
+                   && r->isPlaygroundActive(),
+                   "a corner whose preset FILE is gone still comes back - the project carries its own copy of it");
+
+            // ...and a project saved by an OLDER build, which held only the corner NAMES, still
+            // reads the folder: its corner whose file is gone comes back EMPTY, never substituted.
+            juce::MemoryBlock legacy;
+            if (auto x = juce::AudioProcessor::getXmlFromBinary (blob.getData(), (int) blob.getSize()))
+            {
+                if (auto* pgx = x->getChildByName ("PLAYGROUND"))
+                    pgx->deleteAllChildElementsWithTagName ("CORNER");
+                juce::AudioProcessor::copyXmlToBinary (*x, legacy);
+            }
+            auto r2 = std::make_unique<Proc>();
+            r2->prepareToPlay (48000.0, 64);
+            r2->setStateInformation (legacy.getData(), (int) legacy.getSize());
+            check (legacy.getSize() > 0
+                   && r2->getPlaygroundCornerName (0) == "zzz-verify-pg-A"
+                   && r2->getPlaygroundCornerName (1).isEmpty()
+                   && ! r2->isPlaygroundActive(),
+                   "a names-only project from an older build still comes back EMPTY on the corner whose file is gone"
+                   " - it never substitutes another one");
         }
 
         // THE WINDOW ITSELF. It is a separate desktop window, so the main layout probe
@@ -12424,13 +12445,20 @@ int main (int argc, char** argv)
 
             juce::String err;
             p.assignPlaygroundCorner (1, "Bravo", err);
+            const auto bravoStore = p.getPlaygroundCornerParamsForTests (1);
             const auto r1 = p.deletePreset ("bravo", corner);
-            std::printf ("  \"bravo\" while Bravo is on corner B: refusal %d, corner %d, file %s\n",
-                         (int) r1, corner, Proc::presetFile ("Bravo").existsAsFile() ? "still there" : "GONE");
-            check (r1 == R::OnPlaygroundCorner && corner == 1 && Proc::presetFile ("Bravo").existsAsFile(),
-                   "a preset on a playground corner is REFUSED - compared as a FILE, so another capitalisation "
-                   "is caught too - naming corner B, and the file stays");
+            std::printf ("  \"bravo\" while Bravo is on corner B: result %d, corner %d, file %s, corner B \"%s\"\n",
+                         (int) r1, corner, Proc::presetFile ("Bravo").existsAsFile() ? "still there" : "gone",
+                         p.getPlaygroundCornerName (1).toRawUTF8());
+            // POLYPRESETS (2026-09-15): this used to be REFUSED, because the corner was only a name
+            // that re-read the file. The corner carries its own copy now, so the delete goes through.
+            check (r1 == R::None && corner == 1 && ! Proc::presetFile ("Bravo").existsAsFile(),
+                   "a preset on a playground corner DELETES - compared as a FILE, so another capitalisation finds it"
+                   " - and the result names corner B, which keeps a copy");
+            check (p.getPlaygroundCornerName (1) == "Bravo" && p.getPlaygroundCornerParamsForTests (1) == bravoStore,
+                   "...while corner B keeps its preset, name and every value, from its own copy");
             p.assignPlaygroundCorner (1, {}, err);
+            setGain (-2.0f); p.savePreset ("Bravo");   // back on disk, for the checks below
 
             const auto aBefore = bytes (Proc::presetFile ("Alpha"));
             const auto cBefore = bytes (Proc::presetFile ("Charlie"));
@@ -12568,23 +12596,26 @@ int main (int argc, char** argv)
                     }
                     Proc::presetFile ("Broken").deleteFile();
 
-                    // (3) REFUSED, THROUGH THE SAME TWO CLICKS
+                    // (3) A PRESET ON A PLAYGROUND CORNER, THROUGH THE SAME TWO CLICKS
                     // The corner goes on AFTER the row click, not before: the click LOADS
                     // Bravo, and a preset load replaces the playground's corners with the
-                    // preset's own (none, here) - assigned first, the corner was gone by
-                    // the time Delete was pressed, and the first run of this check
-                    // "failed" on a delete that was, at that moment, perfectly allowed.
+                    // preset's own (none, here). Until 2026-09-15 this Delete was REFUSED;
+                    // a corner carries its own copy now, so it goes through and says so.
                     click (rowCentre ("Bravo"));
                     p.assignPlaygroundCorner (0, "Bravo", err);
                     check (p.getPlaygroundCornerName (0) == "Bravo", "(Bravo is on corner A as Delete is pressed)");
+                    const auto bravoOnCorner = p.getPlaygroundCornerParamsForTests (0);
                     click (buttonCentre());
                     std::printf ("  Delete on \"Bravo\" while it is on corner A: file %s, strip: %s\n",
-                                 Proc::presetFile ("Bravo").existsAsFile() ? "still there" : "GONE",
+                                 Proc::presetFile ("Bravo").existsAsFile() ? "STILL THERE" : "gone",
                                  panel->statusText().toRawUTF8());
-                    check (Proc::presetFile ("Bravo").existsAsFile(), "Bravo, on corner A, survives the Delete click");
-                    check (panel->statusIsError && panel->status.contains ("\"Bravo\"")
-                             && panel->all.contains ("Bravo") && panel->deleteBtn.isVisible(),
-                           "...the strip says why, the row stays, and the button stays armed");
+                    check (! Proc::presetFile ("Bravo").existsAsFile() && ! panel->all.contains ("Bravo"),
+                           "Delete on a preset that is on corner A goes through - its file and its row are gone");
+                    check (! panel->statusIsError && panel->status.contains ("\"Bravo\"")
+                             && panel->status.contains ("corner A keeps its own copy"),
+                           "...and the strip says so, and that corner A keeps its own copy");
+                    check (p.getPlaygroundCornerName (0) == "Bravo" && p.getPlaygroundCornerParamsForTests (0) == bravoOnCorner,
+                           "...which is true: corner A still holds Bravo, every value");
                     const int needH = (int) std::ceil (panel->statusLayout (panel->statusArea.getWidth()).getHeight());
                     std::printf ("    that sentence needs %d px; the strip is %d px\n", needH, panel->statusArea.getHeight());
                     check (panel->statusArea.getHeight() >= needH,
@@ -12612,9 +12643,23 @@ int main (int argc, char** argv)
                 }
 
                 //-- A CORNER WHOSE PRESET IS GONE IS NAMED, NOT SILENTLY EMPTIED ---------
+                // Since polypresets this can only happen to a preset saved by an OLDER build
+                // (corner names, no copies), so that is what the preset is made into here.
+                p.savePreset ("Bravo");   // deleted by (3)
                 p.assignPlaygroundCorner (0, "Alpha", err);
                 p.assignPlaygroundCorner (1, "Bravo", err);
                 p.savePreset ("Carries corners");
+                {
+                    const auto f = Proc::presetFile ("Carries corners");
+                    bool namesOnly = false;
+                    if (auto x = juce::XmlDocument::parse (f))
+                        if (auto* pgx = x->getChildByName ("PLAYGROUND"))
+                        {
+                            pgx->deleteAllChildElementsWithTagName ("CORNER");
+                            namesOnly = x->writeTo (f);
+                        }
+                    check (namesOnly, "(the preset is rewritten the way an older build saved it: corner names only)");
+                }
                 p.assignPlaygroundCorner (0, {}, err);
                 p.assignPlaygroundCorner (1, {}, err);
                 check (p.deletePreset ("Bravo", corner) == R::None, "(Bravo, off the pad, is deleted)");
@@ -12639,6 +12684,291 @@ int main (int argc, char** argv)
         Proc::setPresetFolderForTests (prevFolder);
         dir.deleteRecursively();
         outside.deleteFile();
+    }
+
+    //--- POLYPRESETS: A PRESET SAVED WITH THE PLAYGROUND CARRIES ITS CORNERS ----------
+    // "y existen los polypresets? ... al guardarse deberian contener la info de todos los
+    //  presets que contienen, para poder ser trasladados a otro pc facilmente" (2026-09-15)
+    //
+    // Before: a pad saved only its corner NAMES and each corner re-read its file on load, so
+    // on another computer the corners came back empty. Now each corner carries a copy of its
+    // preset, the copy wins over the folder, and only names-only states from older builds
+    // still read the folder. "Another computer" is a second scratch folder holding the one
+    // file and nothing else; "identical" is the corner's parameter store AND its compiled
+    // spectrum, compared bit for bit.
+    //
+    // And the deleted-preset Ctrl+Z: X and a pick on a corner are undo steps of their own now,
+    // so Ctrl+Z walks them in order, and a corner it brings back carries its preset.
+    {
+        std::printf ("\npolypresets - a pad carries its corners' presets, and Ctrl+Z after a delete:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        using R    = Proc::PresetDeleteRefusal;
+        const auto prevFolder = Proc::getPresetFolder();
+        const auto stamp = juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL);
+        const auto tmp   = juce::File::getSpecialLocation (juce::File::tempDirectory);
+        const auto here  = tmp.getChildFile ("fiblo-verify-poly-here-" + stamp);
+        const auto there = tmp.getChildFile ("fiblo-verify-poly-there-" + stamp);
+        here.deleteRecursively();
+        there.deleteRecursively();
+        there.createDirectory();
+        Proc::setPresetFolderForTests (here);
+        Proc::setPresetDeleteToTrashForTests (false);
+
+        // Empty when the two corners are the same corner; otherwise what differs.
+        const auto sameCorner = [] (Proc& a, int ca, Proc& b, int cb) -> juce::String
+        {
+            if (a.getPlaygroundCornerName (ca) != b.getPlaygroundCornerName (cb))
+                return "name \"" + a.getPlaygroundCornerName (ca) + "\" vs \"" + b.getPlaygroundCornerName (cb) + "\"";
+            if (a.getPlaygroundCornerParamsForTests (ca) != b.getPlaygroundCornerParamsForTests (cb))
+                return "parameter store differs";
+            const auto ta = a.getPlaygroundCornerTemplateForTests (ca), tb = b.getPlaygroundCornerTemplateForTests (cb);
+            if (ta == nullptr || tb == nullptr) return "no compiled spectrum";
+            if (ta->partials.size() != tb->partials.size())
+                return "partials " + juce::String ((int) ta->partials.size()) + " vs " + juce::String ((int) tb->partials.size());
+            for (size_t k = 0; k < ta->partials.size(); ++k)
+                if (ta->partials[k].ratio != tb->partials[k].ratio || ta->partials[k].amp != tb->partials[k].amp)
+                    return "partial " + juce::String ((int) k) + " differs";
+            return {};
+        };
+        // Every CORNER element anywhere under an element, however deep.
+        std::function<int (const juce::XmlElement&)> countCorners = [&] (const juce::XmlElement& e)
+        {
+            int n = e.hasTagName ("CORNER") ? 1 : 0;
+            for (auto* c : e.getChildIterator()) n += countCorners (*c);
+            return n;
+        };
+        const auto cornerCopyXml = [] (const juce::XmlElement& root, int i) -> const juce::XmlElement*
+        {
+            if (auto* pgx = root.getChildByName ("PLAYGROUND"))
+                for (auto* c : pgx->getChildWithTagNameIterator ("CORNER"))
+                    if (c->getIntAttribute ("i", -1) == i) return c->getChildElement (0);
+            return nullptr;
+        };
+        const auto fresh = [] { auto q = std::make_unique<Proc>(); q->prepareToPlay (48000.0, 256); return q; };
+
+        {
+            auto owned = fresh();
+            auto& p = *owned;
+            const auto sp = [] (Proc& on, const char* id, float v)
+            {
+                if (auto* q = on.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+                on.pollParametersForTests();
+            };
+            juce::String err;
+            sp (p, "baseN", 3.0f); sp (p, "curveSlope", 0.4f); sp (p, "filterCutoff", 2400.0f);
+            check (p.savePreset ("Poly-A") == "Poly-A", "(corner preset A saves)");
+            sp (p, "baseN", 1.0f); sp (p, "filterCutoff", 6000.0f);
+            check (p.loadTimbreText ("1 5/4 3/2 2", err), "(corner preset B gets a custom-engine spectrum)");
+            p.getModEngine().addTarget (3, "filterCutoff");
+            check (p.savePreset ("Poly-B") == "Poly-B", "(corner preset B saves, with an LFO routed to its cutoff)");
+            check (p.assignPlaygroundCorner (0, "Poly-A", err) && p.assignPlaygroundCorner (1, "Poly-B", err),
+                   "(Poly-A and Poly-B go on corners A and B)");
+            sp (p, "pgX", 0.3f);
+            check (p.savePreset ("Poly-Mix") == "Poly-Mix", "(the pad saves as a preset of its own: Poly-Mix)");
+            const auto polyFile = Proc::presetFile ("Poly-Mix");
+
+            //-- (1) ANOTHER COMPUTER, WITH NONE OF THE CORNER PRESETS -------------------------
+            polyFile.copyFileTo (there.getChildFile (polyFile.getFileName()));
+            Proc::setPresetFolderForTests (there);
+            {
+                auto q = fresh();
+                const bool loaded = q->loadPreset ("Poly-Mix");
+                const auto loss = q->takePlaygroundRestoreLoss();
+                const auto d0 = sameCorner (p, 0, *q, 0), d1 = sameCorner (p, 1, *q, 1);
+                std::printf ("  a computer with only Poly-Mix.gsting (%lld bytes): loaded %s, corner A %s, corner B %s,"
+                             " %d corner(s) lost\n", (long long) polyFile.getSize(), loaded ? "yes" : "NO",
+                             d0.isEmpty() ? "identical" : d0.toRawUTF8(), d1.isEmpty() ? "identical" : d1.toRawUTF8(),
+                             (int) loss.size());
+                check (loaded && q->getPresetNames().size() == 1,
+                       "  (gate) that preset folder holds Poly-Mix and nothing else");
+                check (loss.empty() && d0.isEmpty() && d1.isEmpty() && q->isPlaygroundActive(),
+                       "a preset saved with the pad opens on a computer that has NONE of its corner presets, both corners"
+                       " identical to the originals - parameter store and compiled spectrum, bit for bit");
+                juce::MemoryBlock st;
+                q->getStateInformation (st);
+                const auto x = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize());
+                const auto* b = x != nullptr ? cornerCopyXml (*x, 1) : nullptr;
+                const auto* mods = b != nullptr ? b->getChildByName ("MODS") : nullptr;
+                check (mods != nullptr && mods->getStringAttribute ("t3").contains ("filterCutoff"),
+                       "...and corner B's modulator routing travelled with it (saved again from there, it is still in its copy)");
+            }
+
+            //-- (2) THE SAME, AS A HOST PROJECT -----------------------------------------------
+            {
+                juce::MemoryBlock blob;
+                p.getStateInformation (blob);
+                auto q = fresh();
+                q->setStateInformation (blob.getData(), (int) blob.getSize());
+                const auto loss = q->takePlaygroundRestoreLoss();
+                check (loss.empty() && sameCorner (p, 0, *q, 0).isEmpty() && sameCorner (p, 1, *q, 1).isEmpty(),
+                       "a PROJECT made with the pad reopens on that computer with both corners identical too");
+            }
+
+            //-- (3) THE CARRIED COPY WINS OVER THE FOLDER --------------------------------------
+            Proc::setPresetFolderForTests (here);
+            {
+                auto w = fresh();
+                sp (*w, "baseN", 9.0f);
+                check (w->savePreset ("Poly-A") == "Poly-A", "(Poly-A's file is re-saved with baseN 9)");
+            }
+            {
+                auto q = fresh();
+                check (q->loadPreset ("Poly-Mix"), "(Poly-Mix loads here, next to the re-saved Poly-A)");
+                const float carried = q->getPlaygroundCornerParamForTests (0, "baseN");
+                std::printf ("  after Poly-A.gsting is re-saved with baseN 9: Poly-Mix's corner A has baseN %.1f\n", (double) carried);
+                check (sameCorner (p, 0, *q, 0).isEmpty() && std::abs (carried - 3.0f) < 1.0e-4f,
+                       "re-saving a corner's preset file afterwards does not change a pad that already carries it -"
+                       " its copy wins (baseN 3, not the file's 9)");
+                check (q->assignPlaygroundCorner (0, "Poly-A", err)
+                         && std::abs (q->getPlaygroundCornerParamForTests (0, "baseN") - 9.0f) < 1.0e-4f,
+                       "...and picking the preset again on that corner takes in its current file (baseN 9)");
+            }
+
+            //-- (4) CORNERS NEVER NEST, AND A SAVE/LOAD CYCLE DOES NOT GROW THE FILE --------------
+            {
+                auto n = fresh();
+                check (n->assignPlaygroundCorner (0, "Poly-Mix", err) && n->assignPlaygroundCorner (1, "Poly-B", err),
+                       "(a pad whose corner A is itself a polypreset)");
+                check (n->savePreset ("Poly-Nest") == "Poly-Nest", "(it saves as Poly-Nest)");
+                juce::Array<juce::int64> sizes;
+                sizes.add (Proc::presetFile ("Poly-Nest").getSize());
+                for (int cycle = 0; cycle < 3; ++cycle)
+                {
+                    auto c = fresh();
+                    c->loadPreset ("Poly-Nest");
+                    c->savePreset ("Poly-Nest");
+                    sizes.add (Proc::presetFile ("Poly-Nest").getSize());
+                }
+                int corners = -1;
+                bool copyHasPad = true;
+                if (auto x = juce::XmlDocument::parse (Proc::presetFile ("Poly-Nest")))
+                {
+                    corners = countCorners (*x);
+                    if (auto* a = cornerCopyXml (*x, 0)) copyHasPad = a->getChildByName ("PLAYGROUND") != nullptr;
+                }
+                std::printf ("  Poly-Nest over three load/save cycles: %lld, %lld, %lld, %lld bytes; %d CORNER element(s) in it\n",
+                             (long long) sizes[0], (long long) sizes[1], (long long) sizes[2], (long long) sizes[3], corners);
+                check (corners == 2 && ! copyHasPad,
+                       "a polypreset put on a corner is carried WITHOUT its own pad - two corners in the file, no copy of a copy");
+                check (sizes[0] == sizes[1] && sizes[1] == sizes[2] && sizes[2] == sizes[3],
+                       "...and loading and saving it again and again leaves the file exactly the same size");
+            }
+
+            //-- (5) AN UNSAVED CORNER EDIT (THE "*") IS SAVED AS IT SOUNDS -------------------------
+            {
+                auto e = fresh();
+                check (e->assignPlaygroundCorner (0, "Poly-B", err) && e->assignPlaygroundCorner (1, "Poly-Mix", err),
+                       "(corners for the edit)");
+                check (e->beginPlaygroundCornerEdit (0), "(corner A goes into edit mode)");
+                for (int i = 0; i < 4; ++i) e->pollParametersForTests();
+                sp (*e, "ampDecay", 7.0f);
+                for (int i = 0; i < 20; ++i) e->pollParametersForTests();
+                e->endPlaygroundCornerEdit();
+                for (int i = 0; i < 4; ++i) e->pollParametersForTests();
+                const bool starred = e->isPlaygroundCornerEdited (0);
+                const float editedDecay = e->getPlaygroundCornerParamForTests (0, "ampDecay");
+                check (starred && std::abs (editedDecay - 7.0f) < 1.0e-3f,
+                       "  (gate) corner A carries an unsaved edit: the \"*\", amp decay 7 s");
+                check (e->savePreset ("Poly-Edited") == "Poly-Edited", "(the pad saves with that edit unsaved)");
+                Proc::presetFile ("Poly-Edited").copyFileTo (there.getChildFile ("Poly-Edited" + juce::String (Proc::kPresetExt)));
+                Proc::setPresetFolderForTests (there);
+                auto q = fresh();
+                check (q->loadPreset ("Poly-Edited"), "(Poly-Edited loads on the other computer)");
+                std::printf ("  an unsaved corner edit, reopened elsewhere: \"*\" %s, amp decay %.3f s\n",
+                             q->isPlaygroundCornerEdited (0) ? "kept" : "LOST", (double) q->getPlaygroundCornerParamForTests (0, "ampDecay"));
+                check (q->isPlaygroundCornerEdited (0) && sameCorner (*e, 0, *q, 0).isEmpty(),
+                       "an unsaved corner edit is saved as it sounds - reopened elsewhere the corner is the edited one, \"*\" and all"
+                       " (it used to be lost, and the file came back)");
+                Proc::setPresetFolderForTests (here);
+            }
+
+            //-- (6) A NAMES-ONLY FILE FROM AN OLDER BUILD, AND (7) A DAMAGED COPY ---------------
+            {
+                const auto rewrite = [&] (const juce::String& name, std::function<void (juce::XmlElement&)> change)
+                {
+                    auto x = juce::XmlDocument::parse (polyFile);
+                    if (x == nullptr) return false;
+                    change (*x);
+                    return x->writeTo (there.getChildFile (name + Proc::kPresetExt));
+                };
+                const bool wroteLegacy = rewrite ("Poly-Legacy", [] (juce::XmlElement& x)
+                { if (auto* pgx = x.getChildByName ("PLAYGROUND")) pgx->deleteAllChildElementsWithTagName ("CORNER"); });
+                const bool wroteDamaged = rewrite ("Poly-Damaged", [] (juce::XmlElement& x)
+                {
+                    if (auto* pgx = x.getChildByName ("PLAYGROUND"))
+                        for (auto* c : pgx->getChildWithTagNameIterator ("CORNER"))
+                            if (c->getIntAttribute ("i", -1) == 0)
+                            {
+                                c->deleteAllChildElements();
+                                c->createNewChildElement ("JUNK");
+                            }
+                });
+                Proc::setPresetFolderForTests (there);
+                auto q = fresh();
+                q->loadPreset ("Poly-Legacy");
+                const auto lossL = q->takePlaygroundRestoreLoss();
+                check (wroteLegacy && q->getPlaygroundCornerName (0).isEmpty() && q->getPlaygroundCornerName (1).isEmpty()
+                         && lossL.size() == 2 && lossL[0].name == "Poly-A",
+                       "a names-only preset from an older build still reads the folder: where its presets are missing,"
+                       " both corners come back EMPTY and both are reported by name");
+                auto d = fresh();
+                d->loadPreset ("Poly-Damaged");
+                const auto lossD = d->takePlaygroundRestoreLoss();
+                std::printf ("  a damaged corner copy: corner A \"%s\", corner B \"%s\", reason \"%s\"\n",
+                             d->getPlaygroundCornerName (0).toRawUTF8(), d->getPlaygroundCornerName (1).toRawUTF8(),
+                             lossD.empty() ? "" : lossD[0].why.toRawUTF8());
+                check (wroteDamaged && d->getPlaygroundCornerName (0).isEmpty() && lossD.size() == 1
+                         && lossD[0].why.contains ("damaged") && sameCorner (p, 1, *d, 1).isEmpty(),
+                       "a damaged corner copy leaves THAT corner empty and says it is damaged - the other corner is untouched");
+                Proc::setPresetFolderForTests (here);
+            }
+        }
+
+        //-- (8) Ctrl+Z AFTER A PRESET WAS DELETED ------------------------------------------------
+        {
+            juce::String err;
+            auto u = fresh();
+            // Picked the way the playground window picks: each one an undo step.
+            check (u->assignPlaygroundCornerUndoable (0, "Poly-A", err) && u->assignPlaygroundCornerUndoable (1, "Poly-B", err),
+                   "(Poly-A and Poly-B picked onto corners A and B)");
+            const auto aStore = u->getPlaygroundCornerParamsForTests (0);
+            const int depthBefore = u->undoStackDepthForTests();
+            u->assignPlaygroundCornerUndoable (0, {}, err);
+            check (u->getPlaygroundCornerName (0).isEmpty() && u->undoStackDepthForTests() == depthBefore + 1,
+                   "taking a preset off a corner (X) is ONE undo step of its own - it used to be none");
+            int corner = -7;
+            check (u->deletePreset ("Poly-A", corner) == R::None && ! Proc::presetFile ("Poly-A").existsAsFile(),
+                   "(Poly-A's file is deleted)");
+            const bool undid = u->performUndo();
+            std::printf ("  X on corner A, delete Poly-A, Ctrl+Z: corner A \"%s\", store %s\n",
+                         u->getPlaygroundCornerName (0).toRawUTF8(),
+                         u->getPlaygroundCornerParamsForTests (0) == aStore ? "identical" : "DIFFERENT");
+            check (undid && u->getPlaygroundCornerName (0) == "Poly-A" && u->getPlaygroundCornerParamsForTests (0) == aStore,
+                   "Ctrl+Z takes back exactly the X - corner A returns WITH its preset, although the file is gone");
+            {
+                juce::MemoryBlock st;
+                u->getStateInformation (st);
+                Proc::setPresetFolderForTests (there);
+                auto v = fresh();
+                v->setStateInformation (st.getData(), (int) st.getSize());
+                const auto loss = v->takePlaygroundRestoreLoss();
+                check (loss.empty() && sameCorner (*u, 0, *v, 0).isEmpty(),
+                       "...and a project saved right then reopens elsewhere with that corner whole - it carries the preset,"
+                       " not a name pointing at a deleted file");
+                Proc::setPresetFolderForTests (here);
+            }
+            check (u->performRedo() && u->getPlaygroundCornerName (0).isEmpty(), "Ctrl+Y takes corner A back off again");
+            check (u->performUndo() && u->getPlaygroundCornerName (0) == "Poly-A", "(Ctrl+Z: corner A back)");
+            u->assignPlaygroundCornerUndoable (0, "Poly-B", err);
+            check (u->getPlaygroundCornerName (0) == "Poly-B", "(Poly-B picked over it)");
+            check (u->performUndo() && u->getPlaygroundCornerName (0) == "Poly-A" && u->getPlaygroundCornerParamsForTests (0) == aStore,
+                   "Ctrl+Z after picking another preset for a corner puts back the corner that pick replaced");
+        }
+
+        Proc::setPresetDeleteToTrashForTests (true);
+        Proc::setPresetFolderForTests (prevFolder);
+        here.deleteRecursively();
+        there.deleteRecursively();
     }
 
     //--- THE PRESET LIST: TOOLTIPS ONLY WHEN CUT, A CLICKED ROW IS SELECTED ------------

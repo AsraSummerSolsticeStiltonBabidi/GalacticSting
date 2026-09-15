@@ -101,6 +101,8 @@ namespace fgerr
         // nothing at all - it has to translate like every other reason (night review).
         { "Invalid value.",
           "Valor no v\xc3\xa0lid." },
+        { "The copy of this preset saved inside the file is damaged.",
+          "La c\xc3\xb2pia d'aquest preset desada dins del fitxer est\xc3\xa0 malmesa." },
         { "Invalid period.",
           "Per\xc3\xado" "de inv\xc3\xa0lid." },
         // These two carry escaped quotes and are still WHOLE messages - the examples are
@@ -1582,7 +1584,7 @@ public:
         // The preset list writes its words when it is BUILT (the real one is built each
         // time it opens, in the language of the moment), so the rig's copy is rebuilt here
         // or the Catalan picture would show the English panel.
-        if (snapshotPresetPanel != nullptr) showPresetSearchForSnapshot (snapshotPresetRefuse);
+        if (snapshotPresetPanel != nullptr) showPresetSearchForSnapshot (snapshotPresetOnCorner);
     }
     // The modulator sub-tab strip (AMP / PITCH / FILTER / CUSTOM) and, inside CUSTOM, which
     // of the six modulators is bound. Through the real callbacks, so the snapshot shows the
@@ -2148,19 +2150,30 @@ public:
     // corner A and Delete pressed, so the strip carries the refusal. The drop-down itself
     // is a CallOutBox, which needs a message loop to launch; this is the same panel, built
     // by the same makePresetSearchPanel, so the picture is of what a click opens.
-    void showPresetSearchForSnapshot (bool refuse)
+    void showPresetSearchForSnapshot (bool onCorner)
     {
-        snapshotPresetRefuse = refuse;
+        snapshotPresetOnCorner = onCorner;
         snapshotPresetPanel = makePresetSearchPanel (processorRef.getPresetNames());
         auto& pnl = *snapshotPresetPanel;
         pnl.onDismissed = nullptr;   // it dies with the editor: no refocus into a window mid-destruction
-        if (pnl.shown.size() > 0)
-            pnl.audition (juce::jmin (1, pnl.shown.size() - 1));
-        if (refuse && pnl.armed.isNotEmpty())
+        if (onCorner && snapshotDeletedName.isNotEmpty())
         {
-            juce::String err;
-            processorRef.assignPlaygroundCorner (0, pnl.armed, err);
-            pnl.deleteArmed();
+            // A LANGUAGE REBUILD OF A PICTURE THAT ALREADY DELETED: the outcome is re-said in the
+            // new language, never re-done - pressing Delete again would take ANOTHER preset.
+            pnl.setStatus (presetDeletedMessage (snapshotDeletedName, lastDeleteWentToBin, lastDeleteCorner), false);
+        }
+        else
+        {
+            if (pnl.shown.size() > 0)
+                pnl.audition (juce::jmin (1, pnl.shown.size() - 1));
+            if (onCorner && pnl.armed.isNotEmpty())
+            {
+                // The preset on corner A, then Delete: the file goes, the corner keeps its copy.
+                juce::String err;
+                processorRef.assignPlaygroundCorner (0, pnl.armed, err);
+                snapshotDeletedName = pnl.armed;
+                pnl.deleteArmed();
+            }
         }
         addAndMakeVisible (pnl);
         const auto under = getLocalArea (&presetBox, presetBox.getLocalBounds());
@@ -2169,7 +2182,17 @@ public:
     }
 private:
     std::unique_ptr<PresetSearchPanel> snapshotPresetPanel;   // only ever set by the snapshot rig
-    bool snapshotPresetRefuse = false;
+    bool snapshotPresetOnCorner = false;
+    juce::String snapshotDeletedName;                         // the rig's one real delete, re-said on a language switch
+    // The last delete's outcome, for re-saying it (see presetDeletedMessage).
+    bool lastDeleteWentToBin = false;
+    int  lastDeleteCorner    = -1;
+public:
+    // The sentence for a preset that was deleted: where the file went, and - when it was on a
+    // playground corner - that the corner keeps its own copy. One builder, used by the list's
+    // Delete and by the rig's language rebuild, so the two can never say different things.
+    juce::String presetDeletedMessage (const juce::String& name, bool wentToBin, int keptOnCorner) const;
+private:
 
     // TextEditor with a focus hook. It used to stretch to the window edge while
     // typing (the intervals box was one 24 px line); now that box is a multi-line
@@ -5779,7 +5802,7 @@ private:
                     // it ends any edit of it (and throws the unsaved edits away - the one
                     // explicit act that does, see rule 4). Tell the main window.
                     const bool wasEditing = proc->getPlaygroundEditCorner() == i;
-                    noteAssign (i, proc->assignPlaygroundCorner (i, name, err), err);
+                    noteAssign (i, proc->assignPlaygroundCornerUndoable (i, name, err), err);   // one Ctrl+Z step
                     refresh (true);
                     if (wasEditing && onEditModeChanged) onEditModeChanged();
                 };
@@ -5809,7 +5832,7 @@ private:
                     // be told, or it would keep showing a frozen preset field for a
                     // corner that no longer exists.
                     const bool wasEditing = proc->getPlaygroundEditCorner() == i;
-                    noteAssign (i, proc->assignPlaygroundCorner (i, {}, err), err);
+                    noteAssign (i, proc->assignPlaygroundCornerUndoable (i, {}, err), err);   // one Ctrl+Z step
                     cornerBox[i].setSelectedId (1, juce::dontSendNotification);
                     refresh (true);
                     if (wasEditing && onEditModeChanged) onEditModeChanged();
@@ -5933,10 +5956,21 @@ private:
                 refillCorner (i);
                 cornerBox[i].setTooltip (trF ? trF ("The preset on this corner. Drop up to four; two make a line, "
                                                     "three a triangle, four the whole rectangle. An empty corner "
-                                                    "contributes nothing at all.",
+                                                    "contributes nothing at all.\n\n"
+                                                    "The corner keeps its OWN COPY of the preset, and a preset or "
+                                                    "project saved with the pad carries every corner's copy - so it "
+                                                    "opens the same on another computer, and does not change if the "
+                                                    "preset file is later edited, renamed or deleted. Pick the preset "
+                                                    "here again to take in its current file.",
                                                     "El preset d'aquesta cantonada. Posa'n fins a quatre; dos fan una "
                                                     "l\xc3\xadnia, tres un triangle, quatre tot el rectangle. Una "
-                                                    "cantonada buida no hi aporta res.")
+                                                    "cantonada buida no hi aporta res.\n\n"
+                                                    "La cantonada guarda la seva PR\xc3\x92PIA C\xc3\x92PIA del preset, i "
+                                                    "un preset o projecte desat amb el pad porta la c\xc3\xb2pia de cada "
+                                                    "cantonada - o sigui que s'obre igual en un altre ordinador, i no "
+                                                    "canvia si despr\xc3\xa9s s'edita, es reanomena o s'esborra el fitxer "
+                                                    "del preset. Torna a triar el preset aqu\xc3\xad per agafar-ne el "
+                                                    "fitxer actual.")
                                               : juce::String());
                 cornerClear[i].setTooltip (trF ? trF ("Take the preset off this corner.",
                                                       "Treu el preset d'aquesta cantonada.")

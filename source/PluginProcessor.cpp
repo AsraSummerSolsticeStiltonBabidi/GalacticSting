@@ -4742,21 +4742,90 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
     state.removeChild (state.getChildWithName ("REALTIME"), nullptr);
     state.appendChild (realtimeSettingsToTree(), nullptr);
 
-    // THE PLAYGROUND: which preset is on which corner. Only the NAMES - the corners are
-    // presets in their own right and re-reading the files on load is what keeps a corner
-    // in step with the preset it points at (and stops a project file carrying four whole
-    // copies of other presets around). pgX/pgY are ordinary parameters and are already in
-    // the tree above.
+    // THE PLAYGROUND: which preset is on which corner, AND THE PRESETS THEMSELVES. This used
+    // to store only the NAMES, on purpose, so a corner would follow later edits of its file and
+    // a project would not carry four copies of other presets. The price was that nothing made
+    // with the pad could leave this computer: on another one - or here, after a preset was
+    // renamed or deleted - its corners came back empty. The user asked for the opposite
+    // ("polypresets ... para poder ser trasladados a otro pc facilmente", 2026-09-15), so a
+    // saved pad now carries a copy of every corner's preset (see playgroundChildForState).
+    // Four copies are ~60 KB of XML. pgX/pgY are ordinary parameters, already in the tree above.
     state.removeChild (state.getChildWithName ("PLAYGROUND"), nullptr);
     if (getPlaygroundAssignedCount() > 0)
-    {
-        juce::ValueTree pg ("PLAYGROUND");
-        for (int i = 0; i < kPlaygroundCorners; ++i)
-            if (pgCorner[(size_t) i].assigned())
-                pg.setProperty ("c" + juce::String (i), pgCorner[(size_t) i].name, nullptr);
-        state.appendChild (pg, nullptr);
-    }
+        state.appendChild (playgroundChildForState(), nullptr);
     return state;
+}
+
+juce::ValueTree FractalAdditiveAudioProcessor::cornerTreeForSaving (const PlaygroundCorner& c)
+{
+    // A COPY, always: `source` is shared with every undo step holding this corner.
+    auto t = c.source.isValid() ? c.source.createCopy() : juce::ValueTree (apvts.state.getType());
+    if (! c.edited)
+        return t;   // exactly the preset it was built from
+
+    // AN UNSAVED EDIT (the "*") IS SAVED AS IT SOUNDS. Before, a corner's edits lived only in
+    // memory and a reload brought back the file. Written over the copy, so everything a corner
+    // does not edit (routing, realtime settings, the rest of the .gsting) stays the preset's.
+    const auto& all = getParameters();
+    for (int i = 0; i < all.size() && (size_t) i < c.params.size(); ++i)
+        if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]))
+        {
+            auto child = t.getChildWithProperty ("id", p->paramID);
+            if (! child.isValid())
+            {
+                child = juce::ValueTree ("PARAM");
+                child.setProperty ("id", p->paramID, nullptr);
+                t.appendChild (child, nullptr);
+            }
+            child.setProperty ("value", (double) c.params[(size_t) i], nullptr);
+        }
+    t.removeChild (t.getChildWithName ("TIMBRE"), nullptr);
+    if (c.timbreSource.isNotEmpty())
+    {
+        juce::ValueTree tim ("TIMBRE");
+        tim.setProperty ("name",   c.timbreName,   nullptr);
+        tim.setProperty ("source", c.timbreSource, nullptr);
+        double on = 1.0;
+        tim.setProperty ("on", c.value (paramIndexOf ("timbreOn"), on) ? on > 0.5 : true, nullptr);
+        if (c.provName.isNotEmpty())
+        {
+            tim.setProperty ("provName",   c.provName,   nullptr);
+            tim.setProperty ("provSource", c.provSource, nullptr);
+            tim.setProperty ("provPeriod", c.provPeriod, nullptr);
+        }
+        t.appendChild (tim, nullptr);
+    }
+    t.removeChild (t.getChildWithName ("PGAINS"), nullptr);
+    if (! c.gains.empty())
+    {
+        juce::String packed;   // the format captureState writes and the assign reads back
+        for (const auto& g : c.gains)
+            packed << g.key << ':' << juce::String (g.dB, 3) << ' ';
+        juce::ValueTree pg ("PGAINS");
+        pg.setProperty ("v", packed.trim(), nullptr);
+        t.appendChild (pg, nullptr);
+    }
+    return t;
+}
+
+juce::ValueTree FractalAdditiveAudioProcessor::playgroundChildForState()
+{
+    juce::ValueTree pg ("PLAYGROUND");
+    for (int i = 0; i < kPlaygroundCorners; ++i)
+    {
+        const auto& c = pgCorner[(size_t) i];
+        if (! c.assigned()) continue;
+        // The name stays where older builds look for it, so a file saved here still opens
+        // there - by name, from the folder, as it always did.
+        pg.setProperty ("c" + juce::String (i), c.name, nullptr);
+        juce::ValueTree cn ("CORNER");
+        cn.setProperty ("i", i, nullptr);
+        cn.setProperty ("name", c.name, nullptr);
+        if (c.edited) cn.setProperty ("edited", true, nullptr);
+        cn.appendChild (cornerTreeForSaving (c), nullptr);
+        pg.appendChild (cn, nullptr);
+    }
+    return pg;
 }
 
 juce::ValueTree FractalAdditiveAudioProcessor::realtimeSettingsToTree() const
@@ -5246,10 +5315,12 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     // follower down, and doing it the other way round would arm a follower and then
     // immediately suspend it, losing the arming the file actually carried.
     //
-    // The corners are re-read from their .gsting files by name. A corner whose preset has
-    // been renamed or deleted comes back EMPTY rather than silently substituting
-    // something else - a playground quietly morphing towards a preset the user never
-    // chose is worse than one that visibly lost a corner.
+    // THE COPY A STATE CARRIES WINS (since 2026-09-15): a corner is rebuilt from the preset
+    // saved inside the state, whatever the preset folder holds now - the only rule under which
+    // a pad sounds the same on another computer, and under which a preset renamed, deleted or
+    // re-saved here cannot change a project made with it. Only a state saved by an older build,
+    // which has names and no copies, still reads the folder by name - and a corner whose preset
+    // is not there comes back EMPTY and is reported, never silently substituted.
     //
     // AND THE CORNER-EDIT SESSION GOES WITH THEM, which is not tidiness - it is what stops
     // the patch that was just loaded from being overwritten about sixteen milliseconds
@@ -5295,12 +5366,30 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     if (auto pg = tree.getChildWithName ("PLAYGROUND"); pg.isValid())
         for (int i = 0; i < kPlaygroundCorners; ++i)
         {
-            const auto n = pg.getProperty ("c" + juce::String (i)).toString();
-            if (n.isNotEmpty())
+            auto n = pg.getProperty ("c" + juce::String (i)).toString();
+            juce::ValueTree embedded;
+            for (auto child : pg)   // matched by the int, not by getChildWithProperty: an XML attribute reads back as a string
+                if (child.hasType ("CORNER") && (int) child.getProperty ("i", -1) == i) { embedded = child; break; }
+
+            juce::String err;
+            if (embedded.isValid())
             {
-                juce::String err;
-                // The bool used to be dropped here, and the corner was left EMPTY with
-                // nothing saying why. Parked for the editor, which names corner + preset.
+                if (n.isEmpty()) n = embedded.getProperty ("name").toString();
+                if (n.isEmpty()) n = "?";
+                const auto copy = embedded.getChild (0);
+                const bool usable = copy.isValid() && copy.hasType (apvts.state.getType());
+                if (assignPlaygroundCornerFromTree (i, n, copy,
+                                                    usable ? juce::String()
+                                                           : juce::String ("The copy of this preset saved inside the file is damaged."),
+                                                    err))
+                    pgCorner[(size_t) i].edited = (bool) embedded.getProperty ("edited", false);
+                else
+                    pgRestoreLoss.push_back ({ i, n, err });
+            }
+            else if (n.isNotEmpty())
+            {
+                // A STATE FROM AN OLDER BUILD: names only, read from the folder. The bool used
+                // to be dropped here, and the corner was left EMPTY with nothing saying why.
                 if (! assignPlaygroundCorner (i, n, err))
                     pgRestoreLoss.push_back ({ i, n, err.isNotEmpty() ? err
                                                                       : juce::String ("That preset could not be read.") });
@@ -5356,13 +5445,7 @@ void FractalAdditiveAudioProcessor::getStateInformation (juce::MemoryBlock& dest
         auto live = pgEditLiveState.createCopy();
         live.removeChild (live.getChildWithName ("PLAYGROUND"), nullptr);
         if (getPlaygroundAssignedCount() > 0)
-        {
-            juce::ValueTree pg ("PLAYGROUND");
-            for (int i = 0; i < kPlaygroundCorners; ++i)
-                if (pgCorner[(size_t) i].assigned())
-                    pg.setProperty ("c" + juce::String (i), pgCorner[(size_t) i].name, nullptr);
-            live.appendChild (pg, nullptr);
-        }
+            live.appendChild (playgroundChildForState(), nullptr);   // with the copies, as captureState
         if (auto xml = live.createXml())
             copyXmlToBinary (*xml, destData);
         return;
@@ -5773,12 +5856,14 @@ FractalAdditiveAudioProcessor::deletePreset (const juce::String& name, int& corn
     if (name.trim().isEmpty() || file.getParentDirectory() != folder || ! file.existsAsFile())
         return PresetDeleteRefusal::NoSuchPreset;
 
-    // Compared as FILES (see writePresetFile): "bell" and "Bell" are one file on Windows.
+    // NOT REFUSED FOR A CORNER ANY MORE: the corner carries its own copy (see the declaration).
+    // Only NAMED, so the editor can say that corner is unaffected. Compared as FILES (see
+    // writePresetFile): "bell" and "Bell" are one file on Windows.
     for (int i = 0; i < kPlaygroundCorners; ++i)
         if (pgCorner[(size_t) i].assigned() && presetFile (pgCorner[(size_t) i].name) == file)
         {
             cornerOut = i;
-            return PresetDeleteRefusal::OnPlaygroundCorner;
+            break;
         }
 
     // WHERE IT WENT, TOLD TRUTHFULLY. FOF_ALLOWUNDO on a drive with no Recycle Bin (a network
@@ -5825,6 +5910,83 @@ bool FractalAdditiveAudioProcessor::assignPlaygroundCorner (int corner, const ju
     // exactly what discards unsaved edits (rule 4) - so edit mode has to end first, or
     // the frozen live patch would be handed back later from a corner that no longer
     // exists and the scratch surface would be left standing as if it were the patch.
+    // FROM THE FILE. A pick from the corner list is the one way a corner re-reads its preset:
+    // a saved state rebuilds corners from the copies it carries (restoreState).
+    juce::ValueTree tree;
+    juce::String readError;
+    if (presetName.isNotEmpty())
+    {
+        const auto file = presetFile (presetName);
+        if (! file.existsAsFile())
+            readError = "That preset no longer exists.";
+        else if (auto xml = juce::XmlDocument::parse (file))
+            tree = juce::ValueTree::fromXml (*xml);
+        else
+            readError = "That preset could not be read.";
+    }
+    return assignPlaygroundCornerFromTree (corner, presetName, tree, readError, errorOut);
+}
+
+bool FractalAdditiveAudioProcessor::assignPlaygroundCornerUndoable (int corner, const juce::String& presetName,
+                                                                    juce::String& errorOut)
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners))
+        return false;
+    // Edit mode ends FIRST and leaves its own session step, so the pick lands on top of it and
+    // the first Ctrl+Z takes back the pick, the next one the edits - the order they happened in.
+    if (corner == pgEditCorner)
+        endPlaygroundCornerEdit();
+    const auto before = pgCorner[(size_t) corner];
+    const bool ok = assignPlaygroundCorner (corner, presetName, errorOut);
+    // A failed pick changes the corner too (it is left empty, with the reason), so it is a step.
+    if (before.assigned() || pgCorner[(size_t) corner].assigned())
+    {
+        undoManager.beginNewTransaction ("corner");
+        undoManager.perform (new CornerEditSessionAction (*this, corner, before, pgCorner[(size_t) corner]));
+        undoManager.beginNewTransaction();   // the next knob turn is a step of its own
+    }
+    return ok;
+}
+
+void FractalAdditiveAudioProcessor::readCornerRouting (PlaygroundCorner& c, const juce::ValueTree& tree) const
+{
+    // THE ADAPTIVE / REALTIME SPECTRUM IS PART OF THE PRESET, not something outside
+    // it: a corner remembers whether it was saved with the follower armed, and the
+    // nearest-corner rule carries that over like any other discrete setting.
+    c.rtLink = 0;
+    c.rtSet  = RtSettings{};
+    if (auto rt = tree.getChildWithName ("REALTIME"); rt.isValid())
+    {
+        c.rtLink = (int) rt.getProperty ("link", 0);
+        c.rtSet  = realtimeSettingsFromTree (rt);
+    }
+
+    // The preset's MODULATOR ROUTING, for MIX mode's per-corner ModEngine (see
+    // PlaygroundCorner). Kept as the saved text and parsed only when a sub-engine
+    // is refreshed - morph mode never pays for it.
+    for (auto& t : c.modTargets) t.clear();
+    for (auto& w : c.modWaves)   w.clear();
+    if (auto ms = tree.getChildWithName ("MODS"); ms.isValid())
+    {
+        for (int m = 0; m < ModEngine::kMods; ++m)
+            c.modTargets[m] = ms.getProperty ("t" + juce::String (m)).toString();
+        for (int l = 0; l < ModEngine::kLfos; ++l)
+            c.modWaves[l] = ms.getProperty ("w" + juce::String (l)).toString();
+    }
+}
+
+bool FractalAdditiveAudioProcessor::assignPlaygroundCornerFromTree (int corner, const juce::String& presetName,
+                                                                    const juce::ValueTree& tree,
+                                                                    const juce::String& readError,
+                                                                    juce::String& errorOut)
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners))
+        return false;
+
+    // Re-assigning the corner being EDITED replaces its contents, which is exactly what
+    // discards unsaved edits (rule 4) - so edit mode has to end first, or the frozen live
+    // patch would be handed back later from a corner that no longer exists and the scratch
+    // surface would be left standing as if it were the patch.
     if (corner == pgEditCorner)
         endPlaygroundCornerEdit();
 
@@ -5833,22 +5995,20 @@ bool FractalAdditiveAudioProcessor::assignPlaygroundCorner (int corner, const ju
 
     if (presetName.isNotEmpty())
     {
-        auto file = presetFile (presetName);
-        if (! file.existsAsFile())
-        { errorOut = "That preset no longer exists."; refreshPlaygroundActive(); return false; }
-
-        auto xml = juce::XmlDocument::parse (file);
-        if (xml == nullptr)
-        { errorOut = "That preset could not be read."; refreshPlaygroundActive(); return false; }
+        if (readError.isNotEmpty())
+        { errorOut = readError; refreshPlaygroundActive(); return false; }
 
         // Same gate loadPreset uses: .gsting files are user-editable, and a foreign tree
         // would give every corner value a default and make the corner sound like an
         // init patch while claiming to be the preset.
-        auto tree = juce::ValueTree::fromXml (*xml);
         if (! tree.hasType (apvts.state.getType()))
         { errorOut = "That file is not a Fibl\xc3\xb3 preset."; refreshPlaygroundActive(); return false; }
 
         c.name = presetName;
+        // The copy the corner is saved with - without that preset's own pad, so corners
+        // never nest (a corner never reads it, and a copy of a copy would grow every save).
+        c.source = tree.createCopy();
+        c.source.removeChild (c.source.getChildWithName ("PLAYGROUND"), nullptr);
 
         // Parameter values, indexed by getParameters() order (see PlaygroundCorner).
         // DEFAULTS FIRST, then whatever the file carries on top: that is what makes the
@@ -5891,25 +6051,7 @@ bool FractalAdditiveAudioProcessor::assignPlaygroundCorner (int corner, const ju
             c.manual = c.value (mi, v) && v > 0.5;
         }
 
-        // THE ADAPTIVE / REALTIME SPECTRUM IS PART OF THE PRESET, not something outside
-        // it: a corner remembers whether it was saved with the follower armed, and the
-        // nearest-corner rule carries that over like any other discrete setting.
-        if (auto rt = tree.getChildWithName ("REALTIME"); rt.isValid())
-        {
-            c.rtLink = (int) rt.getProperty ("link", 0);
-            c.rtSet  = realtimeSettingsFromTree (rt);
-        }
-
-        // The preset's MODULATOR ROUTING, for MIX mode's per-corner ModEngine (see
-        // PlaygroundCorner). Kept as the saved text and parsed only when a sub-engine
-        // is refreshed - morph mode never pays for it.
-        if (auto ms = tree.getChildWithName ("MODS"); ms.isValid())
-        {
-            for (int m = 0; m < ModEngine::kMods; ++m)
-                c.modTargets[m] = ms.getProperty ("t" + juce::String (m)).toString();
-            for (int l = 0; l < ModEngine::kLfos; ++l)
-                c.modWaves[l] = ms.getProperty ("w" + juce::String (l)).toString();
-        }
+        readCornerRouting (c, tree);
 
         compileCornerTemplate (c);
     }
@@ -6295,15 +6437,23 @@ juce::String FractalAdditiveAudioProcessor::savePlaygroundCornerAs (int corner, 
     // that is why: here the surface IS the corner's stored state (see writePresetFile).
     PresetWriteRefusal why = PresetWriteRefusal::None;
     int blocked = -1;
-    if (! writePresetFile (safe, captureState(), true, why, blocked))
+    const auto written = captureState();
+    if (! writePresetFile (safe, written, true, why, blocked))
         return {};
 
     // The corner now IS that file: renamed, and the "*" goes away because the edits it
     // warned about are on disk. snapshotLoadedPreset is deliberately NOT called - the
     // LIVE patch's identity is frozen while a corner is being edited (rule 1), and
     // saving a corner must not quietly claim the user's own patch is now this preset.
+    //
+    // ...AND ITS COPY IS THE TREE JUST WRITTEN, so what a saved pad carries for this corner is
+    // the file it now names - routing and realtime link included, which the corner used to go
+    // on reading from the ORIGINAL preset while the new file held the live ones.
     c.name   = safe;
     c.edited = false;
+    c.source = written.createCopy();
+    c.source.removeChild (c.source.getChildWithName ("PLAYGROUND"), nullptr);
+    readCornerRouting (c, c.source);
     ++c.rev;
     return safe;
 }
