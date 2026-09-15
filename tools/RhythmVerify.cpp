@@ -2141,6 +2141,521 @@ static void runProcessorAuditChecks();
 // The silent-limit runs (70+), same arrangement and same reason. --limits runs them alone.
 static void runSilentLimitChecks();
 
+//==============================================================================
+// --makepresets <folder>: A PRESET COLLECTION, BUILT THROUGH THE PRODUCT AND MEASURED.
+// "creame muchos presets ... eligire entre esos presets" (2026-09-14)
+//
+// NOT part of the suite: it runs only under its own switch and writes only into the
+// folder it is given (the preset-folder redirect, the same one every check here uses).
+// Moving the results into the user's folder is a separate, deliberate step.
+//
+// Every preset is made the way a player makes one - parameters, the Custom Engine's text,
+// modulator routings - and saved with savePreset, so the file is the product's own format
+// and nothing is hand-written XML. Then each one is MEASURED, not trusted:
+//   * rendered as a held chord (or a single note for monophonic leads) and released;
+//   * LEVEL-MATCHED: masterGain is set so the loudest 100 ms of the held part sits at
+//     kTargetDb, then the render is repeated and must peak at or under -1 dBFS;
+//   * gated on: every sample finite, |DC| < 0.01, peak <= -1 dBFS, the tail back under
+//     -60 dBFS by the end of its window (presets whose release outlasts the window are
+//     REPORTED as long tails, not gated), and the render running faster than real time;
+//   * ROUND-TRIPPED: a fresh processor loads the saved FILE and renders again; its level
+//     must match the one that was saved, or the file does not carry the sound.
+namespace makepresets
+{
+    using Proc = FractalAdditiveAudioProcessor;
+    constexpr double kTargetDb = -18.0;
+
+    struct Route { int mod; const char* target; };
+    struct Spec
+    {
+        const char* name;
+        std::vector<std::pair<juce::String, float>> params;
+        const char* timbre = nullptr;       // Custom Engine intervals; nullptr = harmonic engine
+        std::vector<Route> routes;
+        int  root = 60;
+        bool chord = true;
+    };
+
+    struct Take
+    {
+        bool   finite = true;
+        double peak = 0, loudDb = -300, dc = 0, tailDb = -300, rt = 0, audioSec = 0;
+        int    partials = 0;
+    };
+
+    static double releaseOf (const Spec& s)
+    {
+        double r = 0.300;
+        for (const auto& kv : s.params) if (kv.first == "ampRelease") r = kv.second;
+        return r;
+    }
+
+    static bool build (Proc& p, const Spec& s, double gainDb, juce::String& err)
+    {
+        p.prepareToPlay (48000.0, 256);
+        const auto set = [&p, &err] (const juce::String& id, float v)
+        {
+            if (auto* q = p.apvts.getParameter (id)) { q->setValueNotifyingHost (q->convertTo0to1 (v)); return true; }
+            err = "no parameter " + id;
+            return false;
+        };
+        for (int m = 0; m < ModEngine::kMods; ++m) p.getModEngine().unmapAll (m);
+        // The harmonic engine unless the spec gives the Custom Engine its text: stated
+        // explicitly in the file rather than left to whatever the default is this year.
+        if (! set ("timbreOn", 0.0f)) return false;
+        for (const auto& kv : s.params) if (! set (kv.first, kv.second)) return false;
+        if (s.timbre != nullptr)
+        {
+            juce::String e;
+            if (! p.loadTimbreText (s.timbre, e)) { err = "Custom Engine text refused: " + e; return false; }
+            for (const auto& kv : s.params)   // Reps may have been set before the text existed
+                if (kv.first == "timbreRepeats") set (kv.first, kv.second);
+        }
+        for (const auto& r : s.routes) p.getModEngine().addTarget (r.mod, r.target);
+        if (! set ("masterGain", (float) gainDb)) return false;
+        for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+        if (! awaitSpectrumIdle (p, s.name)) { err = "spectrum never compiled"; return false; }
+        p.pollParametersForTests();
+        return true;
+    }
+
+    static Take render (Proc& p, const Spec& s)
+    {
+        const double sr = 48000.0;
+        const int blk = 256;
+        const double hold = 4.0;
+        const double tail = juce::jmin (10.0, releaseOf (s) + 2.0);
+        const int holdBlocks = (int) std::ceil (hold * sr / blk);
+        const int tailBlocks = (int) std::ceil (tail * sr / blk);
+        const int win = (int) (0.100 * sr);
+        const int lastQuarterSec = (int) std::ceil (0.25 * sr / blk);
+
+        std::vector<int> notes { s.root };
+        if (s.chord) notes = { s.root, s.root + 4, s.root + 7, s.root + 12 };
+
+        Take t;
+        juce::AudioBuffer<float> b (2, blk);
+        double sum = 0, winSq = 0, cpu = 0, maxWin = 0, tailPeak = 0;
+        long long n = 0; int inWin = 0;
+        for (int k = 0; k < holdBlocks + tailBlocks; ++k)
+        {
+            juce::MidiBuffer m;
+            if (k == 0)          for (int nt : notes) m.addEvent (juce::MidiMessage::noteOn  (1, nt, (juce::uint8) 100), 0);
+            if (k == holdBlocks) for (int nt : notes) m.addEvent (juce::MidiMessage::noteOff (1, nt), 0);
+            b.clear();
+            const double t0 = juce::Time::getMillisecondCounterHiRes();
+            p.processBlock (b, m);
+            cpu += juce::Time::getMillisecondCounterHiRes() - t0;
+            for (int i = 0; i < blk; ++i)
+            {
+                const double l = b.getSample (0, i), r = b.getSample (1, i);
+                if (! std::isfinite (l) || ! std::isfinite (r)) { t.finite = false; continue; }
+                t.peak = std::max ({ t.peak, std::abs (l), std::abs (r) });
+                if (k < holdBlocks)
+                {
+                    // DC over the SOUNDING part only: averaged over the silent tail too, a real
+                    // offset was diluted below the gate (night review).
+                    sum += 0.5 * (l + r); ++n;
+                    winSq += 0.5 * (l * l + r * r);
+                    if (++inWin == win) { maxWin = std::max (maxWin, winSq / win); winSq = 0; inWin = 0; }
+                }
+                if (k >= holdBlocks + tailBlocks - lastQuarterSec)
+                    tailPeak = std::max ({ tailPeak, std::abs (l), std::abs (r) });
+            }
+        }
+        t.audioSec = (holdBlocks + tailBlocks) * blk / sr;
+        t.rt       = (cpu / 1000.0) / t.audioSec;
+        t.dc       = n > 0 ? sum / (double) n : 0.0;
+        t.loudDb   = maxWin > 0 ? 10.0 * std::log10 (maxWin) : -300.0;
+        t.tailDb   = tailPeak > 0 ? 20.0 * std::log10 (tailPeak) : -300.0;
+        if (auto tpl = p.getLiveTemplate()) t.partials = (int) tpl->partials.size();
+        return t;
+    }
+
+    // Vibrato the only way this synth has one: the pitch envelope held at full
+    // (instant attack, sustain 1, amount 0) and LFO 1 moving its AMOUNT. The range is in
+    // the amount's normalised space, which spans 96 semitones.
+    static void addVibrato (Spec& s, float hz, float semis)
+    {
+        s.params.insert (s.params.end(), {
+                 { "pitchAttack", 0.001f }, { "pitchDecay", 0.001f }, { "pitchSustain", 1.0f },
+                 { "pitchEnvAmount", 0.0f }, { "modL1Wave", 0.0f }, { "modL1RateMode", 2.0f },
+                 { "modL1Hz", hz }, { "modL1Range", semis / 96.0f }, { "modL1On", 1.0f } });
+        s.routes.push_back ({ 3, "pitchEnvAmount" });
+    }
+    // A slow free-running LFO (2 or 3) on a per-voice target.
+    static void addDrift (Spec& s, int lfo, const char* target, float hz, float range, float wave = 0.0f)
+    {
+        const juce::String pre = "modL" + juce::String (lfo);
+        s.params.insert (s.params.end(), {
+                 { pre + "Wave", wave }, { pre + "RateMode", 2.0f }, { pre + "Hz", hz },
+                 { pre + "Range", range }, { pre + "On", 1.0f } });
+        s.routes.push_back ({ 2 + lfo, target });
+    }
+
+    static std::vector<Spec> catalogue()
+    {
+        std::vector<Spec> v;
+        const auto add = [&v] (Spec s) -> Spec& { v.push_back (std::move (s)); return v.back(); };
+        using P = std::vector<std::pair<juce::String, float>>;
+        const auto U = [] (const char* s) { return s; };   // names are UTF-8 literals
+
+        //-- BELLS -------------------------------------------------------------------
+        add ({ U ("BELL Campana de Vidre"),
+               P { { "ampAttack", 0.001f }, { "ampDecay", 6.0f }, { "ampSustain", 0.0f }, { "ampRelease", 4.0f },
+                   { "ampCurveD", 0.7f }, { "curveSlope", 1.2f }, { "timbreRepeats", 1.0f }, { "binaural", 0.2f } },
+               "1 6/5 3/2 2 5/2 8/3 3 4 16/3 6" });
+        add ({ U ("BELL Orbital Chime"),
+               P { { "ampAttack", 0.001f }, { "ampDecay", 3.5f }, { "ampSustain", 0.0f }, { "ampRelease", 2.5f },
+                   { "curveSlope", 0.8f }, { "timbreRepeats", 1.0f }, { "binaural", 0.3f } },
+               "1 1755.1 2920.4 3789.6 4000.0" });
+        add ({ U ("BELL Gamelan Estel"),
+               P { { "ampAttack", 0.001f }, { "ampDecay", 4.0f }, { "ampSustain", 0.0f }, { "ampRelease", 3.0f },
+                   { "curveSlope", 1.0f }, { "timbreRepeats", 1.0f }, { "binaural", 0.35f } },
+               "1 1457.4 2504.1 3273.4 3400.0" });
+        {
+            auto& s = add ({ U ("BELL Tubular Nebula"),
+                             P { { "ampAttack", 0.001f }, { "ampDecay", 7.0f }, { "ampSustain", 0.0f }, { "ampRelease", 5.0f },
+                                 { "curveSlope", 1.1f }, { "timbreRepeats", 1.0f }, { "binaural", 0.45f }, { "phaseMode", 0.4f } },
+                             "1 2 3 2484.5 2919.6 3318.8 3400.0" });
+            addDrift (s, 2, "curveSlope", 0.11f, 0.05f);
+        }
+        add ({ U ("BELL Tritave Glass"),
+               P { { "ampAttack", 0.001f }, { "ampDecay", 2.2f }, { "ampSustain", 0.08f }, { "ampRelease", 1.5f },
+                   { "curveSlope", 1.5f }, { "timbreRepeats", 3.0f } },
+               "1 5/3 7/3 3" });
+        add ({ U ("BELL Stretched Octaves"),
+               P { { "ampAttack", 0.002f }, { "ampDecay", 5.0f }, { "ampSustain", 0.0f }, { "ampRelease", 3.0f },
+                   { "curveSlope", 1.3f }, { "timbreRepeats", 1.0f }, { "binaural", 0.15f } },
+               "1 1202.0 1905.9 2405.9 2790.3 3113.0 3391.2 3605.9 3700.0" });
+        add ({ U ("BELL Prime Glass"),
+               P { { "harmonics", 3.0f }, { "curveSlope", 1.3f }, { "ampAttack", 0.001f }, { "ampDecay", 3.0f },
+                   { "ampSustain", 0.0f }, { "ampRelease", 2.5f }, { "binaural", 0.25f } } });
+        add ({ U ("BELL Hidden Fundamental"),
+               P { { "baseN", 7.0f }, { "harmonics", 2.0f }, { "curveSlope", 2.2f }, { "ampAttack", 0.001f },
+                   { "ampDecay", 2.5f }, { "ampSustain", 0.0f }, { "ampRelease", 2.0f } } });
+
+        //-- KEYS --------------------------------------------------------------------
+        {
+            auto& s = add ({ U ("KEYS Rhodes Gal\xc3\xa0" "ctic"),
+                             P { { "harmonics", 1.35f }, { "curveSlope", 1.9f }, { "ampAttack", 0.002f }, { "ampDecay", 1.8f },
+                                 { "ampSustain", 0.25f }, { "ampRelease", 0.5f }, { "filterCutoff", 1800.0f },
+                                 { "filterEnvAmount", 3.5f }, { "filterDecay", 0.8f }, { "filterSustain", 0.3f },
+                                 { "filterResonance", 0.9f }, { "binaural", 0.15f } } });
+            addDrift (s, 2, "ampSustain", 4.5f, 0.08f);
+        }
+        add ({ U ("KEYS Organ Odd Stars"),
+               P { { "harmonics", 2.0f }, { "curveSlope", 0.9f }, { "spectrumRange", 4.0f }, { "ampAttack", 0.01f },
+                   { "ampDecay", 0.1f }, { "ampSustain", 1.0f }, { "ampRelease", 0.15f } } });
+        add ({ U ("KEYS Organ Full"),
+               P { { "harmonics", 1.0f }, { "curveSlope", 1.0f }, { "spectrumRange", 5.0f }, { "ampAttack", 0.005f },
+                   { "ampDecay", 0.1f }, { "ampSustain", 1.0f }, { "ampRelease", 0.12f }, { "binaural", 0.1f } } });
+        add ({ U ("KEYS Toy Piano"),
+               P { { "ampAttack", 0.001f }, { "ampDecay", 0.7f }, { "ampSustain", 0.0f }, { "ampRelease", 0.4f },
+                   { "curveSlope", 1.0f }, { "timbreRepeats", 1.0f } },
+               "1 5/2 4 6 7" });
+        add ({ U ("KEYS Glass Clav"),
+               P { { "curveSlope", 0.6f }, { "filterCutoff", 2400.0f }, { "filterResonance", 3.5f },
+                   { "filterEnvAmount", 2.0f }, { "filterDecay", 0.15f }, { "filterSustain", 0.1f },
+                   { "ampAttack", 0.001f }, { "ampDecay", 0.5f }, { "ampSustain", 0.35f }, { "ampRelease", 0.08f } } });
+        {
+            auto& s = add ({ U ("KEYS Vibraphone"),
+                             P { { "ampAttack", 0.001f }, { "ampDecay", 3.0f }, { "ampSustain", 0.35f }, { "ampRelease", 1.5f },
+                                 { "curveSlope", 1.4f }, { "timbreRepeats", 1.0f } },
+                             "1 4 10 11" });
+            addDrift (s, 2, "ampSustain", 5.5f, 0.25f);
+        }
+
+        //-- PADS --------------------------------------------------------------------
+        {
+            auto& s = add ({ U ("PAD Nebulosa"),
+                             P { { "curveSlope", 1.7f }, { "phaseMode", 1.0f }, { "binaural", 0.45f }, { "ampAttack", 1.6f },
+                                 { "ampDecay", 2.5f }, { "ampSustain", 0.85f }, { "ampRelease", 4.5f },
+                                 { "filterCutoff", 3600.0f }, { "filterResonance", 0.8f } } });
+            addDrift (s, 2, "curveSlope", 0.09f, 0.06f);
+            addDrift (s, 3, "filterCutoff", 0.13f, 0.05f, 1.0f);
+        }
+        {
+            auto& s = add ({ U ("PAD Odd Aurora"),
+                             P { { "harmonics", 2.0f }, { "curveSlope", 2.0f }, { "phaseMode", 0.7f }, { "binaural", 0.6f },
+                                 { "ampAttack", 2.5f }, { "ampSustain", 1.0f }, { "ampRelease", 6.0f } } });
+            addDrift (s, 2, "curveSlope", 0.07f, 0.08f);
+        }
+        add ({ U ("PAD Fractal Choir"),
+               P { { "fractalLevel", 2.0f }, { "baseN", 3.0f }, { "curveSlope", 2.4f }, { "spectrumRange", 7.0f },
+                   { "phaseMode", 1.0f }, { "binaural", 0.3f }, { "ampAttack", 1.2f }, { "ampDecay", 2.0f },
+                   { "ampSustain", 0.8f }, { "ampRelease", 3.5f }, { "filterCutoff", 3000.0f } } });
+        add ({ U ("PAD Prime Horizon"),
+               P { { "harmonics", 3.0f }, { "curveSlope", 1.4f }, { "phaseMode", 0.5f }, { "binaural", 0.5f },
+                   { "ampAttack", 2.0f }, { "ampDecay", 3.0f }, { "ampSustain", 0.9f }, { "ampRelease", 5.0f } } });
+        {
+            auto& s = add ({ U ("PAD Binaural Breath"),
+                             P { { "harmonics", 1.5f }, { "curveSlope", 1.8f }, { "binaural", 1.0f }, { "phaseMode", 1.0f },
+                                 { "ampAttack", 1.8f }, { "ampSustain", 0.9f }, { "ampRelease", 4.0f } } });
+            addDrift (s, 2, "curveSlope", 0.05f, 0.07f);
+        }
+        {
+            auto& s = add ({ U ("PAD Warm Strings"),
+                             P { { "curveSlope", 1.1f }, { "filterCutoff", 2200.0f }, { "filterResonance", 0.7f },
+                                 { "phaseMode", 1.0f }, { "binaural", 0.25f }, { "ampAttack", 0.45f }, { "ampDecay", 1.0f },
+                                 { "ampSustain", 0.9f }, { "ampRelease", 1.2f } } });
+            addVibrato (s, 5.0f, 0.12f);
+        }
+        add ({ U ("PAD Tritave Mist"),
+               P { { "curveSlope", 1.6f }, { "phaseMode", 1.0f }, { "binaural", 0.5f }, { "timbreRepeats", 2.0f },
+                   { "ampAttack", 2.0f }, { "ampSustain", 0.9f }, { "ampRelease", 5.0f } },
+               "1 9/7 5/3 15/7 7/3 3" });
+        add ({ U ("PAD Just Chorale"),
+               P { { "curveSlope", 1.8f }, { "phaseMode", 1.0f }, { "binaural", 0.3f }, { "timbreRepeats", 3.0f },
+                   { "ampAttack", 1.0f }, { "ampSustain", 0.9f }, { "ampRelease", 3.0f } },
+               "1 5/4 3/2 7/4 2" });
+        add ({ U ("PAD Shepard Ascension"),
+               P { { "curveSlope", 1.5f }, { "shepOn", 1.0f }, { "shepMode", 0.0f }, { "shepTime", 16000.0f },
+                   { "ampAttack", 1.0f }, { "ampSustain", 1.0f }, { "ampRelease", 3.0f }, { "binaural", 0.3f } } });
+        add ({ U ("PAD Shepard Descent"),
+               P { { "curveSlope", 1.5f }, { "harmonics", 2.0f }, { "shepOn", 1.0f }, { "shepDown", 1.0f },
+                   { "shepMode", 0.0f }, { "shepTime", 20000.0f }, { "ampAttack", 1.0f }, { "ampSustain", 1.0f },
+                   { "ampRelease", 3.0f }, { "binaural", 0.4f } } });
+
+        //-- DRONES ------------------------------------------------------------------
+        {
+            auto& s = add ({ U ("DRONE Sub Oce\xc3\xa0"),
+                             P { { "harmonics", 2.0f }, { "curveSlope", 2.5f }, { "octaveShift", -1.0f }, { "ampAttack", 3.0f },
+                                 { "ampSustain", 1.0f }, { "ampRelease", 8.0f }, { "phaseMode", 0.5f }, { "binaural", 0.35f },
+                                 { "filterCutoff", 2400.0f } } });
+            addDrift (s, 2, "filterCutoff", 0.03f, 0.06f);
+        }
+        add ({ U ("DRONE Harmonic Cathedral"),
+               P { { "baseN", 8.0f }, { "curveSlope", 1.2f }, { "spectrumRange", 6.0f }, { "phaseMode", 1.0f },
+                   { "binaural", 0.5f }, { "ampAttack", 4.0f }, { "ampSustain", 1.0f }, { "ampRelease", 9.0f } } });
+        add ({ U ("DRONE Fractal Void"),
+               P { { "baseN", 5.0f }, { "baseMode", 1.0f }, { "harmonics", 3.0f }, { "fractalLevel", 3.0f },
+                   { "curveSlope", 2.8f }, { "spectrumRange", 6.0f }, { "ampAttack", 3.0f }, { "ampSustain", 1.0f },
+                   { "ampRelease", 8.0f }, { "binaural", 0.6f } } });
+
+        //-- BASS --------------------------------------------------------------------
+        const auto bass = [&add] (const char* name, P params, const char* timbre = nullptr) -> Spec&
+        { auto& s = add ({ name, std::move (params), timbre }); s.root = 48; s.chord = false; return s; };
+        bass (U ("BASS Saw Sub"),
+              P { { "curveSlope", 1.0f }, { "octaveShift", -1.0f }, { "filterCutoff", 1700.0f }, { "filterResonance", 1.8f },
+                  { "filterEnvAmount", 2.5f }, { "filterDecay", 0.22f }, { "filterSustain", 0.5f },
+                  { "ampAttack", 0.002f }, { "ampDecay", 0.3f }, { "ampSustain", 1.0f }, { "ampRelease", 0.1f } });
+        bass (U ("BASS Square Deep"),
+              P { { "harmonics", 2.0f }, { "curveSlope", 1.0f }, { "octaveShift", -1.0f }, { "filterCutoff", 1200.0f },
+                  { "filterResonance", 1.2f }, { "filterEnvAmount", 2.0f }, { "filterDecay", 0.3f }, { "filterSustain", 0.3f },
+                  { "ampAttack", 0.002f }, { "ampSustain", 1.0f }, { "ampRelease", 0.08f } });
+        bass (U ("BASS Rubber Pluck"),
+              P { { "curveSlope", 1.2f }, { "octaveShift", -1.0f }, { "filterCutoff", 900.0f }, { "filterResonance", 4.0f },
+                  { "filterEnvAmount", 4.5f }, { "filterDecay", 0.25f }, { "filterSustain", 0.0f },
+                  { "ampAttack", 0.001f }, { "ampDecay", 0.7f }, { "ampSustain", 0.0f }, { "ampRelease", 0.15f } });
+        bass (U ("BASS Ghost Fundamental"),
+              P { { "baseN", 2.0f }, { "curveSlope", 1.3f }, { "filterCutoff", 3000.0f }, { "filterEnvAmount", 2.0f },
+                  { "filterDecay", 0.4f }, { "filterSustain", 1.0f }, { "ampAttack", 0.002f }, { "ampDecay", 0.5f },
+                  { "ampSustain", 0.9f }, { "ampRelease", 0.12f } });
+        {
+            auto& s = bass (U ("BASS Prime Growl"),
+                            P { { "harmonics", 3.0f }, { "curveSlope", 0.8f }, { "octaveShift", -1.0f },
+                                { "filterCutoff", 600.0f }, { "filterResonance", 5.0f }, { "filterEnvAmount", 3.0f },
+                                { "filterDecay", 0.35f }, { "filterSustain", 0.4f }, { "ampAttack", 0.002f },
+                                { "ampSustain", 1.0f }, { "ampRelease", 0.1f } });
+            addDrift (s, 2, "filterCutoff", 3.0f, 0.04f);
+        }
+
+        //-- LEADS -------------------------------------------------------------------
+        const auto lead = [&add] (const char* name, P params, const char* timbre = nullptr) -> Spec&
+        { auto& s = add ({ name, std::move (params), timbre }); s.root = 72; s.chord = false; return s; };
+        {
+            auto& s = lead (U ("LEAD Saw Glide"),
+                            P { { "curveSlope", 0.95f }, { "monoGlide", 1.0f }, { "glideTime", 90.0f },
+                                { "filterCutoff", 3600.0f }, { "filterResonance", 1.5f }, { "ampAttack", 0.005f },
+                                { "ampSustain", 1.0f }, { "ampRelease", 0.2f } });
+            addVibrato (s, 5.2f, 0.18f);
+        }
+        {
+            auto& s = lead (U ("LEAD Odd Flute"),
+                            P { { "harmonics", 2.0f }, { "curveSlope", 2.4f }, { "spectrumRange", 5.0f },
+                                { "ampAttack", 0.06f }, { "ampDecay", 0.2f }, { "ampSustain", 0.85f }, { "ampRelease", 0.25f },
+                                { "binaural", 0.1f }, { "monoGlide", 1.0f }, { "glideTime", 60.0f } });
+            addVibrato (s, 4.8f, 0.15f);
+        }
+        {
+            auto& s = lead (U ("LEAD Fibl\xc3\xb3"),
+                            P { { "harmonics", 3.0f }, { "curveSlope", 3.2f }, { "spectrumRange", 3.0f },
+                                { "ampAttack", 0.03f }, { "ampSustain", 1.0f }, { "ampRelease", 0.3f },
+                                { "monoGlide", 1.0f }, { "glideTime", 120.0f } });
+            addVibrato (s, 5.5f, 0.22f);
+        }
+        lead (U ("LEAD Brass Stack"),
+              P { { "curveSlope", 1.1f }, { "filterCutoff", 600.0f }, { "filterEnvAmount", 4.0f }, { "filterAttack", 0.08f },
+                  { "filterDecay", 0.5f }, { "filterSustain", 0.5f }, { "filterResonance", 0.9f },
+                  { "ampAttack", 0.04f }, { "ampDecay", 0.3f }, { "ampSustain", 0.9f }, { "ampRelease", 0.2f } });
+        lead (U ("LEAD Hollow Square"),
+              P { { "harmonics", 2.0f }, { "curveSlope", 1.1f }, { "filterCutoff", 4800.0f }, { "filterResonance", 2.0f },
+                  { "monoGlide", 1.0f }, { "glideTime", 45.0f }, { "ampAttack", 0.003f }, { "ampSustain", 1.0f },
+                  { "ampRelease", 0.15f } });
+
+        //-- PLUCKS ------------------------------------------------------------------
+        add ({ U ("PLUCK Harp Estel"),
+               P { { "curveSlope", 1.6f }, { "ampAttack", 0.001f }, { "ampDecay", 1.6f }, { "ampSustain", 0.0f },
+                   { "ampRelease", 1.2f }, { "filterCutoff", 1400.0f }, { "filterEnvAmount", 3.0f },
+                   { "filterDecay", 0.5f }, { "filterSustain", 0.0f }, { "binaural", 0.25f } } });
+        add ({ U ("PLUCK Kalimba"),
+               P { { "ampAttack", 0.001f }, { "ampDecay", 1.1f }, { "ampSustain", 0.0f }, { "ampRelease", 0.7f },
+                   { "curveSlope", 1.0f }, { "timbreRepeats", 1.0f } },
+               "1 2 3159.0 3300.0" });
+        add ({ U ("PLUCK Glass Marimba"),
+               P { { "ampAttack", 0.001f }, { "ampDecay", 0.9f }, { "ampSustain", 0.0f }, { "ampRelease", 0.6f },
+                   { "curveSlope", 0.8f }, { "timbreRepeats", 1.0f } },
+               "1 2369.4 3868.0 4000.0" });
+        add ({ U ("PLUCK Koto Prime"),
+               P { { "harmonics", 3.0f }, { "curveSlope", 1.1f }, { "filterCutoff", 2400.0f }, { "filterEnvAmount", 3.0f },
+                   { "filterDecay", 0.3f }, { "filterSustain", 0.0f }, { "ampAttack", 0.001f }, { "ampDecay", 0.8f },
+                   { "ampSustain", 0.0f }, { "ampRelease", 0.5f } } });
+        add ({ U ("PLUCK Fractal Rain"),
+               P { { "fractalLevel", 2.0f }, { "baseN", 2.0f }, { "baseMode", 1.0f }, { "harmonics", 2.0f },
+                   { "curveSlope", 1.8f }, { "ampAttack", 0.001f }, { "ampDecay", 0.5f }, { "ampSustain", 0.0f },
+                   { "ampRelease", 0.8f }, { "binaural", 0.7f }, { "phaseMode", 1.0f } } });
+
+        //-- FX AND TEXTURES ---------------------------------------------------------
+        add ({ U ("FX Riser Gal\xc3\xa0" "ctic"),
+               P { { "curveSlope", 1.3f }, { "pitchEnvAmount", 24.0f }, { "pitchAttack", 4.0f }, { "pitchSustain", 1.0f },
+                   { "filterCutoff", 1200.0f }, { "filterEnvAmount", 5.0f }, { "filterAttack", 4.0f },
+                   { "filterSustain", 1.0f }, { "ampAttack", 2.0f }, { "ampSustain", 1.0f }, { "ampRelease", 2.0f },
+                   { "binaural", 0.5f } } });
+        add ({ U ("FX Falling Star"),
+               P { { "harmonics", 3.0f }, { "curveSlope", 2.0f }, { "pitchEnvAmount", 24.0f }, { "pitchAttack", 0.001f },
+                   { "pitchDecay", 2.5f }, { "pitchSustain", 0.0f }, { "ampAttack", 0.001f }, { "ampDecay", 3.0f },
+                   { "ampSustain", 0.0f }, { "ampRelease", 1.0f }, { "binaural", 0.4f } } });
+        add ({ U ("FX Laser Zap"),
+               P { { "curveSlope", 0.7f }, { "pitchEnvAmount", 36.0f }, { "pitchAttack", 0.001f }, { "pitchDecay", 0.18f },
+                   { "pitchSustain", 0.0f }, { "ampAttack", 0.001f }, { "ampDecay", 0.45f }, { "ampSustain", 0.1f },
+                   { "ampRelease", 0.1f } } });
+        {
+            auto& s = add ({ U ("TEXTURE Scattered Dust"),
+                             P { { "phaseMode", 1.0f }, { "harmonics", 3.0f }, { "fractalLevel", 2.5f }, { "baseN", 4.0f },
+                                 { "baseMode", 1.0f }, { "curveSlope", 3.0f }, { "spectrumRange", 7.0f },
+                                 { "binaural", 1.0f }, { "ampAttack", 0.8f }, { "ampSustain", 0.7f }, { "ampRelease", 3.0f } } });
+            addDrift (s, 2, "ampSustain", 6.0f, 0.3f, 6.0f);
+        }
+        add ({ U ("TEXTURE Beating Planets"),
+               P { { "timbreRepeats", 2.0f }, { "binaural", 0.5f }, { "ampAttack", 0.5f }, { "ampSustain", 0.9f },
+                   { "ampRelease", 3.0f }, { "curveSlope", 1.4f } },
+               "1 1203.0 1906.0 2397.0" });
+        {
+            auto& s = add ({ U ("TEXTURE Even Ghost"),
+                             P { { "harmonics", 0.0f }, { "curveSlope", 1.3f }, { "filterCutoff", 2400.0f },
+                                 { "phaseMode", 1.0f }, { "binaural", 0.8f }, { "ampAttack", 1.2f }, { "ampSustain", 1.0f },
+                                 { "ampRelease", 4.0f } } });
+            addDrift (s, 2, "filterCutoff", 0.08f, 0.07f);
+        }
+        {
+            auto& s = add ({ U ("TEXTURE Spectral Pulse"),
+                             P { { "curveSlope", 1.4f }, { "ampAttack", 0.01f }, { "ampSustain", 0.6f }, { "ampRelease", 0.3f } } });
+            addDrift (s, 2, "ampSustain", 6.0f, 0.45f, 4.0f);
+        }
+        return v;
+    }
+
+    static int run (const juce::File& outDir, const juce::String& only)
+    {
+        // NEVER THE USER'S FOLDER, AND NEVER A FOLDER WITH SOMETHING IN IT. The generator saves
+        // under fixed names and DELETES the files of rejected presets, so a folder that already
+        // held a same-named preset would lose it. The real path is spelled out rather than taken
+        // from getPresetFolder(), which creates and seeds that folder as a side effect.
+        const auto real = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                              .getChildFile ("Galactic Sting").getChildFile ("Presets");
+        if (outDir == juce::File() || outDir == real || outDir.isAChildOf (real) || real.isAChildOf (outDir))
+        {
+            std::printf ("--makepresets: refusing %s - it is (or contains, or sits inside) the user's preset folder\n",
+                         outDir.getFullPathName().toRawUTF8());
+            return 1;
+        }
+        if (outDir.exists() && (! outDir.isDirectory()
+                                || outDir.getNumberOfChildFiles (juce::File::findFilesAndDirectories) > 0))
+        {
+            std::printf ("--makepresets: refusing %s - it must be an empty folder or not exist yet\n",
+                         outDir.getFullPathName().toRawUTF8());
+            return 1;
+        }
+        outDir.createDirectory();
+        // RESTORED TO WHAT IT WAS, NEVER TO {}. An empty redirect means "the user's real folder",
+        // and this function is also called from inside the suite (the guard checks), where the
+        // folder in force is the suite's scratch one: ending with {} would have pointed every
+        // later block of the suite at the user's own presets.
+        const auto previousRedirect = Proc::getPresetFolder();
+        Proc::setPresetFolderForTests (outDir);
+        const auto specs = catalogue();
+        std::printf ("building %d presets into %s (target: loudest 100 ms at %.0f dBFS, peak <= -1 dBFS)\n\n",
+                     (int) specs.size(), outDir.getFullPathName().toRawUTF8(), kTargetDb);
+        std::printf ("%-30s %6s %7s %7s %7s %8s %6s %5s  %s\n",
+                     "preset", "gain", "loud", "peak", "tail", "partials", "xRT", "trip", "verdict");
+        int bad = 0;
+        for (const auto& s : specs)
+        {
+            if (only.isNotEmpty() && ! juce::String (juce::CharPointer_UTF8 (s.name)).containsIgnoreCase (only)) continue;
+            const juce::String name (juce::CharPointer_UTF8 (s.name));
+            juce::String err, why;
+            double gain = 0.0;
+            Take t;
+            // Pass 1 measures at 0 dB; pass 2 applies the match; pass 3 only if pass 2
+            // still peaks over -1 dBFS (a nonlinear stage would make pass 2 miss).
+            for (int pass = 0; pass < 3 && err.isEmpty(); ++pass)
+            {
+                auto up = std::make_unique<Proc>();
+                if (! build (*up, s, gain, err)) break;
+                t = render (*up, s);
+                if (pass == 0)
+                {
+                    gain = juce::jlimit (-40.0, 12.0, kTargetDb - t.loudDb);
+                    continue;
+                }
+                const double peakDb = t.peak > 0 ? 20.0 * std::log10 (t.peak) : -300.0;
+                if (peakDb > -1.0 && pass == 1) { gain -= (peakDb + 1.05); continue; }
+                if (up->savePreset (name) != name) err = "savePreset stored a different name";
+                break;
+            }
+            if (err.isNotEmpty())
+            {
+                ++bad;
+                std::printf ("%-30s  BUILD FAILED: %s\n", name.toRawUTF8(), err.toRawUTF8());
+                continue;
+            }
+            // THE FILE, NOT THE PROCESSOR: a fresh one loads what was written and renders.
+            double tripDb = 999.0;
+            {
+                auto up = std::make_unique<Proc>();
+                up->prepareToPlay (48000.0, 256);
+                if (up->loadPreset (name))
+                {
+                    for (int i = 0; i < 3; ++i) up->pollParametersForTests();
+                    awaitSpectrumIdle (*up, s.name);
+                    up->pollParametersForTests();
+                    tripDb = render (*up, s).loudDb - t.loudDb;
+                }
+            }
+            const double peakDb = t.peak > 0 ? 20.0 * std::log10 (t.peak) : -300.0;
+            const bool longTail = releaseOf (s) + 2.0 > 10.0;
+            if (! t.finite)                                   why << "non-finite samples; ";
+            if (std::abs (t.dc) >= 0.01)                      why << "DC " << juce::String (t.dc, 3) << "; ";
+            if (peakDb > -1.0)                                why << "peak over -1 dBFS; ";
+            if (std::abs (t.loudDb - kTargetDb) > 1.5)        why << "level not matched (gain limit); ";
+            if (! longTail && t.tailDb > -60.0)               why << "tail not silent; ";
+            if (t.rt >= 1.0)                                  why << "slower than real time; ";
+            if (std::abs (tripDb) > 1.5)                      why << "file does not reproduce the sound; ";
+            const bool ok = why.isEmpty();
+            if (! ok) ++bad;
+            std::printf ("%-30s %+6.1f %7.1f %7.1f %7.1f %8d %6.2f %+5.1f  %s%s\n",
+                         name.toRawUTF8(), gain, t.loudDb, peakDb, t.tailDb, t.partials, t.rt, tripDb,
+                         ok ? "ok" : "REJECT: ", why.toRawUTF8());
+            if (ok && longTail) std::printf ("%-30s   (long tail: release outlasts the 10 s window, tail reported not gated)\n", "");
+            if (! ok) Proc::presetFile (name).deleteFile();   // only in outDir: the redirect is in force
+        }
+        Proc::setPresetFolderForTests (previousRedirect);
+        std::printf ("\n%d preset(s) rejected%s\n", bad, bad == 0 ? "" : " - their files were removed from the output folder");
+        return bad;
+    }
+}
+
 int main (int argc, char** argv)
 {
     // A RIG THAT DIES MUST SAY WHERE. stdout is fully buffered the moment this is run
@@ -2442,6 +2957,33 @@ int main (int argc, char** argv)
         }
         std::printf ("\nREAD ONLY: nothing was written to that file, or anywhere else.\n");
         return 0;
+    }
+
+    // --makepresets <folder> [name filter]: see namespace makepresets. Never part of a
+    // suite run, and it never names the user's folder itself.
+    if (argc > 1 && std::strcmp (argv[1], "--makepresets") == 0)
+    {
+        // Matched on the SWITCH alone: "--makepresets" with its folder forgotten used to fall
+        // through to the whole suite, run for minutes and end "ALL PASSED" - read as a preset
+        // build that succeeded (night review).
+        if (argc < 3)
+        {
+            std::printf ("usage: RhythmVerify --makepresets <absolute empty output folder> [name filter]\n");
+            return 2;
+        }
+        const auto outText = juce::String (juce::CharPointer_UTF8 (argv[2]));
+        // AN EMPTY OR RELATIVE ARGUMENT IS REFUSED HERE, BEFORE A File EXISTS. An empty File
+        // handed to setPresetFolderForTests means "the REAL folder": `--makepresets ""` would have
+        // saved 49 presets into the user's own folder and then deleted the rejects from it
+        // (night review). See makepresets::run for the rest of the rule.
+        if (! juce::File::isAbsolutePath (outText))
+        {
+            std::printf ("--makepresets: refusing \"%s\" - the output folder must be an absolute path\n", argv[2]);
+            return 1;
+        }
+        const auto out = juce::File (outText);   // "= File (...)": the parenthesised form is a function declaration
+        const int bad = makepresets::run (out, argc > 3 ? juce::String (juce::CharPointer_UTF8 (argv[3])) : juce::String());
+        return bad == 0 ? 0 : 1;
     }
 
     // ONE BLOCK, ON DEMAND: only the silent-limit runs (70+). Same shape and same
@@ -11823,6 +12365,442 @@ int main (int argc, char** argv)
         }
     }
 
+    //--- PRESETS CAN BE DELETED, FROM THE DROP-DOWN ------------------------------------
+    // "haz que sean borrables con boton izquierdo y clic en un boton de delete que se abra
+    //  al dar ese clic" (2026-09-14)
+    //
+    // Two halves. The PROCESSOR's rule (what may be deleted, what is refused and why, what
+    // happens to the loaded patch) is asked directly. The GESTURE is asked through JUCE's
+    // own mouse routing: the wired panel goes on a hidden off-screen peer and real left
+    // clicks are injected at a row and at the button, so "a left click opens Delete" is
+    // measured on the event path a hand takes, not on a method called by name.
+    //
+    // All of it in a scratch folder, and with delete-to-Recycle-Bin switched OFF for the
+    // run: a suite that parked its scratch presets in the user's Recycle Bin on every run
+    // would be the run48 droppings again, one folder over. The bin call itself is JUCE's
+    // and is not run here - stated at setPresetDeleteToTrashForTests.
+    {
+        std::printf ("\ndeleting presets from the drop-down:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        using R    = Proc::PresetDeleteRefusal;
+        const auto prevFolder = Proc::getPresetFolder();
+        const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                             .getChildFile ("fiblo-verify-delete-"
+                                            + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        dir.deleteRecursively();
+        Proc::setPresetFolderForTests (dir);
+        Proc::setPresetDeleteToTrashForTests (false);
+        const auto outside = dir.getSiblingFile (dir.getFileName() + "-outside" + Proc::kPresetExt);
+        outside.replaceWithText ("not a preset, and not in the preset folder");
+        const auto bytes = [] (const juce::File& f) { juce::MemoryBlock mb; f.loadFileAsData (mb); return mb; };
+
+        {
+            auto owned = std::make_unique<Proc>();
+            auto& p = *owned;
+            p.prepareToPlay (sr, blk);
+            const auto setGain = [&p] (float db)
+            {
+                auto* g = p.apvts.getParameter ("masterGain");
+                g->setValueNotifyingHost (g->convertTo0to1 (db));
+            };
+            const auto gain = [&p] { return p.apvts.getRawParameterValue ("masterGain")->load(); };
+            const juce::String longName ("A preset whose name is long enough to have been cut off in the list");
+            // Enough fillers that the list SCROLLS, so the width check below is made with
+            // the scrollbar taking its share of the row.
+            for (int i = 1; i <= 14; ++i) p.savePreset ("Filler " + juce::String (i).paddedLeft ('0', 2));
+            setGain (-1.0f); p.savePreset ("Alpha");
+            setGain (-2.0f); p.savePreset ("Bravo");
+            setGain (-3.0f); p.savePreset ("Charlie");
+            setGain (-4.0f); p.savePreset (longName);
+            const int total = p.getPresetNames().size();
+
+            //-- THE RULE -----------------------------------------------------------------
+            int corner = -7;
+            check (p.deletePreset ("Nope", corner) == R::NoSuchPreset && corner == -1,
+                   "a name with no file behind it is refused as NoSuchPreset, naming no corner");
+            check (p.deletePreset ("../" + outside.getFileNameWithoutExtension(), corner) == R::NoSuchPreset
+                     && outside.existsAsFile(),
+                   "a name that climbs out of the preset folder is refused, and the file out there is untouched");
+
+            juce::String err;
+            p.assignPlaygroundCorner (1, "Bravo", err);
+            const auto r1 = p.deletePreset ("bravo", corner);
+            std::printf ("  \"bravo\" while Bravo is on corner B: refusal %d, corner %d, file %s\n",
+                         (int) r1, corner, Proc::presetFile ("Bravo").existsAsFile() ? "still there" : "GONE");
+            check (r1 == R::OnPlaygroundCorner && corner == 1 && Proc::presetFile ("Bravo").existsAsFile(),
+                   "a preset on a playground corner is REFUSED - compared as a FILE, so another capitalisation "
+                   "is caught too - naming corner B, and the file stays");
+            p.assignPlaygroundCorner (1, {}, err);
+
+            const auto aBefore = bytes (Proc::presetFile ("Alpha"));
+            const auto cBefore = bytes (Proc::presetFile ("Charlie"));
+            const auto r2 = p.deletePreset ("Bravo", corner);
+            check (r2 == R::None && ! Proc::presetFile ("Bravo").existsAsFile(),
+                   "off the pad, Bravo deletes: its file is gone");
+            check (! p.getPresetNames().contains ("Bravo") && p.getPresetNames().size() == total - 1,
+                   "...the folder no longer lists it, and still lists every other preset");
+            check (bytes (Proc::presetFile ("Alpha")) == aBefore && bytes (Proc::presetFile ("Charlie")) == cBefore,
+                   "...and its neighbours are byte-for-byte what they were");
+            check (p.deletePreset ("Bravo", corner) == R::NoSuchPreset,
+                   "deleting it a second time is refused as NoSuchPreset, not reported as another delete");
+
+            p.loadPreset ("Charlie");
+            check (p.getLoadedPresetName() == "Charlie" && std::abs (gain() + 3.0f) < 1.0e-3f,
+                   "(Charlie loads, at -3 dB)");
+            check (p.deletePreset ("Charlie", corner) == R::None, "the LOADED preset can be deleted");
+            check (p.getLoadedPresetName().isEmpty(),
+                   "...and stops being tracked as a preset: there is no file left for its \"*\" to mean");
+            check (std::abs (gain() + 3.0f) < 1.0e-3f,
+                   "...while the sound stays exactly as it was (-3 dB, from memory)");
+
+            //-- THE GESTURE --------------------------------------------------------------
+            setGain (-2.0f); p.savePreset ("Bravo");
+            setGain (-3.0f); p.savePreset ("Charlie");
+            p.loadPreset ("Alpha");
+            // For (2b). Written BEFORE the editor exists, so the preset box - filled once when the
+            // editor is built - holds it too; written after, the box's own count was one short of
+            // the folder's and the "box keeps every other name" check below failed on that alone.
+            Proc::presetFile ("Broken").replaceWithText ("this is not a preset");
+            std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+            auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+            check (ed != nullptr, "the editor builds");
+            if (ed != nullptr)
+            {
+                auto panel = ed->presetSearchPanelForTests();
+                panel->setTopLeftPosition (-4000, -4000);   // off every real screen
+                panel->setVisible (true);
+                panel->addToDesktop (0);
+                auto* peer = panel->getPeer();
+                check (peer != nullptr, "the panel is on a hidden peer, so clicks go through JUCE's own routing");
+                if (peer != nullptr)
+                {
+                    // Event times are OURS and spaced a second apart, so two separate clicks
+                    // are never taken for a double-click by the multi-click timer.
+                    auto t = juce::Time::currentTimeMillis();
+                    const auto inject = [peer, &t] (juce::Point<int> pos, juce::ModifierKeys mods, int gapMs)
+                    {
+                        t += gapMs;
+                        peer->handleMouseEvent (juce::MouseInputSource::InputSourceType::mouse, pos.toFloat(), mods,
+                                                juce::MouseInputSource::defaultPressure,
+                                                juce::MouseInputSource::defaultOrientation, t);
+                    };
+                    const auto left  = juce::ModifierKeys::leftButtonModifier;
+                    const auto click = [&] (juce::Point<int> pos)
+                    { inject (pos, {}, 1000); inject (pos, left, 5); inject (pos, {}, 5); };
+                    const auto rowCentre = [&panel] (const juce::String& name)
+                    {
+                        const int row = panel->shown.indexOf (name);
+                        return panel->getLocalPoint (&panel->list, panel->list.getRowPosition (row, true).getCentre());
+                    };
+                    const auto buttonCentre = [&panel] { return panel->deleteBtn.getBounds().getCentre(); };
+
+                    check (! panel->deleteBtn.isVisible() && panel->statusText().isNotEmpty(),
+                           "before any click there is no Delete button, and the strip says how the list works");
+                    {
+                        // ...AND THE WHOLE OF IT FITS. "Not empty" was all this asked, and the
+                        // panel was sized before its hint existed: the strip was measured empty
+                        // and the explanation opened cut to nothing (night review, 2026-09-15).
+                        const int needHint = (int) std::ceil (panel->statusLayout (panel->statusArea.getWidth()).getHeight());
+                        std::printf ("  as it opens, the hint needs %d px; the strip is %d px\n",
+                                     needHint, panel->statusArea.getHeight());
+                        check (needHint > 0 && panel->statusArea.getHeight() >= needHint,
+                               "...and as the list OPENS, before any click, the strip is tall enough for the whole hint");
+                    }
+
+                    // (1) A LEFT CLICK ON A ROW
+                    click (rowCentre ("Charlie"));
+                    std::printf ("  left click on \"Charlie\": loaded \"%s\" at %.2f dB, list %s, Delete %s (armed \"%s\")\n"
+                                 "    strip: %s\n",
+                                 p.getLoadedPresetName().toRawUTF8(), (double) gain(),
+                                 panel->isVisible() ? "open" : "CLOSED", panel->deleteBtn.isVisible() ? "shown" : "hidden",
+                                 panel->armed.toRawUTF8(), panel->statusText().toRawUTF8());
+                    check (p.getLoadedPresetName() == "Charlie" && std::abs (gain() + 3.0f) < 1.0e-3f,
+                           "a LEFT click on a row loads that preset, to be heard at once (-3 dB)");
+                    check (panel->isVisible(), "...and the list STAYS OPEN, so the next preset is one click away");
+                    check (panel->deleteBtn.isVisible() && panel->armed == "Charlie",
+                           "...with the Delete button showing, armed on the row just clicked");
+                    check (panel->current == "Charlie", "...and the gold 'loaded' colour has moved to it");
+                    check (panel->statusText().contains ("\"Charlie\""),
+                           "...and the strip under the button names the preset it will delete");
+
+                    // (2) THE DELETE BUTTON
+                    const auto aBytes = bytes (Proc::presetFile ("Alpha"));
+                    const auto boxBefore = ed->presetBoxItemsForTests();
+                    click (buttonCentre());
+                    std::printf ("  Delete clicked: file %s, box %d -> %d item(s), strip: %s\n",
+                                 Proc::presetFile ("Charlie").existsAsFile() ? "STILL THERE" : "gone",
+                                 boxBefore.size(), ed->presetBoxItemsForTests().size(), panel->statusText().toRawUTF8());
+                    check (! Proc::presetFile ("Charlie").existsAsFile(), "clicking Delete removes that preset's file");
+                    check (! panel->shown.contains ("Charlie") && ! panel->all.contains ("Charlie"),
+                           "...the open list drops its row at once");
+                    check (! ed->presetBoxItemsForTests().contains ("Charlie")
+                             && ed->presetBoxItemsForTests().contains ("Alpha")
+                             && ed->presetBoxItemsForTests().size() == boxBefore.size() - 1,
+                           "...and so does the preset box itself, keeping every other name");
+                    check (! panel->deleteBtn.isVisible() && panel->armed.isEmpty(),
+                           "...the button disarms: there is nothing left for it to act on");
+                    check (panel->status.contains ("\"Charlie\"") && ! panel->statusIsError,
+                           "...and the strip says it was moved, naming it");
+                    check (bytes (Proc::presetFile ("Alpha")) == aBytes && Proc::presetFile ("Bravo").existsAsFile(),
+                           "...and nothing else in the folder was touched");
+                    check (std::abs (gain() + 3.0f) < 1.0e-3f, "the sound that was playing is still playing");
+
+                    // (2b) A PRESET THAT WILL NOT LOAD, CLICKED: said in the list's own strip - never
+                    // as a notice over a list the user was told stays open, and never leaving its
+                    // name in the preset box (night review, 2026-09-15). Keyboard focus is NOT
+                    // checked here: it needs the OS to give this off-screen peer the foreground,
+                    // which a console run does not get - stated, not faked.
+                    ed->dismissNoticeForTests();
+                    ed->tickTimerForTests();
+                    click (rowCentre ("Broken"));
+                    ed->tickTimerForTests();
+                    {
+                        const auto nb = ed->noticeProbeForTests();
+                        std::printf ("  left click on a preset that is not XML: strip %s \"%s\"; notice %s; box \"%s\"\n",
+                                     panel->statusIsError ? "(error)" : "(info)", panel->status.toRawUTF8(),
+                                     nb.visible ? "SHOWN" : "none", ed->presetBoxTextForTests().toRawUTF8());
+                        check (panel->isVisible() && panel->statusIsError && panel->status.contains ("Broken"),
+                               "a click on a preset that will not load says so IN THE LIST, naming it, and the list stays open");
+                        check (! nb.visible,
+                               "...and raises no notice over the open list - it used to stack one per click, each closing the list");
+                        check (ed->presetBoxTextForTests() != "Broken",
+                               "...and the preset box does not go on naming the preset that did not load");
+                    }
+                    Proc::presetFile ("Broken").deleteFile();
+
+                    // (3) REFUSED, THROUGH THE SAME TWO CLICKS
+                    // The corner goes on AFTER the row click, not before: the click LOADS
+                    // Bravo, and a preset load replaces the playground's corners with the
+                    // preset's own (none, here) - assigned first, the corner was gone by
+                    // the time Delete was pressed, and the first run of this check
+                    // "failed" on a delete that was, at that moment, perfectly allowed.
+                    click (rowCentre ("Bravo"));
+                    p.assignPlaygroundCorner (0, "Bravo", err);
+                    check (p.getPlaygroundCornerName (0) == "Bravo", "(Bravo is on corner A as Delete is pressed)");
+                    click (buttonCentre());
+                    std::printf ("  Delete on \"Bravo\" while it is on corner A: file %s, strip: %s\n",
+                                 Proc::presetFile ("Bravo").existsAsFile() ? "still there" : "GONE",
+                                 panel->statusText().toRawUTF8());
+                    check (Proc::presetFile ("Bravo").existsAsFile(), "Bravo, on corner A, survives the Delete click");
+                    check (panel->statusIsError && panel->status.contains ("\"Bravo\"")
+                             && panel->all.contains ("Bravo") && panel->deleteBtn.isVisible(),
+                           "...the strip says why, the row stays, and the button stays armed");
+                    const int needH = (int) std::ceil (panel->statusLayout (panel->statusArea.getWidth()).getHeight());
+                    std::printf ("    that sentence needs %d px; the strip is %d px\n", needH, panel->statusArea.getHeight());
+                    check (panel->statusArea.getHeight() >= needH,
+                           "...and the panel grew to hold the WHOLE sentence - no line of it is cut");
+                    p.assignPlaygroundCorner (0, {}, err);
+
+                    // (4) NO NAME IS CUT OFF
+                    const int nameW = (int) std::ceil (juce::GlyphArrangement::getStringWidth (
+                                                           juce::Font (juce::FontOptions (13.0f)), longName));
+                    const int rowTextW = panel->list.getVisibleRowWidth() - 10;
+                    std::printf ("  the longest name needs %d px; a row gives it %d px (panel %d px, scrollbar %s)\n",
+                                 nameW, rowTextW, panel->getWidth(),
+                                 panel->list.getVerticalScrollBar().isVisible() ? "showing" : "hidden");
+                    check (panel->list.getVerticalScrollBar().isVisible(), "(the list is long enough to scroll)");
+                    check (nameW <= rowTextW,
+                           "the panel is as wide as its longest name: no row ends in an ellipsis");
+
+                    // (5) DOUBLE-CLICK STILL LOADS AND CLOSES
+                    const auto aPos = rowCentre ("Alpha");
+                    inject (aPos, {}, 1000); inject (aPos, left, 5); inject (aPos, {}, 5);
+                    inject (aPos, left, 60); inject (aPos, {}, 5);
+                    check (! panel->isVisible() && p.getLoadedPresetName() == "Alpha",
+                           "a DOUBLE click loads and closes, as a click used to");
+                    panel->removeFromDesktop();
+                }
+
+                //-- A CORNER WHOSE PRESET IS GONE IS NAMED, NOT SILENTLY EMPTIED ---------
+                p.assignPlaygroundCorner (0, "Alpha", err);
+                p.assignPlaygroundCorner (1, "Bravo", err);
+                p.savePreset ("Carries corners");
+                p.assignPlaygroundCorner (0, {}, err);
+                p.assignPlaygroundCorner (1, {}, err);
+                check (p.deletePreset ("Bravo", corner) == R::None, "(Bravo, off the pad, is deleted)");
+                (void) p.takePlaygroundRestoreLoss();
+                ed->dismissNoticeForTests();
+                ed->tickTimerForTests();
+                check (p.loadPreset ("Carries corners"),
+                       "(a preset saved with Alpha on corner A and Bravo on corner B loads)");
+                ed->tickTimerForTests();
+                const auto n = ed->noticeProbeForTests();
+                std::printf ("  loading it: corner A \"%s\", corner B \"%s\"; notice %s \"%s\"\n",
+                             p.getPlaygroundCornerName (0).toRawUTF8(), p.getPlaygroundCornerName (1).toRawUTF8(),
+                             n.visible ? "SHOWN" : "silent", n.title.toRawUTF8());
+                check (p.getPlaygroundCornerName (0) == "Alpha" && p.getPlaygroundCornerName (1).isEmpty(),
+                       "(corner A comes back; corner B cannot - its preset is gone)");
+                check (n.visible && n.body.contains ("B: \"Bravo\""),
+                       "...and the window SAYS so, naming corner B and its preset - it used to come back empty in silence");
+                ed->dismissNoticeForTests();
+            }
+        }
+        Proc::setPresetDeleteToTrashForTests (true);
+        Proc::setPresetFolderForTests (prevFolder);
+        dir.deleteRecursively();
+        outside.deleteFile();
+    }
+
+    //--- THE PRESET LIST: TOOLTIPS ONLY WHEN CUT, A CLICKED ROW IS SELECTED ------------
+    // And the generator's folder guard. All three flagged as having no biting check by the
+    // night review (2026-09-15).
+    {
+        std::printf ("\nthe preset list's row tooltips, row selection and the generator's folder guard:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        const auto prevFolder = Proc::getPresetFolder();
+        const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                             .getChildFile ("fiblo-verify-rowtips-" + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+        dir.deleteRecursively();
+        Proc::setPresetFolderForTests (dir);
+        {
+            auto owned = std::make_unique<Proc>();
+            auto& p = *owned;
+            p.prepareToPlay (sr, blk);
+            const juce::String shortName ("Alpha short");
+            const juce::String longName = "Zulu " + juce::String::repeatedString ("very long name ", 12) + "end";
+            const auto storedShort = p.savePreset (shortName);
+            const auto storedLong  = p.savePreset (longName);   // stored CUT to 128 characters (createLegalFileName)
+            std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+            auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+            check (ed != nullptr, "the editor builds");
+            if (ed != nullptr)
+            {
+                // AT THE WINDOW'S FLOOR, where the panel's width limit is smallest. Preset names are
+                // capped at 128 characters when saved, so at the 1200 px the plugin opens at no
+                // stored name can outgrow the panel - the first version of this check looked for a
+                // 188-character name that had been stored cut, and never found its row.
+                ed->setSize (690, 510);
+                auto panel = ed->presetSearchPanelForTests();
+                const int rShort = panel->shown.indexOf (storedShort), rLong = panel->shown.indexOf (storedLong);
+                const float longW = juce::GlyphArrangement::getStringWidth (juce::Font (juce::FontOptions (13.0f)), storedLong);
+                std::printf ("  the long name needs %.0f px; a row gives %d px (the window is %d px wide)\n",
+                             (double) longW, panel->list.getVisibleRowWidth() - 10, ed->getWidth());
+                check (rShort >= 0 && rLong >= 0 && longW > (float) (panel->list.getVisibleRowWidth() - 10),
+                       "  (gate) one name here really is longer than the widest panel the window allows");
+                check (panel->getTooltipForRow (rShort).isEmpty(),
+                       "a name shown whole gets NO tooltip - a hover repeating visible text is noise");
+                check (panel->getTooltipForRow (rLong) == storedLong,
+                       "a name the row has to cut gets its whole self as the tooltip");
+
+                const int before = panel->list.getSelectedRow();
+                const int target = before == rLong ? rShort : rLong;
+                panel->audition (target);
+                check (panel->list.getSelectedRow() == target,
+                       "auditioning a row selects it, so the highlight and the armed Delete are the same row");
+            }
+        }
+        Proc::setPresetFolderForTests (prevFolder);
+        dir.deleteRecursively();
+
+        // THE GENERATOR REFUSES ANY FOLDER THAT IS NOT ITS OWN EMPTY ONE, BEFORE WRITING ANYTHING.
+        const auto realFolder = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                                    .getChildFile ("Galactic Sting").getChildFile ("Presets");
+        const auto busy = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("fiblo-verify-gen-busy");
+        busy.createDirectory();
+        const auto keepFile = busy.getChildFile ("BELL Campana de Vidre.gsting");
+        keepFile.replaceWithText ("someone's preset");
+        // A filter matching NO spec in all three, so even a broken guard could build nothing.
+        check (makepresets::run (juce::File(), "zzz-no-such-spec") == 1, "--makepresets refuses an empty folder (it would have meant the user's own)");
+        check (makepresets::run (realFolder, "zzz-no-such-spec") == 1, "--makepresets refuses the user's real preset folder");
+        check (makepresets::run (busy, "zzz-no-such-spec") == 1 && keepFile.loadFileAsString() == "someone's preset",
+               "--makepresets refuses a folder that already holds files, and leaves them exactly as they were");
+        busy.deleteRecursively();
+    }
+
+    //--- THE SPECTRUM WORKER NEVER SLEEPS ON A JOB IT STILL OWES ----------------------
+    // Found by --makepresets, not by any check here: 1 build in 9 of the same preset
+    // waited 15 s for a spectrum that never came. prepareToPlay posts a plan request, the
+    // preset's parameters post a rebuild a few ms later, the auto-reset event keeps ONE
+    // signal for the two, and the worker took the rebuild and went back to sleep owing
+    // the plan. The same shape stranded a rebuild posted just after a playground blend -
+    // with the BLEND left live, which is the "I moved it and nothing happened" family.
+    //
+    // Made deterministic rather than lucky: a compile slow enough to queue behind is
+    // started first, and both jobs are posted while it runs.
+    {
+        std::printf ("\nthe spectrum worker never sleeps on a job it still owes:\n");
+        using namespace spectrum;
+        const auto nowMs = [] { return juce::Time::getMillisecondCounterHiRes(); };
+        // HEAVY BY MEASUREMENT, NOT BY GUESS. The first version of this probe used twelve
+        // degrees at fractal 3 and measured 5 ms - the reach prunes almost every product -
+        // so nothing could ever queue behind it and its own gate below failed. A dense
+        // degree set (inharmonic, so nothing merges) at fractal 2 is grown until one compile
+        // takes at least 300 ms on THIS machine, and the time is printed.
+        SpectrumSettings heavy;
+        heavy.source = Source::ScalaTimbre;
+        heavy.timbrePeriod = 2.0f;
+        heavy.timbrePeriodRepeats = 8;
+        heavy.fractalLevel = 2.0f;
+        double heavyMs = 0.0;
+        for (int n = 100; n <= 6400 && heavyMs < 300.0; n *= 2)
+        {
+            heavy.timbreDegrees.clear();
+            for (int i = 0; i < n; ++i)
+                heavy.timbreDegrees.push_back ((float) std::pow (2.0, (double) i / n + 0.37 / (n * 7.0)));
+            const double c0 = nowMs();
+            (void) compileSpectrum (heavy, nullptr);
+            heavyMs = nowMs() - c0;
+            std::printf ("    (%d degrees x 8 periods at fractal 2: %.0f ms)\n", n, heavyMs);
+        }
+        SpectrumSettings lightA; lightA.spectrumRangeOct = 3;
+        SpectrumSettings lightB; lightB.spectrumRangeOct = 5;
+        const int countA = (int) compileSpectrum (lightA, nullptr).partials.size();
+        const int countB = (int) compileSpectrum (lightB, nullptr).partials.size();
+        std::printf ("  the busy compile takes %.0f ms here; the two light spectra have %d and %d partials\n",
+                     heavyMs, countA, countB);
+        check (heavyMs > 150.0 && countA != countB,
+               "(the busy compile is slow enough for two jobs to queue behind it, and the light spectra differ)");
+
+        const auto waitIdle = [&nowMs] (const SpectrumEngine& e, double limitMs)
+        {
+            const double t0 = nowMs();
+            while (e.isBuildPending())
+            {
+                if (nowMs() - t0 > limitMs) return false;
+                juce::Thread::sleep (1);
+            }
+            return true;
+        };
+        const double limit = heavyMs * 3.0 + 3000.0;
+
+        {
+            SpectrumEngine eng;
+            eng.setRenderRate (48000.0);
+            eng.buildNow (lightA);
+            eng.requestRebuild (heavy);
+            juce::Thread::sleep (30);
+            eng.requestPlan();
+            eng.requestRebuild (lightB);
+            const bool idle = waitIdle (eng, limit);
+            const int live = eng.getLive() != nullptr ? (int) eng.getLive()->partials.size() : -1;
+            std::printf ("  a plan request + a rebuild queued behind it: %s after %.0f ms limit, live spectrum %d partials\n",
+                         idle ? "idle" : "STILL OWED", limit, live);
+            check (idle, "a plan request and a rebuild queued behind one busy compile are BOTH done - "
+                         "the worker does not go back to sleep owing the plan");
+            check (live == countB, "...and the spectrum left live is the last one asked for");
+        }
+        {
+            SpectrumEngine eng;
+            eng.setRenderRate (48000.0);
+            eng.buildNow (lightB);
+            eng.requestRebuild (heavy);
+            juce::Thread::sleep (30);
+            SpectrumEngine::BlendJob job;
+            job.corner[0] = std::make_shared<const SpectrumTemplate> (compileSpectrum (lightA, nullptr));
+            job.w[0] = 1.0;
+            job.curveSlope = lightA.curveSlope;
+            eng.requestBlend (std::move (job));   // clears any request queued BEFORE it...
+            eng.requestRebuild (lightB);          // ...so this one is NEWER than the blend
+            const bool idle = waitIdle (eng, limit);
+            const int live = eng.getLive() != nullptr ? (int) eng.getLive()->partials.size() : -1;
+            std::printf ("  a blend + a newer rebuild queued behind it: %s, live spectrum %d partials (blend %d, rebuild %d)\n",
+                         idle ? "idle" : "STILL OWED", live, countA, countB);
+            check (idle, "a blend and the rebuild posted after it are BOTH done");
+            check (live == countB,
+                   "...and the rebuild, being newer, is what is left live - not the blend it was stranded behind");
+        }
+    }
+
     //==========================================================================
     // --- NO STRING IN THE WHOLE EDITOR IS CUT OFF, IN EITHER LANGUAGE ----------------
     // "haz un repaso de todos los textos que quedan cortados como 'not in this spectrum'
@@ -19486,6 +20464,356 @@ int main (int argc, char** argv)
                 check (n3.title.containsIgnoreCase ("preset"),
                        "...and the notice is about the PRESET, not about a tuning");
             }
+
+            //-- THE FOURTH: A CUSTOM ENGINE SPECTRUM THAT DID NOT COME BACK ----------
+            // Found in the 2026-09-14 night round: restoreState dropped loadTimbreText's bool,
+            // and a patch whose typed intervals no longer parse played the HARMONIC engine
+            // with nothing said.
+            {
+                juce::MemoryBlock st;
+                p.getStateInformation (st);
+                if (auto x = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+                {
+                    x->removeChildElement (x->getChildByName ("SCALA"),  true);   // no second notice
+                    x->removeChildElement (x->getChildByName ("TIMBRE"), true);
+                    auto* tim = x->createNewChildElement ("TIMBRE");
+                    tim->setAttribute ("name", "typed");
+                    tim->setAttribute ("source", "3/2 zzz-not-an-interval");
+                    tim->setAttribute ("on", 1);
+                    juce::MemoryBlock broken;
+                    juce::AudioProcessor::copyXmlToBinary (*x, broken);
+                    ed->dismissNoticeForTests();
+                    ed->tickTimerForTests();
+                    p.setStateInformation (broken.getData(), (int) broken.getSize());
+                }
+                for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+                ed->tickTimerForTests();
+                const auto n4 = ed->noticeProbeForTests();
+                const bool customOn = p.apvts.getRawParameterValue ("timbreOn")->load() > 0.5f;
+                std::printf ("  a project whose Custom Engine intervals no longer parse: engine %s, overlay %s,"
+                             " title \"%s\"\n", customOn ? "CUSTOM" : "harmonic",
+                             n4.visible ? "SHOWN" : "silent", n4.title.toRawUTF8());
+                check (! customOn, "  (gate) the unreadable spectrum really did not come back");
+                check (n4.visible && n4.body.contains ("zzz-not-an-interval"),
+                       "a Custom Engine spectrum that did not come back says so, naming the token the"
+                       " parser refused - it used to play the harmonic engine in silence");
+                ed->dismissNoticeForTests();
+            }
+
+            //-- THE FIFTH: A FILE THE TUNING BANK WOULD NOT TAKE ----------------------
+            // Same night, same family: three bare returns in setTuningBankFile. Pick a file
+            // that is not a readable tuning and the chooser closed on an unchanged bank.
+            {
+                const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                     .getChildFile ("fiblo-verify-bankadd");
+                dir.createDirectory();
+                const auto badScl = dir.getChildFile ("not-a-scale.scl");
+                const auto badTun = dir.getChildFile ("not-a-tuning.tun");
+                badScl.replaceWithText ("this is not a scale\n");
+                badTun.replaceWithText ("garbage\n");
+                for (const auto& f : { badScl, badTun })
+                {
+                    const int before = p.firstEmptyBankSlot();
+                    ed->dismissNoticeForTests();
+                    ed->tickTimerForTests();
+                    p.setTuningBankFile (before, f);
+                    ed->tickTimerForTests();
+                    const auto n5 = ed->noticeProbeForTests();
+                    std::printf ("  adding \"%s\" to the bank: first empty slot %d -> %d, overlay %s \"%s\"\n"
+                                 "    last line: %s\n",
+                                 f.getFileName().toRawUTF8(), before, p.firstEmptyBankSlot(),
+                                 n5.visible ? "SHOWN" : "silent", n5.title.toRawUTF8(),
+                                 n5.body.fromLastOccurrenceOf ("\n", false, false).toRawUTF8());
+                    check (p.firstEmptyBankSlot() == before, "  (gate) the file really was not added");
+                    check (n5.visible && n5.body.contains (f.getFileName()),
+                           "a file the tuning bank refuses says so, naming the file - it used to close"
+                           " the chooser on an unchanged bank, in silence");
+                    ed->dismissNoticeForTests();
+                }
+                dir.deleteRecursively();
+            }
+
+            //-- THREE FAILURES FROM ONE LOAD: ALL THREE ARE READ, AND READ WHOLE -------
+            // raiseNotice REPLACED whatever was up, so failures parked in the same tick
+            // showed only the last; and the overlay was a fixed 560x220 box drawing its body
+            // with drawFittedText capped at 8 lines. One project load here breaks its scale,
+            // all four playground corners and its custom-engine text; the editor is at its
+            // floor size, where the long corner list is tallest. The notices are walked with
+            // the overlay's REAL X (clickNoticeCloseForTests runs closeBtn.onClick).
+            {
+                const auto before = ed->getBounds();
+                ed->setSize (690, 510);
+                juce::MemoryBlock st;
+                p.getStateInformation (st);
+                if (auto x = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+                {
+                    x->removeChildElement (x->getChildByName ("SCALA"), true);
+                    auto* scl = x->createNewChildElement ("SCALA");
+                    scl->setAttribute ("name", "zzz-queue-lost-scale");
+                    scl->setAttribute ("source", "this was a scale once, and is not one now");
+                    x->removeChildElement (x->getChildByName ("TIMBRE"), true);
+                    auto* tim = x->createNewChildElement ("TIMBRE");
+                    tim->setAttribute ("name", "typed");
+                    tim->setAttribute ("source", "3/2 zzz-queue-token");
+                    tim->setAttribute ("on", 1);
+                    x->removeChildElement (x->getChildByName ("PLAYGROUND"), true);
+                    auto* pg = x->createNewChildElement ("PLAYGROUND");
+                    // LONG NAMES, ON PURPOSE. With short ones every notice here fit the old
+                    // 220 px box, and sabotaging the growth back to 220 left this check green -
+                    // measured, 2026-09-15. Real preset names run this long (the user's own
+                    // folder has a 64-character one); each of these wraps in the notice body.
+                    for (int c = 0; c < 4; ++c)
+                        pg->setAttribute ("c" + juce::String (c),
+                                          "zzz-queue-missing-preset-" + juce::String (c)
+                                          + " AN EDITED VERSION OF A CAMPANA THAT SOMEBODY NAMED AT LENGTH SO IT WRAPS");
+                    juce::MemoryBlock broken;
+                    juce::AudioProcessor::copyXmlToBinary (*x, broken);
+                    ed->dismissNoticeForTests();
+                    ed->tickTimerForTests();
+                    p.setStateInformation (broken.getData(), (int) broken.getSize());
+                }
+                for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+                ed->tickTimerForTests();
+                std::vector<FractalAdditiveAudioProcessorEditor::NoticeProbe> seen;
+                for (int i = 0; i < 5; ++i)
+                {
+                    const auto n = ed->noticeProbeForTests();
+                    if (! n.visible) break;
+                    seen.push_back (n);
+                    std::printf ("  notice %d: \"%s\" - %d waiting%s, window %dx%d, overlay %d px for a text needing %d px%s\n",
+                                 i + 1, n.title.toRawUTF8(), n.queued, n.more.isNotEmpty() ? " (says so)" : "",
+                                 ed->getWidth(), ed->getHeight(), n.heightPx, n.needPx,
+                                 n.fits ? ", every line fits" : ", TEXT DOES NOT FIT");
+                    ed->clickNoticeCloseForTests();
+                }
+                const auto body = [&seen] (int i) { return i < (int) seen.size() ? seen[(size_t) i].body : juce::String(); };
+                check (seen.size() == 3,
+                       "one load that fails three ways shows THREE notices, one after another - "
+                       "a second notice used to overwrite the first, which nobody ever saw");
+                check (! seen.empty() && seen[0].queued == 2 && seen[0].more.isNotEmpty(),
+                       "...the first says two more wait behind it");
+                check (body (1).contains ("zzz-queue-missing-preset-0") && body (1).contains ("zzz-queue-missing-preset-3"),
+                       "...the corner notice names all four lost corners");
+                check (body (2).contains ("zzz-queue-token"), "...the last names the token the parser refused");
+                check (! ed->noticeProbeForTests().visible, "...and the X after the last one closes the overlay");
+                bool allFit = ! seen.empty();
+                int tallestNeed = 0;
+                for (const auto& n : seen) { allFit = allFit && n.fits; tallestNeed = juce::jmax (tallestNeed, n.needPx); }
+                check (tallestNeed > 220,
+                       "  (gate) at least one of these notices needs more than the old fixed 220 px box - "
+                       "otherwise the fit check below could not tell growth from no growth");
+                check (allFit, "...and at the window's floor size every notice is tall enough for every line of its text");
+                ed->setBounds (before);
+            }
+
+            //-- A "NAME - SENTENCE" MESSAGE IS TRANSLATED TOO -------------------------
+            // Seen in the snapshot of scenario 57 (2026-09-15): the Catalan notice said
+            // "rig-lost-scale - Not a valid .scl file (too short)." in ENGLISH. The processor
+            // parks "<scale name> \xe2\x80\x94 <parser sentence>", and trErr only matched a
+            // WHOLE string against the table, so the name in front defeated a sentence the
+            // table has translated all along. The rig's language gate reads components, not
+            // painted notice bodies, so nothing had ever flagged it.
+            {
+                ed->setLanguageForSnapshot (true);
+                juce::MemoryBlock st;
+                p.getStateInformation (st);
+                if (auto x = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+                {
+                    x->removeChildElement (x->getChildByName ("SCALA"), true);
+                    auto* scl = x->createNewChildElement ("SCALA");
+                    scl->setAttribute ("name", "zzz-ca-lost-scale");
+                    scl->setAttribute ("source", "this was a scale once, and is not one now");
+                    x->removeChildElement (x->getChildByName ("TIMBRE"), true);
+                    x->removeChildElement (x->getChildByName ("PLAYGROUND"), true);
+                    juce::MemoryBlock broken;
+                    juce::AudioProcessor::copyXmlToBinary (*x, broken);
+                    ed->dismissNoticeForTests();
+                    ed->tickTimerForTests();
+                    p.setStateInformation (broken.getData(), (int) broken.getSize());
+                }
+                for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+                ed->tickTimerForTests();
+                const auto nc = ed->noticeProbeForTests();
+                const auto lastLine = nc.body.trimEnd().fromLastOccurrenceOf ("\n", false, false);
+                std::printf ("  in Catalan, a project whose scale no longer reads: \"%s\"\n", lastLine.toRawUTF8());
+                check (nc.visible && lastLine.contains ("zzz-ca-lost-scale"),
+                       "  (gate) the Catalan notice is up and names the scale");
+                check (lastLine.contains (juce::String (juce::CharPointer_UTF8 ("No \xc3\xa9s un fitxer .scl v\xc3\xa0lid (massa curt)."))),
+                       "a \"name - sentence\" message reaches a Catalan window in Catalan - the name in front used to"
+                       " stop the table from matching, and the sentence stayed English");
+                check (! lastLine.contains ("Not a valid .scl file"),
+                       "...and the English sentence is not left beside it");
+                ed->dismissNoticeForTests();
+                ed->setLanguageForSnapshot (false);
+            }
+
+            //-- THE NIGHT REVIEW'S UNTESTED PATHS (2026-09-15) -------------------------
+            // A shared state builder: this processor's own state with SCALA / TIMBRE /
+            // PLAYGROUND replaced, so no other notice rides along with the one asked about.
+            const auto restoreWith = [&p] (std::function<void (juce::XmlElement&)> dress)
+            {
+                juce::MemoryBlock st;
+                p.getStateInformation (st);
+                if (auto x = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+                {
+                    x->removeChildElement (x->getChildByName ("SCALA"), true);
+                    x->removeChildElement (x->getChildByName ("TIMBRE"), true);
+                    x->removeChildElement (x->getChildByName ("PLAYGROUND"), true);
+                    dress (*x);
+                    juce::MemoryBlock b;
+                    juce::AudioProcessor::copyXmlToBinary (*x, b);
+                    p.setStateInformation (b.getData(), (int) b.getSize());
+                }
+                for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+            };
+
+            // (a) A FAILURE FROM AN EARLIER LOAD IS NOT REPORTED AGAINST A LATER ONE.
+            {
+                ed->dismissNoticeForTests();
+                ed->tickTimerForTests();
+                restoreWith ([] (juce::XmlElement& x)
+                { x.createNewChildElement ("PLAYGROUND")->setAttribute ("c0", "zzz-stale-missing-preset"); });
+                restoreWith ([] (juce::XmlElement&) {});       // a clean load, before any tick
+                ed->tickTimerForTests();
+                const auto n = ed->noticeProbeForTests();
+                std::printf ("  a failed load then a clean one, window ticking only after both: notice %s \"%s\"\n",
+                             n.visible ? "SHOWN" : "silent", n.title.toRawUTF8());
+                check (! (n.visible && n.body.contains ("zzz-stale-missing-preset")),
+                       "a lost corner from an EARLIER load is not reported after a later load that has no such corner"
+                       " - the parked failures used to pile up across restores and be shown as the present state");
+                ed->dismissNoticeForTests();
+            }
+            // (b) A CUSTOM ENGINE SAVED OFF: an unreadable spectrum it never played is not a loss.
+            {
+                ed->dismissNoticeForTests();
+                ed->tickTimerForTests();
+                restoreWith ([] (juce::XmlElement& x)
+                {
+                    auto* tim = x.createNewChildElement ("TIMBRE");
+                    tim->setAttribute ("name", "typed");
+                    tim->setAttribute ("source", "3/2 zzz-off-token");
+                    tim->setAttribute ("on", 0);
+                });
+                ed->tickTimerForTests();
+                const auto n = ed->noticeProbeForTests();
+                check (! (n.visible && n.body.contains ("zzz-off-token")),
+                       "a patch saved with the custom engine OFF does not get the 'not the sound that was saved' notice");
+                ed->dismissNoticeForTests();
+            }
+            // (c) KEYED NOTICES: the same key refreshes in place, withdraw takes back only its own.
+            {
+                ed->dismissNoticeForTests();
+                ed->raiseKeyedNoticeForTests ({}, "zzz-first");
+                ed->raiseKeyedNoticeForTests ("degrees", "zzz-degrees-1");
+                ed->raiseKeyedNoticeForTests ("degrees", "zzz-degrees-2");
+                const auto q1 = ed->noticeProbeForTests();
+                check (q1.visible && q1.title == "zzz-first" && q1.queued == 1,
+                       "a keyed notice raised twice behind another waits ONCE, not twice");
+                ed->withdrawNoticeForTests ("degrees");
+                const auto q2 = ed->noticeProbeForTests();
+                check (q2.visible && q2.title == "zzz-first" && q2.queued == 0,
+                       "withdrawing that key removes only the queued copy - the notice on screen stays");
+                ed->dismissNoticeForTests();
+                ed->raiseKeyedNoticeForTests ("degrees", "zzz-degrees-shown");
+                ed->raiseKeyedNoticeForTests ({}, "zzz-behind");
+                ed->withdrawNoticeForTests ("degrees");
+                const auto q3 = ed->noticeProbeForTests();
+                check (q3.visible && q3.title == "zzz-behind" && q3.queued == 0,
+                       "withdrawing the key that is ON SCREEN hides it and shows the next one - never the whole overlay");
+                ed->dismissNoticeForTests();
+            }
+            // (d) THE BANK'S "File not found." path names the file too.
+            {
+                const auto missing = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                         .getChildFile ("fiblo-verify-bank-missing.scl");
+                missing.deleteFile();
+                ed->dismissNoticeForTests();
+                ed->tickTimerForTests();
+                p.setTuningBankFile (p.firstEmptyBankSlot(), missing);
+                ed->tickTimerForTests();
+                const auto n = ed->noticeProbeForTests();
+                check (n.visible && n.body.contains ("fiblo-verify-bank-missing.scl") && n.body.contains ("File not found"),
+                       "adding a file that is not there to the bank says so, naming it");
+                ed->dismissNoticeForTests();
+            }
+            // (e) THE SNAPSHOT RIG'S PANEL FOLLOWS A LANGUAGE SWITCH.
+            {
+                ed->showPresetSearchForSnapshot (false);
+                ed->setLanguageForSnapshot (true);
+                const auto ca = ed->snapshotPanelDeleteTextForTests();
+                ed->setLanguageForSnapshot (false);
+                const auto en = ed->snapshotPanelDeleteTextForTests();
+                std::printf ("  the rig's preset list: Delete reads \"%s\" in Catalan, \"%s\" in English\n",
+                             ca.toRawUTF8(), en.toRawUTF8());
+                check (ca == "Esborra" && en == "Delete",
+                       "the snapshot rig's copy of the preset list is rebuilt in the language it is photographed in");
+                ed->clearSnapshotPresetPanelForTests();   // a rig panel left over would cover the notice in (f)
+            }
+            // (f) A NOTICE THAT IS UP IS NOT BURIED BY A LAYOUT PASS OR BY THE RHYTHM PANEL OPENING.
+            {
+                ed->dismissNoticeForTests();
+                ed->raiseKeyedNoticeForTests ({}, "zzz-stay-on-top");
+                ed->setRhythmPanelForSnapshot (true);
+                const auto buriedByPanel = ed->noticeBuriedByForTests();
+                ed->setSize (ed->getWidth() + 10, ed->getHeight());
+                const auto buriedByResize = ed->noticeBuriedByForTests();
+                ed->setSize (ed->getWidth() - 10, ed->getHeight());
+                ed->setRhythmPanelForSnapshot (false);
+                std::printf ("  a notice while the rhythm panel opens: covered by %s; after a resize: covered by %s\n",
+                             buriedByPanel.isEmpty() ? "nothing" : buriedByPanel.toRawUTF8(),
+                             buriedByResize.isEmpty() ? "nothing" : buriedByResize.toRawUTF8());
+                check (buriedByPanel.isEmpty() && buriedByResize.isEmpty(),
+                       "a notice that is up stays above the rhythm panel and above everything a resize brings to the front");
+                ed->dismissNoticeForTests();
+            }
+            // (h) A FULL BANK ON ADD goes to the ADD notice, not "that bank slot could not be loaded".
+            {
+                const auto good = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                      .getChildFile ("fiblo-verify-bankfull.scl");
+                good.replaceWithText ("! bf.scl\nbank full probe\n 2\n!\n 700.0\n 2/1\n");
+                ed->dismissNoticeForTests();
+                ed->tickTimerForTests();
+                p.setTuningBankFile (FractalAdditiveAudioProcessor::kBankSlots, good);   // one past the last slot
+                ed->tickTimerForTests();
+                const auto n = ed->noticeProbeForTests();
+                std::printf ("  adding to a full bank: \"%s\"\n", n.title.toRawUTF8());
+                check (n.visible && n.title.contains ("not added") && n.body.contains ("fiblo-verify-bankfull.scl")
+                         && n.body.contains ("full"),
+                       "a full bank on Add says the tuning was NOT ADDED because the bank is full - not that a slot could not load");
+                good.deleteFile();
+                ed->dismissNoticeForTests();
+            }
+            // (i) A PRESET WHOSE SAVED SCALE DOES NOT READ, loaded over a tuning the user has on:
+            // the preset's scale is only an OFFER, the user's tuning goes straight back, so no
+            // notice may say the instrument fell to 12-TET (night review, pre-existing).
+            {
+                juce::String err;
+                const bool scaleOn = p.loadScalaText ("! k7.scl\nseven equal\n 7\n!\n 171.4286\n 342.8571\n 514.2857\n"
+                                                      " 685.7143\n 857.1429\n 1028.5714\n 2/1\n", "zzz-keep-7edo", err);
+                p.savePreset ("zzz-broken-scala-preset");
+                const auto f = FractalAdditiveAudioProcessor::presetFile ("zzz-broken-scala-preset");
+                bool edited = false;
+                if (auto x = juce::XmlDocument::parse (f))
+                    if (auto* s = x->getChildByName ("SCALA"))
+                    {
+                        s->setAttribute ("source", "not a scale at all");
+                        edited = x->writeTo (f);
+                    }
+                ed->dismissNoticeForTests();
+                ed->tickTimerForTests();
+                const bool loaded = p.loadPreset ("zzz-broken-scala-preset");
+                for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+                ed->tickTimerForTests();
+                const auto n = ed->noticeProbeForTests();
+                std::printf ("  a preset whose saved scale does not read, loaded over 7-EDO: notice %s \"%s\"\n",
+                             n.visible ? "SHOWN" : "none", n.title.toRawUTF8());
+                check (scaleOn && edited && loaded, "  (gate) 7-EDO is on, the preset's SCALA is broken, and the preset itself loads");
+                check (! (n.visible && n.title.containsIgnoreCase ("tuning")),
+                       "a preset whose saved scale does not read does not claim the instrument fell to 12-TET"
+                       " - loadPreset puts the user's own tuning straight back");
+                f.deleteFile();
+                ed->dismissNoticeForTests();
+            }
         }
     }
 
@@ -23814,6 +25142,7 @@ static void runSilentLimitChecks()
         }
         for (int i = 0; i < 2; ++i) p->pollParametersForTests();
         p->takeBankSlotError();   // drain anything the restore itself parked
+        p->takeBankAddError();
 
         const auto slot0Was = p->getTuningBankName (0);
         std::printf ("    bank full: slot 0 holds \"%s\", firstEmptyBankSlot() = %d\n",
@@ -23830,7 +25159,11 @@ static void runSilentLimitChecks()
         const auto newFile = scratch.getChildFile ("zzz74-the-129th.scl");
         newFile.replaceWithText ("! the 129th\nzzz74-the-129th\n 1\n 1200.\n");
         p->setTuningBankFile (p->firstEmptyBankSlot(), newFile);
-        const auto fullMsg = p->takeBankSlotError();
+        // Through the ADD channel since 2026-09-15 ({file, reason}): under the bank-SLOT channel
+        // it was shown as "That bank slot could not be loaded", which says the opposite.
+        check (p->takeBankSlotError().isEmpty(),
+               "  a full bank on Add is NOT reported as a bank slot that could not be loaded");
+        const auto fullMsg = p->takeBankAddError().joinIntoString (" \xe2\x80\x94 ");
         std::printf ("    after offering the 129th: slot 0 holds \"%s\", message \"%s\"\n",
                      p->getTuningBankName (0).toRawUTF8(), fullMsg.toRawUTF8());
         check (p->getTuningBankName (0) == slot0Was,
@@ -23843,7 +25176,9 @@ static void runSilentLimitChecks()
         // The other door into the bank: every loaded tuning joins it automatically, and a
         // full bank used to drop those on the floor without a word.
         const int auto0 = p->bankAutoAdd ("zzz74-auto", "! auto\nzzz74-auto\n 1\n 1300.\n");
-        const auto autoMsg = p->takeBankSlotError();
+        check (p->takeBankSlotError().isEmpty(),
+               "  a full bank on auto-add is not reported as a bank slot that could not be loaded either");
+        const auto autoMsg = p->takeBankAddError().joinIntoString (" \xe2\x80\x94 ");
         std::printf ("    bankAutoAdd into a full bank: slot %d, message \"%s\"\n", auto0,
                      autoMsg.toRawUTF8());
         check (auto0 < 0, "  a tuning cannot join a full bank");
@@ -23858,7 +25193,7 @@ static void runSilentLimitChecks()
         const int back = p->bankAutoAdd ("zzz74-auto", "! auto\nzzz74-auto\n 1\n 1300.\n");
         check (back == 5 && p->getTuningBankName (5) == "zzz74-auto",
                "  ...and the tuning that was refused a moment ago lands in it");
-        check (p->takeBankSlotError().isEmpty(),
+        check (p->takeBankSlotError().isEmpty() && p->takeBankAddError().isEmpty(),
                "  ...with nothing to say about it, because nothing went wrong");
 
         scratch.deleteRecursively();

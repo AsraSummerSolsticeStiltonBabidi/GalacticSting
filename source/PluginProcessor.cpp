@@ -1132,10 +1132,13 @@ int FractalAdditiveAudioProcessor::bankAutoAdd (const juce::String& name, const 
     // this, so a full bank meant scales quietly stopped joining it while the panel went on
     // describing a bank that "just keeps growing". The tuning IS loaded and sounding; what
     // did not happen is the one-click way back to it, and that is worth a sentence.
-    bankSlotError = (name.isNotEmpty() ? name : juce::String ("This tuning"))
-                  + " \xe2\x80\x94 the tuning bank is full (" + juce::String (kBankSlots)
-                  + " slots), so it did not join the bank. It IS loaded and sounding; remove "
-                    "a tuning from the bank with its X to make room for it.";
+    // Through the ADD notice, like setTuningBankFile's full bank: under bankSlotError it was shown
+    // as "That bank slot could not be loaded", which says the opposite of this sentence (night
+    // review, pre-existing).
+    bankAddFile  = name.isNotEmpty() ? name : juce::String ("This tuning");
+    bankAddError = "The tuning bank is full (" + juce::String (kBankSlots)
+                 + " slots), so this tuning did not join the bank. It IS loaded and sounding; remove "
+                   "a tuning from the bank with its X to make room for it.";
     return -1; // bank full - the user curates it with the X
 }
 
@@ -1227,8 +1230,19 @@ int FractalAdditiveAudioProcessor::firstEmptyBankSlot() const noexcept
 
 void FractalAdditiveAudioProcessor::setTuningBankFile (int slot0, const juce::File& f)
 {
+    // EVERY WAY THIS CAN ADD NOTHING SAYS SO. Three of the returns below used to be bare:
+    // pick a file that is not a readable tuning, and the bank simply did not change, with
+    // the chooser closed and nothing on screen - indistinguishable from a click that missed.
+    // Parked on bankAddError (file name kept apart from the parser's sentence, so the
+    // sentence can still be translated) and drained by the editor's timer.
+    const auto refuseAdd = [this, &f] (const juce::String& why)
+    {
+        bankAddFile  = f.getFileName();
+        bankAddError = why.isNotEmpty() ? why : juce::String ("Invalid value.");
+    };
+
     if (! f.existsAsFile())
-        return;                       // nothing to store, and nothing to say about it
+    { refuseAdd ("File not found."); return; }
 
     // THE LIMIT IS STATED WHERE THE USER CAN SEE IT, WHICH IS THE ONLY WAY IT IS ALLOWED
     // TO EXIST. kBankSlots is 128 because "tuningBankSlot" is an automatable parameter and
@@ -1237,9 +1251,15 @@ void FractalAdditiveAudioProcessor::setTuningBankFile (int slot0, const juce::Fi
     // notice overlay the editor already drains on its timer - see takeBankSlotError.
     if (! juce::isPositiveAndBelow (slot0, kBankSlots))
     {
-        bankSlotError = f.getFileNameWithoutExtension() + " \xe2\x80\x94 the tuning bank is full ("
-                      + juce::String (kBankSlots) + " slots). Nothing was stored and nothing was "
-                        "overwritten - remove a tuning from the bank with its X to make room.";
+        // Through the ADD notice: this used to go to bankSlotError, whose notice says "That bank
+        // slot could not be loaded ... the tuning you were already using is still the one
+        // sounding" - about a file that was never added (night review, pre-existing).
+        // Assigned directly rather than through refuseAdd: the refusal-template audit in
+        // RhythmVerify reads `bankAddError = "..."` as a message, and a sentence it cannot find is
+        // a translation template it cannot prove will ever fire.
+        bankAddFile  = f.getFileName();   // full bank
+        bankAddError = "The tuning bank is full (" + juce::String (kBankSlots) + " slots). Nothing was stored "
+                       "and nothing was overwritten - remove a tuning from the bank with its X to make room.";
         return;
     }
 
@@ -1262,7 +1282,7 @@ void FractalAdditiveAudioProcessor::setTuningBankFile (int slot0, const juce::Fi
             std::array<double, 128> freqs {};
             juce::String tabErr;
             if (! TuningManager::readTunTable (text, freqs, tabErr))
-                return;                       // not a readable .tun either: nothing to store
+            { refuseAdd (tabErr.isNotEmpty() ? tabErr : tunErr); return; }   // not a readable .tun either
             bankSource[(size_t) slot0] = text; // the table itself is the source
             bankName[(size_t) slot0]   = f.getFileNameWithoutExtension();
             addRecentScl (f);
@@ -1273,7 +1293,7 @@ void FractalAdditiveAudioProcessor::setTuningBankFile (int slot0, const juce::Fi
 
     std::vector<double> tmp; double per = 2.0; juce::String err;
     if (! TuningManager::parseScalaScale (text, tmp, per, err)) // validate before storing
-        return;
+    { refuseAdd (err); return; }
 
     bankSource[(size_t) slot0] = text;
     bankName[(size_t) slot0]   = f.getFileNameWithoutExtension();
@@ -4829,6 +4849,17 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     presetPendingSclSource.clear();
     presetPendingTablePeriod.clear();
 
+    // THE PARKED FAILURES DESCRIBE THE LOAD THAT MADE THEM, and this is a new load. Never
+    // cleared here, a failure from an earlier restore survived any number of later successful
+    // ones (the editor's timer only drains them while a window exists) and was then shown as
+    // the present state - "these corners are EMPTY now" about corners this load filled, a
+    // corner listed twice, a HARMONIC-engine notice over a spectrum that came back (night
+    // review; tuningRestoreError had the same flaw before tonight).
+    pgRestoreLoss.clear();
+    timbreRestoreError.clear();
+    tuningRestoreError.clear();
+    lastReportedBadCornerTimbre.clear();
+
     // WHICH <PARAM> CHILDREN THE CHUNK ITSELF CARRIES, asked HERE and not one line later.
     // apvts.replaceState does `state = newState`, and a juce::ValueTree assignment shares
     // the same reference-counted object rather than copying it - so from the next line on,
@@ -5180,8 +5211,24 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
         }
         else if (src.isNotEmpty()) // typed intervals (Spectrum Builder)
         {
-            loadTimbreText (src, err);
+            juce::String textErr;
+            loadTimbreText (src, textErr);
             setTimbreOnParam ((bool) tim.getProperty ("on", true) && ! timbreDegrees.empty());
+            // A SPECTRUM THAT DID NOT COME BACK IS STATED. The bool was dropped here and the
+            // patch quietly played the HARMONIC engine instead of the one it was saved
+            // with. Parked like tuningRestoreError (this runs on a load thread, maybe with
+            // no editor at all), with the parser's own words - they name the bad token.
+            //
+            // ONLY WHEN THE PATCH HAD THE ENGINE ON: a patch saved with it off never played this
+            // spectrum, so nothing it sounded like was lost, and "not the sound that was saved"
+            // would be false. And a file NAMED as a scale (not "typed") failed the SCALA parser
+            // first - that parser's words describe what is wrong with it, not the typed-interval
+            // grammar's (both from the night review).
+            if (timbreDegrees.empty() && (bool) tim.getProperty ("on", true))
+                timbreRestoreError = (name != "typed" && err.isNotEmpty())
+                                       ? err
+                                       : (textErr.isNotEmpty() ? textErr
+                                                               : (err.isNotEmpty() ? err : juce::String ("Invalid value.")));
         }
         // Provenance LAST: both load paths above clear it (they cannot tell a saved
         // adaptation from hand-typed text), and only the state knows the difference.
@@ -5249,7 +5296,15 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
         for (int i = 0; i < kPlaygroundCorners; ++i)
         {
             const auto n = pg.getProperty ("c" + juce::String (i)).toString();
-            if (n.isNotEmpty()) { juce::String err; assignPlaygroundCorner (i, n, err); }
+            if (n.isNotEmpty())
+            {
+                juce::String err;
+                // The bool used to be dropped here, and the corner was left EMPTY with
+                // nothing saying why. Parked for the editor, which names corner + preset.
+                if (! assignPlaygroundCorner (i, n, err))
+                    pgRestoreLoss.push_back ({ i, n, err.isNotEmpty() ? err
+                                                                      : juce::String ("That preset could not be read.") });
+            }
         }
     refreshPlaygroundActive();
 
@@ -5666,10 +5721,19 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
 
         // Put the CURRENTLY ACTIVE tuning back exactly as it was - source, name AND a
         // table's chosen period, which is as much part of "as it was" as the pitches.
+        //
+        // THE PRESET'S SCALA IS ONLY AN OFFER HERE (see above), so a SCALA that does not parse
+        // is not "the instrument is playing 12-TET": the kept tuning goes straight back on this
+        // very line. restoreState parked that sentence all the same, and a preset load showed a
+        // notice claiming the tuning was lost while it went on sounding (night review,
+        // pre-existing). It is taken back, and a failure is parked only if putting the user's
+        // OWN tuning back fails - the one loss this path can really cause.
+        tuningRestoreError.clear();   // the kept tuning goes straight back
         if (keep.source.isNotEmpty())
         {
             juce::String err;
-            tuning.restoreTuning (keep, err);
+            if (! tuning.restoreTuning (keep, err))
+                tuningRestoreError = err.isNotEmpty() ? err : juce::String ("Invalid value.");
         }
         else
             tuning.clearScala();
@@ -5683,6 +5747,55 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
     // (truncated by a crash mid-save, edited by hand, or simply something else).
     return refuse ("this preset file could not be read - it is not valid XML. Nothing was "
                    "loaded - the patch you were playing is untouched.");
+}
+
+//==============================================================================
+// DELETING A PRESET - the rules are at the declaration.
+static bool presetDeleteToTrash = true;   // TESTS flip it; production never does
+
+void FractalAdditiveAudioProcessor::setPresetDeleteToTrashForTests (bool toTrash)
+{
+    presetDeleteToTrash = toTrash;
+}
+
+FractalAdditiveAudioProcessor::PresetDeleteRefusal
+FractalAdditiveAudioProcessor::deletePreset (const juce::String& name, int& cornerOut, bool* wentToBinOut)
+{
+    cornerOut = -1;
+    if (wentToBinOut != nullptr) *wentToBinOut = false;
+    const auto folder = getPresetFolder();
+    const auto file   = presetFile (name);
+
+    // IN THE PRESET FOLDER, AND NOWHERE ELSE. presetFile is getChildFile, which resolves
+    // "..\\" and absolute paths - a name that is not a plain file name would otherwise
+    // aim this at any file on the disk. The list only ever hands over plain names; this
+    // is the function's own guarantee, not the list's.
+    if (name.trim().isEmpty() || file.getParentDirectory() != folder || ! file.existsAsFile())
+        return PresetDeleteRefusal::NoSuchPreset;
+
+    // Compared as FILES (see writePresetFile): "bell" and "Bell" are one file on Windows.
+    for (int i = 0; i < kPlaygroundCorners; ++i)
+        if (pgCorner[(size_t) i].assigned() && presetFile (pgCorner[(size_t) i].name) == file)
+        {
+            cornerOut = i;
+            return PresetDeleteRefusal::OnPlaygroundCorner;
+        }
+
+    // WHERE IT WENT, TOLD TRUTHFULLY. FOF_ALLOWUNDO on a drive with no Recycle Bin (a network
+    // share, a removable stick) deletes for good and still reports success, so "it can be
+    // restored" is only claimed for a file on a local disk - and never for the suite's own
+    // outright deletes (night review).
+    const bool toBin = presetDeleteToTrash && file.isOnHardDisk();
+    const bool moved = presetDeleteToTrash ? file.moveToTrash() : file.deleteFile();
+    // BOTH: SHFileOperation can report success for an operation the user's shell hook
+    // cancelled, and a file still standing is the only fact that matters.
+    if (! moved || file.existsAsFile())
+        return PresetDeleteRefusal::CouldNotDelete;
+
+    if (loadedPresetName.isNotEmpty() && presetFile (loadedPresetName) == file)
+        loadedPresetName.clear();   // nothing left on disk for the "*" to be measured against
+    if (wentToBinOut != nullptr) *wentToBinOut = toBin;
+    return PresetDeleteRefusal::None;
 }
 
 //==============================================================================
@@ -5981,8 +6094,13 @@ void FractalAdditiveAudioProcessor::endPlaygroundCornerEdit()
                     timbreName   = nm;
                     timbreSource = src;
                 }
-                else
-                    loadTimbreText (src, err);
+                else if (! loadTimbreText (src, err))
+                {
+                    // Same rule as the MIX/winner load: never the previous spectrum under a name
+                    // that did not load, and never in silence (night review, pre-existing).
+                    clearTimbre();
+                    timbreRestoreError = err.isNotEmpty() ? err : juce::String ("Invalid value.");
+                }
                 specProvName   = tim.getProperty ("provName").toString();
                 specProvSource = tim.getProperty ("provSource").toString();
                 specProvPeriod = tim.getProperty ("provPeriod").toString();
@@ -6940,9 +7058,19 @@ void FractalAdditiveAudioProcessor::applyPlaygroundDiscreteState (int corner)
             timbreName   = c.timbreName;
             timbreSource = c.timbreSource;
         }
-        else
+        else if (! loadTimbreText (c.timbreSource, err))
         {
-            loadTimbreText (c.timbreSource, err);
+            // A CORNER WHOSE INTERVALS NO LONGER PARSE must not go on sounding the PREVIOUS
+            // corner's spectrum: loadTimbreText leaves the old one in place when it refuses, so
+            // this used to be a silent wrong sound (night review, pre-existing). The engine is
+            // cleared and the failure stated - once per source, since this runs on every winner
+            // change and a notice per crossing would be noise, not information.
+            clearTimbre();
+            if (c.timbreSource != lastReportedBadCornerTimbre)
+            {
+                lastReportedBadCornerTimbre = c.timbreSource;
+                timbreRestoreError = err.isNotEmpty() ? err : juce::String ("Invalid value.");
+            }
         }
         // AFTER the loads (loadTimbreText clears provenance): the winner's spectrum
         // arrives with the winner's own origin - which is empty when its preset had

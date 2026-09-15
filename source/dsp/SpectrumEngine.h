@@ -393,7 +393,27 @@ namespace spectrum
         {
             while (! threadShouldExit())
             {
-                wakeUp.wait (-1);
+                // SLEEP ONLY WHEN NOTHING IS OWED. The event is auto-reset and every request
+                // signals it, but one pass takes ONE kind of job - and two jobs that land
+                // while the worker is busy leave ONE signal behind. The worker used to take
+                // the first, finish, and go back to sleep on the second: a plan request
+                // posted by prepareToPlay and a rebuild a few ms later left hasPlanRequest
+                // set for ever (isBuildPending() never went false - measured, 1 build in 9
+                // of the same preset timed out after 15 s), and a rebuild posted just after
+                // a blend was stranded behind it until some later request happened to wake
+                // the thread. That request is NEWER than the blend, never older:
+                // requestBlend and publishNow both clear any request queued before them. So
+                // doing it next, after the blend has published, is the right order.
+                {
+                    bool owed = false;
+                    {
+                        const std::lock_guard<std::mutex> lk (requestMutex);
+                        owed = hasRequest || hasBlend || hasPlanRequest;
+                    }
+                    // A request that lands between that look and this wait sets the flag
+                    // and THEN signals, so the wait returns at once - nothing slips past.
+                    if (! owed) wakeUp.wait (-1);
+                }
                 if (threadShouldExit()) break;
 
                 SpectrumSettings s;

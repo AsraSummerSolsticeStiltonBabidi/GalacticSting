@@ -908,6 +908,41 @@ public:
     bool presetHasDrifted() const;
     juce::String getLoadedPresetName() const { return loadedPresetName; }
 
+    // DELETING A PRESET. "haz que sean borrables" - asked 2026-09-14.
+    //
+    // The file goes to the RECYCLE BIN, never straight off the disk: a preset list is
+    // clicked through fast, one click away from the one you meant, and the undo for a
+    // wrong delete is "restore it from the Recycle Bin", which the user already knows.
+    // (Windows' own rule applies underneath: a folder with no Recycle Bin - a network
+    // share - deletes for good. Documents is not one of those.)
+    //
+    // REFUSED, out loud, when the preset is on a playground corner: a corner is stored as
+    // a NAME and re-reads its file every time a project or a preset carrying it opens, so
+    // the delete would empty that corner the next time the project opens. The editor says
+    // which corner, and the way out (take it off the pad). As with PresetWriteRefusal,
+    // the processor decides and the editor writes the sentence.
+    //
+    // Deleting the preset that is LOADED leaves the sound exactly as it is - it is in
+    // memory - but stops tracking it as a preset: there is no file left for the "*" to
+    // mean "differs from", so the patch is simply unsaved from then on.
+    enum class PresetDeleteRefusal { None, NoSuchPreset, OnPlaygroundCorner, CouldNotDelete };
+    // `wentToBinOut` (optional): whether the file went to a place it can be restored from -
+    // false for a drive Windows keeps no Recycle Bin on, where FOF_ALLOWUNDO deletes for good.
+    PresetDeleteRefusal deletePreset (const juce::String& name, int& cornerOut, bool* wentToBinOut = nullptr);
+    // TESTS ONLY: delete the file outright instead of moving it to the Recycle Bin, so a
+    // suite run does not leave a pile of scratch presets in the user's bin. The trash
+    // call itself is JUCE's (SHFileOperation, FOF_ALLOWUNDO) and the suite does not run it.
+    static void setPresetDeleteToTrashForTests (bool toTrash);
+
+    // THE CORNERS A LOAD COULD NOT PUT BACK, for the editor to say once (the one-shot
+    // pattern of takePresetLoadError). A corner is stored by NAME; restoreState re-reads
+    // each file, and a preset that has been deleted, renamed or broken since then used to
+    // leave its corner EMPTY with nothing anywhere saying so. Now that presets can be
+    // deleted from the list itself this is no longer a rare path.
+    struct LostCorner { int corner = -1; juce::String name, why; };
+    std::vector<LostCorner> takePlaygroundRestoreLoss()
+    { auto v = std::move (pgRestoreLoss); pgRestoreLoss.clear(); return v; }
+
     //==========================================================================
     // THE PRESET PLAYGROUND.
     //
@@ -1921,7 +1956,28 @@ private:
     // nothing anywhere saying the load had not happened. Three lies for the price of one
     // dropped return value.
     juce::String presetLoadError;
+    // See takePlaygroundRestoreLoss. Written where tuningRestoreError is written, read
+    // where it is read - the same thread arrangement, deliberately not a new one.
+    std::vector<LostCorner> pgRestoreLoss;
+    // THE CUSTOM ENGINE SPECTRUM A LOAD COULD NOT PUT BACK - the parser's message, one shot,
+    // consumed by takeTimbreRestoreError. See restoreState.
+    juce::String timbreRestoreError;
+    // The last corner intervals already reported as unreadable - see the MIX / winner load.
+    juce::String lastReportedBadCornerTimbre;
+    // A FILE THE BANK REFUSED TO ADD - which file, and the parser's sentence. One shot,
+    // consumed by takeBankAddError. See setTuningBankFile.
+    juce::String bankAddFile, bankAddError;
 public:
+    // {file name, reason}, or empty when nothing was refused since the last call.
+    juce::StringArray takeBankAddError()
+    {
+        if (bankAddError.isEmpty()) return {};
+        juce::StringArray out { bankAddFile, bankAddError };
+        bankAddFile.clear(); bankAddError.clear();
+        return out;
+    }
+    juce::String takeTimbreRestoreError()
+    { auto e = timbreRestoreError; timbreRestoreError.clear(); return e; }
     juce::String takeTuningRestoreError()
     { auto e = tuningRestoreError; tuningRestoreError.clear(); return e; }
     juce::String takeBankSlotError()

@@ -2534,6 +2534,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         rhythmScrim.setVisible (show); // dims + click-blocks everything behind the panel
         rhythmPanel.setVisible (show);
         if (show) { rhythmScrim.toFront (false); rhythmPanel.toFront (false); }
+        if (noticeOverlay.isVisible()) noticeOverlay.toFront (false);   // a notice that is up stays on top
         else refocus();
     };
     addAndMakeVisible (rhythmBtn);
@@ -2612,6 +2613,11 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         const auto name = presetBox.getText();
         if (name.isNotEmpty() && processorRef.loadPreset (name))
             applyEngineState();
+        else if (name.isNotEmpty())
+            // A LOAD THAT FAILED PUTS BACK THE NAME OF WHAT IS STILL PLAYING. The box kept the
+            // failed name while the notice said "the preset name in the box is the one that was
+            // there before" - which nothing made true (night review, pre-existing).
+            presetBox.setText (processorRef.getLoadedPresetName(), juce::dontSendNotification);
         refreshPresetDirtyMark();
         resized(); repaint(); refocus(); // the Tuning panel's "Load preset's tuning" button may now show
     };
@@ -5089,6 +5095,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     if (noticeOverlay.isVisible() && noticeRender)
     {
         noticeRender();
+        layoutNotice();          // the other language is a different height
         noticeOverlay.repaint();
     }
     repaint(); // title uses the language
@@ -5307,16 +5314,70 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
         };
         overlayText ("warningOverlay/title", warningOverlay.title, warningOverlay, false, 26, 18.0f, 14.0f);
         overlayText ("warningOverlay/body",  warningOverlay.body,  warningOverlay, true,  26, 18.0f, 14.0f);
-        overlayText ("noticeOverlay/title",  noticeOverlay.title,  noticeOverlay,  false, 24, 17.0f, 13.5f);
-        overlayText ("noticeOverlay/body",   noticeOverlay.body,   noticeOverlay,  true,  24, 17.0f, 13.5f);
+
+        // THE NOTICE OVERLAY IS MEASURED THE WAY IT NOW PAINTS. It is no longer a fixed box
+        // with an 8-line body: layoutNotice gives it the width it will have at this window
+        // size and the height its whole text needs, up to the window. So the one way a
+        // notice can still be cut is a text taller than the tallest box the window can
+        // give it - and that is what is asked here, through the overlay's OWN layouts (the
+        // same TextLayout calls paint makes), for the title and the body together.
+        // `withMore`: measure as if the "N more notices wait" line is showing - the worst case
+        // has to include it, since any notice can arrive with others queued behind it.
+        const auto noticeText = [this, &out] (const char* path, const juce::String& title, const juce::String& body, bool withMore)
+        {
+            if (title.isEmpty() && body.isEmpty()) return;
+            using NO = NoticeOverlay;
+            const int w     = juce::jmin (560, juce::jmax (200, getWidth() - 20));
+            const int inner = w - 2 * NO::kPadX;
+            const int maxH  = juce::jmax (120, getHeight() - 20);
+            const float titleH = (float) juce::jmax (NO::kMinTitleH, (int) std::ceil (noticeOverlay.titleLayout (inner).getHeight()));
+            const float bodyH  = std::ceil (noticeOverlay.layoutOf (body, juce::Font (juce::FontOptions (13.5f)),
+                                                                    juce::Colours::white, inner).getHeight());
+            const float titleNeedH = std::ceil (noticeOverlay.layoutOf (title, juce::Font (juce::FontOptions (17.0f).withStyle ("Bold")),
+                                                                        juce::Colour (0xff5cb8ff), inner - NO::kCloseRoom).getHeight());
+            const float fixed = (float) (2 * NO::kPadY + NO::kGap + (withMore ? NO::kMoreH : 0));
+            const auto area = getLocalBounds().withSizeKeepingCentre (w, maxH);
+            if (title.isNotEmpty())
+            {
+                TextFit t;
+                t.path = juce::String (path) + "/title"; t.kind = "Painted"; t.text = title;
+                t.bounds = area;
+                t.need   = juce::GlyphArrangement::getStringWidth (juce::Font (juce::FontOptions (17.0f).withStyle ("Bold")), title);
+                t.avail  = (float) (inner - NO::kCloseRoom);
+                t.wraps  = true;
+                t.needH  = titleNeedH;
+                t.availH = (float) maxH - fixed - bodyH;
+                out.push_back (t);
+            }
+            if (body.isNotEmpty())
+            {
+                TextFit t;
+                t.path = juce::String (path) + "/body"; t.kind = "Painted"; t.text = body;
+                t.bounds = area;
+                t.need   = juce::GlyphArrangement::getStringWidth (juce::Font (juce::FontOptions (13.5f)), body);
+                t.avail  = (float) inner;
+                t.wraps  = true;
+                t.needH  = bodyH;
+                t.availH = (float) maxH - fixed - titleH;
+                out.push_back (t);
+            }
+        };
+        // The title the TITLE layout measures is the overlay's current one, so the worst
+        // body below is asked with its own title put there for the length of the call.
+        noticeText ("noticeOverlay", noticeOverlay.title, noticeOverlay.body, noticeOverlay.moreText.isNotEmpty());
         // THE NOTICE THE RIG CANNOT STAGE. "Fewer degrees than requested" only appears
         // after a dissonance search returns short, which a scenario cannot arrange
         // without running the search itself - so the longest sentence in the plugin has
         // never been measured. Asked here at its WORST CASE instead, which is stronger
         // than photographing one instance: the Notes box offers 1..24, so 24 and 23 are
         // the widest numbers the sentence can ever carry.
-        overlayText ("noticeOverlay/worstBody", fewerDegreesBody (24, 23),
-                     noticeOverlay, true, 24, 17.0f, 13.5f);
+        {
+            const auto keepTitle = noticeOverlay.title;
+            auto& mutableTitle = const_cast<juce::String&> (noticeOverlay.title);
+            mutableTitle = tr ("Fewer degrees than requested", "Menys graus dels demanats");
+            noticeText ("noticeOverlay/worst", mutableTitle, fewerDegreesBody (24, 23), true);
+            mutableTitle = keepTitle;
+        }
     }
 
         // A string that fits on ONE line needs no wrapping test; one that does not may
@@ -5939,19 +6000,36 @@ int FractalAdditiveAudioProcessorEditor::comboReopenProbeForTests (int attempts)
     return opened;
 }
 
-bool FractalAdditiveAudioProcessorEditor::openPresetSearch()
+juce::String FractalAdditiveAudioProcessorEditor::recycleBinName() const
 {
-    const auto names = processorRef.getPresetNames();
-    if (names.isEmpty())
-        return false;   // nothing to filter: let the ordinary popup say "empty" its own way
+   #if JUCE_MAC
+    return tr ("the Trash", "la Paperera");
+   #else
+    return tr ("the Recycle Bin", "la Paperera de reciclatge");
+   #endif
+}
 
+std::unique_ptr<FractalAdditiveAudioProcessorEditor::PresetSearchPanel>
+FractalAdditiveAudioProcessorEditor::makePresetSearchPanel (const juce::StringArray& names)
+{
     auto panel = std::make_unique<PresetSearchPanel> (
-        names, presetBox.getText(),
+        names, processorRef.getLoadedPresetName(),
         tr ("Search presets...", "Cerca presets..."));
+
+    // WIDE ENOUGH FOR THE LONGEST NAME, so no row is cut short - measured in the row's
+    // own font, plus the row's 6+4 px inset, an 18 px scrollbar (the look-and-feel's
+    // default) and the panel's 4+4 px margins - but never wider than the window can hold
+    // beside the callout's own border.
+    int longest = 0;
+    const juce::Font rowFont (juce::FontOptions (13.0f));
+    for (const auto& n : names)
+        longest = juce::jmax (longest, (int) std::ceil (juce::GlyphArrangement::getStringWidth (rowFont, n)));
+    const int maxW  = juce::jmax (200, getWidth() - 60);
+    const int width = juce::jlimit (200, maxW, juce::jmax (presetBox.getWidth() + 90, longest + 10 + 18 + 8 + 2));
     // Tall enough for ~12 rows, short enough that the callout still fits inside the
     // editor above a box sitting near the top - CallOutBox flips it below/above by itself.
-    panel->setSize (juce::jmax (200, presetBox.getWidth() + 90),
-                    30 + juce::jlimit (60, 240, names.size() * 20 + 8));
+    panel->setWidthAndListHeight (width, juce::jlimit (60, 240, names.size() * 20 + 8));
+
     panel->onPick = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
                     (const juce::String& n)
     {
@@ -5961,12 +6039,127 @@ bool FractalAdditiveAudioProcessorEditor::openPresetSearch()
         // tuning offer and the relayout that go with it.
         safe->presetBox.setText (n, juce::sendNotificationSync);
     };
+    panel->loadedName = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
+    { return safe != nullptr ? safe->processorRef.getLoadedPresetName() : juce::String(); };
+    // A CLICK THAT KEEPS THE LIST OPEN REPORTS ITS OWN LOAD, IN THE LIST. The same load through
+    // the box parks its failures for the timer, which raised them as notices over a list that is
+    // a modal CallOutBox: they covered it, a click on their X closed the list too, and a run of
+    // broken presets stacked one notice per click (night review). So this path takes those
+    // parked failures straight back - the timer finds nothing - and hands them to the strip,
+    // where they describe the preset just clicked.
+    panel->onAudition = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
+                        (const juce::String& n) -> juce::String
+    {
+        if (safe == nullptr) return {};
+        auto& ed = *safe;
+        ed.presetBox.setText (n, juce::sendNotificationSync);
+        juce::StringArray lines;
+        if (const auto e = ed.processorRef.takePresetLoadError(); e.isNotEmpty())
+            lines.add (ed.tr ("Not loaded - the sound you had is still playing: ",
+                              "No s'ha carregat - el so que tenies segueix sonant: ") + ed.trErr (e));
+        if (const auto t = ed.processorRef.takeTuningRestoreError(); t.isNotEmpty())
+            lines.add (ed.tr ("Its saved tuning does not read: ", "La seva afinaci\xc3\xb3 desada no es pot llegir: ")
+                       + ed.trErr (t));
+        for (const auto& l : ed.processorRef.takePlaygroundRestoreLoss())
+            lines.add (ed.tr ("Playground corner ", "Cantonada del laboratori ")
+                       + juce::String::charToString ((juce::juce_wchar) ('A' + juce::jlimit (0, 3, l.corner)))
+                       + ed.tr (" left empty: \"", " buida: \"") + l.name + "\" \xe2\x80\x94 " + ed.trErr (l.why));
+        if (const auto s = ed.processorRef.takeTimbreRestoreError(); s.isNotEmpty())
+            lines.add (ed.tr ("Its custom engine spectrum does not read, so it plays the harmonic engine: ",
+                              "El seu espectre del motor propi no es pot llegir, o sigui que sona amb el motor harm\xc3\xb2nic: ")
+                       + ed.trErr (s));
+        return lines.joinIntoString ("\n");
+    };
+
+    panel->deleteBtn.setButtonText (tr ("Delete", "Esborra"));
+    panel->deleteBtn.setTooltip (tr ("Moves this preset's file to ", "Mou el fitxer d'aquest preset a ")
+                                 + recycleBinName()
+                                 + tr (". Refused, with the reason, if the preset is on a playground corner.",
+                                       ". Si el preset \xc3\xa9s en una cantonada del laboratori, no ho fa i diu per qu\xc3\xa8."));
+    panel->hintText = tr ("Click a preset to load it and hear it - the list stays open, with a Delete button for it. "
+                          "Double-click or Enter loads it and closes.",
+                          "Fes clic en un preset per carregar-lo i escoltar-lo - la llista es queda oberta, amb un bot\xc3\xb3 "
+                          "Esborra per a ell. Doble clic o Enter el carrega i la tanca.");
+    panel->armedText = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
+                       (const juce::String& n)
+    {
+        if (safe == nullptr) return juce::String();
+        return safe->tr ("Delete moves \"", "Esborra mou \"") + n + safe->tr ("\" to ", "\" a ")
+             + safe->recycleBinName()
+             + safe->tr (" - it can be restored from there.", " - es pot recuperar d'all\xc3\xad.");
+    };
+    panel->onDelete = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
+                      (const juce::String& n)
+    {
+        PresetSearchPanel::DeleteOutcome out;
+        if (safe == nullptr) return out;
+        auto& ed = *safe;
+        using R = FractalAdditiveAudioProcessor::PresetDeleteRefusal;
+        int corner = -1;
+        const auto q = "\"" + n + "\"";
+        bool wentToBin = false;
+        switch (ed.processorRef.deletePreset (n, corner, &wentToBin))
+        {
+            case R::None:
+                ed.refreshPresetList();
+                ed.refreshPresetDirtyMark();
+                out.removeFromList = true;
+                out.isError = false;
+                out.message = wentToBin
+                    ? ed.tr ("Moved to ", "S'ha mogut a ") + ed.recycleBinName() + ": " + q
+                      + ed.tr (". It can be restored from there.", ". Es pot recuperar d'all\xc3\xad.")
+                    // No REASON claimed: a drive with no bin and the suite's own outright delete both
+                    // land here, and only what happened is true for both.
+                    : ed.tr ("Deleted: ", "S'ha esborrat: ") + q
+                      + ed.tr (". It did not go to ", ". No ha anat a ") + ed.recycleBinName()
+                      + ed.tr (", so it cannot be restored from there.", ", o sigui que no es pot recuperar d'all\xc3\xa0.");
+                break;
+            case R::OnPlaygroundCorner:
+                out.message = q + ed.tr (" was not deleted: it is on playground corner ",
+                                         " no s'ha esborrat: \xc3\xa9s a la cantonada ")
+                            + juce::String::charToString ((juce::juce_wchar) ('A' + juce::jlimit (0, 3, corner)))
+                            + ed.tr (". Take it off the pad first - a corner reads its preset from disk every "
+                                     "time a project opens, so deleting the file would leave that corner empty.",
+                                     " del laboratori. Treu-lo primer del pad - una cantonada llegeix el seu preset "
+                                     "del disc cada cop que s'obre un projecte, i esborrar el fitxer deixaria aquella "
+                                     "cantonada buida.");
+                break;
+            case R::NoSuchPreset:
+                // Gone already (deleted or renamed outside the synth): the list stops
+                // offering it, and says that is what happened rather than claiming a delete.
+                ed.refreshPresetList();
+                out.removeFromList = true;
+                out.message = q + ed.tr (" is no longer in the preset folder - nothing was deleted.",
+                                         " ja no \xc3\xa9s a la carpeta de presets - no s'ha esborrat res.");
+                break;
+            case R::CouldNotDelete:
+                out.message = q + ed.tr (" could not be moved to ", " no s'ha pogut moure a ") + ed.recycleBinName()
+                            + ed.tr (", so nothing was deleted. It may be open in another program, or read-only.",
+                                     ", o sigui que no s'ha esborrat res. Pot ser que estigui obert en un altre "
+                                     "programa, o que sigui nom\xc3\xa9s de lectura.");
+                break;
+        }
+        return out;
+    };
     // Whatever closes it - a pick, Escape, a click outside - the editor takes the
     // keyboard back, or the computer-keyboard play the search field suspended would
     // stay suspended (pollComputerKeyboard only re-arms once no TextEditor has focus).
     panel->onDismissed = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
     { if (safe != nullptr) safe->refocus(); };
+    // SIZED AGAIN NOW THAT ITS WORDS EXIST. setWidthAndListHeight above ran before hintText was
+    // written, so the strip was measured EMPTY and the list opened with its own explanation
+    // cut to nothing until the first click resized it (found by the night's review).
+    panel->fitHeight();
+    return panel;
+}
 
+bool FractalAdditiveAudioProcessorEditor::openPresetSearch()
+{
+    const auto names = processorRef.getPresetNames();
+    if (names.isEmpty())
+        return false;   // nothing to filter: let the ordinary popup say "empty" its own way
+
+    auto panel = makePresetSearchPanel (names);
     auto* raw = panel.get();
     juce::CallOutBox::launchAsynchronously (std::move (panel),
                                             getLocalArea (&presetBox, presetBox.getLocalBounds()), this);
@@ -6874,13 +7067,88 @@ juce::String FractalAdditiveAudioProcessorEditor::adaptReadoutTip() const
 
 // Put something on the notice overlay, and remember HOW it was written so applyLanguage
 // can write it again. See the member's own comment for why this is a callable.
-void FractalAdditiveAudioProcessorEditor::raiseNotice (std::function<void()> render)
+void FractalAdditiveAudioProcessorEditor::raiseNotice (std::function<void()> render, const juce::String& key)
 {
+    // Assigned ONCE. This used to be re-assigned on every raise - including the raise that
+    // showNextNotice makes from INSIDE onClosed, which replaced the std::function while it was
+    // still executing (undefined behaviour; found by the night's review).
+    if (! noticeOverlay.onClosed)
+        noticeOverlay.onClosed = [this] { showNextNotice(); };
+    if (noticeOverlay.isVisible())
+    {
+        // The same live condition again: refresh it where it is, never stack a copy.
+        if (key.isNotEmpty() && key == noticeKey)
+        {
+            noticeRender = std::move (render);
+            if (noticeRender) noticeRender();
+            layoutNotice();
+            noticeOverlay.repaint();
+            return;
+        }
+        for (auto& q : noticeQueue)
+            if (key.isNotEmpty() && q.key == key) { q.render = std::move (render); return; }
+        noticeQueue.push_back ({ key, std::move (render) });
+        layoutNotice();                 // the "N more" line changes
+        noticeOverlay.repaint();
+        return;
+    }
+    noticeKey    = key;
     noticeRender = std::move (render);
     if (noticeRender) noticeRender();
     noticeOverlay.setVisible (true);
     noticeOverlay.toFront (false);
+    layoutNotice();
     noticeOverlay.repaint();
+}
+
+void FractalAdditiveAudioProcessorEditor::showNextNotice()
+{
+    if (noticeQueue.empty())
+    {
+        noticeKey.clear();
+        noticeRender = nullptr;
+        noticeOverlay.moreText.clear();
+        return;
+    }
+    auto next = std::move (noticeQueue.front());
+    noticeQueue.erase (noticeQueue.begin());
+    noticeOverlay.setVisible (false);             // so raiseNotice SHOWS it rather than queueing it
+    raiseNotice (std::move (next.render), next.key);
+}
+
+void FractalAdditiveAudioProcessorEditor::withdrawNotice (const juce::String& key)
+{
+    noticeQueue.erase (std::remove_if (noticeQueue.begin(), noticeQueue.end(),
+                                       [&key] (const QueuedNotice& q) { return q.key == key; }),
+                       noticeQueue.end());
+    if (noticeOverlay.isVisible() && noticeKey == key)
+    {
+        noticeOverlay.setVisible (false);
+        showNextNotice();
+    }
+    else if (noticeOverlay.isVisible())
+    {
+        layoutNotice();
+        noticeOverlay.repaint();
+    }
+}
+
+void FractalAdditiveAudioProcessorEditor::layoutNotice()
+{
+    // The X had no hover at all - found the first time a rig scenario (57) ever put a notice
+    // in front of the tooltip gate. Written here so it follows a language switch with the text.
+    noticeOverlay.closeBtn.setTooltip (tr ("Close this notice. If more are waiting, the next one appears.",
+                                           "Tanca aquest av\xc3\xads. Si n'hi ha m\xc3\xa9s esperant, apareix el seg\xc3\xbc" "ent."));
+    const auto waiting = (int) noticeQueue.size();
+    noticeOverlay.moreText = waiting == 0 ? juce::String()
+        : waiting == 1 ? tr ("1 more notice waits behind this one - close it to read it.",
+                             "1 av\xc3\xads m\xc3\xa9s espera darrere d'aquest - tanca'l per llegir-lo.")
+                       : juce::String (waiting)
+                         + tr (" more notices wait behind this one - close it to read the next.",
+                               " avisos m\xc3\xa9s esperen darrere d'aquest - tanca'l per llegir el seg\xc3\xbc" "ent.");
+    const int w = juce::jmin (560, juce::jmax (200, getWidth() - 20));
+    const int h = juce::jmin (noticeOverlay.heightFor (w), juce::jmax (120, getHeight() - 20));
+    noticeOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (w, juce::jmax (120, h)));
 }
 
 // THE PROCESSOR'S REALTIME REFUSALS, IN THE WINDOW'S LANGUAGE.
@@ -6938,7 +7206,7 @@ void FractalAdditiveAudioProcessorEditor::paintRealtimeButtons()
             {
                 noticeOverlay.title = tr ("Realtime switched off", "Temps real desactivat");
                 noticeOverlay.body  = realtimeRefusalText (why);
-            });
+            }, "realtime-refused");
             resized();
         }
     }
@@ -7312,7 +7580,7 @@ void FractalAdditiveAudioProcessorEditor::refreshDegreeList (bool showNotice)
     if (processorRef.getDissFound() >= processorRef.getDissRequested() || ! showNotice)
     {
         if (processorRef.getDissFound() >= processorRef.getDissRequested())
-            noticeOverlay.setVisible (false);
+            withdrawNotice ("degrees");   // only ITS notice - not whatever else is on screen
     }
     else
     {
@@ -7321,7 +7589,7 @@ void FractalAdditiveAudioProcessorEditor::refreshDegreeList (bool showNotice)
         {
             noticeOverlay.title = tr ("Fewer degrees than requested", "Menys graus dels demanats");
             noticeOverlay.body  = fewerDegreesBody (want, got);
-        });
+        }, "degrees");
     }
 }
 
@@ -9536,6 +9804,7 @@ void FractalAdditiveAudioProcessorEditor::layoutPlaygroundBandButton()
                                    .withCentre ({ box.getCentreX(),
                                                   box.getBottom() - 24 }));
     pgEditNearestBtn.toFront (false);
+    if (noticeOverlay.isVisible()) noticeOverlay.toFront (false);   // never above a notice that is up
 }
 
 void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
@@ -12312,13 +12581,17 @@ void FractalAdditiveAudioProcessorEditor::resized()
     }
     warningOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (580, 200));
     warningOverlay.toFront (false);
-    noticeOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (560, 220));
+    layoutNotice();
     recentOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (520, 380));
     if (recentOverlay.isVisible()) recentOverlay.toFront (false);
     rhythmScrim.setBounds (getLocalBounds());
     rhythmPanel.setBounds (getLocalBounds().withSizeKeepingCentre (820, 640));
     rhythmScrim.toFront (false);
     rhythmPanel.toFront (false);
+    // ...and a notice that is up stays above both: resized() used to bury it under the rhythm
+    // scrim and panel (and the playground band button below), so a notice raised before a
+    // resize sat hidden behind them (night review, pre-existing).
+    if (noticeOverlay.isVisible()) noticeOverlay.toFront (false);   // resized: above what this pass fronted
     // Last, so it sits over the band that explains it.
     layoutPlaygroundBandButton();
 }
@@ -12983,7 +13256,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                         : tr ("Only ", "Nom\xc3\xa9s ") + juce::String (got) + tr (" of the ", " dels ") + juce::String (req)
                           + tr (" chords you asked for satisfy a smallest interval of ", " acords demanats compleixen l'interval m\xc3\xadnim de ")
                           + gap + tr (" cents.", " cents.");
-                });
+                }, "chords");
             }
         }
     }
@@ -13046,6 +13319,58 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             noticeOverlay.body  = tr ("Nothing has changed: the sound you had is the sound you still have, and the preset name in the box is the one that was there before.\n\nThe file may have been written by a newer build, moved, or edited by hand.\n\n",
                                       "No ha canviat res: el so que tenies \xc3\xa9s el que segueixes tenint, i el nom del preset de la casella \xc3\xa9s el que ja hi havia.\n\nPot ser que el fitxer l'hagi escrit una versi\xc3\xb3 m\xc3\xa9s nova, que s'hagi mogut, o que l'hagin editat a m\xc3\xa0.\n\n")
                                 + trErr (presetErr);
+        });
+    }
+
+    // ...AND PLAYGROUND CORNERS THAT CAME BACK EMPTY. A corner is stored as a preset NAME
+    // and re-reads that file on every project or preset load; a file deleted, renamed or
+    // broken since then used to leave the corner empty with nothing saying so. Presets
+    // can be deleted from the drop-down now, so this is the day that path got common.
+    if (auto lost = processorRef.takePlaygroundRestoreLoss(); ! lost.empty())
+    {
+        raiseNotice ([this, lost]
+        {
+            noticeOverlay.title = tr ("Playground corners left empty",
+                                      "Cantonades del laboratori buides");
+            auto body = tr ("A corner is saved as the NAME of a preset, and reads that preset from the preset folder every time a project or a preset carrying it opens. These could not be read, so these corners are EMPTY now:\n\n",
+                            "Una cantonada es desa com el NOM d'un preset, i llegeix aquest preset de la carpeta de presets cada cop que s'obre un projecte o un preset que la porta. Aquests no s'han pogut llegir, o sigui que aquestes cantonades ara estan BUIDES:\n\n");
+            for (const auto& l : lost)
+                body += tr ("Corner ", "Cantonada ")
+                      + juce::String::charToString ((juce::juce_wchar) ('A' + juce::jlimit (0, 3, l.corner)))
+                      + ": \"" + l.name + "\" \xe2\x80\x94 " + trErr (l.why) + "\n";
+            body += tr ("\nPut the preset back (from ", "\nTorna a posar el preset (des de ") + recycleBinName()
+                  + tr (", if it was deleted) and open this again, or put another preset on the corner.",
+                        ", si s'havia esborrat) i torna a obrir aix\xc3\xb2, o posa un altre preset a la cantonada.");
+            noticeOverlay.body = body;
+        });
+    }
+
+    // ...A CUSTOM ENGINE SPECTRUM THAT DID NOT COME BACK (see restoreState): the patch is
+    // playing the HARMONIC engine, which is not the sound that was saved.
+    if (const auto specErr = processorRef.takeTimbreRestoreError(); specErr.isNotEmpty())
+    {
+        raiseNotice ([this, specErr]
+        {
+            noticeOverlay.title = tr ("The custom engine's spectrum could not be restored",
+                                      "No s'ha pogut restaurar l'espectre del motor propi");
+            noticeOverlay.body  = tr ("The intervals saved for the custom engine no longer read, so this sound is playing on the HARMONIC engine instead - it is not the sound that was saved.\n\nType the intervals into the custom engine's box again if you know them.\n\n",
+                                      "Els intervals desats per al motor propi ja no es poden llegir, o sigui que aquest so est\xc3\xa0 sonant amb el motor HARM\xc3\x92NIC - no \xc3\xa9s el so que es va desar.\n\nTorna a escriure els intervals a la casella del motor propi si els saps.\n\n")
+                                + trErr (specErr);
+        });
+    }
+
+    // ...AND A FILE THE TUNING BANK WOULD NOT TAKE (see setTuningBankFile).
+    if (const auto bankAdd = processorRef.takeBankAddError(); bankAdd.size() == 2)
+    {
+        raiseNotice ([this, bankAdd]
+        {
+            noticeOverlay.title = tr ("That tuning was not added to the bank",
+                                      "Aquesta afinaci\xc3\xb3 no s'ha afegit al banc");
+            // The reason line says WHY (an unreadable file, a full bank); this line only says what
+            // happened, so it is true for every refusal routed here.
+            noticeOverlay.body  = tr ("Nothing was added, and the bank is exactly as it was.\n\n",
+                                      "No s'ha afegit res, i el banc est\xc3\xa0 exactament com estava.\n\n")
+                                + "\"" + bankAdd[0] + "\" \xe2\x80\x94 " + trErr (bankAdd[1]);
         });
     }
 

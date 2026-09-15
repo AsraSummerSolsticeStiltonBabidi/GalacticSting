@@ -727,6 +727,77 @@ namespace
                   p.pollParametersForTests();
                   e.tickTimerForTests();
               } },
+
+            // DELETING A PRESET (2026-09-14): the list after a LEFT click - Delete armed and
+            // the strip under it naming the preset and where the file goes - and the same
+            // Delete REFUSED because that preset is on a playground corner. Neither state
+            // had ever been in front of a camera, and both strips are painted text the
+            // component walk cannot see. One name is long on purpose: the panel is sized to
+            // its longest name, and this is where a cut row would show.
+            { "55-preset-delete-armed", "the preset list after a click: Delete armed, the strip naming the preset",
+              tEditor, fNone,
+              [] (Proc& p, Ed& e)
+              {
+                  auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                     .getChildFile ("fiblo-rig-presetdelete");
+                  scratch.deleteRecursively();
+                  Proc::setPresetFolderForTests (scratch);
+                  Proc::setPresetDeleteToTrashForTests (false);   // a Delete pressed here must never reach the user's Recycle Bin
+                  for (const char* n : { "rig-Bell Glass", "rig-Pad Nebula", "rig-Bass Sub",
+                                         "rig-A preset whose name is long enough to test the list width",
+                                         "rig-Lead Fiblo", "rig-Pluck Harp" })
+                      p.savePreset (juce::String (n));
+                  e.showPresetSearchForSnapshot (false);
+                  e.tickTimerForTests();
+              } },
+            { "56-preset-delete-refused", "the same Delete refused: the preset is on playground corner A",
+              tEditor, fNone,
+              [] (Proc& p, Ed& e)
+              {
+                  auto scratch = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                     .getChildFile ("fiblo-rig-presetdelete");
+                  scratch.deleteRecursively();
+                  Proc::setPresetFolderForTests (scratch);
+                  Proc::setPresetDeleteToTrashForTests (false);   // a Delete pressed here must never reach the user's Recycle Bin
+                  for (const char* n : { "rig-Bell Glass", "rig-Pad Nebula", "rig-Bass Sub",
+                                         "rig-A preset whose name is long enough to test the list width",
+                                         "rig-Lead Fiblo", "rig-Pluck Harp" })
+                      p.savePreset (juce::String (n));
+                  e.showPresetSearchForSnapshot (true);
+                  e.tickTimerForTests();
+              } },
+            // THREE FAILURES FROM ONE PROJECT LOAD: the notice queue and the notice that grows
+            // to its text. A project whose scale, four playground corners and custom-engine
+            // text all fail to come back - the first notice must say two more wait, and at the
+            // floor size the corner list is where a fixed box would have cut the body.
+            { "57-notice-queue", "one project load that fails three ways: the first notice, two more waiting",
+              tEditor, fSizes,
+              [] (Proc& p, Ed& e)
+              {
+                  juce::MemoryBlock st;
+                  p.getStateInformation (st);
+                  if (auto x = juce::AudioProcessor::getXmlFromBinary (st.getData(), (int) st.getSize()))
+                  {
+                      x->removeChildElement (x->getChildByName ("SCALA"), true);
+                      auto* scl = x->createNewChildElement ("SCALA");
+                      scl->setAttribute ("name", "rig-lost-scale");
+                      scl->setAttribute ("source", "this was a scale once, and is not one now");
+                      x->removeChildElement (x->getChildByName ("TIMBRE"), true);
+                      auto* tim = x->createNewChildElement ("TIMBRE");
+                      tim->setAttribute ("name", "typed");
+                      tim->setAttribute ("source", "3/2 rig-not-an-interval");
+                      tim->setAttribute ("on", 1);
+                      x->removeChildElement (x->getChildByName ("PLAYGROUND"), true);
+                      auto* pg = x->createNewChildElement ("PLAYGROUND");
+                      for (int c = 0; c < 4; ++c)
+                          pg->setAttribute ("c" + juce::String (c), "rig-missing-preset-" + juce::String (c));
+                      juce::MemoryBlock broken;
+                      juce::AudioProcessor::copyXmlToBinary (*x, broken);
+                      p.setStateInformation (broken.getData(), (int) broken.getSize());
+                  }
+                  for (int i = 0; i < 3; ++i) p.pollParametersForTests();
+                  e.tickTimerForTests();
+              } },
         };
         return v;
     }

@@ -97,6 +97,10 @@ namespace fgerr
           "No s'ha pogut escriure el fitxer." },
         { "File not found.",
           "No s'ha trobat el fitxer." },
+        // The fallback reason tonight's restore / bank-add refusals use when a parser said
+        // nothing at all - it has to translate like every other reason (night review).
+        { "Invalid value.",
+          "Valor no v\xc3\xa0lid." },
         { "Invalid period.",
           "Per\xc3\xado" "de inv\xc3\xa0lid." },
         // These two carry escaped quotes and are still WHOLE messages - the examples are
@@ -240,6 +244,10 @@ namespace fgerr
           "basefreq incorrecta al .tun: \"%\"." },
         // saveCurrentTuningTun, in PluginProcessor.h - a file the refusal walk did not
         // read until 2026-09-09, so this one had no translation and nothing said so.
+        { "The tuning bank is full (% slots). Nothing was stored and nothing was overwritten - remove a tuning from the bank with its X to make room.",
+          "El banc d'afinacions \xc3\xa9s ple (% ranures). No s'ha desat res i no s'ha sobreescrit res - treu una afinaci\xc3\xb3 del banc amb la seva X per fer lloc." },
+        { "The tuning bank is full (% slots), so this tuning did not join the bank. It IS loaded and sounding; remove a tuning from the bank with its X to make room for it.",
+          "El banc d'afinacions \xc3\xa9s ple (% ranures), o sigui que aquesta afinaci\xc3\xb3 no s'ha afegit al banc. S\xc3\xad que est\xc3\xa0 carregada i sonant; treu una afinaci\xc3\xb3 del banc amb la seva X per fer-li lloc." },
         { "Could not write %",
           "No s'ha pogut escriure %" },
         { "Bad value for note % in .tun: \"%\".",
@@ -1427,12 +1435,45 @@ public:
     // recorded" and "the failure is on screen" are two different claims, and until this
     // probe existed only the first of them was ever checked. The bank-slot message was
     // recorded for a whole commit with nothing anywhere reading it.
-    struct NoticeProbe { bool visible = false; juce::String title, body; };
+    // `queued` is how many notices wait behind the one shown; `fits` is whether the overlay
+    // is tall enough for every line of its title and body at its width.
+    // `heightPx` is the overlay's height, `needPx` what its whole text needs at its width.
+    struct NoticeProbe { bool visible = false; juce::String title, body; int queued = 0; bool fits = true; juce::String more;
+                         int heightPx = 0, needPx = 0; };
     NoticeProbe noticeProbeForTests() const
-    { return { noticeOverlay.isVisible(), noticeOverlay.title, noticeOverlay.body }; }
-    // What pressing the overlay's X does, so a test can ask the question that matters
-    // after it: does the next tick put the notice straight back?
-    void dismissNoticeForTests() { noticeOverlay.setVisible (false); }
+    {
+        const int need = noticeOverlay.heightFor (noticeOverlay.getWidth());
+        return { noticeOverlay.isVisible(), noticeOverlay.title, noticeOverlay.body, (int) noticeQueue.size(),
+                 ! noticeOverlay.isVisible() || noticeOverlay.getHeight() >= need,
+                 noticeOverlay.moreText, noticeOverlay.getHeight(), need };
+    }
+    // TESTS: a RESET - hides the notice and forgets anything queued behind it, so a check
+    // starts from a clean overlay. NOT what the X does: see clickNoticeCloseForTests.
+    void dismissNoticeForTests() { noticeQueue.clear(); noticeKey.clear(); noticeOverlay.setVisible (false); }
+    // TESTS: exactly what pressing the overlay's X does - hide it and show the next one.
+    void clickNoticeCloseForTests() { noticeOverlay.closeBtn.onClick(); }
+    // TESTS: raise / withdraw a KEYED notice through the real functions (title doubles as body).
+    void raiseKeyedNoticeForTests (const juce::String& key, const juce::String& title)
+    { raiseNotice ([this, title] { noticeOverlay.title = title; noticeOverlay.body = title; }, key); }
+    void withdrawNoticeForTests (const juce::String& key) { withdrawNotice (key); }
+    // TESTS: the first VISIBLE child laid above a showing notice that OVERLAPS it - its name, or
+    // its class - or empty when nothing covers it. "Is it the last child" was the first version,
+    // and it failed on children that sit above without covering anything.
+    juce::String noticeBuriedByForTests() const
+    {
+        if (! noticeOverlay.isVisible()) return {};
+        const int me = getIndexOfChildComponent (&noticeOverlay);
+        for (int i = me + 1; i < getNumChildComponents(); ++i)
+            if (auto* c = getChildComponent (i); c != nullptr && c->isVisible()
+                                                  && c->getBounds().intersects (noticeOverlay.getBounds()))
+                return c->getName().isNotEmpty() ? c->getName() : juce::String (typeid (*c).name());
+        return {};
+    }
+    // TESTS: take the snapshot rig's preset list back off the editor.
+    void clearSnapshotPresetPanelForTests() { snapshotPresetPanel.reset(); }
+    // TESTS: the Delete button's words on the snapshot rig's copy of the preset list.
+    juce::String snapshotPanelDeleteTextForTests() const
+    { return snapshotPresetPanel != nullptr ? snapshotPresetPanel->deleteBtn.getButtonText() : juce::String(); }
     // TESTS: what this window would SHOW for a refusal the processor handed it. The two
     // feedback-loop refusals are English sentences built in PluginProcessor.cpp, which has
     // no tr(); this is where they become the window's language, and a check that feeds it
@@ -1538,6 +1579,10 @@ public:
         catalan = useCatalan;
         applyLanguage();                        // Label COMPONENTS' text is written here...
         if (getWidth() > 0) resized();          // ...and some rows are sized from their own text
+        // The preset list writes its words when it is BUILT (the real one is built each
+        // time it opens, in the language of the moment), so the rig's copy is rebuilt here
+        // or the Catalan picture would show the English panel.
+        if (snapshotPresetPanel != nullptr) showPresetSearchForSnapshot (snapshotPresetRefuse);
     }
     // The modulator sub-tab strip (AMP / PITCH / FILTER / CUSTOM) and, inside CUSTOM, which
     // of the six modulators is bound. Through the real callbacks, so the snapshot shows the
@@ -1560,6 +1605,7 @@ public:
         rhythmPanel.setVisible (show);
         if (getWidth() > 0) resized();
         if (show) { rhythmScrim.toFront (false); rhythmPanel.toFront (false); }
+        if (noticeOverlay.isVisible()) noticeOverlay.toFront (false);   // a notice that is up stays on top
     }
     // The two FLOATING panels, laid out at the size their own window opens at and handed
     // back for the rig to photograph. They are not children of this editor (they live in
@@ -1724,6 +1770,25 @@ private:
             }
             return out;
         }
+
+        // ...AND "<name> \xe2\x80\x94 <sentence>". The processor names WHAT failed in front of the
+        // parser's own sentence (a scale, a bank file), and neither lookup above can match a
+        // string with a user's file name glued to its start - so the scale notice showed a
+        // Catalan body ending in an English sentence the table has translated all along
+        // (seen in rig scenario 57). The name is kept exactly as written; only the sentence
+        // after the LAST dash is looked up, and only a sentence that actually translates
+        // replaces anything.
+        {
+            const auto dash = juce::String::fromUTF8 (" \xe2\x80\x94 ");
+            const int at = fromProcessor.lastIndexOf (dash);
+            if (at > 0)
+            {
+                const auto tail = fromProcessor.substring (at + dash.length());
+                const auto translated = trErr (tail);
+                if (translated != tail)
+                    return fromProcessor.substring (0, at + dash.length()) + translated;
+            }
+        }
         return fromProcessor;
     }
     void timerCallback() override;
@@ -1834,19 +1899,54 @@ private:
     // letters typed here can never fire notes - and the instant this closes, focus goes
     // back to the editor and the same letters play again. That is why the search field is
     // a real TextEditor and not a hand-rolled key handler.
+    //
+    // DELETING ("haz que sean borrables con boton izquierdo y clic en un boton de delete
+    // que se abra al dar ese clic"). A LEFT CLICK on a row loads that preset AND LEAVES
+    // THE LIST OPEN, with a Delete button under it acting on the row just clicked - so a
+    // long list can be auditioned and thinned out without reopening it for every preset.
+    // Double-click or Enter is the old gesture: load and close. The strip under the button
+    // always says what the button will do, to which preset, and where the file goes;
+    // after a delete it says what happened, and a refusal says why. That strip is a
+    // wrapped TextLayout the panel grows to fit, never a Label that could squash or
+    // ellipsise the one sentence that matters.
     struct PresetSearchPanel : juce::Component,
                                juce::ListBoxModel
     {
         juce::TextEditor search;
         juce::ListBox    list { "presets", this };
+        juce::TextButton deleteBtn;
         juce::StringArray all, shown;
         juce::String      current;
+        // The preset the Delete button acts on: the one last CLICKED, whatever the
+        // filter or the scroll position has done since. Empty = no button.
+        juce::String      armed;
+        juce::String      status;           // the last delete's outcome; empty = none
+        bool              statusIsError = false;
+        int               listHeight = 60;
         std::function<void (const juce::String&)> onPick;
         std::function<void()> onDismissed;
+        // Asked after every pick, so the gold "this is loaded" colour follows what the
+        // processor actually LOADED - a preset that failed to load must not look loaded.
+        std::function<juce::String()> loadedName;
+        struct DeleteOutcome { bool removeFromList = false, isError = true; juce::String message; };
+        std::function<DeleteOutcome (const juce::String&)> onDelete;
+        // The sentences (the panel has no tr): what an armed button will do, and the
+        // hint shown before anything is clicked.
+        std::function<juce::String (const juce::String&)> armedText;
+        juce::String hintText;
 
         PresetSearchPanel (juce::StringArray items, juce::String cur, juce::String placeholder)
             : all (std::move (items)), current (std::move (cur))
         {
+            deleteBtn.setColour (juce::TextButton::buttonColourId,  juce::Colour (0xffa83a3a));
+            deleteBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+            // Never focusable: Enter or Space typed into the search field must not be able
+            // to land on this button.
+            deleteBtn.setWantsKeyboardFocus (false);
+            deleteBtn.setMouseClickGrabsKeyboardFocus (false);
+            deleteBtn.onClick = [this] { deleteArmed(); };
+            addChildComponent (deleteBtn);
+
             search.setTextToShowWhenEmpty (placeholder, juce::Colour (0xff6a7285));
             search.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff141a24));
             search.setColour (juce::TextEditor::outlineColourId,    juce::Colour (0xff55557a));
@@ -1862,10 +1962,18 @@ private:
             list.setRowHeight (20);
             list.setColour (juce::ListBox::backgroundColourId, juce::Colour (0xff0e1118));
             list.setOutlineThickness (0);
+            // THE KEYBOARD STAYS IN THE SEARCH FIELD. A click on a row used to hand it to the
+            // ListBox, and with the list now staying open that meant typed letters stopped
+            // filtering - and in the Standalone, where no text field held focus any more, they
+            // PLAYED NOTES (night review). Rows are clicked, never typed into.
+            list.setWantsKeyboardFocus (false);
             addAndMakeVisible (list);
             refilter();
         }
         ~PresetSearchPanel() override { if (onDismissed) onDismissed(); }
+        // Load for a click that keeps the list open. Returns what went wrong with that load,
+        // in the user's language (empty when nothing did) - see makePresetSearchPanel.
+        std::function<juce::String (const juce::String&)> onAudition;
 
         void refilter()
         {
@@ -1881,6 +1989,7 @@ private:
             list.selectRow (cur >= 0 ? cur : (shown.isEmpty() ? -1 : 0), true, true);
             list.repaint();
         }
+        // LOAD AND CLOSE: double-click, Enter.
         void pick (int row)
         {
             if (! juce::isPositiveAndBelow (row, shown.size())) return;
@@ -1888,10 +1997,88 @@ private:
             dismiss();
             if (onPick) onPick (name);
         }
+        // LOAD AND STAY: a single click. Arms Delete on that row.
+        void audition (int row)
+        {
+            if (! juce::isPositiveAndBelow (row, shown.size())) return;
+            const auto name = shown[row];
+            // A click has already selected this row; saying so here keeps every other way
+            // in (the snapshot rig, a future keyboard gesture) showing the same highlight.
+            list.selectRow (row, true, true);
+            juce::String problems;
+            if (onAudition)  problems = onAudition (name);
+            else if (onPick) onPick (name);
+            if (loadedName) current = loadedName();
+            // Armed even when the load failed: a preset that will not load is exactly the one
+            // somebody wants to delete - and the strip says it did not load, so nothing claims
+            // it did.
+            armed = name;
+            deleteBtn.setVisible (true);
+            setStatus (problems, problems.isNotEmpty());
+            list.repaint();
+            // The editor's own refocus() runs inside that load; give the keyboard back here.
+            search.grabKeyboardFocus();
+        }
+        void deleteArmed()
+        {
+            if (armed.isEmpty() || ! onDelete) return;
+            const auto name = armed;
+            const auto out  = onDelete (name);
+            if (out.removeFromList)
+            {
+                all.removeString (name);   // exact spelling: it came out of this very list
+                armed.clear();
+                deleteBtn.setVisible (false);
+            }
+            if (loadedName) current = loadedName();
+            refilter();
+            setStatus (out.message, out.isError);
+        }
         void dismiss()
         {
             if (auto* box = findParentComponentOfClass<juce::CallOutBox>()) box->dismiss();
             else                                                            setVisible (false);
+        }
+
+        // The strip's sentence: an outcome if there is one, else what the armed button
+        // will do, else how to use the list.
+        juce::String statusText() const
+        {
+            if (status.isNotEmpty())                return status;
+            if (armed.isNotEmpty() && armedText)    return armedText (armed);
+            return hintText;
+        }
+        juce::TextLayout statusLayout (int width) const
+        {
+            juce::AttributedString as;
+            as.setWordWrap (juce::AttributedString::byWord);
+            as.append (statusText(), juce::Font (juce::FontOptions (12.0f)),
+                       status.isEmpty() ? juce::Colour (0xffb8c0d0)
+                                        : (statusIsError ? juce::Colour (0xffffa05c)
+                                                         : juce::Colour (0xff8fd18f)));
+            juce::TextLayout tl;
+            tl.createLayout (as, (float) juce::jmax (40, width));
+            return tl;
+        }
+        void setStatus (const juce::String& s, bool isError)
+        {
+            status = s;
+            statusIsError = isError;
+            fitHeight();
+            repaint();
+        }
+        // search 22 + list + button 24 + the WHOLE sentence, with 4 px between them.
+        void fitHeight()
+        {
+            if (getWidth() <= 0) return;
+            const int textH = (int) std::ceil (statusLayout (getWidth() - 8).getHeight());
+            setSize (getWidth(), 4 + 22 + 4 + listHeight + 4 + 24 + 4 + textH + 6);
+        }
+        void setWidthAndListHeight (int width, int listH)
+        {
+            listHeight = listH;
+            setSize (width, 100);
+            fitHeight();
         }
 
         int getNumRows() override { return shown.size(); }
@@ -1903,18 +2090,86 @@ private:
             g.setFont (juce::Font (juce::FontOptions (13.0f)));
             g.drawText (shown[row], 6, 0, w - 10, h, juce::Justification::centredLeft, true);
         }
-        void listBoxItemClicked (int row, const juce::MouseEvent&) override { pick (row); }
+        // The panel is sized to the longest name (see makePresetSearchPanel); a name
+        // longer than the whole window can still be cut, and ONLY THEN does the row get a
+        // tooltip, carrying the whole of it. A tooltip repeating a name already fully on
+        // screen is noise - and the snapshot rig's language gate rightly reads a preset
+        // name as an untranslated string.
+        juce::String getTooltipForRow (int row) override
+        {
+            if (! juce::isPositiveAndBelow (row, shown.size())) return {};
+            const auto w = juce::GlyphArrangement::getStringWidth (juce::Font (juce::FontOptions (13.0f)), shown[row]);
+            return w > (float) (list.getVisibleRowWidth() - 10) ? shown[row] : juce::String();
+        }
+        void listBoxItemClicked (int row, const juce::MouseEvent&) override       { audition (row); }
+        void listBoxItemDoubleClicked (int row, const juce::MouseEvent&) override { pick (row); }
         void returnKeyPressed (int row) override { pick (row); }
 
+        juce::Rectangle<int> statusArea;
         void resized() override
         {
             auto r = getLocalBounds().reduced (4);
             search.setBounds (r.removeFromTop (22));
             r.removeFromTop (4);
-            list.setBounds (r);
+            list.setBounds (r.removeFromTop (listHeight));
+            r.removeFromTop (4);
+            auto bar = r.removeFromTop (24);
+            deleteBtn.setBounds (bar.removeFromLeft (juce::jmin (bar.getWidth(), 110)));
+            r.removeFromTop (4);
+            statusArea = r;
         }
-        void paint (juce::Graphics& g) override { g.fillAll (juce::Colour (0xff0e1118)); }
+        void paint (juce::Graphics& g) override
+        {
+            g.fillAll (juce::Colour (0xff0e1118));
+            statusLayout (statusArea.getWidth()).draw (g, statusArea.toFloat());
+        }
     };
+    // The panel with every callback wired to this editor - the ONE builder, so the check
+    // that clicks it drives exactly what the drop-down opens.
+    std::unique_ptr<PresetSearchPanel> makePresetSearchPanel (const juce::StringArray& names);
+    juce::String recycleBinName() const;
+public:
+    // TESTS: the wired panel, not in a CallOutBox (a CallOutBox needs a message loop to
+    // launch), over the current preset folder. dismiss() then hides it instead.
+    std::unique_ptr<PresetSearchPanel> presetSearchPanelForTests()
+    { return makePresetSearchPanel (processorRef.getPresetNames()); }
+    // TESTS: what the preset combo's field says right now.
+    juce::String presetBoxTextForTests() const { return presetBox.getText(); }
+    // TESTS: the items the preset combo itself holds right now.
+    juce::StringArray presetBoxItemsForTests() const
+    {
+        juce::StringArray out;
+        for (int i = 0; i < presetBox.getNumItems(); ++i) out.add (presetBox.getItemText (i));
+        return out;
+    }
+    // SNAPSHOT: the wired preset list laid over the editor where the CallOutBox puts it
+    // (just under the preset box), with its second row CLICKED - so Delete is armed and
+    // the strip names the preset - and, with `refuse`, that preset put on playground
+    // corner A and Delete pressed, so the strip carries the refusal. The drop-down itself
+    // is a CallOutBox, which needs a message loop to launch; this is the same panel, built
+    // by the same makePresetSearchPanel, so the picture is of what a click opens.
+    void showPresetSearchForSnapshot (bool refuse)
+    {
+        snapshotPresetRefuse = refuse;
+        snapshotPresetPanel = makePresetSearchPanel (processorRef.getPresetNames());
+        auto& pnl = *snapshotPresetPanel;
+        pnl.onDismissed = nullptr;   // it dies with the editor: no refocus into a window mid-destruction
+        if (pnl.shown.size() > 0)
+            pnl.audition (juce::jmin (1, pnl.shown.size() - 1));
+        if (refuse && pnl.armed.isNotEmpty())
+        {
+            juce::String err;
+            processorRef.assignPlaygroundCorner (0, pnl.armed, err);
+            pnl.deleteArmed();
+        }
+        addAndMakeVisible (pnl);
+        const auto under = getLocalArea (&presetBox, presetBox.getLocalBounds());
+        pnl.setTopLeftPosition (under.getX(), under.getBottom() + 12);
+        pnl.toFront (false);
+    }
+private:
+    std::unique_ptr<PresetSearchPanel> snapshotPresetPanel;   // only ever set by the snapshot rig
+    bool snapshotPresetRefuse = false;
 
     // TextEditor with a focus hook. It used to stretch to the window edge while
     // typing (the intervals box was one 24 px line); now that box is a multi-line
@@ -2545,16 +2800,45 @@ private:
         }
     };
 
+    // THE WHOLE NOTICE, ALWAYS. This used to be a fixed 560x220 box whose body was drawn
+    // with drawFittedText capped at 8 lines - a notice with a parser's message, or a
+    // playground that lost three corners, was squashed and then cut with an ellipsis, and
+    // no check in the suite looked at it (the text sweep walks Labels, Buttons and combos;
+    // this paints its own). Title and body are wrapped TextLayouts now and heightFor() is
+    // the height that shows every line of both; the editor sizes the overlay with it.
     struct NoticeOverlay : juce::Component
     {
         juce::String title, body;
+        juce::String moreText;             // "1 more notice waits..." - empty when none wait
         juce::TextButton closeBtn { "X" };
+        std::function<void()> onClosed;    // the editor shows the next queued notice
+        static constexpr int kPadX = 22, kPadY = 14, kMinTitleH = 24, kGap = 6, kMoreH = 20, kCloseRoom = 30;
         NoticeOverlay()
         {
             closeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
             closeBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
-            closeBtn.onClick = [this] { setVisible (false); };
+            closeBtn.onClick = [this] { setVisible (false); if (onClosed) onClosed(); };
             addAndMakeVisible (closeBtn);
+        }
+        juce::TextLayout layoutOf (const juce::String& text, juce::Font font, juce::Colour colour, int width) const
+        {
+            juce::AttributedString as;
+            as.setWordWrap (juce::AttributedString::byWord);
+            as.append (text, font, colour);
+            juce::TextLayout tl;
+            tl.createLayout (as, (float) juce::jmax (40, width));
+            return tl;
+        }
+        juce::TextLayout titleLayout (int innerW) const
+        { return layoutOf (title, juce::Font (juce::FontOptions (17.0f).withStyle ("Bold")), juce::Colour (0xff5cb8ff), innerW - kCloseRoom); }
+        juce::TextLayout bodyLayout (int innerW) const
+        { return layoutOf (body, juce::Font (juce::FontOptions (13.5f)), juce::Colours::white, innerW); }
+        int heightFor (int width) const
+        {
+            const int inner = width - 2 * kPadX;
+            return kPadY + juce::jmax (kMinTitleH, (int) std::ceil (titleLayout (inner).getHeight())) + kGap
+                 + (int) std::ceil (bodyLayout (inner).getHeight())
+                 + (moreText.isNotEmpty() ? kMoreH : 0) + kPadY;
         }
         void resized() override { closeBtn.setBounds (getWidth() - 28, 6, 22, 22); }
         void paint (juce::Graphics& g) override
@@ -2564,14 +2848,24 @@ private:
             g.fillRoundedRectangle (r, 10.0f);
             g.setColour (juce::Colour (0xff5cb8ff));
             g.drawRoundedRectangle (r.reduced (1.5f), 10.0f, 3.0f);
-            auto in = getLocalBounds().reduced (22, 14);
-            g.setColour (juce::Colour (0xff5cb8ff));
-            g.setFont (juce::Font (juce::FontOptions (17.0f).withStyle ("Bold")));
-            g.drawText (title, in.removeFromTop (24), juce::Justification::centredLeft);
-            in.removeFromTop (6);
-            g.setColour (juce::Colours::white);
-            g.setFont (juce::Font (juce::FontOptions (13.5f)));
-            g.drawFittedText (body, in, juce::Justification::topLeft, 8, 1.0f);
+            auto in = getLocalBounds().reduced (kPadX, kPadY);
+            const auto tl = titleLayout (in.getWidth());
+            auto titleArea = in.removeFromTop (juce::jmax (kMinTitleH, (int) std::ceil (tl.getHeight())));
+            tl.draw (g, titleArea.withWidth (in.getWidth() - kCloseRoom).toFloat());
+            in.removeFromTop (kGap);
+            if (moreText.isNotEmpty())
+            {
+                g.setColour (juce::Colour (0xffffc95c));
+                g.setFont (juce::Font (juce::FontOptions (12.5f)));
+                g.drawText (moreText, in.removeFromBottom (kMoreH), juce::Justification::bottomLeft, false);
+            }
+            // Clipped to its own area: when a window too small for the whole notice caps the
+            // overlay (the ONE case heightFor cannot satisfy, and noticeProbeForTests reports it
+            // as not fitting), the body must not run over the "N more wait" line below it.
+            const auto bl = bodyLayout (in.getWidth());
+            juce::Graphics::ScopedSaveState keep (g);
+            g.reduceClipRegion (in);
+            bl.draw (g, in.withHeight (juce::jmax (in.getHeight(), (int) std::ceil (bl.getHeight()))).toFloat());
         }
     };
 
@@ -6382,7 +6676,22 @@ private:
     // again while the panel is up, and every notice in this window follows the language
     // for the same reason and by the same line.
     std::function<void()> noticeRender;
-    void raiseNotice (std::function<void()> render);
+    // NOTICES QUEUE; THEY NEVER OVERWRITE. raiseNotice used to replace whatever was on
+    // screen, so two failures parked in the same tick - a project that lost its scale AND
+    // a corner - showed only the second, and the first was never seen by anyone. A notice
+    // raised while one is up now waits behind it (the panel says how many), and the X shows
+    // the next. A KEY is for the notices that restate a live condition (a search coming
+    // back short, realtime refused): raising the same key again refreshes that notice in
+    // place instead of stacking copies. Processor failures pass no key - every one queues.
+    juce::String noticeKey;
+    struct QueuedNotice { juce::String key; std::function<void()> render; };
+    std::vector<QueuedNotice> noticeQueue;
+    void raiseNotice (std::function<void()> render, const juce::String& key = {});
+    void showNextNotice();
+    // Takes back ONE kind of notice - on screen or queued - and nothing else. The degree
+    // search used to hide the overlay outright when it succeeded, whatever it was saying.
+    void withdrawNotice (const juce::String& key);
+    void layoutNotice();
     // The processor's realtime refusals in the window's language (see the definition).
     juce::String realtimeRefusalText (const juce::String& raw) const;
     RecentOverlay  recentOverlay;   // floating list of every scale file loaded
