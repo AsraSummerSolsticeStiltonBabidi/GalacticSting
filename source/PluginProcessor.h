@@ -929,7 +929,10 @@ public:
     enum class PresetDeleteRefusal { None, NoSuchPreset, CouldNotDelete };
     // `wentToBinOut` (optional): whether the file went to a place it can be restored from -
     // false for a drive Windows keeps no Recycle Bin on, where FOF_ALLOWUNDO deletes for good.
-    PresetDeleteRefusal deletePreset (const juce::String& name, int& cornerOut, bool* wentToBinOut = nullptr);
+    // `cornerMaskOut` (optional): bit i set for EVERY corner i that holds this preset and keeps
+    // its copy - `cornerOut` is only the first of them.
+    PresetDeleteRefusal deletePreset (const juce::String& name, int& cornerOut, bool* wentToBinOut = nullptr,
+                                      int* cornerMaskOut = nullptr);
     // TESTS ONLY: delete the file outright instead of moving it to the Recycle Bin, so a
     // suite run does not leave a pile of scratch presets in the user's bin. The trash
     // call itself is JUCE's (SHFileOperation, FOF_ALLOWUNDO) and the suite does not run it.
@@ -1109,6 +1112,14 @@ public:
     // TESTS: the corner store's value for one parameter id (NaN if unassigned/unknown).
     float getPlaygroundCornerParamForTests (int corner, const juce::String& id) const;
 
+    // TESTS: a corner's per-partial amplitude edits and its Custom Engine text.
+    std::vector<spectrum::PartialGain> getPlaygroundCornerGainsForTests (int corner) const
+    {
+        return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].gains
+                                                                     : std::vector<spectrum::PartialGain>{};
+    }
+    juce::String getPlaygroundCornerTimbreSourceForTests (int corner) const
+    { return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].timbreSource : juce::String(); }
     // The corner's compiled template, so a test can prove it CHANGES when the chord does.
     std::shared_ptr<const spectrum::SpectrumTemplate> getPlaygroundCornerTemplateForTests (int corner) const
     {
@@ -2186,6 +2197,11 @@ private:
         // SHARES its object, so a change made in place would rewrite history. Replace it,
         // never modify it (cornerTreeForSaving works on a createCopy()).
         juce::ValueTree source;
+        // WHICH VERSION of this corner it is. Bumped on every assign and every undo/redo of a
+        // corner, so two versions with the same NAME (a re-picked, re-saved preset; an undone
+        // pick; a project reloaded under a running search) can be told apart. The name used to
+        // be the identity, and since corners carry their own copies it no longer is.
+        juce::uint32 serial = 0;
         bool assigned() const noexcept { return name.isNotEmpty(); }
         // THIS CORNER'S value for parameter #i. Always succeeds for a corner that has
         // been assigned (the store is total - see `params`); false only for an index
@@ -2199,6 +2215,7 @@ private:
         }
     };
     std::array<PlaygroundCorner, kPlaygroundCorners> pgCorner;
+    juce::uint32 pgCornerSerial = 0;   // the source of PlaygroundCorner::serial (message thread)
     bool  pgActive   = false;   // >= 2 corners assigned: the morph is driving
     int   pgWinner   = -1;      // the corner every discrete setting comes from
     double pgLastX = -1.0, pgLastY = -1.0;
@@ -2299,10 +2316,12 @@ private:
         bool undo()    override { return applyOne (before); }
         int  getSizeInUnits() override
         {
-            // ~16 KB per carried preset copy (a .gsting is 12-16 KB of XML, most of it drawn
-            // LFO waves), so the undo limit counts what these steps really hold.
-            return (int) ((before.params.size() + after.params.size()) * sizeof (float)) + 512
-                 + (before.source.isValid() ? 16000 : 0) + (after.source.isValid() ? 16000 : 0);
+            // The preset copies (PlaygroundCorner::source) are NOT counted by their size. They
+            // are immutable, refcounted trees SHARED with the live corner and the neighbouring
+            // steps, and the first version counted 16000 units per copy: one step then blew
+            // JUCE's default 30000-unit budget by itself, trimmed the user's whole history to 30
+            // transactions, and broke endPlaygroundCornerEdit's depth guard (review, 2026-09-15).
+            return (int) ((before.params.size() + after.params.size()) * sizeof (float)) + 512;
         }
         bool applyOne (const PlaygroundCorner& c)
         {
@@ -2313,6 +2332,9 @@ private:
             // generation bump: without both, taking the edits back would be inaudible
             // until something else happened to recompile the spectrum.
             dst.rev = rev + 1;
+            // A NEW VERSION of the corner, even when the name is the same: an adaptive search
+            // launched for the version this replaces must not land on it (see CornerAdaptResult).
+            dst.serial = ++proc.pgCornerSerial;
             proc.pgDirty = true;
             return true;
         }
@@ -2362,6 +2384,7 @@ private:
     {
         int corner = -1;
         juce::String cornerName;
+        juce::uint32 cornerSerial = 0;      // the VERSION it was started for (PlaygroundCorner::serial)
         std::vector<double> ratios, amps;   // ascending, ratios[0] == 1.0
         double period = 2.0;
         std::vector<double> aimAlphas;

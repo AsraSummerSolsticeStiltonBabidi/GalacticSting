@@ -6010,7 +6010,7 @@ juce::String FractalAdditiveAudioProcessorEditor::recycleBinName() const
 }
 
 juce::String FractalAdditiveAudioProcessorEditor::presetDeletedMessage (const juce::String& name, bool wentToBin,
-                                                                       int keptOnCorner) const
+                                                                       int keptCornerMask) const
 {
     const auto q = "\"" + name + "\"";
     auto msg = wentToBin
@@ -6021,12 +6021,21 @@ juce::String FractalAdditiveAudioProcessorEditor::presetDeletedMessage (const ju
         : tr ("Deleted: ", "S'ha esborrat: ") + q
           + tr (". It did not go to ", ". No ha anat a ") + recycleBinName()
           + tr (", so it cannot be restored from there.", ", o sigui que no es pot recuperar d'all\xc3\xa0.");
-    if (keptOnCorner >= 0)
-        msg += tr (" Playground corner ", " La cantonada ")
-             + juce::String::charToString ((juce::juce_wchar) ('A' + juce::jlimit (0, 3, keptOnCorner)))
+    juce::StringArray letters;
+    for (int i = 0; i < 4; ++i)
+        if (keptCornerMask & (1 << i))
+            letters.add (juce::String::charToString ((juce::juce_wchar) ('A' + i)));
+    if (letters.size() == 1)
+        msg += tr (" Playground corner ", " La cantonada ") + letters[0]
              + tr (" keeps its own copy of it, so it still sounds and still saves with your presets and projects.",
                    " del laboratori en guarda la seva pr\xc3\xb2pia c\xc3\xb2pia, o sigui que segueix sonant i es "
                    "segueix desant amb els teus presets i projectes.");
+    else if (letters.size() > 1)
+        msg += tr (" Playground corners ", " Les cantonades ")
+             + letters.joinIntoString (", ", 0, letters.size() - 1) + tr (" and ", " i ") + letters[letters.size() - 1]
+             + tr (" keep their own copies of it, so they still sound and still save with your presets and projects.",
+                   " del laboratori en guarden les seves pr\xc3\xb2pies c\xc3\xb2pies, o sigui que segueixen sonant i es "
+                   "segueixen desant amb els teus presets i projectes.");
     return msg;
 }
 
@@ -6119,16 +6128,17 @@ FractalAdditiveAudioProcessorEditor::makePresetSearchPanel (const juce::StringAr
         int corner = -1;
         const auto q = "\"" + n + "\"";
         bool wentToBin = false;
-        switch (ed.processorRef.deletePreset (n, corner, &wentToBin))
+        int  holding   = 0;
+        switch (ed.processorRef.deletePreset (n, corner, &wentToBin, &holding))
         {
             case R::None:
                 ed.refreshPresetList();
                 ed.refreshPresetDirtyMark();
-                ed.lastDeleteWentToBin = wentToBin;
-                ed.lastDeleteCorner    = corner;
+                ed.lastDeleteWentToBin  = wentToBin;
+                ed.lastDeleteCornerMask = holding;
                 out.removeFromList = true;
                 out.isError = false;
-                out.message = ed.presetDeletedMessage (n, wentToBin, corner);
+                out.message = ed.presetDeletedMessage (n, wentToBin, holding);
                 break;
             case R::NoSuchPreset:
                 // Gone already (deleted or renamed outside the synth): the list stops
@@ -6458,17 +6468,22 @@ void FractalAdditiveAudioProcessorEditor::savePresetFlow()
                         : juce::String();
                     const auto msg =
                         why == FractalAdditiveAudioProcessor::PresetWriteRefusal::CornerFixedPoint
+                          // Since polypresets a project reload no longer re-reads a corner's file,
+                          // so the drift this warns about has ONE door left: picking that preset
+                          // for the corner again. Said that way (review, 2026-09-15).
                           ? safe->tr ("\"%N%\" is on playground corner %C%, and these controls are "
-                                      "showing the pad's blend, not that preset. Saving over it would "
-                                      "make the corner a blend of itself, drifting a little further "
-                                      "every time you reload the project. Save under a different name, "
-                                      "or use that corner's own Edit button.",
+                                      "showing the pad's blend, not that preset. Saving under that name "
+                                      "would write the blend into that preset's file, and the corner "
+                                      "would turn into that blend the next time the preset is picked for "
+                                      "it from the corner list. Save under a different name, or use that "
+                                      "corner's own Edit button.",
                                       "\"%N%\" \xc3\xa9s a la cantonada %C% del laboratori, i aquests "
                                       "controls mostren la barreja del tauler, no pas aquell preset. "
-                                      "Desar-hi a sobre convertiria la cantonada en una barreja d'ella "
-                                      "mateixa, i s'allunyaria una mica m\xc3\xa9s cada cop que "
-                                      "obr\xc3\xadssiu el projecte. Deseu-lo amb un altre nom, o feu "
-                                      "servir el bot\xc3\xb3 Edit d'aquella cantonada.")
+                                      "Desar-lo amb aquest nom escriuria la barreja al fitxer d'aquell "
+                                      "preset, i la cantonada es convertiria en aquesta barreja el proper "
+                                      "cop que se li tri\xc3\xa9s el preset a la llista de cantonades. "
+                                      "Deseu-lo amb un altre nom, o feu servir el bot\xc3\xb3 Edit "
+                                      "d'aquella cantonada.")
                                 .replace ("%N%", shown).replace ("%C%", letter) + also
                           : safe->tr ("Could not save the preset. Try a different name.",
                                       "No s'ha pogut desar el preset. Prova un altre nom.");

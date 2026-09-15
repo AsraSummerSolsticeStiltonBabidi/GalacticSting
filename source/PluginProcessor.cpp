@@ -2076,6 +2076,33 @@ juce::String FractalAdditiveAudioProcessor::embeddedPresetComment() const
     auto state = const_cast<FractalAdditiveAudioProcessor*> (this)->captureState();
     // The scale itself is already in the file - no need to carry it twice.
     state.removeChild (state.getChildWithName ("SCALA"), nullptr);
+
+    // NO EXPORT INSIDE AN EXPORT. A scale text anywhere in the state - a tuning-bank slot, a
+    // Custom Engine source, a playground corner's copy - can itself be a scale this function
+    // wrote, with a whole patch folded into its comments. Carried along, every "add to bank"
+    // embedded all the earlier ones: ~2.3x per add, into megabytes after a handful (review,
+    // 2026-09-15; older than polypresets, which multiplied the base). Those comment lines are
+    // dropped from the COPY exported here; the scales themselves are kept.
+    const juce::String tagLine = "! " + juce::String (kPresetTag);
+    std::function<void (juce::ValueTree)> dropNestedPatches = [&] (juce::ValueTree t)
+    {
+        for (int i = 0; i < t.getNumProperties(); ++i)
+        {
+            const auto id = t.getPropertyName (i);
+            const auto v  = t.getProperty (id);
+            if (v.isString() && v.toString().contains (tagLine))
+            {
+                juce::StringArray kept;
+                for (const auto& line : juce::StringArray::fromLines (v.toString()))
+                    if (! line.trimStart().startsWith (tagLine))
+                        kept.add (line);
+                t.setProperty (id, kept.joinIntoString ("\n"), nullptr);
+            }
+        }
+        for (auto child : t)
+            dropNestedPatches (child);
+    };
+    dropNestedPatches (state);
     auto xml = state.createXml();
     if (xml == nullptr) return {};
     const auto b64 = juce::Base64::toBase64 (xml->toString (juce::XmlElement::TextFormat().singleLine()));
@@ -4766,10 +4793,19 @@ juce::ValueTree FractalAdditiveAudioProcessor::cornerTreeForSaving (const Playgr
     // AN UNSAVED EDIT (the "*") IS SAVED AS IT SOUNDS. Before, a corner's edits lived only in
     // memory and a reload brought back the file. Written over the copy, so everything a corner
     // does not edit (routing, realtime settings, the rest of the .gsting) stays the preset's.
+    //
+    // EXCEPT AN ADAPTIVE CORNER'S SPECTRUM. Its Custom Engine text, partial edits and the two
+    // switches are whatever the chord follower last put there (applyCornerAdaptResult), with
+    // the amplitude shaping baked only into the compiled template - saved, they would reload
+    // as a spectrum the corner never had, and the preset's own would be gone from the file.
+    // The follower makes that spectrum again from the chord, so the copy keeps the preset's.
+    const bool adaptive = c.rtLink == (int) RtLink::SpectrumFromChord;
     const auto& all = getParameters();
     for (int i = 0; i < all.size() && (size_t) i < c.params.size(); ++i)
         if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]))
         {
+            if (adaptive && (p->paramID == "timbreOn" || p->paramID == "partialManual"))
+                continue;
             auto child = t.getChildWithProperty ("id", p->paramID);
             if (! child.isValid())
             {
@@ -4779,6 +4815,8 @@ juce::ValueTree FractalAdditiveAudioProcessor::cornerTreeForSaving (const Playgr
             }
             child.setProperty ("value", (double) c.params[(size_t) i], nullptr);
         }
+    if (adaptive)
+        return t;   // the preset's own TIMBRE and PGAINS stay (see above)
     t.removeChild (t.getChildWithName ("TIMBRE"), nullptr);
     if (c.timbreSource.isNotEmpty())
     {
@@ -5650,9 +5688,11 @@ bool FractalAdditiveAudioProcessor::presetHasDrifted() const
 // real drivePlayground drift nothing (run 47). THE LOOP CLOSES THROUGH THE FILE. While
 // the pad drives, the live control surface is the blend's OUTPUT; a corner's file is
 // the blend's INPUT. Save a preset under an assigned corner's own name while parked
-// mid-pad and that corner's file becomes blend(A, B). Re-assign it - or simply reopen
-// the project, because captureState stores corner NAMES and setStateInformation re-reads
-// every one of them from disk - and the corner IS the previous interpolation's output.
+// mid-pad and that corner's file becomes blend(A, B). Re-assign it - pick the preset for the
+// corner again - and the corner IS the previous interpolation's output. (Reopening the project
+// was the second door until polypresets, 2026-09-15: a project rebuilds each corner from the
+// copy it carries now, and only a names-only project from an older build re-reads the file -
+// which is the path run 51 measures that door through.)
 // The next trip blends that with B again, so the corner walks towards B by the blend
 // weight every cycle. Measured, run 51: stored ampSustain 0.9000 0.4750 0.2625 0.1563
 // ... 0.0501, masterGain 0.00 -9.00 -13.50 ... -17.99 dB, rendered RMS 0.04097 ->
@@ -5842,10 +5882,12 @@ void FractalAdditiveAudioProcessor::setPresetDeleteToTrashForTests (bool toTrash
 }
 
 FractalAdditiveAudioProcessor::PresetDeleteRefusal
-FractalAdditiveAudioProcessor::deletePreset (const juce::String& name, int& cornerOut, bool* wentToBinOut)
+FractalAdditiveAudioProcessor::deletePreset (const juce::String& name, int& cornerOut, bool* wentToBinOut,
+                                             int* cornerMaskOut)
 {
     cornerOut = -1;
     if (wentToBinOut != nullptr) *wentToBinOut = false;
+    if (cornerMaskOut != nullptr) *cornerMaskOut = 0;
     const auto folder = getPresetFolder();
     const auto file   = presetFile (name);
 
@@ -5859,11 +5901,12 @@ FractalAdditiveAudioProcessor::deletePreset (const juce::String& name, int& corn
     // NOT REFUSED FOR A CORNER ANY MORE: the corner carries its own copy (see the declaration).
     // Only NAMED, so the editor can say that corner is unaffected. Compared as FILES (see
     // writePresetFile): "bell" and "Bell" are one file on Windows.
+    int holding = 0;   // EVERY corner holding it - the message names them all, not just the first
     for (int i = 0; i < kPlaygroundCorners; ++i)
         if (pgCorner[(size_t) i].assigned() && presetFile (pgCorner[(size_t) i].name) == file)
         {
-            cornerOut = i;
-            break;
+            if (cornerOut < 0) cornerOut = i;
+            holding |= 1 << i;
         }
 
     // WHERE IT WENT, TOLD TRUTHFULLY. FOF_ALLOWUNDO on a drive with no Recycle Bin (a network
@@ -5880,6 +5923,7 @@ FractalAdditiveAudioProcessor::deletePreset (const juce::String& name, int& corn
     if (loadedPresetName.isNotEmpty() && presetFile (loadedPresetName) == file)
         loadedPresetName.clear();   // nothing left on disk for the "*" to be measured against
     if (wentToBinOut != nullptr) *wentToBinOut = toBin;
+    if (cornerMaskOut != nullptr) *cornerMaskOut = holding;
     return PresetDeleteRefusal::None;
 }
 
@@ -5932,8 +5976,15 @@ bool FractalAdditiveAudioProcessor::assignPlaygroundCornerUndoable (int corner, 
 {
     if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners))
         return false;
-    // Edit mode ends FIRST and leaves its own session step, so the pick lands on top of it and
-    // the first Ctrl+Z takes back the pick, the next one the edits - the order they happened in.
+    // RULE 7 AGAIN: WHILE ANOTHER CORNER IS BEING EDITED, NOTHING IS MINTED. endPlaygroundCornerEdit
+    // unwinds the shared stack back to the session's marker, so a pick or an X made on a
+    // DIFFERENT corner during the session was undone the moment OK was pressed - silently, and
+    // with its redo cleared by the session's own step (review, 2026-09-15). Inside a session a
+    // pick is the plain assign it always was; the session's step is the one Ctrl+Z gets.
+    if (pgEditCorner >= 0 && corner != pgEditCorner)
+        return assignPlaygroundCorner (corner, presetName, errorOut);
+    // Edit mode on THIS corner ends FIRST and leaves its own session step, so the pick lands on
+    // top of it and the first Ctrl+Z takes back the pick, the next one the edits.
     if (corner == pgEditCorner)
         endPlaygroundCornerEdit();
     const auto before = pgCorner[(size_t) corner];
@@ -5943,7 +5994,11 @@ bool FractalAdditiveAudioProcessor::assignPlaygroundCornerUndoable (int corner, 
     {
         undoManager.beginNewTransaction ("corner");
         undoManager.perform (new CornerEditSessionAction (*this, corner, before, pgCorner[(size_t) corner]));
-        undoManager.beginNewTransaction();   // the next knob turn is a step of its own
+        // LEFT OPEN, with the ~1 s transaction clock restarted. In MORPH mode the blend writes
+        // every control for the new corner on the next ticks, and APVTS files those writes onto
+        // the stack a few hundred ms later: closed here, they became a step IN FRONT of the pick,
+        // and the first Ctrl+Z reverted only the controls while the corner kept the new preset.
+        undoTxnTick = 0;
     }
     return ok;
 }
@@ -5992,6 +6047,7 @@ bool FractalAdditiveAudioProcessor::assignPlaygroundCornerFromTree (int corner, 
 
     auto& c = pgCorner[(size_t) corner];
     c = PlaygroundCorner{};                    // clearing is just "assign nothing"
+    c.serial = ++pgCornerSerial;               // a new version, whatever its name
 
     if (presetName.isNotEmpty())
     {
@@ -6006,9 +6062,12 @@ bool FractalAdditiveAudioProcessor::assignPlaygroundCornerFromTree (int corner, 
 
         c.name = presetName;
         // The copy the corner is saved with - without that preset's own pad, so corners
-        // never nest (a corner never reads it, and a copy of a copy would grow every save).
+        // never nest (a corner never reads it, and a copy of a copy would grow every save),
+        // and without its tuning BANK, which a corner never reads either and whose slots can
+        // each hold a whole exported patch.
         c.source = tree.createCopy();
         c.source.removeChild (c.source.getChildWithName ("PLAYGROUND"), nullptr);
+        c.source.removeChild (c.source.getChildWithName ("BANK"), nullptr);
 
         // Parameter values, indexed by getParameters() order (see PlaygroundCorner).
         // DEFAULTS FIRST, then whatever the file carries on top: that is what makes the
@@ -6101,9 +6160,10 @@ juce::String FractalAdditiveAudioProcessor::getPlaygroundCornerDisplayName (int 
 //     corner points at is NEVER written by editing. Unsaved edits stay on the corner
 //     when edit mode ends (they are what you were just listening to - discarding them
 //     silently would be the worse surprise) and the trailing "*" says so, in the pad,
-//     in the corner's box and in the frozen preset field. Re-assigning that corner, or
-//     reopening the project - both of which re-read the preset from disk - is what
-//     discards them, and both are explicit acts.
+//     in the corner's box and in the frozen preset field. Re-assigning that corner (a pick
+//     from the corner list, which re-reads the preset from disk) is what discards them.
+//     Saving a preset or project KEEPS them: a saved pad carries each corner's copy with
+//     its unsaved edits and its "*" (polypresets, 2026-09-15).
 //  5. THE TUNING IS NOT PART OF A CORNER. Push and pull both go through
 //     presetmorph::morphSpaceFor and skip everything it excludes, so tuningMode, refA,
 //     octaveShift, bendRange, the bank slot and the playground's own point cannot be
@@ -6194,10 +6254,11 @@ void FractalAdditiveAudioProcessor::endPlaygroundCornerEdit()
     // history only - nothing it undoes may take the corner's own content with it.
     pgCorner[(size_t) corner] = cornerAfter;
 
-    // Hand the LIVE PATCH back. Deliberately NOT restoreState(): that would re-read
-    // every corner's .gsting from disk (its PLAYGROUND child re-assigns them), which
-    // would throw away the very edits this session was making - including the ones on
-    // the corner just left. Only what entering edit mode touched is put back.
+    // Hand the LIVE PATCH back. Deliberately NOT restoreState(): that would rebuild every
+    // corner from the frozen state's PLAYGROUND child - the copies as they were when edit
+    // mode was entered - which would throw away the very edits this session was making,
+    // including the ones on the corner just left. Only what entering edit mode touched is
+    // put back.
     if (pgEditLiveState.isValid())
     {
         const auto& all = getParameters();
@@ -6437,23 +6498,42 @@ juce::String FractalAdditiveAudioProcessor::savePlaygroundCornerAs (int corner, 
     // that is why: here the surface IS the corner's stored state (see writePresetFile).
     PresetWriteRefusal why = PresetWriteRefusal::None;
     int blocked = -1;
-    const auto written = captureState();
-    if (! writePresetFile (safe, written, true, why, blocked))
-        return {};
+    auto written = captureState();
+
+    // THE CORNER'S OWN ROUTING, NOT THE LIVE PATCH'S. Edit mode puts a corner's PARAMETERS on
+    // the controls, never its modulator routing or its chord follower - those stay the live
+    // patch's (morph mode treats routing as live-patch state). So captureState's MODS and
+    // REALTIME describe the USER's patch, and a corner saved with them - the file, and since
+    // polypresets the corner's own copy - took the user's LFOs and follower (review,
+    // 2026-09-15). They come from the corner's copy instead, so file, copy and corner agree.
+    for (const char* child : { "MODS", "REALTIME" })
+    {
+        written.removeChild (written.getChildWithName (child), nullptr);
+        if (auto own = c.source.getChildWithName (child); own.isValid())
+            written.appendChild (own.createCopy(), nullptr);
+    }
 
     // The corner now IS that file: renamed, and the "*" goes away because the edits it
     // warned about are on disk. snapshotLoadedPreset is deliberately NOT called - the
     // LIVE patch's identity is frozen while a corner is being edited (rule 1), and
     // saving a corner must not quietly claim the user's own patch is now this preset.
     //
-    // ...AND ITS COPY IS THE TREE JUST WRITTEN, so what a saved pad carries for this corner is
-    // the file it now names - routing and realtime link included, which the corner used to go
-    // on reading from the ORIGINAL preset while the new file held the live ones.
+    // Done BEFORE the write, so the file's own pad names this corner as the preset it now is
+    // - it used to carry it under its OLD name, marked edited - and put back if the write fails.
+    const auto keep = c;
     c.name   = safe;
     c.edited = false;
     c.source = written.createCopy();
     c.source.removeChild (c.source.getChildWithName ("PLAYGROUND"), nullptr);
-    readCornerRouting (c, c.source);
+    c.source.removeChild (c.source.getChildWithName ("BANK"), nullptr);
+    written.removeChild (written.getChildWithName ("PLAYGROUND"), nullptr);
+    if (getPlaygroundAssignedCount() > 0)
+        written.appendChild (playgroundChildForState(), nullptr);
+    if (! writePresetFile (safe, written, true, why, blocked))
+    {
+        c = keep;
+        return {};
+    }
     ++c.rev;
     return safe;
 }
@@ -6641,7 +6721,7 @@ bool FractalAdditiveAudioProcessor::startCornerAdapt (int corner, const std::vec
 
     adaptThread = std::make_unique<std::thread> (
         [this, seed = std::move (seed), alphas, f0, s, N, gap, topRatio, regs,
-         corner, name = c.name, period]()
+         corner, name = c.name, serial = c.serial, period]()
         {
             const auto goal = s.goal == 1 ? dissonance::Goal::Max
                             : s.goal == 2 ? dissonance::Goal::Range
@@ -6654,6 +6734,7 @@ bool FractalAdditiveAudioProcessor::startCornerAdapt (int corner, const std::vec
             {
                 CornerAdaptResult r;
                 r.corner     = corner;
+                r.cornerSerial = serial;   // ...and so does the VERSION (see PlaygroundCorner::serial)
                 r.cornerName = name;    // identity travels WITH the result: the corner may
                 r.period     = period;  // be reassigned before this lands (see the consume)
                 r.aimAlphas  = alphas;
@@ -6800,7 +6881,11 @@ void FractalAdditiveAudioProcessor::drivePlaygroundAdaptive()
         // The name check is the identity check: the corner may have been reassigned (or
         // cleared) while the search ran, and this result belongs to the preset it was
         // started FOR, not to whichever one sits on that corner now.
-        if (r.valid && ! stale && c != nullptr && c->rtAdaptive() && c->name == r.cornerName)
+        // AND THE VERSION: since corners carry their own copies, two corners with one name can
+        // differ - an undone pick, a re-picked re-saved preset, a project reloaded while the
+        // search ran - and a result must land only on the version it was computed for.
+        if (r.valid && ! stale && c != nullptr && c->rtAdaptive() && c->name == r.cornerName
+            && c->serial == r.cornerSerial)
         {
             applyCornerAdaptResult (*c, r);
             ++pgAdaptApplies;

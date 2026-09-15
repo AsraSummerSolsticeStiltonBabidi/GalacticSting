@@ -1334,6 +1334,12 @@ public:
     // snapshot of the preset folder and the file can be gone by the time it is picked.
     void playgroundAssignForTests (int corner, const juce::String& name)
     { playgroundPanel.assignForTests (corner, name); }
+    // TESTS: the playground window's X button on a corner (its real onClick), the panel's own
+    // poll, and what a corner box shows.
+    void playgroundClearForTests (int corner)
+    { if (playgroundPanel.cornerClear[corner & 3].onClick) playgroundPanel.cornerClear[corner & 3].onClick(); }
+    void playgroundRefreshForTests() { playgroundPanel.refresh (false); }
+    juce::String playgroundCornerBoxTextForTests (int corner) const { return playgroundPanel.cornerBox[corner & 3].getText(); }
     // The floating windows' OS ownership, read BACK from the OS. The Z-order behaviour
     // itself (clicking the editor no longer buries the floating window) is enforced by
     // Windows from this one recorded relationship, so the honest automated check is
@@ -2160,7 +2166,7 @@ public:
         {
             // A LANGUAGE REBUILD OF A PICTURE THAT ALREADY DELETED: the outcome is re-said in the
             // new language, never re-done - pressing Delete again would take ANOTHER preset.
-            pnl.setStatus (presetDeletedMessage (snapshotDeletedName, lastDeleteWentToBin, lastDeleteCorner), false);
+            pnl.setStatus (presetDeletedMessage (snapshotDeletedName, lastDeleteWentToBin, lastDeleteCornerMask), false);
         }
         else
         {
@@ -2185,13 +2191,14 @@ private:
     bool snapshotPresetOnCorner = false;
     juce::String snapshotDeletedName;                         // the rig's one real delete, re-said on a language switch
     // The last delete's outcome, for re-saying it (see presetDeletedMessage).
-    bool lastDeleteWentToBin = false;
-    int  lastDeleteCorner    = -1;
+    bool lastDeleteWentToBin  = false;
+    int  lastDeleteCornerMask = 0;
 public:
-    // The sentence for a preset that was deleted: where the file went, and - when it was on a
-    // playground corner - that the corner keeps its own copy. One builder, used by the list's
-    // Delete and by the rig's language rebuild, so the two can never say different things.
-    juce::String presetDeletedMessage (const juce::String& name, bool wentToBin, int keptOnCorner) const;
+    // The sentence for a preset that was deleted: where the file went, and - when it was on
+    // playground corners - that EVERY one of them (bit i = corner i) keeps its own copy. One
+    // builder, used by the list's Delete and by the rig's language rebuild, so the two can
+    // never say different things.
+    juce::String presetDeletedMessage (const juce::String& name, bool wentToBin, int keptCornerMask) const;
 private:
 
     // TextEditor with a focus hook. It used to stretch to the window edge while
@@ -5755,6 +5762,7 @@ private:
         juce::TooltipWindow tooltips { this, 600 }; // the editor's own number - see tooltipWindow
         float lastX = -1.0f, lastY = -1.0f;
         int   lastAssigned = -1, lastWinner = -2, lastMode = -1;
+        juce::String lastNamesSig;   // every corner's display name: Ctrl+Z can change one with nothing else moving
         // Adaptive-corner state the status line reports: count + whether a refusal is
         // showing. In the change detection because a corner can be SWAPPED without the
         // assigned count moving, and a stale line would claim a follower that is gone.
@@ -5960,8 +5968,8 @@ private:
                                                     "The corner keeps its OWN COPY of the preset, and a preset or "
                                                     "project saved with the pad carries every corner's copy - so it "
                                                     "opens the same on another computer, and does not change if the "
-                                                    "preset file is later edited, renamed or deleted. Pick the preset "
-                                                    "here again to take in its current file.",
+                                                    "preset file is later edited, renamed or deleted. To take in the "
+                                                    "preset's current file instead, press X and pick the preset again.",
                                                     "El preset d'aquesta cantonada. Posa'n fins a quatre; dos fan una "
                                                     "l\xc3\xadnia, tres un triangle, quatre tot el rectangle. Una "
                                                     "cantonada buida no hi aporta res.\n\n"
@@ -5969,8 +5977,8 @@ private:
                                                     "un preset o projecte desat amb el pad porta la c\xc3\xb2pia de cada "
                                                     "cantonada - o sigui que s'obre igual en un altre ordinador, i no "
                                                     "canvia si despr\xc3\xa9s s'edita, es reanomena o s'esborra el fitxer "
-                                                    "del preset. Torna a triar el preset aqu\xc3\xad per agafar-ne el "
-                                                    "fitxer actual.")
+                                                    "del preset. Per agafar el fitxer actual del preset, prem X i "
+                                                    "torna'l a triar.")
                                               : juce::String());
                 cornerClear[i].setTooltip (trF ? trF ("Take the preset off this corner.",
                                                       "Treu el preset d'aquesta cantonada.")
@@ -6073,13 +6081,23 @@ private:
             int editSig = proc->getPlaygroundEditCorner() + 1;
             for (int i = 0; i < 4; ++i)
                 if (proc->isPlaygroundCornerEdited (i)) editSig += 16 << i;
+            // WHICH PRESET IS ON EACH CORNER, too. A pick and an X are undo steps now, so Ctrl+Z
+            // (from either window, or the host) can swap a corner's preset with every signal
+            // above standing still - and the box went on naming the preset just taken back,
+            // the one mismatch noteAssign's comment calls the worst (review, 2026-09-15).
+            juce::String namesSig;
+            for (int i = 0; i < 4; ++i)
+                namesSig << proc->getPlaygroundCornerDisplayName (i) << "\n";
             if (! force && x == lastX && y == lastY && n == lastAssigned && wn == lastWinner
-                && adSig == lastAdaptSig && mode == lastMode && editSig == lastEditSig)
+                && adSig == lastAdaptSig && mode == lastMode && editSig == lastEditSig
+                && namesSig == lastNamesSig)
                 return;
             lastX = x; lastY = y; lastAssigned = n; lastWinner = wn; lastAdaptSig = adSig;
             lastMode = mode;
-            const bool editChanged = editSig != lastEditSig;
-            lastEditSig = editSig;
+            const bool editChanged  = editSig != lastEditSig;
+            const bool namesChanged = namesSig != lastNamesSig;
+            lastEditSig  = editSig;
+            lastNamesSig = namesSig;
 
             // The corner rows: only an ASSIGNED corner has anything to edit, and only
             // while the playground is really driving (two corners) does editing one mean
@@ -6097,11 +6115,16 @@ private:
                                              i == ed ? juce::Colours::black : juce::Colours::white);
                     // The "*" lives on the name, so the box has to be re-read whenever the
                     // edit signature moved - not only when a corner is (re)assigned.
-                    if (editChanged)
+                    if (editChanged || namesChanged)
                     {
                         const auto disp = proc->getPlaygroundCornerDisplayName (i);
-                        if (disp.isNotEmpty() && cornerBox[i].getText() != disp)
-                            cornerBox[i].setText (disp, juce::dontSendNotification);
+                        if (disp.isNotEmpty())
+                        {
+                            if (cornerBox[i].getText() != disp)
+                                cornerBox[i].setText (disp, juce::dontSendNotification);
+                        }
+                        else if (namesChanged && cornerBox[i].getSelectedId() != 1)
+                            cornerBox[i].setSelectedId (1, juce::dontSendNotification);   // "(empty)"
                     }
                 }
             }

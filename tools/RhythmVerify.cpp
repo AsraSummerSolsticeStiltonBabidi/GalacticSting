@@ -11966,6 +11966,19 @@ int main (int argc, char** argv)
                    "a project saved mid-edit reopens as the USER'S patch, never as somebody's corner");
             check (q->getPlaygroundCornerName (1) == "zzz-verify-ce-B",
                    "...with the corner assignments still on it");
+            // ...AND WITH THE COPIES. This check alone passed on a names-only state, because
+            // the folder still holds the corner files (review, 2026-09-15).
+            int named = 0, carried = 0;
+            if (auto x = juce::AudioProcessor::getXmlFromBinary (blob.getData(), (int) blob.getSize()))
+                if (auto* pgx = x->getChildByName ("PLAYGROUND"))
+                {
+                    for (int c = 0; c < 4; ++c) if (pgx->hasAttribute ("c" + juce::String (c))) ++named;
+                    for (auto* cn : pgx->getChildWithTagNameIterator ("CORNER"))
+                        if (cn->getChildElement (0) != nullptr) ++carried;
+                }
+            std::printf ("  the mid-edit project names %d corner(s) and carries %d preset copy(ies)\n", named, carried);
+            check (named > 0 && carried == named,
+                   "...and every corner on it is saved WITH its preset copy - mid-edit too");
         }
 
         // TURNING A CONTROL EDITS THE CORNER - and reaches the SOUND, not just the store.
@@ -12012,7 +12025,11 @@ int main (int argc, char** argv)
                "a corner that is NOT in edit mode refuses to be saved - its full state is nowhere to save from");
         p->beginPlaygroundCornerEdit (1);
         tick (3);
+        // A ROUTING THE LIVE PATCH HAS AND THE CORNER DOES NOT: edit mode never puts a corner's
+        // routing on the live engine, so Save As used to write this one into the corner.
+        p->getModEngine().addTarget (5, "masterGain");
         const auto stored = p->savePlaygroundCornerAs (1, "zzz-verify-ce-B2");
+        p->getModEngine().removeTarget (5, "masterGain");
         check (stored == "zzz-verify-ce-B2" && fS.existsAsFile(),
                "Save writes the edited corner as a preset of its own, under a new name");
         check (p->getPlaygroundCornerName (1) == stored && ! p->isPlaygroundCornerEdited (1),
@@ -12033,6 +12050,56 @@ int main (int argc, char** argv)
             check (std::abs (q->apvts.getRawParameterValue ("ampDecay")->load() - 0.11f) < 0.005f
                    && std::abs (q->apvts.getRawParameterValue ("baseN")->load() - 3.0f) < 0.01f,
                    "...and the file really carries the edit, not the preset it started from");
+        }
+        // POLYPRESETS (review, 2026-09-15): the file Save As writes carries the CORNER's routing,
+        // not the live patch's; its own pad names that corner as the preset it now is; and a
+        // project saved afterwards reopens with the SAVED corner even where the file is absent.
+        {
+            const auto xS = juce::XmlDocument::parse (fS);
+            const auto xB = juce::XmlDocument::parse (fB);
+            const auto modsT5 = [] (const std::unique_ptr<juce::XmlElement>& x)
+            {
+                auto* m = x != nullptr ? x->getChildByName ("MODS") : nullptr;
+                return m != nullptr ? m->getStringAttribute ("t5") : juce::String();
+            };
+            std::printf ("  Save As file: LFO 3 routes \"%s\" (the corner's preset: \"%s\", the live patch: masterGain)\n",
+                         modsT5 (xS).toRawUTF8(), modsT5 (xB).toRawUTF8());
+            check (xS != nullptr && xB != nullptr && ! modsT5 (xS).contains ("masterGain") && modsT5 (xS) == modsT5 (xB),
+                   "the corner saved with Save As carries the CORNER's modulator routing, not the live patch's");
+            const juce::XmlElement* own = nullptr;
+            if (xS != nullptr)
+                if (auto* pgx = xS->getChildByName ("PLAYGROUND"))
+                    for (auto* cn : pgx->getChildWithTagNameIterator ("CORNER"))
+                        if (cn->getIntAttribute ("i", -1) == 1) own = cn;
+            check (own != nullptr && own->getStringAttribute ("name") == "zzz-verify-ce-B2" && ! own->hasAttribute ("edited"),
+                   "...and that file's own pad names the corner as the preset it now is, with no *");
+        }
+        {
+            juce::MemoryBlock blob;
+            p->getStateInformation (blob);
+            const auto prevF = Proc::getPresetFolder();
+            const auto empty = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                   .getChildFile ("fiblo-verify-ce-empty-"
+                                                  + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+            empty.deleteRecursively();
+            Proc::setPresetFolderForTests (empty);
+            {
+                auto q = std::make_unique<Proc>();
+                q->prepareToPlay (48000.0, 64);
+                q->setStateInformation (blob.getData(), (int) blob.getSize());
+                const auto loss = q->takePlaygroundRestoreLoss();
+                std::printf ("  a project saved after Save As, opened where no preset file exists: corner B \"%s\","
+                             " ampDecay %.3f baseN %.1f, %d lost\n", q->getPlaygroundCornerDisplayName (1).toRawUTF8(),
+                             (double) q->getPlaygroundCornerParamForTests (1, "ampDecay"),
+                             (double) q->getPlaygroundCornerParamForTests (1, "baseN"), (int) loss.size());
+                check (loss.empty() && q->getPlaygroundCornerName (1) == "zzz-verify-ce-B2" && ! q->isPlaygroundCornerEdited (1)
+                         && std::abs (q->getPlaygroundCornerParamForTests (1, "ampDecay") - 0.11f) < 0.005f
+                         && std::abs (q->getPlaygroundCornerParamForTests (1, "baseN") - 3.0f) < 0.01f,
+                       "a project saved after Save As reopens, with no preset files at all, with corner B as the SAVED"
+                       " corner - its copy is the file it now names, not the preset it started from");
+            }
+            Proc::setPresetFolderForTests (prevF);
+            empty.deleteRecursively();
         }
 
         // RULE 6: MORPH MODE PINS THE POINT, and the blend stops fighting the user.
@@ -12456,7 +12523,20 @@ int main (int argc, char** argv)
                    "a preset on a playground corner DELETES - compared as a FILE, so another capitalisation finds it"
                    " - and the result names corner B, which keeps a copy");
             check (p.getPlaygroundCornerName (1) == "Bravo" && p.getPlaygroundCornerParamsForTests (1) == bravoStore,
-                   "...while corner B keeps its preset, name and every value, from its own copy");
+                   "...while corner B keeps its preset, name and every value, in memory");
+            {
+                // ...AND IN A PROJECT: the in-memory check above passes with no copy at all
+                // (review, 2026-09-15). Reopened next to the folder where Bravo is gone.
+                juce::MemoryBlock st;
+                p.getStateInformation (st);
+                auto q = std::make_unique<Proc>();
+                q->prepareToPlay (sr, blk);
+                q->setStateInformation (st.getData(), (int) st.getSize());
+                check (q->takePlaygroundRestoreLoss().empty() && q->getPlaygroundCornerName (1) == "Bravo"
+                         && q->getPlaygroundCornerParamsForTests (1) == bravoStore,
+                       "...and a project saved now reopens with corner B whole although Bravo's file is gone"
+                       " - the copy is what the project carries");
+            }
             p.assignPlaygroundCorner (1, {}, err);
             setGain (-2.0f); p.savePreset ("Bravo");   // back on disk, for the checks below
 
@@ -12675,7 +12755,7 @@ int main (int argc, char** argv)
                              n.visible ? "SHOWN" : "silent", n.title.toRawUTF8());
                 check (p.getPlaygroundCornerName (0) == "Alpha" && p.getPlaygroundCornerName (1).isEmpty(),
                        "(corner A comes back; corner B cannot - its preset is gone)");
-                check (n.visible && n.body.contains ("B: \"Bravo\""),
+                check (n.visible && n.body.contains ("B: \"Bravo\"") && n.body.contains ("older version"),
                        "...and the window SAYS so, naming corner B and its preset - it used to come back empty in silence");
                 ed->dismissNoticeForTests();
             }
@@ -12862,6 +12942,14 @@ int main (int argc, char** argv)
                 check (e->beginPlaygroundCornerEdit (0), "(corner A goes into edit mode)");
                 for (int i = 0; i < 4; ++i) e->pollParametersForTests();
                 sp (*e, "ampDecay", 7.0f);
+                // ...and its Custom Engine text and a partial edit, so the TIMBRE and PGAINS
+                // rewrite is measured too, not only a plain parameter (review, 2026-09-15).
+                check (e->loadTimbreText ("1 7/4 2", err), "(its custom-engine text is retyped during the edit)");
+                {
+                    std::vector<spectrum::PartialGain> g;
+                    spectrum::setPartialGain (g, spectrum::gainKey (2.0), -6.0f);
+                    e->commitPartialGains (e->getPartialGains(), g);
+                }
                 for (int i = 0; i < 20; ++i) e->pollParametersForTests();
                 e->endPlaygroundCornerEdit();
                 for (int i = 0; i < 4; ++i) e->pollParametersForTests();
@@ -12879,6 +12967,19 @@ int main (int argc, char** argv)
                 check (q->isPlaygroundCornerEdited (0) && sameCorner (*e, 0, *q, 0).isEmpty(),
                        "an unsaved corner edit is saved as it sounds - reopened elsewhere the corner is the edited one, \"*\" and all"
                        " (it used to be lost, and the file came back)");
+                {
+                    const auto ge = e->getPlaygroundCornerGainsForTests (0), gq = q->getPlaygroundCornerGainsForTests (0);
+                    bool sameGains = ! ge.empty() && ge.size() == gq.size();
+                    for (size_t k = 0; sameGains && k < ge.size(); ++k)
+                        sameGains = ge[k].key == gq[k].key && std::abs (ge[k].dB - gq[k].dB) < 1.0e-3f;
+                    std::printf ("  ...its text \"%s\" (edited \"%s\"), %d partial edit(s) (edited %d)\n",
+                                 q->getPlaygroundCornerTimbreSourceForTests (0).toRawUTF8(),
+                                 e->getPlaygroundCornerTimbreSourceForTests (0).toRawUTF8(), (int) gq.size(), (int) ge.size());
+                    check (e->getPlaygroundCornerTimbreSourceForTests (0).contains ("7/4")
+                             && q->getPlaygroundCornerTimbreSourceForTests (0) == e->getPlaygroundCornerTimbreSourceForTests (0)
+                             && sameGains,
+                           "...with its retyped custom-engine text and its partial edit as well");
+                }
                 Proc::setPresetFolderForTests (here);
             }
 
@@ -12963,6 +13064,194 @@ int main (int argc, char** argv)
             check (u->getPlaygroundCornerName (0) == "Poly-B", "(Poly-B picked over it)");
             check (u->performUndo() && u->getPlaygroundCornerName (0) == "Poly-A" && u->getPlaygroundCornerParamsForTests (0) == aStore,
                    "Ctrl+Z after picking another preset for a corner puts back the corner that pick replaced");
+        }
+
+        // Shared by the blocks below.
+        const auto setOn = [] (Proc& on, const char* id, float v)
+        {
+            if (auto* q = on.apvts.getParameter (id)) q->setValueNotifyingHost (q->convertTo0to1 (v));
+            on.pollParametersForTests();
+        };
+
+        //-- (7b) THE UNDO HISTORY IS NOT CUT SHORT BY THE PRESET COPIES A CORNER STEP HOLDS ----------
+        {
+            juce::String err;
+            auto h = fresh();
+            for (int k = 0; k < 40; ++k)
+            {
+                h->undoManager.beginNewTransaction();
+                juce::ValueTree probe ("PROBE");
+                probe.setProperty ("v", k, &h->undoManager);
+            }
+            const int d0 = h->undoStackDepthForTests();
+            h->assignPlaygroundCornerUndoable (0, "Poly-Mix", err);
+            h->assignPlaygroundCornerUndoable (0, "Poly-Edited", err);   // replaces: before AND after carry a copy
+            h->undoManager.beginNewTransaction();
+            const int d1 = h->undoStackDepthForTests();
+            std::printf ("  undo history: %d steps, then two corner picks -> %d steps\n", d0, d1);
+            check (d0 == 40 && d1 == 42,
+                   "two corner picks add two undo steps and cut nothing off the history - counting each carried copy"
+                   " as 16 KB used to trim it to 30 steps");
+        }
+
+        //-- (9) A PICK OR X ON ANOTHER CORNER WHILE ONE IS BEING EDITED SURVIVES OK ---------------
+        {
+            juce::String err;
+            auto s9 = fresh();
+            check (s9->assignPlaygroundCorner (0, "Poly-B", err) && s9->assignPlaygroundCorner (1, "Poly-Mix", err)
+                     && s9->assignPlaygroundCorner (2, "Poly-Edited", err), "(three corners)");
+            check (s9->beginPlaygroundCornerEdit (0), "(corner A goes into edit mode)");
+            for (int i = 0; i < 4; ++i) s9->pollParametersForTests();
+            setOn (*s9, "ampDecay", 3.0f);
+            for (int i = 0; i < 10; ++i) s9->pollParametersForTests();
+            s9->assignPlaygroundCornerUndoable (2, {}, err);          // X on corner C, as the window does it
+            s9->assignPlaygroundCornerUndoable (1, "Poly-B", err);    // a pick on corner B
+            s9->endPlaygroundCornerEdit();
+            for (int i = 0; i < 4; ++i) s9->pollParametersForTests();
+            std::printf ("  after OK on corner A: corner B \"%s\", corner C \"%s\"\n",
+                         s9->getPlaygroundCornerName (1).toRawUTF8(), s9->getPlaygroundCornerName (2).toRawUTF8());
+            check (s9->getPlaygroundCornerName (1) == "Poly-B" && s9->getPlaygroundCornerName (2).isEmpty(),
+                   "a pick and an X made on OTHER corners while one corner is being edited are still there after OK"
+                   " - ending the edit used to undo them");
+
+            //-- (9b) DELETING A PRESET HELD BY TWO CORNERS NAMES BOTH ---------------------------
+            // Corner A holds Poly-B too (assigned above, and the corner that was edited), so three do.
+            check (s9->assignPlaygroundCorner (3, "Poly-B", err), "(Poly-B is now on corners A, B and D)");
+            int corner9 = -7, mask9 = 0;
+            check (s9->deletePreset ("Poly-B", corner9, nullptr, &mask9) == R::None && corner9 == 0
+                     && mask9 == ((1 << 0) | (1 << 1) | (1 << 3)),
+                   "deleting a preset held by three corners reports ALL of them (A, B and D) - it used to report only the first");
+            std::unique_ptr<juce::AudioProcessorEditor> base9 (s9->createEditor());
+            if (auto* ed9 = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base9.get()))
+            {
+                const auto msg = ed9->presetDeletedMessage ("Poly-B", true, mask9);
+                std::printf ("  the delete message: %s\n", msg.toRawUTF8());
+                check (msg.contains ("corners A, B and D keep their own copies"), "...and the message names all three");
+            }
+        }
+
+        //-- (10) MORPH MODE: ONE Ctrl+Z TAKES BACK A PICK, THE BLEND'S OWN WRITES INCLUDED -----------
+        {
+            juce::String err;
+            auto m = fresh();
+            setOn (*m, "pgMode", 0.0f);
+            check (m->assignPlaygroundCorner (0, "Poly-Mix", err) && m->assignPlaygroundCorner (1, "Poly-Edited", err),
+                   "(two corners, morph mode)");
+            setOn (*m, "pgX", 0.3f);
+            for (int i = 0; i < 6; ++i) m->pollParametersForTests();
+            // APVTS files parameter writes onto the undo stack on its own timer, which a console
+            // run never fires - this is that flush, by hand (as the rule-7 block above does it).
+            const auto settle = [&m]
+            {
+                for (auto* ap : m->getParameters())
+                    if (auto* q = dynamic_cast<juce::RangedAudioParameter*> (ap))
+                        if (auto ch = m->apvts.state.getChildWithProperty ("id", q->paramID); ch.isValid())
+                            ch.setProperty ("value", (double) q->convertFrom0to1 (q->getValue()), &m->undoManager);
+            };
+            settle();
+            m->undoManager.beginNewTransaction();
+            check (m->assignPlaygroundCornerUndoable (0, "Poly-Edited", err), "(Poly-Edited picked onto corner A)");
+            for (int i = 0; i < 3; ++i) m->pollParametersForTests();   // the blend writes the controls for it
+            settle();                                                  // ...and APVTS files them
+            const bool undid = m->performUndo();
+            std::printf ("  morph mode, one Ctrl+Z after a pick: corner A \"%s\"\n", m->getPlaygroundCornerName (0).toRawUTF8());
+            check (undid && m->getPlaygroundCornerName (0) == "Poly-Mix",
+                   "in MORPH mode the FIRST Ctrl+Z after a pick takes the pick back - the blend's writes for it are"
+                   " part of that step, not a step in front of it");
+        }
+
+        //-- (11) THE PLAYGROUND WINDOW: ITS PICK AND X ARE THE STEPS, AND ITS BOXES FOLLOW Ctrl+Z -----
+        {
+            auto w = fresh();
+            std::unique_ptr<juce::AudioProcessorEditor> base (w->createEditor());
+            auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+            check (ed != nullptr, "the editor builds");
+            if (ed != nullptr)
+            {
+                ed->playgroundRefreshForTests();
+                const int d0 = w->undoStackDepthForTests();
+                ed->playgroundAssignForTests (0, "Poly-Mix");
+                ed->playgroundAssignForTests (1, "Poly-Edited");
+                check (w->getPlaygroundCornerName (0) == "Poly-Mix" && w->undoStackDepthForTests() == d0 + 2,
+                       "a preset picked in the playground window's corner box is ONE undo step");
+                ed->playgroundClearForTests (1);
+                ed->playgroundRefreshForTests();
+                check (w->getPlaygroundCornerName (1).isEmpty() && w->undoStackDepthForTests() == d0 + 3,
+                       "...and so is the window's X button");
+                check (w->performUndo() && w->getPlaygroundCornerName (1) == "Poly-Edited", "(Ctrl+Z puts corner B back)");
+                ed->playgroundRefreshForTests();
+                const auto boxB = ed->playgroundCornerBoxTextForTests (1);
+                ed->playgroundAssignForTests (0, "Poly-Edited");
+                ed->playgroundRefreshForTests();
+                check (w->performUndo() && w->getPlaygroundCornerName (0) == "Poly-Mix", "(a pick on corner A, then Ctrl+Z)");
+                ed->playgroundRefreshForTests();
+                const auto boxA = ed->playgroundCornerBoxTextForTests (0);
+                std::printf ("  the window's boxes after Ctrl+Z: corner A \"%s\", corner B \"%s\"\n", boxA.toRawUTF8(), boxB.toRawUTF8());
+                check (boxB == w->getPlaygroundCornerDisplayName (1) && boxA == w->getPlaygroundCornerDisplayName (0),
+                       "...and after Ctrl+Z the window's corner boxes name the presets the corners really hold - they used to"
+                       " go on showing what was taken back");
+            }
+        }
+
+        //-- (12) AN EDITED ADAPTIVE CORNER IS SAVED WITH ITS PRESET'S OWN SPECTRUM -------------------
+        {
+            juce::String err;
+            {
+                auto a = fresh();
+                check (a->loadTimbreText ("1 6/5 3/2 2", err), "(the adaptive preset has a custom-engine spectrum of its own)");
+                a->setRealtimeLink (Proc::RtLink::SpectrumFromChord, {});
+                check (a->getRealtimeLink() == Proc::RtLink::SpectrumFromChord, "(its chord follower is armed)");
+                check (a->savePreset ("Poly-Adapt") == "Poly-Adapt", "(saved as Poly-Adapt)");
+                a->setRealtimeLink (Proc::RtLink::Off, {});
+            }
+            auto e = fresh();
+            check (e->assignPlaygroundCorner (0, "Poly-Adapt", err) && e->assignPlaygroundCorner (1, "Poly-Mix", err),
+                   "(Poly-Adapt and Poly-Mix on corners A and B)");
+            const bool adaptiveCorner = e->getPlaygroundAdaptiveCount() == 1;
+            check (adaptiveCorner && e->getPlaygroundCornerTimbreSourceForTests (0).contains ("6/5"),
+                   "  (gate) corner A is an adaptive corner whose preset has its own spectrum");
+            check (e->beginPlaygroundCornerEdit (0), "(corner A goes into edit mode)");
+            for (int i = 0; i < 4; ++i) e->pollParametersForTests();
+            check (e->loadTimbreText ("1 9/8 2", err), "(another spectrum stands on it, as a follower result would)");
+            setOn (*e, "ampDecay", 5.0f);
+            for (int i = 0; i < 20; ++i) e->pollParametersForTests();
+            e->endPlaygroundCornerEdit();
+            for (int i = 0; i < 4; ++i) e->pollParametersForTests();
+            check (e->isPlaygroundCornerEdited (0) && e->getPlaygroundCornerTimbreSourceForTests (0).contains ("9/8"),
+                   "  (gate) the corner is edited, and the spectrum standing on it is not its preset's");
+            check (e->savePreset ("Poly-AdaptEd") == "Poly-AdaptEd", "(the pad saves)");
+            Proc::presetFile ("Poly-AdaptEd").copyFileTo (there.getChildFile ("Poly-AdaptEd" + juce::String (Proc::kPresetExt)));
+            Proc::setPresetFolderForTests (there);
+            {
+                auto q = fresh();
+                check (q->loadPreset ("Poly-AdaptEd"), "(Poly-AdaptEd loads on the other computer)");
+                std::printf ("  an edited adaptive corner, reopened: spectrum \"%s\", ampDecay %.3f\n",
+                             q->getPlaygroundCornerTimbreSourceForTests (0).toRawUTF8(),
+                             (double) q->getPlaygroundCornerParamForTests (0, "ampDecay"));
+                check (q->getPlaygroundCornerTimbreSourceForTests (0).contains ("6/5")
+                         && std::abs (q->getPlaygroundCornerParamForTests (0, "ampDecay") - 5.0f) < 1.0e-3f,
+                       "an edited ADAPTIVE corner is saved with its preset's own spectrum plus the knob edits - never with"
+                       " the spectrum the follower put on it, which it makes again from the chord");
+            }
+            Proc::setPresetFolderForTests (here);
+        }
+
+        //-- (13) A SCALE EXPORT CARRIES THE PATCH ONCE, NOT EVERY EARLIER EXPORT IN THE BANK ----------
+        {
+            juce::String err;
+            auto b = fresh();
+            check (b->loadScalaText ("! k5.scl\nfive\n 5\n!\n 240.0\n 480.0\n 720.0\n 960.0\n 2/1\n", "zzz-k5", err),
+                   "(a five-note scale is loaded)");
+            const auto s1 = b->currentTuningAsScl ("zzz-k5");
+            b->bankAutoAdd ("zzz-export-1", s1);
+            const auto s2 = b->currentTuningAsScl ("zzz-k5");
+            b->bankAutoAdd ("zzz-export-2", s2);
+            const auto s3 = b->currentTuningAsScl ("zzz-k5");
+            std::printf ("  scale exports after adding each one to the bank: %d, %d, %d characters\n",
+                         s1.length(), s2.length(), s3.length());
+            check (s1.contains (Proc::kPresetTag) && s3.length() < s1.length() * 2,
+                   "an export carries its patch ONCE - not a copy of every earlier export sitting in the tuning bank"
+                   " (it used to grow ~2.3x per add)");
         }
 
         Proc::setPresetDeleteToTrashForTests (true);
@@ -17698,10 +17987,21 @@ int main (int argc, char** argv)
                 p->savePreset ("zzz88-A");
                 if (viaProjectReload)
                 {
-                    // A genuine host project save + reload: setStateInformation re-reads
-                    // every corner from disk BY NAME (captureState stores only names).
+                    // A host project save + reload - AS AN OLDER BUILD SAVED IT, names only.
+                    // Since polypresets a project carries each corner's copy and a reload never
+                    // reads the corner's file, so a plain reload could no longer fail here even
+                    // with the write guard removed (review, 2026-09-15). The names-only project
+                    // is the one reload that still re-reads the file, so the guard is still
+                    // what keeps this green.
                     juce::MemoryBlock mb;
                     p->getStateInformation (mb);
+                    if (auto x = juce::AudioProcessor::getXmlFromBinary (mb.getData(), (int) mb.getSize()))
+                    {
+                        if (auto* pgx = x->getChildByName ("PLAYGROUND"))
+                            pgx->deleteAllChildElementsWithTagName ("CORNER");
+                        mb.reset();
+                        juce::AudioProcessor::copyXmlToBinary (*x, mb);
+                    }
                     auto q = std::make_unique<Proc>();
                     q->prepareToPlay (psr, pblk);
                     q->setStateInformation (mb.getData(), (int) mb.getSize());
@@ -21078,6 +21378,36 @@ int main (int argc, char** argv)
                 check (ca == "Esborra" && en == "Delete",
                        "the snapshot rig's copy of the preset list is rebuilt in the language it is photographed in");
                 ed->clearSnapshotPresetPanelForTests();   // a rig panel left over would cover the notice in (f)
+            }
+            // (e2) THE RIG'S DELETE-ON-CORNER PICTURE DELETES ONE PRESET, AND A LANGUAGE REBUILD
+            // RE-SAYS IT - it used to press Delete again for every language (review, 2026-09-15).
+            {
+                using ProcE = FractalAdditiveAudioProcessor;
+                const auto prevF = ProcE::getPresetFolder();
+                const auto dirE  = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                       .getChildFile ("fiblo-verify-rigdelete-"
+                                                      + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
+                dirE.deleteRecursively();
+                ProcE::setPresetFolderForTests (dirE);
+                ProcE::setPresetDeleteToTrashForTests (false);
+                for (const char* n : { "rig-a", "rig-b", "rig-c", "rig-d" })
+                    p.savePreset (juce::String (n));
+                ed->showPresetSearchForSnapshot (true);
+                const int afterDelete = p.getPresetNames().size();
+                ed->setLanguageForSnapshot (true);
+                const int afterRebuild = p.getPresetNames().size();
+                ed->setLanguageForSnapshot (false);
+                std::printf ("  the rig's delete-on-corner picture: 4 presets -> %d after its Delete -> %d after a language rebuild\n",
+                             afterDelete, afterRebuild);
+                check (afterDelete == 3 && afterRebuild == 3,
+                       "the rig's delete-on-corner picture deletes ONE preset, and a language rebuild re-says it"
+                       " without deleting another");
+                juce::String errE;
+                p.assignPlaygroundCorner (0, {}, errE);
+                ed->clearSnapshotPresetPanelForTests();
+                ProcE::setPresetDeleteToTrashForTests (true);
+                ProcE::setPresetFolderForTests (prevF);
+                dirE.deleteRecursively();
             }
             // (f) A NOTICE THAT IS UP IS NOT BURIED BY A LAYOUT PASS OR BY THE RHYTHM PANEL OPENING.
             {
