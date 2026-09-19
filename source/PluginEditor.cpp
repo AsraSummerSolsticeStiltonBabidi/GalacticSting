@@ -2310,29 +2310,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         // closure rather than to the editor, so the editor is named here and captured by
         // that name below.
         juce::Component* const selfComp = this;
-        juce::PopupMenu m;
-        m.addItem (1, tr ("Reset all parameters", "Reinicia tots els par\xc3\xa0metres"));
-        m.addItem (2, catalan ? juce::String ("Language: English")
-                              : juce::String::fromUTF8 ("Idioma: catal\xc3\xa0"));
-        // NOTE NAMES. Ticked when the preference is on. When it is on but this tuning
-        // cannot be named, the item SAYS WHY on its own line rather than silently doing
-        // nothing - "solo para tunings regulares y para JI" means most scales get numbers,
-        // and an option that looks broken is worse than one that explains itself.
-        {
-            const auto why = noteNamesReason();
-            juce::String label = tr ("Note names on the keyboard",
-                                     "Noms de nota al teclat");
-            if (why.isNotEmpty())
-                label += " - " + tr ("numbers: ", "n\xc3\xbameros: ") + why;
-            m.addItem (3, label, true, noteNamesOn);
-            m.addItem (4, tr ("Note names: credits", "Noms de nota: cr\xc3\xa8" "dits"));
-        }
-        // WHERE THE PRESETS ACTUALLY ARE. The Save dialog names the folder once and then
-        // it is gone; every other way of finding it means guessing at a path under
-        // Documents. This opens it in the file manager - and creates it first, because
-        // before the first save it does not exist and Explorer would answer a nonexistent
-        // path with an error box instead of a folder.
-        m.addItem (5, tr ("Open preset folder", "Obre la carpeta de presets"));
+        auto m = buildMainMenu();
         // A MENU OUTLIVES THE WINDOW IT WAS OPENED FROM. showMenuAsync returns
         // immediately and its callback fires whenever the user gets round to choosing -
         // or when the menu is dismissed, with r = 0 - and the plugin window can be closed
@@ -2342,99 +2320,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (menuButton),
             [this, safe = juce::Component::SafePointer<juce::Component> (selfComp)] (int r)
             {
-                // The guard decides; `this` only serves the body once the guard has said
-                // the editor is still there. Capturing both keeps the body unchanged,
-                // which on a callback this long is worth more than the tidier capture.
+                // The guard decides; the choice itself is a member of its own (so a check can
+                // make the same choice a click makes - see mainMenuChoiceForTests).
                 if (safe == nullptr) return;
-                if (r == 1)
-                {
-                    processorRef.requestHardSilence(); // never leave a note stuck sounding through Init
-                    for (auto* p : processorRef.getParameters())
-                        p->setValueNotifyingHost (p->getDefaultValue());
-                    processorRef.clearScala();
-                    processorRef.clearTimbre();
-                    setIntervalText ({});
-                    // Init also unroutes every Spectrum-to-Rhythm pulse.
-                    for (auto& s : processorRef.getRhythm().slots)
-                    {
-                        s.enabled = false; s.partial = -1;
-                        s.steps = 0; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f; s.vel = 100;
-                    }
-                    // ...AND EVERY MODULATOR ROUTING, which is not a parameter and so
-                    // survived every "reset all parameters" there has ever been.
-                    //
-                    // "AL DARLE A RESET ALL PARAMETERS EL PITCH SE MUEVE COMO SI TUVIESE
-                    // ENVOLVENTE DE PITCH, Y POR MUCHO QUE CAMBIE LA ENVOLVENTE DE PITCH
-                    // NO PUEDO QUITARSELO ... ES POR QUE A PESAR DE RESET ALL PARAMETERS
-                    // SE QUEDO EL LFO PUESTO."
-                    //
-                    // Exactly that: an LFO mapped onto pitch keeps modulating after the
-                    // reset, and nothing in the pitch ENVELOPE can stop it, because it is
-                    // not the envelope doing it. The map lives in ModEngine, outside the
-                    // APVTS, so setting every parameter to its default never touched it.
-                    // Init means init.
-                    for (int m = 0; m < ModEngine::kMods; ++m)
-                        processorRef.getModEngine().unmapAll (m);
-                    // The per-partial pencil edits are the same kind of state: not
-                    // parameters, and a reset that leaves them behind hands the user a
-                    // "default" patch with somebody else's amplitudes in it.
-                    processorRef.setPartialGains ({}, false);
-                    rhythmPanel.refreshSlots();
-                    rhythmPanel.list.repaint();
-                }
-                else if (r == 2)
-                {
-                    catalan = ! catalan;
-                    applyLanguage();
-                }
-                else if (r == 3)
-                {
-                    setNoteNamesForTests (! noteNamesOn);   // the one path, menu and check
-                }
-                else if (r == 4)
-                {
-                    // The credit, where someone using the feature can actually find it.
-                    // Names, not just licences: the notation, the algorithm and the font
-                    // are three different people's work.
-                    juce::NativeMessageBox::showMessageBoxAsync (
-                        juce::MessageBoxIconType::InfoIcon,
-                        tr ("Note names: credits", "Noms de nota: cr\xc3\xa8" "dits"),
-                        juce::String::fromUTF8 (
-                            catalan
-                              ? "Notaci\xc3\xb3 d'ups and downs, de Kite Giedraitis.\n\n"
-                                "Algorisme de grafia adaptat de \"Notation\", de Richie Greene "
-                                "(llic\xc3\xa8ncia MIT) - github.com/richiegreene/notation\n\n"
-                                "Glifs d'alteraci\xc3\xb3: notes.otf, de Sintel, del projecte tessera "
-                                "(llic\xc3\xa8ncia MIT) - github.com/Sin-tel/tessera\n\n"
-                                "La notaci\xc3\xb3 HEJI per a entonaci\xc3\xb3 justa (Marc Sabat i Thomas "
-                                "Nicholson, amb Wolfgang von Schweinitz) encara NO hi \xc3\xa9s: els seus "
-                                "glifs SMuFL nom\xc3\xa9s existeixen aqu\xc3\xad en format WOFF2, que JUCE no pot "
-                                "carregar, i dibuixar-los donaria quadres buits.\n\n"
-                                "Textos complets de les llic\xc3\xa8ncies: assets/fonts/NOTATION-LICENSES.txt"
-                              : "Ups and downs notation, devised by Kite Giedraitis.\n\n"
-                                "Spelling algorithm ported from \"Notation\" by Richie Greene "
-                                "(MIT licence) - github.com/richiegreene/notation\n\n"
-                                "Accidental glyphs: notes.otf by Sintel, from tessera "
-                                "(MIT licence) - github.com/Sin-tel/tessera\n\n"
-                                "HEJI, the just-intonation notation by Marc Sabat and Thomas "
-                                "Nicholson with Wolfgang von Schweinitz, is NOT here yet: its "
-                                "SMuFL glyphs exist here only as WOFF2, which JUCE cannot load, "
-                                "and drawing them would give empty boxes.\n\n"
-                                "Full licence texts: assets/fonts/NOTATION-LICENSES.txt"),
-                        this);
-                }
-                else if (r == 5)
-                {
-                    // createDirectory() on a folder that already exists is a no-op that
-                    // returns ok, so there is no "does it exist" branch to get wrong -
-                    // and it is the SAME getPresetFolder() the save and load paths use,
-                    // so a test rig that redirected the folder opens the redirected one
-                    // rather than the user's.
-                    const auto dir = FractalAdditiveAudioProcessor::getPresetFolder();
-                    dir.createDirectory();
-                    dir.revealToUser();
-                }
-                refocus();
+                handleMainMenuChoice (r);
             });
     };
     addAndMakeVisible (menuButton);
@@ -3606,8 +3495,14 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // setSize() and applyEngineState(), and a timer tick there would read a half-built
     // editor and, worse, set lastEngineShown so applyEngineState() would then skip.
     editorConstructed = true;
-    juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<juce::Component> (this)]
-    { if (safe != nullptr) safe->grabKeyboardFocus(); });
+    juce::Desktop::getInstance().addGlobalMouseListener (&gestureWatch);   // see refocusAllowed
+    // The load watch starts from NOW: what was measured while no window was open (peaks,
+    // overruns, a slow tick) is not what this window should open with a warning about.
+    processorRef.takeLoadSnapshot();
+    // The Standalone takes the keyboard as it opens, so the letters play at once. A plugin
+    // does not: opening its window must leave the keys with the host (see focusReclaimState).
+    if (focusFollowsPointer())
+        queueOpenFocusGrab();
 
     // THE ONE CALL SITE OF THE SELF-SNAPSHOT RIG (source/SnapshotRig.h).
     //
@@ -3625,6 +3520,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 
 FractalAdditiveAudioProcessorEditor::~FractalAdditiveAudioProcessorEditor()
 {
+    juce::Desktop::getInstance().removeGlobalMouseListener (&gestureWatch);
     stopTimer();
     // The amplitude window is a real top-level window: it must go before the panel it
     // shows (which is a member of this editor) and before the editor leaves the desktop,
@@ -3644,6 +3540,321 @@ FractalAdditiveAudioProcessorEditor::~FractalAdditiveAudioProcessorEditor()
     if (activePrompt != nullptr)
         activePrompt->exitModalState (0);
     setLookAndFeel (nullptr);
+}
+
+// THE MAIN MENU, built in ONE place so the check that reads its items reads the menu a
+// click really opens (mainMenuItemsForTests).
+juce::PopupMenu FractalAdditiveAudioProcessorEditor::buildMainMenu()
+{
+    juce::PopupMenu m;
+    m.addItem (1, tr ("Reset all parameters", "Reinicia tots els par\xc3\xa0metres"));
+    m.addItem (2, catalan ? juce::String ("Language: English")
+                          : juce::String::fromUTF8 ("Idioma: catal\xc3\xa0"));
+    // NOTE NAMES. Ticked when the preference is on. When it is on but this tuning
+    // cannot be named, the item SAYS WHY on its own line rather than silently doing
+    // nothing - "solo para tunings regulares y para JI" means most scales get numbers,
+    // and an option that looks broken is worse than one that explains itself.
+    {
+        const auto why = noteNamesReason();
+        juce::String label = tr ("Note names on the keyboard",
+                                 "Noms de nota al teclat");
+        if (why.isNotEmpty())
+            label += " - " + tr ("numbers: ", "n\xc3\xbameros: ") + why;
+        m.addItem (3, label, true, noteNamesOn);
+        m.addItem (4, tr ("Note names: credits", "Noms de nota: cr\xc3\xa8" "dits"));
+    }
+    // WHERE THE PRESETS ACTUALLY ARE. The Save dialog names the folder once and then
+    // it is gone; every other way of finding it means guessing at a path under
+    // Documents. This opens it in the file manager - and creates it first, because
+    // before the first save it does not exist and Explorer would answer a nonexistent
+    // path with an error box instead of a folder.
+    m.addItem (5, tr ("Open preset folder", "Obre la carpeta de presets"));
+    // THE FREEZE WARNING (see refreshLoadWarning). ON unless the user turned it off - here or
+    // with the notice's own "Don't show this again" - and it never limits anything: it only
+    // says so, and the settings stay exactly where the user put them.
+    m.addItem (6, tr ("Warn when the synth is close to freezing",
+                      "Avisa quan el sinte estigui a punt de bloquejar-se"),
+               true, processorRef.getWarnNearFreeze());
+    return m;
+}
+
+// WHAT A MAIN-MENU CHOICE DOES (see buildMainMenu for the items). r = 0 is a dismissed menu.
+void FractalAdditiveAudioProcessorEditor::handleMainMenuChoice (int r)
+{
+    if (r == 1)
+    {
+        processorRef.requestHardSilence(); // never leave a note stuck sounding through Init
+        for (auto* p : processorRef.getParameters())
+            p->setValueNotifyingHost (p->getDefaultValue());
+        processorRef.clearScala();
+        processorRef.clearTimbre();
+        setIntervalText ({});
+        // Init also unroutes every Spectrum-to-Rhythm pulse.
+        for (auto& s : processorRef.getRhythm().slots)
+        {
+            s.enabled = false; s.partial = -1;
+            s.steps = 0; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f; s.vel = 100;
+        }
+        // ...AND EVERY MODULATOR ROUTING, which is not a parameter and so
+        // survived every "reset all parameters" there has ever been.
+        //
+        // "AL DARLE A RESET ALL PARAMETERS EL PITCH SE MUEVE COMO SI TUVIESE
+        // ENVOLVENTE DE PITCH, Y POR MUCHO QUE CAMBIE LA ENVOLVENTE DE PITCH
+        // NO PUEDO QUITARSELO ... ES POR QUE A PESAR DE RESET ALL PARAMETERS
+        // SE QUEDO EL LFO PUESTO."
+        //
+        // Exactly that: an LFO mapped onto pitch keeps modulating after the
+        // reset, and nothing in the pitch ENVELOPE can stop it, because it is
+        // not the envelope doing it. The map lives in ModEngine, outside the
+        // APVTS, so setting every parameter to its default never touched it.
+        // Init means init.
+        for (int m = 0; m < ModEngine::kMods; ++m)
+            processorRef.getModEngine().unmapAll (m);
+        // The per-partial pencil edits are the same kind of state: not
+        // parameters, and a reset that leaves them behind hands the user a
+        // "default" patch with somebody else's amplitudes in it.
+        processorRef.setPartialGains ({}, false);
+        rhythmPanel.refreshSlots();
+        rhythmPanel.list.repaint();
+    }
+    else if (r == 2)
+    {
+        catalan = ! catalan;
+        applyLanguage();
+    }
+    else if (r == 3)
+    {
+        setNoteNamesForTests (! noteNamesOn);   // the one path, menu and check
+    }
+    else if (r == 4)
+    {
+        // The credit, where someone using the feature can actually find it.
+        // Names, not just licences: the notation, the algorithm and the font
+        // are three different people's work.
+        juce::NativeMessageBox::showMessageBoxAsync (
+            juce::MessageBoxIconType::InfoIcon,
+            tr ("Note names: credits", "Noms de nota: cr\xc3\xa8" "dits"),
+            juce::String::fromUTF8 (
+                catalan
+                  ? "Notaci\xc3\xb3 d'ups and downs, de Kite Giedraitis.\n\n"
+                    "Algorisme de grafia adaptat de \"Notation\", de Richie Greene "
+                    "(llic\xc3\xa8ncia MIT) - github.com/richiegreene/notation\n\n"
+                    "Glifs d'alteraci\xc3\xb3: notes.otf, de Sintel, del projecte tessera "
+                    "(llic\xc3\xa8ncia MIT) - github.com/Sin-tel/tessera\n\n"
+                    "La notaci\xc3\xb3 HEJI per a entonaci\xc3\xb3 justa (Marc Sabat i Thomas "
+                    "Nicholson, amb Wolfgang von Schweinitz) encara NO hi \xc3\xa9s: els seus "
+                    "glifs SMuFL nom\xc3\xa9s existeixen aqu\xc3\xad en format WOFF2, que JUCE no pot "
+                    "carregar, i dibuixar-los donaria quadres buits.\n\n"
+                    "Textos complets de les llic\xc3\xa8ncies: assets/fonts/NOTATION-LICENSES.txt"
+                  : "Ups and downs notation, devised by Kite Giedraitis.\n\n"
+                    "Spelling algorithm ported from \"Notation\" by Richie Greene "
+                    "(MIT licence) - github.com/richiegreene/notation\n\n"
+                    "Accidental glyphs: notes.otf by Sintel, from tessera "
+                    "(MIT licence) - github.com/Sin-tel/tessera\n\n"
+                    "HEJI, the just-intonation notation by Marc Sabat and Thomas "
+                    "Nicholson with Wolfgang von Schweinitz, is NOT here yet: its "
+                    "SMuFL glyphs exist here only as WOFF2, which JUCE cannot load, "
+                    "and drawing them would give empty boxes.\n\n"
+                    "Full licence texts: assets/fonts/NOTATION-LICENSES.txt"),
+            this);
+    }
+    else if (r == 5)
+    {
+        // createDirectory() on a folder that already exists is a no-op that
+        // returns ok, so there is no "does it exist" branch to get wrong -
+        // and it is the SAME getPresetFolder() the save and load paths use,
+        // so a test rig that redirected the folder opens the redirected one
+        // rather than the user's.
+        const auto dir = FractalAdditiveAudioProcessor::getPresetFolder();
+        dir.createDirectory();
+        dir.revealToUser();
+    }
+    else if (r == 6)
+    {
+        toggleWarnNearFreeze();
+    }
+    refocus();
+}
+
+void FractalAdditiveAudioProcessorEditor::toggleWarnNearFreeze()
+{
+    const bool on = ! processorRef.getWarnNearFreeze();
+    processorRef.setWarnNearFreeze (on);
+    // Off takes a warning that is up down with it. On shows an episode that is going on
+    // RIGHT NOW at once - waiting for the next one would say nothing through this one.
+    loadEpisodeRaised = on && loadPolicy.showing;
+    loadRefreshSeconds = 0.0;
+    if (! on)
+        withdrawNotice ("load");
+    else if (loadEpisodeRaised)
+        raiseLoadNotice();
+}
+
+void FractalAdditiveAudioProcessorEditor::queueOpenFocusGrab()
+{
+    openFocusGrabQueued = true;
+    juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<juce::Component> (this)]
+    { if (safe != nullptr) safe->grabKeyboardFocus(); });
+}
+
+bool FractalAdditiveAudioProcessorEditor::loadNoticeUp() const
+{
+    if (noticeOverlay.isVisible() && noticeKey == "load") return true;
+    for (const auto& q : noticeQueue)
+        if (q.key == "load") return true;
+    return false;
+}
+
+// THE FREEZE WARNING - "que te avise de cuando estas cerca de que haya un freeze, y te de
+// opcion a no mostrar de nuevo" (2026-09-19).
+//
+// Once per timer tick: take what the audio thread and the interface thread measured (see
+// dsp/LoadMonitor.h), and let the Policy decide whether an EPISODE is on. The notice goes up
+// ONCE per episode, keeps its numbers current while it lasts, and when the load calms down
+// it stays up with its final numbers and says so - a warning that vanished two seconds after
+// a burst of clicks could not be read. Closing it with X is honoured for the rest of that
+// episode; the next episode raises it again. "Don't show this again" turns the Menu option
+// off. NOTHING is limited: it says what costs the most and leaves every setting alone.
+void FractalAdditiveAudioProcessorEditor::refreshLoadWarning (double dtSeconds)
+{
+    if (loadWatchHeld) return;
+    const auto snap = processorRef.takeLoadSnapshot();
+    const bool was  = loadPolicy.showing;
+    const bool on   = loadPolicy.update (snap, dtSeconds);
+    if (on && ! was)
+    {
+        // The preference is read from the settings file once per EPISODE - a disk read, so
+        // never per tick - which also means another instance's "Don't show this again" is
+        // obeyed from its next episode on.
+        loadEpisodeRaised = processorRef.getWarnNearFreeze();
+        loadRefreshSeconds = 0.0;
+        if (loadEpisodeRaised)
+            raiseLoadNotice();
+        // ...and an option read as OFF here - another instance's "Don't show this again" -
+        // takes this instance's last notice down too, or it would sit through the whole of
+        // a new overload saying that nothing has come close.
+        else if (loadNoticeUp())
+            withdrawNotice ("load");
+        return;
+    }
+    if (! loadEpisodeRaised) return;
+    if (! loadNoticeUp())
+    {
+        // Closed with X (or by the Menu): silent for the rest of this episode - UNLESS the
+        // episode has turned into something the closed notice never said. A notice closed
+        // over "the load is high" says nothing about blocks now breaking up or the screen
+        // now freezing, and staying silent through that would hide exactly what it is for.
+        if (! on) { loadEpisodeRaised = false; return; }
+        if ((loadPolicy.kinds() & ~loadShownKinds) != 0)
+        {
+            loadRefreshSeconds = 0.0;
+            raiseLoadNotice();
+        }
+        return;
+    }
+    loadRefreshSeconds += dtSeconds > 0.0 && std::isfinite (dtSeconds) ? dtSeconds : 0.0;
+    if (! on)
+    {
+        loadEpisodeRaised = false;              // the episode is over: its final numbers
+        raiseLoadNotice();
+    }
+    else if (loadRefreshSeconds >= 0.5)         // twice a second: readable, never a flicker
+    {
+        loadRefreshSeconds = 0.0;
+        raiseLoadNotice();
+    }
+}
+
+// One place that puts the warning up or rewrites it, and remembers what it said.
+void FractalAdditiveAudioProcessorEditor::raiseLoadNotice()
+{
+    loadShownKinds = loadPolicy.kinds();
+    raiseNotice ([this, shown = loadPolicy] { renderLoadNotice (shown); }, "load");
+}
+
+// The warning's words, from the numbers it was raised (or last refreshed) with. A COPY, so
+// a language switch re-writes the same numbers in the other language - and an episode that
+// begins while the notice is closed, or with the option off, cannot rewrite the one that
+// is showing behind the user's back.
+void FractalAdditiveAudioProcessorEditor::renderLoadNotice (const fibload::Policy& shown)
+{
+    noticeOverlay.title = tr ("Close to freezing", "A punt de bloquejar-se");
+    noticeOverlay.body  = loadNoticeBody (shown);
+    noticeOverlay.actionText = tr ("Don't show this again", "No ho tornis a mostrar");
+    noticeOverlay.actionBtn.setTooltip (tr ("Turns this warning off. Menu: \"Warn when the synth is close to freezing\" turns it back on.",
+                                            "Apaga aquest av\xc3\xads. Men\xc3\xba: \"Avisa quan el sinte estigui a punt de bloquejar-se\" el torna a encendre."));
+    noticeOverlay.onAction = [this]
+    {
+        processorRef.setWarnNearFreeze (false);
+        loadEpisodeRaised = false;
+        withdrawNotice ("load");
+        refocus();
+    };
+}
+
+juce::String FractalAdditiveAudioProcessorEditor::loadNoticeBody (const fibload::Policy& L) const
+{
+    const auto pct = [] (float r) { return juce::String (juce::roundToInt (r * 100.0f)) + "%"; };
+    juce::String b;
+    // While the episode lasts: what it is NOW, and the worst so far. Once it is over, only
+    // the worst - a "now" would be a number from after the thing the notice is about.
+    if (L.showing)
+        b << tr ("The synth is using ", "El sinte fa servir el ") << pct (L.nowEma)
+          << tr (" of the time the host gives it for each block of audio (at its worst so far ",
+                 " del temps que el host li d\xc3\xb3na per a cada bloc d'\xc3\xa0udio (en el pitjor moment, el ")
+          << pct (L.worstEma)
+          << tr (", and ", ", i el ") << pct (L.worstPeak)
+          << tr (" in the worst single block).", " en el pitjor bloc).");
+    else
+        b << tr ("At its worst the synth used ", "En el pitjor moment el sinte ha fet servir el ") << pct (L.worstEma)
+          << tr (" of the time the host gives it for each block of audio (",
+                 " del temps que el host li d\xc3\xb3na per a cada bloc d'\xc3\xa0udio (el ")
+          << pct (L.worstPeak) << tr (" in the worst single block).", " en el pitjor bloc).");
+    if (L.overruns > 0)
+        b << " " << juce::String (L.overruns)
+          << (L.overruns == 1 ? tr (" block took longer than that, and it was a click or a gap in the sound.",
+                                    " bloc ha trigat m\xc3\xa9s que aix\xc3\xb2, i ha estat un clic o un forat en el so.")
+                              : tr (" blocks took longer than that, and each one was a click or a gap in the sound.",
+                                    " blocs han trigat m\xc3\xa9s que aix\xc3\xb2, i cadascun ha estat un clic o un forat en el so."));
+    b << tr (" At 100% the audio breaks up, and a host kept waiting long enough stops answering altogether.",
+             " Al 100% l'\xc3\xa0udio es trenca, i un host que espera prou temps deixa de respondre del tot.");
+    if (L.oscillators > 0)
+        b << "\n\n" << tr ("About ", "Sonaven uns ") << juce::String (L.oscillators)
+          << tr (" oscillators were sounding at once (notes \xc3\x97 partials)",
+                 " oscil\xc2\xb7ladors alhora (notes \xc3\x97 parcials)")
+          << (L.mixOscillators > 0
+                ? juce::String (", ") + juce::String (L.mixOscillators)
+                    + tr (" of them in the MIX corners of the Preset Playground.",
+                          " d'ells a les cantonades de MESCLA del Laboratori de Presets.")
+                : juce::String ("."));
+    b << (L.oscillators > 0 ? " " : "\n\n")
+      << tr ("What makes the audio cost more: more partials (HARMONICS, FRACTAL, OCTAVES), more notes held at once, "
+             "Shepard (several copies of the spectrum per note), a morph while it crossfades, and MIX in the "
+             "Preset Playground (every corner sounds through an engine of its own). Lowering any of them lowers the load.",
+             "El que fa costar m\xc3\xa9s l'\xc3\xa0udio: m\xc3\xa9s parcials (HARM\xc3\x92NICS, FRACTAL, OCTAVES), m\xc3\xa9s "
+             "notes alhora, Shepard (diverses c\xc3\xb2pies de l'espectre per nota), un morph mentre fa el fos, i MESCLA al "
+             "Laboratori de Presets (cada cantonada sona amb un motor propi). Baixar qualsevol d'aquests redueix la c\xc3\xa0rrega.");
+    if (L.sawStall)
+        b << "\n\n" << tr ("One step on the interface thread took ", "Un pas al fil de la interf\xc3\xad" "cie ha trigat ")
+          << juce::String (juce::roundToInt (L.worstStallMs)) << " ms"
+          << tr (", and while it ran this window and the host's own screen could not answer. Steps that can take "
+                 "this long: REALTIME with a high FRACTAL, and MIX building its corners' voices.",
+                 ", i mentre durava aquesta finestra i la pantalla del host no podien respondre. Passos que poden "
+                 "trigar tant: TEMPS REAL amb un FRACTAL alt, i MESCLA construint les veus de les cantonades.");
+    b << "\n\n" << tr ("Nothing has been limited: every setting is still exactly where you put it.",
+                       "No s'ha limitat res: cada ajust \xc3\xa9s exactament on el vas deixar.");
+    // HOW IT ENDED, in the words that are true for it: the load came down, or the audio
+    // stopped arriving (a stopped engine is not a calmer one, and its last number is stale).
+    if (! L.showing)
+        b << " " << (L.endedWithoutAudio
+                       ? tr ("The audio stopped reaching the synth, so there is nothing more to measure.",
+                             "L'\xc3\xa0udio ha deixat d'arribar al sinte, aix\xc3\xad que ja no hi ha res m\xc3\xa9s a mesurar.")
+                       : tr ("Nothing has come close for two seconds now (the load is at ",
+                             "Fa dos segons que res no s'hi acosta (la c\xc3\xa0rrega \xc3\xa9s ara del ")
+                         + pct (L.nowEma) + ").");
+    b << "\n\n" << tr ("This warning can be turned off here, or in Menu: \"Warn when the synth is close to freezing\".",
+                       "Aquest av\xc3\xads es pot apagar aqu\xc3\xad, o al Men\xc3\xba: \"Avisa quan el sinte estigui a punt de bloquejar-se\".");
+    return b;
 }
 
 //==============================================================================
@@ -3676,7 +3887,57 @@ bool FractalAdditiveAudioProcessorEditor::mouseButtonHeld()
 void FractalAdditiveAudioProcessorEditor::refocus()
 {
     if (mouseButtonHeld()) return;
+    if (! refocusAllowed()) return;
     grabKeyboardFocus();
+}
+
+// IN A HOST, refocus() FOLLOWS A GESTURE MADE HERE, and nothing else.
+//
+// ~40 controls call refocus() from their onChange / onClick, and JUCE runs those when the
+// HOST moves the parameter too - an automation lane, a MIDI-mapped knob, Live's own Ctrl+Z:
+// ComboBoxParameterAttachment and ButtonParameterAttachment notify synchronously. So every
+// automated step of Shepard, Mono Glide or a prime toggle pulled the keyboard out of Live
+// (found by the review of 2026-09-19, after the hover grab had been taken out for exactly
+// that). The Standalone keeps the old rule: there is no host to take it from.
+bool FractalAdditiveAudioProcessorEditor::refocusAllowed() const
+{
+    if (focusFollowsPointer()) return true;
+    if (hasKeyboardFocus (true)) return true;    // already ours: a move INSIDE this window
+    return juce::Time::getMillisecondCounter() - lastGestureMs < kGestureMs;
+}
+
+bool FractalAdditiveAudioProcessorEditor::isOurComponent (const juce::Component* c) const
+{
+    if (c == nullptr) return false;
+    const auto within = [c] (const juce::Component* root)
+    { return root != nullptr && (c == root || root->isParentOf (c)); };
+    return within (this) || within (partialWindow.get()) || within (playgroundWindow.get());
+}
+
+void FractalAdditiveAudioProcessorEditor::GestureWatch::note (const juce::MouseEvent& e)
+{
+    if (ed.isOurComponent (e.eventComponent))
+        ed.lastGestureMs = juce::Time::getMillisecondCounter();
+}
+
+// TAB DOES NOT WALK THE FOCUS AROUND IN A HOST. JUCE answers an unused Tab by moving the
+// focus to the next focusable child - and consumes the key whatever this window says, so
+// Live never gets it. With the default traverser a few Tabs landed in a text field, and a
+// focused text field takes EVERY letter (JUCE hands them to it as text), so Live's note
+// keys typed into Fiblo until the next click. Tab itself still does not reach Live: that
+// part is inside JUCE, and is said here rather than claimed otherwise.
+std::unique_ptr<juce::ComponentTraverser> FractalAdditiveAudioProcessorEditor::createKeyboardFocusTraverser()
+{
+    if (focusFollowsPointer())
+        return juce::AudioProcessorEditor::createKeyboardFocusTraverser();
+    struct NoTraversal : juce::ComponentTraverser
+    {
+        juce::Component* getDefaultComponent (juce::Component*) override  { return nullptr; }
+        juce::Component* getNextComponent (juce::Component*) override     { return nullptr; }
+        juce::Component* getPreviousComponent (juce::Component*) override { return nullptr; }
+        std::vector<juce::Component*> getAllComponents (juce::Component*) override { return {}; }
+    };
+    return std::make_unique<NoTraversal>();
 }
 
 FractalAdditiveAudioProcessorEditor::FocusReclaimProbe
@@ -3693,7 +3954,15 @@ FractalAdditiveAudioProcessorEditor::focusReclaimState() const
     // unbounded retry, once per mouse move, each one a focus change. The same 250 ms the
     // play-state debounce uses, and for the same reason: below that it is a flicker.
     s.tooSoon     = (juce::Time::getMillisecondCounter() - lastFocusReclaimMs) < 250;
-    s.wouldGrab   = ! s.typing && ! s.mouseHeld && ! s.alreadyOurs && ! s.tooSoon;
+    // ...AND NEVER IN A HOST. "no se puede tocar con el teclado cuando la ventana del sinte
+    // esta abierta en ableton": every time the pointer crossed this window it took the
+    // keyboard focus away from Live, so Live's own computer keyboard - the ONLY way the
+    // letters play anything in a plugin, see playKeysLive - went dead until the user
+    // clicked back on Live. A click on this window still takes the focus (mouseDown), and
+    // the keys it does not use go on to the host (keyPressed).
+    s.hostOwnsKeys = ! focusFollowsPointer();
+    s.wouldGrabIfFollowing = ! s.typing && ! s.mouseHeld && ! s.alreadyOurs && ! s.tooSoon;
+    s.wouldGrab   = s.wouldGrabIfFollowing && ! s.hostOwnsKeys;
     return s;
 }
 
@@ -5323,7 +5592,9 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
         // same TextLayout calls paint makes), for the title and the body together.
         // `withMore`: measure as if the "N more notices wait" line is showing - the worst case
         // has to include it, since any notice can arrive with others queued behind it.
-        const auto noticeText = [this, &out] (const char* path, const juce::String& title, const juce::String& body, bool withMore)
+        // `withAction`: the same for a notice that carries an action button's row.
+        const auto noticeText = [this, &out] (const char* path, const juce::String& title, const juce::String& body,
+                                              bool withMore, bool withAction)
         {
             if (title.isEmpty() && body.isEmpty()) return;
             using NO = NoticeOverlay;
@@ -5335,7 +5606,8 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
                                                                     juce::Colours::white, inner).getHeight());
             const float titleNeedH = std::ceil (noticeOverlay.layoutOf (title, juce::Font (juce::FontOptions (17.0f).withStyle ("Bold")),
                                                                         juce::Colour (0xff5cb8ff), inner - NO::kCloseRoom).getHeight());
-            const float fixed = (float) (2 * NO::kPadY + NO::kGap + (withMore ? NO::kMoreH : 0));
+            const float fixed = (float) (2 * NO::kPadY + NO::kGap + (withMore ? NO::kMoreH : 0)
+                                                               + (withAction ? NO::kActionH : 0));
             const auto area = getLocalBounds().withSizeKeepingCentre (w, maxH);
             if (title.isNotEmpty())
             {
@@ -5364,7 +5636,8 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
         };
         // The title the TITLE layout measures is the overlay's current one, so the worst
         // body below is asked with its own title put there for the length of the call.
-        noticeText ("noticeOverlay", noticeOverlay.title, noticeOverlay.body, noticeOverlay.moreText.isNotEmpty());
+        noticeText ("noticeOverlay", noticeOverlay.title, noticeOverlay.body, noticeOverlay.moreText.isNotEmpty(),
+                    noticeOverlay.actionText.isNotEmpty());
         // THE NOTICE THE RIG CANNOT STAGE. "Fewer degrees than requested" only appears
         // after a dissonance search returns short, which a scenario cannot arrange
         // without running the search itself - so the longest sentence in the plugin has
@@ -5375,7 +5648,26 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
             const auto keepTitle = noticeOverlay.title;
             auto& mutableTitle = const_cast<juce::String&> (noticeOverlay.title);
             mutableTitle = tr ("Fewer degrees than requested", "Menys graus dels demanats");
-            noticeText ("noticeOverlay/worst", mutableTitle, fewerDegreesBody (24, 23), true);
+            noticeText ("noticeOverlay/worst", mutableTitle, fewerDegreesBody (24, 23), true, false);
+            // ...and THE FREEZE WARNING at its longest: every paragraph on (overruns, the
+            // oscillator count, an interface stall, the "back under 50%" line) with numbers
+            // wider than any it can print, behind a queue and with its action row.
+            fibload::Policy worst;
+            worst.nowEma = worst.worstPeak = 99.99f;
+            worst.worstStallMs = 99999.0f;
+            worst.overruns = 9999999;
+            worst.oscillators = 9999999;
+            worst.mixOscillators = 9999999;
+            worst.worstEma = 99.99f;
+            worst.sawStall = true;
+            mutableTitle = tr ("Close to freezing", "A punt de bloquejar-se");
+            worst.showing = true;
+            noticeText ("noticeOverlay/worstLoad", mutableTitle, loadNoticeBody (worst), true, true);
+            worst.showing = false;
+            worst.endedWithoutAudio = false;
+            noticeText ("noticeOverlay/worstLoadEnded", mutableTitle, loadNoticeBody (worst), true, true);
+            worst.endedWithoutAudio = true;
+            noticeText ("noticeOverlay/worstLoadStopped", mutableTitle, loadNoticeBody (worst), true, true);
             mutableTitle = keepTitle;
         }
     }
@@ -7101,8 +7393,9 @@ void FractalAdditiveAudioProcessorEditor::raiseNotice (std::function<void()> ren
         if (key.isNotEmpty() && key == noticeKey)
         {
             noticeRender = std::move (render);
+            clearNoticeAction();
             if (noticeRender) noticeRender();
-            layoutNotice();
+            layoutNotice (true);    // rewritten in place: its X and its button stay where they were
             noticeOverlay.repaint();
             return;
         }
@@ -7115,6 +7408,7 @@ void FractalAdditiveAudioProcessorEditor::raiseNotice (std::function<void()> ren
     }
     noticeKey    = key;
     noticeRender = std::move (render);
+    clearNoticeAction();
     if (noticeRender) noticeRender();
     noticeOverlay.setVisible (true);
     noticeOverlay.toFront (false);
@@ -7154,7 +7448,7 @@ void FractalAdditiveAudioProcessorEditor::withdrawNotice (const juce::String& ke
     }
 }
 
-void FractalAdditiveAudioProcessorEditor::layoutNotice()
+void FractalAdditiveAudioProcessorEditor::layoutNotice (bool keepTop)
 {
     // The X had no hover at all - found the first time a rig scenario (57) ever put a notice
     // in front of the tooltip gate. Written here so it follows a language switch with the text.
@@ -7169,7 +7463,21 @@ void FractalAdditiveAudioProcessorEditor::layoutNotice()
                                " avisos m\xc3\xa9s esperen darrere d'aquest - tanca'l per llegir el seg\xc3\xbc" "ent.");
     const int w = juce::jmin (560, juce::jmax (200, getWidth() - 20));
     const int h = juce::jmin (noticeOverlay.heightFor (w), juce::jmax (120, getHeight() - 20));
-    noticeOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (w, juce::jmax (120, h)));
+    auto r = getLocalBounds().withSizeKeepingCentre (w, juce::jmax (120, h));
+    // THE SAME NOTICE REWRITTEN IN PLACE (the freeze warning, twice a second) keeps its top
+    // edge and never shrinks. Re-centred, every change of line count moved the X and the
+    // "Don't show this again" button by half of it - out from under a pointer on its way to
+    // them. Growing still moves the button down, which a new paragraph has to; shrinking and
+    // re-centring do not happen at all until the next ordinary layout.
+    if (keepTop && noticeOverlay.isVisible() && noticeOverlay.getWidth() == w)
+    {
+        const int maxH = juce::jmax (120, getHeight() - 20);
+        const int hh   = juce::jmin (maxH, juce::jmax (r.getHeight(), noticeOverlay.getHeight()));
+        const int top  = juce::jlimit (0, juce::jmax (0, getHeight() - hh), noticeOverlay.getY());
+        r = { r.getX(), top, w, hh };
+    }
+    noticeOverlay.setBounds (r);
+    noticeOverlay.resized();   // the action button follows the text even when the size did not change
 }
 
 // THE PROCESSOR'S REALTIME REFUSALS, IN THE WINDOW'S LANGUAGE.
@@ -12626,11 +12934,12 @@ void FractalAdditiveAudioProcessorEditor::mouseDown (const juce::MouseEvent& e)
     grabKeyboardFocus();
 }
 
-// After switching to another plugin window (or app) and back, nothing in our
-// hierarchy holds keyboard focus, so the computer keyboard can't play (and with no
-// driving note the Spectrum-to-Rhythm pulses stop too). Reclaim focus when the host
-// re-activates our window OR the mouse re-enters the plugin - unless the user is in a
-// text field, whose typing must not be hijacked.
+// IN THE STANDALONE: after switching to another app and back, nothing in our hierarchy
+// holds keyboard focus, so the letter keyboard can't play (and with no driving note the
+// Spectrum-to-Rhythm pulses stop too). Reclaim focus when the window is re-activated OR
+// the mouse re-enters it - unless the user is in a text field, whose typing must not be
+// hijacked. IN A PLUGIN this does nothing (focusFollowsPointer): the letters belong to the
+// host there, and taking the focus on a hover took them away from Live.
 void FractalAdditiveAudioProcessorEditor::reclaimFocusUnlessTyping()
 {
     if (! focusReclaimState().wouldGrab) return;   // see refocus() for what each test is for
@@ -12661,12 +12970,25 @@ bool FractalAdditiveAudioProcessorEditor::keyPressed (const juce::KeyPress& key)
     // Left/right arrows scroll the colour keyboard's visible window by one period.
     if (key == juce::KeyPress::leftKey)  { keyboard.scrollView (-period); return true; }
     if (key == juce::KeyPress::rightKey) { keyboard.scrollView ( period); return true; }
+    // IN A PLUGIN THE LETTERS ARE THE HOST'S - ALL OF THEM, Z AND X INCLUDED.
+    //
+    // "no se puede tocar con el teclado cuando la ventana del sinte esta abierta en
+    // ableton". keyStateChanged already let them go in a plugin, but THIS function kept
+    // returning true for every mapped letter and for Z/X, and on Windows one "used" answer
+    // from either is enough for JUCE to take the key message away from the host
+    // (offerKeyMessageToJUCEWindow replaces it with WM_USER). So with this window focused
+    // Live's computer keyboard lost A-K and its own octave keys, while our mapping - off in
+    // a plugin, see playKeysLive - played nothing in their place. Z/X only move OUR
+    // mapping's base note, which a plugin never plays, so they go to Live as well.
+    if (processorRef.wrapperType != juce::AudioProcessor::wrapperType_Standalone)
+        return false;
     if (c == 'z' || c == 'Z') { baseKey = juce::jlimit (0, 112, baseKey - period); return true; }
     if (c == 'x' || c == 'X') { baseKey = juce::jlimit (0, 112, baseKey + period); return true; }
-    // SWALLOW every mapped play key: if it escapes to the host, the DAW's own
-    // computer-MIDI-keyboard (Live: A S D = C D E, diatonic) fires TOO and its
-    // note lands a unison / minor second from ours (our A S D = degrees 0 1 2,
-    // chromatic) - the reported "ghost second note". Never let them through.
+    // In the STANDALONE, swallow every mapped play key: there is no host to give them to,
+    // and this is where the QWERTY mapping plays. (The swallow used to be argued against a
+    // host's keyboard - Live's A S D landing a unison / second from ours, the "ghost second
+    // note" - and that is exactly what the plugin return above now answers by not playing
+    // ours at all there.)
     const auto lc = (juce::juce_wchar) juce::CharacterFunctions::toLowerCase (c);
     for (const auto& m : kKeyMap)
         if (m.ch == (int) lc) return true;
@@ -12814,6 +13136,19 @@ void FractalAdditiveAudioProcessorEditor::pollComputerKeyboard()
 
 void FractalAdditiveAudioProcessorEditor::timerCallback()
 {
+    // This window's own share of the interface thread, for the load watch (a tick that held
+    // it is a freeze of this window and of the host's screen with it).
+    struct StallScope
+    {
+        FractalAdditiveAudioProcessor& p;
+        double t0;
+        ~StallScope() { p.noteMessageStallMs (juce::Time::getMillisecondCounterHiRes() - t0); }
+    } stallScope { processorRef, juce::Time::getMillisecondCounterHiRes() };
+    {
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        refreshLoadWarning (lastLoadTickMs > 0.0 ? (now - lastLoadTickMs) / 1000.0 : 0.0);
+        lastLoadTickMs = now;
+    }
     pollComputerKeyboard(); // safety net for missed KEYUPs / ghost keys / focus loss
 
     // The envelope curve follows its parameters live (automation, a modulator

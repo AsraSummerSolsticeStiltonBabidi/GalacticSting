@@ -344,11 +344,19 @@ namespace spectrum
         // REJECTED: a -1 sentinel inside renderedCount. The verifier reads
         // getRenderedCount() as a plain count in two places, and a negative would have to
         // be understood at both, off screen, by whoever edits them next.
-        void reportRendered (int n) const noexcept
+        // `samples`: the length of the chunk those `n` oscillators ran for. Summed across every
+        // voice and chunk into oscillator-SAMPLES, so the processor can divide by the block
+        // length and get how many oscillators were really running - the load's first cause
+        // (see dsp/LoadMonitor.h). A per-chunk COUNT of calls would not do: a voice renders a
+        // block in several chunks.
+        void reportRendered (int n, int samples = 0) const noexcept
         {
             renderedCount.store (n, std::memory_order_relaxed);
             everRendered.store (true, std::memory_order_relaxed);
+            if (samples > 0 && n > 0)
+                oscSamples.fetch_add ((long long) n * samples, std::memory_order_relaxed);
         }
+        long long takeOscillatorSamples() const noexcept { return oscSamples.exchange (0, std::memory_order_relaxed); }
         int  getRenderedCount() const noexcept     { return renderedCount.load (std::memory_order_relaxed); }
         bool hasEverRendered()  const noexcept     { return everRendered.load (std::memory_order_relaxed); }
 
@@ -665,6 +673,7 @@ namespace spectrum
         std::atomic<bool> abortBuild { false };
         mutable std::atomic<int> renderedCount { 0 };
         mutable std::atomic<bool> everRendered { false }; // see reportRendered: 0 is not a diagnosis
+        mutable std::atomic<long long> oscSamples { 0 };  // see reportRendered
 
         mutable std::mutex requestMutex;
         std::mutex        buildMutex;

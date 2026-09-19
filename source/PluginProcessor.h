@@ -11,6 +11,7 @@
 
 #include "dsp/AdditiveVoice.h"
 #include "dsp/Dissonance.h"
+#include "dsp/LoadMonitor.h"
 #include "dsp/LookaheadDelay.h"
 #include "dsp/ModEngine.h"
 #include "dsp/MonoGlide.h"
@@ -78,6 +79,30 @@ public:
     //==========================================================================
     // For the editor's partial/CPU meter.
     int  getPartialCount() const noexcept { return spectrumEngine.getRenderedCount(); }
+
+    //==========================================================================
+    // THE LOAD WATCH (see dsp/LoadMonitor.h). processBlock feeds it every block; this
+    // plugin's own timers feed it how long they held the interface thread; the editor takes
+    // a snapshot each tick and decides whether to warn. Nothing is ever reduced by it.
+    fibload::Monitor::Snapshot takeLoadSnapshot() noexcept { return loadMonitor.take(); }
+    void noteMessageStallMs (double ms) noexcept { loadMonitor.noteStallMs (ms); }
+    // TESTS: synthetic blocks through the SAME audio-side code, so the warning's verdicts
+    // can be checked without depending on how fast this machine is.
+    void feedLoadForTests (double ratio, double blockSeconds, int blocks, int oscillators = 0, int mix = 0) noexcept
+    {
+        for (int i = 0; i < blocks; ++i) loadMonitor.noteBlock (ratio * blockSeconds, blockSeconds);
+        if (oscillators > 0) loadMonitor.noteOscillators (oscillators, mix);
+    }
+    // THE OPTION: "Warn when close to a freeze", ON unless the user turned it off. Stored in
+    // the global settings file, re-read from disk every time (other instances write it too).
+    bool getWarnNearFreeze();
+    void setWarnNearFreeze (bool on);
+    // TESTS ONLY: every processor built after this reads and writes THIS settings file, not
+    // the user's %APPDATA%\GalacticSting\GalacticSting.settings - a verifier that turned the
+    // warning off, or added its temp scales to "recent", would be doing it to the user.
+    // An empty File restores the real one.
+    static void setSettingsFileForTests (const juce::File& f);
+    juce::File settingsFileInUseForTests() const { return appProps != nullptr ? appProps->getFile() : juce::File(); }
     // ...and whether that count is an ANSWER or still its initial value - see
     // SpectrumEngine::reportRendered. The meter must not print "0 partials audible" as a
     // diagnosis when the honest statement is "nothing has been played yet".
@@ -433,12 +458,8 @@ public:
     void setKeyboardNoteNames (bool on)
     {
         keyboardNoteNames = on;
-        if (appProps != nullptr)
-        {
-            appProps->setValue ("keyboardNoteNames", on);
-            appProps->saveIfNeeded();   // written NOW: a host that is killed rather than
-        }                               // closed never runs a destructor to flush it
-    }
+        writeSetting ("keyboardNoteNames", on);   // written NOW: a host that is killed rather
+    }                                             // than closed never runs a destructor to flush it
 
     //==========================================================================
     // Timbre -> rhythm MIDI out (see RhythmEngine.h). The editor edits the slots
@@ -1933,6 +1954,12 @@ private:
     // Persistent recent-.scl list + UI preferences (global app settings, shared across
     // instances). See setKeyboardNoteNames for why a preference is not patch state.
     std::unique_ptr<juce::PropertiesFile> appProps;
+    // EVERY SETTINGS WRITE GOES THROUGH HERE: reload, set, save. Every instance of the plugin
+    // (and the standalone) owns its own PropertiesFile over the same file and saves ALL of its
+    // in-memory values; without the reload an older instance's next unrelated write (a
+    // recent scale) would put back a "warn" flag another instance had just turned off.
+    void writeSetting (const juce::String& key, const juce::var& value);
+    fibload::Monitor loadMonitor;   // see the LOAD WATCH block in the public API
     juce::StringArray                     recentSclPaths;
     bool                                  keyboardNoteNames = false; // OFF by default
 

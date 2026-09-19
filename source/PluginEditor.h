@@ -1253,6 +1253,8 @@ public:
         bool mouseHeld = false;   // a press is in progress: a focus change could end it
         bool alreadyOurs = false;
         bool tooSoon = false;     // another attempt inside the debounce window
+        bool hostOwnsKeys = false;// a plugin: the pointer crossing us is no reason to take them
+        bool wouldGrabIfFollowing = false;  // every test but the host one says yes (the Standalone's answer)
         bool wouldGrab = false;
     };
     FocusReclaimProbe focusReclaimProbeForTests() const { return focusReclaimState(); }
@@ -1447,14 +1449,63 @@ public:
     // is tall enough for every line of its title and body at its width.
     // `heightPx` is the overlay's height, `needPx` what its whole text needs at its width.
     struct NoticeProbe { bool visible = false; juce::String title, body; int queued = 0; bool fits = true; juce::String more;
-                         int heightPx = 0, needPx = 0; };
+                         int heightPx = 0, needPx = 0;
+                         // Measured on the PAINTED geometry, not on heightFor (which also sized
+                         // the overlay, so asking it again could never disagree with itself):
+                         bool bodyShown = true;     // the body's own layout fits the rectangle paint clips it to
+                         bool actionClear = true;   // the action button is inside the notice and below the body
+                         juce::Rectangle<int> bounds; };
     NoticeProbe noticeProbeForTests() const
     {
         const int need = noticeOverlay.heightFor (noticeOverlay.getWidth());
-        return { noticeOverlay.isVisible(), noticeOverlay.title, noticeOverlay.body, (int) noticeQueue.size(),
-                 ! noticeOverlay.isVisible() || noticeOverlay.getHeight() >= need,
-                 noticeOverlay.moreText, noticeOverlay.getHeight(), need };
+        NoticeProbe p { noticeOverlay.isVisible(), noticeOverlay.title, noticeOverlay.body, (int) noticeQueue.size(),
+                        ! noticeOverlay.isVisible() || noticeOverlay.getHeight() >= need,
+                        noticeOverlay.moreText, noticeOverlay.getHeight(), need };
+        p.bounds = noticeOverlay.getBounds();
+        if (noticeOverlay.isVisible())
+        {
+            const auto body = noticeOverlay.bodyArea();
+            p.bodyShown = noticeOverlay.bodyLayout (body.getWidth()).getHeight() <= (float) body.getHeight() + 0.5f;
+            const auto& ab = noticeOverlay.actionBtn;
+            p.actionClear = ! ab.isVisible()
+                         || (noticeOverlay.getLocalBounds().contains (ab.getBounds())
+                             && body.getBottom() + (noticeOverlay.moreText.isNotEmpty() ? NoticeOverlay::kMoreH : 0) <= ab.getY());
+        }
+        return p;
     }
+    // TESTS: which notice is up (its key), and its action button's text.
+    juce::String noticeKeyForTests() const { return noticeOverlay.isVisible() ? noticeKey : juce::String(); }
+    juce::String noticeActionForTests() const
+    { return noticeOverlay.isVisible() && noticeOverlay.actionBtn.isVisible() ? noticeOverlay.actionBtn.getButtonText() : juce::String(); }
+    void clickNoticeActionForTests() { noticeOverlay.actionBtn.onClick(); }
+    // TESTS: the hover / host-activation focus reclaim, called the way mouseEnter calls it.
+    void reclaimFocusForTests() { reclaimFocusUnlessTyping(); }
+    // TESTS: a mouse press/release in this window just happened (GestureWatch), or none ever did.
+    void noteGestureForTests()   { lastGestureMs = juce::Time::getMillisecondCounter(); }
+    void forgetGestureForTests() { lastGestureMs = juce::Time::getMillisecondCounter() - 10 * kGestureMs; }
+    bool gestureRecentForTests() const { return juce::Time::getMillisecondCounter() - lastGestureMs < kGestureMs; }
+    bool openFocusGrabQueuedForTests() const { return openFocusGrabQueued; }
+    // TESTS: the main Menu's items as built for a click (label + ticked), and the freeze item's toggle.
+    juce::StringArray mainMenuItemsForTests()
+    {
+        juce::StringArray out;
+        auto m = buildMainMenu();
+        for (juce::PopupMenu::MenuItemIterator it (m); it.next();)
+            out.add (juce::String (it.getItem().itemID) + (it.getItem().isTicked ? " [x] " : " [ ] ") + it.getItem().text);
+        return out;
+    }
+    void toggleWarnNearFreezeForTests() { toggleWarnNearFreeze(); }
+    // TESTS: the choice a click on item r makes, through the same function the menu calls.
+    // NEVER 5 from a test: it opens the preset folder in Explorer.
+    void mainMenuChoiceForTests (int r) { jassert (r != 5); if (r != 5) handleMainMenuChoice (r); }
+    // TESTS: one step of the load watch with an EXACT elapsed time (the timer hands it the
+    // wall clock), and what the episode has seen.
+    void refreshLoadWarningForTests (double dtSeconds) { refreshLoadWarning (dtSeconds); }
+    // THE SNAPSHOT RIG: after staging the warning, stop the watch, so the rig's own slow ticks
+    // (a busy machine photographing 150 views) cannot start a real episode and change - or,
+    // with the option off, withdraw - the notice between the English and Catalan pictures.
+    void holdLoadWatchForSnapshot() { loadWatchHeld = true; }
+    const fibload::Policy& loadPolicyForTests() const { return loadPolicy; }
     // TESTS: a RESET - hides the notice and forgets anything queued behind it, so a check
     // starts from a clean overlay. NOT what the X does: see clickNoticeCloseForTests.
     void dismissNoticeForTests() { noticeQueue.clear(); noticeKey.clear(); noticeOverlay.setVisible (false); }
@@ -2842,13 +2893,26 @@ private:
         juce::String moreText;             // "1 more notice waits..." - empty when none wait
         juce::TextButton closeBtn { "X" };
         std::function<void()> onClosed;    // the editor shows the next queued notice
-        static constexpr int kPadX = 22, kPadY = 14, kMinTitleH = 24, kGap = 6, kMoreH = 20, kCloseRoom = 30;
+        // ONE OPTIONAL ACTION per notice (the load warning's "Don't show this again"). The
+        // render lambda sets both, and a new notice starts with neither (raiseNotice clears
+        // them), so a button can never be left over from the notice before.
+        juce::TextButton actionBtn;
+        juce::String actionText;
+        std::function<void()> onAction;
+        static constexpr int kPadX = 22, kPadY = 14, kMinTitleH = 24, kGap = 6, kMoreH = 20, kCloseRoom = 30,
+                             kActionH = 32;
         NoticeOverlay()
         {
             closeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
             closeBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
             closeBtn.onClick = [this] { setVisible (false); if (onClosed) onClosed(); };
             addAndMakeVisible (closeBtn);
+            actionBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2d6da8));
+            actionBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+            // A COPY is called: the action may close this notice, and the next one's
+            // raiseNotice clears onAction - replacing a std::function while it runs.
+            actionBtn.onClick = [this] { auto f = onAction; if (f) f(); };
+            addChildComponent (actionBtn);
         }
         juce::TextLayout layoutOf (const juce::String& text, juce::Font font, juce::Colour colour, int width) const
         {
@@ -2868,9 +2932,28 @@ private:
             const int inner = width - 2 * kPadX;
             return kPadY + juce::jmax (kMinTitleH, (int) std::ceil (titleLayout (inner).getHeight())) + kGap
                  + (int) std::ceil (bodyLayout (inner).getHeight())
-                 + (moreText.isNotEmpty() ? kMoreH : 0) + kPadY;
+                 + (moreText.isNotEmpty() ? kMoreH : 0)
+                 + (actionText.isNotEmpty() ? kActionH : 0) + kPadY;
         }
-        void resized() override { closeBtn.setBounds (getWidth() - 28, 6, 22, 22); }
+        // WHERE THE BODY IS PAINTED - one function for paint and for the check that asks
+        // whether the body fits it (noticeProbeForTests), so the two cannot disagree.
+        juce::Rectangle<int> bodyArea() const
+        {
+            auto in = getLocalBounds().reduced (kPadX, kPadY);
+            in.removeFromTop (juce::jmax (kMinTitleH, (int) std::ceil (titleLayout (in.getWidth()).getHeight())));
+            in.removeFromTop (kGap);
+            if (actionText.isNotEmpty()) in.removeFromBottom (kActionH);   // the action button's own row
+            if (moreText.isNotEmpty())   in.removeFromBottom (kMoreH);     // the "N more" line
+            return in;
+        }
+        void resized() override
+        {
+            closeBtn.setBounds (getWidth() - 28, 6, 22, 22);
+            actionBtn.setButtonText (actionText);
+            actionBtn.setVisible (actionText.isNotEmpty());
+            const int w = juce::jmin (getWidth() - 2 * kPadX, fgfit::snugTextButtonWidth (actionBtn, 24));
+            actionBtn.setBounds (kPadX, getHeight() - kPadY - 26, juce::jmax (40, w), 24);
+        }
         void paint (juce::Graphics& g) override
         {
             auto r = getLocalBounds().toFloat();
@@ -2878,16 +2961,17 @@ private:
             g.fillRoundedRectangle (r, 10.0f);
             g.setColour (juce::Colour (0xff5cb8ff));
             g.drawRoundedRectangle (r.reduced (1.5f), 10.0f, 3.0f);
-            auto in = getLocalBounds().reduced (kPadX, kPadY);
-            const auto tl = titleLayout (in.getWidth());
-            auto titleArea = in.removeFromTop (juce::jmax (kMinTitleH, (int) std::ceil (tl.getHeight())));
-            tl.draw (g, titleArea.withWidth (in.getWidth() - kCloseRoom).toFloat());
-            in.removeFromTop (kGap);
+            auto top = getLocalBounds().reduced (kPadX, kPadY);
+            const auto tl = titleLayout (top.getWidth());
+            auto titleArea = top.removeFromTop (juce::jmax (kMinTitleH, (int) std::ceil (tl.getHeight())));
+            tl.draw (g, titleArea.withWidth (top.getWidth() - kCloseRoom).toFloat());
+            const auto in = bodyArea();
             if (moreText.isNotEmpty())
             {
                 g.setColour (juce::Colour (0xffffc95c));
                 g.setFont (juce::Font (juce::FontOptions (12.5f)));
-                g.drawText (moreText, in.removeFromBottom (kMoreH), juce::Justification::bottomLeft, false);
+                g.drawText (moreText, juce::Rectangle<int> (in.getX(), in.getBottom(), in.getWidth(), kMoreH),
+                            juce::Justification::bottomLeft, false);
             }
             // Clipped to its own area: when a window too small for the whole notice caps the
             // overlay (the ONE case heightFor cannot satisfy, and noticeProbeForTests reports it
@@ -6333,10 +6417,10 @@ private:
         // It is a separate DESKTOP window, so opening it moves the keyboard focus out
         // of the editor and the QWERTY-as-MIDI mapping simply stopped: you could not
         // hear the partial you were dragging. These two forward the key events to the
-        // editor's OWN handlers - one mapping, not a second copy that could drift -
-        // and returning true is also what stops a play key escaping to the host, where
-        // the DAW's own computer-MIDI keyboard would fire a second, differently tuned
-        // note (the "ghost note" the editor's keyPressed already guards against).
+        // editor's OWN handlers - one mapping, not a second copy that could drift. In
+        // the STANDALONE that is the letter mapping and Ctrl+Z; in a PLUGIN the editor
+        // uses only Ctrl+Z/Y and the arrows, and every other key goes on to the host
+        // (see the editor's keyPressed: Live's own computer keyboard is how a plugin plays).
         std::function<bool (const juce::KeyPress&)> onKey;
         std::function<bool()>                       onKeyState;
         explicit PartialAmpWindow (const juce::String& name)
@@ -6733,6 +6817,52 @@ private:
     // again while the panel is up, and every notice in this window follows the language
     // for the same reason and by the same line.
     std::function<void()> noticeRender;
+    // THE LOAD WATCH'S WARNING (see dsp/LoadMonitor.h and refreshLoadWarning). One EPISODE
+    // is the time from the load going hot to it cooling again: the notice goes up once per
+    // episode, is refreshed in place while it lasts, and a notice the user closed with X
+    // stays closed until the next one.
+    fibload::Policy loadPolicy;
+    bool loadEpisodeRaised = false;
+    double loadRefreshSeconds = 0.0;   // since the shown numbers were last rewritten (twice a second)
+    double lastLoadTickMs = 0.0;       // wall clock of the previous timer tick, for the Policy's calm
+    void refreshLoadWarning (double dtSeconds);
+    void renderLoadNotice (const fibload::Policy& shown);
+    juce::String loadNoticeBody (const fibload::Policy&) const;
+    bool loadNoticeUp() const;
+    void clearNoticeAction()
+    { noticeOverlay.actionText.clear(); noticeOverlay.onAction = nullptr; noticeOverlay.actionBtn.setTooltip ({}); }
+    void toggleWarnNearFreeze();
+    juce::PopupMenu buildMainMenu();
+    void handleMainMenuChoice (int r);
+    // THE FOCUS FOLLOWS THE POINTER ONLY IN THE STANDALONE. In a host the window is one of
+    // many, and taking the keyboard just because the pointer crossed it took it away from the
+    // host (Live's own computer keyboard among it) - see keyPressed.
+    bool focusFollowsPointer() const
+    { return processorRef.wrapperType == juce::AudioProcessor::wrapperType_Standalone; }
+    // The one place the window asks for the keyboard as it opens (the Standalone only - see
+    // the constructor). A function of its own so a check can see whether it was asked.
+    void queueOpenFocusGrab();
+    bool openFocusGrabQueued = false;
+    // A GESTURE IN THIS WINDOW: the last mouse press or release on the editor or one of its
+    // own floating windows, seen through a global listener (a Button's onClick runs on the
+    // release, a Slider's onDragEnd too). See refocusAllowed.
+    struct GestureWatch : juce::MouseListener
+    {
+        explicit GestureWatch (FractalAdditiveAudioProcessorEditor& e) : ed (e) {}
+        void mouseDown (const juce::MouseEvent& e) override { note (e); }
+        void mouseUp   (const juce::MouseEvent& e) override { note (e); }
+        void note (const juce::MouseEvent& e);
+        FractalAdditiveAudioProcessorEditor& ed;
+    };
+    GestureWatch gestureWatch { *this };
+    juce::uint32 lastGestureMs = 0;
+    static constexpr juce::uint32 kGestureMs = 1500;
+    bool isOurComponent (const juce::Component* c) const;
+    bool refocusAllowed() const;
+    std::unique_ptr<juce::ComponentTraverser> createKeyboardFocusTraverser() override;
+    int  loadShownKinds = 0;          // which kinds of trigger the shown warning spoke of
+    bool loadWatchHeld = false;       // the snapshot rig only (holdLoadWatchForSnapshot)
+    void raiseLoadNotice();
     // NOTICES QUEUE; THEY NEVER OVERWRITE. raiseNotice used to replace whatever was on
     // screen, so two failures parked in the same tick - a project that lost its scale AND
     // a corner - showed only the second, and the first was never seen by anyone. A notice
@@ -6748,7 +6878,7 @@ private:
     // Takes back ONE kind of notice - on screen or queued - and nothing else. The degree
     // search used to hide the overlay outright when it succeeded, whatever it was saying.
     void withdrawNotice (const juce::String& key);
-    void layoutNotice();
+    void layoutNotice (bool keepTop = false);
     // The processor's realtime refusals in the window's language (see the definition).
     juce::String realtimeRefusalText (const juce::String& raw) const;
     RecentOverlay  recentOverlay;   // floating list of every scale file loaded

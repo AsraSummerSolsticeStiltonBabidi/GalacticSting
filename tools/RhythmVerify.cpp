@@ -34,6 +34,27 @@ extern "C" __declspec(dllimport) int   __stdcall QueryThreadCycleTime (void*, un
 #include <vector>
 
 static int failures = 0;
+
+// TAB, as JUCE handles an unused one: start on the first focusable child that is not a text
+// field, then move the focus to the next sibling up to 300 times. 1 = a TextEditor got the
+// focus on the way, 0 = none did, -1 = there was no child to start from.
+static int tabWalkReachesText (juce::Component& root)
+{
+    juce::Component* start = nullptr;
+    for (auto* c : root.getChildren())
+        if (c->getWantsKeyboardFocus() && c->isShowing() && dynamic_cast<juce::TextEditor*> (c) == nullptr)
+        { start = c; break; }
+    if (start == nullptr) return -1;
+    start->grabKeyboardFocus();
+    for (int i = 0; i < 300; ++i)
+        if (auto* f = juce::Component::getCurrentlyFocusedComponent())
+        {
+            if (dynamic_cast<juce::TextEditor*> (f) != nullptr) return 1;
+            f->moveKeyboardFocusToSibling (true);
+        }
+    return 0;
+}
+
 static void check (bool ok, const char* what)
 {
     std::printf ("  [%s] %s\n", ok ? "PASS" : "FAIL", what);
@@ -3055,6 +3076,38 @@ int main (int argc, char** argv)
                                           .getChildFile ("fiblo-verify-tunings-"
                                               + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL));
     FractalAdditiveAudioProcessor::setTuningsFolderForTests (scratchTunings);
+
+    // ...AND THE GLOBAL SETTINGS FILE (%APPDATA%\GalacticSting\GalacticSting.settings): the
+    // user's recent scales, note-name preference, tuning folder and freeze-warning option.
+    // Every instance writes it, the suite included (the note-name checks, the freeze
+    // warning's "Don't show this again"), so it is redirected before the first processor
+    // exists, like the two folders above. The real file's bytes are kept to report on at the end.
+    const juce::File realSettings = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+                                        .getChildFile ("GalacticSting").getChildFile ("GalacticSting.settings");
+    juce::MemoryBlock realSettingsAtStart;
+    const bool realSettingsExisted = realSettings.loadFileAsData (realSettingsAtStart);
+    const juce::File scratchSettings = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                           .getChildFile ("fiblo-verify-settings-"
+                                               + juce::String (juce::Time::getHighResolutionTicks() & 0xffffffLL)
+                                               + ".settings");
+    FractalAdditiveAudioProcessor::setSettingsFileForTests (scratchSettings);
+    {
+        std::printf ("\nthe settings file is a scratch one, and the freeze warning ships ON:\n");
+        auto fresh = std::make_unique<FractalAdditiveAudioProcessor>();
+        check (fresh->settingsFileInUseForTests() == scratchSettings,
+               "  (gate) the first processor already reads and writes the SCRATCH settings file");
+        check (! scratchSettings.existsAsFile(),
+               "  (gate) ...which does not exist yet, so the next answer is the default");
+        check (fresh->getWarnNearFreeze(),
+               "the freeze warning is ON by default: a settings file that never heard of it says yes");
+        // ...and OFF for the rest of the suite, which renders dense spectra back to back as
+        // fast as the CPU goes: its own blocks can be genuinely over budget, and a load
+        // notice arriving in the middle of another block's notice checks would be noise.
+        // The block that tests the warning turns it on for itself.
+        fresh->setWarnNearFreeze (false);
+        check (scratchSettings.existsAsFile() && ! fresh->getWarnNearFreeze(),
+               "  (gate) ...and turning it off is written to the scratch file and read back");
+    }
 
     constexpr double sr = 48000.0;
     constexpr int    blk = 256;
@@ -13852,12 +13905,18 @@ int main (int argc, char** argv)
                              (int) starved.mouseHeld,   (int) starved.wouldGrab,
                              (int) pressed.alreadyOurs, (int) pressed.tooSoon,
                              (int) pressed.mouseHeld,   (int) pressed.wouldGrab);
-                check (starved.wouldGrab,
+                // Asked of wouldGrabIfFollowing: this editor is a PLUGIN, where the reclaim
+                // no longer runs at all (the host owns the keys - see the keyboard block), so
+                // wouldGrab would be false here for that reason alone and the press gate below
+                // would go untested. The Standalone's answer is the one the press gate is for.
+                check (starved.wouldGrabIfFollowing,
                        "with the keyboard elsewhere and no button down, the editor DOES take it "
-                       "back - the reclaim still does its job");
+                       "back where focus follows the pointer - the reclaim still does its job");
+                check (starved.hostOwnsKeys && ! starved.wouldGrab,
+                       "...and in THIS (plugin) build it leaves the keys with the host");
                 check (pressed.mouseHeld,
                        "an injected press really registers as a mouse button being held");
-                check (! pressed.wouldGrab,
+                check (! pressed.wouldGrabIfFollowing,
                        "...and while it is held the editor will NOT take the keyboard focus, "
                        "so nothing can revoke the capture the drag is riding on");
                 inject (b, press); inject (b, {});
@@ -16649,6 +16708,19 @@ int main (int argc, char** argv)
             // that was never written is a corner assignment that silently does nothing,
             // and every voice count below would then be measuring the default patch.
             check (okA && okB, "the two corner presets really were written to disk");
+            // THE FREEZE WARNING'S OSCILLATOR COUNT (dsp/LoadMonitor.h): the same note, first
+            // on the main engine alone, then in MIX, where every corner renders through a
+            // SpectrumEngine of its own and is most of the cost. Measured here because this
+            // is where two real corner engines exist.
+            const auto oscOfOneNote = [&]
+            {
+                p->takeLoadSnapshot();
+                pump (40, on (60));
+                const auto snap = p->takeLoadSnapshot();
+                pump (2, off (60)); pump (40, {});
+                return snap;
+            };
+            const auto oscMainOnly = oscOfOneNote();
             p->assignPlaygroundCorner (0, presetA.name, err);
             p->assignPlaygroundCorner (1, presetB.name, err);
             sp ("pgMode", 1.0f);            // MIX
@@ -16667,6 +16739,21 @@ int main (int argc, char** argv)
             check (monoMix0 == 1 && monoMix1 == 1,
                    "mono glide makes EVERY mix sub-engine mono too - never one engine mono and another not");
             check (backMix0 == 8, "...and switching it off hands the corners their polyphony back");
+            {
+                for (int i = 0; i < 20; ++i) { p->pollParametersForTests(); juce::Thread::sleep (10); }
+                const auto oscMix = oscOfOneNote();
+                std::printf ("  oscillators on one note: main engine alone %d (in MIX corners %d);"
+                             " in MIX with two corners %d (in MIX corners %d)\n",
+                             oscMainOnly.oscillators, oscMainOnly.mixOscillators,
+                             oscMix.oscillators, oscMix.mixOscillators);
+                // Asked of the corners' OWN count, not of a ratio of totals: the main engine's
+                // total here carries release tails from the blocks above, and a 1.5x ratio passed
+                // with the corners not counted at all (454 against 91 - the sabotage said so).
+                check (oscMainOnly.oscillators > 0 && oscMainOnly.mixOscillators == 0
+                       && oscMix.mixOscillators > 0 && oscMix.oscillators > oscMix.mixOscillators,
+                       "the load watch COUNTS the MIX corners' oscillators, apart and in the total"
+                       " (the numbers the freeze warning prints)");
+            }
             sp ("pgMode", 0.0f);
             p->assignPlaygroundCorner (0, {}, err);
             p->assignPlaygroundCorner (1, {}, err);
@@ -18528,56 +18615,6 @@ int main (int argc, char** argv)
             check (gOns == gOffs,
                    "reset() still owes every open pulse gate its note-off - nothing hangs in the receiving track");
         }
-    }
-
-    // --- the audit: what did this suite leave behind, and where? ---------------------
-    {
-        std::printf ("\npreset folders, before and after:\n");
-        // (1) THE SCRATCH FOLDER: the same per-site cleanup audit as before. Every file
-        // still here is a block that saved a preset and did not remove it.
-        const auto leftBehind = presetFolderInventory (scratchPresets);
-        std::printf ("  scratch folder %s: %d preset(s) left behind%s%s\n",
-                     scratchPresets.getFileName().toRawUTF8(), leftBehind.size(),
-                     leftBehind.isEmpty() ? "" : ": ",
-                     leftBehind.joinIntoString (", ").toRawUTF8());
-        check (leftBehind.isEmpty(),
-               "every block that saved a preset cleaned it up again");
-
-        // (2) THE USER'S OWN FOLDER. What is asserted here is a fact about THIS PROCESS,
-        // not about the directory, and the difference matters.
-        //
-        // The tempting assertion - "the user's folder is byte-for-byte the list it was" -
-        // is not this suite's to make: measured on 2026-08-29, two RhythmVerify processes
-        // running at once made it fail BOTH WAYS in consecutive runs of the same binary
-        // (5 -> 7 presets, then 7 -> 5) as the other process's presets appeared and were
-        // cleaned up again. A verdict that flips on what a different program is doing is
-        // the same non-determinism that made every other verdict here untrustworthy, and
-        // it would have blamed this run for someone else's files.
-        //
-        // What this process CAN prove is that it never had the user's folder open. The
-        // redirect is installed before the first processor exists, and every block that
-        // narrows it further restores what it FOUND, so the folder in force at the end
-        // must still be the scratch one. A block that restored to {} instead of to its
-        // predecessor - exactly what run 51's ScratchFolder guard did until it was fixed,
-        // which would have handed twenty overwrites of one name to the user's folder -
-        // lands here as a failure, deterministically, with no other process able to
-        // affect the verdict.
-        check (FractalAdditiveAudioProcessor::getPresetFolder() == scratchPresets,
-               "the preset-folder redirect held for the WHOLE run: no block left the "
-               "user's own folder in force under a later block's saves");
-
-        FractalAdditiveAudioProcessor::setPresetFolderForTests ({});
-        scratchPresets.deleteRecursively();
-        const auto realNow = presetFolderInventory (realPresets);
-        // Still REPORTED as a list, not a count - a run that deleted one patch and added
-        // one of its own would pass a count - but reported, not asserted, and it names
-        // the only thing it can honestly mean.
-        std::printf ("  the user's folder: %d preset(s) before, %d after%s\n",
-                     presetsAtStart.size(), realNow.size(),
-                     realNow == presetsAtStart
-                       ? "  (unchanged)"
-                       : "  <- CHANGED, and not by this run: something else is writing it"
-                         " (a second RhythmVerify? the plugin open in a host?)");
     }
 
     // --- run 52: THE CUSTOM ENGINE'S TEXT BOX DRIVES THE SPECTRUM -------------------
@@ -21073,6 +21110,14 @@ int main (int argc, char** argv)
             // A preset that half-loads sounds exactly like one that loaded.
             {
                 juce::String perr;
+                // Put back what it FOUND on the way out (the run's scratch folder): the audit at
+                // the end of main checks the redirect is still the scratch one, and this block
+                // used to leave its own folder in force for everything after it.
+                struct KeepFolder
+                {
+                    juce::File prev { FractalAdditiveAudioProcessor::getPresetFolder() };
+                    ~KeepFolder() { FractalAdditiveAudioProcessor::setPresetFolderForTests (prev); }
+                } keepFolder;
                 p.setPresetFolderForTests (juce::File::getSpecialLocation (juce::File::tempDirectory)
                                                .getChildFile ("fiblo-notice-presets"));
                 ed->dismissNoticeForTests();
@@ -21817,7 +21862,124 @@ int main (int argc, char** argv)
             check (! ed->playKeysLiveForTests(),
                    "the letter mapping does not ring notes in a plugin - the host's own"
                    " computer keyboard does, and what it plays is recorded");
-            // THE SWALLOW HALF IS NOT ASSERTED HERE, and that is deliberate.
+            // "no se puede tocar con el teclado cuando la ventana del sinte esta abierta en
+            // ableton" (2026-09-19). keyPressed answering TRUE is what takes a key away from
+            // the host on Windows (JUCE's message hook replaces a used key with WM_USER), and
+            // it answered true for every mapped letter and for Z/X even in a plugin. Asked
+            // here with the editor on a peer and holding the keyboard - the state Live was in.
+            {
+                const bool a  = ed->keyPressed (juce::KeyPress ('a', 0, 'a'));
+                const bool k  = ed->keyPressed (juce::KeyPress ('k', 0, 'k'));
+                const bool w  = ed->keyPressed (juce::KeyPress ('w', 0, 'w'));
+                const bool z  = ed->keyPressed (juce::KeyPress ('z', 0, 'z'));
+                const bool x  = ed->keyPressed (juce::KeyPress ('x', 0, 'x'));
+                const bool cz = ed->keyPressed (juce::KeyPress ('z', juce::ModifierKeys::ctrlModifier, 0));
+                std::printf ("  plugin keyPressed used: a %d k %d w %d z %d x %d ctrl+z %d\n",
+                             (int) a, (int) k, (int) w, (int) z, (int) x, (int) cz);
+                check (! a && ! k && ! w,
+                       "IN A PLUGIN the play letters (A, K, W) are NOT used by this window, so"
+                       " they reach Live's own computer keyboard with the window focused");
+                check (! z && ! x,
+                       "...and neither are Z and X - Live's own octave keys - which only moved"
+                       " a base note this window never plays in a plugin");
+                check (cz,
+                       "  (gate) ...while Ctrl+Z IS still used, so \"not used\" above is the"
+                       " plugin gate and not a keyPressed that answers false to everything");
+            }
+            // THE HOVER RECLAIM. Every time the pointer crossed this window it took the
+            // keyboard focus back, away from Live - so even keys this window passes on went
+            // to it rather than to Live. Focus taken away first, then the reclaim that
+            // mouseEnter runs.
+            {
+                juce::Component::unfocusAllComponents();
+                const bool lost = ! ed->editorHasFocusForTests();
+                ed->reclaimFocusForTests();
+                const auto st = ed->focusReclaimProbeForTests();
+                std::printf ("  plugin: focus lost %d, after a hover %d, hostOwnsKeys %d\n",
+                             (int) lost, (int) ed->editorHasFocusForTests(), (int) st.hostOwnsKeys);
+                check (lost, "  (gate) the focus really was elsewhere before the hover");
+                check (! ed->editorHasFocusForTests() && st.hostOwnsKeys && ! st.wouldGrab,
+                       "IN A PLUGIN the pointer crossing the window does NOT take the keyboard"
+                       " from the host");
+                check (! ed->openFocusGrabQueuedForTests(),
+                       "...and opening the window did not ask for it either");
+            }
+            // A PARAMETER THE HOST MOVES (automation, a mapped knob, Live's own Ctrl+Z) runs the
+            // control's onClick / onChange too, and those call refocus(). Mono Glide is a toggle
+            // with an attachment; flipped twice, it ends where it began.
+            {
+                const auto flip = [&p] (const char* id)
+                { auto* q = p.apvts.getParameter (id); q->setValueNotifyingHost (q->getValue() < 0.5f ? 1.0f : 0.0f); };
+                juce::Component::unfocusAllComponents();
+                ed->forgetGestureForTests();
+                flip ("monoGlide"); flip ("monoGlide");
+                check (! ed->editorHasFocusForTests(),
+                       "IN A PLUGIN a parameter the HOST moves does not take the keyboard from Live");
+                ed->noteGestureForTests();
+                flip ("monoGlide"); flip ("monoGlide");
+                check (ed->editorHasFocusForTests(),
+                       "  (gate) ...while right after a click in this window the same change does - the"
+                       " refocus is live, and what gates it is the gesture");
+            }
+            // ...AND "A CLICK IN THIS WINDOW" IS REAL CLICKS: a press and release injected through
+            // JUCE's own routing onto the editor's background count; the same on a window that is
+            // not ours does not.
+            {
+                const auto clickOn = [] (juce::ComponentPeer* peer, juce::Point<float> at)
+                {
+                    auto t = juce::Time::currentTimeMillis();
+                    for (auto mods : { juce::ModifierKeys(), juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier),
+                                       juce::ModifierKeys() })
+                        peer->handleMouseEvent (juce::MouseInputSource::InputSourceType::mouse, at, mods,
+                                                juce::MouseInputSource::defaultPressure,
+                                                juce::MouseInputSource::defaultOrientation, t += 5);
+                };
+                juce::Point<int> bg { -1, -1 };
+                for (int y = ed->getHeight() / 3; y < ed->getHeight() && bg.x < 0; y += 5)
+                    for (int x = 4; x < ed->getWidth() && bg.x < 0; x += 5)
+                        if (ed->getComponentAt (x, y) == ed) bg = { x, y };
+                // OPAQUE, and painted. A non-opaque desktop component is a LAYERED window, and
+                // Windows lets clicks fall through its unpainted pixels - the first version of this
+                // check clicked on nothing, and passed with the gesture filter removed.
+                struct Foreign : juce::Component
+                {
+                    Foreign() { setOpaque (true); }
+                    void paint (juce::Graphics& g) override { g.fillAll (juce::Colours::black); }
+                    void mouseDown (const juce::MouseEvent&) override { ++downs; }
+                    int downs = 0;
+                } foreign;
+                foreign.setBounds (-4000, -3000, 120, 120);
+                foreign.setVisible (true);
+                foreign.addToDesktop (0);
+                bool elsewhere = true, here = false, foreignSawIt = false;
+                if (bg.x >= 0 && ed->getPeer() != nullptr && foreign.getPeer() != nullptr)
+                {
+                    ed->forgetGestureForTests();
+                    clickOn (foreign.getPeer(), { 60.0f, 60.0f });
+                    elsewhere = ed->gestureRecentForTests();
+                    foreignSawIt = foreign.downs > 0;
+                    clickOn (ed->getPeer(), bg.toFloat());
+                    here = ed->gestureRecentForTests();
+                }
+                foreign.removeFromDesktop();
+                std::printf ("  a click on another window counts as a gesture here: %d; on this editor: %d\n",
+                             (int) elsewhere, (int) here);
+                check (bg.x >= 0, "  (gate) the editor has bare background to click on");
+                check (foreignSawIt, "  (gate) the click on the other window really reached a component there");
+                check (! elsewhere && here,
+                       "a real click in THIS window is the gesture refocus follows - and a click in some"
+                       " other window is not");
+            }
+            // TAB, in a host: JUCE moves the focus on an unused Tab, and a text field that gets it
+            // takes every letter after it.
+            {
+                const int walked = tabWalkReachesText (*ed);
+                check (walked >= 0, "  (gate) the walk starts from a focusable child of the editor");
+                check (walked == 0,
+                       "IN A PLUGIN three hundred Tabs never walk the focus into a text field, where"
+                       " Live's note keys would type instead of play");
+            }
+            // WHAT keyStateChanged DOES WITH A HELD KEY IS NOT ASSERTED HERE, deliberately.
             //
             // keyStateChanged only claims an event when a mapped key is PHYSICALLY down,
             // and it learns that from juce::KeyPress::isKeyCurrentlyDown - GetAsyncKeyState
@@ -21826,9 +21988,11 @@ int main (int argc, char** argv)
             // first version of this block asserted it anyway and it passed under sabotage,
             // which is a check that cannot fail dressed as a check that passed.
             //
-            // What protects it instead: the swallow is gated by the SAME one line as
-            // playKeysLive above, three lines apart in the same file, and that line is
-            // asserted. Saying so is worth more than an assertion that cannot go red.
+            // What protects it instead: its plugin gate is the same wrapper test as
+            // playKeysLive's and keyPressed's, and those two ARE asserted above. (keyPressed
+            // is the half that was really broken - it had no plugin gate at all, and this
+            // comment used to claim the swallow was "gated by the SAME one line", which was
+            // only ever true of keyStateChanged.)
 
             // ...AND IT SAYS SO. A window that quietly stopped answering its own documented
             // keys would be the silent failure this project refuses; the line under the
@@ -21884,7 +22048,435 @@ int main (int argc, char** argv)
                    " asked for, and the half I had written off as unverifiable");
             check (sed->keyboardHelpTextForTests (true).contains ("A S D F"),
                    "...and the line under the keys is the letter one there");
+            // The other side of the keyPressed fork: in the standalone the letters ARE this
+            // window's (there is no host to give them to), Z/X move its base note.
+            {
+                const bool a = sed->keyPressed (juce::KeyPress ('a', 0, 'a'));
+                const bool z = sed->keyPressed (juce::KeyPress ('z', 0, 'z'));
+                const bool x = sed->keyPressed (juce::KeyPress ('x', 0, 'x'));   // back where it was
+                check (a && z && x,
+                       "IN THE STANDALONE keyPressed still uses A and Z/X - the fork above is a"
+                       " fork, not a keyPressed that gave up on the letters");
+                juce::Component::unfocusAllComponents();
+                const bool lost = ! sed->editorHasFocusForTests();
+                sed->reclaimFocusForTests();
+                check (lost && sed->editorHasFocusForTests(),
+                       "IN THE STANDALONE the pointer coming back still takes the keyboard back,"
+                       " so the letters play again without a click");
+                check (sed->openFocusGrabQueuedForTests(),
+                       "...and opening the standalone window asks for the keyboard at once");
+                {
+                    auto* q = sp->apvts.getParameter ("monoGlide");
+                    juce::Component::unfocusAllComponents();
+                    sed->forgetGestureForTests();
+                    q->setValueNotifyingHost (q->getValue() < 0.5f ? 1.0f : 0.0f);
+                    q->setValueNotifyingHost (q->getValue() < 0.5f ? 1.0f : 0.0f);
+                    check (sed->editorHasFocusForTests(),
+                           "IN THE STANDALONE a control that changes still hands the keyboard back to the"
+                           " letters, gesture or not");
+                }
+                {
+                    check (tabWalkReachesText (*sed) == 1,
+                           "  (gate) in the standalone the same Tabs DO reach a text field, so the plugin"
+                           " check above walked a real focus chain");
+                    juce::Component::unfocusAllComponents();
+                }
+            }
             if (sed->isOnDesktop()) sed->removeFromDesktop();
+        }
+    }
+
+    //== THE FREEZE WARNING ========================================================
+    //
+    // "es frecuente con ciertos settings llegar a freezes severos ... me gustaria que
+    //  hubiese una opcion en el menu que por default este on que te avise de cuando estas
+    //  cerca de que haya un freeze, y te de opcion a no mostrar de nuevo" (2026-09-19).
+    //
+    // The load is FED here (feedLoadForTests: blocks of a known cost against a known
+    // budget) so every verdict is exact; the last part checks that a REAL render feeds the
+    // same monitor. The elapsed time the Policy counts calm with is handed in exactly too.
+    {
+        std::printf ("\nthe freeze warning (Menu option, ON by default, never limits anything):\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();
+        auto& p = *pp;
+        p.prepareToPlay (48000.0, 256);
+        std::unique_ptr<juce::AudioProcessorEditor> base (p.createEditor());
+        auto* ed = dynamic_cast<FractalAdditiveAudioProcessorEditor*> (base.get());
+        check (ed != nullptr, "the editor builds");
+        if (ed != nullptr)
+        {
+            ed->setSize (1200, 650);
+            constexpr double bs = 256.0 / 48000.0;           // one block's budget, seconds
+            const auto blocksFor = [bs] (double secs) { return (int) std::ceil (secs / bs); };
+            const auto step = [&] (double dt) { ed->refreshLoadWarningForTests (dt); };
+            const auto upKey = [&] { return ed->noticeKeyForTests(); };
+            // ENDING AN EPISODE takes two takes, as it does at 30 Hz: the first take after a
+            // hot moment still carries its TAIL (the smoothed load needs ~0.1 s to fall back
+            // under 70%, an overrun burst ~0.15 s to decay under 2.5), and a take that saw a
+            // trigger restarts the calm. The second take is the 2 s of calm itself.
+            const auto calm = [&]
+            {
+                p.feedLoadForTests (0.10, bs, blocksFor (0.3));
+                step (0.3);
+                p.feedLoadForTests (0.10, bs, blocksFor (2.5));
+                step (2.5);
+            };
+            // A settled, quiet start: whatever the build measured is taken away first.
+            p.takeLoadSnapshot();
+            step (0.0);
+            ed->dismissNoticeForTests();
+
+            // THE MENU ITEM, and it is ON as the settings file says.
+            p.setWarnNearFreeze (true);
+            const auto menuItem = [&]
+            {
+                for (const auto& it : ed->mainMenuItemsForTests())
+                    if (it.startsWith ("6 ")) return it;
+                return juce::String();
+            };
+            std::printf ("  menu item: \"%s\"\n", menuItem().toRawUTF8());
+            check (menuItem().contains ("[x]") && menuItem().containsIgnoreCase ("freez"),
+                   "the Menu has the option, ticked, and it names what it is about");
+
+            // BELOW THE LINE: 65% for three seconds, and one 0.3 s spike at 90%.
+            p.feedLoadForTests (0.65, bs, blocksFor (3.0));
+            step (0.033);
+            check (upKey().isEmpty() && ! ed->loadPolicyForTests().showing,
+                   "65% of the budget held for 3 s is NOT a warning (the line is 70%)");
+            p.feedLoadForTests (0.95, bs, blocksFor (0.3));
+            step (0.033);
+            p.feedLoadForTests (0.20, bs, blocksFor (3.0));
+            step (0.033);
+            check (upKey().isEmpty(),
+                   "...nor is a 0.3 s spike to 95%: it must HOLD for half a second");
+
+            // SUSTAINED: 85% for 1.2 s.
+            p.feedLoadForTests (0.85, bs, blocksFor (1.2), 12345, 9876);
+            step (0.033);
+            auto n = ed->noticeProbeForTests();
+            std::printf ("  after 1.2 s at 85%%: key \"%s\", title \"%s\", action \"%s\"\n",
+                         upKey().toRawUTF8(), n.title.toRawUTF8(), ed->noticeActionForTests().toRawUTF8());
+            check (upKey() == "load" && n.title == "Close to freezing",
+                   "85% held for 1.2 s RAISES the warning (0.44 s for the smoothed load to pass 70%, then half a second there)");
+            check (ed->noticeActionForTests() == "Don't show this again",
+                   "...with its \"Don't show this again\" button on it");
+            check (n.body.contains ("12345") && n.body.contains ("9876 of them in the MIX corners")
+                       && n.body.contains ("HARMONICS") && n.body.contains ("Shepard"),
+                   "...and it says how many oscillators were sounding and WHICH settings cost the most");
+            check (n.body.contains ("Nothing has been limited"),
+                   "...and that nothing was limited (the user asked for no limits, and got none)");
+            check (n.fits && n.bodyShown && n.actionClear,
+                   "...and the whole notice fits WHERE IT IS PAINTED: every line of the body inside the"
+                   " rectangle paint clips it to, and the button inside the notice, below the body");
+
+            // ITS NUMBERS FOLLOW THE EPISODE while it lasts - rewritten twice a second, not
+            // frozen at the moment it went up and not rebuilt on every tick.
+            p.feedLoadForTests (0.88, bs, blocksFor (0.3), 54321);
+            step (0.2);
+            const bool sameAfter02 = ! ed->noticeProbeForTests().body.contains ("54321");
+            step (0.4);
+            const bool newAfter06 = ed->noticeProbeForTests().body.contains ("54321");
+            check (sameAfter02 && newAfter06,
+                   "while the episode lasts the notice's numbers are rewritten (after half a"
+                   " second, not on every tick)");
+            {
+                const auto before = ed->noticeProbeForTests();
+                p.noteMessageStallMs (400.0);      // a new paragraph: the text grows
+                step (0.6);
+                const auto after = ed->noticeProbeForTests();
+                std::printf ("  rewritten in place: top %d -> %d, height %d -> %d\n",
+                             before.bounds.getY(), after.bounds.getY(), before.heightPx, after.heightPx);
+                check (after.body.contains ("interface thread") && after.heightPx > before.heightPx,
+                       "  (gate) the rewrite really added a paragraph and the notice grew");
+                check (after.bounds.getY() == before.bounds.getY() && after.bodyShown && after.actionClear,
+                       "rewritten in place, the notice keeps its TOP EDGE - its X does not jump out from"
+                       " under the pointer twice a second - and it still shows every line");
+            }
+
+            // THE LOAD CALMS DOWN: the notice stays with its final numbers and says so.
+            p.feedLoadForTests (0.20, bs, blocksFor (0.3));
+            step (0.3);                                   // the hot moment's tail (see calm)
+            p.feedLoadForTests (0.20, bs, blocksFor (1.0));
+            step (1.0);
+            check (ed->loadPolicyForTests().showing,
+                   "  (gate) one calm second is not yet the end of the episode");
+            p.feedLoadForTests (0.20, bs, blocksFor (1.2));
+            step (1.2);
+            n = ed->noticeProbeForTests();
+            check (! ed->loadPolicyForTests().showing && upKey() == "load"
+                       && n.body.contains ("Nothing has come close for two seconds")
+                       && n.body.startsWith ("At its worst the synth used"),
+                   "after 2 s with nothing close the episode is over, and the notice STAYS, saying so"
+                   " and giving its worst numbers (a warning that vanished could not be read)");
+
+            // X HOLDS FOR THE REST OF THE EPISODE, and the next episode raises it again.
+            ed->clickNoticeCloseForTests();
+            p.feedLoadForTests (0.90, bs, blocksFor (1.2));
+            step (0.033);
+            check (upKey() == "load", "  (gate) a new episode raises it again after the X");
+            ed->clickNoticeCloseForTests();
+            p.feedLoadForTests (0.90, bs, blocksFor (1.0));
+            step (0.6);
+            check (upKey().isEmpty(),
+                   "closed with X, it stays closed while the SAME episode goes on");
+            calm();
+            p.feedLoadForTests (0.90, bs, blocksFor (1.2));
+            step (0.033);
+            check (upKey() == "load", "...and the NEXT episode raises it again");
+            calm();
+            ed->dismissNoticeForTests();
+
+            // A PLATEAU UNDER THE LINE ENDS AN EPISODE. The first version only ended one after
+            // two seconds UNDER 50%, so a load that settled at 60% kept its episode going for
+            // ever - and after one X, every later overload was silent (review, 2026-09-19).
+            p.feedLoadForTests (0.90, bs, blocksFor (1.2));
+            step (0.033);
+            check (upKey() == "load", "  (gate) an overload raises it");
+            ed->clickNoticeCloseForTests();
+            p.feedLoadForTests (0.60, bs, blocksFor (0.5));   // the 90% tail: ~0.33 s to fall under 70%
+            step (0.5);
+            p.feedLoadForTests (0.60, bs, blocksFor (2.5));
+            step (2.5);
+            check (! ed->loadPolicyForTests().showing,
+                   "two seconds at a steady 60% - under the 70% line, with nothing coming close - END"
+                   " the episode");
+            p.feedLoadForTests (0.95, bs, blocksFor (1.2));
+            step (0.033);
+            check (upKey() == "load",
+                   "...so an overload after that plateau is warned about, although the last notice"
+                   " was closed with X");
+            calm();
+            ed->dismissNoticeForTests();
+
+            // ...AND AN EPISODE THAT GETS WORSE AFTER AN X IS SHOWN AGAIN: closed over "the load is
+            // high", it has said nothing about blocks now breaking up.
+            p.feedLoadForTests (0.90, bs, blocksFor (1.2));
+            step (0.033);
+            ed->clickNoticeCloseForTests();
+            p.feedLoadForTests (0.90, bs, blocksFor (0.5));
+            step (0.3);
+            check (upKey().isEmpty(), "  (gate) closed with X, the same kind of trouble keeps it closed");
+            for (int i = 0; i < 3; ++i)
+            {
+                p.feedLoadForTests (1.3, bs, 1);
+                p.feedLoadForTests (0.90, bs, 4);
+            }
+            step (0.033);
+            check (upKey() == "load" && ed->noticeProbeForTests().body.contains ("took longer"),
+                   "...but blocks starting to break up in that same episode bring it back, saying so");
+            calm();
+            ed->dismissNoticeForTests();
+
+            // A HOST'S SPLIT OF ONE PERIOD IS NOT A CLICK. A 4-sample remainder pays every per-call
+            // cost against a budget of four samples; it is judged together with what follows it.
+            for (int i = 0; i < 3; ++i)
+            {
+                p.feedLoadForTests (3.0, 4.0 / 48000.0, 1);
+                p.feedLoadForTests (0.30, bs, 1);
+            }
+            step (0.033);
+            check (upKey().isEmpty() && ! ed->loadPolicyForTests().showing,
+                   "three 4-sample calls at 300% of their own tiny budget, each inside an ordinary"
+                   " period, are NOT three clicks");
+            calm();
+
+            // OVERRUNS: one block over budget is one click, not a warning; a burst is.
+            p.feedLoadForTests (1.3, bs, 1);
+            calm();
+            check (upKey().isEmpty(), "ONE block over its budget is not a warning");
+            for (int i = 0; i < 3; ++i)
+            {
+                p.feedLoadForTests (1.3, bs, 1);
+                p.feedLoadForTests (0.10, bs, 4);
+            }
+            step (0.033);
+            n = ed->noticeProbeForTests();
+            std::printf ("  after three overruns in %.0f ms: key \"%s\"\n", 1000.0 * 15 * bs, upKey().toRawUTF8());
+            check (upKey() == "load" && n.body.contains ("3 blocks took longer"),
+                   "THREE blocks over budget close together raise it, and it counts them");
+            calm();
+            ed->dismissNoticeForTests();
+
+            // THE INTERFACE THREAD: 200 ms is allowed, 400 ms is a freeze.
+            p.noteMessageStallMs (200.0);
+            step (0.033);
+            check (upKey().isEmpty(), "a 200 ms step on the interface thread is not a warning");
+            p.noteMessageStallMs (400.0);
+            step (0.033);
+            n = ed->noticeProbeForTests();
+            check (upKey() == "load" && n.body.contains ("interface thread") && n.body.contains ("400 ms"),
+                   "a 400 ms step IS, and the notice says which thread and how long");
+            // No audio at all while it lasts (blocks == 0): calm is counted anyway, so a host
+            // that stopped calling the plugin cannot hold the warning up for ever.
+            step (1.0);
+            step (1.1);
+            check (! ed->loadPolicyForTests().showing,
+                   "with no audio blocks arriving, the episode still ends after 2 s");
+            ed->dismissNoticeForTests();
+            // ...AND THE AUDIO STOPPING WHILE THE LOAD IS HIGH: the smoothed load is frozen
+            // at 90% with no block to lower it, and a host that stopped calling the plugin
+            // (transport stopped, track frozen) must not hold the warning up for ever.
+            p.feedLoadForTests (0.90, bs, blocksFor (1.2));
+            step (0.033);
+            check (ed->loadPolicyForTests().showing, "  (gate) an episode at 90% is on");
+            step (1.0);
+            step (1.1);
+            n = ed->noticeProbeForTests();
+            check (! ed->loadPolicyForTests().showing,
+                   "the audio stopping mid-episode ends it after 2 s, whatever the last load was");
+            check (n.body.contains ("The audio stopped reaching the synth") && ! n.body.contains ("Nothing has come close"),
+                   "...and the notice says the AUDIO STOPPED - not that the load came down, which"
+                   " nothing measured");
+            ed->dismissNoticeForTests();
+
+            // IN CATALAN, re-rendered where it stands.
+            p.feedLoadForTests (0.90, bs, blocksFor (1.2));
+            step (0.033);
+            ed->setLanguageForSnapshot (true);
+            n = ed->noticeProbeForTests();
+            check (n.title == juce::String::fromUTF8 ("A punt de bloquejar-se")
+                       && ed->noticeActionForTests() == "No ho tornis a mostrar"
+                       && n.body.contains ("No s'ha limitat res") && ! n.body.contains ("Nothing has been limited")
+                       && n.fits && n.bodyShown && n.actionClear,
+                   "switched to Catalan, the warning and its button re-render in Catalan, and fit");
+            ed->setLanguageForSnapshot (false);
+
+            // BEHIND ANOTHER NOTICE: it queues like every notice, and keeps its button.
+            ed->dismissNoticeForTests();
+            ed->raiseKeyedNoticeForTests ("other", "Another notice");
+            calm();
+            p.feedLoadForTests (0.90, bs, blocksFor (1.2));
+            step (0.033);
+            n = ed->noticeProbeForTests();
+            check (upKey() == "other" && n.queued == 1 && ed->noticeActionForTests().isEmpty(),
+                   "raised behind another notice it WAITS (1 queued), and the other notice has"
+                   " no button it does not own");
+            ed->clickNoticeCloseForTests();
+            check (upKey() == "load" && ed->noticeActionForTests() == "Don't show this again",
+                   "...and closing that one shows the warning, button and all");
+
+            // "DON'T SHOW THIS AGAIN": off, remembered, and read by every other instance.
+            ed->clickNoticeActionForTests();
+            check (upKey().isEmpty() && ! p.getWarnNearFreeze(),
+                   "\"Don't show this again\" closes it and turns the option OFF");
+            {
+                auto other = std::make_unique<Proc>();
+                check (! other->getWarnNearFreeze(),
+                       "...in the settings file, so ANOTHER instance (and the next session) reads it off");
+            }
+            check (menuItem().contains ("[ ]"), "...and the Menu item is unticked");
+            // TWO INSTANCES, ONE FILE (every Fibló open in a Live set shares it). An instance
+            // writing ANOTHER setting must not put back the stale copy it read when it was
+            // built (writeSetting re-reads the file first), and a RUNNING instance must see
+            // the other's change (getWarnNearFreeze re-reads it too).
+            {
+                auto other = std::make_unique<Proc>();       // built while it is OFF
+                p.setWarnNearFreeze (true);                  // this instance turns it ON
+                const bool names = other->getKeyboardNoteNames();
+                other->setKeyboardNoteNames (! names);       // an unrelated write (a CHANGE, so it is saved)
+                auto third = std::make_unique<Proc>();
+                check (third->getWarnNearFreeze(),
+                       "another instance writing an UNRELATED setting does not undo this one's choice");
+                p.setWarnNearFreeze (false);
+                check (! other->getWarnNearFreeze(),
+                       "...and a RUNNING instance reads the other's change, not its own old copy");
+                other->setKeyboardNoteNames (names);
+
+                // ANOTHER INSTANCE'S "Don't show this again" takes this one's last notice down at
+                // its next episode, instead of leaving "nothing has come close" up through it.
+                p.setWarnNearFreeze (true);
+                calm();
+                ed->dismissNoticeForTests();
+                p.feedLoadForTests (0.90, bs, blocksFor (1.2));
+                step (0.033);
+                calm();
+                check (upKey() == "load" && ! ed->loadPolicyForTests().showing,
+                       "  (gate) this instance's final notice is up, its episode over");
+                other->setWarnNearFreeze (false);
+                p.feedLoadForTests (0.95, bs, blocksFor (1.2));
+                step (0.033);
+                check (upKey().isEmpty(),
+                       "another instance turned it OFF: the next episode here takes the old notice down");
+            }
+            calm();
+            p.feedLoadForTests (0.95, bs, blocksFor (1.2));
+            step (0.033);
+            check (upKey().isEmpty() && ed->loadPolicyForTests().showing,
+                   "turned off, an episode is still MEASURED but no warning is shown");
+
+            // THE MENU TURNS IT BACK ON - during that very episode, which is then shown at once -
+            // and off again withdraws a warning that is up.
+            ed->mainMenuChoiceForTests (6);     // what a click on the item does
+            check (p.getWarnNearFreeze() && menuItem().contains ("[x]"),
+                   "the Menu item turns it back ON");
+            check (upKey() == "load",
+                   "...and an episode going on RIGHT NOW is shown at once, not after the next one");
+            calm();
+            ed->dismissNoticeForTests();
+            p.feedLoadForTests (0.95, bs, blocksFor (1.2));
+            step (0.033);
+            check (upKey() == "load", "...and the next episode warns again");
+            ed->mainMenuChoiceForTests (6);
+            check (upKey().isEmpty() && ! p.getWarnNearFreeze(),
+                   "the Menu item turned OFF takes a warning that is up down with it");
+
+            // BOTH TIMERS REPORT HOW LONG THEY HELD THE INTERFACE THREAD (the stall half of the
+            // watch). Any tick takes SOME time, so a stall of exactly zero means nobody measured.
+            {
+                p.takeLoadSnapshot();
+                ed->tickTimerForTests();
+                const float edStall = p.takeLoadSnapshot().stallMs;
+                p.pollParametersForTests();
+                const float procStall = p.takeLoadSnapshot().stallMs;
+                std::printf ("  one editor tick held the interface thread %.3f ms, one processor tick %.3f ms\n",
+                             edStall, procStall);
+                check (edStall > 0.0f && procStall > 0.0f,
+                       "the window's tick AND the processor's tick each report how long they took");
+                ed->dismissNoticeForTests();
+            }
+
+            // A REAL RENDER FEEDS THE SAME MONITOR: blocks, a load and the oscillators.
+            {
+                awaitSpectrumIdle (p, "the freeze warning's real render");
+                p.takeLoadSnapshot();
+                juce::AudioBuffer<float> b (2, 256);
+                juce::MidiBuffer on;
+                // ONE note, so the engine's own count for it (getPartialCount: the last voice
+                // that rendered) is exactly what the watch should report - two notes at
+                // different pitches have different counts under Nyquist (60 and 67: 91 + 61).
+                on.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+                b.clear();
+                p.processBlock (b, on);
+                for (int i = 0; i < 39; ++i) { juce::MidiBuffer m; b.clear(); p.processBlock (b, m); }
+                const auto snap = p.takeLoadSnapshot();
+                std::printf ("  real render: %d blocks, load %.1f%%, peak %.1f%%, %d oscillators\n",
+                             snap.blocks, 100.0 * snap.ema, 100.0 * snap.peak, snap.oscillators);
+                const int perNote = p.getPartialCount();
+                std::printf ("  (the engine renders %d partials for that note)\n", perNote);
+                check (snap.blocks == 40 && snap.peak > 0.0f && snap.peak < 20.0f,
+                       "a real render reports every block and what the worst of them cost - a real"
+                       " fraction of its budget, not ticks or microseconds");
+                check (perNote > 0 && snap.oscillators == perNote,
+                       "...and the oscillators sounding: one note is exactly the engine's own partial"
+                       " count for it (the number the warning prints)");
+                {
+                    p.takeLoadSnapshot();
+                    p.setNonRealtime (true);
+                    for (int i = 0; i < 10; ++i) { juce::MidiBuffer m; b.clear(); p.processBlock (b, m); }
+                    const auto offline = p.takeLoadSnapshot();
+                    p.setNonRealtime (false);
+                    check (offline.blocks == 0 && offline.peak == 0.0f,
+                           "an OFFLINE render (Freeze, Export) is not measured: it has no deadline, and a"
+                           " slow block there is no click");
+                }
+                juce::MidiBuffer off;
+                off.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+                b.clear();
+                p.processBlock (b, off);
+            }
+            p.setWarnNearFreeze (false);   // the rest of the suite runs with it off (see the top)
+            ed->dismissNoticeForTests();
         }
     }
 
@@ -23335,6 +23927,9 @@ int main (int argc, char** argv)
                    "...and the SPECTRUM panel reaches the sound again the moment it does -"
                    " which is the way out a user can actually take");
         }
+        // Its two presets go again (the audit at the end of main counts what is left behind).
+        FractalAdditiveAudioProcessor::presetFile ("zzz-verify-pgdead-A").deleteFile();
+        FractalAdditiveAudioProcessor::presetFile ("zzz-verify-pgdead-B").deleteFile();
     }
 
     //== NO FADER LOSES ITS NUMBER, AND THE TWO BORDERS CANNOT DRIFT ================
@@ -23542,6 +24137,8 @@ int main (int argc, char** argv)
         check (after == before,
                "...and the corner's file on disk is byte-for-byte what it was - the refusal"
                " is a refusal, not a return value with a write behind it");
+        FractalAdditiveAudioProcessor::presetFile ("zzz-Case-Corner").deleteFile();
+        FractalAdditiveAudioProcessor::presetFile ("zzz-Case-Other").deleteFile();
     }
 
     //== EVERY REFUSAL TEMPLATE CAN ACTUALLY FIRE ==================================
@@ -23765,6 +24362,83 @@ int main (int argc, char** argv)
 
     runProcessorAuditChecks();
     runSilentLimitChecks();
+
+    // THE AUDIT IS THE LAST THING MAIN DOES, and it has to be. It used to sit two thirds of
+    // the way down, between run 52(E) and run 52, and it ends by LIFTING the preset-folder and
+    // settings-file redirects - so every block after it (run 52 onwards: runs 65 and 66 load
+    // scales, which writes the recent list; the freeze warning writes its option) ran against
+    // the user's REAL %APPDATA% settings file, while this audit had already reported that
+    // file "byte-identical". Found by the review of 2026-09-19, after the suite had filled the
+    // user's Recent list with 64 temp-folder scales and switched the freeze warning off.
+    // --- the audit: what did this suite leave behind, and where? ---------------------
+    {
+        std::printf ("\npreset folders, before and after:\n");
+        // (1) THE SCRATCH FOLDER: the same per-site cleanup audit as before. Every file
+        // still here is a block that saved a preset and did not remove it.
+        const auto leftBehind = presetFolderInventory (scratchPresets);
+        std::printf ("  scratch folder %s: %d preset(s) left behind%s%s\n",
+                     scratchPresets.getFileName().toRawUTF8(), leftBehind.size(),
+                     leftBehind.isEmpty() ? "" : ": ",
+                     leftBehind.joinIntoString (", ").toRawUTF8());
+        check (leftBehind.isEmpty(),
+               "every block that saved a preset cleaned it up again");
+
+        // (2) THE USER'S OWN FOLDER. What is asserted here is a fact about THIS PROCESS,
+        // not about the directory, and the difference matters.
+        //
+        // The tempting assertion - "the user's folder is byte-for-byte the list it was" -
+        // is not this suite's to make: measured on 2026-08-29, two RhythmVerify processes
+        // running at once made it fail BOTH WAYS in consecutive runs of the same binary
+        // (5 -> 7 presets, then 7 -> 5) as the other process's presets appeared and were
+        // cleaned up again. A verdict that flips on what a different program is doing is
+        // the same non-determinism that made every other verdict here untrustworthy, and
+        // it would have blamed this run for someone else's files.
+        //
+        // What this process CAN prove is that it never had the user's folder open. The
+        // redirect is installed before the first processor exists, and every block that
+        // narrows it further restores what it FOUND, so the folder in force at the end
+        // must still be the scratch one. A block that restored to {} instead of to its
+        // predecessor - exactly what run 51's ScratchFolder guard did until it was fixed,
+        // which would have handed twenty overwrites of one name to the user's folder -
+        // lands here as a failure, deterministically, with no other process able to
+        // affect the verdict.
+        check (FractalAdditiveAudioProcessor::getPresetFolder() == scratchPresets,
+               "the preset-folder redirect held for the WHOLE run: no block left the "
+               "user's own folder in force under a later block's saves");
+
+        // The redirects are NOT lifted. Nothing after this line needs the user's folders, and
+        // a redirect that is never lifted cannot be lifted too early: this audit once sat in
+        // the middle of main, and everything after it ran against the user's real files.
+        scratchPresets.deleteRecursively();
+        // THE SETTINGS FILE, the same way: what this process can prove is that its redirect
+        // held to the end; the user's own file is REPORTED (the plugin open in Live writes it
+        // too, and that is not this run's doing).
+        {
+            auto last = std::make_unique<FractalAdditiveAudioProcessor>();
+            check (last->settingsFileInUseForTests() == scratchSettings,
+                   "the settings-file redirect held for the WHOLE run: the user's own settings "
+                   "file was never the one in force");
+        }
+        scratchSettings.deleteFile();   // (the redirect stays in force - see above)
+        {
+            juce::MemoryBlock realSettingsNow;
+            const bool existsNow = realSettings.loadFileAsData (realSettingsNow);
+            const bool same = existsNow == realSettingsExisted && realSettingsNow == realSettingsAtStart;
+            std::printf ("  the user's settings file: %s\n",
+                         same ? "byte-identical to the start of the run"
+                              : "CHANGED - and not by this run (its redirect held): the plugin open in a host?");
+        }
+        const auto realNow = presetFolderInventory (realPresets);
+        // Still REPORTED as a list, not a count - a run that deleted one patch and added
+        // one of its own would pass a count - but reported, not asserted, and it names
+        // the only thing it can honestly mean.
+        std::printf ("  the user's folder: %d preset(s) before, %d after%s\n",
+                     presetsAtStart.size(), realNow.size(),
+                     realNow == presetsAtStart
+                       ? "  (unchanged)"
+                       : "  <- CHANGED, and not by this run: something else is writing it"
+                         " (a second RhythmVerify? the plugin open in a host?)");
+    }
 
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASSED" : "FAILURES", failures);
     return failures == 0 ? 0 : 1;

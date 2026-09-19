@@ -1361,7 +1361,7 @@ private:
         // load the machine is carrying and hiding it would be the one dishonest
         // number on the panel.
         fillShepardCopies (sl, span, n, f0, sr);
-        engine.reportRendered (sl.total);
+        engine.reportRendered (sl.total, numSamples);
 
         // LIVE RE-PHASING. Runs AFTER fillShepardCopies because it needs this block's
         // increments (a correction may not push a partial into the Nyquist clamp) and

@@ -16,6 +16,13 @@ namespace
 }
 
 //==============================================================================
+// TESTS ONLY (see setSettingsFileForTests): empty in production, read once per constructor.
+static juce::File& settingsFileOverrideForTests()
+{
+    static juce::File f;
+    return f;
+}
+
 FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     : AudioProcessor (BusesProperties()
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
@@ -49,7 +56,9 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     o.filenameSuffix      = "settings";
     o.folderName          = "GalacticSting";
     o.osxLibrarySubFolder = "Application Support";
-    appProps = std::make_unique<juce::PropertiesFile> (o);
+    appProps = settingsFileOverrideForTests () != juce::File()
+                 ? std::make_unique<juce::PropertiesFile> (settingsFileOverrideForTests(), o)
+                 : std::make_unique<juce::PropertiesFile> (o);
     recentSclPaths.addLines (appProps->getValue ("recentScl"));
     recentSclPaths.removeEmptyStrings();
     // The keyboard's note-name preference, read back BEFORE any editor is built so the
@@ -80,11 +89,32 @@ void FractalAdditiveAudioProcessor::addRecentScl (const juce::File& f)
     recentSclPaths.insert (0, path);
     while (recentSclPaths.size() > 64)   // the Recent window lists them all, newest first
         recentSclPaths.remove (recentSclPaths.size() - 1);
-    if (appProps != nullptr)
-    {
-        appProps->setValue ("recentScl", recentSclPaths.joinIntoString ("\n"));
-        appProps->saveIfNeeded();
-    }
+    writeSetting ("recentScl", recentSclPaths.joinIntoString ("\n"));
+}
+
+void FractalAdditiveAudioProcessor::writeSetting (const juce::String& key, const juce::var& value)
+{
+    if (appProps == nullptr) return;
+    appProps->reload();   // what the other instances wrote since this one last read it
+    appProps->setValue (key, value);
+    appProps->saveIfNeeded();
+}
+
+bool FractalAdditiveAudioProcessor::getWarnNearFreeze()
+{
+    if (appProps == nullptr) return true;
+    appProps->reload();   // another instance's menu, or its "don't show again", may have changed it
+    return appProps->getBoolValue ("warnNearFreeze", true);
+}
+
+void FractalAdditiveAudioProcessor::setWarnNearFreeze (bool on)
+{
+    writeSetting ("warnNearFreeze", on);
+}
+
+void FractalAdditiveAudioProcessor::setSettingsFileForTests (const juce::File& f)
+{
+    settingsFileOverrideForTests() = f;
 }
 
 FractalAdditiveAudioProcessor::~FractalAdditiveAudioProcessor()
@@ -812,6 +842,14 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::settingsFromValues (
 
 void FractalAdditiveAudioProcessor::timerCallback()
 {
+    // How long this tick held the host's interface thread (the realtime-adapt compiles and a
+    // MIX engine growing its voices run in here) - the load watch's second half.
+    struct StallScope
+    {
+        fibload::Monitor& m;
+        double t0;
+        ~StallScope() { m.noteStallMs (juce::Time::getMillisecondCounterHiRes() - t0); }
+    } stallScope { loadMonitor, juce::Time::getMillisecondCounterHiRes() };
     // Catch the moment manual mode is switched on and FREEZE slope there, before
     // currentSettings() below reads it. Everything the user had is preserved: the sound
     // does not move by a single dB at the switch, and from then on the slope fader is
@@ -3632,6 +3670,8 @@ bool FractalAdditiveAudioProcessor::saveCurrentTuningScl (const juce::File& f, j
 //==============================================================================
 void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    // The load watch judges whole periods, never a host's short split of one (LoadMonitor.h).
+    loadMonitor.setJudgeSeconds (sampleRate > 0.0 ? (double) samplesPerBlock / sampleRate : 0.0);
     // Build the phase engine's fader-slope table HERE, on a thread that is allowed to be
     // slow. A live re-phase reads it on the audio thread, and the FIRST read is the one
     // that fills 16384 entries behind an initialisation guard - 16384 std::sin calls and
@@ -3789,6 +3829,46 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                                                   juce::MidiBuffer& midiMessages)
 {
     juce::ScopedNoDenormals noDenormals;
+
+    // THE LOAD WATCH (dsp/LoadMonitor.h): what this whole block cost against what it was
+    // allowed, reported on the way out whatever path the block takes. Two clock reads and a
+    // few relaxed atomics - nothing that could itself be the reason a block is late.
+    struct LoadScope
+    {
+        FractalAdditiveAudioProcessor& p;
+        juce::int64 t0;
+        double blockSeconds;
+        ~LoadScope()
+        {
+            const auto dt = juce::Time::highResolutionTicksToSeconds (juce::Time::getHighResolutionTicks() - t0);
+            // AN OFFLINE RENDER HAS NO DEADLINE. Freeze and Export may take longer than real
+            // time per block and nothing is heard; measured, every such block would be an
+            // "overrun" and the notice would call it a click. The oscillator count is still
+            // taken below, so it cannot pile up into the first realtime block after.
+            if (! p.isNonRealtime())
+                p.loadMonitor.noteBlock (dt, blockSeconds);
+            // How many oscillators ran, on average over the block, across every voice of the
+            // main engine AND of every MIX corner's sub-engine (each has a SpectrumEngine of
+            // its own, and in MIX they are most of the cost): the first thing the warning
+            // names. The corners through mixEngLive, as the audio thread reaches them
+            // everywhere else - an engine is never deleted mid-session.
+            // The corners' share is kept apart as well: "most of them are in MIX" is the most
+            // useful single thing the warning can say about a MIX patch.
+            const long long mainSamples = p.spectrumEngine.takeOscillatorSamples();
+            long long mixSamples = 0;
+            for (auto& pe : p.mixEngLive)
+                if (auto* e = pe.load (std::memory_order_acquire))
+                    mixSamples += e->spectrum.takeOscillatorSamples();
+            if (! p.isNonRealtime() && buffer_samples > 0)
+                p.loadMonitor.noteOscillators ((int) ((mainSamples + mixSamples) / buffer_samples),
+                                               (int) (mixSamples / buffer_samples));
+        }
+        int buffer_samples;
+    } loadScope { *this, juce::Time::getHighResolutionTicks(),
+                  // lastSr, prepareToPlay's own rate: getSampleRate() is whatever the WRAPPER
+                  // last set, and is 0 wherever nothing did (the offline verifier did not).
+                  lastSr > 0.0 ? buffer.getNumSamples() / lastSr : 0.0,
+                  buffer.getNumSamples() };
 
     buffer.clear();
 
@@ -5636,8 +5716,7 @@ void FractalAdditiveAudioProcessor::setTuningChooserFolder (const juce::File& di
 {
     if (appProps == nullptr || ! dir.isDirectory())
         return;
-    appProps->setValue ("tuningFolder", dir.getFullPathName());
-    appProps->saveIfNeeded(); // written NOW: a host that is killed rather than closed
+    writeSetting ("tuningFolder", dir.getFullPathName()); // written NOW: a host that is killed rather than closed
 }                            // never runs a destructor to flush it (see keyboardNoteNames)
 
 juce::StringArray FractalAdditiveAudioProcessor::getPresetNames()

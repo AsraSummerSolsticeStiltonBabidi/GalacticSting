@@ -800,6 +800,30 @@ namespace
                   for (int i = 0; i < 3; ++i) p.pollParametersForTests();
                   e.tickTimerForTests();
               } },
+            // THE FREEZE WARNING AT ITS LONGEST: a load held at 92%, a burst of three blocks
+            // over budget, a 380 ms interface stall - and then the calm that ends the episode,
+            // so the "back under 50%" line is on as well and the picture cannot change under
+            // a later timer tick. Its "Don't show this again" row is on the button sweep.
+            { "58-load-warning", "the freeze warning after a heavy moment: every paragraph and its button",
+              tEditor, fSizes,
+              [] (Proc& p, Ed& e)
+              {
+                  constexpr double bs = 512.0 / 48000.0;
+                  p.setWarnNearFreeze (true);
+                  p.takeLoadSnapshot();
+                  e.refreshLoadWarningForTests (0.0);
+                  e.dismissNoticeForTests();
+                  p.feedLoadForTests (0.92, bs, 200, 23456, 18432);
+                  for (int i = 0; i < 3; ++i) { p.feedLoadForTests (1.4, bs, 1); p.feedLoadForTests (0.9, bs, 2); }
+                  p.noteMessageStallMs (380.0);
+                  e.refreshLoadWarningForTests (0.033);
+                  p.feedLoadForTests (0.2, bs, 30);        // the heavy moment's tail...
+                  e.refreshLoadWarningForTests (0.3);
+                  p.feedLoadForTests (0.2, bs, 300);       // ...then the calm that ends it
+                  e.refreshLoadWarningForTests (3.0);
+                  e.holdLoadWatchForSnapshot();   // the pictures are of THIS notice, in both languages
+                  p.setWarnNearFreeze (false);   // the rest of the walk runs with it off (see walk)
+              } },
         };
         return v;
     }
@@ -1245,6 +1269,18 @@ namespace
         dir.createDirectory();
         gLog = dir.getChildFile ("snapshot-log.txt");
         gLog.deleteFile();
+        // THE SETTINGS FILE IS THE RIG'S OWN. Every processor this walk builds would otherwise
+        // read and WRITE the user's %APPDATA% one (the note-name switch, the freeze warning's
+        // option). Set before the first processor below exists; a fresh file each walk, with
+        // the freeze warning OFF - the rig's own renders and ticks are no load the pictures
+        // should be about. Scenario 58 turns it on for itself.
+        {
+            const auto rigSettings = dir.getChildFile ("rig-settings.settings");
+            rigSettings.deleteFile();
+            Proc::setSettingsFileForTests (rigSettings);
+            auto first = std::make_unique<Proc>();
+            first->setWarnNearFreeze (false);
+        }
         // A RIG THAT DIES MUST SAY WHERE. This walk builds a whole instrument per
         // scenario and paints panels nothing else in this build ever paints; a silent
         // access violation half way through leaves a directory of files that LOOKS
