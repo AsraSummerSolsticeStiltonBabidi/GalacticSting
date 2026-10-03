@@ -1452,6 +1452,7 @@ public:
                          int heightPx = 0, needPx = 0;
                          // Measured on the PAINTED geometry, not on heightFor (which also sized
                          // the overlay, so asking it again could never disagree with itself):
+                         int fullNeedPx = 0;        // what the WHOLE text needs, even while it is folded
                          bool bodyShown = true;     // the body's own layout fits the rectangle paint clips it to
                          bool actionClear = true;   // the action button is inside the notice and below the body
                          juce::Rectangle<int> bounds; };
@@ -1462,6 +1463,7 @@ public:
                         ! noticeOverlay.isVisible() || noticeOverlay.getHeight() >= need,
                         noticeOverlay.moreText, noticeOverlay.getHeight(), need };
         p.bounds = noticeOverlay.getBounds();
+        p.fullNeedPx = noticeOverlay.heightForFull (noticeOverlay.getWidth());
         if (noticeOverlay.isVisible())
         {
             const auto body = noticeOverlay.bodyArea();
@@ -1475,6 +1477,14 @@ public:
     }
     // TESTS: which notice is up (its key), and its action button's text.
     juce::String noticeKeyForTests() const { return noticeOverlay.isVisible() ? noticeKey : juce::String(); }
+    // TESTS: the fold - whether this notice can fold, whether it is folded now, the button's
+    // word, and the text actually on screen (which must be the start of the whole text).
+    bool noticeCanExpandForTests() const { return noticeOverlay.canExpand(); }
+    bool noticeExpandedForTests() const  { return noticeOverlay.expanded; }
+    juce::String noticeExpandTextForTests() const
+    { return noticeOverlay.expandBtn.isVisible() ? noticeOverlay.expandBtn.getButtonText() : juce::String(); }
+    juce::String noticeShownBodyForTests() const { return noticeOverlay.shownBody(); }
+    void clickNoticeExpandForTests() { noticeOverlay.expandBtn.onClick(); }
     juce::String noticeActionForTests() const
     { return noticeOverlay.isVisible() && noticeOverlay.actionBtn.isVisible() ? noticeOverlay.actionBtn.getButtonText() : juce::String(); }
     void clickNoticeActionForTests() { noticeOverlay.actionBtn.onClick(); }
@@ -2893,14 +2903,41 @@ private:
         juce::String moreText;             // "1 more notice waits..." - empty when none wait
         juce::TextButton closeBtn { "X" };
         std::function<void()> onClosed;    // the editor shows the next queued notice
+        std::function<void()> onExpand;    // the editor re-lays the overlay around the new height
         // ONE OPTIONAL ACTION per notice (the load warning's "Don't show this again"). The
         // render lambda sets both, and a new notice starts with neither (raiseNotice clears
         // them), so a button can never be left over from the notice before.
         juce::TextButton actionBtn;
         juce::String actionText;
         std::function<void()> onAction;
+        // A LONG NOTICE OPENS SHORT. "veo que la ventana close to freezing tiene un texto
+        // gigante, haz que todos los textos asi sean desplegables siempre que sea posible"
+        // (2026-10-03). The first paragraph stays on screen and the rest is one click away,
+        // behind a button that SAYS how much more there is - the text is folded, never cut,
+        // and nothing decides for the reader that they did not want it.
+        bool expanded = false;
+        juce::TextButton expandBtn;
         static constexpr int kPadX = 22, kPadY = 14, kMinTitleH = 24, kGap = 6, kMoreH = 20, kCloseRoom = 30,
                              kActionH = 32;
+        // Only a body with a SECOND paragraph folds: a notice that is one paragraph long is
+        // already short enough, and a fold with nothing behind it is a button that lies.
+        int leadEnd() const
+        {
+            const int i = body.indexOf ("\n\n");
+            return i > 0 && body.length() - i > 24 ? i : -1;
+        }
+        bool canExpand() const { return leadEnd() > 0; }
+        bool hasButtonRow() const { return actionText.isNotEmpty() || canExpand(); }
+        juce::String shownBody() const
+        { return canExpand() && ! expanded ? body.substring (0, leadEnd()) : body; }
+        // How much is folded away, in lines of the body's own paragraphs - a number, so the
+        // button is an offer and not a mystery.
+        int foldedParagraphs() const
+        {
+            const int i = leadEnd();
+            if (i <= 0) return 0;
+            return juce::StringArray::fromTokens (body.substring (i + 2), "\n\n", "").size();
+        }
         NoticeOverlay()
         {
             closeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff44445e));
@@ -2913,6 +2950,10 @@ private:
             // raiseNotice clears onAction - replacing a std::function while it runs.
             actionBtn.onClick = [this] { auto f = onAction; if (f) f(); };
             addChildComponent (actionBtn);
+            expandBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3a3a52));
+            expandBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+            expandBtn.onClick = [this] { expanded = ! expanded; if (onExpand) onExpand(); };
+            addChildComponent (expandBtn);
         }
         juce::TextLayout layoutOf (const juce::String& text, juce::Font font, juce::Colour colour, int width) const
         {
@@ -2926,14 +2967,29 @@ private:
         juce::TextLayout titleLayout (int innerW) const
         { return layoutOf (title, juce::Font (juce::FontOptions (17.0f).withStyle ("Bold")), juce::Colour (0xff5cb8ff), innerW - kCloseRoom); }
         juce::TextLayout bodyLayout (int innerW) const
+        { return layoutOf (shownBody(), juce::Font (juce::FontOptions (13.5f)), juce::Colours::white, innerW); }
+        // What the WHOLE text would need, folded or not: the fit sweep asks this so a notice
+        // whose expanded form cannot fit the window is still reported, never discovered by a
+        // reader who opens it.
+        juce::TextLayout fullBodyLayout (int innerW) const
         { return layoutOf (body, juce::Font (juce::FontOptions (13.5f)), juce::Colours::white, innerW); }
+        // What the WHOLE text needs, folded or not (the fit sweep and the checks that ask
+        // whether the box grows to its text use this, so a fold cannot make them pass).
+        int heightForFull (int width) const
+        {
+            const int inner = width - 2 * kPadX;
+            return kPadY + juce::jmax (kMinTitleH, (int) std::ceil (titleLayout (inner).getHeight())) + kGap
+                 + (int) std::ceil (fullBodyLayout (inner).getHeight())
+                 + (moreText.isNotEmpty() ? kMoreH : 0)
+                 + (hasButtonRow() ? kActionH : 0) + kPadY;
+        }
         int heightFor (int width) const
         {
             const int inner = width - 2 * kPadX;
             return kPadY + juce::jmax (kMinTitleH, (int) std::ceil (titleLayout (inner).getHeight())) + kGap
                  + (int) std::ceil (bodyLayout (inner).getHeight())
                  + (moreText.isNotEmpty() ? kMoreH : 0)
-                 + (actionText.isNotEmpty() ? kActionH : 0) + kPadY;
+                 + (hasButtonRow() ? kActionH : 0) + kPadY;
         }
         // WHERE THE BODY IS PAINTED - one function for paint and for the check that asks
         // whether the body fits it (noticeProbeForTests), so the two cannot disagree.
@@ -2942,7 +2998,7 @@ private:
             auto in = getLocalBounds().reduced (kPadX, kPadY);
             in.removeFromTop (juce::jmax (kMinTitleH, (int) std::ceil (titleLayout (in.getWidth()).getHeight())));
             in.removeFromTop (kGap);
-            if (actionText.isNotEmpty()) in.removeFromBottom (kActionH);   // the action button's own row
+            if (hasButtonRow()) in.removeFromBottom (kActionH);            // the buttons' own row
             if (moreText.isNotEmpty())   in.removeFromBottom (kMoreH);     // the "N more" line
             return in;
         }
@@ -2951,8 +3007,15 @@ private:
             closeBtn.setBounds (getWidth() - 28, 6, 22, 22);
             actionBtn.setButtonText (actionText);
             actionBtn.setVisible (actionText.isNotEmpty());
+            const int rowY = getHeight() - kPadY - 26;
             const int w = juce::jmin (getWidth() - 2 * kPadX, fgfit::snugTextButtonWidth (actionBtn, 24));
-            actionBtn.setBounds (kPadX, getHeight() - kPadY - 26, juce::jmax (40, w), 24);
+            actionBtn.setBounds (kPadX, rowY, juce::jmax (40, w), 24);
+            expandBtn.setVisible (canExpand());
+            if (canExpand())
+            {
+                const int ew = juce::jmin (getWidth() - 2 * kPadX, fgfit::snugTextButtonWidth (expandBtn, 24));
+                expandBtn.setBounds (getWidth() - kPadX - juce::jmax (40, ew), rowY, juce::jmax (40, ew), 24);
+            }
         }
         void paint (juce::Graphics& g) override
         {

@@ -5602,6 +5602,8 @@ void FractalAdditiveAudioProcessorEditor::walkTextFits (
             const int inner = w - 2 * NO::kPadX;
             const int maxH  = juce::jmax (120, getHeight() - 20);
             const float titleH = (float) juce::jmax (NO::kMinTitleH, (int) std::ceil (noticeOverlay.titleLayout (inner).getHeight()));
+            // The WHOLE body, even when the notice is folded: a text that could not fit the
+            // window if the reader opened it is still a text that does not fit.
             const float bodyH  = std::ceil (noticeOverlay.layoutOf (body, juce::Font (juce::FontOptions (13.5f)),
                                                                     juce::Colours::white, inner).getHeight());
             const float titleNeedH = std::ceil (noticeOverlay.layoutOf (title, juce::Font (juce::FontOptions (17.0f).withStyle ("Bold")),
@@ -7387,6 +7389,10 @@ void FractalAdditiveAudioProcessorEditor::raiseNotice (std::function<void()> ren
     // still executing (undefined behaviour; found by the night's review).
     if (! noticeOverlay.onClosed)
         noticeOverlay.onClosed = [this] { showNextNotice(); };
+    // Unfolding changes the height: the overlay keeps its top edge (so the buttons under the
+    // pointer do not jump) and re-lays itself around the text it now shows.
+    if (! noticeOverlay.onExpand)
+        noticeOverlay.onExpand = [this] { layoutNotice (true); noticeOverlay.repaint(); };
     if (noticeOverlay.isVisible())
     {
         // The same live condition again: refresh it where it is, never stack a copy.
@@ -7408,6 +7414,7 @@ void FractalAdditiveAudioProcessorEditor::raiseNotice (std::function<void()> ren
     }
     noticeKey    = key;
     noticeRender = std::move (render);
+    noticeOverlay.expanded = false;     // a new notice opens at its first paragraph
     clearNoticeAction();
     if (noticeRender) noticeRender();
     noticeOverlay.setVisible (true);
@@ -7452,6 +7459,19 @@ void FractalAdditiveAudioProcessorEditor::layoutNotice (bool keepTop)
 {
     // The X had no hover at all - found the first time a rig scenario (57) ever put a notice
     // in front of the tooltip gate. Written here so it follows a language switch with the text.
+    // THE FOLD'S OWN WORDS, and how much is behind it. Written here, like the X's tooltip,
+    // so a language switch re-words them with everything else.
+    if (noticeOverlay.canExpand())
+    {
+        noticeOverlay.expandBtn.setButtonText (noticeOverlay.expanded
+            ? tr ("Show less", "Mostra'n menys")
+            : tr ("Show more", "Mostra'n m\xc3\xa9s") + " (" + juce::String (noticeOverlay.foldedParagraphs()) + ")");
+        noticeOverlay.expandBtn.setTooltip (noticeOverlay.expanded
+            ? tr ("Fold this notice back to its first paragraph. Nothing is lost - it opens again here.",
+                  "Plega aquest av\xc3\xads al primer par\xc3\xa0graf. No es perd res: es torna a obrir aqu\xc3\xad.")
+            : tr ("Open the rest of this notice - it is folded, not cut.",
+                  "Obre la resta d'aquest av\xc3\xads: est\xc3\xa0 plegat, no retallat."));
+    }
     noticeOverlay.closeBtn.setTooltip (tr ("Close this notice. If more are waiting, the next one appears.",
                                            "Tanca aquest av\xc3\xads. Si n'hi ha m\xc3\xa9s esperant, apareix el seg\xc3\xbc" "ent."));
     const auto waiting = (int) noticeQueue.size();

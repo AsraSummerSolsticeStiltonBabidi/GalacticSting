@@ -21273,7 +21273,9 @@ int main (int argc, char** argv)
                 check (! ed->noticeProbeForTests().visible, "...and the X after the last one closes the overlay");
                 bool allFit = ! seen.empty();
                 int tallestNeed = 0;
-                for (const auto& n : seen) { allFit = allFit && n.fits; tallestNeed = juce::jmax (tallestNeed, n.needPx); }
+                // The WHOLE text's need, not the folded one: a notice opens at its first
+                // paragraph now, and this gate is about the box growing to the text it HAS.
+                for (const auto& n : seen) { allFit = allFit && n.fits; tallestNeed = juce::jmax (tallestNeed, n.fullNeedPx); }
                 check (tallestNeed > 220,
                        "  (gate) at least one of these notices needs more than the old fixed 220 px box - "
                        "otherwise the fit check below could not tell growth from no growth");
@@ -22170,6 +22172,47 @@ int main (int argc, char** argv)
                    "...and the whole notice fits WHERE IT IS PAINTED: every line of the body inside the"
                    " rectangle paint clips it to, and the button inside the notice, below the body");
 
+            // IT OPENS FOLDED. "veo que la ventana close to freezing tiene un texto gigante, haz
+            // que todos los textos asi sean desplegables siempre que sea posible" (2026-10-03):
+            // the first paragraph is on screen, the rest is behind a button that says how much.
+            {
+                const auto shown = ed->noticeShownBodyForTests();
+                const int foldedH = ed->noticeProbeForTests().heightPx;
+                std::printf ("  folded: %d of %d characters shown, button \"%s\"\n",
+                             shown.length(), n.body.length(), ed->noticeExpandTextForTests().toRawUTF8());
+                check (ed->noticeCanExpandForTests() && ! ed->noticeExpandedForTests(),
+                       "a long notice opens FOLDED, with a button to open it");
+                check (n.body.startsWith (shown) && shown.length() < n.body.length(),
+                       "...and what is on screen is the START of the whole text, not a rewrite of it");
+                check (ed->noticeExpandTextForTests().startsWith ("Show more (")
+                           && ! ed->noticeExpandTextForTests().contains ("(0)"),
+                       "...and the button says how many paragraphs are folded away");
+                const int topFolded = ed->noticeProbeForTests().bounds.getY();
+                ed->clickNoticeExpandForTests();
+                const auto open = ed->noticeProbeForTests();
+                std::printf ("  unfolded: height %d -> %d, top %d -> %d, button \"%s\"\n",
+                             foldedH, open.heightPx, topFolded, open.bounds.getY(),
+                             ed->noticeExpandTextForTests().toRawUTF8());
+                check (ed->noticeExpandedForTests() && ed->noticeShownBodyForTests() == open.body
+                           && open.heightPx > foldedH,
+                       "clicking it opens the WHOLE text, and the notice grows to hold it");
+                check (open.bounds.getY() == topFolded && open.bodyShown && open.actionClear,
+                       "...keeping its top edge, with every line inside the painted area and the"
+                       " buttons clear of it");
+                check (ed->noticeExpandTextForTests() == "Show less",
+                       "...and the button now offers to fold it back");
+                // A REWRITE MUST NOT FOLD IT BACK UNDER THE READER. The load warning rewrites
+                // itself twice a second while an episode lasts.
+                p.feedLoadForTests (0.88, bs, blocksFor (0.3), 23456);   // above the 12345 fed above: the max moves
+                step (0.6);
+                check (ed->noticeExpandedForTests() && ed->noticeProbeForTests().body.contains ("23456"),
+                       "a notice REWRITTEN in place stays open: the fold is the reader's, not the"
+                       " writer's");
+                ed->clickNoticeExpandForTests();
+                check (! ed->noticeExpandedForTests(),
+                       "...and it folds again on a second click");
+            }
+
             // ITS NUMBERS FOLLOW THE EPISODE while it lasts - rewritten twice a second, not
             // frozen at the moment it went up and not rebuilt on every tick.
             p.feedLoadForTests (0.88, bs, blocksFor (0.3), 54321);
@@ -22181,6 +22224,7 @@ int main (int argc, char** argv)
                    "while the episode lasts the notice's numbers are rewritten (after half a"
                    " second, not on every tick)");
             {
+                ed->clickNoticeExpandForTests();   // open it: this is about the box following its text
                 const auto before = ed->noticeProbeForTests();
                 p.noteMessageStallMs (400.0);      // a new paragraph: the text grows
                 step (0.6);
@@ -22192,6 +22236,7 @@ int main (int argc, char** argv)
                 check (after.bounds.getY() == before.bounds.getY() && after.bodyShown && after.actionClear,
                        "rewritten in place, the notice keeps its TOP EDGE - its X does not jump out from"
                        " under the pointer twice a second - and it still shows every line");
+                ed->clickNoticeExpandForTests();   // and back to the state the rest of the block expects
             }
 
             // THE LOAD CALMS DOWN: the notice stays with its final numbers and says so.
@@ -22335,6 +22380,8 @@ int main (int argc, char** argv)
             step (0.033);
             ed->setLanguageForSnapshot (true);
             n = ed->noticeProbeForTests();
+            check (ed->noticeExpandTextForTests().startsWith (juce::String::fromUTF8 ("Mostra'n m\xc3\xa9s")),
+                   "...and the fold's button speaks Catalan too");
             check (n.title == juce::String::fromUTF8 ("A punt de bloquejar-se")
                        && ed->noticeActionForTests() == "No ho tornis a mostrar"
                        && n.body.contains ("No s'ha limitat res") && ! n.body.contains ("Nothing has been limited")
@@ -22345,6 +22392,9 @@ int main (int argc, char** argv)
             // BEHIND ANOTHER NOTICE: it queues like every notice, and keeps its button.
             ed->dismissNoticeForTests();
             ed->raiseKeyedNoticeForTests ("other", "Another notice");
+            check (! ed->noticeCanExpandForTests() && ed->noticeExpandTextForTests().isEmpty(),
+                   "a SHORT notice has no fold at all - a button with nothing behind it would be a"
+                   " button that lies");
             calm();
             p.feedLoadForTests (0.90, bs, blocksFor (1.2));
             step (0.033);
