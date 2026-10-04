@@ -1772,14 +1772,43 @@ public:
 
     //==========================================================================
     // Shared with the editor:
-    juce::MidiKeyboardState keyboardState;
+    juce::MidiKeyboardState keyboardState;   // DISPLAY only: what the colour keyboard lights
+    // What the controller really sends (see dsp/ExpressionState.h). Public: the MIX corner
+    // engines' voices read the same one, because it is a property of the stream, not of an
+    // engine. Written on the audio thread as each block is scanned.
+    ExpressionState expression;
+    // The window plays a note (a letter, a click on the colour keyboard). The channel is
+    // ours to choose: in the MPE zone mode channel 1 is the zone MASTER, and a note there
+    // carries no per-note bend and is swept by every master-channel wheel, so the window
+    // plays on a MEMBER channel there and on channel 1 everywhere else.
+    void playUiNote (int note, float velocity);
+    void stopUiNote (int note);
+    int  uiNoteChannelForTests() const noexcept { return uiNoteChannel.load (std::memory_order_relaxed); }
     juce::UndoManager undoManager; // parameter undo/redo (MUST outlive + precede apvts)
     juce::AudioProcessorValueTreeState apvts;
     // Chord-preview injection: the editor queues timestamped MIDI (note+per-channel
     // bend) here; processBlock feeds it to the SYNTH ONLY (never the rhythm engine,
     // never the MIDI out). MidiMessageCollector is thread-safe by design.
     juce::MidiMessageCollector previewCollector;
+    // THE WINDOW'S OWN NOTES (the letter keyboard and the on-screen one) DO NOT SHARE
+    // BOOKKEEPING WITH THE HOST'S STREAM.
+    //
+    // They used to go through `keyboardState`, the same MidiKeyboardState that
+    // processNextMidiBuffer feeds from the INCOMING buffer - so the host's and the
+    // controller's notes set and cleared the very bits the window's notes were tracked by.
+    // Hold a letter, let the Hexboard play the same pitch, and the controller's note-off
+    // silenced the letter you were still holding; the other way round, releasing the letter
+    // cut the controller's note (found 2026-10-03). They are their own stream now, and
+    // keyboardState keeps only the job it can do safely: lighting up the on-screen keys.
+    juce::MidiMessageCollector uiNoteCollector;
+    std::atomic<int> uiNoteChannel { 1 };   // audio thread reads it; see playUiNote
+    // Message thread only: which channel each note the window started went out on, and
+    // which channels it is using. A note-off must leave on the channel its note-on did.
+    std::array<juce::int8, 128> uiNoteFor {};
+    std::array<bool, 17>        uiNoteOn {};
     juce::MidiBuffer           previewMidi; // reused per block (audio thread)
+    juce::MidiBuffer           uiMidi;      // the window's own notes, merged into the stream
+    juce::MidiBuffer           pedalEcho;   // the pedal, copied to the other channels
     // ...AND SO ARE THESE TWO, for the same reason previewMidi is a member and not a
     // local. juce::MidiBuffer holds a juce::Array that ALLOCATES on its first addEvent,
     // so the "held" and "synthMidi" buffers the self-play and preview paths used to build
@@ -1848,6 +1877,38 @@ private:
     // setZoneLayout, which does its own synchronisation, and the flag's only job is to say
     // which branch runs. No acquire/release pairing to get wrong, and no cost.
     std::atomic<bool> lastZoneMpe { false };
+    // A controller asked for a zone this mode cannot honour (see repairMpeZoneOf). The
+    // window reads these once and says so; nothing is overruled in silence.
+    std::atomic<bool> zoneOverrideSeen { false };
+    std::atomic<int>  zoneAskedPerNote { 48 };
+    std::atomic<int>  zoneAskedMembers { 15 };
+public:
+    struct ZoneOverride { bool seen = false; int perNote = 48; int members = 15; };
+    ZoneOverride takeZoneOverride() noexcept
+    {
+        if (! zoneOverrideSeen.exchange (false, std::memory_order_acq_rel)) return {};
+        return { true, zoneAskedPerNote.load (std::memory_order_relaxed),
+                 zoneAskedMembers.load (std::memory_order_relaxed) };
+    }
+    // TESTS: the zone actually in force on the main synth.
+    juce::MPEZoneLayout zoneLayoutForTests() const { return synth.getZoneLayout(); }
+    // TESTS: put a controller's zone on the synth and ask the repair what it makes of it -
+    // the rule itself, with no render path in between to put the answer back.
+    juce::MPEZoneLayout zoneAfterRepairForTests (int members, int perNote, int master)
+    {
+        juce::MPEZoneLayout z;
+        z.setLowerZone (members, perNote, master);
+        synth.setZoneLayout (z);
+        repairMpeZoneOf (synth);
+        return synth.getZoneLayout();
+    }
+    void noteZoneOverrideForTests (int perNote, int members) noexcept
+    {
+        zoneAskedPerNote.store (perNote, std::memory_order_relaxed);
+        zoneAskedMembers.store (members, std::memory_order_relaxed);
+        zoneOverrideSeen.store (true, std::memory_order_release);
+    }
+private:
 
     // THE ONLY PLACE A .gsting IS WRITTEN, and where the fixed-point rule that closes
     // case #88 is enforced - one gate rather than one check per call site, because
@@ -2488,7 +2549,7 @@ private:
         {
             want = juce::jlimit (1, 32, want);
             while (synth.getNumVoices() < want)
-                synth.addVoice (new AdditiveVoice (p.apvts, spectrum, p.tuning, mods, &bank));
+                synth.addVoice (new AdditiveVoice (p.apvts, spectrum, p.tuning, mods, p.expression, &bank));
             if (synth.getNumVoices() <= want) { shrinkTicks = 0; return; }
 
             // Rank the sounding voices by age so the oldest are the ones asked to go.
@@ -2701,8 +2762,22 @@ public:
     static void buildMixRestrike (juce::MidiBuffer& out,
                                   const std::array<std::array<bool, 128>, 16>& held,
                                   const std::array<int, 16>& bend,
-                                  const std::array<std::array<juce::uint8, 128>, 16>& vel)
+                                  const std::array<std::array<juce::uint8, 128>, 16>& vel,
+                                  bool mpeZone)
     {
+        // THE ZONE'S MASTER BEND BELONGS TO EVERY NOTE IN THE ZONE, and the master channel
+        // holds no keys of its own - so the loop below, which only sends a channel's bend
+        // when that channel has a key down, never sent it. The corners then came in playing
+        // a chord up to four octaves away from the main engine, and the crossfade blended
+        // two different chords (found 2026-10-03).
+        if (mpeZone && bend[0] != 8192)
+        {
+            const bool anyKeyAnywhere =
+                std::any_of (held.begin(), held.end(), [] (const auto& row)
+                             { return std::any_of (row.begin(), row.end(), [] (bool b) { return b; }); });
+            if (anyKeyAnywhere)
+                out.addEvent (juce::MidiMessage::pitchWheel (1, bend[0]), 0);
+        }
         for (int ch = 0; ch < 16; ++ch)
         {
             const bool anyOnThisChannel =

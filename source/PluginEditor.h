@@ -1494,6 +1494,9 @@ public:
     void noteGestureForTests()   { lastGestureMs = juce::Time::getMillisecondCounter(); }
     void forgetGestureForTests() { lastGestureMs = juce::Time::getMillisecondCounter() - 10 * kGestureMs; }
     bool gestureRecentForTests() const { return juce::Time::getMillisecondCounter() - lastGestureMs < kGestureMs; }
+    // TESTS: where the letter row starts, and the note each letter would play from there.
+    int baseKeyForTests() const { return baseKey; }
+    juce::Array<int> letterNotesForTests() const;   // defined where kKeyMap lives
     bool openFocusGrabQueuedForTests() const { return openFocusGrabQueued; }
     // TESTS: the main Menu's items as built for a click (label + ticked), and the freeze item's toggle.
     juce::StringArray mainMenuItemsForTests()

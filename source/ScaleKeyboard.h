@@ -19,6 +19,11 @@ class ScaleKeyboard : public juce::Component,
                       private juce::Timer
 {
 public:
+    // `state` is the DISPLAY state (what is sounding, from any source); the two callbacks
+    // are how this keyboard PLAYS - through the processor's own note path, so a click here
+    // can never cancel a note the host or the controller is holding (see uiNoteCollector).
+    std::function<void (int, float)> onPlay;
+    std::function<void (int)>        onStop;
     ScaleKeyboard (juce::MidiKeyboardState& s, std::function<int()> degreesProvider)
         : state (s), getDegrees (std::move (degreesProvider))
     {
@@ -1192,7 +1197,7 @@ private:
         releaseHeld();
         if (note >= 0)
         {
-            state.noteOn (1, note, 0.85f);
+            if (onPlay) onPlay (note, 0.85f);
             mouseNote = note;
         }
     }
@@ -1201,7 +1206,7 @@ private:
     {
         if (mouseNote >= 0)
         {
-            state.noteOff (1, mouseNote, 0.0f);
+            if (onStop) onStop (mouseNote);
             mouseNote = -1;
         }
     }

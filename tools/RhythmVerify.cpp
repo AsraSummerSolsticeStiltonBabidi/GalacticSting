@@ -21618,8 +21618,36 @@ int main (int argc, char** argv)
         // it is off centre" half is exercised rather than assumed.
         held[5][72] = true;  vel[5][72] = 99;
 
+        const bool mpeZone = false;      // the legacy case: no zone, so no master bend to carry
         juce::MidiBuffer out;
-        Proc::buildMixRestrike (out, held, bend, vel);
+        Proc::buildMixRestrike (out, held, bend, vel, mpeZone);
+        // THE ZONE'S MASTER BEND, which no key is ever down on. Asked in both modes, because
+        // the same wheel value must be carried in one and left alone in the other.
+        {
+            auto withMaster = bend; withMaster[0] = 9000;
+            juce::MidiBuffer zoned, legacy;
+            Proc::buildMixRestrike (zoned,  held, withMaster, vel, true);
+            Proc::buildMixRestrike (legacy, held, withMaster, vel, false);
+            const auto firstOn = [] (const juce::MidiBuffer& b)
+            { int i = 0; for (const auto m : b) { if (m.getMessage().isNoteOn()) return i; ++i; } return -1; };
+            int masterIdx = -1, masterVal = -1, i = 0, legacyMaster = 0;
+            for (const auto m : zoned)
+            {
+                const auto msg = m.getMessage();
+                if (msg.isPitchWheel() && msg.getChannel() == 1) { masterIdx = i; masterVal = msg.getPitchWheelValue(); }
+                ++i;
+            }
+            for (const auto m : legacy)
+                if (m.getMessage().isPitchWheel() && m.getMessage().getChannel() == 1) ++legacyMaster;
+            std::printf ("  MPE zone: master wheel %d re-sent at index %d (first note-on at %d);"
+                         " legacy: %d master wheels\n", masterVal, masterIdx, firstOn (zoned), legacyMaster);
+            check (masterVal == 9000 && masterIdx >= 0 && masterIdx < firstOn (zoned),
+                   "engaging MIX carries the ZONE'S MASTER BEND to the corners, before any note-on -"
+                   " the master channel holds no keys, so its wheel used to be left behind and the"
+                   " corners played a different chord");
+            check (legacyMaster == 0,
+                   "...and outside the MPE zone there is no master to carry, so nothing extra is sent");
+        }
 
         int bends = 0, ons = 0, bendCh = -1, bendVal = -1;
         int firstBendIdx = -1, firstOnIdxSameCh = -1, idx = 0;
@@ -22067,6 +22095,37 @@ int main (int argc, char** argv)
                        " so the letters play again without a click");
                 check (sed->openFocusGrabQueuedForTests(),
                        "...and opening the standalone window asks for the keyboard at once");
+                // THE LETTER ROW REACHES EVERY DEGREE, AND NO TWO LETTERS SHARE A NOTE.
+                // Z/X used to move by a whole PERIOD while the row is 19 letters wide, so on
+                // a 31-degree scale twelve degrees of every period could not be played at
+                // all; and the base was clamped to 112 while the notes clamp at 127, so the
+                // top four letters collapsed onto note 127 and releasing one silenced a note
+                // another was still holding.
+                {
+                    juce::String scl ("! zzzkb31.scl\n31-EDO for the letter row\n 31\n!\n");
+                    for (int i = 1; i <= 31; ++i) scl << " " << juce::String (1200.0 * (double) i / 31.0, 6) << "\n";
+                    juce::String err;
+                    const bool loaded = sp->loadScalaText (scl, "zzzkb31", err);
+                    check (loaded && sp->getScaleDegrees() == 31,
+                           "  (gate) a 31-degree scale is in force for the letter-row checks");
+                    const int base0 = sed->baseKeyForTests();
+                    sed->keyPressed (juce::KeyPress ('x', 0, 'x'));
+                    const int base1 = sed->baseKeyForTests();
+                    std::printf ("  31 degrees: one X moved the letter row by %d (the row is 19 letters wide)\n",
+                                 base1 - base0);
+                    check (base1 - base0 == 19,
+                           "X moves the letter row by ONE ROW on a scale with more degrees than letters,"
+                           " so degrees 19..30 can be reached at all");
+                    for (int i = 0; i < 12; ++i) sed->keyPressed (juce::KeyPress ('x', 0, 'x'));
+                    const auto notes = sed->letterNotesForTests();
+                    std::set<int> distinct (notes.begin(), notes.end());
+                    std::printf ("  after thirteen X presses: base %d, letters play %d..%d, %d distinct notes\n",
+                                 sed->baseKeyForTests(), notes[0], notes[notes.size() - 1], (int) distinct.size());
+                    check (sed->baseKeyForTests() <= 109 && (int) distinct.size() == notes.size(),
+                           "...and at the top of the range every letter still plays its OWN note - the row"
+                           " stops at 127 minus its own width, not at 127");
+                    for (int i = 0; i < 13; ++i) sed->keyPressed (juce::KeyPress ('z', 0, 'z'));
+                }
                 {
                     auto* q = sp->apvts.getParameter ("monoGlide");
                     juce::Component::unfocusAllComponents();
@@ -22085,6 +22144,181 @@ int main (int argc, char** argv)
                 }
             }
             if (sed->isOnDesktop()) sed->removeFromDesktop();
+        }
+    }
+
+    //== THE WINDOW'S OWN NOTES, PRESSURE, AND THE PEDAL ===========================
+    //
+    // "hay bugs de tocarlo con el teclado del pc tambien" + "arregla bugs de mpe que tengo
+    // al tocarlo con el hexboard" (2026-10-03). The Hexboard sends notes on member channels
+    // 2..16 with its own per-note bend, no channel pressure and no CC74, and announces its
+    // MPE zone (RPN 6) at power-on; its 12-EDO mode plays everything on channel 1 - the same
+    // channel the window's own keyboards used to play on, through the same note bookkeeping.
+    {
+        std::printf ("\nthe window's own notes, pressure and the pedal:\n");
+        using Proc = FractalAdditiveAudioProcessor;
+        auto pp = std::make_unique<Proc>();
+        auto& p = *pp;
+        constexpr int blk2 = 256;
+        p.setPlayConfigDetails (0, 2, 48000.0, blk2);
+        p.prepareToPlay (48000.0, blk2);
+        awaitSpectrumIdle (p, "the window-notes block");
+        juce::AudioBuffer<float> buf (2, blk2);
+        const auto render = [&] (int blocks, const juce::MidiBuffer& first = {})
+        {
+            double sum = 0.0; int n = 0;
+            for (int i = 0; i < blocks; ++i)
+            {
+                juce::MidiBuffer m; if (i == 0) m = first;
+                buf.clear();
+                p.processBlock (buf, m);
+                for (int ch = 0; ch < buf.getNumChannels(); ++ch)
+                    for (int k = 0; k < blk2; ++k) { const double v = buf.getSample (ch, k); sum += v * v; ++n; }
+            }
+            return n > 0 ? std::sqrt (sum / n) : 0.0;
+        };
+        const auto midi = [] (const juce::MidiMessage& m) { juce::MidiBuffer b; b.addEvent (m, 0); return b; };
+        // The level a note is SUSTAINING at: render `blocks`, measure only the last eight.
+        // A note that is dying away reads far below its own sustain here, which is the whole
+        // point - the first version of these checks compared against a release tail and
+        // passed on notes that were already going.
+        const auto steady = [&] (int blocks, const juce::MidiBuffer& first = {})
+        {
+            double sum = 0.0; int n = 0;
+            for (int i = 0; i < blocks; ++i)
+            {
+                juce::MidiBuffer m; if (i == 0) m = first;
+                buf.clear();
+                p.processBlock (buf, m);
+                if (i < blocks - 8) continue;
+                for (int ch = 0; ch < buf.getNumChannels(); ++ch)
+                    for (int k = 0; k < blk2; ++k) { const double v = buf.getSample (ch, k); sum += v * v; ++n; }
+            }
+            return n > 0 ? std::sqrt (sum / n) : 0.0;
+        };
+        const auto allOff = [&] { juce::MidiBuffer b; b.addEvent (juce::MidiMessage::allNotesOff (1), 0); render (8, b); render (30); };
+
+        //-- PRESSURE ARMS ITSELF. A controller that sends none plays at full gain.
+        {
+            const double quiet = render (24, midi (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100)));
+            allOff();
+            juce::MidiBuffer withPress;
+            withPress.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+            withPress.addEvent (juce::MidiMessage::channelPressureChange (1, 0), 1);   // "my finger is at rest"
+            const double pressed = render (24, withPress);
+            allOff();
+            std::printf ("  one note, no pressure sent: RMS %.5f; the same note with pressure 0: %.5f (ratio %.2f)\n",
+                         quiet, pressed, pressed > 0.0 ? quiet / pressed : 0.0);
+            check (quiet > 0.0 && pressed > 0.0 && quiet / pressed > 2.0,
+                   "a controller that sends NO pressure plays at full gain, and one that says"
+                   " \"pressure 0\" is quiet because it asked to be - the Hexboard sends none, and"
+                   " every note used to be 9 dB down");
+        }
+
+        //-- THE WINDOW'S NOTES ARE THE WINDOW'S. A letter and a controller note on the same
+        //   pitch no longer cancel each other.
+        {
+            const double alone = steady (24, midi (juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100)));
+            p.playUiNote (64, 0.8f);
+            const int uiCh = p.uiNoteChannelForTests();
+            steady (8);
+            p.stopUiNote (64);                       // the window lets go; the controller has not
+            const double afterUiOff = steady (40);   // a third of a second later, still sounding?
+            std::printf ("  controller holds note 64 on ch1 at %.5f; the window played the same pitch on ch%d;"
+                         " after the window released: %.5f\n", alone, uiCh, afterUiOff);
+            check (uiCh != 1,
+                   "the window does not put its note on a channel the player is already using - two"
+                   " note-ons for one pitch on one channel are ONE note to a receiver");
+            check (alone > 0.0 && afterUiOff > 0.8 * alone,
+                   "releasing a letter does NOT cut the note the controller is still holding");
+            allOff();
+        }
+
+        //-- ...AND THE OTHER WAY ROUND.
+        {
+            p.playUiNote (67, 0.8f);
+            const double ui = steady (24);
+            juce::MidiBuffer off; off.addEvent (juce::MidiMessage::noteOff (1, 67), 0);
+            const double afterHostOff = steady (40, off);     // the controller's note-off for that pitch
+            std::printf ("  the window's own note sustains at %.5f; after a controller note-off for that"
+                         " pitch: %.5f\n", ui, afterHostOff);
+            check (ui > 0.0 && afterHostOff > 0.8 * ui,
+                   "...and a controller's note-off does not cut the note the WINDOW is holding");
+            p.stopUiNote (67);
+            const double afterOwnOff = steady (120);
+            check (afterOwnOff < 0.25 * ui,
+                   "...while the window letting go of its OWN note does stop it (the note-off goes out"
+                   " on the channel the note-on went out on)");
+            allOff();
+        }
+
+        //-- IN MPE MODE THE WINDOW PLAYS ON A MEMBER CHANNEL, so its notes sound at all.
+        {
+            if (auto* q = p.apvts.getParameter ("tuningMode"))
+                q->setValueNotifyingHost (q->convertTo0to1 (3.0f));   // MPE (bend input)
+            for (int i = 0; i < 4; ++i) p.pollParametersForTests();
+            render (2);
+            // THE ZONE IS THE ONE THIS MODE PROMISES, whatever the controller announced. The
+            // Hexboard announces RPN 0 = 48 on all sixteen channels at power-on; another
+            // controller may announce anything, and this synth encodes every bend it SENDS at
+            // +-48 with 15 members (the pulses, the previews, the drone), so a zone with other
+            // numbers would put its own MIDI outside the zone or decode it out of tune.
+            //
+            // Asked of the RULE, not through a render: the render path repairs the zone in
+            // several places and would answer for them instead of for the rule.
+            {
+                p.takeZoneOverride();                       // clear anything standing
+                const auto lz = p.zoneAfterRepairForTests (8, 24, 2).getLowerZone();
+                std::printf ("  a controller asked for 8 members, +-24 per note, +-2 master; the repair"
+                             " made it %d members, +-%d per note, +-%d master\n",
+                             lz.numMemberChannels, lz.perNotePitchbendRange, lz.masterPitchbendRange);
+                check (lz.numMemberChannels == 15 && lz.perNotePitchbendRange == 48
+                           && lz.masterPitchbendRange == 48,
+                       "a controller's own MPE zone does not shrink this mode's: 15 members and +-48"
+                       " both ways, which is what the panel promises and what every bend this synth"
+                       " sends is encoded at");
+                const auto told = p.takeZoneOverride();
+                check (told.seen && told.members == 8 && told.perNote == 24,
+                       "...and the synth REMEMBERS that it overruled the controller, so the window can"
+                       " say so instead of the two disagreeing in silence");
+                p.zoneAfterRepairForTests (15, 48, 48);
+                check (! p.takeZoneOverride().seen,
+                       "...while a controller that announces the same zone is not reported at all -"
+                       " the Hexboard's own 48 is not news");
+            }
+            p.playUiNote (62, 0.8f);
+            const double mpeNote = render (16);
+            const int ch = p.uiNoteChannelForTests();
+            std::printf ("  MPE mode: the window played on channel %d, RMS %.5f\n", ch, mpeNote);
+            check (ch >= 2 && ch <= 16,
+                   "in the MPE zone mode the window plays on a MEMBER channel, never on the zone's"
+                   " master - a note on the master carries no per-note bend and every master wheel"
+                   " sweeps it");
+            check (mpeNote > 0.0, "...and it really sounds there");
+            p.stopUiNote (62);
+            if (auto* q = p.apvts.getParameter ("tuningMode"))
+                q->setValueNotifyingHost (q->convertTo0to1 (0.0f));
+            for (int i = 0; i < 4; ++i) p.pollParametersForTests();
+            allOff();
+        }
+
+        //-- THE PEDAL IS THE FOOT, NOT THE CHANNEL.
+        {
+            juce::MidiBuffer on3; on3.addEvent (juce::MidiMessage::noteOn (3, 59, (juce::uint8) 100), 0);
+            const double held = render (10, on3);
+            juce::MidiBuffer pedal; pedal.addEvent (juce::MidiMessage::controllerEvent (1, 64, 127), 0);
+            render (2, pedal);                                  // pedal down on channel 1
+            juce::MidiBuffer off3; off3.addEvent (juce::MidiMessage::noteOff (3, 59), 0);
+            const double sustained = render (16, off3);          // key up on channel 3
+            juce::MidiBuffer up; up.addEvent (juce::MidiMessage::controllerEvent (1, 64, 0), 0);
+            const double released = render (160, up);   // long enough for the release to finish
+            std::printf ("  note on ch3: held %.5f, after key-up with the ch1 pedal down %.5f, after the pedal up %.5f\n",
+                         held, sustained, released);
+            check (held > 0.0 && sustained > 0.5 * held,
+                   "a pedal on channel 1 holds a note played on channel 3 - a controller that"
+                   " rotates channels used to lose most of the chord to the pedal");
+            check (released < 0.35 * sustained, "...and lifting the pedal lets it go");
+            allOff();
         }
     }
 
@@ -22124,6 +22358,20 @@ int main (int argc, char** argv)
                 p.feedLoadForTests (0.10, bs, blocksFor (2.5));
                 step (2.5);
             };
+            // THE WINDOW SAYS WHEN A CONTROLLER'S ZONE WAS OVERRULED (see repairMpeZoneOf).
+            {
+                ed->dismissNoticeForTests();
+                p.noteZoneOverrideForTests (24, 8);
+                ed->tickTimerForTests();
+                const auto zn = ed->noticeProbeForTests();
+                std::printf ("  zone notice: key \"%s\", title \"%s\"\n",
+                             ed->noticeKeyForTests().toRawUTF8(), zn.title.toRawUTF8());
+                check (ed->noticeKeyForTests() == "mpezone" && zn.body.contains ("24") && zn.body.contains ("8"),
+                       "a controller whose MPE zone this mode cannot honour is TOLD so, with the numbers"
+                       " it asked for - overruling it in silence is the one thing this project refuses");
+                ed->dismissNoticeForTests();
+            }
+
             // A settled, quiet start: whatever the build measured is taken away first.
             p.takeLoadSnapshot();
             step (0.0);

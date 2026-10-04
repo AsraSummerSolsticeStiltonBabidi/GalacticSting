@@ -3480,6 +3480,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // "can't move faders while a note plays unless I started dragging before" bug.
     tooltipWindow.setInterceptsMouseClicks (false, false);
 
+    // The colour keyboard plays through the processor's own note path (see uiNoteCollector):
+    // a click here must not share note bookkeeping with the host's stream.
+    keyboard.onPlay = [this] (int note, float vel) { processorRef.playUiNote (note, vel); };
+    keyboard.onStop = [this] (int note)            { processorRef.stopUiNote (note); };
     setWantsKeyboardFocus (true);
     setSize (1200, 650); // +30 vs before for the keyboard's below-key hover-delta strip
     // The TRANSITION cell, before the first paint and NOT left to the first timer tick.
@@ -3533,7 +3537,7 @@ FractalAdditiveAudioProcessorEditor::~FractalAdditiveAudioProcessorEditor()
     stopChordPreview();
     // Release any computer-keyboard notes still held when the UI closes.
     for (const auto& kv : heldKeys)
-        processorRef.keyboardState.noteOff (1, kv.second, 0.0f);
+        processorRef.stopUiNote (kv.second);
     heldKeys.clear();
     // Dismiss a still-open save-preset dialog so no orphaned modal window
     // survives the editor (its callback is already SafePointer-guarded).
@@ -7660,11 +7664,21 @@ void FractalAdditiveAudioProcessorEditor::stopChordPreview()
             off.setTimeStamp (nowS);
             processorRef.previewCollector.addMessageToQueue (off);
         }
-        for (int ch = 9; ch <= 16; ++ch)
+        // ONLY THE CHANNELS THIS PREVIEW USED. It used to recentre 9..16 wholesale, and
+        // those are MEMBER channels an MPE controller plays on: clicking a chord row while
+        // the Hexboard held a chord threw away the per-note bend of every note on them -
+        // the retuning IS that bend, so the held chord jumped to 12-EDO (2026-10-03).
+        bool centred[17] = {};
+        for (const auto& [ch, key] : previewNotes)
         {
-            auto centre = juce::MidiMessage::pitchWheel (ch, 8192);
-            centre.setTimeStamp (nowS);
-            processorRef.previewCollector.addMessageToQueue (centre);
+            juce::ignoreUnused (key);
+            if (ch >= 1 && ch <= 16 && ! centred[ch])
+            {
+                centred[ch] = true;
+                auto centre = juce::MidiMessage::pitchWheel (ch, 8192);
+                centre.setTimeStamp (nowS);
+                processorRef.previewCollector.addMessageToQueue (centre);
+            }
         }
     }
     previewNotes.clear();
@@ -12973,6 +12987,14 @@ void FractalAdditiveAudioProcessorEditor::broughtToFront()
     { if (safe != nullptr) safe->reclaimFocusUnlessTyping(); });
 }
 
+// TESTS: the note each letter of the row would play from where the row stands now.
+juce::Array<int> FractalAdditiveAudioProcessorEditor::letterNotesForTests() const
+{
+    juce::Array<int> out;
+    for (const auto& m : kKeyMap) out.add (juce::jlimit (0, 127, baseKey + m.off));
+    return out;
+}
+
 bool FractalAdditiveAudioProcessorEditor::keyPressed (const juce::KeyPress& key)
 {
     const auto c = key.getTextCharacter();
@@ -13002,8 +13024,18 @@ bool FractalAdditiveAudioProcessorEditor::keyPressed (const juce::KeyPress& key)
     // mapping's base note, which a plugin never plays, so they go to Live as well.
     if (processorRef.wrapperType != juce::AudioProcessor::wrapperType_Standalone)
         return false;
-    if (c == 'z' || c == 'Z') { baseKey = juce::jlimit (0, 112, baseKey - period); return true; }
-    if (c == 'x' || c == 'X') { baseKey = juce::jlimit (0, 112, baseKey + period); return true; }
+    // THE STEP IS THE SMALLER OF THE PERIOD AND THE LETTER ROW, so no degree is unreachable.
+    // Z/X used to move by a whole period: on a 31-degree scale the letters cover 0..18 and
+    // the next press jumped to degree 31, so twelve degrees of every period could not be
+    // played at all - in the one instrument whose whole point is those degrees.
+    //
+    // ...AND THE TOP IS 127 MINUS THE ROW, not 127 minus nothing. The base was clamped to
+    // 112 while the notes were clamped to 127, so the last four letters all landed on note
+    // 127: pressing one and releasing another silenced a key that was still held.
+    const int step = juce::jmin (period, (int) (sizeof (kKeyMap) / sizeof (kKeyMap[0])));
+    const int topBase = 127 - kKeyMap[(sizeof (kKeyMap) / sizeof (kKeyMap[0])) - 1].off;
+    if (c == 'z' || c == 'Z') { baseKey = juce::jlimit (0, topBase, baseKey - step); return true; }
+    if (c == 'x' || c == 'X') { baseKey = juce::jlimit (0, topBase, baseKey + step); return true; }
     // In the STANDALONE, swallow every mapped play key: there is no host to give them to,
     // and this is where the QWERTY mapping plays. (The swallow used to be argued against a
     // host's keyboard - Live's A S D landing a unison / second from ours, the "ghost second
@@ -13139,16 +13171,16 @@ void FractalAdditiveAudioProcessorEditor::pollComputerKeyboard()
         {
             const int note = juce::jlimit (0, 127, baseKey + m.off);
             heldKeys[m.ch] = note;
-            // Guard against a SECOND note-on for a note that is already sounding
-            // (from an overlapping key/source or a reconcile race): a duplicate
-            // note-on starts a second voice, which is exactly the "press one key
-            // and two sound at once" bug. Only ring it if it is not already on.
-            if (! processorRef.keyboardState.isNoteOn (1, note))
-                processorRef.keyboardState.noteOn (1, note, 0.8f);
+            // Through the processor's own note path: it refuses a second note-on for a
+            // note the window is already sounding (the "press one key and two sound at
+            // once" bug this guard was written for) and, unlike the shared keyboard
+            // state this used to go through, it cannot cancel - or be cancelled by - a
+            // note the host or the controller is holding on the same pitch.
+            processorRef.playUiNote (note, 0.8f);
         }
         else if (! wantOn && it != heldKeys.end())
         {
-            processorRef.keyboardState.noteOff (1, it->second, 0.0f);
+            processorRef.stopUiNote (it->second);
             heldKeys.erase (it);
         }
     }
@@ -13170,6 +13202,34 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         lastLoadTickMs = now;
     }
     pollComputerKeyboard(); // safety net for missed KEYUPs / ghost keys / focus loss
+    // A CONTROLLER ASKED FOR A ZONE THIS MODE CANNOT HONOUR. The MPE (bend input) mode is
+    // fixed at 15 members and +-48 both ways - that is what the panel promises when it
+    // hides the bend selector, and what every bend this synth GENERATES is encoded at. A
+    // controller that announces something else is overruled, and told so here rather than
+    // quietly ignored.
+    if (const auto zo = processorRef.takeZoneOverride(); zo.seen)
+        raiseNotice ([this, zo]
+        {
+            noticeOverlay.title = tr ("Your controller asked for a different MPE zone",
+                                      "El teu controlador ha demanat una zona MPE diferent");
+            juce::String b;
+            b << tr ("It announced ", "Ha anunciat ") << juce::String (zo.members)
+              << tr (" member channels and \xc2\xb1", " canals de membre i \xc2\xb1") << juce::String (zo.perNote)
+              << tr (" semitones per note. This mode is fixed at 15 member channels and \xc2\xb1""48 both ways, "
+                     "which is what the Pitch bend read-out says and what every bend this synth sends is "
+                     "encoded at - so the two would disagree by the ratio between them.",
+                     " semitons per nota. Aquest mode \xc3\xa9s fix: 15 canals de membre i \xc2\xb1""48 als dos "
+                     "costats, que \xc3\xa9s el que diu el r\xc3\xa8tol de Pitch bend i com es codifica tot el bend "
+                     "que envia aquest sintetitzador; si no, els dos n\xc3\xbameros es contradirien.");
+            b << "\n\n"
+              << tr ("Nothing was changed on your controller, and nothing you play is limited: the zone this "
+                     "plugin uses is the one above. If you want the controller's own range instead, use one of "
+                     "the other tuning modes, where the Pitch bend selector is yours to set.",
+                     "No s'ha canviat res al teu controlador, i res del que toques queda limitat: la zona que "
+                     "fa servir aquest plugin \xc3\xa9s la de dalt. Si vols el rang del controlador, fes servir un "
+                     "dels altres modes d'afinaci\xc3\xb3, on el selector de Pitch bend \xc3\xa9s teu.");
+            noticeOverlay.body = b;
+        }, "mpezone");
 
     // The envelope curve follows its parameters live (automation, a modulator
     // driving them, the selector switching modulator, an undo...).

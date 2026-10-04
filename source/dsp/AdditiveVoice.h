@@ -36,6 +36,7 @@
 #include "Spectrum.h"
 #include "PhaseSets.h"
 #include "SpectrumEngine.h"
+#include "ExpressionState.h"
 #include "CurvedEnv.h"
 #include "SineTable.h"
 #include "TuningManager.h"
@@ -60,9 +61,9 @@ public:
     // voice class either way: forking it would let the two drift apart.
     AdditiveVoice (juce::AudioProcessorValueTreeState& state, const spectrum::SpectrumEngine& eng,
                    const TuningManager& tuningManager, const ModEngine& modulators,
-                   ParamBank* bank = nullptr)
+                   const ExpressionState& expressionState, ParamBank* bank = nullptr)
         : src { &state, bank }, engine (eng), tuning (tuningManager), mods (modulators),
-          sine (spectrum::sineTable())
+          expression (expressionState), sine (spectrum::sineTable())
     {
         attackParam  = src.raw ("ampAttack");
         decayParam   = src.raw ("ampDecay");
@@ -366,10 +367,26 @@ public:
         // resets on note-off - so a note on an aftertouch-touched channel would start up
         // to ~9 dB louder than one on a fresh channel. Start at rest; genuine aftertouch
         // still swells in through notePressureChanged().
-        pressureTarget = 0.0f;
+        // ...AND PRESSURE ONLY TAKES THE GAIN WHEN A CONTROLLER IS REALLY SENDING IT.
+        //
+        // The gain term is 0.35 + 0.65 * pressure, and pressure starts at rest, so an
+        // instrument played from anything that sends NO aftertouch - the Hexboard, most
+        // keyboards, a clip in the host - sounded 9.1 dB under its own full scale for
+        // ever, with nothing on screen saying why (found 2026-10-03). Pressure is ARMED by
+        // the first pressure this note is given: unarmed, the note plays at full gain;
+        // armed, it follows the player's finger exactly as before. A controller that sends
+        // a pressure of 0 with its note-on (the MPE default) arms it at once and is quiet
+        // on purpose, which is what it asked for.
+        // ARMED BY THE STREAM, not by the value: a controller sending "pressure 0" means it,
+        // and one that sends nothing at all must not be read as a finger at rest. See
+        // dsp/ExpressionState.h for who marks the channel.
+        pressureArmed  = expression.sendsPressure (currentlyPlayingNote.midiChannel)
+                      || currentlyPlayingNote.pressure.asUnsignedFloat() > 0.0f;
+        pressureTarget = pressureArmed ? currentlyPlayingNote.pressure.asUnsignedFloat() : 0.0f;
         if (! reuse)
         {
-            pressure = 0.0f;
+            pressure = pressureTarget;
+            pressGain = pressureArmed ? pressureGainFor (pressureTarget) : 1.0f;
             // ...but if the pressure that BELONGS to this note arrives with it (an MPE
             // host sends it before the first block renders), take it immediately
             // instead of gliding up to it. Gliding turned every fresh note into a
@@ -492,6 +509,7 @@ public:
     // Aftertouch is a gain term too: set the TARGET so a jumpy 7-bit stream glides.
     void notePressureChanged() override
     {
+        pressureArmed  = true;   // a controller IS sending pressure: it owns the gain from here
         pressureTarget = currentlyPlayingNote.pressure.asUnsignedFloat();
         // Delivered together with the note-on (before its first block): that is this
         // note's OWN starting pressure, not a gesture, so it applies at once.
@@ -1893,12 +1911,15 @@ private:
             // whatever the amplitude glide is currently doing.
             velocityLevel += (velTarget      - velocityLevel) * gainSlew;
             pressure      += (pressureTarget - pressure)      * gainSlew;
+            // The pressure GAIN glides too, so arming it mid-note (the first aftertouch of
+            // a phrase) swells instead of stepping.
+            pressGain     += (pressureGainFor (pressureArmed ? pressure : 1.0f) - pressGain) * gainSlew;
             if (! fastKill && fastKillGain < 1.0f)
                 fastKillGain += (1.0f - fastKillGain) * gainSlew;
 
             const float env    = adsr.getNextSample();
             const float killG  = fastKillGain; // 1 normally; fading out, or ramping back after a steal
-            const float gain   = env * killG * velocityLevel * (0.35f + 0.65f * pressure) * normGain;
+            const float gain   = env * killG * velocityLevel * pressGain * normGain;
             // TWO CHANNELS THROUGH THE FILTER, not one filtered sum split afterwards. The
             // filter is linear, so splitting after it would be equivalent ONLY if the split
             // were one constant gain - and here every partial has its own. Channel 1 is why
@@ -3400,6 +3421,11 @@ private:
 
     float velocityLevel = 0.0f, velTarget = 0.0f;
     float pressure = 0.0f, pressureTarget = 0.0f;
+    // The gain pressure asks for, and whether it is asking at all (see noteStarted).
+    static constexpr float pressureGainFor (float p) noexcept { return 0.35f + 0.65f * p; }
+    float pressGain = 1.0f;
+    bool  pressureArmed = false;
+    const ExpressionState& expression;
     bool  pressureSnap = false; // take the note's own initial pressure instantly (see noteStarted)
 
     bool  fastKill = false;

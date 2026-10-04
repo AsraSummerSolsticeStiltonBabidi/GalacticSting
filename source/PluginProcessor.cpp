@@ -48,7 +48,7 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     }
 
     for (int i = 0; i < 32; ++i)
-        synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning, modEngine));
+        synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning, modEngine, expression));
 
     // Global app settings (recent .scl files), shared across all instances.
     juce::PropertiesFile::Options o;
@@ -1215,6 +1215,53 @@ void FractalAdditiveAudioProcessor::clearScala()
 }
 
 //==============================================================================
+// THE WINDOW'S OWN NOTES. Message thread; the collector is the thread-safe hand-over the
+// chord preview already uses. The channel is decided HERE, once per note-on, and the
+// note-off is sent on the channel that note was started on - a rotation that forgot which
+// channel a note went out on is a note that never stops.
+void FractalAdditiveAudioProcessor::playUiNote (int note, float velocity)
+{
+    if (! juce::isPositiveAndBelow (note, 128) || ! (getSampleRate() > 0.0)) return;
+    // In the MPE zone mode channel 1 is the MASTER: a note there carries no per-note bend
+    // of its own and every master wheel sweeps it. The window plays on member channels
+    // instead, one per sounding note, so two letters held together can never share one.
+    // THE WINDOW'S CHANNEL IS ONE NOBODY ELSE IS PLAYING.
+    //
+    // Two note-ons for the same pitch on the same channel are ONE note to a MIDI receiver:
+    // JUCE's MPEInstrument retriggers it, and then either release kills it. So a letter and
+    // a controller on the same pitch used to fight - which is exactly what the player feels
+    // as "my note died when the Hexboard played the same key". The window takes the highest
+    // channel the stream has not carried a note on, working down; in the MPE zone mode it
+    // stays inside the members (2..16), because channel 1 is the zone's master and a note
+    // there has no per-note bend and is swept by every master wheel.
+    const bool mpe = lastZoneMpe.load (std::memory_order_relaxed);
+    const int  lowest = mpe ? 2 : 1;
+    int ch = mpe ? 2 : 1;
+    for (int c = 16; c >= lowest; --c)
+        if (! expression.hostPlaysOn (c) && ! uiNoteOn[(size_t) c]) { ch = c; break; }
+    if (uiNoteFor[(size_t) note] != 0)        // already sounding from the window: leave it alone
+        return;
+    uiNoteFor[(size_t) note] = (juce::int8) ch;
+    uiNoteOn[(size_t) ch] = true;
+    uiNoteChannel.store (ch, std::memory_order_relaxed);
+    auto m = juce::MidiMessage::noteOn (ch, note, velocity);
+    m.setTimeStamp (juce::Time::getMillisecondCounterHiRes() * 0.001);
+    uiNoteCollector.addMessageToQueue (m);
+}
+
+void FractalAdditiveAudioProcessor::stopUiNote (int note)
+{
+    if (! juce::isPositiveAndBelow (note, 128)) return;
+    const int ch = (int) uiNoteFor[(size_t) note];
+    if (ch <= 0) return;                      // not ours: never send a note-off for somebody else's note
+    uiNoteFor[(size_t) note] = 0;
+    uiNoteOn[(size_t) ch] = false;
+    if (! (getSampleRate() > 0.0)) return;
+    auto m = juce::MidiMessage::noteOff (ch, note, 0.0f);
+    m.setTimeStamp (juce::Time::getMillisecondCounterHiRes() * 0.001);
+    uiNoteCollector.addMessageToQueue (m);
+}
+
 void FractalAdditiveAudioProcessor::applyTuningMode (int paramIndex)
 {
     const bool mpe = paramIndex == 3;
@@ -3305,7 +3352,7 @@ void FractalAdditiveAudioProcessor::applyMonoVoiceCount (bool mono)
 {
     const int want = mono ? 1 : kPolyVoices;
     while (synth.getNumVoices() < want)
-        synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning, modEngine));
+        synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning, modEngine, expression));
     if (synth.getNumVoices() <= want) { monoShrinkTicks = 0; return; }
 
     // SHRINKING WITH KEYS DOWN. This is a panel switch and an automatable parameter, so
@@ -3689,6 +3736,8 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
 
     synth.setCurrentPlaybackSampleRate (sampleRate);
     previewCollector.reset (sampleRate);
+    uiNoteCollector.reset (sampleRate);
+    uiMidi.ensureSize (256);
     noteGate.prepare (sampleRate);
     monoGate.prepare();
     laDelay.prepare();
@@ -3903,6 +3952,12 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
     for (const auto meta : midiMessages)
     {
         const auto m = meta.getMessage();
+        // Does this controller send pressure at all? (dsp/ExpressionState.h - a note whose
+        // source sends none must not be read as a finger resting at zero.)
+        if (m.isChannelPressure() || m.isAftertouch())
+            expression.noteSeenPressure (m.getChannel());
+        if (m.isNoteOn())
+            expression.noteSeenNote (m.getChannel());   // ...and which channels are the player's
         if (m.isAllNotesOff() || m.isAllSoundOff())
         { pendingHardSilence.store (true, std::memory_order_release); break; }
     }
@@ -3945,8 +4000,44 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
     if (pendingHostReset.exchange (false, std::memory_order_acq_rel))
         rhythm.resetState();
 
-    // Merge on-screen / computer-keyboard notes into the incoming MIDI stream.
-    keyboardState.processNextMidiBuffer (midiMessages, 0, nSamp, true);
+    // Merge on-screen / computer-keyboard notes into the incoming MIDI stream - from OUR
+    // OWN collector, not through keyboardState (see uiNoteCollector for what that cost).
+    uiMidi.clear();
+    uiNoteCollector.removeNextBlockOfMessages (uiMidi, nSamp);
+    for (const auto meta : uiMidi)
+        midiMessages.addEvent (meta.getMessage(), juce::jlimit (0, juce::jmax (0, nSamp - 1), meta.samplePosition));
+    // ...and the colour keyboard lights whatever is sounding, ours and the host's alike.
+    // `false`: this state no longer injects anything, it only watches.
+    keyboardState.processNextMidiBuffer (midiMessages, 0, nSamp, false);
+
+    // THE SUSTAIN PEDAL IS THE PLAYER'S FOOT, NOT A CHANNEL'S. Outside the MPE zone mode
+    // JUCE's legacy mode treats every channel as its own instrument, so a pedal arriving on
+    // channel 1 held only the notes that happened to be on channel 1 - with a controller
+    // that rotates channels (any MPE controller in its non-MPE mode, the Hexboard included)
+    // that is most of the chord left unsustained. The pedal is copied to every channel that
+    // is not the one it came on; MPE mode needs none of this, because there the zone master
+    // already owns the pedal for the whole zone.
+    if (! lastZoneMpe.load (std::memory_order_relaxed))
+    {
+        int pedalCount = 0;
+        for (const auto meta : midiMessages)
+        {
+            const auto m = meta.getMessage();
+            if (! m.isController()) continue;
+            const int cc = m.getControllerNumber();
+            if (cc != 64 && cc != 66) continue;      // sustain, sostenuto
+            if (++pedalCount > 8) break;             // a stream of pedal spam stays bounded
+            for (int ch = 1; ch <= 16; ++ch)
+                if (ch != m.getChannel())
+                    pedalEcho.addEvent (juce::MidiMessage::controllerEvent (ch, cc, m.getControllerValue()),
+                                        meta.samplePosition);
+        }
+        if (! pedalEcho.isEmpty())
+        {
+            midiMessages.addEvents (pedalEcho, 0, nSamp, 0);
+            pedalEcho.clear();
+        }
+    }
 
     //== ADAPTIVE LOOKAHEAD (see LookaheadDelay.h) =============================
     // The order here IS the feature: the follower's early view is taken from the stream
@@ -4344,11 +4435,37 @@ void FractalAdditiveAudioProcessor::repairMpeZoneOf (juce::MPESynthesiser& s)
     auto layout = s.getZoneLayout();
     const auto lower = layout.getLowerZone();
     const bool dead  = ! lower.isActive();
-    if (dead || lower.masterPitchbendRange != 48)
+    // THE WHOLE ZONE IS WHAT THIS MODE PROMISES, not two thirds of it.
+    //
+    // The repair used to pin only the MASTER range and copy the member count and the
+    // per-note range back from whatever the controller last announced. Two things broke
+    // when a controller announced its own (the Hexboard announces 48 on all 16 channels at
+    // power-on, and anything else is legal):
+    //   * a per-note range other than 48 made everything this synth GENERATES as bend
+    //     wrong by range/48 - the rhythm pulses, the driver f0, the chord and hover
+    //     previews - while the played notes stayed right, because the one rule that
+    //     encodes bend (RhythmEngine::bendRangeSemis) answers 48 in this mode, which is
+    //     also what the panel promises when it hides the bend selector here;
+    //   * a member count under 15 left this synth's OWN channels outside the zone, and
+    //     MPEInstrument drops every note on a channel the zone is not using - the preview
+    //     (channels 9..16), the MPE pulses and the self-play drone went silent with no
+    //     message at all.
+    // So the zone is 15 members, +-48 per note, +-48 master, and a controller that asked
+    // for something else is TOLD (zoneOverrideSeen -> the window raises a notice), never
+    // quietly overruled.
+    const bool drifted = dead
+                      || lower.masterPitchbendRange != 48
+                      || lower.perNotePitchbendRange != 48
+                      || lower.numMemberChannels != 15;
+    if (drifted)
     {
-        layout.setLowerZone (dead ? 15 : lower.numMemberChannels,
-                             dead ? 48 : lower.perNotePitchbendRange,
-                             48);
+        if (! dead && (lower.perNotePitchbendRange != 48 || lower.numMemberChannels != 15))
+        {
+            zoneAskedPerNote.store (lower.perNotePitchbendRange, std::memory_order_relaxed);
+            zoneAskedMembers.store (lower.numMemberChannels, std::memory_order_relaxed);
+            zoneOverrideSeen.store (true, std::memory_order_release);
+        }
+        layout.setLowerZone (15, 48, 48);
         s.setZoneLayout (layout);
     }
 }
@@ -4529,7 +4646,8 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
         // The building itself is buildMixRestrike (see the header): lifted out so a test
         // can ask it what it produces without a playground, corner presets and preset
         // files behind it. This is its only caller.
-        buildMixRestrike (mixInject, modKeyHeld, modChanBend, modKeyVel);
+        buildMixRestrike (mixInject, modKeyHeld, modChanBend, modKeyVel,
+                          lastZoneMpe.load (std::memory_order_relaxed));
         cornerFeed = &mixInject;
     }
     mixWasOn = on;

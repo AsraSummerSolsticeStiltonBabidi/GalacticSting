@@ -1263,6 +1263,10 @@ namespace
                                  : juce::File::getCurrentWorkingDirectory().getChildFile (outArg);
         const juce::String only = valueAfter ("--only");
         const bool tracing = args.contains ("--trace");
+        // THE LEGIBLE-SIZE SEARCH IS THE SLOW PART OF THIS RIG: two walks per language over
+        // ~150 window sizes, each asking the whole text-fit sweep. It is a REPORT (nothing
+        // asserts it), so a run that only wants the pictures can skip it and say so.
+        const bool skipLegible = args.contains ("--nolegible");
         float baseScale = valueAfter ("--scale").getFloatValue();
         if (! (baseScale > 0.05f && baseScale <= 8.0f)) baseScale = 1.0f;
 
@@ -1314,7 +1318,8 @@ namespace
     dissonance::adaptNsPerPairOverride() = dissonance::kAdaptNsPerPairFallback;
                 ed->setNoteNamesForSnapshot (false);   // the shipped default, not this machine's
                 gEditorMin = findSmallestLaidOutSize (*ed);
-                gLegible = findSmallestFullyLegibleSize (*ed);
+                if (! skipLegible) gLegible = findSmallestFullyLegibleSize (*ed);
+                else say ("  smallest fully legible size: NOT MEASURED (--nolegible)");
             }
             say ("  editor floor used by the matrix: "
                       + juce::String (gEditorMin.w) + " x " + juce::String (gEditorMin.h));
@@ -1702,8 +1707,11 @@ namespace
         // ...AND THE TWO SIZES IT REPORTS HAVE TO BE REAL. They are the numbers every
         // layout decision in this project is argued from, and an unset one reads as a
         // triumph: "floor 0x0" is a smaller floor than any window ever measured.
+        // (--nolegible is a DELIBERATE skip: the legible size is a report, and a run that
+        // says it did not measure it is not a run that failed to. The floor is not optional -
+        // the matrix is expanded from it.)
         const bool sizesMeasured = gEditorMin.w > 0 && gEditorMin.h > 0
-                                && gLegible.w  > 0 && gLegible.h  > 0;
+                                && (skipLegible || (gLegible.w > 0 && gLegible.h > 0));
         if (photographedSomething && ! sizesMeasured)
         {
             say ("");
@@ -1723,8 +1731,8 @@ namespace
                   + juce::String (gNoTooltip.size()) + " without a tooltip, "
                   + juce::String (gStructural.size()) + " structural, floor "
                   + juce::String (gEditorMin.w) + "x" + juce::String (gEditorMin.h)
-                  + ", fully legible at "
-                  + juce::String (gLegible.w) + "x" + juce::String (gLegible.h));
+                  + (skipLegible ? juce::String (", fully legible NOT MEASURED (--nolegible)")
+                                 : ", fully legible at " + juce::String (gLegible.w) + "x" + juce::String (gLegible.h)));
     }
 } // namespace
 
