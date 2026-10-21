@@ -36,9 +36,26 @@ FetchContent_MakeAvailable(JUCE)
 #-------------------------------------------------------------------------------
 juce_add_plugin(FractalAdditive
     COMPANY_NAME                "Asra3"
-    BUNDLE_ID                   com.asrabeats.fractaladditive
+    BUNDLE_ID                   com.asrabeats.fiblogalactic
     PLUGIN_MANUFACTURER_CODE    Asrb
-    PLUGIN_CODE                 Frac
+    # A SEPARATE PLUGIN FROM "Galactic Sting", ON PURPOSE.
+    #
+    # JUCE builds the VST3 class ID out of the manufacturer code and this one, so while
+    # this read `Frac` the new bundle and the installed "Galactic Sting.vst3" carried the
+    # SAME CID (...4173726246726163, which is "AsrbFrac" in ASCII) under two different
+    # filenames. A host that finds one identity in two files picks one of them, and which
+    # one it picks is not something a project file can express - so an old session could
+    # silently come back on the new binary, or the reverse.
+    #
+    # The two are now different plugins. Old projects resolve to "Galactic Sting" and open
+    # the old binary, which is what its presets were written against; this one is offered
+    # beside it under its own name. Deliberately NOT a compatibility shim: the user asked
+    # for the separation rather than for the old state to be carried forward.
+    #
+    # The user's preset folder is untouched by this - Documents/Galactic Sting/Presets is
+    # a path in the source, not something derived from the plugin code - so every .gsting
+    # file still loads here.
+    PLUGIN_CODE                 Fbgl
     IS_SYNTH                    TRUE
     NEEDS_MIDI_INPUT            TRUE
     NEEDS_MIDI_OUTPUT           TRUE          # timbre->rhythm MIDI out (RhythmEngine)
@@ -54,13 +71,38 @@ juce_add_plugin(FractalAdditive
     # finding the file. The DISPLAYED name keeps its accents - see JucePlugin_Name below.
     PRODUCT_NAME                "Fiblo Galactic")
 
-# Embedded assets (title font + the one-shot startup jingle).
-juce_add_binary_data(GalacticAssets SOURCES assets/fonts/Kablammo.ttf assets/audio/jingle.wav)
+# Embedded assets (title font, the microtonal accidental font, and the one-shot startup
+# jingle). notes.otf carries the ups-and-downs accidentals the keyboard's note names are
+# spelled in - they ride on ordinary ASCII letters, so without this face embedded the
+# names would not be missing, they would be WRONG (C sharp reading as the letters "Cc").
+# Licence and credits: assets/fonts/NOTATION-LICENSES.txt.
+#
+# THE SIX FACTORY TUNINGS RIDE IN THE SAME TARGET.
+#
+# "mete archivos .tun DENTRO del VST". They have to be INSIDE the binary because a VST3
+# is one file a host copies wherever it likes, and a tuning that shipped beside it as a
+# loose file is gone the first time somebody drags the plugin into another folder. So
+# they are compiled in, exactly like the fonts, and written out to disk on first use -
+# a file chooser cannot browse BinaryData (see getTuningsFolder in PluginProcessor.cpp).
+#
+# Generated, not hand-written: tools/MakeTunings.ps1 regenerates all six from four
+# lines of arithmetic each. Editing the .tun files directly is editing the output.
+juce_add_binary_data(GalacticAssets SOURCES
+    assets/fonts/Kablammo.ttf
+    assets/fonts/notes.otf
+    assets/audio/jingle.wav
+    assets/tunings/harmonic-series-8-16.tun
+    assets/tunings/7ed2.tun
+    assets/tunings/12ed2.tun
+    assets/tunings/24ed2.tun
+    assets/tunings/31ed2.tun
+    assets/tunings/bohlen-pierce.tun)
 
 target_sources(FractalAdditive PRIVATE
     source/PluginProcessor.cpp
     source/PluginEditor.cpp
     source/FloatingWindowOwner.cpp
+    source/SnapshotRig.cpp
     source/dsp/Spectrum.cpp
     third_party/MTS-ESP/libMTSClient.cpp)
 
@@ -87,6 +129,17 @@ target_link_libraries(FractalAdditive
 # AudioProcessor::getName() returns them directly - see PluginProcessor.h.)
 
 #-------------------------------------------------------------------------------
+# The search that CHOSE the palette (JUCE-free, like the palette itself). Committed
+# because the colours in GalacticPalette.h are a RESULT: without the derivation in the
+# tree they are eleven magic hexes nobody can re-derive or extend.
+#-------------------------------------------------------------------------------
+add_executable(PaletteSearch tools/PaletteSearch.cpp)
+target_include_directories(PaletteSearch PRIVATE source)
+set_target_properties(PaletteSearch PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON)
+
+#-------------------------------------------------------------------------------
 # Unit tests for the (JUCE-free) spectrum compiler.
 #-------------------------------------------------------------------------------
 add_executable(SpectrumTests
@@ -94,6 +147,37 @@ add_executable(SpectrumTests
     source/dsp/Spectrum.cpp)
 target_include_directories(SpectrumTests PRIVATE source)
 set_target_properties(SpectrumTests PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON)
+
+#-------------------------------------------------------------------------------
+# Unit tests for the (JUCE-free) phase-set engine behind the Aligned<->Scattered
+# fader. Same shape as SpectrumTests because it has the same dependency: the real
+# compileSpectrum, so the partial lists it measures are the ones the plugin plays.
+#
+# WHY IT IS A SEPARATE TARGET AND NOT A FILE IN SpectrumTests: its measuring rig is
+# a direct std::sin over the true unquantised ratios and deliberately shares NOTHING
+# with the engine it scores. Version 1 of that engine shipped a GREEN suite and a
+# BROKEN feature because the test called the engine's own analysis grid; keeping the
+# rig in its own translation unit with its own main() is what stops that from
+# silently coming back through a shared helper.
+#-------------------------------------------------------------------------------
+add_executable(PhaseSetTests
+    tests/PhaseSetTests.cpp
+    source/dsp/Spectrum.cpp)
+target_include_directories(PhaseSetTests PRIVATE source)
+set_target_properties(PhaseSetTests PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON)
+
+#-------------------------------------------------------------------------------
+# Unit tests for the ups-and-downs note-name speller. JUCE-free like the header it
+# tests, so the whole thing builds and runs in about a second - which is what makes it
+# worth running on every edit of an algorithm whose wrong answers still look like names.
+#-------------------------------------------------------------------------------
+add_executable(NoteNameTests tests/NoteNameTests.cpp)
+target_include_directories(NoteNameTests PRIVATE source)
+set_target_properties(NoteNameTests PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON)
 
@@ -121,13 +205,18 @@ target_sources(RhythmVerify PRIVATE
     source/PluginProcessor.cpp
     source/PluginEditor.cpp
     source/FloatingWindowOwner.cpp
+    source/SnapshotRig.cpp
     source/dsp/Spectrum.cpp
     third_party/MTS-ESP/libMTSClient.cpp)
 target_include_directories(RhythmVerify PRIVATE source third_party/MTS-ESP)
 target_compile_definitions(RhythmVerify PRIVATE
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
-    JUCE_STRICT_REFCOUNTEDPOINTER=1)
+    JUCE_STRICT_REFCOUNTEDPOINTER=1
+    # The tr-pair audit reads the SOURCE, because that is the only place a string which
+    # is never on screen in any photographed state can be checked at all. Dev-only tool,
+    # dev-only path; the check says so and skips itself if the directory is not there.
+    FG_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(RhythmVerify PRIVATE
     GalacticAssets
     juce::juce_audio_utils
@@ -141,6 +230,7 @@ target_sources(FftVerify PRIVATE
     source/PluginProcessor.cpp
     source/PluginEditor.cpp
     source/FloatingWindowOwner.cpp
+    source/SnapshotRig.cpp
     source/dsp/Spectrum.cpp
     third_party/MTS-ESP/libMTSClient.cpp)
 target_include_directories(FftVerify PRIVATE source third_party/MTS-ESP)
@@ -154,3 +244,12 @@ target_link_libraries(FftVerify PRIVATE
     juce::juce_dsp
     juce::juce_audio_processors
     juce::juce_recommended_config_flags)
+# FftVerify's main() is ONE frame: seventy-odd sections, each with its own locals, all
+# live at once because they are written as blocks in a single function - and MSVC commits
+# the whole frame on entry. It was one call away from the 1 MB default: adding a check
+# with two small arrays and a juce::Colour turned the first deep call in the file into a
+# stack overflow (0xC00000FD, no message, no output). The next check to be added would
+# have done the same. 8 MB, so growing this verifier stays a matter of writing checks.
+if (MSVC)
+    target_link_options(FftVerify PRIVATE /STACK:8388608)
+endif()

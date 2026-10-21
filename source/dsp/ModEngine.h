@@ -292,6 +292,35 @@ public:
     bool isRateLimited (int lfo) const noexcept
     { return juce::isPositiveAndBelow (lfo, kLfos) && rateLimited[(size_t) lfo].load(); }
 
+    // WHAT THE CAP ACTUALLY DID, in numbers a sentence can be written from. A flag can
+    // only say "something was taken away"; this says how much, which is the difference
+    // between a warning light and telling the user what they are hearing.
+    //
+    //   asked   - the rate the panel and the host asked for, in Hz
+    //   actual  - the rate this LFO is really running at (== ceiling while limited)
+    //   ceiling - what a block-stepped LFO can represent at the CURRENT buffer size,
+    //             0.5 * sr / blockSize. Published even when nothing is capped, because
+    //             "your ceiling here is 86.1 Hz" is the sentence that explains WHY, and
+    //             it moves with the buffer size the user picked in their host.
+    //   limited - asked > ceiling this block
+    //
+    // Message thread (a 30 Hz repaint). Three relaxed loads, so a repaint that lands
+    // mid-store can show one block-old numbers together with this block's flag; at 30 Hz
+    // against a block rate of hundreds per second that is invisible, and the alternative
+    // is a lock on the audio thread, which this engine does not take.
+    struct RateState { float asked = 0.0f, actual = 0.0f, ceiling = 0.0f; bool limited = false; };
+    RateState rateState (int lfo) const noexcept
+    {
+        RateState r;
+        if (! juce::isPositiveAndBelow (lfo, kLfos)) return r;
+        const size_t k = (size_t) lfo;
+        r.asked   = askedHz  [k].load (std::memory_order_relaxed);
+        r.actual  = actualHz [k].load (std::memory_order_relaxed);
+        r.ceiling = ceilingHz[k].load (std::memory_order_relaxed);
+        r.limited = rateLimited[k].load (std::memory_order_relaxed);
+        return r;
+    }
+
     // How many of this modulator's 8 target slots are in use (the map menu shows it).
     bool isFull (int mod) const { return numTargets (mod) >= kMaxTargets; }
 
@@ -405,20 +434,76 @@ public:
                 else                    rate = (double) q.hz->load();
                 // The phase steps once per block, so the honest ceiling is the BLOCK
                 // rate's Nyquist, not an arbitrary 40 Hz: with a 64-sample buffer a
-                // fundamental-tracking LFO can run into the hundreds of Hz. The
-                // limit is reported to the UI (lfoRateLimited) instead of hiding.
+                // fundamental-tracking LFO can run into the hundreds of Hz.
+                //
+                // AND THE USER IS TOLD. The old comment here said "the limit is reported
+                // to the UI (lfoRateLimited)"; there was no lfoRateLimited and nothing
+                // outside this header ever read isRateLimited(), so the sentence was a
+                // description of an intention. A cap the user cannot see is exactly the
+                // thing this synth does not do, so BOTH numbers are published: the rate
+                // that was ASKED for and the rate actually running. Three relaxed float
+                // stores per block per LFO, no allocation and no lock - see rateState().
                 const double ceiling = std::max (1.0, 0.5 * sr / (double) numSamples);
-                if (rate > ceiling) { rate = ceiling; if (reportRateLimit) rateLimited[(size_t) (i - kEnvs)] = true; }
-                else                { if (reportRateLimit) rateLimited[(size_t) (i - kEnvs)] = false; }
-                rate = std::max (0.0, rate);
+                const double asked   = std::max (0.0, rate);
+                rate = std::min (asked, ceiling);
+                if (reportRateLimit)
+                {
+                    const size_t k = (size_t) (i - kEnvs);
+                    rateLimited[k].store (asked > ceiling, std::memory_order_relaxed);
+                    askedHz  [k].store ((float) asked,   std::memory_order_relaxed);
+                    actualHz [k].store ((float) rate,    std::memory_order_relaxed);
+                    ceilingHz[k].store ((float) ceiling, std::memory_order_relaxed);
+                }
 
                 if (phaseMode == 1 && rateMode != 1 && ppq >= 0.0 && bpm > 1.0)
                 {
                     // Transport-locked. Cycles elapsed since the timeline start:
                     //   BPM mode : beats / 2^div
                     //   free Hz  : seconds * Hz  (seconds = ppq * 60 / bpm)
-                    const double cycles = rateMode == 0 ? ppq / std::exp2 ((double) divN)
-                                                        : ppq * (60.0 / bpm) * rate;
+                    //
+                    // EVALUATED AT THE END OF THE BLOCK, like the other branch, and that
+                    // matters now. The host reports ppq for the block's FIRST sample, so
+                    // this branch used to return the modulator's value at the START while
+                    // the note-restart branch below advances by dt and returns the value
+                    // at the END. One array, two different instants, and nothing noticed
+                    // while every consumer simply HELD the number across the block.
+                    //
+                    // The pitch path stopped holding it: it ramps from the previous
+                    // block's value to this one's, which is only the right pair of ends if
+                    // the value IS this block's end. Left as it was, a transport-locked
+                    // LFO on pitch would have come out smooth and one whole buffer late -
+                    // 5.8 ms at 256 samples and 44.1 kHz, 21 at 1024 and 48. Found by
+                    // reading, not by hearing, and the comment that justified the ramp
+                    // cited THIS branch's neighbour rather than this branch.
+                    //
+                    // One block of beats, not a second formula: both dresses are a
+                    // function of ppq, so advancing ppq is the whole correction.
+                    //
+                    // AND NOT TWO FORMULAE EITHER, which is the second thing that was
+                    // wrong here. The BPM dress used to read `ppqEnd / 2^div` - beats
+                    // divided down - which is the rate BEFORE the ceiling above touched
+                    // it, so the cap applied to the free-Hz dress and simply did not
+                    // exist in BPM mode. The same LFO then ran at two different rates
+                    // depending on which dropdown entry named it. MEASURED (RhythmVerify
+                    // run 70, which is where these figures come from) at 44.1 kHz on an
+                    // 8192-sample offline-render block - ceiling 2.6917 Hz - with BPM 300
+                    // and Div 0, a pair that asks for 5 Hz just as a free-Hz 5 does: the
+                    // free dress walked 0.50000 0.00000 0.50000 ..., half a cycle a block,
+                    // and the BPM dress walked 0.92880 0.85760 0.78639 ... - 1.86x the
+                    // ceiling, in the one mode whose phase is the host's and cannot be
+                    // argued with. Nothing exotic was needed to reach it: Div only ever
+                    // divides (0..24), so the BPM dress tops out at bpm/60 and the buffer
+                    // is what brings the ceiling down to meet it.
+                    //
+                    // Seconds * Hz is now the ONE formula, and the BPM dress reaches it
+                    // through `rate`, which is the number the ceiling already clamped.
+                    // The two are identical arithmetic while nothing is capped: with
+                    // rate = (bpm/60)/2^div, ppqEnd * (60/bpm) * rate IS ppqEnd / 2^div
+                    // to within a rounding of the bpm round trip (~1e-16 relative, and
+                    // the phase is taken mod 1 anyway). It is only when the cap bites
+                    // that they differ, and then differing is the entire point.
+                    const double ppqEnd = ppq + dt * bpm / 60.0;
+                    const double cycles = ppqEnd * (60.0 / bpm) * rate;
                     l.phase = std::fmod (cycles + phOff, 1.0);
                 }
                 else
@@ -456,7 +541,7 @@ public:
         {
             if (! act[i]) continue;
             auto& m = mods[(size_t) i];
-            const float contrib = (float) vals[i] * prm[(size_t) i].range->load();
+            const float rawRange = prm[(size_t) i].range->load();
             for (int t = 0; t < kMaxTargets; ++t)
             {
                 auto* p   = m.slot[(size_t) t].param.load (std::memory_order_acquire);
@@ -468,6 +553,26 @@ public:
                 // for them: with several notes sounding there is no single value it
                 // could show. The editor draws the reachable RANGE as an arc instead.
                 if (m.slot[(size_t) t].pv.load (std::memory_order_relaxed) >= 0) continue;
+                // THE RANGE CANNOT ASK FOR MORE ROOM THAN THE PARAMETER HAS.
+                //
+                // "PUSE UNA LFO EN PITCH Y PARECE COMO SI ESTUVIESE CORTADA, EN UN TROZO
+                // DEL MOVIMIENTO SUBE Y BAJA Y EN EL OTRO SE QUEDA QUIETO, VI QUE ES POR
+                // QUE EL RANGE SE PASA DE LARGO."
+                //
+                // A modulator's value runs 0..1 and the contribution is that times the
+                // Range, so a Range of 1.0 on a parameter sitting at 0.5 asks the
+                // parameter to reach 1.5. The write below clamps to [0,1], so the wave
+                // came out with a flat top: it moved for half the cycle and stood still
+                // for the other half, which is what a clipped LFO looks and sounds like.
+                //
+                // Clamped HERE, once, against the headroom this target actually has,
+                // instead of clamping the instantaneous value: the shape stays a whole
+                // LFO shape and merely stops growing once it fills the parameter. That is
+                // "the maximum of the Range adapts to the maximum of each parameter",
+                // and it is per TARGET, because one modulator can drive several.
+                const float base  = src.normOf (p);
+                const float range = juce::jlimit (-base, 1.0f - base, rawRange);
+                const float contrib = (float) vals[i] * range;
                 int f = -1;
                 for (int k = 0; k < nW; ++k) if (writes[k].raw == raw) { f = k; break; }
                 if (f >= 0) writes[f].sum += contrib;
@@ -670,7 +775,12 @@ private:
     int  lastBlock = 256;        // last block size, for the hold duration
     // Written from evaluateMods(), which is const so a voice can call it; only the
     // engine's own pass reports (reportRateLimit), so 32 voices do not all write it.
-    mutable std::array<std::atomic<bool>, kLfos> rateLimited {};
+    // askedHz/actualHz/ceilingHz are the same publication carried in numbers instead of
+    // in one bit - read them through rateState(), never one at a time.
+    mutable std::array<std::atomic<bool>,  kLfos> rateLimited {};
+    mutable std::array<std::atomic<float>, kLfos> askedHz   {};
+    mutable std::array<std::atomic<float>, kLfos> actualHz  {};
+    mutable std::array<std::atomic<float>, kLfos> ceilingHz {};
     std::array<std::array<float, kWaveN>, kLfos> customWave {};
     double sr = 44100.0;
     juce::uint32 noteSeen = 0;

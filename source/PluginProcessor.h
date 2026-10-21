@@ -4,12 +4,17 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_dsp/juce_dsp.h>
 
+#include <algorithm>
 #include <set>
 #include <thread>
+#include <vector>
 
 #include "dsp/AdditiveVoice.h"
 #include "dsp/Dissonance.h"
+#include "dsp/LoadMonitor.h"
+#include "dsp/LookaheadDelay.h"
 #include "dsp/ModEngine.h"
+#include "dsp/MonoGlide.h"
 #include "dsp/NoteGate.h"
 #include "dsp/PresetMorph.h"
 #include "dsp/RhythmEngine.h"
@@ -28,9 +33,24 @@ public:
     //==========================================================================
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override {}
-    // Host reset (transport re-arm, state clear): flush any sounding rhythm-MIDI
-    // notes so none hang in the receiving track.
-    void reset() override { rhythm.flushOpenGates(); }
+    // HOST RESET: "stop making sound now, and forget what you were doing".
+    // A bypass, a panic button and a transport re-arm all arrive here, and until this
+    // was written it only flushed the rhythm-MIDI gates - so a note the player was
+    // holding went on sounding for ever through a bypass, and a panic silenced nothing
+    // at all. It owes both halves: silence, AND a synth that is not left deaf, so the
+    // very next note must still play normally.
+    //
+    // The work itself is NOT done here. reset() can be called from the message thread
+    // while the audio thread is inside processBlock, and voice / NoteGate / MonoGlide /
+    // lookahead-ring state is only ever allowed to be touched from one of them - the
+    // same rule restoreState() already follows through pendingHardSilence. So this only
+    // RAISES the request; the next block carries it out, one block being the shortest
+    // honest latency for "silence" from a thread that does not own the voices.
+    void reset() override
+    {
+        pendingHardSilence.store (true, std::memory_order_release);
+        pendingHostReset .store (true, std::memory_order_release);
+    }
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
@@ -59,9 +79,49 @@ public:
     //==========================================================================
     // For the editor's partial/CPU meter.
     int  getPartialCount() const noexcept { return spectrumEngine.getRenderedCount(); }
+
+    //==========================================================================
+    // THE LOAD WATCH (see dsp/LoadMonitor.h). processBlock feeds it every block; this
+    // plugin's own timers feed it how long they held the interface thread; the editor takes
+    // a snapshot each tick and decides whether to warn. Nothing is ever reduced by it.
+    fibload::Monitor::Snapshot takeLoadSnapshot() noexcept { return loadMonitor.take(); }
+    void noteMessageStallMs (double ms) noexcept { loadMonitor.noteStallMs (ms); }
+    // TESTS: synthetic blocks through the SAME audio-side code, so the warning's verdicts
+    // can be checked without depending on how fast this machine is.
+    void feedLoadForTests (double ratio, double blockSeconds, int blocks, int oscillators = 0, int mix = 0) noexcept
+    {
+        for (int i = 0; i < blocks; ++i) loadMonitor.noteBlock (ratio * blockSeconds, blockSeconds);
+        if (oscillators > 0) loadMonitor.noteOscillators (oscillators, mix);
+    }
+    // THE OPTION: "Warn when close to a freeze", ON unless the user turned it off. Stored in
+    // the global settings file, re-read from disk every time (other instances write it too).
+    bool getWarnNearFreeze();
+    void setWarnNearFreeze (bool on);
+    // TESTS ONLY: every processor built after this reads and writes THIS settings file, not
+    // the user's %APPDATA%\GalacticSting\GalacticSting.settings - a verifier that turned the
+    // warning off, or added its temp scales to "recent", would be doing it to the user.
+    // An empty File restores the real one.
+    static void setSettingsFileForTests (const juce::File& f);
+    juce::File settingsFileInUseForTests() const { return appProps != nullptr ? appProps->getFile() : juce::File(); }
+    // ...and whether that count is an ANSWER or still its initial value - see
+    // SpectrumEngine::reportRendered. The meter must not print "0 partials audible" as a
+    // diagnosis when the honest statement is "nothing has been played yet".
+    bool hasSoundedYet() const noexcept   { return spectrumEngine.hasEverRendered(); }
     int  getTemplatePartialCount() const noexcept { return spectrumEngine.getPartialCount(); }
     int  getRawPartialCount() const noexcept { return spectrumEngine.getRawCount(); }
     bool isSpectrumTruncated() const noexcept { return spectrumEngine.isTruncated(); }
+    // The SHEPARD's own version of the same honesty: while the band's bottom edge is
+    // travelling up to a density change, the deepest copies want more partials than one
+    // kStride slot holds and the rest are not sounding. Kept separate from the engine's
+    // flag (that one describes the TEMPLATE and is republished on every compile) and
+    // OR-ed into the same meter, so the one cap left in the Shepard is never silent.
+    bool isShepardSlotCapped() const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<const AdditiveVoice*> (synth.getVoice (v)))
+                if (av->shepardSlotCapped()) return true;
+        return false;
+    }
 
     //==========================================================================
     // Microtuning (12-TET / MTS-ESP / Scala). Called from the editor.
@@ -76,85 +136,17 @@ public:
         tuning.setMode (TuningManager::Mode::Scala);
         return true;
     }
-    // Write the CURRENT tuning as an AnaMark .tun (v2). This is the primary interchange
-    // format now: unlike .scl it carries the reference frequency, so a scale exported
-    // here reopens at the same absolute pitch instead of losing its A and being guessed
-    // at by whatever loads it. Every MIDI note is written out, so a mapping of any size
-    // survives - a .scl would need a .kbm alongside it to say the same thing.
+    // Write the CURRENT tuning as an AnaMark .tun (v2). The text itself is built by
+    // TuningManager::writeTunText - it belongs beside the scale it describes, and only
+    // there can a unit test load a scale, export it and load the export back.
     bool saveCurrentTuningTun (const juce::File& f, juce::String& errorOut)
     {
-        const double f0 = tuning.frequencyForNote (0);
-        if (! (f0 > 0.0) || ! std::isfinite (f0))
-        { errorOut = "The current tuning has no usable pitch for MIDI note 0."; return false; }
-
-        // What Fiblo exports is a SCALE whenever it HAS one, never a scale it merely
-        // guessed at. A .tun can legitimately hold a non-repeating mapping - a stretched
-        // piano curve, per-note tweaks - and Fiblo now holds exactly that as an absolute
-        // 128-key table; for those the [Scale Begin] block is omitted rather than filled
-        // with the estimated period, which would state as fact a structure the tuning
-        // does not have. The 128 exact pitches below carry it losslessly either way, and
-        // reloading the file lands back in table mode.
-        const bool   isTable = tuning.usesAbsoluteTable();
-        const int    degrees = tuning.degreesPerPeriod();
-        const double period  = tuning.periodRatio();
-        if (! isTable && (degrees <= 0 || ! (period > 1.0001) || ! std::isfinite (period)))
-        {
-            errorOut = "This tuning has no repeating scale behind it (an MTS-ESP master can "
-                       "supply an arbitrary 128-key table), so it cannot be written as a scale. "
-                       "Nothing was saved.";
-            return false;
-        }
-
-        const auto centsAt = [this, f0] (int n)
-        {
-            const double fn = tuning.frequencyForNote (n);
-            return (fn > 0.0 && std::isfinite (fn)) ? 1200.0 * std::log2 (fn / f0) : 0.0;
-        };
-
-        juce::String s;
-        s << "; AnaMark TUN v2 - written by Fiblo Galactic\n"
-          << "; " << getTuningStatus() << "\n\n";
-
-        if (isTable)
-        {
-            // Said in a comment, so no reader can mistake it for structure: the period is
-            // Fiblo's estimate (or the user's own choice), not something the file repeats at.
-            const auto est = tuning.getTablePeriodEstimate();
-            s << "; 128-key tuning table - this mapping does not repeat, so it declares no scale.\n"
-              << "; period used inside Fiblo: " << juce::String (1200.0 * std::log2 (period), 6)
-              << " cents (" << (tuning.tablePeriodIsUserSet() ? "chosen by the user" : "Fiblo's estimate")
-              << ", " << juce::String (tuning.tablePeriodDevCents(), 2) << " cents off at worst"
-              << (est.found ? "" : ", nothing to measure") << ")\n\n";
-        }
-        else
-        {
-            // Declare the SCALE, so the file says what it is instead of leaving a reader to
-            // infer a period from 128 numbers. Degrees as cents above 1/1, then the period
-            // as the closing interval - the same shape a .scl has, which is what makes this
-            // a scale file rather than a table that happens to repeat.
-            s << "[Scale Begin]\n"
-              << "; " << degrees << " degrees per period of "
-              << juce::String (1200.0 * std::log2 (period), 6) << " cents\n";
-            for (int d = 1; d <= degrees; ++d)
-            {
-                const double r = d < degrees ? getDegreeRatio (d) : period;
-                s << "degree " << d << "=" << juce::String (1200.0 * std::log2 (std::max (1.0e-9, r)), 6) << "\n";
-            }
-            s << "[Scale End]\n\n";
-        }
-
-        s << "[Tuning]\n";
-        for (int n = 0; n < 128; ++n)
-            s << "note " << n << "=" << juce::String ((int) std::llround (centsAt (n))) << "\n";
-        // The exact block is what actually carries the pitch: integer cents above are
-        // only the coarse fallback for readers that predate it.
-        s << "\n[Exact Tuning]\nbasefreq=" << juce::String (f0, 10) << "\n";
-        for (int n = 0; n < 128; ++n)
-            s << "note " << n << "=" << juce::String (centsAt (n), 6) << "\n";
-
-        if (! f.replaceWithText (s)) { errorOut = "Could not write " + f.getFullPathName(); return false; }
+        juce::String text;
+        if (! tuning.writeTunText (text, errorOut)) return false;
+        if (! f.replaceWithText (text)) { errorOut = "Could not write " + f.getFullPathName(); return false; }
         return true;
     }
+
 
     void clearScala();
     juce::String getTuningStatus() const { return tuning.getStatusText(); }
@@ -180,6 +172,23 @@ public:
     // the PERIOD is separate metadata, so the Tuning panel offers it as an editable
     // field marked as Fibló's estimate. Nothing here can move a pitch.
     bool tuningIsAbsoluteTable() const noexcept { return tuning.usesAbsoluteTable(); }
+    // ...and the same question asked about WHAT IS SOUNDING. usesAbsoluteTable() answers
+    // for the loaded SOURCE and knows nothing about the mode, which is right for it -
+    // TuningManager::restoreTuning asks it while putting a tuning back, BEFORE the mode
+    // parameter has been restored, so a mode test inside the accessor would break state
+    // restore. The guard therefore belongs with the consumers, and this is it.
+    //
+    // What it cost to be missing: load a non-repeating .tun once, switch the Tuning box
+    // back to 12-TET, and the instrument was in plain 12-tone equal temperament while
+    // ".scl export" refused with "this tuning is a 128-key table" and right-click degree
+    // editing refused the same way. Both were describing a tuning that had not made a
+    // sound since the user changed the mode. Everything that REFUSES, REWRITES or EXPORTS
+    // "the tuning" asks this one; the panel's period FIELD still asks the sibling above,
+    // because that field describes the loaded file rather than the sounding pitches.
+    bool tuningTableIsInForce() const noexcept
+    {
+        return getTuningMode() == (int) TuningManager::Mode::Scala && tuning.usesAbsoluteTable();
+    }
     juce::String tuningTablePeriodSpec() const { return tuning.tablePeriodSpec(); }
     bool   tuningTablePeriodIsUserSet() const noexcept { return tuning.tablePeriodIsUserSet(); }
     double tuningTablePeriodDevCents()  const noexcept { return tuning.tablePeriodDevCents(); }
@@ -242,6 +251,11 @@ public:
         // to go back to, so undoing a typed spectrum back to an adapted one silently
         // lost its "Load spectrum's tuning" button (caught by RhythmVerify b2). The
         // same order protects `before` = timbreSource, which the load overwrites too.
+        // RULE 7: TimbreTextAction has PartialGainsAction's shape - it always writes the
+        // LIVE spectrum - so a copy of it minted while a corner is being edited is the
+        // same data-loss bug with a typed scale instead of a drawn one. The corner picks
+        // the text up from pullPlaygroundCornerEdit like every other edit in a session.
+        if (pgEditCorner >= 0) return loadTimbreText (text, errorOut);
         std::unique_ptr<TimbreTextAction> act (new TimbreTextAction (*this, timbreSource, text));
         if (! loadTimbreText (text, errorOut)) return false;   // rejected: nothing is pushed
         undoManager.beginNewTransaction();
@@ -257,6 +271,7 @@ public:
     void clearTimbreUndoable()
     {
         if (timbreSource.isEmpty() && timbreDegrees.empty()) return;
+        if (pgEditCorner >= 0) { clearTimbre(); return; }   // rule 7, as above
         const auto before = timbreSource;
         undoManager.beginNewTransaction();
         undoManager.perform (new TimbreTextAction (*this, before, juce::String()));
@@ -292,7 +307,14 @@ public:
     juce::String makeRandomSpectrumText();
 
     // Degrees per period of the active tuning (for the colour keyboard).
+    // The MTS master's own keyboard-mapping report, straight through (see
+    // TuningManager::mtsMapInfo for why it exists and what -1 means).
+    TuningManager::MtsMapInfo mtsMapInfo() const { return tuning.mtsMapInfo(); }
     int getScaleDegrees() const noexcept { return tuning.degreesPerPeriod(); }
+    // How many EQUAL steps the active tuning cuts the OCTAVE into, or 0 when it does not
+    // cut the octave into equal steps at all. The keyboard's note-name option hangs off
+    // this - see TuningManager::equalDivisionsOfOctave. Message thread.
+    int getEqualDivisionsOfOctave() const { return tuning.equalDivisionsOfOctave(); }
 
     // True when EVERY degree sits one equal step from the last (any N-EDO, or any
     // scale that happens to be equal-stepped). In such a tuning a chord shape has
@@ -303,7 +325,15 @@ public:
     {
         const int D = tuning.degreesPerPeriod();
         if (D < 2) return false;
-        const double periodC = 1200.0 * std::log2 (std::max (1.0e-9, tuning.periodRatio()));
+        // NO STATED PERIOD, NO EQUAL STEPS. "Equal-stepped" here means "the scale
+        // repeats, and every step of the repeat is the same size" - the second half is
+        // meaningless without the first. Asking periodRatio() would have measured the
+        // steps against a 2/1 nobody wrote, and a descending .scl whose steps happen to
+        // divide an octave evenly would have been declared rootless: the n-ad list then
+        // prints "any +10 +18", telling the user a shape works from every degree of a
+        // scale that does not come back to itself at all.
+        if (! tuning.hasUsablePeriod()) return false;
+        const double periodC = 1200.0 * std::log2 (std::max (1.0e-9, tuning.statedPeriodRatio()));
         const double step    = periodC / (double) D;
         for (int d = 0; d < D; ++d)
         {
@@ -334,36 +364,36 @@ public:
         numKeys = hi - lo + 1;
     }
 
+    // The ACTIVE tuning's repeat interval (2/1 in octave tunings, 3/1 under
+    // Bohlen-Pierce). The editor asks so the Shepard's rise-interval choice can exist
+    // only when it is really a choice - see shepard::periodDiffersFromOctave.
+    double getTuningPeriodRatio() const noexcept { return tuning.periodRatio(); }
+
+    // ...and the SAME question asked honestly: the period the active tuning really
+    // STATES, or 0.0 when it states none that ascends. Anything that DESCRIBES the
+    // tuning to the user has to ask this one, for the same reason the sound path does:
+    // getTuningPeriodRatio() answers 2.0 for a descending .scl and for a degenerate
+    // 1/1 scale, and a read-out built on that number prints an octave the user's file
+    // never contained. Naming it after the question ("does this tuning state a period")
+    // rather than after temper, because temper is no longer the only caller.
+    double getStatedTuningPeriodRatio() const noexcept { return tuning.statedPeriodRatio(); }
+    bool   tuningStatesPeriod() const noexcept         { return tuning.hasUsablePeriod(); }
+
+    // Can "Temper to tuning" do anything at all? Temper snaps partials onto
+    // "degree x period^k", which needs a period that ASCENDS - a descending .scl or a
+    // degenerate period-1 scale states none. The editor asks so the toggle can be
+    // greyed WITH A REASON instead of appearing to work while the spectrum is silently
+    // snapped to a 2/1 grid the user's file never contained.
+    bool temperIsPossible() const noexcept { return tuningStatesPeriod(); }
+
     // Frequency ratio of scale degree `d` relative to degree 0 (the tonic on
     // key 60), for the keyboard's just-interval labels. Degree d is mapped to an
     // IN-RANGE key of the same degree class (walking down whole periods) rather
     // than clamping the MIDI note, so dense scales (72-EDO etc.) label correctly.
-    double getDegreeRatio (int d) const
-    {
-        const int D = juce::jmax (1, tuning.degreesPerPeriod());
-        const double per = tuning.periodRatio();
-        // Degree index -> (period count, step inside the period), floored so negative
-        // degrees work too. The PERIOD factor is applied explicitly, never inferred
-        // from where the degree happens to land on the keyboard.
-        const int wraps = (int) std::floor ((double) d / (double) D);
-        const int step  = d - wraps * D;
-        // Scala: read the scale's own degree ratio. The 128-key table only holds 128
-        // degree classes, so a scale with more degrees than that CANNOT be read back
-        // through it (degrees 68..D-61 used to all collapse onto key 127's value).
-        double r = 0.0;
-        if (tuning.scalaDegreeRatio (step, r))
-            return r * std::pow (per, (double) wraps);
-        // No scale to ask (MTS, an absolute 128-key table): read the KEY the degree lands
-        // on, which for a table is the file's own pitch. Keys past 127 are walked DOWN by
-        // whole periods rather than clamped - a table with a wide period spans more than
-        // 68 keys per period, and clamping made every degree above that report key 127.
-        int key = 60 + step, extra = 0;
-        while (key > 127) { key -= D; ++extra; }
-        while (key < 0)   { key += D; --extra; }
-        const double f0 = tuning.frequencyForNote (60);
-        const double f  = tuning.frequencyForNote (juce::jlimit (0, 127, key));
-        return f0 > 0.0 ? (f / f0) * std::pow (per, (double) (wraps + extra)) : 1.0;
-    }
+    // Moved into TuningManager (see TuningManager::degreeRatio) so the .tun exporter and
+    // every readout mean the same thing by "degree d" - the exporter used to reach this
+    // through the processor, which is why nothing cheap could test what it wrote.
+    double getDegreeRatio (int d) const { return tuning.degreeRatio (d); }
 
     // Genuine JI test BY SOURCE: is scale degree `d` (0..getScaleDegrees(), where the
     // top index is the period) a rational-sourced interval, and if so its exact p/q?
@@ -380,7 +410,7 @@ public:
     bool getDegreeIsRational (int d, long long& p, long long& q) const
     {
         const int D = juce::jmax (1, tuning.degreesPerPeriod());
-        if (getTuningMode() == (int) TuningManager::Mode::Scala && ! tuning.usesAbsoluteTable())
+        if (getTuningMode() == (int) TuningManager::Mode::Scala && ! tuningTableIsInForce())
             return tuning.scalaDegreeRational (d, p, q);
         if (d <= 0) { p = 1; q = 1; return true; }        // unison
         if (d >= D)                                        // the period/octave
@@ -412,22 +442,200 @@ public:
     // Recently-used .scl files (persisted across sessions, newest first, max 3).
     juce::StringArray getRecentSclPaths() const { return recentSclPaths; }
 
+    //== USER PREFERENCES, not patch state =====================================
+    // "quiero que ... el sinte se acuerde de si el usuario la activo o no y que se abra
+    // ya con ese setting al re-abrirse."
+    //
+    // Note names on the keyboard are a PREFERENCE about how this person reads a
+    // keyboard, not a property of the sound. They therefore live in the same global
+    // settings file as the recent-.scl list (appProps) and NOT in getStateInformation:
+    // patch state travels with the project and with every preset, so a preference stored
+    // there would flip back the moment someone loaded a preset saved before they turned
+    // it on - which is exactly the "it forgot again" the user asked twice to be rid of.
+    // Stored globally, it survives closing the plugin, the host, and the machine, and it
+    // is the same in every project and every instance.
+    bool getKeyboardNoteNames() const noexcept { return keyboardNoteNames; }
+    void setKeyboardNoteNames (bool on)
+    {
+        keyboardNoteNames = on;
+        writeSetting ("keyboardNoteNames", on);   // written NOW: a host that is killed rather
+    }                                             // than closed never runs a destructor to flush it
+
     //==========================================================================
     // Timbre -> rhythm MIDI out (see RhythmEngine.h). The editor edits the slots
     // directly (atomics) and reads the live pulse rates for its panel.
     RhythmEngine& getRhythm() noexcept { return rhythm; }
 
     //==========================================================================
-    // Shepard tone generator (Tuning panel). The engine itself is stateless about
-    // the transport: processBlock resolves the quantized mode's beats against the
-    // host BPM and hands the engine plain seconds. Exposed for the verifiers
-    // (probe of the live components) and the editor (the honesty flag below).
-    ShepardEngine& getShepard() noexcept { return shepard; }
+    // SHEPARD MODE (Tuning panel). There is no separate engine any more: the mode is
+    // rendered inside the VOICES, from the key that was pressed and from the synth's
+    // own spectrum (see AdditiveVoice::planShepard). Only one fact still belongs to
+    // the processor - the transport's, below.
+    //
+    // TESTS ONLY: the Shepard copies of the first SOUNDING main-engine voice - grid
+    // index, ROOT frequency (the transposed played pitch each copy's spectrum is
+    // built on), window amplitude and partial count. Any pointer may be null. This is
+    // how run 46 proves the stack is anchored on the key that was pressed.
+    int voiceShepardForTests (long long* ms, double* roots, double* wins, int* counts, int maxN)
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive())
+                    return av->shepProbeForTests (ms, roots, wins, counts, maxN);
+        return 0;
+    }
+    // The rise interval the first sounding voice is ACTUALLY using, as a ratio.
+    double voiceShepardRiseRatioForTests()
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive())
+                    return av->shepRiseRatioForTests();
+        return 0.0;
+    }
+    // TESTS ONLY: the worst-case evidence for the Shepard's three stated invariants
+    // (see AdditiveVoice::shepEvidenceForTests). Reset covers EVERY voice, because the
+    // note under test may be a stolen one and a per-voice reset would measure a fresh
+    // voice while the evidence sat on the one that was actually playing.
+    void shepardEvidenceResetForTests()
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                av->shepEvidenceResetForTests();
+    }
+    // ...and the worst case across every voice, for the same reason.
+    void shepardEvidenceForTests (double& claimW, double& claimX, double& dropW, double& loStep,
+                                  int& planned, int& dropped, int& minCopies, int& blocks,
+                                  int& cutBlocks, int& cutWorst)
+    {
+        claimW = claimX = dropW = loStep = 0.0; planned = dropped = blocks = 0; minCopies = 0;
+        cutBlocks = cutWorst = 0;
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+            {
+                double cw, cx, dw, ls; int pl, dr, mc, bl, cb, cwo;
+                av->shepEvidenceForTests (cw, cx, dw, ls, pl, dr, mc, bl, cb, cwo);
+                if (bl == 0) continue;
+                if (cw > claimW) { claimW = cw; claimX = cx; }
+                dropW = std::max (dropW, dw); loStep = std::max (loStep, ls);
+                planned = std::max (planned, pl); dropped += dr; blocks += bl;
+                cutBlocks += cb; cutWorst = std::max (cutWorst, cwo);
+                minCopies = (minCopies == 0) ? mc : std::min (minCopies, mc);
+            }
+    }
     // TRUE while the rate control is in Sync mode but the host offers no BPM, so
     // the FREE (ms) value is what actually drives the rise. The editor shows this
     // state instead of letting the beats box claim a sync that is not happening.
     bool shepardSyncHasNoBpm() const noexcept { return shepSyncNoBpm.load (std::memory_order_relaxed); }
     const spectrum::SpectrumTemplate* getLiveTemplate() const noexcept { return spectrumEngine.getLive(); }
+    // The phase plan measured on that template, and the report that says how it did.
+    // Exposed so the offline verifiers can hold the engine to its own guarantee - a plan
+    // that is never worse than the hash is a claim, and a claim nobody measures is a
+    // comment. Not used by the audio path yet: this publishes and checks the plan, the
+    // voice consuming it is the next step.
+    const spectrum::phaseset::PhasePlan* getLivePhasePlan() const noexcept
+    { return spectrumEngine.getLivePlan(); }
+    const spectrum::phaseset::PhaseReport* getLivePhaseReport() const noexcept
+    { return spectrumEngine.getLiveReport(); }
+
+    //== MONOPHONIC GLIDE probes (verifiers only, single-threaded harnesses) ====
+    // The size of the pool, how many of it are sounding, and the pitch the sounding
+    // voice ended its last block on. Run 48 checks all three: the pool being ONE is
+    // the "no chords" promise, the active count is what a second simultaneous key must
+    // not increase, and the pitch is the internal counterpart of the audio's own f0
+    // probe (a disagreement between them names which half broke).
+    int synthVoiceCountForTests() const noexcept { return synth.getNumVoices(); }
+    // One MIX sub-engine's pool size and how many of its voices are sounding. The pair is
+    // what proves the shrink FADES rather than deletes: a fade leaves the pool at its old
+    // size for a tick or two while the doomed voices go quiet, so `pool` may exceed the
+    // requested count while `active` falls. A delete moves both in the same instant, and
+    // that is the difference no audio metric could see - a dense spectrum's own envelope
+    // swings further in 1.3 ms than six of eight sub-engine voices are worth.
+    int mixVoicePoolForTests (int corner) const noexcept
+    {
+        if (corner < 0 || corner >= kPlaygroundCorners || mixEng[(size_t) corner] == nullptr) return -1;
+        return mixEng[(size_t) corner]->synth.getNumVoices();
+    }
+    int mixVoicesActiveForTests (int corner) const noexcept
+    {
+        if (corner < 0 || corner >= kPlaygroundCorners || mixEng[(size_t) corner] == nullptr) return -1;
+        auto& s = mixEng[(size_t) corner]->synth;
+        int n = 0;
+        for (int v = 0; v < s.getNumVoices(); ++v)
+            if (auto* mv = s.getVoice (v); mv != nullptr && mv->isActive()) ++n;
+        return n;
+    }
+    int activeVoiceCountForTests() const noexcept
+    {
+        int c = 0;
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (synth.getVoice (v)->isActive()) ++c;
+        return c;
+    }
+    double voiceSoundingHzForTests() const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) return av->soundingHzForTests();
+        return 0.0;
+    }
+    // Is the sounding voice still in Shepard mode, and is a portamento still running on
+    // it? Run 48 uses the pair to prove a takeover does not interrupt a rising Shepard:
+    // its stack is a played mode latched per NOTE, and a legato takeover is one note.
+    bool voiceShepardActiveForTests() const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) return av->shepActiveForTests();
+        return false;
+    }
+    bool voiceGlidingForTests() const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) return av->glidingForTests();
+        return false;
+    }
+    double voiceMorphWeightForTests() const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) return av->morphWeightForTests();
+        return 0.0;
+    }
+    //== PHASE FADER probes (verifiers only) ===================================
+    // Where the SOUNDING phases sit on the Phase fader, and what those phases are.
+    // The pair is how run 53 separates the two halves of the reported symptom: the
+    // level is a function of the first, and the second is the thing that has to have
+    // moved before the first is allowed to.
+    double voiceSoundingScatterForTests() const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) return av->soundingScatterForTests();
+        return -1.0;
+    }
+    int voicePhasesForTests (double* out, int maxN, int base = 0) const noexcept
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) return av->phasesForTests (out, maxN, base);
+        return 0;
+    }
+    // The worst detune a live re-phase actually applied, in cents of the partial it was
+    // applied to. The whole answer to "a single transition time cannot be inaudible
+    // across the whole bank" is a measured number, and this is where it comes from.
+    double voiceRephaseWorstCentsForTests() const noexcept
+    {
+        double w = 0.0;
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive()) w = std::max (w, av->rephaseWorstCentsForTests());
+        return w;
+    }
+    // Voices in one playground MIX sub-engine (-1 when that corner has no engine).
+    // Declared here, defined after kPlaygroundCorners exists.
+    int mixVoiceCountForTests (int corner) const noexcept;
     // Every swap of the live template, gains-only republishes included (see
     // SpectrumEngine::getLiveRevision). Read by run 42 to count what the ear gets.
     juce::uint32 getSpectrumLiveRevision() const noexcept { return spectrumEngine.getLiveRevision(); }
@@ -478,40 +686,241 @@ public:
     // Commit one gesture's worth of edits THROUGH the undo stack. `before` is the list
     // as it stood when the gesture started - captured by the caller, because by the time
     // the mouse comes up the live list is already the new one.
+    //
+    // `startNewTransaction == false` is for the gesture that ALSO armed manual mode
+    // (armManualPartialAmpsForEdit below): that call already opened the transaction, and
+    // opening a second one here would split one user action - "I dragged a partial" -
+    // into two undo steps, the second of which leaves manual switched on with no edits.
     void commitPartialGains (std::vector<spectrum::PartialGain> before,
-                             std::vector<spectrum::PartialGain> after)
+                             std::vector<spectrum::PartialGain> after,
+                             bool startNewTransaction = true)
     {
         if (before == after) return;                 // a click that moved nothing
-        undoManager.beginNewTransaction();
+        // RULE 7: while a corner is being edited the pencil is drawing THAT CORNER, not
+        // the live patch - but this action always writes the LIVE gains, so a copy of it
+        // left on the shared stack is what wiped a hand-drawn spectrum one Ctrl+Z after
+        // leaving edit mode (gains=1 -> gains=0, and redo then installed the corner's
+        // drawing). The edit still reaches the corner: pullPlaygroundCornerEdit reads
+        // getPartialGains() every tick and the corner's own rev carries it.
+        if (pgEditCorner >= 0)
+        {
+            setPartialGains (std::move (after),
+                             apvts.getRawParameterValue ("partialManual")->load() > 0.5f);
+            return;
+        }
+        if (startNewTransaction) undoManager.beginNewTransaction();
         undoManager.perform (new PartialGainsAction (*this, std::move (before), std::move (after)));
+    }
+
+    //== UNDO / REDO, THROUGH THE PROCESSOR ======================================
+    // The editor's Ctrl+Z used to call undoManager.undo() straight. Inside a corner-edit
+    // session that unwound the LIVE PATCH's history into the scratch surface, and the
+    // next pull absorbed the result into the corner and stamped it with the "*" - so the
+    // honesty mark blamed the user for a change they never made. Measured inside the
+    // first second of a session: "fast undo: surface 4000 (starred yes); corner B now
+    // reads 4000 (saved 9000)". UndoManager::undo() unwinds the currently-open
+    // transaction too, so there is no grace period to hide behind.
+    //
+    // There is no per-corner history to walk instead, so the honest answer is to refuse.
+    // Returns false when nothing was done, so a caller can say so.
+    bool performUndo()
+    {
+        if (pgEditCorner >= 0) return false;   // a corner has no history of its own
+        return undoManager.undo();
+    }
+    bool performRedo()
+    {
+        if (pgEditCorner >= 0) return false;
+        return undoManager.redo();
+    }
+    // How many undo STEPS are on the stack. The unit a test has to count when the claim
+    // is "one gesture is one Ctrl+Z" - the actions inside a step are not the question,
+    // how many times the user has to press Ctrl+Z is.
+    int undoStackDepthForTests() const { return undoManager.getUndoDescriptions().size(); }
+
+    //== ONE GESTURE IS ONE UNDO STEP, EVEN WHEN IT IS SLOW =======================
+    // The 60 Hz timer below cuts parameter edits into ~1-second transactions so a slider
+    // drag undoes as one step instead of hundreds of micro-moves. A PENCIL drag is also
+    // one user action, and it can easily last longer than a second - so that cut landed
+    // INSIDE it and split it in two.
+    //
+    // The half that hurts is the first pencil drag of a session, the one that arms manual
+    // mode: armManualPartialAmpsForEdit() opens the transaction and the flip reaches the
+    // undo stack on the APVTS's own 20-500 ms timer, i.e. early in the drag, while
+    // commitPartialGains lands at mouse-up. With a cut between them, step 2 is the
+    // amplitudes and step 1 is the flip, so ONE Ctrl+Z takes back the edits and leaves
+    // manual mode ARMED WITH NO EDITS - exactly the state f40623d exists to forbid, and
+    // the state in which SLOPE is frozen for a spectrum nobody drew.
+    //
+    // So the cut is held off while a gesture is open. It is a COUNT, not a flag, because
+    // nothing forbids a second grid opening one, and it is released by the panel's
+    // destructor as well as by mouse-up: a mouse-up is not guaranteed if the window dies
+    // mid-drag, and a stuck hold would silently restore the unbounded-ActionSet bug the
+    // cut was added to prevent.
+    void beginUndoGesture() noexcept { ++undoGestureDepth; undoTxnTick = 0; }
+    void endUndoGesture()   noexcept
+    {
+        if (undoGestureDepth > 0) --undoGestureDepth;
+        undoTxnTick = 0;   // the next cut is a full second AFTER the gesture, not mid-flight
+    }
+    int  undoGestureDepthForTests() const noexcept { return undoGestureDepth; }
+
+    // THE FIRST PENCIL EDIT OF A SESSION SWITCHES MANUAL MODE ON, ITSELF.
+    //
+    // "partialManual" ships OFF, and while it is off SpectrumEngine::fillGains throws the
+    // resolved edits away (`t.gain.clear()`), so the voice's amplitude loop is skipped
+    // entirely. The gesture was still accepted: the value was stored, the grid dimmed to
+    // 55%, the read-out showed the new dB - and the sound moved by EXACTLY 0.00 dB.
+    // Measured at 2*f0, a +12 dB pencil edit gave +6.01 dB with manual on and +0.00 dB
+    // with it off. That is a control that lies, and it is what the user reported as
+    // "cambiar el volumen de 2 no produce ningun cambio perceptible".
+    //
+    // The alternative - refusing the drag while manual is off - was rejected: the pencil
+    // window exists to draw a spectrum by hand, so opening it, dragging a knob and being
+    // told "no" is a worse answer than doing the obvious thing. The precedent is already
+    // in the plugin: applySpectrumAdapt arms manual the same way, for the same reason.
+    // The pill stays, in both places, so it is one click back off.
+    //
+    // Through the PARAMETER, so the host records it and it is undoable like every other
+    // control; and BEFORE the drag's first frame, so:
+    //   - the very first pixel of the drag is audible, and
+    //   - manualSlopeFrozen catches the PRE-drag slope. Freezing it here rather than
+    //     leaving it to timerCallback is the same ordering applySpectrumAdapt uses: the
+    //     poll builds its settings AFTER this check, so a flip noticed one tick late
+    //     would compile one template at the old slope and a second at the frozen one -
+    //     an audible extra amplitude fade for a spectrum that had not changed.
+    //
+    // Returns true if it actually flipped (and therefore opened the undo transaction).
+    bool armManualPartialAmpsForEdit()
+    {
+        if (apvts.getRawParameterValue ("partialManual")->load() > 0.5f)
+            return false;                            // already on: nothing to arm, nothing to undo
+
+        // Opened HERE so the parameter flip cannot land in the PREVIOUS undo step:
+        // APVTS writes a parameter into the ValueTree (and so onto the undo stack) on its
+        // own 20-500 ms timer, not synchronously, so whichever transaction is open when
+        // that timer fires is the one that gets it. Opening ours now and telling
+        // commitPartialGains not to open another puts the flip and the edit in the same
+        // one whether the flush lands mid-drag or after the mouse comes up.
+        //
+        // RULE 7: not while a corner is being edited. Opening a transaction there starts
+        // a step on the LIVE patch's stack for a flip that belongs to the corner, and the
+        // corner's own rev already carries it. (commitPartialGains pushes nothing in a
+        // session either, so there is no split gesture to protect against here.)
+        if (pgEditCorner < 0)
+            undoManager.beginNewTransaction();
+
+        manualSlopeFrozen = apvts.getRawParameterValue ("curveSlope")->load();
+        lastManualMode    = true;
+        if (auto* pm = apvts.getParameter ("partialManual"))
+        {
+            pm->beginChangeGesture();
+            pm->setValueNotifyingHost (1.0f);
+            pm->endChangeGesture();
+        }
+        // Hand the engine the new state now. It only learns whether the edits are in
+        // force through setOverrides, and waiting for timerCallback to notice would make
+        // the first frames of the drag silent - the very defect this is fixing.
+        setPartialGains (partialGains, true);
+        return true;
     }
     // How many of those edits currently sit on a partial that actually exists. The rest
     // are not lost - their partial is simply not in this spectrum right now.
     int getPartialGainsMatched() const noexcept { return spectrumEngine.getGainMatchedCount(); }
     juce::uint32 getTemplateGeneration() const noexcept { return spectrumEngine.getGeneration(); }
+    // "Is the spectrum worker still owed anything?" - see SpectrumEngine::isBuildPending.
+    bool isSpectrumBuildPending() const { return spectrumEngine.isBuildPending(); }
 
     //==========================================================================
-    // Tuning bank: load as many .scl files as you like (effectively unlimited - the
-    // automatable "tuningBankSlot" parameter just needs a bounded range, so the ceiling
-    // is a generous 128). 0 = none, 1..N = slot; the switch is picked up on the message
-    // thread (timerCallback) and loaded there. The UI only ever shows the loaded slots.
+    // Tuning bank: 128 slots. The ceiling exists because "tuningBankSlot" is an
+    // automatable parameter and a parameter needs a bounded range - it is generous, not
+    // unlimited, and the difference matters: this used to be described as "effectively
+    // unlimited" everywhere while firstEmptyBankSlot() answered 0 with the bank full, so
+    // the 129th tuning silently overwrote the user's own first one. A limit is allowed to
+    // exist here only because it is now STATED when it bites (see setTuningBankFile and
+    // bankAutoAdd, which park the sentence on bankSlotError).
+    // 0 = none, 1..N = slot; the switch is picked up on the message thread
+    // (timerCallback) and loaded there. The UI only ever shows the loaded slots.
     static constexpr int kBankSlots = 128;
     void setTuningBankFile (int slot0, const juce::File& f);       // load a .scl into a slot + activate it
     juce::String getTuningBankName (int slot0) const { return juce::isPositiveAndBelow (slot0, kBankSlots) ? bankName[(size_t) slot0] : juce::String(); }
     int  getTuningBankSlotParam() const noexcept { return (int) apvts.getRawParameterValue ("tuningBankSlot")->load(); }
     void setTuningBankSlotParam (int slot);                        // 0 = none, 1..N = slot (drives automation + load)
+    // The first free slot, or -1 when there is none. NEVER 0-as-a-fallback: the caller
+    // passes this straight to setTuningBankFile, and a fallback slot is somebody's scale.
     int  firstEmptyBankSlot() const noexcept;
     // Every loaded tuning joins the bank. Returns the 0-based slot it landed in (or
-    // an existing duplicate's), -1 if the bank is full.
+    // an existing duplicate's), -1 if the bank is full - and a full bank parks a sentence
+    // on bankSlotError rather than dropping the tuning out of the bank in silence.
     int  bankAutoAdd (const juce::String& name, const juce::String& source);
     void syncBankSelector (int slot0); // point the selector at a slot without re-loading it
     void bankClearSlot (int slot0);                                          // the bank's X button
 
     //==========================================================================
     // File presets (.gsting). Called from the editor.
+    //
+    // ONE SPELLING OF THE EXTENSION, because the literal was written out in a dozen
+    // places across this file and the verifiers, and one of those copies drifted:
+    // RhythmVerify's run 48 saved through savePreset() (which writes ".gsting") and
+    // then deleted "<name>.fibpreset", so its own cleanup deleted nothing and the
+    // suite left run48-A.gsting and run48-B.gsting sitting in the USER'S real preset
+    // folder, run after run, next to their own patches. presetFile() is the only way
+    // to name one, so that cannot happen again by typing.
+    static constexpr const char* kPresetExt = ".gsting";
     static juce::File getPresetFolder();
+    // TESTS ONLY: point every preset read and write at a scratch directory instead of
+    // the user's Documents folder. run 48 saved through savePreset() into the USER'S
+    // real folder and then deleted "<name>.fibpreset", so its cleanup removed nothing
+    // and run48-A/B.gsting sat beside the player's own patches until somebody noticed.
+    // A suite that must WRITE presets redirects the folder rather than promising to
+    // tidy up. An empty File restores the real folder.
+    static void setPresetFolderForTests (const juce::File& dir);
+    static juce::File presetFile (const juce::String& name)
+    { return getPresetFolder().getChildFile (name + kPresetExt); }
     juce::StringArray getPresetNames();
-    juce::String savePreset (const juce::String& name); // returns the stored name, or empty on failure
+
+    //==========================================================================
+    // THE FACTORY TUNINGS, AND THE FOLDER "Load tuning" OPENS IN.
+    //
+    // "mete archivos .tun DENTRO del VST ... que 'Load tuning' abra esa carpeta por
+    // defecto; y si el usuario carga desde otra carpeta, que recuerde ESA."
+    //
+    // Six .tun files are compiled into the binary (see juce_add_binary_data in
+    // CMakeLists.txt): the harmonic series 8..16, 7/12/24/31 equal divisions of the
+    // octave, and Bohlen-Pierce. A FILE CHOOSER CANNOT BROWSE BinaryData, so they are
+    // written out to a real folder the first time anything asks for it.
+    //
+    // Documents/Galactic Sting/Tunings - the same idiom and the same parent as
+    // getPresetFolder(), because these are the user's files once they exist: they can
+    // be edited, renamed, deleted and added to, and nothing here ever writes over one
+    // again (see getTuningsFolder). It is NOT the preset folder and never touches it.
+    static juce::File getTuningsFolder();
+    // TESTS ONLY, and for the same reason setPresetFolderForTests exists: a verifier
+    // that called getTuningsFolder() would extract six files into the USER'S Documents
+    // on every run. An empty File restores the real folder.
+    static void setTuningsFolderForTests (const juce::File& dir);
+
+    // Where the tuning chooser should open: the folder the user last LOADED a tuning
+    // from, or the bundled folder above when there is none (a first run, or a
+    // remembered folder that has since been moved or unplugged).
+    //
+    // Stored in appProps beside recentScl / keyboardNoteNames, NOT in the patch state:
+    // "the folder I keep my scales in" is a fact about this person's disk, and a patch
+    // travels to other machines and into every preset. Saved there it would follow a
+    // .gsting file onto a computer where that path is somebody else's folder or none.
+    juce::File getTuningChooserFolder() const;
+    void setTuningChooserFolder (const juce::File& dir);
+    // Why a preset write was refused. The PROCESSOR decides the rule; the EDITOR writes
+    // the sentence, because the sentence has to be in the user's language and the
+    // processor has no tr(). CornerFixedPoint carries the corner it was refused for.
+    enum class PresetWriteRefusal { None, BadName, CornerFixedPoint, WriteFailed };
+    // Returns the stored name (sanitised), or empty on failure with `why` set. A CORNER
+    // IS A FIXED POINT: while the pad is driving, the controls are the blend's OUTPUT,
+    // so a save under an assigned corner's own name is REFUSED, out loud - that write is
+    // what closes case #88's drain through the .gsting file. See writePresetFile, which
+    // is where the rule lives.
+    juce::String savePreset (const juce::String& name, PresetWriteRefusal& why, int& corner);
+    juce::String savePreset (const juce::String& name); // ...when the caller has nowhere to show it
     bool loadPreset (const juce::String& name);
     // True once ANY parameter's BASE value (a knob turned, host automation, undo...)
     // no longer matches what was in the loaded preset - modulation from the
@@ -519,6 +928,45 @@ public:
     // (see ModEngine.h), never the base value this compares against.
     bool presetHasDrifted() const;
     juce::String getLoadedPresetName() const { return loadedPresetName; }
+
+    // DELETING A PRESET. "haz que sean borrables" - asked 2026-09-14.
+    //
+    // The file goes to the RECYCLE BIN, never straight off the disk: a preset list is
+    // clicked through fast, one click away from the one you meant, and the undo for a
+    // wrong delete is "restore it from the Recycle Bin", which the user already knows.
+    // (Windows' own rule applies underneath: a folder with no Recycle Bin - a network
+    // share - deletes for good. Documents is not one of those.)
+    //
+    // A PRESET ON A PLAYGROUND CORNER DELETES LIKE ANY OTHER (since 2026-09-15). It used to be
+    // refused, because a corner was stored as a NAME and re-read its file on every load, so
+    // the delete would have emptied it. A corner now carries its own copy of the preset and is
+    // saved WITH it (see PlaygroundCorner::source), so the file is no longer what the corner
+    // stands on: `cornerOut` names the first corner that keeps a copy, so the editor can SAY
+    // the corner is unaffected, and nothing is refused for it.
+    //
+    // Deleting the preset that is LOADED leaves the sound exactly as it is - it is in
+    // memory - but stops tracking it as a preset: there is no file left for the "*" to
+    // mean "differs from", so the patch is simply unsaved from then on.
+    enum class PresetDeleteRefusal { None, NoSuchPreset, CouldNotDelete };
+    // `wentToBinOut` (optional): whether the file went to a place it can be restored from -
+    // false for a drive Windows keeps no Recycle Bin on, where FOF_ALLOWUNDO deletes for good.
+    // `cornerMaskOut` (optional): bit i set for EVERY corner i that holds this preset and keeps
+    // its copy - `cornerOut` is only the first of them.
+    PresetDeleteRefusal deletePreset (const juce::String& name, int& cornerOut, bool* wentToBinOut = nullptr,
+                                      int* cornerMaskOut = nullptr);
+    // TESTS ONLY: delete the file outright instead of moving it to the Recycle Bin, so a
+    // suite run does not leave a pile of scratch presets in the user's bin. The trash
+    // call itself is JUCE's (SHFileOperation, FOF_ALLOWUNDO) and the suite does not run it.
+    static void setPresetDeleteToTrashForTests (bool toTrash);
+
+    // THE CORNERS A LOAD COULD NOT PUT BACK, for the editor to say once (the one-shot
+    // pattern of takePresetLoadError). A corner is stored by NAME; restoreState re-reads
+    // each file, and a preset that has been deleted, renamed or broken since then used to
+    // leave its corner EMPTY with nothing anywhere saying so. Now that presets can be
+    // deleted from the list itself this is no longer a rare path.
+    struct LostCorner { int corner = -1; juce::String name, why; };
+    std::vector<LostCorner> takePlaygroundRestoreLoss()
+    { auto v = std::move (pgRestoreLoss); pgRestoreLoss.clear(); return v; }
 
     //==========================================================================
     // THE PRESET PLAYGROUND.
@@ -543,11 +991,23 @@ public:
     // the SOUND, not what the keys mean. Same promise loadPreset() already makes.
     static constexpr int kPlaygroundCorners = presetmorph::kCorners;
 
+    // BYTES reserved for the MIX engage-edge injection buffer, sized here (and named, so a
+    // verifier can measure the real number rather than a copy of it) and reserved once in
+    // prepareToPlay. The arithmetic is written out at that call: the unit is BYTES, not
+    // events, and the fill's own bound is the 16 x 128 loop in renderSynthMix.
+    static constexpr int kMixInjectBytes = 32768;
+
     // Put a preset on a corner (empty name clears it). Compiles that preset's spectrum
     // there and then - synchronously, on the message thread, exactly as prepareToPlay's
     // buildNow does - because a corner has to have a template before the very first
     // blend, and the alternative is a first drag that silently does nothing.
     bool assignPlaygroundCorner (int corner, const juce::String& presetName, juce::String& errorOut);
+    // THE SAME, AS ONE UNDO STEP - what the playground window's corner box and X use. A pick
+    // and a clear used to be invisible to Ctrl+Z, so the first Ctrl+Z after one jumped over it
+    // to an older corner-edit step and put back a corner the user had since replaced or cleared
+    // - including one whose preset had been DELETED in between (the night review, 2026-09-15).
+    // Restores and tests keep the plain call: a state load is not something to undo.
+    bool assignPlaygroundCornerUndoable (int corner, const juce::String& presetName, juce::String& errorOut);
     juce::String getPlaygroundCornerName (int corner) const;
     int  getPlaygroundAssignedCount() const;
     // The morph only DRIVES anything with two or more corners assigned. One preset has
@@ -627,11 +1087,75 @@ public:
     // Non-empty when a corner's saved settings cannot run at all (bad period, absurd
     // cost...). The corner stops retrying and this SAYS so - never a silent stop.
     juce::String getPlaygroundAdaptRefusal() const { return pgAdaptRefusal; }
+    //==========================================================================
+    // EDITING A CORNER IN PLACE. Full rules (and the ownership contract this obeys) are
+    // in the big comment above beginPlaygroundCornerEdit in PluginProcessor.cpp. The
+    // short version, because getting it wrong is a data-loss bug:
+    //
+    //   * While a corner is being edited the main editor's controls are a SCRATCH
+    //     SURFACE showing that corner - they are NOT the live patch. The live patch is
+    //     frozen (parameters, timbre, per-partial edits, its preset identity and its
+    //     drift mark) and handed back byte-for-byte when edit mode ends.
+    //   * The edits live in the CORNER, in memory, for this session only. Nothing is
+    //     written to the .gsting the corner points at - ever. The trailing "*" on the
+    //     corner's name is the warning, and it survives leaving edit mode.
+    //   * Saving from edit mode writes the corner under a NAME OF ITS OWN and renames
+    //     the corner to it; the live patch's own preset identity is not touched.
+    //
+    // Returns false if the corner holds no preset, or the playground is not engaged.
+    bool beginPlaygroundCornerEdit (int corner);
+    // Hand the live patch back. Safe to call when nothing is being edited.
+    void endPlaygroundCornerEdit();
+    int  getPlaygroundEditCorner() const noexcept { return pgEditCorner; }
+    bool isPlaygroundCornerEdited (int corner) const noexcept
+    { return juce::isPositiveAndBelow (corner, kPlaygroundCorners) && pgCorner[(size_t) corner].edited; }
+    // The corner's name as the UI must show it: with the "*" when it carries unsaved
+    // edits. ONE place, so the pad, the corner box and the frozen preset field cannot
+    // disagree about whether a corner has been touched.
+    juce::String getPlaygroundCornerDisplayName (int corner) const;
+    // Save the corner (edited or not) as a preset file of its own and rename the corner
+    // to it. Returns the name actually stored (sanitised) or empty on failure.
+    juce::String savePlaygroundCornerAs (int corner, const juce::String& name);
+    // TESTS: how many times the edited corner's spectrum has been recompiled, so a check
+    // can prove an edit reaches the SOUND and not merely the store.
+    int getPlaygroundCornerRevForTests (int corner) const noexcept
+    { return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].rev : -1; }
+
+    // TESTS: the corner STORE's own parameter values - the blend's INPUT, in
+    // getParameters() order. A corner is a fixed point of the blend, so twenty save /
+    // re-assign round trips must leave this vector bit-identical; case #88 is what
+    // happens when it does not. Empty for an unassigned corner.
+    std::vector<float> getPlaygroundCornerParamsForTests (int corner) const
+    {
+        return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].params
+                                                                     : std::vector<float>{};
+    }
+    // TESTS: the corner store's value for one parameter id (NaN if unassigned/unknown).
+    float getPlaygroundCornerParamForTests (int corner, const juce::String& id) const;
+
+    // TESTS: a corner's per-partial amplitude edits and its Custom Engine text.
+    std::vector<spectrum::PartialGain> getPlaygroundCornerGainsForTests (int corner) const
+    {
+        return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].gains
+                                                                     : std::vector<spectrum::PartialGain>{};
+    }
+    juce::String getPlaygroundCornerTimbreSourceForTests (int corner) const
+    { return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].timbreSource : juce::String(); }
     // The corner's compiled template, so a test can prove it CHANGES when the chord does.
     std::shared_ptr<const spectrum::SpectrumTemplate> getPlaygroundCornerTemplateForTests (int corner) const
     {
         return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].tmpl
                                                                      : nullptr;
+    }
+    // TESTS ONLY: the gliding ratios of the first ACTIVE main-engine voice (see
+    // AdditiveVoice::curRatiosForTests). How run 47 proves a drag BENDS frequencies.
+    int voiceCurRatiosForTests (double* out, int maxN)
+    {
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive())
+                    return av->curRatiosForTests (out, maxN);
+        return 0;
     }
 
     //==========================================================================
@@ -717,8 +1241,20 @@ public:
     bool isNadBusy() const noexcept { return nadBusy.load(); }
     // Honesty surface: never hide a coverage limit silently.
     bool nadWasOverBudget() const noexcept { return nadOverBudget.load(); }
+    // ...and the same rule for the OTHER thing this list can be missing: the tuning it
+    // ranked states no ascending period, so the search could not treat one shape as
+    // standing for all its transpositions (no "any" chip), could not skip a pair that
+    // repeats the period, and nothing here may be read as being "per octave". Published
+    // so the list can SAY that rather than quietly behave differently.
+    bool nadHadNoPeriod() const noexcept { return nadNoPeriod.load(); }
     int  getNadUsedDegrees()  const noexcept { return nadUsedD.load(); }
     int  getNadTotalDegrees() const noexcept { return nadTotalD.load(); }
+    // HOW MANY DEGREES THE PUBLISHED ROWS WERE COMPUTED OVER. Published with the
+    // results, not read live off the tuning: a row's numbers are degree INDICES into
+    // the scale that was loaded when the worker ran, so a caller that shows them beside
+    // a different scale is printing degrees that scale does not have. That is exactly
+    // what "en una pentatonica me dice 7 y 11" was - 12-TET's answer left on screen.
+    int  getNadResultDegrees() const noexcept { return nadResultD.load(); }
     std::vector<NadRow> getNadResults() const
     {
         const juce::ScopedLock sl (nadLock);
@@ -745,26 +1281,64 @@ public:
         // clusters as nearly free and builds them, which is precisely the roughness that
         // dominates two octaves up.
         //
-        // ONE NUMBER, and it is a COUNT OF SCALE STEPS: the range runs from the anchor key
-        // (see registerAnchorKey) to `regSteps` degrees of the loaded tuning above it. Two
-        // absolute bounds could not do this - they were pinned to fixed pitches, so the
-        // adaptation answered with the same spectrum whichever register was actually being
-        // played, and they had to be re-read every time the tuning changed. A step count is
-        // the same musical width in any tuning (24 in 12-EDO, 62 in 31-EDO, 26 in
-        // Bohlen-Pierce are all two periods) and it FOLLOWS the hands.
+        // ONE NUMBER, and it is a COUNT OF PERIODS EACH WAY: the band runs from
+        // `regPeriods` periods BELOW the anchor key (see registerAnchorKey) to the same
+        // number of periods ABOVE it. Both halves matter - the interval that beats worst
+        // is ~434 cents low and ~61 cents four octaves up, so the register a fifth below
+        // the played note is as different a question as the one above it, and an
+        // anchor-and-up band (what this was) simply never asked it.
         //
-        // < 0 means "the default width", which is kAdaptRegisterDefaultPeriods periods of
-        // whatever scale is loaded - so a follower running with the window shut still spans
-        // the register being played instead of collapsing to one pitch.
-        int    regSteps  = -1;
+        // WHY PERIODS AND NOT STEPS. A step count was the previous unit and it was exact
+        // but unreadable: "62" is two periods in 31-EDO and 62 periods in a one-degree
+        // scale, so every value had to be divided by the degree count before it meant
+        // anything, and a typed number had to be deliberately protected from being
+        // re-derived when the tuning changed. A period IS the tuning's own unit: the same
+        // number is the same musical width in every scale, nothing is re-derived, and the
+        // only tuning that has no period of its own is the absolute .tun table - where
+        // adaptRegistersFor uses the period Fibló measured for the file and the panel says
+        // so, rather than pretending.
+        //
+        // < 0 means "the default width", which is kAdaptRegisterDefaultPeriods (measured,
+        // see SpectrumTests (8)) - so a follower running with the window shut still spans
+        // the registers around the note being played instead of collapsing to one pitch.
+        double regPeriods = -1.0;
     };
+    // WHERE THE PERIOD USED BY THE REGISTER BAND COMES FROM. A .scl (or MTS) states its
+    // own period, so the band is exact. An absolute 128-key .tun states 128 pitches and
+    // NOTHING about repetition: what periodRatio()/degreesPerPeriod() answer there is
+    // Fibló's estimate for the file, or - when the file has nothing ascending to measure -
+    // the 2/1-over-12-keys fallback, which is a guess and not a measurement. The panel
+    // shows which of the three it is standing on, because a band silently built on a made
+    // up period is exactly the "silently wrong" this instrument refuses to be.
+    // Where the number the register band counts in came from. `NoneStated` was called
+    // TableFallback and could only be reached from an absolute .tun - but a .scl that
+    // states no ASCENDING period (descending, or a degenerate 1/1) is the same
+    // situation exactly: the band is being counted in 2/1s that appear nowhere in the
+    // user's file. It is named for the fact now, not for the file format that first
+    // showed it.
+    enum class RegisterPeriodSource { Scale, TableEstimate, NoneStated };
+    struct RegisterPeriodInfo
+    {
+        RegisterPeriodSource source = RegisterPeriodSource::Scale;
+        double ratio    = 2.0;      // the period in force, as a frequency ratio
+        int    keys     = 12;       // ...and how many MIDI keys of THIS tuning span it
+        double devCents = 0.0;      // worst cents the .tun strays from it (table modes only)
+    };
+    RegisterPeriodInfo registerPeriodInfo() const;
     // The KEY the register range hangs off: the lowest note being HELD, else the last one
     // played, else 60. In that order and for that reason - the hand-pressed Adapt must have
     // a defensible anchor without the user holding a key down while they reach for the
     // mouse, and "middle C" is only ever the answer before a single note has been played.
     int registerAnchorKey() const noexcept;
-    // How many steps the DEFAULT range spans under the scale loaded right now.
-    int defaultRegisterSteps() const noexcept;
+    // THE BAND'S TWO ENDS IN Hz, resolved exactly as adaptRegistersFor resolves them (it
+    // calls this). Registers are FREQUENCIES, not notes: the objective is sampled at
+    // pitches, so the ends are the anchor's frequency multiplied and divided by the
+    // tuning's period raised to `periods`. Going through the key ladder instead - anchor
+    // +- round(periods x degrees) keys, which is what the step-count form did - rounded
+    // every fractional width to the nearest key: 1.5 periods of a five-note scale came out
+    // 120 cents wide of what was asked for, silently. Only the CLAMP is in keys, because
+    // "the instrument stops here" really is a statement about the keyboard.
+    void registerBandHz (double periods, double& loHz, double& hiHz) const noexcept;
     // The registers a run would use, resolved exactly as startSpectrumAdapt resolves them -
     // the panel prints these, so what it claims and what the search does cannot drift.
     // A member, not a static: the range is now anchor-relative and step-counted, so it can
@@ -831,6 +1405,11 @@ public:
     // The chord being HELD right now, as ratios above its lowest note (empty if nothing
     // is down). f0Out is that lowest note's exact sounding frequency.
     std::vector<double> heldChordAsTargetAlphas (double& f0Out) const;
+    // The same chord read one lookahead budget EARLIER - the notes that have arrived but
+    // have not sounded yet (see LookaheadPeek). Only ever called while lookahead is
+    // active; with it off the rhythm engine's own bookkeeping is the single answer, as
+    // heldChordAsTargetAlphas' comment insists.
+    std::vector<double> heldChordEarlyAsTargetAlphas (double& f0Out) const;
 
     // Write the adapted spectrum into the Custom Engine: the partial RATIOS become its
     // scale and the per-partial AMPLITUDES become manual gain edits. `undoable` wraps it
@@ -874,9 +1453,22 @@ public:
         double       minGapCents = 50.0;
         bool         rootOnly = false;
         SpectrumAdaptSettings adapt;   // the other two links
+        // ADAPTIVE LOOKAHEAD. Deliberately NOT an automatable parameter: it changes the
+        // plugin's reported latency, and a host re-running its delay compensation
+        // because a knob moved in a clip is not a thing anyone wants automated. It is
+        // part of the saved state like the rest of the link (see realtimeSettingsToTree).
+        bool lookahead = false;
     };
     void setRealtimeLink (RtLink mode, const RtSettings& s);
-    void updateRealtimeSettings (const RtSettings& s) { rtSet = s; }
+    // The link as a STATE LOAD installs it. Not the same call: replaceState clears the
+    // undo history, so the step setRealtimeLink would mint on the way out belongs to a
+    // patch that no longer exists and to a history that no longer has room for it - the
+    // FIRST Ctrl+Z after a project load installed the PREVIOUS patch's tuning. See the
+    // .cpp for why dropping that step is only half the fix.
+    void restoreRealtimeLink (RtLink mode, const RtSettings& s);
+    // The panel pushes its settings here on every touch, so this is also where a change
+    // to the LOOKAHEAD toggle is noticed. applyLookahead() is a no-op when nothing moved.
+    void updateRealtimeSettings (const RtSettings& s) { rtSet = s; applyLookahead(); }
     RtLink getRealtimeLink() const noexcept { return rtLink; }
     // Non-empty when a link REFUSED to run (and switched itself off). Never silent.
     juce::String getRealtimeRefusal() const { return rtRefusal; }
@@ -884,6 +1476,64 @@ public:
     // follower actually launched, and how many results it actually applied.
     int getRealtimeStarts()  const noexcept { return rtStarts; }
     int getRealtimeApplies() const noexcept { return rtApplies; }
+
+    //== ADAPTIVE LOOKAHEAD ====================================================
+    // THE BUDGET, and where the number comes from. Every figure below was MEASURED on
+    // this machine while this feature was being written, not inherited.
+    //
+    // The budget has to cover everything between a note ARRIVING and the adapted spectrum
+    // being live in the voices. Broken into its four parts, each measured separately:
+    //
+    //   THE THROTTLE, up to kRtAdaptTicks = 6 ticks = 100 ms. This is the biggest term
+    //     and the one a "how long does the search take" reading misses entirely: a chord
+    //     change that arrives while the previous one's search is still fresh waits for the
+    //     throttle before it even starts. Run 49 measures it directly - its lookahead-OFF
+    //     take launched 97.3 ms after the notes arrived, against 12-13 ms when the
+    //     throttle was already clear.
+    //   ONE 60 Hz POLL to notice the notes at all: 16.7 ms.
+    //   THE SEARCH on its worker. Timed with no other load, realtime register cap, over
+    //     the whole settings range (RhythmVerify's probe, and Dissonance.h's model):
+    //     4 partials 2.6 ms, 8 partials 10.5 ms, 12 partials 33 ms, 16 partials 104 ms,
+    //     24 partials 84 ms against a 3-note chord in root-only scope (137 ms at 16
+    //     partials in all-vs-all). In situ, with the audio rendering beside it, the
+    //     default 8-partial follower measured 17-33 ms.
+    //   ONE MORE POLL to apply the finished result (16.7 ms) and the 50 ms template
+    //     de-click fade, so the spectrum is not merely published but SETTLED when the
+    //     note sounds.
+    //
+    // 100 + 16.7 + 33 + 16.7 + 50 = 216 ms at the DEFAULT follower settings, and 250 is
+    // that rounded up with the slack a loaded machine needs (the same run measured 200 ms
+    // for a search that takes 33 ms idle, once, while a compiler was running beside it).
+    //
+    // IT DOES NOT COVER EVERY SETTING, AND THE PANEL SAYS SO RATHER THAN PRETENDING.
+    // 16 or 24 partials against a wide chord outgrow it, and the honest answer is not a
+    // latency that silently moves under the user: getLastRealtimeLandingMs() reports how
+    // long the LAST spectrum change really took, the lookahead button prints it beside
+    // the budget, and it says LATE when it did not fit. A measured read-out beats an
+    // estimate - especially here, where the estimator's calibration constant is known
+    // wrong on this machine (SpectrumTests fits 14.67 ns/pair against the header's 9.8)
+    // and phase 3 re-fits it.
+    //
+    // The budget stays a CONSTANT rather than a function of the adapt settings so the
+    // reported latency only ever moves when the user works the LOOKAHEAD toggle itself.
+    // A latency that changed with a partial count would have the host re-run its delay
+    // compensation in the middle of a session, and the search cost also depends on how
+    // many keys are down - which no reported latency may ever depend on.
+    static constexpr double kLookaheadMs = 250.0;
+    // Is the user asking for it, and is it actually running? The second is not always the
+    // first: the budget is only armed while a spectrum-side realtime link is on, because
+    // with no follower to give a head start to, latency would buy nothing at all.
+    bool isLookaheadArmed()  const noexcept { return rtSet.lookahead; }
+    bool isLookaheadActive() const noexcept { return laSamples.load (std::memory_order_relaxed) > 0; }
+    int  getLookaheadSamples() const noexcept { return laSamples.load (std::memory_order_relaxed); }
+    void setLookaheadForTests (bool on) { rtSet.lookahead = on; applyLookahead(); }
+    // HOW LONG THE LAST SPECTRUM CHANGE REALLY TOOK, in milliseconds from the moment the
+    // chord moved to the moment the adapted spectrum was written. < 0 = nothing measured
+    // yet. Wall clock, message thread only, and it is the whole reason the budget above is
+    // allowed to be a constant: the number the user is shown is the one their own machine
+    // produced with their own settings, so a budget that does not fit says so out loud
+    // instead of quietly delivering a late spectrum. Read by the editor and by run 49.
+    double getLastRealtimeLandingMs() const noexcept { return rtLandingMs; }
     // How many 60 Hz ticks the two links wait between launches, on top of never running two
     // at once. Measured on this machine: a 3-note grid+refine chord search over 2/1 with a
     // rich spectrum (the 64-partial analysis cap) USED to be ~1.4 s and is now ~0.30 s cold
@@ -944,7 +1594,11 @@ public:
     enum class EngineInForce { Harmonic, CustomScale, Tempered };
     EngineInForce engineInForce() const noexcept
     {
-        if (apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f) return EngineInForce::Tempered;
+        // Mirrors currentSettings() exactly, because the UI names the engine from here:
+        // with the toggle ON but no usable period to temper TO, nothing is tempered, so
+        // saying "Tempered" would label the spectrum after a snap that did not happen.
+        if (apvts.getRawParameterValue ("timbreTemper")->load() > 0.5f)
+            return temperIsPossible() ? EngineInForce::Tempered : EngineInForce::Harmonic;
         if (isTimbreActive())                                           return EngineInForce::CustomScale;
         return EngineInForce::Harmonic;
     }
@@ -966,13 +1620,42 @@ public:
     juce::String getLfoWavePoints (int lfo) const
     { return juce::isPositiveAndBelow (lfo, 3) ? lfoWavePoints[(size_t) lfo] : juce::String(); }
 
+    // THE SCALE'S OWN ANCHOR, AS ONE LINE, FOR EVERY RENDERER THAT NEEDS IT.
+    //
+    // A .scl states INTERVALS and nothing else, so a tuning rendered to .scl form loses any
+    // absolute reference it had - and the reload that immediately follows re-pins degree 0
+    // to 12-TET middle C. This plugin renders a .scl in FOUR places (export, add a note,
+    // edit a degree, delete a degree) and every one of them is reached by an ordinary edit,
+    // so a scale anchored anywhere else moved the WHOLE INSTRUMENT the first time the user
+    // retyped one key. Measured: an .scl anchored at C = 256 came back at 261.6256 after
+    // editing a degree to the value it already had - 37.63 cents, from an edit that changed
+    // nothing.
+    //
+    // "! @ABL REFERENCE_PITCH <octave> <degree> <freq>" is the Ableton .ascl extension this
+    // plugin's own parser already honours, so it costs nothing in compatibility: any other
+    // Scala host ignores a comment line. Octave 3 degree 0 IS the reference key by that
+    // format's definition, which is the key these renderers count their degrees from.
+    //
+    // Empty when the anchor is already the default, so every .scl this plugin has produced
+    // up to now is written byte-identically.
+    juce::String sclAnchorLine() const
+    {
+        const double refHz = tuning.frequencyForNote (TuningManager::kRefKey);
+        if (! std::isfinite (refHz) || refHz <= 0.0
+            || std::abs (refHz - TuningManager::kRefFreq) <= 1.0e-6)
+            return {};
+        return "! @ABL REFERENCE_PITCH 3 0 " + juce::String (refHz, 6) + "\n";
+    }
     juce::String currentTuningAsScl (const juce::String& name) const; // rationals stay ratios, rest cents
     // What "put the tuning that is playing into the bank" must STORE. For a scale that is
     // the .scl Fibló writes. For an absolute 128-key table there is no .scl to write, so
     // the bank keeps the .tun text itself - currentTuningAsScl() would hand the bank a
     // flattened copy of the user's tuning under the user's own name for it.
+    // ...and IN FORCE, not merely loaded: with a table left over from an earlier load and
+    // the box back on 12-TET, "put the tuning that is playing into the bank" used to bank
+    // the .tun, which is the one tuning that was NOT playing.
     juce::String currentTuningAsBankSource (const juce::String& name) const
-    { return tuning.usesAbsoluteTable() ? tuning.getScalaSource() : currentTuningAsScl (name); }
+    { return tuningTableIsInForce() ? tuning.getScalaSource() : currentTuningAsScl (name); }
     // Scales this synth writes carry the patch they were made with, as Scala
     // comments (invisible to other programs). "Load its original spectrum" reads
     // it back without disturbing the tuning that is loaded.
@@ -1089,14 +1772,53 @@ public:
 
     //==========================================================================
     // Shared with the editor:
-    juce::MidiKeyboardState keyboardState;
+    juce::MidiKeyboardState keyboardState;   // DISPLAY only: what the colour keyboard lights
+    // What the controller really sends (see dsp/ExpressionState.h). Public: the MIX corner
+    // engines' voices read the same one, because it is a property of the stream, not of an
+    // engine. Written on the audio thread as each block is scanned.
+    ExpressionState expression;
+    // The window plays a note (a letter, a click on the colour keyboard). The channel is
+    // ours to choose: in the MPE zone mode channel 1 is the zone MASTER, and a note there
+    // carries no per-note bend and is swept by every master-channel wheel, so the window
+    // plays on a MEMBER channel there and on channel 1 everywhere else.
+    void playUiNote (int note, float velocity);
+    void stopUiNote (int note);
+    int  uiNoteChannelForTests() const noexcept { return uiNoteChannel.load (std::memory_order_relaxed); }
     juce::UndoManager undoManager; // parameter undo/redo (MUST outlive + precede apvts)
     juce::AudioProcessorValueTreeState apvts;
     // Chord-preview injection: the editor queues timestamped MIDI (note+per-channel
     // bend) here; processBlock feeds it to the SYNTH ONLY (never the rhythm engine,
     // never the MIDI out). MidiMessageCollector is thread-safe by design.
     juce::MidiMessageCollector previewCollector;
+    // THE WINDOW'S OWN NOTES (the letter keyboard and the on-screen one) DO NOT SHARE
+    // BOOKKEEPING WITH THE HOST'S STREAM.
+    //
+    // They used to go through `keyboardState`, the same MidiKeyboardState that
+    // processNextMidiBuffer feeds from the INCOMING buffer - so the host's and the
+    // controller's notes set and cleared the very bits the window's notes were tracked by.
+    // Hold a letter, let the Hexboard play the same pitch, and the controller's note-off
+    // silenced the letter you were still holding; the other way round, releasing the letter
+    // cut the controller's note (found 2026-10-03). They are their own stream now, and
+    // keyboardState keeps only the job it can do safely: lighting up the on-screen keys.
+    juce::MidiMessageCollector uiNoteCollector;
+    std::atomic<int> uiNoteChannel { 1 };   // audio thread reads it; see playUiNote
+    // Message thread only: which channel each note the window started went out on, and
+    // which channels it is using. A note-off must leave on the channel its note-on did.
+    std::array<juce::int8, 128> uiNoteFor {};
+    std::array<bool, 17>        uiNoteOn {};
     juce::MidiBuffer           previewMidi; // reused per block (audio thread)
+    juce::MidiBuffer           uiMidi;      // the window's own notes, merged into the stream
+    juce::MidiBuffer           pedalEcho;   // the pedal, copied to the other channels
+    // ...AND SO ARE THESE TWO, for the same reason previewMidi is a member and not a
+    // local. juce::MidiBuffer holds a juce::Array that ALLOCATES on its first addEvent,
+    // so the "held" and "synthMidi" buffers the self-play and preview paths used to build
+    // as locals were three heap allocations per block on the audio thread, every block,
+    // whenever either path was active - which is the hardest rule this project has, and
+    // the one a dropout comes from. Members cleared per block instead: MidiBuffer::clear
+    // keeps the capacity, so after the first few blocks nothing allocates at all.
+    //
+    // One synthMidi for both paths: they are mutually exclusive branches of the same if.
+    juce::MidiBuffer           rtHeld, rtSynthMidi;
 
 public:
     // The jingle is ON DEMAND only: clicking the title asks for it. It never plays
@@ -1140,8 +1862,59 @@ private:
     // per-note bends from an MPE controller/host are honoured; other modes run the
     // legacy single-channel layout. Message thread; switching releases held notes.
     void applyTuningMode (int paramIndex);
-    bool lastZoneMpe = false;
+    // ATOMIC, because two threads read it and one of them is the audio thread.
+    //
+    // applyTuningMode writes it on the MESSAGE thread; processBlock reads it every block
+    // to decide whether to re-assert the MPE zone, and applyZoneTo reads it when a MIX
+    // corner engine is built. As a plain bool that is a data race - undefined behaviour by
+    // the standard, and on real hardware a read that can see a stale value for an
+    // unbounded time, which here means an instrument that has been switched INTO MPE mode
+    // and goes on running the legacy single-channel layout until something else happens to
+    // touch the flag.
+    //
+    // Relaxed on both sides is enough and is deliberate: nothing else is published
+    // alongside it. The zone layout it guards is written through MPESynthesiser's own
+    // setZoneLayout, which does its own synchronisation, and the flag's only job is to say
+    // which branch runs. No acquire/release pairing to get wrong, and no cost.
+    std::atomic<bool> lastZoneMpe { false };
+    // A controller asked for a zone this mode cannot honour (see repairMpeZoneOf). The
+    // window reads these once and says so; nothing is overruled in silence.
+    std::atomic<bool> zoneOverrideSeen { false };
+    std::atomic<int>  zoneAskedPerNote { 48 };
+    std::atomic<int>  zoneAskedMembers { 15 };
+public:
+    struct ZoneOverride { bool seen = false; int perNote = 48; int members = 15; };
+    ZoneOverride takeZoneOverride() noexcept
+    {
+        if (! zoneOverrideSeen.exchange (false, std::memory_order_acq_rel)) return {};
+        return { true, zoneAskedPerNote.load (std::memory_order_relaxed),
+                 zoneAskedMembers.load (std::memory_order_relaxed) };
+    }
+    // TESTS: the zone actually in force on the main synth.
+    juce::MPEZoneLayout zoneLayoutForTests() const { return synth.getZoneLayout(); }
+    // TESTS: put a controller's zone on the synth and ask the repair what it makes of it -
+    // the rule itself, with no render path in between to put the answer back.
+    juce::MPEZoneLayout zoneAfterRepairForTests (int members, int perNote, int master)
+    {
+        juce::MPEZoneLayout z;
+        z.setLowerZone (members, perNote, master);
+        synth.setZoneLayout (z);
+        repairMpeZoneOf (synth);
+        return synth.getZoneLayout();
+    }
+    void noteZoneOverrideForTests (int perNote, int members) noexcept
+    {
+        zoneAskedPerNote.store (perNote, std::memory_order_relaxed);
+        zoneAskedMembers.store (members, std::memory_order_relaxed);
+        zoneOverrideSeen.store (true, std::memory_order_release);
+    }
+private:
 
+    // THE ONLY PLACE A .gsting IS WRITTEN, and where the fixed-point rule that closes
+    // case #88 is enforced - one gate rather than one check per call site, because
+    // there is no such thing as remembering to add the third one. See the .cpp.
+    bool writePresetFile (const juce::String& safeName, const juce::ValueTree& state,
+                          bool isCornerOwnSave, PresetWriteRefusal& why, int& corner);
     juce::ValueTree captureState();
     void restoreState (const juce::ValueTree&);
 
@@ -1153,14 +1926,52 @@ private:
     spectrum::SpectrumSettings  lastPushed;
     RhythmEngine                rhythm { apvts, spectrumEngine, tuning };
     NoteGate                    noteGate; // quantize-to-tempo / mono / quantize-to-pulse
-    // The Shepard tone (Tuning panel). Runs after the synth mix, before master gain,
-    // so the master fader still scales it with everything else.
-    ShepardEngine               shepard;
+    MonoGlide                   monoGate; // MONOPHONIC GLIDE's note-stream half (MonoGlide.h)
+    // Voices the pool holds when mono glide is OFF. Mono forces it to 1 - which is what
+    // makes chords impossible AND what makes every new note a steal, i.e. a takeover the
+    // voice can bend through. Tracked here so switching back restores the real number.
+    static constexpr int kPolyVoices = 32;
+public:
+    // TESTS: how many voice objects the pool holds right now. Each carries fourteen
+    // std::array<double, kMaxPartials> banks - 1.75 MiB - so "how many" is also "how much",
+    // and growing the pool back after Mono Glide is the one place that cost lands in a
+    // single message-thread tick.
+    int getNumVoicesForTests() const noexcept { return synth.getNumVoices(); }
+private:
+    bool lastMonoGlide = false;           // message thread: last value the voice pool follows
+    // The mono shrink is spread over 60 Hz ticks: the notes it has to drop are faded
+    // first and the pool follows once they are quiet (see applyMonoVoiceCount). The cap
+    // is the backstop for the case where nothing is rendering those fades at all - half a
+    // second, after which the ONE-VOICE promise is kept regardless.
+    int monoShrinkTicks = 0;
+    static constexpr int kMonoShrinkTicks = 30;
+    void applyMonoVoiceCount (bool mono); // message thread; see the definition
+    //== ADAPTIVE LOOKAHEAD (see LookaheadDelay.h) =============================
+    LookaheadDelay laDelay;   // the MIDI is re-stamped `laSamples` later
+    LookaheadPeek  laPeek;    // ...and the follower reads it at its ORIGINAL time
+    // How many samples of latency the plugin is CURRENTLY reporting and delaying by.
+    // Written on the message thread (setLatencySamples must not run on the audio one),
+    // read on the audio thread through the atomic.
+    std::atomic<int> laSamples { 0 };
+    bool  laLastOn   = false;  // last value applyLookahead() acted on
+    int   laLastSr   = 0;      // ...and the block/rate the budget was rounded for
+    int   laLastBlk  = 0;
+    std::atomic<bool> laFlush { false };   // message -> audio: drop what is in flight
+    void applyLookahead();     // message thread; see the definition
+    // Transport-jump detection, audio thread only. -1e30 = nothing seen yet.
+    double laLastPpq = -1.0e30;
+    bool   laWasPlaying = false;
     std::atomic<bool>           shepSyncNoBpm { false }; // see shepardSyncHasNoBpm()
     // Set by restoreState() (any thread); consumed at the top of the next processBlock
     // (audio thread) - see there for why. A preset/project load must never leave a
     // note stuck sounding.
     std::atomic<bool>           pendingHardSilence { false };
+    // Set by reset() (any thread); consumed in the same place, one block later. It is a
+    // SECOND flag rather than a wider pendingHardSilence because the two requests are not
+    // the same request: a state swap must not forget where the running pattern was in its
+    // cycle, a host reset must. Keeping them apart is what lets reset() also re-zero the
+    // rhythm engine without changing what a preset load does.
+    std::atomic<bool>           pendingHostReset { false };
 
     // Scala-as-timbre state (message thread; read into SpectrumSettings each poll).
     std::vector<float> timbreDegrees;
@@ -1201,18 +2012,87 @@ private:
     juce::Random       randomSpectrumRng { (juce::int64) juce::Time::getHighResolutionTicks() };
     juce::String       lastRandomSpectrumText; // redraw if a draw repeats the previous one
 
-    // Persistent recent-.scl list (global app settings, shared across instances).
+    // Persistent recent-.scl list + UI preferences (global app settings, shared across
+    // instances). See setKeyboardNoteNames for why a preference is not patch state.
     std::unique_ptr<juce::PropertiesFile> appProps;
+    // EVERY SETTINGS WRITE GOES THROUGH HERE: reload, set, save. Every instance of the plugin
+    // (and the standalone) owns its own PropertiesFile over the same file and saves ALL of its
+    // in-memory values; without the reload an older instance's next unrelated write (a
+    // recent scale) would put back a "warn" flag another instance had just turned off.
+    void writeSetting (const juce::String& key, const juce::var& value);
+    fibload::Monitor loadMonitor;   // see the LOAD WATCH block in the public API
     juce::StringArray                     recentSclPaths;
+    bool                                  keyboardNoteNames = false; // OFF by default
 
     // Tuning bank: per-instance .scl slots (name + raw source), persisted in state.
     std::array<juce::String, kBankSlots> bankName, bankSource;
     int lastBankSlot = 0; // last applied "tuningBankSlot" value (message thread)
+    // ...the SOURCE TEXT of the last load ATTEMPTED for that slot, and whether it failed.
+    // A slot whose load fails keeps its index, so the index alone could never retry it -
+    // not even for the obvious repair of dropping a good file into it. These two let a
+    // FAILED slot be re-attempted when its text changes, and only then. See the bank block
+    // in timerCallback. Message thread.
+    juce::String lastBankSource;
+    bool         lastBankFailed = false;
 
     // Last dissonance-generated .scl (text + display name), for saving to disk,
     // plus the degree/height data shown in the Spectrum-to-Scale panel.
     juce::String lastDissScl, lastDissName;
     juce::String presetPendingSclSource, presetPendingSclName; // see hasPendingPresetTuning()
+    // THE SCALE A PROJECT COULD NOT GET BACK, for the editor to show once.
+    //
+    // setStateInformation runs on a load thread and there may be no editor at all, so the
+    // failure is parked here rather than raised there. Consumed by takeTuningRestoreError,
+    // which clears it: this is a one-shot message about one load, not a state.
+    juce::String tuningRestoreError;
+    // WHAT THE BANK COULD NOT DO, for the editor to show once, on the same one-shot
+    // pattern and for the same reason: the load runs on the processor's timer (host
+    // automation can move that parameter with no window open at all), so the parser's
+    // message is parked here rather than raised from a place that may have no editor.
+    // Consumed by takeBankSlotError, which clears it - one message about one event.
+    // Two events use it: a slot whose stored text will not load, and a bank that is FULL
+    // (setTuningBankFile / bankAutoAdd) - the second used to overwrite slot 0 in silence.
+    juce::String bankSlotError;
+    // THE PRESET THAT DID NOT LOAD, on the same one-shot pattern and for the same reason
+    // as the two above. loadPreset returns false from three places - the file is not in
+    // the folder, the XML will not parse, the tree is not one of ours - and its only
+    // caller drops that bool on the floor ("if (name.isNotEmpty() && loadPreset (name))").
+    // So a preset that failed left the NAME in the box, the PREVIOUS preset's sound in the
+    // instrument, and the previous preset's tuning on offer in the Tuning panel, with
+    // nothing anywhere saying the load had not happened. Three lies for the price of one
+    // dropped return value.
+    juce::String presetLoadError;
+    // See takePlaygroundRestoreLoss. Written where tuningRestoreError is written, read
+    // where it is read - the same thread arrangement, deliberately not a new one.
+    std::vector<LostCorner> pgRestoreLoss;
+    // THE CUSTOM ENGINE SPECTRUM A LOAD COULD NOT PUT BACK - the parser's message, one shot,
+    // consumed by takeTimbreRestoreError. See restoreState.
+    juce::String timbreRestoreError;
+    // The last corner intervals already reported as unreadable - see the MIX / winner load.
+    juce::String lastReportedBadCornerTimbre;
+    // A FILE THE BANK REFUSED TO ADD - which file, and the parser's sentence. One shot,
+    // consumed by takeBankAddError. See setTuningBankFile.
+    juce::String bankAddFile, bankAddError;
+public:
+    // {file name, reason}, or empty when nothing was refused since the last call.
+    juce::StringArray takeBankAddError()
+    {
+        if (bankAddError.isEmpty()) return {};
+        juce::StringArray out { bankAddFile, bankAddError };
+        bankAddFile.clear(); bankAddError.clear();
+        return out;
+    }
+    juce::String takeTimbreRestoreError()
+    { auto e = timbreRestoreError; timbreRestoreError.clear(); return e; }
+    juce::String takeTuningRestoreError()
+    { auto e = tuningRestoreError; tuningRestoreError.clear(); return e; }
+    juce::String takeBankSlotError()
+    { auto e = bankSlotError; bankSlotError.clear(); return e; }
+    // Consumed exactly like the two above - the editor's timer already takes those two
+    // and puts them on the notice overlay; this one belongs beside them.
+    juce::String takePresetLoadError()
+    { auto e = presetLoadError; presetLoadError.clear(); return e; }
+private:
     juce::String presetPendingTablePeriod;                     // its table period, if it had one
     // Self-play routing as of the last block: a CHANGE strands notes (see processBlock).
     // `known` starts false so the very first block only records the state - flushing
@@ -1220,6 +2100,10 @@ private:
     bool wasSelfPlay = false, selfPlayKnown = false;
     int  lastTempoSent = -1; // last CC20 BPM sent by the tempo sync (see timerCallback)
     int  undoTxnTick   = 0;  // groups edits into ~1 s undo transactions (see timerCallback)
+    // How many gestures are open right now. While this is above zero the ~1 s cut is
+    // held off, so a drag that outlasts a second is still ONE Ctrl+Z (see
+    // beginUndoGesture for the failure that made this necessary).
+    int  undoGestureDepth = 0;
 
     // MTS-ESP adoption is a ONE-SHOT check at load (see timerCallback), never repeated.
     // Manual per-partial amplitudes: slope is frozen at the value it had when manual was
@@ -1272,6 +2156,13 @@ private:
     juce::String rtRefusal;
     int  rtTick = 0, rtLastStart = -1000, rtStarts = 0, rtApplies = 0;
     bool rtPending = false;
+    // THE MEASURED LANDING (see getLastRealtimeLandingMs). `rtMovedAtMs` is stamped the
+    // first time the chord is seen to have MOVED since the last landing - the moment the
+    // clock the lookahead budget is racing starts - and is cleared when the result lands,
+    // so a chord that moves twice during one search is timed from its FIRST move (the
+    // pessimistic, and honest, end of the interval). Wall clock, message thread only.
+    double rtMovedAtMs = -1.0;
+    double rtLandingMs = -1.0;
     unsigned int rtSeenSpecGen = 0;
     int  rtSeenChordGen = 0, rtSeenAdaptGen = 0;
     // The held chord the last adaptation was actually AIMED AT - the ratios and the root's
@@ -1306,8 +2197,13 @@ private:
     int  rtTuneBaseMode = 0;
     bool rtTuneBaseTaken = false;
     SpecSnapshot rtSpecBase;
-    void takeRealtimeBaseline (RtLink mode);
+    // `addToBank` is false for a STATE LOAD only: the baseline it takes is the project's
+    // own tuning, which the project's own BANK child already describes, and a load must
+    // not go on mutating the bank it just restored.
+    void takeRealtimeBaseline (RtLink mode, bool addToBank = true);
     void commitRealtimeBaseline();
+    // The one body behind setRealtimeLink and restoreRealtimeLink - see the .cpp.
+    void setRealtimeLinkImpl (RtLink mode, const RtSettings& s, bool fromStateLoad);
     void applySpecSnapshot (const SpecSnapshot& s);
     SpecSnapshot captureSpecSnapshot() const;
     void driveRealtimeLink();
@@ -1324,8 +2220,22 @@ private:
         // all four corners for every parameter, thirty times a second; an id lookup per
         // read is 200x200 string compares per frame for no benefit, because the index
         // order is identical for every corner by construction.
+        //
+        // TOTAL, ALWAYS. Every parameter has a value here the moment the corner is
+        // assigned: the preset's own where the file carries it, the parameter's DEFAULT
+        // where the preset PREDATES it (fillCornerDefaults). There used to be a parallel
+        // `hasParam` flag meaning "this preset predates that parameter", and every reader
+        // answered that state differently - push skipped it (so the corner-edit surface
+        // kept the BLEND's value there and the pull absorbed it back into the corner,
+        // hunt entry 10), the continuous blend renormalised it away (so the parameter was
+        // ruled 100 % by the OTHER corner and the vertex became path-dependent, hunt
+        // entry 11), the discrete branch skipped it (so a corner whose preset never
+        // mentioned mono was left permanently monophonic, hunt entry 8), while MIX mode's
+        // ParamBank::fill quietly used the default. FOUR readers, four answers.
+        // Deleting the flag is what makes that unrepresentable: there is now ONE answer,
+        // it is the default, it is decided once at assign time, and morph, mix and edit
+        // cannot disagree about it because there is nothing left to disagree about.
         std::vector<float> params;
-        std::vector<char>  hasParam;   // 0 = this preset predates that parameter
         std::vector<spectrum::PartialGain> gains;
         bool manual = false;                                  // "partialManual"
         juce::String timbreName, timbreSource;                // the Custom Engine's own scale
@@ -1356,26 +2266,202 @@ private:
         // still be reading a corner the user has just replaced. Immutable + refcounted is
         // what makes reassigning a corner mid-blend safe without a lock.
         std::shared_ptr<const spectrum::SpectrumTemplate> tmpl;
+        // CORNER EDIT (see beginPlaygroundCornerEdit). `edited` is the "*": this corner
+        // no longer matches the .gsting it was loaded from. `rev` counts every change to
+        // the corner's stored VALUES - the mix sub-engine keys its bank refill on it,
+        // because a filter tweak changes no template pointer and would otherwise be
+        // inaudible until something else happened to recompile the spectrum.
+        bool edited = false;
+        int  rev    = 0;
+        // THE PRESET THIS CORNER WAS BUILT FROM, WHOLE - a deep copy of its .gsting tree with
+        // that preset's own PLAYGROUND child removed (so corners never nest). Every field above
+        // is extracted from it, and it is what captureState SAVES for the corner: a preset or a
+        // project made with the pad carries all of its corners' presets and opens the same on
+        // a computer that has none of them ("polypresets", asked 2026-09-15). Before, only the
+        // NAME was saved and each corner re-read its file on load - a moved project came back
+        // with empty corners, and editing a preset silently changed every project using it.
+        //
+        // IMMUTABLE ONCE SET: the undo steps copy whole corners, and a juce::ValueTree copy
+        // SHARES its object, so a change made in place would rewrite history. Replace it,
+        // never modify it (cornerTreeForSaving works on a createCopy()).
+        juce::ValueTree source;
+        // WHICH VERSION of this corner it is. Bumped on every assign and every undo/redo of a
+        // corner, so two versions with the same NAME (a re-picked, re-saved preset; an undone
+        // pick; a project reloaded under a running search) can be told apart. The name used to
+        // be the identity, and since corners carry their own copies it no longer is.
+        juce::uint32 serial = 0;
         bool assigned() const noexcept { return name.isNotEmpty(); }
-        // The preset's value for parameter #i, or false if this preset predates it.
+        // THIS CORNER'S value for parameter #i. Always succeeds for a corner that has
+        // been assigned (the store is total - see `params`); false only for an index
+        // that is not a parameter at all, which is a programming error, not a preset
+        // that predates something.
         bool value (int i, double& out) const noexcept
         {
-            if (i < 0 || (size_t) i >= params.size() || ! hasParam[(size_t) i]) return false;
+            if (i < 0 || (size_t) i >= params.size()) return false;
             out = (double) params[(size_t) i];
             return true;
         }
     };
     std::array<PlaygroundCorner, kPlaygroundCorners> pgCorner;
+    juce::uint32 pgCornerSerial = 0;   // the source of PlaygroundCorner::serial (message thread)
     bool  pgActive   = false;   // >= 2 corners assigned: the morph is driving
     int   pgWinner   = -1;      // the corner every discrete setting comes from
     double pgLastX = -1.0, pgLastY = -1.0;
     bool  pgDirty    = true;    // force one full apply (a corner changed, or we just engaged)
     int   pgParamTick = 0;      // throttles the CONTROL writes (see drivePlayground)
     bool  pgParamsPending = false; // a throttled tick still owes the controls one write
+    // THE DRAG'S FREQUENCY GLIDE. A drag posts a blend every tick, and every
+    // kPgGlideTicks-th of them is published WITH a generation bump so the voices treat
+    // it as a real spectrum change: with Morph on the partials BEND to the new blend
+    // (the pitch glide morph does everywhere else in this app - the user's request),
+    // with Morph off they cross the 50 ms template fade. 10 Hz, the same cadence the
+    // adaptive corners already republish at ("a rate the 50 ms fade absorbs" -
+    // kRtAdaptTicks); the frames in between still publish bump-less so the AMPLITUDES
+    // track at the full 60 Hz. Bumping every frame instead is the documented click
+    // machine (sixty morph restarts a second); bumping never is what the user reported:
+    // ratios that only ever crossfade in place, "no pitch bend en los parciales".
+    int   pgBlendTick = 0;         // frames since engage, clocks the glide throttle
+    int   pgLastBump  = -1000000;  // pgBlendTick of the last bumped publish
+    bool  pgGlidePending = false;  // a bump-less blend went out after the last bump
+    static constexpr int kPgGlideTicks = kRtAdaptTicks;
     // What the realtime link was doing when the playground took the spectrum over, so
     // it can be handed back untouched when the playground lets go.
     RtLink pgSuspendedRt = RtLink::Off;
     bool   pgRtSuspended = false;
+
+    //== CORNER EDIT (see the ownership block in the .cpp) ======================
+    // The corner whose values the main editor's controls are currently standing in
+    // for, or -1. Everything below exists so that leaving edit mode can hand the LIVE
+    // patch back exactly as it was found - it is the frozen live patch, not the corner.
+    int             pgEditCorner = -1;
+    juce::ValueTree pgEditLiveState;                  // captureState() at entry
+    float           pgEditLiveX = 0.0f, pgEditLiveY = 0.0f;   // the point, before pinning
+    juce::String    pgEditLivePresetName;             // the live patch's preset identity
+    std::vector<std::pair<juce::String, float>> pgEditLivePresetSnap;  // ...and its drift reference
+    // The corner recompile is THROTTLED to the glide cadence (kPgGlideTicks, 10 Hz): a
+    // full compileSpectrum per 60 Hz frame of a knob drag is the message thread's own
+    // click machine. `pending` is the pgParamsPending lesson applied here - a drag that
+    // STOPS on a skipped tick must still get its final compile, or the corner would be
+    // left permanently one edit short of what the controls show.
+    int  pgEditTick = 0;
+    bool pgEditCompilePending = false;
+    // THE FIRST PULL IS A BASELINE, NOT AN EDIT. Push writes only the parameters the
+    // corner's preset actually HAS; pull reads every parameter a corner may own. So the
+    // first pull always finds differences - the ones the preset predates, plus whatever
+    // a normalise/denormalise round trip costs a skewed range - and without this the "*"
+    // would appear the instant Edit was pressed, on a corner nobody had touched. That
+    // makes the warning meaningless, which is worse than not having it.
+    bool pgEditPrimed = false;
+
+    //== RULE 7: A CORNER-EDIT SESSION IS NOT PART OF THE LIVE PATCH'S HISTORY ===
+    //
+    // The scratch surface writes through the SAME UndoManager as the live patch. Every
+    // knob turned and every partial drawn while editing a corner therefore landed on the
+    // live patch's undo stack as a step that WRITES INTO THE LIVE PATCH, and the whole
+    // gesture is one the shipped GUI offers: Edit a corner, drag the pencil, click OK,
+    // press Ctrl+Z. Measured before this fix:
+    //     after leaving edit mode  gains=1 [190196:-9.00] cutoff=1611
+    //     after one Ctrl+Z         gains=0               cutoff=6543
+    //     after Ctrl+Y             gains=1 [336883:11.00] cutoff=1611
+    // - the user's hand-drawn spectrum wiped, the corner's cutoff on the live patch, and
+    // redo installing the CORNER's drawing there. Hand-drawn amplitudes exist nowhere
+    // else, so that first keystroke destroyed work with no way back.
+    //
+    // The cure is that the session leaves the stack as it found it. Two halves:
+    //   * the actions this file mints (gains, timbre) are simply not minted while a
+    //     session is open - the corner's own rev carries the edit;
+    //   * the APVTS parameter writes cannot be intercepted (APVTS holds the undo manager
+    //     by const pointer and flushes on its own timer), so they are UNWOUND on the way
+    //     out, back through a boundary marker pushed on the way in.
+    //
+    // Undoing is not the same as dropping, and dropping is what one would want - but
+    // JUCE's UndoManager cannot drop transactions. clearUndoHistory() takes the user's
+    // own history with it, which is the same data-loss bug wearing a different hat.
+    //
+    // The marker itself. It does nothing to the patch in either direction; it exists so
+    // the unwind knows where the session's own transactions start and, above all, where
+    // to STOP - undoing one transaction too many would eat the user's own last edit.
+    struct CornerEditBoundaryAction : public juce::UndoableAction
+    {
+        explicit CornerEditBoundaryAction (FractalAdditiveAudioProcessor& p) : proc (p) {}
+        bool perform() override { return true; }   // a marker performs nothing
+        bool undo()    override { proc.pgEditUnwound = true; return true; }
+        int  getSizeInUnits() override { return 16; }
+        FractalAdditiveAudioProcessor& proc;
+    };
+    // ...and the ONE step the whole session leaves behind, in place of the dozens it used
+    // to leave. It writes only the CORNER - never the live patch - so neither Ctrl+Z nor
+    // Ctrl+Y can put somebody's corner on the user's sound. It is also the only way to
+    // clear the redo stack the unwind fills: JUCE drops future transactions when a new
+    // action is performed and by no other route. Undoing it takes back the corner edits,
+    // which is a step this feature never had at all.
+    struct CornerEditSessionAction : public juce::UndoableAction
+    {
+        CornerEditSessionAction (FractalAdditiveAudioProcessor& p, int c,
+                                 PlaygroundCorner prev, PlaygroundCorner next)
+            : proc (p), corner (c), after (std::move (next)), before (std::move (prev)) {}
+        bool perform() override { return applyOne (after); }
+        bool undo()    override { return applyOne (before); }
+        int  getSizeInUnits() override
+        {
+            // The preset copies (PlaygroundCorner::source) are NOT counted by their size. They
+            // are immutable, refcounted trees SHARED with the live corner and the neighbouring
+            // steps, and the first version counted 16000 units per copy: one step then blew
+            // JUCE's default 30000-unit budget by itself, trimmed the user's whole history to 30
+            // transactions, and broke endPlaygroundCornerEdit's depth guard (review, 2026-09-15).
+            return (int) ((before.params.size() + after.params.size()) * sizeof (float)) + 512;
+        }
+        bool applyOne (const PlaygroundCorner& c)
+        {
+            auto& dst = proc.pgCorner[(size_t) corner];
+            const int rev = dst.rev;
+            dst = c;
+            // The mix sub-engine keys its bank refill on rev, and the blend needs a
+            // generation bump: without both, taking the edits back would be inaudible
+            // until something else happened to recompile the spectrum.
+            dst.rev = rev + 1;
+            // A NEW VERSION of the corner, even when the name is the same: an adaptive search
+            // launched for the version this replaces must not land on it (see CornerAdaptResult).
+            dst.serial = ++proc.pgCornerSerial;
+            proc.pgDirty = true;
+            return true;
+        }
+        FractalAdditiveAudioProcessor& proc;
+        int corner;
+        PlaygroundCorner after, before;
+    };
+    // Raised by the marker's undo(): "the unwind has reached the start of the session".
+    bool pgEditUnwound = false;
+    // The corner as it stood BEFORE the session, so leaving can hand the session to
+    // CornerEditSessionAction as one undoable step.
+    PlaygroundCorner pgEditCornerBefore;
+    // How deep the undo stack was once the marker was on it. The unwind stops on the
+    // marker; this stops it anyway if the marker has been dropped off the bottom of a
+    // full stack, because unwinding past it would be eating the user's own history.
+    int pgEditStackDepth = 0;
+
+    // Write corner `corner`'s stored values onto the live control surface, and read the
+    // surface back into the corner. Both skip every parameter presetmorph excludes -
+    // the tuning, the reference, the transpose and the playground's own point are NOT
+    // part of a corner and must survive a round trip untouched.
+    void pushCornerToLiveSurface (int corner);
+    void pullPlaygroundCornerEdit();
+    // Every parameter at its DEFAULT - the base every corner store is built on, and the
+    // one answer to "what does this corner mean for a parameter its preset predates?".
+    void fillCornerDefaults (PlaygroundCorner& c) const;
+    // Build a corner from a preset TREE - the file's (assignPlaygroundCorner) or the copy a
+    // saved state carries (restoreState). `readError` non-empty = the tree could not be had,
+    // and the corner is left empty with that reason, exactly as a missing file always did.
+    bool assignPlaygroundCornerFromTree (int corner, const juce::String& name, const juce::ValueTree& tree,
+                                         const juce::String& readError, juce::String& errorOut);
+    // The modulator routing and realtime link, read from a preset tree into a corner.
+    void readCornerRouting (PlaygroundCorner& c, const juce::ValueTree& tree) const;
+    // The preset tree SAVED for a corner: its source copy, with an unsaved edit ("*") written
+    // over it so a saved pad sounds as it was heard.
+    juce::ValueTree cornerTreeForSaving (const PlaygroundCorner& c);
+    // The PLAYGROUND child a state carries: corner names (c0..c3, which older builds read)
+    // plus a CORNER child per assigned corner holding its preset copy.
+    juce::ValueTree playgroundChildForState();
 
     //== ADAPTIVE CORNERS (see the public block). Message thread except where noted. ==
     // One finished corner search. It carries its OWN identity (corner + preset name) and
@@ -1386,6 +2472,7 @@ private:
     {
         int corner = -1;
         juce::String cornerName;
+        juce::uint32 cornerSerial = 0;      // the VERSION it was started for (PlaygroundCorner::serial)
         std::vector<double> ratios, amps;   // ascending, ratios[0] == 1.0
         double period = 2.0;
         std::vector<double> aimAlphas;
@@ -1439,14 +2526,60 @@ private:
         // an inaudible-until-it-crackles trap and a fixed lower number a silent cap).
         // Message thread; MPESynthesiser's own voice lock serialises this against the
         // audio thread, and reduceNumVoices steals sounding voices properly.
+        // Growing is free. SHRINKING has the same two audible faults applyMonoVoiceCount
+        // documents at length, and for the same reason: reduceNumVoices() DELETES sounding
+        // voices, and a deleted voice stops mid-waveform because the object that would
+        // render a fade is gone. This is reached from the 60 Hz poll whenever the user
+        // turns "Mix voices per corner" down, which they will do with keys held - four
+        // sub-engines make it the control people reach for when the CPU meter climbs.
+        //
+        // Same two-step cure. FADE FIRST: every sounding voice above the new count is
+        // ASKED to fade over its own 5 ms fast kill, through the atomic the voice consumes
+        // at the top of its own render - beginFastKill() from this thread would mutate
+        // ADSR state and currentlyPlayingNote underneath a block the audio thread is
+        // rendering, and MPESynthesiser's voicesLock is not reachable from outside.
+        // DELETE SECOND, on a later tick, once they are quiet: findFreeVoice() hands
+        // reduceNumVoices the INACTIVE voices first, so the survivors are chosen inside
+        // JUCE under its own lock rather than by index surgery from here.
+        //
+        // Unlike mono, there is no last-note contract to honour - this is a polyphony
+        // budget, not an articulation - so the newest `want` voices stay and the oldest
+        // fade, which is what a player running out of voices expects.
         void setVoices (FractalAdditiveAudioProcessor& p, int want)
         {
             want = juce::jlimit (1, 32, want);
             while (synth.getNumVoices() < want)
-                synth.addVoice (new AdditiveVoice (p.apvts, spectrum, p.tuning, mods, &bank));
-            if (synth.getNumVoices() > want)
-                synth.reduceNumVoices (want);
+                synth.addVoice (new AdditiveVoice (p.apvts, spectrum, p.tuning, mods, p.expression, &bank));
+            if (synth.getNumVoices() <= want) { shrinkTicks = 0; return; }
+
+            // Rank the sounding voices by age so the oldest are the ones asked to go.
+            std::vector<juce::MPESynthesiserVoice*> live;
+            for (int v = 0; v < synth.getNumVoices(); ++v)
+                if (auto* mv = synth.getVoice (v); mv != nullptr && mv->isActive())
+                    live.push_back (mv);
+
+            if ((int) live.size() > want && shrinkTicks < kMixShrinkTicks)
+            {
+                ++shrinkTicks;
+                std::sort (live.begin(), live.end(),
+                           [] (auto* a, auto* b) { return a->noteOnTime > b->noteOnTime; });
+                // Re-asked every tick, not once: a key pressed DURING the shrink takes the
+                // newest slot and must not be the one that goes.
+                for (size_t i = (size_t) want; i < live.size(); ++i)
+                    if (auto* av = dynamic_cast<AdditiveVoice*> (live[i]))
+                        av->requestFadeOut();
+                return;   // the delete waits for the fades; re-entered from the 60 Hz tick
+            }
+
+            // Either the fades landed, or nothing is rendering them - a stopped transport,
+            // a bypassed plugin - and the polyphony the user asked for must not wait for
+            // ever on a voice that will never be asked for another sample.
+            shrinkTicks = 0;
+            synth.reduceNumVoices (want);
         }
+        // Half a second of 60 Hz ticks; a 5 ms fade has landed a hundred times over.
+        static constexpr int kMixShrinkTicks = 30;
+        int shrinkTicks = 0;
         ParamBank                 bank;      // the corner preset's values (see ParamBank.h)
         spectrum::SpectrumEngine  spectrum;  // holds the corner's compiled template
         ModEngine                 mods;      // the corner's own modulators, reading `bank`
@@ -1456,6 +2589,11 @@ private:
         // refreshes when the corner actually changed (assign, or an adaptive apply).
         std::shared_ptr<const spectrum::SpectrumTemplate> lastTmpl;
         juce::String lastName;
+        // ...and which REVISION of the corner's stored values. A corner edit that moves
+        // only voice parameters leaves the template pointer alone, so without this the
+        // sub-engine would keep the values it was built with and the user would hear
+        // nothing move (the exact "the store changed but the sound did not" trap).
+        int lastRev = -1;
     };
     // The message thread OWNS the engines (built on demand, kept for the processor's
     // lifetime - never deleted mid-session, so the audio thread can hold a pointer
@@ -1486,9 +2624,16 @@ private:
     void renderSynthMix (juce::AudioBuffer<float>& out, const juce::MidiBuffer& midi, int nSamp);
     // Mirror the live zone layout / bend range onto a sub-synth (corners follow the
     // LIVE tuning plumbing - the tuning is global, exactly as the morph promises).
+    // The MPE zone, put back after the host's own configuration message has been through
+    // JUCE's handler - and the render that splits at each such message so a note in the
+    // SAME buffer is not lost to a zone that was inactive for the width of one block.
+    // Both defined beside renderSynthMix, which is where the reasoning lives.
+    void repairMpeZoneOf (juce::MPESynthesiser& s);
+    void renderSplitAtMcm (juce::MPESynthesiser& s, juce::AudioBuffer<float>& buf,
+                           const juce::MidiBuffer& midi, int start, int len);
     void applyZoneTo (juce::MPESynthesiser& s) const
     {
-        if (lastZoneMpe)
+        if (lastZoneMpe.load (std::memory_order_relaxed))
         {
             juce::MPEZoneLayout zone;
             zone.setLowerZone (15, 48, 48);   // same numbers as applyTuningMode, same reason
@@ -1496,7 +2641,24 @@ private:
         }
         else
         {
+            // ...AND THE RANGE THROUGH THE SETTER, because enableLegacyMode DOES NOT SET IT
+            // on a synth that is already in legacy mode.
+            //
+            // juce_MPEInstrument.cpp opens with `if (legacyMode.isEnabled) return;` - and
+            // it must, since the rest of that function releases every sounding note. Every
+            // corner engine is built with enableLegacyMode(48) in its constructor
+            // (buildMixEngine, ~line 2311, which this function was written to correct), so
+            // by the time we get here legacy mode is already on and this call has always
+            // been a no-op. The corner therefore kept +-48 while the main engine ran at
+            // whatever the Pitch bend box says: at the +-2 st setting the wheel swept a MIX
+            // corner TWENTY-FOUR TIMES further than the voice it is supposed to be blended
+            // with, which is not a subtle mistune - it is a different note.
+            //
+            // enableLegacyMode stays, for the case where the synth is NOT yet in legacy
+            // mode (a corner rebuilt after the zone layout was set), and the setter goes
+            // after it because that is the call that works in both states.
             s.enableLegacyMode (lastBendApplied);
+            s.setLegacyModePitchbendRange (lastBendApplied);
         }
     }
     // Where a parameter sits in getParameters(). -1 if there is no such parameter.
@@ -1561,8 +2723,9 @@ private:
 
     // n-ad worker state.
     std::unique_ptr<std::thread> nadThread;
-    std::atomic<bool> nadCancel { false }, nadBusy { false }, nadOverBudget { false };
-    std::atomic<int>  nadGeneration { 0 }, nadUsedD { 0 }, nadTotalD { 0 };
+    std::atomic<bool> nadCancel { false }, nadBusy { false }, nadOverBudget { false },
+                      nadNoPeriod { false };
+    std::atomic<int>  nadGeneration { 0 }, nadUsedD { 0 }, nadTotalD { 0 }, nadResultD { 0 };
     mutable juce::CriticalSection nadLock;
     std::vector<NadRow> nadResults;
 
@@ -1572,6 +2735,70 @@ private:
     juce::uint32 modNoteOns = 0;     // running note-on counter (envelope retrigger)
     int          modHeld    = 0;     // notes currently held (audio thread; envelope gate)
     std::array<std::array<bool, 128>, 16> modKeyHeld {}; // which (channel, key) are down
+    // ...AND WHAT THOSE KEYS ARRIVED WITH, for the MIX engage edge.
+    //
+    // Engaging MIX re-strikes every held key into the cold corner engines, and it used to
+    // do that with a bare noteOn at a hard-coded velocity of 100. Both halves of the note
+    // were thrown away. The pitch bend is the serious one: in MPE every note carries its
+    // own per-channel bend, and in this instrument that bend IS the tuning for anything a
+    // controller retunes - so the corners sounded the chord in untuned 12-EDO under a main
+    // engine playing it correctly, which is not a blend of two spectra but two different
+    // chords. Velocity is smaller and just as free to keep right.
+    //
+    // Bend is per CHANNEL (that is what an MPE member channel means) and starts centred;
+    // velocity is per (channel, key), because that is what a note-on carries. 2 KB, and
+    // both are written on the audio thread beside modKeyHeld and read on it.
+    std::array<int, 16> modChanBend { { 8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192,
+                                        8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192 } };
+    std::array<std::array<juce::uint8, 128>, 16> modKeyVel {};
+public:
+    // THE RE-STRIKE, AS A FUNCTION, so the one question that matters can be asked of it.
+    //
+    // Reaching this through the audio path means building a playground with corner presets
+    // - which means preset FILES, and the user's own preset folder is not a thing a test
+    // gets to go near. Lifted out instead: it takes only what it reads, so a test hands it
+    // a held key with a bend and asks what came out. renderSynthMix calls this and nothing
+    // else, so there is no second copy to drift.
+    static void buildMixRestrike (juce::MidiBuffer& out,
+                                  const std::array<std::array<bool, 128>, 16>& held,
+                                  const std::array<int, 16>& bend,
+                                  const std::array<std::array<juce::uint8, 128>, 16>& vel,
+                                  bool mpeZone)
+    {
+        // THE ZONE'S MASTER BEND BELONGS TO EVERY NOTE IN THE ZONE, and the master channel
+        // holds no keys of its own - so the loop below, which only sends a channel's bend
+        // when that channel has a key down, never sent it. The corners then came in playing
+        // a chord up to four octaves away from the main engine, and the crossfade blended
+        // two different chords (found 2026-10-03).
+        if (mpeZone && bend[0] != 8192)
+        {
+            const bool anyKeyAnywhere =
+                std::any_of (held.begin(), held.end(), [] (const auto& row)
+                             { return std::any_of (row.begin(), row.end(), [] (bool b) { return b; }); });
+            if (anyKeyAnywhere)
+                out.addEvent (juce::MidiMessage::pitchWheel (1, bend[0]), 0);
+        }
+        for (int ch = 0; ch < 16; ++ch)
+        {
+            const bool anyOnThisChannel =
+                std::any_of (held[(size_t) ch].begin(), held[(size_t) ch].end(),
+                             [] (bool b) { return b; });
+            // The bend goes in BEFORE any note-on on its channel: sent after, the voice is
+            // born untuned and has to glide there. Only for channels that really have a
+            // key down, and only when it is off centre, so an idle wheel does not become
+            // fifteen redundant messages on the audio thread.
+            if (anyOnThisChannel && bend[(size_t) ch] != 8192)
+                out.addEvent (juce::MidiMessage::pitchWheel (ch + 1, bend[(size_t) ch]), 0);
+            for (int k = 0; k < 128; ++k)
+                if (held[(size_t) ch][(size_t) k])
+                {
+                    const auto v = vel[(size_t) ch][(size_t) k];
+                    out.addEvent (juce::MidiMessage::noteOn (ch + 1, k,
+                                      v != 0 ? v : (juce::uint8) 100), 0);
+                }
+        }
+    }
+private:
     std::vector<DissDegreeInfo> dissDegrees;
     double dissGreenH = 0.0, dissRedH = 1.0;
     int    dissRequested = 0, dissFound = 0, dissGeneration = 0;

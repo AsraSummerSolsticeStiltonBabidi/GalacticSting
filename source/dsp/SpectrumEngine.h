@@ -16,6 +16,7 @@
 #include <juce_core/juce_core.h>
 #include "Spectrum.h"
 #include "PartialGains.h"
+#include "PhaseSets.h"
 
 #include <array>
 #include <atomic>
@@ -51,11 +52,20 @@ namespace spectrum
             }
             wakeUp.signal();
         }
-
         // Build synchronously (call once from prepareToPlay so a template always exists).
         void buildNow (const SpectrumSettings& s)
         {
             publish (compileSpectrum (s));
+            // NO planLive() HERE, AND THE REASON IS MEASURED. buildNow() is the message
+            // thread, and the live adaptation reaches it while notes are held: with the
+            // plan built here the editor's worst timer tick went to 93.9 ms against a
+            // 33.6 ms frame - the window stops following the mouse. 38 ms is simply too
+            // much to spend anywhere the message thread can wait for it.
+            //
+            // The worker plans its own publishes behind the release-store instead, so a
+            // template compiled at prepareToPlay has no plan until the first real
+            // recompile - and a voice with no plan gets today's hash, which is the sound
+            // this synth already ships.
         }
 
         //----------------------------------------------------------------------
@@ -64,6 +74,97 @@ namespace spectrum
         {
             const int i = live.load (std::memory_order_acquire);
             return i < 0 ? nullptr : &pool[(size_t) i];
+        }
+
+        // The phase plan measured on the live template, or nullptr when there is none.
+        //
+        // ONE acquire-load for both, so a caller that wants the pair takes the slot index
+        // once: reading getLive() and then getLivePlan() can straddle a publish and hand
+        // back a plan measured on a template the caller is not looking at. The pair is
+        // what the guarantee is about - a plan is only ever "not worse than the hash" for
+        // the amplitudes it was built on.
+        const spectrum::phaseset::PhasePlan* getLivePlan() const noexcept
+        {
+            const int i = live.load (std::memory_order_acquire);
+            if (i < 0) return nullptr;
+            // Only if it was measured on the template that is live NOW.
+            const juce::uint32 g = pool[(size_t) i].generation;
+            if (g == 0 || planStamp[(size_t) i].load (std::memory_order_acquire) != g) return nullptr;
+            return &planPool[(size_t) i];
+        }
+        const spectrum::phaseset::PhaseReport* getLiveReport() const noexcept
+        {
+            const int i = live.load (std::memory_order_acquire);
+            if (i < 0) return nullptr;
+            const juce::uint32 g = pool[(size_t) i].generation;
+            if (g == 0 || planStamp[(size_t) i].load (std::memory_order_acquire) != g) return nullptr;
+            return &reportPool[(size_t) i];
+        }
+        struct LivePair { const SpectrumTemplate* t = nullptr; const spectrum::phaseset::PhasePlan* p = nullptr; };
+        LivePair getLivePair() const noexcept
+        {
+            const int i = live.load (std::memory_order_acquire);
+            if (i < 0) return {};
+            // THE SAME STAMP CHECK getLivePlan MAKES, and it was missing here.
+            //
+            // This handed back &planPool[i] unconditionally, so a caller could take a plan
+            // that had not been measured on the template it was about to be used with -
+            // the exact thing the comment above says the pair exists to prevent - or one
+            // that was mid-publish. getLivePlan has guarded this since it was written;
+            // the pair overload, added later to take the slot index once, dropped it.
+            // The template half is still returned either way, because a live template
+            // with no plan is an ordinary state and the caller falls back to the hash.
+            const juce::uint32 g = pool[(size_t) i].generation;
+            if (g == 0 || planStamp[(size_t) i].load (std::memory_order_acquire) != g)
+                return { &pool[(size_t) i], nullptr };
+            return { &pool[(size_t) i], &planPool[(size_t) i] };
+        }
+
+        // The rate the voices render at, for the plan's analysis. Set from prepareToPlay;
+        // a plan built at the wrong rate would analyse partials that cannot sound, or
+        // miss ones that can. Templates published before this is set use the 48 kHz
+        // default and are re-planned by the recompile prepareToPlay already triggers.
+        void setRenderRate (double sr) noexcept
+        { if (sr > 0.0) renderRate.store (sr, std::memory_order_relaxed); }
+
+        // Message thread: is a build or a blend queued, or in flight right now?
+        //
+        // This exists for the offline verifiers. They have no message loop and no ear, so
+        // they have to KNOW that a publish they asked for has happened before they measure
+        // what is sounding - and the worker is Priority::low, so "sleep a bit and hope" is
+        // a race that a busy machine loses. Measured: 1907 ms and 2309 ms to publish while
+        // a verifier ran back-to-back processBlock calls against it, against 3.0 ms of
+        // actual compile work. That race is most of why the rhythm suite could report
+        // 2, 3, 11, 12, 17 and 19 failures from the same binary at the same commit.
+        //
+        // ASK THE WORKER TO PLAN THE LIVE TEMPLATE, without compiling anything.
+        //
+        // prepareToPlay compiles SYNCHRONOUSLY (buildNow) and deliberately does not plan:
+        // 38 ms on the message thread is a lost frame, measured. That left the template a
+        // session opens with - the one the FIRST note plays - as the only one with no
+        // plan, until the user happened to change something. This closes that without
+        // putting a millisecond back on the message thread: the worker wakes, plans the
+        // slot that is already live, and publishes nothing.
+        //
+        // Counted in isBuildPending() so awaitSpectrumIdle() and the verifiers wait for it
+        // like they wait for a compile - a plan that lands after the check looked is a
+        // plan the check will call missing.
+        void requestPlan()
+        {
+            {
+                const std::lock_guard<std::mutex> lk (requestMutex);
+                hasPlanRequest = true;
+            }
+            wakeUp.signal();
+        }
+
+        // The pending flag and `working` are read together under the request lock, and the
+        // worker sets `working` under that same lock as it clears the flag, so there is no
+        // instant where a job is neither pending nor in flight.
+        bool isBuildPending() const
+        {
+            const std::lock_guard<std::mutex> lk (requestMutex);
+            return hasRequest || hasBlend || hasPlanRequest || working.load (std::memory_order_acquire);
         }
 
         int  getPartialCount() const noexcept { return liveCount.load(); }
@@ -116,6 +217,26 @@ namespace spectrum
             const int w = (cur + 1) % (int) pool.size();
             pool[(size_t) w] = pool[(size_t) cur];     // message thread only - allocation is fine here
             fillGains (pool[(size_t) w]);
+            // THE PLAN IN THE SLOT WE JUST OVERWROTE IS NOT A PLAN FOR WHAT IS IN IT NOW.
+            //
+            // publish() and publishKeepingGeneration() both zero this (see :502 and :529) and
+            // this one did not, which is a different bug BECAUSE the generation is deliberately
+            // carried over verbatim from the source slot. Every other route stamps a slot with a
+            // generation no plan has ever been measured against, so a stale stamp cannot match;
+            // here the copied generation matches whatever the slot was ALREADY stamped with.
+            //
+            // kSlots is 8 and every drag frame advances w by one, so the EIGHTH setOverrides of
+            // a pencil drag lands back on the slot the worker planned before the drag started -
+            // same generation, stamp still equal to it. getLivePlan()/getLivePair() then hand a
+            // voice the plan measured on the PRE-EDIT gains, which the header opposite planFor()
+            // measured at 2.13 dB WORSE than today's hash after a single pencil edit. And it does
+            // not heal: planLive() early-returns on exactly that stamp==generation test, so every
+            // wrap after the first is stale too until something bumps the generation for real.
+            //
+            // Relaxed is enough, exactly as it is in publish(): the release-store of `live` below
+            // is what publishes it, and a reader that acquire-loads `live` cannot see the slot
+            // without seeing this.
+            planStamp[(size_t) w].store (0, std::memory_order_relaxed);
             liveRev.fetch_add (1, std::memory_order_release);
             live.store (w, std::memory_order_release); // same generation: no morph restart
         }
@@ -163,20 +284,21 @@ namespace spectrum
             float  curveSlope = 1.0f;              // stamped on the result (see blendTemplates)
             // WHETHER THE VOICES SHOULD TREAT THIS AS A SPECTRUM CHANGE.
             //
-            // false is the normal case while the point is being dragged, and it is the
-            // SAME trick setOverrides uses: publishing without bumping the generation
-            // means no voice restarts its spectral morph. A drag moves every partial by
-            // a hair per frame, so the voices simply read the new ratios (phase-
-            // continuous - a small frequency move on a running phase is inaudible) and
-            // glide the amplitudes over the usual 7 ms. Bumping the generation 60 times
-            // a second would instead re-seed every voice's morph clock and phase
-            // reference on every frame: the staircase that produced the loud clicks.
+            // false is most frames of a drag, and it is the SAME trick setOverrides
+            // uses: publishing without bumping the generation means no voice restarts
+            // its spectral morph - the amplitudes track the moving blend at 60 Hz over
+            // the usual 7 ms slew. Bumping all sixty frames a second would re-seed
+            // every voice's morph clock and phase reference per frame: the staircase
+            // that produced the loud clicks.
             //
             // true is for a DISCONTINUITY - engaging the playground, a corner being
             // (re)assigned, a discrete setting flipping, or automation jumping the point
-            // across the pad - where the spectrum really does change in one step and the
-            // existing machinery (the per-voice morph, or the 50 ms template fade when
-            // Morph is off) is exactly what should handle it.
+            // across the pad - and, THROTTLED to 10 Hz, for the frames of a drag itself
+            // (drivePlayground's glide block): each bumped publish is what makes the
+            // voices BEND their partial frequencies to the blend (Morph on) or cross
+            // the 50 ms template fade (Morph off). Without any bumps a drag could only
+            // ever crossfade bin amplitudes in place - the reported "morph does not
+            // pitch-bend the partials".
             bool   bumpGeneration = true;
         };
 
@@ -203,20 +325,108 @@ namespace spectrum
         // Audio thread: a voice reports how many partials it actually renders (after the
         // per-pitch Nyquist cull) so the meter can show the audible count, not the
         // (much larger, pitch-independent) template size.
-        void reportRendered (int n) const noexcept { renderedCount.store (n, std::memory_order_relaxed); }
+        // WRITTEN ONLY BY A SOUNDING VOICE, WHICH IS WHY THE COUNT ALONE IS NOT A FACT.
+        //
+        // renderedCount is 0 in two states that could not be further apart: a cold
+        // instrument nobody has played yet, and an instrument that is playing and
+        // producing nothing. The editor's meter read the number without that distinction
+        // and printed "0 partials audible" in the healthy green in BOTH - photographed on
+        // a cold instrument at 1600x900, where the synth is completely fine, and again in
+        // the silent-warning state, where it is not. One string and one colour cannot be
+        // right for both.
+        //
+        // One more relaxed store of a bool is the whole cost on the audio thread: no
+        // allocation, no lock, and no ordering imposed on anything, because both values
+        // are advisory read-outs that the DSP never reads back. Never cleared: the
+        // question is "has this instrument made a sound since it was built", and letting
+        // go of a note must not turn the meter back into a question mark.
+        //
+        // REJECTED: a -1 sentinel inside renderedCount. The verifier reads
+        // getRenderedCount() as a plain count in two places, and a negative would have to
+        // be understood at both, off screen, by whoever edits them next.
+        // `samples`: the length of the chunk those `n` oscillators ran for. Summed across every
+        // voice and chunk into oscillator-SAMPLES, so the processor can divide by the block
+        // length and get how many oscillators were really running - the load's first cause
+        // (see dsp/LoadMonitor.h). A per-chunk COUNT of calls would not do: a voice renders a
+        // block in several chunks.
+        void reportRendered (int n, int samples = 0) const noexcept
+        {
+            renderedCount.store (n, std::memory_order_relaxed);
+            everRendered.store (true, std::memory_order_relaxed);
+            if (samples > 0 && n > 0)
+                oscSamples.fetch_add ((long long) n * samples, std::memory_order_relaxed);
+        }
+        long long takeOscillatorSamples() const noexcept { return oscSamples.exchange (0, std::memory_order_relaxed); }
         int  getRenderedCount() const noexcept     { return renderedCount.load (std::memory_order_relaxed); }
+        bool hasEverRendered()  const noexcept     { return everRendered.load (std::memory_order_relaxed); }
+
+        // MEASURE THE LIVE SLOT'S PLAN, AFTER IT IS ALREADY SOUNDING.
+        //
+        // buildPlan is 38 ms at the compile budget. Done before the release-store, that
+        // is 38 ms of extra latency on EVERY recompile - a patch tweak under a held note
+        // taking that much longer to be heard - and it broke four verifier scenarios that
+        // render a fixed number of blocks after a change. Done inside buildMutex it was
+        // worse still: buildNow() runs on the message thread, and the editor's worst timer
+        // tick went from 0.2 ms to 41.1 ms against a 33.6 ms frame.
+        //
+        // So the template is published at exactly the speed it always was, and the plan
+        // arrives afterwards. The header says why that is sound: "a late upgrade is
+        // inaudible on notes already sounding, because a plan only reaches a voice at
+        // note-on". Notes that start in the gap get today's hash, which is the sound this
+        // synth already ships.
+        //
+        // THE STAMP IS THE WHOLE SAFETY ARGUMENT. A plan is only ever valid for the exact
+        // amplitudes it was measured on, so the slot records WHICH template generation it
+        // was built for and getLivePlan() hands back nothing unless that matches the live
+        // template's own stamp. A publish that lands mid-measurement therefore discards
+        // the plan instead of pairing it with a spectrum it never saw.
+        void planLive()
+        {
+            const int w = live.load (std::memory_order_acquire);
+            if (w < 0) return;
+            const juce::uint32 g = pool[(size_t) w].generation;
+            if (planStamp[(size_t) w].load (std::memory_order_acquire) == g && g != 0) return;
+            spectrum::phaseset::PhasePlan   plan;
+            spectrum::phaseset::PhaseReport rep = planFor (pool[(size_t) w], plan);
+            // Still the same template? If not, this plan describes a spectrum nobody is
+            // playing and is dropped rather than published against the wrong one.
+            if (live.load (std::memory_order_acquire) != w || pool[(size_t) w].generation != g) return;
+            planPool[(size_t) w]   = std::move (plan);
+            reportPool[(size_t) w] = rep;
+            planStamp[(size_t) w].store (g, std::memory_order_release);
+        }
 
     private:
         void run() override
         {
             while (! threadShouldExit())
             {
-                wakeUp.wait (-1);
+                // SLEEP ONLY WHEN NOTHING IS OWED. The event is auto-reset and every request
+                // signals it, but one pass takes ONE kind of job - and two jobs that land
+                // while the worker is busy leave ONE signal behind. The worker used to take
+                // the first, finish, and go back to sleep on the second: a plan request
+                // posted by prepareToPlay and a rebuild a few ms later left hasPlanRequest
+                // set for ever (isBuildPending() never went false - measured, 1 build in 9
+                // of the same preset timed out after 15 s), and a rebuild posted just after
+                // a blend was stranded behind it until some later request happened to wake
+                // the thread. That request is NEWER than the blend, never older:
+                // requestBlend and publishNow both clear any request queued before them. So
+                // doing it next, after the blend has published, is the right order.
+                {
+                    bool owed = false;
+                    {
+                        const std::lock_guard<std::mutex> lk (requestMutex);
+                        owed = hasRequest || hasBlend || hasPlanRequest;
+                    }
+                    // A request that lands between that look and this wait sets the flag
+                    // and THEN signals, so the wait returns at once - nothing slips past.
+                    if (! owed) wakeUp.wait (-1);
+                }
                 if (threadShouldExit()) break;
 
                 SpectrumSettings s;
                 BlendJob job;
-                bool have = false, haveBlend = false;
+                bool have = false, haveBlend = false, havePlan = false;
                 unsigned long long epoch = 0;
                 {
                     const std::lock_guard<std::mutex> lk (requestMutex);
@@ -225,7 +435,17 @@ namespace spectrum
                     // definition from the settings the blend supersedes.
                     if (hasBlend)        { job = blend;     hasBlend   = false; haveBlend = true; epoch = pubEpoch; }
                     else if (hasRequest) { s   = requested; hasRequest = false; have      = true; epoch = pubEpoch; }
+                    // A bare plan request is the lowest priority of the three: a compile
+                    // or a blend will publish a NEW template and plan it anyway, which
+                    // makes this one moot.
+                    if (! have && ! haveBlend && hasPlanRequest) { hasPlanRequest = false; havePlan = true; }
+                    // Taken under the SAME lock that clears the pending flag, so there is
+                    // no instant at which isBuildPending() can see neither the request nor
+                    // the work - which is the whole point of it (see that function).
+                    working.store (have || haveBlend || havePlan, std::memory_order_release);
                 }
+
+                if (havePlan && ! abortBuild.load()) planLive();
 
                 if (haveBlend)
                 {
@@ -251,8 +471,23 @@ namespace spectrum
                         superseded = pubEpoch != epoch;   // publishNow overtook this build
                     }
                     if (! abortBuild.load() && ! superseded)   // also discards a build cancelled at teardown
+                    {
                         publish (std::move (t));
+                        // ...and measure its plan BEHIND the release, only on this path.
+                        //
+                        // NOT after a playground blend: a drag posts a job every 16 ms and
+                        // buildPlan is 38 ms, so planning every frame leaves the worker
+                        // permanently behind the drag - measured, it broke the round-trip
+                        // level check. The header says the same thing (drag budget while a
+                        // control moves, one re-run when it settles), and until that settle
+                        // pass exists a blended template simply has no plan: the stamp will
+                        // not match, getLivePlan() hands back nullptr, and a voice falls
+                        // back to today's hash - the sound this synth already ships.
+                        if (! abortBuild.load()) planLive();
+                    }
                 }
+
+                working.store (false, std::memory_order_release);
             }
         }
 
@@ -305,12 +540,14 @@ namespace spectrum
         // of them starts a spectral morph. See BlendJob::bumpGeneration.
         void publishKeepingGeneration (SpectrumTemplate t)
         {
+            fillGains (t);
             const std::lock_guard<std::mutex> lk (buildMutex);
             const int cur = live.load();
             const int w   = (cur + 1) % (int) pool.size();
             t.generation = generation.load (std::memory_order_relaxed);
-            fillGains (t);
             pool[(size_t) w] = std::move (t);
+            // The plan is measured AFTER the release below - see planLive().
+            planStamp[(size_t) w].store (0, std::memory_order_relaxed);
             liveCount.store ((int) pool[(size_t) w].partials.size());
             rawCount .store (pool[(size_t) w].rawCount);
             truncated.store (pool[(size_t) w].truncated);
@@ -321,12 +558,23 @@ namespace spectrum
         // Serialised between worker and buildNow (never called on the audio thread).
         void publish (SpectrumTemplate t)
         {
+            // GAINS AND PLAN BEFORE THE LOCK, NOT INSIDE IT.
+            //
+            // buildMutex serialises the worker against buildNow(), and buildNow() runs on
+            // the message thread. Measuring a phase plan inside that lock therefore adds
+            // its whole cost to a message-thread wait: written that way first and
+            // measured, the editor's worst timer tick under a held chord went from 0.2 ms
+            // to 41.1 ms against a 33.6 ms frame - the window stops following the mouse.
+            // Neither call needs the lock (fillGains takes its own), and the plan is
+            // measured on `t`, which nothing else can see yet.
+            fillGains (t);                       // no template is ever live without its gains
             const std::lock_guard<std::mutex> lk (buildMutex);
             const int w = (live.load() + 1) % (int) pool.size();
             const juce::uint32 g = generation.load (std::memory_order_relaxed) + 1;
             t.generation = g;                    // stamp BEFORE the slot is written + released
-            fillGains (t);                       // no template is ever live without its gains
             pool[(size_t) w] = std::move (t);
+            // The plan is measured AFTER the release below - see planLive().
+            planStamp[(size_t) w].store (0, std::memory_order_relaxed);
             liveCount.store ((int) pool[(size_t) w].partials.size());
             rawCount .store (pool[(size_t) w].rawCount);
             truncated.store (pool[(size_t) w].truncated);
@@ -337,6 +585,69 @@ namespace spectrum
             live.store (w, std::memory_order_release);
         }
 
+
+        //======================================================================
+        // THE PHASE PLAN, PUBLISHED IN LOCKSTEP WITH THE TEMPLATE IT MEASURES.
+        //
+        // It lives here and not inside SpectrumTemplate because PhaseSets.h includes
+        // Spectrum.h - a plan member would close the cycle. A parallel pool costs the
+        // same guarantee for nothing: slot w's plan is written BEFORE the release-store
+        // of `live`, so a voice that acquire-loads the live slot sees the template and
+        // the plan it was measured on as one pair, exactly as it already does for the
+        // generation stamp.
+        //
+        // WHAT IT IS MEASURED ON. The amplitudes the voice will actually RENDER - the
+        // template's own amps multiplied by the resolved per-partial gains - and at the
+        // slope the template was compiled at, which is what those amps already embody.
+        // The header calls this a precondition rather than a refinement: a plan built on
+        // the pre-edit amplitudes measured 2.13 dB WORSE than today's hash after a single
+        // pencil edit.
+        //
+        // WHAT IT COSTS. buildPlan is the expensive call - 38 ms worst case at the
+        // compile budget on the suite's own box - and this is the background compile
+        // thread, next to a compile that is heavier. It is NOT on the audio thread and
+        // NOT per frame.
+
+        //======================================================================
+
+        spectrum::phaseset::PhaseReport planFor (const SpectrumTemplate& t,
+                                                 spectrum::phaseset::PhasePlan& out) const
+        {
+            const int n = (int) t.partials.size();
+            if (n <= 0) { out = spectrum::phaseset::PhasePlan(); return {}; }
+            // The rendered amplitudes, in the template's own partial order.
+            std::vector<spectrum::Partial> rendered (t.partials);
+            if (t.gain.size() == t.partials.size())
+                for (size_t i = 0; i < rendered.size(); ++i)
+                    rendered[i].amp *= t.gain[i];
+            spectrum::phaseset::Options opt;
+            opt.sampleRate = renderRate.load (std::memory_order_relaxed);
+            // TWICE THE COMPILE BUDGET, and the reason is measured rather than guessed.
+            //
+            // At kWorkBudgetCompile the report comes back with `reachReduced` set: the
+            // budget, not the pitch, was cutting how far the analysis got. Doubling it
+            // clears that flag AND takes the crest from 1.6078 to 1.5517 against a hash of
+            // 2.0830 - 2.25 dB becomes 2.55. Four times and eight times give 1.5517 to the
+            // last digit, so this is the knee and not a slope: the search has found
+            // everything it can find at this reach.
+            //
+            // WHAT IT COSTS is latency-to-plan, not audio and not the editor: this runs on
+            // the worker BEHIND the release-store (see planLive), so a recompile's plan
+            // simply lands about twice as late, and a note started in that window gets
+            // today's hash - which is the documented fallback and the sound this synth
+            // already shipped. The budget is a deterministic WORK counter, so a slower
+            // machine pays proportionally and nothing changes about what is produced.
+            //
+            // AND NOT MORE REACH. Asking the analysis to cover C1 instead of C2 was
+            // measured at 4x and 16x: the reach is reached (32.7 Hz, and at 16x the budget
+            // stops being the limit at all) and the crest win vanishes completely - chosen
+            // 2.1451 against a hash of 2.1451. The advantage lives at this prefix; spread
+            // over a longer one there is nothing to find, and the engine says so by handing
+            // the hash back.
+            opt.workBudget = 2LL * spectrum::phaseset::kWorkBudgetCompile;
+            return spectrum::phaseset::buildPlan (rendered.data(), n, opt, out);
+        }
+
         std::vector<PartialGain> overrides;      // the user's edits (message thread writes)
         bool                     overridesOn = false;
         std::mutex               overrideMutex;
@@ -344,6 +655,14 @@ namespace spectrum
 
         static constexpr int kSlots = 8; // margin so a burst of publishes can't wrap onto a slot a voice is mid-read
         std::array<SpectrumTemplate, kSlots> pool;
+        std::array<spectrum::phaseset::PhasePlan, kSlots> planPool;
+        // Kept beside the plan so the integration can be CHECKED, not just used: the
+        // engine's guarantee is "never worse than the hash", and a number nobody reads
+        // is a guarantee nobody keeps.
+        std::array<spectrum::phaseset::PhaseReport, kSlots> reportPool;
+        // Which template generation each slot's plan was measured on. 0 = none yet.
+        std::array<std::atomic<juce::uint32>, kSlots> planStamp {};
+        std::atomic<double> renderRate { 48000.0 };
 
         std::atomic<int>  live       { -1 };
         std::atomic<juce::uint32> generation { 0 };
@@ -353,17 +672,23 @@ namespace spectrum
         std::atomic<bool> truncated  { false };
         std::atomic<bool> abortBuild { false };
         mutable std::atomic<int> renderedCount { 0 };
+        mutable std::atomic<bool> everRendered { false }; // see reportRendered: 0 is not a diagnosis
+        mutable std::atomic<long long> oscSamples { 0 };  // see reportRendered
 
-        std::mutex        requestMutex;
+        mutable std::mutex requestMutex;
         std::mutex        buildMutex;
         SpectrumSettings  requested;
         bool              hasRequest = false;
+        bool              hasPlanRequest = false;   // plan the live slot, compile nothing
         BlendJob          blend;                  // guarded by requestMutex
         bool              hasBlend   = false;     // coalesced: the latest point wins
         // Guarded by requestMutex. Bumped by publishNow so a build that started earlier
         // cannot publish an older spectrum over a newer one (see publishNow).
         unsigned long long pubEpoch = 0;
         juce::WaitableEvent wakeUp;
+        // True from the moment the worker takes a job until it has finished publishing it.
+        // Read together with the two pending flags by isBuildPending().
+        std::atomic<bool> working { false };
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SpectrumEngine)
     };

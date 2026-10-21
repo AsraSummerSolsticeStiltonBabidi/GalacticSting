@@ -83,15 +83,42 @@ public:
         modeParam = apvts.getRawParameterValue ("rhythmMode");
         mpeParam  = apvts.getRawParameterValue ("rhythmMpe");
         bendParam = apvts.getRawParameterValue ("bendRange");
+        // ...AND WHICH TUNING MODE IS IN FORCE, because in MPE mode the bend selector is
+        // not what decodes the pulses (see bendRangeSemis).
+        //
+        // From the APVTS and NOT from the TuningManager: the manager is switched to
+        // Mode::Equal while MPE is on - that is the whole point of MPE mode, the host owns
+        // the pitches - so asking it "are we in MPE?" answers no, every time.
+        tuneModeParam = apvts.getRawParameterValue ("tuningMode");
     }
 
     void prepare (double sampleRate)
     {
         sr = sampleRate > 0.0 ? sampleRate : 44100.0;
         // Pre-size the output buffer to the worst-case event burst (echo bend+on+off,
-        // main trains, pending flush) so out.addEvent never allocates in processBlock.
-        out.ensureSize ((size_t) (3 * kFbMaxOn + kFbMaxOff + 4 * kSlots * kMaxNotes
-                                  + kSlots * kMaxNotes + kFbMaxOff) * 16);
+        // main trains, pending flush) so out.addEvent does not allocate in processBlock.
+        // It is a FUNCTION and not a line, because process() swaps this buffer away every
+        // block and has to ask for the same number again - see the swap at the end of it.
+        out.ensureSize (outReserveBytes());
+        resetState();
+    }
+
+    static constexpr size_t outReserveBytes() noexcept
+    {
+        return (size_t) (3 * kFbMaxOn + kFbMaxOff + 4 * kSlots * kMaxNotes
+                         + kSlots * kMaxNotes + kFbMaxOff) * 16;
+    }
+
+    // Everything prepare() clears, WITHOUT the one line in it that can allocate.
+    // Split out so AudioProcessor::reset() - the host's "stop making sound now", which a
+    // bypass and a panic both go through - can be honoured on the AUDIO thread, where
+    // an unbounded ensureSize is not wanted. It is still correct to leave it out: process()
+    // re-arms the reserve itself after every swap (see the end of it), so resetState has
+    // nothing to restore and the sizing is never left to a path that only clears state.
+    // (The older wording here said "the sizing prepare() did still holds", which stopped
+    // being true the moment the first swap handed that storage to the caller.)
+    void resetState() noexcept
+    {
         // Before wiping the gate state, remember any OUTPUT notes that are still
         // sounding so the next block can send their note-offs. Otherwise a re-prepare
         // (sample-rate/block-size change, plugin re-init, transport re-arm...) would
@@ -239,6 +266,14 @@ public:
         engineClock += numSamples; // absolute sample frame (pattern anchor/cycle)
 
         io.swapWith (out); // input events consumed; only our pulses leave the plugin
+        // ...AND THE RESERVE IS RE-ARMED. prepare() sized this buffer for the worst-case
+        // burst and the line above then handed that storage to the caller, taking the
+        // caller's in exchange - so the sizing lasted one block and the promise above it
+        // ("does not allocate in processBlock") had a one-block life. This is the engine
+        // with the largest reserve of the four that do this, and therefore the one where
+        // the difference actually costs something. ensureSize returns immediately when the
+        // capacity is already there, so it is free once the rotation settles.
+        out.ensureSize (outReserveBytes());
     }
 
     // Emit every feedback echo whose time has come this block and carry the rest
@@ -402,10 +437,13 @@ private:
         }
         else if (msg.isPitchWheel())
         {
-            static constexpr int bendValues[] = { 2, 12, 48 };
-            const int idx = juce::jlimit (0, 2, bendParam != nullptr ? (int) bendParam->load() : 2);
+            // AT THE RANGE THAT IS REALLY IN FORCE - bendRangeSemis(), the one function
+            // that knows the zone fixes it at +-48 in MPE mode. This site read the selector
+            // directly, so 9f92d77 fixed the CLAMP and left the decode behind: an incoming
+            // wheel on an MPE channel was still scaled by a +-2 selector the panel hides
+            // in that mode, and a held note's f0 came out twenty-four times too close.
             const double semis = ((double) msg.getPitchWheelValue() - 8192.0) / 8192.0
-                               * (double) bendValues[idx];
+                               * bendRangeSemis();
             channelBend[(size_t) juce::jlimit (0, 15, msg.getChannel() - 1)] = semis;
             for (auto& h : heldCol)
                 if (h.active && h.ch == msg.getChannel())
@@ -454,6 +492,23 @@ public:
              ? lastSendBend[(size_t) slot][(size_t) col].load (std::memory_order_relaxed) : 8192;
     }
     double getBendRangeSemis() const noexcept { return bendRangeSemis(); }
+    // TESTS: the two halves the range test above could not reach. getBendRangeSemis says
+    // what the engine BELIEVES the range is; these say what it DOES with a wheel value
+    // coming in and a detune going out. The first version of that test called only the
+    // belief, four times, and sabotaging both of these left it green.
+    // THROUGH THE REAL HANDLER, not a formula of its own. The first version of this
+    // computed the answer itself from bendRangeSemis() - the belief - and stayed green
+    // with the decode site sabotaged to a hard 2.0, which is precisely the probe defect
+    // the old range test had. It now feeds the engine a pitch-wheel message the way the
+    // MIDI input does and reads back what the engine STORED for that channel.
+    double decodeWheelForTests (int wheel14, int channel = 2) noexcept
+    {
+        handleEvent (juce::MidiMessage::pitchWheel (channel, wheel14), 0, true);
+        return channelBend[(size_t) juce::jlimit (0, 15, channel - 1)];
+    }
+    int    encodeBendForTests (double semis) const noexcept { return encodeBend (semis); }
+    void   encodePitchForTests (double hz, bool forSynth, int& note, int& bend, double& produced) noexcept
+    { encodePitch (hz, forSynth, note, bend, produced); }
 
     //==========================================================================
     // THE CHORD BEING HELD RIGHT NOW, with each note's EXACT sounding frequency
@@ -789,21 +844,41 @@ private:
     std::atomic<float>* modeParam = nullptr;
     std::atomic<float>* mpeParam  = nullptr;
     std::atomic<float>* bendParam = nullptr;
+    // Which tuning mode is running - index 3 is MPE, where the ZONE fixes the bend range
+    // at +-48 and bendParam above governs nothing (see bendRangeSemis).
+    std::atomic<float>* tuneModeParam = nullptr;
 
     // Encode a fractional-semitone offset as a 14-bit pitch wheel value using the
     // range the SYNTH is actually set to. This used to assume the MPE default of
     // +-48 unconditionally, so with the range on +-2 or +-12 every JI pulse landed
     // at 1/24 or 1/4 of its intended detune - the "JI breaks the sound" report.
+    //
+    // ...and it now asks bendRangeSemis(), like the clamp two callers up. It kept its own
+    // copy of the selector table after that function learned about MPE, so in MPE mode
+    // the clamp was computed at 48 and the encode at 2: a pulse asked for +3.5 semitones
+    // went out as 16383, which the voice - reading the zone's 48 - played 48 semitones up.
+    // One rule, one function, every caller.
     int encodeBend (double semitoneOffset) const noexcept
     {
-        static constexpr double bendValues[] = { 2.0, 12.0, 48.0 };
-        const int idx = juce::jlimit (0, 2, bendParam != nullptr ? (int) bendParam->load() : 2);
-        const double range = bendValues[idx];
+        const double range = bendRangeSemis();
         return juce::jlimit (0, 16383, 8192 + (int) std::lround (semitoneOffset / range * 8192.0));
     }
     // Widest detune the current bend range can actually express, for clamping.
+    //
+    // IN MPE MODE THE SELECTOR IS NOT WHAT DECODES THESE PULSES. applyTuningMode installs
+    // a real MPE lower zone with a per-note range of +-48, and a zone's range is what the
+    // receiving instrument honours - the `bendRange` parameter governs the LEGACY layout
+    // and nothing else. So with MPE on and the selector at its +-2 setting, this function
+    // used to encode a pulse's detune as if 8192 units meant 2 semitones while the voice
+    // read them as 48: every rhythm pulse landed twenty-four times further off its key
+    // than it was asked to, which on a microtonal instrument is not a detune, it is a
+    // different note. The panel hides the bend selector in this mode precisely because it
+    // does not govern here; this function had not been told.
     double bendRangeSemis() const noexcept
     {
+        // Index 3 = "MPE (bend input)" - the same number applyTuningMode tests.
+        if (tuneModeParam != nullptr && (int) tuneModeParam->load() == 3)
+            return 48.0;
         static constexpr double bendValues[] = { 2.0, 12.0, 48.0 };
         return bendValues[juce::jlimit (0, 2, bendParam != nullptr ? (int) bendParam->load() : 2)];
     }

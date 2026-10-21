@@ -1,0 +1,101 @@
+MICROTONAL NOTE NAMES - CREDITS AND LICENCES
+============================================
+
+This file covers the note-name option on the keyboard: the notation itself, the
+algorithm that spells it, and the font that draws it. It sits beside the font it
+licenses, next to OFL.txt (which covers Kablammo, the title face) - one folder,
+one place to look.
+
+The same credits are shown inside the plugin: Menu -> "Note names: credits".
+
+
+1. THE NOTATION - ups and downs
+-------------------------------
+Devised by Kite Giedraitis.
+    https://en.xen.wiki/w/Kite%27s_ups_and_downs_notation
+
+Ups and downs extends the ordinary letters and sharps/flats with an "up" and a
+"down" so that any equal division of the octave can be spelled with the letters
+A-G rather than bare step numbers. No code of Kite's is used here; the credit is
+for the notation.
+
+
+2. THE SPELLING ALGORITHM - "Notation" by Richie Greene
+------------------------------------------------------
+source/NoteNames.h is a line-for-line port of the edoNames() function from
+"Notation" by Richie Greene.
+    https://github.com/richiegreene/notation
+    https://notation.richiegreene.com
+
+    MIT License - Copyright (c) 2026 Richie Greene
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+
+3. THE ACCIDENTAL GLYPHS - notes.otf
+------------------------------------
+assets/fonts/notes.otf is by Sintel, from tessera, and is MIT-licensed.
+    https://github.com/Sin-tel/tessera
+
+    MIT License - Copyright (c) Sin-tel
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+In this font the accidentals ride on ordinary ASCII letters: 'c' and 'd' are the
+sharp and the double sharp, 'g' and 'h' the three-quarter and the half sharp,
+'a' and 'e' the flat and the half flat, 'v' and 'w' a down and an up, '#' a
+double down, '\' and '/' a drop and a lift. That is why the names look like
+gibberish in any other typeface, and why the keyboard falls back to degree
+NUMBERS rather than draw them in one.
+
+
+4. HELMHOLTZ-ELLIS JI PITCH NOTATION (HEJI) - NOT SHIPPED YET
+-------------------------------------------------------------
+HEJI, by Marc Sabat and Thomas Nicholson with Wolfgang von Schweinitz
+(https://heji.plainsound.org), is the notation this option would use for a
+JUST-INTONATION scale, and the reference implementation this port came from
+spells it. It is NOT in this build.
+
+The reason is honest and specific: HEJI's accidentals are SMuFL codepoints
+(U+E260-E266, U+E2C0-U+E2ED) and the only font here that carries them is a
+Bravura subset in WOFF2 form. JUCE's Typeface::createSystemTypefaceFor reads
+OTF/TTF, not WOFF2, and there is no OTF/TTF Bravura in this tree. Shipping it
+anyway would draw a row of missing-glyph boxes on every JI degree, which is worse
+than the degree numbers it replaced. When a Bravura (or other SMuFL) OTF is
+added under this folder, hejiName() can be ported the same way edoNames() was.
+
+Bravura, if and when it is added, is Copyright (c) 2019 Steinberg Media
+Technologies GmbH, under the SIL Open Font License 1.1 - the same licence as
+OFL.txt in this folder.

@@ -291,6 +291,106 @@ int main()
         check (t.loadScalaString ("desc\n1\n1200.0\n", "ok2", err), "plain cents octave accepted");
     }
 
+    //======================================================================================
+    std::printf ("a few thousand mutations of a valid .scl: no crash, and no silent nonsense:\n");
+    {
+        // A USER DRAGS ANY FILE ONTO THIS PLUGIN. The hand-written cases above cover the
+        // mistakes a person makes while EDITING a scale; this covers the file that was
+        // never a scale, or was one until something truncated it. Two claims, and the
+        // second is the one that matters:
+        //   * the parser returns. It may refuse - refusing is the right answer for most of
+        //     these - but it may not crash, hang or read off the end.
+        //   * and when it ACCEPTS, what it accepted has to be a usable tuning. A parser
+        //     that says yes to rubbish silently retunes the user's whole project, which is
+        //     worse than one that says no to something valid: the second is visible.
+        //
+        // Deterministic mutations, not random ones, so a failure is reproducible from the
+        // index alone and the run means the same thing on every machine.
+        const juce::String base =
+            "! fuzz.scl\na scale to break\n 5\n!\n 100.0\n 3/2\n 700.0\n 9/8\n 2/1\n";
+
+        int accepted = 0, refused = 0, bad = 0;
+        juce::String firstBad;
+        const auto tryOne = [&] (const juce::String& text, const juce::String& what)
+        {
+            TuningManager t; juce::String err;
+            // SCALA MODE, or frequencyForNote returns 12-TET and this whole check measures
+            // nothing: the first version left the default mode and PASSED with the table
+            // deliberately corrupted. Third vacuous pass of the session, and the same
+            // shape as the other two - the thing under test was not connected.
+            t.setMode (TuningManager::Mode::Scala);
+            const bool ok = t.loadScalaString (text, "fuzz", err);
+            if (! ok) { ++refused; return; }
+            ++accepted;
+            // ACCEPTED: then it must be a tuning somebody can play. Every one of the 128
+            // keys has to be a FINITE, POSITIVE frequency - a NaN is a dead note that
+            // poisons the host's mix, a zero or a negative is not a pitch at all.
+            //
+            // NOT "strictly ascending", which is what this asked first and got 363 of 364
+            // mutations flagged. A .scl may state its degrees in any order and this build
+            // deliberately accepts descending ones, so a non-monotonic table is the FILE
+            // faithfully represented, not a defect. An assertion that fails on almost
+            // everything is an assertion about the wrong thing.
+            bool good = t.degreesPerPeriod() > 0 && std::isfinite (t.periodRatio())
+                     && t.periodRatio() > 0.0;
+            for (int n = 0; good && n < 128; ++n)
+            {
+                const double f = t.frequencyForNote (n);
+                if (! std::isfinite (f) || f <= 0.0) good = false;
+            }
+            if (! good) { ++bad; if (firstBad.isEmpty()) firstBad = what; }
+        };
+
+        // 1. Truncation at every 1/64th of the file: the half-written download.
+        for (int i = 0; i <= 64; ++i)
+            tryOne (base.substring (0, base.length() * i / 64), "truncated at " + juce::String (i) + "/64");
+        // 2. Every single byte replaced by each of a handful of awkward characters.
+        const char* pokes = "\0\n\r\t 0.-/!x";
+        for (int i = 0; i < base.length(); ++i)
+            for (int p = 0; p < 10; ++p)
+            {
+                auto m = base;
+                m = m.replaceSection (i, 1, juce::String::charToString ((juce::juce_wchar) pokes[p]));
+                tryOne (m, "byte " + juce::String (i) + " -> poke " + juce::String (p));
+            }
+        // 3. Each line duplicated, and each line deleted.
+        {
+            juce::StringArray lines;
+            lines.addLines (base);
+            for (int i = 0; i < lines.size(); ++i)
+            {
+                auto dup = lines; dup.insert (i, lines[i]);
+                tryOne (dup.joinIntoString ("\n"), "line " + juce::String (i) + " duplicated");
+                auto del = lines; del.remove (i);
+                tryOne (del.joinIntoString ("\n"), "line " + juce::String (i) + " deleted");
+            }
+        }
+        // 4. The count line, which is the one number the rest of the file is measured
+        //    against, set to everything it should never be.
+        for (const char* n : { "0", "-1", "1", "4", "6", "2147483647", "-2147483648",
+                               "99999999999999999999", "3.5", "0x10", "", " " })
+        {
+            auto m = base.replace ("\n 5\n", "\n " + juce::String (n) + "\n");
+            tryOne (m, juce::String ("count = '") + n + "'");
+        }
+        // 5. Not a text file at all.
+        {
+            juce::String binary;
+            for (int i = 0; i < 512; ++i) binary += juce::String::charToString ((juce::juce_wchar) (i % 256));
+            tryOne (binary, "512 bytes of binary");
+            tryOne ("", "empty file");
+            tryOne (juce::String::repeatedString ("A", 100000), "100 kB of one letter");
+        }
+
+        std::printf ("    %d mutations: %d accepted, %d refused\n", accepted + refused, accepted, refused);
+        check (bad == 0, "every mutation the parser ACCEPTS is a playable tuning "
+                         "(a finite, positive frequency on all 128 keys)");
+        if (bad != 0)
+            std::printf ("    %d accepted but unplayable; first was: %s\n", bad, firstBad.toRawUTF8());
+        // ...and it must not refuse EVERYTHING either, or the check above is vacuous.
+        check (accepted > 0, "and the sweep is not vacuous: some mutations are still valid scales");
+    }
+
     //--------------------------------------------------------------------------
     // AnaMark .tun. A .tun states 128 ABSOLUTE pitches, so the test that matters is
     // note-for-note: "it loaded" proves nothing about what the keys now sound at.
@@ -599,6 +699,620 @@ int main()
                    && centsApart (t.frequencyForNote (127), 440.0) <= 0.01, "every key is 440 Hz, as written");
             check (! t.getTablePeriodEstimate().found, "and NO period is claimed for it");
         }
+    }
+
+    //======================================================================================
+    std::printf ("the same treatment for a .tun: 128 absolute frequencies, mutated:\n");
+    {
+        // THE SECOND FILE TYPE A USER DRAGS IN, and a completely different parser: an
+        // INI with sections, keys and 128 absolute frequencies, where the .scl side is a
+        // list of intervals. The failure modes are its own - a section header that is
+        // gone, a key that repeats, a basefreq that is text - so it gets its own sweep
+        // rather than trusting the .scl one to have covered the idea.
+        //
+        // Same two claims, and the same reason the second is the one that matters: a
+        // parser that says yes to rubbish silently retunes the user's whole project.
+        // TWO BASES, because loadTunString has two paths and one of them was getting all
+        // the traffic: a REPEATING table is converted to a .scl and goes through
+        // loadScalaString, so a 12-TET .tun never reaches loadAbsoluteTable at all. The
+        // second base is deliberately irregular - no interval repeats per octave - so the
+        // absolute path is swept too. Found by sabotaging the absolute path and watching
+        // this check not notice.
+        double f12[128], fIrr[128];
+        for (int n = 0; n < 128; ++n)
+        {
+            f12[n]  = 440.0 * std::pow (2.0, (n - 69) / 12.0);
+            fIrr[n] = 55.0 * std::pow (2.0, n / 12.0 + 0.011 * std::sin (n * 0.7));
+        }
+        const juce::String base = makeTun (f12);
+        const juce::String baseIrr = makeTun (fIrr);
+
+        int accepted = 0, refused = 0, bad = 0;
+        juce::String firstBad;
+        const auto tryTun = [&] (const juce::String& text, const juce::String& what)
+        {
+            TuningManager t; juce::String err;
+            t.setMode (TuningManager::Mode::Scala);   // .tun loads into the same table
+            if (! t.loadTunString (text, "tunfuzz", err)) { ++refused; return; }
+            ++accepted;
+            bool good = std::isfinite (t.periodRatio()) && t.periodRatio() > 0.0;
+            for (int n = 0; good && n < 128; ++n)
+            {
+                const double fr = t.frequencyForNote (n);
+                if (! std::isfinite (fr) || fr <= 0.0) good = false;
+            }
+            if (! good) { ++bad; if (firstBad.isEmpty()) firstBad = what; }
+        };
+
+        // Truncation, which for an INI means losing whole sections from the bottom up.
+        for (int i = 0; i <= 64; ++i)
+            tryTun (base.substring (0, base.length() * i / 64), "truncated at " + juce::String (i) + "/64");
+        // The structural pieces, each broken in turn: the section headers, the base
+        // frequency, and the note keys' numbering.
+        for (const auto& r : { std::pair<const char*, const char*> { "[Exact Tuning]", "[Exact Tuning" },
+                               { "[Exact Tuning]", "[Exakt Tuning]" },
+                               { "[Exact Tuning]", "" },
+                               { "[Tuning]", "" },
+                               { "basefreq=", "basefreq" },
+                               { "basefreq=", "basefreq=abc" },
+                               { "basefreq=", "basefreq=-1e9" },
+                               { "basefreq=", "basefreq=0" },
+                               { "note 0=", "note -1=" },
+                               { "note 0=", "note 999=" },
+                               { "note 0=", "note x=" },
+                               { "note 0=", "note 0=nan" },
+                               { "note 0=", "note 0=1e400" },
+                               { "note 1=", "note 1=" } })
+            tryTun (base.replace (r.first, r.second), juce::String (r.first) + " -> '" + r.second + "'");
+        // Every line deleted, one at a time, across the whole file.
+        {
+            juce::StringArray lines;
+            lines.addLines (base);
+            for (int i = 0; i < lines.size(); ++i)
+            {
+                auto del = lines; del.remove (i);
+                tryTun (del.joinIntoString ("\n"), "line " + juce::String (i) + " deleted");
+            }
+        }
+        // ...and not a text file at all.
+        // ...and the whole sweep again on the irregular base, which is the only way the
+        // absolute-table path is reached at all.
+        for (int i = 0; i <= 64; ++i)
+            tryTun (baseIrr.substring (0, baseIrr.length() * i / 64),
+                    "irregular, truncated at " + juce::String (i) + "/64");
+        {
+            juce::StringArray lines;
+            lines.addLines (baseIrr);
+            for (int i = 0; i < lines.size(); ++i)
+            {
+                auto del = lines; del.remove (i);
+                tryTun (del.joinIntoString ("\n"), "irregular, line " + juce::String (i) + " deleted");
+            }
+        }
+        tryTun (baseIrr.replace ("basefreq=", "basefreq=0"), "irregular, basefreq 0");
+        tryTun (baseIrr.replace ("[Exact Tuning]", ""), "irregular, no Exact Tuning section");
+
+        tryTun ("", "empty file");
+        tryTun (juce::String::repeatedString ("\n", 5000), "5000 blank lines");
+
+        std::printf ("    %d mutations: %d accepted, %d refused\n", accepted + refused, accepted, refused);
+        check (bad == 0, "every .tun mutation the parser ACCEPTS gives a finite, positive "
+                         "frequency on all 128 keys");
+        if (bad != 0)
+            std::printf ("    %d accepted but unplayable; first was: %s\n", bad, firstBad.toRawUTF8());
+        check (accepted > 0, "and the .tun sweep is not vacuous either");
+    }
+
+    //==========================================================================
+    // A DEGREE NUMBER IS AN INDEX INTO *THIS* SCALE, 0..N-1 - never a semitone.
+    //
+    // "los resultados de tuning info aparecen con numeros que no corresponden a los
+    //  numeros de tunings que no son 12edo, tipo en una pentatonica me dice 7 y 11 como
+    //  recomendaciones de acordes en ese tuning, cuando el periodo es 2"
+    //
+    // Everything in the UI that prints a degree as a NUMBER indexes the loaded scale by
+    // degreesPerPeriod(): the recommendation chips, the Degrees list, the keyboard hues.
+    // So the number that source hands out has to be the loaded scale's own count for
+    // every shape of tuning, and each degree it names has to sit inside one period.
+    // If this ever answered 12 for a five-note scale, every readout downstream would
+    // print semitones and call them degrees.
+    {
+        std::printf ("\ndegree numbers belong to the loaded scale, whatever its shape:\n");
+
+        // Checks the whole contract in one place: N degrees, and degrees 0..N-1 all
+        // ascending inside one period (degree N IS the period).
+        auto degreesRunFrom0 = [] (TuningManager& t, int expectN, const char* what)
+        {
+            const int N = t.degreesPerPeriod();
+            std::printf ("  %-22s -> %d degrees, period %.5f\n", what, N, t.periodRatio());
+            check (N == expectN, what);
+            bool inside = N > 0, ascending = true;
+            double prev = 0.0;
+            for (int d = 0; d < N; ++d)
+            {
+                double r = 0.0;
+                if (! t.scalaDegreeRatio (d, r)) { inside = false; break; }
+                if (! (r >= 1.0 - 1.0e-9 && r < t.periodRatio() - 1.0e-9)) inside = false;
+                if (r <= prev - 1.0e-9) ascending = false;
+                prev = r;
+            }
+            check (inside, "  ...and degrees 0..N-1 all land inside ONE period");
+            check (ascending, "  ...in order, so a bigger number is never a lower pitch");
+        };
+
+        juce::String err;
+        {   // (1) A five-note scale: the user's pentatonic. Legal numbers are 0..4.
+            TuningManager t;
+            check (t.loadScalaString ("! penta.scl\nmajor pentatonic\n 5\n!\n 9/8\n 5/4\n 3/2\n 5/3\n 2/1\n",
+                                      "penta", err), "a five-note pentatonic loads");
+            t.setMode (TuningManager::Mode::Scala);
+            degreesRunFrom0 (t, 5, "5-note pentatonic");
+        }
+        {   // (2) 19-EDO: more degrees than 12, so a 12-wide table would UNDER-count.
+            juce::String s ("! edo19.scl\n19-EDO\n 19\n!\n");
+            for (int i = 1; i <= 19; ++i) s << " " << juce::String (1200.0 * (double) i / 19.0, 6) << "\n";
+            TuningManager t;
+            check (t.loadScalaString (s, "edo19", err), "a 19-EDO scale loads");
+            t.setMode (TuningManager::Mode::Scala);
+            degreesRunFrom0 (t, 19, "19-EDO");
+        }
+        {   // (3) Bohlen-Pierce: 13 degrees to a 3/1 period. Both numbers are unusual,
+            //     and a readout that assumed an octave would place every degree wrongly.
+            juce::String s ("! bp.scl\nBohlen-Pierce equal\n 13\n!\n");
+            for (int i = 1; i <= 13; ++i)
+                s << " " << juce::String (1200.0 * std::log2 (3.0) * (double) i / 13.0, 6) << "\n";
+            TuningManager t;
+            check (t.loadScalaString (s, "bp13", err), "a Bohlen-Pierce 3/1 scale loads");
+            t.setMode (TuningManager::Mode::Scala);
+            check (std::abs (t.periodRatio() - 3.0) < 1.0e-6, "  its period really is 3/1, not 2/1");
+            degreesRunFrom0 (t, 13, "Bohlen-Pierce 13");
+        }
+        {   // (4) An absolute .tun table: the file states 128 pitches and NO degrees, so
+            //     the count is how many KEYS span the period. 24 keys to the octave here,
+            //     which must be answered as 24 - not as the file's key count and not as 12.
+            // STRETCHED, so it cannot be reduced back to a .scl: any table whose period
+            // repeats exactly IS a scale and is converted to one, and then this is not
+            // testing the table path at all. Quarter-tone steps that widen as they climb.
+            double f[128];
+            for (int n = 0; n < 128; ++n)
+                f[n] = 8.1757989156 * std::pow (2.0, (50.0 * (double) n + 0.004 * (double) (n * n)) / 1200.0);
+            TuningManager t;
+            check (t.loadTunString (makeTun (f), "tun24", err), "a quarter-tone .tun table loads");
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.usesAbsoluteTable(), "  held as an absolute table (no degrees in the file)");
+            const auto est = t.getTablePeriodEstimate();
+            std::printf ("  %-22s -> %d keys per period, period %.5f (estimate: %d keys, found %d)\n",
+                         "stretched .tun table", t.degreesPerPeriod(), t.periodRatio(),
+                         est.keys, (int) est.found);
+            check (est.found && t.degreesPerPeriod() == est.keys,
+                   "  the degree count is the KEYS the FILE's own period spans, not a constant");
+            check (t.degreesPerPeriod() == 24,
+                   "  quarter-tone steps -> 0..23, so no readout can print a 12-ET semitone here");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // equalDivisionsOfOctave: the gate the keyboard's NOTE NAMES hang off. Ups-and-downs
+    // spelling names the degrees of an equal division of the OCTAVE, so anything else
+    // has to answer 0 and keep its degree numbers. The failure this guards against is
+    // not a crash - it is a keyboard confidently printing "C D E F G A B" over a scale
+    // whose degrees are nothing of the kind.
+    std::printf ("equal divisions of the octave (the note-name gate):\n");
+    {
+        // A helper that builds an N-EDO .scl the way a real one is written.
+        const auto edoScl = [] (int n)
+        {
+            juce::String s;
+            s << n << "-EDO\n " << n << "\n!\n";
+            for (int i = 1; i <= n; ++i)
+                s << " " << juce::String (1200.0 * (double) i / (double) n, 6) << "\n";
+            return s;
+        };
+
+        {
+            TuningManager t;  // untouched = 12-TET
+            check (t.equalDivisionsOfOctave() == 12, "plain 12-TET answers 12");
+        }
+        for (int n : { 5, 19, 22, 31, 53 })
+        {
+            TuningManager t; juce::String err;
+            check (t.loadScalaString (edoScl (n), "edo", err), "an N-EDO .scl loads");
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.equalDivisionsOfOctave() == n, "  ...and is measured back as its own N");
+        }
+        {
+            // 96-EDO: wide enough that a window starting at the reference key would run
+            // off the top of the keyboard. The answer must not depend on where we asked.
+            TuningManager t; juce::String err;
+            t.loadScalaString (edoScl (96), "edo96", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.equalDivisionsOfOctave() == 96,
+                   "96-EDO answers 96 - the measuring window slides down instead of running off key 127");
+        }
+        {
+            // Bohlen-Pierce: 13 EQUAL steps, but of 3/1. Equal is not enough; the period
+            // has to be the octave, or the letters name intervals that are not there.
+            juce::String bp; bp << "Bohlen-Pierce\n 13\n!\n";
+            for (int i = 1; i <= 13; ++i)
+                bp << " " << juce::String (1200.0 * std::log2 (3.0) * (double) i / 13.0, 6) << "\n";
+            TuningManager t; juce::String err;
+            t.loadScalaString (bp, "bp", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.degreesPerPeriod() == 13, "Bohlen-Pierce has 13 degrees...");
+            check (t.equalDivisionsOfOctave() == 0,
+                   "  ...and answers 0: its period is 3/1, so there are no octave degrees to name");
+        }
+        {
+            // Ptolemy's intense diatonic: an octave, seven degrees, UNequal steps.
+            TuningManager t; juce::String err;
+            t.loadScalaString ("Ptolemy 5-limit major\n 7\n!\n 9/8\n 5/4\n 4/3\n 3/2\n 5/3\n 15/8\n 2/1\n",
+                               "ji", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.equalDivisionsOfOctave() == 0,
+                   "a 5-limit JI major scale answers 0 - an octave, but not divided equally");
+        }
+        {
+            // One cent off equal, everywhere. This is the tolerance's whole job: a scale
+            // a cent away from 12-EDO is a different scale, and naming its degrees after
+            // 12-EDO's would be a quiet lie about what is sounding.
+            juce::String warped; warped << "almost 12-EDO\n 12\n!\n";
+            for (int i = 1; i <= 12; ++i)
+                warped << " " << juce::String (100.0 * (double) i + (i == 5 ? 1.0 : 0.0), 6) << "\n";
+            TuningManager t; juce::String err;
+            t.loadScalaString (warped, "warp", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.degreesPerPeriod() == 12, "a scale one cent off 12-EDO still has 12 degrees...");
+            check (t.equalDivisionsOfOctave() == 0, "  ...and is NOT called 12-EDO");
+        }
+    }
+
+    //==========================================================================
+    // TEMPER MODE MUST NOT INVENT AN OCTAVE.
+    //
+    // "Temper to tuning" snaps every harmonic-engine partial onto the grid
+    // "degree x period^k". That grid EXISTS only if the tuning states a period that
+    // ASCENDS. Two legal .scl files state none:
+    //
+    //   * a DESCENDING scale - the last listed interval is below 1/1;
+    //   * a degenerate period of exactly 1/1 - every "period" lands on the same pitch.
+    //
+    // periodRatio() answers 2.0 for both, because displays (key colours, degree
+    // readouts) always need a finite number to lay out with. Temper used to read THAT
+    // and snap the whole spectrum to a 2/1 grid appearing nowhere in the user's file,
+    // with nothing on screen saying so - the user's tuning, silently changed.
+    //
+    // So there are now TWO questions, and this is the pair the sound path must ask:
+    // statedPeriodRatio() / hasUsablePeriod() tell the truth (0.0 / false), and only
+    // periodRatio() keeps the display fallback. The processor gates temper on
+    // hasUsablePeriod() and the toggle says why it is refused.
+    std::printf ("\ntemper mode refuses a tuning with no period, instead of inventing 2/1:\n");
+    {
+        auto probe = [] (const char* scl, const char* what, bool expectUsable, double expectStated)
+        {
+            TuningManager t; juce::String err;
+            check (t.loadScalaString (scl, "probe", err), what);
+            t.setMode (TuningManager::Mode::Scala);
+            std::printf ("  %-26s -> stated %.5f, usable %d, display fallback %.5f\n",
+                         what, t.statedPeriodRatio(), (int) t.hasUsablePeriod(), t.periodRatio());
+            check (t.hasUsablePeriod() == expectUsable, "  ...usable-period verdict");
+            check (std::abs (t.statedPeriodRatio() - expectStated) < 1.0e-9,
+                   "  ...and the period it STATES is the file's own, never a substitute");
+        };
+
+        // (1) A degenerate period of exactly 1/1. Representable, legal to write, and no
+        //     grid at all: degree x 1^k is the degree list over and over on one pitch.
+        probe ("! unison.scl\nperiod of exactly 1/1\n 3\n!\n 1/1\n 1/1\n 1/1\n",
+               "period-1 scale", false, 0.0);
+
+        // (2) A DESCENDING scale: every listed interval falls. Its period is 1/2, which
+        //     is not a repeat interval going up, so temper has nothing to snap to.
+        probe ("! down.scl\ndescending\n 3\n!\n -300.0\n -700.0\n 1/2\n",
+               "descending scale", false, 0.0);
+
+        // (3) The control: a normal octave scale still tempers, to ITS OWN 2/1 - the fix
+        //     must refuse the two above without disabling temper for everybody else.
+        probe ("! penta.scl\nmajor pentatonic\n 5\n!\n 9/8\n 5/4\n 3/2\n 5/3\n 2/1\n",
+               "normal 2/1 pentatonic", true, 2.0);
+
+        // (4) ...and a non-octave period is a usable period too: the refusal is about
+        //     "does it ascend", never about "is it an octave".
+        probe ("! bp.scl\nBohlen-Pierce-ish\n 4\n!\n 7/5\n 9/5\n 11/5\n 3/1\n",
+               "3/1 period scale", true, 3.0);
+
+        // And the display fallback is still there for whoever needs a number: a caller
+        // that only paints must never divide by zero because the scale is degenerate.
+        {
+            TuningManager t; juce::String err;
+            t.loadScalaString ("! unison.scl\nperiod of exactly 1/1\n 2\n!\n 1/1\n 1/1\n", "u", err);
+            t.setMode (TuningManager::Mode::Scala);
+            check (std::abs (t.periodRatio() - 2.0) < 1.0e-12,
+                   "periodRatio() still hands displays a finite 2.0 - it is the SOUND path that must ask");
+        }
+    }
+
+    //==========================================================================
+    // A .tun EXPORT IS A ROUND TRIP, OR IT IS NOTHING.
+    //
+    // The user asked for .tun export specifically so their tunings would TRAVEL. An
+    // exporter that alters them is worse than none - and Fibló's did: the [Scale Begin]
+    // block it wrote was ignored by its own reader, which re-guessed the structure from
+    // the 128 pitches. The guess takes the SMALLEST exact repeat and only overrides it
+    // for a CANONICAL period, so 9 equal degrees per 1000 cents came back as 1 degree
+    // per 111.111 cents. Same frequencies to the last decimal; a different scale in
+    // every readout, on the keyboard, and in what the next export then declared.
+    //
+    // So the assertion is the whole trip: load, export, load the export, and compare the
+    // PITCHES *and* the STRUCTURE - degree count, period, and whether it is held as a
+    // repeating scale at all.
+    std::printf ("\n.tun export round trip - pitches AND structure survive:\n");
+    {
+        auto roundTrip = [] (TuningManager& src, const char* what, bool expectTable, int expectDegrees)
+        {
+            juce::String tun, err;
+            if (! src.writeTunText (tun, err))
+            { check (false, what); std::printf ("      export refused: %s\n", err.toRawUTF8()); return; }
+
+            TuningManager back;
+            if (! back.loadTunString (tun, "roundtrip", err))
+            { check (false, what); std::printf ("      reload refused: %s\n", err.toRawUTF8()); return; }
+            back.setMode (TuningManager::Mode::Scala);
+
+            double worst = 0.0;
+            for (int n = 0; n < 128; ++n)
+                worst = std::max (worst, centsApart (back.frequencyForNote (n), src.frequencyForNote (n)));
+
+            std::printf ("  %-24s in: %d deg / %.4fc / table %d   out: %d deg / %.4fc / table %d"
+                         "   worst %.6fc\n",
+                         what, src.degreesPerPeriod(), 1200.0 * std::log2 (src.periodRatio()),
+                         (int) src.usesAbsoluteTable(),
+                         back.degreesPerPeriod(), 1200.0 * std::log2 (back.periodRatio()),
+                         (int) back.usesAbsoluteTable(), worst);
+
+            check (worst <= 0.01, "  every one of the 128 pitches comes back (<= 0.01c)");
+            check (back.usesAbsoluteTable() == expectTable,
+                   expectTable ? "  a non-repeating map stays a TABLE - no scale is invented for it"
+                               : "  a scale comes back as a SCALE, not flattened into a table");
+            check (back.degreesPerPeriod() == expectDegrees, "  the degree count is the one that went in");
+            if (! expectTable)
+                check (std::abs (1200.0 * std::log2 (back.periodRatio() / src.periodRatio())) <= 0.01,
+                       "  and so is the period - the export never re-slices the user's scale");
+        };
+
+        juce::String err;
+
+        // (1) A normal octave .scl: seven unequal degrees. Key 0 is degree 3 here, not
+        //     degree 0, which is exactly why the exported block has to say where degree 0
+        //     sits instead of leaving a reader to assume key 0.
+        {
+            TuningManager t;
+            check (t.loadScalaString ("Ptolemy 5-limit major\n 7\n!\n 9/8\n 5/4\n 4/3\n 3/2\n 5/3\n 15/8\n 2/1\n",
+                                      "ji", err), "a 7-note just major loads");
+            t.setMode (TuningManager::Mode::Scala);
+            roundTrip (t, "7-note just major", false, 7);
+        }
+
+        // (2) A NON-OCTAVE, NON-CANONICAL period. This is the case the guess destroyed:
+        //     nothing in kCanonPeriods is 1000 cents, so the smallest exact repeat (one
+        //     equal step) won and the scale came back as 1 degree per 111.111 cents.
+        {
+            juce::String s ("nine equal degrees per 1000 cents\n 9\n!\n");
+            for (int i = 1; i <= 9; ++i) s << " " << juce::String (1000.0 * (double) i / 9.0, 6) << "\n";
+            TuningManager t;
+            check (t.loadScalaString (s, "n9", err), "a 9-per-1000c scale loads");
+            t.setMode (TuningManager::Mode::Scala);
+            roundTrip (t, "9 per 1000c", false, 9);
+        }
+
+        // (3) Bohlen-Pierce: a non-octave period that IS canonical (3/1). It survived the
+        //     guess, so it is the control that proves the fix did not break what worked.
+        {
+            juce::String s ("Bohlen-Pierce equal\n 13\n!\n");
+            for (int i = 1; i <= 13; ++i)
+                s << " " << juce::String (1200.0 * std::log2 (3.0) * (double) i / 13.0, 6) << "\n";
+            TuningManager t;
+            check (t.loadScalaString (s, "bp", err), "a Bohlen-Pierce 3/1 scale loads");
+            t.setMode (TuningManager::Mode::Scala);
+            roundTrip (t, "Bohlen-Pierce 13 per 3/1", false, 13);
+        }
+
+        // (4) An ABSOLUTE, NON-REPEATING .tun - a stretched piano curve. It has no scale,
+        //     so the export must declare none and the reload must stay a table. Inventing
+        //     a scale here would be the same lie in the other direction.
+        {
+            double fr[128];
+            for (int n = 0; n < 128; ++n)
+                fr[n] = 8.1757989156 * std::pow (2.0, (100.0 * (double) n + 0.004 * (double) (n * n)) / 1200.0);
+            TuningManager t;
+            check (t.loadTunString (makeTun (fr), "stretched", err), "a stretched .tun table loads");
+            t.setMode (TuningManager::Mode::Scala);
+            check (t.usesAbsoluteTable(), "  and is held as an absolute table");
+            roundTrip (t, "stretched .tun table", true, t.degreesPerPeriod());
+        }
+
+        // (5) THE USER'S OWN SCALES, read off disk exactly as the plugin reads them. These
+        //     are the files this whole feature exists for; a round trip that works only on
+        //     scales written by the test is not the promise that was made.
+        for (const char* fn : { "scales/19_edo.scl", "scales/just_intonation_major.scl" })
+        {
+            juce::File f (juce::File::getCurrentWorkingDirectory().getChildFile (fn));
+            if (! f.existsAsFile())
+            { std::printf ("  (skipped %s - not found from %s)\n", fn,
+                           juce::File::getCurrentWorkingDirectory().getFullPathName().toRawUTF8()); continue; }
+            TuningManager t;
+            check (t.loadScalaFile (f, err), fn);
+            t.setMode (TuningManager::Mode::Scala);
+            roundTrip (t, f.getFileName().toRawUTF8(), false, t.degreesPerPeriod());
+        }
+    }
+
+    //== THE CENTS PRINTED ON A KEY ARE THE SCALE'S, NOT 12-TET'S ==================
+    //
+    // "ESTOY USANDO 31ED2 Y LOS VALORES EN CENTS QUE ME SALEN EN LAS TECLAS NO TIENEN
+    //  SENTIDO, ME DICE VALORES DE 100 EN 100 EN LAS PRIMERAS TECLAS, CUANDO DEBERIAN
+    //  AUMENTAR DE 30 Y PICO EN 30 Y PICO... EL SONIDO ESTABA BIEN, ERA LA REPRESENTACION
+    //  EN CENTS, EL NUMERO DE TECLAS POR PERIODO ERA CORRECTO, 31."
+    //
+    // The key labels come from degreeRatio(), the same call the chord search, the
+    // dissonance lists and the .scl export all read - so if it answers 12-TET while the
+    // sound is right, four separate readouts are lying at once and only the loudest one
+    // got noticed. Measured here on BOTH ways a 31ed2 can arrive: as a .scl (a real
+    // degree list) and as an AnaMark .tun (128 absolute keys, no degree list at all),
+    // because those take different branches inside degreeRatio().
+    {
+        std::printf ("\ndegree cents for 31ed2, both ways it can be loaded:\n");
+        const double step = 1200.0 / 31.0;
+
+        const auto degreeCents = [] (const TuningManager& t, int d)
+        { return 1200.0 * std::log2 (juce::jmax (1.0e-12, t.degreeRatio (d))); };
+
+        const auto report = [&] (TuningManager& t, const char* how)
+        {
+            std::printf ("  %-22s %d degrees/period, first six:", how, t.degreesPerPeriod());
+            for (int d = 0; d < 6; ++d) std::printf (" %.1f", degreeCents (t, d));
+            std::printf ("  (a step is %.1f)\n", step);
+            check (t.degreesPerPeriod() == 31, (juce::String (how) + ": 31 degrees per period").toRawUTF8());
+            double worst = 0.0; int worstD = 0;
+            for (int d = 1; d <= 31; ++d)
+            {
+                const double err = std::abs (degreeCents (t, d) - step * (double) d);
+                if (err > worst) { worst = err; worstD = d; }
+            }
+            std::printf ("    worst degree error: %.4f cents at degree %d\n", worst, worstD);
+            check (worst < 0.05,
+                   (juce::String (how) + ": every degree's cents are the scale's own, "
+                    "not a 12-TET semitone grid").toRawUTF8());
+        };
+
+        juce::String err;
+        {
+            // As a .scl: 31 cents values, written the way Scala Workshop writes them.
+            juce::String scl ("! 31ed2.scl\n!\n31 equal divisions of the octave\n 31\n!\n");
+            for (int d = 1; d <= 31; ++d) scl << " " << juce::String (step * (double) d, 6) << "\n";
+            TuningManager t;
+            check (t.loadScalaString (scl, "31ed2.scl", err), "a 31ed2 .scl loads");
+            t.setMode (TuningManager::Mode::Scala);
+            report (t, ".scl degree list");
+        }
+        {
+            // As a .tun: 128 absolute keys and no degree list. degreeRatio() takes its
+            // OTHER branch here - it reads the key the degree lands on - and that branch
+            // is the one a 12-TET answer would come out of.
+            juce::String tun ("[Tuning]\n");
+            for (int k = 0; k < 128; ++k)
+                tun << "note " << k << "=" << juce::String (step * (double) (k - 60), 6) << "\n";
+            TuningManager t;
+            check (t.loadTunString (tun, "31ed2.tun", err), "a 31ed2 .tun loads");
+            t.setMode (TuningManager::Mode::Scala);
+            std::printf ("  (.tun held as an absolute table: %d)\n", (int) t.usesAbsoluteTable());
+            report (t, ".tun absolute table");
+        }
+    }
+
+    //== THE SAME 31ED2, ARRIVING THROUGH MTS ======================================
+    //
+    // The two probes above load 31ed2 as a FILE. The user's 31ed2 arrived through an
+    // MTS-ESP master, and that is the path that was broken - so this one reproduces the
+    // actual sequence: a fresh object stocked with a 12ED2 .scl exactly as prepareToPlay
+    // stocks it, then MTS-ESP selected, then a 31-EDO tuning arriving from outside.
+    //
+    // NO MASTER IS NEEDED. libMTSClient serves its LOCAL table from MTS_NoteToFrequency
+    // whenever it is offline, and MTS SysEx is what fills that table - the same read
+    // frequencyForNote() makes. What a live master would additionally supply is the MAP
+    // SIZE, so degreesPerPeriod() answers 12 here rather than 31; this test therefore
+    // asserts the INVARIANT rather than the number 31, and the invariant is the point:
+    //
+    //     the cents printed for degree d must be the cents of the key degree d lands on.
+    //
+    // Under the bug, degrees 0..11 came out of the dead 12ED2 at 0, 100, 200 ... and the
+    // worst disagreement was 61.3 cents at degree 1.
+    {
+        std::printf ("\n31ed2 arriving as MTS SysEx, with a 12ED2 .scl still in the object:\n");
+        const double step = 1200.0 / 31.0;
+
+        TuningManager t;
+        juce::String err, twelve ("! 12ED2.scl\n!\n12 equal divisions of the octave\n 12\n!\n");
+        for (int i = 1; i <= 12; ++i) twelve << " " << juce::String (i * 100.0, 6) << "\n";
+        check (t.loadScalaString (twelve, "12ED2", err),
+               "12ED2 loads, exactly as prepareToPlay does on every instance");
+
+        // MTS bulk dump, non-real-time: F0 7E 7F 08 01 <prog> <16 ASCII> <128 x 3> <sum> F7.
+        // Each note is a semitone byte plus a 14-bit fraction of a semitone. No byte may
+        // exceed 0x7F - the client silently DROPS one that does, so a bad builder would
+        // desync rather than fail, and the gate below is what catches that.
+        std::vector<unsigned char> sx { 0xF0, 0x7E, 0x7F, 0x08, 0x01, 0x00 };
+        {
+            const char* nm = "Fiblo 31ed2 test";       // exactly 16 bytes
+            for (int i = 0; i < 16; ++i) sx.push_back ((unsigned char) nm[i]);
+        }
+        for (int n = 0; n < 128; ++n)
+        {
+            const double f     = 261.6255653005986 * std::pow (2.0, (double) (n - 60) / 31.0);
+            const double semis = 69.0 + 12.0 * std::log2 (f / 440.0);
+            int semi = (int) std::floor (semis);
+            int frac = (int) std::lround ((semis - (double) semi) * 16383.0);
+            if (frac >= 16384) { frac = 0; ++semi; }   // rounding must never carry silently
+            semi = juce::jlimit (0, 127, semi);
+            sx.push_back ((unsigned char) (semi & 0x7F));
+            sx.push_back ((unsigned char) ((frac >> 7) & 0x7F));
+            sx.push_back ((unsigned char) (frac & 0x7F));
+        }
+        sx.push_back (0x00);                            // checksum: parsed and discarded
+        sx.push_back (0xF7);
+
+        t.parseMtsSysEx (sx.data(), (int) sx.size());
+        t.setMode (TuningManager::Mode::MtsEsp);
+
+        // TWO GATES BEFORE ANY ASSERTION. Without them the checks below would be
+        // comparing 12-TET against 12-TET and would pass while proving nothing - which
+        // is the exact shape of the vacuous pass this suite exists to refuse.
+        check (t.hasMtsSysEx(), "the client accepted the bulk dump");
+        const double sounding = 1200.0 * std::log2 (t.frequencyForNote (61) / t.frequencyForNote (60));
+        std::printf ("  key 60 -> 61 sounds %.4f cents apart (a 31ed2 step is %.4f)\n", sounding, step);
+        check (std::abs (sounding - step) < 0.05,
+               "the SOUND is 31ed2 - which is what the user said was the one thing right");
+
+        const int D = juce::jmax (1, t.degreesPerPeriod());
+        std::printf ("  %d degrees/period (offline, so no master reports a map size); first six:", D);
+        for (int d = 0; d < 6; ++d)
+            std::printf (" %.1f", 1200.0 * std::log2 (juce::jmax (1.0e-12, t.degreeRatio (d))));
+        std::printf ("\n");
+
+        double worst = 0.0; int worstD = 0;
+        for (int d = 0; d < D; ++d)
+        {
+            const double got  = 1200.0 * std::log2 (juce::jmax (1.0e-12, t.degreeRatio (d)));
+            const double want = 1200.0 * std::log2 (t.frequencyForNote (60 + d) / t.frequencyForNote (60));
+            if (std::abs (got - want) > worst) { worst = std::abs (got - want); worstD = d; }
+        }
+        std::printf ("  worst degree-vs-key disagreement: %.4f cents at degree %d\n", worst, worstD);
+        check (worst < 0.05,
+               "every degree's cents are the cents of the key it lands on, not a leftover 12ED2 grid");
+    }
+
+    //== ...AND THE GUARD IS A NO-OP EVERYWHERE ELSE ================================
+    // The fix refuses the loaded scale outside Scala mode. In EQUAL mode the answer has
+    // to be numerically identical, because the branch it now falls through to reads
+    // equalFreq - which IS 12ED2. Asserted rather than assumed: a "fix" that quietly
+    // changed 12-TET's own degree labels would be a far bigger regression than the bug.
+    // And the scale must SURVIVE the trip: refusing to answer is not the same as
+    // forgetting, which is why the guard is a read-time test and not a clear().
+    {
+        std::printf ("\nthe mode guard changes nothing it should not:\n");
+        TuningManager t;
+        juce::String err, twelve ("! 12ED2.scl\n!\n12 equal divisions of the octave\n 12\n!\n");
+        for (int i = 1; i <= 12; ++i) twelve << " " << juce::String (i * 100.0, 6) << "\n";
+        t.loadScalaString (twelve, "12ED2", err);
+        t.setMode (TuningManager::Mode::Equal);
+        double worst = 0.0;
+        for (int d = 0; d < 12; ++d)
+            worst = juce::jmax (worst, std::abs (1200.0 * std::log2 (t.degreeRatio (d)) - 100.0 * (double) d));
+        std::printf ("  Equal mode, worst deviation from a semitone grid: %.6f cents\n", worst);
+        check (worst < 1.0e-6, "Equal mode still reads 0, 100, 200 ... 1100");
+
+        t.setMode (TuningManager::Mode::MtsEsp);
+        t.setMode (TuningManager::Mode::Scala);
+        check (std::abs (1200.0 * std::log2 (t.degreeRatio (1)) - 100.0) < 1.0e-6,
+               "...and the loaded scale is still there after a round trip through another mode");
     }
 
     std::printf ("\n%s (%d failure%s)\n", failures == 0 ? "ALL PASSED" : "FAILURES",

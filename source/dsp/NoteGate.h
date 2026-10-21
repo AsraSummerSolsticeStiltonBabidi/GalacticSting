@@ -31,10 +31,13 @@ public:
     static constexpr int kMaxPending = 32; // deferred note-ons
     static constexpr int kMaxActive  = 32; // sounding notes (for Mono)
 
+    // ONE NUMBER, because process() has to re-arm it every block (see the swap there).
+    static constexpr int kReserveBytes = 4096;
+
     void prepare (double sampleRate)
     {
         sr = sampleRate > 0.0 ? sampleRate : 44100.0;
-        out.ensureSize (4096);
+        out.ensureSize (kReserveBytes);
         pendingN = 0; // held-back notes never sounded -> nothing owed
         activeN  = 0;
         clock    = 0;
@@ -199,6 +202,9 @@ public:
         flushPendingUpTo (blockStart + numSamples - 1);
 
         io.swapWith (out);
+        // ...AND THE RESERVE IS RE-ARMED: the swap gave prepare()'s sizing to the caller.
+        // Free once the rotation has settled; see LookaheadDelay for the full reasoning.
+        out.ensureSize (kReserveBytes);
         clock += numSamples;
     }
 

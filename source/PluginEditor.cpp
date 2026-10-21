@@ -1,6 +1,8 @@
 #include "PluginEditor.h"
 #include "BinaryData.h"
 #include "FloatingWindowOwner.h" // keeps the floating windows above the editor (Win32 ownership)
+#include "SnapshotRig.h"         // the editor photographs itself when asked to (--snapshot)
+#include "GalacticPalette.h"
 #include "dsp/Dissonance.h"
 
 namespace
@@ -13,39 +15,87 @@ namespace
         return tf;
     }
 
-    // Section colours, deliberately spread around the hue wheel so that NO two
-    // neighbouring panels (horizontally OR vertically) share a similar hue - in
-    // particular no two near-identical blues sit side by side. Reading the two
-    // rows left-to-right the hue hops far each step:
-    //   Row 1: Harmonic(blue) | Range(yellow) | Fractal(vermilion) | Phase(green)
-    //   Row 2: Filter(orange) | Volume(purple) | Pitch(teal) | Tuning(gold) | Custom(pink)
-    // and every vertical pair contrasts too (blue over orange, yellow over purple,
-    // vermilion over teal, green over gold...).
-    // Layout (so the adjacency reasoning is legible):
-    //   Row 1: SPECTRUM = [Harmonic Engine(blue) | Custom Engine(pink) | Both engines(mint)]
-    //   Row 2: Essentials(green) | Modulators(tab colour) | Tuning(purple)
-    //   Right: Spectrum-to-Scale (full height, orange)
-    // The SPECTRUM container itself is deliberately NEUTRAL steel: it holds three
-    // coloured boxes and must not compete with them for the eye.
-    // Colours are placed around the hue wheel so every ADJACENT pair (horizontal
-    // AND vertical) is a clearly different colour - no two near-identical neighbours.
-    const juce::Colour cBase      { 0xff5cb8ff }; // Harmonic Engine is one blue
-    const juce::Colour cHarmonic  { 0xff5cb8ff }; // blue   210
-    const juce::Colour cWhitelist { 0xff5ff2b0 };
-    const juce::Colour cSpectrum  { 0xffc3ccdf }; // steel  - the neutral SPECTRUM container
-    const juce::Colour cSlope     { 0xff8ef0c4 }; // mint   - Slope/Fractal/Morph/Range (BOTH engines)
-    const juce::Colour cOverride  { 0xffffb020 }; // amber  - "this is being overridden" (as FROZEN)
-    const juce::Colour cRange     { 0xffffce3d }; // yellow 50
-    const juce::Colour cFractal   { 0xfff062cf }; // magenta 318
-    const juce::Colour cEssentials{ 0xff4fe09a }; // green  148  (Phase/Gain/Reference/Octave macro)
-    const juce::Colour cPrime     { 0xffffd84d };
-    const juce::Colour cFilter    { 0xff3fd0e6 }; // cyan   190
-    const juce::Colour cEnv       { 0xff3ad9b0 }; // teal-green 165 (Volume envelope)
-    const juce::Colour cPitch     { 0xffff5b52 }; // red    5
-    const juce::Colour cTuning    { 0xffb27bff }; // purple 275
-    const juce::Colour cTimbre    { 0xffff77c8 }; // pink   332  (Custom Engine)
-    const juce::Colour cSpecScale { 0xffff9a3c }; // orange 32   (its own colour now, not a yellow twin of Range)
-    const juce::Colour cScaleDiss { 0xff32c8be }; // teal        (live scale-dissonance list, under Tuning)
+    // THE TITLE'S OWN GEOMETRY, asked once and answered for both callers. paint() draws
+    // the squares from it and resized() centres the credit line under it. Two hand-copies
+    // of these six lines is exactly how the credit drifts off the title the first time
+    // the free zone moves - the class of mistake the whole of fgfit exists to prevent.
+    inline juce::String titleWord()
+    { return juce::String::fromUTF8 ("Fibl\xc3\xb3 Gal\xc3\xa0" "ctic"); }
+
+    struct TitleBand
+    {
+        float side, total, x;                            // square edge, row width, left edge
+        float centreX() const { return x + total * 0.5f; }
+        float bottom()  const { return 8.0f + side; }    // cy + side/2, with cy = 8 + side/2
+    };
+
+    inline TitleBand titleBandFor (int windowWidth)
+    {
+        const auto title = titleWord();
+        int squaresN = 0, spaces = 0;
+        for (int i = 0; i < title.length(); ++i) (title[i] == ' ' ? spaces : squaresN)++;
+        TitleBand t;
+        t.side = 52.0f;
+        const float gap = 4.0f;
+        t.total = (float) squaresN * (t.side + gap) + (float) spaces * (t.side * 0.5f);
+        const float freeLeft  = 214.0f;                       // clears Playground/Menu/Presets/Save
+        const float freeRight = (float) windowWidth - 186.0f; // clears the Spectrum-to-Rhythm button
+        const float freeW     = juce::jmax (120.0f, freeRight - freeLeft);
+        if (t.total > freeW) { t.side *= freeW / t.total; t.total = freeW; }
+        t.x = juce::jmax (((float) windowWidth - t.total) * 0.5f, freeLeft);
+        if (t.x + t.total > freeRight) t.x = freeRight - t.total;
+        return t;
+    }
+
+    // The microtonal accidental face (notes.otf by Sintel, from tessera - MIT; see
+    // assets/fonts/NOTATION-LICENSES.txt). Loaded once, like the title face.
+    //
+    // It is not a decoration. In this font the accidentals ride on ordinary ASCII
+    // letters, so the ups-and-downs name for C sharp is the two characters "Cc" and any
+    // other typeface draws it as the literal letters C and c - a WRONG NOTE NAME, not a
+    // missing-glyph box, and therefore invisible to every check that only inspects
+    // rectangles. If this ever fails to load, the keyboard keeps its degree numbers.
+    const juce::Typeface::Ptr& notesTypeface()
+    {
+        static juce::Typeface::Ptr tf = juce::Typeface::createSystemTypefaceFor (
+            BinaryData::notes_otf, (size_t) BinaryData::notes_otfSize);
+        return tf;
+    }
+
+    // SECTION COLOURS - every one of them from galactic::palette (source/GalacticPalette.h),
+    // which is where they are DECIDED and where a test can read them.
+    //
+    // They used to be hand-picked hues right here, in an anonymous namespace nothing
+    // could measure, "deliberately spread around the hue wheel" by eye. Spread by eye is
+    // how the TUNING panel (0xb27bff) and the CUSTOM modulator tab (0xff9a7bff) ended up
+    // 3.8 units of OKLab apart - two panels no one can tell apart, with every check in
+    // the build green - and how the least legible of them sat at 6.2:1 against the page.
+    //
+    // The set is now the answer to a maximin problem (tools/PaletteSearch.cpp): the
+    // SMALLEST perceptual distance between any two of them is as large as it can be
+    // while each stays legible, in gamut, and a real colour rather than a near-white.
+    // The worst pair is 15.2 apart instead of 3.8, and nothing here is a free choice any
+    // more - to change one, change it in the palette and re-run the search.
+    const juce::Colour cHarmonic  { 0xff000000u | galactic::palette::kHarmonic };
+    const juce::Colour cSlope     { 0xff000000u | galactic::palette::kSlope };
+    const juce::Colour cFractal   { 0xff000000u | galactic::palette::kFractal };
+    const juce::Colour cEssentials{ 0xff000000u | galactic::palette::kEssentials };
+    const juce::Colour cFilter    { 0xff000000u | galactic::palette::kFilter };
+    const juce::Colour cEnv       { 0xff000000u | galactic::palette::kEnv };
+    const juce::Colour cPitch     { 0xff000000u | galactic::palette::kPitch };
+    const juce::Colour cTuning    { 0xff000000u | galactic::palette::kTuning };
+    const juce::Colour cTimbre    { 0xff000000u | galactic::palette::kTimbre };
+    const juce::Colour cCustomMod { 0xff000000u | galactic::palette::kCustomMod };
+    const juce::Colour cScaleDiss { 0xff000000u | galactic::palette::kScaleDiss };
+    // ...and the one that is NOT chosen: Spectrum-vs-Tuning is the MIXTURE of the two
+    // panels it sits between, computed from them (rule (a) - see GalacticPalette.h). It
+    // was a hard-coded orange, which said nothing about what that column is for; now it
+    // cannot stop being a mixture, because there is no hex to edit.
+    const juce::Colour cSpecScale { 0xff000000u | galactic::palette::specScale() };
+    // SEMANTIC colours, deliberately outside the separation rule: these mean go, stop
+    // and "something else is driving this", and a colour chosen to win a distance
+    // contest would stop meaning it.
+    const juce::Colour cOverride  { 0xffffb020 }; // amber - "this is being overridden" (as FROZEN)
     // Phase/Gain/Reference now share the Essentials colour (one macro, one colour).
     const juce::Colour cPhase     = cEssentials;
     const juce::Colour cGain      = cEssentials;
@@ -60,6 +110,52 @@ namespace
     // is a claim about where those centre lines land, and a test that guessed the number
     // would pass while the two lines sat side by side.
     constexpr float kFrameLine = 1.3f;
+
+    // ONE DECIMAL POLICY FOR EVERY FADER READ-OUT.
+    //
+    // The SPECTRUM panel alone showed four different precisions at once - "1.000" (amp
+    // decay), "1.00" (fractal), "0.3000" (transition time), "0.000" (phase) - with "0.00"
+    // (gain) in ESSENTIALS beside it and "0.500" (a modulator Range) in MODULATORS. Six
+    // ways of writing the same kind of number in one window, and not one of them was a
+    // decision: juce::AudioParameterFloat derives its decimals from the parameter's own
+    // INTERVAL (0.001 -> three, 0.0001 -> four), so the read-out was reporting the
+    // automation grid rather than the value, and two faders that happen to step
+    // differently printed differently for no reason a user can see.
+    //
+    // Capped, never extended: a fader whose step already gives it fewer digits keeps them
+    // (the glide time stays "120.0 ms", shepTime stays whole milliseconds), so this adds a
+    // ceiling and never a trailing zero. What is left on screen is two policies - whole
+    // numbers where the step is whole, and at most two decimals everywhere else.
+    //
+    // It is a DISPLAY cap and nothing else: the parameter, the automation lane, the
+    // modulation and the saved state are all untouched, and the fader still moves in its
+    // own steps. (The one place two decimals would have been a lie is the REFERENCE field
+    // in ESSENTIALS, which is a text box the user types into and which is READ BACK on
+    // focus loss - rounding 261.6255653 to 261.626 there would retune the instrument by
+    // 0.0006 Hz the next time the field lost focus. It is deliberately not touched here;
+    // it is not a fader read-out.)
+    inline constexpr int kFaderMaxDecimals = 2;
+
+    // Re-render a bare decimal number with at most `dp` decimals. Anything that is NOT a
+    // bare number - a note name, "Even-All 50%", "7th harmonic", a unit word - is somebody
+    // else's wording and comes back untouched, so this can never mangle a fader that
+    // writes its own text.
+    juce::String capDecimals (const juce::String& text, int dp)
+    {
+        const auto s = text.trim();
+        if (s.isEmpty()) return text;
+        int i = (s[0] == '-' || s[0] == '+') ? 1 : 0;
+        if (i >= s.length()) return text;
+        int dot = -1;
+        for (int k = i; k < s.length(); ++k)
+        {
+            const auto c = s[k];
+            if (c == '.') { if (dot >= 0) return text; dot = k; }
+            else if (! juce::CharacterFunctions::isDigit (c)) return text;
+        }
+        if (dot < 0 || s.length() - dot - 1 <= dp) return text;   // already short enough
+        return juce::String (s.getDoubleValue(), dp);             // rounds, never truncates
+    }
 
     // UI wrapper over the (unit-tested, pure-C++) label logic in Dissonance.h.
     juce::String justName (double ratio)
@@ -106,34 +202,14 @@ namespace
         if (p * q <= 150 && std::abs (d.cents - 1200.0 * std::log2 ((double) p / (double) q)) < 0.3)
         { d.genuine = true; d.p = p; d.q = q; return d; } // float-exact (e.g. a dissonance-curve pick)
 
-        // The "≈ p/q" hint: scan the SIMPLE fractions directly (denominators 1..12)
-        // and prefer the SIMPLEST one whose distance fits its simplicity window - very
-        // simple ratios get ~17c (697c AND 700c -> "≈ 3/2"; 400c -> "≈ 5/4 (+14c)";
-        // 800c -> "≈ 8/5 (-14c)"), moderately simple ones ~8c (200c -> "≈ 9/8"),
-        // complex ones only a hair. A continued-fraction "best" pick would prefer
-        // obscure closer fractions (800c is nearer 19/12 than 8/5) - not helpful.
-        long long bestP = 0, bestQ = 1; double bestErr = 0.0; double bestSimp = 1.0e18;
-        long long nearP = 0, nearQ = 1; double nearErr = 0.0, nearSimp = 1.0e18;
-        for (long long q2 = 1; q2 <= 17; ++q2)
-        {
-            const long long p2 = (long long) std::llround (ratio * (double) q2);
-            if (p2 <= 0 || std::gcd (p2, q2) != 1) continue;
-            const double err  = d.cents - 1200.0 * std::log2 ((double) p2 / (double) q2);
-            const double simp = (double) (p2 * q2);
-            // Simplicity-tiered windows; the last tier catches VERY close but less
-            // simple ratios like 17/16 (100c is only ~1c away from it).
-            const double tol  = simp <= 40.0 ? 17.0 : (simp <= 80.0 ? 8.0 : (simp <= 300.0 ? 2.5 : 0.0));
-            if (std::abs (err) <= tol && simp < bestSimp)
-            { bestSimp = simp; bestP = p2; bestQ = q2; bestErr = err; }
-            // ...and, separately, the simplest ratio within earshot at all (35c), so
-            // an interval like 600c can still name its closest just neighbour.
-            if (std::abs (err) <= 35.0 && simp <= 200.0 && simp < nearSimp)
-            { nearSimp = simp; nearP = p2; nearQ = q2; nearErr = err; }
-        }
-        if (bestP > 0)
-        { d.hasApprox = true; d.ap = bestP; d.aq = bestQ; d.approxErr = (int) std::llround (bestErr); }
-        if (nearP > 0)
-        { d.hasNear = true; d.np = nearP; d.nq = nearQ; d.nearErr = (int) std::llround (nearErr); }
+        // The "≈ p/q" hint and the nearest neighbour - ONE rule, in fgjust::nearestJust,
+        // where a test can reach it. See the comment on that function for what the two
+        // answers mean and for the two intervals this used to get wrong.
+        const auto h = fgjust::nearestJust (d.cents);
+        if (h.has)
+        { d.hasApprox = true; d.ap = h.p; d.aq = h.q; d.approxErr = (int) std::llround (h.err); }
+        if (h.hasNear)
+        { d.hasNear = true; d.np = h.np; d.nq = h.nq; d.nearErr = (int) std::llround (h.nearErr); }
         return d;
     }
     // Compact scale-degree label: the exact ratio when genuine, else its cents (with a
@@ -186,6 +262,23 @@ namespace
         p.lineTo (r.getRight(), r.getBottom());
         p.closeSubPath();
         return p;
+    }
+
+    // THE OUTLINE A TEXT EDITOR IS DRAWN WITH: the rect its border is stroked along, the
+    // corner radius and the pen width. ONE place, because GalacticLnF strokes exactly
+    // this and ratiosInkProbeForTests measures exactly this - a probe that rebuilt the
+    // shape from its own copy of the radius could not see a radius paint() had changed.
+    //
+    // A PILL (radius = half the height) is right for a ONE-LINE field, and wrong for a
+    // multi-line text AREA: on the 70 px tall custom-ratios box the same rule gave a
+    // 35 px radius, and the arc cut so far into the first and last rows that the digits
+    // sat on top of the border - "adapta la caja de custom ratios para que los numeros no
+    // toquen su borde". A text area gets the modest corner the macro panels use instead.
+    struct EditorOutline { juce::Rectangle<float> rect; float radius, thickness; };
+    EditorOutline textEditorOutline (float w, float h, bool multiLine)
+    {
+        const auto r = juce::Rectangle<float> (0.0f, 0.0f, w, h).reduced (0.9f);
+        return { r, multiLine ? 6.0f : h * 0.5f, 1.4f };
     }
 
     // How far INSIDE its own top-right corner a frame's drawn border passes, walked along
@@ -345,9 +438,25 @@ namespace
             return juce::Font (juce::FontOptions (juce::jmax (12.5f, l.getFont().getHeight())).withStyle ("Bold"));
         }
 
+        // fgfit (see PluginEditor.h) is the ONE place these numbers live: this painter,
+        // the resized() that sizes these buttons to their words, and the text sweep that
+        // checks them all read from it. A font stated twice is a truncation waiting for
+        // a translation - it was, in the tuning row.
         juce::Font getTextButtonFont (juce::TextButton&, int buttonHeight) override
+        { return fgfit::textButtonFont (buttonHeight); }
+
+        // The CLOSED box's read-out. Only a small-item box (see fgfit::kSmallComboName)
+        // overrides anything: every other combo keeps LookAndFeel_V4's font exactly, so
+        // this cannot move a single control that did not ask for it. Routed through fgfit
+        // so the text sweep, which measures whatever getComboBoxFont returns, measures the
+        // face the item is really drawn in. The OPEN menu is untouched - a mode you are
+        // choosing from a list wants to be read easily, and only the panel needs the
+        // chosen name to sit under its title.
+        juce::Font getComboBoxFont (juce::ComboBox& box) override
         {
-            return juce::Font (juce::FontOptions (juce::jmin (16.0f, (float) buttonHeight * 0.62f)).withStyle ("Bold"));
+            if (box.getName() == fgfit::kSmallComboName)
+                return fgfit::comboItemFont (box, box.getHeight());
+            return juce::LookAndFeel_V4::getComboBoxFont (box);
         }
 
         // Slider value read-outs: a small font + generous horizontal squish so the
@@ -358,6 +467,19 @@ namespace
             l->setFont (juce::Font (juce::FontOptions (10.0f))); // small: fits the squeezed fader value boxes
             l->setMinimumHorizontalScale (0.35f); // shrink-to-fit rather than ellipsize
             l->setJustificationType (juce::Justification::centred);
+            // AND GIVE THE WORD THE WHOLE BOX. A juce::Label reserves 5 px of padding at
+            // EACH end by default, so a 37 px value box only ever had 27 px of text in
+            // it - which is how BINAURAL's "Centred" came back from the snapshot rig
+            // needing 32.6 in 27 while the box it sits in was plenty wide enough. The box
+            // is drawn with no fill and no outline here, so that padding was buying
+            // nothing at all; 1 px keeps the glyphs off the edge. Nothing moves - this
+            // widens the text INSIDE boxes whose bounds are decided elsewhere - so every
+            // read-out in the window gets 8 px it was already occupying.
+            // THE SAME CONSTANT fgfit::faderValueWidth adds, so the two cannot drift. The
+            // first version of this wrote 1 here and left a hard-coded 10 there, and every
+            // fader within 8 px of its column's width silently lost its number.
+            l->setBorderSize (juce::BorderSize<int> (1, fgfit::kSliderValueBorderX,
+                                                     1, fgfit::kSliderValueBorderX));
             return l;
         }
 
@@ -421,6 +543,62 @@ namespace
             g.setColour (txt);
             g.setFont (getTextButtonFont (b, b.getHeight()));
 
+            // A STEPPER'S + AND - ARE DRAWN, NOT TYPED.
+            //
+            // As glyphs they are not a pair at all: in this face the hyphen is a ~5 px bar
+            // about 1 px thick sitting on the x-height, while the plus is a ~10 px cross of
+            // two ~2 px strokes on the maths axis. Side by side in two 20 px circles - the
+            // OCTAVE pair in ESSENTIALS, OCTAVE RANGE in SPECTRUM, and the rhythm panel's
+            // PULSE RATE and Octave (all) - the minus reads as optically half the weight of
+            // the plus and 5 px higher, so one half of a symmetrical control looks disabled.
+            // No font choice fixes that; the two characters are simply not designed as a
+            // set. Two rectangles are: same length, same pen, same centre, and the plus is
+            // the minus with one more bar across it.
+            //
+            // Sized from the circle GalacticLnF::drawButtonBackground really fills (the
+            // SHORTER side of the button), so a stepper laid out in a rect that is not
+            // square still gets a glyph centred in its own circle rather than in the rect.
+            // ...AND SO IS AN ARROW. Same reason as the stepper pair above: as a glyph the
+            // up and down arrows render about 4 px tall inside a 24 px button at 1x, which
+            // reads as a smudge rather than as a direction - and at that size the two are
+            // told apart by a handful of pixels at the tip. The Shepard's direction is the
+            // whole point of the control, so it is drawn: one shaft, one head, sized from
+            // the button and pointing the way the toggle says.
+            if (b.getName() == "arrow")
+            {
+                const auto  r   = b.getLocalBounds().toFloat();
+                const float d   = juce::jmin (r.getWidth(), r.getHeight());
+                const float pen = juce::jmax (1.6f, std::round (d * 0.11f));
+                const float len = std::round (d * 0.58f);
+                const float hw  = std::round (d * 0.24f);   // head half-width
+                const float hh  = std::round (d * 0.26f);   // head height
+                const float cx  = r.getCentreX(), cy = r.getCentreY();
+                const bool  down = b.getToggleState();
+                const float tipY  = down ? cy + len * 0.5f : cy - len * 0.5f;
+                const float tailY = down ? cy - len * 0.5f : cy + len * 0.5f;
+                const float baseY = down ? tipY - hh : tipY + hh;
+                g.fillRect (cx - pen * 0.5f, juce::jmin (tailY, baseY), pen, std::abs (baseY - tailY));
+                juce::Path head;
+                head.addTriangle (cx, tipY, cx - hw, baseY, cx + hw, baseY);
+                g.fillPath (head);
+                return;
+            }
+            if (b.getName() == "round")
+            {
+                const auto t = b.getButtonText();
+                if (t == "+" || t == "-")
+                {
+                    const auto r  = b.getLocalBounds().toFloat();
+                    const float d = juce::jmin (r.getWidth(), r.getHeight());
+                    const float arm = std::round (d * 0.46f);                    // bar length
+                    const float pen = juce::jmax (1.6f, std::round (d * 0.14f)); // bar weight
+                    const float cx = r.getCentreX(), cy = r.getCentreY();
+                    g.fillRect (cx - arm * 0.5f, cy - pen * 0.5f, arm, pen);
+                    if (t == "+") g.fillRect (cx - pen * 0.5f, cy - arm * 0.5f, pen, arm);
+                    return;
+                }
+            }
+
             auto area = b.getLocalBounds().reduced (4, 0);
             // A button flagged "fork" gets a real tuning fork drawn at its left edge.
             // There is no tuning-fork character in any font we can rely on - the nearest
@@ -429,6 +607,7 @@ namespace
             if (b.getProperties().contains ("fork"))
             {
                 const float fh = juce::jmin (13.0f, (float) b.getHeight() - 4.0f);
+                // (the width taken here is textButtonForkWidth minus the 2 px gap below)
                 auto fr = area.removeFromLeft ((int) std::ceil (fh * 0.62f) + 3).toFloat()
                               .withSizeKeepingCentre (fh * 0.62f, fh);
                 g.strokePath (tuningForkPath (fr), juce::PathStrokeType (juce::jmax (1.2f, fh * 0.14f),
@@ -704,6 +883,37 @@ namespace
 
         // Toggle buttons named "onled" render as a big filled ON/OFF pill: green
         // when on, red when off (used for the Spectrum-to-Rhythm master switch).
+        //
+        // ...WITH A STATE LED IN FRONT OF THE WORD, BECAUSE HUE IS THE ONE CUE A
+        // COLOURBLIND READER DOES NOT GET.
+        //
+        // These pills - the rhythm dialog's "MIDI out (to DAW)" and "Play in Fibló", and
+        // the manual-amplitudes switch under the pencil in SPECTRUM - carried their state
+        // in a saturated green (0x2fb155) against a saturated red (0xe0453f). Under
+        // deuteranopia and protanopia those two fills converge on the same ochre, which is
+        // about one man in twelve reading a switch that no longer says anything. The pill
+        // has always ALSO printed ON or OFF, so it was never hue-alone in the strict sense
+        // - but a three-letter word at h * 0.62 has to be read, and this is a switch whose
+        // state you want to take in at a glance across a 1200 px window.
+        //
+        // So the shape says it too: a FILLED disc for on, a HOLLOW ring for off. Solid
+        // versus hollow survives every colour deficiency, greyscale, a thumbnail and the
+        // corner of an eye. Three cues - hue, word, shape - all saying one thing, and any
+        // one of them enough on its own.
+        //
+        // NOT a hollow PILL for off - a red outline on the dark ground with red letters
+        // inside it - which is the obvious way to make the whole control change shape and
+        // is the wrong one here. It changes the pill's WEIGHT rather than its shape, and
+        // a thin outline where a filled slab was reads as a control that is disabled or
+        // not there at all. This LookAndFeel already has an appearance that means exactly
+        // that (the 0.45 transparency layer at the foot of this function, for
+        // ! isEnabled), and OFF is emphatically not the same state as unavailable: an off
+        // switch is one you can turn on. The pill stays filled and its word stays white
+        // on a saturated fill; only the LED changes shape.
+        //
+        // The disc and its gap are fgfit::onLedDot / kOnLedGap, and fgfit::onLedInkWidth
+        // is what the fit sweep measures - so the probe that checks this pill is wide
+        // enough for its own contents measures the geometry this function really draws.
         void drawToggleButton (juce::Graphics& g, juce::ToggleButton& b,
                                bool over, bool down) override
         {
@@ -716,12 +926,123 @@ namespace
                 else if (over) col = col.brighter (0.10f);
                 g.setColour (col);
                 g.fillRoundedRectangle (r, 5.0f);
+
+                const juce::String word (on ? "ON" : "OFF");
+                const int   h    = b.getHeight();
+                const float dot  = fgfit::onLedDot (h);
+                const float ink  = fgfit::onLedInkWidth (h, word);
+                // The LED and the word are ONE object, centred together - not a word
+                // centred in the button with a disc hung off its left, which moves the
+                // word by half a disc between the two states and makes the pill twitch as
+                // it is clicked.
+                const float x0   = r.getCentreX() - ink * 0.5f;
+                const float cy   = r.getCentreY();
+                const float lead = fgfit::onLedLead (h);
+                // Guarded, not just sized to zero: drawEllipse on a rect shrunk by 0.8 px
+                // from nothing is a NEGATIVE rect, and that is a different kind of bug
+                // from an invisible one.
+                if (dot > 0.0f)
+                {
+                    const juce::Rectangle<float> led (x0, cy - dot * 0.5f, dot, dot);
+                    g.setColour (juce::Colours::white);
+                    if (on) g.fillEllipse (led);
+                    else    g.drawEllipse (led.reduced (0.8f), 1.6f);
+                }
+                g.setFont (fgfit::onLedFont (h));
                 g.setColour (juce::Colours::white);
-                g.setFont (juce::Font (juce::FontOptions ((float) b.getHeight() * 0.62f).withStyle ("Bold")));
-                g.drawText (on ? "ON" : "OFF", b.getLocalBounds(), juce::Justification::centred, false);
+                g.drawText (word,
+                            juce::Rectangle<float> (x0 + lead, r.getY(),
+                                                    ink - lead, r.getHeight()),
+                            juce::Justification::centredLeft, false);
                 return;
             }
-            juce::LookAndFeel_V4::drawToggleButton (g, b, over, down);
+            // EVERY OTHER TICK BOX IS THE SAME BOX, WITH THE SAME GAP TO ITS WORD.
+            //
+            // LookAndFeel_V4 derives the box from the BUTTON'S HEIGHT
+            // (jmin (15, h * 0.75) * 1.1) and starts the text at roundToInt (that) + 10,
+            // so a 215 x 106 block of one PRIME CONTROL panel drew three different tick
+            // boxes - 15x15 for the nine prime toggles, 18x18 for "Temper to tuning", and
+            // 18x16 for "On" (not even square, because the rounding of a fractional height
+            // lands the outline between pixels) - with 6 px after one word and 9 after
+            // another. Nothing was wrong with any single control; they simply had three
+            // different heights, and V4 turned that into three different SIZES.
+            //
+            // A tick box is not a scaled part of its row: it is a fixed 16 px square glyph
+            // that says on or off, and the word beside it always sits the same distance
+            // away. fgfit::kTickBox / kTickGap / kTickX are those three numbers, and
+            // fgfit::toggleRoom / toggleWidth are computed FROM them - so the sweep that
+            // checks a toggle's word fits and the resized() that sizes it to its word both
+            // measure the geometry this function really draws.
+            //
+            // ...AND A DISABLED ONE LOOKS DISABLED. drawTickBox is handed an isEnabled flag
+            // and uses it only for the BORDER - the tick itself is filled in full
+            // tickColourId whatever the state - so the nine prime boxes sat at full olive
+            // saturation under a greyed "Whitelist" the moment that panel's switch went
+            // off, which is the one state where they are not acting on the sound at all.
+            // Caught by reading the rig's own photographs; no gate could see it, because
+            // nothing overflowed and nothing was clipped - it was simply the wrong colour.
+            //
+            // A transparency layer rather than a hand-copy of the tick path: it costs one
+            // small offscreen buffer per disabled box per repaint (these are 16x16) and it
+            // covers the box, the word and anything added here later. 0.45 is the same
+            // order as the 0.5 the text already used on its own.
+            const auto paintToggle = [&]
+            {
+                const float box = (float) fgfit::kTickBox;
+                drawTickBox (g, b, (float) fgfit::kTickX, ((float) b.getHeight() - box) * 0.5f,
+                             box, box, b.getToggleState(), b.isEnabled(), over, down);
+                g.setColour (b.findColour (juce::ToggleButton::textColourId));
+                g.setFont (fgfit::toggleFont (b.getHeight()));
+                g.drawFittedText (b.getButtonText(),
+                                  b.getLocalBounds()
+                                      .withTrimmedLeft (fgfit::kTickX + fgfit::kTickBox + fgfit::kTickGap)
+                                      .withTrimmedRight (2),
+                                  juce::Justification::centredLeft, 10);
+            };
+            if (! b.isEnabled())
+            {
+                g.beginTransparencyLayer (0.45f);
+                paintToggle();
+                g.endTransparencyLayer();
+            }
+            else paintToggle();
+        }
+
+        // A SCROLLBAR THAT BELONGS TO THIS WINDOW.
+        //
+        // There was no drawScrollbar here at all, so the five result lists inside the
+        // salmon Spectrum-vs-Tuning column - and the per-partial window's grid - drew
+        // LookAndFeel_V4's default thumb, which is its colour scheme's `highlightedFill`:
+        // a #42a2c8 cyan that appears nowhere else in this product's chrome. On the zebra
+        // rows of a salmon panel it read as an unstyled system control that had escaped
+        // the theme, and it had no track at all, so it floated on the stripes with nothing
+        // to say how far the list ran.
+        //
+        // Neutral on purpose, and not one more identity colour: this is a mechanism, not a
+        // section. It is the same 0x14ffffff wash the zebra rows themselves are drawn in,
+        // one step up for the thumb, so the bar reads as part of the LIST rather than as a
+        // thing sitting on top of it - and it stays out of the way of every panel hue it
+        // has to appear in, which is what stopped the cyan from working.
+        void drawScrollbar (juce::Graphics& g, juce::ScrollBar& bar, int x, int y, int w, int h,
+                            bool vertical, int thumbStart, int thumbSize,
+                            bool over, bool down) override
+        {
+            juce::ignoreUnused (bar);
+            const auto full = juce::Rectangle<int> (x, y, w, h).toFloat();
+            const float rad = (vertical ? full.getWidth() : full.getHeight()) * 0.5f;
+            // The track: the whole travel, so the bar says how much list there is even
+            // when the thumb is short.
+            g.setColour (juce::Colour (0x14ffffff));
+            g.fillRoundedRectangle (full.reduced (vertical ? 2.0f : 0.0f, vertical ? 0.0f : 2.0f), rad);
+            if (thumbSize <= 0) return;
+            auto thumb = vertical ? juce::Rectangle<float> (full.getX(), (float) thumbStart,
+                                                            full.getWidth(), (float) thumbSize)
+                                  : juce::Rectangle<float> ((float) thumbStart, full.getY(),
+                                                            (float) thumbSize, full.getHeight());
+            thumb = thumb.reduced (vertical ? 1.5f : 1.0f, vertical ? 1.0f : 1.5f);
+            g.setColour (juce::Colour (down ? 0xffc4ccda : (over ? 0xffa2a8b8 : 0xff70768a)));
+            g.fillRoundedRectangle (thumb, juce::jmin (rad, thumb.getWidth() * 0.5f,
+                                                       thumb.getHeight() * 0.5f));
         }
 
         // Custom tooltip rendering: line-based, so the "from the partial: n/1" line of
@@ -743,24 +1064,75 @@ namespace
         //     `value`  -> BOLD + blue:  a literal value, unit or example you can type
         //     !warn!   -> BOLD + red:   a consequence worth noticing before you act
         // Anything unmarked stays plain white; a "from the partial" line stays orange.
-        static juce::TextLayout layoutFor (const juce::String& text, float maxW)
+        //
+        // ...AND THREE RULES THAT NEED NO MARKUP AT ALL, because the strings already
+        // follow them and nothing was reading them. "QUE TENGAN FORMATO DE VERDAD
+        // (ESPACIADO, COLOR, NEGRITA, SUBRAYADO) EN VEZ DE UN PARRAFAZO":
+        //     - a FIRST line that reads like a title - all capitals, or ending in a
+        //       colon - is drawn bold, brighter, and UNDERLINED. Dozens of these strings
+        //       open with one and every one of them was body text;
+        //     - a BLANK line (the paragraph break, used in the longest hovers) becomes a
+        //       HALF line of air instead of a whole empty one, so paragraphs separate
+        //       without the card growing a hole;
+        //     - a (parenthetical) inside otherwise unmarked text is dimmed. There are
+        //       hundreds; they are asides by construction, and at full white they
+        //       compete with the sentence they qualify.
+        // The heading test is on the WHOLE line and refuses anything ending in . ! ?,
+        // because capitals are also used INSIDE sentences here for emphasis - "How a
+        // combination is SCORED." is a sentence, not a title - and it needs a letter in
+        // it, or "1200c" would be promoted for having no lower case to lose.
+        //
+        // headingLines is an out-param rather than part of the return value because the
+        // underline cannot be expressed in an AttributedString at all: its Attribute is
+        // {range, font, colour} and nothing more, in JUCE 8.0.14. It is stroked from the
+        // TextLayout's own line geometry in drawTooltip, the only place with a Graphics.
+        // Measurement (getTooltipBounds) passes nullptr and is unchanged - and because
+        // both paths call THIS function, the card still sizes itself to what is painted.
+        static juce::TextLayout layoutFor (const juce::String& text, float maxW,
+                                           int* headingLines = nullptr)
         {
             const juce::Font plain (juce::FontOptions (13.5f));
             const juce::Font bold  (juce::FontOptions (13.5f).withStyle ("Bold"));
+            const juce::Font gapF  (juce::FontOptions (6.5f));   // the half-line of air
             const juce::Colour cPlain  { juce::Colours::white };
             const juce::Colour cTerm   { 0xffffc95c }; // amber - concepts
             const juce::Colour cValue  { 0xff7fd4ff }; // blue  - literals you can type
             const juce::Colour cWarn   { 0xffff8a7a }; // red   - consequences
             const juce::Colour cSource { 0xffff9a3c }; // orange - "from the partial"
+            const juce::Colour cHead   { 0xffffffff }; // the title line
+            const juce::Colour cAside  { 0xffa2a8b8 }; // (parentheticals)
+
+            if (headingLines != nullptr) *headingLines = 0;
 
             juce::AttributedString as;
             juce::StringArray lines;
             lines.addLines (text);
+
+            const auto readsAsHeading = [] (const juce::String& l)
+            {
+                const auto t = l.trim();
+                if (t.isEmpty()) return false;
+                if (juce::String (".!?").containsChar (t.getLastCharacter())) return false;
+                bool hasLetter = false;
+                for (int k = 0; k < t.length(); ++k)
+                    if (juce::CharacterFunctions::isLetter (t[k])) { hasLetter = true; break; }
+                if (! hasLetter) return false;
+                return t.endsWithChar (':') || t == t.toUpperCase();
+            };
+
             for (int i = 0; i < lines.size(); ++i)
             {
                 const auto& line = lines[i];
                 const auto tail = (i < lines.size() - 1 ? juce::String ("\n") : juce::String());
                 if (isSourceLine (line)) { as.append (line + tail, plain, cSource); continue; }
+                if (line.trim().isEmpty() && tail.isNotEmpty())
+                { as.append (tail, gapF, cPlain); continue; }
+                if (i == 0 && lines.size() > 1 && readsAsHeading (line))
+                {
+                    as.append (line + tail, bold, cHead);
+                    if (headingLines != nullptr) *headingLines = 1;
+                    continue;
+                }
 
                 // Walk the line, splitting on the three delimiters. An unmatched
                 // delimiter is treated as ordinary text, so a stray * never eats
@@ -771,30 +1143,47 @@ namespace
                 // highlighted "7) and 25 (5" - which is exactly where the meaningless
                 // coloured runs in the prime tooltip came from. Arithmetic in a tooltip
                 // is ordinary text and has to stay that way.
-                const auto opensHere = [&line] (int i)
+                const auto opensHere = [&line] (int k)
                 {
-                    if (i + 1 >= line.length()) return false;
-                    const auto prev = i > 0 ? line[i - 1] : (juce::juce_wchar) ' ';
+                    if (k + 1 >= line.length()) return false;
+                    const auto prev = k > 0 ? line[k - 1] : (juce::juce_wchar) ' ';
                     return ! juce::CharacterFunctions::isLetterOrDigit (prev)
-                        && ! juce::CharacterFunctions::isWhitespace (line[i + 1]);
+                        && ! juce::CharacterFunctions::isWhitespace (line[k + 1]);
+                };
+
+                // Unmarked text, with its parentheses dimmed. Only balanced pairs on the
+                // same line, and only OUTSIDE a marked span - a colour somebody chose
+                // deliberately is never overridden by this.
+                const auto plainRun = [&] (const juce::String& s)
+                {
+                    int p = 0;
+                    while (p < s.length())
+                    {
+                        const int open = s.indexOfChar (p, '(');
+                        const int shut = open < 0 ? -1 : s.indexOfChar (open + 1, ')');
+                        if (open < 0 || shut < 0) { as.append (s.substring (p), plain, cPlain); break; }
+                        if (open > p) as.append (s.substring (p, open), plain, cPlain);
+                        as.append (s.substring (open, shut + 1), plain, cAside);
+                        p = shut + 1;
+                    }
                 };
 
                 int pos = 0;
                 while (pos < line.length())
                 {
                     int at = -1; juce::juce_wchar delim = 0;
-                    for (int i = pos; i < line.length(); ++i)
+                    for (int k = pos; k < line.length(); ++k)
                     {
-                        const auto ch = line[i];
-                        if ((ch == '*' || ch == '`' || ch == '!') && opensHere (i))
-                        { at = i; delim = ch; break; }
+                        const auto ch = line[k];
+                        if ((ch == '*' || ch == '`' || ch == '!') && opensHere (k))
+                        { at = k; delim = ch; break; }
                     }
 
-                    if (at < 0) { as.append (line.substring (pos), plain, cPlain); break; }
+                    if (at < 0) { plainRun (line.substring (pos)); break; }
                     const int close = line.indexOfChar (at + 1, delim);
-                    if (close < 0) { as.append (line.substring (pos), plain, cPlain); break; }
+                    if (close < 0) { plainRun (line.substring (pos)); break; }
 
-                    if (at > pos) as.append (line.substring (pos, at), plain, cPlain);
+                    if (at > pos) plainRun (line.substring (pos, at));
                     const auto inner = line.substring (at + 1, close);
                     as.append (inner, bold, delim == '*' ? cTerm : delim == '`' ? cValue : cWarn);
                     pos = close + 1;
@@ -870,8 +1259,26 @@ namespace
             g.fillRoundedRectangle (body, 6.0f);
             g.setColour (juce::Colour (0xff5cb8ff).withAlpha (0.8f));
             g.drawRoundedRectangle (body.reduced (0.8f), 6.0f, 1.4f);
-            layoutFor (text, (float) width - 18.0f)
-                .draw (g, body.reduced (9.0f, 5.0f));
+            // The heading's rule, stroked by hand. juce::AttributedString carries no
+            // underline attribute in JUCE 8, so the only way to get one is to draw it
+            // from the laid-out line's own geometry - and TextLayout::Line gives exactly
+            // what that needs: the baseline origin, the descent, and the line's real
+            // horizontal extent. Drawn INSIDE the descent, so it costs the card no
+            // height and getTooltipBounds needs no adjustment. Same precedent as the
+            // fraction bar under a ratio on the keyboard: the rule is exactly as long as
+            // the glyphs, never as long as the box.
+            const auto area = body.reduced (9.0f, 5.0f);
+            int heads = 0;
+            const auto tl = layoutFor (text, (float) width - 18.0f, &heads);
+            tl.draw (g, area);
+            for (int i = 0; i < juce::jmin (heads, tl.getNumLines()); ++i)
+            {
+                const auto& ln = tl.getLine (i);
+                const auto xs  = ln.getLineBoundsX();
+                const float y  = area.getY() + ln.lineOrigin.y + ln.descent * 0.45f;
+                g.setColour (juce::Colours::white.withAlpha (0.75f));
+                g.fillRect (area.getX() + xs.getStart(), y, xs.getLength(), 1.0f);
+            }
         }
 
         // Text FIELDS (combo boxes + text editors) are as rounded as possible - a
@@ -886,7 +1293,10 @@ namespace
             g.setColour (box.findColour (juce::ComboBox::outlineColourId));
             g.drawRoundedRectangle (r.reduced (0.75f), rad, 1.4f);
 
-            // Chevron on the right.
+            // Chevron on the right. THESE THREE NUMBERS ARE WHERE fgfit::comboArrowGutter
+            // comes from - left ink edge = width - h*0.55 - h*0.15 - half the 1.6 px cap -
+            // so moving any of them without moving that function puts the item's last
+            // glyph back under the arrow, which is exactly the defect it was written for.
             const float cx = (float) width - (float) height * 0.55f;
             const float cy = (float) height * 0.5f;
             const float s  = (float) height * 0.15f;
@@ -898,12 +1308,41 @@ namespace
             g.strokePath (p, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         }
 
-        // Keep the selected-item text clear of the rounded left end.
+        // Keep the selected-item text clear of the rounded left end. The usable width is
+        // fgfit::comboTextWidth - the ONE place it lives, shared with the resized() that
+        // sizes a box to its words and with the probe that checks it fits (see the
+        // comment there for what a second copy of this formula cost).
         void positionComboBoxText (juce::ComboBox& box, juce::Label& label) override
         {
             const int inset = box.getHeight() / 3;
-            label.setBounds (inset, 1, box.getWidth() - inset - box.getHeight() / 2, box.getHeight() - 2);
+            label.setBounds (inset, 1, fgfit::comboTextWidth (box.getWidth(), box.getHeight()), box.getHeight() - 2);
             label.setFont (getComboBoxFont (box));
+            // AN ITEM THAT DOES NOT FIT IS SHORTENED, NEVER SQUEEZED.
+            //
+            // juce::Label leaves minimumHorizontalScale at 0, which drawFittedText reads as
+            // Font::getDefaultMinimumHorizontalScaleFactor() (0.7) and spends BEFORE it
+            // considers cutting anything: the glyphs are stretched to 70% of their width
+            // and the string is drawn in full, narrower than the same face two boxes away.
+            // Photographed in the Preset Playground at every window size: a corner's
+            // preset name needed 404 px and was drawn condensed into 174, while the pad's
+            // own corner read-out - 25 px above it, same string, same font - ellipsised.
+            // Two policies on one string, side by side.
+            //
+            // 1.0f is the whole fix: GlyphArrangement::fitLineIntoSpace skips
+            // stretchRangeOfGlyphs entirely at that scale and goes straight to dropping
+            // glyphs and appending an ellipsis, which is this project's rule ("nothing is
+            // silently squashed") and what the neighbour already did. Set for EVERY combo,
+            // not just the preset pickers: every other box in this window is sized by
+            // fgfit::snugComboWidth to hold its own widest item, so this can only ever
+            // fire where the box was ALREADY too small - and there it is the difference
+            // between a word you cannot read and one that says it was cut.
+            label.setMinimumHorizontalScale (1.0f);
+            // ...and let getLabelFont keep it. drawLabel does not use the font set here:
+            // it asks getLabelFont, which puts a 12.5 px BOLD floor under everything. For
+            // a small-item box that floor is the whole thing being opted out of, so the
+            // label is renamed into the existing "small" escape hatch. Done HERE because
+            // this is the one place that owns the box label's font.
+            if (box.getName() == fgfit::kSmallComboName) label.setName ("small");
         }
 
         void fillTextEditorBackground (juce::Graphics& g, int width, int height, juce::TextEditor& te) override
@@ -914,9 +1353,9 @@ namespace
         }
         void drawTextEditorOutline (juce::Graphics& g, int width, int height, juce::TextEditor& te) override
         {
+            const auto o = textEditorOutline ((float) width, (float) height, te.isMultiLine());
             g.setColour (te.findColour (juce::TextEditor::outlineColourId));
-            g.drawRoundedRectangle (juce::Rectangle<float> (0.0f, 0.0f, (float) width, (float) height).reduced (0.9f),
-                                    (float) height * 0.5f, 1.4f);
+            g.drawRoundedRectangle (o.rect, o.radius, o.thickness);
         }
     };
 }
@@ -975,26 +1414,78 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // its fader went on working.
     configFader (baseNFader,   "baseN",    baseNAtt,     cHarmonic, "Base harmonic N");
     configCombo (basePitchBox, "baseMode", basePitchAtt, cHarmonic, "Original = harmonics at natural positions.  Transposed down = lowest partial at the played pitch.");
+    // A SMALL-ITEM BOX: its item is a PHRASE ("Transposed down", "Transposada avall")
+    // read under the painted "Pitch" caption right above it, which is exactly what the
+    // hatch is for - the caption is what the eye finds, the item only has to be legible.
+    // Measured: this box's longest item is what the rig's legibility walk names as the
+    // binding control in BOTH languages, so the type size it asks for is the type size
+    // the whole window's minimum width is standing on.
+    basePitchBox.setName (fgfit::kSmallComboName);
     makeLabel (lblBaseN, cHarmonic); makeLabel (lblBasePitch, cHarmonic);
     lblBasePitch.setJustificationType (juce::Justification::centredLeft); // top-LEFT of its combo, like the others
 
-    // Morphing: when ON, a spectrum change glides each partial to its new position
-    // (a per-partial pitch bend) over the Morph time, instead of snapping. It glides
-    // ANY template change, from either engine, so it wears the shared (mint) colour and
-    // lives in the BOTH ENGINES box - inside the Harmonic Engine it was dimmed whenever
-    // a custom scale took over, while it went on morphing that scale's partials.
-    // An ON/OFF pill, not a tick box: the painted MORPH sub-label above it is already the
-    // name, so a checkbox ALSO labelled "Morph" read as a second, different control.
-    morphToggle.setName ("onled"); // green(on)/red(off) pill, drawn by GalacticLnF
-    morphToggle.setMouseClickGrabsKeyboardFocus (false);
-    morphToggle.onClick = [this] { refocus(); };
-    addAndMakeVisible (morphToggle);
-    morphAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "morph", morphToggle);
-    addMapListener (morphToggle, "morph");
+    // TRANSITION: ONE question - how does a spectrum change LAND? - asked once.
+    //
+    // "haz que morph y dry/wet sean dos opciones dentro de un mismo desplegable en el
+    //  submenu transition, asi economizamos espacio, que las dos a la vez no tienen
+    //  sentido, haz que la default sea drywet"
+    //
+    // Morph and Dry/Wet used to be two cells, each with its own ON/OFF pill, its own
+    // painted name and its own Time fader - six controls answering one question, plus a
+    // greyed-out cell and an amber MORPH ON tag whose whole job was to explain that the
+    // second answer could not act while the first one did. They are ONE crossfade machine
+    // per voice (see AdditiveVoice.h and bf0f768), so exactly one of them can ever act,
+    // and a dropdown is the shape of a question with one answer.
+    //
+    // THE PARAMETERS DO NOT CHANGE, and that is the point. "morph" and "dryWet" are still
+    // the two booleans they always were: the DSP reads them unchanged, every automation
+    // lane already drawn on them still moves them, every project ever saved still restores
+    // them, and the preset playground still blends them. This box is a VIEW of that pair,
+    // not a new parameter laid over it - which is also why it is the honest view: the
+    // pair has four states and only THREE sounds, because with Morph on the crossfade
+    // cannot act at all. Off / Morph / Dry/Wet is that set of three, exactly.
+    //
+    //   both off  -> Off       a spectrum change lands instantly (the 50 ms template fade)
+    //   morph     -> Morph     every partial GLIDES to its new place
+    //   dryWet    -> Dry/Wet   the old spectrum fades out while the new one fades in
+    //   both on   -> Morph     what a project with both flags set already SOUNDS like
+    //
+    // OFF IS AN ITEM, not "turn the Time fader down". The Time fader cannot express it:
+    // its range bottoms out at 1 ms and the crossfade clamps itself to a 5 ms floor
+    // (below that the phase hand-over cannot be made click-free), so there is no fader
+    // position that means "no transition". It is also a state a player chooses on purpose
+    // - it is what every build before bf0f768 did - and a state you can only reach by
+    // failing to find it is a state that has been removed.
+    transitionBox.setName (fgfit::kSmallComboName);   // its item reads BELOW the TRANSITION title
+    transitionBox.setMouseClickGrabsKeyboardFocus (false);
+    addAndMakeVisible (transitionBox);
+    // No ComboBoxAttachment: this box does not own a parameter, it shows two. Items carry
+    // FIXED ids (1/2/3) rather than positions, so applyLanguage can re-word them without
+    // the selection sliding onto a different mode.
+    transitionBox.onChange = [this]
+    {
+        const int id = transitionBox.getSelectedId();
+        if (id <= 0) return;              // mid-relabel: getSelectedId reads 0, see applyLanguage
+        setTransitionParams (id == 2, id == 3);
+        refocus();
+    };
+    // The right-click "Map to" menu, kept from the two pills this replaced: the mode is
+    // still modulable, and the one it routes is the one the box is currently showing -
+    // a modulator on "morph" gates Morph, one on "dryWet" gates the crossfade.
+    addMapListener (transitionBox, "morph");
+
+    // ONE Time fader, for whichever mode is selected - but still the two PARAMETERS, so
+    // each mode keeps the time the user set for it and neither lane is disturbed. The two
+    // sliders share one rectangle and exactly one of them is ever visible; `resized()`
+    // lays out only that one, and the layout probe records only what is on screen.
     configFader (morphTimeFader, "morphTime", morphTimeAtt, cSlope, "Morph transition time in seconds: how long partials take to glide to the new spectrum.");
     morphTimeFader.setSliderStyle (juce::Slider::LinearHorizontal);
     morphTimeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 14);
-    makeLabel (lblMorphTime, cSlope);
+    configFader (dryWetTimeFader, "dryWetTime", dryWetTimeAtt, cSlope,
+                 "Dry/wet transition time in seconds: how long the old spectrum takes to fade out while the new one fades in.");
+    dryWetTimeFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    dryWetTimeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 42, 14);
+    makeLabel (lblTransTime, cSlope);
 
     // Harmonics is a magnetic FADER now (Even - All - Odd - Prime), so a modulator
     // can sweep it and it can sit BETWEEN two sets (blended).
@@ -1010,6 +1501,36 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // unreachable, which is what made it feel coarse and jumpy.
     harmonicsFader.normalSensitivity = 480;
     harmonicsFader.snapWindow = 0.06;
+    // THE NUMBER UNDER BASE SAYS WHAT IT IS. It used to read "1", "2", "7" - a bare
+    // number under a bare "N", which tells a reader nothing about what it selects. It is
+    // the harmonic the spectrum is built from, so it says so: "1st harmonic", "7th
+    // harmonic", and in Catalan the noun first with the ordinal on the number.
+    //
+    // Through tr(), not through juce::String(const char*): the Catalan needs an accent,
+    // and a raw literal is read as Latin-1 and comes out "harmA-2nic". The mojibake gate
+    // caught exactly that, 22 times.
+    baseNFader.textFromValueFunction = [this] (double v)
+    {
+        const int n = juce::jmax (1, (int) std::lround (v));
+        if (catalan)
+        {
+            // The ordinal letters are not translations - they are Catalan spelling. Wrapping
+            // each one in a translation pair just to get the ACCENT decoded invented three
+            // pairs whose two halves were identical, and the source audit rightly called
+            // them out. Only the two pieces that actually carry an accent are decoded, and
+            // this comment deliberately avoids spelling the call out: the audit greps the
+            // SOURCE, so an example in a comment is a finding.
+            const char* plain = n == 1 ? "r" : n == 2 ? "n" : n == 3 ? "r" : n == 4 ? "t" : nullptr;
+            return tr ("harmonic ", "harm\xc3\xb2nic ") + juce::String (n)
+                 + (plain != nullptr ? juce::String (plain)
+                                     : juce::String::fromUTF8 ("\xc3\xa8"));
+        }
+        const int t = n % 10, h = n % 100;
+        const char* suf = (t == 1 && h != 11) ? "st"
+                        : (t == 2 && h != 12) ? "nd"
+                        : (t == 3 && h != 13) ? "rd" : "th";
+        return juce::String (n) + suf + " harmonic";
+    };
     harmonicsFader.textFromValueFunction = [this] (double v)
     {
         const juce::String names[] = { tr ("Even", "Parells"), tr ("All", "Tots"),
@@ -1058,15 +1579,71 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // No onEdited hook: the main window shows nothing that a knob move changes (the
     // FROZEN tag follows the PARAMETER, and refreshSlopeFreeze already watches that),
     // and repainting the whole Harmonic Engine box on every drag frame was pure cost.
+    //
+    // onManualArmed is the exception, and it is not cosmetic. When the first pencil drag
+    // switches manual mode on by itself, AMP DECAY silently stops working, and somebody
+    // who reaches for it afterwards has been ambushed. So the freeze is shown the instant
+    // it happens rather than up to a 30 Hz tick later: grey fader, FROZEN tag, and the
+    // fader's tooltip already rewritten by the time a hand arrives at it.
+    //
+    // Deliberately NOT a forced TooltipWindow::displayTip here. The tip would be aimed at
+    // the main window while the mouse is mid-drag in the floating knob window - JUCE hides
+    // a displayed tip on the next mouse move, so it would flash and vanish, and it can sit
+    // behind that always-on-top window anyway. The warning the user actually sees is the
+    // banner in the panel they are looking at (PartialAmpPanel::refreshText), which says
+    // the same thing and stays up for as long as it is true.
+    partialPanel.onManualArmed = [this] { refreshSlopeFreeze(); };
     partialPanel.init (processorRef);
     // Fractal is a cell of the BOTH ENGINES box now (it multiplies whatever spectrum the
     // running engine produced), so it has no GroupComponent of its own - its frame is
     // that box's, and its title is a painted sub-label like SLOPE and MORPH.
     configFader (fractalFader, "fractalLevel", fractalAtt, cFractal, "Fractal self-similarity level (1 = off)");
-    // Essentials macro (Phase / Gain / Reference) - one framed box drawn
+    // Essentials macro (Gain / Reference / Octave) - one framed box drawn
     // in paint() like the Harmonic Engine, so no per-cell GroupComponents here.
-    configCombo (phaseBox, "phaseMode", phaseAtt, cEssentials, "Aligned: tonal pulse, never clips.  Scattered: louder, noisier.");
+    // PHASE, the fader. 0 = Aligned, 1 = Scattered, and every position between them is
+    // a real sound now rather than a rounding to one of the two - which is the whole
+    // request. The end words live in the tooltip and in the value read-out, because the
+    // sub-section's painted title already says PHASE and a second one would not fit.
+    //
+    // cSlope, NOT cEssentials: the fader lives in the SPECTRUM panel now, in the same
+    // column as SLOPE / MORPH / DRY-WET, and the hue is what tells a player which
+    // compartment a control belongs to. Left on the Essentials hue it would read as a
+    // stray from the box below - the one thing the move was meant to stop.
+    configFader (phaseFader, "phaseMode", phaseAtt, cSlope,
+                 "0 = Aligned (tonal pulse, never clips), 1 = Scattered (louder, noisier). Anywhere between is a real blend. "
+                 "Under a held note it re-phases over the Morph / Dry-Wet transition - with both off, at the next note.");
+    phaseFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    phaseFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 38, 14);
+    // There is no glide box beside the fader any more: how a mid-note move reaches
+    // sounding notes, and how long it takes, both come from the SPECTRUM panel's
+    // Morph / Dry-Wet transition now (see the phaseGlide note in createParameterLayout).
     configFader (gainFader, "masterGain", gainAtt, cEssentials, "Master output gain");
+    // BINAURAL, beside OCTAVE. Horizontal like GAIN above it, because this row is a row.
+    configFader (binauralFader, "binaural", binauralAtt, cEssentials, {});
+    binauralFader.setSliderStyle (juce::Slider::LinearHorizontal);
+    // THE VALUE GOES UNDER THE TRACK, which is the only reason this fader can be aimed.
+    // Beside it (TextBoxRight, the shape GAIN uses) the read-out ate 37 of the cell's 67
+    // px and JUCE reserves the thumb's width at BOTH ends of what is left, so the
+    // photograph came back with an 8 px track under a 24 px star: legible, measured, and
+    // impossible to drag. Underneath, the track keeps the full width - 39 px of travel at
+    // the size the plugin opens at - and the box gets 60, which is nearly twice what its
+    // widest word needs. See the ecBin block in resized() for the room this asks for.
+    binauralFader.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 60, 13);
+    binauralFader.textFromValueFunction = [this] (double v)
+    {
+        // "Centred" and not "0%": the number a fader shows should say what you HEAR, and
+        // at the bottom of this one you hear exactly what the instrument always sounded
+        // like. A percentage would invite the reading that 0 is a setting rather than off.
+        //
+        // Through tr(), like every word on the glass - the snapshot rig's translation
+        // audit caught this one drawn identically in both languages the first time it
+        // was photographed. applyLanguage()'s updateSliderValueTexts() sweep is what
+        // makes it re-render: a Slider only rebuilds its value box when the VALUE moves,
+        // so a read-out that is a WORD would otherwise survive a switch in English.
+        return v <= 0.0005 ? tr ("Centred", "Centrat")
+                           : juce::String ((int) std::lround (v * 100.0)) + "%";
+    };
+    binauralFader.updateText();
     gainFader.setSliderStyle (juce::Slider::LinearHorizontal);
     gainFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 46, 14);
     // Two +1/-1 stepper rows (no faders), each now titled by its cell's painted
@@ -1084,26 +1661,45 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         }
         refocus();
     };
-    auto configStep = [&] (juce::TextButton& b, const char* txt, const char* id, int delta, const juce::String& tip)
+    // NO TOOLTIP HERE. The two stepper hovers used to be built as plain English
+    // juce::Strings on the next two lines and handed to this lambda, which meant they
+    // were written ONCE, in the constructor, and applyLanguage() never touched them
+    // again: they stayed English for the rest of the editor's life in both languages.
+    // That is exactly cause (a) of commit 2b51e2f ("strings set once in the constructor")
+    // and the same fix applies - the words live in applyLanguage() now (search octTip
+    // there), which is the only place a language switch can reach.
+    // A STEPPER PAIR IS ONE CONTROL, AND IT WEARS ITS PANEL'S COLOUR.
+    //
+    // "-" used to be cReset (red) and "+" cLoad (green) - the semantic pair that means
+    // DESTROY and LOAD everywhere else in this window. Stepping a transpose by one octave
+    // is neither: it is the most ordinary, most reversible edit there is, and painting it
+    // in the two loudest colours the product owns put the same red on the octave minus
+    // that is on the X which deletes a bank slot. Red then meant five different things at
+    // once (destructive, off, decrement, un-map, and a neutral read-out) and therefore
+    // meant nothing.
+    //
+    // Both halves now take the colour of the panel they sit in, at the same alpha, so the
+    // pair reads as one control belonging to one box - and the direction is carried by the
+    // glyph, which is what the glyph is for. `col` is passed in rather than assumed:
+    // OCTAVE lives in ESSENTIALS and OCTAVE RANGE in SPECTRUM, and a stepper wearing the
+    // wrong panel's hue is exactly the kind of drift this parameter prevents.
+    auto configStep = [&] (juce::TextButton& b, const char* txt, const char* id, int delta,
+                           juce::Colour col)
     {
         b.setButtonText (txt);
-        b.setName ("round"); // circular body (see GalacticLnF::drawButtonBackground)
-        b.setColour (juce::TextButton::buttonColourId, cEssentials.withAlpha (0.30f));
+        b.setName ("round"); // circular body + drawn glyph (see GalacticLnF)
+        b.setColour (juce::TextButton::buttonColourId, col.withAlpha (0.45f));
         b.setMouseClickGrabsKeyboardFocus (false);
-        b.setTooltip (tip);
         b.onClick = [stepParam, id, delta] { stepParam (id, delta); };
         addAndMakeVisible (b);
     };
-    const auto octTip = juce::String ("Octave transpose: shift the WHOLE synth by whole octaves (+-5).");
-    const auto sprTip = juce::String ("Spectrum's octaves: keep only partials within this many octaves above the played note. 10 = no cut (full spectrum).");
-    configStep (octDn, "-", "octaveShift", -1, octTip);
-    configStep (octUp, "+", "octaveShift",  1, octTip);
-    configStep (sprDn, "-", "spectrumRange", -1, sprTip);
-    configStep (sprUp, "+", "spectrumRange",  1, sprTip);
-    octDn.setColour (juce::TextButton::buttonColourId, cReset.withAlpha (0.85f)); // "-" red
-    sprDn.setColour (juce::TextButton::buttonColourId, cReset.withAlpha (0.85f));
-    octUp.setColour (juce::TextButton::buttonColourId, cLoad.withAlpha (0.95f));  // "+" green
-    sprUp.setColour (juce::TextButton::buttonColourId, cLoad.withAlpha (0.95f));
+    configStep (octDn, "-", "octaveShift", -1, cEssentials);
+    configStep (octUp, "+", "octaveShift",  1, cEssentials);
+    // The SPECTRUM panel re-colours itself with the selected engine (see
+    // recolourSpectrumControls), so this pair is seeded with the "both engines" hue and
+    // repainted from there like every other control in that panel.
+    configStep (sprDn, "-", "spectrumRange", -1, cSlope);
+    configStep (sprUp, "+", "spectrumRange",  1, cSlope);
     for (auto* v : { &octVal, &sprVal })
     {
         v->setJustificationType (juce::Justification::centred);
@@ -1111,9 +1707,19 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         v->setFont (juce::Font (juce::FontOptions (12.0f).withStyle ("Bold")));
         addAndMakeVisible (*v);
     }
-    octVal.setTooltip (octTip);
-    sprVal.setTooltip (sprTip);
+    // (octVal's and sprVal's hovers are written by applyLanguage() too - same reason.)
 
+    // THE PRIME CONTROL SWITCH. It sits on the mode row, to the right of Limit/Whitelist,
+    // in space that row was already wasting. Same colours as the nine tick boxes it
+    // governs, because it is the same control at a higher level.
+    primeOnToggle.setColour (juce::ToggleButton::textColourId, juce::Colour (0xffb9c0d0));
+    primeOnToggle.setColour (juce::ToggleButton::tickColourId, cHarmonic);
+    primeOnToggle.setColour (juce::ToggleButton::tickDisabledColourId, cHarmonic.withAlpha (0.4f));
+    primeOnToggle.setMouseClickGrabsKeyboardFocus (false);
+    primeOnToggle.onClick = [this] { refocus(); resized(); };
+    addAndMakeVisible (primeOnToggle);
+    primeOnAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "primeOn", primeOnToggle);
+    addMapListener (primeOnToggle, "primeOn");
     configCombo (primeModeBox,  "primeMode",  primeModeAtt,  cHarmonic, "Limit = drop harmonics with a prime factor above the value.  Whitelist = only the ticked primes.");
     // Prime LIMIT as a FADER (so it can be driven by the modulators). The value is
     // the index into {Off, 2, 3, 5, 7, 11, 13, 17, 19, 23}, shown by name.
@@ -1123,14 +1729,18 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     primeLimitFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 40, 15);
     primeLimitFader.setSliderSnapsToMousePosition (false);
     primeLimitFader.normalSensitivity = 300;
-    primeLimitFader.textFromValueFunction = [] (double v)
+    primeLimitFader.textFromValueFunction = [this] (double v)
     {
-        static const char* names[] = { "Off", "23", "19", "17", "13", "11", "7", "5", "3", "2" };
+        // The only WORD in this read-out; the other nine entries are prime numbers. It
+        // was a bare const char* and so was the one label on the fader that never
+        // changed language - and "No" is the very word its own tooltip uses for this
+        // position ("No = sense filtre de primers").
+        const juce::String names[] = { tr ("Off", "No"), "23", "19", "17", "13", "11", "7", "5", "3", "2" };
         const int lo = juce::jlimit (0, 9, (int) std::floor (v));
         const double t = v - (double) lo;
-        if (t < 0.01) return juce::String (names[lo]);
-        return juce::String (names[lo]) + juce::String::fromUTF8 ("\xe2\x86\x92")
-             + juce::String (names[juce::jmin (9, lo + 1)])
+        if (t < 0.01) return names[lo];
+        return names[lo] + juce::String::fromUTF8 ("\xe2\x86\x92")
+             + names[juce::jmin (9, lo + 1)]
              + " " + juce::String ((int) std::lround (t * 100.0)) + "%";
     };
     primeLimitFader.updateText();
@@ -1148,6 +1758,20 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         primeToggleAtt[i] = std::make_unique<ButtonAttachment> (processorRef.apvts, "primeWL" + juce::String (i), primeToggle[i]);
         addMapListener (primeToggle[i], "primeWL" + juce::String (i));
         makeLabel (primeLbl[i], cHarmonic); primeLbl[i].setText (pn[i], juce::dontSendNotification);
+        // A 2 px border each side is right for a caption sitting in open panel space and
+        // wrong for these: nine of them share one cell width, so 4 px of border is 4 px
+        // the DIGITS do not get, and "11" was the string the whole window's legibility
+        // measurement stopped on - needing 14.6 px in the 14.0 the border left it. The
+        // cells are adjacent and each holds one short token under its own tick, so 1 px
+        // is enough to keep two neighbours from touching.
+        primeLbl[i].setBorderSize (juce::BorderSize<int> (0, 1, 0, 1));
+        // ...and out of the 12.5 px BOLD floor GalacticLnF::getLabelFont puts under every
+        // Label. That floor is right for a caption in open space and wrong for nine
+        // numbers sharing one cell width: "17" needs 14.6 px at 12.5 Bold and the cell is
+        // often 16, which is what the whole window's legibility measurement kept stopping
+        // on. Named "small" (the opt-out the LnF already documents), resized() then picks
+        // the size from the width the cell really has.
+        primeLbl[i].setName ("small");
     }
 
     configGroup (gFilter, cFilter);
@@ -1166,6 +1790,21 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 
     configFader (pEnvAmtFader, "pitchEnvAmount", pEnvAmtAtt, cPitch, "How far the pitch envelope bends the pitch (semitones, +/-).");
     makeLabel (lblPitchAmt, cPitch);
+
+    // MONOPHONIC GLIDE. Both controls live on the PITCH tab and are shown only while it
+    // is the tab on screen (see resized()). They are ordinary parameter attachments -
+    // everything that makes the mode work (the one-voice pool, the legato takeover, the
+    // portamento itself) is in the processor and the voice, so it works with this window
+    // shut and under host automation.
+    monoGlideT.setMouseClickGrabsKeyboardFocus (false);
+    monoGlideT.onClick = [this] { refocus(); };
+    addChildComponent (monoGlideT);
+    monoGlideAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "monoGlide", monoGlideT);
+    addMapListener (monoGlideT, "monoGlide");
+    configFader (glideFader, "glideTime", glideAtt, cPitch,
+                 "How long the pitch takes to travel from the previous note to the new one (ms).");
+    glideFader.setTextValueSuffix (" ms");
+    makeLabel (lblGlide, cPitch);
     const char* ampIds[]   = { "ampAttack","ampDecay","ampSustain","ampRelease" };
     const char* fltIds[]   = { "filterAttack","filterDecay","filterSustain","filterRelease" };
     const char* pitchIds[] = { "pitchAttack","pitchDecay","pitchSustain","pitchRelease" };
@@ -1188,7 +1827,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // CUSTOM tab: 6 modulators (3 envelopes + 3 LFOs). The controls below re-attach
     // to whichever modulator the selector shows; map any fader via right-click.
     {
-        const juce::Colour cCustom (0xff9a7bff);
+        const juce::Colour & cCustom = cCustomMod; // the CUSTOM modulator identity, from the palette
         // The envelope is EDITED as a curve with nodes (the faders below stay as the
         // automation targets, but are no longer shown).
         envEditor.col = cCustom;
@@ -1260,11 +1899,30 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             k->setSliderStyle (juce::Slider::RotaryVerticalDrag);
             k->setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
                                     juce::MathConstants<float>::pi * 2.75f, true);
-            k->setTextBoxStyle (juce::Slider::TextBoxBelow, false, 44, 13);
+            // THE NUMBER GOES TO THE RIGHT, so the knob can have the whole height of its
+            // column. A rotary is drawn as a SQUARE inside whatever the text box leaves,
+            // so a box BELOW took 13 px straight off the diameter of controls that are
+            // small to begin with - "los knobs de lfo siguen siendo enanos... molaria que
+            // tuviesen el numero blanco a su derecha y no debajo, asi podrian crecer hacia
+            // abajo, que es lo que les impide crecer".
+            //
+            // Set HERE, in the constructor, which is what keeps it: applyLanguage()
+            // captures each fader's box position as its HOME the first time it runs -
+            // after every caller has moved the box it wanted - and the sweep at the end of
+            // resized() skips any fader whose home is not TextBoxBelow. So this decision
+            // is not undone by either of them.
+            //
+            // AND THE BOX ASKS FOR ALMOST NOTHING, on purpose. applyLanguage's sizing pass
+            // widens every box to jmax (the width asked for here, faderValueWidth + 2), so
+            // asking for 4 means the box ends up exactly as wide as the widest number it
+            // can show and not one pixel more. Asking for 44 - which is what it used to -
+            // spent 43 px of a 73 px column writing "8" and "0.000", and the knob got what
+            // was left. The measurement decides the split now.
+            k->setTextBoxStyle (juce::Slider::TextBoxRight, false, 4, 13);
         }
         makeLabel (lblLfoDiv, cCustom);   lblLfoDiv.setText ("Div", juce::dontSendNotification);
         makeLabel (lblLfoHz, cCustom);    lblLfoHz.setText ("Hz", juce::dontSendNotification);
-        makeLabel (lblLfoPhase, cCustom); lblLfoPhase.setText ("Ph", juce::dontSendNotification);
+        makeLabel (lblLfoPhase, cCustom); lblLfoPhase.setText ("Phase", juce::dontSendNotification);
 
         modSelBox.addItem ("Env 1", 1); modSelBox.addItem ("Env 2", 2); modSelBox.addItem ("Env 3", 3);
         modSelBox.addItem ("LFO 1", 4); modSelBox.addItem ("LFO 2", 5); modSelBox.addItem ("LFO 3", 6);
@@ -1277,7 +1935,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         // added here (an empty combo was why the LFO menus showed nothing).
         lfoWaveBox.addItem ("Sine", 1);        lfoWaveBox.addItem ("Triangle", 2);
         lfoWaveBox.addItem ("Saw up", 3);      lfoWaveBox.addItem ("Saw down", 4);
-        lfoWaveBox.addItem ("Square", 5);      lfoWaveBox.addItem ("Custom (draw)", 6);
+        lfoWaveBox.addItem ("Square", 5);      lfoWaveBox.addItem ("Custom", 6);
         lfoWaveBox.addItem ("Random", 7);
         lfoRateModeBox.addItem ("BPM / 2^n", 1);
         lfoRateModeBox.addItem ("Fundamental / 2^n", 2);
@@ -1288,6 +1946,15 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         {
             cb->setColour (juce::ComboBox::outlineColourId, cCustom.withAlpha (0.7f));
             cb->setMouseClickGrabsKeyboardFocus (false);
+            // SMALL-ITEM BOXES. These three hold PHRASES - "Fundamental / 2^n",
+            // "Restart each note" - not one-word modes, and at LookAndFeel_V4's default
+            // (16 px, which getLabelFont then draws BOLD) the rate mode needed 129 px in
+            // the 108 it had and was drawn shrunk. The hatch exists for exactly this: a
+            // box whose item is a sentence sitting under a painted sub-label, where the
+            // sub-label is what the eye reads first and the item only has to be legible.
+            // All three together, not the one that overflowed, or the row would carry two
+            // different type sizes side by side.
+            cb->setName (fgfit::kSmallComboName);
             addChildComponent (*cb);
         }
         lfoWaveBox.onChange     = [this] { resized(); }; // Draw button appears with "Custom (draw)"
@@ -1309,17 +1976,6 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             refocus();
         };
         addChildComponent (modUnmapBtn);
-        lfoWaveEditBtn.setColour (juce::TextButton::buttonColourId, cCustom.withAlpha (0.85f));
-        lfoWaveEditBtn.setMouseClickGrabsKeyboardFocus (false);
-        lfoWaveEditBtn.onClick = [this]
-        {
-            const int l = modSel - 3;
-            if (l < 0) return;
-            waveEditor.fromText (processorRef.getLfoWavePoints (l));
-            waveEditor.setVisible (true);
-            waveEditor.toFront (false);
-        };
-        addChildComponent (lfoWaveEditBtn);
         waveEditor.onChange = [this]
         {
             const int l = modSel - 3;
@@ -1372,12 +2028,6 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     loadSclButton.setTooltip ("Load a Scala scale file (retunes the notes).");
     loadSclButton.onClick = [this] { openScalaChooser(); };
     addAndMakeVisible (loadSclButton);
-    clearSclButton.setColour (juce::TextButton::buttonColourId, cReset);
-    clearSclButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
-    clearSclButton.setMouseClickGrabsKeyboardFocus (false);
-    clearSclButton.setTooltip ("Back to 12-TET.");
-    clearSclButton.onClick = [this] { processorRef.clearScala(); refocus(); };
-    addAndMakeVisible (clearSclButton);
     makeLabel (recentLabel, cTuning); recentLabel.setJustificationType (juce::Justification::centredLeft);
     for (int i = 0; i < 3; ++i)
     {
@@ -1391,10 +2041,30 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuningNameLabel.setJustificationType (juce::Justification::centredLeft);
     tuningNameLabel.setColour (juce::Label::textColourId, cTuning); // the loaded scale's file name
     tuningNameLabel.setFont (juce::Font (juce::FontOptions (13.0f).withStyle ("Bold")));
-    // Period of the active scale, in RED, clearly labelled.
+    tuningNameLabel.setBorderSize (juce::BorderSize<int> (0, 2, 0, 2)); // one inset - see tuningPeriodLbl
+    // Period of the active scale, in the TUNING PANEL'S OWN COLOUR, clearly labelled.
+    //
+    // IT WAS RED, AND RED WAS SAYING NOTHING. This read-out is not a warning, not an
+    // off-state and not a button: it is a neutral fact about the loaded scale, printed
+    // ALWAYS - "Period 2" in the shipped state, "Period 3" for a tritave, "Period 1 (no
+    // repeat)" for a scale that declares none. A colour that is on screen in every single
+    // state carries no information by definition, and this one was the same red as the X
+    // that deletes a bank slot, the Reset buttons and the OFF pills. Four jobs for one
+    // hue teaches the eye to stop reading it, which costs the red where it MATTERS.
+    //
+    // cTuning is what the rest of this panel is already wearing (its border, its title
+    // chip, its captions, the scale name directly above this line), so the period now
+    // reads as one more field of the TUNING box instead of as an alarm inside it. Red is
+    // left to mean exactly one thing in this window: this control destroys something.
     tuningPeriodLbl.setJustificationType (juce::Justification::centredLeft);
-    tuningPeriodLbl.setColour (juce::Label::textColourId, juce::Colour (0xffe0453f));
+    tuningPeriodLbl.setColour (juce::Label::textColourId, cTuning.brighter (0.15f));
     tuningPeriodLbl.setFont (juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")));
+    // The same 2 px inline-caption border every makeLabel() caption in this panel keeps
+    // (see makeLabel), instead of juce::Label's default 5. Four stacked text items in this
+    // box started their ink at 537 / 536 / 533 / 533 px because the two read-outs kept the
+    // default border and the captions did not - a 3 px stagger down one column with every
+    // component rect on the same x. One inset, so the column is a column.
+    tuningPeriodLbl.setBorderSize (juce::BorderSize<int> (0, 2, 0, 2));
     addAndMakeVisible (tuningPeriodLbl);
     addAndMakeVisible (tuningNameLabel);
 
@@ -1404,7 +2074,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // dissonance lists. Applied on Return, so a half-typed "3/" is never read as a period.
     tablePeriodEdit.setJustification (juce::Justification::centred);
     tablePeriodEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
-    tablePeriodEdit.setColour (juce::TextEditor::outlineColourId, juce::Colour (0xffe0453f).withAlpha (0.7f));
+    // Outlined in the panel's own colour, like every other field in it - it was the same
+    // red as the period read-out beside it, and for the same wrong reason (see
+    // tuningPeriodLbl above): typing a period is not a destructive act.
+    tablePeriodEdit.setColour (juce::TextEditor::outlineColourId, cTuning.withAlpha (0.7f));
     tablePeriodEdit.setIndents (6, 2);
     tablePeriodEdit.setSelectAllWhenFocused (true);
     tablePeriodEdit.onReturnKey = [this]
@@ -1413,7 +2086,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         if (! processorRef.setTuningTablePeriod (tablePeriodEdit.getText(), err))
             juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
                                                          tr ("Invalid period", "Per\xc3\xado" "de inv\xc3\xa0lid"),
-                                                         err, this);
+                                                         trErr (err), this);   // the Catalan reader gets Catalan
         // Whatever happened, show what is actually in force - never leave the field
         // displaying a period the tuning did not accept.
         tablePeriodEdit.setText (processorRef.tuningTablePeriodSpec(), juce::dontSendNotification);
@@ -1442,15 +2115,12 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuningBankBox.setColour (juce::ComboBox::outlineColourId, cTuning.withAlpha (0.7f));
     tuningBankBox.setColour (juce::ComboBox::textColourId, juce::Colours::white);
     tuningBankBox.setMouseClickGrabsKeyboardFocus (false);
-    tuningBankBox.setTooltip (tr (
-        "Bank of scales: pick a slot to make it the active tuning. This selector is a PARAMETER, so a host can automate switching between the loaded scales.",
-        "Banc d'escales: tria una ranura per fer-la l'afinaci\xc3\xb3 activa. Aquest selector \xc3\xa9s un PAR\xc3\x80METRE, aix\xc3\xad que un host pot automatitzar el canvi entre les escales carregades."));
+    // (tooltip in applyLanguage - a tooltip set here would keep the launch language)
     tuningBankBox.onChange = [this] { processorRef.setTuningBankSlotParam (tuningBankBox.getSelectedId() - 1); refocus(); };
     addAndMakeVisible (tuningBankBox);
     tuningBankLoadBtn.setColour (juce::TextButton::buttonColourId, cLoad);
     tuningBankLoadBtn.setMouseClickGrabsKeyboardFocus (false);
-    tuningBankLoadBtn.setTooltip (tr ("Load a .tun / .scl / .ascl into the selected bank slot.",
-                                      "Carrega un .tun / .scl / .ascl a la ranura seleccionada del banc."));
+    // (tooltip in applyLanguage)
     tuningBankLoadBtn.onClick = [this] { openTuningBankChooser(); };
     // Put the tuning that is playing RIGHT NOW into the bank (any mode: a generated
     // scale, an edited one, an EDO...), without going through a file.
@@ -1493,7 +2163,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         juce::String err;
         if (! processorRef.loadPendingPresetTuning (err))
             juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                tr ("Load preset's tuning", "Carrega l'afinaci\xc3\xb3 del preset"), err, this);
+                tr ("Load preset's tuning", "Carrega l'afinaci\xc3\xb3 del preset"), trErr (err), this);
         resized(); repaint(); refocus();
     };
     addChildComponent (loadPresetTuningBtn);
@@ -1508,7 +2178,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         juce::String err;
         if (! processorRef.loadSpectrumProvenanceTuning (err))
             juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                tr ("Load spectrum's tuning", "Carrega l'afinaci\xc3\xb3 de l'espectre"), err, this);
+                tr ("Load spectrum's tuning", "Carrega l'afinaci\xc3\xb3 de l'espectre"), trErr (err), this);
         resized(); repaint(); refocus();
     };
     addChildComponent (loadSpectrumTuningBtn);
@@ -1535,8 +2205,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     tuningBankClearBtn.setButtonText ("X");
     tuningBankClearBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xffe0453f));
     tuningBankClearBtn.setMouseClickGrabsKeyboardFocus (false);
-    tuningBankClearBtn.setTooltip (tr ("Remove the selected tuning from the bank.",
-                                       "Treu l'afinaci\xc3\xb3 seleccionada del banc."));
+    // (tooltip in applyLanguage)
     tuningBankClearBtn.onClick = [this]
     {
         const int slot0 = tuningBankBox.getSelectedId() - 2; // id i+2 -> slot i
@@ -1637,36 +2306,24 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     menuButton.setMouseClickGrabsKeyboardFocus (false);
     menuButton.onClick = [this]
     {
-        juce::PopupMenu m;
-        m.addItem (1, tr ("Reset all parameters", "Reinicia tots els par\xc3\xa0metres"));
-        m.addItem (2, catalan ? juce::String ("Language: English")
-                              : juce::String::fromUTF8 ("Idioma: catal\xc3\xa0"));
+        // MSVC resolves a bare pointer-to-self inside a NESTED lambda init-capture to the
+        // closure rather than to the editor, so the editor is named here and captured by
+        // that name below.
+        juce::Component* const selfComp = this;
+        auto m = buildMainMenu();
+        // A MENU OUTLIVES THE WINDOW IT WAS OPENED FROM. showMenuAsync returns
+        // immediately and its callback fires whenever the user gets round to choosing -
+        // or when the menu is dismissed, with r = 0 - and the plugin window can be closed
+        // in between. This captured `this` raw and ended with an unconditional refocus(),
+        // so a dismissed menu was enough to call grabKeyboardFocus() on a destroyed
+        // Component. SafePointer is JUCE's own answer and it nulls itself on destruction.
         m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (menuButton),
-            [this] (int r)
+            [this, safe = juce::Component::SafePointer<juce::Component> (selfComp)] (int r)
             {
-                if (r == 1)
-                {
-                    processorRef.requestHardSilence(); // never leave a note stuck sounding through Init
-                    for (auto* p : processorRef.getParameters())
-                        p->setValueNotifyingHost (p->getDefaultValue());
-                    processorRef.clearScala();
-                    processorRef.clearTimbre();
-                    setIntervalText ({});
-                    // Init also unroutes every Spectrum-to-Rhythm pulse.
-                    for (auto& s : processorRef.getRhythm().slots)
-                    {
-                        s.enabled = false; s.partial = -1;
-                        s.steps = 0; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f; s.vel = 100;
-                    }
-                    rhythmPanel.refreshSlots();
-                    rhythmPanel.list.repaint();
-                }
-                else if (r == 2)
-                {
-                    catalan = ! catalan;
-                    applyLanguage();
-                }
-                refocus();
+                // The guard decides; the choice itself is a member of its own (so a check can
+                // make the same choice a click makes - see mainMenuChoiceForTests).
+                if (safe == nullptr) return;
+                handleMainMenuChoice (r);
             });
     };
     addAndMakeVisible (menuButton);
@@ -1690,13 +2347,32 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         // .tun is the default: it carries the reference frequency, which .scl cannot, so
         // an exported scale reopens at the same absolute pitch. .scl stays available in
         // the file-type dropdown for anything that only speaks Scala.
-        auto ch = std::make_shared<juce::FileChooser> (
-            tr ("Save tuning", "Desa l'afinaci\xc3\xb3"),
+        //
+        // THE CHOOSER IS THE EDITOR'S, LIKE THE OTHER FOUR. This one was a shared_ptr
+        // captured by its own callback - self-owning, so it outlived the editor - while
+        // the callback captured `this` raw. Open SAVE TUNING, close the plugin window
+        // while the Windows dialog is still up, then pick a file, and the callback runs
+        // against a destroyed editor: refocus() calls grabKeyboardFocus() on a dead
+        // Component, tr() reads the freed language flag to choose which words to show, and
+        // the message box is parented to rubble. The host goes down, or the tuning is
+        // written from garbage.
+        //
+        // The plugin's other four choosers all assign to the `fileChooser` member, which
+        // dies with the editor - and destroying a juce::FileChooser cancels its pending
+        // callback, which is exactly the protection this one opted out of. It was the odd
+        // one out for no reason; it is not any more.
+        // THE TITLE COMES OUT OF fgdlg, like the other nine. This one was written out
+        // here instead - the same two words, a second time - and a table whose whole job
+        // is to be the ONE place an OS-window title is written has exactly one failure
+        // mode: a second copy. The gate at fgdlg::all walks the TABLE, so the copy was
+        // invisible to it; only the copy could go stale, and it was the copy the user saw.
+        fileChooser = std::make_unique<juce::FileChooser> (
+            tr (fgdlg::saveTuning.en, fgdlg::saveTuning.ca),
             juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
                 .getChildFile ("tuning.tun"),
             "*.tun;*.scl");
-        ch->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
-            [this, ch] (const juce::FileChooser& fc)
+        fileChooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles,
+            [this] (const juce::FileChooser& fc)
             {
                 auto f = fc.getResult();
                 if (f == juce::File()) { refocus(); return; }
@@ -1708,20 +2384,32 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
                 if (! (asScl ? processorRef.saveCurrentTuningScl (f, err)
                              : processorRef.saveCurrentTuningTun (f, err)))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        tr ("Save tuning", "Desa l'afinaci\xc3\xb3"), err, this);
+                        tr (fgdlg::saveTuning.en, fgdlg::saveTuning.ca), trErr (err), this);
                 refocus();
             });
     };
     addAndMakeVisible (saveTuningBtn);
 
-    // Spectrum -> rhythm MIDI panel (top-bar button toggles it). WHITE: maximum
-    // contrast against the dark bar and the rainbow title squares beside it.
-    rhythmBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xfff2f2f2));
+    // Spectrum -> rhythm MIDI panel (top-bar button toggles it), IN THE COLOUR OF THE
+    // PANEL IT OPENS.
+    //
+    // It was 0xfff2f2f2 - "WHITE: maximum contrast against the dark bar" - and that was
+    // the problem, not the intention. On a 0x0c0c12 page it was the only near-white
+    // element in the entire window, so it was the first thing the eye landed on, ahead of
+    // the title, the preset selector and every panel: maximum contrast spent on a
+    // SECONDARY view toggle. Nothing else in this product is painted white, either, so it
+    // read as an unstyled system control that had escaped the theme.
+    //
+    // 0xff5cb8ff is the exact colour the panel's own SPECTRUM VS RHYTHM heading is drawn
+    // in (see RhythmPanel::heading), which is the only relationship this button has to
+    // express: press it and that heading appears. Still light enough for
+    // GalacticLnF::drawButtonText to put BLACK letters on it (perceived brightness ~0.66,
+    // well over the 0.52 threshold), so it loses none of its legibility - only its
+    // undeserved first place in the reading order.
+    rhythmBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff5cb8ff));
     rhythmBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::black);
     rhythmBtn.setMouseClickGrabsKeyboardFocus (false);
-    rhythmBtn.setTooltip (tr (
-        "SPECTRUM VS RHYTHM: turns partials of the current patch into MIDI pulse trains - exact polyrhythms derived from the spectrum's frequency ratios, sample-locked to the sound - sent out of this plugin's MIDI OUTPUT to any other track/instrument. Click to open the panel.",
-        "ESPECTRE A RITME: converteix parcials del patch actual en trens de polsos MIDI - poliritmes exactes derivats de les relacions de freq\xc3\xbc\xc3\xa8ncia de l'espectre, clavats al so mostra a mostra - que surten per la SORTIDA MIDI del plugin cap a qualsevol altra pista/instrument. Clica per obrir el panell."));
+    // (tooltip in applyLanguage)
     rhythmBtn.onClick = [this]
     {
         const bool show = ! rhythmPanel.isVisible();
@@ -1735,6 +2423,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         rhythmScrim.setVisible (show); // dims + click-blocks everything behind the panel
         rhythmPanel.setVisible (show);
         if (show) { rhythmScrim.toFront (false); rhythmPanel.toFront (false); }
+        if (noticeOverlay.isVisible()) noticeOverlay.toFront (false);   // a notice that is up stays on top
         else refocus();
     };
     addAndMakeVisible (rhythmBtn);
@@ -1768,17 +2457,14 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     rhythmVelSlopeAtt = std::make_unique<SliderAttachment>(processorRef.apvts, "rhythmVelSlope", rhythmPanel.velSlopeS);
     rhythmStepsAllAtt = std::make_unique<SliderAttachment>(processorRef.apvts, "rhythmStepsAll", rhythmPanel.stepsAllS);
     addMapListener (rhythmPanel.stepsAllS, "rhythmStepsAll");
-    rhythmPanel.stepsAllLbl.setText (tr ("Steps", "Passos"), juce::dontSendNotification);
-    rhythmPanel.stepsAllS.setTooltip (tr (
-        "Shifts EVERY step-pitched pulse by this many scale steps from the played note (JI/ratio pulses have no step, so they are unaffected). Right-click to map a modulator.",
-        "Desplaç""a TOTS els polsos amb to per passos aquests passos d'""escala des de la nota tocada (els polsos JI/raó no en tenen, i no els afecta). Clic dret per assignar-hi un modulador."));
+    // (label + tooltip in applyLanguage: "Steps" was set here once and stayed English
+    //  through every later language switch - it is one of the strings the en/ca drawn-text
+    //  assertion in SnapshotRig.cpp was added to catch.)
     // Modulatable, like every other fader: right-click to route a modulator.
     addMapListener (rhythmPanel.velSlopeS, "rhythmVelSlope");
     addMapListener (rhythmPanel.octAllVal, "rhythmOctAll");     // Octave (all pulses)
-    rhythmPanel.velSlopeS.setTooltip (tr (
-        "Velocity SLOPE across the spectrum. 0 = flat (every pulse keeps its own velocity). To the right the HIGH partials start losing velocity; to the left the low ones. At the end of its travel the ramp is vertical and no pulse has any velocity left. Right-click to map a modulator.",
-        "PENDENT de velocitat sobre l'espectre. 0 = plana (cada pols mant\xc3\xa9 la seva). Cap a la dreta els parcials AGUTS comencen a perdre velocitat; cap a l'esquerra els greus. Al final del recorregut la pendent \xc3\xa9s vertical i cap pols conserva velocitat. Clic dret per assignar-hi un modulador."));
-    rhythmMpeAtt  = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmMpe",  rhythmPanel.mpeT);
+    // (tooltip in applyLanguage)
+    rhythmMpeAtt = std::make_unique<ButtonAttachment>   (processorRef.apvts, "rhythmMpe",  rhythmPanel.mpeT);
     rhythmTempoAtt = std::make_unique<ButtonAttachment>  (processorRef.apvts, "rhythmTempoSync", rhythmPanel.tempoT);
     rhythmModeAtt = std::make_unique<ComboBoxAttachment> (processorRef.apvts, "rhythmMode", rhythmPanel.modeBox);
 
@@ -1804,11 +2490,23 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     presetBox.setColour (juce::ComboBox::outlineColourId, juce::Colour (0xff55557a));
     presetBox.setMouseClickGrabsKeyboardFocus (false);
     presetBox.onBeforePopup = [this] { refreshPresetList(); };
+    // The drop-down is a SEARCHABLE list, not a plain menu (see PresetSearchPanel).
+    presetBox.onShowPopup   = [this] { return openPresetSearch(); };
     presetBox.onChange = [this]
     {
+        // The field is frozen while a playground corner is being edited: its text is a
+        // corner's name, not a preset's, and loading from it would drop a whole preset
+        // onto the corner's scratch surface. It is disabled there, so this is belt and
+        // braces for a programmatic setText that forgot dontSendNotification.
+        if (processorRef.getPlaygroundEditCorner() >= 0) return;
         const auto name = presetBox.getText();
         if (name.isNotEmpty() && processorRef.loadPreset (name))
             applyEngineState();
+        else if (name.isNotEmpty())
+            // A LOAD THAT FAILED PUTS BACK THE NAME OF WHAT IS STILL PLAYING. The box kept the
+            // failed name while the notice said "the preset name in the box is the one that was
+            // there before" - which nothing made true (night review, pre-existing).
+            presetBox.setText (processorRef.getLoadedPresetName(), juce::dontSendNotification);
         refreshPresetDirtyMark();
         resized(); repaint(); refocus(); // the Tuning panel's "Load preset's tuning" button may now show
     };
@@ -1820,9 +2518,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     presetDirtyMark.setFont (juce::Font (juce::FontOptions (16.0f).withStyle ("Bold")));
     presetDirtyMark.setJustificationType (juce::Justification::centredLeft);
     presetDirtyMark.setInterceptsMouseClicks (false, false);
-    presetDirtyMark.setTooltip (tr (
-        "*Changed since loaded.*\nSome parameter no longer matches this preset - moved by something other than one of its OWN modulators (a knob, host automation, an undo).\n!Save stores it as a NEW preset! instead of overwriting the original.",
-        "*Canviat des de la c\xc3\xa0rrega.*\nAlg\xc3\xban par\xc3\xa0metre ja no coincideix amb aquest preset - l'ha mogut alguna cosa que no \xc3\xa9s un dels seus PROPIS moduladors (un bot\xc3\xb3, automatitzaci\xc3\xb3, un desfer).\n!Desar el guarda com un preset NOU! en lloc de sobreescriure l'original."));
+    // (tooltip in applyLanguage)
     addChildComponent (presetDirtyMark);
     refreshPresetList();
 
@@ -1843,41 +2539,130 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     playgroundPanel.proc = &processorRef;
     playgroundPanel.pad.proc = &processorRef;
     playgroundPanel.trF     = [this] (const char* en, const char* ca) { return tr (en, ca); };
+    playgroundPanel.trErrF  = [this] (const juce::String& e) { return trErr (e); };
+    // The lock band's button. addChildComponent, not addAndMakeVisible: it exists only
+    // while the playground is driving, and refreshPlaygroundDrivingUi decides that.
+    pgEditNearestBtn.setMouseClickGrabsKeyboardFocus (false);
+    // THE PANEL'S OWN COLOUR, at full strength. The first version wore a dimmed hue and
+    // sat on a dimmed band looking like part of the slab: the one thing on that band that
+    // can be pressed has to be the one thing that is not faded.
+    pgEditNearestBtn.setColour (juce::TextButton::buttonColourId, spectrumPanelColour);
+    pgEditNearestBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::black);
+    pgEditNearestBtn.onClick = [this]
+    {
+        // Entering EDIT is what makes these controls MEAN something again: they become
+        // that corner's own, its name takes the "*" the moment one of them moves, and
+        // saving it is the ordinary preset save. refreshCornerEditUi says whose they are.
+        processorRef.beginPlaygroundCornerEdit (pgNearestCorner);
+        refreshPlaygroundDrivingUi();
+        refreshCornerEditUi();
+        playgroundPanel.refresh (true);
+    };
+    addChildComponent (pgEditNearestBtn);
     playgroundPanel.pad.trF = [this] (const char* en, const char* ca) { return tr (en, ca); };
     playgroundPanel.attachVoices();   // needs proc: the pgVoices attachment
+    // CORNER EDIT: the panel owns the Edit buttons, the MAIN window owns the preset field
+    // and the Save flow they redirect (savePresetFlow reroutes itself), so the two are
+    // wired here rather than the panel reaching into the editor.
+    playgroundPanel.onEditModeChanged = [this]
+    {
+        refreshCornerEditUi();
+        applyEngineState();   // the corner's engine/scale are on the controls now
+        resized(); repaint();
+    };
 
     // Pitch-bend range (inside the Tuning box).
     configCombo (bendBox, "bendRange", bendAtt, cTuning, {});
+    // A SMALL-ITEM BOX: "±48 st (MPE)" needs 98 px of the 92 its row gives it, and the row
+    // cannot spare the difference - widening it made the tuning panel's ladder drop a row
+    // at the floor, which is a whole control lost to gain six pixels. The smaller face
+    // costs no width at all, and this box sits under a "Pitch bend" caption that already
+    // says what it is.
+    bendBox.setName (fgfit::kSmallComboName);
     makeLabel (lblBend, cTuning);
 
-    // SHEPARD TONE GENERATOR (the Tuning box's bottom row). The tone's component
-    // spacing is the ACTIVE tuning's period, which is why it lives in this panel.
-    // Words and tooltips are written by applyLanguage(); which of the two rate
-    // dresses (ms fader / beats box) is on screen is decided by resized().
+    // SHEPARD MODE (the Tuning box's bottom row). It lives in this panel because the
+    // one tuning-dependent choice it offers - rise by an octave or by the tuning's own
+    // period - only exists here. Words and tooltips are written by applyLanguage();
+    // which of the two rate dresses (ms fader / beats box) is on screen, and whether
+    // the rise-interval box exists at all, is decided by resized().
     shepOnT.setColour (juce::ToggleButton::textColourId, juce::Colours::white);
     shepOnT.setColour (juce::ToggleButton::tickColourId, cTuning);
     shepOnT.setMouseClickGrabsKeyboardFocus (false);
     addAndMakeVisible (shepOnT);
     shepOnAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "shepOn", shepOnT);
+    // THE DIRECTION ARROW. One press flips a rising Shepard into a falling one.
+    //
+    // The glyph carries the whole meaning, so it is the same in both languages and only
+    // the hover needs translating - which is also why this is a button and not a two-item
+    // dropdown: a dropdown would cost the row about 90 px to say what an arrow says in 24,
+    // on the tightest row in the tuning panel.
+    //
+    // setClickingTogglesState so a plain ButtonAttachment drives it, exactly like the
+    // Shepard switch beside it; onStateChange (not onClick) keeps the glyph honest when
+    // the parameter moves from somewhere else - host automation, a preset load, an undo.
+    shepDirBtn.setClickingTogglesState (true);
+    // BOTH STATES ARE LIVE, so neither may read as "off". The first version gave the
+    // untoggled state a near-background slate and the toggled state the panel hue, which
+    // is the idiom for a switch that is on or off - but this is a DIRECTION, and "up" is
+    // not less of an answer than "down". Photographed, the arrow was darker with the
+    // Shepard running than with it stopped: it looked disabled exactly when it mattered,
+    // and in a panel of purple pills it read as a hole rather than as a control.
+    //
+    // Both states now carry the panel's hue and differ in FILL rather than in presence -
+    // outlined for up, solid for down - which is the same pair the transition chips use.
+    shepDirBtn.setColour (juce::TextButton::buttonColourId, cTuning.withAlpha (0.22f));
+    shepDirBtn.setColour (juce::TextButton::buttonOnColourId, cTuning.withAlpha (0.85f));
+    shepDirBtn.setColour (juce::TextButton::textColourOffId, cTuning.brighter (0.55f));
+    shepDirBtn.setColour (juce::TextButton::textColourOnId, juce::Colours::black);
+    shepDirBtn.setName ("arrow"); // the painter draws the glyph - see GalacticLnF
+    shepDirBtn.setMouseClickGrabsKeyboardFocus (false);
+    shepDirBtn.onStateChange = [this]
+    {
+        shepDirBtn.setButtonText (shepDirBtn.getToggleState()
+                                      ? juce::String::fromUTF8 ("\xe2\x86\x93")   // down
+                                      : juce::String::fromUTF8 ("\xe2\x86\x91")); // up
+    };
+    shepDirBtn.onStateChange();
+    shepDirAtt = std::make_unique<ButtonAttachment> (processorRef.apvts, "shepDown", shepDirBtn);
+    addAndMakeVisible (shepDirBtn);
     configCombo (shepModeBox, "shepMode", shepModeAtt, cTuning, {});
+    // SMALL-ITEM BOXES, for the same reason the LFO row's three are: these hold PHRASES
+    // ("Sync Project Tempo", "Bend de periode"), not one-word modes, and the row's
+    // meaning is already carried by the SHEPARD toggle beside them.
+    //
+    // Tried and REVERTED one commit ago, on a measurement that was wrong: the walk went
+    // width first and reported 820x680, which read as 60 px of width bought with 130 of
+    // height. Measured both ways round it is 850x550 - a smaller window than the 880x550
+    // it replaces, in both dimensions at once. The change was always right; the ruler was
+    // one-sided.
+    shepModeBox.setName (fgfit::kSmallComboName);
+    shepRiseBox.setName (fgfit::kSmallComboName);
     // Switching mode swaps which rate control is on screen, so it must re-lay the
     // row NOW - the attachment only moves the parameter, never the layout.
     shepModeBox.onChange = [this] { resized(); repaint(); refocus(); };
     configCombo (shepDivBox, "shepDiv", shepDivAtt, cTuning, {});
+    // ...and it RE-LAYS OUT when the division changes, because its width is reserved from
+    // what the SELECTED item needs. Without this the reservation is only true at the
+    // moment the row was laid out: pick "1/16" at a narrow window and the box keeps the
+    // width "4" was given. configCombo's own handler is kept - it is the focus return.
+    shepDivBox.onChange = [this] { resized(); refocus(); };
     // configFader dresses them as the standard vertical fader; these two live in a
     // 22 px row, so they are re-dressed horizontal with a value box at their right.
     configFader (shepTimeFader, "shepTime", shepTimeAtt, cTuning, {});
     shepTimeFader.setSliderStyle (juce::Slider::LinearHorizontal);
     shepTimeFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 15);
     shepTimeFader.setNumDecimalPlacesToDisplay (0);
-    configFader (shepLevelFader, "shepLevel", shepLevelAtt, cTuning, {});
-    shepLevelFader.setSliderStyle (juce::Slider::LinearHorizontal);
-    shepLevelFader.setTextBoxStyle (juce::Slider::TextBoxRight, false, 44, 15);
-    shepLevelFader.setNumDecimalPlacesToDisplay (0);
+    configCombo (shepRiseBox, "shepRise", shepRiseAtt, cTuning, {});
 
     // "Spectrum to Scale" (Sethares): generate + count + reverse + period + save,
     // plus the sorted degree/height list.
     configGroup (gSpecScale, cSpecScale);
+    // ...and IMMEDIATELY after it, before a single control of this column: the section
+    // frame has to sit ABOVE the group's interior fill and BELOW everything clickable,
+    // and in JUCE that is decided by the order these two lines run in. See SpecSections.
+    specSections.col = cSpecScale;
+    addChildComponent (specSections);   // shown by resized(), per mode
     dissBtn.setColour (juce::TextButton::buttonColourId, cSpecScale.withAlpha (0.35f));
     dissBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
     dissBtn.setMouseClickGrabsKeyboardFocus (false);
@@ -1931,17 +2716,20 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // the segment picker.
     specModeBox.addItem ("Find tunings based on beating", 1);
     specModeBox.addItem ("Adapt spectrum to tuning based on beating", 2);
-    specModeBox.addItem ("From spectrum's segment", 3);
+    specModeBox.addItem ("Find tunings from spectrum's segment", 3);
     tuneSourceBox.addItem ("From current tuning", 1);
-    tuneSourceBox.addItem ("From all possible tunings", 2);
+    // "all tunings", not "all possible tunings": see applyLanguage() for why the word
+    // this box could not afford is the one that was adding nothing.
+    tuneSourceBox.addItem ("From all tunings", 2);
     tuneSourceBox.setSelectedId (1, juce::dontSendNotification);
     tuneScopeBox.addItem ("0 vs all", 1);
-    tuneScopeBox.addItem ("all vs all", 2);
-    tuneScopeBox.setTooltip (
-        "How a combination is SCORED.\n"
-        "*0 vs all* - each note is judged only by its beating against the root (0).\n"
-        "*all vs all* - every pair of notes in the combination counts.");
-    tuneScopeBox.setSelectedId (2, juce::dontSendNotification); // "all vs all" by default
+    // Sentence case, like every other item and caption in this column. It used to be
+    // "all vs all", and beside "0 vs all" - which opens on a digit and so reads as
+    // capitalised whatever you do - that lower-case "a" was the only lower-case opening
+    // letter in the whole box. See applyLanguage() for the pair this is translated to.
+    tuneScopeBox.addItem ("All vs all", 2);
+    // (its hover is written by applyLanguage(); set once here it stayed English for ever)
+    tuneScopeBox.setSelectedId (2, juce::dontSendNotification); // "All vs all" by default
     for (auto* b : { &tuneSourceBox, &tuneScopeBox })
     {
         b->setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
@@ -1952,6 +2740,14 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     specModeBox.setSelectedId (processorRef.isSegmentModeActive() ? 3 : 1, juce::dontSendNotification); // restored state
     specModeBox.setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
     specModeBox.setMouseClickGrabsKeyboardFocus (false);
+    // A SMALL-ITEM BOX, and this one is why the hatch has to be measured rather than
+    // assumed. Its three items are SENTENCES ("Adapt spectrum to tuning based on
+    // beating"), it is 192x34, and that height was chosen so they take TWO lines. At the
+    // default face they take one and get cut - the shipped 1200x650 read "Find tunings
+    // based on beati..." - because juce::Label gives its painter one line per font height
+    // and this font is too tall for two. Dropped to the small face they fit two lines of
+    // 154 px, which is what the box was built for.
+    specModeBox.setName (fgfit::kSmallComboName);
     lastSpecMode = specModeBox.getSelectedId();
     specModeBox.onChange = [this]
     {
@@ -1971,6 +2767,13 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // --- Adapt-spectrum mode (2): target, partial count, goal, range, amplitudes ---
     adaptTargetBox.addItem ("To the loaded tuning", 1);
     adaptTargetBox.addItem ("To the chord held now", 2);
+    // SMALL-ITEM BOXES, for the same reason as the mode box above them: their items are
+    // PHRASES, not one-word modes, and they sit in a column whose painted titles already
+    // say what they are for. At the default face "To the chord held now" needs 165 px of
+    // the 164 the column gives and "De totes les afinacions" needs 167 - one and three
+    // pixels, which is a squeeze nobody can see and every check now reports honestly.
+    tuneSourceBox.setName (fgfit::kSmallComboName);
+    adaptTargetBox.setName (fgfit::kSmallComboName);
     adaptTargetBox.setSelectedId (1, juce::dontSendNotification);
     for (const int n : { 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24 })
         adaptPartialsBox.addItem (juce::String (n), n);
@@ -1999,24 +2802,27 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         ed->onFocusLost  = [this] { syncRealtimeLink(); };
         addChildComponent (*ed);
     }
-    // --- The REGISTER RANGE the adaptation is optimised over -------------------
-    // ONE number: N STEPS of the loaded tuning, counted UP from the note being played (see
-    // the block comment at registerDegreesPerPeriod). A step is the only unit every tuning
-    // this instrument loads really has, and an anchor the hands move makes the range follow
-    // the register actually being played instead of a pair of fixed pitches.
+    // --- The REGISTER BAND the adaptation is optimised over --------------------
+    // ONE number: N PERIODS of the loaded tuning, counted BOTH WAYS from the note being
+    // played (see the block comment at registerDegreesPerPeriod). A period is the unit the
+    // tuning itself is built from, so the number reads as a musical width in every scale,
+    // and an anchor the hands move makes the band follow the register actually being played
+    // instead of a pair of fixed pitches.
     {
-        auto* ed = &adaptRegStepsEdit;
+        auto* ed = &adaptRegPeriodsEdit;
         ed->setJustification (juce::Justification::centred);
         ed->setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
         ed->setColour (juce::TextEditor::outlineColourId, cSpecScale.withAlpha (0.7f));
         ed->setIndents (4, 2);
-        // A COUNT: up to three digits, no sign. The range runs upward from the note being
-        // played, so a negative width is not a direction, it is a typo - and the old field
-        // admitted "-" only because a period NUMBER could legitimately be negative.
-        ed->setInputRestrictions (3, "0123456789");
+        // A WIDTH IN PERIODS: up to four characters, a decimal point allowed (a period is a
+        // coarse unit - 1902 cents in Bohlen-Pierce - so half of one is a real setting), a
+        // comma accepted because that is the decimal separator on screen in Catalan, and no
+        // sign at all. The width runs both ways by construction, so a negative number is
+        // not a direction, it is a typo.
+        ed->setInputRestrictions (4, "0123456789.,");
         ed->setSelectAllWhenFocused (true);
-        ed->onReturnKey = [this] { commitAdaptRegisterSteps(); refocus(); };
-        ed->onFocusLost = [this] { commitAdaptRegisterSteps(); };
+        ed->onReturnKey = [this] { commitAdaptRegisterPeriods(); refocus(); };
+        ed->onFocusLost = [this] { commitAdaptRegisterPeriods(); };
         addChildComponent (*ed);
     }
     makeLabel (adaptPartialsLbl, cSpecScale); adaptPartialsLbl.setVisible (false);
@@ -2026,16 +2832,22 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // (the caption, the field and an aggregate box that has since gone): the caption still
     // has to leave the field its full width in Catalan, and RhythmVerify measures that.
     adaptRegLbl.setFont (juce::Font (juce::FontOptions (10.0f).withStyle ("Bold")));
-    // WHAT N AMOUNTS TO, and WHICH NOTE it is counted from - one line, under the field.
-    // Without it N is a magic number: "62" says nothing about being two periods, and a
-    // range that hangs off a note nobody named is a control the user cannot aim.
+    // HOW FAR N REACHES EACH WAY, and WHICH NOTE it is counted from - one line, under the
+    // field. Without it the two ends are invisible: a band that hangs off a note nobody
+    // named is a control the user cannot aim, and one shortened by the end of the keyboard
+    // would look symmetric while the search used something else.
     adaptRegSpanLbl.setJustificationType (juce::Justification::topLeft);
     adaptRegSpanLbl.setColour (juce::Label::textColourId, cSpecScale.withAlpha (0.8f));
-    // 9.5 pt, half a point under its neighbours: this line carries the widest numbers the
-    // panel can produce (a one-degree-per-period scale reaches anchor "-10:0" and 127
-    // steps), and at 10 pt the Catalan form of that overflowed its single line by 8 px.
-    // A Label answers that by condensing to 70%, which is unreadable and looks intentional.
-    adaptRegSpanLbl.setFont (juce::Font (juce::FontOptions (9.5f)));
+    // 9 pt, a point and a half under its neighbours: this line carries the widest numbers
+    // the panel can produce - a one-degree-per-period scale reaches an anchor of "-10:0",
+    // the width takes its two-sided form at the ends of the keyboard ("-7.5/+8.0"), the two
+    // band edges are five digits each, and an absolute .tun adds its "(no period)" marker on
+    // top of all of that. At 10 pt the Catalan form overflowed by 8 px and at 9.5 by 7 (both
+    // measured by the layout probe, which is the only thing in this build that can see it:
+    // a Label answers an overflow by CONDENSING to 70%, which is unreadable and looks
+    // intentional). Every one of those forms is a readoutVariant below, so this size is
+    // checked and not hoped for.
+    adaptRegSpanLbl.setFont (juce::Font (juce::FontOptions (9.0f)));
     adaptRegSpanLbl.setBorderSize (juce::BorderSize<int> (0, 1, 0, 1));
     adaptRegSpanLbl.setMinimumHorizontalScale (1.0f); // it must FIT, not condense
     addChildComponent (adaptRegSpanLbl);
@@ -2045,7 +2857,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // reopening the window while a REALTIME link was running computed "no link wanted" and
     // switched the user's running follower off. The timer picks it up on its first tick,
     // when the panel really does know what it is showing.
-    adaptRegStepsEdit.setText (juce::String (registerStepsEffective()), juce::dontSendNotification);
+    adaptRegPeriodsEdit.setText (juce::String (registerPeriodsEffective(), 1), juce::dontSendNotification);
     adaptInfoLbl.setJustificationType (juce::Justification::topLeft);
     adaptInfoLbl.setColour (juce::Label::textColourId, cSpecScale.brighter (0.2f));
     adaptInfoLbl.setFont (juce::Font (juce::FontOptions (10.5f)));
@@ -2077,7 +2889,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // The two REALTIME buttons. They are plain toggles in the editor; everything that
     // makes them safe - the throttle, the coalescing, the feedback-loop refusal and the
     // single undo step - lives in the processor, so it also works with this window shut.
-    for (auto* b : { &chordRtBtn, &adaptRtBtn })
+    for (auto* b : { &chordRtBtn, &adaptRtBtn, &lookaheadBtn })
     {
         b->setMouseClickGrabsKeyboardFocus (false);
         addChildComponent (*b);
@@ -2085,6 +2897,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     chordRtBtn.onClick = [this] { chordRtOn = ! chordRtOn; syncRealtimeLink(); resized(); refocus(); };
     adaptRtBtn.onClick = [this]
     { adaptRtOn = ! adaptRtOn; syncAdaptTargetLock(); syncRealtimeLink(); resized(); refocus(); };
+    // LOOKAHEAD rides on the same syncRealtimeLink path as everything else on this panel,
+    // so the processor learns about it through the settings it already receives on every
+    // touch - and re-reports its latency from there (see applyLookahead).
+    lookaheadBtn.onClick = [this] { lookaheadOn = ! lookaheadOn; syncRealtimeLink(); resized(); refocus(); };
     // Two labelled view buttons: "Results" = the list of ALL found chords;
     // "Tuning info" = the LOADED chord's degrees ranked like any scale.
     for (auto* b : { &chordViewBack, &chordViewFwd })
@@ -2097,7 +2913,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
 
     // --- Chord search (mode 3): n notes, period, min/max, list count, Transmute ---
     for (int n = 2; n <= 8; ++n) chordNotesBox.addItem (juce::String (n), n);
-    chordNotesBox.setSelectedId (3, juce::dontSendNotification);
+    // FIVE, not three ("que por defecto sean 5 notas"). Three notes is a triad and the
+    // search is for TUNINGS: five is where the result starts being a scale you can play
+    // rather than one chord, and it is still well inside what the search does quickly.
+    chordNotesBox.setSelectedId (5, juce::dontSendNotification);
     for (const int c : { 4, 8, 12, 16, 24 }) chordCountBox.addItem (juce::String (c), c);
     chordCountBox.setSelectedId (12, juce::dontSendNotification);
     chordMinMaxBox.addItem ("Min", 1); // most consonant
@@ -2145,8 +2964,8 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         ed->setSelectAllWhenFocused (true);
         ed->onReturnKey  = [this] { syncRealtimeLink(); refocus(); };
         ed->onFocusLost  = [this] { syncRealtimeLink(); };
-        ed->setTooltip (tr ("Minimum interval between generated notes, in cents (also to the tonic and the period).",
-                            "Interval m\xc3\xadnim entre notes generades, en cents (tamb\xc3\xa9 respecte a la t\xc3\xb2nica i el per\xc3\xado" "de)."));
+        // (its hover is written by applyLanguage(): a correct tr() pair set ONLY here
+        //  would be frozen in the constructor's language for the editor's whole life)
         addChildComponent (*ed);
         makeLabel (*pr.second, cSpecScale);
         pr.second->setVisible (false);
@@ -2182,7 +3001,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         juce::String err;
         if (! processorRef.loadChordAsScale (row, err))
             juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                tr ("Chords based on beating", "Acords basats en batec"), err, this);
+                tr ("Chords based on beating", "Acords basats en batec"), trErr (err), this);
         else { chordDegView = true; resized(); } // jump to the loaded chord's ranked degrees
         refocus();
     };
@@ -2195,15 +3014,12 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // their TOTAL beating (every pair counted). Items rebuilt live per tuning.
     nadBox.setColour (juce::ComboBox::outlineColourId, cSpecScale.withAlpha (0.7f));
     nadBox.setMouseClickGrabsKeyboardFocus (false);
-    nadBox.setTooltip (tr (
-        "What the list below shows: Degrees = each scale step against the tonic. Dyads, triads, tetrads... = EVERY combination of that many scale notes, ranked by total beating (all pairs counted, not just against 0).",
-        "Qu\xc3\xa8 mostra la llista: Graus = cada pas contra la t\xc3\xb2nica. D\xc3\xad""ades, tr\xc3\xad""ades, t\xc3\xa8trades... = TOTES les combinacions d'aquest nombre de notes, ordenades pel batec total (tots els parells, no nom\xc3\xa9s contra el 0)."));
+    // (tooltip in applyLanguage)
     addChildComponent (nadBox); // kept for state; the shared "Notes" box drives it now
     nadView.setViewedComponent (&nadList, false);
     nadView.setScrollBarsShown (true, false);
     addChildComponent (nadView);
-    nadList.tip = tr ("Combinations of scale degrees with the LEAST total beating first (colour = the value's height on the beating range).",
-                      "Combinacions de graus de l'escala amb MENYS batec total primer (color = al\xc3\xa7""ada del valor dins el rang de batec).");
+    // (tip in applyLanguage)
 
     segList.proc      = &processorRef;
     segList.ratioName = [] (double r) { return justName (r); };
@@ -2212,6 +3028,22 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     segView.setScrollBarsShown (true, false);
     addAndMakeVisible (segView);
     makeLabel (segPeriodLbl, cSpecScale);
+    // EVERY LEFT-HAND CAPTION IN THE SPECTRUM-vs-TUNING COLUMN, JUSTIFIED ONCE.
+    //
+    // makeLabel's default is CENTRED, and these seven are captions: each names the
+    // control immediately to its right, so a centred one floats away from what it names
+    // by however much its cell exceeds its word - which differs per language. Four of
+    // them were re-justified inside resized() instead, on every layout pass, and the
+    // other three only got it because they happen to go through the `caption` helper.
+    // That is one decision written in three different places, and it drifted: the two
+    // rows that did NOT set it were the two that had never been touched since.
+    //
+    // Set here, where the labels are made, it is a property of the label - so a row that
+    // stops using `caption` cannot silently lose it, and `caption` setting it again is a
+    // no-op rather than the only thing holding it up.
+    for (auto* l : { &chordNotesLbl, &chordPerLbl, &chordMinLbl, &segPeriodLbl,
+                     &adaptPartialsLbl, &adaptRangeLbl, &adaptRegLbl })
+        l->setJustificationType (juce::Justification::centredLeft);
     segPeriodEdit.setText (processorRef.getSegmentPeriodText(), juce::dontSendNotification); // restored
     segPeriodEdit.setJustification (juce::Justification::centred);
     segPeriodEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
@@ -2232,13 +3064,29 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     segHelpLbl.setJustificationType (juce::Justification::topLeft);
     segHelpLbl.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
     segHelpLbl.setFont (juce::Font (juce::FontOptions (10.5f)));
+    // ...and the painter has to KEEP that 10.5, which it only does through the "small"
+    // escape hatch: GalacticLnF::getLabelFont puts a 12.5 px BOLD floor under every other
+    // label, and drawLabel asks IT, not the font set here. At 12.5 px only ONE line fits
+    // this 26 px box, so a two-line hint was drawn as one line squashed to 70% - the
+    // silent condensation a juce::Label does instead of clipping. This is the same class
+    // of hint as the play-keys line, which is what the hatch was made for.
+    segHelpLbl.setName ("small");
     addAndMakeVisible (segHelpLbl);
 
     // Spectrum Builder: typed intervals -> partials (Enter applies them).
     intervalEdit.setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff20202b));
     intervalEdit.setColour (juce::TextEditor::outlineColourId, cTimbre.withAlpha (0.7f));
     intervalEdit.setColour (juce::TextEditor::textColourId, juce::Colours::white);
-    intervalEdit.setIndents (8, 4);
+    // "adapta la caja de custom ratios para que los numeros no toquen su borde."
+    // A TextEditor's clearances are NOT symmetric out of the box: setIndents gives a left
+    // and a TOP indent with no bottom or right twin, and the default border is
+    // {1,1,1,3} - so the last row of digits was drawn one pixel from the outline and the
+    // first row started inside the pill's arc. The border is what actually CLIPS, so the
+    // room on all four sides is set there, and the indents only add to the two sides that
+    // have them. Measured by ratiosInkProbeForTests, which reads these values back out of
+    // JUCE rather than repeating them.
+    intervalEdit.setBorder (juce::BorderSize<int> (4, 5, 5, 6)); // top, left, bottom, right
+    intervalEdit.setIndents (4, 2);
     intervalEdit.setFont (juce::Font (juce::FontOptions (13.0f)));
     // A real multi-line text AREA now: the shared engine box hands the custom view far
     // more room than the old one-line strip, so a long interval list wraps and stays
@@ -2265,11 +3113,35 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             }
             else
                 juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                    tr ("Spectrum Builder", "Constructor d'espectre"), err, this);
+                    tr ("Spectrum Builder", "Constructor d'espectre"), trErr (err), this);
         }
         refocus();
     };
     intervalEdit.onEscapeKey = [this] { refocus(); };
+    // ...AND CLICKING AWAY COMMITS IT TOO. There was only a Return handler, so a user who
+    // typed a spectrum and then clicked anywhere else lost it silently - which is most of
+    // "escribo algo en la caja de texto de intervalos y no se aplica". Every other text
+    // field in this window commits on blur (the reference-A box, the period boxes, the
+    // smallest-interval boxes); this one was the exception, in the section where it is
+    // least forgivable, because the box IS the feature.
+    //
+    // Guarded on the text having actually changed, so a blur that follows a Return - or a
+    // blur with nothing typed - does not re-run the load, push a second undo step, and
+    // re-seed every sounding voice's phases for no reason.
+    intervalEdit.onFocusLost = [this]
+    {
+        const auto typed = intervalEdit.getText().trim();
+        // An EMPTY box is an unfinished edit, not an instruction to throw the spectrum
+        // away: "que se pueda quitar el 1" is about being able to delete it and type
+        // something else, and the Remove button is the one control that means "drop it".
+        // Committing empty would also pop an error dialog on every click away.
+        if (intervalCommitting || typed.isEmpty()
+            || typed == processorRef.getTimbreSource().trim()
+            || intervalEdit.onReturnKey == nullptr)
+            return;
+        const juce::ScopedValueSetter<bool> oneAtATime (intervalCommitting, true);
+        intervalEdit.onReturnKey();
+    };
     // Every value in its own colour, re-done on each edit. See recolourIntervalTokens().
     intervalEdit.onTextChange = [this] { recolourIntervalTokens(); };
     // No focus-grow any more (the box is already big); on blur just show the start,
@@ -2290,7 +3162,7 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     }
 
     // Master reference A = <hz> (transposes everything, all tuning modes). A text
-    // box you type the Hz into (with "hz" shown to its right), not a fader.
+    // box you type the Hz into (with "Hz" shown to its right), not a fader.
     refAEdit.setJustification (juce::Justification::centred);
     refAEdit.setFont (juce::Font (juce::FontOptions (13.0f))); // fits the slim cell, no clipped descenders
     refAEdit.setInputRestrictions (11, "0123456789."); // fits C3's unrounded 261.6255653
@@ -2299,16 +3171,19 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     refAEdit.setColour (juce::TextEditor::textColourId, juce::Colours::white);
     refAEdit.setIndents (8, 2); // clear the rounded (pill) ends
     refAEdit.setSelectAllWhenFocused (true);
-    refAEdit.setText (juce::String ((double) processorRef.apvts.getRawParameterValue ("refA")->load()
-                                    * 0.59460355750136051, 7) // shown as C3 (= A * 2^(-9/12)), unrounded
-                          .trimCharactersAtEnd ("0").trimCharactersAtEnd ("."),
-                      juce::dontSendNotification);
+    // ...and the first value through the ONE formatter (see refreshRefAText), rather than
+    // a second copy of the format string here. The copy is how this field came to show a
+    // number that was not the value: it wrote all seven decimals unconditionally, and a
+    // juce::TextEditor does not clip a string it cannot hold - it SCROLLS, with the caret
+    // parked at the end after setText. At 690x550 "261.6255653" was drawn as "55653": no
+    // ellipsis, no cut glyph, just a plausible and entirely wrong 55653 Hz.
+    refreshRefAText();
     refAEdit.onReturnKey  = [this] { commitRefA(); refocus(); };
     refAEdit.onFocusLost  = [this] { commitRefA(); };
     refAEdit.onEscapeKey  = [this] { refreshRefAText(); refocus(); };
     addAndMakeVisible (refAEdit);
     makeLabel (lblRefA, cEssentials);
-    lblRefHz.setText ("hz", juce::dontSendNotification);
+    lblRefHz.setText ("Hz", juce::dontSendNotification); // the SI capital - see ScaleKeyboard
     lblRefHz.setJustificationType (juce::Justification::centredLeft);
     lblRefHz.setColour (juce::Label::textColourId, cEssentials.brighter (0.15f));
     lblRefHz.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
@@ -2345,6 +3220,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     addAndMakeVisible (helpLabel);
 
     keyboard.setDegreeLabeller ([this] (int d) { return degreeLabel (processorRef, d); });
+    // Note names (off unless the user turned them on in a previous session - the
+    // preference lives in the processor's global settings file, not in patch state).
+    noteNamesOn = processorRef.getKeyboardNoteNames();
+    refreshDegreeNames();
     keyboard.setHoverTextProvider ([this] (int d) -> juce::String
     {
         // Floating window: EVERY key answers. A degree with no just interval near
@@ -2463,19 +3342,37 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         // EVERY period, not just the one that was right-clicked.
         w->addButton (tr ("Delete", "Esborra"), 2);
         w->addButton (tr ("Cancel", "Cancel\xc2\xb7la"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+        activePrompt = w; // so the destructor can dismiss an orphaned dialog
+        // NAMED, because this dialog is built inside onEditKey - a lambda - and MSVC
+        // resolves a bare `this` in a NESTED lambda's init-capture to the enclosing
+        // CLOSURE rather than to the object. SafePointer<Editor>(this) then does not
+        // compile, and the shape that does compile is not the one that is wanted.
+        FractalAdditiveAudioProcessorEditor* const selfEd = this;
+        // THE EDITOR IS THE THING THAT DIES, NOT THE WINDOW.
+        //
+        // This callback used to guard a SafePointer to the AlertWindow and capture `this`
+        // RAW - which is exactly backwards. ModalComponentManager invokes the callback
+        // BEFORE deleting the window, so that pointer is the one that cannot be null;
+        // the editor is a plugin UI the host may close at any moment, and an AlertWindow
+        // is a TopLevelWindow that outlives it. Right-click a key, close the plugin
+        // window, press OK: processorRef, tr() and refocus() all read freed memory, and
+        // the tuning is rewritten from it. savePresetFlow states the correct pattern in
+        // as many words; this is that pattern, plus the activePrompt registration that
+        // lets ~Editor dismiss the dialog instead of leaving it orphaned on screen.
         w->enterModalState (true, juce::ModalCallbackFunction::create (
-            [this, safe = juce::Component::SafePointer<juce::AlertWindow> (w), deg] (int r)
+            [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (selfEd),
+             win  = juce::Component::SafePointer<juce::AlertWindow> (w), deg] (int r)
             {
-                if (safe == nullptr) return;
-                const auto txt = safe->getTextEditorContents ("v");
+                if (safe == nullptr || win == nullptr) return;
+                const auto txt = win->getTextEditorContents ("v");
                 juce::String err;
-                if (r == 1 && ! processorRef.editTuningDegree (deg, txt, err))
+                if (r == 1 && ! safe->processorRef.editTuningDegree (deg, txt, err))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        tr ("Edit degree", "Edita el grau"), err, this);
-                if (r == 2 && ! processorRef.deleteTuningDegree (deg, err))
+                        safe->tr ("Edit degree", "Edita el grau"), safe->trErr (err), safe);
+                if (r == 2 && ! safe->processorRef.deleteTuningDegree (deg, err))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        tr ("Delete degree", "Esborra el grau"), err, this);
-                refocus();
+                        safe->tr ("Delete degree", "Esborra el grau"), safe->trErr (err), safe);
+                safe->refocus();
             }), true);
     };
     // Ctrl+click anywhere on the keys: add a note at that exact spot - it joins every
@@ -2498,26 +3395,32 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
         w->addTextEditor ("v", pre);
         w->addButton (tr ("OK", "OK"), 1, juce::KeyPress (juce::KeyPress::returnKey));
         w->addButton (tr ("Cancel", "Cancel\xc2\xb7la"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+        activePrompt = w; // so the destructor can dismiss an orphaned dialog
+        // Same fix as Edit degree above, for the same reason: the EDITOR is what can die
+        // under an open dialog, so it is the editor that is held by SafePointer - and the
+        // same named local, for the same MSVC nested-lambda reason stated there.
+        FractalAdditiveAudioProcessorEditor* const selfEd = this;
         w->enterModalState (true, juce::ModalCallbackFunction::create (
-            [this, safe = juce::Component::SafePointer<juce::AlertWindow> (w)] (int r)
+            [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (selfEd),
+             win  = juce::Component::SafePointer<juce::AlertWindow> (w)] (int r)
             {
-                if (safe == nullptr) return;
-                const auto txt = safe->getTextEditorContents ("v").trim();
+                if (safe == nullptr || win == nullptr) return;
+                const auto txt = win->getTextEditorContents ("v").trim();
                 if (r == 1)
                 {
                     double ratio = 0.0;
                     TuningManager::DegreeSrc src;
                     juce::String err;
                     if (! TuningManager::parsePitchSpec (txt, ratio, src) || ! (ratio > 0.0))
-                        err = tr ("Invalid value. Use cents with a decimal point (\"702.0\") or a ratio (\"3/2\").",
-                                  "Valor inv\xc3\xa0lid. Fes servir cents amb punt decimal (\"702.0\") o un ratio (\"3/2\").");
+                        err = safe->tr ("Invalid value. Use cents with a decimal point (\"702.0\") or a ratio (\"3/2\").",
+                                        "Valor inv\xc3\xa0lid. Fes servir cents amb punt decimal (\"702.0\") o un ratio (\"3/2\").");
                     else
-                        processorRef.addNoteToTuning (ratio, err, txt);
+                        safe->processorRef.addNoteToTuning (ratio, err, txt);
                     if (err.isNotEmpty())
                         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                            tr ("Add note", "Afegeix nota"), err, this);
+                            safe->tr ("Add note", "Afegeix nota"), safe->trErr (err), safe);
                 }
-                refocus();
+                safe->refocus();
             }), true);
     };
     // Hover dissonance: every other key shows its Sethares roughness AGAINST the
@@ -2563,6 +3466,10 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
             if (live == RtLink::SpectrumFromChord) { adaptRtOn = true; syncAdaptTargetLock(); }
             else { chordRtOn = true; tuneSourceBox.setSelectedId (2, juce::dontSendNotification); }
         }
+        // The LOOKAHEAD toggle is adopted whether or not a link is running: it is part of
+        // the saved realtime settings, and a reopened panel showing it OFF while the
+        // processor is reporting latency would be the same lie the block above fixes.
+        lookaheadOn = processorRef.isLookaheadArmed();
     }
 
     applyLanguage();
@@ -2573,15 +3480,51 @@ FractalAdditiveAudioProcessorEditor::FractalAdditiveAudioProcessorEditor (
     // "can't move faders while a note plays unless I started dragging before" bug.
     tooltipWindow.setInterceptsMouseClicks (false, false);
 
+    // The colour keyboard plays through the processor's own note path (see uiNoteCollector):
+    // a click here must not share note bookkeeping with the host's stream.
+    keyboard.onPlay = [this] (int note, float vel) { processorRef.playUiNote (note, vel); };
+    keyboard.onStop = [this] (int note)            { processorRef.stopUiNote (note); };
     setWantsKeyboardFocus (true);
     setSize (1200, 650); // +30 vs before for the keyboard's below-key hover-delta strip
+    // The TRANSITION cell, before the first paint and NOT left to the first timer tick.
+    // configFader made BOTH Time faders visible and they share ONE rectangle, so until
+    // this runs the panel is two sliders stacked on each other - which is exactly what
+    // RhythmVerify's "no two controls overlap" check caught, in an editor built by a
+    // verifier that has no message loop to tick a timer with. After setSize, because it
+    // re-lays the cell it just changed.
+    applyTransitionMode();
     startTimerHz (30); // also the reconcile rate for stuck/ghost computer-keyboard notes
-    juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<juce::Component> (this)]
-    { if (safe != nullptr) safe->grabKeyboardFocus(); });
+    // From here on a language switch may re-run the live read-out pass itself (see the
+    // tail of applyLanguage). Not before: the applyLanguage() above runs ahead of
+    // setSize() and applyEngineState(), and a timer tick there would read a half-built
+    // editor and, worse, set lastEngineShown so applyEngineState() would then skip.
+    editorConstructed = true;
+    juce::Desktop::getInstance().addGlobalMouseListener (&gestureWatch);   // see refocusAllowed
+    // The load watch starts from NOW: what was measured while no window was open (peaks,
+    // overruns, a slow tick) is not what this window should open with a warning about.
+    processorRef.takeLoadSnapshot();
+    // The Standalone takes the keyboard as it opens, so the letters play at once. A plugin
+    // does not: opening its window must leave the keys with the host (see focusReclaimState).
+    if (focusFollowsPointer())
+        queueOpenFocusGrab();
+
+    // THE ONE CALL SITE OF THE SELF-SNAPSHOT RIG (source/SnapshotRig.h).
+    //
+    // juce_add_plugin writes the Standalone's main(), so there is no entry point of ours
+    // to put this in; the command line is reachable from here through JUCEApplicationBase.
+    // On an ordinary launch this returns after one enum-less test and one StringArray
+    // lookup, before touching anything at all: in a plugin wrapper isStandaloneApp() is
+    // false and it leaves immediately, and in a standalone with no --snapshot flag it
+    // leaves on the next line. Nothing below it runs, nothing is allocated by it, and no
+    // state of this editor is read or written - a normal launch behaves exactly as it did
+    // before this line existed. It is last in the constructor for the same reason: by the
+    // time it can do anything, this editor is fully built.
+    fgsnap::runIfRequested();
 }
 
 FractalAdditiveAudioProcessorEditor::~FractalAdditiveAudioProcessorEditor()
 {
+    juce::Desktop::getInstance().removeGlobalMouseListener (&gestureWatch);
     stopTimer();
     // The amplitude window is a real top-level window: it must go before the panel it
     // shows (which is a member of this editor) and before the editor leaves the desktop,
@@ -2594,7 +3537,7 @@ FractalAdditiveAudioProcessorEditor::~FractalAdditiveAudioProcessorEditor()
     stopChordPreview();
     // Release any computer-keyboard notes still held when the UI closes.
     for (const auto& kv : heldKeys)
-        processorRef.keyboardState.noteOff (1, kv.second, 0.0f);
+        processorRef.stopUiNote (kv.second);
     heldKeys.clear();
     // Dismiss a still-open save-preset dialog so no orphaned modal window
     // survives the editor (its callback is already SafePointer-guarded).
@@ -2603,8 +3546,429 @@ FractalAdditiveAudioProcessorEditor::~FractalAdditiveAudioProcessorEditor()
     setLookAndFeel (nullptr);
 }
 
+// THE MAIN MENU, built in ONE place so the check that reads its items reads the menu a
+// click really opens (mainMenuItemsForTests).
+juce::PopupMenu FractalAdditiveAudioProcessorEditor::buildMainMenu()
+{
+    juce::PopupMenu m;
+    m.addItem (1, tr ("Reset all parameters", "Reinicia tots els par\xc3\xa0metres"));
+    m.addItem (2, catalan ? juce::String ("Language: English")
+                          : juce::String::fromUTF8 ("Idioma: catal\xc3\xa0"));
+    // NOTE NAMES. Ticked when the preference is on. When it is on but this tuning
+    // cannot be named, the item SAYS WHY on its own line rather than silently doing
+    // nothing - "solo para tunings regulares y para JI" means most scales get numbers,
+    // and an option that looks broken is worse than one that explains itself.
+    {
+        const auto why = noteNamesReason();
+        juce::String label = tr ("Note names on the keyboard",
+                                 "Noms de nota al teclat");
+        if (why.isNotEmpty())
+            label += " - " + tr ("numbers: ", "n\xc3\xbameros: ") + why;
+        m.addItem (3, label, true, noteNamesOn);
+        m.addItem (4, tr ("Note names: credits", "Noms de nota: cr\xc3\xa8" "dits"));
+    }
+    // WHERE THE PRESETS ACTUALLY ARE. The Save dialog names the folder once and then
+    // it is gone; every other way of finding it means guessing at a path under
+    // Documents. This opens it in the file manager - and creates it first, because
+    // before the first save it does not exist and Explorer would answer a nonexistent
+    // path with an error box instead of a folder.
+    m.addItem (5, tr ("Open preset folder", "Obre la carpeta de presets"));
+    // THE FREEZE WARNING (see refreshLoadWarning). ON unless the user turned it off - here or
+    // with the notice's own "Don't show this again" - and it never limits anything: it only
+    // says so, and the settings stay exactly where the user put them.
+    m.addItem (6, tr ("Warn when the synth is close to freezing",
+                      "Avisa quan el sinte estigui a punt de bloquejar-se"),
+               true, processorRef.getWarnNearFreeze());
+    return m;
+}
+
+// WHAT A MAIN-MENU CHOICE DOES (see buildMainMenu for the items). r = 0 is a dismissed menu.
+void FractalAdditiveAudioProcessorEditor::handleMainMenuChoice (int r)
+{
+    if (r == 1)
+    {
+        processorRef.requestHardSilence(); // never leave a note stuck sounding through Init
+        for (auto* p : processorRef.getParameters())
+            p->setValueNotifyingHost (p->getDefaultValue());
+        processorRef.clearScala();
+        processorRef.clearTimbre();
+        setIntervalText ({});
+        // Init also unroutes every Spectrum-to-Rhythm pulse.
+        for (auto& s : processorRef.getRhythm().slots)
+        {
+            s.enabled = false; s.partial = -1;
+            s.steps = 0; s.useRatio = false; s.ratio = 1.0; s.durMs = 60.0f; s.vel = 100;
+        }
+        // ...AND EVERY MODULATOR ROUTING, which is not a parameter and so
+        // survived every "reset all parameters" there has ever been.
+        //
+        // "AL DARLE A RESET ALL PARAMETERS EL PITCH SE MUEVE COMO SI TUVIESE
+        // ENVOLVENTE DE PITCH, Y POR MUCHO QUE CAMBIE LA ENVOLVENTE DE PITCH
+        // NO PUEDO QUITARSELO ... ES POR QUE A PESAR DE RESET ALL PARAMETERS
+        // SE QUEDO EL LFO PUESTO."
+        //
+        // Exactly that: an LFO mapped onto pitch keeps modulating after the
+        // reset, and nothing in the pitch ENVELOPE can stop it, because it is
+        // not the envelope doing it. The map lives in ModEngine, outside the
+        // APVTS, so setting every parameter to its default never touched it.
+        // Init means init.
+        for (int m = 0; m < ModEngine::kMods; ++m)
+            processorRef.getModEngine().unmapAll (m);
+        // The per-partial pencil edits are the same kind of state: not
+        // parameters, and a reset that leaves them behind hands the user a
+        // "default" patch with somebody else's amplitudes in it.
+        processorRef.setPartialGains ({}, false);
+        rhythmPanel.refreshSlots();
+        rhythmPanel.list.repaint();
+    }
+    else if (r == 2)
+    {
+        catalan = ! catalan;
+        applyLanguage();
+    }
+    else if (r == 3)
+    {
+        setNoteNamesForTests (! noteNamesOn);   // the one path, menu and check
+    }
+    else if (r == 4)
+    {
+        // The credit, where someone using the feature can actually find it.
+        // Names, not just licences: the notation, the algorithm and the font
+        // are three different people's work.
+        juce::NativeMessageBox::showMessageBoxAsync (
+            juce::MessageBoxIconType::InfoIcon,
+            tr ("Note names: credits", "Noms de nota: cr\xc3\xa8" "dits"),
+            juce::String::fromUTF8 (
+                catalan
+                  ? "Notaci\xc3\xb3 d'ups and downs, de Kite Giedraitis.\n\n"
+                    "Algorisme de grafia adaptat de \"Notation\", de Richie Greene "
+                    "(llic\xc3\xa8ncia MIT) - github.com/richiegreene/notation\n\n"
+                    "Glifs d'alteraci\xc3\xb3: notes.otf, de Sintel, del projecte tessera "
+                    "(llic\xc3\xa8ncia MIT) - github.com/Sin-tel/tessera\n\n"
+                    "La notaci\xc3\xb3 HEJI per a entonaci\xc3\xb3 justa (Marc Sabat i Thomas "
+                    "Nicholson, amb Wolfgang von Schweinitz) encara NO hi \xc3\xa9s: els seus "
+                    "glifs SMuFL nom\xc3\xa9s existeixen aqu\xc3\xad en format WOFF2, que JUCE no pot "
+                    "carregar, i dibuixar-los donaria quadres buits.\n\n"
+                    "Textos complets de les llic\xc3\xa8ncies: assets/fonts/NOTATION-LICENSES.txt"
+                  : "Ups and downs notation, devised by Kite Giedraitis.\n\n"
+                    "Spelling algorithm ported from \"Notation\" by Richie Greene "
+                    "(MIT licence) - github.com/richiegreene/notation\n\n"
+                    "Accidental glyphs: notes.otf by Sintel, from tessera "
+                    "(MIT licence) - github.com/Sin-tel/tessera\n\n"
+                    "HEJI, the just-intonation notation by Marc Sabat and Thomas "
+                    "Nicholson with Wolfgang von Schweinitz, is NOT here yet: its "
+                    "SMuFL glyphs exist here only as WOFF2, which JUCE cannot load, "
+                    "and drawing them would give empty boxes.\n\n"
+                    "Full licence texts: assets/fonts/NOTATION-LICENSES.txt"),
+            this);
+    }
+    else if (r == 5)
+    {
+        // createDirectory() on a folder that already exists is a no-op that
+        // returns ok, so there is no "does it exist" branch to get wrong -
+        // and it is the SAME getPresetFolder() the save and load paths use,
+        // so a test rig that redirected the folder opens the redirected one
+        // rather than the user's.
+        const auto dir = FractalAdditiveAudioProcessor::getPresetFolder();
+        dir.createDirectory();
+        dir.revealToUser();
+    }
+    else if (r == 6)
+    {
+        toggleWarnNearFreeze();
+    }
+    refocus();
+}
+
+void FractalAdditiveAudioProcessorEditor::toggleWarnNearFreeze()
+{
+    const bool on = ! processorRef.getWarnNearFreeze();
+    processorRef.setWarnNearFreeze (on);
+    // Off takes a warning that is up down with it. On shows an episode that is going on
+    // RIGHT NOW at once - waiting for the next one would say nothing through this one.
+    loadEpisodeRaised = on && loadPolicy.showing;
+    loadRefreshSeconds = 0.0;
+    if (! on)
+        withdrawNotice ("load");
+    else if (loadEpisodeRaised)
+        raiseLoadNotice();
+}
+
+void FractalAdditiveAudioProcessorEditor::queueOpenFocusGrab()
+{
+    openFocusGrabQueued = true;
+    juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<juce::Component> (this)]
+    { if (safe != nullptr) safe->grabKeyboardFocus(); });
+}
+
+bool FractalAdditiveAudioProcessorEditor::loadNoticeUp() const
+{
+    if (noticeOverlay.isVisible() && noticeKey == "load") return true;
+    for (const auto& q : noticeQueue)
+        if (q.key == "load") return true;
+    return false;
+}
+
+// THE FREEZE WARNING - "que te avise de cuando estas cerca de que haya un freeze, y te de
+// opcion a no mostrar de nuevo" (2026-09-19).
+//
+// Once per timer tick: take what the audio thread and the interface thread measured (see
+// dsp/LoadMonitor.h), and let the Policy decide whether an EPISODE is on. The notice goes up
+// ONCE per episode, keeps its numbers current while it lasts, and when the load calms down
+// it stays up with its final numbers and says so - a warning that vanished two seconds after
+// a burst of clicks could not be read. Closing it with X is honoured for the rest of that
+// episode; the next episode raises it again. "Don't show this again" turns the Menu option
+// off. NOTHING is limited: it says what costs the most and leaves every setting alone.
+void FractalAdditiveAudioProcessorEditor::refreshLoadWarning (double dtSeconds)
+{
+    if (loadWatchHeld) return;
+    const auto snap = processorRef.takeLoadSnapshot();
+    const bool was  = loadPolicy.showing;
+    const bool on   = loadPolicy.update (snap, dtSeconds);
+    if (on && ! was)
+    {
+        // The preference is read from the settings file once per EPISODE - a disk read, so
+        // never per tick - which also means another instance's "Don't show this again" is
+        // obeyed from its next episode on.
+        loadEpisodeRaised = processorRef.getWarnNearFreeze();
+        loadRefreshSeconds = 0.0;
+        if (loadEpisodeRaised)
+            raiseLoadNotice();
+        // ...and an option read as OFF here - another instance's "Don't show this again" -
+        // takes this instance's last notice down too, or it would sit through the whole of
+        // a new overload saying that nothing has come close.
+        else if (loadNoticeUp())
+            withdrawNotice ("load");
+        return;
+    }
+    if (! loadEpisodeRaised) return;
+    if (! loadNoticeUp())
+    {
+        // Closed with X (or by the Menu): silent for the rest of this episode - UNLESS the
+        // episode has turned into something the closed notice never said. A notice closed
+        // over "the load is high" says nothing about blocks now breaking up or the screen
+        // now freezing, and staying silent through that would hide exactly what it is for.
+        if (! on) { loadEpisodeRaised = false; return; }
+        if ((loadPolicy.kinds() & ~loadShownKinds) != 0)
+        {
+            loadRefreshSeconds = 0.0;
+            raiseLoadNotice();
+        }
+        return;
+    }
+    loadRefreshSeconds += dtSeconds > 0.0 && std::isfinite (dtSeconds) ? dtSeconds : 0.0;
+    if (! on)
+    {
+        loadEpisodeRaised = false;              // the episode is over: its final numbers
+        raiseLoadNotice();
+    }
+    else if (loadRefreshSeconds >= 0.5)         // twice a second: readable, never a flicker
+    {
+        loadRefreshSeconds = 0.0;
+        raiseLoadNotice();
+    }
+}
+
+// One place that puts the warning up or rewrites it, and remembers what it said.
+void FractalAdditiveAudioProcessorEditor::raiseLoadNotice()
+{
+    loadShownKinds = loadPolicy.kinds();
+    raiseNotice ([this, shown = loadPolicy] { renderLoadNotice (shown); }, "load");
+}
+
+// The warning's words, from the numbers it was raised (or last refreshed) with. A COPY, so
+// a language switch re-writes the same numbers in the other language - and an episode that
+// begins while the notice is closed, or with the option off, cannot rewrite the one that
+// is showing behind the user's back.
+void FractalAdditiveAudioProcessorEditor::renderLoadNotice (const fibload::Policy& shown)
+{
+    noticeOverlay.title = tr ("Close to freezing", "A punt de bloquejar-se");
+    noticeOverlay.body  = loadNoticeBody (shown);
+    noticeOverlay.actionText = tr ("Don't show this again", "No ho tornis a mostrar");
+    noticeOverlay.actionBtn.setTooltip (tr ("Turns this warning off. Menu: \"Warn when the synth is close to freezing\" turns it back on.",
+                                            "Apaga aquest av\xc3\xads. Men\xc3\xba: \"Avisa quan el sinte estigui a punt de bloquejar-se\" el torna a encendre."));
+    noticeOverlay.onAction = [this]
+    {
+        processorRef.setWarnNearFreeze (false);
+        loadEpisodeRaised = false;
+        withdrawNotice ("load");
+        refocus();
+    };
+}
+
+juce::String FractalAdditiveAudioProcessorEditor::loadNoticeBody (const fibload::Policy& L) const
+{
+    const auto pct = [] (float r) { return juce::String (juce::roundToInt (r * 100.0f)) + "%"; };
+    juce::String b;
+    // While the episode lasts: what it is NOW, and the worst so far. Once it is over, only
+    // the worst - a "now" would be a number from after the thing the notice is about.
+    if (L.showing)
+        b << tr ("The synth is using ", "El sinte fa servir el ") << pct (L.nowEma)
+          << tr (" of the time the host gives it for each block of audio (at its worst so far ",
+                 " del temps que el host li d\xc3\xb3na per a cada bloc d'\xc3\xa0udio (en el pitjor moment, el ")
+          << pct (L.worstEma)
+          << tr (", and ", ", i el ") << pct (L.worstPeak)
+          << tr (" in the worst single block).", " en el pitjor bloc).");
+    else
+        b << tr ("At its worst the synth used ", "En el pitjor moment el sinte ha fet servir el ") << pct (L.worstEma)
+          << tr (" of the time the host gives it for each block of audio (",
+                 " del temps que el host li d\xc3\xb3na per a cada bloc d'\xc3\xa0udio (el ")
+          << pct (L.worstPeak) << tr (" in the worst single block).", " en el pitjor bloc).");
+    if (L.overruns > 0)
+        b << " " << juce::String (L.overruns)
+          << (L.overruns == 1 ? tr (" block took longer than that, and it was a click or a gap in the sound.",
+                                    " bloc ha trigat m\xc3\xa9s que aix\xc3\xb2, i ha estat un clic o un forat en el so.")
+                              : tr (" blocks took longer than that, and each one was a click or a gap in the sound.",
+                                    " blocs han trigat m\xc3\xa9s que aix\xc3\xb2, i cadascun ha estat un clic o un forat en el so."));
+    b << tr (" At 100% the audio breaks up, and a host kept waiting long enough stops answering altogether.",
+             " Al 100% l'\xc3\xa0udio es trenca, i un host que espera prou temps deixa de respondre del tot.");
+    if (L.oscillators > 0)
+        b << "\n\n" << tr ("About ", "Sonaven uns ") << juce::String (L.oscillators)
+          << tr (" oscillators were sounding at once (notes \xc3\x97 partials)",
+                 " oscil\xc2\xb7ladors alhora (notes \xc3\x97 parcials)")
+          << (L.mixOscillators > 0
+                ? juce::String (", ") + juce::String (L.mixOscillators)
+                    + tr (" of them in the MIX corners of the Preset Playground.",
+                          " d'ells a les cantonades de MESCLA del Laboratori de Presets.")
+                : juce::String ("."));
+    b << (L.oscillators > 0 ? " " : "\n\n")
+      << tr ("What makes the audio cost more: more partials (HARMONICS, FRACTAL, OCTAVES), more notes held at once, "
+             "Shepard (several copies of the spectrum per note), a morph while it crossfades, and MIX in the "
+             "Preset Playground (every corner sounds through an engine of its own). Lowering any of them lowers the load.",
+             "El que fa costar m\xc3\xa9s l'\xc3\xa0udio: m\xc3\xa9s parcials (HARM\xc3\x92NICS, FRACTAL, OCTAVES), m\xc3\xa9s "
+             "notes alhora, Shepard (diverses c\xc3\xb2pies de l'espectre per nota), un morph mentre fa el fos, i MESCLA al "
+             "Laboratori de Presets (cada cantonada sona amb un motor propi). Baixar qualsevol d'aquests redueix la c\xc3\xa0rrega.");
+    if (L.sawStall)
+        b << "\n\n" << tr ("One step on the interface thread took ", "Un pas al fil de la interf\xc3\xad" "cie ha trigat ")
+          << juce::String (juce::roundToInt (L.worstStallMs)) << " ms"
+          << tr (", and while it ran this window and the host's own screen could not answer. Steps that can take "
+                 "this long: REALTIME with a high FRACTAL, and MIX building its corners' voices.",
+                 ", i mentre durava aquesta finestra i la pantalla del host no podien respondre. Passos que poden "
+                 "trigar tant: TEMPS REAL amb un FRACTAL alt, i MESCLA construint les veus de les cantonades.");
+    b << "\n\n" << tr ("Nothing has been limited: every setting is still exactly where you put it.",
+                       "No s'ha limitat res: cada ajust \xc3\xa9s exactament on el vas deixar.");
+    // HOW IT ENDED, in the words that are true for it: the load came down, or the audio
+    // stopped arriving (a stopped engine is not a calmer one, and its last number is stale).
+    if (! L.showing)
+        b << " " << (L.endedWithoutAudio
+                       ? tr ("The audio stopped reaching the synth, so there is nothing more to measure.",
+                             "L'\xc3\xa0udio ha deixat d'arribar al sinte, aix\xc3\xad que ja no hi ha res m\xc3\xa9s a mesurar.")
+                       : tr ("Nothing has come close for two seconds now (the load is at ",
+                             "Fa dos segons que res no s'hi acosta (la c\xc3\xa0rrega \xc3\xa9s ara del ")
+                         + pct (L.nowEma) + ").");
+    b << "\n\n" << tr ("This warning can be turned off here, or in Menu: \"Warn when the synth is close to freezing\".",
+                       "Aquest av\xc3\xads es pot apagar aqu\xc3\xad, o al Men\xc3\xba: \"Avisa quan el sinte estigui a punt de bloquejar-se\".");
+    return b;
+}
+
 //==============================================================================
-void FractalAdditiveAudioProcessorEditor::refocus() { grabKeyboardFocus(); }
+// NEVER MOVE THE KEYBOARD FOCUS WHILE A MOUSE BUTTON IS DOWN.
+//
+// "mover controles con notas apretadas sigue siendo buggy, a veces no deja mover el
+//  control y a veces si, solo si has movido el control un instante antes de empezar a
+//  tocar teclas"
+//
+// A drag is not just a stream of events, it is a mouse CAPTURE held by the window the
+// press landed in. When the OS revokes that capture, JUCE does not report an error - it
+// synthesises a mouse-UP (HWNDComponentPeer::doCaptureChanged) and the gesture is simply
+// over, mid-drag, with the control left wherever it happened to be. A focus change is
+// one of the things that can take a capture away when the editor is a child window
+// inside a host, and this editor asks for the keyboard from ~40 places, including from
+// MOUSE MOVEMENT (mouseEnter -> reclaimFocusUnlessTyping) - i.e. in the instant before
+// every press, and only when the focus is not already ours. That is exactly the
+// asymmetry in the report: moving a control first leaves the focus with us
+// (onDragEnd -> refocus), so the grab is a no-op and the next drag is undisturbed.
+//
+// A focus grab in the middle of a press can never help, so it does not happen. The
+// button-down test is Desktop's own: it is false again by the time mouseUp is
+// dispatched (setButtons clears buttonState before sending it), so onDragEnd, onClick
+// and every modal callback still take the keyboard back exactly as before.
+bool FractalAdditiveAudioProcessorEditor::mouseButtonHeld()
+{
+    return juce::Desktop::getInstance().getNumDraggingMouseSources() > 0;
+}
+
+void FractalAdditiveAudioProcessorEditor::refocus()
+{
+    if (mouseButtonHeld()) return;
+    if (! refocusAllowed()) return;
+    grabKeyboardFocus();
+}
+
+// IN A HOST, refocus() FOLLOWS A GESTURE MADE HERE, and nothing else.
+//
+// ~40 controls call refocus() from their onChange / onClick, and JUCE runs those when the
+// HOST moves the parameter too - an automation lane, a MIDI-mapped knob, Live's own Ctrl+Z:
+// ComboBoxParameterAttachment and ButtonParameterAttachment notify synchronously. So every
+// automated step of Shepard, Mono Glide or a prime toggle pulled the keyboard out of Live
+// (found by the review of 2026-09-19, after the hover grab had been taken out for exactly
+// that). The Standalone keeps the old rule: there is no host to take it from.
+bool FractalAdditiveAudioProcessorEditor::refocusAllowed() const
+{
+    if (focusFollowsPointer()) return true;
+    if (hasKeyboardFocus (true)) return true;    // already ours: a move INSIDE this window
+    return juce::Time::getMillisecondCounter() - lastGestureMs < kGestureMs;
+}
+
+bool FractalAdditiveAudioProcessorEditor::isOurComponent (const juce::Component* c) const
+{
+    if (c == nullptr) return false;
+    const auto within = [c] (const juce::Component* root)
+    { return root != nullptr && (c == root || root->isParentOf (c)); };
+    return within (this) || within (partialWindow.get()) || within (playgroundWindow.get());
+}
+
+void FractalAdditiveAudioProcessorEditor::GestureWatch::note (const juce::MouseEvent& e)
+{
+    if (ed.isOurComponent (e.eventComponent))
+        ed.lastGestureMs = juce::Time::getMillisecondCounter();
+}
+
+// TAB DOES NOT WALK THE FOCUS AROUND IN A HOST. JUCE answers an unused Tab by moving the
+// focus to the next focusable child - and consumes the key whatever this window says, so
+// Live never gets it. With the default traverser a few Tabs landed in a text field, and a
+// focused text field takes EVERY letter (JUCE hands them to it as text), so Live's note
+// keys typed into Fiblo until the next click. Tab itself still does not reach Live: that
+// part is inside JUCE, and is said here rather than claimed otherwise.
+std::unique_ptr<juce::ComponentTraverser> FractalAdditiveAudioProcessorEditor::createKeyboardFocusTraverser()
+{
+    if (focusFollowsPointer())
+        return juce::AudioProcessorEditor::createKeyboardFocusTraverser();
+    struct NoTraversal : juce::ComponentTraverser
+    {
+        juce::Component* getDefaultComponent (juce::Component*) override  { return nullptr; }
+        juce::Component* getNextComponent (juce::Component*) override     { return nullptr; }
+        juce::Component* getPreviousComponent (juce::Component*) override { return nullptr; }
+        std::vector<juce::Component*> getAllComponents (juce::Component*) override { return {}; }
+    };
+    return std::make_unique<NoTraversal>();
+}
+
+FractalAdditiveAudioProcessorEditor::FocusReclaimProbe
+FractalAdditiveAudioProcessorEditor::focusReclaimState() const
+{
+    FocusReclaimProbe s;
+    // Typing wins: letters belong to the text field, never to the keyboard mapping.
+    s.typing      = dynamic_cast<juce::TextEditor*> (juce::Component::getCurrentlyFocusedComponent()) != nullptr;
+    s.mouseHeld   = mouseButtonHeld();
+    s.alreadyOurs = hasKeyboardFocus (true);
+    // ...and at most one attempt per debounce window. The reclaim runs off mouseEnter,
+    // which fires every time the pointer crosses between the editor and any of its ~90
+    // children; while the focus is NOT ours (a host that wants it back) that is an
+    // unbounded retry, once per mouse move, each one a focus change. The same 250 ms the
+    // play-state debounce uses, and for the same reason: below that it is a flicker.
+    s.tooSoon     = (juce::Time::getMillisecondCounter() - lastFocusReclaimMs) < 250;
+    // ...AND NEVER IN A HOST. "no se puede tocar con el teclado cuando la ventana del sinte
+    // esta abierta en ableton": every time the pointer crossed this window it took the
+    // keyboard focus away from Live, so Live's own computer keyboard - the ONLY way the
+    // letters play anything in a plugin, see playKeysLive - went dead until the user
+    // clicked back on Live. A click on this window still takes the focus (mouseDown), and
+    // the keys it does not use go on to the host (keyPressed).
+    s.hostOwnsKeys = ! focusFollowsPointer();
+    s.wouldGrabIfFollowing = ! s.typing && ! s.mouseHeld && ! s.alreadyOurs && ! s.tooSoon;
+    s.wouldGrab   = s.wouldGrabIfFollowing && ! s.hostOwnsKeys;
+    return s;
+}
 
 void FractalAdditiveAudioProcessorEditor::loadRecent (int index)
 {
@@ -2613,46 +3977,394 @@ void FractalAdditiveAudioProcessorEditor::loadRecent (int index)
     {
         juce::String err;
         if (! processorRef.loadScalaFile (juce::File (paths[index]), err))
-            juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Could not load scale", err, this);
+            juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr (fgdlg::loadScale.en, fgdlg::loadScale.ca), trErr (err), this);
     }
     refocus();
+}
+
+namespace
+{
+    // Ask every Slider under `root` to re-render its value box. See the call site at the
+    // end of applyLanguage(): a Slider only refreshes that text when its VALUE moves, so
+    // a read-out that is a WORD survives a language switch untouched.
+    void updateSliderValueTexts (juce::Component& root)
+    {
+        for (auto* child : root.getChildren())
+        {
+            if (auto* s = dynamic_cast<juce::Slider*> (child)) s->updateText();
+            updateSliderValueTexts (*child);
+        }
+    }
+
+    // ...and hand every Slider's tooltip back to the sub-components JUCE gave a COPY of
+    // it to. Same shape of defect as the line above, same sweep, and it was found the
+    // same way - by a standing check, once tooltips were finally included in one.
+    //
+    // juce_Slider.cpp:606 does `valueBox->setTooltip (owner.getTooltip())` ONCE, while it
+    // is building the text box, and Slider::setTooltip does not propagate afterwards. So
+    // every fader in this window whose hover applyLanguage() re-writes kept its
+    // CONSTRUCTION-TIME English on the little numeric box beside it, in both languages,
+    // for ever: SLOPE, FRACTAL, HARMONICS, the prime limit, PHASE, GAIN, the transition
+    // times. Hovering the number said one thing and hovering the fader two pixels away
+    // said another. The inc/dec buttons of an IncDecButtons slider get the same copy at
+    // juce_Slider.cpp:637, so they are re-pointed here too.
+    void pushSliderTooltipsIntoSubComponents (juce::Component& root)
+    {
+        for (auto* child : root.getChildren())
+        {
+            if (auto* s = dynamic_cast<juce::Slider*> (child))
+            {
+                const auto tip = s->getTooltip();
+                // The children of a Slider are JUCE's own - the value box and, in
+                // IncDecButtons style, the two arrows. Giving them the slider's tooltip
+                // is exactly what JUCE did at construction; this only makes it happen
+                // again, now, in the language that is actually on screen.
+                for (auto* sub : s->getChildren())
+                    if (auto* t = dynamic_cast<juce::SettableTooltipClient*> (sub))
+                        t->setTooltip (tip);
+            }
+            pushSliderTooltipsIntoSubComponents (*child);
+        }
+    }
+}
+
+//==============================================================================
+// NOTE NAMES ON THE KEYBOARD.
+//
+// The keyboard asks for a name per degree through a std::function it may call once per
+// key per repaint, so the SPELLING IS CACHED HERE and the function is an array lookup.
+// Spelling on demand would rebuild the whole name vector - one std::string per degree -
+// dozens of times a second on the message thread, for an answer that only changes when
+// the tuning does.
+//
+// The cache is keyed on the EDO itself (0 = "this tuning is not an equal division of the
+// octave"), so it is rebuilt exactly when the answer can have changed: a new .scl, an
+// MTS master appearing, the mode switching. `namesOff` is remembered separately from an
+// empty cache because "the user turned them off" and "this tuning has no names" are
+// different states and the menu has to tell them apart.
+void FractalAdditiveAudioProcessorEditor::refreshDegreeNames()
+{
+    const int edo = noteNamesOn ? processorRef.getEqualDivisionsOfOctave() : 0;
+    if (edo == degreeNameEdo)
+        return;   // same tuning, same answer - and this runs from resized()
+
+    degreeNameEdo = edo;
+    degreeNameCache.clear();
+    for (const auto& s : notenames::edoNames (edo))
+        degreeNameCache.push_back (juce::String (s));   // ASCII by construction
+
+    // No names to give? Hand the keyboard nothing, and it keeps its numbers. The face
+    // may also be null if the embedded font failed to load - same outcome, no boxes.
+    if (degreeNameCache.empty() || notesTypeface() == nullptr)
+    {
+        keyboard.setDegreeNamer (nullptr, {});
+        return;
+    }
+    keyboard.setDegreeNamer (
+        [this] (int d) -> juce::String
+        {
+            // The cache belongs to ONE tuning. If the scale changed under it and nothing
+            // has refreshed us yet, handing out its names is not a MISSING label, it is a
+            // WRONG one - 12-EDO's letters printed over a seven-note just scale, which no
+            // rectangle check can see. The guard is a comparison of two integers, so it is
+            // affordable on the per-key path the keyboard calls this from: the cache only
+            // ever holds an EDO's worth of names, so a degree count that no longer matches
+            // it means the cache is stale and the keys must go back to numbers.
+            return (degreeNameEdo > 0
+                    && (int) degreeNameCache.size() == degreeNameEdo
+                    && processorRef.getScaleDegrees() == degreeNameEdo
+                    && juce::isPositiveAndBelow (d, (int) degreeNameCache.size()))
+                     ? degreeNameCache[(size_t) d] : juce::String();
+        },
+        notesTypeface());
+}
+
+// Is EVERY degree of this scale a genuine ratio - the "y para JI" half of the request?
+// Asked by SOURCE, not by arithmetic: getDegreeIsRational reports what the .scl actually
+// wrote, so a degree spelled "3/2" is just and a degree spelled "701.955" is not, however
+// close the two sound. A cents approximation of a just scale is a tempered scale, and
+// telling its player "this is just intonation" would be a confident lie.
+bool FractalAdditiveAudioProcessorEditor::scaleIsJustIntonation() const
+{
+    const int D = processorRef.getScaleDegrees();
+    if (D < 2) return false;
+    long long p = 1, q = 1;
+    // Degree 0 is the unison in every tuning, so it proves nothing and is skipped; the
+    // top index D is the period, which must be just too - a just scale inside a stretched
+    // octave is not a JI scale.
+    for (int d = 1; d <= D; ++d)
+        if (! processorRef.getDegreeIsRational (d, p, q))
+            return false;
+    return true;
+}
+
+// Why the keyboard is showing NUMBERS while the option is on - in words, in the user's
+// language. An option that silently does nothing is the thing the task forbade: when
+// neither ups-and-downs nor JI applies, the toggle has to SAY so.
+juce::String FractalAdditiveAudioProcessorEditor::noteNamesReason() const
+{
+    if (! noteNamesOn) return {};
+
+    // Built with the language flag directly rather than through tr(): every one of these
+    // carries a NUMBER, and tr() takes literals. The Catalan is written with explicit
+    // UTF-8 escapes, like every other accented string in this file.
+    const int edo = processorRef.getEqualDivisionsOfOctave();
+    if (edo == 0)
+    {
+        // THE OTHER HALF OF THE REQUEST, named out loud. "solo para tunings regulares y
+        // para JI" asked for two notations, and this build ships one. A just scale
+        // answering only "not an equal division of the octave" would be true and useless:
+        // it would read as "your scale is wrong" when what is missing is the FONT. See
+        // section 4 of assets/fonts/NOTATION-LICENSES.txt for why HEJI is not here.
+        if (scaleIsJustIntonation())
+            return catalan
+                     ? juce::String::fromUTF8 (
+                           "l'entonaci\xc3\xb3 justa es nota amb HEJI, i aquesta versi\xc3\xb3 no en porta els glifs")
+                     : juce::String (
+                           "just intonation is notated with HEJI, whose glyphs are not in this build");
+        return catalan ? juce::String::fromUTF8 ("aquesta afinaci\xc3\xb3 no divideix l'octava en parts iguals")
+                       : juce::String ("this tuning is not an equal division of the octave");
+    }
+    if (edo > notenames::kMaxEdo)
+        return catalan ? juce::String::fromUTF8 ("m\xc3\xa9s de ") + juce::String (notenames::kMaxEdo)
+                             + juce::String::fromUTF8 (" graus per octava")
+                       : juce::String ("more than ") + juce::String (notenames::kMaxEdo)
+                             + juce::String (" degrees per octave");
+    if (degreeNameCache.empty())
+        return catalan ? juce::String (edo) + juce::String::fromUTF8 (
+                             " EDO no t\xc3\xa9 cap grafia que doni un nom diferent a cada grau")
+                       : juce::String (edo) + juce::String (
+                             "-EDO has no spelling that gives every degree a different name");
+    if (! keyboard.namesFitTheKeys())
+        return catalan ? juce::String::fromUTF8 ("els noms de ") + juce::String (edo)
+                             + juce::String::fromUTF8 (" EDO no caben en una tecla")
+                       : juce::String ("the names of ") + juce::String (edo)
+                             + juce::String ("-EDO are too wide for a key");
+    return {};
+}
+
+void FractalAdditiveAudioProcessorEditor::setNoteNamesForSnapshot (bool on)
+{
+    // No preference write - see the declaration. degreeNameEdo is reset so the re-spell
+    // is unconditional: the cache is keyed on the EDO alone, and a scenario that loads a
+    // scale and then asks for names is exactly the sequence where "same number, nothing
+    // to do" would photograph the previous tuning's keys.
+    noteNamesOn   = on;
+    degreeNameEdo = -1;
+    refreshDegreeNames();
+    keyboard.repaint();
+}
+
+void FractalAdditiveAudioProcessorEditor::setNoteNamesForTests (bool on)
+{
+    noteNamesOn = on;
+    processorRef.setKeyboardNoteNames (on);   // persisted immediately, globally
+    refreshDegreeNames();
+    keyboard.repaint();
+}
+
+FractalAdditiveAudioProcessorEditor::NoteNameProbe
+FractalAdditiveAudioProcessorEditor::noteNameProbeForTests() const
+{
+    NoteNameProbe p;
+    p.optionOn     = noteNamesOn;
+    p.edo          = processorRef.getEqualDivisionsOfOctave();
+    p.namedCount   = (int) degreeNameCache.size();
+    p.showing      = keyboard.showingNames();
+    p.fits         = keyboard.namesFitTheKeys();
+    p.widest       = keyboard.widestDegreeText();
+    p.reason       = noteNamesReason();
+    // At the NARROWEST key the keyboard ever draws, not the one this window produced.
+    // The NAME height, even when numbers are winning: "9.9 pt, needs 8.5" is what tells
+    // a reader whether a tuning missed the fit by a hair or by a mile.
+    p.fontAtMinKey = keyboard.nameFontAtMinKey();
+    p.face         = notesTypeface();
+    return p;
+}
+
+FractalAdditiveAudioProcessorEditor::NoteNameProbe
+FractalAdditiveAudioProcessorEditor::noteNameProbeInLanguage (bool useCatalan)
+{
+    const bool was = catalan;
+    catalan = useCatalan;
+    applyLanguage();
+    resized();
+    auto p = noteNameProbeForTests();
+    catalan = was;
+    applyLanguage();
+    resized();
+    return p;
+}
+
+std::vector<ScaleKeyboard::PeriodTag>
+FractalAdditiveAudioProcessorEditor::keyboardPeriodTagsInLanguage (bool useCatalan)
+{
+    const bool was = catalan;
+    catalan = useCatalan;
+    applyLanguage();
+    resized();
+    auto t = keyboard.periodTagProbe();
+    catalan = was;
+    applyLanguage();
+    resized();
+    return t;
 }
 
 void FractalAdditiveAudioProcessorEditor::applyLanguage()
 {
     using juce::dontSendNotification;
     langButton.setButtonText (catalan ? "ENG" : "CAT");
+    // The credit line. It was set once in the constructor and never again, so it was the
+    // one string in the title bar that could not change language.
+    vibeLabel.setText (tr ("Vibe coded by", "Vibe coded per"), dontSendNotification);
     menuButton.setButtonText (tr ("Menu", "Men\xc3\xba"));
     rhythmBtn.setButtonText (tr ("Spectrum vs Rhythm", "Espectre vs ritme"));
     partialEditBtn.setTooltip (tr (
-        "Draw the spectrum by hand: opens a resizable window with *one knob per partial* of the current sound. Every partial is there, however many - nothing is hidden or capped.\nThe switch below is the same switch as the one inside the window; while it is on, !SLOPE is frozen!.",
-        "Dibuixa l'espectre a m\xc3\xa0: obre una finestra redimensionable amb *un control per parcial* del so actual. Hi ha tots els parcials, siguin quants siguin - res amagat ni limitat.\nL'interruptor de sota \xc3\xa9s el mateix que el de dins la finestra; mentre estigui actiu, !el PENDENT queda congelat!."));
+        "Draw the spectrum by hand: a resizable window with *one knob per partial* of the current sound. Every partial is there, however many - nothing is hidden or capped.\nThe switch below is the same one as inside the window; while it is on, !SLOPE is frozen!.",
+        "Dibuixa l'espectre a m\xc3\xa0: una finestra redimensionable amb *un control per parcial* del so actual. Hi ha tots els parcials, siguin quants siguin - res amagat ni limitat.\nL'interruptor de sota \xc3\xa9s el mateix que el de dins la finestra; mentre estigui actiu, !el PENDENT queda congelat!."));
     partialManualT.setTooltip (tr (
-        "Manual per-partial amplitudes on/off. The SAME switch as the one inside the pencil's window - one control in two places. Off by default; while it is on, !SLOPE is frozen! where it stood and the amplitudes come from the knobs.",
-        "Activa/desactiva les amplituds manuals per parcial. \xc3\x89s EL MATEIX interruptor que el de dins la finestra del llapis - un control en dos llocs. Apagat per defecte; mentre estigui actiu, !el PENDENT queda congelat! on era i les amplituds venen dels controls."));
+        "Manual per-partial amplitudes. The SAME switch as the one inside the pencil's window. Off by default, but your first drag on a partial knob switches it on for you (otherwise that drag would be stored and never heard); while it is on, !SLOPE is frozen! where it stood and the amplitudes come from the knobs.",
+        "Amplituds manuals per parcial. \xc3\x89s EL MATEIX interruptor que el de dins la finestra del llapis. Apagat per defecte, per\xc3\xb2 el teu primer arrossegament d'un parcial l'activa (si no, aquell arrossegament es desaria i no sonaria mai); mentre estigui actiu, !el PENDENT queda congelat! on era i les amplituds venen dels controls."));
     if (partialWindow != nullptr)
         partialWindow->setName (tr ("Fibl\xc3\xb3 - partial amplitudes", "Fibl\xc3\xb3 - amplituds dels parcials"));
     partialPanel.applyLanguage();
+    lastTransitionShown = -1;     // ...and the TRANSITION cell, so the re-worded item is re-selected
     lastManualFrozenShown = -1;   // re-apply the slope fader's tooltip in the new language
     lastEngineShown       = -1;   // and re-light the engine chips with the new words
+    // ...and the playground lock, whose BUTTON carries a translated word ("Edit corner A").
+    // Its refresh is guarded by a change detector, and a language switch is not a change
+    // of state - so without this the button kept its English text in the Catalan window,
+    // which is exactly what the snapshot rig reported the first time it photographed it.
+    pgEditNearestBtn.setTooltip (tr (
+        "Takes you straight into editing that corner, without opening the playground window: "
+        "these controls become ITS controls, its name takes a * the moment one of them moves, "
+        "and you can then save it under the same name to replace it, or under a new one to keep "
+        "both. The corner offered is the one the pad is nearest to - the one you are mostly "
+        "hearing. Your own patch is kept and comes back when you leave edit mode.",
+        "Et porta directament a editar aquella cantonada, sense obrir la finestra del laboratori: "
+        "aquests controls passen a ser ELS SEUS, el seu nom agafa un * en el moment que en mous "
+        "un, i despr\xc3\xa9s la pots desar amb el mateix nom per substituir-la, o amb un de nou "
+        "per conservar totes dues. La cantonada oferta \xc3\xa9s la m\xc3\xa9s propera al punt del "
+        "tauler - la que est\xc3\xa0s sentint sobretot. El teu patch es guarda i torna quan surts "
+        "del mode edici\xc3\xb3."));
+    lastPgDrivingSeen     = -1;
     rhythmPanel.heading.setText (tr ("SPECTRUM VS RHYTHM", "ESPECTRE VS RITME"), dontSendNotification);
     rhythmPanel.outLbl.setText  (tr ("MIDI out (to DAW)", "Sortida MIDI (al DAW)"), dontSendNotification);
     rhythmPanel.selfLbl.setText (juce::String::fromUTF8 (catalan ? "Sona al Fibl\xc3\xb3" : "Play in Fibl\xc3\xb3"), dontSendNotification);
+    // SIX CONTROLS THAT EXPLAINED NOTHING. Found by asking the probe which components it
+    // records WITHOUT a Tooltip row beside them: seven of seventy-nine, and one of them
+    // is the box that decides what the whole Spectrum-vs-Tuning panel does. The two
+    // symbols in the rhythm panel are the worst of it - "x2" and "/2" name an operation
+    // without naming what it operates on - and "X" is a glyph with no word at all.
+    // (Menu is the seventh and is left alone: the word IS the explanation.)
+    // ...AND THE FOUR IN THE MODULATORS PANEL, which the same sweep found in the custom
+    // view: the box that says WHICH modulator you are editing, and the three that shape
+    // an LFO. A phrase like "Fundamental / 2^n" names a rule without saying what it does.
+    lblLfoPhase.setText (tr ("Phase", "Fase"), dontSendNotification);
+    modSelBox.setTooltip (tr (
+        "WHICH modulator these controls edit. Env 1-3 are envelopes (they follow a note); "
+        "LFO 1-3 run continuously. Each keeps its own targets and settings.",
+        "QUIN modulador editen aquests controls. Env 1-3 s\xc3\xb3n envolupants (segueixen una "
+        "nota); LFO 1-3 van cont\xc3\xad" "nuament. Cadascun mant\xc3\xa9 els seus destins."));
+    lfoWaveBox.setTooltip (tr (
+        "The LFO's shape. 'Custom' opens an editor beside this box where you draw "
+        "the wave yourself, point by point.",
+        "La forma de l'LFO. 'Pr\xc3\xb2pia' obre un editor al costat d'aquesta "
+        "caixa on dibuixes l'ona tu mateix, punt a punt."));
+    lfoRateModeBox.setTooltip (tr (
+        "WHAT SETS THE SPEED. BPM / 2^n locks to the project tempo, halving or doubling. "
+        "Fundamental / 2^n locks to the played note's own frequency, so the LFO stays in "
+        "step with the pitch. Free Hz ignores both.",
+        "QU\xc3\x88 FIXA LA VELOCITAT. BPM / 2^n es lliga al tempo del projecte, dividint o "
+        "doblant. Fundamental / 2^n es lliga a la freq\xc3\xbc\xc3\xa8ncia de la nota tocada, "
+        "o sigui que l'LFO va al pas del to. Free Hz no fa cas de cap dels dos."));
+    lfoPhaseModeBox.setTooltip (tr (
+        "WHERE THE WAVE STARTS. 'Restart each note' begins every note at the same point of "
+        "the wave; 'Project transport' leaves it running with the song, so two notes a bar "
+        "apart hear different parts of it.",
+        "ON COMEN\xc3\x87" "A L'ONA. 'Reinicia a cada nota' comen\xc3\xa7" "a cada nota al "
+        "mateix punt de l'ona; 'Transport del projecte' la deixa c\xc3\xb3rrer amb la "
+        "can\xc3\xa7\xc3\xb3, o sigui que dues notes separades per un comp\xc3\xa0s en senten "
+        "trossos diferents."));
+    specModeBox.setTooltip (tr (
+        "WHAT THIS PANEL DOES. Find = search for tunings whose notes beat least (or most) "
+        "against the spectrum you have. Adapt = keep the tuning and move the SPECTRUM's "
+        "partials to it instead. From spectrum's segment = build a scale out of the "
+        "partials themselves.",
+        "QU\xc3\x88 FA AQUEST PANELL. Troba = cerca afinacions les notes de les quals baten "
+        "menys (o m\xc3\xa9s) contra l'espectre que tens. Adapta = mant\xc3\xa9 l'afinaci\xc3\xb3 "
+        "i mou els parcials de l'ESPECTRE cap a ella. Del segment de l'espectre = construeix "
+        "una escala amb els mateixos parcials."));
+    tuneSourceBox.setTooltip (tr (
+        "WHICH NOTES the search listens to: the tuning loaded now, every tuning in the bank, "
+        "or the chord you are holding.",
+        "QUINES NOTES escolta la cerca: l'afinaci\xc3\xb3 carregada ara, totes les del banc, "
+        "o l'acord que estiguis prement."));
+    tuningBankAddBtn.setTooltip (tr (
+        "Put the tuning loaded now into the bank, so 'From all tunings' can search it and "
+        "the Bank box can reload it later.",
+        "Posa l'afinaci\xc3\xb3 carregada ara al banc, perqu\xc3\xa8 'De totes les afinacions' "
+        "la pugui cercar i la caixa Banc la pugui tornar a carregar."));
+    rhythmPanel.tempoX2.setTooltip (tr (
+        "Send the DAW a tempo twice as fast for the same pulse - use it when the transport "
+        "locks to half the speed you meant.",
+        "Envia al DAW un tempo el doble de r\xc3\xa0pid per al mateix pols - fes-ho servir quan "
+        "el transport es lliga a la meitat de la velocitat que volies."));
+    rhythmPanel.tempoD2.setTooltip (tr (
+        "Send the DAW a tempo half as fast for the same pulse - use it when the transport "
+        "locks to twice the speed you meant.",
+        "Envia al DAW un tempo la meitat de r\xc3\xa0pid per al mateix pols - fes-ho servir quan "
+        "el transport es lliga al doble de la velocitat que volies."));
+    rhythmPanel.closeB.setTooltip (tr ("Close this panel.", "Tanca aquest panell."));
     rhythmPanel.droneT.setButtonText (tr ("Note under pulses", "Nota sota els polsos"));
     rhythmPanel.droneT.setTooltip (tr (
         "With \"Play in Fibló\" on, ALSO sound the held note normally underneath the pulses. Off = only the rhythm sounds.",
         "Amb \"Sona al Fibl\xc3\xb3\" actiu, fes sonar TAMB\xc3\x89 la nota mantinguda normal sota els polsos. Desactivat = nom\xc3\xa9s sona el ritme."));
     rhythmPanel.feedbackT.setButtonText (tr ("Fractal feedback", "Feedback fractal"));
     rhythmPanel.feedbackT.setTooltip (tr (
-        "Play in Fibló only: every pulse becomes a parent - it spawns the WHOLE set of routed trains one level down, anchored at ITS pitch (rates and intervals rebuilt from it), with its velocity faded by the slope and its gate inherited. Those pulses spawn again -> a self-similar fractal rhythm that always dies out (never a runaway).",
-        "Nom\xc3\xa9s amb Sona al Fibl\xc3\xb3: cada pols esdev\xc3\xa9 pare - genera TOT el conjunt de trens encaminats un nivell avall, ancorat al SEU to (velocitats i intervals reconstru\xc3\xafts des d'ell), amb la seva velocity esva\xc3\xaf" "da pel pendent i el seu gate heretat. Aquells polsos tornen a generar -> un ritme fractal autosimilar que sempre s'apaga (mai descontrolat)."));
+        "Play in Fibló only: every pulse spawns the WHOLE set of routed trains one level down, anchored at ITS pitch (rates and intervals rebuilt from it), with its velocity faded by the slope and its gate inherited. Those pulses spawn again -> a self-similar fractal rhythm that always dies out (never a runaway).",
+        "Nom\xc3\xa9s amb Sona al Fibl\xc3\xb3: cada pols genera TOT el conjunt de trens encaminats un nivell avall, ancorat al SEU to (velocitats i intervals reconstru\xc3\xafts des d'ell), amb la seva velocity esva\xc3\xaf" "da pel pendent i el seu gate heretat. Aquells polsos tornen a generar -> un ritme fractal autosimilar que sempre s'apaga (mai descontrolat)."));
     rhythmPanel.feedbackLbl.setText (tr ("Decay", "Deca\xc3\xafment"), dontSendNotification);
     rhythmPanel.feedbackS.setTooltip (tr (
-        "Volume slope of the feedback: how much of each repeat's velocity carries to the next loop. 50% = halve each time (short tail); higher = a longer, louder tail.",
-        "Pendent de volum del feedback: quanta velocity de cada repetici\xc3\xb3 passa al seg\xc3\xbc" "ent bucle. 50% = meitat cada cop (cua curta); m\xc3\xa9s alt = cua m\xc3\xa9s llarga i forta."));
+        "How much of each repeat's velocity carries to the next loop. 50% = halve each time (short tail); higher = a longer, louder tail.",
+        "Quanta velocity de cada repetici\xc3\xb3 passa al seg\xc3\xbc" "ent bucle. 50% = meitat cada cop (cua curta); m\xc3\xa9s alt = cua m\xc3\xa9s llarga i forta."));
     rhythmPanel.selfT.setTooltip (tr (
-        "Play in Fibló: this synth interprets the rhythm itself - the played note becomes a trigger and only the pulses sound. On by default; it engages once you route a partial. No feedback loop: pulses never spawn pulses.",
-        "Sona al Fibl\xc3\xb3: aquest sinte interpreta el ritme ell mateix - la nota tocada esdev\xc3\xa9 un activador i nom\xc3\xa9s sonen els polsos. Actiu per defecte; s'activa quan encamines un parcial. Sense bucle: els polsos mai generen polsos."));
+        "This synth plays the rhythm itself: the played note becomes a trigger and only the pulses sound. On by default; it engages once you route a partial. No feedback loop: pulses never spawn pulses.",
+        "Aquest sinte toca el ritme ell mateix: la nota tocada esdev\xc3\xa9 un activador i nom\xc3\xa9s sonen els polsos. Actiu per defecte; s'activa quan encamines un parcial. Sense bucle: els polsos mai generen polsos."));
+    // EVERY CONTROL IN A ROUTED ROW SAYS WHAT IT DOES. There are five of them per train
+    // and not one had a tooltip: the pitch box, the two ±12 buttons, the velocity fader,
+    // the gate fader and the delete. They are the controls a user touches MOST in this
+    // panel and the only ones it never explained - and nothing had noticed, because no
+    // picture had ever contained a routed row (scenario 53 is the first).
+    //
+    // Set per row, in the language currently on screen, alongside every other string the
+    // panel localises.
+    for (int i = 0; i < RhythmEngine::kSlots; ++i)
+    {
+        rhythmPanel.pitchE[i].setTooltip (tr (
+            "WHAT THIS TRAIN PLAYS. A number of scale steps from the played note "
+            "(\"7step\" up, \"-7step\" down), or a ratio (\"3/2\"), or a note name. "
+            "Steps follow the loaded tuning; a ratio does not.",
+            "QU\xc3\x88 TOCA AQUEST TREN. Un nombre de graus de l'escala des de la nota "
+            "tocada (\"7step\" amunt, \"-7step\" avall), o una ra\xc3\xb3 (\"3/2\"), o un nom "
+            "de nota. Els graus segueixen l'afinaci\xc3\xb3 carregada; una ra\xc3\xb3 no."));
+        rhythmPanel.s12M[i].setTooltip (tr ("An octave down, without retyping the box.",
+                                            "Una octava avall, sense reescriure la caixa."));
+        rhythmPanel.s12P[i].setTooltip (tr ("An octave up, without retyping the box.",
+                                            "Una octava amunt, sense reescriure la caixa."));
+        rhythmPanel.velS[i].setTooltip (tr (
+            "MIDI velocity of this train's pulses (1-127). The knob over the VEL column "
+            "tilts every train at once.",
+            "Velocitat MIDI dels polsos d'aquest tren (1-127). El comandament sobre la "
+            "columna VEL els inclina tots alhora."));
+        rhythmPanel.durS[i].setTooltip (tr (
+            "How long each pulse of this train is held, in milliseconds - the gate. Short "
+            "is a click, long is a note.",
+            "Quant dura cada pols d'aquest tren, en mil\xc2\xb7lisegons - la porta. Curt \xc3\xa9s "
+            "un clic, llarg \xc3\xa9s una nota."));
+        rhythmPanel.delB[i].setTooltip (tr ("Stop routing this partial.",
+                                            "Deixa d'encaminar aquest parcial."));
+    }
     rhythmPanel.velHead.setText (tr ("VEL", "VEL"), dontSendNotification);
     rhythmPanel.velHead.setTooltip (tr ("MIDI velocity of every pulse this train sends (1-127).",
                                         "Velocity MIDI de cada pols que envia aquest tren (1-127)."));
@@ -2660,12 +4372,27 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     for (auto* b : { &rhythmPanel.octAllUp, &rhythmPanel.octAllDn })
         b->setTooltip (tr ("Shift ALL pulses together by whole octaves (-4..+4). Ratio pitches move by exact 2/1s; steps pitches by whole periods of the scale.",
                            "Despla\xc3\xa7""a TOTS els polsos alhora per octaves senceres (-4..+4). Els tons en ratio es mouen per 2/1 exactes; els de passos per per\xc3\xado" "des sencers de l'escala."));
-    rhythmPanel.listHead.setText (tr ("Partials of the current patch (click to route)",
-                                      "Parcials del patch actual (clica per encaminar)"), dontSendNotification);
+    // Short enough for the 236 px column it sits over. The long form - "of the current
+    // patch" - was 28 px wider than the column in English and 43 in Catalan, so it was
+    // drawn condensed; it lives in the hover now, where it has all the room it wants.
+    rhythmPanel.listHead.setText (tr ("Partials (click to route)",
+                                      "Parcials (clica per encaminar)"), dontSendNotification);
+    rhythmPanel.listHead.setTooltip (tr ("The partials of the patch loaded right now. Click one to route it "
+                                         "to a pulse train.",
+                                         "Els parcials del patch carregat ara mateix. Clica'n un per "
+                                         "encaminar-lo a un tren de polsos."));
     rhythmPanel.pickHint.setText (juce::String::fromUTF8 (catalan
                                       ? "\xe2\x9f\xb5 Clica un parcial per encaminar-lo"
                                       : "\xe2\x9f\xb5 Click a partial to route it"), dontSendNotification);
     rhythmPanel.onT.setButtonText (tr ("On", "Actiu"));
+    // THE ONE GROUP THAT HAD NO NAME. secPlay existed - it was constructed, coloured,
+    // given a font and laid out at the top of its box - and no line ever put a word in
+    // it, so the first frame in the panel was a bordered rectangle with a blank caption
+    // strip while the four below it were captioned. That is why the audit reported "a
+    // bordered box with NO CAPTION AT ALL": not a missing frame, a missing string. It is
+    // invisible from inside the code (an empty Label draws nothing and reports no fault)
+    // and obvious in a photograph, which is what the photographs are for.
+    rhythmPanel.secPlay.setText  (tr ("PLAYBACK", "REPRODUCCI\xc3\x93"), dontSendNotification);
     rhythmPanel.secRate.setText  (tr ("PULSE RATE", "VELOCITAT DELS POLSOS"), dontSendNotification);
     rhythmPanel.secOut.setText   (tr ("OUTPUT", "SORTIDA"), dontSendNotification);
     rhythmPanel.secTempo.setText (tr ("DAW TEMPO", "TEMPO DEL DAW"), dontSendNotification);
@@ -2676,8 +4403,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Una nota nom\xc3\xa9s pot COMEN\xc3\x87""AR en un beat del BPM del projecte: premuda a mig beat queda en sil\xc3\xa8nci i entra exactament al beat seg\xc3\xbc" "ent. Cal que el DAW reprodueixi; si la deixes anar abans, es cancel\xc2\xb7la en sil\xc3\xa8nci. Desactivat per defecte."));
     rhythmPanel.monoT.setButtonText (tr ("Mono", "Mono"));
     rhythmPanel.monoT.setTooltip (tr (
-        "Monophonic: when a new note starts, the note currently sounding stops. Off = polyphonic.",
-        "Monof\xc3\xb2nic: quan comen\xc3\xa7""a una nota nova, la que sonava s'atura. Desactivat = polif\xc3\xb2nic."));
+        "Monophonic: a new note stops the one sounding. Off = polyphonic.\nThis one CUTS the old note (a restrike at the new pitch). \"Monophonic glide\" on the PITCH tab BENDS it to the new one instead, and while that is on this greys out, because cutting the note first is exactly what stops it gliding.",
+        "Monof\xc3\xb2nic: una nota nova atura la que sona. Desactivat = polif\xc3\xb2nic.\nAquest TALLA la nota antiga (un atac nou a la nova al\xc3\xa7""ada). El \"Glide monof\xc3\xb2nic\" de la pestanya PITCH la DOBLEGA fins a la nova, i mentre aquell estigui actiu aquest queda desactivat, perqu\xc3\xa8 tallar la nota primer \xc3\xa9s justament el que impedeix que llisqui."));
     rhythmPanel.qPulseT.setButtonText (tr ("Quantize to pulse", "Quantitza al pols"));
     rhythmPanel.qPulseT.setTooltip (tr (
         "A new note waits for the moment the RUNNING pulse pattern resets - when all its polyrhythm subdivisions coincide on the 1 - and joins exactly there. With no pattern running it starts normally.",
@@ -2695,72 +4422,130 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Needs MPE out. Sets every routed pulse's pitch to the JUST ratio of ITS OWN partial (P3 -> 3/1...), so the receiving synth plays the partials' exact pitches.",
         "Necessita MPE out. Posa el to de cada pols al ratio JUST del SEU parcial (P3 -> 3/1...), perqu\xc3\xa8 el sinte receptor toqui els tons exactes dels parcials."));
     rhythmPanel.helpB.setTooltip (tr ("Routing & setup help", "Ajuda d'encaminament i configuraci\xc3\xb3"));
-    rhythmPanel.noteHead.setText (tr ("Steps from the played note", "Passos des de la nota tocada"),
+    // The column header over the pitch boxes, 165 px wide: the full Catalan sentence
+    // measured 167 and the English 157 against 155 of usable width, so both were drawn
+    // condensed. Shortened here and stated in full in the hover below.
+    rhythmPanel.noteHead.setText (tr ("Steps from the note", "Passos des de la nota"),
                                   dontSendNotification);
     rhythmPanel.noteHead.setTooltip (tr (
-        "Each train sends the PLAYED note shifted by this many scale steps: \"7st\" = 7 steps up, \"7st-\" = 7 steps down. Never a fixed note. With MPE out, ratios (\"3/2\") and cents (\"702c\") are also FROM the played note.",
+        "Each train sends the PLAYED note shifted by this many scale steps: \"7st\" = 7 up, \"7st-\" = 7 down. Never a fixed note. With MPE out, ratios (\"3/2\") and cents (\"702c\") are also FROM the played note.",
         "Cada tren envia la nota TOCADA despla\xc3\xa7""ada aquests passos d'escala: \"7st\" = 7 amunt, \"7st-\" = 7 avall. Mai una nota fixa. Amb MPE out, els ratios (\"3/2\") i cents (\"702c\") tamb\xc3\xa9 s\xc3\xb3n DES DE la nota tocada."));
-    rhythmPanel.durHead.setText ("GATE", dontSendNotification);
+    // GATE stays GATE in both languages: it is the universal name of the MIDI note
+    // length on every sequencer, Catalan ones included. Written as an explicit tr() pair
+    // rather than a bare literal so the en/ca drawn-text assertion can tell a DECISION
+    // from an oversight - a raw literal here would look exactly like the "Steps" bug.
+    rhythmPanel.durHead.setText (tr ("GATE", "GATE"), dontSendNotification);
     rhythmPanel.durHead.setTooltip (tr (
         "GATE: how long each pulse's MIDI note lasts (5-500 ms). It is NOT latency - pulse timing stays sample-locked; this only sets where the note-off lands.",
         "GATE: quant dura la nota MIDI de cada pols (5-500 ms). NO \xc3\xa9s lat\xc3\xa8ncia - els polsos queden clavats a la mostra; nom\xc3\xa9s fixa on cau el note-off."));
     // Help popup text (the "?" button). fromUTF8 directly: tr()'s English branch
     // does not decode UTF-8 accents.
+    rhythmPanel.helpTitle = tr (fgdlg::rhythmHelp.en, fgdlg::rhythmHelp.ca);
     rhythmPanel.helpText = juce::String::fromUTF8 (catalan
-        ? "ENCAMINAMENT (qualsevol DAW):\nEn una altra pista d'instrument, tria com a ENTRADA MIDI la SORTIDA MIDI d'aquest plugin (no l'entrada de la pista del Fibl\xc3\xb3!) i activa el monitoratge d'entrada.\nA Ableton: MIDI From -> pista del Fibl\xc3\xb3 -> 2n selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In.\n\nTEMPO DEL DAW (CC20):\n. Ableton (f\xc3\xa0" "cil): arrossega el dispositiu Max for Live \"Fibl\xc3\xb3 Tempo Sync\" (a User Library > Presets > MIDI Effects) a una pista MIDI que rebi la sortida del Fibl\xc3\xb3, i activa Sync de tempo. Sense mapejar res: el tempo segueix el pols 1.\n. Altres DAW (Reaper, FL...): instal\xc2\xb7la loopMIDI (gratu\xc3\xaft), crea un port; envia la sortida MIDI del Fibl\xc3\xb3 a aquest port; al DAW, mapeja el tempo a l'entrada loopMIDI (rang 20-147) i activa Sync de tempo.\n\nLAT\xc3\x88NCIA: els polsos surten clavats a la mostra; el DAW pot afegir un buffer al MIDI entre pistes - fes servir un buffer petit."
+        ? "ENCAMINAMENT (qualsevol DAW):\nEn una altra pista d'instrument, tria com a ENTRADA MIDI la SORTIDA MIDI d'aquest plugin (no l'entrada de la pista del Fibl\xc3\xb3!) i activa el monitoratge d'entrada.\nA Ableton: MIDI From -> pista del Fibl\xc3\xb3 -> 2n selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In.\n\nTEMPO DEL DAW (CC20):\n. Ableton (f\xc3\xa0" "cil): arrossega el dispositiu Max for Live \"Fibl\xc3\xb3 Tempo Sync\" (a User Library > Presets > MIDI Effects) a una pista MIDI que rebi la sortida del Fibl\xc3\xb3, i activa Sync de tempo. Sense mapejar res: el tempo ix el pols 1.\n. Altres DAW (Reaper, FL...): instal\xc2\xb7la loopMIDI (gratu\xc3\xaft), crea un port; envia la sortida MIDI del Fibl\xc3\xb3 a aquest port; al DAW, mapeja el tempo a l'entrada loopMIDI (rang 20-147) i activa Sync de tempo.\n\nLAT\xc3\x88NCIA: els polsos surten clavats a la mostra; el DAW pot afegir un buffer al MIDI entre pistes - fes servir un buffer petit."
         : "ROUTING (any DAW):\nOn another instrument track, choose this plugin's MIDI OUTPUT as the track's MIDI INPUT (not the Fibl\xc3\xb3 track's own input!) and enable input monitoring.\nIn Ableton: MIDI From -> the Fibl\xc3\xb3 track -> 2nd selector \"Fibl\xc3\xb3 Gal\xc3\xa0" "ctic\" -> Monitor In.\n\nDAW TEMPO (CC20):\n. Ableton (easy): drag the Max for Live device \"Fibl\xc3\xb3 Tempo Sync\" (in User Library > Presets > MIDI Effects) onto a MIDI track that receives the Fibl\xc3\xb3's MIDI output, and turn Tempo sync on. No mapping needed - the tempo follows pulse 1.\n. Other DAWs (Reaper, FL...): install loopMIDI (free), create a port; send the Fibl\xc3\xb3's MIDI output to that port; in the DAW, MIDI-map the tempo to the loopMIDI input (range 20-147) and turn Tempo sync on.\n\nLATENCY: pulses leave sample-locked; the DAW may add one buffer to inter-track MIDI - use a small buffer size.");
     rhythmPanel.mpeT.setButtonText ("MPE out");
     rhythmPanel.mpeT.setTooltip (tr (
-        "MPE output: each pulse train gets its own MIDI channel with per-note pitch bend, and the pitch boxes also accept cents (\"1987.4c\") or ratios (\"3\", \"3/2\") - sent RETUNED so an MPE-capable synth plays the exact pitch (assumes the receiver's bend range is +-48, the MPE default).",
-        "Sortida MPE: cada tren de polsos t\xc3\xa9 el seu canal MIDI amb pitch bend per nota, i les caselles de to tamb\xc3\xa9 accepten cents (\"1987.4c\") o ratios (\"3\", \"3/2\") - s'envien REAFINATS perqu\xc3\xa8 un sinte amb MPE toqui el to exacte (assumeix rang de bend +-48 al receptor, el defecte MPE)."));
+        "Each pulse train gets its own MIDI channel with per-note pitch bend, and the pitch boxes also accept cents (\"1987.4c\") or ratios (\"3\", \"3/2\") - sent RETUNED so an MPE-capable synth plays the exact pitch (assumes the receiver's bend range is +-48, the MPE default).",
+        "Cada tren de polsos t\xc3\xa9 el seu canal MIDI amb pitch bend per nota, i les caselles de to tamb\xc3\xa9 accepten cents (\"1987.4c\") o ratios (\"3\", \"3/2\") - s'envien REAFINATS perqu\xc3\xa8 un sinte amb MPE toqui el to exacte (assumeix rang de bend +-48 al receptor, el defecte MPE)."));
     rhythmPanel.modeBox.setTooltip (tr (
         "Lowest note: only the lowest held note drives the pulses. All notes: every held note drives its own copy of the trains, transposed by its interval from the lowest.",
         "Nota m\xc3\xa9s greu: nom\xc3\xa9s la nota m\xc3\xa9s greu mant\xc3\xa9 els polsos. Totes les notes: cada nota mantinguda porta la seva c\xc3\xb2pia dels trens, transposada pel seu interval respecte a la m\xc3\xa9s greu."));
     rhythmPanel.tempoT.setButtonText (tr ("Tempo sync (CC20)", "Sync de tempo (CC20)"));
+    // "el bot\xc3\xb3 \"Com encaminar\"", not the English label. A tooltip that ENDS by
+    // sending the reader to a button is the one string in the window where naming it
+    // wrongly costs something real: there is no button anywhere on screen carrying the
+    // English words, so the instruction reads as a reference to a control that is not
+    // there. The Catalan of that button is set 450 lines down, in this same function.
     rhythmPanel.tempoT.setTooltip (tr (
-        "While ON, the DAW tempo FOLLOWS pulse 1 (x2 / /2 to scale). NEEDS a one-time setup: in Ableton, drop the free \"Fibló Tempo Sync\" Max for Live device on a MIDI track that receives this plugin's MIDI output. In other DAWs, MIDI-map the tempo to CC20 with a 20-147 BPM range. Full steps: the \"How to route\" button.",
-        "Mentre \xc3\xa9s actiu, el tempo del DAW SEGUEIX el pols 1 (x2 / /2 per escalar). CAL una configuraci\xc3\xb3 \xc3\xbanica: a Ableton, posa el dispositiu Max for Live gratu\xc3\xaft \"Fibl\xc3\xb3 Tempo Sync\" en una pista MIDI que rebi la sortida MIDI del plugin. En altres DAW, mapeja el tempo al CC20 amb rang 20-147 BPM. Passos complets: el bot\xc3\xb3 \"How to route\"."));
+        "The DAW tempo FOLLOWS pulse 1 (x2 / /2 to scale). NEEDS a one-time setup: in Ableton, drop the free \"Fibló Tempo Sync\" Max for Live device on a MIDI track that receives this plugin's MIDI output. In other DAWs, MIDI-map the tempo to CC20 with a 20-147 BPM range. Full steps: the \"How to route\" button.",
+        "El tempo del DAW SEGUEIX el pols 1 (x2 / /2 per escalar). CAL una configuraci\xc3\xb3 \xc3\xbanica: a Ableton, posa el dispositiu Max for Live gratu\xc3\xaft \"Fibl\xc3\xb3 Tempo Sync\" en una pista MIDI que rebi la sortida MIDI del plugin. En altres DAW, mapeja el tempo al CC20 amb rang 20-147 BPM. Passos complets: el bot\xc3\xb3 \"Com encaminar\"."));
     for (int i = 0; i < RhythmEngine::kSlots; ++i)
     {
         rhythmPanel.pitchE[i].setTooltip (tr (
-            "Scale steps FROM the played note: \"7st\" = 7 up, \"7st-\" = 7 down (always relative, never a fixed note). With MPE out on, also cents (\"1987.4c\") or a ratio (\"3\", \"3/2\") above the played note, sent retuned via per-note bend.",
-            "Passos d'escala DES DE la nota tocada: \"7st\" = 7 amunt, \"7st-\" = 7 avall (sempre relatiu, mai una nota fixa). Amb MPE out actiu, tamb\xc3\xa9 cents (\"1987.4c\") o un ratio (\"3\", \"3/2\") sobre la nota tocada, enviat reafinat amb bend per nota."));
+            "Scale steps FROM the played note: \"7st\" = 7 up, \"7st-\" = 7 down (never a fixed note). With MPE out on, also cents (\"1987.4c\") or a ratio (\"3\", \"3/2\") above the played note, sent retuned via per-note bend.",
+            "Passos d'escala DES DE la nota tocada: \"7st\" = 7 amunt, \"7st-\" = 7 avall (mai una nota fixa). Amb MPE out actiu, tamb\xc3\xa9 cents (\"1987.4c\") o un ratio (\"3\", \"3/2\") sobre la nota tocada, enviat reafinat amb bend per nota."));
         rhythmPanel.durS[i].setTooltip (tr (
             "GATE: how long each pulse's MIDI note lasts (5-500 ms). It is NOT latency - pulse timing stays sample-locked; this only sets where the note-off lands.",
             "GATE: quant dura la nota MIDI de cada pols (5-500 ms). NO \xc3\xa9s lat\xc3\xa8ncia - els polsos queden clavats a la mostra; nom\xc3\xa9s fixa on cau el note-off."));
     }
     rhythmPanel.onT.setTooltip (tr (
-        "MIDI OUT: send the rhythm pulses out of the plugin to another DAW track. Off by default - turn it on to route the rhythm elsewhere (independent of \"Play in Fibló\").",
-        "SORTIDA MIDI: envia els polsos de ritme fora del plugin cap a una altra pista del DAW. Desactivat per defecte - activa'l per encaminar el ritme a un altre lloc (independent de \"Sona al Fibl\xc3\xb3\")."));
+        "MIDI OUT: send the rhythm pulses out of the plugin to another DAW track. Off by default, and independent of \"Play in Fibló\".",
+        "SORTIDA MIDI: envia els polsos de ritme fora del plugin cap a una altra pista del DAW. Desactivat per defecte, i independent de \"Sona al Fibl\xc3\xb3\"."));
     langButton.setTooltip (tr ("Switch the interface language to Catal\xc3\xa0.",
                                "Torna la interf\xc3\xad" "cie a l'angl\xc3\xa8s."));
 
     gFilter.setText        (tr ("Filter", "Filtre"));
     gAmpEnv.setText        (tr ("Modulators", "Moduladors")); // shared chip-tabbed box
     gPitchEnv.setText      (tr ("Pitch Envelope", "Envolupant to"));
+    // THE MODULATOR TAB STRIP, and the one rule this window applies to a panel word:
+    // translate it unless the Catalan word IS the English one. AMP is the same
+    // abbreviation in both (amplitud), so it stays; PITCH and FILTER are not, so they
+    // move; and CUSTOM becomes PROPI here for the same reason the engine chip below
+    // already says PROPI - one English word printing as two different Catalan words in
+    // two chip rows of the same window is the inconsistency this pass exists to end.
     envTabB[0].setButtonText (tr ("AMP",    "AMP"));
     envTabB[1].setButtonText (tr ("PITCH",  "TO"));
     envTabB[2].setButtonText (tr ("FILTER", "FILTRE"));
-    envTabB[3].setButtonText (tr ("CUSTOM", "CUSTOM"));
+    envTabB[3].setButtonText (tr ("CUSTOM", "PROPI"));
     for (auto* b : { &envTabB[0], &envTabB[1], &envTabB[2] })
         b->setTooltip (tr ("The envelopes share this box - click a title to switch.",
                            "Les envolupants comparteixen aquesta caixa - clica un t\xc3\xadtol per canviar."));
+    // SAME FAULT AS THE TEMPO TOOLTIP ABOVE, and one worse: this one named a button that
+    // does not exist in EITHER language. The button is "Unmap" / "Desassigna" (three lines
+    // down, and again in the CUSTOM tab), and both sides of this pair sent the reader
+    // looking for an "Unmap all" that is nowhere in the window. Each side now quotes the
+    // words its own reader can actually see.
     envTabB[3].setTooltip (tr (
-        "6 modulators: 3 note-retriggered envelopes + 3 LFOs. Right-click ANY fader -> \"Map to\" routes a modulator onto it (several parameters per modulator allowed); it rides on the knob's own value over +-Range. Each modulator has On/Off and \"Unmap all\".",
-        "6 moduladors: 3 envolupants redisparades per nota + 3 LFOs. Clic dret a QUALSEVOL fader -> \"Assigna a\" hi encamina un modulador (diversos par\xc3\xa0metres per modulador); cavalca sobre el valor del knob amb +-Range. Cada modulador t\xc3\xa9 On/Off i \"Unmap all\"."));
+        "6 modulators: 3 note-retriggered envelopes + 3 LFOs. Right-click ANY fader -> \"Map to\" routes a modulator onto it (several parameters per modulator allowed); it rides on the knob's own value over +-Range. Each modulator has On/Off and \"Unmap\".",
+        "6 moduladors: 3 envolupants redisparades per nota + 3 LFOs. Clic dret a QUALSEVOL fader -> \"Assigna a\" hi encamina un modulador (diversos par\xc3\xa0metres per modulador); cavalca sobre el valor del knob amb +-Range. Cada modulador t\xc3\xa9 On/Off i \"Desassigna\"."));
     lblCustRange.setText (tr ("Range", "Rang"),  dontSendNotification);
     modUnmapBtn.setButtonText (tr ("Unmap", "Desassigna"));
     modUnmapBtn.setTooltip (tr ("Unmap this modulator from EVERYTHING it modulates.",
                                 "Desassigna aquest modulador de TOT el que modula."));
-    lfoWaveEditBtn.setButtonText (tr ("Draw", "Dibuixa"));
-    lfoWaveEditBtn.setTooltip (tr ("Draw this LFO's wave: points + curved segments, like automation.",
-                                   "Dibuixa l'ona d'aquest LFO: punts + segments corbats, com una automatitzaci\xc3\xb3."));
     modOnT.setTooltip (tr ("This modulator on/off (off restores its targets to their own values).",
                            "Aquest modulador on/off (off retorna els seus dest\xc3\xadns al seu valor propi)."));
-    temperToggle.setButtonText (tr ("Temper to tuning", "Tempera a l'afinaci\xc3\xb3"));
+    // THE CUSTOM TAB'S OWN FADERS, and the pitch envelope's amount. Every one of these
+    // was handed a bare English literal by configFader in the constructor and never
+    // re-set, so the whole CUSTOM modulator panel explained itself in English however
+    // the window was set - the last corner of the editor still doing cause (a). Found by
+    // the "translated?" gate the moment tooltips were let into it.
+    pEnvAmtFader.setTooltip (tr (
+        "How far the pitch envelope bends the pitch (semitones, \xc2\xb1).",
+        "Quant desafina la nota l'envolupant de to (semitons, \xc2\xb1)."));
+    for (auto* a : { &custAdsr[0], &custAdsr[1], &custAdsr[2], &custAdsr[3] })
+        // Same wording as the volume / filter envelopes six lines further down: the four
+        // stage names are the terms of art this window already uses in Catalan, and one
+        // envelope spelling them differently from the other three would be the
+        // inconsistency, not the translation.
+        a->setTooltip (tr ("Custom envelope: Attack, Decay, Sustain (level), Release. Times in seconds.",
+                           "Envolupant pr\xc3\xb2pia: Atac, Decay, Sustain (nivell), Release. Temps en segons."));
+    custRangeFader.setTooltip (tr (
+        "How far this modulator MOVES its mapped parameters (\xc2\xb1 of their full range), riding on each knob's own value. Note: parameters that REBUILD the spectrum (Base, Harmonics, Decay, Fractal, Prime, Range, Reps) follow the modulator at the 60 Hz rebuild rate and glide when Morph is on - everything else follows per audio block.",
+        "Quant MOU aquest modulador els par\xc3\xa0metres que t\xc3\xa9 assignats (\xc2\xb1 del seu rang complet), cavalcant sobre el valor propi de cada control. Nota: els par\xc3\xa0metres que RECONSTRUEIXEN l'espectre (Base, Harm\xc3\xb2nics, Caiguda, Fractal, Primer, Rang, Reps) segueixen el modulador al ritme de reconstrucci\xc3\xb3 de 60 Hz i llisquen amb el Morphing actiu - la resta segueix bloc a bloc."));
+    lfoDivSlider.setTooltip (tr (
+        "Rate divider: halves the base rate per step (base = project BPM or the lowest held note's frequency).",
+        "Divisor de velocitat: parteix per la meitat la velocitat base a cada pas (la base \xc3\xa9s el tempo del DAW o la freq\xc3\xbc\xc3\xa8ncia de la nota m\xc3\xa9s greu que sona)."));
+    lfoHzSlider.setTooltip (tr ("Free LFO rate in Hz.", "Velocitat lliure de l'LFO, en Hz."));
+    lfoPhaseSlider.setTooltip (tr (
+        "Phase offset: where in the wave the oscillation starts.",
+        "Despla\xc3\xa7""ament de fase: en quin punt de l'ona comen\xc3\xa7""a l'oscil\xc2\xb7laci\xc3\xb3."));
+    // ONE WORD, AND IT IS A DECISION RATHER THAN A CUT - the same trade "PRIME CONTROL"
+    // made to become "PRIMES" and "OCTAVE RANGE" to become "OCTAVES", and the same one
+    // this very control already made when " - no period" was dropped from its disabled
+    // state (see applyEngineState). It now shares the HARMONICS title row, which is 199 px
+    // wide at the shipped 1200x650 and has to hold the painted word too: "Temper to
+    // tuning" measured 124 px there and just fitted, while the Catalan "Tempera a
+    // l'afinacio" needed about 150 and the toggle was HIDDEN OUTRIGHT in Catalan at the
+    // size the plugin ships at. Caught by the rig, in the language nobody was looking at.
+    //
+    // The verb is the half that carries the meaning - it sits inside the HARMONICS
+    // compartment, so what it tempers is not in doubt - and the tooltip below states the
+    // whole of it, including what happens to the other engine.
+    temperToggle.setButtonText (tr ("Temper", "Tempera"));
     temperToggle.setTooltip (tr (
-        "ON: the HARMONIC ENGINE keeps generating partials and each one is snapped to the nearest pitch of the ACTIVE TUNING loaded in the Tuning box (degree x period^k), following it live - both engines work TOGETHER and the Custom Engine's own scale is bypassed. In MPE input mode the host does not hand the plugin a scale, so the grid there is plain 12-TET. OFF: no snapping (the Custom Engine's .scl, if loaded and ON, is the spectrum by itself).",
-        "ON: el MOTOR HARM\xc3\x92NIC segueix generant parcials i cadascun s'ajusta al to m\xc3\xa9s proper de l'AFINACI\xc3\x93 ACTIVA carregada a la caixa Tuning (grau x per\xc3\xado" "de^k), seguint-la en viu - els dos motors treballen JUNTS i l'escala del Motor propi queda de banda. En mode d'entrada MPE l'amfitri\xc3\xb3 no d\xc3\xb3na cap escala al plugin, aix\xc3\xad que all\xc3\xa0 la graella \xc3\xa9s 12-TET. OFF: sense ajust (l'.scl del Motor propi, si est\xc3\xa0 carregat i actiu, \xc3\xa9s l'espectre per si mateix)."));
+        "ON: the HARMONIC ENGINE keeps generating partials, each snapped to the nearest pitch of the ACTIVE TUNING in the Tuning box (degree x period^k) and following it live - both engines work TOGETHER and the Custom Engine's own scale is bypassed. In MPE input mode the host hands the plugin no scale, so the grid there is plain 12-TET. OFF: no snapping (the Custom Engine's .scl, if loaded and ON, is the spectrum by itself).",
+        "ON: el MOTOR HARM\xc3\x92NIC segueix generant parcials, cadascun ajustat al to m\xc3\xa9s proper de l'AFINACI\xc3\x93 ACTIVA de la caixa Tuning (grau x per\xc3\xado" "de^k) i seguint-la en viu - els dos motors treballen JUNTS i l'escala del Motor propi queda de banda. En mode d'entrada MPE l'amfitri\xc3\xb3 no d\xc3\xb3na cap escala al plugin, aix\xc3\xad que all\xc3\xa0 la graella \xc3\xa9s 12-TET. OFF: sense ajust (l'.scl del Motor propi, si est\xc3\xa0 carregat i actiu, \xc3\xa9s l'espectre per si mateix)."));
     gTuning.setText        (tr ("Tuning", "Afinaci\xc3\xb3"));
     // The SPECTRUM panel's two engine chips. Their tooltips spell out what each state
     // does to the OTHER engine, and where temper sits now - that is the question the
@@ -2776,13 +4561,20 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     intervalEdit.setTextToShowWhenEmpty (tr ("intervals: 3/2 2 700c ...", "intervals: 3/2 2 700c ..."),
                                          juce::Colour (0xff8f96a8));
     gSpecScale.setText     (tr ("Spectrum vs Tuning", "Espectre vs afinaci\xc3\xb3"));
-    gScaleDiss.setText     (tr ("Scale Dissonance", "Dissonancia de l'escala"));
+    // "Disson\xc3\xa0ncia", with its accent: every other Catalan use of the word in this file
+    // carries it, and this one - a GROUP TITLE, drawn upper-cased in a chip - was the one
+    // that did not. Neither language gate can see it: it is spelled the same either way
+    // to a byte-compare, and a missing accent is not a missing translation.
+    gScaleDiss.setText     (tr ("Scale Dissonance", "Disson\xc3\xa0ncia de l'escala"));
     segPeriodLbl.setText   (tr ("Period", "Per\xc3\xado" "de"), juce::dontSendNotification);
     segTopToggle.setButtonText (tr ("= top", "= sup"));
     segTopToggle.setTooltip (tr ("Use the highest selected partial as the period (instead of the typed value).",
                                  "Fes servir el parcial seleccionat m\xc3\xa9s agut com a per\xc3\xado" "de (en lloc del valor escrit)."));
-    segHelpLbl.setText (tr ("Click partials to add them to the scale; Shift-click for a range. Lowest selected = tonic (C3).",
-                            "Clica parcials per afegir-los a l'escala; Shift-clic per un rang. El m\xc3\xa9s greu seleccionat = t\xc3\xb2nica (C3)."),
+    // Short enough for the two lines the box really has (192 px at 10.5 px, so ~380 px of
+    // room): the old sentence needed 529 and was drawn condensed. "Lowest = tonic" says
+    // what "Lowest selected = tonic" said - only selected partials are in the scale.
+    segHelpLbl.setText (tr ("Click a partial to add it; Shift-click a range. Lowest = tonic (C3).",
+                            "Clica un parcial per afegir-lo; Shift-clic un rang. El m\xc3\xa9s greu = t\xc3\xb2nica (C3)."),
                         juce::dontSendNotification);
     segList.tip = tr ("Each partial of the current spectrum. Click to add/remove it as a scale degree (live). Shift-click selects the span to the last click. The lowest selected is the tonic (C3); all selected share one colour.",
                       "Cada parcial de l'espectre actual. Clica per afegir/treure'l com a grau de l'escala (en viu). Shift-clic selecciona el tram fins a l'\xc3\xbaltim clic. El m\xc3\xa9s greu seleccionat \xc3\xa9s la t\xc3\xb2nica (C3); tots els seleccionats comparteixen color.");
@@ -2791,22 +4583,49 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     lblBasePitch.setText (tr ("Pitch", "To"), dontSendNotification);
     lblPrimeLimit.setText(tr ("Limit", "L\xc3\xadmit"), dontSendNotification);
     lblCutoff.setText    (tr ("Cut", "Tall"), dontSendNotification);
-    lblRes.setText       (tr ("Res", "Res"), dontSendNotification);
+    // NOT "Res" in Catalan: beside "Tall" (cut) it reads as the Catalan word for
+    // NOTHING, which is the opposite of what a resonance control does.
+    lblRes.setText       (tr ("Res", "Ress."), dontSendNotification);
     lblEnvAmt.setText    (tr ("Env", "Env"), dontSendNotification);
     lblPitchAmt.setText  (tr ("St", "St"), dontSendNotification);
-    lblMorphTime.setText (tr ("Time", "Temps"), dontSendNotification);
-    // No text: the painted MORPH sub-label above it is the name, and the toggle saying
-    // "Morph" under a heading that says MORPH read as two different controls.
-    morphToggle.setButtonText ({});
-    // The tooltip must name the SCOPE: morph rides on every spectrum change from any
-    // source. Users read it as a Base-only glide, because Base is where they first
-    // hear it - so the causes are spelled out.
-    morphToggle.setTooltip (tr (
-        "Morph ON: whenever the spectrum CHANGES - for ANY reason: Base, Harmonics, Prime, Fractal, Range, switching engine, loading or typing a scale, an adapted spectrum from Spectrum vs Tuning, a modulator moving any of those - every partial GLIDES from its old position to its place in the new spectrum over the Time below, instead of jumping. OFF: every change lands instantly.",
-        "Morph ACTIU: quan l'espectre CANVIA - per QUALSEVOL motiu: Base, Harm\xc3\xb2nics, Primers, Fractal, Abast, canviar de motor, carregar o escriure una escala, un espectre adaptat d'Espectre vs afinaci\xc3\xb3, un modulador que mogui qualsevol d'aquests - cada parcial LLISCA de la seva posici\xc3\xb3 antiga al seu lloc del nou espectre durant el Temps de sota, en comptes de saltar-hi. APAGAT: cada canvi cau a l'instant."));
+    lblGlide.setText     (tr ("Glide", "Glide"), dontSendNotification);
+    monoGlideT.setButtonText (tr ("Monophonic glide", "Glide monof\xc3\xb2nic"));
+    monoGlideT.setTooltip (tr (
+        "ON, the synth plays ONE note at a time - it cannot make chords - and a new key does not start a new voice: it TAKES OVER the sounding one and BENDS its pitch there over the Glide time, through the tuning's own frequencies (per-note bend included), never through 12-TET semitones.\nLAST-NOTE priority: the newest key wins, so a second note always moves the pitch.\nLegato does NOT retrigger: while a key is held, the takeover keeps the envelopes, the modulators and a running Shepard exactly where they are. Lift every key and the next note starts fresh, at its own pitch, with everything retriggered.\nRelease the key you are on while another is still down and the pitch glides BACK to the newest key still held.\nIn playground MIX mode every corner engine is mono too, on the same note stream - \"Mix Voices per Corner\" reads 1 and waits while this is on.",
+        "Actiu, el sinte toca UNA nota alhora - no pot fer acords - i una tecla nova no engega cap veu nova: PREN la que sona i li DOBLEGA l'al\xc3\xa7""ada fins all\xc3\xa0 en el temps de Glide, per les freq\xc3\xbc\xc3\xa8ncies de la mateixa afinaci\xc3\xb3 (amb el bend per nota inclos), mai per semitons de 12-TET.\nPrioritat a l'\xc3\x9aLTIMA nota: la tecla m\xc3\xa9s nova guanya, o sigui que una segona nota sempre mou l'al\xc3\xa7""ada.\nEl legato NO redispara: mentre mantens una tecla, la presa de rel\xc3\xa8u deixa les envolupants, els moduladors i un Shepard en marxa exactament on eren. Deixa anar totes les tecles i la nota seg\xc3\xbc" "ent comen\xc3\xa7""a de nou, a la seva al\xc3\xa7""ada i amb tot redisparat.\nDeixa anar la tecla on ets mentre en mantens una altra i l'al\xc3\xa7""ada torna lliscant a la tecla m\xc3\xa9s nova que encara mantens.\nEn mode MIX del playground cada motor de cantonada tamb\xc3\xa9 \xc3\xa9s mono, sobre el mateix flux de notes - \"Veus per cantonada\" marca 1 i espera mentre aix\xc3\xb2 estigui actiu."));
+    glideFader.setTooltip (tr (
+        "How long the pitch takes to travel from the previous note to the new one, in milliseconds. It is a TIME, not a rate: two octaves take exactly as long as a semitone. The fader is logarithmic (1 ms to 5 s, half its travel below 100 ms). Only does anything while Monophonic glide is on.",
+        "Quant triga l'al\xc3\xa7""ada a anar de la nota anterior a la nova, en millisegons. \xc3\x89s un TEMPS, no una velocitat: dues octaves triguen exactament el mateix que un semit\xc3\xb2. El fader \xc3\xa9s logar\xc3\xadtmic (1 ms a 5 s, mitja cursa per sota de 100 ms). Nom\xc3\xa9s fa res amb el Glide monof\xc3\xb2nic actiu."));
+    lblTransTime.setText (tr ("Time", "Temps"), dontSendNotification);
+    // THE TRANSITION ITEMS, re-worded in place. The ids are fixed (1 Off, 2 Morph,
+    // 3 Dry/Wet) and the selection is put back explicitly, because changeItemText leaves
+    // the box's displayed label disagreeing with its selected item for as long as it
+    // takes to finish - and getSelectedId() reads 0 through exactly that window. A
+    // language switch that dropped the selection would be the whole cell going blank
+    // (RhythmVerify's combo sweep asserts no box loses its selection across two
+    // round-trips of both languages, which is what caught that class of bug before).
+    {
+        const int keep = transitionBox.getSelectedId();
+        transitionBox.clear (dontSendNotification);
+        transitionBox.addItem (tr ("Off",     "Cap"),          1);
+        transitionBox.addItem (tr ("Morph",   "Morphing"),     2);
+        transitionBox.addItem (tr ("Dry/Wet", "Sec/Humit"),    3);
+        transitionBox.setSelectedId (keep > 0 ? keep : 3, dontSendNotification);
+    }
+    // ONE tooltip where there were two, because there is one control. It must name the
+    // SCOPE - a transition rides on every spectrum change from any source, and users read
+    // it as a Base-only effect because Base is where they first hear it - and it must say
+    // what each of the three items does, including Off, which is the one that has no
+    // Time and no visible sign that it is doing its job.
+    transitionBox.setTooltip (tr (
+        "How a spectrum CHANGE lands - for ANY reason it changes: Base, Harmonics, Prime, Fractal, Range, switching engine, loading or typing a scale, an adapted spectrum from Spectrum vs Tuning, a modulator moving any of those.\n*Off* - the change lands instantly.\n*Morph* - every partial GLIDES to its place in the new spectrum, over the Time beside this. A per-partial pitch bend: mid-glide you hear frequencies that are in neither spectrum.\n*Dry/Wet* - the spectrum you were hearing FADES OUT while the new one FADES IN, over the Time beside this. Nothing moves in frequency at any point; you hear both standing spectra at once, and the two are mixed so the loudness does not dip through the middle.\nOne at a time, because a voice has ONE crossfade between two banks of oscillators and both of these are that same machine under different rules.",
+        "Com cau un CANVI d'espectre - pel motiu que sigui: Base, Harm\xc3\xb2nics, Primers, Fractal, Abast, canviar de motor, carregar o escriure una escala, un espectre adaptat d'Espectre vs afinaci\xc3\xb3, un modulador que mogui qualsevol d'aquests.\n*Cap* - el canvi cau a l'instant.\n*Morphing* - cada parcial LLISCA al seu lloc del nou espectre, durant el Temps del costat. \xc3\x89s un pitch bend per parcial: a mig lliscament sents freq\xc3\xbc\xc3\xa8ncies que no s\xc3\xb3n de cap dels dos espectres.\n*Sec/Humit* - l'espectre que senties s'ESVAEIX mentre el nou APAREIX, durant el Temps del costat. No es mou res de freq\xc3\xbc\xc3\xa8ncia en cap moment; sents els dos espectres quiets alhora, barrejats de manera que el volum no caigui pel mig.\nNom\xc3\xa9s un alhora, perqu\xc3\xa8 una veu t\xc3\xa9 UNA sola fosa creuada entre dos bancs d'oscilladors i tots dos s\xc3\xb3n aquella mateixa m\xc3\xa0quina sota regles diferents."));
     morphTimeFader.setTooltip (tr (
-        "How long the glide takes, in seconds. It applies to EVERY spectrum change, whatever caused it (Base, Harmonics, Prime, Fractal, engine switch, an adapted spectrum, a modulator...) - not just Base.",
-        "Quant dura el lliscament, en segons. S'aplica a QUALSEVOL canvi d'espectre, el causi el que el causi (Base, Harm\xc3\xb2nics, Primers, Fractal, canvi de motor, un espectre adaptat, un modulador...) - no nom\xc3\xa9s Base."));
+        "How long the glide takes, in seconds. It applies to EVERY spectrum change, whatever caused it (Base, Harmonics, Prime, Fractal, engine switch, an adapted spectrum, a modulator...) - not just Base.\nMorph and Dry/Wet keep their own Time, so switching between them brings each one's back.",
+        "Quant dura el lliscament, en segons. S'aplica a QUALSEVOL canvi d'espectre, el causi el que el causi (Base, Harm\xc3\xb2nics, Primers, Fractal, canvi de motor, un espectre adaptat, un modulador...) - no nom\xc3\xa9s Base.\nEl Morphing i el Sec/Humit tenen cadascun el seu Temps, o sigui que canviar d'un a l'altre torna a treure el que \xc3\xa9s seu."));
+    dryWetTimeFader.setTooltip (tr (
+        "How long the crossfade takes, in seconds. Same range and feel as Morph Time, and it applies to EVERY spectrum change whatever caused it. Below about 5 ms the phase hand-over cannot be made click-free, so 5 ms is the floor the transition actually uses.\nMorph and Dry/Wet keep their own Time, so switching between them brings each one's back. With the transition Off this fader is greyed: there is no transition for it to time.",
+        "Quant dura la fosa creuada, en segons. El mateix abast i tacte que el Temps de Morphing, i s'aplica a QUALSEVOL canvi d'espectre, el causi el que el causi. Per sota d'uns 5 ms el relleu de fase no es pot fer sense clic, i 5 ms \xc3\xa9s el m\xc3\xadnim que la transici\xc3\xb3 fa servir de deb\xc3\xb2.\nEl Morphing i el Sec/Humit tenen cadascun el seu Temps, o sigui que canviar d'un a l'altre torna a treure el que \xc3\xa9s seu. Amb la transici\xc3\xb3 a Cap aquest fader queda apagat: no hi ha cap transici\xc3\xb3 a cronometrar."));
     lblTimbreRepeats.setText (tr ("Reps", "Reps"), dontSendNotification);
     lblBend.setText      (tr ("Pitch bend", "Pitch bend"), dontSendNotification);
     lblPeriod.setText    (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
@@ -2817,12 +4636,12 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Each row is a DYAD: the red \"0\" chip (the root key) plus that degree, played together. Colour chip = the degree's keyboard colour, then its interval from 0, then the dyad's Sethares BEATING against the current timbre (how rough 0 + that degree sound together) - lower = more consonant. Ordered most consonant first. The period is the red row.",
         "Cada fila \xc3\xa9s una D\xc3\x8d""ADA: el xip vermell \"0\" (la tecla arrel) m\xc3\xa9s aquell grau, tocats junts. Xip de color = el color del grau al teclat, despr\xc3\xa9s el seu interval des de 0, i el BATEC de Sethares de la d\xc3\xad""ada contra el timbre actual (com d'aspre sonen 0 + aquell grau junts) - m\xc3\xa9s baix = m\xc3\xa9s consonant. Ordenats de m\xc3\xa9s consonant primer. El per\xc3\xado""de \xc3\xa9s la fila vermella.");
     dissHeader.tip = tr (
-        "Sethares dissonance: how ROUGH each scale step sounds with the CURRENT timbre. It is not fixed - it recomputes live from the synth's actual partials, so editing the timbre (N, fractal, decay, primes, .scl...) changes these values in real time. Lower = more consonant; the rows are ordered most consonant first.",
-        "Dissonancia de Sethares: com d'ASPRE sona cada pas de l'escala amb el timbre ACTUAL. No \xc3\xa9s fixa - es recalcula en viu a partir dels parcials reals del sinte, aix\xc3\xad que editar el timbre (N, fractal, caiguda, primers, .scl...) canvia aquests valors en temps real. M\xc3\xa9s baix = m\xc3\xa9s consonant; les files van de m\xc3\xa9s consonant primer.");
+        "Sethares dissonance: how ROUGH each scale step sounds with the CURRENT timbre. It recomputes live from the synth's actual partials, so editing the timbre (N, fractal, decay, primes, .scl...) changes these values in real time. Lower = more consonant; the rows are ordered most consonant first.",
+        "Disson\xc3\xa0ncia de Sethares: com d'ASPRE sona cada pas de l'escala amb el timbre ACTUAL. Es recalcula en viu a partir dels parcials reals del sinte, aix\xc3\xad que editar el timbre (N, fractal, caiguda, primers, .scl...) canvia aquests valors en temps real. M\xc3\xa9s baix = m\xc3\xa9s consonant; les files van de m\xc3\xa9s consonant primer.");
     recentLabel.setText  (tr ("Recent", "Recents"), dontSendNotification);
     recentOpenBtn.setButtonText (tr ("Recent...", "Recents..."));
     recentOpenBtn.setTooltip (tr ("Every scale file loaded in this plugin, newest first. Click one to load it.",
-                                  "Tots els fitxers d'""escala carregats en aquest plugin, del més recent al més antic. Clica'n un per carregar-lo."));
+                                  "Tots els fitxers d'""escala carregats en aquest plugin, els més recents primer. Clica'n un per carregar-lo."));
     recentOverlay.title = tr ("Recent scales", "Escales recents");
 
     // These two used to BOTH read "Load .scl" in adjacent boxes, and clicking the
@@ -2830,7 +4649,6 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // as the plugin breaking. They say what they load now.
     loadSclButton.setButtonText    (tr ("Load", "Obrir"));
     loadSclButton.getProperties().set ("fork", true);
-    clearSclButton.setButtonText   (tr ("Reset", "Reinicia"));
     // "Add to Bank", not "+". A lone plus beside Load and Save named neither the thing
     // it adds nor where it adds it, and the two other + buttons on screen (the octave
     // steppers, and the bank's own "+ .scl") add something else entirely.
@@ -2858,10 +4676,10 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     // tuning Load, so the pair reads as two destinations for one kind of file.
     refreshCustomEngineButtons();
     savePresetButton.setButtonText (tr ("Save", "Desa"));
-    playgroundButton.setButtonText (tr ("Open Preset Playground", "Obre el Laboratori de Presets"));
+    playgroundButton.setButtonText (tr ("Preset Playground", "Laboratori de Presets"));
     playgroundButton.setTooltip (tr (
-        "*Preset Playground.* Put up to four presets on the corners of a rectangle and drag a point between them: everything you hear morphs, including !across engines! (a custom scale on one corner and the harmonic engine on another blend their compiled PARTIALS, because their knobs have nothing in common to average).\nThe point is two automatable parameters, so a move recorded in the DAW plays back with the window shut.\n!The tuning is never touched! - mode, scale, reference A, octave and bend range all stay exactly as you left them.",
-        "*Laboratori de Presets.* Posa fins a quatre presets a les cantonades d'un rectangle i arrossega un punt entre ells: tot el que sents es transforma, !fins i tot entre motors! (una escala pr\xc3\xb2pia a una cantonada i el motor harm\xc3\xb2nic a una altra barregen els seus PARCIALS compilats, perqu\xc3\xa8 els seus controls no tenen res en com\xc3\xba per promitjar).\nEl punt s\xc3\xb3n dos par\xc3\xa0metres automatitzables, o sigui que un moviment gravat al DAW es reprodueix amb la finestra tancada.\n!L'afinaci\xc3\xb3 no es toca mai! - mode, escala, refer\xc3\xa8ncia A, octava i rang de bend queden exactament com els tenies."));
+        "Put up to four presets on the corners of a rectangle and drag a point between them: everything you hear morphs, including !across engines! (a custom scale on one corner and the harmonic engine on another blend their compiled PARTIALS, because their knobs have nothing in common to average).\nThe point is two automatable parameters, so a move recorded in the DAW plays back with the window shut.\n!The tuning is never touched! - mode, scale, reference A, octave and bend range all stay exactly as you left them.",
+        "Posa fins a quatre presets a les cantonades d'un rectangle i arrossega un punt entre ells: tot el que sents es transforma, !fins i tot entre motors! (una escala pr\xc3\xb2pia a una cantonada i el motor harm\xc3\xb2nic a una altra barregen els seus PARCIALS compilats, perqu\xc3\xa8 els seus controls no tenen res en com\xc3\xba per promitjar).\nEl punt s\xc3\xb3n dos par\xc3\xa0metres automatitzables, o sigui que un moviment gravat al DAW es reprodueix amb la finestra tancada.\n!L'afinaci\xc3\xb3 no es toca mai! - mode, escala, refer\xc3\xa8ncia A, octava i rang de bend queden exactament com els tenies."));
     playgroundPanel.applyLanguage();
     if (playgroundWindow != nullptr)
         playgroundWindow->setName (tr ("Fibl\xc3\xb3 - preset playground", "Fibl\xc3\xb3 - laboratori de presets"));
@@ -2869,8 +4687,13 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     dissBtn.setButtonText          (tr ("Find", "Troba"));
     dissSaveBtn.setButtonText      (tr ("Save", "Desa"));
 
-    helpLabel.setText (tr ("Play: A S D F G H J K L = the scale in order, then Q W E R T Y U I O P continue higher.   Z / X = down / up one scale period.",
-                           "Toca: A S D F G H J K L = l'escala en ordre, i Q W E R T Y U I O P segueixen m\xc3\xa9s agudes.   Z / X = avall / amunt un per\xc3\xado" "de."),
+    // TWO SENTENCES, BECAUSE THERE ARE TWO BEHAVIOURS. The letter layout is the
+    // standalone's (see playKeysLive); inside a DAW the keys go to the host and the host's
+    // own computer keyboard is what plays - and what RECORDS, which is the reason. Saying
+    // the first sentence in a plugin would promise a layout that is not there, which is
+    // the one thing this window never does.
+    helpLabel.setText (keyboardHelpText (processorRef.wrapperType
+                                             == juce::AudioProcessor::wrapperType_Standalone),
                        dontSendNotification);
 
     //-- Tooltips: one idea per sentence, no loose ends. ------------------------
@@ -2889,10 +4712,59 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     fractalFader.setTooltip (tr (
         "Replaces each partial with a scaled copy of the whole spectrum, this many levels deep. 1 = off. Continuous: between whole levels the next level's new partials fade in from low to high. Snaps to the 4 marked levels - hold Ctrl for free fine setting.",
         "Substitueix cada parcial per una c\xc3\xb2pia escalada de tot l'espectre, tants nivells com indiquis. 1 = apagat. Continu: entre nivells sencers els parcials nous del nivell seg\xc3\xbc""ent entren de greu a agut. S'imanta als 4 nivells marcats - mant\xc3\xa9n Ctrl per ajust fi lliure."));
-    phaseBox.setTooltip (tr (
-        "Starting phase of the partials. 'Aligned': all peak together, forming a periodic pulse - tonal, never clips, and with dense spectra the pulse itself is heard as a low difference tone. 'Scattered': random phases - smoother, louder, no pulse.",
-        "Fase inicial dels parcials. 'Alineat': tots fan el pic alhora i formen un pols peri\xc3\xb2""dic - tonal, mai clipa, i amb espectres densos el pols s'escolta com un to diferencial greu. 'Dispers': fases aleat\xc3\xb2ries - m\xc3\xa9s suau, m\xc3\xa9s fort, sense pols."));
+    // The old tooltip promised "Aligned: never clips" as a property of the whole
+    // control. That stops being true at any position past 0, because the peak-capped
+    // normalisation law is only fully in force at the very bottom of the travel - so
+    // the promise is now attached to the END where it holds, not to the control.
+    phaseFader.setTooltip (tr (
+        "Starting phase of the partials, as a continuous fade. 0 = Aligned: all peak together, forming a periodic pulse - tonal, never clips, and with dense spectra the pulse itself is heard as a low difference tone. 1 = Scattered: pseudo-random phases - smoother, louder, no pulse. In between, every partial moves the shortest way from one to the other and the level follows.",
+        "Fase inicial dels parcials, com un fos continu. 0 = Alineat: tots fan el pic alhora i formen un pols peri\xc3\xb2""dic - tonal, mai clipa, i amb espectres densos el pols s'escolta com un to diferencial greu. 1 = Dispers: fases pseudoaleat\xc3\xb2ries - m\xc3\xa9s suau, m\xc3\xa9s fort, sense pols. Enmig, cada parcial va pel cam\xc3\xad m\xc3\xa9s curt d'un a l'altre i el volum el segueix."));
+    // HONEST ABOUT WHAT THIS BUILD DOES, IN THE ONE PLACE THE USER READS.
+    //
+    // The glide dropdown is gone, so its sentence has to live here or nowhere - and the
+    // sentence still has to be TRUE. Live re-phasing is NOT implemented: this build
+    // changes a held note's LEVEL immediately (the normalisation law is blended by the
+    // same control) and its PHASES only from the next note-on. So this names where the
+    // mode and the duration WILL come from - the SPECTRUM panel's transition, which is
+    // now the single place that answers "how is a spectrum change made smooth" - without
+    // claiming a re-phasing that would not happen. A tooltip promising a glide the
+    // oscillators never perform is worse than no tooltip: the player trusts it on stage.
+    //
+    // APPENDED rather than retyped, so the continuous-fade paragraph above stays the one
+    // copy of itself; two hand-kept halves of one tooltip drift, and only one of them
+    // would get corrected.
+    phaseFader.setTooltip (phaseFader.getTooltip() + tr (
+        "\nWHILE NOTES ARE SOUNDING: a Phase move changes their LEVEL at once, and their PHASES only from the next note on - this build does not re-phase a held note. When live re-phasing lands it will take BOTH its mode and its duration from the SPECTRUM panel's TRANSITION, because re-phasing IS a spectrum change. Transition Morph: by pitchbend, over its Time. Transition Dry/Wet: by crossfade, over its Time. Transition Off: no live re-phasing at all.",
+        "\nMENTRE SONEN LES NOTES: moure la Fase els canvia el VOLUM a l'instant, i les FASES nom\xc3\xa9s a partir de la nota seg\xc3\xbc""ent - aquesta versi\xc3\xb3 no refasa una nota que ja sona. Quan arribi el refasat en directe, en prendr\xc3\xa0 el mode I la durada de la transici\xc3\xb3 del plaf\xc3\xb3 ESPECTRE, perqu\xc3\xa8 refasar \xc3\x89S un canvi d'espectre. Transici\xc3\xb3 a Morphing: per pitchbend, durant el seu Temps. Transici\xc3\xb3 a Sec/Humit: per fosa creuada, durant el seu Temps. Transici\xc3\xb3 a Cap: cap refasat en directe."));
     gainFader.setTooltip (tr ("Final output volume, in dB.", "Volum final de sortida, en dB."));
+    binauralFader.setTooltip (tr (
+        "Spreads the SPECTRUM across the ears: from 100 Hz up, every partial goes to the opposite ear from the one before it - one right, the next left, all the way to the highest. Down is *Centred*, which is exactly what this instrument sounded like before this control existed; at the top the partials are panned to the extremes. Everything below 100 Hz stays in the middle, because that is where the ear stops placing a sound by level - putting a fundamental in one ear would move the NOTE rather than open the spectrum out. On a MONO bus no partial is lost - both halves are summed, never one of them picked - but the placement cannot be: the pan law here holds the loudness steady as you raise the fader, which means a folded-down partial comes back up to 3 dB quieter than the centred ones at the very top. Mono at *Centred* is bit-for-bit the instrument without this control.",
+        "Reparteix l'ESPECTRE entre les orelles: a partir de 100 Hz, cada parcial va a l'orella contr\xc3\xa0ria que l'anterior - un a la dreta, el seg\xc3\xbc" "ent a l'esquerra, fins al m\xc3\xa9s agut. A baix \xc3\xa9s *Centrat*, que \xc3\xa9s exactament com sonava aquest instrument abans que existeixi aquest control; a dalt els parcials es paneen fins als extrems. Tot el que hi ha per sota de 100 Hz es queda al mig, perqu\xc3\xa8 \xc3\xa9s on l'orella deixa de situar un so pel nivell - posar un fonamental en una sola orella mouria la NOTA en comptes d'obrir l'espectre. En una sortida MONO no es perd cap parcial - les dues meitats se sumen, mai se n'agafa nom\xc3\xa9s una - per\xc3\xb2 la col\xc2\xb7locaci\xc3\xb3 s\xc3\xad: la llei de panoramitzaci\xc3\xb3 d'aqu\xc3\xad mant\xc3\xa9 el volum estable mentre puges el fader, i aix\xc3\xb2 vol dir que un parcial replegat torna fins a 3 dB m\xc3\xa9s fluix que els centrats a dalt de tot. En mono i a *Centrat* \xc3\xa9s bit a bit l'instrument sense aquest control."));
+    // THE TWO STEPPER ROWS' HOVERS. They were built in the constructor as plain English
+    // juce::Strings and never re-set, so OCTAVE's and RANGE's only explanation stayed
+    // English in Catalan - and neither the fit sweep nor the "translated?" check could
+    // see it, because both only ever looked at DRAWN text and a hover is not drawn.
+    // Each is set on all three components of its row (- , value, +) so the hover is the
+    // same wherever the pointer lands, in one place rather than three.
+    {
+        const auto octTip = tr (
+            "Octave transpose: shift the WHOLE synth by whole octaves (\xc2\xb1""5).",
+            "Transposici\xc3\xb3 d'octava: despla\xc3\xa7""a TOT el sintetitzador per octaves senceres (\xc2\xb1""5).");
+        const auto sprTip = tr (
+            "Spectrum's octaves: keep only partials within this many octaves above the played note. 10 = no cut (full spectrum).",
+            "Octaves de l'espectre: mant\xc3\xa9 nom\xc3\xa9s els parcials dins d'aquest nombre d'octaves per sobre de la nota tocada. 10 = sense tall (espectre sencer).");
+        for (auto* b : { &octDn, &octUp }) b->setTooltip (octTip);
+        for (auto* b : { &sprDn, &sprUp }) b->setTooltip (sprTip);
+        octVal.setTooltip (octTip);
+        sprVal.setTooltip (sprTip);
+    }
+    // The switch says ON because that is the state you are asking for when you click it,
+    // and the tooltip carries the part that is not obvious: OFF is not "limit 0" or "all
+    // primes ticked", it is no filter at all.
+    primeOnToggle.setButtonText (tr ("On", "Actiu"));
+    primeOnToggle.setTooltip (tr (
+        "Turns the whole prime filter on and off. OFF passes every harmonic, whichever mode and ticks are showing - it is not the same as ticking all nine primes, because a harmonic like 29 has a prime factor no tick can allow.",
+        "Activa i desactiva tot el filtre de primers. Desactivat deixa passar tots els harm\xc3\xb2nics, sigui quin sigui el mode i les caselles - no \xc3\xa9s el mateix que marcar els nou primers, perqu\xc3\xa8 un harm\xc3\xb2nic com el 29 t\xc3\xa9 un factor primer que cap casella pot permetre."));
     primeModeBox.setTooltip (tr (
         "How prime numbers filter the harmonics. 'Limit': a harmonic passes only if its largest prime factor is at most the chosen limit. 'Whitelist': it passes only if EVERY prime factor is ticked below.",
         "Com filtren els primers els harm\xc3\xb2nics. 'L\xc3\xadmit': un harm\xc3\xb2nic passa nom\xc3\xa9s si el seu factor primer m\xc3\xa9s gran \xc3\xa9s com a molt el l\xc3\xadmit triat. 'Llista': passa nom\xc3\xa9s si TOTS els seus factors primers estan marcats a sota."));
@@ -2904,8 +4776,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         primeToggle[i].setTooltip (tr ("Allow harmonics whose prime factors include ",
                                        "Permet harm\xc3\xb2nics amb el factor primer ") + juce::String (pn2[i]));
     cutoffFader.setTooltip (tr (
-        "Low-pass cutoff as an INTERVAL above the played note, in cents (1200 = one octave, 12000 = fully open). It TRACKS the note, so the same partials are cut at every pitch - a partial at ratio r sits at 1200·log2(r) cents (e.g. harmonic 2 = 1200c, harmonic 3 = 1902c). An absolute-Hz cutoff would eat different partials depending on the note.",
-        "Tall del passa-baixos com a INTERVAL per sobre de la nota tocada, en cents (1200 = una octava, 12000 = tot obert). SEGUEIX la nota, aix\xc3\xad que talla els mateixos parcials a qualsevol al\xc3\xa7""ada - un parcial de ratio r \xc3\xa9s a 1200·log2(r) cents (p. ex. harm\xc3\xb2nic 2 = 1200c, harm\xc3\xb2nic 3 = 1902c). Un tall en Hz absoluts es menjaria parcials diferents segons la nota."));
+        "Low-pass cutoff as an INTERVAL above the played note, in cents (1200 = one octave, 12000 = fully open). It TRACKS the note, so the same partials are cut at every pitch - a partial at ratio r sits at 1200·log2(r) cents (e.g. harmonic 2 = 1200c, harmonic 3 = 1902c).",
+        "Tall del passa-baixos com a INTERVAL per sobre de la nota tocada, en cents (1200 = una octava, 12000 = tot obert). SEGUEIX la nota, aix\xc3\xad que talla els mateixos parcials a qualsevol al\xc3\xa7""ada - un parcial de ratio r \xc3\xa9s a 1200·log2(r) cents (p. ex. harm\xc3\xb2nic 2 = 1200c, harm\xc3\xb2nic 3 = 1902c)."));
     resFader.setTooltip (tr ("Resonance: a volume peak right at the cutoff frequency.",
                              "Res(son\xc3\xa0ncia): un pic de volum just a la freq\xc3\xbc\xc3\xa8ncia de tall."));
     fEnvAmtFader.setTooltip (tr (
@@ -2926,44 +4798,58 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     loadSclButton.setTooltip (tr (
         "Load an AnaMark .tun, a Scala .scl or an Ableton .ascl file to retune the keys. The 1/1 sits on middle C unless the file sets its own reference (@ABL REFERENCE_PITCH, or a .tun's basefreq - a .tun always sounds at the absolute pitches it states). A .tun whose mapping does not repeat cannot be held as a scale and is refused rather than approximated.",
         "Carrega un fitxer AnaMark .tun, un Scala .scl o un Ableton .ascl per reafinar les tecles. L'1/1 queda al Do central tret que el fitxer porti la seva refer\xc3\xa8ncia (@ABL REFERENCE_PITCH, o el basefreq d'un .tun - un .tun sempre sona als tons absoluts que indica). Un .tun amb un mapatge que no es repeteix no es pot desar com a escala i es rebutja en comptes d'aproximar-lo."));
-    clearSclButton.setTooltip (tr ("Unload the scale and return to standard 12-TET.",
-                                   "Descarrega l'escala i torna al 12-TET est\xc3\xa0ndard."));
     for (int i = 0; i < 3; ++i)
         recentBtn[i].setTooltip (tr ("Reload this recently used file as the scale.",
                                      "Torna a carregar aquest fitxer recent com a escala."));
     bendBox.setTooltip (tr (
         "Per-note pitch-bend range. +-48 st is the MPE standard and is REQUIRED for Ableton Live 12's tuning systems and the Microtuner device (enable MPE on this plugin in Live). Use +-2 for a classic keyboard pitch wheel.",
         "Rang del pitch bend per nota. +-48 st \xc3\xa9s l'est\xc3\xa0ndard MPE i \xc3\x89S NECESSARI per als sistemes d'afinaci\xc3\xb3 d'Ableton Live 12 i el Microtuner (activa MPE al plugin dins de Live). Fes servir +-2 per a la roda d'un teclat cl\xc3\xa0ssic."));
-    //-- Shepard tone generator (bottom row of the Tuning box) ------------------
+    //-- SHEPARD MODE (bottom row of the Tuning box) ---------------------------
     shepOnT.setButtonText ("Shepard");
-    shepOnT.setTooltip (tr (
-        "An endlessly rising Shepard tone, mixed under the synth's output. Its components are spaced exactly ONE PERIOD of the *active tuning* apart - 2/1 here means it rises one octave; load Bohlen-Pierce and the spacing (and the rise) becomes 3/1 - and the stack is anchored on C3's own sounding pitch, so it stays consonant with the keyboard. Up to 64 sine components under a fixed spectral envelope whose edges reach zero: the component that wraps re-enters SILENT, so there are no clicks and no audible reset. With a period under ~187 cents the covered band narrows rather than any component being dropped. Off by default.",
-        "Un to de Shepard que puja sense fi, mesclat sota el so del sinte. Els components van separats exactament UN PER\xc3\x8dODE de l'*afinaci\xc3\xb3 activa* - amb 2/1 puja una octava; carrega Bohlen-Pierce i la separaci\xc3\xb3 (i la pujada) passa a ser 3/1 - i la pila queda ancorada al to real de Do3, per aix\xc3\xb2 \xc3\xa9s consonant amb el teclat. Fins a 64 components sinuso\xc3\xaf" "dals sota una envolupant espectral fixa amb vores a zero: el component que d\xc3\xb3na la volta hi torna a entrar EN SILENCI, o sigui sense clics ni reinici audible. Amb un per\xc3\xado" "de per sota d'uns 187 cents la banda coberta s'estreny en comptes de perdre cap component. Apagat per defecte."));
+    // (its hover is written by refreshShepardRiseState() below - it carries the
+    //  rise-interval state, which depends on the TUNING and so cannot live here)
     shepModeBox.setTooltip (tr (
-        "How the rise time is set. *Free*: the fader beside gives the time to rise one period, in ms. *Sync*: rising one period lasts the chosen number of host beats. Switching mode (or moving the rate) GLIDES the speed - the tone never jumps.",
-        "Com es fixa el temps de pujada. *Lliure*: el fader del costat d\xc3\xb3na el temps de pujar un per\xc3\xado" "de, en ms. *Sinc*: pujar un per\xc3\xado" "de dura els beats triats del tempo del DAW. Canviar de mode (o moure la velocitat) fa LLISCAR la marxa - el to mai salta."));
+        "How the rise time is set. *Free*: the fader beside gives the time to rise one interval, in ms. *Sync* (the default): rising one interval lasts the chosen number of host beats. Switching mode (or moving the rate) GLIDES the speed - a sounding Shepard never jumps.",
+        "Com es fixa el temps de pujada. *Lliure*: el fader del costat d\xc3\xb3na el temps de pujar un interval, en ms. *Sinc* (per defecte): pujar un interval dura els beats triats del tempo del DAW. Canviar de mode (o moure la velocitat) fa LLISCAR la marxa - un Shepard que sona mai salta."));
     shepTimeFader.setTooltip (tr (
-        "Time to rise ONE period of the active tuning, 100 ms to 60 s (log fader). Changes glide - the tone never jumps.",
-        "Temps de pujar UN per\xc3\xado" "de de l'afinaci\xc3\xb3 activa, de 100 ms a 60 s (fader logar\xc3\xadtmic). Els canvis llisquen - el to mai salta."));
-    shepLevelFader.setTooltip (tr ("Shepard tone level, in dB.", "Nivell del to de Shepard, en dB."));
+        "Time to rise ONE interval, 100 ms to 60 s (log fader). Changes glide - a sounding Shepard never jumps.",
+        "Temps de pujar UN interval, de 100 ms a 60 s (fader logar\xc3\xadtmic). Els canvis llisquen - un Shepard que sona mai salta."));
+    shepRiseBox.setTooltip (tr (
+        "What ONE rise step is. *Octave*: 2/1, the default in every tuning - an octave is what the ear hears as the same note again, so the illusion works whatever scale is loaded. *Period*: the active tuning's own repeat interval (3/1 under Bohlen-Pierce), which makes the rise land on the scale's own steps instead. This control only appears when the two differ.",
+        "Qu\xc3\xa8 \xc3\xa9s UN pas de pujada. *Octava*: 2/1, el valor per defecte en qualsevol afinaci\xc3\xb3 - una octava \xc3\xa9s el que l'orella sent com la mateixa nota un altre cop, aix\xc3\xad la il\xc2\xb7lusi\xc3\xb3 funciona amb l'escala que sigui. *Per\xc3\xad" "ode*: l'interval de repetici\xc3\xb3 de l'afinaci\xc3\xb3 activa (3/1 amb Bohlen-Pierce), que fa que la pujada caigui sobre els graus de l'escala. Aquest control nom\xc3\xa9s apareix quan els dos difereixen."));
     // The beats box's tooltip carries the no-BPM state and is written by
     // refreshShepardSyncState(); resetting the memo makes it re-render in this language.
     lastShepNoBpm = -1;
     refreshShepardSyncState();
+    // ...and the LFO rate fader's, which names three numbers inside a sentence whose word
+    // order differs between the two languages. Same memo, same reason.
+    lastLfoLimited = -1;
+    refreshLfoRateLimitState();
+    // ...and the SHEPARD switch's carries the rise-interval state (see
+    // refreshShepardRiseState), for the same reason and by the same rule.
+    lastShepRiseState = -1;
+    refreshShepardRiseState();
     // (loadTimbreButton's and randomSpectrumBtn's tooltips are set by
     //  refreshCustomEngineButtons above: they depend on which job the button has.)
     timbreRepeatsFader.setTooltip (tr (
         "How many periods of the scale are stacked as partials. More repeats = the timbre reaches higher in the spectrum.",
         "Quants per\xc3\xado""des de l'escala s'apilen com a parcials. M\xc3\xa9s repeticions = el timbre arriba m\xc3\xa9s amunt de l'espectre."));
-    presetBox.setTooltip (tr ("Load a saved preset.", "Carrega un preset desat."));
+    presetBox.setTooltip (tr ("Load a saved preset. The drop-down has a search box: type to filter the list "
+                              "(accents and capitals are ignored).",
+                              "Carrega un preset desat. El desplegable t\xc3\xa9 un cercador: escriu per filtrar "
+                              "la llista (els accents i les maj\xc3\xbascules s'ignoren)."));
     savePresetButton.setTooltip (tr ("Save the current sound as a preset (stored in Documents/Galactic Sting/Presets).",
                                      "Desa el so actual com a preset (a Documents/Galactic Sting/Presets)."));
+    // Corner-edit mode gives both of these a different meaning - re-apply it, or a
+    // language switch mid-edit would put the live patch's tooltips back on a frozen field.
+    lastEditCornerSeen = -12345;   // a value no corner index can be: force one rebuild
+    refreshCornerEditUi();
     dissBtn.setTooltip (tr (
         "Computes the Sethares sensory-dissonance curve of the CURRENT timbre and builds a scale from its most consonant points (the curve's minima), then loads it as the active tuning. With Max ticked it uses the roughest points (maxima) instead.",
-        "Calcula la corba de dissonancia sensorial de Sethares del timbre ACTUAL i construeix una escala amb els seus punts m\xc3\xa9s consonants (els m\xc3\xadnims de la corba), i la carrega com a afinaci\xc3\xb3 activa. Amb Max marcat fa servir els punts m\xc3\xa9s aspres (m\xc3\xa0xims)."));
+        "Calcula la corba de disson\xc3\xa0ncia sensorial de Sethares del timbre ACTUAL i construeix una escala amb els seus punts m\xc3\xa9s consonants (els m\xc3\xadnims de la corba), i la carrega com a afinaci\xc3\xb3 activa. Amb Max marcat fa servir els punts m\xc3\xa9s aspres (m\xc3\xa0xims)."));
     dissCountBox.setTooltip (tr (
         "How many notes the generated scale gets (curve minima - or maxima in Max mode), plus the period as the final note.",
-        "Quantes notes tindra l'escala generada (m\xc3\xadnims de la corba - o m\xc3\xa0xims en mode Max), m\xc3\xa9s el per\xc3\xado" "de com a nota final."));
+        "Quantes notes tindr\xc3\xa0 l'escala generada (m\xc3\xadnims de la corba - o m\xc3\xa0xims en mode Max), m\xc3\xa9s el per\xc3\xado" "de com a nota final."));
     dissModeBox.setTooltip (tr (
         "Min = pick the curve's minima (the most consonant intervals).  Max = pick the maxima (the most dissonant intervals) instead.",
         "Min = tria els m\xc3\xadnims de la corba (els intervals m\xc3\xa9s consonants).  Max = tria els m\xc3\xa0xims (els m\xc3\xa9s dissonants) en lloc d'aix\xc3\xb2."));
@@ -2993,10 +4879,38 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         b.setSelectedId (keep, juce::dontSendNotification); // refresh displayed text
     };
     localise (basePitchBox, { tr ("Transposed down", "Transposada avall"), tr ("Original", "Original") });
-    localise (phaseBox,     { tr ("Aligned", "Alineat"), tr ("Scattered", "Dispers") });
+    // Phase has NOTHING to localise here any more. Its two end words live on the fader
+    // (its tooltip and its read-out), and the glide choice that used to need a localised
+    // two-item box is gone entirely - the mode comes from the SPECTRUM panel's Morph /
+    // Dry-Wet transition, whose own words are already translated where they are drawn.
+    // That also retires the "Bend" compromise: the box was 67 px wide, "Pitchbend"
+    // measured 65 px in RhythmVerify's drawn-string sweep, and the English word had to be
+    // shortened to keep it off the fader. No box, no compromise.
     localise (primeModeBox, { tr ("Limit", "L\xc3\xadmit"), tr ("Whitelist", "Llista") });
-    localise (bendBox,      { "\xc2\xb1""2 st", "\xc2\xb1""12 st", "\xc2\xb1""48 st (MPE)" });
-    localise (shepModeBox,  { tr ("Free (ms)", "Lliure (ms)"), tr ("Sync (beats)", "Sinc (beats)") });
+    // THROUGH tr(), even though the three items are the same word in both languages.
+    // Written as raw const char* they went through juce::String(const char*), which reads
+    // each byte as a code point, and U+00B1 shipped as "Â±48 st (MPE)" - the most-repeated
+    // visual defect in the product (visible in every one of the 42 main-editor snapshots).
+    // tr() is the one place that decodes UTF-8, so "same in both languages" is spelled as
+    // an identical pair rather than as an escape from the decoder.
+    localise (bendBox,      { tr ("\xc2\xb1""2 st",        "\xc2\xb1""2 st"),
+                              tr ("\xc2\xb1""12 st",       "\xc2\xb1""12 st"),
+                              tr ("\xc2\xb1""48 st (MPE)", "\xc2\xb1""48 st (MPE)") });
+    // "Sync (beats)" said nothing about WHOSE beats: the user read it as a beat
+    // subdivision of the rise rather than a lock to the host clock. Name the thing it
+    // actually locks to. (Only the TEXT changes - changeItemText keeps the item's
+    // POSITION, which is the whole contract with the ComboBoxAttachment.)
+    // "SYNC" IS THE WORD THIS ROW CANNOT AFFORD, so it goes - in both languages, the
+    // same trade the source selector made. It was the single control holding the
+    // fully-legible size at 820 px wide, needing 101.0 (en) / 101.9 (ca) of the 99.0
+    // the row can give it, and three ways of finding it more room are already measured
+    // and rejected. Against "Free (ms)" beside it, "Project Tempo" says which clock the
+    // rate comes from and the syncing is what CHOOSING it means. The parameter's own
+    // choice strings are untouched: those are what the host writes into automation.
+    localise (shepModeBox,  { tr ("Free (ms)", "Lliure (ms)"),
+                              tr ("Project Tempo", "Tempo projecte") });
+    localise (shepRiseBox,  { tr ("Octave pitch bend", "Bend d'octava"),
+                              tr ("Period pitch bend", "Bend de per\xc3\xad" "ode") });
     voiceEnv.tip = tr (
         "This envelope, drawn as a line with nodes. Drag a node for the attack time, the decay time + sustain level, or the release time; drag the LINE between nodes to bend it concave or convex; double-click a segment to straighten it.",
         "Aquesta envolupant, dibuixada com una línia amb nodes. Arrossega un node per al temps d'""atac, el de caï""da + nivell de sosteniment, o el d'""alliberament; arrossega la LÍNIA entre nodes per corbar-la; doble clic en un tram per aplanar-lo.");
@@ -3007,7 +4921,7 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (modSelBox,      { "Env 1", "Env 2", "Env 3", "LFO 1", "LFO 2", "LFO 3" });
     localise (lfoWaveBox,     { tr ("Sine", "Sinus"), tr ("Triangle", "Triangle"),
                                 tr ("Saw up", "Serra amunt"), tr ("Saw down", "Serra avall"),
-                                tr ("Square", "Quadrada"), tr ("Custom (draw)", "Pr\xc3\xb2pia (dibuixa)"),
+                                tr ("Square", "Quadrada"), tr ("Custom", "Pr\xc3\xb2pia"),
                                 tr ("Random", "Aleat\xc3\xb2ria") });
     localise (lfoRateModeBox, { tr ("BPM / 2^n", "BPM / 2^n"),
                                 tr ("Fundamental / 2^n", "Fonamental / 2^n"),
@@ -3015,8 +4929,11 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
     localise (lfoPhaseModeBox,{ tr ("Restart each note", "Reinicia a cada nota"),
                                 tr ("Project transport", "Transport del projecte") });
     modUnmapBtn.setButtonText  (tr ("Unmap", "Desassigna"));
-    lfoWaveEditBtn.setButtonText (tr ("Draw", "Dibuixa"));
     rhythmPanel.helpB.setButtonText (tr ("How to route", "Com encaminar"));
+    // The unit on every routed row's steps field. Set here rather than at the call site
+    // because stepsText is static - see the comment on stepWord.
+    rhythmPanel.stepWord = tr ("step", "pas");
+    rhythmPanel.refreshSlots();
     chordList.emptyText = tr ("Press Find to search.\nhover a row to hear it\ndouble-click loads it as the scale",
                               "Prem Troba per cercar.\npassa-hi el cursor per escoltar-lo\ndoble clic el carrega com a escala");
     // The adaptation's read-out is one plain sentence with ONE job at a time; every number
@@ -3027,23 +4944,138 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Qu\xc3\xa8 est\xc3\xa0 passant, o qu\xc3\xa8 passar\xc3\xa0 si prems Adapta: quant trigar\xc3\xa0 la cerca, si un v\xc3\xadncle en TEMPS REAL hi pot seguir el ritme, i quant batec ha tret l'\xc3\xbaltima adaptaci\xc3\xb3. Els n\xc3\xbameros de Sethares en cru surten aqu\xc3\xad quan una cerca ha acabat.");
     adaptInfoLbl.setTooltip (adaptInfoTipBase);
     {
+        // THE TUNING MODE BOX'S OWN ITEMS, which come straight from the parameter's
+        // StringArray and were never translated at all. Three of the four are the same
+        // word in Catalan - 12ED2 is a name, MTS-ESP a standard, Scala a file format -
+        // and the fourth is two English words that stayed English. Nothing found it
+        // because it is the WIDEST item, so it is never the one a picture shows: every
+        // shot has "Scala (.scl)" selected.
+        //
+        // changeItemText, not localise, because the attachment owns the selection and
+        // re-adding the items would move it. The PARAMETER's strings are untouched: those
+        // are what the host writes into automation lanes.
+        const int keepTuning = tuningBox.getSelectedId();
+        tuningBox.changeItemText (1, tr ("12ED2", "12ED2"));
+        tuningBox.changeItemText (2, tr ("MTS-ESP", "MTS-ESP"));
+        tuningBox.changeItemText (3, tr ("Scala (.scl)", "Scala (.scl)"));
+        // THE CATALAN GLOSS IS SHORTER THAN THE ENGLISH ONE ON PURPOSE, and this is the
+        // one string in the window where that is a LAYOUT decision rather than a
+        // translation one. This box is sized to its WIDEST item, this is that item, and
+        // it shares the TUNING panel's 24 px mode row with three fork buttons that each
+        // measure their own word. Measured at the shipped 1200x650, where that row is
+        // 447 px wide (the row's own comment already states the four controls want ~466
+        // of it):
+        //
+        //   english   box 174 + 5 + Load 57 + 4 + Save 58 + 4 + the bank word 107 = 409
+        //   catalan   box 215 + 5 + Obrir 60 + 4 + Desa 58 + 4 + the bank word 134 = 480
+        //
+        // The Catalan gloss is 41 px wider than the English one and the Catalan bank word
+        // 27 px wider, so the Catalan row was 33 px over and the LAST control on it paid:
+        // the button that puts the playing tuning into the bank measured 134 against the
+        // 101 it was left, hid itself by this row's stated rule - a word that cannot be
+        // read is hidden, never smeared - and so never got bounds at all. It is also not
+        // reachable any other way: it is the only route into the bank that does not go
+        // through a file. A FEATURE THAT EXISTS IN ONE LANGUAGE AND NOT THE OTHER is not
+        // an outcome that rule may produce, so the row has to fit.
+        //
+        // And nothing saw it, by construction: layoutProbe and the text sweep both skip
+        // invisible children, so hiding a control REMOVES its measurements and every
+        // bounds, overlap and fit check stays green. Only the word survived, in
+        // buttonTexts - a word present with no control under it, which is exactly the
+        // fingerprint a human found by looking at the rendered picture.
+        //
+        // Dropping the gloss to the one word that names the mechanism takes the box to
+        // 122, so the row asks 151 + 5 + 260 = 416 of 447 - 31 px spare against English's
+        // 38, with all four controls laid out in both languages from about a 1090 px
+        // window up. The mechanism is not lost: this box's own hover says the host sends
+        // the tuning as per-note bend, in both languages, and "bend" is the word an MPE
+        // user already has for it. English is not touched by a pixel.
+        //
+        // TRIED AND REJECTED, both measured:
+        //   - sizing the box to its SELECTED item and reserving all three buttons. It
+        //     does fix the row, and it moves the rig's smallest fully legible size from
+        //     780x550 to about 1190x550: the text sweep measures every combo against its
+        //     WIDEST item, this box is already the control that walk names as binding for
+        //     the whole window, and it starts clipping below about 174 px.
+        //   - shortening the bank button's word instead. That word is the FEATURE'S NAME;
+        //     a lone plus sign was replaced by a sentence precisely because it named
+        //     neither what it added nor where, and there is a standing check that it
+        //     still says so.
+        //   - wrapping the three buttons onto a row of their own, which resized() already
+        //     does when it can. It cannot here: the panel has 112 px under the mode row
+        //     and the wrap wants 123, and the 27 px would come off the tuning BANK row -
+        //     trading the panel's whole bank UI for the one button that reaches it.
+        tuningBox.changeItemText (4, tr ("MPE (bend input)", "MPE (bend)"));
+        if (keepTuning > 0) tuningBox.setSelectedId (keepTuning, juce::dontSendNotification);
+    }
+    {
         const int keepMode = specModeBox.getSelectedId(); // BEFORE the texts move - see localise
         specModeBox.changeItemText (1, tr ("Find tunings based on beating", "Troba afinacions pel batec"));
         specModeBox.changeItemText (2, tr ("Adapt spectrum to tuning based on beating",
                                            "Adapta l'espectre a l'afinaci\xc3\xb3 pel batec"));
-        specModeBox.changeItemText (3, tr ("From spectrum's segment", "Del segment de l'espectre"));
+        specModeBox.changeItemText (3, tr ("Find tunings from spectrum's segment",
+                                         "Troba afinacions del segment de l'espectre"));
         specModeBox.setSelectedId (keepMode, juce::dontSendNotification);
     }
+    // THE SOURCE, IN THE WORDS THE BOX CAN AFFORD.
+    //
+    // This box is already the full width of the Spectrum-vs-Tuning column, and at the
+    // SHIPPED 1200x650 "De totes les afinacions possibles" needed 213.96 px of the 174 it
+    // has - it drew 39.96 px past its own right edge, and a ComboBox neither clips
+    // visibly nor resizes, so what a Catalan player actually read was a sentence that
+    // stopped mid-word with nothing on screen saying so. There is no width to take: the
+    // column is 208 px at every window size from the 870x540 floor to the shipped size,
+    // and the previous pass measured what happens when it is widened there (rows 1-2
+    // start clipping instead).
+    //
+    // So the SENTENCE gives way, and the word it gives up is the one that was carrying
+    // nothing. The pair reads "from current tuning" against "from all tunings": the
+    // contrast that matters is THIS tuning against ALL of them, and "possible" was only
+    // ever restating "all". Both languages lose exactly the same word, so the two still
+    // say the same thing - and the English was not comfortable either, at 165.03 px of
+    // 174 with nine pixels to spare in a box whose items get re-worded on every language
+    // switch.
     localise (tuneSourceBox, { tr ("From current tuning", "De l'afinaci\xc3\xb3 actual"),
-                               tr ("From all possible tunings", "De totes les afinacions possibles") });
-    localise (tuneScopeBox,  { tr ("0 vs all", "0 vs tot"), tr ("all vs all", "tot vs tot") });
+                               tr ("From all tunings", "De totes les afinacions") });
+    localise (tuneScopeBox,  { tr ("0 vs all", "0 vs tot"), tr ("All vs all", "Tot vs tot") });
+    // TWO BOXES THAT WERE NEVER ON THIS LIST AT ALL. Both are populated with English at
+    // construction, like every other box here, and both were missing their line - so they
+    // stayed English in the Catalan window. "Min" was on screen in 41 of the rig's Catalan
+    // pictures and the translated gate did not object, because it compares the two
+    // languages and these were identical in both. The dissonance one is worse: its items
+    // are not on screen in ANY photographed state, so nothing could have found it by
+    // looking. Same words as adaptGoalBox above, same accents.
+    localise (chordMinMaxBox, { tr ("Min", "M\xc3\xadn"), tr ("Max", "M\xc3\xa0x") });
+    localise (dissModeBox,    { tr ("Minima", "M\xc3\xadnims"), tr ("Maxima", "M\xc3\xa0xims") });
+    // Its ITEMS were already localised (line above) but its HOVER was not: it was set
+    // once in the constructor as an English literal, so the two-word items changed
+    // language and the sentence that says what they MEAN never did. The items alone do
+    // not carry the meaning - "0 vs tot" is only intelligible from this hover - so this
+    // is the half that mattered.
+    tuneScopeBox.setTooltip (tr (
+        "How a combination is SCORED.\n"
+        "*0 vs all* - each note is judged only by its beating against the root (0).\n"
+        "*All vs all* - every pair of notes in the combination counts.",
+        "Com es PUNTUA una combinaci\xc3\xb3.\n"
+        "*0 vs tot* - cada nota es jutja nom\xc3\xa9s pel seu batec contra la fonamental (0).\n"
+        "*Tot vs tot* - hi compta cada parella de notes de la combinaci\xc3\xb3."));
     lastNadD = 0; // force the n-ad selector's items to rebuild in the new language
 
     // Chord-search mode texts.
     chordNotesLbl.setText (tr ("Notes", "Notes"), dontSendNotification);
     chordPerLbl.setText   (tr ("Period", "Per\xc3\xado" "de"), dontSendNotification);
-    dissMinLbl.setText    (tr ("smallest interval (c)", "interval m\xc3\xa9s petit (c)"), dontSendNotification);
-    chordMinLbl.setText   (tr ("smallest interval (c)", "interval m\xc3\xa9s petit (c)"), dontSendNotification);
+    // Capitalised like "Notes" and "Period" above them: these three are the SAME kind of
+    // thing - a caption over a value in one stack - and two of them opened on a capital
+    // while the third did not. The extra letter costs nothing: a capital S is 1 px wider
+    // than a lower-case one at this face and the caption is sized to its own words.
+    dissMinLbl.setText    (tr ("Smallest interval (c)", "Interval m\xc3\xa9s petit (c)"), dontSendNotification);
+    chordMinLbl.setText   (tr ("Smallest interval (c)", "Interval m\xc3\xa9s petit (c)"), dontSendNotification);
+    // The two minimum-interval boxes. Their tr() pair was correct and sat in the
+    // constructor, where applyLanguage() could never reach it - the four-word caption
+    // above each box changed language and the sentence explaining it did not.
+    for (auto* e : { &dissMinEdit, &chordMinEdit })
+        e->setTooltip (tr ("Minimum interval between generated notes, in cents (also to the tonic and the period).",
+                           "Interval m\xc3\xadnim entre notes generades, en cents (tamb\xc3\xa9 respecte a la t\xc3\xb2nica i el per\xc3\xado" "de)."));
     chordCountLbl.setText (tr ("Chords", "Acords"), dontSendNotification);
     chordViewBack.setButtonText (tr ("Results", "Resultats"));
     chordViewFwd.setButtonText  (tr ("Tuning info", "Info afinaci\xc3\xb3"));
@@ -3057,8 +5089,8 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Desa l'afinaci\xc3\xb3 ACTUAL com a fitxer .scl a qualsevol carpeta - incloses les escales editades al teclat (clic dret per reescriure un grau, Ctrl+clic per afegir una nota)."));
     chordGoBtn.setButtonText (tr ("Find", "Troba"));
     chordNotesBox.setTooltip (tr (
-        "How many notes each combination has (the root 1/1 is included). From the current tuning it stops at the number of degrees the scale has; from all possible tunings it goes to 8. More notes = a heavier search.",
-        "Quantes notes t\xc3\xa9 cada combinaci\xc3\xb3 (l'arrel 1/1 hi \xc3\xa9s inclosa). Des de l'afinaci\xc3\xb3 actual arriba fins als graus que t\xc3\xa9 l'escala; des de totes les afinacions possibles arriba a 8. M\xc3\xa9s notes = cerca m\xc3\xa9s pesada."));
+        "How many notes each combination has (the root 1/1 is included). From the current tuning it stops at the number of degrees the scale has; from all tunings it goes to 8. More notes = a heavier search.",
+        "Quantes notes t\xc3\xa9 cada combinaci\xc3\xb3 (l'arrel 1/1 hi \xc3\xa9s inclosa). Des de l'afinaci\xc3\xb3 actual arriba fins als graus que t\xc3\xa9 l'escala; des de totes les afinacions arriba a 8. M\xc3\xa9s notes = cerca m\xc3\xa9s pesada."));
     chordCountBox.setTooltip (tr ("How many chords to list.", "Quants acords llistar."));
     chordMinMaxBox.setTooltip (tr (
         "Min = the most CONSONANT combinations with this exact timbre (Sethares sensory dissonance of all partial pairs). Max = the roughest.",
@@ -3073,58 +5105,272 @@ void FractalAdditiveAudioProcessorEditor::applyLanguage()
         "Ordena totes les combinacions de n notes per la seva disson\xc3\xa0ncia sensorial de Sethares contra l'espectre ACTUAL (cerca en graella + refinament exacte, en segon pla). Play pre-escolta un acord; doble clic el carrega com a escala activa (.scl)."));
     chordList.tip = tr ("Each note in its own colour.\n*Hover* a row to hear it (all together, then an ascending strum).\n*Double-click* it to LOAD the chord as the active scale.",
                         "Cada nota amb el seu color.\n*Passa-hi el cursor* per escoltar-lo (tot alhora i despr\xc3\xa9s un strum ascendent).\n*Doble clic* per CARREGAR l'acord com a escala activa.");
+    chordList.rowTipLoad  = tr ("*Double-click to load*", "*Doble clic per carregar*");
+    chordList.rowTipValue = tr ("total dissonance:", "disson\xc3\xa0ncia total:");
 
     //== "Adapt spectrum to tuning based on beating" + the two REALTIME buttons =====
     localise (adaptTargetBox, { tr ("To the loaded tuning", "A l'afinaci\xc3\xb3 carregada"),
                                 tr ("To the chord held now", "A l'acord que sona ara") });
-    localise (adaptGoalBox,   { tr ("Min", "Min"), tr ("Max", "Max"), tr ("Range", "Rang") });
+    localise (adaptGoalBox,   { tr ("Min", "M\xc3\xadn"), tr ("Max", "M\xc3\xa0x"), tr ("Range", "Rang") });
     adaptPartialsLbl.setText (tr ("Partials", "Parcials"), dontSendNotification);
-    adaptRangeLbl.setText    (tr ("between", "entre"), dontSendNotification);
-    // "Steps", not "Steps up": at 10 pt bold the Catalan "Passos amunt" needs more than this
-    // row can spare and juce::Label answers that by CONDENSING to 70% rather than by
-    // clipping, which looks deliberate and reads as a different font (RhythmVerify measured
-    // it). The direction is in the line underneath, which says it in words - "24 steps above
-    // 3:0" - where there is room for it.
-    adaptRegLbl.setText      (tr ("Steps", "Passos"), dontSendNotification);
+    adaptRangeLbl.setText    (tr ("Between", "Entre"), dontSendNotification);
+    // "Periods", bare: the DIRECTIONS are in the line underneath, which has room to print
+    // them as numbers ("+-1.0 per around 3:0 = 2:0..4:0"). A caption that tried to say
+    // "Periods each way" would need more than this row can spare, and juce::Label answers
+    // that by CONDENSING to 70% rather than by clipping - which looks deliberate and reads
+    // as a different font (RhythmVerify measured exactly that on the word this replaces).
+    adaptRegLbl.setText      (tr ("Periods", "Per\xc3\xado" "des"), dontSendNotification);
     refreshAdaptButtonText();
-    adaptAmpsToggle.setButtonText (tr ("+ amps", "+ amplituds"));
-    chordRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
-    adaptRtBtn.setButtonText (tr ("REALTIME", "TEMPS REAL"));
+    // THE TICK IS THE "+".
+    //
+    // "+ amplituds" needed 75.11 px of the 62 its cell left it and drew 13.11 px past the
+    // toggle at the SHIPPED 1200x650, and again at the 870x540 floor - a ToggleButton
+    // does not clip its word, it just draws it over whatever is to its right.
+    //
+    // Nowhere in this column can hold it. The content is 192 px wide at EVERY window size
+    // the product ships (the column is a flat 208 from the floor to 1200x650), a
+    // ToggleButton spends 28 px of its width on the tick box and its gap before a letter
+    // is drawn, and the widest slot any row here can free is 102 px - two pixels short of
+    // the 104 the Catalan wanted. A row of its own is the one thing that would fit it and
+    // it is the one thing this panel cannot pay for: the adapted-partial list is the
+    // LEFTOVER of this column, RhythmVerify holds it to three unscrolled rows, and in the
+    // goal-Range shape it is already down to 56 px of the 54 that bar demands.
+    //
+    // So the LABEL gives way, and what it gives up is the "+" - which the tick box was
+    // already saying. A checkbox reading "amplitudes" is a checkbox that turns amplitudes
+    // on; the "+" was a second copy of the tick, in the row's most expensive pixels. Both
+    // languages drop it, so the two still say the same thing, and the noun each keeps is
+    // its own real word rather than an abbreviation shared out of desperation.
+    adaptAmpsToggle.setButtonText (tr ("Amps", "Amplituds"));
+    // SENTENCE CASE, NOT SHOUTING. These two were the only ALL-CAPS words among the
+    // column's controls - every caption, item and button around them is sentence case -
+    // so the caps read as emphasis this pair has not earned over the action beside it.
+    // The hierarchy inside the pair is carried by ORDER and COLOUR (see actionPair), and
+    // neither of those changes here.
+    //
+    // It is also the one capitalisation change that BUYS room rather than spending it.
+    // actionPair measures the follower's word and gives the action what is left, and the
+    // comment there records what the all-caps pair cost: "REALTIME" wanted 79 px of the
+    // 76 the old 2/5 split gave it and "TEMPS REAL" wanted 96. Lower-case letters are
+    // narrower than capitals in this face, so both words shrink and the action - whose
+    // text GROWS when a run would take more than a second - gets the difference.
+    chordRtBtn.setButtonText (tr ("Realtime", "Temps real"));
+    adaptRtBtn.setButtonText (tr ("Realtime", "Temps real"));
     adaptTargetBox.setTooltip (tr (
-        "WHICH NOTES the spectrum is adapted to.\n*The loaded tuning* - its degrees.\n*The chord held now* - literally the notes under your fingers, at the pitch they are really sounding. Play a major chord in 31-EDO and the partials go where that chord beats least.\nONE note counts as a target too: with nothing else sounding, the thing being minimised is the beating of the partials against EACH OTHER, at that note's own pitch.\nREALTIME always follows the held chord, so this box shows that and waits while the link is on.",
-        "QUINES NOTES fan d'objectiu.\n*L'afinaci\xc3\xb3 carregada* - els seus graus.\n*L'acord que sona ara* - literalment les notes sota els dits, a l'al\xc3\xa7""ada real. Toca un acord major en 31-EDO i els parcials van on aquell acord bat menys.\nUNA sola nota tamb\xc3\xa9 val com a objectiu: si no sona res m\xc3\xa9s, el que es minimitza \xc3\xa9s el batec dels parcials ENTRE ELLS, a l'al\xc3\xa7""ada d'aquella nota.\nTEMPS REAL sempre segueix l'acord que mantens, per aix\xc3\xb2 aquesta casella ho mostra i espera mentre el v\xc3\xadncle est\xc3\xa0 actiu."));
+        "WHICH NOTES the spectrum is adapted to.\n*The loaded tuning* - its degrees.\n*The chord held now* - literally the notes under your fingers, at the pitch they are really sounding.\nONE note counts as a target too: with nothing else sounding, what is minimised is the partials' beating against EACH OTHER, at that note's own pitch.\nREALTIME always follows the held chord, so this box shows that and waits while the link is on.",
+        "QUINES NOTES fan d'objectiu.\n*L'afinaci\xc3\xb3 carregada* - els seus graus.\n*L'acord que sona ara* - literalment les notes sota els dits, a l'al\xc3\xa7""ada real.\nUNA sola nota tamb\xc3\xa9 val com a objectiu: si no sona res m\xc3\xa9s, el que es minimitza \xc3\xa9s el batec dels parcials ENTRE ELLS, a l'al\xc3\xa7""ada d'aquella nota.\nTEMPS REAL sempre segueix l'acord que mantens, per aix\xc3\xb2 aquesta casella ho mostra i espera mentre el v\xc3\xadncle est\xc3\xa0 actiu."));
     adaptPartialsBox.setTooltip (tr (
         "How many partials the adapted spectrum has. They are all kept: the search MOVES them and never merges or removes one - each keeps at least the smallest interval below from its neighbours.",
         "Quants parcials t\xc3\xa9 l'espectre adaptat. Es conserven tots: la cerca els MOU i mai no en fusiona ni n'elimina cap - cada un guarda com a m\xc3\xadnim l'interval m\xc3\xa9s petit de sota respecte als ve\xc3\xafns."));
     adaptGoalBox.setTooltip (tr (
         "The TARGET. Min = the partials go where these notes beat least. Max = where they beat most. Range = hit a beating value between the two numbers you type (the read-out below shows the scale those numbers are on).",
-        "L'OBJECTIU. Min = els parcials van on aquestes notes baten menys. Max = on baten m\xc3\xa9s. Rang = arriba a un valor de batec entre els dos n\xc3\xbameros que escriguis (el marcador de sota mostra l'escala d'aquests n\xc3\xbameros)."));
-    adaptRegStepsEdit.setTooltip (tr (
-        "HOW WIDE a band of registers the spectrum is optimised for, counted in STEPS of the loaded tuning and running UPWARD from the note you are playing.\nThe anchor is the lowest note you are HOLDING; with nothing down it is the last note you played, and before you have played anything it is the reference key. The line below names it as period:degree - \"3:0\" is that reference key - and says what your number comes to in periods, because a step count is exact in every tuning and unreadable as a width: 24 steps is two octaves in 12-EDO, 62 steps is the same two periods in 31-EDO, 26 in Bohlen-Pierce. That is why this is not typed in octaves - most of this instrument's tunings do not have one.\nWhy a band and not one pitch: Sethares' critical band is a width in Hz, not in cents, so the answer really is different up and down the keyboard - the interval that beats worst is about 434 cents low and only 61 cents four octaves up, and a partial pair closer than 33 cents gets steadily WORSE the higher you play. A spectrum optimised at ONE pitch is optimal only there, and optimised in the bass it packs partials into tight clusters that cost almost nothing down there and dominate the roughness two periods up.\nThe default is two periods, and that is measured rather than guessed: across three anchors, nothing narrower wins, while three periods and more buy a little insurance high up and pay for it at the register you are actually playing (11.9 -> 13.7 on the search's own scale). 0 is legal and means the played register alone. Your number stays YOUR number when the tuning changes; until you type, it follows the loaded scale's own two periods.\nHOW THE BAND IS COMBINED: every register in it counts EQUALLY - the spectrum is optimised for the AVERAGE beating across the whole span, so a wider band trades a little at the note under your fingers for the registers above it. That is not a setting: there used to be a *worst case* choice beside this field, and with the band anchored at the played note and running UPWARD its worst register is always the anchor, so it optimised that one pitch alone and this width stopped changing anything (10.742 at every value). The objective is evaluated at one point per period, capped at 7 for the Adapt button and 3 for the REALTIME follower (the cost is exactly linear in that count, and 3 is still exact sampling for a two-period range). Nothing is degraded silently.",
-        "L'AMPLADA de la banda de registres per als quals s'optimitza l'espectre, comptada en PASSOS de l'afinaci\xc3\xb3 carregada i cap AMUNT des de la nota que toques.\nL'\xc3\xa0ncora \xc3\xa9s la nota m\xc3\xa9s greu que MANTENS; si no en mantens cap, l'\xc3\xbaltima que has tocat, i abans de tocar res, la tecla de refer\xc3\xa8ncia. La l\xc3\xadnia de sota l'anomena com a per\xc3\xado" "de:grau - \"3:0\" \xc3\xa9s aquella tecla de refer\xc3\xa8ncia - i diu a quants per\xc3\xado" "des equival el teu n\xc3\xbamero, perqu\xc3\xa8 un compte de passos \xc3\xa9s exacte en qualsevol afinaci\xc3\xb3 i illegible com a amplada: 24 passos s\xc3\xb3n dues octaves en 12-EDO, 62 passos s\xc3\xb3n els mateixos dos per\xc3\xado" "des en 31-EDO, 26 en Bohlen-Pierce. Per aix\xc3\xb2 no s'escriu en octaves - la majoria d'afinacions d'aquest instrument no en tenen.\nPer qu\xc3\xa8 una banda i no una sola al\xc3\xa7""ada: la banda cr\xc3\xadtica de Sethares \xc3\xa9s una amplada en Hz, no en cents, i per aix\xc3\xb2 la resposta \xc3\xa9s realment diferent amunt i avall del teclat - l'interval que m\xc3\xa9s bat \xc3\xa9s d'uns 434 cents als greus i nom\xc3\xa9s 61 quatre octaves m\xc3\xa9s amunt, i una parella de parcials a menys de 33 cents empitjora com m\xc3\xa9s amunt toques. Un espectre optimitzat per a UNA sola al\xc3\xa7""ada nom\xc3\xa9s ho \xc3\xa9s all\xc3\xa0, i optimitzat als greus amuntega els parcials en grups atapa\xc3\xafts que all\xc3\xa0 baix no costen gaire i dos per\xc3\xado" "des m\xc3\xa9s amunt dominen l'aspresa.\nPer defecte s\xc3\xb3n dos per\xc3\xado" "des, i aix\xc3\xb2 est\xc3\xa0 mesurat, no suposat: des de tres \xc3\xa0ncores, res m\xc3\xa9s estret no guanya, mentre que tres per\xc3\xado" "des o m\xc3\xa9s compren una mica d'asseguran\xc3\xa7""a amunt i la paguen al registre que realment toques (11,9 -> 13,7 a l'escala de la mateixa cerca). 0 \xc3\xa9s legal i vol dir nom\xc3\xa9s el registre tocat. El teu n\xc3\xbamero segueix sent EL TEU quan canvia l'afinaci\xc3\xb3; fins que no escriguis, segueix els dos per\xc3\xado" "des de l'escala carregada.\nCOM ES COMBINA LA BANDA: tots els seus registres compten IGUAL - l'espectre s'optimitza per a la MITJANA del batec de tot el tram, de manera que una banda m\xc3\xa9s ampla cedeix una mica a la nota que tens sota els dits per guanyar als registres de sobre. Aix\xc3\xb2 no \xc3\xa9s cap opci\xc3\xb3: al costat d'aquest camp hi havia un *pitjor cas*, i amb la banda ancorada a la nota tocada i cap AMUNT el pitjor registre \xc3\xa9s sempre l'\xc3\xa0ncora, o sigui que nom\xc3\xa9s optimitzava aquella al\xc3\xa7""ada i aquesta amplada deixava de canviar res (10,742 amb qualsevol valor).\nL'objectiu s'avalua a un punt per per\xc3\xado" "de, amb un m\xc3\xa0xim de 7 per al bot\xc3\xb3 Adapta i de 3 per al seguidor en TEMPS REAL (el cost \xc3\xa9s exactament lineal amb aquest nombre, i 3 encara \xc3\xa9s mostreig exacte per a un rang de dos per\xc3\xado" "des). No es degrada res en silenci."));
+        "L'OBJECTIU. M\xc3\xadn = els parcials van on aquestes notes baten menys. M\xc3\xa0x = on baten m\xc3\xa9s. Rang = arriba a un valor de batec entre els dos n\xc3\xbameros que escriguis (el marcador de sota mostra l'escala d'aquests n\xc3\xbameros)."));
+    adaptRegPeriodsEdit.setTooltip (tr (
+        "HOW WIDE a band of registers the spectrum is optimised for, counted in PERIODS of the loaded tuning and reaching that far BOTH ABOVE AND BELOW the note you are playing. 1.0 means one period down and one period up.\nThe anchor is the lowest note you are HOLDING; with nothing down it is the last note you played, and before you have played anything it is the reference key. The line below names it as period:degree - \"3:0\" is that reference key - and prints the two keys the band really reaches, so a band cut short by the end of the keyboard shows as \"-0.4/+1.0\" instead of pretending to be symmetric.\nWhy PERIODS and not steps or octaves: a period is the unit the tuning itself is built from, so one number is the same musical width in every scale (1200 cents in 12-EDO, 1902 in Bohlen-Pierce) and it never has to be re-read when you change tuning. Most of this instrument's tunings have no octave, and a count of scale steps is exact but unreadable: 62 is two periods in 31-EDO and sixty-two in a one-degree scale.\nWhy BOTH WAYS: Sethares' critical band is a width in Hz, not in cents, so the answer really is different up and down the keyboard - the interval that beats worst is about 434 cents low and only 61 cents four octaves up. Measured, one period below the played note costs 1.46x a spectrum optimised there, against 1.27x once the band straddles the note.\nThe default is one period each way, and that is measured rather than guessed: across a symmetric band the coverage average barely separates the widths at all - a 2.4% spread - so the default is decided by what does separate them. It costs the register you are really playing almost nothing, and it is the WIDEST band the REALTIME follower samples exactly: one register per period, three points, which is the follower's own cap. 0 is legal and means the played register alone.\nWITH AN ABSOLUTE .tun TABLE there is no scale behind the pitches and therefore no period; the band is then built on the period Fibló measured for the file, and the line below says so and by how many cents the file strays from it. If the file has nothing ascending to measure at all, that line says so too - it is never presented as a fact.\nHOW THE BAND IS COMBINED: every register in it counts EQUALLY - the spectrum is optimised for the AVERAGE beating across the whole span, so a wider band trades a little at the note under your fingers for the registers around it. That is not a setting: there used to be a *worst case* choice beside this field and it could not change the result. The objective is evaluated at one point per period, capped at 7 for the Adapt button and 3 for the REALTIME follower (the cost is exactly linear in that count). Nothing is degraded silently - the panel prints how many points each path really uses.",
+        "L'AMPLADA de la banda de registres per als quals s'optimitza l'espectre, comptada en PER\xc3\x8dODES de l'afinaci\xc3\xb3 carregada i que arriba fins all\xc3\xa0 tant PER SOBRE com PER SOTA de la nota que toques. 1,0 vol dir un per\xc3\xado" "de avall i un amunt.\nL'\xc3\xa0ncora \xc3\xa9s la nota m\xc3\xa9s greu que MANTENS; si no en mantens cap, l'\xc3\xbaltima que has tocat, i abans de tocar res, la tecla de refer\xc3\xa8ncia. La l\xc3\xadnia de sota l'anomena com a per\xc3\xado" "de:grau - \"3:0\" \xc3\xa9s aquella tecla de refer\xc3\xa8ncia - i escriu les dues tecles a les quals arriba de deb\xc3\xb2, de manera que una banda escap\xc3\xa7""ada pel final del teclat es veu com a \"-0,4/+1,0\" en comptes de fer veure que \xc3\xa9s sim\xc3\xa8trica.\nPer qu\xc3\xa8 PER\xc3\x8dODES i no passos ni octaves: el per\xc3\xado" "de \xc3\xa9s la unitat amb qu\xc3\xa8 est\xc3\xa0 constru\xc3\xaf" "da l'afinaci\xc3\xb3 mateixa, o sigui que un sol n\xc3\xbamero \xc3\xa9s la mateixa amplada musical a qualsevol escala (1200 cents en 12-EDO, 1902 en Bohlen-Pierce) i no s'ha de rellegir mai en canviar d'afinaci\xc3\xb3. La majoria d'afinacions d'aquest instrument no tenen octava, i un compte de passos \xc3\xa9s exacte per\xc3\xb2 il\xc2\xb7legible: 62 s\xc3\xb3n dos per\xc3\xado" "des en 31-EDO i seixanta-dos en una escala d'un sol grau.\nPer qu\xc3\xa8 CAP A TOTES DUES BANDES: la banda cr\xc3\xadtica de Sethares \xc3\xa9s una amplada en Hz, no en cents, i per aix\xc3\xb2 la resposta \xc3\xa9s realment diferent amunt i avall del teclat - l'interval que m\xc3\xa9s bat \xc3\xa9s d'uns 434 cents als greus i nom\xc3\xa9s 61 quatre octaves m\xc3\xa9s amunt. Mesurat, un per\xc3\xado" "de per sota de la nota tocada costa 1,46x respecte d'un espectre optimitzat all\xc3\xa0, contra 1,27x quan la banda encavalca la nota.\nPer defecte \xc3\xa9s un per\xc3\xado" "de a cada banda, i aix\xc3\xb2 est\xc3\xa0 mesurat, no suposat: amb una banda sim\xc3\xa8trica la mitjana de cobertura gaireb\xc3\xa9 no separa les amplades - un 2,4% de difer\xc3\xa8ncia - de manera que el valor per defecte el decideix el que s\xc3\xad que les separa. Costa gaireb\xc3\xa9 res al registre que est\xc3\xa0s tocant de deb\xc3\xb2, i \xc3\xa9s la banda M\xc3\x89S AMPLA que el seguidor en TEMPS REAL mostreja exactament: un registre per per\xc3\xado" "de, tres punts, que \xc3\xa9s el seu propi m\xc3\xa0xim. 0 \xc3\xa9s legal i vol dir nom\xc3\xa9s el registre tocat.\nAMB UNA TAULA .tun ABSOLUTA no hi ha cap escala darrere de les al\xc3\xa7""ades i per tant no hi ha per\xc3\xado" "de; la banda es construeix llavors sobre el per\xc3\xado" "de que Fibl\xc3\xb3 ha mesurat per al fitxer, i la l\xc3\xadnia de sota ho diu i tamb\xc3\xa9 quants cents se n'aparta el fitxer. Si el fitxer no t\xc3\xa9 res ascendent per mesurar, aquella l\xc3\xadnia tamb\xc3\xa9 ho diu - mai no es presenta com un fet.\nCOM ES COMBINA LA BANDA: tots els seus registres compten IGUAL - l'espectre s'optimitza per a la MITJANA del batec de tot el tram, de manera que una banda m\xc3\xa9s ampla cedeix una mica a la nota que tens sota els dits per guanyar als registres del voltant. Aix\xc3\xb2 no \xc3\xa9s cap opci\xc3\xb3: al costat d'aquest camp hi havia un *pitjor cas* i no podia canviar el resultat. L'objectiu s'avalua a un punt per per\xc3\xado" "de, amb un m\xc3\xa0xim de 7 per al bot\xc3\xb3 Adapta i de 3 per al seguidor en TEMPS REAL (el cost \xc3\xa9s exactament lineal amb aquest nombre). No es degrada res en silenci - el panell escriu quants punts fa servir de deb\xc3\xb2 cada cam\xc3\xad."));
     // The SAME hover on the caption and on the line under the field: the sentence that
     // explains the aggregate now lives here (the box that used to say it in words is gone),
     // and a user reaching for "what happened to the average/worst choice" is as likely to
     // hover the words as the number.
-    adaptRegSpanLbl.setTooltip (adaptRegStepsEdit.getTooltip());
-    adaptRegLbl.setTooltip     (adaptRegStepsEdit.getTooltip());
+    adaptRegSpanLbl.setTooltip (adaptRegPeriodsEdit.getTooltip());
+    adaptRegLbl.setTooltip     (adaptRegPeriodsEdit.getTooltip());
     adaptAmpsToggle.setTooltip (tr (
         "Also shape each partial's AMPLITUDE, not only where it sits. The amplitudes are written as per-partial edits (the pencil window's own values), bounded and never muted - a silenced partial would be a deleted one.",
         "Modela tamb\xc3\xa9 l'AMPLITUD de cada parcial, no nom\xc3\xa9s la posici\xc3\xb3. Les amplituds s'escriuen com a edicions per parcial (els mateixos valors de la finestra del llapis), acotades i mai silenciades - un parcial silenciat seria un parcial esborrat."));
     adaptGoBtn.setTooltip (tr (
-        "Adapt the spectrum once, now. It is written into the Custom Engine (partial ratios) plus the per-partial amplitudes, as ONE undo step.\nThis is a ONE-SHOT calculation, so it is allowed to take time: when it will take more than a moment the button says roughly how long, and pressing it again while it runs STOPS it. Nothing is refused for being big except a request estimated past ten minutes, which is stated as a number rather than a verdict. The search runs on a background thread - you can keep playing while it works.",
-        "Adapta l'espectre un cop, ara. S'escriu al Motor Propi (raons dels parcials) m\xc3\xa9s les amplituds per parcial, com UN sol pas d'anul\xc2\xb7laci\xc3\xb3.\n\xc3\x89s un c\xc3\xa0lcul D'UN SOL COP, i per tant t\xc3\xa9 dret a trigar: quan trigui m\xc3\xa9s d'un instant, el bot\xc3\xb3 diu aproximadament quant, i tornar-lo a pr\xc3\xa9mer mentre treballa l'ATURA. No es rebutja res per ser gran, tret d'una petici\xc3\xb3 estimada en m\xc3\xa9s de deu minuts, i aix\xc3\xb2 es diu amb un n\xc3\xbamero, no amb un veredicte. La cerca va en un fil de fons - pots seguir tocant mentre treballa."));
+        "Adapt the spectrum once, now. It is written into the Custom Engine (partial ratios) plus the per-partial amplitudes, as ONE undo step.\nA one-shot calculation, so it is allowed to take time: when it will take more than a moment the button says roughly how long, and pressing it again while it runs STOPS it. Nothing is refused for being big except a request estimated past ten minutes, which is stated as a number rather than a verdict. You can keep playing while it works.",
+        "Adapta l'espectre un cop, ara. S'escriu al Motor Propi (raons dels parcials) m\xc3\xa9s les amplituds per parcial, com UN sol pas d'anul\xc2\xb7laci\xc3\xb3.\nUn c\xc3\xa0lcul D'UN SOL COP, i per tant t\xc3\xa9 dret a trigar: quan trigui m\xc3\xa9s d'un instant, el bot\xc3\xb3 diu aproximadament quant, i tornar-lo a pr\xc3\xa9mer mentre treballa l'ATURA. No es rebutja res per ser gran, tret d'una petici\xc3\xb3 estimada en m\xc3\xa9s de deu minuts, i aix\xc3\xb2 es diu amb un n\xc3\xbamero, no amb un veredicte. Pots seguir tocant mentre treballa."));
     chordRtBtn.setTooltip (tr (
-        "REALTIME: the tuning follows the TOP result on its own, every time the spectrum changes (a knob, a modulator, a preset). At most three searches a second, never two at once, and many changes while it is busy collapse into one - so a sweeping modulator cannot pile searches up. A full search takes about 0.3 s with a rich spectrum (0.1 s when the spectrum's tables can be reused), so each retune lands as its own search finishes. Realtime updates do NOT fill the tuning bank: the tuning you had joins it ONCE when you switch this on, and switching it off leaves ONE Ctrl+Z back to it.",
-        "TEMPS REAL: l'afinaci\xc3\xb3 segueix sola el PRIMER resultat cada cop que canvia l'espectre (un potenci\xc3\xb2metre, un modulador, un preset). Com a m\xc3\xa0xim tres cerques per segon, mai dues alhora, i molts canvis mentre treballa es fusionen en un - aix\xc3\xad un modulador escombrant no pot acumular cerques. Una cerca completa triga uns 0,3 s amb un espectre ric (0,1 s quan es poden reaprofitar les taules de l'espectre), per aix\xc3\xb2 cada reafinaci\xc3\xb3 arriba quan acaba la seva cerca. Les actualitzacions en temps real NO omplen el banc: l'afinaci\xc3\xb3 que tenies hi entra UN sol cop en activar-ho, i en desactivar-ho queda UN Ctrl+Z per recuperar-la."));
+        "REALTIME: the tuning follows the TOP result on its own, every time the spectrum changes (a knob, a modulator, a preset). At most three searches a second, never two at once, and many changes while it is busy collapse into one, so a sweeping modulator cannot pile them up. A full search takes about 0.3 s with a rich spectrum (0.1 s when the spectrum's tables can be reused), so each retune lands as its own search finishes. Realtime updates do NOT fill the tuning bank: the tuning you had joins it ONCE when you switch this on, and switching it off leaves ONE Ctrl+Z back to it.",
+        "TEMPS REAL: l'afinaci\xc3\xb3 segueix sola el PRIMER resultat cada cop que canvia l'espectre (un potenci\xc3\xb2metre, un modulador, un preset). Com a m\xc3\xa0xim tres cerques per segon, mai dues alhora, i molts canvis mentre treballa es fusionen en un, aix\xc3\xad un modulador escombrant no els pot acumular. Una cerca completa triga uns 0,3 s amb un espectre ric (0,1 s quan es poden reaprofitar les taules de l'espectre), per aix\xc3\xb2 cada reafinaci\xc3\xb3 arriba quan acaba la seva cerca. Les actualitzacions en temps real NO omplen el banc: l'afinaci\xc3\xb3 que tenies hi entra UN sol cop en activar-ho, i en desactivar-ho queda UN Ctrl+Z per recuperar-la."));
     adaptRtBtn.setTooltip (tr (
-        "REALTIME: the spectrum follows WHAT YOU PLAY - it re-adapts to the chord under your fingers, at the pitch it is really sounding, every time that chord changes. A SINGLE note works: with nothing else sounding the target is the partials' beating against each other, so a lead or a bass line still gets its own smoothest (or roughest) timbre, and a different one in each register. Hold nothing and it does nothing; hold the same chord and it stays put instead of re-adapting to it over and over. Throttled to about four adaptations a second and coalesced. (The loaded tuning is a target for the Adapt button, not for a follower: it would just keep writing the same scale into the spectrum.) Switching it off leaves ONE Ctrl+Z back to the spectrum you had before.",
-        "TEMPS REAL: l'espectre segueix el QUE TOQUES - es torna a adaptar a l'acord que tens sota els dits, a l'al\xc3\xa7""ada real, cada cop que aquell acord canvia. UNA sola nota ja funciona: si no sona res m\xc3\xa9s, l'objectiu \xc3\xa9s el batec dels parcials entre ells, de manera que una melodia o un baix tamb\xc3\xa9 tenen el seu timbre m\xc3\xa9s llis (o m\xc3\xa9s aspre), i un de diferent a cada registre. Si no mantens res, no fa res; si mantens el mateix acord, es queda quiet en comptes de tornar-s'hi a adaptar un cop i un altre. Limitat a ~quatre adaptacions per segon i fusionat. (L'afinaci\xc3\xb3 carregada \xc3\xa9s un objectiu per al bot\xc3\xb3 Adapta, no per a un seguidor: nom\xc3\xa9s escriuria la mateixa escala a l'espectre.) En desactivar-ho queda UN Ctrl+Z per recuperar l'espectre anterior."));
+        "REALTIME: the spectrum follows WHAT YOU PLAY - it re-adapts to the chord under your fingers, at the pitch it is really sounding, every time that chord changes. A SINGLE note works: with nothing else sounding the target is the partials' beating against each other, so a lead or a bass line still gets its own smoothest (or roughest) timbre, and a different one in each register. Hold nothing and it does nothing; hold the same chord and it stays put. Throttled to about four adaptations a second and coalesced. (The loaded tuning is a target for the Adapt button, not for a follower: it would just keep writing the same scale into the spectrum.) Switching it off leaves ONE Ctrl+Z back to the spectrum you had before.",
+        "TEMPS REAL: l'espectre segueix el QUE TOQUES - es torna a adaptar a l'acord que tens sota els dits, a l'al\xc3\xa7""ada real, cada cop que aquell acord canvia. UNA sola nota ja funciona: si no sona res m\xc3\xa9s, l'objectiu \xc3\xa9s el batec dels parcials entre ells, de manera que una melodia o un baix tamb\xc3\xa9 tenen el seu timbre m\xc3\xa9s llis (o m\xc3\xa9s aspre), i un de diferent a cada registre. Si no mantens res, no fa res; si mantens el mateix acord, es queda quiet. Limitat a ~quatre adaptacions per segon i fusionat. (L'afinaci\xc3\xb3 carregada \xc3\xa9s un objectiu per al bot\xc3\xb3 Adapta, no per a un seguidor: nom\xc3\xa9s escriuria la mateixa escala a l'espectre.) En desactivar-ho queda UN Ctrl+Z per recuperar l'espectre anterior."));
+    lookaheadBtn.setTooltip (tr (
+        "LOOKAHEAD: the spectrum is ready BEFORE the note sounds, for written MIDI played back by the DAW.\nA plugin cannot see future MIDI - so this makes the plugin ARRIVE LATE on purpose. It reports 250 ms of latency, the host's delay compensation shifts everything back into place, and the incoming MIDI is buffered here by exactly that much. The adaptive search runs on each note as it ARRIVES, so on playback the partials change sample-aligned with the note instead of ~50-200 ms into it.\nWHERE 250 ms COMES FROM (all measured): up to 100 ms of the follower's own throttle before the search may start, one 60 Hz poll to notice the notes, the search itself (11 ms at 8 partials, 33 at 12, ~104-137 at 16), one more poll to apply it and the 50 ms de-click fade.\nSO IT DOES NOT FIT EVERY SETTING: beside the budget the button prints how long the LAST chord change really took on your machine, and marks it LATE when it did not fit. If you see LATE, use fewer partials.\nPLAYING LIVE FEELS THOSE 250 ms: this is for composing, not for performing. The plugin's rhythm MIDI OUT is delayed by the same amount (it is generated from the same shifted stream, which is what keeps the pulses locked to the audio) and hosts differ in whether they compensate a plugin's MIDI output.\nIt only costs latency while a REALTIME spectrum follower is actually running; otherwise it waits and reports zero. A loop or a locator jump flushes what is in flight, so no stale note is replayed.",
+        "ANTICIPACI\xc3\x93: l'espectre est\xc3\xa0 llest ABANS que soni la nota, per a MIDI escrit i reprodu\xc3\xaft pel DAW.\nUn plugin no pot veure el MIDI futur - o sigui que aix\xc3\xb2 fa que el plugin ARRIBI TARD expressament. Declara 250 ms de lat\xc3\xa8ncia, la compensaci\xc3\xb3 de retard de l'amfitri\xc3\xb3 ho torna tot al seu lloc, i el MIDI d'entrada es reserva aqu\xc3\xad exactament aquest temps. La cerca adaptativa s'executa sobre cada nota quan ARRIBA, o sigui que en reproducci\xc3\xb3 els parcials canvien clavats a la mostra amb la nota, en comptes de ~50-200 ms m\xc3\xa9s tard.\nD'ON SURTEN ELS 250 ms (tot mesurat): fins a 100 ms del limitador del seguidor abans que la cerca pugui comen\xc3\xa7""ar, un sondeig de 60 Hz per adonar-se'n, la cerca mateixa (11 ms amb 8 parcials, 33 amb 12, ~104-137 amb 16), un altre sondeig per aplicar-la i els 50 ms d'esvaniment anti-clic.\nAIX\xc3\x92 VOL DIR QUE NO ENCAIXA A TOTES LES CONFIGURACIONS: al costat del pressupost el bot\xc3\xb3 escriu quant ha trigat de deb\xc3\xb2 el darrer canvi d'acord a la teva m\xc3\xa0quina, i el marca TARD quan no hi ha cabut. Si veus TARD, fes servir menys parcials.\nTOCAR EN VIU NOTA aquests 250 ms: aix\xc3\xb2 \xc3\xa9s per compondre, no per tocar. La sortida MIDI de ritme del plugin es retarda igual (es genera del mateix flux despla\xc3\xa7""at, que \xc3\xa9s el que mant\xc3\xa9 els polsos clavats a l'\xc3\xa0udio) i els amfitrions difereixen en si compensen la sortida MIDI d'un plugin.\nNom\xc3\xa9s costa lat\xc3\xa8ncia mentre un seguidor d'espectre en TEMPS REAL est\xc3\xa0 realment en marxa; si no, espera i declara zero. Un bucle o un salt de localitzador buida el que hi ha en vol, o sigui que no es repeteix cap nota vella."));
     adaptList.tip = tr ("The adapted spectrum: every partial's interval from the played note, and the amplitude the search gave it. All of them are here - the search moves partials, it never drops them.",
                         "L'espectre adaptat: l'interval de cada parcial respecte a la nota tocada i l'amplitud que li ha donat la cerca. Hi s\xc3\xb3n tots - la cerca mou parcials, no en descarta cap.");
     adaptList.emptyText = tr ("Press Adapt to move the partials to where these notes beat least (or most).",
                               "Prem Adapta per moure els parcials on aquestes notes baten menys (o m\xc3\xa9s).");
 
+    // MOVED HERE OUT OF THE CONSTRUCTOR. Every one of these was written exactly once, at
+    // construction, so it kept whatever language the editor was BUILT in for the rest of
+    // its life: the rhythm panel's "Steps" caption never became "Passos", and eight
+    // tooltips never changed language at all. A string set in the constructor is a string
+    // that cannot be translated - this is the whole of cause (a).
+    //
+    // BEFORE the sub-panel relayout below, not after: the rhythm panel sizes this caption
+    // from its own text, so a caption rewritten after the layout is measured against the
+    // other language's width.
+    rhythmPanel.stepsAllLbl.setText (tr ("Steps", "Passos"), dontSendNotification);
+    rhythmPanel.stepsAllS.setTooltip (tr (
+        "Shifts EVERY step-pitched pulse by this many scale steps from the played note (JI/ratio pulses have no step, so they are unaffected). Right-click to map a modulator.",
+        "Despla\xc3\xa7""a TOTS els polsos amb to per passos aquests passos d'escala des de la nota tocada (els polsos JI/ra\xc3\xb3 no en tenen, i no els afecta). Clic dret per assignar-hi un modulador."));
+    rhythmPanel.velSlopeS.setTooltip (tr (
+        "Velocity SLOPE across the spectrum. 0 = flat (every pulse keeps its own velocity). To the right the HIGH partials start losing velocity; to the left the low ones. At the end of its travel the ramp is vertical and no pulse has any velocity left. Right-click to map a modulator.",
+        "PENDENT de velocitat sobre l'espectre. 0 = plana (cada pols mant\xc3\xa9 la seva). Cap a la dreta els parcials AGUTS comencen a perdre velocitat; cap a l'esquerra els greus. Al final del recorregut la pendent \xc3\xa9s vertical i cap pols conserva velocitat. Clic dret per assignar-hi un modulador."));
+    rhythmBtn.setTooltip (tr (
+        "Turns partials of the current patch into MIDI pulse trains - exact polyrhythms derived from the spectrum's frequency ratios, sample-locked to the sound - sent out of this plugin's MIDI OUTPUT to any other track/instrument. Click to open the panel.",
+        "Converteix parcials del patch actual en trens de polsos MIDI - poliritmes exactes derivats de les relacions de freq\xc3\xbc\xc3\xa8ncia de l'espectre, clavats al so mostra a mostra - que surten per la SORTIDA MIDI del plugin cap a qualsevol altra pista/instrument. Clica per obrir el panell."));
+    tuningBankBox.setTooltip (tr (
+        "Bank of scales: pick a slot to make it the active tuning. This selector is a PARAMETER, so a host can automate switching between the loaded scales.",
+        "Banc d'escales: tria una ranura per fer-la l'afinaci\xc3\xb3 activa. Aquest selector \xc3\xa9s un PAR\xc3\x80METRE, aix\xc3\xad que un host pot automatitzar el canvi entre les escales carregades."));
+    tuningBankLoadBtn.setTooltip (tr ("Load a .tun / .scl / .ascl into the selected bank slot.",
+                                      "Carrega un .tun / .scl / .ascl a la ranura seleccionada del banc."));
+    tuningBankClearBtn.setTooltip (tr ("Remove the selected tuning from the bank.",
+                                       "Treu l'afinaci\xc3\xb3 seleccionada del banc."));
+    // Rebuilt, not just re-tooltipped: its first item is the translated "- none -" /
+    // "- cap -", and the only thing that ever rebuilt this list was the timer, once every
+    // 30 ticks and only when the NUMBER of items changed - which a language switch never
+    // does. So the one word in it stayed English for ever.
+    refreshTuningBank();
+    presetDirtyMark.setTooltip (tr (
+        "*Changed since loaded.*\nSome parameter no longer matches this preset - moved by something other than one of its OWN modulators (a knob, host automation, an undo).\n!Save stores it as a NEW preset! instead of overwriting the original.",
+        "*Canviat des de la c\xc3\xa0rrega.*\nAlg\xc3\xban par\xc3\xa0metre ja no coincideix amb aquest preset - l'ha mogut alguna cosa que no \xc3\xa9s un dels seus PROPIS moduladors (un bot\xc3\xb3, automatitzaci\xc3\xb3, un desfer).\n!Desar el guarda com un preset NOU! en lloc de sobreescriure l'original."));
+    nadBox.setTooltip (tr (
+        "What the list below shows: Degrees = each scale step against the tonic. Dyads, triads, tetrads... = EVERY combination of that many scale notes, ranked by total beating (all pairs counted, not just against 0).",
+        "Qu\xc3\xa8 mostra la llista: Graus = cada pas contra la t\xc3\xb2nica. D\xc3\xad""ades, tr\xc3\xad""ades, t\xc3\xa8trades... = TOTES les combinacions d'aquest nombre de notes, ordenades pel batec total (tots els parells, no nom\xc3\xa9s contra el 0)."));
+    nadList.tip = tr ("Combinations of scale degrees with the LEAST total beating first (colour = the value's height on the beating range).",
+                      "Combinacions de graus de l'escala amb MENYS batec total primer (color = al\xc3\xa7""ada del valor dins el rang de batec).");
+    // NEVER TRANSLATED AT ALL - cause (b). The rhythm panel's mode box was filled with two
+    // English literals in RhythmPanel::init() and had only its TOOLTIP localised, so the
+    // words the user reads stayed English while the explanation of them was in Catalan.
+    localise (rhythmPanel.modeBox, { tr ("Lowest note", "Nota m\xc3\xa9s greu"),
+                                     tr ("All notes",   "Totes les notes") });
+
+    // THE SUB-PANELS MUST BE LAID OUT AGAIN, NOT ONLY RE-WORDED.
+    // Component::setBounds only calls resized() when the SIZE changes, and these three
+    // panels are always given the same size - so each was laid out exactly once, in
+    // whatever language the editor was built in, and every later language switch put
+    // Catalan strings into boxes measured for English. That is why the rhythm panel's
+    // captions were the last things in the window still drawn condensed: they size
+    // themselves from their own text (fgfit), and nothing ever asked them to.
+    rhythmPanel.resized();
+    playgroundPanel.resized();
+    partialPanel.resized();
+
+    // EVERY SLIDER'S VALUE BOX RE-RENDERS.
+    //
+    // juce::Slider caches whatever its textFromValueFunction returned and only asks for
+    // it again when the VALUE moves. Most of ours print numbers, but two print WORDS -
+    // the harmonics fader ("Even/All/Odd/Prime" -> "Parells/Tots/Senars/Primers") and the
+    // prime-limit fader ("Off") - and those kept the old language's word on screen until
+    // the user happened to drag them. Swept over the whole tree rather than named one by
+    // one, because the next fader with a worded read-out must not have to remember this.
+    updateSliderValueTexts (*this);
+    updateSliderValueTexts (playgroundPanel);   // not children of this editor: they live
+    updateSliderValueTexts (partialPanel);      // in their own floating windows
+
+    // The degrees list's own status line ("this scale states no period...") is written
+    // by rebuildScaleDissList, which the timer only reaches when the SCALE changes - and
+    // a language switch is not a scale change. Rebuilt from the analysis already in hand,
+    // so nothing is recomputed and the sentence arrives in this language.
+    rebuildScaleDissList();
+
+    // ...AND EVERY SLIDER'S VALUE BOX GETS THIS LANGUAGE'S HOVER (see the sweep's own
+    // comment: JUCE copied the English one into it once, at construction).
+    pushSliderTooltipsIntoSubComponents (*this);
+    pushSliderTooltipsIntoSubComponents (playgroundPanel);
+    pushSliderTooltipsIntoSubComponents (partialPanel);
+
+    // ...AND THE LIVE READ-OUTS ARE RE-RUN, NOT LEFT TO THE NEXT TIMER TICK.
+    //
+    // A whole class of strings in this window is written by the 30 Hz timer, not by this
+    // function: the "N partials audible - M in the full timbre" line under the panels, the
+    // Custom-engine status, the adaptation read-out, the register band, the LOOKAHEAD
+    // button, the tuning-bank combo's "- none -". Every one of them is a correct tr()
+    // pair; none of them was in the new language when this function returned, and the
+    // rhythm panel's read-outs (its "(hold a note to pulse)" line, the "- missing" suffix
+    // on a routed slot, the BPM read-out) are never rewritten by the timer at all while
+    // the panel is shut, so those stayed English for ever.
+    //
+    // refreshSlots/refreshLive first because the timer does not touch a hidden panel;
+    // then one timer pass for everything else. Guarded both ways: not before the
+    // constructor has finished (the first applyLanguage() runs before setSize() and
+    // applyEngineState(), and a timer tick there would read a half-built editor), and
+    // never reentrantly.
+    if (editorConstructed && ! inLanguageRefresh)
+    {
+        const juce::ScopedValueSetter<bool> guard (inLanguageRefresh, true);
+        rhythmPanel.refreshSlots();
+        rhythmPanel.refreshLive();
+        timerCallback();
+    }
+    // EVERY FADER'S VALUE BOX IS AS WIDE AS THE VALUE IT SHOWS.
+    //
+    // Done here, and not in configFader, because here every piece is finally in place:
+    // the attachment's text function, the suffix the caller sets afterwards, and the
+    // language, which can change a unit word. Slider::resized() clamps the box to the
+    // slider's width, so this is a ceiling and not a promise - but a box that asks for
+    // less than its own text needs can never be honest, whatever the column does.
+    //
+    // THE BOX IS WIDENED, NEVER MOVED. This loop used to pass TextBoxBelow to every fader
+    // it touched, and that is not a detail of the sizing - it is a second decision, made
+    // by a function whose job is the language, about a fader eight callers had already
+    // turned horizontal with its value to the RIGHT. configFader pushes onto
+    // configuredFaders BEFORE those callers run, so the list is full of faders whose box
+    // had been moved since; Morph time, Dry/Wet time, Harmonics, Prime limit and Reps were
+    // all put back UNDER a track in a 22-24 px row, leaving the number about 9 px and the
+    // track the rest. Photographed at 1200x650: "0.30" under the Dry/Wet fader and "Tots"
+    // under Harmonics, both of which the caller had sized a right-hand box for.
+    //
+    // Nothing re-set them, and the rig had been reporting the consequence without anyone
+    // reading it as this: at the 690x550 floor the Dry/Wet value label is the control that
+    // pins the window's minimum HEIGHT, at "-1.0 tall" of room.
+    //
+    // So: the position and the height are read LIVE and written back unchanged (resized()
+    // switches phaseFader's box between right and none by how much room its cell has, and
+    // a language pass has no business undoing that), and the floor is the width the CALLER
+    // chose rather than a global 46 - which for every untouched fader IS 46, the width
+    // configFader gives them. Re-set only when the number really changes: setTextBoxStyle
+    // rebuilds the label.
+    if (faderBoxHome.size() != configuredFaders.size())
+    {
+        // Captured the first time this runs, which is the constructor's own
+        // applyLanguage() - by then every caller has finished moving the box it wanted.
+        faderBoxHome.clear();
+        for (auto* s : configuredFaders)
+            faderBoxHome.push_back ({ s->getTextBoxPosition(), s->getTextBoxWidth() });
+    }
+    for (size_t i = 0; i < configuredFaders.size(); ++i)
+    {
+        auto* s = configuredFaders[i];
+        const int want = juce::jmax (faderBoxHome[i].w, fgfit::faderValueWidth (*s) + 2);
+        if (s->getTextBoxWidth() != want)
+            s->setTextBoxStyle (s->getTextBoxPosition(), false, want, s->getTextBoxHeight());
+    }
+    // The one word the KEYBOARD paints for itself, in the language on screen. It used to
+    // be a literal inside ScaleKeyboard::paint and so was the only user-visible string in
+    // the window that never changed language.
+    keyboard.setReferenceWord (tr ("REFERENCE", "REFER\xc3\x88NCIA"));
+    // The three info rows above the keys, named on the left. "cents" really is the same
+    // word in Catalan - the unit is spelled that way in both - so it is declared to the
+    // audits rather than translated into itself; the other two are not.
+    keyboard.setRowCaptions (tr ("steps", "passos"), tr ("cents", "cents"),
+                             tr ("beating", "batec"));
+    // The self-painting components' own EN/CA hook. They draw their words straight onto a
+    // Graphics, so nothing else in this file can put those words in the right language -
+    // and, until d8aeeaf, nothing could see that they were in the wrong one.
+    {
+        auto hook = [this] (const char* en, const char* ca) { return tr (en, ca); };
+        waveEditor.trF        = hook;
+        recentOverlay.trF     = hook;
+        recentOverlay.list.trF = hook;
+        dissHeader.trF        = hook;
+    }
+    // AND THE NOTICE THAT IS ALREADY ON SCREEN, which was the one thing in this window
+    // that this function could not reach. NoticeOverlay holds two plain Strings, written
+    // once by whichever site raised it and never again - so the panel telling the user
+    // their project's tuning would not load stayed in the language it happened in, and
+    // pressing CAT to read it was exactly the gesture that could not work. The site left
+    // its recipe behind (see raiseNotice); run it again and the notice follows.
+    if (noticeOverlay.isVisible() && noticeRender)
+    {
+        noticeRender();
+        layoutNotice();          // the other language is a different height
+        noticeOverlay.repaint();
+    }
     repaint(); // title uses the language
 }
 
@@ -3142,8 +5388,1314 @@ void FractalAdditiveAudioProcessorEditor::refreshPresetList()
         presetBox.setText (current, juce::dontSendNotification);
 }
 
+juce::StringArray FractalAdditiveAudioProcessorEditor::presetSearchProbeForTests (
+    const juce::StringArray& names, const juce::String& typed)
+{
+    PresetSearchPanel panel (names, {}, {});
+    panel.search.setText (typed, false);
+    // ...then the very function onTextChange calls. NOT setText's own notification:
+    // TextEditor::textChanged POSTS the callback (postCommandMessage), so with no
+    // message loop running it never arrives and a probe that trusted it would report
+    // "everything matches" for every query - which is a filter that is not being tested
+    // at all rather than one that works.
+    panel.refilter();
+    return panel.shown;
+}
+
+namespace
+{
+    // A readable name for one component in the walk: its own name if it has one, else
+    // the class, so the report says WHERE the clipped string is instead of "label 47".
+    juce::String probeNameFor (const juce::Component& c)
+    {
+        if (c.getName().isNotEmpty()) return c.getName();
+        juce::String cls (typeid (c).name());
+        // MSVC gives "class juce::Label"; keep the last word, drop the namespaces.
+        cls = cls.fromLastOccurrenceOf (" ", false, false)
+                 .fromLastOccurrenceOf ("::", false, false);
+        return cls;
+    }
+
+    // How much room a control really leaves for its text, and in which font - from
+    // fgfit, the same functions the layout sizes these controls with, so the check and
+    // the painter cannot drift apart. Returns false for a Button that paints its own
+    // graphics (the pencil), whose button TEXT is only its name and never reaches the
+    // glass at all.
+    bool buttonTextRoom (const juce::Button& b, juce::Font& fontOut, float& availOut, int& maxLines)
+    {
+        maxLines = 1;
+        if (const auto* t = dynamic_cast<const juce::ToggleButton*> (&b))
+        {
+            if (t->getName() == "onled")   // the green/red pill: LED + "ON" / "OFF", centred
+            {
+                // THROUGH fgfit, not a hand copy of h * 0.62. This was the second place in
+                // the file spelling the pill's font out for itself, and the moment the
+                // painter grew a state LED in front of the word (see
+                // GalacticLnF::drawToggleButton) the hand copy was measuring a pill that
+                // no longer exists - it would have certified one 9-10 px too narrow. The
+                // room the WORD gets is the button less the disc and its gap.
+                fontOut  = fgfit::onLedFont (b.getHeight());
+                availOut = (float) b.getWidth() - fgfit::onLedLead (b.getHeight());
+                return true;
+            }
+            fontOut  = fgfit::toggleFont (b.getHeight());
+            availOut = fgfit::toggleRoom (b.getWidth(), b.getHeight());
+            return true;
+        }
+        if (dynamic_cast<const juce::TextButton*> (&b) != nullptr)
+        {
+            fontOut  = fgfit::textButtonFont (b.getHeight());
+            availOut = fgfit::textButtonRoom (b.getWidth(), b.getHeight(),
+                                              b.getProperties().contains ("fork"));
+            maxLines = (float) b.getHeight() >= fontOut.getHeight() * 1.9f ? 2 : 1;
+            return true;
+        }
+        return false;
+    }
+
+    // Word-wrap `text` in `font` at `width` and report the height it takes. The same
+    // measurement drawFittedText makes before it starts condensing.
+    float wrappedHeight (const juce::String& text, const juce::Font& font, float width,
+                         juce::Justification just, float& widthOut)
+    {
+        juce::AttributedString as;
+        as.setText (text);
+        as.setFont (font);
+        as.setJustification (just);
+        as.setWordWrap (juce::AttributedString::byWord);
+        juce::TextLayout tl;
+        tl.createLayout (as, width);
+        widthOut = tl.getWidth();
+        return tl.getHeight();
+    }
+}
+
+void FractalAdditiveAudioProcessorEditor::walkTextFits (
+    const juce::Component& parent, const juce::String& path,
+    std::vector<TextFit>& out) const
+{
+    int index = 0;
+    for (auto* c : parent.getChildren())
+    {
+        const int myIndex = index++;
+        if (c == nullptr || ! c->isVisible() || c->getWidth() <= 0) continue;
+        // Most of these components have no name, so the index makes the path unique and
+        // stable - and the report prints the TEXT and the rect too, which is what a hand
+        // actually needs to find one.
+        const auto here = path + "/" + probeNameFor (*c) + "#" + juce::String (myIndex);
+
+        // THE HOVER, recorded as a row of its own.
+        //
+        // A tooltip is a user-visible string that is NEVER DRAWN into a box of ours, so
+        // until this line it was invisible to every standing check in the build: the fit
+        // sweep only walks drawn text, and the "translated?" gate compares exactly what
+        // the fit sweep collected. That is why three of them (tuneScopeBox's, and the
+        // octave / range steppers') sat in the constructor as bare English literals for
+        // months with both rigs green - the same defect class commit 2b51e2f fixed for
+        // eight others, which only a person happening to hover in Catalan could find.
+        //
+        // `need` and `avail` stay 0 on purpose: a TooltipWindow sizes ITSELF to the
+        // string, so there is no box to overflow and over() is 0 - the fit sweep sees
+        // these rows and correctly has nothing to say about them. What DOES read them is
+        // the pair of language gates in SnapshotRig.cpp, which is the whole point.
+        if (auto* tc = dynamic_cast<juce::TooltipClient*> (c))
+        {
+            const auto tip = tc->getTooltip();
+            if (tip.isNotEmpty())
+            {
+                TextFit f;
+                f.path = here; f.kind = "Tooltip"; f.text = tip;
+                f.bounds = getLocalArea (c, c->getLocalBounds());
+                out.push_back (f);
+            }
+        }   // <- THE TOOLTIP BRANCH ENDS HERE, and it did not.
+
+    // A REGISTRY OF FIXED STRINGS RAN ONCE PER CONTROL IN THE WINDOW.
+    //
+    // This block was inside the `if (auto* tc = ...)` above - one missing brace - and
+    // every juce::Label, Slider, Button and ComboBox derives from SettableTooltipClient,
+    // so the dynamic_cast succeeded on nearly every leaf the walk touched. The list below
+    // does not depend on `c` at all: it names a fixed set of self-painted strings. So the
+    // same rows were appended again for every control, hundreds of times per walk - and
+    // the walk itself runs inside two size searches, in two languages, in every scenario.
+    //
+    // Nothing was WRONG in the output: duplicate rows say the same thing, and a fit that
+    // passes passes as often as you ask it. It was pure cost, in the one place that makes
+    // this suite's wall-clock checks flaky, and it made the tables unreadable.
+    //
+    // ...and the same for every other component that paints its own words. Each entry
+    // carries no geometry: it is here for the language checks, not for a fit measurement
+    // it has not made. Keep this list in step with the trF hooks in applyLanguage - a
+    // string that has a hook but no entry here is one the gate still cannot see.
+    {
+        const auto painted = [this, &out] (const char* path, juce::String text,
+                                           const juce::Component& c)
+        {
+            TextFit f;
+            f.path = path; f.kind = "Painted"; f.text = std::move (text);
+            f.bounds = getLocalArea (&c, c.getLocalBounds());
+            out.push_back (f);
+        };
+        painted ("waveEditor/hint",
+                 tr ("LFO wave  -  drag points, double-click adds, right-click deletes,"
+                     " drag a line's middle to curve it",
+                     "Ona de l'LFO  -  arrossega els punts, doble clic n'afegeix,"
+                     " clic dret n'esborra, arrossega el mig d'una l\xc3\xadnia per corbar-la"),
+                 waveEditor);
+        painted ("recentOverlay/empty",
+                 tr ("nothing loaded yet", "encara no s'ha carregat res"), recentOverlay);
+        painted ("dissHeader/step",    tr ("Step", "Grau"),      dissHeader);
+        painted ("dissHeader/beating", tr ("beating", "batec"),  dissHeader);
+        // THE TWO FLOATING EXPLAINERS, which nothing has ever measured. They paint their
+        // own title and body, so walkTextFits cannot reach them, and they are only on
+        // screen in states no scenario reaches - the two ways a string escapes every gate
+        // in this build at once.
+        //
+        // The BODY is the one at risk: drawFittedText is given 8 lines and NO horizontal
+        // squash, so a Catalan sentence that needs a ninth is not simply taller - it is
+        // SHRUNK to fit or cut. Measured here with the same geometry paint() uses, and
+        // the two overlays do NOT share it: the warning band is 26 px at 18/14 pt, the
+        // notice band 24 px at 17/13.5. A probe that measures the wrong font measures
+        // nothing, so both numbers are passed in rather than assumed equal.
+        //
+        // availH is the EIGHT-LINE cap, not the box: the box is 140 px tall and eight
+        // 14 px lines are 112, so a body wrapping to nine lines would still "fit" the
+        // box while paint() quietly shrank it. The question asked is paint's own.
+        const auto overlayText = [this, &out] (const char* path, const juce::String& text,
+                                               const juce::Component& c, bool isBody,
+                                               int bandH, float titlePt, float bodyPt)
+        {
+            if (text.isEmpty()) return;
+            auto in = c.getLocalBounds().reduced (22, 14);
+            const juce::Font f (juce::FontOptions (isBody ? bodyPt : titlePt)
+                                    .withStyle (isBody ? "" : "Bold"));
+            auto band = in.removeFromTop (bandH);
+            if (isBody) { in.removeFromTop (6); }
+            TextFit t;
+            t.path = path; t.kind = "Painted"; t.text = text;
+            t.bounds = getLocalArea (&c, c.getLocalBounds());
+            t.need   = juce::GlyphArrangement::getStringWidth (f, text);
+            t.avail  = (float) (isBody ? in.getWidth() : band.getWidth());
+            t.availH = isBody ? juce::jmin ((float) in.getHeight(), 8.0f * f.getHeight())
+                              : (float) band.getHeight();
+            if (isBody)
+            {
+                t.wraps = true;
+                t.needH = wrappedHeight (text, f, t.avail, juce::Justification::topLeft, t.need);
+            }
+            out.push_back (t);
+        };
+        overlayText ("warningOverlay/title", warningOverlay.title, warningOverlay, false, 26, 18.0f, 14.0f);
+        overlayText ("warningOverlay/body",  warningOverlay.body,  warningOverlay, true,  26, 18.0f, 14.0f);
+
+        // THE NOTICE OVERLAY IS MEASURED THE WAY IT NOW PAINTS. It is no longer a fixed box
+        // with an 8-line body: layoutNotice gives it the width it will have at this window
+        // size and the height its whole text needs, up to the window. So the one way a
+        // notice can still be cut is a text taller than the tallest box the window can
+        // give it - and that is what is asked here, through the overlay's OWN layouts (the
+        // same TextLayout calls paint makes), for the title and the body together.
+        // `withMore`: measure as if the "N more notices wait" line is showing - the worst case
+        // has to include it, since any notice can arrive with others queued behind it.
+        // `withAction`: the same for a notice that carries an action button's row.
+        const auto noticeText = [this, &out] (const char* path, const juce::String& title, const juce::String& body,
+                                              bool withMore, bool withAction)
+        {
+            if (title.isEmpty() && body.isEmpty()) return;
+            using NO = NoticeOverlay;
+            const int w     = juce::jmin (560, juce::jmax (200, getWidth() - 20));
+            const int inner = w - 2 * NO::kPadX;
+            const int maxH  = juce::jmax (120, getHeight() - 20);
+            const float titleH = (float) juce::jmax (NO::kMinTitleH, (int) std::ceil (noticeOverlay.titleLayout (inner).getHeight()));
+            // The WHOLE body, even when the notice is folded: a text that could not fit the
+            // window if the reader opened it is still a text that does not fit.
+            const float bodyH  = std::ceil (noticeOverlay.layoutOf (body, juce::Font (juce::FontOptions (13.5f)),
+                                                                    juce::Colours::white, inner).getHeight());
+            const float titleNeedH = std::ceil (noticeOverlay.layoutOf (title, juce::Font (juce::FontOptions (17.0f).withStyle ("Bold")),
+                                                                        juce::Colour (0xff5cb8ff), inner - NO::kCloseRoom).getHeight());
+            const float fixed = (float) (2 * NO::kPadY + NO::kGap + (withMore ? NO::kMoreH : 0)
+                                                               + (withAction ? NO::kActionH : 0));
+            const auto area = getLocalBounds().withSizeKeepingCentre (w, maxH);
+            if (title.isNotEmpty())
+            {
+                TextFit t;
+                t.path = juce::String (path) + "/title"; t.kind = "Painted"; t.text = title;
+                t.bounds = area;
+                t.need   = juce::GlyphArrangement::getStringWidth (juce::Font (juce::FontOptions (17.0f).withStyle ("Bold")), title);
+                t.avail  = (float) (inner - NO::kCloseRoom);
+                t.wraps  = true;
+                t.needH  = titleNeedH;
+                t.availH = (float) maxH - fixed - bodyH;
+                out.push_back (t);
+            }
+            if (body.isNotEmpty())
+            {
+                TextFit t;
+                t.path = juce::String (path) + "/body"; t.kind = "Painted"; t.text = body;
+                t.bounds = area;
+                t.need   = juce::GlyphArrangement::getStringWidth (juce::Font (juce::FontOptions (13.5f)), body);
+                t.avail  = (float) inner;
+                t.wraps  = true;
+                t.needH  = bodyH;
+                t.availH = (float) maxH - fixed - titleH;
+                out.push_back (t);
+            }
+        };
+        // The title the TITLE layout measures is the overlay's current one, so the worst
+        // body below is asked with its own title put there for the length of the call.
+        noticeText ("noticeOverlay", noticeOverlay.title, noticeOverlay.body, noticeOverlay.moreText.isNotEmpty(),
+                    noticeOverlay.actionText.isNotEmpty());
+        // THE NOTICE THE RIG CANNOT STAGE. "Fewer degrees than requested" only appears
+        // after a dissonance search returns short, which a scenario cannot arrange
+        // without running the search itself - so the longest sentence in the plugin has
+        // never been measured. Asked here at its WORST CASE instead, which is stronger
+        // than photographing one instance: the Notes box offers 1..24, so 24 and 23 are
+        // the widest numbers the sentence can ever carry.
+        {
+            const auto keepTitle = noticeOverlay.title;
+            auto& mutableTitle = const_cast<juce::String&> (noticeOverlay.title);
+            mutableTitle = tr ("Fewer degrees than requested", "Menys graus dels demanats");
+            noticeText ("noticeOverlay/worst", mutableTitle, fewerDegreesBody (24, 23), true, false);
+            // ...and THE FREEZE WARNING at its longest: every paragraph on (overruns, the
+            // oscillator count, an interface stall, the "back under 50%" line) with numbers
+            // wider than any it can print, behind a queue and with its action row.
+            fibload::Policy worst;
+            worst.nowEma = worst.worstPeak = 99.99f;
+            worst.worstStallMs = 99999.0f;
+            worst.overruns = 9999999;
+            worst.oscillators = 9999999;
+            worst.mixOscillators = 9999999;
+            worst.worstEma = 99.99f;
+            worst.sawStall = true;
+            mutableTitle = tr ("Close to freezing", "A punt de bloquejar-se");
+            worst.showing = true;
+            noticeText ("noticeOverlay/worstLoad", mutableTitle, loadNoticeBody (worst), true, true);
+            worst.showing = false;
+            worst.endedWithoutAudio = false;
+            noticeText ("noticeOverlay/worstLoadEnded", mutableTitle, loadNoticeBody (worst), true, true);
+            worst.endedWithoutAudio = true;
+            noticeText ("noticeOverlay/worstLoadStopped", mutableTitle, loadNoticeBody (worst), true, true);
+            mutableTitle = keepTitle;
+        }
+    }
+
+        // A string that fits on ONE line needs no wrapping test; one that does not may
+        // still be fine if its box is tall enough for the extra lines the painter is
+        // allowed to use. Both cases go through here so there is one rule, not three.
+        auto record = [this, c, &out] (const juce::String& path_, const char* kind,
+                                       const juce::String& text, const juce::Font& font,
+                                       float avail, float availH, int maxLines,
+                                       juce::Justification just)
+        {
+            TextFit f;
+            f.path = path_; f.kind = kind; f.text = text;
+            f.bounds = getLocalArea (c, c->getLocalBounds());
+            f.need   = juce::GlyphArrangement::getStringWidth (font, text);
+            f.avail  = avail;
+            f.availH = availH;
+            if (f.need > f.avail && maxLines > 1)
+            {
+                f.wraps = true;
+                f.needH = wrappedHeight (text, font, avail, just, f.need);
+                // Wrapped: the question is now whether the LINES fit, and never more
+                // than the painter is allowed to draw.
+                f.availH = juce::jmin (availH, font.getHeight() * (float) maxLines * 1.15f);
+            }
+            out.push_back (f);
+        };
+
+        if (const auto* box = dynamic_cast<const juce::ComboBox*> (c))
+        {
+            const auto txt = box->getText();
+            if (txt.isNotEmpty())
+            {
+                // MEASURED OFF THE LABEL THE BOX REALLY DRAWS IN, through the same three
+                // fgfit helpers the layout probe's combo() uses - one body, so the two
+                // can never again disagree about the same box.
+                //
+                // What this used to be: getComboBoxFont's LIGHTER face measured against
+                // fgfit::comboTextWidth, with the Label's own {1,5,1,5} border not taken
+                // off and the arrow gutter understated by h*0.20 + 0.8 px (see
+                // fgfit::comboArrowGutter). Three misses, all of them running towards "it
+                // fits", which is why three photographed collisions between an item and
+                // its own chevron - "Find tunings based on beating" at 1200x650 in both
+                // languages, "Whitelist" at 690x550 - came back from this sweep as ZERO
+                // fit problems. avail now subtracts the very gutter positionComboBoxText
+                // reserves, because it IS the rectangle positionComboBoxText produced.
+                const auto  font = fgfit::comboDrawnFont (*box);
+                const float w    = (float) fgfit::comboDrawnRoom (*box);
+                const float h    = (float) fgfit::comboDrawnRoomH (*box);
+                // The label inside a ComboBox is a juce::Label, so a TALL box really does
+                // get a second line - that is how the mode selector shows its full names.
+                const int lines = juce::jmax (1, (int) (h / font.getHeight()));
+                record (here, "ComboBox", txt, font, w, h, lines, juce::Justification::centredLeft);
+                // ...AND THE WIDEST ITEM IT HOLDS, which is a different question and the
+                // one that keeps finding defects. A closed ComboBox draws only the item
+                // that is CHOSEN, so every picture measures whatever happened to be
+                // selected when it was taken - the Shepard beats box sat at "4" in every
+                // shot while "1/16" needed 31 px of the 28 it had, and the rig called it
+                // fine. Asked here for every box at once instead of one scenario at a
+                // time: whatever the user picks, the box must be able to show it.
+                //
+                // Reported as its own row so a box that is right about its selection and
+                // wrong about its widest item names which of the two it failed.
+                // ...EXCEPT where the items are the USER'S OWN DATA. A preset picker is
+                // filled with whatever the user called their patches, and one of them here
+                // is 64 characters long and needs 502 px: no box can be asked to hold a
+                // name whose length nobody controls, and asking flagged four boxes in
+                // every one of the 98 scenarios. RefreshingComboBox is exactly the set
+                // that refills itself from disk, which is the same thing said in code.
+                if (dynamic_cast<const RefreshingComboBox*> (box) == nullptr)
+                {
+                    juce::String widest;
+                    float widestW = 0.0f;
+                    for (int i = 0; i < box->getNumItems(); ++i)
+                    {
+                        const auto item = box->getItemText (i);
+                        const float iw = juce::GlyphArrangement::getStringWidth (font, item);
+                        if (iw > widestW) { widestW = iw; widest = item; }
+                    }
+                    if (widest.isNotEmpty() && widest != txt)
+                        record (here + "#widest", "ComboBox", widest, font, w, h, lines,
+                                juce::Justification::centredLeft);
+                }
+            }
+            continue;   // its label is the box's own; do not measure it twice
+        }
+        // A SINGLE-LINE TEXT FIELD, which nothing in this build had ever measured.
+        //
+        // This sweep walked Labels, Buttons and ComboBoxes, and each of those fails
+        // VISIBLY: a Label condenses, a button's word is cut, a combo draws what fits.
+        // A juce::TextEditor does none of those - it SCROLLS. setText leaves the caret at
+        // the end of the string (cursorWasAtEnd is true on an empty editor, so the very
+        // first setText scrolls to the end), and a value wider than the field is then
+        // truncated from the LEFT with no ellipsis and no clipped glyph. That is not a
+        // cut number, it is a DIFFERENT number: the reference-pitch field displayed
+        // "55653" for 261.6255653 Hz at 690x550, which reads as a perfectly plausible
+        // 55653 Hz. Nothing was out of bounds, nothing overflowed, nothing went red.
+        //
+        // SINGLE-LINE ONLY. A multi-line editor (the custom engine's typed ratios) is a
+        // scrolling document by design and holds however much the user types; asking it
+        // to fit its content would report a problem on every keystroke and mean nothing.
+        // The room is TextEditor::getMaximumTextWidth's own formula (see
+        // fgfit::textEditorRoom), so this measures the width the text is really given.
+        if (const auto* te = dynamic_cast<const juce::TextEditor*> (c))
+        {
+            const auto txt = te->getText();
+            if (txt.isNotEmpty() && ! te->isMultiLine())
+                record (here, "TextEditor", txt, te->getFont(),
+                        (float) fgfit::textEditorRoom (*te),
+                        (float) te->getBorder().subtractedFrom (te->getLocalBounds()).getHeight(),
+                        1, juce::Justification::centred);
+            continue;   // its viewport and text holder are plumbing, not our text
+        }
+        if (const auto* b = dynamic_cast<const juce::Button*> (c))
+        {
+            const auto txt = b->getButtonText();
+            juce::Font font; float avail = 0.0f; int lines = 1;
+            if (txt.isNotEmpty() && buttonTextRoom (*b, font, avail, lines))
+                record (here, dynamic_cast<const juce::ToggleButton*> (b) != nullptr ? "ToggleButton" : "Button",
+                        txt, font, avail, (float) b->getHeight(), lines, juce::Justification::centred);
+            // A TICK BOX IS A CONTROL EVEN WITH NO WORD BESIDE IT.
+            //
+            // Everything above this line is a question about TEXT, so a ToggleButton whose
+            // label lives in a separate juce::Label - the nine prime checkboxes - was read
+            // as an empty string and skipped by every check in the build. At 690x550 they
+            // are 6 px wide against a 20.5 px tick box that drawToggleButton starts at
+            // x = 4: what reaches the glass is a 2 px sliver, and the row that decides
+            // which primes the whole spectrum is allowed cannot be read or aimed at.
+            //
+            // Its own kind, not "ToggleButton": the no-tooltip gate keys on the kinds that
+            // name controls, and this row is a SECOND measurement of a control that may
+            // already have one - the same reason "#widest" rows are skipped there. `need`
+            // is the tick's own right edge and `avail` the button's width, so over() reads
+            // as "this many pixels of tick box are drawn outside the button".
+            //
+            // The "onled" pill has no tick at all (GalacticLnF draws it as a coloured
+            // capsule with ON / OFF centred in the whole button) so it is not asked.
+            if (const auto* t = dynamic_cast<const juce::ToggleButton*> (b);
+                t != nullptr && t->getName() != "onled")
+            {
+                TextFit f;
+                f.path = here + "#tick"; f.kind = "TickBox"; f.text = txt;
+                f.bounds = getLocalArea (c, c->getLocalBounds());
+                f.need   = (float) fgfit::toggleTickWidth (t->getHeight());
+                f.avail  = (float) t->getWidth();
+                f.availH = (float) t->getHeight();
+                out.push_back (f);
+            }
+            continue;
+        }
+        if (const auto* l = dynamic_cast<const juce::Label*> (c))
+        {
+            const auto txt = l->getText();
+            if (txt.isNotEmpty())
+            {
+                const auto area = l->getBorderSize().subtractedFrom (l->getLocalBounds());
+                const auto font = l->getLookAndFeel().getLabelFont (const_cast<juce::Label&> (*l));
+                const int lines = juce::jmax (1, (int) ((float) area.getHeight() / font.getHeight()));
+                record (here, "Label", txt, font, (float) area.getWidth(), (float) area.getHeight(),
+                        lines, l->getJustificationType());
+            }
+            // No `continue`: a Slider's value box IS a Label and lives under the slider,
+            // so the recursion below still has to reach it.
+        }
+        walkTextFits (*c, here, out);
+    }
+}
+
+std::vector<FractalAdditiveAudioProcessorEditor::TextFit>
+FractalAdditiveAudioProcessorEditor::textFitProbeForTests (bool useCatalan)
+{
+    const bool was = catalan;
+    catalan = useCatalan;
+    // applyLanguage() and a relayout, for the same reason layoutProbeInLanguage does it:
+    // a Label's text was written once by applyLanguage, so probing on the flag alone
+    // would measure this language's geometry against the other language's strings.
+    applyLanguage();
+    if (getWidth() > 0) resized();
+
+    std::vector<TextFit> out;
+    walkTextFits (*this, {}, out);
+
+    // THE STRINGS A COMPONENT PAINTS FOR ITSELF, which walkTextFits cannot reach: it
+    // walks juce::Components, and a word drawn straight onto a Graphics has no component
+    // to find. That is not a technicality - it is how the keyboard's "REFERENCE" stayed
+    // English through every run of the translated gate, in a window where every other
+    // string changes language.
+    //
+    // It has a MEASUREMENT now, where before it went in with none. Its band is
+    // jmax (keyWidth, kReferenceBandMinWidth), so the constant is the width the word is
+    // guaranteed to get: a word that fits it fits at every key width, and one that does
+    // not is clipped at the narrowest. That matters here more than anywhere - the word is
+    // drawn with drawText (useEllipsis = false), the one call in this file that cuts a
+    // string without leaving a mark on it.
+    {
+        TextFit f;
+        f.path = "keyboard/reference"; f.kind = "Painted";
+        f.text = keyboard.getReferenceWord();
+        f.bounds = getLocalArea (&keyboard, keyboard.getLocalBounds());
+        const juce::Font rf (juce::FontOptions (ScaleKeyboard::kReferenceFontHeight)
+                                 .withStyle ("Bold"));
+        f.need  = juce::GlyphArrangement::getStringWidth (rf, f.text);
+        f.avail = ScaleKeyboard::kReferenceBandMinWidth;
+        out.push_back (f);
+    }
+
+    // THE KEYBOARD'S THREE ROW CAPTIONS, painted onto its own Graphics exactly like
+    // REFERENCE above, and only on screen while a key is HOVERED - which is both of this
+    // build's ways of hiding a string at once. No snapshot scenario hovers a key, so the
+    // pictures will never contain them: this registration is the ONLY thing that makes
+    // them visible to the language gate, and it is deliberately NOT conditional on
+    // hoveredNote, or the gate would see them in neither language and be satisfied.
+    //
+    // Measured against the gutter they are guaranteed, less its 3 px inset each side, so
+    // a Catalan caption that would be drawn condensed fails the fit sweep here instead of
+    // looking slightly wrong on somebody's screen.
+    {
+        const char* paths[3] = { "keyboard/rowSteps", "keyboard/rowCents", "keyboard/rowBeating" };
+        const juce::String texts[3] = { tr ("steps", "passos"), tr ("cents", "cents"),
+                                        tr ("beating", "batec") };
+        const juce::Font cf (juce::FontOptions (ScaleKeyboard::kCaptionFontHeight).withStyle ("Bold"));
+        for (int i = 0; i < 3; ++i)
+        {
+            TextFit f;
+            f.path = paths[i]; f.kind = "Painted"; f.text = texts[i];
+            f.bounds = getLocalArea (&keyboard, keyboard.getLocalBounds());
+            f.need  = juce::GlyphArrangement::getStringWidth (cf, f.text);
+            f.avail = (float) (ScaleKeyboard::kCaptionW - 6);
+            out.push_back (f);
+        }
+    }
+
+    // THE ONE WORD IN THE PENCIL WINDOW'S CELLS, which is only ON SCREEN when a partial
+    // is muted - a state no scenario reaches - and is painted straight into the cell, so
+    // walkTextFits could not reach it either. Both of this build's ways of hiding a
+    // string at once, which is why it sat there in English. Declared here so the
+    // translated gate sees it whether or not anything is muted.
+    //
+    // Its band is the cell's bottom 12 px, and the cell is never narrower than kCellW,
+    // so kCellW - 4 is the width the word is guaranteed at any window size.
+    {
+        TextFit f;
+        f.path = "partialAmpGrid/mute"; f.kind = "Painted";
+        f.text = tr ("MUTE", "MUT");
+        f.bounds = getLocalArea (&partialPanel, partialPanel.getLocalBounds());
+        const juce::Font mf (juce::FontOptions (10.5f).withStyle ("Bold"));
+        f.need  = juce::GlyphArrangement::getStringWidth (mf, f.text);
+        f.avail = (float) (PartialAmpGrid::kCellW - 4);
+        out.push_back (f);
+    }
+
+    // THE BLEND PAD'S OWN FOUR LABELS, which nothing could see. The pad paints them
+    // straight onto its Graphics, so walkTextFits has no component to find, and until
+    // scenario 52 no picture even contained one - the only playground scenario showed the
+    // panel EMPTY, which is the one state where none of its text is real.
+    //
+    // What they carry is the corner letter, the preset's name and the blend percentage,
+    // and the percentage is the number the whole pad exists to show. Measured against the
+    // box paint() actually used, so a name that grows can never push it out again.
+    {
+        const auto& pad = playgroundPanel.pad;
+        for (int i = 0; i < 4; ++i)
+        {
+            if (pad.lastLabel[i].isEmpty() || pad.lastLabelBox[i].isEmpty()) continue;
+            TextFit f;
+            f.path = "playgroundPad/corner" + juce::String::charToString ((juce::juce_wchar) ('A' + i));
+            f.kind = "Painted";
+            f.text = pad.lastLabel[i];
+            f.bounds = pad.lastLabelBox[i];
+            const juce::Font lf (juce::FontOptions (12.0f).withStyle ("Bold"));
+            f.need  = juce::GlyphArrangement::getStringWidth (lf, f.text);
+            f.avail = (float) pad.lastLabelBox[i].getWidth();
+            f.availH = (float) pad.lastLabelBox[i].getHeight();
+            out.push_back (f);
+        }
+    }
+
+    // THE NATIVE DIALOG TITLES, read from the SAME table the call sites use (fgdlg), so
+    // the gate cannot go stale by holding a copy of a string that has since changed.
+    // With no geometry: the OS sizes its own title bar, so there is no width to measure
+    // and this makes no claim to have measured one.
+    {
+        int i = 0;
+        for (const auto& d : fgdlg::all)
+        {
+            TextFit f;
+            f.path = "dialogTitle#" + juce::String (i++); f.kind = "Painted";
+            f.text = tr (d.en, d.ca);
+            out.push_back (f);
+        }
+    }
+
+    // THE PANELS THAT ARE NORMALLY SHUT. The user's own example - "not in this
+    // spectrum" - lives in the Spectrum-to-Rhythm panel, which is invisible until a
+    // button is pressed, so a sweep of what happens to be on screen would never have
+    // seen it. Opened here, walked, and put straight back.
+    {
+        const bool rhythmWas = rhythmPanel.isVisible();
+        rhythmPanel.numRows = processorRef.getTemplatePartialCount();
+        rhythmPanel.list.updateContent();
+        rhythmPanel.refreshSlots();
+        rhythmPanel.refreshLive();
+        rhythmPanel.setVisible (true);
+        if (getWidth() > 0) resized();
+        walkTextFits (rhythmPanel, "rhythm", out);
+        rhythmPanel.setVisible (rhythmWas);
+    }
+    // The two FLOATING panels are not children of this editor at all (they live in their
+    // own windows), so they have to be walked by name. Given the size their windows open
+    // at, so the measurement is the one the user sees.
+    {
+        playgroundPanel.applyLanguage();
+        playgroundPanel.setSize (560, 520);
+        playgroundPanel.refresh (true);
+        walkTextFits (playgroundPanel, "playground", out);
+
+        partialPanel.applyLanguage();
+        partialPanel.setSize (760, 520);
+        partialPanel.resized();
+        walkTextFits (partialPanel, "partials", out);
+    }
+
+    catalan = was;
+    applyLanguage();
+    if (getWidth() > 0) resized();
+    return out;
+}
+
+FractalAdditiveAudioProcessorEditor::FaderBoxProbe
+FractalAdditiveAudioProcessorEditor::faderBoxProbeForTests (const juce::String& name) const
+{
+    FaderBoxProbe p;
+    const juce::Slider* s = nullptr;
+    if      (name == "morphTime")     s = &morphTimeFader;
+    else if (name == "dryWetTime")    s = &dryWetTimeFader;
+    else if (name == "harmonics")     s = &harmonicsFader;
+    else if (name == "primeLimit")    s = &primeLimitFader;
+    else if (name == "timbreRepeats") s = &timbreRepeatsFader;
+    else if (name == "slope")         s = &slopeFader;
+    else if (name == "baseN")         s = &baseNFader;
+    if (s == nullptr) return p;
+    p.found = true;
+    p.pos   = (int) s->getTextBoxPosition();
+    p.boxW  = s->getTextBoxWidth();
+    p.boxH  = s->getTextBoxHeight();
+    p.rowH  = s->getHeight();
+    return p;
+}
+
+FractalAdditiveAudioProcessorEditor::DragProbe
+FractalAdditiveAudioProcessorEditor::dragFaderForTests (const juce::String& name, int dy, int settleTicks)
+{
+    DragProbe d;
+    juce::Slider* s = nullptr;
+    if      (name == "slope")     s = &slopeFader;
+    else if (name == "baseN")     s = &baseNFader;
+    else if (name == "fractal")   s = &fractalFader;
+    else if (name == "morphTime") s = &morphTimeFader;
+    else if (name == "dryWetTime") s = &dryWetTimeFader;
+    else if (name == "harmonics") s = &harmonicsFader;
+    if (s == nullptr) return d;
+
+    d.found   = true;
+    d.visible = s->isVisible();
+    d.enabled = s->isEnabled();
+    d.before  = s->getValue();
+
+    // The state a failure would have to be explained by, captured BEFORE the drag.
+    d.heldNotes = (int) heldKeys.size();
+    if (auto* f = juce::Component::getCurrentlyFocusedComponent())
+        d.focusOwner = juce::String (typeid (*f).name());
+    d.editorHasFocus = hasKeyboardFocus (true);
+    d.msSinceFocused = (int) (juce::Time::getMillisecondCounter() - lastFocusedMs);
+
+    const auto src = juce::Desktop::getInstance().getMainMouseSource();
+    const auto t0  = juce::Time::getCurrentTime();
+    const juce::Point<float> down ((float) (s->getWidth() / 2), (float) (s->getHeight() / 2));
+    const juce::Point<float> to   (down.x, down.y + (float) dy);
+    const auto press = juce::ModifierKeys::leftButtonModifier;
+
+    s->mouseDown (juce::MouseEvent (src, down, press, 1.0f, 0, 0, 0, 0, s, s, t0, down, t0, 1, false));
+    s->mouseDrag (juce::MouseEvent (src, to,   press, 1.0f, 0, 0, 0, 0, s, s, t0, down, t0, 1, true));
+    d.afterDrag = s->getValue();
+    s->mouseUp   (juce::MouseEvent (src, to, juce::ModifierKeys(), 1.0f, 0, 0, 0, 0, s, s, t0, down, t0, 1, true));
+
+    for (int i = 0; i < settleTicks; ++i) timerCallback();
+    d.afterSettle = s->getValue();
+    return d;
+}
+
+FractalAdditiveAudioProcessorEditor::NadShownProbe
+FractalAdditiveAudioProcessorEditor::nadShownProbeForTests() const
+{
+    NadShownProbe n;
+    n.rows             = (int) nadList.rows.size();
+    n.equalStep        = nadList.equalStep;
+    n.degreesPerPeriod = processorRef.getScaleDegrees();
+    for (const auto& r : nadList.rows)
+        for (const int d : r.degs)
+            n.maxDegree = juce::jmax (n.maxDegree, d);
+    return n;
+}
+
+FractalAdditiveAudioProcessorEditor::RatiosInkProbe
+FractalAdditiveAudioProcessorEditor::ratiosInkProbeForTests (const juce::String& typed)
+{
+    RatiosInkProbe r;
+    intervalEdit.setText (typed, false);
+
+    r.box = intervalEdit.getLocalBounds();
+    // The BORDER is what the viewport is inset by, so it is what clips: no glyph can be
+    // drawn outside this, whatever the text says. Read back from JUCE, not restated.
+    const auto b = intervalEdit.getBorder();
+    r.clip = r.box.reduced (0, 0)
+                  .withTrimmedLeft (b.getLeft()).withTrimmedRight (b.getRight())
+                  .withTrimmedTop (b.getTop()).withTrimmedBottom (b.getBottom());
+    r.ink  = intervalEdit.getTextBounds (juce::Range<int> (0, intervalEdit.getTotalNumChars())).getBounds();
+    r.inkInsideClip = r.ink.isEmpty() || r.clip.contains (r.ink);
+
+    const auto o = textEditorOutline ((float) r.box.getWidth(), (float) r.box.getHeight(),
+                                      intervalEdit.isMultiLine());
+    r.radius = o.radius;
+    // The stroke is centred on o.rect, so its INNER edge is half a pen-width further in.
+    const auto inner = o.rect.reduced (o.thickness * 0.5f);
+    const float innerRad = juce::jmax (0.0f, o.radius - o.thickness * 0.5f);
+    r.minGap = juce::jmin (juce::jmin ((float) r.clip.getX() - inner.getX(),
+                                       (float) r.clip.getY() - inner.getY()),
+                           juce::jmin (inner.getRight()  - (float) r.clip.getRight(),
+                                       inner.getBottom() - (float) r.clip.getBottom()));
+    juce::Path shape;
+    shape.addRoundedRectangle (inner, innerRad);
+    const auto c = r.clip.toFloat();
+    for (auto pt : { c.getTopLeft(), c.getTopRight(), c.getBottomLeft(), c.getBottomRight() })
+        if (! shape.contains (pt.x, pt.y))
+            r.clipInsideOutline = false;   // the pill's arc is eating the text area's corner
+    return r;
+}
+
+FractalAdditiveAudioProcessorEditor::IntervalBoxProbe
+FractalAdditiveAudioProcessorEditor::typeIntervalsProbeForTests (const juce::String& typed,
+                                                                 int backspaces, bool tickTimer)
+{
+    IntervalBoxProbe r;
+    auto* peer = getPeer();   // present only when the caller put us on an off-screen peer
+
+    auto press = [this, peer] (const juce::KeyPress& k)
+    {
+        if (peer != nullptr) peer->handleKeyPress (k);
+        else                 intervalEdit.keyPressed (k);
+    };
+    // AFTER EVERY KEYSTROKE, the two things that really follow one in the plugin: the
+    // POSTED onTextChange (delivered by hand - postCommandMessage never arrives without a
+    // message loop, and a probe that trusted it would be testing nothing), and, if asked,
+    // one tick of this editor's own 30 Hz timer.
+    auto afterKey = [this, tickTimer]
+    {
+        recolourIntervalTokens();
+        if (tickTimer) timerCallback();
+    };
+
+    setIntervalText ({});   // start from an empty box, through the one seeding helper
+    if (peer != nullptr) intervalEdit.grabKeyboardFocus();
+
+    // ONE KeyPress PER CHARACTER, not setText: a probe that assigns the text cannot see a
+    // box that has stopped accepting keys, and "typing does nothing" is the report.
+    for (auto p = typed.getCharPointer(); ! p.isEmpty(); ++p)
+    {
+        press (juce::KeyPress (0, juce::ModifierKeys(), *p));
+        afterKey();
+    }
+    for (int i = 0; i < backspaces; ++i)
+    {
+        press (juce::KeyPress (juce::KeyPress::backspaceKey));
+        afterKey();
+    }
+
+    r.boxText  = intervalEdit.getText();
+    r.visible  = intervalEdit.isVisible();
+    r.enabled  = intervalEdit.isEnabled();
+    r.readOnly = intervalEdit.isReadOnly();
+    r.bounds   = intervalEdit.getBounds();
+    r.hadFocus = intervalEdit.hasKeyboardFocus (false);
+
+    // RETURN. keyPressed() alone only reaches TextEditor::returnPressed(), which is a
+    // postCommandMessage, so the handler is delivered by hand for the same reason.
+    press (juce::KeyPress (juce::KeyPress::returnKey));
+    if (intervalEdit.onReturnKey != nullptr) intervalEdit.onReturnKey();
+    if (tickTimer) { timerCallback(); timerCallback(); }
+
+    r.timbreSource = processorRef.getTimbreSource();
+    r.timbreNotes  = processorRef.getTimbreNoteCount();
+    return r;
+}
+
+juce::String FractalAdditiveAudioProcessorEditor::typeThenBlurForTests (const juce::String& typed)
+{
+    setIntervalText ({});                       // an empty box, through the one seeding helper
+    intervalEdit.grabKeyboardFocus();
+    for (auto p = typed.getCharPointer(); ! p.isEmpty(); ++p)
+    {
+        intervalEdit.keyPressed (juce::KeyPress (0, juce::ModifierKeys(), *p));
+        recolourIntervalTokens();               // the posted onTextChange, delivered by hand
+    }
+    // NO RETURN. The keyboard simply goes somewhere else, which is what happens when the
+    // user reaches for a fader - and it is juce::TextEditor::focusLost that has to be the
+    // thing that starts the commit. Called on the COMPONENT, so a build that never wired
+    // the handler to focusLost at all is caught here rather than assumed away.
+    intervalEdit.focusLost (juce::Component::focusChangedByMouseClick);
+    // ...and then the message that focusLost POSTS, delivered by hand. JUCE routes the
+    // blur through postCommandMessage (TextEditorDefs::focusLossMessageId) and this
+    // binary has no message loop to deliver it - JUCE_MODAL_LOOPS_PERMITTED is 0 - which
+    // is the same reason this file's other interval probes deliver onTextChange and
+    // onReturnKey themselves. The claim under test is that a blur commits the typing, not
+    // that JUCE's queue works.
+    if (intervalEdit.onFocusLost != nullptr) intervalEdit.onFocusLost();
+    return processorRef.getTimbreSource();
+}
+
+FractalAdditiveAudioProcessorEditor::IntervalDraftProbe
+FractalAdditiveAudioProcessorEditor::intervalDraftProbeForTests (const juce::String& edit)
+{
+    IntervalDraftProbe r;
+    timerCallback();                       // let the re-seed put the loaded spectrum in
+    r.seeded = intervalEdit.getText();
+
+    if (auto* peer = getPeer()) { juce::ignoreUnused (peer); intervalEdit.grabKeyboardFocus(); }
+    intervalEdit.setCaretPosition (intervalEdit.getTotalNumChars());
+    for (auto p = edit.getCharPointer(); ! p.isEmpty(); ++p)
+    {
+        intervalEdit.keyPressed (juce::KeyPress (0, juce::ModifierKeys(), *p));
+        recolourIntervalTokens();
+    }
+    r.afterEdit = intervalEdit.getText();
+
+    // WHAT refocus() DOES, and it is called by nearly every control in this window: the
+    // editor takes the keyboard back. No click on the box is undone by this; the draft
+    // is simply no longer the focused component's.
+    grabKeyboardFocus();
+    timerCallback();
+    r.afterTick = intervalEdit.getText();
+    r.survived  = r.afterTick == r.afterEdit;
+    return r;
+}
+
+FractalAdditiveAudioProcessorEditor::PencilUndoProbe
+FractalAdditiveAudioProcessorEditor::pencilGestureUndoProbeForTests (int cell, float dB, int ticksMidDrag)
+{
+    PencilUndoProbe r;
+    partialPanel.resync();                       // the knobs must match the live spectrum
+    r.cells = partialPanel.grid.model.count();
+    if (! partialPanel.grid.model.valid (cell)) return r;
+
+    r.stepsBefore = processorRef.undoStackDepthForTests();
+
+    // MOUSE DOWN. The real handler: it takes the undo-gesture hold, arms manual mode
+    // (which opens the transaction) and captures the before-state.
+    if (partialPanel.grid.onGestureStart) partialPanel.grid.onGestureStart();
+    r.armed = partialPanel.armedManualThisGesture;
+
+    // THE PARAMETER FLIP REACHES THE UNDO STACK, and it reaches it DURING the drag.
+    // In the product that is APVTS's own 20-500 ms timer writing the value into the
+    // ValueTree through the undo manager; a verifier has no message loop, so the same
+    // flush is asked for by hand. Without this the flip would land at some arbitrary
+    // later point and the probe would be measuring a timeline no user ever sees - and
+    // the mid-drag cut, which is the whole question, would have nothing to separate.
+    processorRef.apvts.copyState();
+    r.stepsAfterFlush = processorRef.undoStackDepthForTests();
+
+    // DRAG. One frame is enough: the defect is about WHEN the transaction boundary
+    // falls, not about how many frames are inside it.
+    partialPanel.grid.model.cells[(size_t) cell].dB = dB;
+    if (partialPanel.grid.onEdited) partialPanel.grid.onEdited();
+
+    // ...AND THE DRAG TAKES TIME. Each tick is one turn of the processor's 60 Hz timer,
+    // so 60 of them is the ~1 s mark where the undo cut used to fall inside the gesture.
+    for (int i = 0; i < ticksMidDrag; ++i) processorRef.pollParametersForTests();
+    r.stepsAfterTicks = processorRef.undoStackDepthForTests();
+
+    // MOUSE UP: commit, and release the hold.
+    if (partialPanel.grid.onGestureEnd) partialPanel.grid.onGestureEnd();
+    r.stepsAfter = processorRef.undoStackDepthForTests();
+
+    // ONE Ctrl+Z. The claim under test is not "the stack is tidy" - it is that a single
+    // undo puts the user back where they started, rather than leaving manual mode armed
+    // over a spectrum nobody drew.
+    r.undid = processorRef.performUndo();
+    r.manualAfterUndo = processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+    r.editsAfterUndo  = (int) processorRef.getPartialGains().size();
+    return r;
+}
+
+int FractalAdditiveAudioProcessorEditor::comboReopenProbeForTests (int attempts)
+{
+    RefreshingComboBox box;
+    box.addItem ("one", 1);
+    box.setSelectedId (1, juce::dontSendNotification);
+
+    int opened = 0;
+    // The presets box's contract exactly: "I handled it, do not show the plain menu."
+    // No CallOutBox here - the failure is entirely in ComboBox's own bookkeeping, and a
+    // real callout would need a desktop window and a user to dismiss it.
+    box.onShowPopup = [&opened] { ++opened; return true; };
+
+    for (int i = 0; i < attempts; ++i)
+    {
+        const bool wasActive = box.isPopupActive();
+        // The Return key runs the SAME showPopupIfNotActive() a mouseDown does (that one
+        // is private, so this is the honest way in from outside). If menuActive is stuck
+        // up, this call does nothing at all - precisely what the user saw.
+        box.keyPressed (juce::KeyPress (juce::KeyPress::returnKey));
+
+        // showPopupIfNotActive() raises menuActive and then defers showPopup() with
+        // MessageManager::callAsync. This build has no dispatch loop to deliver that
+        // (JUCE_MODAL_LOOPS_PERMITTED is off in the verifier), so the callback's one
+        // statement - safePointer->showPopup() - is delivered by hand, and ONLY on the
+        // transition that actually queued it. Calling showPopup() unconditionally would
+        // be a probe that opens the box itself and could never see the bug.
+        if (! wasActive && box.isPopupActive())
+            box.showPopup();
+    }
+    return opened;
+}
+
+juce::String FractalAdditiveAudioProcessorEditor::recycleBinName() const
+{
+   #if JUCE_MAC
+    return tr ("the Trash", "la Paperera");
+   #else
+    return tr ("the Recycle Bin", "la Paperera de reciclatge");
+   #endif
+}
+
+juce::String FractalAdditiveAudioProcessorEditor::presetDeletedMessage (const juce::String& name, bool wentToBin,
+                                                                       int keptCornerMask) const
+{
+    const auto q = "\"" + name + "\"";
+    auto msg = wentToBin
+        ? tr ("Moved to ", "S'ha mogut a ") + recycleBinName() + ": " + q
+          + tr (". It can be restored from there.", ". Es pot recuperar d'all\xc3\xad.")
+        // No REASON claimed: a drive with no bin and the suite's own outright delete both
+        // land here, and only what happened is true for both.
+        : tr ("Deleted: ", "S'ha esborrat: ") + q
+          + tr (". It did not go to ", ". No ha anat a ") + recycleBinName()
+          + tr (", so it cannot be restored from there.", ", o sigui que no es pot recuperar d'all\xc3\xa0.");
+    juce::StringArray letters;
+    for (int i = 0; i < 4; ++i)
+        if (keptCornerMask & (1 << i))
+            letters.add (juce::String::charToString ((juce::juce_wchar) ('A' + i)));
+    if (letters.size() == 1)
+        msg += tr (" Playground corner ", " La cantonada ") + letters[0]
+             + tr (" keeps its own copy of it, so it still sounds and still saves with your presets and projects.",
+                   " del laboratori en guarda la seva pr\xc3\xb2pia c\xc3\xb2pia, o sigui que segueix sonant i es "
+                   "segueix desant amb els teus presets i projectes.");
+    else if (letters.size() > 1)
+        msg += tr (" Playground corners ", " Les cantonades ")
+             + letters.joinIntoString (", ", 0, letters.size() - 1) + tr (" and ", " i ") + letters[letters.size() - 1]
+             + tr (" keep their own copies of it, so they still sound and still save with your presets and projects.",
+                   " del laboratori en guarden les seves pr\xc3\xb2pies c\xc3\xb2pies, o sigui que segueixen sonant i es "
+                   "segueixen desant amb els teus presets i projectes.");
+    return msg;
+}
+
+std::unique_ptr<FractalAdditiveAudioProcessorEditor::PresetSearchPanel>
+FractalAdditiveAudioProcessorEditor::makePresetSearchPanel (const juce::StringArray& names)
+{
+    auto panel = std::make_unique<PresetSearchPanel> (
+        names, processorRef.getLoadedPresetName(),
+        tr ("Search presets...", "Cerca presets..."));
+
+    // WIDE ENOUGH FOR THE LONGEST NAME, so no row is cut short - measured in the row's
+    // own font, plus the row's 6+4 px inset, an 18 px scrollbar (the look-and-feel's
+    // default) and the panel's 4+4 px margins - but never wider than the window can hold
+    // beside the callout's own border.
+    int longest = 0;
+    const juce::Font rowFont (juce::FontOptions (13.0f));
+    for (const auto& n : names)
+        longest = juce::jmax (longest, (int) std::ceil (juce::GlyphArrangement::getStringWidth (rowFont, n)));
+    const int maxW  = juce::jmax (200, getWidth() - 60);
+    const int width = juce::jlimit (200, maxW, juce::jmax (presetBox.getWidth() + 90, longest + 10 + 18 + 8 + 2));
+    // Tall enough for ~12 rows, short enough that the callout still fits inside the
+    // editor above a box sitting near the top - CallOutBox flips it below/above by itself.
+    panel->setWidthAndListHeight (width, juce::jlimit (60, 240, names.size() * 20 + 8));
+
+    panel->onPick = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
+                    (const juce::String& n)
+    {
+        if (safe == nullptr) return;
+        // Straight through the combo, so the ONE onChange handler loads it - a second
+        // load path here is how a preset ends up applied without the dirty mark, the
+        // tuning offer and the relayout that go with it.
+        safe->presetBox.setText (n, juce::sendNotificationSync);
+    };
+    panel->loadedName = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
+    { return safe != nullptr ? safe->processorRef.getLoadedPresetName() : juce::String(); };
+    // A CLICK THAT KEEPS THE LIST OPEN REPORTS ITS OWN LOAD, IN THE LIST. The same load through
+    // the box parks its failures for the timer, which raised them as notices over a list that is
+    // a modal CallOutBox: they covered it, a click on their X closed the list too, and a run of
+    // broken presets stacked one notice per click (night review). So this path takes those
+    // parked failures straight back - the timer finds nothing - and hands them to the strip,
+    // where they describe the preset just clicked.
+    panel->onAudition = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
+                        (const juce::String& n) -> juce::String
+    {
+        if (safe == nullptr) return {};
+        auto& ed = *safe;
+        ed.presetBox.setText (n, juce::sendNotificationSync);
+        juce::StringArray lines;
+        if (const auto e = ed.processorRef.takePresetLoadError(); e.isNotEmpty())
+            lines.add (ed.tr ("Not loaded - the sound you had is still playing: ",
+                              "No s'ha carregat - el so que tenies segueix sonant: ") + ed.trErr (e));
+        if (const auto t = ed.processorRef.takeTuningRestoreError(); t.isNotEmpty())
+            lines.add (ed.tr ("Its saved tuning does not read: ", "La seva afinaci\xc3\xb3 desada no es pot llegir: ")
+                       + ed.trErr (t));
+        for (const auto& l : ed.processorRef.takePlaygroundRestoreLoss())
+            lines.add (ed.tr ("Playground corner ", "Cantonada del laboratori ")
+                       + juce::String::charToString ((juce::juce_wchar) ('A' + juce::jlimit (0, 3, l.corner)))
+                       + ed.tr (" left empty: \"", " buida: \"") + l.name + "\" \xe2\x80\x94 " + ed.trErr (l.why));
+        if (const auto s = ed.processorRef.takeTimbreRestoreError(); s.isNotEmpty())
+            lines.add (ed.tr ("Its custom engine spectrum does not read, so it plays the harmonic engine: ",
+                              "El seu espectre del motor propi no es pot llegir, o sigui que sona amb el motor harm\xc3\xb2nic: ")
+                       + ed.trErr (s));
+        return lines.joinIntoString ("\n");
+    };
+
+    panel->deleteBtn.setButtonText (tr ("Delete", "Esborra"));
+    panel->deleteBtn.setTooltip (tr ("Moves this preset's file to ", "Mou el fitxer d'aquest preset a ")
+                                 + recycleBinName()
+                                 + tr (". A playground corner holding this preset keeps its own copy of it.",
+                                       ". Una cantonada del laboratori que tingui aquest preset en guarda la seva pr\xc3\xb2pia c\xc3\xb2pia."));
+    panel->hintText = tr ("Click a preset to load it and hear it - the list stays open, with a Delete button for it. "
+                          "Double-click or Enter loads it and closes.",
+                          "Fes clic en un preset per carregar-lo i escoltar-lo - la llista es queda oberta, amb un bot\xc3\xb3 "
+                          "Esborra per a ell. Doble clic o Enter el carrega i la tanca.");
+    panel->armedText = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
+                       (const juce::String& n)
+    {
+        if (safe == nullptr) return juce::String();
+        return safe->tr ("Delete moves \"", "Esborra mou \"") + n + safe->tr ("\" to ", "\" a ")
+             + safe->recycleBinName()
+             + safe->tr (" - it can be restored from there.", " - es pot recuperar d'all\xc3\xad.");
+    };
+    panel->onDelete = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
+                      (const juce::String& n)
+    {
+        PresetSearchPanel::DeleteOutcome out;
+        if (safe == nullptr) return out;
+        auto& ed = *safe;
+        using R = FractalAdditiveAudioProcessor::PresetDeleteRefusal;
+        int corner = -1;
+        const auto q = "\"" + n + "\"";
+        bool wentToBin = false;
+        int  holding   = 0;
+        switch (ed.processorRef.deletePreset (n, corner, &wentToBin, &holding))
+        {
+            case R::None:
+                ed.refreshPresetList();
+                ed.refreshPresetDirtyMark();
+                ed.lastDeleteWentToBin  = wentToBin;
+                ed.lastDeleteCornerMask = holding;
+                out.removeFromList = true;
+                out.isError = false;
+                out.message = ed.presetDeletedMessage (n, wentToBin, holding);
+                break;
+            case R::NoSuchPreset:
+                // Gone already (deleted or renamed outside the synth): the list stops
+                // offering it, and says that is what happened rather than claiming a delete.
+                ed.refreshPresetList();
+                out.removeFromList = true;
+                out.message = q + ed.tr (" is no longer in the preset folder - nothing was deleted.",
+                                         " ja no \xc3\xa9s a la carpeta de presets - no s'ha esborrat res.");
+                break;
+            case R::CouldNotDelete:
+                out.message = q + ed.tr (" could not be moved to ", " no s'ha pogut moure a ") + ed.recycleBinName()
+                            + ed.tr (", so nothing was deleted. It may be open in another program, or read-only.",
+                                     ", o sigui que no s'ha esborrat res. Pot ser que estigui obert en un altre "
+                                     "programa, o que sigui nom\xc3\xa9s de lectura.");
+                break;
+        }
+        return out;
+    };
+    // Whatever closes it - a pick, Escape, a click outside - the editor takes the
+    // keyboard back, or the computer-keyboard play the search field suspended would
+    // stay suspended (pollComputerKeyboard only re-arms once no TextEditor has focus).
+    panel->onDismissed = [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this)]
+    { if (safe != nullptr) safe->refocus(); };
+    // SIZED AGAIN NOW THAT ITS WORDS EXIST. setWidthAndListHeight above ran before hintText was
+    // written, so the strip was measured EMPTY and the list opened with its own explanation
+    // cut to nothing until the first click resized it (found by the night's review).
+    panel->fitHeight();
+    return panel;
+}
+
+bool FractalAdditiveAudioProcessorEditor::openPresetSearch()
+{
+    const auto names = processorRef.getPresetNames();
+    if (names.isEmpty())
+        return false;   // nothing to filter: let the ordinary popup say "empty" its own way
+
+    auto panel = makePresetSearchPanel (names);
+    auto* raw = panel.get();
+    juce::CallOutBox::launchAsynchronously (std::move (panel),
+                                            getLocalArea (&presetBox, presetBox.getLocalBounds()), this);
+    raw->search.grabKeyboardFocus();
+    return true;
+}
+
+void FractalAdditiveAudioProcessorEditor::saveCornerFlow (int corner)
+{
+    const auto base = processorRef.getPlaygroundCornerName (corner);
+    // Suggest a name that is NOT the corner's own, for the same reason savePresetFlow
+    // does: a reflex Enter must not overwrite the preset the corner was loaded FROM,
+    // which is very probably still on another corner or in somebody's project.
+    const auto existing = processorRef.getPresetNames();
+    juce::String suggested = base + " 2";
+    for (int n = 3; existing.contains (suggested); ++n) suggested = base + " " + juce::String (n);
+
+    auto* aw = new juce::AlertWindow (
+        tr ("Save corner ", "Desar cantonada ") + juce::String::charToString ((juce::juce_wchar) ('A' + corner)),
+        tr ("Name for this edited corner (it is saved as a normal preset, and the corner "
+            "takes the new name):",
+            "Nom per a aquesta cantonada editada (es desa com un preset normal, i la "
+            "cantonada passa a dir-se aix\xc3\xad):"),
+        juce::MessageBoxIconType::NoIcon, this);
+    aw->addTextEditor ("name", suggested, {});
+    aw->addButton (tr ("Save", "Desa"), 1, juce::KeyPress (juce::KeyPress::returnKey));
+    aw->addButton (tr ("Cancel", "Cancel\xc2\xb7la"), 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    activePrompt = aw;
+
+    aw->enterModalState (true, juce::ModalCallbackFunction::create (
+        [safe = juce::Component::SafePointer<FractalAdditiveAudioProcessorEditor> (this), aw, corner] (int result)
+        {
+            if (safe == nullptr) return;
+            const auto name = aw->getTextEditorContents ("name").trim();
+            if (result == 1 && name.isNotEmpty())
+            {
+                const auto stored = safe->processorRef.savePlaygroundCornerAs (corner, name);
+                if (stored.isEmpty())
+                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                        safe->tr ("Save corner", "Desar cantonada"),
+                        safe->tr ("Could not save the corner. Try a different name.",
+                                  "No s'ha pogut desar la cantonada. Prova un altre nom."),
+                        safe.getComponent());
+                else
+                {
+                    safe->refreshPresetList();            // the new file is a preset like any other
+                    safe->playgroundPanel.refresh (true); // the corner's "*" is gone
+                    safe->refreshCornerEditUi();
+                }
+            }
+            safe->refocus();
+        }), true);
+}
+
+// CAN THIS PANEL REACH THE SOUND RIGHT NOW? While the PLAYGROUND is engaged in morph
+// mode, no. The spectrum is the blend of the corners' compiled partial lists, and
+// PluginProcessor::timerCallback deliberately does not compile the live settings over it
+// (see the comment at the requestRebuild call). Worse, drivePlayground WRITES the morphed
+// values into the parameters every tick, so an edit made here is overwritten 16 ms later:
+// it is not merely ignored, it is erased.
+//
+// All of which was invisible. Every control in the panel stayed enabled, lit, correctly
+// coloured and answering the mouse while nothing any of them did could be heard:
+//
+//   "esta como bloqueado en un estado del custom parece, y como que cambiar de harmonic a
+//    custom no produce ningun cambio en el espectro que se escucha sonar, y cambiar el
+//    texto de la caja de texto de ratios del menu custom tampoco afecta. esto es grave."
+//
+// He is right that it is grave: an entire panel of an instrument, silently inert. This is
+// the largest silent limit this synth had, and the rule here has always been that limits
+// are STATED. So the panel goes visibly dead and says why, and says the two ways out -
+// edit a corner (the controls then BELONG to that corner: see refreshCornerEditUi), or
+// take a corner off the pad.
+void FractalAdditiveAudioProcessorEditor::refreshPlaygroundDrivingUi()
+{
+    // Not while a corner is being EDITED: there the controls do reach something real -
+    // that corner - and refreshCornerEditUi already says whose they are. And not in MIX
+    // mode, where the live patch keeps its own spectrum and keeps rebuilding it.
+    const bool driving = processorRef.isPlaygroundActive()
+                      && ! processorRef.isPlaygroundMixEngaged()
+                      && processorRef.getPlaygroundEditCorner() < 0;
+    if ((int) driving == lastPgDrivingSeen)
+        return;
+    lastPgDrivingSeen = (int) driving;
+    pgDrivingUi       = driving;
+
+    setSpectrumControlsEnabled (! driving);
+    // The panel colour follows the engine, so the button is re-dressed with the lock.
+    pgEditNearestBtn.setColour (juce::TextButton::buttonColourId, spectrumPanelColour);
+    // THE WAY OUT, ON THE BAND ITSELF. Telling the user to go and press EDIT in another
+    // window is a true instruction and a poor one: the button is here, on the corner the
+    // pad is actually nearest to, which is the corner whose sound he is listening to.
+    // "Nearest" is not invented here either - it is the largest BLEND WEIGHT, the
+    // product's own definition of which corner this point mostly is.
+    pgEditNearestBtn.setVisible (driving);
+    if (driving)
+    {
+        double w[FractalAdditiveAudioProcessor::kPlaygroundCorners] {};
+        processorRef.getPlaygroundWeights (w);
+        pgNearestCorner = 0;
+        for (int i = 1; i < FractalAdditiveAudioProcessor::kPlaygroundCorners; ++i)
+            if (w[i] > w[pgNearestCorner]) pgNearestCorner = i;
+        const auto nm = processorRef.getPlaygroundCornerName (pgNearestCorner);
+        pgEditNearestBtn.setButtonText (
+            tr ("Edit corner %C%", "Edita la cantonada %C%")
+                .replace ("%C%", juce::String::charToString ((juce::juce_wchar) ('A' + pgNearestCorner))
+                                     + (nm.isNotEmpty() ? " (" + nm + ")" : juce::String())));
+    }
+    // The three controls that already have exactly ONE owner of their enabled state read
+    // the lock from inside that owner, so nothing here writes over them. Poke each owner
+    // instead, which is what makes the lock arrive without a second writer appearing.
+    applyTransitionMode();
+    refreshSlopeFreeze();
+    applyEngineState();
+    resized();
+    repaint();
+}
+
+// The controls whose edits the blend discards - the same members recolourSpectrumControls
+// dresses, from one list, so a control cannot be dressed by one and forgotten by the
+// other. Disabled rather than merely greyed: a control that cannot act must not answer
+// the mouse either, or the greying is decoration.
+void FractalAdditiveAudioProcessorEditor::setSpectrumControlsEnabled (bool on)
+{
+    for (juce::Slider* s : { (juce::Slider*) &baseNFader, (juce::Slider*) &harmonicsFader,
+                             (juce::Slider*) &primeLimitFader, (juce::Slider*) &timbreRepeatsFader,
+                             (juce::Slider*) &fractalFader, (juce::Slider*) &slopeFader,
+                             (juce::Slider*) &phaseFader })
+        s->setEnabled (on);
+    for (juce::ComboBox* b : { &basePitchBox, &primeModeBox })
+        b->setEnabled (on);
+    for (int i = 0; i < 9; ++i) primeToggle[i].setEnabled (on);
+    primeOnToggle.setEnabled (on);
+    temperToggle.setEnabled (on && processorRef.temperIsPossible());
+    for (auto* b : { &sprDn, &sprUp, &engineChip[0], &engineChip[1],
+                     &loadTimbreButton, &randomSpectrumBtn })
+        b->setEnabled (on);
+    intervalEdit.setEnabled (on);
+    intervalEdit.setReadOnly (! on);
+}
+
+// WHOSE PATCH ARE THESE CONTROLS? While a playground corner is being edited the answer
+// is "not yours", and the preset field is the only place the main window ever said
+// whose it was - so it says THAT instead, and stops being a way to load anything.
+// See FractalAdditiveAudioProcessor::beginPlaygroundCornerEdit, rules 1 and 3.
+void FractalAdditiveAudioProcessorEditor::refreshCornerEditUi()
+{
+    const int  ed   = processorRef.getPlaygroundEditCorner();
+    const auto disp = ed >= 0 ? juce::String::charToString ((juce::juce_wchar) ('A' + ed)) + ": "
+                                  + processorRef.getPlaygroundCornerDisplayName (ed)
+                              : juce::String();
+    // The FIELD's text, not just the mode, is the change detector: a "*" appears the
+    // moment any control moves - with the corner, the mode and everything else unchanged.
+    if (ed == lastEditCornerSeen && (ed < 0 || presetBox.getText() == disp))
+        return;
+    lastEditCornerSeen = ed;
+
+    if (ed >= 0)
+    {
+        // Park the LIVE patch's own name on the way in - once, on the transition, or a
+        // later refresh would "park" the corner's name over it and the real one is gone.
+        if (! cornerEditUiActive)
+        {
+            cornerEditUiActive         = true;
+            presetTextBeforeCornerEdit = presetBox.getText();
+        }
+        presetBox.setText (disp, juce::dontSendNotification);
+        presetBox.setEnabled (false);   // a corner is not "the loaded preset" (rule 3)
+        presetDirtyMark.setVisible (false);
+        presetBox.setTooltip (tr ("These controls are a PLAYGROUND CORNER right now, not your patch. "
+                                  "Your own sound is kept and comes back when you press OK in the "
+                                  "playground window. A * means this corner no longer matches the preset "
+                                  "it was loaded from.",
+                                  "Aquests controls s\xc3\xb3n ARA una CANTONADA del laboratori, no el teu "
+                                  "patch. El teu so es guarda i torna quan prems OK a la finestra del "
+                                  "laboratori. Un * vol dir que aquesta cantonada ja no coincideix amb el "
+                                  "preset d'on ve."));
+        savePresetButton.setButtonText (tr ("Save ", "Desa ")
+                                        + juce::String::charToString ((juce::juce_wchar) ('A' + ed)));
+        savePresetButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xffffc95c));
+        savePresetButton.setColour (juce::TextButton::textColourOffId, juce::Colours::black);
+        savePresetButton.setTooltip (tr ("Save this edited corner as a preset of its own, under a new name. "
+                                         "The corner then takes that name and loses its *. Your own patch is "
+                                         "not written anywhere.",
+                                         "Desa aquesta cantonada editada com un preset propi, amb un nom nou. "
+                                         "La cantonada passa a dir-se aix\xc3\xad i perd l'*. El teu patch no "
+                                         "s'escriu enlloc."));
+    }
+    else
+    {
+        // Only put the parked name back if we were REALLY in edit mode. A plain refresh
+        // (a language switch, a first paint) must never overwrite the field with a name
+        // from an edit session that never happened.
+        if (cornerEditUiActive)
+        {
+            cornerEditUiActive = false;
+            presetBox.setText (presetTextBeforeCornerEdit, juce::dontSendNotification);
+        }
+        presetBox.setEnabled (true);
+        presetBox.setTooltip (tr ("Load a saved preset. The drop-down has a search box: type to filter the "
+                                  "list (accents and capitals are ignored).",
+                                  "Carrega un preset desat. El desplegable t\xc3\xa9 un cercador: escriu per "
+                                  "filtrar la llista (els accents i les maj\xc3\xbascules s'ignoren)."));
+        savePresetButton.setButtonText (tr ("Save", "Desa"));
+        savePresetButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2d6da8));
+        savePresetButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+        savePresetButton.setTooltip (tr ("Save the current sound as a preset (stored in Documents/Galactic "
+                                         "Sting/Presets).",
+                                         "Desa el so actual com a preset (a Documents/Galactic Sting/Presets)."));
+        refreshPresetDirtyMark();
+    }
+}
+
 void FractalAdditiveAudioProcessorEditor::savePresetFlow()
 {
+    // In corner-edit mode Save belongs to the CORNER: the controls are its values, so
+    // saving "the current sound" would otherwise write somebody's corner into the user's
+    // own preset name. The corner flow asks for a name of its own (the user's words:
+    // "que dandole a save se pueda guardar luego con otro nombre").
+    if (const int ed = processorRef.getPlaygroundEditCorner(); ed >= 0)
+    { saveCornerFlow (ed); return; }
+
     // Drifted (some parameter no longer matches what THIS preset was saved with):
     // suggest a name that is NOT the original, so a reflex Save/Enter creates a
     // separate preset instead of silently overwriting the one that still sounds
@@ -3177,7 +6729,9 @@ void FractalAdditiveAudioProcessorEditor::savePresetFlow()
             const auto name = aw->getTextEditorContents ("name").trim();
             if (result == 1 && name.isNotEmpty())
             {
-                const auto stored = safe->processorRef.savePreset (name); // sanitised name, or empty
+                auto why = FractalAdditiveAudioProcessor::PresetWriteRefusal::None;
+                int blockedCorner = -1;
+                const auto stored = safe->processorRef.savePreset (name, why, blockedCorner);
                 if (stored.isNotEmpty())
                 {
                     safe->refreshPresetList();
@@ -3186,11 +6740,53 @@ void FractalAdditiveAudioProcessorEditor::savePresetFlow()
                 }
                 else
                 {
+                    // THE REFUSAL IS SPOKEN, and it names the corner. A save the
+                    // fixed-point rule turns down - this name is on a playground corner
+                    // and the controls are showing the pad's BLEND, not that preset -
+                    // must say so in those words: a silent no-op, or a generic "try
+                    // another name", would leave the user believing the corner they were
+                    // listening to had been saved, which is the same kind of lie as the
+                    // drain itself (case #88). Any other failure keeps the old wording.
+                    const auto letter = juce::String::charToString (
+                        (juce::juce_wchar) ('A' + juce::jmax (0, blockedCorner)));
+                    // THE CORNER'S OWN SPELLING, not the one that was typed. The two can
+                    // now differ - the fixed-point rule compares FILES, so "bell" is
+                    // refused against a corner called "Bell" on this filesystem - and a
+                    // message that quotes what the user typed sends them looking on the
+                    // pad for a name that is not written there. When they differ, the
+                    // message says both, because "these are the same file" is exactly the
+                    // thing that is not obvious.
+                    const auto stored = safe->processorRef.getPlaygroundCornerName (
+                                            juce::jmax (0, blockedCorner));
+                    const auto shown  = stored.isNotEmpty() ? stored : name;
+                    const auto also   = (stored.isNotEmpty() && stored != name)
+                        ? safe->tr (" You typed \"%T%\", which on this system is the same file.",
+                                    " Has escrit \"%T%\", que en aquest sistema \xc3\xa9s el mateix fitxer.")
+                              .replace ("%T%", name)
+                        : juce::String();
+                    const auto msg =
+                        why == FractalAdditiveAudioProcessor::PresetWriteRefusal::CornerFixedPoint
+                          // Since polypresets a project reload no longer re-reads a corner's file,
+                          // so the drift this warns about has ONE door left: picking that preset
+                          // for the corner again. Said that way (review, 2026-09-15).
+                          ? safe->tr ("\"%N%\" is on playground corner %C%, and these controls are "
+                                      "showing the pad's blend, not that preset. Saving under that name "
+                                      "would write the blend into that preset's file, and the corner "
+                                      "would turn into that blend the next time the preset is picked for "
+                                      "it from the corner list. Save under a different name, or use that "
+                                      "corner's own Edit button.",
+                                      "\"%N%\" \xc3\xa9s a la cantonada %C% del laboratori, i aquests "
+                                      "controls mostren la barreja del tauler, no pas aquell preset. "
+                                      "Desar-lo amb aquest nom escriuria la barreja al fitxer d'aquell "
+                                      "preset, i la cantonada es convertiria en aquesta barreja el proper "
+                                      "cop que se li tri\xc3\xa9s el preset a la llista de cantonades. "
+                                      "Deseu-lo amb un altre nom, o feu servir el bot\xc3\xb3 Edit "
+                                      "d'aquella cantonada.")
+                                .replace ("%N%", shown).replace ("%C%", letter) + also
+                          : safe->tr ("Could not save the preset. Try a different name.",
+                                      "No s'ha pogut desar el preset. Prova un altre nom.");
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        safe->tr ("Save preset", "Desar preset"),
-                        safe->tr ("Could not save the preset. Try a different name.",
-                                  "No s'ha pogut desar el preset. Prova un altre nom."),
-                        safe.getComponent());
+                        safe->tr ("Save preset", "Desar preset"), msg, safe.getComponent());
                 }
             }
             safe->refocus();
@@ -3218,7 +6814,7 @@ void FractalAdditiveAudioProcessorEditor::runDissonanceTune()
     juce::String err;
     if (! processorRef.generateDissonanceScale (n, maxima, periodRatio, periodLine, minGap, err))
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-            tr ("Spectrum to Scale", "Espectre a escala"), err, this);
+            tr ("Spectrum to Scale", "Espectre a escala"), trErr (err), this);
     refocus();
 }
 
@@ -3249,7 +6845,7 @@ void FractalAdditiveAudioProcessorEditor::runChordSearch()
                                          tuneScopeBox.getSelectedId() != 2, // SCOPE: 0 vs all
                                          err))
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-            tr ("Chords based on beating", "Acords basats en batec"), err, this);
+            tr ("Chords based on beating", "Acords basats en batec"), trErr (err), this);
     refocus();
 }
 
@@ -3293,20 +6889,68 @@ juce::String FractalAdditiveAudioProcessorEditor::registerKeyText (int key) cons
     return registerPeriodText (k) + ":" + juce::String (first >= 0 ? k - first : 0);
 }
 
-// N as it stands: what the user typed, or - until they type - the default width for the
-// scale loaded right now (see adaptRegSteps and kAdaptRegisterDefaultPeriods).
-int FractalAdditiveAudioProcessorEditor::registerStepsEffective() const
+// N as it stands: what the user typed, or - until they type - the measured default
+// (see adaptRegPeriods and dissonance::kAdaptRegisterDefaultPeriods).
+double FractalAdditiveAudioProcessorEditor::registerPeriodsEffective() const
 {
-    return adaptRegSteps >= 0 ? adaptRegSteps : processorRef.defaultRegisterSteps();
+    return adaptRegPeriods >= 0.0 ? adaptRegPeriods : dissonance::kAdaptRegisterDefaultPeriods;
 }
 
-// ...and how many of those steps the 128-key board really has above the anchor. They differ
-// only near the top of the keyboard, and when they do the panel SAYS the shorter number:
-// the alternative - quietly moving the anchor down so N fits - would optimise for registers
-// the user never asked about, and nothing on screen would show it.
-int FractalAdditiveAudioProcessorEditor::registerStepsFitting() const
+// ...and how much of that width the 128-key board really has BELOW and ABOVE the anchor.
+// Both directions have their own answer now, and near either end of the keyboard they are
+// different numbers - which is exactly why the read-out has a two-sided form. Read back OUT
+// of the frequencies the search is really given (registerBandHz), never recomputed from the
+// typed number, so a clamp the processor applies cannot fail to appear here.
+double FractalAdditiveAudioProcessorEditor::registerPeriodsFrom (double endHz) const
 {
-    return juce::jlimit (0, 127 - processorRef.registerAnchorKey(), registerStepsEffective());
+    const double a = processorRef.getNoteFrequency (processorRef.registerAnchorKey());
+    const double perC = 1200.0 * std::log2 (juce::jmax (1.0001, processorRef.registerPeriodInfo().ratio));
+    if (! (a > 0.0) || ! (endHz > 0.0) || ! std::isfinite (endHz)) return 0.0;
+    return std::abs (1200.0 * std::log2 (endHz / a)) / perC;
+}
+
+double FractalAdditiveAudioProcessorEditor::registerPeriodsFittingDown() const
+{
+    double lo = 0.0, hi = 0.0;
+    processorRef.registerBandHz (registerPeriodsEffective(), lo, hi);
+    return registerPeriodsFrom (lo);
+}
+
+double FractalAdditiveAudioProcessorEditor::registerPeriodsFittingUp() const
+{
+    double lo = 0.0, hi = 0.0;
+    processorRef.registerBandHz (registerPeriodsEffective(), lo, hi);
+    return registerPeriodsFrom (hi);
+}
+
+// IS THE PERIOD A FACT? For a .scl or an MTS master, yes - the tuning states it, and the
+// band is exact. For an absolute 128-key .tun there is no scale behind the pitches at all,
+// so the number the band is built on is either Fibló's own estimate for the file (with the
+// worst deviation it measured) or, when the file has nothing ascending to measure, the
+// 2/1-over-12-keys fallback that nobody supplied. A band whose unit is a guess must SAY it
+// is a guess: "silently wrong" is the one outcome this instrument does not allow itself.
+juce::String FractalAdditiveAudioProcessorEditor::registerPeriodQualifier() const
+{
+    const auto pi = processorRef.registerPeriodInfo();
+    using Src = FractalAdditiveAudioProcessor::RegisterPeriodSource;
+    if (pi.source == Src::Scale) return {};
+    return registerPeriodQualifierText (pi.source == Src::TableEstimate);
+}
+
+// ...as a function of which of the two it is, so the layout probe can measure the WIDER of
+// them (the one nobody sees until they load a .tun with nothing ascending in it). Deliberately
+// only a flag and not the deviation in cents: the number was 7 px too wide for this line at
+// its worst case, and it is already printed in full where it belongs - the Tuning panel's own
+// period field, which is where the user changes it. This line's job is to stop the width
+// LOOKING like a fact when the tuning has no period of its own.
+juce::String FractalAdditiveAudioProcessorEditor::registerPeriodQualifierText (bool estimated) const
+{
+    if (estimated) return " (est.)";
+    // "per." on the Catalan side, matching the abbreviation the same line already uses for
+    // the unit: written out, "cap per\xc3\xado" "de" is 14 characters and put this line 6 px past
+    // its label at 9 pt (the layout probe measured it), and shrinking the whole line again
+    // for one marker would cost every other form its legibility.
+    return catalan ? juce::String (" (cap per.)") : juce::String (" (no period)");
 }
 
 // The key whose ACTIVE-TUNING pitch is nearest `hz`. Through the tuning, never through
@@ -3326,40 +6970,66 @@ int FractalAdditiveAudioProcessorEditor::nearestKeyForHz (double hz) const
     return best;
 }
 
-// WHAT N MEANS RIGHT NOW, in one line: the note the range is counted from, the count
-// itself, and the width that comes to in periods. A step count is exact in every tuning and
-// unreadable as a musical width - "62" is two periods in 31-EDO and nobody should have to
-// do that division - so the panel does the arithmetic out loud.
+// WHAT N MEANS RIGHT NOW, in one line: the note the band is counted from, how far it
+// reaches in each direction, and the two keys those reaches land on. Without it N is a
+// magic number and the anchor is invisible, which is the whole failure mode of a band that
+// follows the hands.
 //
-// The steps that really FIT are said whenever they differ from the steps asked for: at the
-// top of the keyboard the range is genuinely shorter than N, and a control that showed N
-// while the search used seven steps would be the panel lying about its own settings.
-// ...as a function of its own numbers, so the layout probe can measure BOTH of its forms at
-// their widest. Only one is ever on screen, and the one that overflows is always the other.
+// TWO FORMS, and the second one is the reason the first is not enough. Normally the band is
+// symmetric and the line reads "+-1.0 per"; at either end of the keyboard one side is
+// genuinely shorter than N, and then the line reads "-0.4/+1.0 per" instead. A control that
+// showed N while the search used four steps below would be the panel lying about its own
+// settings - and unlike the upward-only form this one can be cut at EITHER end.
+// ...as a function of its own numbers, so the layout probe can measure BOTH forms at their
+// widest. Only one is ever on screen, and the one that overflows is always the other.
 juce::String FractalAdditiveAudioProcessorEditor::adaptRegSpanLine (const juce::String& anchor,
-                                                                    int steps, int fit,
-                                                                    const juce::String& per) const
+                                                                    double periods,
+                                                                    double fitDown, double fitUp,
+                                                                    const juce::String& loHz,
+                                                                    const juce::String& hiHz,
+                                                                    const juce::String& qualifier) const
 {
     // Built by hand rather than through tr(): the numbers are runtime values, so this is
     // the one place where the two languages are assembled instead of chosen. Both forms
     // still exist in both languages - the layout probe measures all four.
-    // "126 of 127" rather than a sentence about the keyboard running out: the long form
-    // ("only 126 steps fit") overflowed this one line in Catalan by 7 px at the widest
-    // numbers a one-degree-per-period scale can produce, and RhythmVerify measures exactly
-    // that case because it is the one nobody sees until the day they play up there.
-    const juce::String count = fit == steps ? juce::String (steps)
-                                            : juce::String (fit) + "/" + juce::String (steps);
-    if (! catalan)
-        return count + " steps above " + anchor + " = " + per + " periods";
-    return count + " passos sobre " + anchor + " = " + per.replaceCharacter ('.', ',')
-         + juce::String::fromUTF8 (" per\xc3\xado" "des");
+    const bool full = std::abs (fitDown - periods) < 0.05 && std::abs (fitUp - periods) < 0.05;
+    const juce::String width = full
+        ? "+-" + juce::String (periods, 1)
+        : "-" + juce::String (fitDown, 1) + "/+" + juce::String (fitUp, 1);
+    // The two ends are the FREQUENCIES the search is really given, not key names. A band a
+    // period and a half wide does not land on a key at all - that was the whole reason the
+    // ends stopped being resolved through the key ladder - so naming a key there would be
+    // naming the wrong pitch, and this way the line prints the search's own two numbers.
+    //
+    // ANCHOR FIRST, then the width, then the ends, with no connecting words: the line
+    // carries four numbers plus a note name at 9.5 pt, and the English "N per around 3:0"
+    // was 7 px past the label in Catalan, where "al voltant de" is three words. Reordered
+    // it needs no preposition at all, so the two languages differ only in the decimal
+    // comma - and the layout probe measures both anyway.
+    const juce::String body = anchor + " " + (catalan ? width.replaceCharacter ('.', ',') : width)
+                            + " per = " + loHz + ".." + hiHz + " Hz";
+    return body + qualifier;
+}
+
+// One rule for both ends: a decimal below 100 Hz (where a cent is worth less than a tenth
+// of a hertz and an integer would round two different bands to the same number) and none
+// above it (where the decimal is noise and costs the line width it does not have).
+juce::String FractalAdditiveAudioProcessorEditor::registerHzText (double hz) const
+{
+    if (! (hz > 0.0) || ! std::isfinite (hz)) return "-";
+    const auto s = hz < 100.0 ? juce::String (hz, 1) : juce::String ((int) std::lround (hz));
+    return catalan ? s.replaceCharacter ('.', ',') : s;
 }
 
 juce::String FractalAdditiveAudioProcessorEditor::adaptRegSpanText() const
 {
-    const int steps = registerStepsEffective(), fit = registerStepsFitting();
-    return adaptRegSpanLine (registerKeyText (processorRef.registerAnchorKey()), steps, fit,
-                             juce::String (fit / (double) registerDegreesPerPeriod(), 1));
+    double lo = 0.0, hi = 0.0;
+    processorRef.registerBandHz (registerPeriodsEffective(), lo, hi);
+    return adaptRegSpanLine (registerKeyText (processorRef.registerAnchorKey()),
+                             registerPeriodsEffective(),
+                             registerPeriodsFrom (lo), registerPeriodsFrom (hi),
+                             registerHzText (lo), registerHzText (hi),
+                             registerPeriodQualifier());
 }
 
 // The anchor MOVES - it is the note being played - so the line under the field has to be
@@ -3368,32 +7038,35 @@ juce::String FractalAdditiveAudioProcessorEditor::adaptRegSpanText() const
 void FractalAdditiveAudioProcessorEditor::syncAdaptRegisterSpan()
 {
     const auto want = adaptRegSpanText();
-    const auto n = juce::String (registerStepsEffective());
-    // The FIELD only follows the tuning while N is untyped (adaptRegSteps < 0). Never with
-    // sendNotification and never when it already reads that, so a field the user is typing
-    // in is not yanked out from under the caret.
-    if (adaptRegStepsEdit.getText() != n && ! adaptRegStepsEdit.hasKeyboardFocus (true))
-        adaptRegStepsEdit.setText (n, juce::dontSendNotification);
+    const auto n = juce::String (registerPeriodsEffective(), 1);
+    // Never with sendNotification and never when it already reads that, so a field the user
+    // is typing in is not yanked out from under the caret. (Unlike the step count this
+    // replaces, N is now in the tuning's own units, so a scale change never rewrites it -
+    // this only re-states the number after a commit or a restore.)
+    if (adaptRegPeriodsEdit.getText() != n && ! adaptRegPeriodsEdit.hasKeyboardFocus (true))
+        adaptRegPeriodsEdit.setText (n, juce::dontSendNotification);
     if (want == adaptRegSpanLbl.getText()) return;
     adaptRegSpanLbl.setText (want, juce::dontSendNotification);
     syncRealtimeLink();   // the follower's settings carry the range, so it must hear this
 }
 
-// The user typed a width. Unreadable text snaps back to the number in force instead of
-// being taken as "no range" - which the processor would read as the default and quietly
-// undo what they were trying to type. A typed number is theirs from then on: it survives
-// every tuning change, because N is a statement about the tuning's own units and
-// re-deriving it on a scale swap is the silent rewrite this control exists to prevent.
-void FractalAdditiveAudioProcessorEditor::commitAdaptRegisterSteps()
+// The user typed a width, in PERIODS. Unreadable text snaps back to the number in force
+// instead of being taken as "no width" - which the processor would read as the default and
+// quietly undo what they were trying to type. A typed number is theirs from then on, and
+// needs no protection from a tuning change: periods are the tuning's own units, so "1.5"
+// means one and a half periods of whatever is loaded, before the swap and after it.
+void FractalAdditiveAudioProcessorEditor::commitAdaptRegisterPeriods()
 {
-    const auto s = adaptRegStepsEdit.getText().trim();
-    if (s.isNotEmpty() && s.containsOnly ("0123456789"))
+    const auto s = adaptRegPeriodsEdit.getText().trim();
+    if (s.isNotEmpty() && s.containsOnly ("0123456789.,"))
         // 0 IS legal and means "just the note I am playing" - one register, the old
         // single-pitch objective, chosen on purpose rather than arrived at by accident.
-        // 127 is the whole board and cannot depend on the tuning, so this clamp can never
-        // reinterpret a width the way a clamp in periods would.
-        adaptRegSteps = juce::jlimit (0, 127, s.getIntValue());
-    adaptRegStepsEdit.setText (juce::String (registerStepsEffective()), juce::dontSendNotification);
+        // The ceiling is kAdaptRegisterMaxPeriods, which is past the keyboard in every
+        // tuning this instrument loads, so the clamp is a guard against a typo pricing a
+        // run in hours and never the thing that decides a musical question.
+        adaptRegPeriods = juce::jlimit (0.0, dissonance::kAdaptRegisterMaxPeriods,
+                                        s.replaceCharacter (',', '.').getDoubleValue());
+    adaptRegPeriodsEdit.setText (juce::String (registerPeriodsEffective(), 1), juce::dontSendNotification);
     adaptRegSpanLbl.setText (adaptRegSpanText(), juce::dontSendNotification);
     syncRealtimeLink();
     resized();
@@ -3422,13 +7095,14 @@ FractalAdditiveAudioProcessorEditor::realtimeSettingsFromPanel() const
     s.adapt.rangeLo     = adaptLoEdit.getText().getDoubleValue();
     s.adapt.rangeHi     = adaptHiEdit.getText().getDoubleValue();
     s.adapt.shapeAmps   = adaptAmpsToggle.getToggleState();
-    // THE REGISTER RANGE, as the STEP COUNT the field shows. Not as two frequencies: the
-    // range hangs off the note being played, and Hz resolved here would freeze the anchor
+    // THE REGISTER BAND, as the PERIOD COUNT the field shows. Not as two frequencies: the
+    // band hangs off the note being played, and Hz resolved here would freeze the anchor
     // at whatever was under the fingers when this ran - which, with the window shut, is for
-    // ever. The processor turns anchor + N into Hz through the active tuning (see
+    // ever. The processor turns anchor +- N periods into Hz through the active tuning (see
     // adaptRegistersFor), which is also where the octave shift, the reference A and a .tun
     // table's anchor live, so nothing here has to know about any of them.
-    s.adapt.regSteps = registerStepsEffective();
+    s.adapt.regPeriods = registerPeriodsEffective();
+    s.lookahead      = lookaheadOn;
     return s;
 }
 
@@ -3450,22 +7124,20 @@ FractalAdditiveAudioProcessorEditor::RegisterProbe
 FractalAdditiveAudioProcessorEditor::registerProbeForTests() const
 {
     RegisterProbe r;
-    r.steps     = registerStepsEffective();
-    r.fitting   = registerStepsFitting();
+    r.periods   = registerPeriodsEffective();
     r.anchorKey = processorRef.registerAnchorKey();
-    r.keyLo     = r.anchorKey;
-    r.keyHi     = juce::jlimit (0, 127, r.anchorKey + r.fitting);
-    r.loHz      = processorRef.getNoteFrequency (r.keyLo);
-    r.hiHz      = processorRef.getNoteFrequency (r.keyHi);
-    r.stepsText = adaptRegStepsEdit.getText();
-    r.spanText  = adaptRegSpanText();
+    processorRef.registerBandHz (r.periods, r.loHz, r.hiHz);
+    r.fitDown   = registerPeriodsFrom (r.loHz);
+    r.fitUp     = registerPeriodsFrom (r.hiHz);
+    r.periodsText = adaptRegPeriodsEdit.getText();
+    r.spanText    = adaptRegSpanText();
     return r;
 }
 
-void FractalAdditiveAudioProcessorEditor::setAdaptRegisterStepsForTests (const juce::String& n)
+void FractalAdditiveAudioProcessorEditor::setAdaptRegisterPeriodsForTests (const juce::String& n)
 {
-    adaptRegStepsEdit.setText (n, juce::dontSendNotification);
-    commitAdaptRegisterSteps();   // exactly what Return and focus-lost do
+    adaptRegPeriodsEdit.setText (n, juce::dontSendNotification);
+    commitAdaptRegisterPeriods();   // exactly what Return and focus-lost do
 }
 
 void FractalAdditiveAudioProcessorEditor::setSpecModeForTests (int mode)
@@ -3481,6 +7153,16 @@ void FractalAdditiveAudioProcessorEditor::setAdaptTargetForTests (int id)
 void FractalAdditiveAudioProcessorEditor::setTuneSourceForTests (int id)
 {
     tuneSourceBox.setSelectedId (id, juce::sendNotificationSync);
+}
+
+// How many notes a searched combination has - the shared "Notes" box. A test that
+// reads the degree list has to be able to set this: the list is combinations of N
+// scale degrees, so N against a scale SMALLER than N is legitimately empty, and a
+// check that cannot tell "empty because there is nothing to find" from "empty
+// because it broke" is not a check.
+void FractalAdditiveAudioProcessorEditor::setChordNotesForTests (int n)
+{
+    chordNotesBox.setSelectedId (juce::jlimit (2, 8, n), juce::sendNotificationSync);
 }
 
 void FractalAdditiveAudioProcessorEditor::setAdaptGoalForTests (int id)
@@ -3702,6 +7384,164 @@ juce::String FractalAdditiveAudioProcessorEditor::adaptReadoutTip() const
     return t;
 }
 
+// Put something on the notice overlay, and remember HOW it was written so applyLanguage
+// can write it again. See the member's own comment for why this is a callable.
+void FractalAdditiveAudioProcessorEditor::raiseNotice (std::function<void()> render, const juce::String& key)
+{
+    // Assigned ONCE. This used to be re-assigned on every raise - including the raise that
+    // showNextNotice makes from INSIDE onClosed, which replaced the std::function while it was
+    // still executing (undefined behaviour; found by the night's review).
+    if (! noticeOverlay.onClosed)
+        noticeOverlay.onClosed = [this] { showNextNotice(); };
+    // Unfolding changes the height: the overlay keeps its top edge (so the buttons under the
+    // pointer do not jump) and re-lays itself around the text it now shows.
+    if (! noticeOverlay.onExpand)
+        noticeOverlay.onExpand = [this] { layoutNotice (true); noticeOverlay.repaint(); };
+    if (noticeOverlay.isVisible())
+    {
+        // The same live condition again: refresh it where it is, never stack a copy.
+        if (key.isNotEmpty() && key == noticeKey)
+        {
+            noticeRender = std::move (render);
+            clearNoticeAction();
+            if (noticeRender) noticeRender();
+            layoutNotice (true);    // rewritten in place: its X and its button stay where they were
+            noticeOverlay.repaint();
+            return;
+        }
+        for (auto& q : noticeQueue)
+            if (key.isNotEmpty() && q.key == key) { q.render = std::move (render); return; }
+        noticeQueue.push_back ({ key, std::move (render) });
+        layoutNotice();                 // the "N more" line changes
+        noticeOverlay.repaint();
+        return;
+    }
+    noticeKey    = key;
+    noticeRender = std::move (render);
+    noticeOverlay.expanded = false;     // a new notice opens at its first paragraph
+    clearNoticeAction();
+    if (noticeRender) noticeRender();
+    noticeOverlay.setVisible (true);
+    noticeOverlay.toFront (false);
+    layoutNotice();
+    noticeOverlay.repaint();
+}
+
+void FractalAdditiveAudioProcessorEditor::showNextNotice()
+{
+    if (noticeQueue.empty())
+    {
+        noticeKey.clear();
+        noticeRender = nullptr;
+        noticeOverlay.moreText.clear();
+        return;
+    }
+    auto next = std::move (noticeQueue.front());
+    noticeQueue.erase (noticeQueue.begin());
+    noticeOverlay.setVisible (false);             // so raiseNotice SHOWS it rather than queueing it
+    raiseNotice (std::move (next.render), next.key);
+}
+
+void FractalAdditiveAudioProcessorEditor::withdrawNotice (const juce::String& key)
+{
+    noticeQueue.erase (std::remove_if (noticeQueue.begin(), noticeQueue.end(),
+                                       [&key] (const QueuedNotice& q) { return q.key == key; }),
+                       noticeQueue.end());
+    if (noticeOverlay.isVisible() && noticeKey == key)
+    {
+        noticeOverlay.setVisible (false);
+        showNextNotice();
+    }
+    else if (noticeOverlay.isVisible())
+    {
+        layoutNotice();
+        noticeOverlay.repaint();
+    }
+}
+
+void FractalAdditiveAudioProcessorEditor::layoutNotice (bool keepTop)
+{
+    // The X had no hover at all - found the first time a rig scenario (57) ever put a notice
+    // in front of the tooltip gate. Written here so it follows a language switch with the text.
+    // THE FOLD'S OWN WORDS, and how much is behind it. Written here, like the X's tooltip,
+    // so a language switch re-words them with everything else.
+    if (noticeOverlay.canExpand())
+    {
+        noticeOverlay.expandBtn.setButtonText (noticeOverlay.expanded
+            ? tr ("Show less", "Mostra'n menys")
+            : tr ("Show more", "Mostra'n m\xc3\xa9s") + " (" + juce::String (noticeOverlay.foldedParagraphs()) + ")");
+        noticeOverlay.expandBtn.setTooltip (noticeOverlay.expanded
+            ? tr ("Fold this notice back to its first paragraph. Nothing is lost - it opens again here.",
+                  "Plega aquest av\xc3\xads al primer par\xc3\xa0graf. No es perd res: es torna a obrir aqu\xc3\xad.")
+            : tr ("Open the rest of this notice - it is folded, not cut.",
+                  "Obre la resta d'aquest av\xc3\xads: est\xc3\xa0 plegat, no retallat."));
+    }
+    noticeOverlay.closeBtn.setTooltip (tr ("Close this notice. If more are waiting, the next one appears.",
+                                           "Tanca aquest av\xc3\xads. Si n'hi ha m\xc3\xa9s esperant, apareix el seg\xc3\xbc" "ent."));
+    const auto waiting = (int) noticeQueue.size();
+    noticeOverlay.moreText = waiting == 0 ? juce::String()
+        : waiting == 1 ? tr ("1 more notice waits behind this one - close it to read it.",
+                             "1 av\xc3\xads m\xc3\xa9s espera darrere d'aquest - tanca'l per llegir-lo.")
+                       : juce::String (waiting)
+                         + tr (" more notices wait behind this one - close it to read the next.",
+                               " avisos m\xc3\xa9s esperen darrere d'aquest - tanca'l per llegir el seg\xc3\xbc" "ent.");
+    const int w = juce::jmin (560, juce::jmax (200, getWidth() - 20));
+    const int h = juce::jmin (noticeOverlay.heightFor (w), juce::jmax (120, getHeight() - 20));
+    auto r = getLocalBounds().withSizeKeepingCentre (w, juce::jmax (120, h));
+    // THE SAME NOTICE REWRITTEN IN PLACE (the freeze warning, twice a second) keeps its top
+    // edge and never shrinks. Re-centred, every change of line count moved the X and the
+    // "Don't show this again" button by half of it - out from under a pointer on its way to
+    // them. Growing still moves the button down, which a new paragraph has to; shrinking and
+    // re-centring do not happen at all until the next ordinary layout.
+    if (keepTop && noticeOverlay.isVisible() && noticeOverlay.getWidth() == w)
+    {
+        const int maxH = juce::jmax (120, getHeight() - 20);
+        const int hh   = juce::jmin (maxH, juce::jmax (r.getHeight(), noticeOverlay.getHeight()));
+        const int top  = juce::jlimit (0, juce::jmax (0, getHeight() - hh), noticeOverlay.getY());
+        r = { r.getX(), top, w, hh };
+    }
+    noticeOverlay.setBounds (r);
+    noticeOverlay.resized();   // the action button follows the text even when the size did not change
+}
+
+// THE PROCESSOR'S REALTIME REFUSALS, IN THE WINDOW'S LANGUAGE.
+//
+// The feedback guard lives in the processor - it has to, because the link keeps running
+// with this window shut - and the processor has no tr(): it is the audio object, it has no
+// idea which language a window it may not even have is drawing in. Everywhere else that
+// mattered, the answer was an ENUM the editor translates (PresetWriteRefusal is the
+// pattern, and its comment says exactly this). These two refusals were written as English
+// sentences instead, and they are not obscure: they are what a Catalan user gets for
+// pressing REALTIME with temper on, which is the single most likely way to meet them.
+//
+// Recognised by their opening words rather than compared whole, so the processor may fix a
+// typo without this silently falling back to English - and run 75 pins the recognition
+// against the strings the processor really produces, so a REWRITE there goes red here
+// instead of shipping. Anything else - a search that could not start, a bound the engine
+// refused - is passed through untouched: those are the processor's own words about its own
+// numbers, and inventing a translation for a message this function has never seen would be
+// worse than showing the one it was given.
+juce::String FractalAdditiveAudioProcessorEditor::realtimeRefusalText (const juce::String& raw) const
+{
+    if (raw.startsWith ("Temper mode already builds"))
+        return tr ("Temper mode already builds the spectrum FROM the tuning. Running this "
+                   "at the same time would feed each into the other with no end to it, so "
+                   "realtime is off. Switch temper off to use it.",
+                   "El mode Tempera ja construeix l'espectre A PARTIR de l'afinaci\xc3\xb3. "
+                   "Fer-ho anar tot alhora els faria alimentar-se l'un a l'altre sense fi, "
+                   "o sigui que el temps real queda desactivat. Desactiva Tempera per "
+                   "fer-lo servir.");
+    if (raw.startsWith ("\"From spectrum's segment\" already builds"))
+        return tr ("\"From spectrum's segment\" already builds the tuning FROM the spectrum. "
+                   "Adapting the spectrum to that tuning would feed each into the other, so "
+                   "realtime is off.",
+                   "\"Troba afinacions del segment de l'espectre\" ja construeix l'afinaci\xc3\xb3 "
+                   "A PARTIR de l'espectre. Adaptar l'espectre a aquella afinaci\xc3\xb3 els "
+                   "faria alimentar-se l'un a l'altre, o sigui que el temps real queda "
+                   "desactivat.");
+    return raw;
+}
+
 // The two REALTIME buttons' look, plus the one case they must OWN UP to: the processor
 // refused the link (a feedback loop) and switched it off under us. The button has to stop
 // claiming to be on, and the reason has to be said out loud, not swallowed.
@@ -3715,11 +7555,11 @@ void FractalAdditiveAudioProcessorEditor::paintRealtimeButtons()
         if (why.isNotEmpty())
         {
             chordRtOn = adaptRtOn = false;
-            noticeOverlay.title = tr ("Realtime switched off", "Temps real desactivat");
-            noticeOverlay.body  = why;
-            noticeOverlay.setVisible (true);
-            noticeOverlay.toFront (false);
-            noticeOverlay.repaint();
+            raiseNotice ([this, why]
+            {
+                noticeOverlay.title = tr ("Realtime switched off", "Temps real desactivat");
+                noticeOverlay.body  = realtimeRefusalText (why);
+            }, "realtime-refused");
             resized();
         }
     }
@@ -3730,6 +7570,44 @@ void FractalAdditiveAudioProcessorEditor::paintRealtimeButtons()
     adaptRtBtn.setColour (juce::TextButton::buttonColourId,
                           (live == RtLink::SpectrumFromTuning || live == RtLink::SpectrumFromChord)
                               ? lit : dim);
+    // LOOKAHEAD has THREE states and the colour says which: off; armed but idle (the
+    // follower is not running, so no latency is being paid and none would help); and
+    // actually delaying. A single lit/dim pair would have let "armed" look like "working"
+    // while the plugin reported zero latency.
+    const bool armed  = lookaheadOn;
+    const bool active = processorRef.isLookaheadActive();
+    lookaheadBtn.setColour (juce::TextButton::buttonColourId,
+                            active ? lit : (armed ? lit.withAlpha (0.45f) : dim));
+    // The button STATES ITS PRICE while it is paying it: a latency you cannot see the
+    // size of is the thing people distrust about lookahead in any plugin.
+    //
+    // ...and, once there is one, THE MEASURED LANDING beside it: how long the last chord
+    // change really took to reach the spectrum, on this machine, at these settings. The
+    // budget is a fixed 250 ms and heavy adapt settings (16 or 24 partials against a wide
+    // chord) can outgrow it - so the alternative to printing this number was a lookahead
+    // that quietly stopped being early and never said so. "late" is the whole point of
+    // the read-out; it is not decoration.
+    //
+    // SENTENCE CASE, for the same reason as the two Realtime buttons above and with the
+    // same benefit: this button sits directly under the follower it belongs to, on the
+    // column's own full width, and it is the longest string in the stack - "ANTICIPACIO
+    // 250 ms | darrer 310 ms TARD" in caps is the widest thing this 192 px column is ever
+    // asked to draw. Lower-case letters are narrower, so the state that has the most to
+    // say is the state that gains the most room to say it. The WARNING still reads as one:
+    // it is the only word in the line that is not a number or a unit.
+    juce::String txt;
+    if (active)
+    {
+        const double budMs = (double) processorRef.getLookaheadSamples() * 1000.0
+                           / juce::jmax (1.0, processorRef.getSampleRate());
+        txt = tr ("Lookahead ", "Anticipaci\xc3\xb3 ") + juce::String ((int) std::lround (budMs)) + " ms";
+        if (const double land = processorRef.getLastRealtimeLandingMs(); land >= 0.0)
+            txt << tr (" | last ", " | darrer ") << juce::String ((int) std::lround (land)) << " ms"
+                << (land <= budMs ? juce::String() : tr (" late", " tard"));
+    }
+    else if (armed) txt = tr ("Lookahead (idle)", "Anticipaci\xc3\xb3 (en espera)");
+    else            txt = tr ("Lookahead", "Anticipaci\xc3\xb3");
+    lookaheadBtn.setButtonText (txt);
 }
 
 // The hand-pressed Adapt: one run against the selected target, then apply it as ONE undo
@@ -3764,7 +7642,7 @@ void FractalAdditiveAudioProcessorEditor::runSpectrumAdapt()
                                          /*targetIsTuning*/ ! toChord);
     if (err.isNotEmpty())
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-            tr ("Adapt spectrum to tuning", "Adapta l'espectre a l'afinaci\xc3\xb3"), err, this);
+            tr ("Adapt spectrum to tuning", "Adapta l'espectre a l'afinaci\xc3\xb3"), trErr (err), this);
     refreshAdaptButtonText();
     refocus();
 }
@@ -3786,11 +7664,21 @@ void FractalAdditiveAudioProcessorEditor::stopChordPreview()
             off.setTimeStamp (nowS);
             processorRef.previewCollector.addMessageToQueue (off);
         }
-        for (int ch = 9; ch <= 16; ++ch)
+        // ONLY THE CHANNELS THIS PREVIEW USED. It used to recentre 9..16 wholesale, and
+        // those are MEMBER channels an MPE controller plays on: clicking a chord row while
+        // the Hexboard held a chord threw away the per-note bend of every note on them -
+        // the retuning IS that bend, so the held chord jumped to 12-EDO (2026-10-03).
+        bool centred[17] = {};
+        for (const auto& [ch, key] : previewNotes)
         {
-            auto centre = juce::MidiMessage::pitchWheel (ch, 8192);
-            centre.setTimeStamp (nowS);
-            processorRef.previewCollector.addMessageToQueue (centre);
+            juce::ignoreUnused (key);
+            if (ch >= 1 && ch <= 16 && ! centred[ch])
+            {
+                centred[ch] = true;
+                auto centre = juce::MidiMessage::pitchWheel (ch, 8192);
+                centre.setTimeStamp (nowS);
+                processorRef.previewCollector.addMessageToQueue (centre);
+            }
         }
     }
     previewNotes.clear();
@@ -3810,10 +7698,10 @@ void FractalAdditiveAudioProcessorEditor::playChordPreview (int row)
 
     // Bend range of the receiver: the MPE-input mode's zone is hard-wired to +-48;
     // the legacy modes follow the bendRange parameter.
-    static constexpr int bendValues[] = { 2, 12, 48 };
-    const int bendRange = processorRef.getTuningMode() == 3 ? 48
-        : bendValues[juce::jlimit (0, 2,
-              (int) processorRef.apvts.getRawParameterValue ("bendRange")->load())];
+    // THE ENGINE'S OWN ANSWER, not a private copy of its rule. This held the last two
+    // bendValues[] tables in the editor; they agreed with RhythmEngine::bendRangeSemis
+    // by coincidence of being written the same day, which is not the same as reading it.
+    const int bendRange = (int) processorRef.getRhythm().getBendRangeSemis();
     const double f60 = processorRef.getNoteFrequency (60);
     if (! (f60 > 0.0)) return;
 
@@ -3871,9 +7759,7 @@ void FractalAdditiveAudioProcessorEditor::hoverPreview (const std::vector<double
     // Heard as before: the whole chord together, then an ascending arpeggio - and
     // it stops the moment the pointer leaves the row (stopChordPreview above).
 
-    static constexpr int bendValues[] = { 2, 12, 48 };
-    const int bendRange = processorRef.getTuningMode() == 3 ? 48
-        : bendValues[juce::jlimit (0, 2, (int) processorRef.apvts.getRawParameterValue ("bendRange")->load())];
+    const int bendRange = (int) processorRef.getRhythm().getBendRangeSemis();   // one rule, one reader
     const double f60 = processorRef.getNoteFrequency (60);
     if (! (f60 > 0.0)) return;
 
@@ -4015,6 +7901,14 @@ void FractalAdditiveAudioProcessorEditor::rebuildScaleDissList()
                                : yellow.interpolatedWith (red, (float) ((t - 0.5) * 2.0));
         degreeList.rows.push_back (std::move (row));
     }
+    // THE MISSING PERIOD ROW, SAID OUT LOUD. A descending .scl and a degenerate 1/1
+    // scale state no ascending period, so there is no "degree 0, one period up" to rank
+    // and the list stops one row early (computeActiveScaleDissonance). Without this line
+    // the user would just see a shorter list and no reason for it.
+    degreeList.noteText = processorRef.tuningStatesPeriod()
+                            ? juce::String()
+                            : tr ("this scale states no period, so there is no period row",
+                                  "aquesta escala no declara cap per\xc3\xado" "de, o sigui que no hi ha fila de per\xc3\xado" "de");
     // Re-size for the Viewport (scrolls when the list is taller than the box).
     const int visH = dissView.getHeight();
     const int ch   = degreeList.contentHeight();
@@ -4022,6 +7916,22 @@ void FractalAdditiveAudioProcessorEditor::rebuildScaleDissList()
     degreeList.setSize (scroll ? dissView.getWidth() - 10 : dissView.getWidth(),
                         juce::jmax (visH, ch));
     degreeList.repaint();
+}
+
+// THE "FEWER DEGREES" BODY, in ONE place. It used to be assembled inline where it was
+// shown, in a state the rig cannot photograph without running a whole dissonance search,
+// so the longest sentence in the plugin was never measured against the eight lines
+// drawFittedText gives it. Built here instead, so the probe can ask the question with
+// the widest numbers the Notes box can produce - it offers 1..24, so two digits each -
+// without a second copy of the words to drift from this one.
+juce::String FractalAdditiveAudioProcessorEditor::fewerDegreesBody (int requested, int found) const
+{
+    return tr ("You asked for ", "N'has demanat ")
+        + juce::String (requested)
+        + tr (" but this timbre's dissonance curve only has ", " per\xc3\xb2 la corba de disson\xc3\xa0ncia d'aquest timbre nom\xc3\xa9s t\xc3\xa9 ")
+        + juce::String (found)
+        + tr (" usable extremes in the chosen period. A curve only forms a notch where partials interact; sparse spectra (few partials, e.g. a near-sine) form few notches - a pure sine forms none. The scale was generated with all the extremes that exist. Add partials (higher N, Fractal, flatter Decay) or widen the period for more.",
+              " extrems usables dins del per\xc3\xado" "de triat. La corba nom\xc3\xa9s fa un clot on els parcials interactuen; els espectres escassos (pocs parcials) en fan pocs - un sinus pur no en fa cap. L'escala s'ha generat amb tots els extrems existents. Afegeix parcials (N m\xc3\xa9s alta, Fractal, Caiguda m\xc3\xa9s plana) o eixampla el per\xc3\xado" "de per obtenir-ne m\xc3\xa9s.");
 }
 
 void FractalAdditiveAudioProcessorEditor::refreshDegreeList (bool showNotice)
@@ -4033,20 +7943,16 @@ void FractalAdditiveAudioProcessorEditor::refreshDegreeList (bool showNotice)
     if (processorRef.getDissFound() >= processorRef.getDissRequested() || ! showNotice)
     {
         if (processorRef.getDissFound() >= processorRef.getDissRequested())
-            noticeOverlay.setVisible (false);
+            withdrawNotice ("degrees");   // only ITS notice - not whatever else is on screen
     }
     else
     {
-        noticeOverlay.title = tr ("Fewer degrees than requested", "Menys graus dels demanats");
-        noticeOverlay.body  = tr ("You asked for ", "N'has demanat ")
-            + juce::String (processorRef.getDissRequested())
-            + tr (" but this timbre's dissonance curve only has ", " per\xc3\xb2 la corba de dissonancia d'aquest timbre nom\xc3\xa9s t\xc3\xa9 ")
-            + juce::String (processorRef.getDissFound())
-            + tr (" usable extremes in the chosen period. A curve only forms a notch where partials interact; sparse spectra (few partials, e.g. a near-sine) form few notches - a pure sine forms none. The scale was generated with all the extremes that exist. Add partials (higher N, Fractal, flatter Decay) or widen the period for more.",
-                  " extrems usables dins del per\xc3\xado" "de triat. La corba nom\xc3\xa9s fa un clot on els parcials interactuen; els espectres escassos (pocs parcials) en fan pocs - un sinus pur no en fa cap. L'escala s'ha generat amb tots els extrems existents. Afegeix parcials (N m\xc3\xa9s alta, Fractal, Caiguda m\xc3\xa9s plana) o eixampla el per\xc3\xado" "de per obtenir-ne m\xc3\xa9s.");
-        noticeOverlay.setVisible (true);
-        noticeOverlay.toFront (false);
-        noticeOverlay.repaint();
+        const int want = processorRef.getDissRequested(), got = processorRef.getDissFound();
+        raiseNotice ([this, want, got]
+        {
+            noticeOverlay.title = tr ("Fewer degrees than requested", "Menys graus dels demanats");
+            noticeOverlay.body  = fewerDegreesBody (want, got);
+        }, "degrees");
     }
 }
 
@@ -4055,14 +7961,14 @@ void FractalAdditiveAudioProcessorEditor::saveDissonanceScl()
     if (! processorRef.hasGeneratedScl())
     {
         juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon,
-            tr ("Save scale", "Desar escala"),
+            tr (fgdlg::saveScale.en, fgdlg::saveScale.ca),   // the table, like line 7026 below
             tr ("Generate a scale first - press 'Find'.",
                 "Primer genera una escala - prem 'Troba'."), this);
         return;
     }
 
     fileChooser = std::make_unique<juce::FileChooser> (
-        tr ("Save the generated scale (.scl)", "Desa l'escala generada (.scl)"),
+        tr (fgdlg::saveGen.en, fgdlg::saveGen.ca),
         juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
             .getChildFile (processorRef.getGeneratedSclName() + ".scl"),
         "*.scl");
@@ -4074,7 +7980,7 @@ void FractalAdditiveAudioProcessorEditor::saveDissonanceScl()
                 juce::String err;
                 if (! processorRef.saveGeneratedScl (fc.getResult(), err))
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        "Save scale", err, this);
+                        tr (fgdlg::saveScale.en, fgdlg::saveScale.ca), trErr (err), this);
             }
             refocus();
         });
@@ -4094,8 +8000,13 @@ void FractalAdditiveAudioProcessorEditor::updateWarning (int templatePartials)
     // the old "selection" id returned NULLPTR and crashed the host on this very path.
     const float selAx    = ap.getRawParameterValue ("harmonics")->load();
     const bool  isPrime  = selAx > 2.5f;
-    const bool wl        = ap.getRawParameterValue ("primeMode")->load() > 0.5f;
-    const int  limitIdx  = (int) ap.getRawParameterValue ("primeLimit")->load();
+    // The switch first: with PRIME CONTROL off there is no prime filter acting, so a
+    // diagnosis that blames the whitelist or the limit is telling the user to go and
+    // change a control that is not doing anything. Read through the same gate the audio
+    // path uses (see prepareSettings) and the branches below stay true by construction.
+    const bool pon       = ap.getRawParameterValue ("primeOn")->load() > 0.5f;
+    const bool wl        = pon && ap.getRawParameterValue ("primeMode")->load() > 0.5f;
+    const int  limitIdx  = pon ? (int) ap.getRawParameterValue ("primeLimit")->load() : 0;
     unsigned mask = 0;
     for (int i = 0; i < 9; ++i)
         if (ap.getRawParameterValue ("primeWL" + juce::String (i))->load() > 0.5f)
@@ -4114,6 +8025,9 @@ void FractalAdditiveAudioProcessorEditor::updateWarning (int templatePartials)
     else if (isPrime && ! wl && limitIdx > 0)
         why = tr ("'Harmonics = Prime' keeps only prime harmonics, but the Prime Limit then removes every prime bigger than the limit - and your Base N starts the series above it.\n\nFix: raise the Prime Limit (or set it to Off), or lower Base N.",
                   "'Harm\xc3\xb2nics = Primers' nom\xc3\xa9s deixa harm\xc3\xb2nics primers, per\xc3\xb2 el L\xc3\xadmit de primers treu tot primer m\xc3\xa9s gran que el l\xc3\xadmit - i la teva Base N comen\xc3\xa7""a la s\xc3\xa8rie per sobre.\n\nSoluci\xc3\xb3: puja el L\xc3\xadmit de primers (o posa'l en No), o abaixa la Base N.");
+    else if (! pon)
+        why = tr ("Prime Control is OFF, so nothing is being filtered by primes - the Harmonics setting alone is removing every harmonic of the current Base N.\n\nFix: set Harmonics to 'All', or change Base N.",
+                  "El Control de primers est\xc3\xa0 desactivat, o sigui que els primers no filtren res - \xc3\xa9s nom\xc3\xa9s el filtre d'Harm\xc3\xb2nics el que treu tots els harm\xc3\xb2nics de la Base N actual.\n\nSoluci\xc3\xb3: posa Harm\xc3\xb2nics en 'Tots', o canvia la Base N.");
     else
         why = tr ("The Harmonics filter and the Prime Control filter, applied together, remove every harmonic of the current Base N.\n\nFix: relax either filter (Harmonics = All, or Prime Control = Off), or change Base N.",
                   "El filtre d'Harm\xc3\xb2nics i el de Control de primers, aplicats alhora, treuen tots els harm\xc3\xb2nics de la Base N actual.\n\nSoluci\xc3\xb3: relaxa qualsevol dels dos (Harm\xc3\xb2nics = Tots, o Control de primers = No), o canvia la Base N.");
@@ -4248,7 +8162,15 @@ FractalAdditiveAudioProcessorEditor::playgroundProbeForTests (int w, int h, bool
     // point and every corner's name - all of it off live processor state, so a null or a
     // stale index in there is a crash in a window nothing else in the build ever opens.
     {
-        juce::Image img (juce::Image::ARGB, juce::jmax (1, w), juce::jmax (1, h), true);
+        // SOFTWARE, not the default native image type. On Windows a JUCE 8 native image
+        // is a Direct2D bitmap, and this throwaway one is never read back on purpose -
+        // its Graphics context is destroyed, which is where Direct2D's own
+        // createPersistentBackup runs. Under the self-snapshot rig (which builds one
+        // instrument per scenario and calls this in a loop) that readback died in
+        // juce::readFromDirect2DBitmap, taking the whole run with it. A plain CPU bitmap
+        // has no device to lose, and this image's only job was ever to make paint() run.
+        juce::Image img (juce::SoftwareImageType().create (juce::Image::ARGB,
+                                                           juce::jmax (1, w), juce::jmax (1, h), true));
         juce::Graphics g (img);
         playgroundPanel.paintEntireComponent (g, true);
     }
@@ -4261,6 +8183,10 @@ FractalAdditiveAudioProcessorEditor::playgroundProbeForTests (int w, int h, bool
         p.box[i]   = playgroundPanel.cornerBox[i].getBounds();
         p.clear[i] = playgroundPanel.cornerClear[i].getBounds();
         p.lbl[i]   = playgroundPanel.cornerLbl[i].getBounds();
+        p.edit[i]       = playgroundPanel.cornerEdit[i].getBounds();
+        p.editText[i]   = playgroundPanel.cornerEdit[i].getButtonText();
+        p.editEnabled[i]= playgroundPanel.cornerEdit[i].isEnabled();
+        p.cornerName[i] = processorRef.getPlaygroundCornerDisplayName (i);
     }
     for (int m = 0; m < 2; ++m)
     {
@@ -4319,16 +8245,109 @@ void FractalAdditiveAudioProcessorEditor::applySlopeFaderColour()
     slopeFader.setColour (juce::Slider::trackColourId, col.withAlpha (0.55f));
 }
 
+// THE TRANSITION BOX IS A VIEW OF TWO BOOLEANS, and this is the half that reads them.
+// It runs off the 30 Hz timer, so the box follows the parameters however they move - a
+// host automation lane, a modulator, a preset, a playground corner, an undo - not just
+// the user's own click on it.
+//
+// FOUR STATES, THREE SOUNDS. Both features are the same crossfade between two banks of
+// oscillators inside a voice (see AdditiveVoice.h and bf0f768), so exactly one can act
+// and MORPH WINS: a patch carrying both flags SOUNDS like Morph, so Morph is what the
+// box shows. That is not a decision made here, it is the voice's rule reported honestly -
+// and it is why an old project with both flags set opens on the right item without any
+// migration. Nothing is written back: leaving the flags as the user's own state means a
+// lane that raises and lowers "dryWet" under a held Morph still means exactly what it
+// meant, instead of being silently rewritten by the panel it is being watched on.
+void FractalAdditiveAudioProcessorEditor::applyTransitionMode()
+{
+    const bool morphOn = processorRef.apvts.getRawParameterValue ("morph")->load()  > 0.5f;
+    const bool dwOn    = processorRef.apvts.getRawParameterValue ("dryWet")->load() > 0.5f;
+    const int  item    = morphOn ? 2 : (dwOn ? 3 : 1);
+    // THE LOCK RIDES IN THE SIGNATURE. This detector used to watch the MODE alone, so a
+    // playground lock arriving with the mode unchanged was skipped entirely and the two
+    // Time faders stayed live under a panel that says nothing in it can be heard - the
+    // gate caught exactly one fader still enabled, named it, and this is why. Same shape
+    // as canTemper riding in applyEngineState's signature, and for the same reason.
+    const int sig = item * 2 + (pgDrivingUi ? 1 : 0);
+    if (sig == lastTransitionShown) return;     // timer rate: everything below repaints
+    lastTransitionShown = sig;
+    transitionBox.setSelectedId (item, juce::dontSendNotification);
+
+    // WHICH Time fader is on screen. Morph shows its own; Dry/Wet and Off both show the
+    // crossfade's. Off shows it because Dry/Wet is the mode the box defaults to, so the
+    // greyed number is the time that will apply the moment the user leaves Off - and
+    // because the alternative, remembering the last live mode, is a piece of UI-only
+    // state that a reopened project cannot restore and that would put a different number
+    // under the same patch depending on what had been clicked first.
+    const bool showMorph = (item == 2);
+    morphTimeFader.setVisible (showMorph);
+    dryWetTimeFader.setVisible (! showMorph);
+
+    // GREYED WHEN THERE IS NOTHING TO TIME. With the transition Off no fade of any kind
+    // runs, so a live fader here would be the panel offering to time something that is
+    // not happening - the same failure the AMP DECAY / FROZEN pair exists to prevent, and
+    // answered the same way.
+    // ...AND THE PLAYGROUND LOCK, read here rather than written over these two from
+    // outside. They already have exactly one owner of their enabled state, which is what
+    // stopped the AMP DECAY / FROZEN pair fighting; a second writer for the lock would
+    // have put that back. See refreshPlaygroundDrivingUi.
+    morphTimeFader.setEnabled (item != 1 && ! pgDrivingUi);
+    dryWetTimeFader.setEnabled (item != 1 && ! pgDrivingUi);
+    applyTransitionFaderColour();
+    resized();                     // the fader that just appeared has to be given the row
+    repaint (bothEnginesBounds);
+}
+
+// THE ONE WRITER of the two Time faders' colour, for the reason applySlopeFaderColour is
+// the one writer of SLOPE's: they have a second state (the transition Off, where they can
+// time nothing) and a control whose colour is set from two places ends up wearing
+// whichever of them ran last.
+void FractalAdditiveAudioProcessorEditor::applyTransitionFaderColour()
+{
+    const bool off = processorRef.apvts.getRawParameterValue ("morph")->load()  <= 0.5f
+                  && processorRef.apvts.getRawParameterValue ("dryWet")->load() <= 0.5f;
+    const auto col = off ? juce::Colour (0xff5a6070) : spectrumPanelColour;
+    for (juce::Slider* s : { &morphTimeFader, &dryWetTimeFader })
+    {
+        s->setColour (juce::Slider::thumbColourId, col);
+        s->setColour (juce::Slider::trackColourId, col.withAlpha (0.55f));
+    }
+}
+
+// The other half: the box's own gesture, written back to the two parameters. One gesture
+// each, because a host recording this sees two lanes move and both have to be a complete
+// begin/end pair or the DAW keeps writing after the mouse is up.
+void FractalAdditiveAudioProcessorEditor::setTransitionParams (bool morphOn, bool dryWetOn)
+{
+    auto put = [this] (const char* id, bool on)
+    {
+        if (auto* p = processorRef.apvts.getParameter (id))
+        {
+            const float v = on ? 1.0f : 0.0f;
+            if (juce::approximatelyEqual (p->getValue(), v)) return;   // no empty gestures
+            p->beginChangeGesture();
+            p->setValueNotifyingHost (v);
+            p->endChangeGesture();
+        }
+    };
+    put ("morph",  morphOn);
+    put ("dryWet", dryWetOn);
+    applyTransitionMode();   // the box drew itself; the fader and the greying follow now
+}
+
 void FractalAdditiveAudioProcessorEditor::refreshSlopeFreeze()
 {
     const bool frozen = processorRef.apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
     if ((frozen ? 1 : 0) == lastManualFrozenShown) return;
     lastManualFrozenShown = frozen ? 1 : 0;
-    slopeFader.setEnabled (! frozen);
+    slopeFader.setEnabled (! frozen && ! pgDrivingUi);   // one writer, the lock included
     applySlopeFaderColour();
     slopeFader.setTooltip (frozen
-        ? tr ("!Frozen!: *manual per-partial amplitudes* are on, so the amplitudes come from the pencil's knobs and this fader does nothing. It is kept exactly where it stood - switch manual off and it applies again.",
-              "!Congelat!: les *amplituds manuals per parcial* estan actives, les amplituds venen dels controls del llapis i aquest fader no fa res. Es conserva tal com estava - apaga el manual i torna a aplicar-se.")
+        // Names the CAUSE, because the commonest way to arrive here is not the pill: it
+        // is dragging one knob in the pencil's window, which arms manual mode for you.
+        // "Frozen" on its own left that user hunting for a switch they never touched.
+        ? tr ("!Frozen!: *manual per-partial amplitudes* are on - switched on either by the pill below the pencil or by your first drag inside the pencil's window - so the amplitudes come from those knobs and this fader does nothing. It is kept exactly where it stood: switch manual off and it applies again.",
+              "!Congelat!: les *amplituds manuals per parcial* estan actives - activades amb la pastilla de sota el llapis o pel teu primer arrossegament dins la finestra del llapis - i per aix\xc3\xb2 les amplituds venen d'aquells controls i aquest fader no fa res. Es conserva tal com estava: apaga el manual i torna a aplicar-se.")
         : tr ("Amplitude roll-off. 0 = flat/bright, 1 = saw, 2 = triangle.  (Also thins the highs when a Custom Engine scale is the spectrum.)",
               "Caiguda d'amplitud. 0 = pla/brillant, 1 = serra, 2 = triangle.  (Tamb\xc3\xa9 aprima els aguts quan l'espectre ve d'una escala del Motor Personalitzat.)"));
     repaint (bothEnginesBounds); // SLOPE (and its FROZEN tag) live in that box now
@@ -4340,8 +8359,17 @@ void FractalAdditiveAudioProcessorEditor::openScalaChooser()
 {
     // .tun is offered first because it is what the Save button writes by default:
     // a tuning exported from here has to be reloadable from here.
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a tuning (.tun / .scl / .ascl)",
-                                                       juce::File(), "*.tun;*.scl;*.ascl");
+    //
+    // WHERE IT OPENS. It used to be juce::File(), which means "wherever the OS last
+    // left this process" - in practice the host's own folder, or the last place ANY
+    // dialog in the session went, which for Fibló is the preset folder. A synth that
+    // ships six tunings inside itself and then opens its tuning dialog somewhere else
+    // is hiding them. So: the bundled folder on a first run (getTuningChooserFolder
+    // extracts it on the way past), and after that the folder the user last actually
+    // loaded a tuning FROM - see the callback.
+    fileChooser = std::make_unique<juce::FileChooser> (tr (fgdlg::openTuning.en, fgdlg::openTuning.ca),
+                                                       processorRef.getTuningChooserFolder(),
+                                                       "*.tun;*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
         {
@@ -4349,7 +8377,14 @@ void FractalAdditiveAudioProcessorEditor::openScalaChooser()
             {
                 juce::String err;
                 if (! processorRef.loadScalaFile (fc.getResult(), err))
-                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Could not load scale", err, this);
+                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr (fgdlg::loadScale.en, fgdlg::loadScale.ca), trErr (err), this);
+                else
+                    // REMEMBERED ONLY ON A SUCCESSFUL LOAD. The user asked for the
+                    // folder they LOAD from ("si el usuario carga desde otra carpeta"),
+                    // and browsing into a folder to click a file that turns out to be
+                    // unreadable is not loading from it - remembering that one would
+                    // send them back to a dead end next time.
+                    processorRef.setTuningChooserFolder (fc.getResult().getParentDirectory());
             }
             refocus();
         });
@@ -4357,7 +8392,7 @@ void FractalAdditiveAudioProcessorEditor::openScalaChooser()
 
 void FractalAdditiveAudioProcessorEditor::openTuningBankChooser()
 {
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale into the tuning bank (.tun / .scl / .ascl)",
+    fileChooser = std::make_unique<juce::FileChooser> (tr (fgdlg::openBank.en, fgdlg::openBank.ca),
                                                        juce::File(), "*.tun;*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
@@ -4392,7 +8427,7 @@ void FractalAdditiveAudioProcessorEditor::refreshTuningBank()
 
 void FractalAdditiveAudioProcessorEditor::openTimbreChooser()
 {
-    fileChooser = std::make_unique<juce::FileChooser> ("Load a scale file as timbre (.tun / .scl / .ascl)",
+    fileChooser = std::make_unique<juce::FileChooser> (tr (fgdlg::openTimbre.en, fgdlg::openTimbre.ca),
                                                        juce::File(), "*.tun;*.scl;*.ascl");
     fileChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
         [this] (const juce::FileChooser& fc)
@@ -4401,7 +8436,7 @@ void FractalAdditiveAudioProcessorEditor::openTimbreChooser()
             {
                 juce::String err;
                 if (! processorRef.loadTimbreFile (fc.getResult(), err))
-                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Could not load timbre", err, this);
+                    juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, tr (fgdlg::loadTimbre.en, fgdlg::loadTimbre.ca), trErr (err), this);
             }
             refocus();
         });
@@ -4503,14 +8538,14 @@ void FractalAdditiveAudioProcessorEditor::refreshCustomEngineButtons()
     loadTimbreButton.getProperties().set ("fork", ! loaded);
     loadTimbreButton.setColour (juce::TextButton::buttonColourId, loaded ? cReset : cLoad);
     loadTimbreButton.setTooltip (loaded
-        ? tr ("Delete the loaded custom spectrum and hand the sound back to the harmonic engine. One Ctrl+Z brings it back. To keep the spectrum but stop it sounding, click the HARMONIC chip instead - that switches engines without erasing anything.",
-              "Esborra l'espectre propi carregat i torna el so al motor harm\xc3\xb2nic. Un Ctrl+Z el recupera. Si el vols conservar per\xc3\xb2 que no soni, clica el xip HARM\xc3\x92NIC: aix\xc3\xb2 canvia de motor sense esborrar res.")
+        ? tr ("Delete the loaded custom spectrum and hand the sound back to the harmonic engine. One Ctrl+Z brings it back. To keep the spectrum but stop it sounding, click the HARMONIC chip instead.",
+              "Esborra l'espectre propi carregat i torna el so al motor harm\xc3\xb2nic. Un Ctrl+Z el recupera. Si el vols conservar per\xc3\xb2 que no soni, clica el xip HARM\xc3\x92NIC.")
         : tr ("Load a .tun/.scl/.ascl whose intervals become the PARTIALS of the sound - the CUSTOM chip lights and this engine replaces the harmonic one. Decay, Fractal, Range and Reps still shape it.",
               "Carrega un .tun/.scl/.ascl els intervals del qual passen a ser els PARCIALS del so - s'enc\xc3\xa9n el xip PROPI i aquest motor substitueix l'harm\xc3\xb2nic. Caiguda, Fractal, Abast i Reps encara hi actuen."));
     randomSpectrumBtn.setButtonText (tr ("Random", "Atzar"));
     randomSpectrumBtn.setTooltip (tr (
-        "Build a brand-new random spectrum. Every press is a different one: 5 to 12 partials per period, spread evenly in PITCH (not in Hz) over the reach your Octave Range and Reps already set, never closer than 35 cents so no two of them collapse into one beating partial. The period stays a whole number of octaves, so Reps stacks it cleanly instead of smearing. Automatable: it is a trigger parameter, so a 0-to-1 step drawn in the host fires it exactly like this click, with the window shut. One Ctrl+Z brings the previous spectrum back.",
-        "Construeix un espectre nou a l'atzar. Cada pulsaci\xc3\xb3 \xc3\xa9s diferent: de 5 a 12 parcials per per\xc3\xado" "de, repartits uniformement en TO (no en Hz) dins l'abast que ja fixen l'Abast d'octaves i les Reps, i mai a menys de 35 cents perqu\xc3\xa8 cap parell no es fongui en un sol parcial batent. El per\xc3\xado" "de es queda en un nombre enter d'octaves, aix\xc3\xad que les Reps l'apilen net en comptes d'esborronar-lo. Automatitzable: \xc3\xa9s un par\xc3\xa0metre disparador, aix\xc3\xad que un escal\xc3\xb3 de 0 a 1 dibuixat a l'amfitri\xc3\xb3 el dispara igual que aquest clic, amb la finestra tancada. Un Ctrl+Z recupera l'espectre anterior."));
+        "A new random spectrum, different every press: 5 to 12 partials per period, spread evenly in PITCH (not in Hz) over the reach your Octave Range and Reps already set, never closer than 35 cents so no two of them collapse into one beating partial. The period stays a whole number of octaves, so Reps stacks it cleanly instead of smearing. Automatable: a 0-to-1 step drawn in the host fires it exactly like this click, with the window shut. One Ctrl+Z brings the previous spectrum back.",
+        "Un espectre nou a l'atzar, diferent a cada pulsaci\xc3\xb3: de 5 a 12 parcials per per\xc3\xado" "de, repartits uniformement en TO (no en Hz) dins l'abast que ja fixen l'Abast d'octaves i les Reps, i mai a menys de 35 cents perqu\xc3\xa8 cap parell no es fongui en un sol parcial batent. El per\xc3\xado" "de es queda en un nombre enter d'octaves, aix\xc3\xad que les Reps l'apilen net en comptes d'esborronar-lo. Automatitzable: un escal\xc3\xb3 de 0 a 1 dibuixat a l'amfitri\xc3\xb3 el dispara igual que aquest clic, amb la finestra tancada. Un Ctrl+Z recupera l'espectre anterior."));
 }
 
 // The "Load spectrum's tuning" button: the current custom spectrum was DERIVED from a
@@ -4565,16 +8600,135 @@ void FractalAdditiveAudioProcessorEditor::refreshShepardSyncState()
     shepDivBox.repaint();
 }
 
+// THE LFO RATE CAP, SAID OUT LOUD ON THE CONTROL THAT IS BEING CAPPED.
+//
+// A block-stepped LFO cannot represent more than half a cycle per block, so ModEngine
+// clamps the rate at 0.5 * sampleRate / blockSize. That clamp is correct and it is not
+// going away; what was wrong is that it happened in SILENCE. The header's own comment
+// claimed "the limit is reported to the UI (lfoRateLimited)" - there was no such thing,
+// nothing outside that header read isRateLimited(), and the fader went on showing a
+// number the engine was not running at. The user turns a knob to 40 Hz, hears 5.4, and
+// has nowhere to find out why.
+//
+// The engine publishes the four numbers a sentence can be built from now (see
+// ModEngine::rateState); this is the half that says them. Amber on the fader itself,
+// exactly as the beats box goes amber when Sync has no BPM to sync to - a live state
+// belongs on the live control, not in a dialog that would pop on every tick.
+//
+// THE CEILING IS NAMED, not just the fact of the cap, because the ceiling is the whole
+// explanation: it is set by the BUFFER SIZE the user chose in their host, so it is
+// something they can change. "Limited" alone would be a warning light; "your buffer size
+// puts the ceiling at 5.4 Hz" is a thing to act on.
+void FractalAdditiveAudioProcessorEditor::refreshLfoRateLimitState()
+{
+    // Only while an LFO is the selected modulator - modSel is 0..2 for the envelopes and
+    // 3..5 for the LFOs, and rateState indexes the LFOs from 0.
+    const int lfo = modSel - 3;
+    const auto rs = juce::isPositiveAndBelow (lfo, 3)
+                        ? processorRef.getModEngine().rateState (lfo)
+                        : ModEngine::RateState{};
+    const bool lim = juce::isPositiveAndBelow (lfo, 3) && rs.limited;
+    if ((int) lim == lastLfoLimited) return;
+    lastLfoLimited = (int) lim;
+
+    const juce::Colour amber (0xffffb020); // cOverride: "this is being overridden"
+    lfoHzSlider.setColour (juce::Slider::thumbColourId, lim ? amber : cCustomMod);
+    lfoHzSlider.setColour (juce::Slider::trackColourId, (lim ? amber : cCustomMod).withAlpha (0.55f));
+    lfoHzSlider.setTooltip (tr ("Free LFO rate in Hz.", "Velocitat lliure de l'LFO, en Hz.")
+        // PLACEHOLDERS, not concatenation: Catalan and English do not put the numbers in
+        // the same places, and a sentence assembled from fragments in call order is a
+        // sentence one of the two languages gets wrong.
+        + (lim ? tr ("\n!This LFO is running at %1 Hz, not the %2 Hz asked for!: an LFO that "
+                     "steps once per audio block cannot go faster than half a step per block, "
+                     "which is %3 Hz at the buffer size your host is using. A smaller buffer "
+                     "raises the ceiling.",
+                     "\n!Aquest LFO va a %1 Hz, no als %2 Hz demanats!: un LFO que avan\xc3\xa7""a "
+                     "un cop per bloc d'\xc3\xa0udio no pot anar m\xc3\xa9s r\xc3\xa0pid que mig "
+                     // The literal is SPLIT after \xba: the next character is 'f', which C++
+                     // would swallow into the hex escape ("\xbafe" is out of range and the
+                     // build says so). Same trap the accented words elsewhere in this file
+                     // carry, and the same answer - end the literal and start a new one.
+                     "pas per bloc, que s\xc3\xb3n %3 Hz amb la mida de b\xc3\xba" "fer que fa "
+                     "servir el teu amfitri\xc3\xb3. Un b\xc3\xba" "fer m\xc3\xa9s petit puja el sostre.")
+                     .replace ("%1", juce::String (rs.actual,  2))
+                     .replace ("%2", juce::String (rs.asked,   2))
+                     .replace ("%3", juce::String (rs.ceiling, 2))
+             : juce::String()));
+    lfoHzSlider.repaint();
+}
+
+// THE RISE INTERVAL, AND WHY THE CHOICE MAY NOT BE THERE.
+//
+// The rise-interval box appears only when the tuning's period differs from the octave -
+// otherwise there is nothing to pick between. That gate used to be asked of
+// periodRatio(), which answers 2.0 when the tuning states NO ascending period at all
+// (a descending .scl, a degenerate 1/1 scale): the box vanished, the rise ran at 2/1,
+// and the reason - "your scale has no period for me to offer you" - existed nowhere on
+// screen. The tuning's own OFF button says why it is off; this is the same courtesy for
+// a control that is not there at all.
+//
+// It owns the whole SHEPARD hover for the same reason refreshShepardSyncState owns the
+// beats box's: a sentence assembled from two places is a sentence that drifts.
+void FractalAdditiveAudioProcessorEditor::refreshShepardRiseState()
+{
+    // statedPeriodRatio(), never the display fallback - the three states have to be told
+    // apart by the FACT, and the fallback collapses two of them into one.
+    const int state = ! processorRef.tuningStatesPeriod() ? 2
+                    : shepardRiseChoiceExists()           ? 1 : 0;
+    // ...AND A FOURTH FACT ON TOP OF THE THREE, because the paragraph below ends with the
+    // words "the bounds are stated, never silent" and then lists TWO of them. The third
+    // was the rise step's own ceiling: a period above 16/1 is served at half what the file
+    // says, and until ShepardEngine grew riseRatioIsLimited() nothing could even ask.
+    // A sentence that advertises its own honesty and leaves out a bound is worse than one
+    // that says nothing, so this rides in the same memo and re-renders with it.
+    // periodRatio(), NOT statedPeriodRatio(), and the difference is the whole correctness
+    // of the sentence: AdditiveVoice::planShepard feeds riseRatio() the DISPLAY ratio
+    // (AdditiveVoice.h:2612), so asking the stated one would answer for a number the rise
+    // never sees. The line three above deliberately uses the stated one, because THAT
+    // question is "did the file declare a period at all"; this one is "what is the rise
+    // actually built from". Two questions, two accessors, one line apart - which is
+    // exactly how a wrong one hides.
+    const double periodNow = processorRef.getTuningPeriodRatio();
+    const bool riseCapped  = shepard::riseRatioIsLimited (
+                                 (int) processorRef.apvts.getRawParameterValue ("shepRise")->load(), periodNow);
+    const int stateKey = state * 2 + (riseCapped ? 1 : 0);
+    if (stateKey == lastShepRiseState) return;
+    lastShepRiseState = stateKey;
+
+    juce::String tip = tr (
+        "The key you press becomes the root of a tone that rises for ever without ever getting higher - built from THIS synth's spectrum, not from sine waves. The voice sounds its whole spectrum at up to 8 transpositions AT ONCE, one rise interval apart, anchored on the pressed key's own tuned pitch, all climbing together under a FIXED spectral window whose edges reach exactly zero, so copies leave the top and enter underneath in silence - no click, nothing to hide. Everything else about the note is untouched - the three envelopes, the filter, the modulators, morph, manual amplitudes - and letting go of the key releases it like any other note. Latched PER NOTE: flipping this changes the notes you play NEXT, never the ones already sounding. The bounds are stated, never silent: at most 8 copies (the band narrows, centred, rather than losing one) and up to 1638 partials each; a spectrum dense enough to need more lifts the window's bottom edge instead of dropping a single partial.",
+        "La tecla que prems es converteix en l'arrel d'un to que puja sense parar sense arribar mai m\xc3\xa9s amunt - fet amb l'espectre D'AQUEST sinte, no amb sinusoides. La veu fa sonar tot el seu espectre en fins a 8 transposicions ALHORA, separades un interval de pujada, ancorades al to real de la tecla premuda i pujant totes juntes sota una finestra espectral FIXA amb vores que arriben exactament a zero, o sigui que les c\xc3\xb2pies surten per dalt i entren per sota en silenci - sense clics ni res a amagar. La resta de la nota no canvia gens - les tres envolupants, el filtre, els moduladors, el morph, les amplituds manuals - i deixar anar la tecla l'allibera com qualsevol nota. Es fixa PER NOTA: canviar-ho afecta les notes que toquis DESPR\xc3\x88S, mai les que ja sonen. Els l\xc3\xadmits es diuen, mai s'amaguen: com a molt 8 c\xc3\xb2pies (la banda s'estreny, centrada, en comptes de perdre'n cap) i fins a 1638 parcials cadascuna; un espectre prou dens puja la vora inferior de la finestra en comptes de perdre ni un sol parcial.");
+    if (state == 2)
+        tip += tr ("\n!This scale states no period! (it descends, or its period is 1/1), so there is no scale period to rise by and the rise-interval choice is not offered: one step is an octave, 2/1. Nothing about your tuning is changed - the pitches are still the file's own.",
+                   "\n!Aquesta escala no declara cap per\xc3\xado" "de! (baixa, o el seu per\xc3\xado" "de \xc3\xa9s 1/1), o sigui que no hi ha per\xc3\xado" "de d'escala per pujar i no s'ofereix l'opci\xc3\xb3 d'interval de pujada: un pas \xc3\xa9s una octava, 2/1. La teva afinaci\xc3\xb3 no canvia gens - els tons segueixen sent els del fitxer.");
+    if (riseCapped)
+        tip += tr ("\n!This scale's period is wider than the widest rise step there is!, so one step is 16/1 rather than the whole period: past that the copies are too far apart for the illusion to close and what is left is an arpeggio. Nothing is dropped and your tuning is untouched - the step is what is capped.",
+                   "\n!El per\xc3\xado" "de d'aquesta escala \xc3\xa9s m\xc3\xa9s ample que el pas de pujada m\xc3\xa9s gran que hi ha!, o sigui que un pas \xc3\xa9s 16/1 i no tot el per\xc3\xado" "de: passat d'aqu\xc3\xad les c\xc3\xb2pies queden massa separades perqu\xc3\xa8 la il\xc2\xb7lusi\xc3\xb3 tanqui i el que queda \xc3\xa9s un arpegi. No es perd res i la teva afinaci\xc3\xb3 no canvia - el que es limita \xc3\xa9s el pas.");
+    shepOnT.setTooltip (tip);
+    // The arrow's own hover. Its glyph says WHICH way; this says what the other way is
+    // for, and that the switch is safe to hit while a note is sounding.
+    shepDirBtn.setTooltip (tr (
+        "*Which way the tone goes.* Up is the endless rise; down is the same illusion falling for ever - the classic demonstration is a pair of them. Press it while a note is sounding and the stack decelerates through zero and comes back the other way over about one buffer, so there is nothing to hear but the turn.",
+        "*Cap on va el to.* Amunt \xc3\xa9s la pujada infinita; avall \xc3\xa9s la mateixa il\xc2\xb7lusi\xc3\xb3 baixant per sempre - la demostraci\xc3\xb3 cl\xc3\xa0ssica \xc3\xa9s una parella. Prem-lo amb una nota sonant i la pila frena fins a zero i torna cap a l'altre cant\xc3\xb3 en aproximadament un buffer, o sigui que nom\xc3\xa9s se sent el gir."));
+}
+
 // ONE PANEL, ONE COLOUR. Every control inside SPECTRUM takes the selected engine's hue,
 // so nothing on screen is left claiming the old nested boxes still exist: the panel used
 // to be three framed boxes in three different colours (blue harmonic / pink custom /
 // mint "both engines" with a magenta Fractal), and after the frames became plain divider
 // lines those leftover hues were the only thing still drawing the boundaries.
 //
-// Deliberately NOT recoloured: the +/- steppers (green = up, red = down, the same pair
-// as Essentials' OCTAVE) and the Load/Remove button (green loads, red deletes). Those
-// colours mean an ACTION, not a compartment, and washing them into the panel hue would
-// erase the one warning that says which of the two the button is about to do.
+// THE OCTAVE RANGE STEPPERS ARE IN THE LIST NOW, and this comment used to be the reason
+// they were not: "green = up, red = down ... those colours mean an ACTION". They did not.
+// Green and red mean LOAD and DESTROY everywhere else in this window, and a stepper that
+// adds one octave to a range does neither - it is the most reversible edit the panel has.
+// Wearing the two loudest colours the product owns, it put the delete-a-bank-slot red on
+// an increment, which is how red came to carry five unrelated jobs at once. The pair now
+// takes the panel hue like everything else here and lets its GLYPH carry the direction
+// (see configStep, and GalacticLnF's drawn +/-, which finally weigh the same).
+//
+// Still deliberately NOT recoloured: the Load/Remove button (green loads, red DELETES a
+// loaded spectrum). That one really is destructive, which is the one job red keeps.
 void FractalAdditiveAudioProcessorEditor::recolourSpectrumControls (juce::Colour col)
 {
     auto fader = [&col] (juce::Slider& s)
@@ -4596,22 +8750,39 @@ void FractalAdditiveAudioProcessorEditor::recolourSpectrumControls (juce::Colour
 
     // Spelled as juce::Slider* because these are four different Slider SUBCLASSES
     // (stepped, magnetic, plain) and a deduced initializer-list has no common type.
+    // PHASE was the sixth and it was not here. "el knob de phase no cambia de color al
+    // cambiar de menu custom a harmonic" - the fader was added to this panel and this
+    // hand-written list was not touched, so it kept whatever hue it was built with while
+    // every control beside it changed. A list of members is exactly the kind of thing
+    // that goes stale silently, so the gate in RhythmVerify no longer trusts it: it
+    // sweeps every control whose bounds are INSIDE the panel and asks the colour it is
+    // actually wearing. Adding a control to this panel and forgetting this line is a
+    // failing check now, not a thing someone has to notice on the glass.
     for (juce::Slider* s : { (juce::Slider*) &baseNFader, (juce::Slider*) &harmonicsFader,
                              (juce::Slider*) &primeLimitFader, (juce::Slider*) &timbreRepeatsFader,
-                             (juce::Slider*) &fractalFader, (juce::Slider*) &morphTimeFader })
+                             (juce::Slider*) &fractalFader, (juce::Slider*) &phaseFader })
         fader (*s);
     // slopeFader is deliberately NOT in that list: it has a SECOND state (frozen by manual
     // per-partial amplitudes) and exactly one function is allowed to write its colour.
     // See applySlopeFaderColour - two writers is what turned it green.
     applySlopeFaderColour();
-    for (juce::ComboBox* b : { &basePitchBox, &primeModeBox }) combo (*b);
-    for (auto* l : { &lblBaseN, &lblBasePitch, &lblPrimeLimit, &lblTimbreRepeats, &lblMorphTime })
+    // The two TRANSITION Time faders are out of the list for exactly the same reason and
+    // were the same accident waiting to happen: they too have a second, greyed state (the
+    // transition Off), and while they sat in the list an engine switch repainted the grey
+    // away and the enablement's own before/after guard then refused to put it back.
+    applyTransitionFaderColour();
+    for (juce::ComboBox* b : { &basePitchBox, &primeModeBox, &transitionBox }) combo (*b);
+    for (auto* l : { &lblBaseN, &lblBasePitch, &lblPrimeLimit, &lblTimbreRepeats, &lblTransTime })
         label (*l);
     for (int i = 0; i < 9; ++i) { tick (primeToggle[i]); label (primeLbl[i]); }
+    tick (primeOnToggle); // the same panel, one level up
     // TEMPER's tick used to be forced to the harmonic blue "because that is the engine it
     // hands the spectrum to" - which was the whole point when the two engines were two
     // boxes, and is now just one control refusing to join the panel it lives in.
     tick (temperToggle);
+    // OCTAVE RANGE's stepper pair - one control, one colour, the panel's own.
+    for (auto* b : { &sprDn, &sprUp })
+        b->setColour (juce::TextButton::buttonColourId, col.withAlpha (0.45f));
     partialEditBtn.col = col;
     randomSpectrumBtn.setColour (juce::TextButton::buttonColourId, col);
 }
@@ -4645,6 +8816,47 @@ void FractalAdditiveAudioProcessorEditor::selectEngineView (bool custom)
     }
     customViewPinned = custom;
     processorRef.setTimbreEnabled (custom);
+    // A CUSTOM ENGINE WITH NOTHING IN IT NOW HOLDS A FUNDAMENTAL, AND SOUNDS.
+    //
+    // "AL CARGAR CUSTOM ENGINE ME GUSTARIA QUE POR DEFECTO SOLO HAYA 1 ESCRITO EN LA
+    // CASILLA, Y ENTONCES SUENE UN SINE."
+    //
+    // Switching to the custom engine with no spectrum loaded used to engage an engine
+    // with an empty partial list: the panel changed colour, the chip lit, and the
+    // instrument went silent - so the section read as broken before the user had typed
+    // anything. A lone fundamental is the smallest honest spectrum there is, it is what
+    // the box's own placeholder always implied, and it is a starting point you can hear.
+    //
+    // Only when there is nothing loaded: a switch back to a spectrum the user typed, or
+    // adapted, or loaded from a file must not overwrite it. And it goes through the same
+    // undoable load every other edit uses, so one Ctrl+Z removes it - which is the other
+    // half of what was asked ("que se pueda quitar el 1").
+    if (custom && processorRef.getTimbreSource().trim().isEmpty()
+              && processorRef.getTimbreNoteCount() == 0)
+    {
+        juce::String err;
+        if (processorRef.loadTimbreTextUndoable ("1", err))
+        {
+            intervalEdit.setText ("1", juce::dontSendNotification);
+            recolourIntervalTokens();
+            // ...AND REPS GOES TO 1, OR IT IS NOT A SINE. Reps stacks the PERIOD, and a
+            // lone fundamental states no period - the parser falls back to the octave,
+            // which is what an unstated period means everywhere else in this plugin - so
+            // at the shipped default of 3 the "sine" would arrive as partials at 1, 2 and
+            // 4. Three octaves is a perfectly good sound and a terrible blank canvas.
+            //
+            // Written through the PARAMETER, so the fader moves under the user's eye, the
+            // host sees it, and Ctrl+Z takes it back: this is a control being set, not a
+            // value being smuggled. It happens only on the blank slate that seeds the "1"
+            // in the first place, so a Reps the user chose is never overwritten.
+            if (auto* rp = processorRef.apvts.getParameter ("timbreRepeats"))
+            {
+                rp->beginChangeGesture();
+                rp->setValueNotifyingHost (rp->convertTo0to1 (1.0f));
+                rp->endChangeGesture();
+            }
+        }
+    }
     applyEngineState();
 }
 
@@ -4659,7 +8871,50 @@ void FractalAdditiveAudioProcessorEditor::applyEngineState()
     using E = FractalAdditiveAudioProcessor::EngineInForce;
     const auto st = processorRef.engineInForce();
     const bool loaded = processorRef.timbreLoaded();
-    lastEngineShown = (int) st * 2 + (loaded ? 1 : 0);
+    // canTemper rides in the same signature the timer watches, so LOADING A TUNING with
+    // no usable period re-dresses the toggle even when temper is off and the engine in
+    // force does not change. Without it the control would keep offering a snap it cannot
+    // perform until something else happened to redraw the panel.
+    const bool canTemper = processorRef.temperIsPossible();
+    lastEngineShown = ((int) st * 2 + (loaded ? 1 : 0)) * 2 + (canTemper ? 1 : 0);
+
+    // TEMPER, REFUSED OUT LOUD. Temper snaps partials onto "degree x period^k", so with a
+    // tuning that states no ascending period (a descending .scl, a degenerate period-1
+    // scale) there is no grid to snap to. The synth used to substitute 2/1 and temper the
+    // spectrum to an octave the user never wrote, invisibly. It now does nothing at all -
+    // and this is where it SAYS so, on the control itself, so the refusal is never
+    // something the user has to deduce from the sound.
+    temperToggle.setEnabled (canTemper && ! pgDrivingUi);   // one writer, the lock included
+    if (canTemper)
+    {
+        // BOTH the word and the tooltip go back. Setting only the word left a control
+        // that worked while still explaining, on hover, that it was unavailable - the
+        // stale half of a two-part message is its own lie.
+        temperToggle.setButtonText (tr ("Temper", "Tempera"));
+        temperToggle.setTooltip (tr (
+            "ON: the HARMONIC ENGINE keeps generating partials and each one is snapped to the nearest pitch of the ACTIVE TUNING loaded in the Tuning box (degree x period^k), following it live - both engines work TOGETHER and the Custom Engine's own scale is bypassed. In MPE input mode the host does not hand the plugin a scale, so the grid there is plain 12-TET. OFF: no snapping (the Custom Engine's .scl, if loaded and ON, is the spectrum by itself).",
+            "ON: el MOTOR HARM\xc3\x92NIC segueix generant parcials i cadascun s'ajusta al to m\xc3\xa9s proper de l'AFINACI\xc3\x93 ACTIVA carregada a la caixa Tuning (grau x per\xc3\xado" "de^k), seguint-la en viu - els dos motors treballen JUNTS i l'escala del Motor propi queda de banda. En mode d'entrada MPE l'amfitri\xc3\xb3 no d\xc3\xb3na cap escala al plugin, aix\xc3\xad que all\xc3\xa0 la graella \xc3\xa9s 12-TET. OFF: sense ajust (l'.scl del Motor propi, si est\xc3\xa0 carregat i actiu, \xc3\xa9s l'espectre per si mateix)."));
+    }
+    else
+    {
+        // THE WORD STAYS SHORT, AND THE TOOLTIP CARRIES THE REASON.
+        //
+        // This branch used to append " - no period" to the button's own text. That row
+        // sizes the toggle to the words it holds and HIDES it when they do not fit - the
+        // right rule - so the longer label made the control vanish outright, at every
+        // size including 1200x650. The message that explains why a feature is unavailable
+        // was exactly the message that could not fit, and the user got neither the
+        // explanation nor the control. Found by scenario 43, which is the first picture
+        // ever taken of a tuning that states no period.
+        //
+        // So the suffix goes, the same trade the source selector and the Shepard row
+        // made. The toggle is already disabled here (setEnabled (canTemper) above), and
+        // the tooltip below says the whole of it.
+        temperToggle.setButtonText (tr ("Temper", "Tempera"));
+        temperToggle.setTooltip (tr (
+            "UNAVAILABLE: this tuning states no period that ascends (a descending scale, or a period of 1/1), so there is no \"degree x period^k\" grid to snap partials onto. Fibl\xc3\xb3 will NOT invent an octave here - the harmonic engine keeps running untempered and your tuning is left exactly as you wrote it. Load a tuning whose last interval rises above 1/1 to use this.",
+            "NO DISPONIBLE: aquesta afinaci\xc3\xb3 no declara cap per\xc3\xado" "de que pugi (una escala descendent, o un per\xc3\xado" "de d'1/1), aix\xc3\xad que no hi ha cap graella \"grau x per\xc3\xado" "de^k\" on ajustar els parcials. Fibl\xc3\xb3 NO s'inventar\xc3\xa0 cap octava aqu\xc3\xad - el motor harm\xc3\xb2nic segueix sonant sense temperar i la teva afinaci\xc3\xb3 queda exactament com l'has escrita. Carrega una afinaci\xc3\xb3 amb l'\xc3\xbaltim interval per sobre d'1/1 per fer-lo servir."));
+    }
 
     // The pin only ever holds the custom view open as an EMPTY workspace: any real
     // non-harmonic engine state observed here (a scale switched on, temper engaged -
@@ -4732,9 +8987,104 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
         if (! engineBoxBounds.isEmpty() && ! customViewShown() && ! hcBase.isEmpty())
         {
             add ("eng.base",  tr ("BASE", "BASE"),                     band (hcBase),  cPanel);
-            add ("eng.harm",  tr ("HARMONICS", "HARM\xc3\x92NICS"),    band (hcHarm),  cPanel);
+            // ...and HARMONICS gets a SHORTER cell, because TEMPER TO TUNING now sits at
+            // the right end of its row (see resized()). Exactly the arrangement the prime
+            // title has with its RESIZE tag below: the cell the fit sweep measures the
+            // word against is the room the word really has, never the room a control is
+            // already standing in. harmTemperW is 0 whenever resized() hid the toggle.
+            //
+            // ...AND WHEN IT DID NOT FIT, THE ROW SAYS SO. A toggle that re-tunes the whole
+            // spectrum cannot simply be absent with nothing in its place: "nothing is ever
+            // silently hidden" is the rule, and this is the same tag, in the same band, in
+            // the same words as the one that says the nine prime ticks are off screen -
+            // one instruction, RESIZE, because widening the window is what brings both of
+            // them back. (TEMPER is still reachable from the custom view at every size, so
+            // what is off screen is this way IN to it, not the feature.)
+            //
+            // Measured and painted at the SAME height, unlike the prime tag below, which
+            // reserves at 9 and draws at 10 - a reservation smaller than the ink is a cut
+            // word waiting for a longer translation.
+            const auto harmTitle = tr ("HARMONICS", "HARM\xc3\x92NICS");
+            const auto harmTag   = tr ("RESIZE", "AMPLIA");
+            auto       harmBand  = band (hcHarm);
+            // THE TITLE OUTRANKS THE TAG, and that is measured rather than assumed.
+            //
+            // Reserving the tag unconditionally cost this window FIFTY PIXELS of minimum
+            // width - the rig's floor went 690 -> 740 in Catalan, where "HARMÒNICS" then
+            // needed 52 px in the 50 its shortened cell had, and these titles are drawn
+            // with no ellipsis so what was left on the glass would have been a cut word.
+            // A tag that says "make the window wider" must not itself be the reason the
+            // window cannot get narrower.
+            //
+            // So the tag takes what is LEFT after the title's own measured need, and is
+            // dropped below that - the same rule FROZEN follows beside AMP DECAY. What is
+            // lost by dropping it is small and bounded: TEMPER goes off screen at about
+            // 900 px, the tag fits with room to spare from there down to ~740, and below
+            // 740 every compartment in this box is degraded and the PRIMES row two lines
+            // under it is already printing the same word for the same reason.
+            const int  harmTitleW = juce::GlyphArrangement::getStringWidthInt (
+                                        juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")),
+                                        harmTitle);
+            const int  harmTagInk = juce::GlyphArrangement::getStringWidthInt (
+                                        juce::Font (juce::FontOptions (10.0f).withStyle ("Bold")),
+                                        harmTag) + 2;
+            const bool tagFits    = harmTemperHidden
+                                 && harmTitleW + 6 + harmTagInk <= harmBand.getWidth() - harmTemperW;
+            const int  harmTagW   = tagFits ? harmTagInk : 0;
+            const int  harmGap    = tagFits ? 6 : 0;
+            add ("eng.harm",  harmTitle,   // the same string the width above was measured from
+                 harmBand.withTrimmedRight (harmTemperW + harmTagW + harmGap), cPanel);
+            if (tagFits)
+                add ("eng.harmHidden", harmTag,
+                     harmBand.removeFromRight (harmTagW), cPanel, 10.0f);
             // PRIME sits right under the shared divider -> nudge it down for air.
-            add ("eng.prime", tr ("PRIME", "PRIMERS"), band (hcPrime.translated (0, 5)), cPanel);
+            //
+            // ONE WORD, NOT TWO, AND IT IS A DECISION RATHER THAN A CUT. This cell is the
+            // narrowest in the panel - its title band is 86 px at a 690 px window - and
+            // the pair it used to carry does not fit it even at the 9 px floor these
+            // labels shrink to. Measured by putting the old pair back and re-running the
+            // rig: "PRIME CONTROL" needs 70 px in the 67 it has at 780, and "CONTROL DE
+            // PRIMERS" 95 px in the 94 it has at 910. paint() draws them with useEllipsis
+            // false, so below those widths what was on the glass was "CONTROL DE PRIMER"
+            // with nothing saying the last letters were gone - and the two of them alone
+            // held this window's floor at 920x550 after the tick row was dealt with.
+            //
+            // A shorter word is a decision; a cut word is a bug. The mode box directly
+            // under it says Limit or Whitelist, so the compartment loses nothing by naming
+            // the thing it filters rather than restating that it is a control.
+            const auto primeTitle = tr ("PRIMES", "PRIMERS");
+            auto       primeBand  = band (hcPrime.translated (0, 5));
+            // ...AND THE TAG THAT SAYS THE NINE TICKS ARE MISSING, in the same band, laid
+            // out exactly like FROZEN beside AMP DECAY below: a cell of its own, so the
+            // two can never print over each other and each is measured against the room it
+            // really has.
+            //
+            // MEASURED, PLUS A GAP THAT IS ALSO NOT GUESSED. The first version reserved a
+            // flat 38 px and no gap, and the two words came out of the Catalan photograph
+            // touching - "PRIMERSAMPLIA", which passes the overprint check (their ink
+            // rectangles do not intersect) and reads as one nonsense word. So the tag is
+            // measured at the 9 px floor these labels shrink to, and 6 px of air is taken
+            // off the TITLE's cell rather than the tag's: the tag is the shorter of the
+            // two and the one that must stay whole, and the title has a shrink loop that
+            // gives ground gracefully. Photographed at 690x550: a 35 px tag, a 6 px gap
+            // and a 45 px title, with "PRIMERS" shrunk to exactly the 45 it is given.
+            //
+            // Kept in the PANEL's colour, not the amber the inertness marks wear: the
+            // whitelist is not inert, it is off screen, and "one box, one colour" has
+            // exactly two stated exceptions (see the check in RhythmVerify) - both of them
+            // saying a control cannot affect the sound. This one says where a control
+            // went, which is a different sentence.
+            const auto primeTag = tr ("RESIZE", "AMPLIA");
+            const int  primeTagW = primeTicksHidden
+                                 ? juce::GlyphArrangement::getStringWidthInt (
+                                       juce::Font (juce::FontOptions (9.0f).withStyle ("Bold")),
+                                       primeTag) + 2
+                                 : 0;
+            const int  primeGap  = primeTicksHidden ? 6 : 0;
+            add ("eng.prime", primeTitle, primeBand.withTrimmedRight (primeTagW + primeGap), cPanel);
+            if (primeTicksHidden)
+                add ("eng.primeHidden", primeTag,
+                     primeBand.removeFromRight (primeTagW), cPanel, 10.0f);
         }
         if (! bothEnginesBounds.isEmpty())
         {
@@ -4763,21 +9113,86 @@ FractalAdditiveAudioProcessorEditor::paintedSubLabels() const
                      cOverride, 10.0f, true);
             }
             add ("both.fractal", tr ("FRACTAL", "FRACTAL"),                   band (beFractal), cPanel);
-            add ("both.morph",   tr ("MORPH", "MORPHING"),                    band (beMorph),   cPanel);
-            add ("both.range",   tr ("OCTAVE RANGE", "ABAST OCTAVES"), band (beRange.translated (0, 3)), cPanel);
+            // ONE TITLE where MORPH and DRY/WET were two, and no warning tag under it.
+            // That tag ("MORPH ON", beside a greyed DRY/WET) existed to explain why one of
+            // two controls could not act; with one dropdown there is no second control to
+            // explain away, and the state it warned about - both flags on at once - is not
+            // reachable from this panel any more.
+            add ("both.transition", tr ("TRANSITION", "TRANSICI\xc3\x93"), band (beTrans), cPanel);
+            // ONE WORD AGAIN, AND THE SAME REASON. This compartment's share of its column
+            // is what is LEFT after PHASE keeps the 40 px its own title needs, which is a
+            // 58 px band at a 690 px window. Measured the same way as the prime title
+            // above - old pair back in, rig re-run: "OCTAVE RANGE" needs 65 px in the 63
+            // it has at 710 and "ABAST OCTAVES" 69 in 68 at 730, so both were being CUT,
+            // in both languages, by a drawText with no ellipsis. This is the "OCTAVE
+            // RANGE" that read "OCTAVE RAN" on the glass, and on its own it held the
+            // floor at 740x550.
+            //
+            // Widening the cell is not available: at 690 the column is 108 px, the old
+            // RANGE title wanted 78 of them (69 + the 6 px insets, rounded to the cell)
+            // and PHASE's own title 38 - which is 116 - so the word is the thing that has
+            // to give. "OCTAVES" and not "RANGE": what the stepper under it shows IS a
+            // number of octaves, so the unit is the half of the old pair that carries the
+            // meaning. It is the same word in Catalan, declared in traudit::allowed,
+            // which is that list's whole purpose. 50 px at the floor, in both languages.
+            add ("both.range",   tr ("OCTAVES", "OCTAVES"), band (beRange.translated (0, 3)), cPanel);
+            // PHASE shares the OCTAVES row, to its right, and is titled in the same
+            // style as every other sub-section here - that title IS its name, which is why
+            // the fader carries no label component of its own.
+            add ("both.phase",   tr ("PHASE", "FASE"),                 band (bePhase.translated (0, 3)), cPanel);
         }
     }
     if (! essentialsBounds.isEmpty())
     {
         // Essentials' labels sit LEFT of their control (vertically centred), in the same
-        // band resized() reserves for them (6 px in, 78 wide, minus a 2 px gap).
-        auto left = [] (juce::Rectangle<int> c) { return c.reduced (6, 0).withWidth (76); };
-        add ("ess.phase", tr ("PHASE", "FASE"),                    left (ecPhase), cEssentials);
+        // band resized() reserves for them (6 px in, 78 wide, minus a 2 px gap) - or
+        // ABOVE it, in the cell's top 13 px, when resized() could not afford the side
+        // band and stacked the cell instead (see essStacked). One flag, read by the two
+        // places that have to agree about where the word goes.
+        auto left = [this] (juce::Rectangle<int> c)
+        {
+            return essStacked ? c.reduced (6, 1).withHeight (13)
+                              : c.reduced (6, 0).withWidth (76);
+        };
         add ("ess.gain",  tr ("GAIN", "GUANY"),                    left (ecGain),  cEssentials);
         add ("ess.ref",   tr ("REFERENCE", "REFER\xc3\x88NCIA"),   left (ecRef),   cEssentials);
         // OCTAVE reads like the three rows above it now: label LEFT of the stepper,
         // not above it - it was the one cell in the box laid out the other way round.
         add ("ess.oct",   tr ("OCTAVE", "OCTAVA"),                 left (ecOct),   cEssentials);
+        // BINAURAL names itself only when resized() found room for it (see ecBin), and
+        // it is the one cell here whose word goes ABOVE its control whatever essStacked
+        // says: it is a leftover strip behind a divider, and the 78 px side band this
+        // row has was already spent on OCTAVE. Same 13 px, from the same constant
+        // resized() removed from the top of the cell before placing the fader.
+        if (! ecBin.isEmpty())
+            add ("ess.bin", tr ("BINAURAL", "BINAURAL"),
+                 ecBin.reduced (2, 0).withHeight (fgfit::kBinTitleH), cEssentials);
+    }
+    // EVERY PAINTED SUB-LABEL IS SHRUNK UNTIL ITS WORD FITS, before anyone draws or
+    // measures it.
+    //
+    // A painted label has no component to squash: paint() calls drawText with
+    // useEllipsis false, so a word wider than its cell is simply CUT at the edge, with
+    // nothing on screen and nothing in any bounds check to say so. "OCTAVE RANGE" needs
+    // 83 px in the 79 it has at the floor, "ABAST OCTAVES" 88, "CAIGUDA AMP" 77 in 72 -
+    // each of them losing its last letters in one language only.
+    //
+    // Done HERE rather than in the painter because layoutProbe() measures this same list:
+    // a font chosen at paint time would be a font the rig never sees, and the check that
+    // is supposed to catch clipping would go on measuring a size nothing is drawn in.
+    //
+    // 9.0 is the floor. Below that the word is not smaller, it is unreadable, so a cell
+    // that still cannot hold its title at 9 px is a LAYOUT problem and stays reported as
+    // one - the rig keeps saying so rather than this quietly making the type invisible.
+    for (auto& s : v)
+    {
+        const auto widthAt = [&s] (float h)
+        {
+            return (float) juce::GlyphArrangement::getStringWidthInt (
+                       juce::Font (juce::FontOptions (h).withStyle ("Bold")), s.text);
+        };
+        while (s.fontHeight > 9.0f && widthAt (s.fontHeight) > (float) s.cell.getWidth())
+            s.fontHeight -= 0.25f;
     }
     return v;
 }
@@ -4804,6 +9219,81 @@ FractalAdditiveAudioProcessorEditor::layoutProbeInLanguage (bool useCatalan)
 // See the header. SPECTRUM and TUNING own the shared wall on their right, so that end is
 // SQUARE; every other corner keeps the 9 px radius. One function, because paint() draws it
 // and layoutProbe() measures it and a second copy of the rule is a check that cannot fail.
+std::vector<std::pair<juce::String, juce::Line<float>>>
+FractalAdditiveAudioProcessorEditor::spectrumDividers() const
+{
+    std::vector<std::pair<juce::String, juce::Line<float>>> out;
+    if (spectrumBounds.isEmpty()) return out;
+
+    // Lines are drawn INSIDE the outer frame: its top line sits at box.y + 16 with a
+    // 2.6 px stroke, so anything starting above ~17.5 pokes through the panel's edge.
+    const float top = (float) spectrumBounds.getY() + 17.5f;
+    const float bot = (float) spectrumBounds.getBottom() - 4.0f;
+
+    // EVERY VERTICAL DIVIDER BETWEEN TWO COLUMNS RUNS THE WHOLE HEIGHT, top to bot. That
+    // is the rule, not a coincidence, and it is why this helper is the only place allowed
+    // to build one: the BASE | HARMONICS wall used to stop at hcPrime's bottom instead,
+    // 23 px above the floor, because the full-width TEMPER row sits under both columns.
+    // A ToggleButton paints nothing but a tick and its text, so the rest of that row is
+    // bare panel and the wall simply ended in mid-air - "la linea de la pared izquierda
+    // de la subcaja de prime esta incompleta, tiene un hueco abajo". TEMPER's text ends
+    // far to the left of that wall, so the line passes through empty button.
+    auto vert = [&out, top, bot] (const char* name, float x)
+    { out.push_back ({ name, juce::Line<float> (x, top, x, bot) }); };
+    // A WALL INSIDE ONE ROW STARTS AT THAT ROW, and it is the only kind that may. The
+    // rule above is about COLUMNS: run one of those short and it ends in mid-air over
+    // bare panel. OCTAVES | PHASE divides two sub-sections of the bottom row alone, so
+    // the full-height version of it ran up THROUGH the TRANSITION compartment above and
+    // cut its Dry/Wet row in two - "la linea que pedi entre octave y phase sube arriba se
+    // pasa de largo". It starts at the transition|range line it meets, which is where
+    // the row it belongs to begins, and there is nothing above that for it to divide.
+    auto vertFrom = [&out, bot] (const char* name, float x, float y0)
+    { out.push_back ({ name, juce::Line<float> (x, y0, x, bot) }); };
+    auto horiz = [&out] (const char* name, const juce::Rectangle<int>& r)
+    { out.push_back ({ name, juce::Line<float> ((float) r.getX(),     (float) r.getY(),
+                                                (float) r.getRight(), (float) r.getY()) }); };
+
+    // THE WALL between the engine compartment and the shared-controls compartment. It
+    // replaces two frame edges and the gutter between them, so the two compartments
+    // share one line instead of facing each other across three.
+    if (! engineBoxBounds.isEmpty() && ! bothEnginesBounds.isEmpty())
+        vert ("engine|both", 0.5f * (float) (engineBoxBounds.getRight() + bothEnginesBounds.getX()));
+
+    // Harmonic view: the dividers of its three cells. (In the custom view resized()
+    // leaves hc* empty, which reads here as "draw none".)
+    //
+    // The CUSTOM view draws no divider at all any more. It had one horizontal line
+    // between the Load/Remove row and the typed-ratios box below - "hay una linea fina
+    // horizontal en custom spectrum entre el boton remove y la caja de ratios de abajo,
+    // es inecesaria y fea, quitala". The two rows it separated are already separated by
+    // the ratios box's own border.
+    if (! customViewShown() && ! hcBase.isEmpty())
+    {
+        vert  ("base|harmonics", (float) hcHarm.getX());
+        horiz ("harmonics|prime", hcPrime);
+    }
+
+    // The shared-controls compartment: Amp Decay | Fractal | Morph over Range.
+    if (! bothEnginesBounds.isEmpty())
+    {
+        vert  ("slope|fractal", (float) beFractal.getX());
+        vert  ("fractal|transition", (float) beTrans.getX());
+        // From the UNION: OCTAVE RANGE and PHASE are two sub-sections on ONE row, so the
+        // line above them must span the whole column. Drawn from beRange alone it would
+        // stop where the stepper's share ends and leave the fader hanging off an
+        // unfinished divider.
+        const auto rangeRow = beRange.getUnion (bePhase);
+        horiz ("transition|range", rangeRow);
+        // ...AND THE ONE BETWEEN THEM. OCTAVES and PHASE share that row and had nothing
+        // dividing them, so a stepper and a fader sat in one undivided space while every
+        // other pair of sub-sections in this window is separated by a line. "falta una
+        // linea vertical que separe phase de octave en spectrum." From the row's own top
+        // edge, not the panel's - see vertFrom.
+        vertFrom ("octaves|phase", (float) bePhase.getX(), (float) rangeRow.getY());
+    }
+    return out;
+}
+
 juce::Path FractalAdditiveAudioProcessorEditor::macroFramePath (const juce::Rectangle<int>& box) const
 {
     const bool sharedRight = box == spectrumBounds || box == lFootBounds;
@@ -4858,8 +9348,90 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
         // rather than in a separate list so it can never name a control the layout no
         // longer produces.
         if (const auto* l = dynamic_cast<const juce::Label*> (&c); l != nullptr && l->getText().isNotEmpty())
+            // ...in the font the PAINTER really uses, which is not the one the Label was
+            // given: GalacticLnF::getLabelFont puts a 12.5 px floor under it and draws it
+            // BOLD. Measured with l->getFont() this check read a lighter, sometimes
+            // smaller face than the screen shows, so it under-reported - it certified as
+            // fitting exactly the labels that condense in front of the user, which is the
+            // hand-copied-formula mistake the rest of fgfit exists to make impossible.
             p.componentLabels.push_back ({ name, l->getText(), l->getBounds(),
-                (float) juce::GlyphArrangement::getStringWidthInt (l->getFont(), l->getText()) });
+                (float) juce::GlyphArrangement::getStringWidthInt (fgfit::labelFont (*l), l->getText()) });
+        // ...and a BUTTON carries a word that has to fit the box it was given, measured
+        // against the room the painter really leaves it (see LayoutProbe::buttonFits).
+        // Recorded through the SAME `add` every control goes through, so a button that
+        // is laid out is a button that is measured - a separate hand-kept list is how
+        // the one control a change actually narrowed ends up being the one not checked.
+        const int bh = c.getHeight(), bw = c.getWidth();
+        if (const auto* tb = dynamic_cast<const juce::TextButton*> (&c);
+            tb != nullptr && tb->getButtonText().isNotEmpty())
+        {
+            // A STEPPER IS MEASURED AGAINST ITS GLYPH, BECAUSE ITS GLYPH IS NOT ITS TEXT.
+            //
+            // GalacticLnF::drawButtonText draws a "round" +/- as two rectangles sized from
+            // the button's own circle - it never lays out the character at all - so
+            // measuring the string "-" in the button font measures something nothing
+            // draws. That mismatch was not academic: the rig's width floor was pinned at
+            // 690 px by "/round#19 (Button) \"-\" has negative room: -1.0 wide", i.e. by a
+            // hyphen the painter had stopped using.
+            //
+            // The check stays, against what is really drawn: the bar is 0.46 of the
+            // circle's diameter, centred, so what it needs of the BUTTON is that plus the
+            // painter's 4 px a side. A stepper squeezed to nothing still fails; one that
+            // has its circle passes, which is the truth.
+            const bool stepper = tb->getName() == "round"
+                              && (tb->getButtonText() == "+" || tb->getButtonText() == "-");
+            if (stepper)
+                p.buttonFits.push_back ({ name, tb->getButtonText(),
+                    std::round ((float) juce::jmin (bw, bh) * 0.46f), juce::jmax (0, bw - 8) });
+            else
+                p.buttonFits.push_back ({ name, tb->getButtonText(),
+                    (float) juce::GlyphArrangement::getStringWidth (fgfit::textButtonFont (bh), tb->getButtonText()),
+                    (int) std::floor (fgfit::textButtonRoom (bw, bh, tb->getProperties().contains ("fork"))) });
+        }
+        else if (const auto* tg = dynamic_cast<const juce::ToggleButton*> (&c); tg != nullptr)
+        {
+            // The "onled" pill prints ON / OFF itself, centred in the whole button, and
+            // has no juce::Button text at all - measured as an empty string it would
+            // "fit" any width, including a width too small for the word it draws.
+            //
+            // ...AND IT DRAWS A STATE LED IN FRONT OF THAT WORD, so what has to fit is the
+            // disc, its gap AND the word - fgfit::onLedInkWidth, which is the very
+            // expression GalacticLnF::drawToggleButton centres. Measuring the word alone
+            // would certify a pill 10 px too narrow for what lands on the glass, which is
+            // exactly the class of miss this whole sweep exists to stop.
+            if (tg->getName() == "onled")
+                p.buttonFits.push_back ({ name, "OFF", fgfit::onLedInkWidth (bh, "OFF"), bw });
+            else if (tg->getButtonText().isNotEmpty())
+                p.buttonFits.push_back ({ name, tg->getButtonText(),
+                    (float) juce::GlyphArrangement::getStringWidth (fgfit::toggleFont (bh), tg->getButtonText()),
+                    (int) std::floor (fgfit::toggleRoom (bw, bh)) });
+
+            // ...AND THE TICK BOX ITSELF HAS TO FIT ITS BUTTON, which nothing measured.
+            //
+            // "la casilla de temper se ve semicortada" - and every gate in this build was
+            // green while it was. The whole sweep above is about WIDTH and about TEXT: a
+            // word that does not fit, a control that overlaps another, a cell that escaped
+            // its box. A tick box is neither. GalacticLnF draws it as a FIXED kTickBox
+            // square at y = (height - kTickBox) / 2 - deliberately fixed, so that one panel
+            // cannot show three different sizes - so a button SHORTER than that square gets
+            // a negative y and JUCE clips the outline top and bottom. Nothing overflows,
+            // nothing overlaps, no letter is lost: it simply looks broken, and only an eye
+            // could see it.
+            //
+            // Recorded here as an ordinary fit - what is needed against the room there is -
+            // so the existing sweep reports it in the same sentence as every other one, in
+            // every scenario and at every size, rather than in a rule of its own that only
+            // runs where somebody thought to put it.
+            //
+            // The label is WORDS and not a box glyph. The first version passed U+25A1 so
+            // the report would show a little square, and the report is printed to a console
+            // that is not UTF-8: it came out as "Ã¢Â¡", which is the exact mojibake this
+            // project has a whole gate against - in the message that is supposed to explain
+            // a defect. "tick box height" says more and survives every terminal.
+            if (tg->getName() != "onled" && bw > 0 && bh > 0)
+                p.buttonFits.push_back ({ juce::String (name) + ".tick", "tick box height",
+                                          (float) fgfit::kTickBox, bh });
+        }
     };
     // A read-out that is MEANT to wrap. Its cell is the text area drawLabel really uses
     // (the Label's own border removed - JUCE's default is 5 px each side, which is 10 px
@@ -4890,6 +9462,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("harm.basePitch",   basePitchBox);    add ("harm.pitchLbl",  lblBasePitch);
     add ("harm.harmonics",   harmonicsFader);
     add ("harm.primeMode",   primeModeBox);    add ("harm.primeLimit", primeLimitFader);
+    add ("harm.primeOn",     primeOnToggle);
     add ("harm.primeLimitLbl", lblPrimeLimit);
     add ("harm.prime0",      primeToggle[0]);  add ("harm.prime8",    primeToggle[8]);
     add ("harm.prime0Lbl",   primeLbl[0]);     add ("harm.prime8Lbl", primeLbl[8]);
@@ -4899,14 +9472,37 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("cust.reps",        timbreRepeatsFader); add ("cust.repsLbl", lblTimbreRepeats);
     add ("cust.temper",      temperToggle); // laid out in BOTH views of the engine box
 
+    // The two CHIP ROWS, so a build can see that they are still one size. They are the
+    // same control doing the same job (see fgfit::chip) and they were 104 x 16 against
+    // 58 x 19 - a difference nothing here could measure, because neither row was probed.
+    add ("eng.chipHarmonic", engineChip[0]);   add ("eng.chipCustom", engineChip[1]);
+    add ("mod.tabAmp",       envTabB[0]);      add ("mod.tabPitch",   envTabB[1]);
+    add ("mod.tabFilter",    envTabB[2]);      add ("mod.tabCustom",  envTabB[3]);
+    // THE CUSTOM MODULATOR'S SELECTOR ROW, which nothing measured until now.
+    //
+    // Three controls share a 199 px row at the shipped size and each is sized to its own
+    // words, so it is exactly the row a longer translation or a wider control breaks -
+    // and none of the three was in this list. The proof is that adding a state LED to the
+    // ON/OFF pill pushed the row six pixels over its budget at 1200x650, flipped all
+    // three into their starved fallback, and every gate in the build passed: the fit
+    // sweep only ever saw the OTHER onled pill, the one with room to spare. A control the
+    // probe cannot see is a control no measurement in this project protects.
+    add ("mod.selector",     modSelBox);
+    add ("mod.on",           modOnT);
+    add ("mod.unmap",        modUnmapBtn);
+
     add ("both.slope",       slopeFader);      add ("both.pencil",    partialEditBtn);
     add ("both.manual",      partialManualT);  add ("both.fractal",   fractalFader);
-    add ("both.morph",       morphToggle);
-    add ("both.morphTime",   morphTimeFader);  add ("both.morphLbl",  lblMorphTime);
+    add ("both.transition",  transitionBox);
+    // Both Time faders go through `add`, whose visibility gate records exactly the one
+    // that is on screen - the same way the Shepard row's shepTime/shepDiv pair is probed.
+    add ("both.morphTime",   morphTimeFader);
+    add ("both.dryWetTime",  dryWetTimeFader); add ("both.transLbl", lblTransTime);
     add ("both.rangeVal",    sprVal);          add ("both.rangeUp",   sprUp);
     add ("both.rangeDn",     sprDn);
 
-    add ("ess.phase",        phaseBox);        add ("ess.gain",       gainFader);
+    add ("both.phase",       phaseFader);
+    add ("ess.gain",         gainFader);
     add ("ess.refA",         refAEdit);        add ("ess.refALbl",    lblRefA);
     add ("ess.refHz",        lblRefHz);
     add ("ess.octVal",       octVal);          add ("ess.octUp",      octUp);
@@ -4936,10 +9532,11 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("tun.bank",         tuningBankBox);   add ("tun.bankLoad",   tuningBankLoadBtn);
     add ("tun.bankClear",    tuningBankClearBtn);
     // The Shepard row. Exactly ONE of shepTime/shepDiv is visible (the mode's own
-    // dress), so `add`'s visibility gate records the one really on screen.
+    // dress), and the rise-interval box only exists under a non-octave tuning, so
+    // `add`'s visibility gate records exactly what is really on screen.
     add ("tun.shepOn",       shepOnT);         add ("tun.shepMode",   shepModeBox);
     add ("tun.shepTime",     shepTimeFader);   add ("tun.shepDiv",    shepDivBox);
-    add ("tun.shepLvl",      shepLevelFader);
+    add ("tun.shepRise",     shepRiseBox);   add ("tun.shepDir",    shepDirBtn);
 
     add ("spec.mode",        specModeBox);     add ("spec.source",    tuneSourceBox);
     add ("spec.scope",       tuneScopeBox);    add ("spec.notesLbl",  chordNotesLbl);
@@ -4952,7 +9549,7 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     add ("spec.amps",        adaptAmpsToggle); add ("spec.rangeLbl",  adaptRangeLbl);
     add ("spec.rangeLo",     adaptLoEdit);     add ("spec.rangeHi",   adaptHiEdit);
     add ("spec.adapt",       adaptGoBtn);      add ("spec.adaptRt",   adaptRtBtn);
-    add ("spec.regLbl",      adaptRegLbl);     add ("spec.regSteps",  adaptRegStepsEdit);
+    add ("spec.regLbl",      adaptRegLbl);     add ("spec.regPer",    adaptRegPeriodsEdit);
     // The result list, never probed before, and the first thing a new row starves.
     add ("spec.adaptList",   adaptView);       add ("spec.prog",      chordProgLbl);
     // ...and the two WRAPPING read-outs, measured by the rule that fits them (see
@@ -4973,15 +9570,23 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
         p.readoutVariants.push_back (measureWrapped ("readout.cost",      adaptInfoLbl, adaptLineCost (44.4 * 60000.0)));
         p.readoutVariants.push_back (measureWrapped ("readout.result",    adaptInfoLbl,
                                                      adaptLineResult (100, false, widestSpan, true)));
-        // ...and the register line in BOTH forms, at their widest numbers: the anchor a
-        // one-degree-per-period scale can reach ("-10:0"), a three-digit step count, and the
-        // "only N fit" wording that only appears at the top of the keyboard. That second
-        // form is the longer one and it is precisely the one a player never sees until the
-        // day they play up there.
+        // ...and the register line in ALL THREE forms, at their widest numbers: the anchor
+        // and the two end keys a one-degree-per-period scale can reach ("-10:0"), the
+        // widest width the field accepts, the "-A/+B" wording that only appears at the ends
+        // of the keyboard, and the .tun qualifier that only appears under an absolute
+        // table. Each of the last two is longer than the plain form and each is one a
+        // player never sees until the day they land on it.
+        const juce::String wideKey ("-10:0"), wideLo ("12.3"), wideHi ("20000");
+        const juce::String wideDev = registerPeriodQualifierText (false);   // the longer of the two
         p.readoutVariants.push_back (measureWrapped ("regSpan.plain",   adaptRegSpanLbl,
-                                                     adaptRegSpanLine ("-10:0", 127, 127, "10.6")));
+                                                     adaptRegSpanLine (wideKey, 8.0, 8.0, 8.0,
+                                                                       wideLo, wideHi, {})));
         p.readoutVariants.push_back (measureWrapped ("regSpan.clamped", adaptRegSpanLbl,
-                                                     adaptRegSpanLine ("-10:0", 127, 127 - 1, "10.5")));
+                                                     adaptRegSpanLine (wideKey, 8.0, 7.5, 8.0,
+                                                                       wideLo, wideHi, {})));
+        p.readoutVariants.push_back (measureWrapped ("regSpan.table",   adaptRegSpanLbl,
+                                                     adaptRegSpanLine (wideKey, 8.0, 7.5, 8.0,
+                                                                       wideLo, wideHi, wideDev)));
     }
     add ("spec.segPerLbl",   segPeriodLbl);    add ("spec.segPeriod", segPeriodEdit);
     add ("spec.segTop",      segTopToggle);
@@ -4991,22 +9596,112 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     auto cell = [&p] (const char* name, const juce::Rectangle<int>& r)
     { if (! r.isEmpty()) p.cells.push_back ({ name, r }); };
     cell ("eng.base",    hcBase);    cell ("eng.harm",    hcHarm);   cell ("eng.prime", hcPrime);
-    cell ("eng.custScale", ccScale); cell ("eng.custBody", ccBody);
     cell ("both.slope",  beSlope);   cell ("both.fractal", beFractal);
-    cell ("both.morph",  beMorph);   cell ("both.range",  beRange);
-    cell ("ess.phase",   ecPhase);   cell ("ess.gain",    ecGain);
-    cell ("ess.ref",     ecRef);     cell ("ess.oct",     ecOct);
+    cell ("both.transition", beTrans);
+    cell ("both.range",  beRange);   cell ("both.phase",  bePhase);
+    cell ("ess.gain",    ecGain);
+    cell ("ess.ref",     ecRef);
+    // ess.oct is registered CLIPPED to the left of the BINAURAL wall. The member rect is
+    // the whole row - paint() draws the cell's top edge right across it, and the wall
+    // takes its height from it - but as a CELL the stepper's territory ends where the
+    // line is and ecBin's begins. Registered whole, the two overlapped by construction
+    // and the neighbour check said so the moment BINAURAL became visible at 1200x650:
+    // "12 cells probed, 1 escaped or overlap (first: ess.oct / ess.bin)". They are
+    // siblings on one row, exactly like both.range and both.phase above.
+    cell ("ess.oct", ecBin.isEmpty() ? ecOct : ecOct.withRight (ecBin.getX() - 5));
+    cell ("ess.bin", ecBin);
 
     // Every combo applyLanguage() re-words, and what it currently has selected.
     auto combo = [&p] (const char* name, const juce::ComboBox& c)
-    { p.comboIds.push_back ({ name, c.getSelectedId() }); };
-    combo ("basePitch",   basePitchBox);   combo ("phase",       phaseBox);
+    {
+        p.comboIds.push_back ({ name, c.getSelectedId() });
+        // The WIDEST item this box can show, against the room it has. The widest one,
+        // not the selected one: the box does not resize when the user changes modes, so
+        // a slot that only fits the current choice clips the other one the moment it is
+        // picked - and a probe that measured the selection would have to catch the box
+        // in that state to see it. The room is GalacticLnF's own comboTextWidth, the
+        // same function positionComboBoxText lays the label out with, so this check can
+        // never drift from what is actually drawn. Measured in the box's live font.
+        if (c.isVisible())
+        {
+            // MEASURED THE WAY THE ITEM IS ACTUALLY DRAWN, which is not the way this
+            // probe used to measure it. Four things stand between the box's width and
+            // the room the word gets, and the old measurement missed three of them:
+            //   - positionComboBoxText leaves the label fgfit::comboTextWidth (chevron
+            //     and left inset off) - the one part it did have;
+            //   - juce::Label keeps its own {1,5,1,5} border off that, so 10 more px go;
+            //   - GalacticLnF::getLabelFont draws the item BOLD (12.5 px floor), while
+            //     this probe measured it in getComboBoxFont's lighter face;
+            //   - drawLabel word-wraps into however many WHOLE lines the height allows,
+            //     which is why the 34 px mode box legitimately holds a long sentence.
+            // Both of the misses ran the same way - towards "it fits" - so the probe was
+            // quietly certifying boxes ~10 px narrower than the word needs.
+            // MEASURED OFF THE LABEL THE BOX REALLY DRAWS IN, not off a model of it.
+            //
+            // A ComboBox draws its item through a child juce::Label, so that Label's own
+            // bounds and its own LookAndFeel font ARE the answer - they cannot drift from
+            // the painter the way a reconstruction can, and reconstructions here have now
+            // been wrong in both directions. The first modelled the room with a constant
+            // and the layout with addFittedText, which SHRINKS THE FONT until the text
+            // fits: `need` could never exceed `avail`, so the check could not fail, and
+            // the SPECTRUM mode box shipped reading "Find tunings based on beati..." at
+            // 1200x650 while the probe reported it needing 153.86 of the 154 it had. The
+            // second measured the string honestly but kept the modelled room, and reported
+            // "+-48 st (MPE)" as truncated when it is drawn in full.
+            // ...and it is the SAME three lines the fit sweep (walkTextFits) uses, because
+            // they are the same question and they were being answered twice. Lifted into
+            // fgfit so the correction above cannot be made here and forgotten there - it
+            // was: this probe took the label's border off and the sweep did not, so the
+            // sweep certified an item that touched its own chevron.
+            const auto  f      = fgfit::comboDrawnFont (c);
+            const int   availW = fgfit::comboDrawnRoom (c);
+            juce::String widest; float need = 0.0f;
+            // HOW MANY LINES THE PAINTER IS ALLOWED, from the label's own area and font -
+            // the same jmax(1, height/fontHeight) juce::Label::paint uses. Most of these
+            // boxes get one; the 34 px SPECTRUM mode box was BUILT to get two, and the
+            // whole point of measuring it here is to say whether it really does.
+            const float fh    = f.getHeight();
+            const int   availH2 = fgfit::comboDrawnRoomH (c);
+            const int   rows  = juce::jmax (1, (int) ((float) availH2 / juce::jmax (1.0f, fh)));
+            for (int i = 0; i < c.getNumItems(); ++i)
+            {
+                const auto  t    = c.getItemText (i);
+                const float oneW = juce::GlyphArrangement::getStringWidth (f, t);
+                // WRAPPED BY WORDS, COUNTED HONESTLY. Not addFittedText, which is what this
+                // check used to call: it lays the text out exactly as the painter does
+                // INCLUDING shrinking the font until it fits, so the measurement made
+                // itself true and the check could never fail. Greedy fill at the real
+                // width instead, then ask whether the lines fit the rows on offer.
+                int   lines = 1;
+                float lineW = 0.0f;
+                if (rows > 1 && oneW > (float) availW)
+                {
+                    auto words = juce::StringArray::fromTokens (t, " ", "");
+                    for (const auto& w : words)
+                    {
+                        const float ww = juce::GlyphArrangement::getStringWidth (f, w + " ");
+                        if (lineW > 0.0f && lineW + ww > (float) availW) { ++lines; lineW = ww; }
+                        else lineW += ww;
+                    }
+                }
+                // What it NEEDS of the width: nothing more than the box has when the lines
+                // it takes fit the rows it is given; the whole single-line width when they
+                // do not, because that is the width it would have had to have.
+                const float w = (rows > 1 && lines <= rows) ? 0.0f : oneW;
+                if (w > need) { need = w; widest = t; }
+            }
+            p.comboTexts.push_back ({ name, widest, need, availW });
+        }
+    };
+    combo ("basePitch",   basePitchBox);
+    combo ("transition",  transitionBox);
     combo ("primeMode",   primeModeBox);   combo ("bend",        bendBox);
     combo ("modSel",      modSelBox);      combo ("lfoWave",     lfoWaveBox);
     combo ("lfoRateMode", lfoRateModeBox); combo ("lfoPhaseMode", lfoPhaseModeBox);
     combo ("specMode",    specModeBox);    combo ("tuneSource",  tuneSourceBox);
     combo ("tuneScope",   tuneScopeBox);   combo ("adaptTarget", adaptTargetBox);
     combo ("adaptGoal",   adaptGoalBox);   combo ("shepMode",    shepModeBox);
+    combo ("shepRise",    shepRiseBox);
 
     // The painted sub-labels, each with the width its text really needs in the font
     // paint() sets for it.
@@ -5014,12 +9709,24 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
         p.paintedLabels.push_back ({ s.name, s.text, s.cell,
             (float) juce::GlyphArrangement::getStringWidthInt (
                 juce::Font (juce::FontOptions (s.fontHeight).withStyle ("Bold")), s.text),
-            s.col });
+            s.col, s.fitted });
 
     // The words that ARE the feature (see LayoutProbe::buttonTexts).
     p.buttonTexts.push_back ({ "cust.load",  loadTimbreButton.getButtonText() });
     p.buttonTexts.push_back ({ "tun.toBank", tuningBankAddBtn.getButtonText() });
     p.buttonTexts.push_back ({ "top.playground", playgroundButton.getButtonText() });
+    // The word the KEYBOARD paints over its reference key. It is here because the
+    // translated-check walks this probe: a component that paints its own text is
+    // otherwise invisible to it, which is how this one stayed English.
+    p.buttonTexts.push_back ({ "keys.reference", keyboard.getReferenceWord() });
+    // BOTH sentences under the keys, not the one this build happens to show. The letter
+    // layout is the standalone's and the rig builds a PLUGIN, so gating the label on the
+    // wrapper would have taken a string that had been under the mojibake and translated
+    // checks for months quietly out of them - a string escaping a gate by living in a
+    // state no scenario reaches, which is this file's oldest blind spot. Read from
+    // keyboardHelpText, the same function applyLanguage uses, so neither can drift.
+    p.buttonTexts.push_back ({ "keys.helpStandalone", keyboardHelpText (true) });
+    p.buttonTexts.push_back ({ "keys.helpPlugin",     keyboardHelpText (false) });
     // Recorded only while it exists (its two words are state-dependent, and probing a
     // hidden button would measure a word resized() never put on screen).
     if (loadSpectrumTuningBtn.isVisible())
@@ -5035,7 +9742,14 @@ FractalAdditiveAudioProcessorEditor::layoutProbe() const
     // probe is. Deliberately the LIVE string the component will hand the tooltip window,
     // not a copy kept beside it: a copy is exactly the thing that goes on passing after
     // the real tooltip has been reworded.
-    p.regStepsTip       = const_cast<juce::TextEditor&> (adaptRegStepsEdit).getTooltip();
+    p.regPeriodsTip     = const_cast<juce::TextEditor&> (adaptRegPeriodsEdit).getTooltip();
+    p.dividers          = spectrumDividers(); // the very lines paint() strokes
+    // The keyboard, and the keys really on it (see LayoutProbe::keyboardBox).
+    p.keyboardBox  = keyboard.getBounds();
+    p.keysDrawn    = keyboard.drawnKeysSpan().getSmallestIntegerContainer()
+                       + keyboard.getBounds().getPosition();
+    p.keysInWindow = keyboard.windowKeyCount();
+    p.keysPlayable = keyboard.drawnKeyCount();
     return p;
 }
 
@@ -5059,12 +9773,56 @@ void FractalAdditiveAudioProcessorEditor::commitRefA()
     refreshRefAText();
 }
 
+// THE REFERENCE PITCH, AT THE PRECISION THE FIELD CAN ACTUALLY SHOW.
+//
+// A juce::TextEditor is the one text control in this window that neither clips nor
+// condenses when its string is too wide: it scrolls, and TextEditor::setText leaves the
+// caret at the END (cursorWasAtEnd is true for an empty editor, so this is true from the
+// very first call). The field is 8 px indented a side and 13 pt, so at 690x550 it holds
+// ~46 px of text while "261.6255653" needs ~65 - and what the user read was "55653".
+// Not a truncated number with a visible cut: a DIFFERENT number, well-formed, plausible,
+// and off by a factor of 213. It is the one failure mode in this file where the wrong
+// pixels look exactly like right ones.
+//
+// So the decimals are dropped one at a time until the number fits, and the INTEGER PART
+// IS NEVER DROPPED - 261.6255653 -> 261.626 -> 261.63 -> 262, and 262 even in a field too
+// narrow for it, where the (now existing) TextEditor row in walkTextFits reports it as a
+// fit problem instead of the field quietly inventing a value. Left-truncation is not one
+// of the options at any width.
+//
+// Measured in the field's OWN font against TextEditor::getMaximumTextWidth's own formula
+// (fgfit::textEditorRoom), not against the box: the 8 px indents and the 2 px the caret
+// keeps at the right edge are 18 of the ~64 px this cell has at the floor.
+juce::String FractalAdditiveAudioProcessorEditor::refATextForRoom (double c3, int room) const
+{
+    // trimCharactersAtEnd only where there IS a point to trim to: at 0 decimals the string
+    // is "262" and stripping "0" from its end would make it "26".
+    const auto trim = [] (juce::String s)
+    { return s.containsChar ('.') ? s.trimCharactersAtEnd ("0").trimCharactersAtEnd (".") : s; };
+    const auto font = refAEdit.getFont();
+    juce::String s;
+    for (int dp = 7; dp >= 0; --dp)   // 7: C3 at A=440 is 261.6255653 exactly
+    {
+        s = trim (juce::String (c3, dp));
+        if (juce::GlyphArrangement::getStringWidth (font, s) <= (float) room) break;
+    }
+    return s;
+}
+
 void FractalAdditiveAudioProcessorEditor::refreshRefAText()
 {
     const double a  = (double) processorRef.apvts.getRawParameterValue ("refA")->load();
-    const auto txt = juce::String (a * kC3overA, 7).trimCharactersAtEnd ("0").trimCharactersAtEnd (".");
+    const auto txt = refATextForRoom (a * kC3overA, fgfit::textEditorRoom (refAEdit));
     if (refAEdit.getText() != txt && ! refAEdit.hasKeyboardFocus (false))
+    {
         refAEdit.setText (txt, juce::dontSendNotification);
+        // ...and the caret HOME. setText scrolls to wherever the caret lands, and the
+        // whole defect above was that landing at the end scrolls the significant digits
+        // off the left of a field that never says so. With the value now sized to the
+        // room this is belt and braces - and it is the line that makes "never truncated
+        // from the left" true for any string this field is ever handed.
+        refAEdit.setCaretPosition (0);
+    }
 }
 
 void FractalAdditiveAudioProcessorEditor::makeLabel (juce::Label& l, juce::Colour c)
@@ -5072,6 +9830,11 @@ void FractalAdditiveAudioProcessorEditor::makeLabel (juce::Label& l, juce::Colou
     l.setJustificationType (juce::Justification::centred);
     l.setColour (juce::Label::textColourId, c.brighter (0.15f));
     l.setFont (juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")));
+    // JUCE reserves 5 px of every Label for a border nothing here draws, which on a
+    // 22 px caption is nearly half its width - and drawLabel then condenses the word to
+    // fit what is left. These captions are inline text in a panel, not framed fields:
+    // 2 px is all the breathing room they need.
+    l.setBorderSize (juce::BorderSize<int> (0, 2, 0, 2));
     addAndMakeVisible (l);
 }
 
@@ -5171,6 +9934,26 @@ void FractalAdditiveAudioProcessorEditor::configFader (juce::Slider& s, const ju
     s.onDragEnd = [this] { refocus(); };
     addAndMakeVisible (s);
     att = std::make_unique<SliderAttachment> (processorRef.apvts, paramID, s);
+    // ...and the ONE decimal policy, wrapped around whatever the attachment just
+    // installed (see kFaderMaxDecimals / capDecimals above for why).
+    //
+    // WRAPPED, not replaced, and that is the whole safety of it. The attachment's function
+    // is the parameter's own getText, and juce::Slider's numDecimalPlaces is derived from
+    // the range the attachment set - so the cap is read LAZILY, inside the lambda, and a
+    // caller that later says setNumDecimalPlacesToDisplay (0) still gets 0 (shepTime does,
+    // and until now that call did nothing at all: the attachment's textFromValueFunction
+    // wins over numDecimalPlaces, so its 0 was silently ignored). A caller that installs
+    // its OWN textFromValueFunction after this line - baseN, harmonics, primeLimit - still
+    // wins outright, because it simply overwrites this one.
+    if (s.textFromValueFunction != nullptr)
+        s.textFromValueFunction = [prev = std::move (s.textFromValueFunction), &s] (double v)
+        { return capDecimals (prev (v), juce::jmin (kFaderMaxDecimals, s.getNumDecimalPlacesToDisplay())); };
+    // Remembered so the value boxes can be sized ONCE, later, when every fader's text is
+    // final: the suffix (" ms", " c", " %") is set by the caller AFTER this function
+    // returns, and the parameter's own text function arrives with the attachment on the
+    // line above. Measured here, "120.0 ms" measures as "120.0" - which is exactly how
+    // the glide fader ended up with a 46 px box it could not fill honestly.
+    configuredFaders.push_back (&s);
     // Double-click ANY fader = straight back to its default value.
     if (auto* prm = processorRef.apvts.getParameter (paramID))
         s.setDoubleClickReturnValue (true, prm->convertFrom0to1 (prm->getDefaultValue()));
@@ -5240,13 +10023,41 @@ void FractalAdditiveAudioProcessorEditor::attachCustomTab()
     modOnAtt     = std::make_unique<ButtonAttachment> (processorRef.apvts, pfx + "On",    modOnT);
 }
 
+// The six modulators' names, the same in both languages ("Env 1", "LFO 3") and therefore
+// the one part of this menu that does not go through tr.
+const char* FractalAdditiveAudioProcessorEditor::modName (int mod)
+{
+    static const char* names[6] = { "Env 1", "Env 2", "Env 3", "LFO 1", "LFO 2", "LFO 3" };
+    return names[(size_t) juce::jlimit (0, 5, mod)];
+}
+
+// ONE PLACE BUILDS THE MAP MENU'S ITEM TEXT, and the read-out is not typed in.
+//
+// It used to read `names[i] + (full ? " (8/8 full)" : "")`, which was wrong twice over.
+// The word was an English literal glued onto a menu whose own title goes through tr, so a
+// Catalan user right-clicking a fader read "Env 2 (8/8 full)" - the only English left in
+// that menu. And "8/8" was a COPY of ModEngine::kMaxTargets: the count a modulator can
+// hold lives there, one line under the array that is sized by it, and a build that grows
+// a ninth slot would have gone on printing 8 with nothing to notice it. Both numbers now
+// come from the engine that owns them, so the sentence cannot outlive the fact.
+//
+// A menu item is drawn by the OS's own popup, so no sweep of this window's components can
+// see this string; modMapItemTextForTests is how the check reads it.
+juce::String FractalAdditiveAudioProcessorEditor::modMapItemText (int mod) const
+{
+    juce::String label (modName (mod));
+    if (processorRef.getModEngine().isFull (mod))
+        label << " (" << processorRef.getModEngine().numTargets (mod)
+              << "/" << ModEngine::kMaxTargets << tr (" full", " ple") << ")";
+    return label;
+}
+
 // Right-click menu on any fader: route one of the 6 modulators to that parameter
 // (it rides on the knob's own value; set its Range in the Custom tab).
 void FractalAdditiveAudioProcessorEditor::showEnvMapMenu (const juce::String& paramID)
 {
     if (processorRef.apvts.getParameter (paramID) == nullptr) return;
     if (paramID.startsWith ("mod") && paramID.endsWith ("On")) return; // see modOnT
-    static const char* names[6] = { "Env 1", "Env 2", "Env 3", "LFO 1", "LFO 2", "LFO 3" };
     juce::PopupMenu m;
     juce::PopupMenu mapTo;
     for (int i = 0; i < 6; ++i)
@@ -5255,15 +10066,18 @@ void FractalAdditiveAudioProcessorEditor::showEnvMapMenu (const juce::String& pa
         if (processorRef.getModEngine().isMappedTo (paramID, i)
             || paramID.startsWith (ModEngine::ownPrefix (i)))
             continue;
-        const bool full = processorRef.getModEngine().isFull (i);
-        mapTo.addItem (100 + i, juce::String (names[i]) + (full ? " (8/8 full)" : ""), ! full);
+        mapTo.addItem (100 + i, modMapItemText (i), ! processorRef.getModEngine().isFull (i));
     }
     m.addSubMenu (tr ("Map to", "Assigna a"), mapTo);
     for (int i = 0; i < 6; ++i)
         if (processorRef.getModEngine().isMappedTo (paramID, i))
-            m.addItem (200 + i, tr ("Unmap from ", "Desassigna de ") + names[i]);
-    m.showMenuAsync (juce::PopupMenu::Options(), [this, paramID] (int r)
+            m.addItem (200 + i, tr ("Unmap from ", "Desassigna de ") + modName (i));
+    // Guarded like the top-bar menu above: the callback outlives the window when the
+    // user closes the plugin with the map menu open, and it ends by touching the editor.
+    m.showMenuAsync (juce::PopupMenu::Options(),
+        [this, paramID, safe = juce::Component::SafePointer<juce::Component> (this)] (int r)
     {
+        if (safe == nullptr) return;
         if (r >= 200)      processorRef.getModEngine().removeTarget (r - 200, paramID);
         else if (r >= 100)
         {
@@ -5296,6 +10110,66 @@ void FractalAdditiveAudioProcessorEditor::configCombo (juce::ComboBox& b, const 
 }
 
 //==============================================================================
+
+// PAINTED OVER THE CHILDREN, not under them.
+//
+// JUCE draws a component's own paint() FIRST and its children on top, so the first
+// version of this band was covered by the very controls it is there to cross out: the
+// photograph came back with the sentence woven between a fader, a chip and the PRIMES
+// ticks, unreadable, and the dimming layer nowhere. paintOverChildren is the one place
+// that can put a lid on a panel.
+void FractalAdditiveAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
+{
+    if (! pgDrivingUi || spectrumBounds.isEmpty())
+        return;
+    auto box = spectrumBounds.toFloat().reduced (6.0f, 6.0f);
+    g.setColour (juce::Colour (0xd0101318));
+    g.fillRoundedRectangle (box, 8.0f);
+    g.setColour (spectrumPanelColour.withAlpha (0.85f));
+    g.drawRoundedRectangle (box, 8.0f, 1.5f);
+    // The block is CENTRED in the panel, not hung from its top: the first photograph had
+    // the sentence in the upper third with half the box empty under it.
+    auto text = box.reduced (18.0f, 10.0f).withSizeKeepingCentre (box.getWidth() - 36.0f,
+                                                                  juce::jmin (box.getHeight() - 20.0f,
+                                                                              132.0f));
+    g.setFont (juce::Font (juce::FontOptions (juce::jmin (17.0f, text.getHeight() * 0.16f))
+                               .withStyle ("Bold")));
+    const auto head = tr ("THE PLAYGROUND IS MAKING THIS SOUND",
+                          "EL PLAYGROUND \xc3\x89S QUI FA AQUEST SO");
+    g.drawFittedText (head, text.removeFromTop (text.getHeight() * 0.32f).toNearestInt(),
+                      juce::Justification::centred, 2, 1.0f);
+    g.setColour (juce::Colours::white.withAlpha (0.82f));
+    g.setFont (juce::Font (juce::FontOptions (juce::jmin (13.0f, text.getHeight() * 0.13f))));
+    g.drawFittedText (
+        tr ("The spectrum you hear is the blend of the assigned corners, so nothing in this"
+            " panel can change it - an edit made here is overwritten by the next blend."
+            "\n\nTo change a corner: press EDIT on it in the Preset Playground, and these"
+            " controls become that corner's own.\nTo get this panel back: take a corner off"
+            " the pad, so fewer than two are assigned.",
+            "L'espectre que sents \xc3\xa9s la barreja de les cantonades assignades, aix\xc3\xad"
+            " que res d'aquest tauler el pot canviar - una edici\xc3\xb3 feta aqu\xc3\xad la"
+            " sobreescriu la barreja seg\xc3\xbc" "ent.\n\nPer canviar una cantonada: prem"
+            " EDIT a la seva fitxa del Preset Playground, i aquests controls passen a ser"
+            " els seus.\nPer recuperar aquest tauler: treu una cantonada del pad, de manera"
+            " que en quedin menys de dues assignades."),
+        text.toNearestInt(), juce::Justification::centred, 8, 1.0f);
+}
+
+// The band's button, placed from the same rect the band is drawn in - under the text,
+// centred, and sized to its own word so a long corner name does not crush it.
+void FractalAdditiveAudioProcessorEditor::layoutPlaygroundBandButton()
+{
+    if (! pgDrivingUi || spectrumBounds.isEmpty()) return;
+    const auto box  = spectrumBounds.reduced (6, 6);
+    const int  w    = juce::jlimit (120, juce::jmax (120, box.getWidth() - 40),
+                                    fgfit::snugTextButtonWidth (pgEditNearestBtn, 24));
+    pgEditNearestBtn.setBounds (juce::Rectangle<int> (w, 24)
+                                   .withCentre ({ box.getCentreX(),
+                                                  box.getBottom() - 24 }));
+    pgEditNearestBtn.toFront (false);
+    if (noticeOverlay.isVisible()) noticeOverlay.toFront (false);   // never above a notice that is up
+}
+
 void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colour (0xff0c0c12));
@@ -5306,18 +10180,16 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     // squares are DRAWN LAST, so the connector lines can tuck their ends under the
     // letters. Each letter is an equal square, keyboard-hue coloured (first/last
     // red), the glyph stretched to fill it.
-    const auto title  = juce::String::fromUTF8 ("Fibl\xc3\xb3 Gal\xc3\xa0" "ctic");
+    //
+    // The six lines that decide side/total/x now live in titleBandFor(), above, because
+    // resized() has to place the credit under this row and a second hand-copy of them is
+    // how the two drift apart.
+    const auto title  = titleWord();
     const int  L      = title.length();
     const int  period = juce::jmax (1, L - 1);
-    float       side  = 52.0f;
+    const auto band   = titleBandFor (getWidth());
+    const float side  = band.side;
     const float gap   = 4.0f;
-    int squaresN = 0, spaces = 0;
-    for (int i = 0; i < L; ++i) (title[i] == ' ' ? spaces : squaresN)++;
-    float total = (float) squaresN * (side + gap) + (float) spaces * (side * 0.5f);
-    const float freeLeft  = 214.0f;                      // clears credit/Menu/Presets/Save
-    const float freeRight = (float) getWidth() - 186.0f; // clears the Spectrum-to-Rhythm button
-    const float freeW     = juce::jmax (120.0f, freeRight - freeLeft);
-    if (total > freeW) { side *= freeW / total; total = freeW; }
     const float margin = side * 0.10f;
     const juce::Font glyphFont = titleTypeface() != nullptr
         ? juce::Font (juce::FontOptions (titleTypeface()).withHeight (64.0f))
@@ -5326,11 +10198,9 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     struct Sq { juce::Rectangle<float> rect; juce::Colour col; juce::Path glyph; juce::Colour glyphCol; };
     std::vector<Sq> squares;
     {
-        // Centre the title on the FULL window width (clamped to the free zone), so
-        // "Fibló Galàctic" sits truly centred rather than centred-between-buttons.
-        float x = ((float) getWidth() - total) * 0.5f;
-        x = juce::jmax (x, freeLeft);
-        if (x + total > freeRight) x = freeRight - total;
+        // Centred on the FULL window width and clamped to the free zone - decided in
+        // titleBandFor(), which resized() reads too so the credit lands under it.
+        float x = band.x;
         // Anchored near the TOP of the title band, so the extra height becomes
         // breathing room between the title and the UI below it.
         const float cy = (float) titleArea.getY() + 8.0f + side * 0.5f;
@@ -5432,42 +10302,14 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         // 2.6 px stroke, so anything starting above ~17.5 pokes through the panel's edge.
         {
             g.setColour (spectrumPanelColour.withAlpha (0.5f));
-            const float top = (float) spectrumBounds.getY() + 17.5f;
-            const float bot = (float) spectrumBounds.getBottom() - 4.0f;
-
-            // THE WALL between the engine compartment and the shared-controls
-            // compartment. It replaces two frame edges and the gutter between them, so
-            // the two compartments now share one line instead of facing each other
-            // across three.
-            if (! engineBoxBounds.isEmpty() && ! bothEnginesBounds.isEmpty())
-            {
-                const float wall = 0.5f * (float) (engineBoxBounds.getRight() + bothEnginesBounds.getX());
-                g.drawLine (wall, top, wall, bot, 1.0f);
-            }
-
-            // Harmonic view: the dividers of its three cells. (The custom view's controls
-            // name themselves; resized() leaves hc* empty, which reads as "draw none".)
-            if (! customViewShown() && ! hcBase.isEmpty())
-            {
-                g.drawLine ((float) hcHarm.getX(), top, (float) hcHarm.getX(), (float) hcPrime.getBottom(), 1.0f);
-                g.drawLine ((float) hcHarm.getX(), (float) hcPrime.getY(),
-                            (float) hcHarm.getRight(), (float) hcPrime.getY(), 1.0f);
-            }
-            // Custom view: the divider between "which spectrum is loaded" and the
-            // spectrum itself.
-            if (customViewShown() && ! ccBody.isEmpty())
-                g.drawLine ((float) ccBody.getX(), (float) ccBody.getY(),
-                            (float) ccBody.getRight(), (float) ccBody.getY(), 1.0f);
-
-            // The shared-controls compartment: Amp Decay | Fractal | Morph over Range.
-            if (! bothEnginesBounds.isEmpty())
-            {
-                g.drawLine ((float) beFractal.getX(), top, (float) beFractal.getX(), bot, 1.0f);
-                g.drawLine ((float) beMorph.getX(),   top, (float) beMorph.getX(),   bot, 1.0f);
-                g.drawLine ((float) beRange.getX(), (float) beRange.getY(),
-                            (float) beRange.getRight(), (float) beRange.getY(), 1.0f);
-            }
+            // ONE list, built by spectrumDividers(), which layoutProbe() also reports.
+            // paint() drawing its own lines while the probe rebuilt them from a second
+            // copy of the rule is exactly how a wall that stopped 23 px short of the
+            // panel floor passed every check in the build.
+            for (const auto& d : spectrumDividers())
+                g.drawLine (d.second, 1.0f);
         }
+
     }
 
     // Essentials macro-group: one framed box, one colour, PHASE / GAIN / REFERENCE /
@@ -5481,8 +10323,19 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
         g.setColour (cEssentials.withAlpha (0.5f)); // shared horizontal dividers between the cells
         const float lx = (float) essentialsBounds.getX() + 4.0f;
         const float rx = (float) essentialsBounds.getRight() - 4.0f;
-        for (auto* cell : { &ecGain, &ecRef, &ecOct })
+        // From ecRef down: a divider is drawn at each cell's TOP, so the FIRST cell must
+        // not be in this list or the line lands on the title band. That used to be
+        // ecPhase; with PHASE moved to the SPECTRUM panel it is ecGain.
+        for (auto* cell : { &ecRef, &ecOct })
             g.drawLine (lx, (float) cell->getY(), rx, (float) cell->getY(), 1.0f);
+        // ...AND THE ONE STANDING UP, between OCTAVE and BINAURAL. It is the only vertical
+        // divider in this box because it is the only row that holds two sub-sections -
+        // which is exactly the structure that was asked for ("a su derecha, separado por
+        // una linea"). Drawn from ecBin's left edge, so it is absent by construction at the
+        // widths where resized() found no room and left that cell empty.
+        if (! ecBin.isEmpty())
+            g.drawLine ((float) ecBin.getX() - 5.0f, (float) ecOct.getY() + 3.0f,
+                        (float) ecBin.getX() - 5.0f, (float) ecOct.getBottom() - 3.0f, 1.0f);
     }
 
     // Every inline sub-label of every macro box, from the one shared list.
@@ -5508,41 +10361,102 @@ void FractalAdditiveAudioProcessorEditor::paint (juce::Graphics& g)
     }
 }
 
+// A KNOB TOO NARROW FOR ITS NUMBER SHOWS NO NUMBER - the same rule the faders follow at
+// the end of resized(), for the four controls that rule cannot reach.
+//
+// That sweep only looks at faders whose box is BELOW the track (a box to the RIGHT
+// belongs to its own owner), so when the LFO knobs moved their number to the right they
+// left its protection with it - and the rig found the consequence at once: the Range
+// knob's label "0.500" needed 23.9 px in the 14 it had, which is a STRUCTURAL fault, not
+// a fit problem. juce clamps a right-hand box to width - 30, so that is the test; below
+// it the number goes and the knob keeps the whole column, which is the trade every
+// hidden-not-squashed control in this window makes.
+void FractalAdditiveAudioProcessorEditor::fitKnobValueBox (juce::Slider& k)
+{
+    const int  need = fgfit::faderValueWidth (k);
+    const bool room = k.getWidth() - 30 >= need;
+    const auto want = room ? juce::Slider::TextBoxRight : juce::Slider::NoTextBox;
+    if (k.getTextBoxPosition() != want || (room && k.getTextBoxWidth() != need))
+        k.setTextBoxStyle (want, false, room ? need : 0, 13);
+}
+
 void FractalAdditiveAudioProcessorEditor::resized()
 {
+    // Re-spell the keys if the tuning moved. The timer does this too, but the timer is
+    // not running in the offline verifiers - and, more to the point, a stale name is a
+    // WRONG name, so the two cheapest moments to notice are both worth taking. It costs
+    // one integer comparison when nothing changed (see refreshDegreeNames).
+    refreshDegreeNames();
+
     auto full = getLocalBounds();
     auto titleBar = full.removeFromTop (78); // matches paint()'s titleArea
     langButton.setVisible (false); // language now lives inside the Menu popup
     {
-        // Left cluster, two rows: the credit at the very top-left (just above the
-        // preset selector) with Menu after it, then [Presets][Save] - Save directly
-        // BELOW Menu, the preset selector directly LEFT of Save.
+        // Left cluster, two rows: PRESET PLAYGROUND at the very top-left with Menu after
+        // it, then [Presets][Save] - Save directly BELOW Menu, the preset selector
+        // directly LEFT of Save.
+        //
+        // "PON 'VIBE CODED BY ASRA3' CENTRADO DEBAJO DEL TITULO, Y QUE 'PRESET
+        // PLAYGROUND' OCUPE SU SITIO." The credit sat in the corner and the playground
+        // button had a private third row under the preset selector, which is what pushed
+        // the left cluster to 77 of the band's 78 px. Swapping them costs nothing and
+        // frees that row outright: the credit needs no row of its own down here, because
+        // under the title there is already empty band.
         auto lc = titleBar.removeFromLeft (208).withTrimmedLeft (8);
         auto r1 = lc.removeFromTop (30).withTrimmedTop (8);
-        {
-            auto credit = r1.removeFromLeft (150).withHeight (18);
-            vibeLabel.setJustificationType (juce::Justification::centredLeft);
-            vibeLabel.setBounds (credit.removeFromLeft (92));
-            credit.removeFromLeft (2);
-            vibeLink.setBounds (credit);
-        }
+        // 150 x 20. The HEIGHT is the one it has always had, and it is the height the
+        // verifier measures its word at - jmin (15, h * 0.6) - so keeping 20 keeps the
+        // measurement that says "Laboratori de Presets" fits. 20 and not the row's 22 on
+        // purpose: at 22 its bottom edge lands exactly on presetDirtyMark's top edge.
+        playgroundButton.setBounds (r1.removeFromLeft (150).withHeight (20));
         r1.removeFromLeft (4);
-        menuButton.setBounds (r1.removeFromLeft (46).withHeight (22));
+        menuButton.setBounds (r1.removeFromLeft (46).withHeight (20));
         auto r2 = lc.withTrimmedTop (2).withHeight (22);
         presetBox.setBounds (r2.removeFromLeft (150));
         presetDirtyMark.setBounds (presetBox.getRight() - 15, presetBox.getY() - 3, 14, 14);
         r2.removeFromLeft (4);
         savePresetButton.setBounds (r2.removeFromLeft (46));
-        // A third row, the full width of the cluster: the button's word is the whole
-        // feature and it is the longer language that decides how wide it has to be, so
-        // it gets the lot rather than a leftover slice (see the probe check in
-        // RhythmVerify - "Obre el Laboratori de Presets" is 8 characters longer than the
-        // English and clipped at 150 px).
-        playgroundButton.setBounds (lc.getX(), presetBox.getBottom() + 3, 200, 20);
     }
-    // Spectrum-to-Rhythm: top right, high-contrast.
-    rhythmBtn.setBounds (titleBar.removeFromRight (178).withSizeKeepingCentre (168, 26));
+    // Spectrum-to-Rhythm: top right, high-contrast - and on the SAME LINE as the
+    // playground button at the other end of the bar ("que Spectrum vs Rhythm quede
+    // alineado con Preset Playground"). It takes its y and its height FROM that button
+    // rather than centring itself in the band, so the two cannot drift apart: aligning
+    // two buttons by writing the same number twice is aligning them until somebody
+    // changes one of the numbers.
+    //
+    // ...AND IT ENDS ON THE WINDOW'S RIGHT WALL, not 4 px past it. `titleBar` is the full
+    // window width, so removeFromRight (178) + withSizeKeepingCentre (168) put its right
+    // edge on getWidth() - 5, while every panel below it stops at getWidth() - 9: the page
+    // margin (`area` = getLocalBounds().reduced (6, 4)) plus the 3 px each macro box keeps
+    // inside it (see gSpecScale's `sp.reduced (3, 2)`). One button breaking a wall that
+    // eight boxes hold is exactly the kind of near-miss that reads as sloppiness rather
+    // than as a decision, so the number is DERIVED from the same two insets instead of
+    // being a third hand-picked margin.
+    const int kPanelRight = getWidth() - 6 - 3;
+    rhythmBtn.setBounds (juce::Rectangle<int> (kPanelRight - 168, playgroundButton.getY(),
+                                               168, playgroundButton.getHeight()));
+    titleBar.removeFromRight (178);   // the band the title must not run into (see titleBandFor)
 
+    // The credit, centred UNDER the title, from the same geometry paint() draws the
+    // squares with. Sized to its own two words: the Label is capped so the link beside
+    // it keeps room for "Asra3", exactly as it was in the corner. "Vibe coded per" is
+    // 4 px wider than "Vibe coded by" and was drawn condensed the moment this line
+    // started translating, which is why the floor and the cap are both measured.
+    {
+        const auto tband = titleBandFor (getWidth());
+        const int labelW = juce::jlimit (92, 100, fgfit::labelWidth (vibeLabel));
+        const int linkW  = (int) std::ceil (juce::GlyphArrangement::getStringWidth (
+                               juce::Font (juce::FontOptions (12.5f).withStyle ("Bold")),
+                               vibeLink.getButtonText())) + 6;
+        const int creditH = 16;
+        auto credit = juce::Rectangle<int> (0, 0, labelW + 2 + linkW, creditH)
+                          .withCentre ({ juce::roundToInt (tband.centreX()),
+                                         juce::roundToInt (tband.bottom()) + 1 + creditH / 2 });
+        vibeLabel.setJustificationType (juce::Justification::centredRight);
+        vibeLabel.setBounds (credit.removeFromLeft (labelW));
+        credit.removeFromLeft (2);
+        vibeLink.setBounds (credit);
+    }
     auto area = full.reduced (6, 4);
 
     {
@@ -5568,9 +10482,65 @@ void FractalAdditiveAudioProcessorEditor::resized()
     auto caption = [] (juce::Label& l, juce::Rectangle<int>& row, int nominal, int keepForControl = 24)
     {
         l.setJustificationType (juce::Justification::centredLeft);
-        const int need = juce::GlyphArrangement::getStringWidthInt (l.getFont(), l.getText()) + 4;
-        const int w    = juce::jmax (nominal, need);
-        l.setBounds (row.removeFromLeft (juce::jmin (w, juce::jmax (0, row.getWidth() - keepForControl))));
+        // fgfit::labelWidth, not a hand-rolled measurement: a juce::Label does NOT draw
+        // into its whole width (getBorderSize is taken off first, 5 px a side by
+        // default) and GalacticLnF draws it in a BOLD face with a 12.5 px floor. Sizing
+        // to l.getFont()'s width plus 4 got both of those wrong at once, so "Period",
+        // "Per\xc3\xado" "de" and "smallest interval (c)" were all quietly condensed.
+        const int w = juce::jmax (nominal, fgfit::labelWidth (l));
+        // THE LABEL'S OWN NEED OUTRANKS THE CONTROL'S NOMINAL RESERVE.
+        //
+        // `keepForControl` is what the control beside this label would LIKE. It used to be
+        // absolute, so a narrow row squeezed the caption instead: "C3 =" needs 27 px of
+        // text room and was handed 25 - and being a juce::Label it did not clip, it
+        // condensed, which is the failure with no visible symptom. It was the control the
+        // rig's legibility walk named as binding the whole window's minimum width.
+        //
+        // So the allowance is at least what the reserve leaves, and may rise to what the
+        // label actually needs - never past leaving the control 24 px, which is the least
+        // an editor or a read-out can be and still be one. The control is elastic; a word
+        // is not.
+        const int soft = juce::jmax (0, row.getWidth() - keepForControl);
+        const int hard = juce::jmax (0, row.getWidth() - 24);
+        const int give = juce::jmax (soft, juce::jmin (fgfit::labelWidth (l), hard));
+        l.setBounds (row.removeFromLeft (juce::jmin (w, give)));
+    };
+
+    // [ THE ACTION ][ REALTIME ] - the pair the Spectrum-vs-Tuning column ends both of its
+    // search modes with, laid out from the WORDS on the two buttons instead of from a
+    // fixed 3/5 - 2/5 split of the row.
+    //
+    // The split was fitted to English and to English alone: "REALTIME" needs 79 px of the
+    // 76 the 2/5 gave it - it was 2.24 px over its own box in the SHIPPED window - and
+    // "TEMPS REAL" needs 96, so the Catalan spilled by 17.42 px in every one of the four
+    // scenarios that show this row. Nothing about a fraction of a row could have found
+    // that: it is the button's word that is long, not the window that is narrow.
+    //
+    // WHO YIELDS TO WHOM. The follower's word never changes (it is a mode name), while the
+    // action's does - "Adapt" grows a duration when a run would take more than a second -
+    // so the FOLLOWER is measured and the ACTION takes the remainder. If the action's word
+    // grows so long that the two no longer fit, the follower falls back to exactly the 2/5
+    // it has today rather than eating into it, which is why this can never be narrower for
+    // either button than what it replaces.
+    //
+    // The follower is capped at half the row on purpose: in Catalan the mode's name is as
+    // long as the action's, so the pair comes out even there. The hierarchy the old
+    // fraction was drawing - "the follower must never be the button the hand lands on" -
+    // is carried by ORDER and COLOUR (the action is the panel's accent, the follower is
+    // grey), neither of which a long word can take away.
+    //
+    // The 2 px gap between the pair is still trimmed off their INNER edges only: reducing
+    // both ends pulled the row 1 px in from the column on each side, so this pair alone
+    // contributed two more of the seven different edges this narrow column used to have.
+    auto actionPair = [] (juce::TextButton& go, juce::TextButton& rt, juce::Rectangle<int> row)
+    {
+        const int h = row.getHeight();
+        auto need = [h] (const juce::TextButton& b)
+        { return fgfit::textButtonWidth (b.getButtonText(), h, b.getProperties().contains ("fork")); };
+        const int keep = row.getWidth() * 2 / 5;               // what the follower has today
+        const int rtW  = juce::jlimit (keep, juce::jmax (keep, row.getWidth() - need (go)), need (rt));
+        go.setBounds (row.removeFromLeft (row.getWidth() - rtW).withTrimmedRight (1));
+        rt.setBounds (row.withTrimmedLeft (1));
     };
 
     //== Right column: ONE full-height Spectrum-to-Tuning box - mode controls on top,
@@ -5598,7 +10568,28 @@ void FractalAdditiveAudioProcessorEditor::resized()
         // between two parallel lines. Reclaiming it widens rows 1-2 by 9 px and the
         // right column by 6, so nothing had to shrink to pay for it - which is why
         // nothing in either box needed re-fitting.
-        const int wallX = area.getRight() - 208;
+        // HOW WIDE THIS COLUMN IS. It used to be a flat 208 px at EVERY window size, so
+        // a 1600x900 window handed its whole extra 400 px to rows 1-2 - panels that were
+        // already comfortable (the tuning name's cell went 57 -> 229 px) - while the one
+        // panel that genuinely overflows stayed exactly as cramped as at the floor.
+        // The strings that paid for that are all in here: "De totes les afinacions
+        // possibles" was over its combo by 39.96 px, "TEMPS REAL" over its button by
+        // 18.42, "+ amplituds" over its toggle - all three at the SHIPPED 1200x650, in
+        // Catalan, which is the binding language.
+        //
+        // The growth is measured from the SHIPPED 1200x650 (1188 px of usable width),
+        // not from zero, so every window at or below that size keeps the exact 208 it
+        // was fitted to - the floor included. A first attempt took a flat 22% of the
+        // width instead, which is 261 px at 1200: rows 1-2 lost 53 px there and started
+        // clipping strings of their own ("Transposada avall" needed 117 px of a 109 px
+        // combo, the CUSTOM modulator chip 45 of 44), which is the same fault moved to a
+        // different panel rather than fixed. Only the width the window did not have at
+        // 1200 is redistributed, and 30% of it comes here.
+        //
+        // Capped at 300: past that the column is wider than its longest sentence needs
+        // and the SPECTRUM row is paying for empty gutter.
+        const int specW = juce::jlimit (208, 300, 208 + (area.getWidth() - 1188) * 3 / 10);
+        const int wallX = area.getRight() - specW;
         // Box inset + the two stroke offsets. ROUNDED, not truncated: 2*1.3 truncates to
         // 2 and leaves the two strokes 0.6 px apart, which is a visible pink sliver down
         // the orange border - the doubled wall in miniature.
@@ -5608,7 +10599,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
         // ONE beating mode now, with two selectors inside it:
         //   SOURCE - from the current tuning (combinations of its own degrees) or
-        //            from all possible tunings (a free search, loadable as a tuning)
+        //            from all tunings (a free search, loadable as a tuning)
         //   SCOPE  - rank by the beating against 0 only, or by every pair's beating
         const int  mode = specModeBox.getSelectedId();
         const bool beat = mode == 1;                       // "Find tunings based on beating"
@@ -5620,8 +10611,63 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
         gSpecScale.setBounds (sp.reduced (3, 2)); // same top/bottom lines as rows 1-2
         auto si = sp.reduced (3).reduced (8, 5); si.removeFromTop (20);
+
+        //== THE THREE NUMBERS THIS WHOLE COLUMN IS SPACED BY ====================
+        //
+        // "esta mal alineado". It was spaced by eleven different ad-hoc gaps - 1, 2, 3
+        // and 4 px, in no pattern - and by two different row heights (22 everywhere and
+        // 24 for the scope box and the action pair), and its values were four different
+        // widths (32, 44, 44, 48) anchored to three different edges. Three constants
+        // replace all of that, and every row below is laid out from them.
+        //
+        //   kRowH   one row height, so the tops and bottoms of a column of controls
+        //           line up whatever kind of control each one is. A ComboBox already
+        //           filled its row and a TextEditor was inset by 1 px top and bottom, so
+        //           the two were 22 and 20 in the same stack: a 1 px step that reads as
+        //           a wobble down the value column and as nothing you can name.
+        //   kGapIn  between two rows of the SAME section.
+        //   kGapSec between sections, and around the framed stack as a whole. It is
+        //           double kGapIn on purpose - that is the only thing separating the two
+        //           kinds of gap once the frame's rules are drawn inside kGapSec - and
+        //           the section rule sits at its centre, 2 px clear of a row either side.
+        //
+        // MEASURED, because this column has no room to be generous with: at 1200x650 the
+        // goal-Range shape had 56 px of adapted-partial list against RhythmVerify's 54 px
+        // floor. Normalising costs 5 px of gaps in that shape and gives back 2 px on the
+        // scope row, 2 px on the action pair and 1 px on a stray one-pixel gap that
+        // belonged to nothing - so it is 4 px cheaper than what it replaces, and the
+        // frames drawn on top of it are free. Every other shape gains far more: the
+        // search from the current tuning gains 39 px, because it was reserving a row for
+        // a progress label that mode never shows (see below).
+        const int kRowH   = 22;
+        const int kGapIn  = 2;
+        const int kGapSec = 4;
+        // ONE VALUE WIDTH for the whole stack, so the values line up on BOTH edges and
+        // not just on the right one. 44, not the 48 the smallest-interval field had: 48
+        // would take four pixels off the amplitudes toggle, which is the one control in
+        // this column that is already measured to the pixel in Catalan (see the
+        // applyLanguage note on why it lost its "+"), and 44 holds five digits with the
+        // 4 px indents these editors are built with.
+        const int kValW   = 44;
+        // The top of each section, in si's coordinates, as the stack is laid out; the
+        // frame and its rules are derived from these at the end (see specSections).
+        int bandTop = si.getY();
+        std::vector<int> bandRules;
+        // Close the section that is open and start a new one. `si.getY()` at this moment
+        // is the first pixel AFTER the section just finished, so the rule goes at the
+        // centre of the kGapSec that follows - which is why sections may only ever be
+        // separated by kGapSec, never by kGapIn.
+        const auto endSection = [&si, &bandRules, kGapSec]
+        {
+            bandRules.push_back (si.getY() + kGapSec / 2);
+            si.removeFromTop (kGapSec);
+        };
+
         specModeBox.setBounds (si.removeFromTop (34));     // two lines: full mode names fit
-        si.removeFromTop (3);
+        // The mode selector is the column's SUBJECT, not one of its settings, so it sits
+        // outside the framed stack - which starts here.
+        si.removeFromTop (kGapSec);
+        bandTop = si.getY();
         tuneSourceBox.setVisible (beat);
         // The SCOPE means the same thing in both directions - judge every note against the
         // root, or every pair - so the adaptation shares the control rather than growing a
@@ -5629,24 +10675,31 @@ void FractalAdditiveAudioProcessorEditor::resized()
         tuneScopeBox.setVisible (beat || adapt);
         if (beat)
         {
-            tuneSourceBox.setBounds (si.removeFromTop (22));
-            si.removeFromTop (2);
+            tuneSourceBox.setBounds (si.removeFromTop (kRowH));
+            si.removeFromTop (kGapIn);
         }
         if (adapt)
         {
-            adaptTargetBox.setBounds (si.removeFromTop (22));
-            si.removeFromTop (2);
+            adaptTargetBox.setBounds (si.removeFromTop (kRowH));
+            si.removeFromTop (kGapIn);
         }
         if (beat || adapt)
         {
-            // 24, not 30. It was sized for two lines of a name it no longer has ("0 vs all"
-            // and "all vs all" are one short line in both languages), and in the adaptation
-            // those six pixels are the difference between four adapted partials on screen
-            // and five - the list is the leftover of this column and pays for every row.
-            tuneScopeBox.setBounds (si.removeFromTop (24));
-            si.removeFromTop (3);
+            // It was 24, and before that 30 - sized for two lines of a name it no longer
+            // has ("0 vs all" and "All vs all" are one short line in both languages). It
+            // is the stack's own row height now, which is what puts it on the same rhythm
+            // as everything under it, and the two pixels go where every pixel in this
+            // column goes: to the results list.
+            // ...and only as wide as "All vs all" / "Tot vs tot" needs. It used to take
+            // the column's whole width for two three-word items.
+            {
+                auto scr = si.removeFromTop (kRowH);
+                tuneScopeBox.setBounds (scr.removeFromLeft (
+                             juce::jmin (fgfit::snugComboWidth (tuneScopeBox, kRowH), scr.getWidth())));
+            }
+            // WHAT is compared, above; HOW the search is set up, below.
+            endSection();
         }
-        si.removeFromTop (1);
 
         // Mode-gated visibility. BOTH beating sources now share ONE set of controls
         // - Notes, Min/Max, Period, smallest interval - so the two submenus differ
@@ -5659,8 +10712,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
                                       &chordPerLbl, &chordPeriodEdit, &chordMinEdit, &chordMinLbl };
         juce::Component* adaptC[] = { &adaptTargetBox, &adaptPartialsBox, &adaptPartialsLbl,
                                       &adaptGoalBox, &adaptAmpsToggle, &adaptGoBtn, &adaptRtBtn,
-                                      &adaptInfoLbl, &adaptView,
-                                      &adaptRegLbl, &adaptRegStepsEdit, &adaptRegSpanLbl };
+                                      &lookaheadBtn, &adaptInfoLbl, &adaptView,
+                                      &adaptRegLbl, &adaptRegPeriodsEdit, &adaptRegSpanLbl };
         for (auto* c : sethC)  c->setVisible (false);
         for (auto* c : segC)   c->setVisible (seg);
         for (auto* c : beatC)  c->setVisible (beat || adapt); // Period + smallest interval are shared
@@ -5679,19 +10732,34 @@ void FractalAdditiveAudioProcessorEditor::resized()
         chordProgLbl.setVisible (chord);   // the adaptation's progress lives in its read-out
         nadBox.setVisible (false); // the note count is the shared "Notes" box now
 
-        const bool fromChord = processorRef.getGeneratedSclName().startsWith ("chord-");
-        chordViewBack.setVisible (chord && fromChord);
-        chordViewFwd.setVisible  (chord && fromChord);
+        // "QUITA EL TUNING INFO EN EL MODO DE ENCONTRAR TUNINGS A PARTIR DE BATIDOS."
+        //
+        // The Results / Tuning info pair was a two-state view switch over the list below
+        // it, and in THIS mode the list is the whole point: you are reading found tunings
+        // to pick one. The second view showed the degrees of whichever one you had
+        // already loaded - a different question, answered by the Tuning panel, and its
+        // button sat over the results permanently offering to hide them. Both halves go:
+        // a lone "Results" button that is always the current view is not a control.
+        //
+        // chordDegView is forced back to false rather than left at whatever it was, or a
+        // user who had switched to the degree view before this build would open the panel
+        // to a list that is no longer reachable.
+        chordDegView = false;
+        chordViewBack.setVisible (false);
+        chordViewFwd.setVisible  (false);
 
         if (seg)
         {
-            auto pr = si.removeFromTop (22);
-            segPeriodLbl.setJustificationType (juce::Justification::centredLeft);
+            auto pr = si.removeFromTop (kRowH);
+            // (its centredLeft justification is set once, where the label is made - see
+            // the specCaptions loop in the constructor. Four rows in this block used to
+            // re-decide it on every layout pass, which is four copies of one decision
+            // that nothing kept in step.)
             segPeriodLbl.setBounds (pr.removeFromLeft (48));
-            segPeriodEdit.setBounds (pr.removeFromLeft (40).reduced (0, 1));
+            segPeriodEdit.setBounds (pr.removeFromLeft (40));
             pr.removeFromLeft (5);
             segTopToggle.setBounds (pr);          // "= top partial"
-            si.removeFromTop (2);
+            si.removeFromTop (kGapIn);
             segHelpLbl.setBounds (si.removeFromTop (26));
         }
         else if (beat || adapt) // the SAME stacked rows for the search and its inverse
@@ -5707,52 +10775,117 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 const int keep = chordNotesBox.getSelectedId();
                 chordNotesBox.clear (juce::dontSendNotification);
                 for (int n = 2; n <= maxN; ++n) chordNotesBox.addItem (juce::String (n), n);
-                chordNotesBox.setSelectedId (juce::jlimit (2, maxN, keep < 2 ? 3 : keep),
+                // 5, matching the shipped default - this fallback still said 3, which is
+                // what the box defaulted to before "que por defecto sean 5 notas".
+                chordNotesBox.setSelectedId (juce::jlimit (2, maxN, keep < 2 ? 5 : keep),
                                              juce::dontSendNotification);
             }
 
-            auto r1 = si.removeFromTop (22);
+            auto r1 = si.removeFromTop (kRowH);
             if (beat)
             {
-                chordNotesLbl.setJustificationType (juce::Justification::centredLeft);
+                // Fixed widths, NOT `caption`, and deliberately: these two rows carry a
+                // second control after the value (Min/Max, and the goal box), so a caption
+                // sized to its own words takes those pixels off a ComboBox - and a
+                // ComboBox does not report the loss, it just draws less of its item.
+                // Measured: routing "Partials" through `caption` takes 61 px instead of
+                // 52 and leaves the goal box 79, where "Range" has 3 px to spare. The
+                // captions here fit their cells in both languages (RhythmVerify's
+                // condensed count is 0), so there is nothing to buy with that risk.
                 chordNotesLbl.setBounds (r1.removeFromLeft (44));
-                compact (chordNotesBox, r1.removeFromLeft (48));
+                // MEASURED, NOT 48. This box is REBUILT above: from the current tuning it
+                // runs 2..12, so on a scale with ten or more degrees its widest item is two
+                // digits - and a flat 48 px leaves 11 px of text room once the chevron
+                // gutter is taken off, against the 19 that "12" needs. Nothing saw it while
+                // the fit sweep measured a combo against its full box; it is the first
+                // thing the sweep named once it started subtracting the gutter.
+                compact (chordNotesBox, r1.removeFromLeft (
+                             juce::jmax (48, fgfit::snugComboWidth (chordNotesBox, kRowH))));
                 r1.removeFromLeft (6);
                 compact (chordMinMaxBox, r1);
             }
             else
             {
-                adaptPartialsLbl.setJustificationType (juce::Justification::centredLeft);
-                adaptPartialsLbl.setBounds (r1.removeFromLeft (52)); // "Partials"
-                compact (adaptPartialsBox, r1.removeFromLeft (46));
+                // MEASURED, BOTH OF THEM. "Partials" is a wider word than the "Notes" this
+                // row holds in the other mode, and the two hard numbers here - 52 for the
+                // caption, 46 for the box - were chosen when the box was measured against
+                // its whole width. Once the fit sweep started subtracting the chevron
+                // gutter it turned out the value had NINE pixels for a two-digit number,
+                // and the box drew "..." where the partial count should be. The caption
+                // takes what its own word needs and the box what its widest item needs;
+                // the goal box beside them still takes the remainder, which is what it was
+                // always for.
+                adaptPartialsLbl.setBounds (r1.removeFromLeft (
+                        juce::jmax (52, fgfit::labelWidth (adaptPartialsLbl))));
+                compact (adaptPartialsBox, r1.removeFromLeft (
+                        juce::jmin (juce::jmax (46, fgfit::snugComboWidth (adaptPartialsBox, kRowH)),
+                                    juce::jmax (1, r1.getWidth() - 6 - 40))));
                 r1.removeFromLeft (6);
                 compact (adaptGoalBox, r1);
             }
-            si.removeFromTop (3);
-            auto r2 = si.removeFromTop (22);
-            chordPerLbl.setJustificationType (juce::Justification::centredLeft);
-            chordPerLbl.setBounds (r2.removeFromLeft (44));
-            chordPeriodEdit.setBounds (r2.removeFromLeft (44).reduced (0, 1));
+            si.removeFromTop (kGapIn);
+            auto r2 = si.removeFromTop (kRowH);
+            // 44 was measured for "Period"; "Per\xc3\xado" "de" needs 4 more and was condensed.
+            caption (chordPerLbl, r2, 44, kValW + 6);
+            // ONE RIGHT EDGE - AND, NOW, ONE WIDTH - for the values in this stack. Every
+            // row here is [caption][value], and the captions are wildly different lengths
+            // - "Notes" against "Smallest interval (c)" - so left-placing each value put
+            // the three of them at three different x (1035 / 1036 / 1116 in the shipped
+            // window): a stack that reads as one column but is not one. Their captions
+            // cannot be made one width (the longest is 125 px inside a 192 px column,
+            // which would leave the Notes row's Min/Max box 13 px), so the alignment is
+            // taken on the side that CAN hold: the values end where the row ends, which
+            // is also where the Notes row's Min/Max box and the buttons under them end.
+            //
+            // The right edge alone was not enough. Two right-anchored fields 44 and 48 px
+            // wide have their LEFT edges 4 px apart, so the column this comment claimed
+            // to be building had a step in it that only showed on the side nobody had
+            // measured. kValW is that width, and it is now the width of EVERY value in
+            // the stack - the two range fields and the register-band field included, and
+            // those two used to be 44 and 32 starting at the same x.
+            //
+            // In the adaptation the period is not the last thing on its row - the
+            // amplitudes toggle follows it - so there it stays left, beside the
+            // caption it belongs to. That is the one value in the stack that cannot take
+            // the shared right edge, and it is not a choice: the toggle needs every
+            // remaining pixel of that row in Catalan (see below), so moving the field
+            // right would either overlap it or condense its word.
             if (adapt)
             {
-                r2.removeFromLeft (6);
-                adaptAmpsToggle.setBounds (r2);      // "+ amplitudes"
+                chordPeriodEdit.setBounds (r2.removeFromLeft (kValW));
+                // ...and the toggle takes EVERY remaining pixel of the row. The 6 px gap
+                // that used to be spent here bought nothing: LookAndFeel_V4 draws the tick
+                // box 4 px in from the button's own left edge, so the air was already
+                // there and the gap was 6 px of it taken off the one control on this row
+                // that had none to spare (see the button text in applyLanguage - the
+                // Catalan word is 13.11 px longer than the box it was drawn in).
+                adaptAmpsToggle.setBounds (r2);
             }
+            else
+                chordPeriodEdit.setBounds (r2.removeFromRight (juce::jmin (kValW, r2.getWidth())));
             // The result count is fixed at 16 - one control less to think about.
             chordCountLbl.setVisible (false); chordCountBox.setVisible (false);
-            si.removeFromTop (3);
-            auto r3 = si.removeFromTop (22);
-            caption (chordMinLbl, r3, 112, 48); // "smallest interval (c)" / "interval mes petit (c)"
-            chordMinEdit.setBounds (r3.removeFromLeft (juce::jmin (48, r3.getWidth())).reduced (0, 1));
+            si.removeFromTop (kGapIn);
+            auto r3 = si.removeFromTop (kRowH);
+            caption (chordMinLbl, r3, 112, kValW); // "Smallest interval (c)" / "Interval mes petit (c)"
+            // ...and this is the value whose caption is the long one, so it is the row
+            // that was 80 px out of line with the two above it. Nothing follows it in
+            // either mode, so it takes the shared right edge unconditionally.
+            chordMinEdit.setBounds (r3.removeFromRight (juce::jmin (kValW, r3.getWidth())));
             if (adapt && adaptGoalBox.getSelectedId() == 3)
             {
-                si.removeFromTop (3);
-                auto rr = si.removeFromTop (22);
-                adaptRangeLbl.setJustificationType (juce::Justification::centredLeft);
-                adaptRangeLbl.setBounds (rr.removeFromLeft (58)); // "between"
-                adaptLoEdit.setBounds (rr.removeFromLeft (44).reduced (0, 1));
-                rr.removeFromLeft (4);
-                adaptHiEdit.setBounds (rr.removeFromLeft (44).reduced (0, 1));
+                si.removeFromTop (kGapIn);
+                auto rr = si.removeFromTop (kRowH);
+                // The PAIR takes the shared right edge, so the high end of the range lands
+                // on the same line as every other value in the stack and the low end one
+                // field-width in from it. Laid out right to left for exactly that reason:
+                // anchoring the pair on the LEFT (which is what it did) put its right edge
+                // wherever the caption's length in the current language happened to leave
+                // it, so the row moved when the language did.
+                caption (adaptRangeLbl, rr, 58, kValW + 4 + kValW); // "Between"
+                adaptHiEdit.setBounds (rr.removeFromRight (juce::jmin (kValW, rr.getWidth())));
+                rr.removeFromRight (4);
+                adaptLoEdit.setBounds (rr.removeFromRight (juce::jmin (kValW, rr.getWidth())));
             }
             if (adapt)
             {
@@ -5760,39 +10893,58 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // the answer genuinely differs per register and the user must be able to
                 // see, and change, what was optimised for rather than infer it from the
                 // note they happened to be holding.
-                si.removeFromTop (2);
-                auto rg = si.removeFromTop (22);
-                // ONE control on this row now: the caption and a three-digit count (32 px,
-                // where a period number needed 25). The aggregate box that used to sit
-                // beside it is gone - it could not change the result - and so are the two
-                // lines of sentence under it that explained the choice; both are now one
-                // paragraph in this field's own hover. The 36 px kept back is the field
-                // plus its gap, so the caption may still grow into the rest of the row
-                // rather than condensing to 70% in a language with a longer word.
-                caption (adaptRegLbl, rg, 46, 36);
-                adaptRegStepsEdit.setBounds (rg.removeFromLeft (32).reduced (0, 1));
+                si.removeFromTop (kGapIn);
+                auto rg = si.removeFromTop (kRowH);
+                // ONE control on this row: the caption and a value like "1.5". The
+                // aggregate box that used to sit beside it is gone - it could not change
+                // the result - and so are the two lines of sentence under it that explained
+                // the choice; both are now one paragraph in this field's own hover. The
+                // field was 32 px and left-anchored, which put it at the same x as the
+                // range row's low field one row up and made the two look like a column
+                // they were not; it is kValW and right-anchored now, like every other
+                // value here. The caption may still grow into the rest of the row rather
+                // than condensing to 70% in a language with a longer word - which is what
+                // the Catalan "Periodes" would do at the 46 px the shorter caption needed.
+                caption (adaptRegLbl, rg, 58, kValW);
+                adaptRegPeriodsEdit.setBounds (rg.removeFromRight (juce::jmin (kValW, rg.getWidth())));
                 // WHAT N COMES TO, and WHICH NOTE it hangs off. One line at 10 pt, and it is
                 // paid for out of the gaps around it rather than out of the result list:
                 // without this line N is a magic number and the anchor is invisible, which
-                // is the whole failure mode of a range that follows the hands.
+                // is the whole failure mode of a range that follows the hands. Glued
+                // directly under the field it explains - no gap at all - because it is
+                // that field's read-out, not a row of its own.
                 adaptRegSpanLbl.setBounds (si.removeFromTop (12));
             }
+            // HOW the search is set up, above; the buttons that RUN it, below.
+            if (chord || adapt) endSection();
             if (chord)
             {
-                si.removeFromTop (4);
-                auto r4 = si.removeFromTop (24);
-                // Find takes the left ~60%, REALTIME the rest: the follower is a mode, not
-                // the primary action, and it must never be the button the hand lands on.
-                chordGoBtn.setBounds (r4.removeFromLeft (r4.getWidth() * 3 / 5).reduced (1, 0));
-                chordRtBtn.setBounds (r4.reduced (1, 0));
+                actionPair (chordGoBtn, chordRtBtn, si.removeFromTop (kRowH));
+                // The chord search keeps its own progress line, and it keeps it INSIDE
+                // this section - it is what the two buttons above it are doing. The
+                // adaptation does NOT have one: its read-out below carries the progress,
+                // and a second line that was blank most of the time and said
+                // "Realtime: 37 retunes" the rest of it was one of the two lines nobody
+                // could explain.
+                //
+                // It used to be laid out for BOTH beating sources - the row was taken off
+                // `si` whenever the mode was not the adaptation - while the label itself
+                // is only ever VISIBLE in the free search. So combining the current
+                // tuning reserved 16 px for a label nobody can see, every time, and the
+                // results list under it paid for them.
+                si.removeFromTop (kGapIn);
+                chordProgLbl.setBounds (si.removeFromTop (14)); // search progress only
             }
             if (adapt)
             {
-                si.removeFromTop (3);
-                auto r4 = si.removeFromTop (24);
-                adaptGoBtn.setBounds (r4.removeFromLeft (r4.getWidth() * 3 / 5).reduced (1, 0));
-                adaptRtBtn.setBounds (r4.reduced (1, 0));
-                si.removeFromTop (1);
+                // Same pair, same shared edges as the search's Find / Realtime above.
+                actionPair (adaptGoBtn, adaptRtBtn, si.removeFromTop (kRowH));
+                // Lookahead on its own row UNDER the follower it belongs to: it is the
+                // follower's latency trade and means nothing without it, so it must not
+                // sit where it could be mistaken for a third action.
+                si.removeFromTop (kGapIn);
+                lookaheadBtn.setBounds (si.removeFromTop (kRowH));   // the column's own edges
+                si.removeFromTop (kGapIn);
                 // THE one read-out (see adaptReadoutText). 28 px is two lines at 10.5 pt,
                 // and every sentence it can print is written to fit two - RhythmVerify
                 // measures all five of them, in both languages, because only one is ever on
@@ -5801,31 +10953,48 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 // while a run is going, the progress IS this line.
                 adaptInfoLbl.setBounds (si.removeFromTop (28));
             }
-            if (chord && fromChord) // labelled view switch: all results vs the loaded chord's degrees
+            // (the Results / Tuning info switch used to be laid out here - see the note
+            // where it is hidden, above: in this mode the results list is the answer, and
+            // a button offering to replace it with something the Tuning panel already
+            // says was clutter over the thing you came to read. The 25 px it took go to
+            // the list.)
+        }
+
+        //== THE FRAME AROUND THE SECTIONS ======================================
+        // The stack ends here, so this is where the frame that encloses it can be
+        // measured. It reaches kGapSec/2 above the first section's first row and the
+        // same below the last section's last row - i.e. it lives in the two gaps that
+        // already separated the stack from the mode box above and the results list
+        // below, and takes not one pixel from either.
+        //
+        // FOUR pixels wider than the content on each side, and that number is the whole
+        // width there is: si is inset 11 px from the column and gSpecScale's own 2.6 px
+        // border sits about 5.6 px in, so the ground can be 4 px wider than the content
+        // and still leave a pixel and a half of dark between itself and that border.
+        // (The first version was 6 px and painted over the border's inner edge.)
+        {
+            const int frameBot = si.getY() + kGapSec / 2;
+            auto frame = juce::Rectangle<int> (si.getX() - 4, bandTop - kGapSec / 2,
+                                               si.getWidth() + 8, frameBot - (bandTop - kGapSec / 2));
+            // Nothing to enclose is nothing to draw. It cannot happen in any of the three
+            // modes as they stand - each lays out at least one row - but a frame around
+            // nothing is the exact claim RhythmPanel's comment warns about, so it is
+            // stated here rather than left to the modes to keep true.
+            const bool haveSections = frame.getHeight() > kGapSec && frame.getWidth() > 8;
+            specSections.setVisible (haveSections);
+            if (haveSections)
             {
-                si.removeFromTop (3);
-                auto r5 = si.removeFromTop (22);
-                chordViewBack.setColour (juce::TextButton::buttonColourId,
-                    ! chordDegView ? cSpecScale.withAlpha (0.85f) : juce::Colour (0xff44445e));
-                chordViewFwd.setColour (juce::TextButton::buttonColourId,
-                    chordDegView ? cSpecScale.withAlpha (0.85f) : juce::Colour (0xff44445e));
-                chordViewBack.setBounds (r5.removeFromLeft (r5.getWidth() / 2).reduced (1, 0));
-                chordViewFwd.setBounds  (r5.reduced (1, 0));
-            }
-            // The chord search keeps its own progress line. The adaptation does NOT: its
-            // read-out above carries the progress, and a second line that was blank most
-            // of the time and said "realtime: 37 updates" the rest of it was one of the
-            // two lines nobody could explain.
-            if (! adapt)
-            {
-                si.removeFromTop (2);
-                chordProgLbl.setBounds (si.removeFromTop (14)); // search progress only
+                specSections.setBounds (frame);
+                specSections.rules.clear();
+                for (const int y : bandRules)
+                    specSections.rules.push_back (y - frame.getY());
+                specSections.repaint();
             }
         }
 
         // The result list fills the REST of this same box.
-        si.removeFromTop (4);
-        const bool showDeg = (dy) || (chord && fromChord && chordDegView);
+        si.removeFromTop (kGapSec);
+        const bool showDeg = dy; // the chord-degree view went with its switch (see above)
         // The SCOPE selector only decides how a combination is RANKED (against 0, or
         // over every pair); how many notes it has is the shared "Notes" box above.
         dissHeader.setVisible (false);
@@ -5834,10 +11003,25 @@ void FractalAdditiveAudioProcessorEditor::resized()
         chordView.setVisible (chord && ! showDeg);
         if (adapt)
         {
-            adaptView.setBounds (si);
-            const int ah  = adaptList.contentHeight();
-            const bool as = ah > si.getHeight();
-            adaptList.setSize (as ? si.getWidth() - 10 : si.getWidth(), juce::jmax (si.getHeight(), ah));
+            // HONEST FAILURE, the bank row's rule again: at the 870x540 floor the rows
+            // above fill this column completely and `si` comes out 0 px tall, so the
+            // result list was being laid out VISIBLE with no pixels - a viewport nobody
+            // can see, scroll or click, with nothing on screen saying the panel ran out
+            // of room. One row (24 px) is the least that can show a result; below that it
+            // is hidden instead of drawn as a ghost.
+            //
+            // This makes the failure honest; it does not make the floor big enough. At
+            // 870x540 the Adapt column genuinely cannot show its results, which is a
+            // layout question for the column as a whole, not for this one line.
+            const bool listFits = si.getHeight() >= 24;
+            adaptView.setVisible (listFits);
+            if (listFits)
+            {
+                adaptView.setBounds (si);
+                const int ah  = adaptList.contentHeight();
+                const bool as = ah > si.getHeight();
+                adaptList.setSize (as ? si.getWidth() - 10 : si.getWidth(), juce::jmax (si.getHeight(), ah));
+            }
         }
         else if (seg)
         {
@@ -5899,7 +11083,9 @@ void FractalAdditiveAudioProcessorEditor::resized()
         bothEnginesBounds = sp;
 
         const int lblH  = 15; // inline sub-label band (BASE / HARMONICS / DECAY / ...)
-        const int chipH = 18; // the box's title band - the engine chips live in it
+        // The box's title band IS the chip row, at the one height every chip row in this
+        // window uses (fgfit::chip) - the modulator sub-tabs included.
+        const int chipH = fgfit::chip::kHeight;
 
         // Which engine's controls the shared box shows = which engine SOUNDS
         // (engineInForce), the same rule that lights the chips: clicking a chip both
@@ -5911,12 +11097,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
         //-- the chip strip IS the box title (like the Modulators box's tab row) -----
         {
             auto eb = engineBoxBounds.reduced (5, 0);
-            auto chips = eb.removeFromTop (chipH);
+            auto chips = eb.removeFromTop (fgfit::chip::kHeight);
             for (int i = 0; i < 2; ++i)
-            {
-                engineChip[i].setBounds (chips.removeFromLeft (104).reduced (1, 1));
-                chips.removeFromLeft (3);
-            }
+                engineChip[i].setBounds (chips.removeFromLeft (
+                    juce::jmin (fgfit::chip::width (engineChip[i]), juce::jmax (0, chips.getWidth())))
+                        .reduced (fgfit::chip::kInsetX, 0));
         }
 
         // View switching: only the selected engine's controls exist on screen. Hidden,
@@ -5932,46 +11117,322 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
         if (! customView)
         {
-            //-- HARMONIC view: BASE | HARMONICS over PRIME, TEMPER along the bottom --
-            ccScale = ccBody = {}; // the custom view's cells: paint() draws no divider for them
+            //-- HARMONIC view: BASE | HARMONICS over PRIME, TEMPER inside PRIME -------
             auto hb = engineBoxBounds.reduced (5, 0);
             hb.removeFromTop (chipH); hb.removeFromBottom (3);
-            // TEMPER is reachable from BOTH views (see the ctor comment): here it spans
-            // the bottom of the box, under the cells.
-            temperToggle.setBounds (hb.removeFromBottom (20));
+            // TEMPER is reachable from BOTH views (see the ctor comment). Here it goes
+            // at the FOOT OF THE PRIME CELL - "haz que el boton temper to tuning este
+            // debajo de todo dentro de la seccion prime" - not spanning the whole box
+            // under the cells, where it read as a fourth column of the box rather than
+            // as something the prime filter owns. The 20 px row it used to take back
+            // goes to the three cells.
             // Base is the wider column so the Base-pitch combo can show "Transposed
             // down" in full without clipping.
             hcBase      = hb.removeFromLeft (hb.getWidth() * 52 / 100);
             auto midCol = hb;
-            hcHarm      = midCol.withHeight (midCol.getHeight() * 2 / 5);
-            hcPrime     = midCol.withTrimmedTop (midCol.getHeight() * 2 / 5);
+            // HARMONICS holds exactly ONE fader, so it takes exactly what that fader
+            // needs and PRIME gets everything else. As a 2/5 : 3/5 fraction it was
+            // hoarding 14 px that prime now needs: with TEMPER moved inside it, the
+            // prime cell has to hold a mode box, nine tick boxes with their labels AND
+            // that row, and the ticks came out 8 px tall - present, laid out, inside
+            // their box, and far too small to hit.
+            //
+            // The half-and-half cap is NOT the thing to tune when the column is short.
+            // Serving prime first instead - it has four rows to harmonics' one - reads
+            // like the obvious improvement and measured 50 px WORSE (floor 590 -> 640):
+            // harmonics cannot shrink at all, because under its caption sits a fader
+            // whose own value label goes to negative height the moment the cell drops
+            // below label + 24 + inset. Tried, measured, reverted; the note is here so
+            // the next person does not spend the same hour.
+            const int harmH = juce::jmin (midCol.getHeight() / 2, lblH + 24 + 6); // label + fader + its 3 px inset
+            hcHarm      = midCol.withHeight (harmH);
+            hcPrime     = midCol.withTrimmedTop (harmH);
             {
                 auto bi = hcBase.reduced (5, 3); bi.removeFromTop (lblH);
-                auto left = bi.removeFromLeft (bi.getWidth() * 34 / 100);
+                // THE WORD IS RESERVED BEFORE THE FADER, not after it. The N fader took a
+                // flat 34% and the pitch box took the remainder, so the box's longest item
+                // - "Transposed down", "Transposada avall" - was the first thing in the
+                // whole window to stop fitting as the window narrowed: it is what the
+                // rig's legibility measurement names as the binding control in BOTH
+                // languages. A fader is elastic and a word is not, so the box states what
+                // it needs and the fader lives on the rest.
+                //
+                // Still capped at the same 34%, so nothing that fits today gets wider, and
+                // floored at 40 px so the fader never becomes a line.
+                const int pitchNeed = fgfit::snugComboWidth (basePitchBox, 24);
+                const int leftW = juce::jlimit (40, juce::jmax (40, bi.getWidth() * 34 / 100),
+                                                bi.getWidth() - 5 - pitchNeed);
+                auto left = bi.removeFromLeft (leftW);
                 lblBaseN.setBounds (left.removeFromTop (13)); baseNFader.setBounds (left);
                 bi.removeFromLeft (5);
                 lblBasePitch.setBounds (bi.removeFromTop (13));
                 compact (basePitchBox, bi.removeFromTop (24));
             }
             {
-                auto hi = hcHarm.reduced (5, 3); hi.removeFromTop (lblH);
+                auto hi = hcHarm.reduced (5, 3);
+                // THE TITLE ROW IS AS TALL AS A TICK BOX, NOT AS TALL AS A CAPTION.
+                //
+                // "la casilla de temper se ve semicortada" - and it was, by exactly half a
+                // pixel at each end. GalacticLnF draws every tick box as a FIXED 16 px
+                // square (fgfit::kTickBox) at y = (height - 16) / 2, which is the whole
+                // point of that constant: LookAndFeel_V4 derived the box from the button's
+                // HEIGHT and produced three different sizes in one panel, and this
+                // LookAndFeel exists partly to stop that. In a 15 px row that fixed glyph
+                // lands at y = -0.5 and JUCE clips it top and bottom. I gave the row the
+                // caption's 15 and read the V4 formula out of a comment that was there to
+                // say it is no longer used.
+                //
+                // So the row asks for kTickBox + 1 - the glyph plus a pixel of air - and
+                // takes it from the fader below, which is elastic in a way a fixed glyph is
+                // not: the harmonics fader is LinearHorizontal and loses 2 px of track,
+                // while a tick box loses its outline. Only when what is left still holds a
+                // usable fader; below that the toggle is hidden and the RESIZE tag beside
+                // the title says so, which is the rule this row already followed for width.
+                const int kTickRow = fgfit::kTickBox + 1;
+                const int titleH   = (hi.getHeight() - kTickRow >= 20)
+                                   ? juce::jmax (lblH, kTickRow) : lblH;
+                auto htop = hi.removeFromTop (titleH);
+
+                //-- TEMPER TO TUNING, IN THE HARMONICS TITLE ROW --------------------
+                //
+                // "me gustaria que la casilla temper to tuning este a la derecha de
+                //  harmonics para que en primes haya mas espacio, que ahora todo lo de
+                //  primes se ve mal por estar chafado."
+                //
+                // It used to take 23 px off the FOOT of the prime cell, and prime is the
+                // cell that cannot spare them: it holds a title, a mode box, an ON switch,
+                // nine tick boxes and nine numbers under them, and what was left for the
+                // tick row was single figures at anything under a wide window. Moving the
+                // toggle hands all 23 px back to the row that was being crushed.
+                //
+                // The TITLE ROW and not beside the fader, and that is arithmetic rather
+                // than taste. This cell is ~245 px wide at the shipped 1200x650; the
+                // harmonics fader is LinearHorizontal with an 86 px value box ("Even-All
+                // 50%") plus a track, and the toggle measures ~142 px in English and ~168
+                // in Catalan - so side by side one of the two would be a sliver. The
+                // painted word "HARMONICS" needs about 62 of those 245 and nothing else
+                // shares its row, which is the only place in this cell with room to spare.
+                //
+                // Hidden rather than squashed when it does not fit, by the same rule the
+                // prime mode switch and this very toggle already followed: a ToggleButton
+                // with no room for its word is an unlabelled tick that silently re-tunes
+                // the whole spectrum, and that is worse than absent. TEMPER is reachable
+                // from the custom view too (see the ctor comment), so it never becomes
+                // unreachable - only unreachable FROM HERE, at widths where this panel
+                // cannot be operated anyway.
+                {
+                    const int th = juce::jmax (1, htop.getHeight());
+                    const int tw = fgfit::snugToggleWidth (temperToggle, th);
+                    // The word it must not tread on, measured in the font paint() really
+                    // uses for it (see paintedSubLabels + the probe that reads them: 11.5
+                    // Bold), in BOTH languages via tr - the Catalan HARMONICS is the wider
+                    // of the two and is what decides at the narrow end.
+                    const int titleW = juce::GlyphArrangement::getStringWidthInt (
+                                           juce::Font (juce::FontOptions (11.5f).withStyle ("Bold")),
+                                           tr ("HARMONICS", "HARM\xc3\x92NICS"));
+                    // ...AND THE GLYPH HAS TO BE WHOLE, not only the word. A tick box drawn
+                    // half outside its button is a control that looks broken rather than
+                    // one that looks small, and the row only gets its kTickRow when the
+                    // fader below can spare it - so this is the case where it could not.
+                    const bool fits = th >= fgfit::kTickBox
+                                   && tw <= htop.getWidth() - titleW - 8;
+                    temperToggle.setVisible (fits);
+                    // Read by paintedSubLabels(), which shortens HARMONICS' cell by it.
+                    harmTemperW = fits ? tw + 8 : 0;
+                    harmTemperHidden = ! fits;   // paintedSubLabels says so on the glass
+                    if (fits)
+                        temperToggle.setBounds (htop.removeFromRight (tw).withSizeKeepingCentre (tw, th));
+                }
                 harmonicsFader.setBounds (hi.withSizeKeepingCentre (hi.getWidth(), juce::jmin (24, hi.getHeight())));
 
                 const bool wl = processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f;
                 primeLimitFader.setVisible (! wl); lblPrimeLimit.setVisible (! wl);
                 for (int i = 0; i < 9; ++i) { primeToggle[i].setVisible (wl); primeLbl[i].setVisible (wl); }
 
+                // With the switch OFF the controls it governs are DIMMED, not removed.
+                // Hiding them would make the panel jump every time the switch is clicked
+                // and would leave the user with no idea what turning it on would do; a
+                // greyed control says both "this exists" and "it is not acting on your
+                // sound right now", which is exactly the state OFF describes.
+                {
+                    const bool pon = processorRef.apvts.getRawParameterValue ("primeOn")->load() > 0.5f;
+                    primeModeBox.setEnabled (pon);
+                    primeLimitFader.setEnabled (pon); lblPrimeLimit.setEnabled (pon);
+                    for (int i = 0; i < 9; ++i) { primeToggle[i].setEnabled (pon); primeLbl[i].setEnabled (pon); }
+                }
+
                 auto pi = hcPrime.reduced (5, 3); pi.removeFromTop (lblH);
-                compact (primeModeBox, pi.removeFromTop (22));
+                // TEMPER TO TUNING IS NOT IN THIS CELL ANY MORE. It used to be reserved off
+                // the FOOT of prime, before the mode row and the primes, and the 23 px it
+                // took were the 23 px this cell most needed: a title, a mode box, an ON
+                // switch, nine tick boxes and nine numbers under them all live here, and
+                // what was left for the tick row was single figures of height at anything
+                // short of a wide window - which is the "todo lo de primes se ve mal por
+                // estar chafado" the user photographed. It now shares the HARMONICS title
+                // row, the one row in this box with width to spare, and every pixel it
+                // used to hold comes back to the ticks. See the harmonics block above.
+                // Limit / Whitelist, at the width those two words need - not the whole
+                // cell. It held a 247 px box for a six-letter mode name. The ON switch
+                // takes the space to its right, which that row was already wasting.
+                {
+                    auto pmr = pi.removeFromTop (22);
+                    compact (primeModeBox, pmr.removeFromLeft (
+                                 juce::jmin (fgfit::snugComboWidth (primeModeBox, 22), pmr.getWidth())));
+                    // Hidden rather than squashed, by the same rule as TEMPER above: a
+                    // ToggleButton with no room for its word is an unlabelled tick that
+                    // silently filters the whole spectrum. When it will not fit, the
+                    // panel is too narrow to be operated anyway - and OFF, its default,
+                    // is the state in which nothing is being hidden from the user.
+                    pmr.removeFromLeft (6);
+                    const int ow = fgfit::snugToggleWidth (primeOnToggle, 20);
+                    const bool onFits = ow <= pmr.getWidth();
+                    primeOnToggle.setVisible (onFits);
+                    if (onFits)
+                        primeOnToggle.setBounds (pmr.removeFromRight (ow).withSizeKeepingCentre (ow, 20));
+                }
                 pi.removeFromTop (2);
+                primeTicksHidden = false;
                 if (wl)
                 {
-                    const int tw = pi.getWidth() / 9;
+                    // Nine cells out of a width that is almost never a multiple of nine.
+                    // The integer division threw the remainder away - up to 8 px, which
+                    // is more than half a digit at the size these labels are drawn - so
+                    // the first (w % 9) cells take one pixel more and the row ends flush
+                    // with the panel instead of short of it.
+                    const int wAll = pi.getWidth();
+                    const int tw   = wAll / 9;
+                    const int extra = wAll - tw * 9;
+                    // ...and the two of them SHARE the height instead of one taking a
+                    // fixed 13 and the other whatever is left. That subtraction went
+                    // negative in a short window and handed the tick box a height of
+                    // ZERO - a visible control with no pixels, which is the structural
+                    // fault the rig refuses to floor on, and it cost the whole window
+                    // 60 px of minimum height the moment Whitelist became the default
+                    // mode. Now the tick keeps 10 px before the number gives any back,
+                    // and neither ever reaches zero.
+                    const int rowH = juce::jmax (1, pi.getHeight());
+                    const int lblRowH = juce::jlimit (1, 13, rowH - 10);
+                    const int tickH   = juce::jmax (1, juce::jmin (22, rowH - lblRowH));
+
+                    //-- NINE TICK BOXES, OR NONE OF THEM --------------------------------
+                    //
+                    // The clamps above stop the row COLLAPSING; they never stopped it
+                    // being useless. Measured off the rig's own photographs, with the
+                    // shipped 1200x650 as the reference: there the row is 199 px wide and
+                    // 34 px tall - nine cells of 22 px around a 21 px tick box, with 13 px
+                    // of number under it, so it clears by a single pixel. Ten pixels of
+                    // window narrower than 1120 and the cell is 19 px against a tick box
+                    // that needs 20, which is the refusal that held this window's floor at
+                    // 1120. At 690x550 the same row is 86 px wide - nine cells of 9 px
+                    // around a tick box that wants 20 - and what is left of the cell's
+                    // height under the title and mode rows is single figures, so the clamp
+                    // above holds the number row at its 1 px minimum. What reaches the
+                    // glass there is a 2 px sliver of a box and a line of ink where the
+                    // primes should be, and the row that decides which primes the whole
+                    // spectrum is allowed cannot be read or aimed at.
+                    //
+                    // So it is HIDDEN, whole, by this decision - the same rule TEMPER and
+                    // the ON switch above already follow in this very cell, and for the
+                    // same reason: a control that cannot be operated is worse than absent,
+                    // because absent is honest and a sliver is not. Never a squashed row,
+                    // never eight ticks instead of nine.
+                    //
+                    // THE THREE NUMBERS. The width test is the RIG's own predicate, not a
+                    // second opinion: fgfit::toggleTickWidth is exactly what the snapshot
+                    // gate measures a tick box against, so the layout can never certify a
+                    // row the gate refuses. 16 px of tick height is where the box itself
+                    // (jmin(15, h*0.75) * 1.1) falls to 13.2 px, which is the smallest
+                    // square anything in this window asks a mouse to hit - the +/- steppers
+                    // are 17 px - and below it the tick is decoration. 10 px of number row
+                    // is the least that shows the 8 px Bold digit the floor below draws
+                    // whole; at 1 px it is a smear.
+                    //
+                    // WRAPPING ONTO TWO ROWS, TRIED ON PAPER AND REJECTED. Five per row
+                    // needs 5 x 21 = 105 px of width and this cell has 86 at 690; three
+                    // rows of three need 63, which does fit - and then three times
+                    // (16 tick + 10 number + 2) = 84 px of HEIGHT, where the whole cell is
+                    // 52 px tall at 550 and the row under its title and mode box is single
+                    // figures. Wrapping trades a width the cell has not got for a height it
+                    // has far less of, because this cell is starved vertically long before
+                    // it is starved horizontally.
+                    //
+                    // GIVING PRIME THE WHOLE ENGINE BOX'S WIDTH (BASE | HARMONICS above,
+                    // PRIME across the foot), ALSO REJECTED. It does solve the width - the
+                    // full inner box is 190 px at 690, which is the nine at 21 - but BASE
+                    // needs 58 px of height and HARMONICS 45 (below that its fader's own
+                    // value label goes to negative height, see the note on harmH above), so
+                    // the stacked arrangement wants 58 + 63 = 121 px where the engine box
+                    // has 97 at 550: it moves the block from width to height and buys the
+                    // ticks nothing under about 610 px of window. And it would make the
+                    // BASE | HARMONICS wall stop in mid-box, which is the exact fault - "la
+                    // linea de la pared izquierda de la subcaja de prime esta incompleta,
+                    // tiene un hueco abajo" - that had spectrumDividers() rewritten so
+                    // every vertical divider in this panel runs top to bottom.
+                    //
+                    // NOT UNREACHABLE. The row comes back the moment the window is big
+                    // enough, and paintedSubLabels() paints a tag beside the cell's title
+                    // saying so while it is gone (primeTicksHidden). The parameters
+                    // themselves are untouched either way: they stay automatable, MIDI
+                    // mappable and preset-visible with the row off screen.
+                    const bool ticksFit = tw >= fgfit::toggleTickWidth (tickH)
+                                       && tickH >= 16 && lblRowH >= 10;
+                    primeTicksHidden = ! ticksFit;
                     for (int i = 0; i < 9; ++i)
                     {
-                        auto cell = pi.removeFromLeft (tw);
-                        primeLbl[i].setBounds (cell.removeFromBottom (13));
-                        primeToggle[i].setBounds (cell.withSizeKeepingCentre (juce::jmin (22, tw), juce::jmin (22, cell.getHeight())));
+                        primeToggle[i].setVisible (ticksFit);
+                        primeLbl[i].setVisible (ticksFit);
+                    }
+                    // The number SHRINKS TO ITS CELL rather than stepping through sizes
+                    // somebody picked by eye. Measured at a reference size and scaled:
+                    // two digits at 12.5 Bold need 14.6 px, the cell is often 16 and was
+                    // 13 at the width where the window's legibility measurement stopped -
+                    // first on "11", then on "17", then on "19", which is the signature of
+                    // a fixed size meeting a variable box. Floored at 8 so it never
+                    // becomes decoration, capped at 12.5 so a roomy panel looks exactly
+                    // as it did.
+                    const juce::Font ref (juce::FontOptions (10.0f).withStyle ("Bold"));
+                    float widest = 1.0f;
+                    for (int i = 0; i < 9; ++i)
+                        widest = juce::jmax (widest, juce::GlyphArrangement::getStringWidth (
+                                                         ref, primeLbl[i].getText()));
+                    const float pf = juce::jlimit (8.0f, 12.5f,
+                                                   10.0f * (float) juce::jmax (1, tw - 2) / widest);
+                    // A TICK AND ITS NUMBER ARE ONE CONTROL, SO THEY GET ONE RECTANGLE -
+                    // AND IT COMES OFF THE TOP OF THE CELL.
+                    //
+                    // The tick used to be centred in whatever the cell had left after the
+                    // number was pinned to the BOTTOM, so the two ends of one control were
+                    // anchored to opposite edges of a box whose height nothing bounds. They
+                    // therefore drifted apart as the window grew, and the drift is the whole
+                    // of the surplus: measured off the rig's own photographs, the gap under
+                    // the tick is 0 px at the shipped 1200x650 (a 34 px row: 21 of tick, 13
+                    // of number, exactly full) and about 80 px at 1600x900, where the same
+                    // row is over 110 px tall and the tick is still capped at 22. What the
+                    // reader saw was a checkbox, a hand's width of nothing, and a number -
+                    // three things, not one, and no way to tell which number was whose.
+                    //
+                    // The pair now takes tickH + lblRowH off the TOP and the surplus stays
+                    // below it as the cell's bottom padding, in one piece. tickH is the same
+                    // number ticksFit above is decided on - jmin (22, rowH - lblRowH) - so
+                    // whenever the row is not taller than the pair needs (rowH - lblRowH
+                    // <= 22, which is every size that fits today, 1200x650 included) the
+                    // pair rectangle IS the whole cell and the layout is pixel-identical to
+                    // what shipped. Only the sizes that had a gap change.
+                    //
+                    // NOT CENTRED IN THE STRIP, which was the first thing tried and looks
+                    // better in isolation: the HARMONICS fader sits directly above this row
+                    // in the same column and the two are read as one stack, so centring the
+                    // block moved the primes ~60 px away from the control they line up
+                    // under and broke the column to tidy the cell. Padding belongs at the
+                    // bottom of a group, not between a control and the word for it.
+                    for (int i = 0; ticksFit && i < 9; ++i)
+                    {
+                        const int cw = tw + (i < extra ? 1 : 0);
+                        auto cell = pi.removeFromLeft (cw).removeFromTop (tickH + lblRowH);
+                        primeLbl[i].setFont (juce::Font (juce::FontOptions (pf).withStyle ("Bold")));
+                        primeLbl[i].setBounds (cell.removeFromBottom (lblRowH));
+                        primeToggle[i].setBounds (cell.withSizeKeepingCentre (
+                            juce::jmin (22, cw), juce::jmax (1, juce::jmin (22, cell.getHeight()))));
                     }
                 }
                 else
@@ -5991,58 +11452,130 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // The prime controls are the harmonic view's; paint() reads empty hc* rects
             // as "draw no harmonic dividers or sub-labels".
             hcBase = hcHarm = hcPrime = {};
+            // ...and with them the width TEMPER was holding in the harmonics title row:
+            // the custom view lays that toggle out somewhere else entirely, and a stale
+            // reservation here would shorten a cell that no longer exists.
+            harmTemperW = 0;
+            harmTemperHidden = false;
             primeLimitFader.setVisible (false); lblPrimeLimit.setVisible (false);
+            primeOnToggle.setVisible (false); // the switch belongs to the harmonic view too
             for (int i = 0; i < 9; ++i) { primeToggle[i].setVisible (false); primeLbl[i].setVisible (false); }
+            // ...and the flag with them. The ticks are absent here because this is the
+            // CUSTOM view and the whole prime compartment belongs to the harmonic one -
+            // not because the panel ran out of room - so the "resize me" tag must not be
+            // left armed for the next harmonic layout to inherit.
+            primeTicksHidden = false;
 
             auto ci = engineBoxBounds.reduced (6, 0);
             ci.removeFromTop (chipH + 2); ci.removeFromBottom (4);
-            const auto ccAll = ci;   // everything below the chip strip
-            auto brow = ci.removeFromTop (24);
-            // TEMPER on the right of the top row (reachable from BOTH views).
-            temperToggle.setBounds (brow.removeFromRight (juce::jmin (170, brow.getWidth() * 40 / 100)));
-            brow.removeFromRight (6);
-            // [Load / Remove][Random] - two buttons that never change in number, so the
-            // row does not re-shape under the user's hand the way it did when the Off
-            // pill appeared and disappeared with the loaded scale. RANDOM is always
-            // there because it is the one control that can CREATE a spectrum out of
-            // nothing, which is exactly the state where a workspace is emptiest.
-            loadTimbreButton.setBounds (brow.removeFromLeft (brow.getWidth() * 1 / 2).reduced (2, 0));
-            randomSpectrumBtn.setBounds (brow.reduced (2, 0));
             // The bottom rows first, then EVERYTHING left goes to the intervals box:
             // the custom view has far fewer controls than the harmonic one, and the
             // freed space is exactly what the typed spectrum needed - it was one 24 px
             // line squeezed into a fifth of the panel.
-            auto repsRow = ci.removeFromBottom (22);
-            ci.removeFromBottom (4);
-            auto statusRow = ci.removeFromBottom (16);
-            ci.removeFromBottom (4);
-            ci.removeFromTop (5);
+            //
+            // ...BUT THE BOX YOU TYPE INTO IS THE LAST THING TO SHRINK, NOT THE FIRST.
+            // "everything left" also means every pixel the panel is SHORT of comes out of
+            // this one control, because it is the only one taking the remainder. At
+            // 1200x540 that left it 13 px tall, and at the 870x540 floor the snapshot rig
+            // photographs, its own text is not visible at all: a pink outline, on screen,
+            // enabled, holding "5/4 3/2 2" and showing none of it. From the player's chair
+            // that is a box which ignores everything typed or deleted in it, while Load,
+            // Random and Temper - buttons - go on working perfectly.
+            //
+            // So the rows below give way FIRST, each down to a floor of its own (a 20 px
+            // button is still hittable; an 18 px fader still draggable), and only what is
+            // left after that comes out of the box. The give is ZERO whenever the panel
+            // can afford the natural heights, which is every size at or above the shipped
+            // 1200x650 - measured, not assumed: RhythmVerify run 52 asserts the box is
+            // still exactly 68 px there, so this cannot move the layout anybody has seen.
+            constexpr int kBoxWants   = 43;                     // two 13 px rows inside its 4/5 px borders
+            constexpr int kBelowNat   = 22 + 4 + 16 + 4 + 24 + 4;
+            constexpr int kBelowFloor = 18 + 2 + 12 + 2 + 20 + 2;
+            const int give = juce::jlimit (0, kBelowNat - kBelowFloor,
+                                           kBoxWants - (ci.getHeight() - 2 - kBelowNat));
+            // Each row moves the same fraction of the way to its own floor, so they stay
+            // in proportion instead of one of them collapsing while its neighbour keeps
+            // its full height - the fault this whole block exists to stop, one level down.
+            auto shrunk = [give, span = kBelowNat - kBelowFloor] (int natural, int floor)
+            { return natural - (natural - floor) * give / span; };
+            auto repsRow = ci.removeFromBottom (shrunk (22, 18));
+            ci.removeFromBottom (shrunk (4, 2));
+            auto statusRow = ci.removeFromBottom (shrunk (16, 12));
+            ci.removeFromBottom (shrunk (4, 2));
+            // [Load / Remove][Random][Temper to tuning] - UNDER the ratios box now:
+            // "haz que los botones remove random y temper to tuning esten abajo de la
+            // caja de ratios de custom tuning, la cual podras subir un poco arriba para
+            // hacer espacio". They were the box's top row, so the thing you type into
+            // began a third of the way down its own panel; the box now starts directly
+            // under the chip strip and the buttons sit beneath it, where the result of
+            // pressing them is what you are already looking at.
+            //
+            // Two buttons that never change in number, so the row does not re-shape
+            // under the user's hand the way it did when the Off pill appeared and
+            // disappeared with the loaded scale. RANDOM is always there because it is
+            // the one control that can CREATE a spectrum out of nothing, which is
+            // exactly the state where a workspace is emptiest. TEMPER is reachable from
+            // BOTH views (see the ctor comment) and joins them at the same size rule.
+            auto brow = ci.removeFromBottom (shrunk (24, 20));
+            ci.removeFromBottom (shrunk (4, 2));
+            {
+                auto b = brow.reduced (2, 0);
+                // A control that cannot show its word is HIDDEN, not squashed - the same
+                // rule the tuning panel's fork buttons follow. This row takes three
+                // controls left to right, so the LAST one gets whatever survives: at
+                // 710x550 the Temper toggle got 20 px, which is NEGATIVE room once its
+                // tick box is drawn, leaving an unlabelled tick that re-tunes the whole
+                // spectrum. Load and Random are the two that can create a spectrum from
+                // nothing, so Temper is the one that goes; it is reachable from the
+                // harmonic view too, and from every size wide enough to say what it does.
+                auto take = [&b] (juce::Component& c, int w, bool mayHide = false)
+                {
+                    if (mayHide && w > b.getWidth()) { c.setVisible (false); return; }
+                    c.setBounds (b.removeFromLeft (juce::jmin (w, juce::jmax (0, b.getWidth()))));
+                    b.removeFromLeft (6);
+                };
+                take (loadTimbreButton,  fgfit::snugTextButtonWidth (loadTimbreButton, 24));
+                take (randomSpectrumBtn, fgfit::snugTextButtonWidth (randomSpectrumBtn, 24));
+                take (temperToggle,      fgfit::snugToggleWidth (temperToggle, 24), true);
+            }
+            ci.removeFromTop (2);                 // the ratios box rides higher now
             intervalEditHome = ci.reduced (1, 0); // multi-line: type intervals, Enter builds
             intervalEdit.setBounds (intervalEditHome);
             timbreStatusLabel.setBounds (statusRow);
             caption (lblTimbreRepeats, repsRow, 38, 60);
             timbreRepeatsFader.setBounds (repsRow.removeFromLeft (juce::jmin (220, repsRow.getWidth())));
-            // The custom view's own two cells, so it gets the SHARED DIVIDER every other
-            // box in the window has. The merge left this view as four rows of controls
-            // floating in one undivided rectangle - the only box in the plugin with no
-            // internal delimitation at all - while the harmonic view it shares the frame
-            // with has three cells and two dividers. Top = what SCALE is loaded (Load /
-            // On-Off / Temper); body = the spectrum itself (the typed intervals, what
-            // they built, and how many times it repeats).
-            ccScale = ccAll.withBottom (intervalEditHome.getY() - 3);
-            ccBody  = ccAll.withTop (ccScale.getBottom());
+            // No cells and no divider here on purpose. This view had one horizontal line
+            // between the Load/Remove row and the typed-ratios box: "hay una linea fina
+            // horizontal en custom spectrum entre el boton remove y la caja de ratios de
+            // abajo, es inecesaria y fea, quitala." The ratios box draws its own border
+            // one pixel below where that line was, so it separated nothing and read as a
+            // doubled edge.
         }
 
-        //-- BOTH ENGINES: SLOPE | FRACTAL | MORPH over RANGE --------------------
+        //-- BOTH ENGINES: SLOPE | FRACTAL | MORPH over DRY/WET over RANGE -------
         {
             auto bo = bothEnginesBounds.reduced (5, 0);
             bo.removeFromTop (chipH); bo.removeFromBottom (3);
             const int bW = bo.getWidth();
             beSlope   = bo.removeFromLeft (bW * 31 / 100);
             beFractal = bo.removeFromLeft (bW * 23 / 100);
+            // TWO cells in this column, where there were three: MORPH and DRY/WET are one
+            // TRANSITION cell now ("asi economizamos espacio"). It sits between FRACTAL's
+            // wall and OCTAVE RANGE, which is where the pair already lived.
+            //
+            // OCTAVE RANGE / PHASE KEEP EXACTLY THE HEIGHT THEY HAD, computed from the
+            // very expression that used to size the two smoothing cells, and the whole row
+            // the merge freed goes to TRANSITION. That is deliberate: this column's total
+            // height is fixed by the panel, so the saving cannot become empty space - it
+            // has to be spent somewhere - and spending it on the cell that lost a row
+            // means nothing below it moves by a pixel. At the 870x540 floor that is what
+            // makes the merge worth doing at all: the pair's control rows were 9 px tall
+            // there (a 26 px cell, less the sub-label band), which is not a size a combo
+            // or a fader can be used at. One cell of 52 gives them 16 px each.
             auto mcol = bo;
-            beMorph   = mcol.withHeight (mcol.getHeight() * 55 / 100);
-            beRange   = mcol.withTrimmedTop (mcol.getHeight() * 55 / 100);
+            const int rangeH = mcol.getHeight() - 2 * juce::jlimit (26, 46, (mcol.getHeight() - 40) / 2);
+            beTrans   = mcol.removeFromTop (juce::jmax (0, mcol.getHeight() - rangeH));
+            beRange   = mcol;
             {
                 auto si = beSlope.reduced (6, 3); si.removeFromTop (lblH);
                 // The pencil and its ON/OFF pill take a narrow column on the RIGHT of the
@@ -6060,26 +11593,125 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 auto fi = beFractal.reduced (6, 3); fi.removeFromTop (lblH);
                 fractalFader.setBounds (fi);
             }
+            // THE TRANSITION CELL: title band, the mode dropdown on its own row, then the
+            // "Time" caption and its fader on the next.
+            //
+            // TWO ROWS AND NOT ONE, and the floor is what decides it. Side by side the row
+            // would have to hold the box (sized to its widest ITEM - the box does not
+            // resize when the mode changes, so anything less clips the others silently),
+            // the caption, and a fader that carries a 42 px value read-out. At 870x540
+            // this cell is 141 px wide inside its inset: the box alone wants ~85 of them
+            // and the caption ~46, which leaves the fader about ten. Stacked, the box gets
+            // the whole width and so does the fader, at every size - and the cell still
+            // costs one row less than the two it replaced.
             {
-                auto mi = beMorph.reduced (6, 3); mi.removeFromTop (lblH);
-                morphToggle.setBounds (mi.removeFromTop (20));
-                mi.removeFromTop (2);
-                auto mr = mi.removeFromTop (juce::jmin (19, juce::jmax (0, mi.getHeight())));
-                caption (lblMorphTime, mr, 34, 60);
-                morphTimeFader.setBounds (mr);
+                auto ci2 = beTrans.reduced (6, 2); ci2.removeFromTop (lblH - 2);
+                // Rows grow with the cell so the wide sizes are not two thin controls
+                // floating in a tall box, and the pair is centred in what is left rather
+                // than pinned under the title with all the slack at the bottom.
+                const int rowH = juce::jlimit (15, 24, (ci2.getHeight() - 3) / 2);
+                auto blk = ci2.withSizeKeepingCentre (ci2.getWidth(),
+                                                      juce::jmin (ci2.getHeight(), rowH * 2 + 3));
+                auto boxRow = blk.removeFromTop (juce::jmin (rowH, blk.getHeight()));
+                blk.removeFromTop (juce::jmin (3, blk.getHeight()));
+                transitionBox.setBounds (boxRow.removeFromLeft (
+                        juce::jmin (fgfit::snugComboWidth (transitionBox, juce::jmax (1, boxRow.getHeight())),
+                                    boxRow.getWidth())));
+                auto tr2 = blk;
+                caption (lblTransTime, tr2, 34, 60);
+                // Only the VISIBLE fader is given the rectangle; the other one keeps
+                // whatever bounds it had and is not drawn, laid out or probed. Both are
+                // set so a mode change cannot leave the incoming fader at a stale size.
+                morphTimeFader.setBounds (tr2);
+                dryWetTimeFader.setBounds (tr2);
             }
             {
                 // RANGE: the spectrum's octave span, as the same [value][+][-] stepper it
-                // had in Essentials. Its name is the painted OCTAVE RANGE sub-label now,
+                // had in Essentials. Its name is the painted OCTAVES sub-label now,
                 // so the row's own "Spectrum" label was deleted rather than hidden - a
                 // member hidden on every single layout pass is a member nothing can ever
                 // show, and it kept a dead entry alive in the layout probe.
-                auto ri = beRange.reduced (6, 3); ri.removeFromTop (lblH + 3);
+                //
+                // PHASE SHARES THIS ROW, to its RIGHT, as its own titled sub-section -
+                // which is where the user asked for it and it is the only side of the
+                // column with room. The split is NOT even, on purpose: RANGE's three
+                // controls are FIXED width (40 + 24 + 4 + 24 = 92 px), so extra pixels do
+                // nothing for them, while width is the whole difference between a fader
+                // you can aim and one you cannot. RANGE therefore keeps just what it
+                // needs and every spare pixel goes to the fader.
+                //
+                // MEASURED AT THE FLOOR RATHER THAN HOPED FOR, because the previous pass
+                // shipped an 18 px fader here by hoping: at 870x540 this column's cell is
+                // 155 px, so RANGE keeps 104 and PHASE gets 51 - a 41 px painted title
+                // band ("PHASE" 33 px, "FASE" 27) and a 39 px fader, which is exactly
+                // what the SLOPE fader beside it already ships at. The binding constraint
+                // was never the fader, it was the Catalan "ABAST OCTAVES" at 88 px - and
+                // that is why the title is one word now: at 690 this column is 108 px, and
+                // the old pair wanted 78 of them for RANGE while PHASE's own title wanted
+                // 38, which is 116. "OCTAVES" needs 38 in both languages, so the split
+                // this code already made (68 / 40) holds both titles whole instead of
+                // cutting one of them in silence.
+                //
+                // Neither side may reach zero width: the layout probe FAILS a control
+                // collapsed to nothing, which would raise the window's minimum size
+                // instead of merely looking cramped. Hence the clamp, and the cap at half
+                // the row so OCTAVES always reads as the row's primary control.
+                // THE VALUE BOX IS SIZED TO THE WIDEST NUMBER IT CAN EVER SHOW, and the
+                // room that frees is what pays for the row's two real problems: the "-"
+                // button had ONE pixel of glyph room at the floor, and PHASE's own title
+                // could not fit its cell at any readable size.
+                //
+                // 40 px was a hand-picked number for a box whose whole content is an
+                // integer: "10" measures 15. Measured off the PARAMETER's own ends rather
+                // than the value on screen, or the box would resize under the user as they
+                // step through it - the same trap a combo sized to its selected item falls
+                // into. 24 stays the minimum so it remains a comfortable read.
+                int valW = 24;
+                if (auto* rp = processorRef.apvts.getParameter ("spectrumRange"))
+                {
+                    const auto vf = fgfit::labelFont (sprVal);
+                    for (const float u : { 0.0f, 1.0f })
+                        valW = juce::jmax (valW, juce::GlyphArrangement::getStringWidthInt (
+                                                     vf, juce::String ((int) rp->convertFrom0to1 (u))) + 10);
+                }
+                // What RANGE's compartment really needs: its stepper, plus the 6 px inset
+                // it keeps either side. PHASE gets the rest, and never less than its own
+                // title needs (28 px at the painted floor of 9 px, plus the same insets) -
+                // it was clamped at 34 and losing the "E" of PHASE in silence.
+                const int rangeCtlNeed = valW + 24 + 4 + 24 + 12;   // at full stepper width
+                const int phaseTitle   = 40;
+                const int phaseW = juce::jlimit (34, juce::jmax (34, beRange.getWidth() / 2),
+                                                 juce::jmax (phaseTitle,
+                                                             beRange.getWidth() - rangeCtlNeed));
+                bePhase = beRange.removeFromRight (phaseW);
+
+                auto ri = beRange.reduced (6, 2); ri.removeFromTop (lblH);
                 auto rr = ri.removeFromTop (juce::jmin (24, juce::jmax (0, ri.getHeight())));
-                sprVal.setBounds (rr.removeFromLeft (40));
-                sprUp.setBounds  (rr.removeFromLeft (24).reduced (0, 1));
-                rr.removeFromLeft (4);
-                sprDn.setBounds  (rr.removeFromLeft (24).reduced (0, 1));
+                // The two stepper buttons shrink together, to a measured floor, instead of
+                // demanding 24 each and letting the LAST of them keep the remainder. That
+                // remainder was ZERO at the floor: a "-" button with no room for its own
+                // glyph, which is a control that exists and cannot be used. 14 px still
+                // holds the WIDER of the two glyphs ("+" measures 8.85, "-" only 4.90) inside
+                // the painter's 4 px a side, and the two are
+                // always the same width - a "+" wider than its "-" reads as a mistake.
+                // 14 was tried first and measured: it fits the "-" and clips the "+".
+                const int stepW = juce::jlimit (17, 24, (rr.getWidth() - valW - 4) / 2);
+                sprVal.setBounds (rr.removeFromLeft (juce::jmin (valW, rr.getWidth())));
+                sprUp.setBounds  (rr.removeFromLeft (juce::jmin (stepW, rr.getWidth())).reduced (0, 1));
+                rr.removeFromLeft (juce::jmin (4, rr.getWidth()));
+                sprDn.setBounds  (rr.removeFromLeft (juce::jmin (stepW, rr.getWidth())).reduced (0, 1));
+
+                // PHASE, laid out to the same recipe as its neighbours: painted title
+                // band, then the control on one row.
+                auto pi = bePhase.reduced (6, 2); pi.removeFromTop (lblH);
+                auto pr = pi.removeFromTop (juce::jmin (24, juce::jmax (0, pi.getHeight())));
+                // The numeric read-out is the first thing to go, for the same reason it
+                // was in Essentials: a 38 px number box inside a 45 px cell leaves a 7 px
+                // track. The ends are named in the tooltip.
+                phaseFader.setTextBoxStyle (pr.getWidth() >= 96 ? juce::Slider::TextBoxRight
+                                                                : juce::Slider::NoTextBox,
+                                            false, 38, 14);
+                phaseFader.setBounds (pr);
             }
         }
     }
@@ -6116,29 +11748,78 @@ void FractalAdditiveAudioProcessorEditor::resized()
             auto e = essentialsBounds.reduced (5, 4);
             e.removeFromTop (20); // clear the "ESSENTIALS" title band
             // OCTAVE holds ONE stepper row now (RANGE moved into SPECTRUM), so it needs
-            // much less than the half-box it used to take and the other three cells get
-            // the difference - the Reference read-out finally has room to breathe.
-            const int octH = juce::jmin (40, e.getHeight() / 3);
-            const int ch   = (e.getHeight() - octH) / 3;
-            ecPhase = e.removeFromTop (ch);
-            ecGain  = e.removeFromTop (ch);
-            ecRef   = e.removeFromTop (ch);
-            ecOct   = e;
-            // Tighter label band + slimmer padding = the controls breathe (the
+            // much less than the half-box it used to take and the other cells get the
+            // difference - the Reference read-out finally has room to breathe.
+            // THREE cells, not four: PHASE moved out to the SPECTRUM panel, beside OCTAVE
+            // RANGE, so GAIN and REFERENCE divide what its row used to hold.
+            //
+            // EVEN THIRDS. OCTAVE used to be capped at 40 px and the other two split what
+            // was left, which is invisible at the 870x540 floor (37/37/38 either way) but
+            // turns into 126/126/40 at 1600x900: two cells that swell as the window grows
+            // and a third that cannot, so the box's last divider sits stranded near the
+            // bottom edge and the panel reads as unfinished rather than as three fields.
+            // Every cell centres its own control (jmin (22, ...) below), so an even cell
+            // spends its extra height as symmetric air around the control rather than on
+            // a stretched widget - the growth is distributed, never pooled.
+            // The remainder is SPREAD, not pooled. e.getHeight() is rarely a multiple of
+            // three, and `h/3, h/3, the rest` hands the whole remainder to the last cell:
+            // 167 px comes out 55/55/57, so OCTAVE's divider sits 2 px off where three even
+            // fields would put it and the panel's bottom field reads as the odd one out.
+            // One pixel at a time from the top instead, so no two cells ever differ by more
+            // than one - and the three still tile the box exactly, which is what paint()
+            // needs (every divider is drawn at a cell's TOP edge).
+            const int eh  = e.getHeight();
+            const int ch  = eh / 3;
+            const int rem = eh - ch * 3;              // 0, 1 or 2
+            ecGain  = e.removeFromTop (ch + (rem > 0 ? 1 : 0));
+            ecRef   = e.removeFromTop (ch + (rem > 1 ? 1 : 0));
+            ecOct   = e;   // the remainder, so the three cells always tile the box exactly
+            // THE LABEL GOES ABOVE THE CONTROL WHEN THE ROW CANNOT HOLD BOTH.
+            //
+            // The sub-label band is a fixed 78 px at the cell's left. At the 870x540
+            // floor the box is 176 px wide, so that leaves 76 for the controls - and the
+            // OCTAVE row alone needs 92 ([value 40][+ 24][gap 4][- 24]). What happened
+            // instead was silent: the "-" button came out 8 px wide with NO room at all
+            // for its glyph, and REFERENCE's "C3 =" caption came out 6 px. Both were
+            // inside their cell, neither had collapsed to zero, and every geometric check
+            // in the build stayed green while two controls on screen were unusable.
+            //
+            // Narrowing the band is not the fix: it would clip the painted word instead
+            // ("REFERÈNCIA" needs 66 of the 76 it has). So when the row is too narrow for
+            // both, the label takes the TOP of the cell and the control the whole width
+            // underneath - 13 + 22 = 35 in a 37 px cell. paintedSubLabels() reads the same
+            // flag, so the word is drawn where the space was actually reserved for it.
+            const int kEssLabelW  = 78;
+            const int kEssCtlNeed = 92;   // the OCTAVE stepper, the widest fixed row here
+            essStacked = ecOct.reduced (6, 1).getWidth() - kEssLabelW < kEssCtlNeed;
+            // One helper so the three cells cannot drift apart, and so "stacked" means
+            // exactly one thing.
+            auto essCell = [this, kEssLabelW] (juce::Rectangle<int> cell)
+            {
+                auto c = cell.reduced (6, 1);
+                if (essStacked) c.removeFromTop (13);
+                else            c.removeFromLeft (kEssLabelW);
+                return c;
+            };
             // Reference value used to clip its descenders).
-            // PHASE / GAIN / REFERENCE: the control sits to the RIGHT of its inline
-            // sub-label (drawn in paint at the cell's left), slightly narrower.
-            { auto c = ecPhase.reduced (6, 1); c.removeFromLeft (78);
-              compact (phaseBox, c.removeFromLeft (juce::jmin (112, c.getWidth()))); }
-            { auto c = ecGain.reduced (6, 1);  c.removeFromLeft (78);
+            // GAIN / REFERENCE / OCTAVE: the control sits to the RIGHT of its inline
+            // sub-label (drawn in paint at the cell's left), or under it when stacked.
+            { auto c = essCell (ecGain);
               gainFader.setBounds (c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))); }
-            { auto c = ecRef.reduced (6, 1);   c.removeFromLeft (78);
+            { auto c = essCell (ecRef);
               auto rr = c.withSizeKeepingCentre (c.getWidth(), juce::jmin (22, c.getHeight()))
                           .withWidth (juce::jmin (c.getWidth(), 158));
               caption (lblRefA, rr, 34, 70);
-              lblRefHz.setBounds (rr.removeFromRight (22));
-              refAEdit.setBounds (rr); }
-            { auto c = ecOct.reduced (6, 1);   c.removeFromLeft (78);
+              lblRefHz.setBounds (rr.removeFromRight (juce::jmax (22, fgfit::labelWidth (lblRefHz))));
+              refAEdit.setBounds (rr);
+              // THE PRECISION FOLLOWS THE WIDTH, and it can only be decided here because
+              // this is where the width is decided. Called from the 30 Hz timer as well,
+              // but a probe or a photograph can be taken between a resize and the next
+              // tick, and at 690x550 that is the difference between "261.626" and the
+              // field scrolling itself to "55653". Cheap: refreshRefAText compares the
+              // string it built with the one on screen and does nothing when they match.
+              refreshRefAText(); }
+            { auto c = essCell (ecOct);
               // Same shape as PHASE / GAIN / REFERENCE: the stepper sits RIGHT of the
               // painted OCTAVE label (see paintedSubLabels()), not below it - it was the
               // one cell in the box laid out the other way round.
@@ -6150,7 +11831,50 @@ void FractalAdditiveAudioProcessorEditor::resized()
               octVal.setBounds (rr.removeFromLeft (40));
               octUp.setBounds  (rr.removeFromLeft (24).reduced (0, 1));
               rr.removeFromLeft (4);
-              octDn.setBounds  (rr.removeFromLeft (24).reduced (0, 1)); }
+              octDn.setBounds  (rr.removeFromLeft (24).reduced (0, 1));
+              // BINAURAL TAKES WHAT THE STEPPER LEAVES, behind its own divider.
+              //
+              // The stepper needs 92 px and never more, so the rest of this row was empty
+              // - which is why the new control goes here rather than into a fourth cell
+              // that would have squeezed the three above it.
+              //
+              // IT SPENDS HEIGHT, NOT WIDTH, and that is the whole reason this control is
+              // on screen at the size the plugin actually opens at. Laid out like GAIN -
+              // [78 title][40 value][46 track] side by side - it wanted 164 px of a row
+              // that has 77 left at 1200x650, so the first photograph of it came back
+              // with the cell EMPTY at 1200x650 AND at the 690x510 floor, visible only at
+              // 1600x900. The second, squeezed into 67, came back with an 8 px track
+              // under a 24 px star.
+              //
+              // So the compartment stacks, the way OCTAVES and PHASE do in the SPECTRUM
+              // panel: title, track, value. It costs 13 + 40 px of a cell 53 tall and
+              // nothing at all in width beyond the track itself, and the width it does
+              // ask for is set by the TRACK - 60 px, of which the star's own width takes
+              // about 24, leaving travel you can aim at. The value box that used to set
+              // this number is no longer in the way.
+              //
+              // Below either figure the whole cell is left EMPTY: paintedSubLabels then
+              // draws no title and resized() hides the fader, the same "hidden, not
+              // squashed" rule TEMPER follows in the SPECTRUM panel. Nothing here is ever
+              // shown at a size that cuts it.
+              const int binNeed = 60;               // the track, with travel left over
+              auto full = c.withLeft (rr.getX() + 10);
+              if (full.getWidth() >= binNeed && full.getHeight() >= fgfit::kBinTitleH + 28)
+              {
+                  // From `c`, not `rr`: the stack needs the cell's full height, and rr is
+                  // the 22 px band the stepper was centred into. The group is CENTRED in
+                  // the cell so it sits level with the stepper beside it, and ecBin IS
+                  // that group - one rect, so paintedSubLabels cannot draw the word
+                  // anywhere but the 13 px this reserved for it.
+                  ecBin = full.withSizeKeepingCentre (full.getWidth(),
+                                                      juce::jmin (full.getHeight(),
+                                                                  fgfit::kBinTitleH + 40));
+                  binauralFader.setVisible (true);
+                  auto bf = ecBin;
+                  bf.removeFromTop (fgfit::kBinTitleH);
+                  binauralFader.setBounds (bf);
+              }
+              else { ecBin = {}; binauralFader.setVisible (false); } }
         }
 
         // ONE shared envelope box with three colour-chip tabs (Volume / Pitch /
@@ -6160,7 +11884,7 @@ void FractalAdditiveAudioProcessorEditor::resized()
         {
             auto eb = row.removeFromLeft (juce::jmin (262, W * 24 / 100));
             row.removeFromLeft (2);   // the same unshared-border air, Envelopes -> Tuning
-            const juce::Colour tabCols[4] = { cEnv, cPitch, cFilter, juce::Colour (0xff9a7bff) };
+            const juce::Colour tabCols[4] = { cEnv, cPitch, cFilter, cCustomMod };
             gAmpEnv.setColour (juce::GroupComponent::outlineColourId, tabCols[envTab]);
             gAmpEnv.setColour (juce::GroupComponent::textColourId,    tabCols[envTab]);
             gAmpEnv.setBounds (eb.reduced (3, 0)); // title = "Envelopes" (set in applyLanguage)
@@ -6169,22 +11893,128 @@ void FractalAdditiveAudioProcessorEditor::resized()
 
             auto in = eb.reduced (3).reduced (5, 4);
             in.removeFromTop (20);                // clear the box title - chips sit BELOW it
-            auto chips = in.removeFromTop (19);
-            const int cw4 = chips.getWidth() / 4;
+            // The SAME chip band as the engine chips above (fgfit::chip), which is what
+            // makes the two rows one size. Height, inset and font are the shared part.
+            //
+            // TWO ROWS OF TWO WHEN FOUR WILL NOT FIT ON ONE. The four used to divide the
+            // box's width evenly, which is fine while the box is wide and a lie when it is
+            // not: at the 750x550 floor the box is 121 px, so each chip gets 25 and its
+            // WORD gets 17 - against 38 for "FILTER" and 46 for "CUSTOM". These words are
+            // the feature. They are the only thing on screen that says which of the four
+            // modulator targets you are editing, and a chip strip that has silently
+            // condensed all four to 70% is a navigation control you have to guess at.
+            //
+            // Measured against what the words really need - the painter's own width for
+            // the text plus the inset each chip keeps, and NOT fgfit::chip::width, which
+            // adds kSnugPad on top. That pad is breathing room a chip sized to its own
+            // word asks for; using it as the WRAP threshold made the strip fold at
+            // 1200x650, where all four words fit a single row comfortably. The question
+            // here is "can these four words be read side by side", not "can they have
+            // their ideal padding".
+            auto chipNeed = [] (const juce::TextButton& b)
+            { return fgfit::textButtonWidth (b.getButtonText(), fgfit::chip::kHeight, false)
+                     + 2 * fgfit::chip::kInsetX; };
+            const int chipsNeed = chipNeed (envTabB[0]) + chipNeed (envTabB[1])
+                                + chipNeed (envTabB[2]) + chipNeed (envTabB[3]);
+            const bool chipsWrap = chipsNeed > in.getWidth();
+            juce::Rectangle<int> chipRect[4];
+            // EQUAL TABS WHILE THEY FIT, PROPORTIONAL WHEN THEY DO NOT.
+            //
+            // Four equal quarters is the look a tab strip wants, and it holds while the
+            // box is wide. It stops being honest the moment the widest WORD does not fit
+            // its quarter: "CUSTOM" needs 45.8 px of text room and an even quarter gives
+            // it 45.0 at 1190 px of window - eight tenths of a pixel, and the strip
+            // silently condenses. AMP has 22 px it is not using at that size.
+            //
+            // So the even split is kept until it fails, and then the row divides by what
+            // each word measures. The shipped 1200x650 and everything above it are
+            // untouched; below that the four tabs stop being the same width and start
+            // being legible, which is the trade this whole pass keeps making.
+            const auto shareOut = [&chipRect, &chipNeed, this] (juce::Rectangle<int> row, int first, int count)
+            {
+                // The FULL row width, captured once: removeFromLeft shrinks `row` as it
+                // goes, so a share computed from row.getWidth() inside the loop is a share
+                // of what is left, not of the row. Written that way first, and measured -
+                // it gave the last chip 98 px of a 220 px row and the one before it 33.
+                const int rowW = row.getWidth();
+                int total = 0, widest = 0;
+                for (int k = 0; k < count; ++k)
+                {
+                    const int n = chipNeed (envTabB[first + k]);
+                    total += n; widest = juce::jmax (widest, n);
+                }
+                const int even = rowW / count;
+                const bool evenFits = widest <= even;
+                for (int k = 0; k < count; ++k)
+                    chipRect[first + k] = (k == count - 1)
+                        ? row
+                        : row.removeFromLeft (evenFits ? even
+                                                       : rowW * chipNeed (envTabB[first + k])
+                                                             / juce::jmax (1, total));
+            };
+            if (! chipsWrap)
+            {
+                shareOut (fgfit::chip::centreInRow (in.removeFromTop (fgfit::chip::kRowHeight)), 0, 4);
+            }
+            else
+            {
+                // Two rows, two chips each, in reading order. AMP/PITCH above,
+                // FILTER/CUSTOM below - the same order the single row has, so the strip
+                // does not reshuffle itself as the window is dragged.
+                for (int row = 0; row < 2; ++row)
+                {
+                    if (row == 1) in.removeFromTop (2);
+                    shareOut (fgfit::chip::centreInRow (in.removeFromTop (fgfit::chip::kRowHeight)), row * 2, 2);
+                }
+            }
+            // ONE NEUTRAL FOR THE THREE TABS YOU ARE NOT ON; THE PANEL'S HUE FOR THE ONE
+            // YOU ARE.
+            //
+            // Each unselected chip used to be its OWN identity colour at 20% alpha, and
+            // that arithmetic produced four accidents rather than four colours. Over the
+            // panel fill the results were AMP #4EDF98 (selected), PITCH #463E2F, FILTER
+            // #2D4C50 and CUSTOM #2B4150 - PITCH a warm brown that matches nothing else in
+            // the product (and looks like a rendering fault once the panel turns blue on
+            // the CUSTOM tab), and FILTER and CUSTOM eleven units apart in ONE channel:
+            // two chips side by side that nobody can tell apart. The identity colours were
+            // chosen to be maximally separated at FULL strength (GalacticPalette.h); at
+            // 20% over a dark fill that separation is simply gone, so the dimming was
+            // destroying the very property it was borrowing.
+            //
+            // A tab strip only has to answer one question - which one am I on - and it
+            // answers it with the CONTRAST between the lit chip and the rest, not with
+            // four hues. So the three unselected chips share ONE neutral - a white wash of
+            // the panel fill, the same family as the 0x14ffffff the zebra rows use, at
+            // 0x2e so a chip still reads as a chip rather than as a hole - and the selected
+            // chip keeps its full identity colour, which is the hue the whole box beside it
+            // is already wearing.
+            const juce::Colour unlit (0x2effffff);
             for (int k = 0; k < 4; ++k)
             {
                 envTabB[k].setColour (juce::TextButton::buttonColourId,
-                                      envTab == k ? tabCols[k] : tabCols[k].withAlpha (0.20f));
+                                      envTab == k ? tabCols[k] : unlit);
                 envTabB[k].setColour (juce::TextButton::textColourOffId,
                                       envTab == k ? juce::Colours::black : juce::Colour (0xffb9c0d0));
-                envTabB[k].setBounds (chips.removeFromLeft (k == 3 ? chips.getWidth() : cw4).reduced (1, 0));
+                envTabB[k].setBounds (chipRect[k].reduced (fgfit::chip::kInsetX, 0));
             }
             in.removeFromTop (4);
 
             juce::Slider* setV[] = { &ampAdsr[0], &ampAdsr[1], &ampAdsr[2], &ampAdsr[3] };
             juce::Label*  labV[] = { &ampAdsrLbl[0], &ampAdsrLbl[1], &ampAdsrLbl[2], &ampAdsrLbl[3] };
-            juce::Slider* setP[] = { &pEnvAmtFader, &pitchAdsr[0], &pitchAdsr[1], &pitchAdsr[2], &pitchAdsr[3] };
-            juce::Label*  labP[] = { &lblPitchAmt, &pitchAdsrLbl[0], &pitchAdsrLbl[1], &pitchAdsrLbl[2], &pitchAdsrLbl[3] };
+            // MONOPHONIC GLIDE: the toggle takes a strip off the BOTTOM of the tab's body
+            // before anything else is laid out (the three tabs each copy `in`, so trimming
+            // it here trims it for all of them - which is why it is done only on PITCH),
+            // and the glide-time fader joins the pitch amount as a second extra column.
+            const bool pitchTab = envTab == 1;
+            monoGlideT.setVisible (pitchTab);
+            if (pitchTab)
+            {
+                auto strip = in.removeFromBottom (18);
+                monoGlideT.setBounds (strip);
+                in.removeFromBottom (2);
+            }
+            juce::Slider* setP[] = { &pEnvAmtFader, &glideFader, &pitchAdsr[0], &pitchAdsr[1], &pitchAdsr[2], &pitchAdsr[3] };
+            juce::Label*  labP[] = { &lblPitchAmt, &lblGlide, &pitchAdsrLbl[0], &pitchAdsrLbl[1], &pitchAdsrLbl[2], &pitchAdsrLbl[3] };
             juce::Slider* setF[] = { &cutoffFader, &resFader, &fEnvAmtFader, &filtAdsr[0], &filtAdsr[1], &filtAdsr[2], &filtAdsr[3] };
             juce::Label*  labF[] = { &lblCutoff, &lblRes, &lblEnvAmt, &filtAdsrLbl[0], &filtAdsrLbl[1], &filtAdsrLbl[2], &filtAdsrLbl[3] };
             // The four A/D/S/R faders of each voice envelope are replaced by the same
@@ -6192,8 +12022,8 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // cutoff, resonance, filter-env amount) keep their faders beside it.
             juce::Slider** sets[] = { setV, setP, setF };
             juce::Label**  labs[] = { labV, labP, labF };
-            const int counts[]    = { 4, 5, 7 };
-            const int extras[]    = { 0, 1, 3 };   // leading faders that are NOT the ADSR
+            const int counts[]    = { 4, 6, 7 };
+            const int extras[]    = { 0, 2, 3 };   // leading faders that are NOT the ADSR
             for (int t = 0; t < 3; ++t)
             {
                 const bool on = t == envTab;
@@ -6202,7 +12032,13 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 {
                     const bool isExtra = i < extras[t];
                     if (! on || ! isExtra) { sets[t][i]->setVisible (false); labs[t][i]->setVisible (false); continue; }
-                    auto c = area2.removeFromLeft (juce::jmax (34, in.getWidth() / 7));
+                    // The column is at least as wide as this fader's own read-out needs:
+                    // the flat 34 knew nothing about the value box inside it, which is how
+                    // the glide fader ended up drawing "120.0 ms" condensed to 70% in a
+                    // 24 px label. Still at least 34, so nothing that fitted gets narrower.
+                    const int colW = juce::jmax (34, fgfit::faderValueWidth (*sets[t][i]),
+                                                 in.getWidth() / 7);
+                    auto c = area2.removeFromLeft (juce::jmin (colW, juce::jmax (34, area2.getWidth())));
                     sets[t][i]->setVisible (true);
                     labs[t][i]->setVisible (true);
                     labs[t][i]->setBounds (c.removeFromTop (13));
@@ -6211,7 +12047,15 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 if (on)
                 {
                     voiceEnv.setVisible (true);
-                    voiceEnv.setBounds (area2.withTrimmedLeft (4));
+                    // THE GRAPH LINES UP WITH THE TAB STRIP ABOVE IT.
+                    //
+                    // It was `withTrimmedLeft (4)` and nothing on the right, while the chip
+                    // row is inset by fgfit::chip::kInsetX (1) on BOTH sides of the same
+                    // `in` rectangle - so the two stacked elements of one panel started 3 px
+                    // apart (292 against 295) and ended 1 px apart (508 against 509). Two
+                    // vertical lines that are almost the same line read as a mistake where
+                    // one line reads as a decision. Same inset, same constant, both edges.
+                    voiceEnv.setBounds (area2.reduced (fgfit::chip::kInsetX, 0));
                     voiceEnvTab = t;
                     voiceEnv.col = tabCols[t];
                     voiceEnv.refresh();
@@ -6229,7 +12073,6 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // for as long as the selected LFO is on "Custom (draw)" - no button to
             // find, and it disappears when you leave that LFO or change its wave.
             const bool drawMode = cust && ! isEnv && lfoWaveBox.getSelectedId() == 6;
-            lfoWaveEditBtn.setVisible (false);
             if (drawMode)
             {
                 const int l = modSel - 3;
@@ -6267,19 +12110,99 @@ void FractalAdditiveAudioProcessorEditor::resized()
             lfoHzSlider.setVisible  (showHz);  lblLfoHz.setVisible  (showHz);
             if (cust)
             {
-                // [modulator][On][Unmap] and, for a drawn LFO wave, [Draw] - which
-                // gets a readable share of the row instead of whatever is left over.
+                // [modulator][On][Unmap]. There was a [Draw] button on the right of this
+                // row; the drawn-wave editor OPENS BY ITSELF now, docked beside the box,
+                // for as long as the selected LFO is on "Custom (draw)". The button had
+                // been setVisible(false) unconditionally ever since - a control that
+                // could not be reached, sized, clicked or photographed, still carrying a
+                // tr() pair the language audits had to keep stepping over.
                 auto selRow = in.removeFromTop (20);
-                const bool drawVis = lfoWaveEditBtn.isVisible();
-                if (drawVis) lfoWaveEditBtn.setBounds (selRow.removeFromRight (56));
-                if (drawVis) selRow.removeFromRight (4);
-                const int nCell = 3;
-                const int cw3 = juce::jmax (30, selRow.getWidth() / nCell - 3);
-                modSelBox.setBounds (selRow.removeFromLeft (cw3));
-                selRow.removeFromLeft (3);
-                modOnT.setBounds (selRow.removeFromLeft (juce::jmin (46, cw3)));
-                selRow.removeFromLeft (3);
-                modUnmapBtn.setBounds (selRow);
+                // EACH OF THE THREE SIZED TO ITS OWN WORDS, AND THE AIR GOES FIRST.
+                //
+                // The selector used to take a THIRD of the row with a floor of 30 px, and
+                // 30 px is a ComboBox with NEGATIVE room for its own item: at h = 20 the
+                // box spends 6 px on the label's left inset, 18 on the chevron gutter and
+                // 10 on the Label's own border, so 30 leaves MINUS FOUR for "Env 1" - a
+                // chevron drawn where a word should be. That is what the rig photographed
+                // the moment this window's floor came down to 690x550 and the Modulators
+                // box became 107 px wide: a structural fault, not a cramped string, and
+                // the kind a hard-coded floor guarantees rather than prevents.
+                //
+                // THREE WIDTHS, TWO SIZES EACH. Every control here is sized by an fgfit
+                // snug...Width, which is the painter's own minimum PLUS kSnugPad - 12 px
+                // of air, stated once for the whole window. Air is the first thing to
+                // give: when the row cannot seat all three with it, all three lose it
+                // together, which keeps them looking like one row rather than one padded
+                // control and two starved ones.
+                //
+                // Measured, and this is the case that decided it: at the shipped 1200x650
+                // the row is 199 px and the three want 91 + 3 + 36 + 3 + 63 = 196 in
+                // English - it fits with air. In Catalan "Desassigna" wants 85 instead of
+                // "Unmap"'s 63, which is 218, and the FIRST version of this fix hid the
+                // button outright at the size the instrument actually ships at. Without
+                // the padding the same three need 79 + 3 + 24 + 3 + 73 = 182 and every one
+                // of them is whole. (Before any of this the button simply took what was
+                // left and drew "Desassigna" squashed into 66 px.)
+                //
+                // ...AND WHAT STILL DOES NOT FIT IS HIDDEN, NOT SQUASHED - the rule TEMPER
+                // and the prime ON switch follow in the SPECTRUM panel. At 690x550 this
+                // row is 97 px, which is the selector and nothing else: a pill with no
+                // word on it is a switch whose state cannot be read, and an Unmap button a
+                // few pixels wide is a click that silently drops every mapping on the
+                // instrument. Both come back the moment the box is wide enough, and the
+                // modulator's On parameter stays automatable and MIDI-mappable throughout.
+                const int selSnug = fgfit::snugComboWidth (modSelBox, 20);
+                const int onSnug  = fgfit::snugToggleWidth (modOnT, 20);
+                const int unSnug  = fgfit::snugTextButtonWidth (modUnmapBtn, 20);
+                const int selFloor = fgfit::snugComboWidthForSelection (modSelBox, 20);
+                // THE COMBO GIVES WAY FIRST, and it is the only one of the three that can.
+                //
+                // The numbers above stopped being true the moment the ON/OFF pill grew a
+                // state LED (see GalacticLnF::drawToggleButton): onSnug went 36 -> 45, so
+                // the three want 205 px in the 199 this row has AT THE SHIPPED 1200x650,
+                // and the all-or-nothing test below flipped the WHOLE row into its
+                // pad-less fallback - which left the pill with about a quarter of a pixel
+                // of clear capsule each side of its word. A row that only knows "everyone
+                // comfortable" and "everyone starved" starves everyone over six pixels.
+                //
+                // The combo is the elastic member and this file already says why: it is
+                // sized to its WIDEST item while it only ever draws the SELECTED one, and
+                // it has a floor of its own for exactly this. The pill and the button have
+                // no such slack - their whole width IS their word. So the overflow comes
+                // out of the combo's surplus first, down to its floor, and only what is
+                // still over after that falls back on the old flat shave.
+                const int need    = selSnug + 3 + onSnug + 3 + unSnug;
+                const int over    = juce::jmax (0, need - selRow.getWidth());
+                const int selGive = juce::jmin (over, juce::jmax (0, selSnug - selFloor));
+                const bool roomy  = need - selGive <= selRow.getWidth();
+                const int pad     = roomy ? 0 : fgfit::kSnugPad;
+                // ...BUT NEVER BELOW WHAT THE CHOSEN NAME NEEDS. The tight fallback shaved
+                // a flat kSnugPad off the snug width, and the snug width is measured
+                // against the WIDEST item while the closed box only ever draws the SELECTED
+                // one - so the shave came out of the wrong measurement and the box read
+                // "En..." where it should say "Env 1". You could not tell Env 1 from Env 3
+                // from LFO 1, in every modulator scenario and both languages.
+                //
+                // Floored at the selection's own width, which is the same rule the Shepard
+                // row's rate control already uses: a box may give up its comfort, never its
+                // word.
+                // (selFloor is measured above, where the give is decided.)
+                const int selW = juce::jmax (1, juce::jmin (juce::jmax (selSnug - selGive - pad, selFloor),
+                                                            selRow.getWidth()));
+                modSelBox.setBounds (selRow.removeFromLeft (selW));
+                selRow.removeFromLeft (juce::jmin (3, selRow.getWidth()));
+                const bool onFits = onSnug - pad <= selRow.getWidth();
+                modOnT.setVisible (cust && onFits);
+                if (onFits)
+                {
+                    modOnT.setBounds (selRow.removeFromLeft (onSnug - pad));
+                    selRow.removeFromLeft (juce::jmin (3, selRow.getWidth()));
+                }
+                // Unmap is sized to the word "Unmap" / "Desassigna", not to whatever the
+                // row had left over - which was a third of the box for six letters.
+                const bool unFits = unSnug - pad <= selRow.getWidth();
+                modUnmapBtn.setVisible (cust && unFits);
+                if (unFits) modUnmapBtn.setBounds (selRow.removeFromLeft (unSnug - pad));
                 in.removeFromTop (3);
                 if (isEnv)
                 {
@@ -6288,14 +12211,65 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     auto rangeCol = a2.removeFromRight (46);
                     envEditor.setBounds (a2.withTrimmedRight (4));
                     lblCustRange.setBounds (rangeCol.removeFromTop (13));
-                    custRangeFader.setBounds (rangeCol);
+                    custRangeFader.setBounds (rangeCol); fitKnobValueBox (custRangeFader);
                 }
                 else
                 {
-                    auto combos = in.removeFromTop (20);
-                    lfoWaveBox.setBounds (combos.removeFromLeft (combos.getWidth() / 2).reduced (1, 0));
-                    lfoRateModeBox.setBounds (combos.reduced (1, 0));
+                    // ONE BOX PER ROW WHEN TWO WILL NOT FIT ONE - AND TWO WHEN THEY DO.
+                    //
+                    // These were side by side, splitting the row in proportion to what
+                    // each asked for. Measured with a probe that no longer lies about it,
+                    // both were squeezed at the shipped size: "Fundamental / 2^n" needed
+                    // 99.6 px of the 92 it got and "Pròpia (dibuixa)" 83.1 of 77 - so
+                    // each took a row at its own width, and that cost the tab 22 px of
+                    // fader height.
+                    //
+                    // "HAZ MAS ESTRECHO EL DESPLEGABLE DE LA FORMA DE ONDA... PARA QUE
+                    // QUEPA EL DE MODO BPM A SU DERECHA" and "LOS KNOBS DE LA LFO CUSTOM
+                    // AHORA SON MUY PEQUENOS, HAZLOS MAS GRANDES CON EL ESPACIO GANADO" -
+                    // which are one complaint: a stacked pair leaves the rest of both rows
+                    // empty and takes the height out of the knobs underneath. The pairing
+                    // is back, but as a MEASURED condition rather than an assumption: the
+                    // two go on one row only where their own snug widths both fit, and
+                    // fall back to a row each where they do not. Neither is ever squashed,
+                    // and every pixel the pairing saves lands on the faders below, which
+                    // is where the 22 px came from in the first place.
+                    // ...and when they share a row they get exactly what their widest
+                    // item needs, without the 12 px of breathing room fgfit::kSnugPad
+                    // adds. Measured: the column is 219 px, the two boxes want 93 and 140
+                    // with the pad and 81 and 128 without, so the pad alone is the
+                    // difference between one row and two. A box sized to its own widest
+                    // item is not cramped - it is exact; the pad is a comfort, and a
+                    // comfort is what you spend when the alternative is a whole row of
+                    // dead space above a set of knobs that then lose 22 px of height.
+                    const int waveRoomy = fgfit::snugComboWidth (lfoWaveBox, 20);
+                    const int rateRoomy = fgfit::snugComboWidth (lfoRateModeBox, 20);
+                    const int waveTight = waveRoomy - fgfit::kSnugPad;
+                    const int rateTight = rateRoomy - fgfit::kSnugPad;
+                    const bool pairRoomy = waveRoomy + 4 + rateRoomy <= in.getWidth();
+                    const bool pairTop   = pairRoomy
+                                        || waveTight + 4 + rateTight <= in.getWidth();
+                    const int waveNeed = pairTop && ! pairRoomy ? waveTight : waveRoomy;
+                    const int rateNeed = pairTop && ! pairRoomy ? rateTight : rateRoomy;
+                    {
+                        auto r = in.removeFromTop (20);
+                        lfoWaveBox.setBounds (r.removeFromLeft (juce::jmin (juce::jmax (24, waveNeed),
+                                                                            r.getWidth())).reduced (1, 0));
+                        if (pairTop)
+                        {
+                            r.removeFromLeft (2);
+                            lfoRateModeBox.setBounds (r.removeFromLeft (
+                                juce::jmin (juce::jmax (24, rateNeed), r.getWidth())).reduced (1, 0));
+                        }
+                    }
                     in.removeFromTop (2);
+                    if (! pairTop)
+                    {
+                        auto r = in.removeFromTop (20);
+                        lfoRateModeBox.setBounds (r.removeFromLeft (juce::jmin (juce::jmax (24, rateNeed),
+                                                                                r.getWidth())).reduced (1, 0));
+                        in.removeFromTop (2);
+                    }
                     lfoPhaseModeBox.setBounds (in.removeFromTop (20).reduced (1, 0));
                     in.removeFromTop (2);
                     // Three columns, not four: whichever of Div/Hz applies, plus
@@ -6303,11 +12277,11 @@ void FractalAdditiveAudioProcessorEditor::resized()
                     const int cw = in.getWidth() / 3;
                     auto a2 = in;
                     if (showDiv)
-                    { auto c = a2.removeFromLeft (cw); lblLfoDiv.setBounds (c.removeFromTop (12)); lfoDivSlider.setBounds (c); }
+                    { auto c = a2.removeFromLeft (cw); lblLfoDiv.setBounds (c.removeFromTop (12)); lfoDivSlider.setBounds (c); fitKnobValueBox (lfoDivSlider); }
                     if (showHz)
-                    { auto c = a2.removeFromLeft (cw); lblLfoHz.setBounds (c.removeFromTop (12));  lfoHzSlider.setBounds (c); }
-                    { auto c = a2.removeFromLeft (cw); lblLfoPhase.setBounds (c.removeFromTop (12)); lfoPhaseSlider.setBounds (c); }
-                    { auto c = a2;                     lblCustRange.setBounds (c.removeFromTop (12)); custRangeFader.setBounds (c); }
+                    { auto c = a2.removeFromLeft (cw); lblLfoHz.setBounds (c.removeFromTop (12));  lfoHzSlider.setBounds (c); fitKnobValueBox (lfoHzSlider); }
+                    { auto c = a2.removeFromLeft (cw); lblLfoPhase.setBounds (c.removeFromTop (12)); lfoPhaseSlider.setBounds (c); fitKnobValueBox (lfoPhaseSlider); }
+                    { auto c = a2;                     lblCustRange.setBounds (c.removeFromTop (12)); custRangeFader.setBounds (c); fitKnobValueBox (custRangeFader); }
                 }
             }
         }
@@ -6323,10 +12297,97 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // leftovers exactly in the states with the most buttons showing. Its height
             // is PAID FOR by merging the old bend and Recent rows into one below, so
             // the bank row keeps the same worst case it had.
+            // Under a tuning whose period is NOT an octave the Shepard block needs a
+            // SECOND line, for the rise-interval box.
+            //
+            // Measured honestly - fgfit::comboItemRoom takes off the label's own 5 px
+            // border and measures the item in the BOLD face it is really drawn in - the
+            // four controls want ~466 px of the 447 this panel has, so on one line the
+            // ms/beats rate control was left 13 px wide: a fader nobody can grab. The
+            // probe used to certify that row because it measured the lighter face against
+            // the label's FULL width, which is 26 px of room that does not exist.
+            const bool riseChoice = shepardRiseChoiceExists();
+            // Both lines come off the bottom FIRST, for the reason the single one did:
+            // reserved after the pile of optional rows above, they would inherit the
+            // zero-height leftovers in exactly the states with the most buttons showing.
+            auto riseRow = riseChoice ? ti.removeFromBottom (22) : juce::Rectangle<int>();
+            if (riseChoice) ti.removeFromBottom (3);
             auto shepRow = ti.removeFromBottom (22);
             ti.removeFromBottom (3);
+            // What is still to be placed BELOW the name row: 2 + period(18),
+            // nSnug x (3 + 22), 3 + bend(22), 3 + bank(24). Hoisted ABOVE the mode row
+            // because two decisions taken up there - whether the name can afford a row of
+            // its own, and whether the three fork buttons can afford one - both turn on
+            // what is left after this.
+            const bool hasPatch = processorRef.activeSclHasPreset();
+            const bool hasPresetTuning = processorRef.hasPendingPresetTuning()
+                                       && ! processorRef.presetHasDrifted();
+            const bool hasProvTuning = processorRef.hasSpectrumProvenance();
+            const int  nSnug = (hasPatch ? 1 : 0) + (hasPresetTuning ? 1 : 0) + (hasProvTuning ? 1 : 0);
+            const int  need  = 72 + 25 * nSnug;
             auto mrow = ti.removeFromTop (24);
-            compact (tuningBox, mrow.removeFromLeft (mrow.getWidth() * 34 / 100));
+            // THE THREE FORK BUTTONS TAKE THEIR OWN ROW WHEN THE MODE ROW CANNOT HOLD
+            // THEM. The mode selector takes a fixed 34% of the row and the buttons take
+            // their own widths out of the rest, left to right - so the LAST of them gets
+            // whatever survives. At the 750x550 floor that is 26 px for "Add to Bank",
+            // which needs 91: a fork glyph and about fifteen pixels of a word, condensed
+            // to 70% by a painter that never clips. Every bounds check green, and a button
+            // whose label cannot be read is a button you press to find out what it does.
+            //
+            // Measured against the words in the language on screen. When they do not fit,
+            // the buttons drop to a row of their own and the mode selector keeps the first
+            // row (which also gives the scale NAME the leftover it needs to stay inline).
+            // The row costs 27 px, and the tuning panel's own ladder decides what pays for
+            // it - the bank row first, by the order it already states.
+            const auto btnW = [] (const juce::TextButton& b)
+            { return fgfit::textButtonWidth (b.getButtonText(), 24, b.getProperties().contains ("fork")); };
+            const int btnNeed = btnW (loadSclButton) + 4 + btnW (saveTuningBtn) + 4
+                              + btnW (tuningBankAddBtn);
+            const bool tooTightForButtons = fgfit::snugComboWidth (tuningBox, 24) + 5 + btnNeed
+                                              > mrow.getWidth();
+            // ...but only if the panel can PAY for that row. Everything in this panel is
+            // on one ladder, and a row taken here is a row the ladder below takes from the
+            // bank and then from the pitch-bend selector. A legible "Add to Bank" is not
+            // worth the control that says how far a note bends, so when the extra row
+            // cannot be afforded the buttons stay on the mode row and the ones that do not
+            // fit are HIDDEN - Add to Bank first, then Save. Load never goes: it is the
+            // only route to a scale file, and a synth with no way to load a tuning is not
+            // a microtonal synth.
+            const bool canAffordBtnRow = ti.getHeight() - 24 - 27 >= need;
+            const bool btnOwnRow = tooTightForButtons && canAffordBtnRow;
+            // THE MODE BOX STATES WHAT ITS WIDEST ITEM NEEDS, and only falls back to a
+            // share of the row when that is the larger of the two. A flat 34% is a
+            // percentage deciding what a word may be: "Scala (.scl)" needs 74 px and the
+            // share handed it 73, which is what the rig's legibility walk named as the
+            // binding control for the whole window in BOTH languages.
+            //
+            // Nothing is taken from the buttons that they are not already prepared to
+            // lose: they measure their own words and hide, in a stated order, when the row
+            // cannot hold them (see the ladder below). A percentage cannot do that.
+            // ...and when the row cannot hold BOTH, the box gives up the comfort before
+            // Load gives up its word.
+            //
+            // Load is the one control on this row that can neither be hidden (it is the
+            // only route to a scale file) nor be crushed - and it was getting 30 px for a
+            // word that needs 32.9, the exact smear this panel's ladder exists to prevent.
+            // The box was taking 174 px at EVERY size, because its widest item is
+            // "MTS-ESP..." and sizing to the widest item is what stops it resizing under
+            // the user's hand as they change modes. That is comfort. At a width where the
+            // row cannot pay for it, showing the item that is CURRENTLY SELECTED is the
+            // part that carries meaning, so the box falls back to that and no further -
+            // never below its own selected word, and Load's width is reserved first.
+            //
+            // The trade is stated rather than silent: at a narrow window the box resizes
+            // when the mode changes. A resizing box is a smaller price than a button
+            // nobody can read, and it is only paid where the alternative is that button.
+            const int loadReserve = btnOwnRow ? 0 : 5 + btnW (loadSclButton);
+            const int modeIdeal   = fgfit::snugComboWidth (tuningBox, 24);
+            const int modeShare   = btnOwnRow ? 0 : mrow.getWidth() * 34 / 100;
+            const int modeAsk     = juce::jmax (modeIdeal, modeShare);
+            const int modeFloor   = fgfit::snugComboWidthForSelection (tuningBox, 24);
+            compact (tuningBox, mrow.removeFromLeft (juce::jmin (mrow.getWidth(),
+                                    juce::jmax (juce::jmin (modeAsk, mrow.getWidth() - loadReserve),
+                                                modeFloor))));
             mrow.removeFromLeft (5);
             // Load / Save / + sit immediately to the RIGHT of the mode selector, each at
             // its OWN minimum width. They used to have a row to themselves underneath,
@@ -6338,28 +12399,195 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 loadSclButton.setVisible (true);
                 saveTuningBtn.setVisible (true);
                 tuningBankAddBtn.setVisible (true);
-                clearSclButton.setVisible (false);  // Reset removed - the mode selector does it
-                const juce::Font bf (juce::FontOptions (12.0f));
-                const auto fit = [&] (juce::TextButton& b)
+                auto brow = mrow;
+                if (btnOwnRow) { ti.removeFromTop (3); brow = ti.removeFromTop (24); }
+                const auto fit = [&brow] (juce::TextButton& b, bool mayHide)
                 {
-                    const int fork = b.getProperties().contains ("fork") ? 13 : 0; // drawn glyph
-                    const int w = juce::GlyphArrangement::getStringWidthInt (bf, b.getButtonText()) + 14 + fork;
-                    b.setBounds (mrow.removeFromLeft (juce::jmin (w, juce::jmax (0, mrow.getWidth()))));
-                    mrow.removeFromLeft (4);
+                    // GalacticLnF's own width rule, in the font the button really draws
+                    // in: measured here with a plain 12 pt while the LookAndFeel painted
+                    // ~15 pt bold, "Afegeix al banc" came out 24 px too narrow and was
+                    // silently squashed.
+                    const int w = fgfit::textButtonWidth (b.getButtonText(), brow.getHeight(),
+                                                          b.getProperties().contains ("fork"));
+                    // A button that cannot show its word is HIDDEN, not squashed: the
+                    // painter never clips, it condenses to 70%, so the crushed state is a
+                    // fork with an unreadable smear beside it and no sign anything is
+                    // wrong. Load is never hidden - see above.
+                    if (mayHide && w > brow.getWidth()) { b.setVisible (false); return; }
+                    b.setBounds (brow.removeFromLeft (juce::jmin (w, juce::jmax (0, brow.getWidth()))));
+                    brow.removeFromLeft (4);
                 };
-                fit (loadSclButton);
-                fit (saveTuningBtn);
-                fit (tuningBankAddBtn);
+                fit (loadSclButton,    false);
+                fit (saveTuningBtn,    true);
+                fit (tuningBankAddBtn, true);
+                if (! btnOwnRow) mrow = brow;   // the name reads what the buttons left
             }
-            tuningNameLabel.setBounds (mrow); // shows the loaded scale's file name
-            // Period of the active scale, in red, always visible. For an absolute 128-key
+            // THE SCALE NAME IS THE IDENTITY OF THE LOADED TUNING, so it must not be
+            // the scrap left over by everything else on its row. Sized as whatever
+            // `mrow` still held after the mode selector and the three buttons, it came
+            // out 21 px wide in Catalan while "12ED2" measures 39, and a juce::Label
+            // does not clip when it is short of room - it CONDENSES the glyphs to 75%,
+            // so the panel drew a squashed name and every bounds check in the build
+            // stayed green. Nothing about that is Catalan-specific: this text is a FILE
+            // NAME, its length is unbounded, and a long .scl starves the same cell in
+            // any language - Catalan's wider buttons only cross the threshold first.
+            // So the name stays inline only while the leftover genuinely holds it, and
+            // takes a row of its own the moment it does not.
+            // ONE GAP BETWEEN THE ROWS OF THIS PANEL.
+            //
+            // Every row here is taken off the top with its own leading, and two of the five
+            // said 2 while the other three said 3 - which, once the panel's spare height is
+            // shared out over the gaps (see `lead` below), photographed as 2, 6, 7, 7, 9 px
+            // down one narrow column. Nothing was wrong with any single number; there were
+            // simply two of them, plus the remainder of an integer division landing in the
+            // last gap. The three places that state the ladder's arithmetic (`fixed`,
+            // `wants` and the row placements themselves) now all read this, so the gap can
+            // never be two different sizes again - and the same value in all three is what
+            // keeps the affordability ladder honest about what it is reserving.
+            const int kTunRowGap = 3;
+            const int nameNeed = tuningNameLabel.getText().isEmpty()
+                               ? 0 : fgfit::labelWidth (tuningNameLabel);
+            // WHEN THE PANEL IS SHORT, THE NAME AND THE PERIOD SHARE ONE ROW.
+            //
+            // Both are single-line READ-OUTS, and at the 870x540 floor the panel is
+            // ~22 px short of its rows: the name takes a whole row of its own (the
+            // leftover beside the mode selector is 13 px), the period takes another, and
+            // what runs out at the far end is the row that carries the pitch-bend
+            // selector and Recent - two real controls, laid out at 12 px in the plain
+            // case and at exactly 0 with a periodic tuning, where the Shepard rise
+            // dropdown takes one row more.
+            //
+            // Merging the two read-outs frees exactly the row those controls need, and
+            // costs nothing: "tritave" is 40 px and "Period  3" is 52 in a 289 px panel,
+            // so side by side they are not even close to touching. It happens ONLY when
+            // the panel cannot afford both rows, so every size that fits today - the
+            // shipped 1200x650 included - is laid out exactly as it was.
+            //
+            // Not merged when the period row carries CONTROLS (an absolute 128-key table
+            // puts the override field and its reset button there): that row is not a
+            // read-out then, and squeezing a name in beside an editor is how the panel
+            // got into this state in the first place.
+            const bool nameOwnRow  = nameNeed > mrow.getWidth() && ti.getHeight() >= 22;
+            const int  periodNeed  = fgfit::labelWidth (tuningPeriodLbl);
+            // The width the shared row would really need. An absolute 128-key table puts
+            // the period OVERRIDE field (72) and, when the user has set one, its reset
+            // button (46) on that row - so the merge is not refused just because the row
+            // carries controls, it is refused when the four things together do not fit.
+            // Refusing on the presence of the controls alone cost the tuning BANK its row
+            // at the shipped size, for a row that had 150 px to spare.
+            const bool periodIsTable = processorRef.tuningIsAbsoluteTable();
+            const int  periodExtra   = periodIsTable
+                                     ? (72 + 5 + (processorRef.tuningTablePeriodIsUserSet() ? 46 + 4 : 0))
+                                     : 0;
+            const bool mergeNamePeriod = nameOwnRow
+                                       && nameNeed + 8 + periodNeed + periodExtra <= ti.getWidth()
+                                       && ti.getHeight() - 22 < need;
+            // ...AND WHEN THERE IS NEITHER A LEFTOVER THAT HOLDS IT NOR A ROW TO GIVE IT,
+            // the name is not drawn at all. `mrow` is whatever the mode selector and the
+            // three buttons left, and at a short window that is nothing: a juce::Label
+            // with zero width paints no pixels while every bounds check stays green -
+            // which is the same fault the buttons on that row refuse for themselves three
+            // dozen lines up, and the structural gate calls a control collapsed to
+            // nothing. Reachable only since the window's floor came down to 510 px tall.
+            // The tuning's identity is still stated by the period read-out's row and by
+            // the tuning selector above it; a smear of nothing states nothing.
+            tuningNameLabel.setVisible (true);
+            if (nameOwnRow && ! mergeNamePeriod)
+            {
+                ti.removeFromTop (kTunRowGap);
+                tuningNameLabel.setBounds (ti.removeFromTop (20));
+            }
+            else if (! mergeNamePeriod)
+            {
+                // 14 is kRowMin below - this panel's own "still a row" threshold, spelled
+                // out here because that constant is declared further down.
+                if (mrow.getWidth() < 8 || mrow.getHeight() < 14)
+                    tuningNameLabel.setVisible (false);
+                else
+                    tuningNameLabel.setBounds (mrow);
+            }
+            // (merged: the name is placed by the period row below, which is the row it
+            // now shares - setting bounds here would put it in the 13 px leftover.)
+
+            //== THE SLACK IS SHARED OUT, NOT POOLED ================================
+            // Every row below is a fixed height taken off the top, and the Shepard block
+            // was reserved off the bottom, so whatever the panel has spare ended up as
+            // ONE void in the middle: 168 px at 1600x900 against 43 at 1200x650, with
+            // the Shepard row orphaned against the bottom edge and the rows above
+            // huddled under the title. It is the same fault as a paragraph set with all
+            // its leading at the end.
+            //
+            // So the spare height is divided evenly over the gaps that are still to
+            // come - one before each remaining row, plus the one that is left between
+            // the last row and the Shepard block - and each of those gaps grows by that
+            // share. Nothing stretches: the rows keep their heights and their controls,
+            // only the air between them changes, which is why no string can start
+            // clipping because of this.
+            //
+            // The three optional "load this tuning from..." buttons are decided HERE
+            // rather than at the row that draws them, because the count of them is what
+            // makes the division right - measured after the fact it would be a guess.
+            // (hasPatch / hasPresetTuning / hasProvTuning / nSnug / need are decided
+            // further up, where whether the name can afford a row of its own depends on
+            // them - see mergeNamePeriod.)
+            //
+            // WHAT THE PANEL CAN AFFORD IS DECIDED BEFORE ANYTHING IS PLACED, in a stated
+            // order and on a ladder: a row hands back its spare height first, and is only
+            // DROPPED when even its minimum will not fit. The row that used to give way
+            // was whichever one the top-down walk reached when the height ran out, which
+            // is not an order but an accident - and it produced both faults this panel had
+            // at the floor: a bend row laid out at 0 px (a control nobody can click, and
+            // nothing on screen saying why), and a bank row that reserved its 27 px, found
+            // it could not use them, hid itself, and left the space behind as a 15 px void
+            // above the Shepard block.
+            //
+            // The bank gives way first - its combo is reachable from the Load button and
+            // the Recent list, so the panel loses a shortcut rather than a capability -
+            // and the bend row second. 14 px is the least a row of controls can be and
+            // still be one; it is the threshold the bank row already used for itself.
+            const int  kRowMin = 14;
+            int  bendH = 22, bankH = 24;
+            bool bendRow = true, bankRow = true;
+            {
+                // Period and the optional "load from..." rows are not on the ladder: the
+                // period read-out is what the panel is FOR, and each snug row exists only
+                // because the state it describes is live right now.
+                const int fixed = kTunRowGap + 18 + nSnug * (kTunRowGap + 22);
+                int over = fixed + (kTunRowGap + bendH) + (kTunRowGap + bankH) - ti.getHeight();
+                if (over > 0) { const int g = juce::jmin (over, bankH - kRowMin); bankH -= g; over -= g; }
+                if (over > 0) { bankRow = false; over -= kTunRowGap + bankH; }
+                if (over > 0) { const int g = juce::jmin (over, bendH - kRowMin); bendH -= g; over -= g; }
+                if (over > 0) { bendRow = false; }
+            }
+            // What the surviving rows will actually occupy...
+            const int  wants = kTunRowGap + 18 + nSnug * (kTunRowGap + 22)
+                             + (bendRow ? kTunRowGap + bendH : 0)
+                             + (bankRow ? kTunRowGap + bankH : 0);
+            // ...over the gaps that can carry the rest: one before each row that survived,
+            // plus the one left between the last of them and the Shepard block. A dropped
+            // row hands its space back here, which is the whole point of `lead` and what a
+            // row hiding itself AFTER the division was computed quietly broke.
+            const int  gapCount = 1 + nSnug + (bendRow ? 1 : 0) + (bankRow ? 1 : 0) + 1;
+            const int  lead  = juce::jmax (0, ti.getHeight() - wants) / gapCount;
+
+            // Period of the active scale, in the panel's own lilac, always visible. For an
+            // absolute 128-key
             // table it is Fibló's ESTIMATE, so the same row also carries the field that
             // overrides it (and a reset back to the estimate) - the readout alone would
             // state a guess as if the tuning had declared it.
-            ti.removeFromTop (2);
+            ti.removeFromTop (kTunRowGap + lead);
             {
                 auto prow = ti.removeFromTop (18);
-                const bool isTable = processorRef.tuningIsAbsoluteTable();
+                // The name rides on the LEFT of this row when the two were merged (see
+                // mergeNamePeriod): it keeps exactly the width its own text needs, and
+                // the period read-out takes the rest, so a long name can never push the
+                // period out - the merge only happens when both were measured to fit.
+                if (mergeNamePeriod)
+                {
+                    tuningNameLabel.setBounds (prow.removeFromLeft (nameNeed));
+                    prow.removeFromLeft (8);
+                }
+                const bool isTable = periodIsTable;
                 tablePeriodEdit.setVisible (isTable);
                 tablePeriodResetBtn.setVisible (isTable && processorRef.tuningTablePeriodIsUserSet());
                 if (isTable)
@@ -6384,40 +12612,55 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // (Load / Save / + are laid out beside the mode selector above; the row that
             // used to be here is gone, which gives the tuning bank its height back.)
             const int tmode = processorRef.getTuningMode();
-            // Only for scales this synth wrote: they carry their own patch.
-            const bool hasPatch = processorRef.activeSclHasPreset();
-            loadItsSpectrumBtn.setVisible (hasPatch);
-            if (hasPatch)
+            // The three "load this tuning from somewhere" buttons each get a row, and in
+            // that row exactly the width their own sentence needs - not the panel's whole
+            // width. "Load spectrum's tuning" was a 420 px slab for 22 characters. Same
+            // padding rule as every other narrowed control (fgfit::kSnugPad), and all
+            // three share ONE helper so a rename cannot widen one and not its neighbours.
+            auto snugRow = [this, lead, kTunRowGap, kRowMin] (juce::Rectangle<int>& ti, juce::TextButton& b)
             {
-                ti.removeFromTop (3);
-                loadItsSpectrumBtn.setBounds (ti.removeFromTop (22).reduced (2, 0));
-            }
+                ti.removeFromTop (kTunRowGap + lead);   // its share of the panel's spare height
+                // A ROW THE PANEL CANNOT AFFORD IS NOT DRAWN AT ALL. removeFromTop hands
+                // back whatever is left, which can be nothing, and a TextButton with zero
+                // height is a control the user cannot see OR press while every bounds
+                // check stays green - the same "unreadable smear" the three buttons on the
+                // mode row above refuse for width. The ladder that sizes this panel
+                // already drops the bank and bend rows under pressure; these snug rows
+                // exist only because the state they describe is live, so dropping one is
+                // the same trade one rung further down. kRowMin (14) is this panel's own
+                // threshold for "still a row".
+                if (ti.getHeight() < kRowMin) { b.setVisible (false); return; }
+                auto row = ti.removeFromTop (juce::jmin (22, ti.getHeight())).reduced (2, 0);
+                b.setBounds (row.removeFromLeft (
+                    juce::jmin (fgfit::snugTextButtonWidth (b, 22), row.getWidth())));
+            };
+            // Only for scales this synth wrote: they carry their own patch.
+            // (hasPatch / hasPresetTuning / hasProvTuning were decided above, where their
+            // count is what divides the spare height.)
+            loadItsSpectrumBtn.setVisible (hasPatch);
+            if (hasPatch) snugRow (ti, loadItsSpectrumBtn);
             // Only when the preset just loaded carries a tuning that actually
             // differs from the one active now (recomputed live: loading it, or
             // changing the tuning some other way, makes the button disappear again) -
             // AND the preset itself has not drifted (a knob/automation/undo moved
             // something outside its own modulators): once it has drifted, "this
             // preset's tuning" is no longer an honest thing to offer.
-            const bool hasPresetTuning = processorRef.hasPendingPresetTuning()
-                                       && ! processorRef.presetHasDrifted();
             loadPresetTuningBtn.setVisible (hasPresetTuning);
-            if (hasPresetTuning)
-            {
-                ti.removeFromTop (3);
-                loadPresetTuningBtn.setBounds (ti.removeFromTop (22).reduced (2, 0));
-            }
+            if (hasPresetTuning) snugRow (ti, loadPresetTuningBtn);
             // The custom spectrum's own tuning, whenever it HAS one (derived by Adapt,
             // or loaded from a scale file). Same idiom as the preset row above, but it
             // stays VISIBLE when that tuning is already active - disabled and saying so
             // (refreshSpectrumTuningButton) - because vanishing right after the click
             // would read as the button failing rather than the job being done.
-            const bool hasProvTuning = processorRef.hasSpectrumProvenance();
             loadSpectrumTuningBtn.setVisible (hasProvTuning);
             if (hasProvTuning)
             {
+                // The WORD first, then the width: this button says "Load spectrum's
+                // tuning" or "Tuning already loaded" depending on state, and sizing it
+                // before refreshSpectrumTuningButton() rewrote it would measure the
+                // word that is about to be replaced.
                 refreshSpectrumTuningButton();
-                ti.removeFromTop (3);
-                loadSpectrumTuningBtn.setBounds (ti.removeFromTop (22).reduced (2, 0));
+                snugRow (ti, loadSpectrumTuningBtn);
             }
             // Pitch bend and Recent share ONE row now (bend left, Recent right): the
             // Shepard row at the bottom is paid for with exactly the row this merge
@@ -6425,42 +12668,105 @@ void FractalAdditiveAudioProcessorEditor::resized()
             // in MPE-input mode (the MPE zone fixes the per-note range at +-48, so
             // the choice is irrelevant there) - Recent then takes the whole row.
             const bool bendVis = tmode != 3;
-            lblBend.setVisible (bendVis); bendBox.setVisible (bendVis);
+            // ...AND on the row surviving the ladder above. Set here, outside the block
+            // that lays the row out: a row that is skipped never reaches the setVisible
+            // inside it, so the two controls stayed VISIBLE carrying the bounds the LAST
+            // window size gave them - drawn at 1200x650 coordinates over the keyboard of
+            // an 870x540 window. Every check in both rigs stayed green through that,
+            // because they were inside the window and neither collapsed.
+            lblBend.setVisible (bendVis && bendRow); bendBox.setVisible (bendVis && bendRow);
+            // ONE LABEL COLUMN for this panel. "Pitch bend" reserved 74 px and "Bank" 38,
+            // so two adjacent rows started their controls 36 px apart - the kind of drift
+            // that has no name on screen and just makes the panel look slightly wrong.
+            // Sized to the WIDER of the two words in the language actually on screen
+            // (fgfit::labelWidth, because a juce::Label draws inside its border in a bold
+            // face and a cell measured any other way condenses the glyphs silently), with
+            // 74 as the floor so nothing that fitted before can stop fitting.
+            const int tunLblW = juce::jmax (74, fgfit::labelWidth (lblBend),
+                                                fgfit::labelWidth (lblTuningBank));
+            // Hoisted out of the row block below because Recent's visibility is set
+            // further down (with the bank UI), after that block has closed.
+            // Hoisted out of the row block below because Recent's visibility is set
+            // further down (with the bank UI), after that block has closed. The plan
+            // above already decided whether this row exists at all.
+            bool bendRowFits = bendRow;
+            bool recentFits  = true;
+            if (bendRow)
             {
-                ti.removeFromTop (3);
-                auto bendRow = ti.removeFromTop (22);
+                ti.removeFromTop (kTunRowGap + lead);   // its share of the panel's spare height
+                auto bendRowRect = ti.removeFromTop (bendH);
                 if (bendVis)
                 {
                     lblBend.setJustificationType (juce::Justification::centredLeft);
-                    lblBend.setBounds (bendRow.removeFromLeft (74));
-                    compact (bendBox, bendRow.removeFromLeft (juce::jmin (120, bendRow.getWidth())));
-                    bendRow.removeFromLeft (6);
+                    lblBend.setBounds (bendRowRect.removeFromLeft (tunLblW));
+                    compact (bendBox, bendRowRect.removeFromLeft (juce::jmin (120, bendRowRect.getWidth())));
+                    bendRowRect.removeFromLeft (6);
                 }
                 // Recent is ONE button that opens a floating list of every file loaded;
                 // the bank stays inline. Both stay reachable in every mode - picking one
                 // of them IS how you get into Scala mode, so gating them on already
                 // being there was a dead end. It also keeps "+ to bank" from ever
                 // feeding a list you cannot see.
-                recentOpenBtn.setBounds (bendRow.reduced (2, 0));
+                // HONEST FAILURE, the same rule the bank row below already applies: at
+                // the 870x540 floor this panel is over-subscribed, and this row is the one
+                // the shortage reaches first (the Shepard block is reserved off the bottom,
+                // so what runs out is the middle). It used to lay out anyway - 12 px in the
+                // plain case, and exactly 0 px with a periodic tuning, where the rise
+                // dropdown takes one more row. A VISIBLE control with no pixels is worse
+                // than an absent one: it cannot be clicked, it cannot be seen, and nothing
+                // on screen says the panel ran out of room. 14 px is the bank row's own
+                // threshold, kept identical so the two rows cannot drift apart.
+                // Belt and braces: the plan says this row was afforded, so it must have
+                // its 22 px. If arithmetic ever says otherwise, hide rather than ghost.
+                bendRowFits = bendRowRect.getHeight() >= 14;
+                lblBend.setVisible (bendVis && bendRowFits);
+                bendBox.setVisible (bendVis && bendRowFits);
+                auto rec = bendRowRect.reduced (2, 0);
+                // Same rule as the fork buttons above: a button that cannot show its word
+                // is hidden, not crushed. Recent takes whatever the bend selector left, so
+                // at the floor it was 19 px against the 56 "Recent..." needs - a smear no
+                // one can read on a control whose whole job is to be recognised. Every
+                // file it lists is still reachable through Load.
+                const int recNeed = fgfit::snugTextButtonWidth (recentOpenBtn, 22);
+                recentFits = recNeed <= rec.getWidth();
+                if (recentFits)
+                    recentOpenBtn.setBounds (rec.removeFromLeft (recNeed));
             }
             recentLabel.setVisible (false);
             for (int i = 0; i < 3; ++i) recentBtn[i].setVisible (false);
-            const bool bankUi = true;
-            recentOpenBtn.setVisible (bankUi);
+            const bool bankUi = bankRow;
+            // Recent lives in the BEND row, not the bank row - it follows that row's fate.
+            // (It was tied to `bankUi` back when that was unconditionally true, which only
+            // became a bug the moment the bank row could be dropped.)
+            recentOpenBtn.setVisible (bendRowFits && recentFits);
             lblTuningBank.setVisible (bankUi); tuningBankBox.setVisible (bankUi);
             tuningBankLoadBtn.setVisible (bankUi);
             tuningBankClearBtn.setVisible (bankUi);
             if (bankUi)
             {
-                ti.removeFromTop (3);
+                ti.removeFromTop (kTunRowGap + lead);   // its share of the panel's spare height
                 // Bank row: the label rides on the LEFT of the row (a separate label
                 // row no longer fits) - [BANK][combo (flex)][+ .scl][X remove].
-                auto bkrow = ti.removeFromTop (juce::jmax (0, juce::jmin (24, ti.getHeight())));
+                // Whatever is still under it - one share of the slack, by construction -
+                // is the gap up to the Shepard block, so that gap matches the others
+                // instead of being the whole void.
+                auto bkrow = ti.removeFromTop (juce::jmax (0, juce::jmin (bankH, ti.getHeight())));
+                // (the plan above already decided this row is affordable; the `fits`
+                // check below stays as belt and braces, not as the decision)
                 lblTuningBank.setJustificationType (juce::Justification::centredLeft);
-                lblTuningBank.setBounds (bkrow.removeFromLeft (38));
-                tuningBankClearBtn.setBounds (bkrow.removeFromRight (24).reduced (1, 1));
+                lblTuningBank.setBounds (bkrow.removeFromLeft (tunLblW));
+                // TWO BUTTONS IN ONE ROW ARE ONE HEIGHT. This was `.reduced (1, 1)` while
+                // "+ .scl" beside it kept `.reduced (1, 0)`, so the row ended with a 24 px
+                // button and a 22 px one whose top edge sat 1 px lower - x 902-949 y
+                // 416-439 against x 955-976 y 417-438. Nothing was clipped and no check
+                // could see it; it just reads as two buttons that were placed on different
+                // days. The 1 px sideways stays (it is the air between them); the vertical
+                // inset goes, so both fill the row.
+                tuningBankClearBtn.setBounds (bkrow.removeFromRight (24).reduced (1, 0));
                 bkrow.removeFromRight (3);
-                tuningBankLoadBtn.setBounds (bkrow.removeFromRight (46).reduced (1, 0));
+                tuningBankLoadBtn.setBounds (bkrow.removeFromRight (juce::jmax (46,
+                                                 fgfit::textButtonWidth (tuningBankLoadBtn.getButtonText(), 24, false) + 2))
+                                             .reduced (1, 0));
                 bkrow.removeFromRight (4);
                 compact (tuningBankBox, bkrow);
                 // Honest failure instead of zero-height ghosts: if the box ran out of
@@ -6469,39 +12775,188 @@ void FractalAdditiveAudioProcessorEditor::resized()
                 lblTuningBank.setVisible (fits); tuningBankBox.setVisible (fits);
                 tuningBankLoadBtn.setVisible (fits); tuningBankClearBtn.setVisible (fits);
             }
-            // SHEPARD generator (the row reserved off the bottom above):
-            // [Shepard][Free-or-Sync][the rate control in that mode's dress][level].
+            // SHEPARD MODE (the row reserved off the bottom above):
+            // [Shepard][Free-or-Sync][the rate control in that mode's dress][rise
+            // interval, only when the tuning's period is not an octave].
             // ONE rate control, two dresses: the ms fader (Free) and the beats box
             // (Sync) occupy the same slot and exactly one is on screen - a knob that
             // does nothing in the current mode is worse than no knob at all (the
-            // same rule as the LFO Div/Hz pair).
+            // same rule as the LFO Div/Hz pair). The rise-interval box follows the
+            // same rule one step further: with an octave-period tuning the two
+            // choices are the SAME interval, so the box is not there at all.
             {
+                // Each box is sized to the WORDS IT HOLDS, in the language actually on
+                // screen - never to a pixel count that only ever fitted English. A
+                // ComboBox does not clip visibly and does not resize: it draws as much
+                // of the item as the cell holds, so a fixed 94 px slot showed the
+                // renamed "Sync Project Tempo" as "Sync Project Te" while every bounds
+                // and overlap check in the build stayed green. The widest ITEM is what
+                // is measured, not the selected one, or the box would resize under the
+                // user as they change modes.
+                const int shepH = juce::jmin (24, shepRow.getHeight());
+                // fgfit::snugComboWidth, the same rule (and the same padding) the six
+                // narrowed controls elsewhere in this window use: this row measured its
+                // own widest item before that rule existed, and two copies of one
+                // measurement are how a padding "system" quietly stops being one.
+                auto needFor = [shepH] (juce::ComboBox& c, int nominal)
+                { return juce::jmax (nominal, fgfit::snugComboWidth (c, shepH)); };
+
                 auto sh = shepRow;
-                shepOnT.setBounds (sh.removeFromLeft (86));
+                // 46 px is the least a beats box ("1/16") or a millisecond fader can be
+                // and still be one. Hoisted above the toggle because the toggle now has
+                // to know what the rest of the row costs before it decides its own width.
+                // 46 px WAS a judgement - "the least a beats box or a millisecond fader
+                // can be and still be one" - and it was the last hand-picked number on
+                // this row. At the floor the beats box got exactly those 46, which is
+                // 18 px of text room, and its widest item "1/16" needs 26: the box was
+                // truncating in silence, and no check saw it because the probe measures
+                // the SELECTED item and "4" fits anywhere.
+                //
+                // Measured now, and measured on the SELECTION rather than the widest item,
+                // because a closed ComboBox only ever draws the one that is chosen - the
+                // widest is what the box ASKS for, so it does not resize as the user
+                // changes it, and the selection is what it must never go below. The ms
+                // fader's read-out is the same question in its other dress, and the larger
+                // of the two is taken so the reservation does not depend on which dress is
+                // showing. Floored at 24, the least any control can be clicked.
+                const int kRateMin = juce::jmax (24,
+                                        juce::jmax (fgfit::snugComboWidthForSelection (shepDivBox, shepH),
+                                                    fgfit::faderValueWidth (shepTimeFader)));
+                // THE TOGGLE WAS THE LAST CONTROL ON THIS ROW STILL ON A HAND-PICKED
+                // NUMBER. Every other box here is sized from the words it holds; this one
+                // took 86 px whatever "Shepard" actually needs, and at a narrow window
+                // those spare pixels were the ones the mode box was 4.5 short of.
+                //
+                // It keeps its 86 whenever the row can PAY for 86 + the mode box's own
+                // ask + the rate minimum - so the shipped size is pixel-identical - and
+                // falls back to what its word needs only when the row cannot. The same
+                // affordability ladder the TUNING panel and the fork buttons use: a
+                // control gives up its comfort before another gives up its meaning.
+                const int roomyToggle = 86;
+                // 24 px square: the arrow's own size, on the tightest row in this panel.
+                // 24 px square when the row can pay for it, 18 when it cannot - the arrow
+                // gives up its comfort before the mode box gives up its word, which is the
+                // ladder this row already runs on. Measured: the arrow and its gap cost the
+                // mode box 28 px, and at the tight end that took "Project Tempo" from the
+                // 73.8 px it needs down to 69 - the rig's fully-legible width went 780 to
+                // 840 in one commit. Six pixels back off the arrow is all it took, and an
+                // 18 px square is still a comfortable target for a single glyph.
+                const int roomyDirW = 24, tightDirW = 18;
+                const int wordToggle  = fgfit::toggleWidth (shepOnT.getButtonText(), shepH);
+                const int rowCanPay   = roomyToggle + 4 + roomyDirW + 4 + needFor (shepModeBox, 94) + 6 + kRateMin;
+                const bool roomy      = sh.getWidth() >= rowCanPay;
+                const int kDirW       = roomy ? roomyDirW : tightDirW;
+                shepOnT.setBounds (sh.removeFromLeft (roomy
+                                                          ? roomyToggle
+                                                          : juce::jmax (wordToggle, 1)));
                 sh.removeFromLeft (4);
-                compact (shepModeBox, sh.removeFromLeft (juce::jmin (94, sh.getWidth())));
-                sh.removeFromLeft (6);
-                shepLevelFader.setBounds (sh.removeFromRight (juce::jmin (120, sh.getWidth())));
-                sh.removeFromRight (6);
+                // THE DIRECTION ARROW, RESERVED BEFORE THE MODE BOX like the rate control
+                // below it, and for the same reason: it is 24 px and it is the difference
+                // between a Shepard that rises and one that falls, so it must not be what
+                // the row spends last. Square, because the glyph is - and because a row
+                // this tightly measured has no pixels for a button that is wider than the
+                // thing inside it.
+                shepDirBtn.setBounds (sh.removeFromLeft (juce::jmin (kDirW, sh.getWidth()))
+                                          .withSizeKeepingCentre (juce::jmin (kDirW, sh.getWidth()), shepH));
+                sh.removeFromLeft (4);
+                // THE RATE CONTROL'S MINIMUM IS RESERVED BEFORE THE MODE BOX IS SIZED.
+                //
+                // The mode box took whatever its widest item asked for and the rate
+                // control got the remainder - which at the 870x540 floor is FOUR PIXELS.
+                // A 4 px ComboBox has negative room once its chevron and insets are taken
+                // off: nothing to read, nothing to click, and the rig counted it as a text
+                // problem because the box was inside its row and had a positive width.
+                // The mode names the control; it cannot be allowed to eat it.
+                //
+                // 46 px is the least a beats box ("1/16") or a millisecond fader can be
+                // and still be one, and the mode box keeps everything above that.
                 const bool sync = shepModeBox.getSelectedId() == 2;
+
+                const int  modeRoom = juce::jmax (46, sh.getWidth() - 6 - kRateMin);
+                compact (shepModeBox, sh.removeFromLeft (juce::jmin (needFor (shepModeBox, 94),
+                                                                     juce::jmin (modeRoom, sh.getWidth()))));
+                sh.removeFromLeft (6);
+                // The rise interval keeps its own line (see riseRow above), right under
+                // the mode box it belongs to, so the rate control keeps a usable width.
+                shepRiseBox.setVisible (riseChoice);
+                if (riseChoice)
+                {
+                    auto rr = riseRow.withTrimmedLeft (86 + 4);
+                    compact (shepRiseBox, rr.removeFromLeft (juce::jmin (needFor (shepRiseBox, 108), rr.getWidth())));
+                }
                 shepTimeFader.setVisible (! sync);
                 shepDivBox.setVisible (sync);
-                if (sync) compact (shepDivBox, sh.removeFromLeft (juce::jmin (86, sh.getWidth())));
+                // The beats box holds "1/16".."16": it never needed 86 px, and the room
+                // it was hoarding is what pays for the rate mode's longer name.
+                if (sync) compact (shepDivBox, sh.removeFromLeft (juce::jmin (needFor (shepDivBox, 60), sh.getWidth())));
                 else      shepTimeFader.setBounds (sh);
             }
         }
     }
 
     // Floating "silent settings" explainer, centred over everything.
+    // A VERTICAL FADER TOO NARROW FOR ITS NUMBER SHOWS NO NUMBER.
+    //
+    // Slider::resized() clamps the value box to the slider's own width, so a fader in a
+    // squeezed column keeps a box it cannot fill: the AMP DECAY fader is 11 px wide at
+    // the 700x550 floor, which leaves its label ONE pixel once juce::Label's own border
+    // is taken off, and "1.000" is then drawn condensed into nothing. The box also costs
+    // the fader 15 px of TRACK to say it - so the crushed state is worse in both
+    // directions at once.
+    //
+    // This is not a new rule: the PHASE fader beside it already drops its read-out below
+    // 96 px for exactly this reason, with the ends named in its tooltip. This applies the
+    // same rule to every fader configFader() built, from the same measurement.
+    //
+    // Run at the END of resized(), because that is the first moment every fader has its
+    // final bounds - and only when the answer CHANGES, since setTextBoxStyle rebuilds the
+    // label. Faders whose caller moved the box to the RIGHT are left alone: the rule there
+    // is a different one and its owner already applies it.
+    for (size_t i = 0; i < configuredFaders.size() && i < faderBoxHome.size(); ++i)
+    {
+        auto* s = configuredFaders[i];
+        // WHICH FADERS THIS RULE IS FOR: the ones whose read-out lives BELOW the track,
+        // which is where configFader puts every box and where all but eight of them stay.
+        // It used to ask the SLIDER STYLE instead, and that is not the same question: the
+        // CUSTOM tab's Range fader is horizontal AND keeps the box below, so it was the
+        // one fader with a box below that this loop never looked at - and it is the one
+        // that turned up with a 1 px track and a label of negative height the moment the
+        // window's floor came down. A box to the RIGHT belongs to its own owner's rule
+        // (phaseFader's cell test earlier in this function), and asking the HOME position
+        // rather than the live one is what keeps this loop from undoing that decision.
+        if (faderBoxHome[i].pos != juce::Slider::TextBoxBelow) continue;
+        const int  want  = juce::jmax (46, fgfit::faderValueWidth (*s) + 2);
+        // ...AND THE SAME RULE IN THE OTHER DIRECTION, which this loop was missing.
+        //
+        // A box below costs the fader 15 px of its own HEIGHT, and a fader shorter than
+        // that hands juce::Slider a label with negative room: the rig classes that as a
+        // control collapsed to nothing, which is a structural fault and not a fit problem.
+        // It was unreachable while the window's floor was 550 px tall and became reachable
+        // the moment the value boxes stopped being pushed under the horizontal faders
+        // (see applyLanguage's sizing pass) and the floor came down to 510. 15 + 8 is the
+        // box plus the least track that is still a track - the same threshold the row
+        // ladder in the tuning panel calls kRowMin, one pixel under.
+        const bool fits  = s->getWidth() >= fgfit::faderValueWidth (*s)
+                        && s->getHeight() >= 15 + 8;
+        const auto style = fits ? juce::Slider::TextBoxBelow : juce::Slider::NoTextBox;
+        if (s->getTextBoxPosition() != style)
+            s->setTextBoxStyle (style, false, want, 15);
+    }
     warningOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (580, 200));
     warningOverlay.toFront (false);
-    noticeOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (560, 220));
+    layoutNotice();
     recentOverlay.setBounds (getLocalBounds().withSizeKeepingCentre (520, 380));
     if (recentOverlay.isVisible()) recentOverlay.toFront (false);
     rhythmScrim.setBounds (getLocalBounds());
     rhythmPanel.setBounds (getLocalBounds().withSizeKeepingCentre (820, 640));
     rhythmScrim.toFront (false);
     rhythmPanel.toFront (false);
+    // ...and a notice that is up stays above both: resized() used to bury it under the rhythm
+    // scrim and panel (and the playground band button below), so a notice raised before a
+    // resize sat hidden behind them (night review, pre-existing).
+    if (noticeOverlay.isVisible()) noticeOverlay.toFront (false);   // resized: above what this pass fronted
+    // Last, so it sits over the band that explains it.
+    layoutPlaygroundBandButton();
 }
 
 void FractalAdditiveAudioProcessorEditor::mouseDown (const juce::MouseEvent& e)
@@ -6513,16 +12968,17 @@ void FractalAdditiveAudioProcessorEditor::mouseDown (const juce::MouseEvent& e)
     grabKeyboardFocus();
 }
 
-// After switching to another plugin window (or app) and back, nothing in our
-// hierarchy holds keyboard focus, so the computer keyboard can't play (and with no
-// driving note the Spectrum-to-Rhythm pulses stop too). Reclaim focus when the host
-// re-activates our window OR the mouse re-enters the plugin - unless the user is in a
-// text field, whose typing must not be hijacked.
+// IN THE STANDALONE: after switching to another app and back, nothing in our hierarchy
+// holds keyboard focus, so the letter keyboard can't play (and with no driving note the
+// Spectrum-to-Rhythm pulses stop too). Reclaim focus when the window is re-activated OR
+// the mouse re-enters it - unless the user is in a text field, whose typing must not be
+// hijacked. IN A PLUGIN this does nothing (focusFollowsPointer): the letters belong to the
+// host there, and taking the focus on a hover took them away from Live.
 void FractalAdditiveAudioProcessorEditor::reclaimFocusUnlessTyping()
 {
-    if (dynamic_cast<juce::TextEditor*> (juce::Component::getCurrentlyFocusedComponent()) != nullptr) return;
-    if (! hasKeyboardFocus (true))
-        grabKeyboardFocus();
+    if (! focusReclaimState().wouldGrab) return;   // see refocus() for what each test is for
+    lastFocusReclaimMs = juce::Time::getMillisecondCounter();
+    grabKeyboardFocus();
 }
 void FractalAdditiveAudioProcessorEditor::mouseEnter (const juce::MouseEvent&) { reclaimFocusUnlessTyping(); }
 void FractalAdditiveAudioProcessorEditor::broughtToFront()
@@ -6531,23 +12987,60 @@ void FractalAdditiveAudioProcessorEditor::broughtToFront()
     { if (safe != nullptr) safe->reclaimFocusUnlessTyping(); });
 }
 
+// TESTS: the note each letter of the row would play from where the row stands now.
+juce::Array<int> FractalAdditiveAudioProcessorEditor::letterNotesForTests() const
+{
+    juce::Array<int> out;
+    for (const auto& m : kKeyMap) out.add (juce::jlimit (0, 127, baseKey + m.off));
+    return out;
+}
+
 bool FractalAdditiveAudioProcessorEditor::keyPressed (const juce::KeyPress& key)
 {
     const auto c = key.getTextCharacter();
     const int  period = juce::jmax (1, processorRef.getScaleDegrees());
     // Ctrl-Z / Ctrl-Y: undo / redo any parameter change (also reachable in the DAW
     // because the editor swallows them while focused).
-    if (key == juce::KeyPress ('z', juce::ModifierKeys::ctrlModifier, 0)) { processorRef.undoManager.undo(); return true; }
-    if (key == juce::KeyPress ('y', juce::ModifierKeys::ctrlModifier, 0)) { processorRef.undoManager.redo(); return true; }
+    // THROUGH THE PROCESSOR, never straight at the undo manager: a bare Ctrl+Z here had
+    // no edit-mode gate, so inside a corner-edit session it unwound the LIVE patch's
+    // history into the scratch surface, the next pull absorbed that into the corner, and
+    // the "*" then blamed the user for a change they never made. performUndo() refuses
+    // while a corner is being edited. The key is still consumed either way - it is being
+    // deliberately swallowed, not passed on to something else to act on.
+    if (key == juce::KeyPress ('z', juce::ModifierKeys::ctrlModifier, 0)) { processorRef.performUndo(); return true; }
+    if (key == juce::KeyPress ('y', juce::ModifierKeys::ctrlModifier, 0)) { processorRef.performRedo(); return true; }
     // Left/right arrows scroll the colour keyboard's visible window by one period.
     if (key == juce::KeyPress::leftKey)  { keyboard.scrollView (-period); return true; }
     if (key == juce::KeyPress::rightKey) { keyboard.scrollView ( period); return true; }
-    if (c == 'z' || c == 'Z') { baseKey = juce::jlimit (0, 112, baseKey - period); return true; }
-    if (c == 'x' || c == 'X') { baseKey = juce::jlimit (0, 112, baseKey + period); return true; }
-    // SWALLOW every mapped play key: if it escapes to the host, the DAW's own
-    // computer-MIDI-keyboard (Live: A S D = C D E, diatonic) fires TOO and its
-    // note lands a unison / minor second from ours (our A S D = degrees 0 1 2,
-    // chromatic) - the reported "ghost second note". Never let them through.
+    // IN A PLUGIN THE LETTERS ARE THE HOST'S - ALL OF THEM, Z AND X INCLUDED.
+    //
+    // "no se puede tocar con el teclado cuando la ventana del sinte esta abierta en
+    // ableton". keyStateChanged already let them go in a plugin, but THIS function kept
+    // returning true for every mapped letter and for Z/X, and on Windows one "used" answer
+    // from either is enough for JUCE to take the key message away from the host
+    // (offerKeyMessageToJUCEWindow replaces it with WM_USER). So with this window focused
+    // Live's computer keyboard lost A-K and its own octave keys, while our mapping - off in
+    // a plugin, see playKeysLive - played nothing in their place. Z/X only move OUR
+    // mapping's base note, which a plugin never plays, so they go to Live as well.
+    if (processorRef.wrapperType != juce::AudioProcessor::wrapperType_Standalone)
+        return false;
+    // THE STEP IS THE SMALLER OF THE PERIOD AND THE LETTER ROW, so no degree is unreachable.
+    // Z/X used to move by a whole period: on a 31-degree scale the letters cover 0..18 and
+    // the next press jumped to degree 31, so twelve degrees of every period could not be
+    // played at all - in the one instrument whose whole point is those degrees.
+    //
+    // ...AND THE TOP IS 127 MINUS THE ROW, not 127 minus nothing. The base was clamped to
+    // 112 while the notes were clamped to 127, so the last four letters all landed on note
+    // 127: pressing one and releasing another silenced a key that was still held.
+    const int step = juce::jmin (period, (int) (sizeof (kKeyMap) / sizeof (kKeyMap[0])));
+    const int topBase = 127 - kKeyMap[(sizeof (kKeyMap) / sizeof (kKeyMap[0])) - 1].off;
+    if (c == 'z' || c == 'Z') { baseKey = juce::jlimit (0, topBase, baseKey - step); return true; }
+    if (c == 'x' || c == 'X') { baseKey = juce::jlimit (0, topBase, baseKey + step); return true; }
+    // In the STANDALONE, swallow every mapped play key: there is no host to give them to,
+    // and this is where the QWERTY mapping plays. (The swallow used to be argued against a
+    // host's keyboard - Live's A S D landing a unison / second from ours, the "ghost second
+    // note" - and that is exactly what the plugin return above now answers by not playing
+    // ours at all there.)
     const auto lc = (juce::juce_wchar) juce::CharacterFunctions::toLowerCase (c);
     for (const auto& m : kKeyMap)
         if (m.ch == (int) lc) return true;
@@ -6558,6 +13051,12 @@ bool FractalAdditiveAudioProcessorEditor::keyStateChanged (bool)
 {
     const bool hadHeld = ! heldKeys.empty();
     pollComputerKeyboard();
+    // ...AND IN A PLUGIN WE SWALLOW NOTHING. The letters belong to the host there (see
+    // playKeysLive), so intercepting them would take the keys away from the host's own
+    // computer keyboard while giving nothing back - the worst of both, and exactly the
+    // state that made one set of keys mean two different things depending on focus.
+    if (processorRef.wrapperType != juce::AudioProcessor::wrapperType_Standalone)
+        return false;
     // Swallow the event whenever it involves our play keys (a mapped key is down
     // now, or one was just released) so key-ups can't reach the DAW's computer
     // keyboard either. Unrelated keys (space, digits...) still pass through.
@@ -6576,8 +13075,52 @@ bool FractalAdditiveAudioProcessorEditor::keyStateChanged (bool)
 // keyStateChanged, see openPartialAmpWindow) so the same mapping keeps working there.
 // isActiveWindow() and not hasKeyboardFocus(): nothing inside that window has to want
 // focus for the window to be the one in front.
+// THE LINE UNDER THE KEYS, in ONE place, because two things read it now.
+//
+// applyLanguage puts the right one on screen, and layoutProbe hands BOTH to the language
+// gates - which is the whole reason this is a function. Gating the sentence on the wrapper
+// meant the rig, which builds the editor as a PLUGIN, stopped photographing the standalone
+// one: a string that had been under the mojibake and translated checks for months would
+// have quietly left them, and this file has a whole section about strings that escape a
+// gate by living in a state no scenario reaches. A second copy declared to the probe would
+// go stale the day one of them is reworded, so the probe reads this.
+juce::String FractalAdditiveAudioProcessorEditor::keyboardHelpText (bool standalone) const
+{
+    return standalone
+        ? tr ("Play: A S D F G H J K L = the scale in order, then Q W E R T Y U I O P continue higher.   Z / X = down / up one scale period.",
+              "Toca: A S D F G H J K L = l'escala en ordre, i Q W E R T Y U I O P segueixen m\xc3\xa9s agudes.   Z / X = avall / amunt un per\xc3\xado" "de.")
+        : tr ("Your DAW's own computer keyboard plays this - so what you play is recorded. Fibl\xc3\xb3's letter layout (one key per scale degree) is in the standalone app.",
+              "El teclat d'ordinador del teu DAW \xc3\xa9s el que toca - i aix\xc3\xad el que toques queda gravat. La disposici\xc3\xb3 per lletres de Fibl\xc3\xb3 (una tecla per grau) \xc3\xa9s a l'aplicaci\xc3\xb3 independent.");
+}
+
 bool FractalAdditiveAudioProcessorEditor::playKeysLive() const
 {
+    // THE LETTER KEYBOARD IS A STANDALONE FEATURE, AND ONLY THERE.
+    //
+    // "haz que el teclado solo funcione de la manera guay en modo standalone, y que de
+    //  normal en el daw funcione como el daw manda."
+    //
+    // Fibló's own layout is LINEAR - one letter per scale degree, A..L then Q..P - which
+    // is the only sane arrangement for a scale of N degrees, and it is genuinely nicer to
+    // play. But it lives entirely inside this editor: the notes are injected straight into
+    // the synth's own MIDI stream (see PluginProcessor's keyboardState merge), so the host
+    // NEVER SEES THEM and nothing you play that way can be recorded. Sending them out of
+    // the plugin's MIDI port instead would need the user to hand-route "MIDI From: Fibló"
+    // onto a second track - and a feature that needs a routing lesson before it can record
+    // a note is not a feature, it is a trap.
+    //
+    // Worse, this editor SWALLOWED those keys (see keyStateChanged), so inside a DAW the
+    // same letters meant two different things depending on which window had focus:
+    // Fibló's linear degrees here, the host's piano layout everywhere else. Two layouts
+    // for one set of keys is the confusion the user reported.
+    //
+    // So in a plugin the keys are simply not ours. They travel to the host, whose own
+    // computer keyboard sends REAL, RECORDABLE MIDI - one instrument, one way to play it,
+    // and it is the host's way because the host is the thing that records. The standalone
+    // has no host to defer to, so there it keeps the good layout. The line under the
+    // on-screen keyboard says which of the two you are looking at; see applyLanguage.
+    if (processorRef.wrapperType != juce::AudioProcessor::wrapperType_Standalone)
+        return false;
     if (hasKeyboardFocus (true)) return true;
     // BOTH floating windows count, or their key forwarding is a lie: the playground
     // forwards its key events exactly like the partial window (hearing the morph move
@@ -6628,16 +13171,16 @@ void FractalAdditiveAudioProcessorEditor::pollComputerKeyboard()
         {
             const int note = juce::jlimit (0, 127, baseKey + m.off);
             heldKeys[m.ch] = note;
-            // Guard against a SECOND note-on for a note that is already sounding
-            // (from an overlapping key/source or a reconcile race): a duplicate
-            // note-on starts a second voice, which is exactly the "press one key
-            // and two sound at once" bug. Only ring it if it is not already on.
-            if (! processorRef.keyboardState.isNoteOn (1, note))
-                processorRef.keyboardState.noteOn (1, note, 0.8f);
+            // Through the processor's own note path: it refuses a second note-on for a
+            // note the window is already sounding (the "press one key and two sound at
+            // once" bug this guard was written for) and, unlike the shared keyboard
+            // state this used to go through, it cannot cancel - or be cancelled by - a
+            // note the host or the controller is holding on the same pitch.
+            processorRef.playUiNote (note, 0.8f);
         }
         else if (! wantOn && it != heldKeys.end())
         {
-            processorRef.keyboardState.noteOff (1, it->second, 0.0f);
+            processorRef.stopUiNote (it->second);
             heldKeys.erase (it);
         }
     }
@@ -6645,15 +13188,59 @@ void FractalAdditiveAudioProcessorEditor::pollComputerKeyboard()
 
 void FractalAdditiveAudioProcessorEditor::timerCallback()
 {
+    // This window's own share of the interface thread, for the load watch (a tick that held
+    // it is a freeze of this window and of the host's screen with it).
+    struct StallScope
+    {
+        FractalAdditiveAudioProcessor& p;
+        double t0;
+        ~StallScope() { p.noteMessageStallMs (juce::Time::getMillisecondCounterHiRes() - t0); }
+    } stallScope { processorRef, juce::Time::getMillisecondCounterHiRes() };
+    {
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        refreshLoadWarning (lastLoadTickMs > 0.0 ? (now - lastLoadTickMs) / 1000.0 : 0.0);
+        lastLoadTickMs = now;
+    }
     pollComputerKeyboard(); // safety net for missed KEYUPs / ghost keys / focus loss
+    // A CONTROLLER ASKED FOR A ZONE THIS MODE CANNOT HONOUR. The MPE (bend input) mode is
+    // fixed at 15 members and +-48 both ways - that is what the panel promises when it
+    // hides the bend selector, and what every bend this synth GENERATES is encoded at. A
+    // controller that announces something else is overruled, and told so here rather than
+    // quietly ignored.
+    if (const auto zo = processorRef.takeZoneOverride(); zo.seen)
+        raiseNotice ([this, zo]
+        {
+            noticeOverlay.title = tr ("Your controller asked for a different MPE zone",
+                                      "El teu controlador ha demanat una zona MPE diferent");
+            juce::String b;
+            b << tr ("It announced ", "Ha anunciat ") << juce::String (zo.members)
+              << tr (" member channels and \xc2\xb1", " canals de membre i \xc2\xb1") << juce::String (zo.perNote)
+              << tr (" semitones per note. This mode is fixed at 15 member channels and \xc2\xb1""48 both ways, "
+                     "which is what the Pitch bend read-out says and what every bend this synth sends is "
+                     "encoded at - so the two would disagree by the ratio between them.",
+                     " semitons per nota. Aquest mode \xc3\xa9s fix: 15 canals de membre i \xc2\xb1""48 als dos "
+                     "costats, que \xc3\xa9s el que diu el r\xc3\xa8tol de Pitch bend i com es codifica tot el bend "
+                     "que envia aquest sintetitzador; si no, els dos n\xc3\xbameros es contradirien.");
+            b << "\n\n"
+              << tr ("Nothing was changed on your controller, and nothing you play is limited: the zone this "
+                     "plugin uses is the one above. If you want the controller's own range instead, use one of "
+                     "the other tuning modes, where the Pitch bend selector is yours to set.",
+                     "No s'ha canviat res al teu controlador, i res del que toques queda limitat: la zona que "
+                     "fa servir aquest plugin \xc3\xa9s la de dalt. Si vols el rang del controlador, fes servir un "
+                     "dels altres modes d'afinaci\xc3\xb3, on el selector de Pitch bend \xc3\xa9s teu.");
+            noticeOverlay.body = b;
+        }, "mpezone");
 
     // The envelope curve follows its parameters live (automation, a modulator
     // driving them, the selector switching modulator, an undo...).
     if (envEditor.isVisible()) envEditor.refresh();
 
+    refreshLfoRateLimitState(); // the LFO rate fader goes amber while the block rate caps it
     refreshModWatch(); // live-modulation marker on every watched fader (see the header)
     refreshSlopeFreeze(); // SLOPE goes grey + "FROZEN" while manual amplitudes are on
+    applyTransitionMode();   // the TRANSITION box follows the two booleans, however they moved
     refreshShepardSyncState(); // beats box goes amber while Sync has no BPM to sync to
+    refreshShepardRiseState(); // ...and the switch says why the rise choice is missing
     // The amplitude window follows the spectrum: the template is rebuilt on a background
     // thread whenever Base/Fractal/primes/tuning move, and the stored edits can change
     // with no rebuild at all (an undo, a preset, a reload). Both are polled here rather
@@ -6661,6 +13248,14 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     if (partialWindow != nullptr && partialWindow->isVisible())
         partialPanel.syncIfNeeded();
     refreshPresetDirtyMark();
+    // ...and WHOSE patch the controls are. Polled, not only pushed: the processor can end
+    // a corner edit on its own (the playground disengaging, a corner cleared by
+    // automation), and the "*" appears the moment any control moves.
+    refreshCornerEditUi();
+    // ...and whether the SPECTRUM panel can reach the sound at all right now. Polled for
+    // the same reason: two corners becoming assigned is what turns the playground on, and
+    // that can happen from the playground window, a preset, automation or an undo.
+    refreshPlaygroundDrivingUi();
     // Keep the Spectrum-Builder box showing the typed spectrum that is actually
     // loaded - it can change under us (a preset, an undo, "load its original
     // spectrum"). Never while it has focus: that would overwrite what is being typed.
@@ -6710,7 +13305,16 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
 
     // n-AD list: recompute when the selection or the scale/timbre changes; publish
     // results when the worker finishes (values coloured green -> red like the list).
-    if (nadView.isVisible() && specModeBox.getSelectedId() == 1 && tuneSourceBox.getSelectedId() != 2)
+    // THE GATE IS "IS THIS LIST ON SCREEN", NOT "WHICH SOURCE IS SELECTED".
+    // It used to also require tuneSourceBox != 2 - i.e. it refused to recompute in the
+    // FREE-SEARCH source. But that source is exactly where the "Tuning info" button
+    // lives: load a chord from the search and the view flips to this same list, showing
+    // the loaded chord's own degrees. With the recompute switched off there, the rows
+    // left over from whatever scale was on screen before simply stayed - so a 5-note
+    // chord loaded as the scale was captioned with 12-TET's answer: "en una pentatonica
+    // me dice 7 y 11 como recomendaciones de acordes en ese tuning". nadView.isVisible()
+    // is already exactly "one of the two views that show this list is up".
+    if (nadView.isVisible() && specModeBox.getSelectedId() == 1)
     {
         // Live: any change to the tuning, the timbre or ANY of the four shared
         // controls recomputes on its own - "From current tuning" has no Find button.
@@ -6765,10 +13369,31 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             lastNadOpts = opts;
             processorRef.startNadCompute (lastNadSel, rootOnly, maxMode, periodRatio, minGap);
         }
+        // THE STAMP IS CHECKED EVERY TICK, not only when a new generation lands.
+        //
+        // A row's chips are degree INDICES into the scale the worker ran over, so once
+        // the tuning moves they name degrees the scale in force does not have - "en una
+        // pentatonica me dice 7 y 11". That check used to live INSIDE the generation
+        // gate, which meant the stale rows stayed on screen for as long as no new result
+        // arrived. That was invisible while every view of this list recomputed
+        // continuously; it stopped being invisible the moment one of those views was
+        // removed, and the verifier caught it as 12-TET's chip 11 under a five-note
+        // scale. Clearing here costs one integer compare a tick and cannot go stale.
+        if (processorRef.getNadResultDegrees() != processorRef.getScaleDegrees()
+            && ! nadList.rows.empty())
+        {
+            nadList.rows.clear();
+            nadList.setSize (nadList.getWidth(), 0);
+            nadList.repaint();
+        }
         if (processorRef.getNadGeneration() != lastNadGen)
         {
             lastNadGen = processorRef.getNadGeneration();
-            const auto res = processorRef.getNadResults();
+            // Belt and braces behind the gate above: the list shows nothing rather than
+            // something wrong, and the pending recompute fills it a tick later.
+            const bool sameScale = processorRef.getNadResultDegrees() == processorRef.getScaleDegrees();
+            const auto res = sameScale ? processorRef.getNadResults()
+                                       : std::vector<FractalAdditiveAudioProcessor::NadRow>();
             double lo = 1.0e30, hi = -1.0e30;
             for (const auto& r : res) { lo = juce::jmin (lo, r.value); hi = juce::jmax (hi, r.value); }
             // In an equal-step tuning every shape is valid from every degree, so the
@@ -6801,6 +13426,14 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                 txt = tr ("first ", "nom\xc3\xa9s els primers ") + juce::String (processorRef.getNadUsedDegrees())
                     + tr (" of ", " de ") + juce::String (processorRef.getNadTotalDegrees())
                     + tr (" degrees analysed", " graus analitzats");
+            // The chips read differently in a tuning with no period and the reason is not
+            // on screen anywhere else: no "any" row, because a shape cannot stand for its
+            // transpositions in a scale that never repeats, so every combination is listed
+            // at the degrees it really uses. Said here rather than inferred from a longer
+            // list, and never by printing an octave the scale does not have.
+            else if (processorRef.nadHadNoPeriod() && ! nadList.rows.empty())
+                txt = tr ("this scale states no period - shapes are listed where they really are",
+                          "aquesta escala no declara cap per\xc3\xado" "de - les formes es llisten on realment s\xc3\xb3n");
             if (txt != nadList.emptyText) { nadList.emptyText = txt; resized(); nadList.repaint(); }
         }
     }
@@ -6854,6 +13487,20 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // switched itself off rather than close a feedback loop.
     paintRealtimeButtons();
 
+    // MONOPHONIC GLIDE stands the note gate's own "Mono" down (see the processor's
+    // noteGate.process call for why: the gate cuts the sounding note BEFORE the new one,
+    // which turned every takeover back into a restrike and killed the glide silently).
+    // The toggle greys out so the panel is not showing a lit switch that is not driving
+    // anything; its tooltip carries the reason permanently.
+    {
+        const bool mg = processorRef.apvts.getRawParameterValue ("monoGlide")->load() > 0.5f;
+        if (rhythmPanel.monoT.isEnabled() == mg)            // only on a real change
+        {
+            rhythmPanel.monoT.setEnabled (! mg);
+            rhythmPanel.monoT.setAlpha (mg ? 0.45f : 1.0f);
+        }
+    }
+
     // Spectrum adaptation (mode 2): progress, the adapted partial list, and the honest
     // before/after read-out.
     if (specModeBox.getSelectedId() == 2)
@@ -6887,7 +13534,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                 juce::String aerr;
                 if (! processorRef.applySpectrumAdapt (true, aerr) && aerr.isNotEmpty())
                     juce::NativeMessageBox::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                        tr ("Adapt spectrum to tuning", "Adapta l'espectre a l'afinaci\xc3\xb3"), aerr, this);
+                        tr ("Adapt spectrum to tuning", "Adapta l'espectre a l'afinaci\xc3\xb3"), trErr (aerr), this);   // the Catalan reader gets Catalan
             }
             const auto info = processorRef.getSpectrumAdaptResult();
             double aMax = 0.0;
@@ -6984,7 +13631,10 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         chordProgLbl.setText (processorRef.isChordSearchRunning()
                                   ? tr ("Searching... ", "Cercant... ")
                                     + juce::String ((int) std::lround (processorRef.getChordSearchProgress() * 100.0f)) + "%"
-                                  : chordRtOn ? tr ("realtime: ", "temps real: ")
+                                  // Capitalised to match "Searching..." - the other half
+                                  // of this same one-line read-out, which a reader sees
+                                  // in the same place a second earlier.
+                                  : chordRtOn ? tr ("Realtime: ", "Temps real: ")
                                                 + juce::String (processorRef.getRealtimeApplies())
                                                 + tr (" retunes", " reafinacions")
                                               : juce::String(),
@@ -7028,22 +13678,141 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             const int req = processorRef.getChordRequested(), got = processorRef.getChordFound();
             if (req > 0 && got < req)
             {
-                const juce::String gap ((int) std::lround (processorRef.getChordMinGap()));
-                noticeOverlay.title = got == 0
-                    ? tr ("No chord fits that smallest interval", "Cap acord no cap amb aquest interval m\xc3\xadnim")
-                    : tr ("Fewer chords than requested", "Menys acords dels demanats");
-                noticeOverlay.body = got == 0
-                    ? tr ("Every note pair must be at least ", "Cada parella de notes ha d'estar a ") + gap
-                      + tr (" cents apart, and that many gaps do not fit inside the period. Lower 'smallest interval', use fewer notes, or widen the period.",
-                            " cents com a m\xc3\xadnim, i tants espais no caben dins el per\xc3\xado" "de. Abaixa 'interval m\xc3\xa9s petit', posa menys notes o eixampla el per\xc3\xado" "de.")
-                    : tr ("Only ", "Nom\xc3\xa9s ") + juce::String (got) + tr (" of the ", " dels ") + juce::String (req)
-                      + tr (" chords you asked for satisfy a smallest interval of ", " acords demanats compleixen l'interval m\xc3\xadnim de ")
-                      + gap + tr (" cents.", " cents.");
-                noticeOverlay.setVisible (true);
-                noticeOverlay.toFront (false);
-                noticeOverlay.repaint();
+                const int gapC = (int) std::lround (processorRef.getChordMinGap());
+                raiseNotice ([this, req, got, gapC]
+                {
+                    const juce::String gap (gapC);
+                    noticeOverlay.title = got == 0
+                        ? tr ("No chord fits that smallest interval", "Cap acord no cap amb aquest interval m\xc3\xadnim")
+                        : tr ("Fewer chords than requested", "Menys acords dels demanats");
+                    noticeOverlay.body = got == 0
+                        ? tr ("Every note pair must be at least ", "Cada parella de notes ha d'estar a ") + gap
+                          + tr (" cents apart, and that many gaps do not fit inside the period. Lower 'smallest interval', use fewer notes, or widen the period.",
+                                " cents com a m\xc3\xadnim, i tants espais no caben dins el per\xc3\xado" "de. Abaixa 'interval m\xc3\xa9s petit', posa menys notes o eixampla el per\xc3\xado" "de.")
+                        : tr ("Only ", "Nom\xc3\xa9s ") + juce::String (got) + tr (" of the ", " dels ") + juce::String (req)
+                          + tr (" chords you asked for satisfy a smallest interval of ", " acords demanats compleixen l'interval m\xc3\xadnim de ")
+                          + gap + tr (" cents.", " cents.");
+                }, "chords");
             }
         }
+    }
+
+    // A PROJECT THAT LOST ITS SCALE SAYS SO, ONCE. setStateInformation parks the parser's
+    // own message on the processor because it runs on a load thread with no editor
+    // guaranteed to exist; this is the first tick after that, and take... clears it, so
+    // the notice appears for the load that failed and not for every tick afterwards.
+    if (const auto lost = processorRef.takeTuningRestoreError(); lost.isNotEmpty())
+    {
+        raiseNotice ([this, lost]
+        {
+            noticeOverlay.title = tr ("This project's tuning could not be restored",
+                                      "No s'ha pogut restaurar l'afinaci\xc3\xb3 d'aquest projecte");
+            noticeOverlay.body  = tr ("The scale saved with this project no longer reads, so the instrument is playing 12-tone equal temperament instead. Nothing you play is in the tuning this project was written in.\n\nLoad the scale again if you still have the file.\n\n",
+                                      "L'escala desada amb aquest projecte ja no es pot llegir, o sigui que l'instrument est\xc3\xa0 tocant temperament igual de 12 tons. Res del que toquis est\xc3\xa0 en l'afinaci\xc3\xb3 amb qu\xc3\xa8 es va escriure el projecte.\n\nTorna a carregar l'escala si encara tens el fitxer.\n\n")
+                                + trErr (lost);
+        });
+    }
+
+    // ...AND SO DOES A BANK SLOT THAT WOULD NOT LOAD. Same arrangement, one line below,
+    // because the failure has the same shape: the processor parks the loader's own words
+    // (the switch happens on a parameter change, with no editor guaranteed) and this is
+    // the first tick that can speak them.
+    //
+    // Without this the message was RECORDED AND NEVER SHOWN. The commit that fixed the
+    // switch itself could not add the consumer - the editor was another agent's file at
+    // the time - so the two halves landed apart, and half of "state the failure" is
+    // silence with extra steps: the selector moves to a slot, the tuning does not change,
+    // and nothing on screen says which of those two facts is the real one.
+    //
+    // A DIFFERENT NOTICE from the one above, not a reuse of it: that one's body says the
+    // PROJECT's tuning is gone and the instrument is on 12-TET, which is a lie about a
+    // bank switch - the tuning you had is still the tuning you have, and it is the SWITCH
+    // that did not happen.
+    if (const auto slotErr = processorRef.takeBankSlotError(); slotErr.isNotEmpty())
+    {
+        raiseNotice ([this, slotErr]
+        {
+            noticeOverlay.title = tr ("That bank slot could not be loaded",
+                                      "No s'ha pogut carregar aquesta ranura del banc");
+            noticeOverlay.body  = tr ("The scale in the slot you picked no longer reads, so the tuning you were already using is still the one sounding - nothing has changed under you.\n\nPick another slot, or put a working scale back into this one.\n\n",
+                                      "L'escala de la ranura que has triat ja no es pot llegir, o sigui que l'afinaci\xc3\xb3 que ja feies servir segueix sent la que sona - no t'ha canviat res sota els dits.\n\nTria una altra ranura, o torna a posar una escala que funcioni en aquesta.\n\n")
+                                + trErr (slotErr);
+        });
+    }
+
+    // ...AND A PRESET THAT WOULD NOT LOAD, which is the third of these and the one that
+    // leaves the most wreckage behind it: the preset NAME stays in the box, the old sound
+    // goes on playing, and the previous preset's tuning is still on offer under a button
+    // that now names a patch which never arrived. Every one of those three is a lie the
+    // user has no way to spot, because a preset that half-loads sounds exactly like a
+    // preset that loaded.
+    if (const auto presetErr = processorRef.takePresetLoadError(); presetErr.isNotEmpty())
+    {
+        raiseNotice ([this, presetErr]
+        {
+            noticeOverlay.title = tr ("That preset could not be loaded",
+                                      "No s'ha pogut carregar aquest preset");
+            noticeOverlay.body  = tr ("Nothing has changed: the sound you had is the sound you still have, and the preset name in the box is the one that was there before.\n\nThe file may have been written by a newer build, moved, or edited by hand.\n\n",
+                                      "No ha canviat res: el so que tenies \xc3\xa9s el que segueixes tenint, i el nom del preset de la casella \xc3\xa9s el que ja hi havia.\n\nPot ser que el fitxer l'hagi escrit una versi\xc3\xb3 m\xc3\xa9s nova, que s'hagi mogut, o que l'hagin editat a m\xc3\xa0.\n\n")
+                                + trErr (presetErr);
+        });
+    }
+
+    // ...AND PLAYGROUND CORNERS THAT CAME BACK EMPTY. A state saved by this build carries a
+    // copy of every corner's preset, so this now fires only for a state from an OLDER build
+    // (names only, read from the folder) whose preset is not there, or for a carried copy that
+    // is damaged. It used to be the everyday path: every corner re-read its file by name.
+    if (auto lost = processorRef.takePlaygroundRestoreLoss(); ! lost.empty())
+    {
+        raiseNotice ([this, lost]
+        {
+            noticeOverlay.title = tr ("Playground corners left empty",
+                                      "Cantonades del laboratori buides");
+            auto body = tr ("These corners could not be restored, so they are EMPTY now:\n\n",
+                            "Aquestes cantonades no s'han pogut restaurar, o sigui que ara estan BUIDES:\n\n");
+            for (const auto& l : lost)
+                body += tr ("Corner ", "Cantonada ")
+                      + juce::String::charToString ((juce::juce_wchar) ('A' + juce::jlimit (0, 3, l.corner)))
+                      + ": \"" + l.name + "\" \xe2\x80\x94 " + trErr (l.why) + "\n";
+            body += tr ("\nA pad saved by this version carries its own copy of every corner's preset. One saved by an older "
+                        "version holds only each preset's NAME and reads it from the preset folder - put that preset back (from ",
+                        "\nUn pad desat amb aquesta versi\xc3\xb3 porta la seva pr\xc3\xb2pia c\xc3\xb2pia del preset de cada "
+                        "cantonada. Un de desat amb una versi\xc3\xb3 anterior nom\xc3\xa9s en t\xc3\xa9 el NOM i el llegeix de "
+                        "la carpeta de presets - torna a posar aquell preset (des de ")
+                  + recycleBinName()
+                  + tr (", if it was deleted) and open this again, or put another preset on the corner.",
+                        ", si s'havia esborrat) i torna a obrir aix\xc3\xb2, o posa un altre preset a la cantonada.");
+            noticeOverlay.body = body;
+        });
+    }
+
+    // ...A CUSTOM ENGINE SPECTRUM THAT DID NOT COME BACK (see restoreState): the patch is
+    // playing the HARMONIC engine, which is not the sound that was saved.
+    if (const auto specErr = processorRef.takeTimbreRestoreError(); specErr.isNotEmpty())
+    {
+        raiseNotice ([this, specErr]
+        {
+            noticeOverlay.title = tr ("The custom engine's spectrum could not be restored",
+                                      "No s'ha pogut restaurar l'espectre del motor propi");
+            noticeOverlay.body  = tr ("The intervals saved for the custom engine no longer read, so this sound is playing on the HARMONIC engine instead - it is not the sound that was saved.\n\nType the intervals into the custom engine's box again if you know them.\n\n",
+                                      "Els intervals desats per al motor propi ja no es poden llegir, o sigui que aquest so est\xc3\xa0 sonant amb el motor HARM\xc3\x92NIC - no \xc3\xa9s el so que es va desar.\n\nTorna a escriure els intervals a la casella del motor propi si els saps.\n\n")
+                                + trErr (specErr);
+        });
+    }
+
+    // ...AND A FILE THE TUNING BANK WOULD NOT TAKE (see setTuningBankFile).
+    if (const auto bankAdd = processorRef.takeBankAddError(); bankAdd.size() == 2)
+    {
+        raiseNotice ([this, bankAdd]
+        {
+            noticeOverlay.title = tr ("That tuning was not added to the bank",
+                                      "Aquesta afinaci\xc3\xb3 no s'ha afegit al banc");
+            // The reason line says WHY (an unreadable file, a full bank); this line only says what
+            // happened, so it is true for every refusal routed here.
+            noticeOverlay.body  = tr ("Nothing was added, and the bank is exactly as it was.\n\n",
+                                      "No s'ha afegit res, i el banc est\xc3\xa0 exactament com estava.\n\n")
+                                + "\"" + bankAdd[0] + "\" \xe2\x80\x94 " + trErr (bankAdd[1]);
+        });
     }
 
     // OCTAVE stepper read-outs (params can also move via host automation).
@@ -7121,11 +13890,20 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
             if (heldHi >= 0)
                 keyboard.ensureVisible (heldLo, heldHi);
         }
+        // ...and re-spell the degrees if the tuning moved under us. Cheap: it compares
+        // one integer and only rebuilds when the EDO itself changed (see
+        // refreshDegreeNames). Here rather than at every load site because the tuning can
+        // change from six of them - a .scl, the bank, MTS, Init, undo, a preset.
+        refreshDegreeNames();
     }
 
     const int  rendered  = processorRef.getPartialCount();
     const int  templ     = processorRef.getTemplatePartialCount();
-    const bool truncated = processorRef.isSpectrumTruncated();
+    // Two ways the same sentence can be true: the TEMPLATE hit kMaxPartials on compile,
+    // or a SHEPARD copy wanted more than its one kStride slot holds while the band's
+    // bottom edge caught up with a density change. Both are caps that change what is
+    // heard, so both wear the same label rather than one of them being silent.
+    const bool truncated = processorRef.isSpectrumTruncated() || processorRef.isShepardSlotCapped();
     juce::String meter;
     if (templ == 0)
     {
@@ -7134,12 +13912,41 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                     "0 parcials \xe2\x80\x94 els filtres d'Harm\xc3\xb2nics / de primers no deixen sonar res");
         meterLabel.setColour (juce::Label::textColourId, juce::Colours::orange);
     }
+    else if (! processorRef.hasSoundedYet())
+    {
+        // THREE STATES, NOT TWO, AND THE COLOUR IS THE DIAGNOSIS.
+        //
+        // This line had one green and one amber. "0 partials audible" came out GREEN in
+        // the one state where the instrument is mute - and in the SAME green on a
+        // perfectly healthy cold instrument, photographed at 1600x900, because
+        // renderedCount is only ever written by a sounding voice, so before the first
+        // note the number is not a measurement at all (see SpectrumEngine::reportRendered).
+        // One string and one colour cannot be right for both.
+        //
+        // So the cold state says what is true - nothing has sounded yet - in the grey this
+        // window uses for "no information", and stops claiming a count it does not have.
+        meter = tr ("not sounded yet", "encara no ha sonat")
+              + "   \xe2\x80\x94   " + juce::String (templ) + tr (" in the full timbre", " al timbre complet");
+        meterLabel.setColour (juce::Label::textColourId, juce::Colour (0xff8f96a8));
+    }
     else
     {
         meter = juce::String (rendered) + tr (" partials audible", " parcials audibles")
               + "   \xe2\x80\x94   " + juce::String (templ) + tr (" in the full timbre", " al timbre complet");
-        if (truncated) meter += tr ("   (safety cap)", "   (l\xc3\xadmit de seguretat)");
-        meterLabel.setColour (juce::Label::textColourId, truncated ? juce::Colours::orange : juce::Colour (0xff7ff59a));
+        // ...and once it HAS sounded, a count of zero is a real diagnosis and wears the
+        // colour of one. Amber and not red: red in this plugin means TRUNCATED - the
+        // engine removed something you asked for. This is "nothing is reaching your ears",
+        // which one control puts right, and it wears the same amber as the overlay that
+        // explains it. Two words and not a sentence: measured at the 690x550 floor the
+        // Catalan line already comes to about 555 px in a 678 px label, and a juce::Label
+        // that runs short does not clip, it CONDENSES - so the honest way to say more here
+        // was to say less.
+        if (truncated)          meter += tr ("   (safety cap)", "   (l\xc3\xadmit de seguretat)");
+        else if (rendered == 0) meter += tr ("   \xe2\x80\x94   SILENT", "   \xe2\x80\x94   EN SILENCI");
+        meterLabel.setColour (juce::Label::textColourId,
+                              truncated     ? juce::Colours::orange
+                            : rendered == 0 ? juce::Colour (0xffffb020)
+                                            : juce::Colour (0xff7ff59a));
     }
     meterLabel.setText (meter, juce::dontSendNotification);
 
@@ -7157,6 +13964,11 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         default: sname = {}; break;
     }
     tuningNameLabel.setText (sname, juce::dontSendNotification);
+    // The NAME decides its own cell - resized() gives it a row of its own when the mode
+    // row cannot hold it - and setText() does not lay anything out. Without this, loading
+    // a scale whose name is longer than the last one leaves it in the old, too-narrow
+    // cell, drawn condensed, until some unrelated relayout happens to come along.
+    if (sname != lastTuningNameLaidOut) { lastTuningNameLaidOut = sname; resized(); }
 
     // Say what is loaded even while the engine is OFF - switching it off no longer
     // discards the scale, so the box must not look empty. And say when the scale is ON
@@ -7214,11 +14026,22 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
                         | (processorRef.tuningIsAbsoluteTable()      ? 1 << 4 : 0)
                         | (processorRef.tuningTablePeriodIsUserSet() ? 1 << 5 : 0)
                         | (processorRef.hasSpectrumProvenance()      ? 1 << 6 : 0)
-                        | (processorRef.spectrumProvenanceIsActive() ? 1 << 7 : 0);
+                        | (processorRef.spectrumProvenanceIsActive() ? 1 << 7 : 0)
+                        // ...and whether the Shepard's rise-interval box is a real
+                        // choice at all. It exists only while the active tuning's
+                        // period is not an octave, and resized() is what puts it on
+                        // screen - so it belongs HERE or the box would appear only at
+                        // the next unrelated relayout after a Bohlen-Pierce load.
+                        | (shepardRiseChoiceExists()                 ? 1 << 8 : 0);
     if (packed != lastResetOffState) { lastResetOffState = packed; resized(); }
     refreshSpectrumTuningButton(); // cheap (sig-guarded): keeps word/enabled honest per tick
 
-    const int mode = (int) (processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f);
+    // Both halves of PRIME CONTROL change what resized() lays out - the mode picks which
+    // sub-controls exist, the switch dims them - and NEITHER change arrives through a
+    // click when it comes from host automation, a preset load or an undo. Packed into
+    // one int and compared, which is what the mode alone already did.
+    const int mode = (int) (processorRef.apvts.getRawParameterValue ("primeMode")->load() > 0.5f)
+                   | (processorRef.apvts.getRawParameterValue ("primeOn")->load() > 0.5f ? 2 : 0);
     if (mode != lastPrimeMode) { lastPrimeMode = mode; resized(); }
 
     if (processorRef.getDissGeneration() != lastDissGeneration)
@@ -7230,7 +14053,7 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // Live active-scale dissonance list (recomputes only when timbre/tuning change).
     updateScaleDissonance();
 
-    // Period of the active scale (red readout in the Tuning box).
+    // Period of the active scale (the lilac read-out in the Tuning box).
     if (processorRef.tuningIsAbsoluteTable())
     {
         // An absolute table declares no period, so the readout must not claim one: it says
@@ -7254,7 +14077,51 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
         const int D = juce::jmax (1, processorRef.getScaleDegrees());
         auto per = degreeLabel (processorRef, D);
         if (per.endsWith ("/1")) per = per.dropLastCharacters (2); // "2/1" reads better as "2"
+        // THE VALUE IS THE FILE'S OWN AND STAYS. This field already printed "1/2" for a
+        // descending scale and "1" for a degenerate one - the .scl's real last line, and
+        // the only place in the window that value is shown. What was missing is the
+        // consequence: that line is NOT a repeat interval going up, which is why the
+        // degrees list has no period row, why no combination is called rootless, why the
+        // register band's unit is marked, and why the Shepard offers no rise-interval
+        // choice. Printing the number and letting the user work out why four other
+        // read-outs changed is the same silence one step earlier, so the field says it.
+        if (! processorRef.tuningStatesPeriod())
+            per += tr ("  (no repeat)", "  (no repeteix)");
         tuningPeriodLbl.setText (tr ("Period  ", "Per\xc3\xado" "de  ") + per, juce::dontSendNotification);
+    }
+
+    // WHAT THE MTS MASTER ACTUALLY SAID ABOUT ITS KEYBOARD MAPPING.
+    //
+    // "ESTOY USANDO 31ED2 Y LOS VALORES EN CENTS QUE ME SALEN EN LAS TECLAS NO TIENEN
+    //  SENTIDO... EL SONIDO ESTABA BIEN, ERA LA REPRESENTACION EN CENTS, EL NUMERO DE
+    //  TECLAS POR PERIODO ERA CORRECTO, 31."
+    //
+    // Sound right, key count right, cents wrong is a signature: the pitches come from
+    // MTS_NoteToFrequency (which is right, or nothing would sound right) while the
+    // DEGREE readouts assume degree d lives on MIDI key 60 + d. MTS-ESP does not promise
+    // that - it has MTS_GetMapStartKey and MTS_GetRefKey precisely because a master says
+    // where its mapping starts and which key is its 1/1 - and this plugin was calling
+    // neither. This line prints what the master reports, so the assumption can be
+    // checked against it instead of argued about.
+    if (processorRef.getTuningMode() == 1)
+    {
+        const auto m = processorRef.mtsMapInfo();
+        // "MTS" is a standard's name and "?" is punctuation - neither is a translation,
+        // and wrapping them in a tr pair would invent two whose sides are identical,
+        // which the source audit rightly refuses.
+        const juce::String unknown ("?");
+        juce::String s ("MTS  ");
+        if (! m.hasMaster) s << tr ("no master", "sense m\xc3\xa0" "ster");
+        else
+        {
+            s << (m.mapSize  > 0 ? juce::String (m.mapSize)  : unknown)
+              << tr (" keys/period", " tecles/per\xc3\xado" "de")
+              << tr (", from key ", ", des de la tecla ")
+              << (m.mapStart >= 0 ? juce::String (m.mapStart) : unknown)
+              << tr (", 1/1 on key ", ", 1/1 a la tecla ")
+              << (m.refKey   >= 0 ? juce::String (m.refKey)   : unknown);
+        }
+        tuningPeriodLbl.setText (s, juce::dontSendNotification);
     }
 
     // The tuning-mode box is wired by hand (12ED2 is not in the list), so it has to be
@@ -7273,8 +14140,9 @@ void FractalAdditiveAudioProcessorEditor::timerCallback()
     // the harmonic controls back to their defaults (as this once did) silently destroyed
     // the user's settings the moment a .scl was loaded, and made the sound depend on the
     // editor being open.
-    if (lastEngineShown != (int) processorRef.engineInForce() * 2
-                           + (processorRef.timbreLoaded() ? 1 : 0))
+    if (lastEngineShown != ((int) processorRef.engineInForce() * 2
+                            + (processorRef.timbreLoaded() ? 1 : 0)) * 2
+                           + (processorRef.temperIsPossible() ? 1 : 0))
     {
         // applyEngineState() re-dresses the Load/Remove button itself: "is a spectrum
         // loaded" is half of the very state this comparison is watching, so the button's

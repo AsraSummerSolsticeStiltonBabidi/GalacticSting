@@ -12,6 +12,7 @@
 #include "dsp/PresetMorph.h"
 #include "PartialAmpEdit.h"
 #include "IntervalTokens.h"
+#include "GalacticPalette.h"
 
 #include <algorithm>
 #include <chrono>
@@ -179,10 +180,60 @@ int main()
         s.fractalLevel = 1.2f; auto ta = compileSpectrum (s);
         s.fractalLevel = 1.5f; auto tb = compileSpectrum (s);
         s.fractalLevel = 1.9f; auto tc = compileSpectrum (s);
-        check (hasRatio (ta, 4.0) && ! hasRatio (ta, 9.0),
-               "at 1.2 the LOWEST new partial (4) is in, the highest (9) is not");
-        check (hasRatio (tb, 4.0) && hasRatio (tb, 6.0) && ! hasRatio (tb, 9.0),
-               "at 1.5 partials 4 and 6 are in, 9 still out (low->high)");
+        // Low->high entry is now measured as REVEAL PROGRESS, not as presence. Each new
+        // partial fades in along its own dB ramp, and the ramps start in ascending-ratio
+        // order and overlap, so a higher new partial can be on the list while still 60 dB
+        // down. Presence stopped being the right question the moment the reveal stopped
+        // switching partials on at full height (which is exactly what made the first
+        // hundredth of a crossing carry half of it). What must hold at every fader
+        // position is that a LOWER new partial is always further along its ramp.
+        auto revealed = [&t2] (const SpectrumTemplate& blend, double ratio)
+        {
+            const float now = ampAtRatio (blend, ratio), full = ampAtRatio (t2, ratio);
+            if (full <= 0.0f) return -1.0;
+            return now < 0.0f ? 0.0 : (double) now / (double) full;
+        };
+        bool orderOk = true, growsOk = true;
+        double prev4 = -1.0, prev6 = -1.0, prev9 = -1.0;
+        for (int k = 1; k <= 99; ++k)
+        {
+            s.fractalLevel = 1.0f + 0.01f * (float) k;
+            const auto bl = compileSpectrum (s);
+            // ORDER: compare each new partial against its own level-2 amplitude. Both
+            // templates are RMS-normalised by a factor common to all three, so the
+            // factor cancels in the comparison BETWEEN them and what is left is pure
+            // reveal progress.
+            const double r4 = revealed (bl, 4.0), r6 = revealed (bl, 6.0), r9 = revealed (bl, 9.0);
+            if (! (r4 >= r6 - 1e-6 && r6 >= r9 - 1e-6)) orderOk = false;
+            // GROWTH: measured against the loudest partial of the SAME template, i.e.
+            // how loud the new partial actually sounds. Reveal progress on its own is
+            // NOT monotone and must not be asserted to be: the whole template is
+            // RMS-renormalised as new energy arrives, so a new partial momentarily
+            // overshoots its level-2 amplitude by ~3% around mid-crossing and settles
+            // back. Its level relative to the fundamental never falls - measured, 0
+            // violations across the sweep.
+            const double a1 = std::max (1.0e-12, (double) ampAtRatio (bl, 1.0));
+            const double n4 = std::max (0.0f, ampAtRatio (bl, 4.0)) / a1;
+            const double n6 = std::max (0.0f, ampAtRatio (bl, 6.0)) / a1;
+            const double n9 = std::max (0.0f, ampAtRatio (bl, 9.0)) / a1;
+            if (n4 < prev4 - 1e-9 || n6 < prev6 - 1e-9 || n9 < prev9 - 1e-9) growsOk = false;
+            prev4 = n4; prev6 = n6; prev9 = n9;
+        }
+        check (orderOk, "at every fader position the lower new partial is further in than the higher (low->high)");
+        check (growsOk, "and every new partial only ever grows against the fundamental as the level rises");
+        // ...and they are genuinely STAGGERED, not merely ordered: half way across the
+        // crossing the three are decades apart, measured 1.035 / 0.065 / 0.0015 of their
+        // final amplitudes. Without the stagger every new partial would fade in together
+        // and the fader would be an ordinary crossfade of the two levels - uniform, but
+        // with the low-to-high growth that gives the control its meaning thrown away.
+        {
+            s.fractalLevel = 1.5f;
+            const auto mid = compileSpectrum (s);
+            const double m4 = revealed (mid, 4.0), m6 = revealed (mid, 6.0), m9 = revealed (mid, 9.0);
+            std::printf ("  mid-crossing reveal: partial 4 %.4f, partial 6 %.4f, partial 9 %.4f of final\n", m4, m6, m9);
+            check (m4 > 2.0 * m6 && m6 > 2.0 * m9,
+                   "the new partials arrive STAGGERED low to high, not all at once");
+        }
         check (hasRatio (tc, 4.0) && hasRatio (tc, 6.0) && hasRatio (tc, 9.0),
                "at 1.9 all three new partials are in");
         check (ta.partials.size() <= tb.partials.size() && tb.partials.size() <= tc.partials.size(),
@@ -193,6 +244,514 @@ int main()
         // The blended amplitudes must stay RMS-normalised like every other template.
         double sq = 0.0; for (const auto& p : tb.partials) sq += (double) p.amp * (double) p.amp;
         check (std::abs (sq - 1.0) < 1e-3, "blended template is RMS-normalised");
+    }
+
+    //--------------------------------------------------------------------------
+    // THE FRACTAL FADER MUST SPEND ITS CHANGE EVENLY.
+    //
+    // The report: "solo subir un poco el lvl por encima de uno de los escalones da un
+    // cambio brusco, nada que ver con subirlo si ya esta entremedio". Measured, the
+    // first hundredth of the 1->2 crossing in Prime mode moved the spectrum 10.157 dB
+    // and the whole crossing 20.736 dB - 49% of the journey in one click, 70x what the
+    // same click costs in the middle of the crossing. At 2->3 it was 67%, at 3->4 73%.
+    //
+    // The yardstick below is per-band energy in dB over 1/12-octave bands from ratio 1
+    // to 1024, floored at -80 dB re the (unit) total energy of an RMS-normalised
+    // template. Equal weight per band = log-frequency weighting, and the dB floor is
+    // what makes "a band lit up from silence" the large event it is to an ear. Every
+    // template compared is finalised the same way - range cut, keep-loudest cap,
+    // ascending sort, RMS normalisation - by whichever path built it, so the numbers are
+    // directly comparable and nothing has to be undone before comparing.
+    std::printf ("fractal fader uniformity:\n");
+    {
+        constexpr int kBands = 120;   // 10 octaves at 1/12 octave = ratio 1 .. 1024
+        auto bandsDb = [kBands] (const SpectrumTemplate& t)
+        {
+            std::vector<double> e ((size_t) kBands, 0.0);
+            for (const auto& p : t.partials)
+            {
+                const int b = (int) std::floor (std::log2 (std::max (1.0e-9, (double) p.ratio)) * 12.0);
+                if (b >= 0 && b < kBands) e[(size_t) b] += (double) p.amp * (double) p.amp;
+            }
+            std::vector<double> d ((size_t) kBands);
+            for (int i = 0; i < kBands; ++i)
+                d[(size_t) i] = 10.0 * std::log10 (std::max (e[(size_t) i], 1.0e-8)); // -80 dB floor
+            return d;
+        };
+        auto dist = [] (const std::vector<double>& a, const std::vector<double>& b)
+        {
+            double s = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) { const double x = a[i] - b[i]; s += x * x; }
+            return std::sqrt (s / (double) a.size());
+        };
+        auto centroidOct = [] (const SpectrumTemplate& t)
+        {
+            double num = 0.0, den = 0.0;
+            for (const auto& p : t.partials)
+            {
+                const double e = (double) p.amp * (double) p.amp;
+                num += e * std::log2 (std::max (1.0e-9, (double) p.ratio));
+                den += e;
+            }
+            return den > 0.0 ? num / den : 0.0;
+        };
+
+        // One crossing, walked on the fader's OWN grid: NormalisableRange(1, 4, 0.01)
+        // snaps the slider, so 1.00, 1.01 ... 2.00 are exactly the values a user can dial.
+        struct Walk
+        {
+            double maxStep = 0.0, meanStep = 0.0, firstStep = 0.0, total = 0.0, worstBackward = 0.0;
+            int    argMax = 0;
+            bool   centroidRises = true;
+            double centroidLo = 0.0, centroidHi = 0.0;
+        };
+        auto walk = [&] (SpectrumSettings s, int Llo)
+        {
+            std::vector<std::vector<double>> B;
+            std::vector<double> C;
+            for (int k = 0; k <= 100; ++k)
+            {
+                s.fractalLevel = (float) Llo + 0.01f * (float) k;
+                const auto x = compileSpectrum (s);
+                B.push_back (bandsDb (x));
+                C.push_back (centroidOct (x));
+            }
+            Walk w;
+            for (int k = 1; k <= 100; ++k)
+            {
+                const double d = dist (B[(size_t) k - 1], B[(size_t) k]);
+                if (d > w.maxStep) { w.maxStep = d; w.argMax = k; }
+                w.meanStep += d;
+                if (k == 1) w.firstStep = d;
+            }
+            w.meanStep /= 100.0;
+            w.total = dist (B[0], B[100]);
+            double prev = 0.0;
+            for (int k = 1; k <= 100; ++k)
+            {
+                const double d = dist (B[0], B[(size_t) k]);
+                w.worstBackward = std::max (w.worstBackward, prev - d);
+                prev = d;
+            }
+            for (int k = 1; k <= 100; ++k)
+                if (C[(size_t) k] < C[(size_t) k - 1] - 1.0e-9) w.centroidRises = false;
+            w.centroidLo = C.front(); w.centroidHi = C.back();
+            return w;
+        };
+
+        // Harmonics = Prime is the worst case and the mode the report names, because
+        // {1} u {primes} is the least multiplicatively closed of the four sets: 4, 6 and
+        // 9 are all NEW at level 2, so there is a large fresh set to reveal. With
+        // Harmonics = All/Odd/Even, or a pure prime LIMIT, the set is closed, there is
+        // nothing fresh, and the fader was always smooth - which is why the user hears
+        // this in prime mode and nowhere else.
+        SpectrumSettings prime; prime.baseN = 1; prime.selection = (float) Selection::Prime;
+        prime.curveSlope = 1.0f;
+
+        // K: the worst single click, as a multiple of the average click. Measured on the
+        // shipping code this was 14.4 / 27.6 / 40.2 for 1->2 / 2->3 / 3->4; with the dB
+        // reveal ramp it is 1.8 / 1.8 / 2.0. 4 sits with 2x headroom over the fix and a
+        // factor of 3.6 below the smallest failure the old code produced.
+        constexpr double kMaxStepRatio = 4.0;
+        // The first click of a crossing must not carry vastly more than its 1% share.
+        // Measured: 0.15% / 0.34% / 0.63% now, 49% / 67% / 73% before.
+        constexpr double kMaxFirstShare = 0.04;
+
+        for (int Llo = 1; Llo <= 3; ++Llo)
+        {
+            const auto w = walk (prime, Llo);
+            const double K = w.meanStep > 0.0 ? w.maxStep / w.meanStep : 0.0;
+            std::printf ("  Prime %d->%d  worst click %.3f dB @%d, mean %.4f dB, K=%.1f;"
+                         " first click %.2f%% of the crossing (%.3f dB total); centroid %.2f -> %.2f oct\n",
+                         Llo, Llo + 1, w.maxStep, w.argMax, w.meanStep, K,
+                         100.0 * w.firstStep / std::max (1.0e-12, w.total), w.total,
+                         w.centroidLo, w.centroidHi);
+
+            check (K <= kMaxStepRatio,
+                   "UNIFORMITY: no single fader click costs more than 4x the average click");
+            check (w.firstStep <= kMaxFirstShare * w.total,
+                   "NO EARLY CLIFF: the first 1% of a crossing delivers at most 4% of it");
+            // Measured worst backward wobble with the fix in place: 0.0101 dB, and it
+            // comes from the RMS renormalisation, not from the reveal. 0.05 dB is a
+            // twentieth of the smallest step the fader can produce.
+            check (w.worstBackward < 0.05,
+                   "MONOTONICITY: the spectrum only ever moves further from where the crossing started");
+            check (w.centroidRises && w.centroidHi > w.centroidLo + 0.2,
+                   "CHARACTER: the spectral centroid still climbs across the crossing - detail grows upward");
+        }
+
+        // Not just prime mode. The closed-set configs never stepped, and they must not
+        // start; the open ones must all come into line. This sweep walks the crossing
+        // INTERIOR (1.00 ... 1.99) only: the last click, from x.99 onto the integer
+        // level, is governed by a separate and OLDER effect - several upper-level
+        // partials inside one ~1-cent bin collapse onto the surviving lower-level
+        // partial, so blend(t->1) carries their summed amplitude on one ratio instead of
+        // three. That is why Base 4 measures a 0.797 dB last click against a 0.186 dB
+        // average (it was 0.820 dB before this change, i.e. untouched by it) while Prime,
+        // whose bins hold one partial each, measures 0.030 dB.
+        auto walkInterior = [&] (SpectrumSettings s, int Llo)
+        {
+            std::vector<std::vector<double>> B;
+            for (int k = 0; k <= 99; ++k)
+            {
+                s.fractalLevel = (float) Llo + 0.01f * (float) k;
+                B.push_back (bandsDb (compileSpectrum (s)));
+            }
+            double mx = 0.0, mean = 0.0;
+            for (int k = 1; k <= 99; ++k)
+            { const double d = dist (B[(size_t) k - 1], B[(size_t) k]); mx = std::max (mx, d); mean += d; }
+            mean /= 99.0;
+            return mean > 0.0 ? mx / mean : 0.0;
+        };
+        {
+            struct Cfg { const char* name; SpectrumSettings s; };
+            std::vector<Cfg> cfgs;
+            { SpectrumSettings s; s.selection = (float) Selection::Prime; s.reach = 256; cfgs.push_back ({ "Prime", s }); }
+            { SpectrumSettings s; s.selection = (float) Selection::All;   s.reach = 256; cfgs.push_back ({ "All (closed set)", s }); }
+            { SpectrumSettings s; s.selection = (float) Selection::Odd;   s.reach = 256; cfgs.push_back ({ "Odd (closed set)", s }); }
+            { SpectrumSettings s; s.selection = 2.5f;                     s.reach = 256; cfgs.push_back ({ "Harmonics 2.5", s }); }
+            { SpectrumSettings s; s.selection = (float) Selection::Prime; s.reach = 256;
+              s.primeLimit = 13; s.primeLimitPos = 1.0f; cfgs.push_back ({ "Prime + 13-limit", s }); }
+            { SpectrumSettings s; s.selection = (float) Selection::Prime; s.reach = 256;
+              s.curveSlope = 2.5f; cfgs.push_back ({ "Prime, slope 2.5", s }); }
+            { SpectrumSettings s; s.selection = (float) Selection::Prime; s.reach = 256;
+              s.curveSlope = 0.3f; cfgs.push_back ({ "Prime, slope 0.3", s }); }
+            { SpectrumSettings s; s.baseN = 3; s.selection = (float) Selection::Prime; s.reach = 256;
+              cfgs.push_back ({ "Base 3, Prime", s }); }
+            bool allEven = true;
+            double worst = 0.0; const char* worstAt = "";
+            for (const auto& c : cfgs)
+                for (int Llo = 1; Llo <= 3; ++Llo)
+                {
+                    const double K = walkInterior (c.s, Llo);
+                    if (K > worst) { worst = K; worstAt = c.name; }
+                    if (K > 4.0) { allEven = false; std::printf ("    %s %d->%d K=%.1f\n", c.name, Llo, Llo + 1, K); }
+                }
+            std::printf ("  worst max/mean click over 8 configs x 3 crossings: %.1f (%s)\n", worst, worstAt);
+            check (allEven, "UNIFORMITY holds across harmonics/prime/slope/base settings, not just prime mode");
+        }
+
+        // THE CLOSED-SET CASE, which is what the geometric survivor is for. When the base
+        // harmonic set is closed under multiplication - Harmonics = All or Odd, or a
+        // prime whitelist that keeps a closed set - the upper level introduces NO new
+        // ratios at all, there is nothing to reveal, and the only thing the fader does is
+        // rescale the partials both levels share. Linearly in amplitude that front-loads:
+        // measured max/mean click 1.8 (All), 1.7 (Odd), 2.4 (whitelist) with the worst
+        // click always the FIRST one. On a straight line in dB it is 1.1 / 1.0 / 1.0 and
+        // the worst click is no longer at the start.
+        //
+        // At the PLUGIN's reach (kSpectrumReach), not a cut-down one: the two levels of a
+        // closed set differ only in how far the products reach, so shortening the reach
+        // shrinks the difference until neither form of the fade is distinguishable
+        // (measured at reach 256: 1.55 linear against 1.58 geometric, a wash).
+        {
+            struct Cfg { const char* name; SpectrumSettings s; };
+            std::vector<Cfg> closed;
+            { SpectrumSettings s; s.selection = (float) Selection::All; closed.push_back ({ "All", s }); }
+            { SpectrumSettings s; s.selection = (float) Selection::Odd; closed.push_back ({ "Odd", s }); }
+            { SpectrumSettings s; s.primeUseWhitelist = true;
+              s.primeWhitelistMask = 0x1FCu; closed.push_back ({ "whitelist without 2 and 3", s }); }
+            bool flat = true;
+            for (const auto& c : closed)
+            {
+                const double K = walkInterior (c.s, 1);
+                std::printf ("  closed set, %-26s max/mean click %.2f\n", c.name, K);
+                if (K > 1.4) flat = false;
+            }
+            check (flat, "with nothing new to reveal the fader is FLAT - the shared partials fade in dB, not in amplitude");
+        }
+
+        // ENDPOINT EXACTNESS, bottom. compileSpectrum takes the single-level path for a
+        // fraction of 1e-3 or less, so the blend at t=0 itself is not reachable through
+        // the public API; what IS reachable, and what matters, is that the blend
+        // CONVERGES on the integer level as the fraction vanishes. Before the fix the
+        // first blended value the automation lane could reach was 4.881 dB away from the
+        // integer level in this config.
+        {
+            SpectrumSettings s = prime;
+            s.fractalLevel = 1.0f;     const auto atL   = compileSpectrum (s);
+            s.fractalLevel = 1.0011f;  const auto justAbove = compileSpectrum (s);
+            const double d = dist (bandsDb (atL), bandsDb (justAbove));
+            std::printf ("  crossing the 1e-3 blend threshold costs %.4f dB (was 4.881)\n", d);
+            check (d < 0.02, "ENDPOINT: entering the blend is not a cliff - below the fader's own smallest step");
+            // Every partial of the integer level is still there, at its own amplitude.
+            bool same = justAbove.partials.size() >= atL.partials.size();
+            double worstAmp = 0.0;
+            for (const auto& p : atL.partials)
+            {
+                const float a = ampAtRatio (justAbove, (double) p.ratio, 1.0e-4 * (double) p.ratio);
+                if (a < 0.0f) { same = false; break; }
+                worstAmp = std::max (worstAmp, std::abs ((double) a - (double) p.amp));
+            }
+            check (same && worstAmp < 1.0e-3,
+                   "ENDPOINT: and every partial of the integer level survives it unchanged");
+        }
+
+        // ENDPOINT EXACTNESS, top. At a fraction of 0.99 the reveal is complete (the
+        // last ramp starts at 0.5 at the latest and is a half-crossing wide) and every
+        // survivor carries the upper level's bin energy, so the template IS the upper
+        // level - partial set included. It cannot be bit-identical, because 1.99 is
+        // genuinely one hundredth short of 2.00 and the survivors are still that far
+        // along their fade; what has to be true is that the remaining gap shrinks in
+        // proportion to the remaining fraction rather than sitting there as an offset,
+        // which is what a blend that did NOT converge on the upper level would show.
+        //
+        // Prime is used because its ~1-cent bins hold exactly one partial each; where
+        // they do not (Base 4) the bin collapse described above applies and the partial
+        // COUNT at the top of a crossing differs from the upper level's. That is older
+        // than this change and untouched by it.
+        {
+            SpectrumSettings s = prime;
+            s.fractalLevel = 2.0f;    const auto exact  = compileSpectrum (s);
+            s.fractalLevel = 1.99f;   const auto near1  = compileSpectrum (s);
+            s.fractalLevel = 1.999f;  const auto near2  = compileSpectrum (s);
+            auto gap = [&exact] (const SpectrumTemplate& n, bool& sameSet)
+            {
+                sameSet = exact.partials.size() == n.partials.size();
+                double worst = 0.0;
+                if (sameSet)
+                    for (size_t i = 0; i < exact.partials.size(); ++i)
+                    {
+                        if (std::abs ((double) exact.partials[i].ratio - (double) n.partials[i].ratio)
+                            > 1.0e-4 * (double) exact.partials[i].ratio) { sameSet = false; break; }
+                        worst = std::max (worst, std::abs ((double) exact.partials[i].amp
+                                                           - (double) n.partials[i].amp));
+                    }
+                return worst;
+            };
+            bool set1 = false, set2 = false;
+            const double g1 = gap (near1, set1), g2 = gap (near2, set2);
+            std::printf ("  level 2 has %d partials; 1.99 is %d partials and %.2e away, 1.999 is %d and %.2e\n",
+                         (int) exact.partials.size(), (int) near1.partials.size(), g1,
+                         (int) near2.partials.size(), g2);
+            check (set1 && set2 && g1 < 5.0e-3,
+                   "ENDPOINT: the top of a crossing is the upper integer level, partial for partial");
+            check (g2 < 0.2 * g1,
+                   "ENDPOINT: and the last of the gap closes with the fraction, so t=1 is the upper level exactly");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // THE INTEGER HANDOVER, x.99 -> x+1.00.
+    //
+    // Going from 1.99 to 2.00 IS crossing a step, and it is the one step the blend never
+    // takes itself: at x+1.00 compileSpectrum drops the blend and returns the single
+    // integer level. Whatever gap the blend leaves at t->1 is paid in that one click, and
+    // once the reveal ramps had shrunk every other click it was the biggest one left.
+    //
+    // The gap was a UNIFORM GAIN, and it came from a silent MERGE. blendFractalTemplates
+    // used to sum each level's ~1-cent bin into a single amplitude and push the whole
+    // upper-level bin onto the LOWER level's partials, so k upper partials sharing a bin
+    // with one lower partial were folded onto that one ratio with their amplitudes added.
+    // Folding k partials of amplitude a into one of amplitude k*a multiplies that bin's
+    // sum of squares by k, so the RMS normalisation in finalisePartials divided the whole
+    // template by too much, and everything that did NOT fold - the loud low partials the
+    // ear follows - came out uniformly quiet. Measured over the 32 loudest partials of
+    // the upper level, the blend at x.999 sat -0.427 dB (Base 4 Odd 2->3), -0.332 dB
+    // (Base 8 All 1->2) and -0.914 dB (Base 16 All 1->2) below it, spread only
+    // 0.010-0.025 dB across those partials - a gain error, not a timbre error - and the
+    // handover click measured 0.740 / 0.993 / 1.480 dB, up to 5.7x the average click of
+    // its crossing. At Base 4 Odd 2->3 the blend also held 7119 partials against level
+    // 3's 14480: 7361 of the user's partials merged away with nothing said.
+    //
+    // The guard that existed could not see any of this. It compares COSINE SIMILARITY,
+    // which normalises both spectra before comparing and is therefore blind to exactly
+    // the quantity that was wrong. These assertions are in dB and in partial COUNTS,
+    // which is what a uniform gain and a silent fold actually move.
+    std::printf ("fractal fader: the integer handover (x.99 -> x+1.00):\n");
+    {
+        constexpr int kBands = 120;   // 10 octaves at 1/12 octave, as above
+        auto bandsDb = [kBands] (const SpectrumTemplate& t)
+        {
+            std::vector<double> e ((size_t) kBands, 0.0);
+            for (const auto& p : t.partials)
+            {
+                const int b = (int) std::floor (std::log2 (std::max (1.0e-9, (double) p.ratio)) * 12.0);
+                if (b >= 0 && b < kBands) e[(size_t) b] += (double) p.amp * (double) p.amp;
+            }
+            std::vector<double> d ((size_t) kBands);
+            for (int i = 0; i < kBands; ++i)
+                d[(size_t) i] = 10.0 * std::log10 (std::max (e[(size_t) i], 1.0e-8));
+            return d;
+        };
+        auto dist = [] (const std::vector<double>& a, const std::vector<double>& b)
+        {
+            double s = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) { const double x = a[i] - b[i]; s += x * x; }
+            return std::sqrt (s / (double) a.size());
+        };
+
+        // Base N with N > 1 is where the bins genuinely collide: the ratio grid is k/N,
+        // so at the top of the reach consecutive harmonics are a fraction of a cent apart
+        // and several of them land in one bin. Prime mode's bins hold one partial each,
+        // which is why the fold was invisible in the mode the original report named.
+        struct HCfg { const char* name; SpectrumSettings s; int Llo; };
+        std::vector<HCfg> cfgs;
+        { SpectrumSettings s; s.baseN = 4;  s.selection = (float) Selection::Odd; s.reach = 256;
+          cfgs.push_back ({ "Base 4 Odd",  s, 2 }); }
+        { SpectrumSettings s; s.baseN = 8;  s.selection = (float) Selection::All; s.reach = 256;
+          cfgs.push_back ({ "Base 8 All",  s, 1 }); }
+        { SpectrumSettings s; s.baseN = 16; s.selection = (float) Selection::All; s.reach = 256;
+          cfgs.push_back ({ "Base 16 All", s, 1 }); }
+
+        for (const auto& c : cfgs)
+        {
+            SpectrumSettings s = c.s;
+            s.fractalLevel = (float) (c.Llo + 1);    const auto up   = compileSpectrum (s);
+            s.fractalLevel = (float) c.Llo + 0.999f; const auto top  = compileSpectrum (s);
+            s.fractalLevel = (float) c.Llo + 0.99f;  const auto last = compileSpectrum (s);
+            s.fractalLevel = (float) c.Llo + 0.98f;  const auto prev = compileSpectrum (s);
+
+            // GAIN, read at 0.999 rather than on the fader's 0.01 grid so that what is
+            // left of the survivors' own fade (1/1000 of a geometric path) cannot be
+            // mistaken for the offset being hunted. The median over the 32 LOUDEST
+            // partials, so neither one outlier nor the inaudible tail can invent or hide
+            // an offset; those 32 are also the ones that never fold, which is precisely
+            // why they carried the error.
+            std::vector<Partial> loudest (up.partials);
+            std::sort (loudest.begin(), loudest.end(),
+                       [] (const Partial& a, const Partial& b) { return a.amp > b.amp; });
+            if (loudest.size() > 32) loudest.resize (32);
+            std::vector<double> off;
+            for (const auto& p : loudest)
+            {
+                const float a = ampAtRatio (top, (double) p.ratio, 1.0e-4 * (double) p.ratio);
+                if (a > 0.0f && p.amp > 0.0f)
+                    off.push_back (20.0 * std::log10 ((double) a / (double) p.amp));
+            }
+            std::sort (off.begin(), off.end());
+            const double med    = off.empty() ? 99.0 : off[off.size() / 2];
+            const double spread = off.empty() ? 99.0 : off.back() - off.front();
+
+            // The handover click itself, and the click immediately before it, on the
+            // fader's own grid. A gain paid back in one step shows up as the last click
+            // dwarfing its neighbour; an ordinary end-of-crossing click does not.
+            const double lastClick = dist (bandsDb (last), bandsDb (up));
+            const double prevClick = dist (bandsDb (prev), bandsDb (last));
+
+            std::printf ("  %-12s %d->%d  gain at x.999 %+.4f dB (spread %.4f over %d partials);"
+                         " handover click %.4f dB vs %.4f dB before it; partials upper %d, blend %d\n",
+                         c.name, c.Llo, c.Llo + 1, med, spread, (int) off.size(),
+                         lastClick, prevClick, (int) up.partials.size(), (int) top.partials.size());
+
+            // 0.05 dB: a factor of 6 below the smallest failure the fold produced
+            // (0.332 dB) and 50x above what pairing leaves (measured +0.0008 / +0.0009 /
+            // +0.0000 dB). It is also about twice the smallest step the fader can make
+            // anywhere (0.023 dB), so it cannot fail on the fader's own quantisation.
+            check (std::abs (med) < 0.05,
+                   "HANDOVER: the top of a crossing carries the upper level's own GAIN, not a fraction of it");
+            // The count is the merge caught directly: every upper-level partial has to be
+            // somewhere in the blend at its OWN ratio. (The blend may hold MORE - a lower
+            // partial the upper level kills is still there, faded to nothing.)
+            check ((int) top.partials.size() >= (int) up.partials.size(),
+                   "HANDOVER: and no upper-level partial has been folded onto a neighbour's ratio");
+            // Measured against the click before it, after pairing: 0.046 vs 0.094,
+            // 0.144 vs 0.260, 0.419 vs 0.539 - every handover SMALLER than its
+            // neighbour. Folding: 0.740 vs 0.061, 0.993 vs 0.233, 1.481 vs 0.483,
+            // i.e. 12.2x, 4.3x and 3.1x the click before it.
+            check (lastClick < 3.0 * prevClick + 0.02,
+                   "HANDOVER: so the last click of a crossing is an ordinary click, not a step");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // A SINGLE NEW PARTIAL MUST STILL USE THE WHOLE FADER.
+    //
+    // The reveal gives each new partial a dB ramp and staggers the ramp STARTS over
+    // [0, 1-kRevealRampW] by the geometric mean of its position by count and by energy.
+    // With a big fresh set the last start lands at 1-kRevealRampW and the last ramp
+    // therefore ends at 1.0, which is the design. With a TINY fresh set both stagger
+    // factors collapse towards zero: with exactly ONE new partial - Harmonics = Prime at
+    // prime limit 2, so the base is {1,2}; or a 2-degree Scala timbre at Reps 1 - its
+    // ramp started at 0 and, at a fixed width of 0.5, was over by the midpoint. Measured
+    // on 1/12-octave band energy, clicks 51-100 then carried 3.2% / 5.9% / 3.1% of the
+    // crossing's loudness path: the top half of the fader did nothing.
+    //
+    // The fix widens the ramp to 1 - lastStart, so the last new partial always lands on
+    // t = 1. Because lastStart <= 1 - kRevealRampW always, the width can only ever GROW,
+    // never shrink - so the per-click bound that kRevealRampW buys (at least 50 fader
+    // clicks per ramp) survives it, and this block re-checks uniformity on the spot
+    // rather than taking that on trust.
+    std::printf ("fractal fader: a single new partial still uses the whole fader:\n");
+    {
+        constexpr int kBands = 120;
+        auto bandsDb = [kBands] (const SpectrumTemplate& t)
+        {
+            std::vector<double> e ((size_t) kBands, 0.0);
+            for (const auto& p : t.partials)
+            {
+                const int b = (int) std::floor (std::log2 (std::max (1.0e-9, (double) p.ratio)) * 12.0);
+                if (b >= 0 && b < kBands) e[(size_t) b] += (double) p.amp * (double) p.amp;
+            }
+            std::vector<double> d ((size_t) kBands);
+            for (int i = 0; i < kBands; ++i)
+                d[(size_t) i] = 10.0 * std::log10 (std::max (e[(size_t) i], 1.0e-8));
+            return d;
+        };
+        auto dist = [] (const std::vector<double>& a, const std::vector<double>& b)
+        {
+            double s = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) { const double x = a[i] - b[i]; s += x * x; }
+            return std::sqrt (s / (double) a.size());
+        };
+
+        struct TCfg { const char* name; SpectrumSettings s; int Llo; };
+        std::vector<TCfg> cfgs;
+        { SpectrumSettings s; s.selection = (float) Selection::Prime;
+          s.primeLimit = 2; s.primeLimitPos = 1.0f; cfgs.push_back ({ "Prime, 2-limit", s, 1 }); }
+        { SpectrumSettings s; s.selection = (float) Selection::Prime;
+          s.primeLimit = 2; s.primeLimitPos = 1.0f; cfgs.push_back ({ "Prime, 2-limit", s, 2 }); }
+        { SpectrumSettings s; s.source = Source::ScalaTimbre; s.timbreDegrees = { 1.0f, 1.5f };
+          s.timbrePeriod = 2.0f; s.timbrePeriodRepeats = 1;
+          cfgs.push_back ({ "Scala 2 degrees", s, 1 }); }
+
+        for (const auto& c : cfgs)
+        {
+            SpectrumSettings s = c.s;
+            s.fractalLevel = (float) c.Llo;       const auto L = compileSpectrum (s);
+            s.fractalLevel = (float) (c.Llo + 1); const auto H = compileSpectrum (s);
+
+            // The PREMISE, asserted rather than assumed: if a settings change ever made
+            // these configs bring two new partials the numbers below would still look
+            // fine and the test would have stopped testing what it says it tests.
+            int fresh = 0;
+            for (const auto& p : H.partials)
+                if (! hasRatio (L, (double) p.ratio, 1.0e-4 * (double) p.ratio)) ++fresh;
+
+            std::vector<std::vector<double>> B;
+            for (int k = 0; k <= 100; ++k)
+            {
+                s.fractalLevel = (float) c.Llo + 0.01f * (float) k;
+                B.push_back (bandsDb (compileSpectrum (s)));
+            }
+            double firstHalf = 0.0, secondHalf = 0.0, mx = 0.0; int arg = 0;
+            for (int k = 1; k <= 100; ++k)
+            {
+                const double d = dist (B[(size_t) k - 1], B[(size_t) k]);
+                (k <= 50 ? firstHalf : secondHalf) += d;
+                if (d > mx) { mx = d; arg = k; }
+            }
+            const double total = firstHalf + secondHalf;
+            const double K     = total > 0.0 ? mx / (total / 100.0) : 0.0;
+            std::printf ("  %-16s %d->%d  %d new partial(s); clicks 1-50 %.1f%%, 51-100 %.1f%%;"
+                         " worst click %.4f dB @%d, K=%.2f\n",
+                         c.name, c.Llo, c.Llo + 1, fresh,
+                         100.0 * firstHalf / std::max (1.0e-12, total),
+                         100.0 * secondHalf / std::max (1.0e-12, total), mx, arg, K);
+
+            check (fresh == 1, "exactly one partial is new at the upper level (the premise of this test)");
+            // 25%: half the fader's travel is asked to deliver at least half of a fair
+            // share. Measured 54.7% / 62.0% / 52.0% with the adaptive width, 3.2% / 5.9%
+            // / 3.1% with the fixed one - so this sits 2x under the fix and 4x over the
+            // failure.
+            check (secondHalf > 0.25 * total,
+                   "TOP HALF: the second half of the crossing still carries the fader's work");
+            // Same K <= 4 the twelve-config sweep above uses. Widening the ramp must not
+            // buy the top half at the cost of a lumpier fader: measured 1.12 / 1.25 /
+            // 1.07 after, against 2.15 / 2.38 / 2.06 before.
+            check (K <= 4.0,
+                   "TOP HALF: and the wider ramp does not make any single click stand out");
+        }
     }
 
     //--------------------------------------------------------------------------
@@ -354,6 +913,89 @@ int main()
         SpectrumSettings full = s; full.spectrumRangeOct = 10; // full = no cut
         auto tf = compileSpectrum (full);
         check (hasRatio (tf, 16.0) && hasRatio (tf, 32.0), "range=10 (full) keeps 16 and 32");
+    }
+
+    //--------------------------------------------------------------------------
+    // ...AND THE RANGE CUT MUST NEVER EMPTY THE SPECTRUM.
+    //
+    // The cut is stated relative to ratio 1 = the played pitch, but ratio 1 is only the
+    // bottom of the spectrum in TRANSPOSED mode. In ORIGINAL mode the harmonics keep
+    // their natural positions, so with base N the lowest partial is at ratio N and a
+    // narrow range can sit entirely BELOW every partial there is.
+    //
+    // Measured before the fix, at the shipping control's own minimum (spectrumRange = 1):
+    //   Original N=4, range 1          ->  0 partials   (silent note, no warning)
+    //   Original N=7, range 1 and 2    ->  0 partials   (idem)
+    // Every (mode, N, range) the control can reach is swept here, both engines' entry
+    // points, so a future change that re-introduces the hole anywhere is caught. The
+    // rule asserted is the one applyRangeCut now implements: the LOWEST-ratio partial
+    // survives whatever the ceiling is, so the played pitch always sounds.
+    std::printf ("Spectrum range can never delete the whole spectrum:\n");
+    {
+        int emptied = 0, worst[3] = { 0, 0, 0 };
+        for (int mode = 0; mode < 2; ++mode)
+            for (int N = 1; N <= 16; ++N)
+                for (int rng = 1; rng <= 10; ++rng)
+                {
+                    SpectrumSettings s;
+                    s.baseN = N;
+                    s.baseMode = mode == 0 ? BaseMode::Transposed : BaseMode::Original;
+                    s.reach = 64;
+                    s.selection = (float) Selection::All;
+                    s.curveSlope = 1.0f;
+                    s.spectrumRangeOct = rng;
+                    const auto t = compileSpectrum (s);
+                    if (t.partials.empty())
+                    {
+                        if (emptied == 0) { worst[0] = mode; worst[1] = N; worst[2] = rng; }
+                        ++emptied;
+                    }
+                }
+        if (emptied > 0)
+            std::printf ("    %d of 320 (mode, N, range) combinations compiled to ZERO partials"
+                         " (first: %s N=%d range=%d)\n",
+                         emptied, worst[0] == 0 ? "Transposed" : "Original", worst[1], worst[2]);
+        check (emptied == 0,
+               "no (base mode, N, range) the controls can reach compiles to a silent spectrum");
+
+        // The three combinations that were MEASURED at zero, named individually so the
+        // regression report says which patch went silent rather than "one of 320".
+        struct Case { int N, rng; };
+        const Case zeroed[] = { { 4, 1 }, { 7, 1 }, { 7, 2 } };
+        bool allSound = true;
+        for (const auto& c : zeroed)
+        {
+            SpectrumSettings s;
+            s.baseN = c.N; s.baseMode = BaseMode::Original; s.reach = 64;
+            s.selection = (float) Selection::All; s.curveSlope = 1.0f;
+            s.spectrumRangeOct = c.rng;
+            const auto t = compileSpectrum (s);
+            // The survivor has to be the LOWEST partial (the played pitch at ratio N),
+            // not just any partial: keeping the loudest one instead would move the pitch.
+            const bool ok = ! t.partials.empty()
+                         && std::abs ((double) t.partials.front().ratio - (double) c.N) < 1e-3;
+            std::printf ("    Original N=%d, range %d: %d partials, lowest ratio %.3f\n",
+                         c.N, c.rng, (int) t.partials.size(),
+                         t.partials.empty() ? 0.0 : (double) t.partials.front().ratio);
+            if (! ok) allSound = false;
+        }
+        check (allSound,
+               "the three configurations measured at 0 partials now keep their played pitch");
+
+        // ...and the cut still cuts. Guaranteeing the lowest partial must not turn into
+        // "the range control does nothing": a range that DOES contain partials keeps
+        // exactly the ones under the ceiling and no more.
+        {
+            SpectrumSettings s;
+            s.baseN = 1; s.baseMode = BaseMode::Transposed; s.reach = 64;
+            s.selection = (float) Selection::All; s.curveSlope = 0.0f;
+            s.spectrumRangeOct = 2;                     // keep ratio <= 4
+            const auto t = compileSpectrum (s);
+            double maxR = 0.0;
+            for (const auto& p : t.partials) maxR = std::max (maxR, (double) p.ratio);
+            check (t.partials.size() == 4 && maxR <= 4.0 + 1e-3,
+                   "a range that does contain partials still cuts everything above it");
+        }
     }
 
     //--------------------------------------------------------------------------
@@ -1454,22 +2096,24 @@ int main()
         }
 
         //---------------------------------------------------------------------
-        // (8) HOW WIDE SHOULD THE RANGE BE? The panel asks for ONE number - N steps above
-        // the note being played - so the default N is a real decision and "two octaves"
-        // was a guess nobody had measured. This measures it.
+        // (8) HOW WIDE SHOULD THE RANGE BE? The panel asks for ONE number - N PERIODS EACH
+        // WAY from the note being played - so the default N is a real decision and neither
+        // "two octaves" nor "the same total width as before" is one anybody had measured.
+        // This measures it, in the form the control now has.
         //
         // The same seed, the same anchor (the note under the fingers), optimised over
-        // widths of 0.5 .. 4 periods with the SHIPPING sampling rule, then judged on a
+        // HALF-WIDTHS of 0 .. 2 periods with the SHIPPING sampling rule, then judged on a
         // dense sweep at three places that matter:
         //   - AT THE ANCHOR      : the register actually being played - the one thing the
         //                          player is guaranteed to hear;
         //   - WORST INSIDE       : the ugliest register the range promised to cover;
-        //   - ONE PERIOD ABOVE   : the hole question. A narrow range says nothing about
-        //                          the register just outside it, and a player who moves up
-        //                          one octave lands exactly there.
-        // The reference for "above" is the spectrum optimised AT that register on its own:
-        // that is the best any spectrum could do there, so the ratio is how much the range
-        // choice costs somebody who steps outside it.
+        //   - ONE PERIOD OUTSIDE : the hole question, and it is now a hole at BOTH ends. A
+        //                          narrow band says nothing about the register just outside
+        //                          it, and a player who moves an octave lands exactly there
+        //                          - in either direction.
+        // The reference for every probe is the spectrum optimised AT that register on its
+        // own: that is the best any spectrum could do there, so the ratio is how much the
+        // width choice costs somebody who plays there.
         {
             const double anch = atOct (kLowHz, 3.0);           // 261.6 Hz: the register a player sits in
             const auto atOne = [&] (const std::vector<dissonance::Partial>& sp, double spF0, double f)
@@ -1477,130 +2121,203 @@ int main()
                 return dissonance::scoreOverRegisters (sp, spF0, { f }, oneNote, true,
                                                        dissonance::Goal::Min, 0.0, 0.0).perRegister[0];
             };
-            // WIDTH 0 is the old single-pitch behaviour, kept in the table as the baseline
-            // every other row has to beat somewhere.
-            const double widths[] = { 0.0, 0.5, 1.0, 2.0, 3.0, 4.0 };
-            // The probes are FIXED absolute registers - the anchor and one, two, three,
-            // four and five periods above it - so a column means the same pitch in every
-            // row. (Judging each width "one period above ITS OWN top" compares a different
-            // register per row, which is exactly how a width can look good by being asked
-            // an easier question.) Each probe's reference is a spectrum optimised for that
-            // register ALONE: the best anything could do there, so a penalty of 1.00x is
-            // "as good as if you had adapted for this register on purpose".
-            const double probes[] = { 0.0, 1.0, 2.0, 3.0, 4.0, 5.0 };
-            double refAt[6] = {};
-            for (int i = 0; i < 6; ++i)
+            // HALF-WIDTH 0 is the old single-pitch behaviour, kept in the table as the
+            // baseline every other row has to beat somewhere.
+            const double halves[] = { 0.0, 0.5, 1.0, 1.5, 2.0 };
+            constexpr int kRows = 5;
+            // The probes are FIXED absolute registers - two periods BELOW the anchor up to
+            // three above it - so a column means the same pitch in every row, and the half
+            // of the keyboard the upward-only band never had an opinion about is now half
+            // the table. (Judging each width "one period outside ITS OWN edge" compares a
+            // different register per row, which is exactly how a width can look good by
+            // being asked an easier question.)
+            const double probes[] = { -2.0, -1.0, 0.0, 1.0, 2.0, 3.0 };
+            constexpr int kProbes = 6;
+            double refAt[kProbes] = {};
+            for (int i = 0; i < kProbes; ++i)
             {
                 const double f = atOct (anch, probes[i]);
                 refAt[i] = atOne (adaptOver (anch, f, f, 1).spectrum, anch, f);
             }
+            // The band the previous design produced, kept as a row of its own: N periods
+            // UP from the anchor and nothing below it. It is the thing "por arriba y por
+            // abajo" is a complaint about, so the table has to contain it or the change is
+            // an assertion rather than a measurement.
+            const auto upwardRun = adaptOver (anch, anch, atOct (anch, 2.0),
+                                              dissonance::registerCountFor (anch, atOct (anch, 2.0),
+                                                                            dissonance::kAdaptRegisterCap));
+            double symBelow = 0.0, upBelow = 0.0;
             {
-                std::printf ("  range WIDTH, anchored at %.1f Hz (dense-judged):\n", anch);
-                std::printf ("    width     pts   at anchor  worst inside  1 period above"
+                std::printf ("  range HALF-WIDTH (each way), anchored at %.1f Hz (dense-judged):\n", anch);
+                std::printf ("    +-width   pts   at anchor  worst inside  1 per outside"
                              "   | penalty vs a spectrum optimised for that register alone\n");
-                std::printf ("    %-56s|   +0     +1     +2     +3     +4     +5 periods\n", "");
-                double anchorAt[6] = {}, penAbove[6] = {}, meanPen04[6] = {};
+                std::printf ("    %-56s|   -2     -1     +0     +1     +2     +3 periods\n", "");
+                double anchorAt[kRows] = {}, penOut[kRows] = {}, meanPen[kRows] = {};
                 int row = 0;
-                for (const double w : widths)
+                for (const double w : halves)
                 {
-                    const double top = atOct (anch, w);
-                    const int pts = dissonance::registerCountFor (anch, top, dissonance::kAdaptRegisterCap);
-                    const auto run = adaptOver (anch, anch, top, pts);
+                    const double lo = atOct (anch, -w), hi = atOct (anch, w);
+                    const int pts = dissonance::registerCountFor (lo, hi, dissonance::kAdaptRegisterCap);
+                    const auto run = adaptOver (anch, lo, hi, pts);
                     double m = 0, worst = 0, wHz = 0;
-                    judge (run.spectrum, anch, anch, top, m, worst, wHz);
+                    judge (run.spectrum, anch, lo, hi, m, worst, wHz);
                     const double here = atOne (run.spectrum, anch, anch);
-                    const double out  = atOne (run.spectrum, anch, atOct (top, 1.0));
-                    const auto refAbove = adaptOver (anch, atOct (top, 1.0), atOct (top, 1.0), 1);
-                    const double refOut = atOne (refAbove.spectrum, anch, atOct (top, 1.0));
+                    // "One period outside" is now the MEAN of the two shoulders, because a
+                    // symmetric band has two of them and reporting only the upper one would
+                    // hide exactly the half this redesign is about.
+                    const double outHi = atOne (run.spectrum, anch, atOct (hi,  1.0));
+                    const double outLo = atOne (run.spectrum, anch, atOct (lo, -1.0));
+                    const double refHi = atOne (adaptOver (anch, atOct (hi, 1.0), atOct (hi, 1.0), 1).spectrum,
+                                                anch, atOct (hi, 1.0));
+                    const double refLo = atOne (adaptOver (anch, atOct (lo, -1.0), atOct (lo, -1.0), 1).spectrum,
+                                                anch, atOct (lo, -1.0));
+                    const double pOut = 0.5 * (outHi / std::max (1.0e-9, refHi)
+                                             + outLo / std::max (1.0e-9, refLo));
                     std::printf ("    %.1f per %4d  %10.3f  %12.3f  %8.3f %5.2fx |",
-                                 w, pts, here, worst, out, out / std::max (1.0e-9, refOut));
-                    double sum04 = 0.0;
-                    for (int i = 0; i < 6; ++i)
+                                 w, pts, here, worst, 0.5 * (outHi + outLo), pOut);
+                    double sum = 0.0;
+                    for (int i = 0; i < kProbes; ++i)
                     {
-                        const double p = atOne (run.spectrum, anch, atOct (anch, probes[i]))
-                                       / std::max (1.0e-9, refAt[i]);
-                        std::printf (" %5.2fx", p);
-                        if (i <= 4) sum04 += p;
+                        const double pen = atOne (run.spectrum, anch, atOct (anch, probes[i]))
+                                         / std::max (1.0e-9, refAt[i]);
+                        std::printf (" %5.2fx", pen);
+                        sum += pen;
                     }
                     std::printf ("\n");
-                    anchorAt[row] = here; penAbove[row] = out / std::max (1.0e-9, refOut);
-                    meanPen04[row] = sum04 / 5.0;
+                    anchorAt[row] = here; penOut[row] = pOut;
+                    meanPen[row] = sum / (double) kProbes;
+                    if (std::abs (w - dissonance::kAdaptRegisterDefaultPeriods) < 1.0e-9)
+                        symBelow = atOne (run.spectrum, anch, atOct (anch, -1.0)) / std::max (1.0e-9, refAt[1]);
                     ++row;
                 }
-                std::printf ("    mean penalty over the anchor and four periods above it:");
-                for (int i = 0; i < row; ++i) std::printf ("  %.1f per %.2fx", widths[i], meanPen04[i]);
+                std::printf ("    mean penalty over -2..+3 periods:");
+                for (int i = 0; i < row; ++i) std::printf ("  %.1f per %.2fx", halves[i], meanPen[i]);
                 std::printf ("\n");
-                // (i) WIDENING COSTS THE PLAYED REGISTER, and the cost is real but
+                // (i) THE POINT OF THE WHOLE CHANGE: the band now buys something BELOW the
+                // played note. Measured against the band the panel used to build - two
+                // periods UP from the anchor, nothing under it - one period below the
+                // anchor is a register the old form never looked at, and it shows.
+                upBelow = atOne (upwardRun.spectrum, anch, atOct (anch, -1.0))
+                        / std::max (1.0e-9, refAt[1]);
+                std::printf ("    one period BELOW the anchor: %.2fx under the old upward-only"
+                             " 2-period band, %.2fx under the symmetric +-%.1f one\n",
+                             upBelow, symBelow, dissonance::kAdaptRegisterDefaultPeriods);
+                check (symBelow < upBelow,
+                       "the symmetric band really does account for the register BELOW the note played -"
+                       " which the anchor-and-up band it replaces never did");
+                // (ii) WIDENING COSTS THE PLAYED REGISTER, and the cost is real but
                 // bounded. If it were not bounded the honest default would be "no
                 // range at all", because the anchor is the one register the player is
                 // certain to hear.
-                std::printf ("    at the anchor: %.3f with no range -> %.3f at 2 periods"
-                             " -> %.3f at 4 periods\n", anchorAt[0], anchorAt[3], anchorAt[5]);
-                check (anchorAt[3] < anchorAt[0] * 1.35,
-                       "a two-period range costs the register being played less than 35% against no range at all");
-                // (ii) THE HOLE IS REAL. Optimising at ONE pitch leaves the register a
-                // period up measurably worse than a range does - that is what makes the
-                // width a decision rather than a shrug.
-                std::printf ("    one period above a ZERO-width range: %.2fx"
-                             " vs %.2fx above a two-period range\n", penAbove[0], penAbove[3]);
-                check (meanPen04[3] < meanPen04[0],
-                       "a two-period range really is better across the anchor and the four periods above it"
-                       " than optimising at the played pitch alone");
-                // (iii) THE WIDTH FIELD ACTUALLY DOES SOMETHING. This is the check that
+                std::printf ("    at the anchor: %.3f with no range -> %.3f at +-1 period"
+                             " -> %.3f at +-2 periods\n", anchorAt[0], anchorAt[2], anchorAt[4]);
+                check (anchorAt[2] < anchorAt[0] * 1.35,
+                       "a one-period-each-way range costs the register being played less than 35%"
+                       " against no range at all");
+                // (iii) WHAT THE COVERAGE AVERAGE DOES *NOT* DECIDE. Under the upward-only
+                // band this column was the whole argument (a zero-width answer was 1.51x
+                // over +0..+4 against 1.25x for a two-period band), because the probes ran
+                // four periods UP, where a spectrum optimised at one pitch falls apart.
+                // Symmetrically the same numbers are nearly flat - every half-width lands
+                // within a few percent of every other - so the coverage average CANNOT be
+                // what picks the default, and pretending it does would be fitting a
+                // decision to noise. Printed, checked as the flat thing it is, and the
+                // decision is made by (ii) above and (v) below instead.
+                double penLo = 1.0e9, penHi = 0.0;
+                for (int i = 0; i < kRows; ++i) { penLo = std::min (penLo, meanPen[i]); penHi = std::max (penHi, meanPen[i]); }
+                std::printf ("    one period outside a ZERO-width range: %.2fx"
+                             " vs %.2fx outside a +-1-period range; the coverage average spans"
+                             " only %.2f..%.2f over every half-width (%.1f%%)\n",
+                             penOut[0], penOut[2], penLo, penHi, 100.0 * (penHi / penLo - 1.0));
+                check (penHi < penLo * 1.15,
+                       "across a symmetric band the coverage average barely separates one half-width from"
+                       " another - so it is not what the default can be argued from");
+                // (iv) THE WIDTH FIELD ACTUALLY DOES SOMETHING. This is the check that
                 // replaces the deleted minimax aggregate rather than merely deleting it.
-                // Under minimax the range's worst register was ALWAYS the anchor (the range
-                // starts there and runs up), so "only the worst register counts" was "only
-                // the anchor counts": the anchor scored 10.742 at 0, 0.5, 1, 2, 3 and 4
-                // periods - identical to five decimals - and the Steps field could not change
-                // the result at all. Under the mean it has to, or the control is decorative.
-                std::printf ("    the anchor moves %.1f%% between a zero-width and a four-period range"
+                // Under minimax the upward band's worst register was ALWAYS the anchor (the
+                // band started there and ran up), so "only the worst register counts" was
+                // "only the anchor counts" and the width field could not change the result
+                // at all. Under the mean it has to, or the control is decorative.
+                std::printf ("    the anchor moves %.1f%% between a zero-width and a +-2-period range"
                              " (under minimax it moved 0.0%%: 10.742 at every width)\n",
-                             100.0 * std::abs (anchorAt[5] - anchorAt[0]) / anchorAt[0]);
-                check (std::abs (anchorAt[5] - anchorAt[0]) > 0.05 * anchorAt[0],
+                             100.0 * std::abs (anchorAt[4] - anchorAt[0]) / anchorAt[0]);
+                check (std::abs (anchorAt[4] - anchorAt[0]) > 0.05 * anchorAt[0],
                        "and the WIDTH really changes the answer - the control the minimax aggregate made inert");
             }
             // ...and the same question asked from three different registers, because a
             // default fitted to middle C would be a default fitted to one measurement. Only
-            // the summary is printed: the mean penalty over the anchor and the four periods
-            // above it, which is the number the choice turns on.
+            // the summary is printed: the mean penalty over the five registers from two
+            // periods below the anchor to two above it, which is the number the choice
+            // turns on.
             {
-                std::printf ("  the same sweep from three anchors (mean penalty over the anchor and +4 periods):\n");
-                const double anchors[] = { atOct (kLowHz, 1.0), atOct (kLowHz, 3.0), atOct (kLowHz, 5.0) };
-                int bestCount[6] = {};
+                std::printf ("  the same sweep from three anchors (mean penalty over -2..+2 periods):\n");
+                const double anchors[] = { atOct (kLowHz, 2.0), atOct (kLowHz, 3.0), atOct (kLowHz, 5.0) };
+                int bestCount[kRows] = {};
+                double worstGiveUp = 1.0;
                 for (const double a : anchors)
                 {
+                    double defPen = 0.0;   // the shipped default's own penalty at this anchor
                     double refs[5] = {};
                     for (int i = 0; i < 5; ++i)
                     {
-                        const double f = atOct (a, (double) i);
+                        const double f = atOct (a, (double) i - 2.0);
                         refs[i] = atOne (adaptOver (a, f, f, 1).spectrum, a, f);
                     }
                     std::printf ("    anchor %7.1f Hz:", a);
                     int best = 0; double bestVal = 1.0e9;
-                    for (int r = 0; r < 6; ++r)
+                    for (int r = 0; r < kRows; ++r)
                     {
-                        const double top = atOct (a, widths[r]);
-                        const auto run = adaptOver (a, a, top,
-                                                    dissonance::registerCountFor (a, top, dissonance::kAdaptRegisterCap));
+                        const double lo = atOct (a, -halves[r]), hi = atOct (a, halves[r]);
+                        const auto run = adaptOver (a, lo, hi,
+                                                    dissonance::registerCountFor (lo, hi, dissonance::kAdaptRegisterCap));
                         double sum = 0.0;
                         for (int i = 0; i < 5; ++i)
-                            sum += atOne (run.spectrum, a, atOct (a, (double) i)) / std::max (1.0e-9, refs[i]);
+                            sum += atOne (run.spectrum, a, atOct (a, (double) i - 2.0)) / std::max (1.0e-9, refs[i]);
                         const double pen = sum / 5.0;
-                        std::printf ("  %.1f per %.2fx", widths[r], pen);
+                        std::printf ("  %.1f per %.2fx", halves[r], pen);
                         if (pen < bestVal) { bestVal = pen; best = r; }
+                        if (std::abs (halves[r] - dissonance::kAdaptRegisterDefaultPeriods) < 1.0e-9)
+                            defPen = pen;
                     }
-                    std::printf ("   (best: %.1f periods)\n", widths[best]);
+                    std::printf ("   (best: %.1f periods each way, %.2fx; the default gives up %.1f%%)\n",
+                                 halves[best], bestVal, 100.0 * (defPen / bestVal - 1.0));
                     ++bestCount[best];
+                    worstGiveUp = std::max (worstGiveUp, defPen / bestVal);
                 }
-                // The DEFAULT is not simply the best cell of that table: the widest range
-                // always wins a coverage average, and it pays for it at the anchor - the
-                // one register the player is certain to hear - and in registers per run,
-                // which the realtime follower cannot afford (kAdaptRegisterCapRt = 3, i.e.
-                // exactly a two-period range at one register per octave). What the table has
-                // to show is that no NARROWER width wins outright, because that would make
-                // the default indefensible.
-                check (bestCount[0] + bestCount[1] + bestCount[2] == 0,
-                       "from every anchor, a range narrower than two periods is beaten - the default is not too wide");
+                // The DEFAULT is not the best cell of that table and does not need to be:
+                // the spread is a few percent (see (iii)), so what has to hold is that the
+                // shipped default gives up almost NOTHING on coverage against the best
+                // width at every anchor. If it ever did, the two reasons it is chosen for -
+                // the cost at the played register, and exact sampling under the realtime
+                // cap - would be buying something the player could hear losing.
+                std::printf ("    worst case, the default gives up %.1f%% of the best width's coverage\n",
+                             100.0 * (worstGiveUp - 1.0));
+                check (worstGiveUp < 1.05,
+                       "from every anchor, the shipped default is within 5% of the best half-width measured");
+            }
+            // (v) THE REASON THE DEFAULT IS THIS WIDTH AND NOT A WIDER ONE: it is the
+            // widest half-width the REALTIME follower samples exactly. The objective is
+            // evaluated at one point per octave and the follower's cap is 3 points
+            // (kAdaptRegisterCapRt), so at +-1 period in an octave-periodic tuning the
+            // follower and the Adapt button optimise over literally the same registers -
+            // while at +-1.5 the follower is already sampling its own band more coarsely
+            // than the rule asks for. Nothing about that is degraded silently (the panel
+            // prints both counts), but it is a real difference and the default should not
+            // start on the wrong side of it.
+            {
+                const auto sameBothCaps = [&] (double half)
+                {
+                    const double lo = atOct (anch, -half), hi = atOct (anch, half);
+                    return dissonance::registerCountFor (lo, hi, dissonance::kAdaptRegisterCapRt)
+                        == dissonance::registerCountFor (lo, hi, dissonance::kAdaptRegisterCap);
+                };
+                std::printf ("    exact under the realtime cap: +-1.0 %s, +-1.5 %s, +-2.0 %s\n",
+                             sameBothCaps (1.0) ? "yes" : "no", sameBothCaps (1.5) ? "yes" : "no",
+                             sameBothCaps (2.0) ? "yes" : "no");
+                check (sameBothCaps (dissonance::kAdaptRegisterDefaultPeriods),
+                       "the default band is sampled EXACTLY by the realtime follower, not just by the button");
+                check (! sameBothCaps (dissonance::kAdaptRegisterDefaultPeriods + 0.5),
+                       "and it is the widest one that is - half a period more and the follower under-samples");
             }
             // WHAT THE ANCHOR-AND-UP FORM COSTS IN TIME, which is not free and shows up in
             // the realtime follower's landing latency (RhythmVerify times it end to end).
@@ -1635,20 +2352,22 @@ int main()
                                  what, (int) rg.f0.size(), r.sweepsDone, ms);
                     return ms;
                 };
-                std::printf ("  the SAME two-period width, placed two ways (the follower's own shape):\n");
-                const double straddle = timeOne ("octave either side (old)", anch * 0.5, anch * 2.0);
-                const double upward   = timeOne ("two periods up (now)",     anch, atOct (anch, 2.0));
-                std::printf ("    the anchor-and-up form costs %.2fx the time of the straddling one\n",
-                             upward / std::max (1.0e-9, straddle));
+                std::printf ("  the SAME two-period band, placed three ways (the follower's own shape):\n");
+                const double upward   = timeOne ("two periods up (old)",      anch, atOct (anch, 2.0));
+                const double straddle = timeOne ("+-1 period (now)",          atOct (anch, -1.0), atOct (anch, 1.0));
+                const double wide     = timeOne ("+-2 periods",               atOct (anch, -2.0), atOct (anch, 2.0));
+                std::printf ("    the symmetric form costs %.2fx the time of the upward one at the same"
+                             " total width, and %.2fx at twice it\n",
+                             straddle / std::max (1.0e-9, upward), wide / std::max (1.0e-9, upward));
             }
             // ...and the DEFAULT the panel ships (kAdaptRegisterDefaultPeriods) has to be one
-            // of the widths this table measured, or the table is not about the product.
-            std::printf ("  the panel's default range is %.1f periods of the loaded tuning\n",
+            // of the half-widths this table measured, or the table is not about the product.
+            std::printf ("  the panel's default range is +-%.1f periods of the loaded tuning\n",
                          dissonance::kAdaptRegisterDefaultPeriods);
             bool measured = false;
-            for (const double w : widths)
+            for (const double w : halves)
                 if (std::abs (w - dissonance::kAdaptRegisterDefaultPeriods) < 1.0e-9) measured = true;
-            check (measured, "and that default is a width this table actually measured");
+            check (measured, "and that default is a half-width this table actually measured");
         }
     }
 
@@ -1676,6 +2395,7 @@ int main()
             { 16, 31, 1, 1, false, false, "16 partials, 31 notes, ALL-vs-all, 1 reg" } };
 
         double worstRatio = 1.0, bestRatio = 1.0e9, sumPairs = 0.0, sumMs = 0.0;
+        std::vector<double> rowRatios;   // every timeable row, for the MEDIAN below
         for (const auto& c : cfgs)
         {
             const double f0 = 220.0;
@@ -1715,6 +2435,7 @@ int main()
             {
                 worstRatio = std::max (worstRatio, ratio);
                 bestRatio  = std::min (bestRatio, ratio);
+                rowRatios.push_back (ratio);
             }
             std::printf ("    %-46s  %2d sweeps  %10.0f pairs   predicted %8.1f ms   measured %8.1f ms   x%.2f%s\n",
                          c.what, done, pairs, pred, ms, ratio, ms < 2.0 ? "  (below the timing floor)" : "");
@@ -1724,29 +2445,83 @@ int main()
                    (std::string ("  ...and it returned all ") + std::to_string (c.N) + " partials").c_str());
         }
         const double fitted = sumMs * 1.0e6 / std::max (1.0, sumPairs);
-        std::printf ("    fitted %.2f ns/pair (header says %.2f); prediction band x%.2f .. x%.2f\n",
-                     fitted, dissonance::kAdaptNsPerPair, bestRatio, worstRatio);
+        const double probed = dissonance::adaptNsPerPair();
+        std::printf ("    fitted %.2f ns/pair over the whole table; the runtime probe said %.2f"
+                     " (fallback %.2f); prediction band x%.2f .. x%.2f\n",
+                     fitted, probed, dissonance::kAdaptNsPerPairFallback, bestRatio, worstRatio);
         // A single constant has to cover every timeable row within a factor of two either
         // way. That is loose enough for a cold cache and a busy machine and far too tight
         // for a wrong exponent: dropping the register factor alone puts row 4 out by 7x.
+        // This is the SHAPE check - it fits its own constant and so says nothing about
+        // whether the number on the button is right.
         check (bestRatio > 0.5 && worstRatio < 2.0,
                "one ns/pair constant predicts every configuration within a factor of 2");
-        // ...and the constant shipped in the header is the one the machine actually shows.
-        check (fitted > dissonance::kAdaptNsPerPair * 0.5 && fitted < dissonance::kAdaptNsPerPair * 2.0,
-               "and kAdaptNsPerPair is within a factor of 2 of the measured fit");
+
+        // ...AND THE NUMBER THE PANEL ACTUALLY PRINTS TRACKS THE CLOCK.
+        //
+        // This replaces "a literal in the header is close to a fit computed here", which
+        // compared two constants and said nothing at all about the user's experience.
+        // What matters is predicted/measured for the estimate the button really shows,
+        // and in particular that it is not systematically LOW: with the hard-coded 9.8
+        // EVERY timeable row came in under its prediction - x0.48 .. x0.67 across every
+        // measurement taken - so every search took 1.5x to 2x longer than the plugin had
+        // promised, and 2-3x on a loaded machine. Nobody notices a red test; they notice
+        // waiting three times as long as the button said.
+        //
+        // Asserted on the MEDIAN row rather than the worst one. These rows take 35 ms to
+        // 1 s, and a single one of them can lose a scheduling slice and swing 30% on its
+        // own; the worst-of-six is therefore a measurement of the busiest millisecond of
+        // the test run, not of the model. The median over five timeable rows moves only
+        // if the model is really off. Measured over ~25 repeat runs on ONE machine, whose
+        // own fitted cost was seen anywhere between 11.2 and 21.8 ns/pair depending on
+        // how busy and how warm it was - which is itself the argument against any literal:
+        //     hard-coded 9.8 ns/pair   ->  median row x0.52 .. x0.83  (0.52 while the
+        //                                  machine ran slow, 0.83 while it ran fast: the
+        //                                  constant is only ever right by coincidence)
+        //     runtime-calibrated       ->  median row x0.83 .. x1.58, wherever the
+        //                                  machine happened to be - it follows it
+        // 0.80 is the line between them. The upper end is a loose 1.80 on purpose: the
+        // probe runs once, at process start, where a cold clock still reads high, and
+        // over-estimating is only a discourtesy - the run finishes early - while
+        // under-estimating is the defect this exists to remove.
+        std::sort (rowRatios.begin(), rowRatios.end());
+        const double medianRatio = rowRatios.empty() ? 0.0 : rowRatios[rowRatios.size() / 2];
+        std::printf ("    median row x%.2f over %d timeable rows;"
+                     " the probe is x%.2f of the table's own fit\n",
+                     medianRatio, (int) rowRatios.size(), probed / std::max (1.0e-9, fitted));
+        check (medianRatio > 0.80 && medianRatio < 1.80,
+               "the estimate the panel prints tracks the clock - it is not systematically optimistic");
+        // ...and the probe's small configuration really does predict the big ones: it is
+        // measured on ~0.3 million pair terms and used to price runs of 53 million. With
+        // the old literal this ratio was 0.47 .. 0.87 (it drifts with the machine, not with the
+        // problem); calibrated it is 0.81 .. 1.65.
+        check (probed > fitted * 0.8 && probed < fitted * 2.0,
+               "the ~0.3M-pair probe generalises to the 53M-pair run it is used to price");
         // THE HARD BOUND is the only thing left that refuses, and it must refuse only the
         // absurd: 16 partials against a 31-note scale in "all vs all" - the configuration
         // the old dialog rejected outright - has to be OFFERED, and a 24-partial spectrum
         // against a full 128-key table in the same scope has to be the thing that is not.
+        //
+        // Asserted on PAIR COUNTS against kAdaptAbsurdPairs, which is what the plugin now
+        // compares too. This assertion used to compare calibrated ms estimates against
+        // kAdaptAbsurdMs, and one run under heavy load showed why that was wrong twice
+        // over: the whole table fitted at 176 ns/pair (11x nominal), the estimate
+        // honestly said the 31x16 search would take over ten minutes THAT MINUTE - and
+        // the check failed, i.e. the plugin would have refused a search it exists to
+        // offer, because a load spike had been cached into the one-shot probe. The set
+        // of offered searches is a property of the REQUEST; only its price follows the
+        // machine.
         {
-            const double offered = dissonance::adaptEstimateMs (16, 31, false, 7, true, 6);
-            const double absurd  = dissonance::adaptEstimateMs (24, 128, false, 7, true, 6);
-            std::printf ("    31 notes x 16 partials all-vs-all, 7 reg, +amps: %.1f s (bound %.0f s)\n"
-                         "    128 notes x 24 partials all-vs-all, 7 reg, +amps: %.0f s\n",
-                         offered * 0.001, dissonance::kAdaptAbsurdMs * 0.001, absurd * 0.001);
-            check (offered < dissonance::kAdaptAbsurdMs,
-                   "the search the old dialog refused is under the hard bound - it is offered");
-            check (absurd > dissonance::kAdaptAbsurdMs,
+            const double offered = dissonance::adaptTotalPairs (16, 31, false, 7, true, 6);
+            const double absurd  = dissonance::adaptTotalPairs (24, 128, false, 7, true, 6);
+            std::printf ("    31 notes x 16 partials all-vs-all, 7 reg, +amps: %.2e pairs (~%.1f s here); bound %.2e pairs\n"
+                         "    128 notes x 24 partials all-vs-all, 7 reg, +amps: %.2e pairs (~%.0f s here)\n",
+                         offered, dissonance::adaptEstimateMs (16, 31, false, 7, true, 6) * 0.001,
+                         dissonance::kAdaptAbsurdPairs,
+                         absurd, dissonance::adaptEstimateMs (24, 128, false, 7, true, 6) * 0.001);
+            check (offered < dissonance::kAdaptAbsurdPairs,
+                   "the search the old dialog refused is under the hard bound - it is offered ON EVERY MACHINE");
+            check (absurd > dissonance::kAdaptAbsurdPairs,
                    "and a 128-note table at 24 partials all-vs-all is over it - that one is refused");
         }
     }
@@ -2455,6 +3230,148 @@ int main()
             const auto bottom = blendTemplates (tB, tA, 0.0);
             const auto out    = blendTemplates (top, bottom, 0.0);
             check (same (out, tA), "the hierarchical four-corner chain is still exact at a corner");
+        }
+    }
+
+    //--------------------------------------------------------------------------
+    // THE COLOUR SYSTEM.
+    //
+    // "haz que el color de spectrum vs tuning sea una mezcla del color de spectrum y del
+    //  color de tuning. haz que todas las demas relaciones de colores incluidas la que
+    //  hay entre spectrum y tuning sean lo mas contrastadas y diferentes posibles."
+    //
+    // The palette is the answer to a maximin problem (tools/PaletteSearch.cpp), which
+    // means it is exactly the kind of thing that decays: every future colour added by
+    // hand lands somewhere, and "somewhere" is on average right next to something.
+    // That is not a hypothetical - it is the history of this palette, which shipped with
+    // the TUNING panel and the CUSTOM modulator tab 3.8 units apart and a panel at
+    // 6.2:1 against the page. These checks live here rather than in RhythmVerify
+    // because the palette is JUCE-free and so is this file: nothing has to build an
+    // editor to ask whether two colours are the same colour.
+    {
+        std::printf ("\nThe colour system:\n");
+        using namespace galactic;
+
+        // (b) EVERY PAIR, AS FAR APART AS POSSIBLE. 15 is what the search reached under
+        // the constraints; asserting it is what stops the next colour landing at 4.
+        {
+            const auto w = palette::worstPair();
+            std::printf ("  closest pair: %s vs %s at %.1f (was 3.8: Tuning vs Custom modulator)\n",
+                         w.a, w.b, w.distance);
+            check (w.distance >= 15.0,
+                   "no two identity colours are closer than 15 units of OKLab");
+        }
+
+        // ...and every one of them is legible on the page, and is a COLOUR - the two
+        // ways an "optimal" separation cheats: park it on white, or park it on grey.
+        {
+            // ON THE SURFACE THE TEXT IS DRAWN ON, not on the easiest surface in the
+            // window. The page is the DARKER ground, so for these light colours it gives
+            // the HIGHER ratio; the labels and outlines that carry the colour sit inside
+            // the panel, on kPanelFill tinted 5% towards that same colour. Measured
+            // there, the shipped set floors at 6.01:1 - real WCAG AA for large text
+            // (3:1) and for normal text (4.5:1), but NOT the AAA this check used to
+            // claim, which it only ever measured against the page.
+            //
+            // The threshold is the honest measured floor rather than an aspiration:
+            // 5.9 stops the palette getting worse (which is what the check is for) while
+            // saying out loud what it actually is. Raising it to 7.0 needs a re-run of
+            // tools/PaletteSearch.cpp with the panel surface in its constraint - it now
+            // has that rule; the shipped hexes predate it.
+            // The surface each colour is really read against, printed. This is what the
+            // check below is measuring, and it is worth seeing: the blend is NOT a lerp
+            // (see colour::blendSrgb) and kEssentials in particular borrows across byte
+            // lanes, so its panel is not the colour a tidy formula would predict.
+            for (const auto& e : palette::identitySet())
+                std::printf ("    %-19s #%06x on page %.2f:1, on its panel #%06x %.2f:1\n",
+                             e.name, e.rgb,
+                             colour::contrastRatio (e.rgb, palette::kPage),
+                             palette::panelSurface (e.rgb),
+                             colour::contrastRatio (e.rgb, palette::panelSurface (e.rgb)));
+            const auto c  = palette::worstContrast();
+            const auto cp = palette::worstContrastOnPage();
+            std::printf ("  least legible: %s at %.2f:1 on %s"
+                         " (the page alone would have said %.2f:1 for %s)\n",
+                         c.a, c.distance, c.b, cp.distance, cp.a);
+            check (c.distance >= 5.9,
+                   "every identity colour clears WCAG AA (4.5:1) on the surface it is drawn on");
+            // ...AND THAT IT IS REALLY MEASURING THE PANEL. The threshold above cannot
+            // tell: measure the page instead and every number goes UP, so the check
+            // passes more easily and the palette is signed off against a surface no
+            // coloured text is drawn on. That is the exact failure this replaced.
+            //
+            // So the direction is asserted too, and it is the claim the old comment had
+            // backwards ("the page is the darker of the two and therefore the harder"):
+            // these are LIGHT colours on a DARK ground, so the DARKER surface is the
+            // EASIER one and the page flatters every colour in the set. If a future
+            // palette goes dark-on-light this fails, which is right - the argument for
+            // measuring the panel would then have to be made again rather than assumed.
+            {
+                bool pageAlwaysEasier = true; const char* odd = "";
+                for (const auto& e : palette::identitySet())
+                    if (! (colour::contrastRatio (e.rgb, palette::kPage)
+                             > colour::contrastRatio (e.rgb, palette::panelSurface (e.rgb))))
+                    { pageAlwaysEasier = false; odd = e.name; }
+                check (pageAlwaysEasier, pageAlwaysEasier
+                         ? "the page flatters every one of them - the panel is the binding surface"
+                         : odd);
+            }
+            check (c.distance < cp.distance,
+                   "...so the reported floor is the PANEL's, strictly below what the page would say");
+            double leastChroma = 1.0e9; const char* greyest = "";
+            for (const auto& e : palette::identitySet())
+            {
+                const double ch = colour::chroma (colour::toOklab (e.rgb));
+                if (ch < leastChroma) { leastChroma = ch; greyest = e.name; }
+            }
+            std::printf ("  least chromatic: %s at %.3f\n", greyest, leastChroma);
+            check (leastChroma >= 0.10,
+                   "and none of them has drifted back towards the neutral steel");
+        }
+
+        // (a) SPECTRUM VS TUNING IS THE MIXTURE OF ITS PARENTS.
+        //
+        // Asserted as a property, not as a hex: recompute the mixture here and require
+        // the palette to agree, then require it to actually LIE BETWEEN them. The second
+        // half is the one that bites, because rule (b) is pushing the parents apart and
+        // a mixture that has been quietly replaced by a hand-picked third colour would
+        // still "agree" with nothing at all if only the first half were checked.
+        {
+            const auto blend = palette::specScale();
+            check (blend == colour::mixOklch (palette::kHarmonic, palette::kTuning, 0.5),
+                   "Spectrum vs Tuning IS the mixture of Spectrum and Tuning - not a third hex");
+
+            const double toS = colour::deltaE (blend, palette::kHarmonic);
+            const double toT = colour::deltaE (blend, palette::kTuning);
+            const double parents = colour::deltaE (palette::kHarmonic, palette::kTuning);
+            std::printf ("  blend #%06x: %.1f from Spectrum, %.1f from Tuning, parents %.1f apart\n",
+                         blend, toS, toT, parents);
+            check (toS < parents && toT < parents,
+                   "and it sits BETWEEN them - closer to each parent than they are to each other");
+            // Rule (b) serving rule (a): far-apart parents are what give the mixture room
+            // to be its own colour. If they ever close up, the blend collapses onto both.
+            check (toS >= 12.0 && toT >= 12.0,
+                   "...and far enough from both to be a colour of its own, not a shade of either");
+            // The hue is genuinely between them, which is what "a mixture" looks like.
+            // Mixed on the straight line in (a,b) instead of round the arc, a saturated
+            // pair averages through the neutral axis and comes out grey.
+            check (colour::chroma (colour::toOklab (blend)) >= 0.10,
+                   "...and the mixture kept its chroma (it is not a grey wash of the two)");
+        }
+
+        // COLOUR BLINDNESS. Reported unconditionally and asserted at a lower bar than
+        // normal vision, because it is a lower bar honestly: dichromacy collapses most
+        // of the hue circle onto one axis, so twelve colours cannot be as separable as
+        // they are for a trichromat. The bar that matters is that no two of them become
+        // THE SAME COLOUR, which is where this palette was (0.7 apart under deuteranopia
+        // - literally indistinguishable).
+        {
+            const auto d = palette::worstPair (colour::Vision::deuteranopia);
+            const auto p = palette::worstPair (colour::Vision::protanopia);
+            std::printf ("  deuteranopia: closest %s vs %s at %.1f (was 0.7)\n", d.a, d.b, d.distance);
+            std::printf ("  protanopia:   closest %s vs %s at %.1f (was 1.2)\n", p.a, p.b, p.distance);
+            check (d.distance >= 5.0, "no two identity colours collapse onto each other under deuteranopia");
+            check (p.distance >= 5.0, "nor under protanopia");
         }
     }
 

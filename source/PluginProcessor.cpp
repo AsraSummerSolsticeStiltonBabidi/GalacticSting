@@ -4,6 +4,7 @@
 #include "BinaryData.h"
 
 #include <string>
+#include <limits>
 #include <unordered_map>
 
 namespace
@@ -15,6 +16,13 @@ namespace
 }
 
 //==============================================================================
+// TESTS ONLY (see setSettingsFileForTests): empty in production, read once per constructor.
+static juce::File& settingsFileOverrideForTests()
+{
+    static juce::File f;
+    return f;
+}
+
 FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     : AudioProcessor (BusesProperties()
                           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
@@ -40,7 +48,7 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     }
 
     for (int i = 0; i < 32; ++i)
-        synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning, modEngine));
+        synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning, modEngine, expression));
 
     // Global app settings (recent .scl files), shared across all instances.
     juce::PropertiesFile::Options o;
@@ -48,9 +56,15 @@ FractalAdditiveAudioProcessor::FractalAdditiveAudioProcessor()
     o.filenameSuffix      = "settings";
     o.folderName          = "GalacticSting";
     o.osxLibrarySubFolder = "Application Support";
-    appProps = std::make_unique<juce::PropertiesFile> (o);
+    appProps = settingsFileOverrideForTests () != juce::File()
+                 ? std::make_unique<juce::PropertiesFile> (settingsFileOverrideForTests(), o)
+                 : std::make_unique<juce::PropertiesFile> (o);
     recentSclPaths.addLines (appProps->getValue ("recentScl"));
     recentSclPaths.removeEmptyStrings();
+    // The keyboard's note-name preference, read back BEFORE any editor is built so the
+    // first editor opens already in the state the user left it in - "que se abra ya con
+    // ese setting al re-abrirse". Defaults to false, so a fresh install shows numbers.
+    keyboardNoteNames = appProps->getBoolValue ("keyboardNoteNames", false);
 
     // Decode the jingle once, here, so clicking the title never has to touch a
     // decoder on the audio thread. It does NOT start playing - see triggerJingle().
@@ -75,11 +89,32 @@ void FractalAdditiveAudioProcessor::addRecentScl (const juce::File& f)
     recentSclPaths.insert (0, path);
     while (recentSclPaths.size() > 64)   // the Recent window lists them all, newest first
         recentSclPaths.remove (recentSclPaths.size() - 1);
-    if (appProps != nullptr)
-    {
-        appProps->setValue ("recentScl", recentSclPaths.joinIntoString ("\n"));
-        appProps->saveIfNeeded();
-    }
+    writeSetting ("recentScl", recentSclPaths.joinIntoString ("\n"));
+}
+
+void FractalAdditiveAudioProcessor::writeSetting (const juce::String& key, const juce::var& value)
+{
+    if (appProps == nullptr) return;
+    appProps->reload();   // what the other instances wrote since this one last read it
+    appProps->setValue (key, value);
+    appProps->saveIfNeeded();
+}
+
+bool FractalAdditiveAudioProcessor::getWarnNearFreeze()
+{
+    if (appProps == nullptr) return true;
+    appProps->reload();   // another instance's menu, or its "don't show again", may have changed it
+    return appProps->getBoolValue ("warnNearFreeze", true);
+}
+
+void FractalAdditiveAudioProcessor::setWarnNearFreeze (bool on)
+{
+    writeSetting ("warnNearFreeze", on);
+}
+
+void FractalAdditiveAudioProcessor::setSettingsFileForTests (const juce::File& f)
+{
+    settingsFileOverrideForTests() = f;
 }
 
 FractalAdditiveAudioProcessor::~FractalAdditiveAudioProcessor()
@@ -131,9 +166,14 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "primeLimit", 1 }, "Prime Limit",
         NormalisableRange<float> (0.0f, 9.0f, 0.01f), 0.0f));
+    // Default WHITELIST, not Limit ("por defecto que este en modo whitelist"). It is the
+    // mode that SHOWS what it is doing - nine ticks you can read at a glance - where
+    // Limit is a single number whose meaning ("largest prime factor allowed") has to be
+    // known in advance. It costs nothing to default to: primeOn ships OFF, so neither
+    // mode filters anything until the user turns the panel on.
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "primeMode", 1 }, "Prime Mode",
-        StringArray { "Limit", "Whitelist" }, 0));
+        StringArray { "Limit", "Whitelist" }, 1));
     {
         const char* pn[] = { "2","3","5","7","11","13","17","19","23" };
         for (int i = 0; i < spectrum::primeListSize; ++i)
@@ -148,9 +188,67 @@ FractalAdditiveAudioProcessor::createParameterLayout()
         NormalisableRange<float> (1.0f, 4.0f, 0.01f), 1.0f));
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "spectrumRange", 1 }, "Spectrum Range (oct)", 1, 10, 10));
-    params.push_back (std::make_unique<AudioParameterChoice>(
+    // PHASE, CONTINUOUS. Was a two-way Choice {Aligned, Scattered}; it is now a fader,
+    // 0 = every partial at its peak (one pulse), 1 = as scattered as PhaseSets.h can
+    // prove is better than the shipping hash.
+    //
+    // THE ID IS KEPT ON PURPOSE. "phaseMode" is what the mod matrix routes to, what the
+    // playground corners capture, and what every automation lane a user has already
+    // drawn addresses. Renaming it would silently drop all three - the modulator would
+    // point at nothing, the corner would restore a default, and the lane would go dead -
+    // and none of those failures announce themselves.
+    //
+    // AND THE OLD STATE STILL LOADS WITHOUT A MIGRATION STEP, which is worth writing
+    // down because it is arithmetic and not luck. APVTS stores the DENORMALISED value
+    // (ParameterAdapter::flushToTree writes unnormalisedValue), and AudioParameterChoice
+    // denormalises to the choice INDEX over NormalisableRange(0, numChoices - 1). With
+    // exactly two choices that range is [0, 1], so an old chunk holds 0.0 for Aligned and
+    // 1.0 for Scattered - already this parameter's own values, and already the host's own
+    // normalised 0.0/1.0 for any automation lane. FftVerify's phase-state round trip feeds
+    // a blob written by the OLD parameter object through setStateInformation and asserts
+    // both ends, so if anyone ever widens this range the check fails instead of a user's
+    // saved project quietly opening on a different sound.
+    params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "phaseMode", 1 }, "Phase",
-        StringArray { "Aligned", "Scattered" }, 0));
+        NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.0f));
+    // THERE IS NO "phaseGlide" PARAMETER ANY MORE, AND THAT IS THE POINT.
+    //
+    // How a MID-NOTE Phase move reaches voices that are already sounding is not a
+    // separate choice the user has to keep in sync with anything: it is ALREADY
+    // answered by the SPECTRUM panel's transition, because re-phasing IS a spectrum
+    // change and those two controls exist to say how a spectrum change is made smooth.
+    //   Morph on   -> PITCHBEND: each partial takes a momentary frequency offset until
+    //                 it has walked to its new phase. That is literally what Morph does
+    //                 to a spectrum change, so Phase borrows it rather than restating it.
+    //                 It TRACKS A DRAG continuously (the offset is proportional to how
+    //                 fast the fader is moving), and the price is that the offset is an
+    //                 offset in Hz, so it is a real interval on a low partial - measured
+    //                 and reported by RhythmVerify run 53 rather than assumed away.
+    //   Dry/Wet on -> CROSSFADE: the old phases fade out while the new ones fade in, with
+    //                 NOTHING DETUNED anywhere - which is the reason to pick it. Again the
+    //                 same machine, driven by the same rule. The incoming bank's phases
+    //                 may not be re-placed while it is audible, so a drag lands in steps
+    //                 of one transition each instead of tracking.
+    //   Both on    -> MORPH WINS, exactly as it does for the spectrum itself (see the
+    //                 Dry/Wet block below): a voice has ONE crossfade between two banks,
+    //                 so there is only one answer available and it is Morph's.
+    //   Both off   -> no live re-phasing at all; the new phases take effect at the next
+    //                 note-on - AND SO DOES THE LEVEL. This line used to end "the level
+    //                 still follows the fader immediately, because the normalisation law
+    //                 is blended live", and that was the bug the user found by playing
+    //                 it: "el volumen aumenta pero no se produce el efecto o no del
+    //                 todo". The normalisation exists to compensate the crest factor the
+    //                 phases produce, so moving it while the phases stand still is not a
+    //                 compensation at all, it is arbitrary loudness. A held note's level
+    //                 now moves when, and only when, its phases do.
+    // and the DURATION is that same transition's Time fader (morphTime / dryWetTime).
+    //
+    // WHY DELETING IT IS SAFE FOR PROJECTS SAVED BY YESTERDAY'S BUILD: APVTS reads the
+    // state by asking each parameter it OWNS for its child node, so a child naming a
+    // parameter that no longer exists is never looked at and is dropped on the next
+    // save. FftVerify's phase-state round trip feeds a chunk that still carries a
+    // <PARAM id="phaseGlide"> child through setStateInformation and asserts phaseMode
+    // survives it, so this stays a checked claim rather than a remembered one.
 
     //-- Amp envelope -----------------------------------------------------------
     auto timeRange = [] (float maxSeconds)
@@ -307,6 +405,37 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterFloat>(
         ParameterID { "morphTime", 1 }, "Morph Time", timeRange (5.0f), 0.300f));
 
+    //-- DRY/WET TRANSITION: the OTHER way to make a spectrum change smooth, and a
+    //   deliberately independent one. Morph glides partial FREQUENCIES from where they are
+    //   to where they are going (a per-partial pitch bend); this CROSSFADES - the previous
+    //   spectrum fades out while the new one fades in, simultaneously, over this time, with
+    //   no frequency movement at all. It is the alternative the user asked for ("es una
+    //   alternativa al pitch bending de morph"), not a refinement of it.
+    //
+    //   THE TWO CANNOT BOTH ACT. A voice has exactly one crossfade machine - the
+    //   phase[]/alignPhase[] bank pair with a single weight (see AdditiveVoice.h) - and
+    //   both features are that machine driven by different rules. MORPH WINS: with Morph on,
+    //   this is inert and the panel greys it out and says why, rather than leaving the user
+    //   to believe two smoothings are running. Same range and same skew as Morph Time, so
+    //   the fader feels identical.
+    //
+    //   IT DEFAULTS TO ON, and Morph does not: "haz que la default sea drywet". The panel
+    //   asks ONE question now - TRANSITION: Off / Morph / Dry/Wet - and this pair of
+    //   booleans is what that question is stored in (see the combo in PluginEditor.cpp),
+    //   so "the default option is Dry/Wet" is exactly this flag starting true. A brand new
+    //   instance therefore CROSSFADES its spectrum changes instead of snapping them.
+    //
+    //   OLD PROJECTS ARE NOT DRAGGED WITH IT. APVTS leaves a parameter whose <PARAM> child
+    //   is missing from the loaded chunk at whatever it currently holds - which on a fresh
+    //   instance is this default - so a project saved before this feature existed would
+    //   silently open with a 0.3 s crossfade on every spectrum change it never had. The
+    //   absent child is exactly what marks it as older than the feature, and restoreState
+    //   turns the flag back off when it sees that. Measured there, not assumed.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "dryWet", 1 }, "Dry/Wet Transition", true));
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "dryWetTime", 1 }, "Dry/Wet Time", timeRange (5.0f), 0.300f));
+
     //-- Tuning ----------------------------------------------------------------
     // Index 0 (plain 12ED2) is no longer OFFERED - MTS-ESP already falls back to
     // 12-TET on its own when no master is connected, so it is the honest default
@@ -330,38 +459,83 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     // Whole-instrument octave transpose (+-5 octaves), on top of the A reference.
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "octaveShift", 1 }, "Octave Transpose", -5, 5, 0));
+    // BINAURAL: every partial from 100 Hz up goes to alternating ears.
+    //
+    // "cada parcial a partir de los 100 hz se panea a un oido distinto, de manera
+    //  alternada, uno a la derecha, el siguiente a la izquierda etc, hasta el mas agudo de
+    //  ellos, el fader al maximo significa paneo hasta los extremos."
+    //
+    // Zero by default, which is dead centre and bit-identical to the instrument without
+    // it: every patch and project made before this parameter existed sounds exactly as it
+    // did. The floor of 100 Hz is the point below which the ear stops localising by
+    // level - putting the fundamental of a low note in one ear would move the NOTE, not
+    // open the spectrum out - so everything under it stays where it was.
+    params.push_back (std::make_unique<AudioParameterFloat>(
+        ParameterID { "binaural", 1 }, "Binaural Spread",
+        NormalisableRange<float> (0.0f, 1.0f, 0.001f), 0.0f));
     // Tuning bank slot (0 = none, 1..N = load that bank .scl). Automatable.
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "tuningBankSlot", 1 }, "Tuning Bank Slot", 0, kBankSlots, 0));
 
-    //-- Shepard tone generator (Tuning panel) ---------------------------------
-    // An endlessly rising tone whose component spacing is the ACTIVE TUNING's
-    // period (see ShepardEngine.h). Default OFF and at a modest level, so nothing
-    // sounds until it is asked for. All five are automatable.
+    //-- MONOPHONIC GLIDE (Pitch tab) ------------------------------------------
+    // "al activarlo el sinte no puede producir acordes pero al pulsar una nota y luego
+    //  otra se hace pitchbend de una a la otra en un tiempo especificado en ms".
+    // ON drops the synth - and every playground MIX sub-engine - to ONE voice, so a new
+    // note-on TAKES OVER the sounding one instead of adding to it, and the voice bends
+    // its pitch from the previous note's tuned frequency to the new one's. Last-note
+    // priority, no envelope retrigger while a key is held, and a release returns to the
+    // most recent key still down (see MonoGlide.h and AdditiveVoice::noteStarted).
     params.push_back (std::make_unique<AudioParameterBool>(
-        ParameterID { "shepOn", 1 }, "Shepard On", false));
-    params.push_back (std::make_unique<AudioParameterFloat>(
-        ParameterID { "shepLevel", 1 }, "Shepard Level",
-        NormalisableRange<float> (-60.0f, 0.0f, 0.1f), -18.0f));
-    // ONE rate control, two modes: FREE = the ms fader below; SYNC = a musical
-    // duration against the host BPM (the beats list). With no transport BPM the
-    // free value takes over and the editor says so (see shepardSyncHasNoBpm).
+        ParameterID { "monoGlide", 1 }, "Monophonic Glide", false));
+    // The portamento's DURATION, log-mapped over 1 ms .. 5 s. 1 ms rather than 0 because
+    // the mapping is logarithmic and because "the shortest glide there is" is a more
+    // useful bottom than a dead zone: at 1 ms the takeover is already indistinguishable
+    // from a jump, so no value is wasted. The centre sits at 100 ms, which is where the
+    // musically useful range lives - the fader spends half its travel between 1 and 100.
+    {
+        NormalisableRange<float> r (1.0f, 5000.0f, 0.1f);
+        r.setSkewForCentre (100.0f);
+        params.push_back (std::make_unique<AudioParameterFloat>(
+            ParameterID { "glideTime", 1 }, "Glide Time (ms)", r, 120.0f));
+    }
+
+    //-- SHEPARD MODE (Tuning panel) -------------------------------------------
+    // A PLAYED mode, not a generator: the key you press becomes the root of an
+    // endlessly rising tone built from THIS synth's spectrum (see ShepardEngine.h
+    // and AdditiveVoice). Default OFF, so nothing changes until it is asked for.
+    // All four are automatable, and all four are read per VOICE - so a playground
+    // corner whose preset is a Shepard patch really sounds like one.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "shepOn", 1 }, "Shepard Mode", false));
+    // ONE rate control, two dresses: FREE = the ms fader below; SYNC = a musical
+    // duration against the host BPM (the beats list). SYNC IS THE DEFAULT: a rise
+    // that drifts against the track is the thing people fix first, and with no
+    // transport BPM the free value takes over anyway and the editor says so (see
+    // shepardSyncHasNoBpm).
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "shepMode", 1 }, "Shepard Rate Mode",
-        StringArray { "Free (ms)", "Sync (beats)" }, 0));
-    // Time to rise ONE period of the tuning, log-mapped over 100 ms .. 60 s.
+        StringArray { "Free (ms)", "Sync Project Tempo" }, 1));
+    // Time to rise ONE interval, log-mapped over 100 ms .. 60 s.
     {
         NormalisableRange<float> r (100.0f, 60000.0f, 1.0f);
         r.setSkewForCentre (2449.5f); // sqrt(100*60000): log-shaped travel
         params.push_back (std::make_unique<AudioParameterFloat>(
             ParameterID { "shepTime", 1 }, "Shepard Rise Time (ms)", r, 8000.0f));
     }
-    // The beats list mirrors ShepardEngine::kDivBeats ENTRY FOR ENTRY - the index
-    // is the contract between this choice and beatsForDiv(), and a list edited on
-    // one side only would silently re-time every saved project.
+    // The beats list mirrors shepard::kDivBeats ENTRY FOR ENTRY - the index is the
+    // contract between this choice and beatsForDiv(), and a list edited on one side
+    // only would silently re-time every saved project.
     params.push_back (std::make_unique<AudioParameterChoice>(
         ParameterID { "shepDiv", 1 }, "Shepard Rise Beats",
         StringArray { "1/16", "1/8", "1/4", "1/3", "1/2", "2/3", "1", "2", "3", "4", "8", "16" }, 9));
+    // WHAT ONE RISE STEP IS. An OCTAVE by default in every tuning - that is what a
+    // listener hears as "the same note again", and silently rising by 3/1 because a
+    // Bohlen-Pierce scale happens to be loaded would be a tuning decision nobody
+    // asked for. The tuning's own period is offered instead only when it differs
+    // from 2/1, and the editor hides the control entirely when it does not.
+    params.push_back (std::make_unique<AudioParameterChoice>(
+        ParameterID { "shepRise", 1 }, "Shepard Rise Interval",
+        StringArray { "Octave pitch bend", "Period pitch bend" }, 0));
 
     //-- Spectrum -> rhythm MIDI out --------------------------------------------
     // Each selected partial pulses at f0 * ratio / x^n; all of these are automatable.
@@ -495,6 +669,38 @@ FractalAdditiveAudioProcessor::createParameterLayout()
     params.push_back (std::make_unique<AudioParameterInt>(
         ParameterID { "pgVoices", 1 }, "Mix Voices per Corner", 1, 32, 8));
 
+    // PRIME CONTROL, ON AND OFF. "PON UN BOTON DE ON/OFF... POR DEFECTO WHITELIST Y
+    // APAGADO."
+    //
+    // Until now the only way to have no prime filtering was to know that the LIMIT
+    // fader's leftmost stop is called "Off" - which does nothing at all for the OTHER
+    // mode, because a whitelist with every prime ticked is still a filter: harmonic 29
+    // has a prime factor nobody can tick, and it was being dropped by a control the user
+    // never touched. So the panel gets its own switch, and OFF means the spectrum sees
+    // no prime filter of any kind (see prepareSettings, where it forces the neutral
+    // state rather than relying on any particular fader position).
+    //
+    // Appended at the END of the list on purpose: a host's automation lanes are indexed,
+    // and inserting this next to its neighbours would renumber every parameter after it.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "primeOn", 1 }, "Prime Control On", false));
+
+    // WHICH WAY IT GOES. "Haz que el shepard pueda ser ascending o descending pulsando un
+    // boton con flecha que al pulsarlo pasa de hacia arriba a hacia abajo."
+    //
+    // A Shepard tone that FALLS for ever is the same illusion run backwards and it is the
+    // half of the effect this synth could not make: the classic demonstration is a pair,
+    // and a descending one is what a riser is answered with. It is one sign on the rise
+    // rate - the grid, the window and the band are all symmetric, and the copies leave
+    // through the zero at whichever edge they reach - so this costs the engine a negation
+    // and nothing else.
+    //
+    // Appended at the END of the parameter list, like every addition here: a host's
+    // automation lanes are indexed, and inserting it beside its four Shepard neighbours
+    // would renumber every parameter after it in projects people have already saved.
+    params.push_back (std::make_unique<AudioParameterBool>(
+        ParameterID { "shepDown", 1 }, "Shepard Descending", false));
+
     return { params.begin(), params.end() };
 }
 
@@ -564,6 +770,20 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::settingsFromValues (
             mask |= (1u << i);
     s.primeWhitelistMask = mask;
 
+    // OFF MEANS OFF, in both modes and whatever the fader and the ticks happen to say.
+    // Written as the NEUTRAL SETTINGS rather than as a branch inside the generator, so
+    // exactly one place decides what "no prime filter" is: limit 0 (which primeLimitOk()
+    // passes unconditionally), no blend towards a next stop, and the whitelist path not
+    // taken. Nothing downstream has to know the switch exists.
+    if (get ("primeOn") <= 0.5f)
+    {
+        s.primeUseWhitelist  = false;
+        s.primeLimit         = 0;
+        s.primeLimitNext     = 0;
+        s.primeLimitPos      = 0.0f;
+        s.primeWhitelistMask = 0xFFFFFFFFu;
+    }
+
     s.fractalLevel   = get ("fractalLevel");
     s.spectrumRangeOct = (int) get ("spectrumRange");
     s.ampFloorDb     = -120.0f;
@@ -580,7 +800,17 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::settingsFromValues (
     // corner's engine is decided by ITS values, not by the live ones.
     const bool temper   = get ("timbreTemper") > 0.5f;
     const bool customOn = ! degrees.empty() && get ("timbreOn") > 0.5f;
-    if (temper)
+    // Temper's grid is "degree x period^k", so it EXISTS only when the tuning states a
+    // period that ascends. hasUsablePeriod() is asked instead of periodRatio() because
+    // that one answers 2.0 for a tuning with no period at all (it feeds displays, which
+    // always need a number) - and snapping to that 2.0 tempers the spectrum to an octave
+    // the user's file never contained. A descending .scl and a degenerate period-1 scale
+    // are both legal and both hit it. So temper REFUSES here: the harmonic engine runs
+    // UNTEMPERED, no partial moves, and the toggle on screen says why (see the editor's
+    // temperToggle). Falling through to the Custom Engine instead would be a second
+    // silent substitution, so it is deliberately not done.
+    const bool canTemper = tuning.hasUsablePeriod();
+    if (temper && canTemper)
     {
         s.source         = spectrum::Source::Harmonic;
         s.temperToTimbre = true;
@@ -589,8 +819,12 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::settingsFromValues (
         s.timbreDegrees.reserve ((size_t) D);
         for (int d = 0; d < D; ++d)
             s.timbreDegrees.push_back ((float) getDegreeRatio (d));
-        s.timbrePeriod = (float) tuning.periodRatio(); // the tuning's OWN period, not a key lookup
-        if (! (s.timbrePeriod > 1.0001f)) { s.timbrePeriod = 2.0f; }
+        s.timbrePeriod = (float) tuning.statedPeriodRatio(); // the tuning's OWN period, never a fallback
+    }
+    else if (temper)
+    {
+        s.source         = spectrum::Source::Harmonic;
+        s.temperToTimbre = false; // refused, and visibly so - never quietly tempered to 2/1
     }
     else if (customOn)
     {
@@ -608,6 +842,14 @@ spectrum::SpectrumSettings FractalAdditiveAudioProcessor::settingsFromValues (
 
 void FractalAdditiveAudioProcessor::timerCallback()
 {
+    // How long this tick held the host's interface thread (the realtime-adapt compiles and a
+    // MIX engine growing its voices run in here) - the load watch's second half.
+    struct StallScope
+    {
+        fibload::Monitor& m;
+        double t0;
+        ~StallScope() { m.noteStallMs (juce::Time::getMillisecondCounterHiRes() - t0); }
+    } stallScope { loadMonitor, juce::Time::getMillisecondCounterHiRes() };
     // Catch the moment manual mode is switched on and FREEZE slope there, before
     // currentSettings() below reads it. Everything the user had is preserved: the sound
     // does not move by a single dB at the switch, and from then on the slope fader is
@@ -656,9 +898,35 @@ void FractalAdditiveAudioProcessor::timerCallback()
     // trigger that only worked while someone was looking would not be automatable.
     pollRandomSpectrumTrigger();
 
+    // MONOPHONIC GLIDE: the voice pool follows the switch. Here rather than in the
+    // editor because it is an automatable parameter and a project can arrive with it
+    // already on - the pool has to be one voice before the first note is played, not
+    // once somebody opens the window.
+    {
+        const bool mg = apvts.getRawParameterValue ("monoGlide")->load() > 0.5f;
+        if (mg != lastMonoGlide)
+        {
+            lastMonoGlide = mg;
+            monoShrinkTicks = 0;
+            applyMonoVoiceCount (mg);
+        }
+        else if (synth.getNumVoices() > (mg ? 1 : kPolyVoices))
+        {
+            // A shrink thrown under a held chord does not finish in one go: the notes it
+            // has to drop are faded first and the pool follows only once they are quiet
+            // (see applyMonoVoiceCount). This is the later tick that finishes it, and it
+            // costs one integer compare on every other tick there has ever been.
+            applyMonoVoiceCount (mg);
+        }
+    }
+
     // Spectrum <-> tuning REALTIME links (throttled + coalesced; refuses to close a
     // feedback loop). Here, not in the editor, so they keep working with the window shut.
     driveRealtimeLink();
+    // ...and the lookahead budget, which the link above can have just switched off by
+    // refusing itself (a feedback-loop refusal ends the link, so the latency must go
+    // with it instead of being paid for a follower that is no longer running).
+    applyLookahead();
 
     // Segment scale tracks the timbre live: whenever the spectrum template changes
     // (Base N, fractal, a completing morph...) OR after a project reload, rebuild it
@@ -671,20 +939,62 @@ void FractalAdditiveAudioProcessor::timerCallback()
     // Runs on the message thread (timerCallback), so the parse/load is safe here.
     {
         const int slot = getTuningBankSlotParam();
-        if (slot != lastBankSlot)
+        const bool inRange = slot >= 1 && slot <= kBankSlots;
+        const juce::String src  = inRange ? bankSource[(size_t) (slot - 1)] : juce::String();
+        const juce::String name = inRange ? bankName  [(size_t) (slot - 1)] : juce::String();
+
+        // A CHANGE OF SLOT, OR A FAILED SLOT WHOSE TEXT HAS MOVED - and nothing else.
+        //
+        // `lastBankSlot = slot` used to be the first statement in this block, so the slot
+        // was marked applied before the load had run. A slot whose stored text no longer
+        // parses then switched the SELECTOR and not the TUNING: the combo read "31-EDO",
+        // the instrument went on playing whatever it had, `err` was dropped unread on the
+        // next line, and nothing anywhere said a word. For a microtonal instrument that is
+        // the quiet failure that matters - everything still sounds, and it sounds wrong.
+        //
+        // The sticky index then blocked every retry, which is the same bug from the other
+        // side. Picking that slot again is not a change, so it did nothing; and neither did
+        // the obvious repair of dropping a good file into it, because setTuningBankFile ends
+        // with setTuningBankSlotParam(slot0 + 1), a no-op when that slot is already
+        // selected. The replacement text sat in the bank, correct and unloaded, with the
+        // broken tuning still under the keys.
+        //
+        // SO THE TEXT IS ONLY CONSULTED FOR A SLOT WHOSE LOAD FAILED, and that narrowness
+        // is measured, not cautious. Testing the text unconditionally re-loads a slot
+        // whenever its stored source changes under the same index - which is exactly what
+        // the plugin itself does when a tuning is edited and re-stored - and that stomps the
+        // mode back to Scala on top of whatever is active. syncBankSelector documents that
+        // very hazard two hundred lines up and sets lastBankSlot FIRST to dodge it; a wider
+        // test here walks straight past that guard. Measured on the full suite: 8 checks in
+        // run 14 and three other runs went red, all of them a tuning coming back after a
+        // clearScala or a mode change.
+        if (slot != lastBankSlot || (lastBankFailed && src != lastBankSource))
         {
-            lastBankSlot = slot;
-            if (slot >= 1 && slot <= kBankSlots && bankSource[(size_t) (slot - 1)].isNotEmpty())
+            lastBankSlot   = slot;
+            lastBankSource = src;
+            lastBankFailed = false;
+            if (src.isNotEmpty())
             {
                 juce::String err;
                 // loadTuningString, not loadScalaString: a bank slot may hold .tun text
                 // (a non-repeating .tun has no .scl form), and the .scl parser would
                 // reject it and leave the previous tuning sounding under the new name.
-                if (tuning.loadTuningString (bankSource[(size_t) (slot - 1)], bankName[(size_t) (slot - 1)], err))
+                if (tuning.loadTuningString (src, name, err))
                 {
                     if (auto* pm = apvts.getParameter ("tuningMode"))
                         pm->setValueNotifyingHost (pm->convertTo0to1 ((float) (int) TuningManager::Mode::Scala));
                     clearSegmentSource(); // a bank .scl replaces any segment scale
+                }
+                else
+                {
+                    // A SLOT THAT DOES NOT LOAD SAYS SO, and says the parser's own reason.
+                    // Parked rather than shown from here: this poll runs whether or not a
+                    // window exists (host automation moves the slot parameter with the
+                    // editor shut), so the editor collects it on its next tick through
+                    // takeBankSlotError - the same one-shot route a project that loses its
+                    // scale already takes.
+                    lastBankFailed = true;
+                    bankSlotError  = name.isNotEmpty() ? name + " \xe2\x80\x94 " + err : err;
                 }
             }
         }
@@ -774,7 +1084,13 @@ void FractalAdditiveAudioProcessor::timerCallback()
     // NOTHING ever opened a transaction: every automated change piled into one
     // unbounded ActionSet and the first Ctrl+Z after opening the window reverted the
     // lot back to the values the plugin was instantiated with.
-    if (++undoTxnTick >= 60) // 60 Hz timer -> ~1 s, same grouping as before
+    //
+    // ...but NOT in the middle of a gesture. A pencil drag is one user action that can
+    // last several seconds, and a cut inside it made "I dragged a partial" two Ctrl+Zs -
+    // the second of which leaves manual mode armed with no edits (see beginUndoGesture).
+    if (undoGestureDepth > 0)
+        undoTxnTick = 0;
+    else if (++undoTxnTick >= 60) // 60 Hz timer -> ~1 s, same grouping as before
     {
         undoTxnTick = 0;
         undoManager.beginNewTransaction();
@@ -787,12 +1103,29 @@ void FractalAdditiveAudioProcessor::timerCallback()
     if (bendValues[bendIdx] != lastBendApplied)
     {
         lastBendApplied = bendValues[bendIdx];
-        synth.setLegacyModePitchbendRange (lastBendApplied);
-        // The MIX sub-engines bend by the same range - one MIDI-to-pitch mapping for
-        // the whole instrument (in MPE zone mode the zone already fixes it at +-48).
-        for (auto& e : mixEng)
-            if (e != nullptr && ! lastZoneMpe)
-                e->synth.setLegacyModePitchbendRange (lastBendApplied);
+        // ...AND IN MPE ZONE MODE IT IS NOT PUSHED AT ALL, only remembered.
+        //
+        // juce::MPEInstrument::setLegacyModePitchbendRange calls releaseAllNotes() FIRST,
+        // unconditionally, and only then looks at legacyMode.pitchbendRange - which in
+        // zone mode nothing reads, because the zone's own +-48 governs. So touching the
+        // Pitch bend selector while an MPE controller was playing cut every sounding note
+        // and changed nothing: the loudest possible way to do nothing. The MIX corners
+        // were already guarded against exactly this (the `! lastZoneMpe` below has been
+        // there); the main synth, which is the one the user is actually playing, was not.
+        //
+        // The choice is still RECORDED, so it is not lost: leaving MPE mode runs
+        // applyTuningMode's else branch, and enableLegacyMode (lastBendApplied) sets the
+        // range there - on a synth that is not yet in legacy mode, which is the one state
+        // where that call does take effect (see applyZoneTo for the other half of that).
+        if (! lastZoneMpe.load (std::memory_order_relaxed))
+        {
+            synth.setLegacyModePitchbendRange (lastBendApplied);
+            // The MIX sub-engines bend by the same range - one MIDI-to-pitch mapping for
+            // the whole instrument.
+            for (auto& e : mixEng)
+                if (e != nullptr)
+                    e->synth.setLegacyModePitchbendRange (lastBendApplied);
+        }
     }
 }
 
@@ -832,6 +1165,18 @@ int FractalAdditiveAudioProcessor::bankAutoAdd (const juce::String& name, const 
             bankName[(size_t) i]   = name.isNotEmpty() ? name : juce::String ("scale");
             return i;
         }
+    // BANK FULL, AND SAID SO. Returning -1 was already the safe half - nothing is
+    // overwritten - but it was also the silent half: every path that loads a tuning calls
+    // this, so a full bank meant scales quietly stopped joining it while the panel went on
+    // describing a bank that "just keeps growing". The tuning IS loaded and sounding; what
+    // did not happen is the one-click way back to it, and that is worth a sentence.
+    // Through the ADD notice, like setTuningBankFile's full bank: under bankSlotError it was shown
+    // as "That bank slot could not be loaded", which says the opposite of this sentence (night
+    // review, pre-existing).
+    bankAddFile  = name.isNotEmpty() ? name : juce::String ("This tuning");
+    bankAddError = "The tuning bank is full (" + juce::String (kBankSlots)
+                 + " slots), so this tuning did not join the bank. It IS loaded and sounding; remove "
+                   "a tuning from the bank with its X to make room for it.";
     return -1; // bank full - the user curates it with the X
 }
 
@@ -842,6 +1187,11 @@ void FractalAdditiveAudioProcessor::syncBankSelector (int slot0)
 {
     if (! juce::isPositiveAndBelow (slot0, kBankSlots)) return;
     lastBankSlot = slot0 + 1;
+    // The other two halves of "already applied" go with it. The tuning that is active right
+    // now IS this slot's, so recording its text and clearing the failed flag is simply the
+    // truth - and it keeps the retry test above from ever looking at this slot's text again.
+    lastBankSource = bankSource[(size_t) slot0];
+    lastBankFailed = false;
     if (auto* p = apvts.getParameter ("tuningBankSlot"))
         p->setValueNotifyingHost (p->convertTo0to1 ((float) (slot0 + 1)));
 }
@@ -865,14 +1215,61 @@ void FractalAdditiveAudioProcessor::clearScala()
 }
 
 //==============================================================================
+// THE WINDOW'S OWN NOTES. Message thread; the collector is the thread-safe hand-over the
+// chord preview already uses. The channel is decided HERE, once per note-on, and the
+// note-off is sent on the channel that note was started on - a rotation that forgot which
+// channel a note went out on is a note that never stops.
+void FractalAdditiveAudioProcessor::playUiNote (int note, float velocity)
+{
+    if (! juce::isPositiveAndBelow (note, 128) || ! (getSampleRate() > 0.0)) return;
+    // In the MPE zone mode channel 1 is the MASTER: a note there carries no per-note bend
+    // of its own and every master wheel sweeps it. The window plays on member channels
+    // instead, one per sounding note, so two letters held together can never share one.
+    // THE WINDOW'S CHANNEL IS ONE NOBODY ELSE IS PLAYING.
+    //
+    // Two note-ons for the same pitch on the same channel are ONE note to a MIDI receiver:
+    // JUCE's MPEInstrument retriggers it, and then either release kills it. So a letter and
+    // a controller on the same pitch used to fight - which is exactly what the player feels
+    // as "my note died when the Hexboard played the same key". The window takes the highest
+    // channel the stream has not carried a note on, working down; in the MPE zone mode it
+    // stays inside the members (2..16), because channel 1 is the zone's master and a note
+    // there has no per-note bend and is swept by every master wheel.
+    const bool mpe = lastZoneMpe.load (std::memory_order_relaxed);
+    const int  lowest = mpe ? 2 : 1;
+    int ch = mpe ? 2 : 1;
+    for (int c = 16; c >= lowest; --c)
+        if (! expression.hostPlaysOn (c) && ! uiNoteOn[(size_t) c]) { ch = c; break; }
+    if (uiNoteFor[(size_t) note] != 0)        // already sounding from the window: leave it alone
+        return;
+    uiNoteFor[(size_t) note] = (juce::int8) ch;
+    uiNoteOn[(size_t) ch] = true;
+    uiNoteChannel.store (ch, std::memory_order_relaxed);
+    auto m = juce::MidiMessage::noteOn (ch, note, velocity);
+    m.setTimeStamp (juce::Time::getMillisecondCounterHiRes() * 0.001);
+    uiNoteCollector.addMessageToQueue (m);
+}
+
+void FractalAdditiveAudioProcessor::stopUiNote (int note)
+{
+    if (! juce::isPositiveAndBelow (note, 128)) return;
+    const int ch = (int) uiNoteFor[(size_t) note];
+    if (ch <= 0) return;                      // not ours: never send a note-off for somebody else's note
+    uiNoteFor[(size_t) note] = 0;
+    uiNoteOn[(size_t) ch] = false;
+    if (! (getSampleRate() > 0.0)) return;
+    auto m = juce::MidiMessage::noteOff (ch, note, 0.0f);
+    m.setTimeStamp (juce::Time::getMillisecondCounterHiRes() * 0.001);
+    uiNoteCollector.addMessageToQueue (m);
+}
+
 void FractalAdditiveAudioProcessor::applyTuningMode (int paramIndex)
 {
     const bool mpe = paramIndex == 3;
     tuning.setMode (mpe ? TuningManager::Mode::Equal          // MPE: no internal tuning
                         : (TuningManager::Mode) paramIndex);
-    if (mpe != lastZoneMpe)
+    if (mpe != lastZoneMpe.load (std::memory_order_relaxed))
     {
-        lastZoneMpe = mpe;
+        lastZoneMpe.store (mpe, std::memory_order_relaxed);
         if (mpe)
         {
             juce::MPEZoneLayout zone;
@@ -907,13 +1304,49 @@ int FractalAdditiveAudioProcessor::firstEmptyBankSlot() const noexcept
     for (int i = 0; i < kBankSlots; ++i)
         if (bankSource[(size_t) i].isEmpty())
             return i;
-    return 0; // all full -> reuse the first
+    // -1, NOT 0. This used to answer "all full -> reuse the first", and its one caller
+    // hands the answer straight to setTuningBankFile - so the 129th tuning added to the
+    // bank OVERWROTE the user's own first one, with nothing on screen either before or
+    // after. A silently destroyed scale is the worst outcome this bank has available: the
+    // slot still lists a name, the name is the new file's, and the scale that was there is
+    // gone from a plugin that promises the bank "just keeps growing".
+    return -1; // the bank is full - the caller must say so, never pick a victim
 }
 
 void FractalAdditiveAudioProcessor::setTuningBankFile (int slot0, const juce::File& f)
 {
-    if (! juce::isPositiveAndBelow (slot0, kBankSlots) || ! f.existsAsFile())
+    // EVERY WAY THIS CAN ADD NOTHING SAYS SO. Three of the returns below used to be bare:
+    // pick a file that is not a readable tuning, and the bank simply did not change, with
+    // the chooser closed and nothing on screen - indistinguishable from a click that missed.
+    // Parked on bankAddError (file name kept apart from the parser's sentence, so the
+    // sentence can still be translated) and drained by the editor's timer.
+    const auto refuseAdd = [this, &f] (const juce::String& why)
+    {
+        bankAddFile  = f.getFileName();
+        bankAddError = why.isNotEmpty() ? why : juce::String ("Invalid value.");
+    };
+
+    if (! f.existsAsFile())
+    { refuseAdd ("File not found."); return; }
+
+    // THE LIMIT IS STATED WHERE THE USER CAN SEE IT, WHICH IS THE ONLY WAY IT IS ALLOWED
+    // TO EXIST. kBankSlots is 128 because "tuningBankSlot" is an automatable parameter and
+    // a parameter needs a bounded range; the panel calls the bank effectively unlimited,
+    // which is true right up until it is not. Parked on bankSlotError so it reaches the
+    // notice overlay the editor already drains on its timer - see takeBankSlotError.
+    if (! juce::isPositiveAndBelow (slot0, kBankSlots))
+    {
+        // Through the ADD notice: this used to go to bankSlotError, whose notice says "That bank
+        // slot could not be loaded ... the tuning you were already using is still the one
+        // sounding" - about a file that was never added (night review, pre-existing).
+        // Assigned directly rather than through refuseAdd: the refusal-template audit in
+        // RhythmVerify reads `bankAddError = "..."` as a message, and a sentence it cannot find is
+        // a translation template it cannot prove will ever fire.
+        bankAddFile  = f.getFileName();   // full bank
+        bankAddError = "The tuning bank is full (" + juce::String (kBankSlots) + " slots). Nothing was stored "
+                       "and nothing was overwritten - remove a tuning from the bank with its X to make room.";
         return;
+    }
 
     auto text = f.loadFileAsString();
     // The bank stores tuning SOURCE text and re-parses it on every slot switch and on
@@ -934,7 +1367,7 @@ void FractalAdditiveAudioProcessor::setTuningBankFile (int slot0, const juce::Fi
             std::array<double, 128> freqs {};
             juce::String tabErr;
             if (! TuningManager::readTunTable (text, freqs, tabErr))
-                return;                       // not a readable .tun either: nothing to store
+            { refuseAdd (tabErr.isNotEmpty() ? tabErr : tunErr); return; }   // not a readable .tun either
             bankSource[(size_t) slot0] = text; // the table itself is the source
             bankName[(size_t) slot0]   = f.getFileNameWithoutExtension();
             addRecentScl (f);
@@ -945,7 +1378,7 @@ void FractalAdditiveAudioProcessor::setTuningBankFile (int slot0, const juce::Fi
 
     std::vector<double> tmp; double per = 2.0; juce::String err;
     if (! TuningManager::parseScalaScale (text, tmp, per, err)) // validate before storing
-        return;
+    { refuseAdd (err); return; }
 
     bankSource[(size_t) slot0] = text;
     bankName[(size_t) slot0]   = f.getFileNameWithoutExtension();
@@ -986,9 +1419,30 @@ bool FractalAdditiveAudioProcessor::loadTimbreFile (const juce::File& f, juce::S
     // the timbre.
     if (f.hasFileExtension ("tun") || TuningManager::looksLikeTun (text))
     {
+        // ASK WHETHER IT IS A READABLE .tun BEFORE BLAMING ITS STRUCTURE. tunToScala fails
+        // for two entirely different reasons and its `errorOut` is what tells them apart:
+        // the file is unreadable (parseTun's own message - a missing [Exact Tuning] block,
+        // a note line that is not a number, fewer than 128 keys), or it reads perfectly and
+        // simply does not repeat. The line below used to overwrite `errorOut` for BOTH, so
+        // a malformed .tun was told the one thing that was not wrong with it - and the
+        // remedy that message offers, "Load it as a TUNING instead", then fails too, because
+        // loadTunString starts with the same parseTun. The user is handed a wrong diagnosis
+        // and a next step that cannot work.
+        //
+        // readTunTable IS parseTun (TuningManager exposes it under that name for exactly
+        // this kind of caller - proving a text will still load without loading it), so this
+        // probe and the conversion below agree by construction rather than by resemblance.
+        // It costs one extra parse of a file the user just picked, on the message thread.
+        std::array<double, 128> probe {};
+        if (! TuningManager::readTunTable (text, probe, errorOut))
+            return false;   // parseTun's own reason, kept verbatim - it is the true one
+
         juce::String scl;
         if (! TuningManager::tunToScala (text, f.getFileNameWithoutExtension(), scl, errorOut))
         {
+            // It reads; it just does not repeat. NOW the structural message is the truth,
+            // and the remedy it offers really does work - loadTunString holds a
+            // non-repeating .tun as an absolute 128-key table.
             errorOut = "This .tun does not repeat at any interval, so it states no degrees "
                        "for the Custom Engine to use. Load it as a TUNING instead - it will "
                        "sound exactly as written.";
@@ -1059,7 +1513,24 @@ bool FractalAdditiveAudioProcessor::parseTimbreIntervals (const juce::String& te
         }
         else { errorOut = "Not an interval: \"" + tk + "\""; return false; }
 
-        if (std::isfinite (r) && r > 1.0000001) // above the (implicit) 1/1 fundamental
+        // THE FUNDAMENTAL IS A TOKEN YOU CAN TYPE, and it used to be thrown away.
+        //
+        // "1" (and "1/1", and "0c") was silently dropped by a `> 1.0000001` test, so the
+        // one thing a user naturally types first was rejected with "type at least one
+        // interval above 1/1" - and the whole Custom Engine looked broken to anyone who
+        // did not already know that the box wants intervals ABOVE the fundamental and
+        // that its highest entry becomes the PERIOD rather than a partial.
+        //
+        // "QUE POR DEFECTO SOLO HAYA 1 ESCRITO EN LA CASILLA, Y ENTONCES SUENE UN SINE,
+        // Y QUE AL ANADIR O QUITAR MAS COSAS TENGA EFECTO... QUE SE PUEDA QUITAR EL 1
+        // PERO QUE DE NORMAL SIEMPRE ESTE AHI POR DEFECTO."
+        //
+        // So the fundamental is accepted, deduplicated with the implicit one below, and a
+        // list that holds nothing else is a SINE rather than an error - one partial at
+        // ratio 1, period 2. Everything above it behaves exactly as before: the highest
+        // entry is still the period and the rest are still the partials, so every
+        // spectrum ever typed or saved reads back identically.
+        if (std::isfinite (r) && r > 0.9999999)
             ratios.push_back (r);
     }
 
@@ -1069,8 +1540,20 @@ bool FractalAdditiveAudioProcessor::parseTimbreIntervals (const juce::String& te
                   ratios.end());
     if (ratios.empty())
     {
-        errorOut = "Type at least one interval above 1/1 (e.g. \"3/2 2\" or \"700c 1200c\").";
+        errorOut = "Type at least one interval - \"1\" on its own is a sine, and "
+                   "\"1 3/2 2\" is a fundamental, a fifth and an octave period.";
         return false;
+    }
+
+    // JUST THE FUNDAMENTAL IS A SINE. The period cannot come from the list here - the
+    // list IS the fundamental and a period of 1/1 is degenerate, every "period" landing
+    // on the same pitch - so it falls back to the octave, which is what an unspecified
+    // period means everywhere else in this plugin.
+    if (ratios.size() == 1 && ratios.front() < 1.0000001)
+    {
+        degOut    = { 1.0f };
+        periodOut = 2.0f;
+        return true;
     }
 
     // Highest interval = the period; the rest (plus the implicit 1/1) are the partials.
@@ -1079,7 +1562,8 @@ bool FractalAdditiveAudioProcessor::parseTimbreIntervals (const juce::String& te
     deg.reserve (ratios.size());
     deg.push_back (1.0f);
     for (size_t i = 0; i + 1 < ratios.size(); ++i)
-        deg.push_back ((float) ratios[i]);
+        if (ratios[i] > 1.0000001)      // the fundamental is already in, typed or not
+            deg.push_back ((float) ratios[i]);
 
     degOut    = deg;
     periodOut = (float) period;
@@ -1374,8 +1858,17 @@ FractalAdditiveAudioProcessor::computeActiveScaleDissonance() const
         return out;
 
     const int D = juce::jmax (1, getScaleDegrees());
-    out.reserve ((size_t) D + 1);
-    for (int s = 0; s <= D; ++s) // 0 = tonic (1/1), D = period
+    // THE LAST ROW IS THE PERIOD, AND ONLY IF THERE IS ONE.
+    // getDegreeRatio(D) is degree 0 one period up, i.e. degree-0's ratio times
+    // periodRatio() - and periodRatio() answers 2.0 when the tuning states nothing.
+    // A descending .scl and a degenerate 1/1 scale therefore both ended this list with
+    // a row reading "2/1", scored as if the user's file had an octave in it. It does
+    // not, so the row is not written: the list says what the scale says and stops. The
+    // editor prints the reason under it (see nadHadNoPeriod / the degrees read-out), so
+    // a shorter list is stated rather than silent.
+    const int last = tuningStatesPeriod() ? D : D - 1;
+    out.reserve ((size_t) last + 1);
+    for (int s = 0; s <= last; ++s) // 0 = tonic (1/1), D = period
     {
         const double r = getDegreeRatio (s);
         out.push_back ({ s, r, dissonance::dissonanceAt (spec, r) });
@@ -1644,7 +2137,10 @@ juce::String FractalAdditiveAudioProcessor::currentTuningAsScl (const juce::Stri
 {
     const int D = juce::jmax (1, tuning.degreesPerPeriod());
     juce::String scl;
-    scl << "! Edited in Fibló Galàctic\n" << name << "\n " << D << "\n!\n";
+    // The scale's own anchor, when it has one - see sclAnchorLine. Without it a .scl
+    // rendered from an anchored tuning re-pins to 12-TET middle C on the reload, and the
+    // whole instrument moves on an edit that changed nothing.
+    scl << "! Edited in Fibló Galàctic\n" << name << "\n " << D << "\n" << sclAnchorLine() << "!\n";
     for (int d = 1; d <= D; ++d)
     {
         long long p = 1, q = 1;
@@ -1665,6 +2161,33 @@ juce::String FractalAdditiveAudioProcessor::embeddedPresetComment() const
     auto state = const_cast<FractalAdditiveAudioProcessor*> (this)->captureState();
     // The scale itself is already in the file - no need to carry it twice.
     state.removeChild (state.getChildWithName ("SCALA"), nullptr);
+
+    // NO EXPORT INSIDE AN EXPORT. A scale text anywhere in the state - a tuning-bank slot, a
+    // Custom Engine source, a playground corner's copy - can itself be a scale this function
+    // wrote, with a whole patch folded into its comments. Carried along, every "add to bank"
+    // embedded all the earlier ones: ~2.3x per add, into megabytes after a handful (review,
+    // 2026-09-15; older than polypresets, which multiplied the base). Those comment lines are
+    // dropped from the COPY exported here; the scales themselves are kept.
+    const juce::String tagLine = "! " + juce::String (kPresetTag);
+    std::function<void (juce::ValueTree)> dropNestedPatches = [&] (juce::ValueTree t)
+    {
+        for (int i = 0; i < t.getNumProperties(); ++i)
+        {
+            const auto id = t.getPropertyName (i);
+            const auto v  = t.getProperty (id);
+            if (v.isString() && v.toString().contains (tagLine))
+            {
+                juce::StringArray kept;
+                for (const auto& line : juce::StringArray::fromLines (v.toString()))
+                    if (! line.trimStart().startsWith (tagLine))
+                        kept.add (line);
+                t.setProperty (id, kept.joinIntoString ("\n"), nullptr);
+            }
+        }
+        for (auto child : t)
+            dropNestedPatches (child);
+    };
+    dropNestedPatches (state);
     auto xml = state.createXml();
     if (xml == nullptr) return {};
     const auto b64 = juce::Base64::toBase64 (xml->toString (juce::XmlElement::TextFormat().singleLine()));
@@ -1734,7 +2257,7 @@ static bool refuseTableEdit (bool isTable, juce::String& errorOut)
 bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce::String& errorOut,
                                                      const juce::String& exactText)
 {
-    if (refuseTableEdit (tuning.usesAbsoluteTable(), errorOut)) return false;
+    if (refuseTableEdit (tuningTableIsInForce(), errorOut)) return false;
     const int    D      = juce::jmax (1, tuning.degreesPerPeriod());
     const double period = getDegreeRatio (D);
     if (! (period > 1.0001) || ! (ratioFromTonic > 0.0) || ! std::isfinite (ratioFromTonic))
@@ -1812,7 +2335,7 @@ bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce
                                         : juce::String (1200.0 * std::log2 (period), 5);
     juce::String scl;
     const auto name = (tuning.getScalaName().isNotEmpty() ? tuning.getScalaName() : juce::String ("scale")) + "+";
-    scl << "! Edited in Fibló Galàctic (note added)\n" << name << "\n " << (int) degs.size() + 1 << "\n!\n";
+    scl << "! Edited in Fibló Galàctic (note added)\n" << name << "\n " << (int) degs.size() + 1 << "\n" << sclAnchorLine() << "!\n";
     for (const auto& dg : degs) scl << " " << dg.text << "\n";
     scl << " " << periodText << "\n";
 
@@ -1830,7 +2353,7 @@ bool FractalAdditiveAudioProcessor::addNoteToTuning (double ratioFromTonic, juce
 bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::String& valueText,
                                                       juce::String& errorOut)
 {
-    if (refuseTableEdit (tuning.usesAbsoluteTable(), errorOut)) return false;
+    if (refuseTableEdit (tuningTableIsInForce(), errorOut)) return false;
     const int D = juce::jmax (1, tuning.degreesPerPeriod());
     if (degree < 1 || degree > D)
     {
@@ -1847,7 +2370,7 @@ bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::St
 
     juce::String scl;
     const auto name = (tuning.getScalaName().isNotEmpty() ? tuning.getScalaName() : juce::String ("scale")) + "*";
-    scl << "! Edited in Fibló Galàctic (degree " << degree << " changed)\n" << name << "\n " << D << "\n!\n";
+    scl << "! Edited in Fibló Galàctic (degree " << degree << " changed)\n" << name << "\n " << D << "\n" << sclAnchorLine() << "!\n";
     for (int d = 1; d <= D; ++d)
     {
         if (d == degree)
@@ -1876,7 +2399,7 @@ bool FractalAdditiveAudioProcessor::editTuningDegree (int degree, const juce::St
 // EVERY repetition of the period (a scale degree is a pitch class, not one key).
 bool FractalAdditiveAudioProcessor::deleteTuningDegree (int degree, juce::String& errorOut)
 {
-    if (refuseTableEdit (tuning.usesAbsoluteTable(), errorOut)) return false;
+    if (refuseTableEdit (tuningTableIsInForce(), errorOut)) return false;
     const int D = juce::jmax (1, tuning.degreesPerPeriod());
     if (degree < 1 || degree >= D)
     {
@@ -1891,7 +2414,7 @@ bool FractalAdditiveAudioProcessor::deleteTuningDegree (int degree, juce::String
 
     juce::String scl;
     const auto name = (tuning.getScalaName().isNotEmpty() ? tuning.getScalaName() : juce::String ("scale")) + "-";
-    scl << "! Edited in Fibló Galàctic (degree " << degree << " deleted)\n" << name << "\n " << D - 1 << "\n!\n";
+    scl << "! Edited in Fibló Galàctic (degree " << degree << " deleted)\n" << name << "\n " << D - 1 << "\n" << sclAnchorLine() << "!\n";
     for (int d = 1; d <= D; ++d)   // d == D is the period line, always kept
     {
         if (d == degree) continue;
@@ -1933,8 +2456,16 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
     // The period the search reasons with: the tuning's own unless the user typed a
     // different one in the box (it decides what counts as an equal-step scale and
     // which intervals are just the same pitch class again).
-    const double periodC = 1200.0 * std::log2 (std::max (1.0e-9,
-                              periodOverride > 1.0 ? periodOverride : tuning.periodRatio()));
+    //
+    // 0.0 MEANS "THIS TUNING STATES NONE", and both readers below check for it.
+    // statedPeriodRatio(), not periodRatio(): the fallback would have handed a
+    // descending .scl (or a degenerate 1/1) a 2/1 the file never contained, and the
+    // list would then have called octave-spaced degrees "the same pitch class again"
+    // and dropped them, and called the scale rootless and shown "any". Both are
+    // statements about a repetition that does not exist.
+    const double statedPeriod = periodOverride > 1.0 ? periodOverride : tuning.statedPeriodRatio();
+    const double periodC = statedPeriod > 1.0001 ? 1200.0 * std::log2 (statedPeriod) : 0.0;
+    nadNoPeriod = ! (periodC > 0.0);   // surfaced in the list, never silent
     const double minGap = juce::jlimit (0.0, 600.0, minGapCents);
     // The SAME analysis spectrum and absolute anchor as the Degrees list
     // (computeActiveScaleDissonance): Sethares roughness depends on register and on
@@ -1954,7 +2485,9 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
         // below), which also shrinks the search space from C(D,n) to C(D-1,n-1).
         std::vector<double> cents ((size_t) D);
         for (int d = 0; d < D; ++d) cents[(size_t) d] = 1200.0 * std::log2 (std::max (1.0e-9, ratios[(size_t) d]));
-        bool regular = D >= 2;
+        // periodC == 0 is "no period stated": a shape cannot be rootless in a scale
+        // that never comes back to itself, so the full enumeration is the honest one.
+        bool regular = D >= 2 && periodC > 0.0;
         {
             const double step = periodC / (double) D;
             for (int d = 0; d < D && regular; ++d)
@@ -2019,7 +2552,13 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
                 for (int i = 1; i < notes; ++i)
                 {
                     const double gap = std::abs (cents[(size_t) cc[i]] - cents[(size_t) cc[i - 1]]);
-                    if (gap < floorC || std::abs (gap - periodC) < 0.5) return true;
+                    if (gap < floorC) return true;
+                    // "the same pitch class an octave up" is only a thing to skip when
+                    // the tuning HAS that octave. With periodC == 0 (nothing stated) the
+                    // old form compared every gap against 0 cents and, worse, would have
+                    // compared it against a fabricated 1200 - dropping perfectly ordinary
+                    // pairs from the list for repeating a period the scale does not have.
+                    if (periodC > 0.0 && std::abs (gap - periodC) < 0.5) return true;
                 }
                 return false;
             };
@@ -2076,6 +2615,10 @@ void FractalAdditiveAudioProcessor::startNadCompute (int notes, bool rootOnly, b
                 const juce::ScopedLock sl (nadLock);
                 nadResults = std::move (out);
             }
+            // The degree COUNT these rows index into, stamped before the generation bump
+            // so a reader that sees the new generation also sees the matching D. Their
+            // numbers mean nothing next to any other scale.
+            nadResultD.store (D);
             nadGeneration.fetch_add (1);
         }
         nadBusy = false;
@@ -2123,6 +2666,39 @@ std::vector<double> FractalAdditiveAudioProcessor::heldChordAsTargetAlphas (doub
     return a;
 }
 
+// The lookahead's early view of the same chord. The pitch formula is the one
+// RhythmEngine::noteHz uses - the tuning's frequency for the key times its channel's
+// bend - and the bend-range table is the same three values the rhythm engine and the
+// MPE zone share, read from the same parameter, so "the notes about to sound" and "the
+// notes sounding" can only ever differ by the budget, never by their tuning.
+std::vector<double> FractalAdditiveAudioProcessor::heldChordEarlyAsTargetAlphas (double& f0Out) const
+{
+    f0Out = 0.0;
+    int keys[LookaheadPeek::kMaxHeld], chans[LookaheadPeek::kMaxHeld];
+    const int n = laPeek.getHeld (keys, chans, LookaheadPeek::kMaxHeld);
+    if (n <= 0) return {};
+
+    // The range the ENGINE decodes at, not a fourth copy of the selector table. In MPE
+    // mode the zone fixes it at +-48 and the selector is hidden; this copy still read
+    // the selector, so the chord seen ahead of time by the lookahead was retuned at a
+    // different range from the one the notes would actually sound at.
+    const double range = rhythm.getBendRangeSemis();
+
+    std::vector<double> hz;
+    hz.reserve ((size_t) n);
+    for (int i = 0; i < n; ++i)
+    {
+        const double semis = (double) laPeek.wheelFor (chans[i]) / 8192.0 * range;
+        const double f = tuning.frequencyForNote (keys[i]) * std::exp2 (semis / 12.0);
+        if (f > 0.0 && std::isfinite (f)) hz.push_back (f);
+    }
+    if (hz.empty()) return {};
+    std::sort (hz.begin(), hz.end());
+    f0Out = hz.front();
+    for (auto& v : hz) v /= f0Out;
+    return hz;
+}
+
 double FractalAdditiveAudioProcessor::measureCurrentAgainstTarget (const std::vector<double>& alphas,
                                                                   double f0Hz, bool rootOnly,
                                                                   const dissonance::Registers& regs) const
@@ -2147,16 +2723,77 @@ double FractalAdditiveAudioProcessor::measureCurrentAgainstTarget (const std::ve
 // to "which note are we on" and they drift.
 int FractalAdditiveAudioProcessor::registerAnchorKey() const noexcept
 {
-    const int k = rhythm.getAnchorNote();
+    // With lookahead active the anchor comes from the early view for the same reason the
+    // target does: the register band the search optimises for has to belong to the note
+    // it is preparing, not to the one still sounding a budget behind it.
+    const int k = isLookaheadActive() ? laPeek.getAnchorNote() : rhythm.getAnchorNote();
     return k >= 0 ? juce::jlimit (0, 127, k) : 60;
 }
 
-// The default width in STEPS of the scale loaded right now: the same musical width in
-// every tuning (see dissonance::kAdaptRegisterDefaultPeriods, which was measured).
-int FractalAdditiveAudioProcessor::defaultRegisterSteps() const noexcept
+// PERIODS -> THE TWO FREQUENCIES, in ONE place (see the header for why it is not keys).
+// The anchor's pitch comes from the KEY LADDER, not from a sounding f0: f0 carries per-note
+// pitch bend, and a band whose ends followed a bend wheel would resample the objective -
+// and re-price the run - on every wheel message.
+void FractalAdditiveAudioProcessor::registerBandHz (double periods,
+                                                    double& loHz, double& hiHz) const noexcept
 {
-    const int D = juce::jmax (1, getScaleDegrees());
-    return juce::jlimit (1, 127, (int) std::lround (dissonance::kAdaptRegisterDefaultPeriods * (double) D));
+    const int anchor = registerAnchorKey();
+    double a = getNoteFrequency (anchor);
+    if (! (a > 0.0) || ! std::isfinite (a)) a = 261.6255653005986;   // no tuning yet: middle C
+    loHz = hiHz = a;
+    const double p = juce::jlimit (0.0, dissonance::kAdaptRegisterMaxPeriods,
+                                   std::isfinite (periods) ? periods : 0.0);
+    if (p <= 0.0) return;                       // a zero width IS the played register alone
+    const double ratio = std::pow (tuning.periodRatio(), p);
+    if (! (ratio > 1.0) || ! std::isfinite (ratio)) return;
+    // CLAMPED TO THE BOARD at both ends, never wrapped and never re-anchored: the user said
+    // "N periods either side of the note I am playing", and sliding the anchor to make N fit
+    // would optimise for registers they never asked about. The panel prints the periods that
+    // really fit at each end whenever this bites, so a shortened band is stated and not
+    // silent - and it is now asymmetric near either edge, which is why the read-out has a
+    // two-sided form at all.
+    const double bottom = getNoteFrequency (0), top = getNoteFrequency (127);
+    loHz = a / ratio;
+    hiHz = a * ratio;
+    if (bottom > 0.0 && std::isfinite (bottom)) loHz = std::max (loHz, std::min (a, bottom));
+    if (top    > 0.0 && std::isfinite (top))    hiHz = std::min (hiHz, std::max (a, top));
+}
+
+// WHICH PERIOD the band is being built on, and how much of a fact it is (see the header).
+// Message thread: the table estimate is not an atomic.
+FractalAdditiveAudioProcessor::RegisterPeriodInfo
+FractalAdditiveAudioProcessor::registerPeriodInfo() const
+{
+    RegisterPeriodInfo i;
+    i.ratio = tuning.periodRatio();
+    i.keys  = juce::jmax (1, getScaleDegrees());
+    // A SCALE THAT STATES NO PERIOD IS NOT A SCALE THAT STATES ONE.
+    // This used to return here for everything that is not an absolute table, i.e. it
+    // called the answer a FACT for every .scl - including a descending one and a
+    // degenerate 1/1, whose stated period is 0.0 and whose `ratio` above is therefore
+    // the 2/1 display fallback. The band's unit was then an octave the user's file
+    // never contained, printed with no qualifier at all, while the .tun that has the
+    // very same problem got one. Now the qualifier follows the fact, not the format.
+    // IN FORCE, not merely loaded, in all three tests below. A .tun table left over from
+    // an earlier load with the box back on 12-TET made this print the TABLE's worst
+    // deviation beside a 2/1 that 12-TET states exactly - a qualifier borrowed from a
+    // tuning that is not sounding, on a band whose unit is a plain octave.
+    if (! tuning.hasUsablePeriod())
+    {
+        i.source = RegisterPeriodSource::NoneStated;
+        if (tuningTableIsInForce()) i.devCents = tuning.tablePeriodDevCents();
+        return i;
+    }
+    if (! tuningTableIsInForce())
+        return i;                      // a scale (or MTS master) states its own period
+    i.devCents = tuning.tablePeriodDevCents();
+    // `found` is false when the file has nothing ascending to measure at all. periodRatio()
+    // then answers the 2/1-over-12-keys fallback, which is neither the file's nor the
+    // user's - the one case where the band is standing on a number nobody supplied.
+    i.source = (tuning.getTablePeriodEstimate().found || tuning.tablePeriodIsUserSet())
+                 ? RegisterPeriodSource::TableEstimate
+                 : RegisterPeriodSource::NoneStated;
+    return i;
 }
 
 // THE REGISTER RANGE, resolved in ONE place. The panel prints what this returns and the
@@ -2164,26 +2801,24 @@ int FractalAdditiveAudioProcessor::defaultRegisterSteps() const noexcept
 // spectrum was optimised for - and that answer genuinely differs (a spectrum optimised at
 // C1 is ~3.7x rougher at C6 than one optimised there; see SpectrumTests).
 //
-// ANCHOR + N STEPS, both resolved here rather than in the editor: the realtime follower
+// ANCHOR +- N PERIODS, all resolved here rather than in the editor: the realtime follower
 // runs with the window shut, and a range the panel had baked into two frequencies would
 // have stayed pinned to whatever register happened to be played when the window closed -
 // which is the exact complaint (the same spectrum whatever octave you play in) this form
 // exists to answer.
+//
+// BOTH DIRECTIONS. The band used to start AT the anchor and run up, so the spectrum was
+// never asked what it does below the note under the fingers - and Sethares' critical band
+// is a width in Hz, so that half of the keyboard is a different question, not a mirror of
+// this one (SpectrumTests (8) measures it: one period below the played note costs 1.46x
+// under the upward band and 1.27x under the symmetric one).
 dissonance::Registers FractalAdditiveAudioProcessor::adaptRegistersFor (const SpectrumAdaptSettings& s,
                                                                         double f0Hz, bool realtime) const
 {
     dissonance::Registers regs;
-    const int steps  = juce::jlimit (0, 127, s.regSteps >= 0 ? s.regSteps : defaultRegisterSteps());
-    const int anchor = registerAnchorKey();
-    // The top is CLAMPED TO THE BOARD, never wrapped and never re-anchored lower: the user
-    // said "N steps above the note I am playing", and moving the anchor to make N fit would
-    // optimise for registers they never asked about. The panel prints the steps that really
-    // fit whenever this bites, so a shortened range is stated and not silent.
-    const int top = juce::jlimit (0, 127, anchor + steps);
-    double lo = getNoteFrequency (anchor), hi = getNoteFrequency (top);
-    // Both ends through the KEY LADDER, not through f0Hz: f0 carries per-note pitch bend,
-    // and a range whose bottom followed a bend wheel would resample the objective (and
-    // re-price the run) on every wheel message.
+    const double per = s.regPeriods >= 0.0 ? s.regPeriods : dissonance::kAdaptRegisterDefaultPeriods;
+    double lo = 0.0, hi = 0.0;
+    registerBandHz (per, lo, hi);
     if (! (lo > 0.0) || ! std::isfinite (lo)) lo = f0Hz;
     if (! (hi > 0.0) || ! std::isfinite (hi)) hi = lo;
     if (hi < lo) std::swap (lo, hi);
@@ -2252,24 +2887,31 @@ bool FractalAdditiveAudioProcessor::startSpectrumAdapt (const SpectrumAdaptSetti
     // simply could not be adapted to in the scope that hears every note against every
     // other). The estimate now goes on the button; only the genuinely absurd is stopped.
     //
-    // The bound is kAdaptAbsurdMs = 10 minutes, and it exists because there IS a shape
-    // beyond argument: 24 partials against a 128-key absolute table in "all vs all" is
-    // ~44 minutes, minutes per single sweep, and it would be indistinguishable from a
-    // hang. The refusal states the number rather than a verdict.
+    // The bound is kAdaptAbsurdPairs - ten minutes priced at the NOMINAL per-pair cost,
+    // fixed in pair terms - and it exists because there IS a shape beyond argument:
+    // 24 partials against a 128-key absolute table in "all vs all" is ~44 minutes,
+    // minutes per single sweep, and it would be indistinguishable from a hang. The
+    // refusal states the number rather than a verdict. Compared in PAIRS, not against
+    // the calibrated ms estimate, because the estimate follows the machine and the
+    // one-shot calibration probe can catch a load spike: measured once, that combination
+    // refused the 31x16 all-vs-all search this very function was fixed to offer (see
+    // kAdaptAbsurdPairs). The estimate still prices the button; only the refusal is
+    // machine-independent.
     const auto regs = adaptRegistersFor (s, f0Hz, realtime);
+    const int  nRegs = (int) std::max<size_t> (1, regs.f0.size());
     const double estMs = dissonance::adaptEstimateMs (N, (int) targetAlphas.size(), s.rootOnly,
-                                                      (int) std::max<size_t> (1, regs.f0.size()),
-                                                      s.shapeAmps);
-    if (estMs > dissonance::kAdaptAbsurdMs)
+                                                      nRegs, s.shapeAmps);
+    if (dissonance::adaptTotalPairs (N, (int) targetAlphas.size(), s.rootOnly,
+                                     nRegs, s.shapeAmps, 6) > dissonance::kAdaptAbsurdPairs)
     {
-        errorOut = "This search is estimated at " + juce::String (estMs / 60000.0, 1)
-                 + " minutes (" + juce::String ((int) targetAlphas.size()) + " notes x "
+        errorOut = "This search is " + juce::String ((int) targetAlphas.size()) + " notes x "
                  + juce::String (N) + " partials"
                  + (s.rootOnly ? juce::String (", 0 vs all") : juce::String (", all vs all"))
-                 + ", " + juce::String ((int) regs.f0.size()) + " registers), past the "
-                 + juce::String ((int) (dissonance::kAdaptAbsurdMs / 60000.0))
-                 + "-minute limit. Fewer partials, fewer registers, or the \"0 vs all\" scope "
-                   "will bring it inside.";
+                 + ", " + juce::String ((int) regs.f0.size()) + " registers - past the hard cap "
+                   "(about " + juce::String ((int) (dissonance::kAdaptAbsurdMs / 60000.0))
+                 + " minutes of computation; on this machine an estimated "
+                 + juce::String (estMs / 60000.0, 1) + "). Fewer partials, fewer registers, or "
+                   "the \"0 vs all\" scope will bring it inside.";
         return false;
     }
 
@@ -2553,7 +3195,7 @@ void FractalAdditiveAudioProcessor::applySpecSnapshot (const SpecSnapshot& s)
         p->setValueNotifyingHost (s.timbreOn ? 1.0f : 0.0f);
 }
 
-void FractalAdditiveAudioProcessor::takeRealtimeBaseline (RtLink mode)
+void FractalAdditiveAudioProcessor::takeRealtimeBaseline (RtLink mode, bool addToBank)
 {
     // BOTH trackers are cleared first. commitRealtimeBaseline returns early when the link
     // never applied anything, leaving its tracker set - so engaging the tuning link, leaving
@@ -2569,7 +3211,12 @@ void FractalAdditiveAudioProcessor::takeRealtimeBaseline (RtLink mode)
         // ...and into the bank ONCE, so the tuning the follower is about to replace is a
         // single click away even without touching the undo history. bankAutoAdd skips
         // exact duplicates, so re-engaging does not add a second copy.
-        if (rtTuneBase.source.isNotEmpty())
+        //
+        // NOT on a state load. There the baseline is the project's OWN tuning, which the
+        // project's own BANK child already describes - and a load that goes on writing
+        // into the bank it has just restored hands the host a different state than the one
+        // it opened, before the user has touched anything.
+        if (addToBank && rtTuneBase.source.isNotEmpty())
             bankAutoAdd (tuning.getScalaName().isNotEmpty() ? tuning.getScalaName()
                                                             : juce::String ("before realtime"),
                          rtTuneBase.source);
@@ -2600,10 +3247,50 @@ void FractalAdditiveAudioProcessor::commitRealtimeBaseline()
 
 void FractalAdditiveAudioProcessor::setRealtimeLink (RtLink mode, const RtSettings& s)
 {
-    rtSet = s;
-    if (mode == rtLink) return;
+    setRealtimeLinkImpl (mode, s, false);
+}
 
-    if (rtLink != RtLink::Off)
+// THE LINK AS A PROJECT LOAD INSTALLS IT, and it is a different job from pressing the
+// button, in both directions.
+//
+// LEAVING: apvts.replaceState calls undoManager->clearUndoHistory(), and restoreState
+// reaches this a few hundred lines later. So the undo step setRealtimeLink mints on the
+// way out - "one Ctrl+Z back to the tuning the follower displaced" - was landing on a
+// history that had just been emptied, describing a patch that no longer exists. The FIRST
+// Ctrl+Z after opening a project therefore installed the PREVIOUS patch's tuning, out of
+// nowhere, in an instrument whose whole promise is that its tuning does not change under
+// the player.
+//
+// ARRIVING, which is the half a naive fix misses: setRealtimeLink returns early when the
+// mode has not changed, so a project that saves the SAME link the instance already had
+// left a still-engaged follower carrying the PREVIOUS patch's baseline. It would then
+// commit that on the way out - the very same wrong tuning, one step later. Dropping the
+// commit alone swaps a wrong undo step for no undo step at all.
+//
+// So the arming is RE-RUN rather than skipped: the stale baseline is dropped without
+// being committed, and a fresh one is taken against the tuning the project just restored.
+// Everything else the engage path resets is exactly right here too - the held target, the
+// tuning signature, the landing time and the adopted generations all belong to the patch
+// that is gone.
+void FractalAdditiveAudioProcessor::restoreRealtimeLink (RtLink mode, const RtSettings& s)
+{
+    setRealtimeLinkImpl (mode, s, true);
+}
+
+void FractalAdditiveAudioProcessor::setRealtimeLinkImpl (RtLink mode, const RtSettings& s,
+                                                         bool fromStateLoad)
+{
+    rtSet = s;
+    if (mode == rtLink && ! fromStateLoad) return;
+
+    if (fromStateLoad)
+    {
+        // Dropped, never committed: see the block above. Both trackers, because either
+        // one of them would have been enough to mint the step.
+        rtTuneBaseTaken = false;
+        rtSpecBase      = {};
+    }
+    else if (rtLink != RtLink::Off)
         commitRealtimeBaseline();      // leaving: one undo step back to what it displaced
 
     rtLink    = mode;
@@ -2620,8 +3307,16 @@ void FractalAdditiveAudioProcessor::setRealtimeLink (RtLink mode, const RtSettin
     rtHeldTarget.clear();
     rtHeldF0  = 0.0;
     rtTuneSig = -1.0;
+    // A landing measured by a link that is no longer running is not this link's answer.
+    // Cleared rather than kept, so the button reads "-" until this link has produced a
+    // real one instead of showing the previous mode's timing under the new mode's name.
+    rtMovedAtMs = -1.0;
+    rtLandingMs = -1.0;
     if (mode != RtLink::Off)
-        takeRealtimeBaseline (mode);
+        takeRealtimeBaseline (mode, ! fromStateLoad);
+    // The budget is only armed while a spectrum-side follower is running, so the link
+    // changing is exactly when it has to be re-decided (and the host re-told).
+    applyLookahead();
 }
 
 // Signature of a set of ratios: changes iff the set does (and cheap enough for 60 Hz).
@@ -2630,6 +3325,149 @@ static double ratioSetSig (const std::vector<double>& r)
     double s = (double) r.size() * 1.7;
     for (size_t i = 0; i < r.size(); ++i) s += r[i] * (double) (i + 3);
     return s;
+}
+
+int FractalAdditiveAudioProcessor::mixVoiceCountForTests (int corner) const noexcept
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners)) return -1;
+    auto* e = mixEng[(size_t) corner].get();
+    return e != nullptr ? e->synth.getNumVoices() : -1;
+}
+
+//==============================================================================
+// MONOPHONIC GLIDE: the voice pool. Message thread only.
+//
+// ONE voice is the whole mechanism. With no free voice left, MPESynthesiser starts a
+// new note by calling noteStarted() on the voice that is already sounding, which is
+// precisely the takeover AdditiveVoice bends through; and a pool of one is also, by
+// construction, the promise that the synth "cannot produce chords". Nothing is
+// filtered out of the MIDI to achieve it - every note-on and note-off still arrives
+// (see MonoGlide.h), so the modulator gate and the rhythm engine still see the real
+// keyboard.
+//
+// reduceNumVoices() steals sounding voices properly (fast-kill, no click), and
+// MPESynthesiser's own voice lock serialises this against the audio thread - the same
+// contract MixCornerEngine::setVoices already relies on.
+void FractalAdditiveAudioProcessor::applyMonoVoiceCount (bool mono)
+{
+    const int want = mono ? 1 : kPolyVoices;
+    while (synth.getNumVoices() < want)
+        synth.addVoice (new AdditiveVoice (apvts, spectrumEngine, tuning, modEngine, expression));
+    if (synth.getNumVoices() <= want) { monoShrinkTicks = 0; return; }
+
+    // SHRINKING WITH KEYS DOWN. This is a panel switch and an automatable parameter, so
+    // it WILL be thrown mid-chord, and reduceNumVoices() on its own got two things wrong
+    // there - both of them audible.
+    //
+    //   * It DELETES sounding voices. A deleted voice stops mid-waveform: there is no
+    //     fade, because the object that would render one is gone.
+    //   * The wrong note survived. JUCE's findVoiceToSteal protects the lowest and the
+    //     topmost sounding notes and gives the LOWEST the final say, so the note left
+    //     ringing was the bottom of the chord - against this mode's own written contract,
+    //     which is last-note priority ("the newest key always wins; a low-note rule would
+    //     be a different instrument", MonoGlide.h). Measured on a 60/72/65 chord with 65
+    //     pressed last: the survivor was 60.
+    //
+    // One two-step shrink answers both. FADE FIRST: every sounding voice except the one
+    // the contract says to keep is ASKED to fade itself out over its own 5 ms fast kill,
+    // the same fade a voice steal already uses. The request is an atomic flag the voice
+    // consumes at the top of its own render (AdditiveVoice::requestFadeOut) rather than a
+    // call made from here, because beginFastKill() from the message thread would mutate
+    // ADSR state and currentlyPlayingNote underneath a block the audio thread is rendering
+    // and MPESynthesiser's voicesLock is not reachable from outside.
+    //
+    // DELETE SECOND, on a later 60 Hz tick, once those voices have gone quiet. That is
+    // also what makes the SURVIVOR right without any index surgery from this thread:
+    // findFreeVoice() hands reduceNumVoices the INACTIVE voices first, so the one still
+    // sounding is the one left standing, and every read of voice state that decides it
+    // happens inside JUCE, under its own lock.
+    int active = 0;
+    juce::MPESynthesiserVoice* held = nullptr;   // newest voice whose KEY is still down
+    juce::MPESynthesiserVoice* any  = nullptr;   // newest sounding voice, held or not
+    for (int v = 0; v < synth.getNumVoices(); ++v)
+    {
+        auto* mv = synth.getVoice (v);
+        if (mv == nullptr || ! mv->isActive()) continue;
+        ++active;
+        if (any == nullptr || mv->noteOnTime > any->noteOnTime) any = mv;
+        // A key that has been LET GO is not what "the last note" means: a released note is
+        // in its tail, and keeping the newest key still under the player's finger is the
+        // same rule MonoGlide's own held-key stack follows.
+        const auto ks = mv->getCurrentlyPlayingNote().keyState;
+        if (ks == juce::MPENote::keyDown || ks == juce::MPENote::keyDownAndSustained)
+            if (held == nullptr || mv->noteOnTime > held->noteOnTime) held = mv;
+    }
+    auto* keep = held != nullptr ? held : any;
+
+    if (active > want && monoShrinkTicks < kMonoShrinkTicks)
+    {
+        ++monoShrinkTicks;
+        // Re-asked every tick rather than once: a key pressed DURING the shrink takes the
+        // newest slot, and last-note priority has to follow it there too.
+        for (int v = 0; v < synth.getNumVoices(); ++v)
+            if (auto* av = dynamic_cast<AdditiveVoice*> (synth.getVoice (v)))
+                if (av->isActive() && av != keep)
+                    av->requestFadeOut();
+        return;   // the delete waits for the fades; re-entered from the 60 Hz tick
+    }
+
+    // Either the fades have landed, or nothing is rendering them - a stopped transport, a
+    // bypassed plugin - and the mode's ONE-VOICE promise must not wait for ever on a voice
+    // that will never be asked for another sample. The cap is half a second of ticks;
+    // anything that could be heard faded a hundred times over before then.
+    monoShrinkTicks = 0;
+    synth.reduceNumVoices (want);
+}
+
+//==============================================================================
+// ADAPTIVE LOOKAHEAD: arm or disarm the budget. Message thread only, because
+// setLatencySamples() must not run on the audio thread.
+//
+// THE JUCE MECHANICS THIS RELIES ON, named so a future reader does not have to guess
+// why a toggle is enough:
+//   AudioProcessor::setLatencySamples(n) stores n and calls updateHostDisplay() with
+//   ChangeDetails().withLatencyChanged(true). The VST3 wrapper turns that into the
+//   Vst::kLatencyChanged flag and hands it to its ComponentRestarter (an AsyncUpdater),
+//   which calls IComponentHandler::restartComponent on the MESSAGE thread; the host then
+//   re-queries getLatencySamples() and re-runs its delay compensation. setLatencySamples
+//   is a no-op when the value has not changed, so calling this every 60 Hz tick costs
+//   nothing and cannot spam the host.
+//
+// THE BUDGET IS ROUNDED UP TO WHOLE BLOCKS. A host's compensation is exact in samples
+// either way, but a whole number of blocks means the delayed copy of an event lands at
+// the same offset WITHIN a block as the original, so nothing downstream that reasons in
+// block-relative positions (the note gate's beat grid, the rhythm engine's pattern
+// anchor) has to deal with an event that changed its place in the buffer.
+//
+// It is only armed while a SPECTRUM-side realtime link is running. Latency with no
+// follower to feed would be a cost with nothing bought - and the tuning-side link
+// (TuningFromSpectrum) is triggered by the spectrum, not by notes, so a head start on
+// the keyboard would give it nothing either.
+void FractalAdditiveAudioProcessor::applyLookahead()
+{
+    const bool want = rtSet.lookahead
+                   && (rtLink == RtLink::SpectrumFromChord || rtLink == RtLink::SpectrumFromTuning);
+    const int  sr   = (int) juce::jmax (1.0, lastSr > 0.0 ? lastSr : getSampleRate());
+    const int  blk  = juce::jmax (16, lastBlockSize);
+
+    int budget = 0;
+    if (want)
+    {
+        const int raw = (int) std::ceil (kLookaheadMs * 0.001 * (double) sr);
+        budget = ((raw + blk - 1) / blk) * blk;      // whole blocks, always >= the ms asked for
+    }
+
+    if (want == laLastOn && sr == laLastSr && blk == laLastBlk && budget == laSamples.load())
+        return;
+
+    laLastOn = want; laLastSr = sr; laLastBlk = blk;
+    laSamples.store (budget, std::memory_order_relaxed);
+    // Events already in flight were stamped for the OLD budget: leaving them would put
+    // them at the wrong distance from everything around them. The audio thread does the
+    // flush (and the all-notes-off that goes with it) so no MIDI state is touched from
+    // two threads at once.
+    laFlush.store (true, std::memory_order_release);
+    setLatencySamples (budget);
 }
 
 void FractalAdditiveAudioProcessor::driveRealtimeLink()
@@ -2715,7 +3553,11 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
     const bool fromChord = rtLink == RtLink::SpectrumFromChord;
     // Read BEFORE anything is published: whether a finished result still belongs to the
     // hands on the keys is the first thing that has to be decided about it.
-    if (fromChord) alphas = heldChordAsTargetAlphas (f0);
+    // WITH LOOKAHEAD ON the follower reads the notes that have ARRIVED, not the ones
+    // that are sounding: they are the same notes one budget apart, and that budget is
+    // exactly the head start the search is being given (see LookaheadDelay.h).
+    if (fromChord) alphas = isLookaheadActive() ? heldChordEarlyAsTargetAlphas (f0)
+                                                : heldChordAsTargetAlphas (f0);
 
     // Has the chord actually MOVED away from the set the last search was AIMED at?
     // Compared note by note, in cents, including the root's absolute pitch: Sethares'
@@ -2731,6 +3573,13 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
             if (std::abs (1200.0 * std::log2 (alphas[i] / rtHeldTarget[i])) > kRtHeldMoveCents)
                 moved = true;
     }
+
+    // START THE STOPWATCH the lookahead budget is racing (see getLastRealtimeLandingMs).
+    // Here, not at the launch below: the interval that matters to the user is from the
+    // chord MOVING to the spectrum landing, and the throttle's wait before the search is
+    // even allowed to start is the largest part of it.
+    if (moved && rtMovedAtMs < 0.0)
+        rtMovedAtMs = juce::Time::getMillisecondCounterHiRes();
 
     // A finished adaptation is published FIRST, before anything below can decide there is
     // nothing to do. A chord let go a moment before its search finished was still a chord
@@ -2751,7 +3600,16 @@ void FractalAdditiveAudioProcessor::driveRealtimeLink()
         {
             juce::String aerr;
             if (applySpectrumAdapt (/*undoable*/ false, aerr))
+            {
                 ++rtApplies;
+                // STOP THE STOPWATCH. This is the number the lookahead button prints and
+                // the only honest answer to "did the budget fit?" - measured on the user's
+                // machine with the user's settings, rather than estimated from a constant
+                // that is known wrong here (see kLookaheadMs).
+                if (rtMovedAtMs > 0.0)
+                    rtLandingMs = juce::Time::getMillisecondCounterHiRes() - rtMovedAtMs;
+                rtMovedAtMs = -1.0;
+            }
         }
     }
 
@@ -2835,7 +3693,11 @@ bool FractalAdditiveAudioProcessor::saveCurrentTuningScl (const juce::File& f, j
     // A .scl can only say "N degrees repeating at a period" (a per-key map needs a .kbm
     // alongside it), so an absolute table cannot go out this way without being flattened
     // into a scale it is not. .tun holds it exactly - that is why .tun is the default.
-    if (tuning.usesAbsoluteTable())
+    //
+    // IN FORCE, not merely loaded (tuningTableIsInForce, not usesAbsoluteTable): with a
+    // .tun table loaded earlier and the box back on 12-TET, this refused to export 12-TET
+    // as a .scl on the grounds that the tuning is a table - which by then it was not.
+    if (tuningTableIsInForce())
     {
         errorOut = "This tuning is a 128-key table (a .tun that does not repeat), and a .scl "
                    "can only hold degrees repeating at a period. Save it as .tun instead - "
@@ -2855,13 +3717,36 @@ bool FractalAdditiveAudioProcessor::saveCurrentTuningScl (const juce::File& f, j
 //==============================================================================
 void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    // The load watch judges whole periods, never a host's short split of one (LoadMonitor.h).
+    loadMonitor.setJudgeSeconds (sampleRate > 0.0 ? (double) samplesPerBlock / sampleRate : 0.0);
+    // Build the phase engine's fader-slope table HERE, on a thread that is allowed to be
+    // slow. A live re-phase reads it on the audio thread, and the FIRST read is the one
+    // that fills 16384 entries behind an initialisation guard - 16384 std::sin calls and
+    // a lock, in a render callback, exactly once, which is a dropout nobody could ever
+    // reproduce. Idempotent, so calling it on every prepare costs nothing.
+    spectrum::phaseset::warmScatterDeltas();
+    // ...and the same argument for the three MIDI buffers the self-play and preview paths
+    // fill. juce::MidiBuffer allocates on its first addEvent, so reserving here means the
+    // FIRST block after a prepare does not allocate either - not just the ones after it.
+    // A generous 4096 bytes each: a pulse train at the fastest rate over a large buffer is
+    // a few hundred events, and this is message-thread memory bought once.
+    previewMidi.ensureSize (4096);
+    rtHeld     .ensureSize (4096);
+    rtSynthMidi.ensureSize (4096);
+
     synth.setCurrentPlaybackSampleRate (sampleRate);
     previewCollector.reset (sampleRate);
+    uiNoteCollector.reset (sampleRate);
+    uiMidi.ensureSize (256);
     noteGate.prepare (sampleRate);
+    monoGate.prepare();
+    laDelay.prepare();
+    laPeek.reset();
     modEngine.prepare (sampleRate);
     modNoteOns = 0; // in step with ModEngine::prepare - the first note-on must retrigger
     modHeld = 0;
     for (auto& row : modKeyHeld) row.fill (false);
+    modChanBend.fill (8192); for (auto& row : modKeyVel) row.fill (0); // in step with modKeyHeld
     lastSr = sampleRate;
 
     // MIX mode's scratch buses are sized HERE, on the prepare call, because the audio
@@ -2869,7 +3754,29 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
     // single-engine render (defensive - hosts honour their own samplesPerBlock).
     lastBlockSize = juce::jmax (16, samplesPerBlock);
     mixScratch.setSize (2, juce::jmax (512, lastBlockSize));
-    mixInject.ensureSize (512);
+    // THE UNIT IS BYTES, AND THAT IS THE WHOLE DEFECT. MidiBuffer::ensureSize takes BYTES,
+    // not events, and JUCE stores each event as its data plus a 4-byte sample position and a
+    // 2-byte length (juce_MidiBuffer.cpp: getEventTotalSize) - 9 bytes for a note-on. This
+    // buffer used to reserve 512 of them, which is 56 events, and it is filled on the MIX
+    // engage edge with the ENTIRE incoming block PLUS one note-on for every key held at that
+    // instant (see renderSynthMix). Past 56, MidiBuffer reallocates: on the audio thread, in
+    // a render callback, which is the one thing that must never happen here. It was the last
+    // buffer in the plugin still at the old number - NoteGate and MonoGlide reserve 4096, the
+    // lookahead ring 8192.
+    //
+    // SIZED TO THE FILL'S OWN BOUND rather than to a comfortable guess. That fill is a
+    // 16-channel x 128-key loop, so it can emit at most 2048 note-ons = 18,432 bytes; the
+    // rest of this reservation is ~14 kB, about 1,500 more events, for the copy of the
+    // incoming block that goes in beside them. 32 kB, once per prepareToPlay, next to four
+    // sub-engines each holding their own audio buffers.
+    //
+    // WHAT IT STILL DOES NOT COVER, said out loud rather than papered over: the incoming
+    // block is not bounded by anything this plugin owns, so a host block carrying more than
+    // ~1,500 events on top of a full hold would grow the buffer anyway. When that happens
+    // MidiBuffer GROWS - it never drops an event - so the cost is one allocation and never a
+    // lost note. RhythmVerify run 67 measures the bound that IS ours: the 2048-event fill,
+    // against this exact constant.
+    mixInject.ensureSize ((size_t) kMixInjectBytes);
     for (auto& e : mixEng)
         if (e != nullptr)
         {
@@ -2881,11 +3788,20 @@ void FractalAdditiveAudioProcessor::prepareToPlay (double sampleRate, int sample
 
     // Build once synchronously so a template exists before the first note.
     lastPushed = currentSettings();
+    // The plan analyses which partials can sound at this rate, so it has to know it
+    // BEFORE the compile below publishes a template to measure.
+    spectrumEngine.setRenderRate (sampleRate);
     spectrumEngine.buildNow (lastPushed);
+    // ...and ask the worker to plan it, off the message thread (see requestPlan).
+    spectrumEngine.requestPlan();
 
     applyTuningMode ((int) apvts.getRawParameterValue ("tuningMode")->load());
+    // The voice pool and the latency budget both depend on things prepareToPlay is the
+    // first to know (a restored monoGlide value; the rate and block the budget rounds to).
+    lastMonoGlide = apvts.getRawParameterValue ("monoGlide")->load() > 0.5f;
+    applyMonoVoiceCount (lastMonoGlide);
+    applyLookahead();
     rhythm.prepare (sampleRate);
-    shepard.prepare (sampleRate);
 
     // Poll the spectrum parameters and rebuild off the audio thread. 60 Hz (not 30):
     // a modulator driving a parameter that REBUILDS the spectrum (Base N, Harmonics,
@@ -2963,6 +3879,46 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 {
     juce::ScopedNoDenormals noDenormals;
 
+    // THE LOAD WATCH (dsp/LoadMonitor.h): what this whole block cost against what it was
+    // allowed, reported on the way out whatever path the block takes. Two clock reads and a
+    // few relaxed atomics - nothing that could itself be the reason a block is late.
+    struct LoadScope
+    {
+        FractalAdditiveAudioProcessor& p;
+        juce::int64 t0;
+        double blockSeconds;
+        ~LoadScope()
+        {
+            const auto dt = juce::Time::highResolutionTicksToSeconds (juce::Time::getHighResolutionTicks() - t0);
+            // AN OFFLINE RENDER HAS NO DEADLINE. Freeze and Export may take longer than real
+            // time per block and nothing is heard; measured, every such block would be an
+            // "overrun" and the notice would call it a click. The oscillator count is still
+            // taken below, so it cannot pile up into the first realtime block after.
+            if (! p.isNonRealtime())
+                p.loadMonitor.noteBlock (dt, blockSeconds);
+            // How many oscillators ran, on average over the block, across every voice of the
+            // main engine AND of every MIX corner's sub-engine (each has a SpectrumEngine of
+            // its own, and in MIX they are most of the cost): the first thing the warning
+            // names. The corners through mixEngLive, as the audio thread reaches them
+            // everywhere else - an engine is never deleted mid-session.
+            // The corners' share is kept apart as well: "most of them are in MIX" is the most
+            // useful single thing the warning can say about a MIX patch.
+            const long long mainSamples = p.spectrumEngine.takeOscillatorSamples();
+            long long mixSamples = 0;
+            for (auto& pe : p.mixEngLive)
+                if (auto* e = pe.load (std::memory_order_acquire))
+                    mixSamples += e->spectrum.takeOscillatorSamples();
+            if (! p.isNonRealtime() && buffer_samples > 0)
+                p.loadMonitor.noteOscillators ((int) ((mainSamples + mixSamples) / buffer_samples),
+                                               (int) (mixSamples / buffer_samples));
+        }
+        int buffer_samples;
+    } loadScope { *this, juce::Time::getHighResolutionTicks(),
+                  // lastSr, prepareToPlay's own rate: getSampleRate() is whatever the WRAPPER
+                  // last set, and is 0 wherever nothing did (the offline verifier did not).
+                  lastSr > 0.0 ? buffer.getNumSamples() / lastSr : 0.0,
+                  buffer.getNumSamples() };
+
     buffer.clear();
 
     const int  nSamp    = buffer.getNumSamples();
@@ -2975,6 +3931,36 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         jingleActive  = jingleOut.getNumSamples() > 0;
     }
     if (jingleActive) playJingleInto (buffer);
+
+    // A HOST'S PANIC IS A HARD SILENCE REQUEST, and it was not being treated as one.
+    //
+    // All Notes Off (CC123) and All Sound Off (CC120) are the two commands a host is
+    // entitled to assume work - they are what a transport stop, a panic button and a
+    // plugin-window close send. The synth acted on them only as far as MPEInstrument
+    // does, which leaves the rhythm engine's pulse trains running, the drone voice on its
+    // reserved channel sounding, and the MIX corner engines untouched. Measured with
+    // self-play and the drone on: All Notes Off took the output from 1.6e-1 to 5.3e-2 and
+    // All Sound Off changed it by nothing at all. A stuck note the user has no way to
+    // stop is the worst thing a synth can do.
+    //
+    // The kill below is exactly the right answer and already exists - it drains the main
+    // synth AND every corner engine, resets the note gates and the mono gate, and flushes
+    // the lookahead - so a panic simply asks for it. Scanned here, immediately before the
+    // consumer, so the silence lands in the SAME block the message arrived in rather than
+    // the next one. It is a read of the incoming buffer and one atomic store: nothing is
+    // allocated and nothing is locked.
+    for (const auto meta : midiMessages)
+    {
+        const auto m = meta.getMessage();
+        // Does this controller send pressure at all? (dsp/ExpressionState.h - a note whose
+        // source sends none must not be read as a finger resting at zero.)
+        if (m.isChannelPressure() || m.isAftertouch())
+            expression.noteSeenPressure (m.getChannel());
+        if (m.isNoteOn())
+            expression.noteSeenNote (m.getChannel());   // ...and which channels are the player's
+        if (m.isAllNotesOff() || m.isAllSoundOff())
+        { pendingHardSilence.store (true, std::memory_order_release); break; }
+    }
 
     // A full state swap (preset load, project reload, "load its original spectrum")
     // was seen leaving a note stuck sounding forever: it rewrites every DSP
@@ -2995,12 +3981,147 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
             if (auto* ce = pe.load (std::memory_order_acquire))
                 ce->synth.turnOffAllVoices (false);
         noteGate.prepare (lastSr > 0.0 ? lastSr : getSampleRate());
+        monoGate.reset();
+        laDelay.flush(); laPeek.reset();
         modHeld = 0; modNoteOns = 0;
         for (auto& row : modKeyHeld) row.fill (false);
+        modChanBend.fill (8192); for (auto& row : modKeyVel) row.fill (0); // in step with modKeyHeld
     }
 
-    // Merge on-screen / computer-keyboard notes into the incoming MIDI stream.
-    keyboardState.processNextMidiBuffer (midiMessages, 0, nSamp, true);
+    // AudioProcessor::reset() raised this (see the header for why the work is not done
+    // there). Everything above already ran - reset() sets pendingHardSilence too, and it
+    // is what silences the voices, empties the lookahead ring and clears the mono glide's
+    // held-key stack. What is left is the one thing a PRESET LOAD deliberately does not
+    // want: the running pattern's own position. A host reset means "forget what you were
+    // doing", so the phases, the gates, the held chord and the engine clock all go back
+    // to zero and the next note starts a pattern instead of joining one that is still
+    // mid-cycle from before the bypass.
+    // resetState() is prepare() minus its single ensureSize, so nothing here allocates.
+    if (pendingHostReset.exchange (false, std::memory_order_acq_rel))
+        rhythm.resetState();
+
+    // Merge on-screen / computer-keyboard notes into the incoming MIDI stream - from OUR
+    // OWN collector, not through keyboardState (see uiNoteCollector for what that cost).
+    uiMidi.clear();
+    uiNoteCollector.removeNextBlockOfMessages (uiMidi, nSamp);
+    for (const auto meta : uiMidi)
+        midiMessages.addEvent (meta.getMessage(), juce::jlimit (0, juce::jmax (0, nSamp - 1), meta.samplePosition));
+    // ...and the colour keyboard lights whatever is sounding, ours and the host's alike.
+    // `false`: this state no longer injects anything, it only watches.
+    keyboardState.processNextMidiBuffer (midiMessages, 0, nSamp, false);
+
+    // THE SUSTAIN PEDAL IS THE PLAYER'S FOOT, NOT A CHANNEL'S. Outside the MPE zone mode
+    // JUCE's legacy mode treats every channel as its own instrument, so a pedal arriving on
+    // channel 1 held only the notes that happened to be on channel 1 - with a controller
+    // that rotates channels (any MPE controller in its non-MPE mode, the Hexboard included)
+    // that is most of the chord left unsustained. The pedal is copied to every channel that
+    // is not the one it came on; MPE mode needs none of this, because there the zone master
+    // already owns the pedal for the whole zone.
+    if (! lastZoneMpe.load (std::memory_order_relaxed))
+    {
+        int pedalCount = 0;
+        for (const auto meta : midiMessages)
+        {
+            const auto m = meta.getMessage();
+            if (! m.isController()) continue;
+            const int cc = m.getControllerNumber();
+            if (cc != 64 && cc != 66) continue;      // sustain, sostenuto
+            if (++pedalCount > 8) break;             // a stream of pedal spam stays bounded
+            for (int ch = 1; ch <= 16; ++ch)
+                if (ch != m.getChannel())
+                    pedalEcho.addEvent (juce::MidiMessage::controllerEvent (ch, cc, m.getControllerValue()),
+                                        meta.samplePosition);
+        }
+        if (! pedalEcho.isEmpty())
+        {
+            midiMessages.addEvents (pedalEcho, 0, nSamp, 0);
+            pedalEcho.clear();
+        }
+    }
+
+    //== ADAPTIVE LOOKAHEAD (see LookaheadDelay.h) =============================
+    // The order here IS the feature: the follower's early view is taken from the stream
+    // at its ORIGINAL time, and only then is the stream re-stamped one budget later for
+    // everything that sounds. Both halves read the same buffer one statement apart.
+    {
+        const int budget = laSamples.load (std::memory_order_relaxed);
+
+        // A TRANSPORT DISCONTINUITY - a loop jumping back, a locator jump, playback
+        // starting or stopping - invalidates everything still in flight: those events
+        // belong to bars the transport has left, and replaying them at the loop point
+        // is a ghost note the user never wrote. Detected as a ppq position that did not
+        // advance by roughly this block's own length.
+        bool jumped = false;
+        if (auto* ph = getPlayHead())
+            if (auto pos = ph->getPosition())
+            {
+                const bool playing = pos->getIsPlaying();
+                double ppq = -1.0e30;
+                if (pos->getPpqPosition().hasValue()) ppq = *pos->getPpqPosition();
+                if (playing != laWasPlaying) jumped = true;
+                else if (playing && ppq > -1.0e29 && laLastPpq > -1.0e29 && lastSr > 0.0)
+                {
+                    double bpm = 120.0;
+                    if (pos->getBpm().hasValue() && *pos->getBpm() > 1.0) bpm = *pos->getBpm();
+                    const double expect = (double) nSamp * bpm / (60.0 * lastSr);
+                    // Half a block of tolerance either way: hosts round their ppq, and a
+                    // tempo ramp inside one buffer moves it slightly off the prediction.
+                    if (std::abs (ppq - laLastPpq - expect) > expect * 0.5 + 1.0e-6) jumped = true;
+                }
+                laWasPlaying = playing;
+                laLastPpq    = playing ? ppq : -1.0e30;
+            }
+
+        // CONSUME THE PENDING-FLUSH FLAG UNCONDITIONALLY, AND BEFORE THE TEST BELOW.
+        // It used to be the right-hand side of `jumped || laFlush.exchange (...)`, which
+        // SHORT-CIRCUITS: on a block that had jumped, the exchange never ran, so the
+        // pending flush survived into the NEXT block and destroyed a ring that by then
+        // held a real note. Measured with lookahead armed, identical processors, identical
+        // MIDI, identical block counts, the only difference being whether a playhead was
+        // attached: no playhead -> first audible sample 12032 (one budget, as designed);
+        // with one -> the note NEVER sounded. It fires on every offline bounce and every
+        // transport start with lookahead armed, because applyLookahead leaves the flag set
+        // on the first poll after prepareToPlay (laLastSr starts at 0).
+        const bool pendingFlush = laFlush.exchange (false, std::memory_order_acq_rel);
+
+        // A JUMP ONLY FLUSHES WHAT THERE IS TO FLUSH. rtSet.lookahead defaults to false,
+        // so budget == 0 with an empty ring is not "a configuration" - it is what every
+        // player gets who never opens the realtime panel, and there is then nothing in
+        // flight for a transport discontinuity to invalidate. Without this guard, simply
+        // pressing PLAY cut off every key the player was holding (measured: voices 1 -> 0,
+        // rms 0.02508 -> 0.00000), and the jump edge is symmetric so STOP and a loop wrap
+        // cut them too. That kill arrived in d44263e; its parent had no transport-jump
+        // handling at all.
+        // With lookahead ARMED the kill deliberately REMAINS, because there the two cases
+        // are genuinely different: the ring really does hold events the host stamped for
+        // bars the transport has left, replaying them at the loop point is a ghost note
+        // nobody wrote, and a buffered note-on dropped with its note-off would hold for
+        // ever. run 52 asserts both halves side by side so neither can be "simplified"
+        // into the other.
+        if ((jumped && (budget > 0 || ! laDelay.isEmpty())) || pendingFlush)
+        {
+            // Dropping buffered note-ons is the point; a buffered note-OFF is a
+            // different animal and is DELIVERED with this block instead. Its note-on
+            // left the ring one budget earlier: it has already sounded and has already
+            // been counted by the note gate, the mono glide, the modulator tally and the
+            // rhythm engine's held chord. Dropping it left all four believing the key
+            // was still down - and the rhythm engine then generated pulse trains from a
+            // key nobody was holding and emitted that MIDI to the DAW for the rest of
+            // the session (measured: 24 ghost pulses in the 600 blocks after one wrap).
+            // The turnOffAllVoices below silences the audio; only the delivered note-off
+            // can correct the bookkeeping.
+            laDelay.flushKeepingNoteOffs();
+            laPeek.reset();
+            monoGate.reset();
+            synth.turnOffAllVoices (false);
+            for (auto& pe : mixEngLive)
+                if (auto* ce = pe.load (std::memory_order_acquire))
+                    ce->synth.turnOffAllVoices (false);
+        }
+
+        if (budget > 0) laPeek.observe (midiMessages);   // ...the notes that HAVE arrived
+        laDelay.process (midiMessages, nSamp, budget);   // ...and the stream that will sound
+    }
     // Chord-preview MIDI (editor play buttons): kept SEPARATE - it feeds only the
     // synth, never the rhythm engine (a preview must not trigger pulse trains or
     // leak to the DAW's MIDI out).
@@ -3011,8 +4132,22 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
     // grid, mono behaviour, and/or quantize to the running pattern's reset.
     {
         const bool qTempo = apvts.getRawParameterValue ("rhythmQTempo")->load() > 0.5f;
-        const bool mono   = apvts.getRawParameterValue ("rhythmMono")->load()   > 0.5f;
         const bool qPulse = apvts.getRawParameterValue ("rhythmQPulse")->load() > 0.5f;
+        // THE GATE'S OWN "Mono" STANDS DOWN WHILE MONOPHONIC GLIDE IS ON, and this is not
+        // a nicety - the two are different answers to the same question and the gate's one
+        // wins by arriving first. Its Mono emits a note-OFF for the sounding key at the
+        // SAME sample as the new note-on and BEFORE it, so the single voice is already in
+        // its release tail when the new note lands: AdditiveVoice::noteStarted then sees
+        // `releasing` and correctly refuses to call it a legato takeover, and the note
+        // restrikes at its own pitch. The result was a glide switch that silently did
+        // nothing whenever this older toggle happened to be on.
+        // Monophonic glide is already mono (the pool is ONE voice), so nothing is lost by
+        // standing the gate down - the notes it would have cut are cut by the takeover
+        // instead, with a bend where it had a restrike. The editor disables the gate's
+        // toggle and says so rather than leaving it lit over a mode it is not driving.
+        const bool monoGlideOn = apvts.getRawParameterValue ("monoGlide")->load() > 0.5f;
+        const bool mono   = ! monoGlideOn
+                         && apvts.getRawParameterValue ("rhythmMono")->load() > 0.5f;
         double beatOff = -1.0, beatPer = -1.0;
         if (qTempo)
             if (auto* ph = getPlayHead())
@@ -3031,6 +4166,13 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                           beatOff, beatPer, qPulse ? rhythm.samplesToNextReset() : -1.0,
                           qPulse ? rhythm.samplesSinceAnchor()  : -1.0);
     }
+
+    // MONOPHONIC GLIDE's note-stream half, AFTER the gate (a note held back by the beat
+    // grid has not been played yet, so it cannot take anything over) and before anything
+    // that sounds. It adds the legato return to a still-held key and nothing else; the
+    // mono-ness itself comes from the one-voice pool (see applyMonoVoiceCount).
+    monoGate.process (midiMessages, nSamp,
+                      apvts.getRawParameterValue ("monoGlide")->load() > 0.5f);
 
     // MODULATORS (3 envelopes + 3 LFOs): stepped once per block, writing straight
     // into the target parameters' raw atomics (base value + modulation) - smooth,
@@ -3054,6 +4196,16 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                     ++modNoteOns;
                     auto& f = modKeyHeld[(size_t) ch][(size_t) m.getNoteNumber()];
                     if (! f) { f = true; ++modHeld; }
+                    // Kept so the MIX engage edge can re-strike this note as it really
+                    // arrived, instead of at a hard-coded 100 (see modKeyVel).
+                    modKeyVel[(size_t) ch][(size_t) m.getNoteNumber()] = m.getVelocity();
+                }
+                else if (m.isPitchWheel())
+                {
+                    // The bend this channel is holding. In MPE that is the note's own
+                    // pitch, so a corner engine re-struck without it plays a different
+                    // note - see modChanBend.
+                    modChanBend[(size_t) ch] = m.getPitchWheelValue();
                 }
                 else if (m.isNoteOff())
                 {
@@ -3063,6 +4215,7 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
                 else if (m.isAllNotesOff() || m.isAllSoundOff())
                 {
                     for (auto& row : modKeyHeld) row.fill (false);
+                    modChanBend.fill (8192); for (auto& row : modKeyVel) row.fill (0); // in step with modKeyHeld
                     modHeld = 0;
                 }
             }
@@ -3127,11 +4280,37 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         wasSelfPlay = selfPlay;
         keyboardState.allNotesOff (0);
         synth.turnOffAllVoices (false);
+        // THE MIX SUB-ENGINES TOO, and this is not symmetry for its own sake - it is the
+        // same stuck note, one engine over. With MIX engaged a held key is sounding in the
+        // corner engines as well (renderSynthMix feeds them the same stream, and the engage
+        // edge deliberately re-strikes every held key into them), and from the next block on
+        // self-play rewrites every note-OFF onto channel 16. That rewritten off matches
+        // nothing a corner voice is holding, so the corner DRONES FOR EVER: the key is up,
+        // the main engine is silent, and the sound continues with no key to release and no
+        // panic that can reach it - the host's all-notes-off goes to keyboardState and the
+        // main synth, which are already quiet. Routing a partial auto-enables self-play, so
+        // the flip that strands them is one click in the rhythm panel while a note is held.
+        //
+        // MEASURED, and it took a corrected measurement to see it: with the pulses routed to
+        // the SAME note and channel as the held key, the pulse's own gate note-off happened
+        // to release the stranded voice and the whole thing looked fine (that collision is
+        // the hazard the drone's reserved channel 16 exists for, see below). Route them
+        // anywhere else and the corner holds a steady 0.0255 RMS for as long as anyone cares
+        // to render, a full second after the key came up. run 61 does exactly that.
+        //
+        // The two siblings of this kill - the hard-silence backstop at the top of
+        // processBlock and the lookahead flush above - have carried this loop from the day
+        // they were written; this one was missed.
+        for (auto& pe : mixEngLive)
+            if (auto* ce = pe.load (std::memory_order_acquire))
+                ce->synth.turnOffAllVoices (false);
         rhythm.flushOpenGates();
         rhythm.flushEchoes();
         noteGate.prepare (lastSr > 0.0 ? lastSr : getSampleRate());
+        monoGate.reset();
         modHeld = 0;
         for (auto& row : modKeyHeld) row.fill (false);
+        modChanBend.fill (8192); for (auto& row : modKeyVel) row.fill (0); // in step with modKeyHeld
     }
 
     if (selfPlay)
@@ -3144,17 +4323,37 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         // the same channel+note would otherwise kill the drone voice with its gate
         // note-off. Note-offs are forwarded ALWAYS (so switching the drone off with a
         // note sounding can never strand its voice); note-ons/bends only while on.
-        juce::MidiBuffer held;
+        rtHeld.clear();   // a member, pre-reserved: see its declaration
+        auto& held = rtHeld;
         for (const auto meta : midiMessages)
         {
             auto m = meta.getMessage();
-            if (m.isNoteOff())                       { m.setChannel (16); held.addEvent (m, meta.samplePosition); }
+            // EVERYTHING THAT CAN STOP A NOTE IS FORWARDED, ALWAYS. Note-offs already
+            // were - "so switching the drone off with a note sounding can never strand
+            // its voice" - but that reasoning covers the pedal and the panic messages
+            // exactly as well, and they were being dropped on the floor. A drone voice
+            // lives on reserved channel 16 and is the only thing that hears this buffer,
+            // so with self-play engaged the sustain pedal did nothing and the host's own
+            // All Notes Off could not stop a drone: the note hung until the plugin was
+            // removed. A stuck note the user has no way to stop is the worst thing a
+            // synth can do, and a panic message is the one command a host is entitled to
+            // assume works.
+            //
+            // The pedals go through unconditionally too, and not only while the drone is
+            // on: a pedal DOWN captured before the drone was switched off has to be
+            // releasable afterwards, which is the same argument the note-off line makes.
+            const bool stopper = m.isNoteOff()
+                              || m.isAllNotesOff() || m.isAllSoundOff() || m.isResetAllControllers()
+                              || m.isSustainPedalOn()   || m.isSustainPedalOff()
+                              || m.isSostenutoPedalOn() || m.isSostenutoPedalOff();
+            if (stopper)                             { m.setChannel (16); held.addEvent (m, meta.samplePosition); }
             else if (drone && (m.isNoteOn() || m.isPitchWheel() || m.isAftertouch() || m.isChannelPressure()))
                                                      { m.setChannel (16); held.addEvent (m, meta.samplePosition); }
         }
         rhythm.process (midiMessages, nSamp);              // midiMessages := pulse MIDI
 
-        juce::MidiBuffer synthMidi;
+        rtSynthMidi.clear();
+        auto& synthMidi = rtSynthMidi;
         synthMidi.addEvents (midiMessages, 0, nSamp, 0);   // synth plays the pulses...
         synthMidi.addEvents (held, 0, nSamp, 0);           // ...and the drone channel (ch 16)
         synthMidi.addEvents (previewMidi, 0, nSamp, 0);    // chord preview always audible AS a chord
@@ -3166,7 +4365,8 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
     {
         // Preview active: the synth hears played notes + the preview; the rhythm
         // engine still sees ONLY the played notes.
-        juce::MidiBuffer synthMidi;
+        rtSynthMidi.clear();
+        auto& synthMidi = rtSynthMidi;
         synthMidi.addEvents (midiMessages, 0, nSamp, 0);
         synthMidi.addEvents (previewMidi, 0, nSamp, 0);
         renderSynthMix (buffer, synthMidi, nSamp);
@@ -3181,33 +4381,16 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
         rhythm.process (midiMessages, nSamp);
     }
 
-    // SHEPARD TONE (Tuning panel): mixed in AFTER the synth render and BEFORE the
-    // master gain, so the master fader scales it with everything else. The engine
-    // gets plain seconds: the quantized mode's beats are resolved against the host
-    // BPM here, where the transport lives - and when Sync is chosen with no BPM on
-    // offer, the FREE value takes over and the flag says so, instead of the beats
-    // box silently meaning milliseconds.
-    {
-        const bool  shepOn = apvts.getRawParameterValue ("shepOn")->load() > 0.5f;
-        const int   mode   = (int) apvts.getRawParameterValue ("shepMode")->load();
-        double riseSec     = (double) apvts.getRawParameterValue ("shepTime")->load() * 0.001;
-        bool   noBpm       = false;
-        if (mode == 1)
-        {
-            // curBpm was read from the playhead earlier this block (the same clock
-            // the BPM-rate LFOs use). Hosts report BPM with the transport stopped
-            // too, so Sync works without pressing play.
-            if (curBpm > 1.0)
-                riseSec = ShepardEngine::beatsForDiv ((int) apvts.getRawParameterValue ("shepDiv")->load())
-                        * 60.0 / curBpm;
-            else
-                noBpm = true;
-        }
-        shepSyncNoBpm.store (mode == 1 && noBpm, std::memory_order_relaxed);
-        shepard.render (buffer, nSamp, shepOn,
-                        apvts.getRawParameterValue ("shepLevel")->load(),
-                        riseSec, tuning.periodRatio(), tuning.frequencyForNote (60));
-    }
+    // SHEPARD MODE is rendered INSIDE the voices now (see AdditiveVoice) - there is
+    // no separate engine to mix in any more, and nothing here touches the buffer.
+    // What still belongs here is the one fact only the transport knows: Sync was
+    // chosen but the host offers no BPM, so the FREE ms value is what actually drives
+    // the rise. The voices reach the same conclusion from the same curBpm; this flag
+    // is purely so the editor can SAY it instead of letting the beats box claim a
+    // sync that is not happening.
+    shepSyncNoBpm.store ((int) apvts.getRawParameterValue ("shepMode")->load() == 1
+                             && curBpm <= 1.0,
+                         std::memory_order_relaxed);
 
     const auto gain = juce::Decibels::decibelsToGain (
         apvts.getRawParameterValue ("masterGain")->load());
@@ -3241,9 +4424,191 @@ void FractalAdditiveAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 // voices are fast-killed and given a few muted blocks to actually finish -
 // stopping cold would leave fastKill armed on voices nothing ever renders again,
 // the exact trap beginFastKill documents.
+// The zone repair, per synth. Only when it has actually drifted: MPEInstrument::
+// setZoneLayout releases every sounding note, so re-asserting a zone that is already
+// right would cut notes off on every block. Follows the host where following costs
+// nothing (member count, per-note range) and refuses where it costs the feature (an
+// inactive zone, a master range other than 48) - see the comment in renderSynthMix.
+void FractalAdditiveAudioProcessor::repairMpeZoneOf (juce::MPESynthesiser& s)
+{
+    if (! lastZoneMpe.load (std::memory_order_relaxed)) return;
+    auto layout = s.getZoneLayout();
+    const auto lower = layout.getLowerZone();
+    const bool dead  = ! lower.isActive();
+    // THE WHOLE ZONE IS WHAT THIS MODE PROMISES, not two thirds of it.
+    //
+    // The repair used to pin only the MASTER range and copy the member count and the
+    // per-note range back from whatever the controller last announced. Two things broke
+    // when a controller announced its own (the Hexboard announces 48 on all 16 channels at
+    // power-on, and anything else is legal):
+    //   * a per-note range other than 48 made everything this synth GENERATES as bend
+    //     wrong by range/48 - the rhythm pulses, the driver f0, the chord and hover
+    //     previews - while the played notes stayed right, because the one rule that
+    //     encodes bend (RhythmEngine::bendRangeSemis) answers 48 in this mode, which is
+    //     also what the panel promises when it hides the bend selector here;
+    //   * a member count under 15 left this synth's OWN channels outside the zone, and
+    //     MPEInstrument drops every note on a channel the zone is not using - the preview
+    //     (channels 9..16), the MPE pulses and the self-play drone went silent with no
+    //     message at all.
+    // So the zone is 15 members, +-48 per note, +-48 master, and a controller that asked
+    // for something else is TOLD (zoneOverrideSeen -> the window raises a notice), never
+    // quietly overruled.
+    const bool drifted = dead
+                      || lower.masterPitchbendRange != 48
+                      || lower.perNotePitchbendRange != 48
+                      || lower.numMemberChannels != 15;
+    if (drifted)
+    {
+        if (! dead && (lower.perNotePitchbendRange != 48 || lower.numMemberChannels != 15))
+        {
+            zoneAskedPerNote.store (lower.perNotePitchbendRange, std::memory_order_relaxed);
+            zoneAskedMembers.store (lower.numMemberChannels, std::memory_order_relaxed);
+            zoneOverrideSeen.store (true, std::memory_order_release);
+        }
+        layout.setLowerZone (15, 48, 48);
+        s.setZoneLayout (layout);
+    }
+}
+
+// RENDER, SPLIT AT EVERY MCM IN THE BUFFER, with the zone repaired between the pieces.
+//
+// An MPE Configuration Message is RPN 6 on channel 1, and its data-entry byte (CC 6) is
+// where JUCE's MPEInstrument rewrites its zone - a member count of zero deactivates it.
+// Whole-block rendering then handed JUCE the message and the note behind it in one call,
+// and the note arrived at a dead zone. So the block is rendered up to and INCLUDING the
+// sample of each channel-1 data-entry byte (CC 6, and CC 38 - see below), the zone is
+// put back, and the rest follows.
+//
+// WHAT MOVES AND WHAT DOES NOT, said precisely because the first version of this comment
+// said "the samples come out identical" and that is false. What is unchanged: the
+// events each render call consumes, and the audio of a block with no channel-1 data
+// entry in it (the one plain call it always took). What changes when a split happens:
+// JUCE restarts its 32-sample sub-block coalescing at every renderNextBlock call, so the
+// chunk boundaries handed to the voices move, and a voice evaluates its per-chunk
+// modulators at different sample offsets - an LSB-level difference whenever a modulator
+// is live, not a click and not a wrong note. And a dense stream of channel-1 data entry
+// costs one render call per message; no host sends one, and a repair that finds no
+// drift is a layout copy and two compares.
+//
+// This is not an RPN scan: it does not decode 101/100/6, it does not decide what the
+// message means, and it never calls the zone setter on its own account - the repair
+// does that, guarded by drift, exactly as it always has. It only chooses where to pause.
+// Which also means a channel-1 CC 6 that completes RPN 0 (the MASTER bend range, which
+// the MPE spec resets to +-2) DOES drift the zone and DOES fire the repair, and the
+// repair's setZoneLayout releases every sounding note - at that sample now, where the
+// old top-of-render repair did the same one block later. Same policy, moved; not new.
+//
+// Not covered, and said: a note at the SAME sample as the data entry, on either side of
+// it. JUCE walks every event at one timestamp inside one render call, so a note AFTER
+// the byte in buffer order meets a dead zone and is dropped; a note BEFORE it is born,
+// the byte kills the zone under it, and the repair that follows releases it with
+// everything else. Lost either way, and no seam this function could split at. Hosts
+// put the message at the top of a block and the first note some samples in; the test
+// uses eight.
+//
+// A buffer with no channel-1 CC 6 in it - every ordinary block - takes the one plain
+// call it always took, byte for byte.
+void FractalAdditiveAudioProcessor::renderSplitAtMcm (juce::MPESynthesiser& s,
+                                                      juce::AudioBuffer<float>& buf,
+                                                      const juce::MidiBuffer& midi,
+                                                      int start, int len)
+{
+    const int end = start + len;
+    int cur = start;
+    if (lastZoneMpe.load (std::memory_order_relaxed))
+    {
+        for (const auto meta : midi)
+        {
+            const int pos = meta.samplePosition;
+            if (pos < cur || pos >= end) continue;
+            const auto msg = meta.getMessage();
+            // CC 6 AND CC 38. Data entry is a 14-bit pair - MSB on 6, LSB on 38 - and
+            // JUCE's RPN detector fires on EITHER (juce_MidiRPN.cpp: both call
+            // sendIfReady). A host that sends the MCM as the full pair delivers CC 38 = 0
+            // after CC 6 = 0; splitting on the MSB alone repaired the zone and then handed
+            // JUCE the LSB, which rebuilt the RPN with value (0 << 7) + 0 and killed the
+            // zone AGAIN - the same-block note was lost exactly as before, one message
+            // later. Found by the adversarial review of the first version of this.
+            if (! (msg.isController() && msg.getChannel() == 1
+                    && (msg.getControllerNumber() == 6 || msg.getControllerNumber() == 38)))
+                continue;
+            // Up to and including this sample, so JUCE has seen the message...
+            const int upto = juce::jmin (end, pos + 1);
+            if (upto > cur) s.renderNextBlock (buf, midi, cur, upto - cur);
+            cur = upto;
+            // ...and the zone it just wrote is put right before anything else is heard.
+            repairMpeZoneOf (s);
+        }
+    }
+    if (end > cur) s.renderNextBlock (buf, midi, cur, end - cur);
+}
+
 void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& out,
                                                     const juce::MidiBuffer& midi, int nSamp)
 {
+    // THE HOST'S MPE CONFIGURATION MESSAGE UNDOES OUR ZONE, so the zone is checked here
+    // and put back before anything is rendered.
+    //
+    // "lo pongo en mpe, y le envio midi retuneado con mpe y no reacciona, cuando otros
+    // sintes compatibles con mpe si lo hacen." Measured, in two halves:
+    //
+    //   * an MCM whose member count is ZERO - which is how a host says "MPE off", and
+    //     which several send before configuring - deactivates the lower zone, after which
+    //     MPEInstrument::noteOn early-returns for every channel and the synth is
+    //     PERMANENTLY DEAF. applyTuningMode cannot save it: its zone write is behind
+    //     `if (mpe != lastZoneMpe)` and that edge has already been spent.
+    //   * ANY MCM re-writes the zone through JUCE's own handler, which calls setLowerZone
+    //     with a DEFAULTED master range of 2. That silently undoes the +-48 master range
+    //     the comment in applyTuningMode explains at length - a retuning arriving on
+    //     channel 1 then collapses to 1/24 of itself. Measured: a note asking for 320.222
+    //     Hz came out at 263.851, which is 335 cents flat.
+    //
+    // The repair follows the host where following costs nothing and refuses where it
+    // costs the feature: the MEMBER COUNT and the PER-NOTE range are whatever the host
+    // last asked for, because those are its business; the zone is never allowed to be
+    // inactive while this mode is on, and the MASTER range is held at 48, because both of
+    // those are what the UI promises when it hides the bend selector in this mode.
+    //
+    // Only when it has actually drifted: MPEInstrument::setZoneLayout releases every
+    // sounding note, so re-asserting a zone that is already right would cut notes off on
+    // every block.
+    //
+    // ...AND ONCE MORE INSIDE THE BLOCK, at every MCM in it - see renderSplitAtMcm. This
+    // top-of-render pass catches a message that arrived in an EARLIER block; it cannot
+    // catch one in THIS block, because the block's MIDI has not been consumed yet when
+    // it runs, and a zero-member MCM at sample 0 deactivated the zone inside JUCE with
+    // the first note eight samples behind it. That note hit noteOn's early return and
+    // was gone: not late, not detuned, gone. The four renders below split at each such
+    // message and repair between the halves.
+    //
+    // THE CORNERS FOLLOW THE MAIN, as they did before the split. The first version of
+    // this repaired each corner on its OWN drift, which is not the same thing: with the
+    // mix off a corner never consumes the block's MIDI, so it never sees the host's
+    // member count or per-note range and kept applyZoneTo's (15, 48, 48) for good. The
+    // old code pushed the main's repaired layout to every corner whenever the main had
+    // drifted; that is what happens again here - and, as before, only inside the MPE
+    // flag, so a legacy-mode block does not touch the message thread's engine slots.
+    if (lastZoneMpe.load (std::memory_order_relaxed))
+    {
+        repairMpeZoneOf (synth);
+        // PER CORNER, NOT PER REPAIR. The first version of this only pushed the layout
+        // when the repair had changed the main's - which misses the case that matters
+        // most: an RPN 0 on a MEMBER channel moves the main's per-note range without
+        // ever tripping the drift test (that watches the master range and the zone being
+        // alive), so main and corners would decode the same wheel bytes at different
+        // ranges and the mix would blend two different chords.
+        //
+        // mixEngLive, acquire-loaded, because this is the audio thread: mixEng is the
+        // message thread's own array and the render loop below already reads the live
+        // view. The old code read mixEng here; that was the audio thread touching a
+        // message-thread unique_ptr, every block.
+        const auto layout = synth.getZoneLayout();
+        for (auto& slot : mixEngLive)
+            if (auto* e = slot.load (std::memory_order_acquire))
+                if (e->synth.getZoneLayout() != layout)
+                    e->synth.setZoneLayout (layout);
+    }
+
     const bool   on = mixEngaged.load (std::memory_order_acquire);
     const double sr = lastSr > 0.0 ? lastSr : 44100.0;
 
@@ -3259,7 +4624,7 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
         mixWasOn       = on;
         mixMainApplied = 1.0f;
         for (auto& a : mixApplied) a = 0.0f;   // the next engage ramps in from silence
-        synth.renderNextBlock (out, midi, 0, nSamp);
+        renderSplitAtMcm (synth, out, midi, 0, nSamp);
         return;
     }
 
@@ -3269,10 +4634,20 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
     {
         mixInject.clear();
         mixInject.addEvents (midi, 0, nSamp, 0);
-        for (int ch = 0; ch < 16; ++ch)
-            for (int k = 0; k < 128; ++k)
-                if (modKeyHeld[(size_t) ch][(size_t) k])
-                    mixInject.addEvent (juce::MidiMessage::noteOn (ch + 1, k, (juce::uint8) 100), 0);
+        // THE BEND GOES IN FIRST, AND THE NOTE ARRIVES AS IT REALLY ARRIVED.
+        //
+        // This used to inject a bare noteOn at a hard-coded velocity of 100, throwing away
+        // both halves of the note. The bend is the one that matters: in MPE every note
+        // carries its own per-channel bend and in this instrument that bend IS the tuning
+        // for anything a controller retunes - so engaging MIX under a held MPE chord gave
+        // the corners the chord in untuned 12-EDO while the main engine went on playing it
+        // correctly. That is not two spectra blending, it is two different chords.
+        //
+        // The building itself is buildMixRestrike (see the header): lifted out so a test
+        // can ask it what it produces without a playground, corner presets and preset
+        // files behind it. This is its only caller.
+        buildMixRestrike (mixInject, modKeyHeld, modChanBend, modKeyVel,
+                          lastZoneMpe.load (std::memory_order_relaxed));
         cornerFeed = &mixInject;
     }
     mixWasOn = on;
@@ -3283,17 +4658,37 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
     if (mixScratch.getNumSamples() >= nSamp && mixScratch.getNumChannels() > 0)
     {
         mixScratch.clear();
-        synth.renderNextBlock (mixScratch, midi, 0, nSamp);
+        renderSplitAtMcm (synth, mixScratch, midi, 0, nSamp);
         mixScratch.applyGainRamp (0, nSamp, mixMainApplied, mainNow);
+        // A NARROWER BUS FOLDS THE SCRATCH DOWN, IT DOES NOT PICK A CHANNEL OUT OF IT.
+        //
+        // This read jmin (ch, srcCh - 1), so a MONO output took channel 0 of a stereo
+        // scratch and threw channel 1 away. That was harmless while the two channels
+        // carried identical audio - and stopped being harmless the moment BINAURAL could
+        // put different partials in each: at the top of that fader every partial assigned
+        // to the right ear vanished from a mono bus, silently, which is the exact loss
+        // this instrument refuses to make. The scratch is summed now, at 1/srcCh, so a
+        // mono listener hears every partial and the level is unchanged.
         const int srcCh = mixScratch.getNumChannels();
-        for (int ch = 0; ch < out.getNumChannels(); ++ch)
-            out.addFrom (ch, 0, mixScratch, juce::jmin (ch, srcCh - 1), 0, nSamp);
+        const int outCh = out.getNumChannels();
+        if (outCh >= srcCh)
+        {
+            for (int ch = 0; ch < outCh; ++ch)
+                out.addFrom (ch, 0, mixScratch, juce::jmin (ch, srcCh - 1), 0, nSamp);
+        }
+        else
+        {
+            const float fold = 1.0f / (float) juce::jmax (1, srcCh);
+            for (int ch = 0; ch < outCh; ++ch)
+                for (int s = ch; s < srcCh; s += outCh)
+                    out.addFrom (ch, 0, mixScratch, s, 0, nSamp, fold);
+        }
     }
     else
     {
         // Defensive: a block larger than prepareToPlay promised. The main engine must
         // sound whatever happens; the mix sits this block out.
-        synth.renderNextBlock (out, midi, 0, nSamp);
+        renderSplitAtMcm (synth, out, midi, 0, nSamp);
     }
     mixMainApplied = mainNow;
 
@@ -3318,7 +4713,7 @@ void FractalAdditiveAudioProcessor::renderSynthMix (juce::AudioBuffer<float>& ou
         const float now = mixGainCur[i] * xAmp;
         if (e->buf.getNumSamples() < nSamp) { mixApplied[i] = now; continue; }  // defensive, as above
         e->buf.clear();
-        e->synth.renderNextBlock (e->buf, *cornerFeed, 0, nSamp);
+        renderSplitAtMcm (e->synth, e->buf, *cornerFeed, 0, nSamp);
         e->buf.applyGainRamp (0, nSamp, mixApplied[i], now);
         mixApplied[i] = now;
         const int srcCh = e->buf.getNumChannels();
@@ -3393,6 +4788,30 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         state.appendChild (scl, nullptr);
     }
 
+    // THE HAND-SET REFERENCE, PARKED - and the promise timerCallback makes about it.
+    //
+    // While MTS-ESP is the mode and a master is up, the master OWNS refA: the parameter is
+    // overwritten with what the master is really doing (display only, so the box does not
+    // lie) and the number the user typed lives in manualRefA, handed straight back the
+    // instant MTS stops being the mode. The comment there states it outright - "MTS can
+    // never permanently overwrite a reference the user typed" - and that held for the
+    // session and not one moment longer: refA is a PARAMETER and rode out in the tree
+    // above, while manualRefA and the flag saying it is parked were plain members that
+    // rode nowhere. Type 432, switch to MTS-ESP, save, reopen: the chunk carries the
+    // master's 440 in refA, manualRefA comes back at its 440 default, and no action can
+    // recover the 432 because it was never written down.
+    //
+    // The FLAG travels too, and it is not optional. Without it a project saved in MTS mode
+    // reopens with mtsHadRef false, so leaving MTS looks like it was never entered and the
+    // parked value is never handed back - the number would be saved and still unreachable.
+    state.removeChild (state.getChildWithName ("REFPARK"), nullptr);
+    {
+        juce::ValueTree rp ("REFPARK");
+        rp.setProperty ("manualA", manualRefA, nullptr);
+        rp.setProperty ("mtsOwns", mtsHadRef,  nullptr);
+        state.appendChild (rp, nullptr);
+    }
+
     state.removeChild (state.getChildWithName ("TIMBRE"), nullptr);
     if (timbreSource.isNotEmpty()) // kept even while switched OFF (On/Off toggle)
     {
@@ -3429,6 +4848,31 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
         juce::ValueTree pg ("PGAINS");
         pg.setProperty ("v", packed.trim(), nullptr);
         state.appendChild (pg, nullptr);
+    }
+
+    // THE FROZEN SLOPE, which belongs to the drawing above and was travelling nowhere.
+    //
+    // While manual per-partial amplitudes are on, currentSettings() compiles the template at
+    // manualSlopeFrozen instead of at the fader - the amplitudes are the user's drawing, and
+    // the slope the drawing started from is what makes switching manual on inaudible. It is
+    // refreshed on exactly ONE event, the moment manual goes on (timerCallback, and the two
+    // paths that arm manual themselves). Nothing refreshes it on a state load, so a patch
+    // that arrives with manual ALREADY on compiled at whatever the PREVIOUS patch happened
+    // to leave here - this instance's 1.0 default on a fresh instrument, or the last thing
+    // anyone drew in this session.
+    //
+    // That is not cosmetic. The amplitude floor culls by an amplitude that depends on slope:
+    // at -120 dB it removes everything above ratio 10^(6/s), which is nothing at slope 1 and
+    // everything above ratio ~32 at slope 4 (see currentSettings). Load a slope-4 patch and
+    // the template physically lacks the partials the drawing was made on, so the user's own
+    // edits up there stop applying - their work dropped, silently, by a number that came
+    // from a different patch. That is this project's cardinal sin, so the number rides with
+    // the patch.
+    state.removeChild (state.getChildWithName ("MANUALAMP"), nullptr);
+    {
+        juce::ValueTree ma ("MANUALAMP");
+        ma.setProperty ("slope", manualSlopeFrozen, nullptr);
+        state.appendChild (ma, nullptr);
     }
 
     state.removeChild (state.getChildWithName ("BANK"), nullptr);
@@ -3523,21 +4967,101 @@ juce::ValueTree FractalAdditiveAudioProcessor::captureState()
     state.removeChild (state.getChildWithName ("REALTIME"), nullptr);
     state.appendChild (realtimeSettingsToTree(), nullptr);
 
-    // THE PLAYGROUND: which preset is on which corner. Only the NAMES - the corners are
-    // presets in their own right and re-reading the files on load is what keeps a corner
-    // in step with the preset it points at (and stops a project file carrying four whole
-    // copies of other presets around). pgX/pgY are ordinary parameters and are already in
-    // the tree above.
+    // THE PLAYGROUND: which preset is on which corner, AND THE PRESETS THEMSELVES. This used
+    // to store only the NAMES, on purpose, so a corner would follow later edits of its file and
+    // a project would not carry four copies of other presets. The price was that nothing made
+    // with the pad could leave this computer: on another one - or here, after a preset was
+    // renamed or deleted - its corners came back empty. The user asked for the opposite
+    // ("polypresets ... para poder ser trasladados a otro pc facilmente", 2026-09-15), so a
+    // saved pad now carries a copy of every corner's preset (see playgroundChildForState).
+    // Four copies are ~60 KB of XML. pgX/pgY are ordinary parameters, already in the tree above.
     state.removeChild (state.getChildWithName ("PLAYGROUND"), nullptr);
     if (getPlaygroundAssignedCount() > 0)
-    {
-        juce::ValueTree pg ("PLAYGROUND");
-        for (int i = 0; i < kPlaygroundCorners; ++i)
-            if (pgCorner[(size_t) i].assigned())
-                pg.setProperty ("c" + juce::String (i), pgCorner[(size_t) i].name, nullptr);
-        state.appendChild (pg, nullptr);
-    }
+        state.appendChild (playgroundChildForState(), nullptr);
     return state;
+}
+
+juce::ValueTree FractalAdditiveAudioProcessor::cornerTreeForSaving (const PlaygroundCorner& c)
+{
+    // A COPY, always: `source` is shared with every undo step holding this corner.
+    auto t = c.source.isValid() ? c.source.createCopy() : juce::ValueTree (apvts.state.getType());
+    if (! c.edited)
+        return t;   // exactly the preset it was built from
+
+    // AN UNSAVED EDIT (the "*") IS SAVED AS IT SOUNDS. Before, a corner's edits lived only in
+    // memory and a reload brought back the file. Written over the copy, so everything a corner
+    // does not edit (routing, realtime settings, the rest of the .gsting) stays the preset's.
+    //
+    // EXCEPT AN ADAPTIVE CORNER'S SPECTRUM. Its Custom Engine text, partial edits and the two
+    // switches are whatever the chord follower last put there (applyCornerAdaptResult), with
+    // the amplitude shaping baked only into the compiled template - saved, they would reload
+    // as a spectrum the corner never had, and the preset's own would be gone from the file.
+    // The follower makes that spectrum again from the chord, so the copy keeps the preset's.
+    const bool adaptive = c.rtLink == (int) RtLink::SpectrumFromChord;
+    const auto& all = getParameters();
+    for (int i = 0; i < all.size() && (size_t) i < c.params.size(); ++i)
+        if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]))
+        {
+            if (adaptive && (p->paramID == "timbreOn" || p->paramID == "partialManual"))
+                continue;
+            auto child = t.getChildWithProperty ("id", p->paramID);
+            if (! child.isValid())
+            {
+                child = juce::ValueTree ("PARAM");
+                child.setProperty ("id", p->paramID, nullptr);
+                t.appendChild (child, nullptr);
+            }
+            child.setProperty ("value", (double) c.params[(size_t) i], nullptr);
+        }
+    if (adaptive)
+        return t;   // the preset's own TIMBRE and PGAINS stay (see above)
+    t.removeChild (t.getChildWithName ("TIMBRE"), nullptr);
+    if (c.timbreSource.isNotEmpty())
+    {
+        juce::ValueTree tim ("TIMBRE");
+        tim.setProperty ("name",   c.timbreName,   nullptr);
+        tim.setProperty ("source", c.timbreSource, nullptr);
+        double on = 1.0;
+        tim.setProperty ("on", c.value (paramIndexOf ("timbreOn"), on) ? on > 0.5 : true, nullptr);
+        if (c.provName.isNotEmpty())
+        {
+            tim.setProperty ("provName",   c.provName,   nullptr);
+            tim.setProperty ("provSource", c.provSource, nullptr);
+            tim.setProperty ("provPeriod", c.provPeriod, nullptr);
+        }
+        t.appendChild (tim, nullptr);
+    }
+    t.removeChild (t.getChildWithName ("PGAINS"), nullptr);
+    if (! c.gains.empty())
+    {
+        juce::String packed;   // the format captureState writes and the assign reads back
+        for (const auto& g : c.gains)
+            packed << g.key << ':' << juce::String (g.dB, 3) << ' ';
+        juce::ValueTree pg ("PGAINS");
+        pg.setProperty ("v", packed.trim(), nullptr);
+        t.appendChild (pg, nullptr);
+    }
+    return t;
+}
+
+juce::ValueTree FractalAdditiveAudioProcessor::playgroundChildForState()
+{
+    juce::ValueTree pg ("PLAYGROUND");
+    for (int i = 0; i < kPlaygroundCorners; ++i)
+    {
+        const auto& c = pgCorner[(size_t) i];
+        if (! c.assigned()) continue;
+        // The name stays where older builds look for it, so a file saved here still opens
+        // there - by name, from the folder, as it always did.
+        pg.setProperty ("c" + juce::String (i), c.name, nullptr);
+        juce::ValueTree cn ("CORNER");
+        cn.setProperty ("i", i, nullptr);
+        cn.setProperty ("name", c.name, nullptr);
+        if (c.edited) cn.setProperty ("edited", true, nullptr);
+        cn.appendChild (cornerTreeForSaving (c), nullptr);
+        pg.appendChild (cn, nullptr);
+    }
+    return pg;
 }
 
 juce::ValueTree FractalAdditiveAudioProcessor::realtimeSettingsToTree() const
@@ -3558,7 +5082,8 @@ juce::ValueTree FractalAdditiveAudioProcessor::realtimeSettingsToTree() const
     rt.setProperty ("aLo",     rtSet.adapt.rangeLo,     nullptr);
     rt.setProperty ("aHi",     rtSet.adapt.rangeHi,     nullptr);
     rt.setProperty ("aAmps",   rtSet.adapt.shapeAmps,   nullptr);
-    rt.setProperty ("aSteps",  rtSet.adapt.regSteps,    nullptr);
+    rt.setProperty ("aPer",    rtSet.adapt.regPeriods,  nullptr);
+    rt.setProperty ("look",    rtSet.lookahead,         nullptr);
     return rt;
 }
 
@@ -3581,7 +5106,22 @@ FractalAdditiveAudioProcessor::realtimeSettingsFromTree (const juce::ValueTree& 
     s.adapt.rangeLo     = (double) rt.getProperty ("aLo",     s.adapt.rangeLo);
     s.adapt.rangeHi     = (double) rt.getProperty ("aHi",     s.adapt.rangeHi);
     s.adapt.shapeAmps   = (bool)   rt.getProperty ("aAmps",   s.adapt.shapeAmps);
-    s.adapt.regSteps    = (int)    rt.getProperty ("aSteps",  s.adapt.regSteps);
+    // THE WIDTH, and the one property in this tree that changed UNIT. Projects saved
+    // before the band became symmetric carry "aSteps": N degrees of the loaded tuning,
+    // running UPWARD from the anchor and nothing below it. Ignoring it would silently
+    // widen every old project to the default; carrying the number across as if it were
+    // periods would widen it by the degree count. It is converted so the TOTAL WIDTH is
+    // preserved and re-centred on the played note - N steps up becomes N/(2D) periods each
+    // way, which is exactly what the new default is to the old one (2 periods up -> +-1).
+    if (rt.hasProperty ("aPer"))
+        s.adapt.regPeriods = (double) rt.getProperty ("aPer", s.adapt.regPeriods);
+    else if (rt.hasProperty ("aSteps"))
+    {
+        const int steps = (int) rt.getProperty ("aSteps", -1);
+        s.adapt.regPeriods = steps < 0 ? -1.0
+                                       : (double) steps / (2.0 * (double) juce::jmax (1, getScaleDegrees()));
+    }
+    s.lookahead         = (bool)   rt.getProperty ("look",    s.lookahead);
     return s;
 }
 
@@ -3599,37 +5139,181 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     // The one-shot MTS adoption must not second-guess it.
     mtsCheckPending = false;
 
+    // THE PRESET'S TUNING ON OFFER BELONGS TO THE PRESET THAT IS LOADED, and after this
+    // line that is no longer the one it came from. Nothing ever cleared these three
+    // fields, so "Load preset's tuning" went on offering the LAST preset's scale across a
+    // project load, a host reopening the session, and every state change after it - a
+    // button naming a scale from a preset this instrument is no longer playing, which on
+    // a press would replace the reopened project's own tuning with it.
+    //
+    // The ORDER is the whole trick, and the obvious version of this fix is backwards:
+    // loadPreset used to fill these fields and THEN call this function, so clearing here
+    // would have disabled the offer outright, for every preset, for ever. loadPreset now
+    // reads the preset's SCALA child AFTER restoreState instead - see the note there.
+    presetPendingSclName.clear();
+    presetPendingSclSource.clear();
+    presetPendingTablePeriod.clear();
+
+    // THE PARKED FAILURES DESCRIBE THE LOAD THAT MADE THEM, and this is a new load. Never
+    // cleared here, a failure from an earlier restore survived any number of later successful
+    // ones (the editor's timer only drains them while a window exists) and was then shown as
+    // the present state - "these corners are EMPTY now" about corners this load filled, a
+    // corner listed twice, a HARMONIC-engine notice over a spectrum that came back (night
+    // review; tuningRestoreError had the same flaw before tonight).
+    pgRestoreLoss.clear();
+    timbreRestoreError.clear();
+    tuningRestoreError.clear();
+    lastReportedBadCornerTimbre.clear();
+
+    // WHICH <PARAM> CHILDREN THE CHUNK ITSELF CARRIES, asked HERE and not one line later.
+    // apvts.replaceState does `state = newState`, and a juce::ValueTree assignment shares
+    // the same reference-counted object rather than copying it - so from the next line on,
+    // `tree` IS apvts.state. Its reconnect pass (updateParameterConnectionsToChildTrees)
+    // then APPENDS a child for every parameter the chunk was missing, which means asking
+    // `tree` afterwards whether a child is absent always answers "no, it is there". The
+    // absence of a child is the only evidence that a chunk predates a parameter, and it
+    // survives exactly until replaceState runs.
+    const bool chunkHasNoDryWet = ! tree.getChildWithProperty ("id", "dryWet").isValid();
+
+    // THE SAME TRAP, ONE PARAMETER YOUNGER: the PRIME CONTROL switch (ce29433). Read on
+    // this line and not below for exactly the reason written above - the absence of the
+    // child is the whole evidence, and replaceState is what manufactures the child.
+    const bool chunkHasNoPrimeOn = ! tree.getChildWithProperty ("id", "primeOn").isValid();
+
+    // THE SAME TRAP, ONE PARAMETER OLDER - and the reason this block had to move up here.
+    // A state saved before the Harmonics fader existed (98a66ed) is recognised ONLY by the
+    // absence of a "harmonics" child, and that evidence dies on the replaceState line below
+    // for exactly the reason written above. The migration that reads it used to sit AFTER
+    // replaceState, where the question always answered "no, the child is there", so it had
+    // never run once since the day it was written - and the projects it exists for have
+    // been opening on the WRONG PRIME LIMIT ever since. See the migration itself for what
+    // that costs and for the one window it deliberately does not cover.
+    //
+    // The two legacy NUMBERS are snapshotted here as well, not re-read afterwards. Reading
+    // them later happens to work today (the reconnect pass leaves an existing child's value
+    // alone and flushes the identical number straight back), but that is an accident of the
+    // old and new ranges coinciding; taken here, the migration is reading THE CHUNK, which
+    // is the only thing it was ever about.
+    const bool chunkPredatesHarmonics = ! tree.getChildWithProperty ("id", "harmonics").isValid();
+    bool legacyHasSelection = false, legacyHasPrimeLimit = false;
+    int  legacySelectionIdx = 0,     legacyPrimeLimitIdx = 0;
+    if (chunkPredatesHarmonics)
+    {
+        const auto sel = tree.getChildWithProperty ("id", "selection");
+        const auto pl  = tree.getChildWithProperty ("id", "primeLimit");
+        legacyHasSelection  = sel.isValid();
+        legacyHasPrimeLimit = pl .isValid();
+        legacySelectionIdx  = juce::jlimit (0, 3, (int) (double) sel.getProperty ("value", 0.0));
+        legacyPrimeLimitIdx = juce::jlimit (0, 9, (int) (double) pl .getProperty ("value", 0.0));
+    }
+
     // Unmap BEFORE replaceState: replaceState's internal flush must not capture
     // base+mod for the OLD routings into the fresh tree.
     for (int m = 0; m < ModEngine::kMods; ++m) modEngine.unmapAll (m);
     apvts.replaceState (tree);
 
-    // A state saved BEFORE the Harmonics fader existed needs two migrations (the
-    // absence of a "harmonics" child is what marks it as old).
-    if (! tree.getChildWithProperty ("id", "harmonics").isValid())
+    // A state saved BEFORE the Harmonics fader existed needs two migrations. The evidence
+    // (chunkPredatesHarmonics and the two legacy indices) was read above replaceState,
+    // because by this line the chunk and apvts.state are the same object and every child
+    // the chunk was missing has been appended to it.
+    //
+    // WHAT THESE PROJECTS OPEN AS WITHOUT THIS BLOCK, which is why it is worth reviving
+    // rather than deleting:
+    //   primeLimit  The old chunk DOES carry a child for it, so replaceState applies its
+    //               number verbatim - and that number is an index into an order that has
+    //               since been REVERSED (09c47e9). Saved "23", the mildest limit, was
+    //               index 9 and comes back as index 9 in today's order, which is limit 2:
+    //               everything but the powers of two silently gone. Saved "2", the
+    //               harshest, comes back as 23, i.e. no filtering at all. Only "Off"
+    //               survives, because 0 is 0 in both orders. A patch reopening with most
+    //               of its spectrum removed and nothing on screen to say so is the exact
+    //               failure this synth must not have.
+    //   harmonics   No child at all, so the reconnect pass appends a valueless <PARAM> for
+    //               it, that append fires valueTreeChildAdded -> setNewState, and with no
+    //               "value" property to read setNewState writes the DEFAULT. The fader
+    //               lands on All whatever it held a moment earlier, so the saved
+    //               Even/Odd/Prime choice is thrown away - on a fresh instance and equally
+    //               on a running plugin fed an old preset.
+    // Both migrations were re-checked against the parameters as they exist today, not as
+    // they existed when they were written: the old Choice really did list
+    // {All,Even,Odd,Prime} and {Off,2,3,5..23} (a7eaa51), APVTS stores a Choice as its
+    // denormalised INDEX, and the maps below still land on the current enum and the
+    // current 0..9 fader.
+    //
+    // THE WINDOW THIS DOES NOT COVER, said out loud rather than papered over: the prime
+    // reorder shipped in 09c47e9, SIX HOURS AFTER the harmonics fader in 98a66ed. A chunk
+    // written in between carries a harmonics child AND the old ascending prime order, so
+    // the gate skips it and it still opens on the reversed limit. Nothing in such a chunk
+    // distinguishes it from one written today, and guessing would corrupt CURRENT projects
+    // to rescue that window - so it is left alone on purpose.
+    if (chunkPredatesHarmonics)
     {
         // 1. The "selection" choice (0=All 1=Even 2=Odd 3=Prime) -> the continuous
         //    Harmonics axis (0=Even 1=All 2=Odd 3=Prime).
-        if (auto legacy = tree.getChildWithProperty ("id", "selection"); legacy.isValid())
+        if (legacyHasSelection)
         {
             static const float map[4] = { (float) spectrum::All, (float) spectrum::Even,
                                           (float) spectrum::Odd, (float) spectrum::Prime };
-            const int idx = juce::jlimit (0, 3, (int) (double) legacy.getProperty ("value", 0.0));
             if (auto* p = apvts.getParameter ("harmonics"))
-                p->setValueNotifyingHost (p->convertTo0to1 (map[idx]));
+                p->setValueNotifyingHost (p->convertTo0to1 (map[legacySelectionIdx]));
         }
         // 2. Prime Limit was listed ascending (Off,2,3,5..23); it now runs the other
         //    way (Off,23,19..2) so raising the fader always filters MORE.
-        if (auto legacy = tree.getChildWithProperty ("id", "primeLimit"); legacy.isValid())
+        if (legacyHasPrimeLimit)
         {
             static const int oldOrder[10] = { 0, 2, 3, 5, 7, 11, 13, 17, 19, 23 };
-            const int oldIdx = juce::jlimit (0, 9, (int) (double) legacy.getProperty ("value", 0.0));
             int newIdx = 0;
-            for (int i = 0; i < 10; ++i) if (primeLimitValues[i] == oldOrder[oldIdx]) { newIdx = i; break; }
+            for (int i = 0; i < 10; ++i)
+                if (primeLimitValues[i] == oldOrder[legacyPrimeLimitIdx]) { newIdx = i; break; }
             if (auto* p = apvts.getParameter ("primeLimit"))
                 p->setValueNotifyingHost (p->convertTo0to1 ((float) newIdx));
         }
     }
+
+    // A state saved BEFORE the Dry/Wet transition existed (it shipped in bf0f768) has no
+    // "dryWet" child, and that flag now DEFAULTS TO ON because the panel's one TRANSITION
+    // question defaults to Dry/Wet. A parameter whose child is absent comes back at its
+    // DEFAULT - the reconnect pass appends a valueless <PARAM>, and the append fires
+    // valueTreeChildAdded -> setNewState, which with no "value" to read writes the default
+    // (measured, see the Harmonics migration above) - so without this line every project
+    // older than that commit would reopen with a 0.3 s crossfade under every spectrum
+    // change, on a patch whose author never had the control at all. The missing child IS the evidence: the
+    // build that wrote it could only be instant, so instant is what it must come back as.
+    // (Read into chunkHasNoDryWet above replaceState - see the note there for why asking
+    // `tree` at this point would always answer "the child is present".)
+    if (chunkHasNoDryWet)
+        if (auto* p = apvts.getParameter ("dryWet"))
+            p->setValueNotifyingHost (0.0f);
+
+    // AND THE PRIME CONTROL SWITCH, which is the same migration pointing the other way.
+    // "primeOn" shipped in ce29433 and DEFAULTS TO OFF, on purpose and with a measurement
+    // behind it: whitelist mode has no neutral position (ticking all nine primes still
+    // drops harmonic 29, whose factor nobody can tick), and with the bypass removed the
+    // DEFAULT patch built 375 partials instead of 1024. Off is therefore the only honest
+    // default for a patch that never had the control.
+    //
+    // It is the WRONG value for every project written before the switch existed. There,
+    // prime filtering was UNCONDITIONAL - whatever the Limit fader and the nine ticks said
+    // is exactly what the spectrum was, and it is what the user tuned the sound to. Absent
+    // this line those projects reopen with the panel OFF, which PUTS BACK every harmonic
+    // the user deliberately removed: a 5-limit patch comes back with its 7ths, 11ths and
+    // 13ths audible, on a spectrum nobody re-edited, with no dialog and nothing on screen
+    // to say the filter the patch was built around is no longer running. The dryWet line
+    // above and the prime-limit reorder above that are the same failure; this one differs
+    // only in direction - it ADDS partials rather than removing them, so it is heard as a
+    // timbre that has grown teeth rather than as one that went quiet.
+    //
+    // The missing child IS the evidence, and it is decisive: a build that had no switch
+    // could only filter, so filtering is what it must come back as.
+    //
+    // primeMode gets no line of its own, and that is checked rather than assumed. It has
+    // existed since a7eaa51 (the initial commit), so every chunk this migration can ever
+    // see carries its own <PARAM> for it and replaceState applies the saved choice
+    // verbatim. The 0 -> 1 default flip that rode along in ce29433 can only reach a chunk
+    // that predates the PARAMETER, and there is no such chunk.
+    if (chunkHasNoPrimeOn)
+        if (auto* p = apvts.getParameter ("primeOn"))
+            p->setValueNotifyingHost (1.0f);
 
     if (auto ms = tree.getChildWithName ("MODS"); ms.isValid())
     {
@@ -3711,6 +5395,29 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
                        [] (const spectrum::PartialGain& a, const spectrum::PartialGain& b)
                        { return a.key < b.key; });
         }
+        // THE SLOPE THE DRAWING WAS MADE AT comes back with it (see captureState for what
+        // was being dropped without this). Restored HERE, beside the edits it belongs to
+        // and before the rebuild request below, so the first template this project compiles
+        // is already the right one rather than a corrected second attempt.
+        //
+        // lastManualMode is put in step in the same breath, and that is load-bearing rather
+        // than tidy: leaving it stale makes timerCallback see a mode TRANSITION on its very
+        // next tick and re-freeze the slope at the fader's current value - which is exactly
+        // the number this line is restoring away from, arriving 16 ms later and undoing it.
+        // Nothing is lost by pre-empting that branch: its other half, the setPartialGains
+        // push that tells the engine whether the edits are in force, is the statement below.
+        //
+        // A chunk that predates this child falls back to the patch's OWN curveSlope, which
+        // replaceState has just restored. That is what the fader reads, it is what the patch
+        // was drawn against, and it is the only slope the file contains - the previous
+        // patch's is not a candidate under any reading.
+        {
+            const auto ma = tree.getChildWithName ("MANUALAMP");
+            manualSlopeFrozen = (float) (double) ma.getProperty ("slope",
+                                    (double) apvts.getRawParameterValue ("curveSlope")->load());
+            lastManualMode = apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+        }
+
         // Through setPartialGains, not the engine directly, so the revision counter is
         // bumped: an open amplitude window would otherwise keep showing the PREVIOUS
         // project's knob positions after a reload (its resync watches that counter).
@@ -3731,16 +5438,59 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
                 bankSource[(size_t) i] = slot.getProperty ("source").toString();
             }
         }
-    lastBankSlot = getTuningBankSlotParam(); // don't re-load on restore; state's SCALA already has it
+    // Don't re-load on restore; the state's SCALA child already carries the tuning. The
+    // whole "already applied" record is primed, not just the index - a restored instance
+    // has attempted nothing and failed at nothing, so the retry test above must not find a
+    // stale failure from this instance's previous life pointing at the new project's slot.
+    lastBankSlot   = getTuningBankSlotParam();
+    lastBankSource = (lastBankSlot >= 1 && lastBankSlot <= kBankSlots)
+                   ? bankSource[(size_t) (lastBankSlot - 1)] : juce::String();
+    lastBankFailed = false;
+
+    // THE PARKED HAND-SET REFERENCE (see captureState for what it is and what was losing
+    // it). Read here, after replaceState so refA below is the RESTORED one, and before the
+    // first timerCallback: that poll hands manualRefA back to refA the moment MTS is not
+    // the mode, so by then it has to hold the user's own number rather than this instance's
+    // 440 default.
+    //
+    // A chunk that predates this carries neither property, and the fallback is the only
+    // reference such a file has: refA itself, which replaceState has just restored. A
+    // project saved OUTSIDE MTS therefore parks its own value (correct, and what leaving a
+    // mode it was never in would hand back anyway); one saved INSIDE MTS parks the master's,
+    // which is exactly what those projects do today - unchanged, not made worse.
+    {
+        const auto rp = tree.getChildWithName ("REFPARK");
+        manualRefA = (float) (double) rp.getProperty ("manualA",
+                         (double) apvts.getRawParameterValue ("refA")->load());
+        mtsHadRef  = (bool) rp.getProperty ("mtsOwns", false);
+    }
 
     if (auto scl = tree.getChildWithName ("SCALA"); scl.isValid())
     {
         juce::String err;
         // restoreTuning (not loadScalaString): the source may be .tun text holding an
         // absolute 128-key table, and it carries the table's chosen period with it.
-        tuning.restoreTuning ({ scl.getProperty ("name").toString(),
-                                scl.getProperty ("source").toString(),
-                                scl.getProperty ("tablePeriod").toString() }, err);
+        const auto savedName = scl.getProperty ("name").toString();
+        if (! tuning.restoreTuning ({ savedName,
+                                      scl.getProperty ("source").toString(),
+                                      scl.getProperty ("tablePeriod").toString() }, err))
+        {
+            // A PROJECT THAT LOSES ITS SCALE SAYS SO. `err` was filled in by the parser
+            // and thrown away on the next line, so a project saved in 31-EDO whose stored
+            // scale text no longer parses reopened playing 12-tone equal temperament -
+            // silently, with no dialog and nothing on screen to say the instrument is not
+            // in the tuning the project was written in. For a microtonal instrument that
+            // is the worst possible quiet failure: everything still sounds, and it sounds
+            // wrong.
+            //
+            // Kept on the processor rather than shown from here, because setStateInformation
+            // runs on a load thread with no editor guaranteed to exist. The editor picks it
+            // up on its next tick and puts it in the notice overlay it already has for
+            // exactly this kind of "something did not go as asked" message.
+            tuningRestoreError = savedName.isNotEmpty()
+                               ? savedName + " \xe2\x80\x94 " + err
+                               : err;
+        }
     }
     else
     {
@@ -3766,8 +5516,24 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
         }
         else if (src.isNotEmpty()) // typed intervals (Spectrum Builder)
         {
-            loadTimbreText (src, err);
+            juce::String textErr;
+            loadTimbreText (src, textErr);
             setTimbreOnParam ((bool) tim.getProperty ("on", true) && ! timbreDegrees.empty());
+            // A SPECTRUM THAT DID NOT COME BACK IS STATED. The bool was dropped here and the
+            // patch quietly played the HARMONIC engine instead of the one it was saved
+            // with. Parked like tuningRestoreError (this runs on a load thread, maybe with
+            // no editor at all), with the parser's own words - they name the bad token.
+            //
+            // ONLY WHEN THE PATCH HAD THE ENGINE ON: a patch saved with it off never played this
+            // spectrum, so nothing it sounded like was lost, and "not the sound that was saved"
+            // would be false. And a file NAMED as a scale (not "typed") failed the SCALA parser
+            // first - that parser's words describe what is wrong with it, not the typed-interval
+            // grammar's (both from the night review).
+            if (timbreDegrees.empty() && (bool) tim.getProperty ("on", true))
+                timbreRestoreError = (name != "typed" && err.isNotEmpty())
+                                       ? err
+                                       : (textErr.isNotEmpty() ? textErr
+                                                               : (err.isNotEmpty() ? err : juce::String ("Invalid value.")));
         }
         // Provenance LAST: both load paths above clear it (they cannot tell a saved
         // adaptation from hand-typed text), and only the state knows the difference.
@@ -3785,10 +5551,44 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     // follower down, and doing it the other way round would arm a follower and then
     // immediately suspend it, losing the arming the file actually carried.
     //
-    // The corners are re-read from their .gsting files by name. A corner whose preset has
-    // been renamed or deleted comes back EMPTY rather than silently substituting
-    // something else - a playground quietly morphing towards a preset the user never
-    // chose is worse than one that visibly lost a corner.
+    // THE COPY A STATE CARRIES WINS (since 2026-09-15): a corner is rebuilt from the preset
+    // saved inside the state, whatever the preset folder holds now - the only rule under which
+    // a pad sounds the same on another computer, and under which a preset renamed, deleted or
+    // re-saved here cannot change a project made with it. Only a state saved by an older build,
+    // which has names and no copies, still reads the folder by name - and a corner whose preset
+    // is not there comes back EMPTY and is reported, never silently substituted.
+    //
+    // AND THE CORNER-EDIT SESSION GOES WITH THEM, which is not tidiness - it is what stops
+    // the patch that was just loaded from being overwritten about sixteen milliseconds
+    // later. A corner-edit session holds pgEditLiveState: the WHOLE live patch, frozen at
+    // the moment edit mode was entered, to be handed back when it ends (see rule 1 above
+    // beginPlaygroundCornerEdit). restoreState never mentioned it, so with the corner-edit
+    // window open one click on "Load its original spectrum" - or a project reload, or any
+    // other preset load - left the session standing over a patch that no longer existed.
+    // The corners reset on the line below then make pgActive false, drivePlayground's very
+    // next tick takes the "the playground let go" branch and calls endPlaygroundCornerEdit(),
+    // and that writes the PRE-EDIT patch back parameter by parameter. The user loads a
+    // preset, hears it, and it is silently replaced by the one they had before, with no
+    // click of their own in between.
+    //
+    // A PLAIN RESET, deliberately NOT a call to endPlaygroundCornerEdit(). That function's
+    // entire job is to hand the frozen live patch back - which is precisely the write that
+    // must not happen here, because the patch this instrument should be holding is the one
+    // in `tree`, already applied by replaceState above. It also unwinds the undo stack and
+    // mints a corner-edit step, neither of which belongs to a state load. So the session is
+    // simply forgotten: every field back to what a fresh instance has.
+    pgEditCorner         = -1;
+    pgEditLiveState      = {};
+    pgEditLiveX          = 0.0f;
+    pgEditLiveY          = 0.0f;
+    pgEditLivePresetName = {};
+    pgEditLivePresetSnap.clear();
+    pgEditCompilePending = false;
+    pgEditPrimed         = false;
+    pgEditTick           = 0;
+    pgEditCornerBefore   = {};
+    pgEditStackDepth     = 0;
+    pgEditUnwound        = false;
     for (int i = 0; i < kPlaygroundCorners; ++i)
         pgCorner[(size_t) i] = PlaygroundCorner{};
     pgActive = false; pgWinner = -1; pgRtSuspended = false; pgSuspendedRt = RtLink::Off;
@@ -3802,15 +5602,44 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
     if (auto pg = tree.getChildWithName ("PLAYGROUND"); pg.isValid())
         for (int i = 0; i < kPlaygroundCorners; ++i)
         {
-            const auto n = pg.getProperty ("c" + juce::String (i)).toString();
-            if (n.isNotEmpty()) { juce::String err; assignPlaygroundCorner (i, n, err); }
+            auto n = pg.getProperty ("c" + juce::String (i)).toString();
+            juce::ValueTree embedded;
+            for (auto child : pg)   // matched by the int, not by getChildWithProperty: an XML attribute reads back as a string
+                if (child.hasType ("CORNER") && (int) child.getProperty ("i", -1) == i) { embedded = child; break; }
+
+            juce::String err;
+            if (embedded.isValid())
+            {
+                if (n.isEmpty()) n = embedded.getProperty ("name").toString();
+                if (n.isEmpty()) n = "?";
+                const auto copy = embedded.getChild (0);
+                const bool usable = copy.isValid() && copy.hasType (apvts.state.getType());
+                if (assignPlaygroundCornerFromTree (i, n, copy,
+                                                    usable ? juce::String()
+                                                           : juce::String ("The copy of this preset saved inside the file is damaged."),
+                                                    err))
+                    pgCorner[(size_t) i].edited = (bool) embedded.getProperty ("edited", false);
+                else
+                    pgRestoreLoss.push_back ({ i, n, err });
+            }
+            else if (n.isNotEmpty())
+            {
+                // A STATE FROM AN OLDER BUILD: names only, read from the folder. The bool used
+                // to be dropped here, and the corner was left EMPTY with nothing saying why.
+                if (! assignPlaygroundCorner (i, n, err))
+                    pgRestoreLoss.push_back ({ i, n, err.isNotEmpty() ? err
+                                                                      : juce::String ("That preset could not be read.") });
+            }
         }
     refreshPlaygroundActive();
 
     // The realtime/adaptive link travels with the patch (see captureState). Restored
-    // through setRealtimeLink so it takes its own undo baseline exactly as pressing the
-    // button would - a follower armed by a preset must be as reversible as one armed by
-    // hand. An absent child means the state predates this and the follower stays off.
+    // through restoreRealtimeLink so it takes its own undo baseline exactly as pressing
+    // the button would - a follower armed by a preset must be as reversible as one armed
+    // by hand - but WITHOUT minting the leaving-step onto the undo history replaceState
+    // has just cleared, and re-arming even when the mode has not changed. Both halves are
+    // written out at that function. An absent child means the state predates this and the
+    // follower stays off.
     {
         const auto rtTree = tree.getChildWithName ("REALTIME");
         const auto s = realtimeSettingsFromTree (rtTree);
@@ -3822,11 +5651,11 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
             rtSet = s;
             pgSuspendedRt = want;
             pgRtSuspended = true;
-            setRealtimeLink (RtLink::Off, s);
+            restoreRealtimeLink (RtLink::Off, s);
         }
         else
         {
-            setRealtimeLink (want, s);
+            restoreRealtimeLink (want, s);
         }
     }
 
@@ -3842,6 +5671,21 @@ void FractalAdditiveAudioProcessor::restoreState (const juce::ValueTree& tree)
 
 void FractalAdditiveAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
+    // CORNER EDIT, rule 2: while the controls are standing in for a playground corner,
+    // captureState() describes THAT CORNER, not this instrument's patch. Saving it here
+    // would make a project reopened mid-edit come back as somebody's corner, with the
+    // user's own sound gone - so the frozen live patch is what the host is handed. The
+    // corner assignments are re-stamped onto it because those CAN change while editing.
+    if (pgEditCorner >= 0 && pgEditLiveState.isValid())
+    {
+        auto live = pgEditLiveState.createCopy();
+        live.removeChild (live.getChildWithName ("PLAYGROUND"), nullptr);
+        if (getPlaygroundAssignedCount() > 0)
+            live.appendChild (playgroundChildForState(), nullptr);   // with the copies, as captureState
+        if (auto xml = live.createXml())
+            copyXmlToBinary (*xml, destData);
+        return;
+    }
     if (auto xml = captureState().createXml())
         copyXmlToBinary (*xml, destData);
 }
@@ -3868,8 +5712,21 @@ void FractalAdditiveAudioProcessor::setStateInformation (const void* data, int s
 // File presets (.gsting XML). User presets live in Documents/Galactic Sting/Presets;
 // factory presets shipped in a "Presets" folder next to the binary are copied in on
 // first run so they "come with the download".
+// TESTS ONLY (see the header). Never written outside a verifier: production reads it
+// once per call and finds it empty.
+static juce::File presetFolderOverrideForTests;
+
+void FractalAdditiveAudioProcessor::setPresetFolderForTests (const juce::File& dir)
+{
+    presetFolderOverrideForTests = dir;
+    if (dir != juce::File()) dir.createDirectory();
+}
+
 juce::File FractalAdditiveAudioProcessor::getPresetFolder()
 {
+    if (presetFolderOverrideForTests != juce::File())
+        return presetFolderOverrideForTests;
+
     auto dir = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
                    .getChildFile ("Galactic Sting").getChildFile ("Presets");
     if (! dir.exists())
@@ -3879,16 +5736,111 @@ juce::File FractalAdditiveAudioProcessor::getPresetFolder()
         auto factory = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
                            .getParentDirectory().getChildFile ("Presets");
         if (factory.isDirectory())
-            for (const auto& f : factory.findChildFiles (juce::File::findFiles, false, "*.gsting"))
+            for (const auto& f : factory.findChildFiles (juce::File::findFiles, false, juce::String ("*") + kPresetExt))
                 f.copyFileTo (dir.getChildFile (f.getFileName()));
     }
     return dir;
 }
 
+//==============================================================================
+// THE BUNDLED TUNINGS, UNPACKED ONTO REAL DISK.
+//
+// Same shape as presetFolderOverrideForTests above, and for the identical reason: the
+// production value of this is a folder in the user's Documents, and a verifier that
+// used it would write six files into it on every run. RhythmVerify redirects it before
+// it builds anything.
+static juce::File tuningsFolderOverrideForTests;
+
+void FractalAdditiveAudioProcessor::setTuningsFolderForTests (const juce::File& dir)
+{
+    tuningsFolderOverrideForTests = dir;
+    if (dir != juce::File()) dir.createDirectory();
+}
+
+juce::File FractalAdditiveAudioProcessor::getTuningsFolder()
+{
+    auto dir = tuningsFolderOverrideForTests != juce::File()
+                 ? tuningsFolderOverrideForTests
+                 : juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                       .getChildFile ("Galactic Sting").getChildFile ("Tunings");
+    dir.createDirectory(); // a no-op that returns ok when it is already there
+
+    // WRITE ONLY WHAT IS NOT THERE. This runs every single time the chooser opens, so
+    // it has to be idempotent, and it has to be idempotent in the STRONG sense: a user
+    // who edited 31ed2.tun - retuned one degree, changed the reference, deleted a file
+    // they never use - must find their own version next time, not ours. So the only
+    // write here is a CREATE. "Restore the factory tunings" is a thing a menu item
+    // could offer later; it is not something the file chooser gets to do behind them.
+    //
+    // The resources are found by walking namedResourceList and asking each one for its
+    // ORIGINAL filename, rather than by naming the generated symbols. Those names are
+    // not guessable and not stable: JUCE builds an identifier out of the filename by
+    // DROPPING the characters that cannot appear in one and turning the dot into an
+    // underscore, then prefixes "_" when the result starts with a digit. Measured on
+    // this build - "harmonic-series-8-16.tun" becomes harmonicseries816_tun (the hyphens
+    // vanish, they do not become underscores) and "7ed2.tun" becomes _7ed2_tun. Six
+    // hand-copied spellings of that would rot one at a time; this way, adding a .tun to
+    // the CMake list is the whole change.
+    for (int i = 0; i < BinaryData::namedResourceListSize; ++i)
+    {
+        const auto* resource = BinaryData::namedResourceList[i];
+        const auto* original = BinaryData::getNamedResourceOriginalFilename (resource);
+        if (original == nullptr)
+            continue;
+
+        // "= juce::String (...)", not "juce::String fileName (...)": the parenthesised
+        // form is a function DECLARATION to the compiler (most vexing parse) and the
+        // next line then fails with "left operand of .endsWithIgnoreCase must have
+        // class/struct/union type", which names everything except what is wrong.
+        const auto fileName = juce::String (juce::CharPointer_UTF8 (original));
+        if (! fileName.endsWithIgnoreCase (".tun"))
+            continue; // the fonts and the jingle live in the same target
+
+        const auto out = dir.getChildFile (fileName);
+        if (out.exists())
+            continue; // theirs now, whatever it says
+
+        int size = 0;
+        if (const auto* data = BinaryData::getNamedResource (resource, size))
+            if (size > 0)
+                out.replaceWithData (data, (size_t) size);
+    }
+    return dir;
+}
+
+juce::File FractalAdditiveAudioProcessor::getTuningChooserFolder() const
+{
+    if (appProps != nullptr)
+    {
+        // isAbsolutePath FIRST: constructing a juce::File from a relative or empty
+        // string asserts in debug builds, and this string comes off disk, where a
+        // half-written settings file can leave anything at all.
+        const auto path = appProps->getValue ("tuningFolder");
+        if (path.isNotEmpty() && juce::File::isAbsolutePath (path))
+        {
+            const juce::File last (path);
+            // Not "did we store one" but "is it still there": a folder on a USB stick
+            // that is not plugged in, or one the user has since deleted, would open the
+            // chooser on nothing at all. Falling back to the bundled folder is the one
+            // answer that always exists.
+            if (last.isDirectory())
+                return last;
+        }
+    }
+    return getTuningsFolder();
+}
+
+void FractalAdditiveAudioProcessor::setTuningChooserFolder (const juce::File& dir)
+{
+    if (appProps == nullptr || ! dir.isDirectory())
+        return;
+    writeSetting ("tuningFolder", dir.getFullPathName()); // written NOW: a host that is killed rather than closed
+}                            // never runs a destructor to flush it (see keyboardNoteNames)
+
 juce::StringArray FractalAdditiveAudioProcessor::getPresetNames()
 {
     juce::StringArray names;
-    for (const auto& f : getPresetFolder().findChildFiles (juce::File::findFiles, false, "*.gsting"))
+    for (const auto& f : getPresetFolder().findChildFiles (juce::File::findFiles, false, juce::String ("*") + kPresetExt))
         names.add (f.getFileNameWithoutExtension());
     names.sortNatural();
     return names;
@@ -3918,28 +5870,119 @@ bool FractalAdditiveAudioProcessor::presetHasDrifted() const
     return false;
 }
 
-juce::String FractalAdditiveAudioProcessor::savePreset (const juce::String& name)
+//==============================================================================
+// THE FIXED-POINT RULE, and the ONLY place in the program a .gsting is ever written.
+//
+//   A CORNER IS A FIXED POINT OF THE BLEND. What is captured, saved or re-read for a
+//   corner must be the corner's OWN stored state, never the surface the blend is
+//   currently driving.
+//
+// CASE #88, the user's oldest report: "si por ejemplo voy adelante y atras entre dos
+// presets uno con menos amp sustain que el otro, el volumen va bajando hasta
+// silenciarse... curiosamente con el modo mix pasa lo mismo."
+//
+// It never reproduced in memory, and could not: ten A->B->A round trips through the
+// real drivePlayground drift nothing (run 47). THE LOOP CLOSES THROUGH THE FILE. While
+// the pad drives, the live control surface is the blend's OUTPUT; a corner's file is
+// the blend's INPUT. Save a preset under an assigned corner's own name while parked
+// mid-pad and that corner's file becomes blend(A, B). Re-assign it - pick the preset for the
+// corner again - and the corner IS the previous interpolation's output. (Reopening the project
+// was the second door until polypresets, 2026-09-15: a project rebuilds each corner from the
+// copy it carries now, and only a names-only project from an older build re-reads the file -
+// which is the path run 51 measures that door through.)
+// The next trip blends that with B again, so the corner walks towards B by the blend
+// weight every cycle. Measured, run 51: stored ampSustain 0.9000 0.4750 0.2625 0.1563
+// ... 0.0501, masterGain 0.00 -9.00 -13.50 ... -17.99 dB, rendered RMS 0.04097 ->
+// 0.00029 (-43 dB), monotone, gap ratio 0.4706..0.5075. A geometric series, exactly as
+// reported, through the re-assign door AND through a genuine host project reload.
+//
+// So while the playground is driving, a preset write may not land on the file an
+// assigned corner points at. The one way to write a corner's file is the corner's own
+// Edit -> Save (savePlaygroundCornerAs), where the controls have been STANDING IN for
+// that corner since beginPlaygroundCornerEdit pushed it onto them, so the surface is
+// the corner's own state and not a blend of anything.
+//
+// This lives HERE, in one function every write goes through, rather than as a check at
+// savePreset and another at savePlaygroundCornerAs, because there is no such thing as
+// remembering to add the third one. And it REFUSES OUT LOUD: the reason travels back to
+// the editor, which puts it in front of the user in their own language. A silent no-op
+// would be a different bug of the same family.
+bool FractalAdditiveAudioProcessor::writePresetFile (const juce::String& safeName,
+                                                     const juce::ValueTree& state,
+                                                     bool isCornerOwnSave,
+                                                     PresetWriteRefusal& why, int& corner)
+{
+    why    = PresetWriteRefusal::None;
+    corner = -1;
+
+    if (safeName.isEmpty())
+    { why = PresetWriteRefusal::BadName; return false; }
+
+    // COMPARED AS FILES, NOT AS NAMES. The guard asked whether two STRINGS matched while
+    // the line below writes to a FILE - and on Windows "Bell" and "bell" are two strings
+    // and one file. Saving a patch under a different capitalisation from a corner's own
+    // name walked straight past this and overwrote that corner's .gsting, and because
+    // captureState keeps the corner's original spelling it never healed: the same door
+    // opened on every later save. Measured as a drain over twenty cycles - ampSustain
+    // 0.9000 -> 0.0501, masterGain 0.00 -> -17.99 dB.
+    //
+    // juce::File::operator== knows what the filesystem is case-sensitive about, which is
+    // the question actually being asked here: would this write land on that corner's file?
+    if (! isCornerOwnSave && pgActive)
+        for (int i = 0; i < kPlaygroundCorners; ++i)
+            if (pgCorner[(size_t) i].assigned()
+                 && presetFile (pgCorner[(size_t) i].name) == presetFile (safeName))
+            {
+                why = PresetWriteRefusal::CornerFixedPoint;
+                corner = i;
+                return false;
+            }
+
+    auto xml = state.createXml();
+    if (xml == nullptr || ! xml->writeTo (presetFile (safeName)))
+    { why = PresetWriteRefusal::WriteFailed; return false; }
+    return true;
+}
+
+juce::String FractalAdditiveAudioProcessor::savePreset (const juce::String& name,
+                                                        PresetWriteRefusal& why, int& corner)
 {
     // Returns the name actually stored (filename characters are sanitised, so it
-    // can differ from what was typed), or empty on failure - the editor shows it.
+    // can differ from what was typed), or empty on failure - the editor shows it,
+    // and `why` always says which of the reasons it was.
     const auto safe = juce::File::createLegalFileName (name).trim();
-    if (safe.isEmpty())
+    if (! writePresetFile (safe, captureState(), false, why, corner))
         return {};
-    auto file = getPresetFolder().getChildFile (safe + ".gsting");
-    if (auto xml = captureState().createXml())
-        if (xml->writeTo (file))
-        {
-            snapshotLoadedPreset (safe);
-            return safe;
-        }
-    return {};
+    snapshotLoadedPreset (safe);
+    return safe;
+}
+
+juce::String FractalAdditiveAudioProcessor::savePreset (const juce::String& name)
+{
+    PresetWriteRefusal why = PresetWriteRefusal::None;
+    int corner = -1;
+    return savePreset (name, why, corner);
 }
 
 bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
 {
-    auto file = getPresetFolder().getChildFile (name + ".gsting");
-    if (! file.existsAsFile())
+    // A FAILED PRESET LOAD IS STATED. Every `return false` below used to be silent, and
+    // the one caller drops the bool: the name stayed in the box, the PREVIOUS preset went
+    // on sounding, and the Tuning panel went on offering the previous preset's scale. The
+    // player is told they loaded something they did not. Parked rather than shown from
+    // here for the same reason tuningRestoreError is - the editor may not exist (the
+    // playground assigns corners with the window shut) - and consumed the same way.
+    presetLoadError.clear();
+    const auto refuse = [this, &name] (const juce::String& why)
+    {
+        presetLoadError = name.isNotEmpty() ? name + " \xe2\x80\x94 " + why : why;
         return false;
+    };
+
+    auto file = presetFile (name);
+    if (! file.existsAsFile())
+        return refuse ("there is no preset by that name in the preset folder. Nothing was "
+                       "loaded - the patch you were playing is untouched.");
     if (auto xml = juce::XmlDocument::parse (file))
     {
         // .gsting files are user-editable: only apply a tree of OUR type, or a
@@ -3947,13 +5990,46 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
         // while reporting success.
         auto tree = juce::ValueTree::fromXml (*xml);
         if (! tree.hasType (apvts.state.getType()))
-            return false;
+            return refuse ("this file is XML, but it is not a Fibl\xc3\xb3 Gal\xc3\xa0" "ctic preset. "
+                           "Nothing was loaded - the patch you were playing is untouched.");
+
+        const auto keep     = tuning.captureTuning();
+        const int  keepMode = getTuningMode();
+        // THE PARKED HAND-SET REFERENCE IS NOT PART OF A PRESET, for the same reason the
+        // active tuning above is not: only the SOUND changes, never what the keys mean.
+        //
+        // It has to be kept EXPLICITLY now that captureState writes it, and this is the one
+        // flow where getting it wrong would lose the very number that fix exists to protect.
+        // While MTS-ESP owns the reference, refA holds the master's display value and the
+        // user's own is parked in manualRefA. Letting a preset's REFPARK land there would
+        // throw the user's number away - and the next poll, seeing the park still in force,
+        // would re-park the preset's value in its place, so leaving MTS would hand back a
+        // reference the user never typed. Kept unconditionally: with no park in force
+        // manualRefA is not read by anything until MTS is next entered, and entering it
+        // overwrites the member from refA anyway.
+        const float keepManualRefA = manualRefA;
+        const bool  keepMtsHadRef  = mtsHadRef;
+
+        restoreState (tree);
+
+        manualRefA = keepManualRefA;
+        mtsHadRef  = keepMtsHadRef;
 
         // The preset's OWN tuning travels IN the file (so it is never lost) but is
         // never applied by loading the preset: only the SOUND changes, never the
         // scale under whatever is already loaded or being played on. It is offered
         // separately - see hasPendingPresetTuning() / loadPendingPresetTuning() -
         // the Tuning panel shows a button for it only when the two actually differ.
+        //
+        // AFTER restoreState, not before it, and that is not tidiness. restoreState now
+        // clears the offer, because an offer belongs to the preset that is loaded and a
+        // state load replaces the patch (see the clear there for what it was costing).
+        // Read into these fields first, as this used to, and the clear one line later
+        // would wipe every offer this function has ever made.
+        //
+        // `tree` still carries the child at this point: apvts.replaceState makes `tree`
+        // and apvts.state the same object and APPENDS the <PARAM> children the chunk was
+        // missing, but it removes nothing, so SCALA is exactly where the file put it.
         if (auto scl = tree.getChildWithName ("SCALA"); scl.isValid())
         {
             presetPendingSclName   = scl.getProperty ("name").toString();
@@ -3962,19 +6038,22 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
             // preset's tuning later reproduces what the preset's author was hearing.
             presetPendingTablePeriod = scl.getProperty ("tablePeriod").toString();
         }
-        else { presetPendingSclName.clear(); presetPendingSclSource.clear(); presetPendingTablePeriod.clear(); }
-
-        const auto keep     = tuning.captureTuning();
-        const int  keepMode = getTuningMode();
-
-        restoreState (tree);
 
         // Put the CURRENTLY ACTIVE tuning back exactly as it was - source, name AND a
         // table's chosen period, which is as much part of "as it was" as the pitches.
+        //
+        // THE PRESET'S SCALA IS ONLY AN OFFER HERE (see above), so a SCALA that does not parse
+        // is not "the instrument is playing 12-TET": the kept tuning goes straight back on this
+        // very line. restoreState parked that sentence all the same, and a preset load showed a
+        // notice claiming the tuning was lost while it went on sounding (night review,
+        // pre-existing). It is taken back, and a failure is parked only if putting the user's
+        // OWN tuning back fails - the one loss this path can really cause.
+        tuningRestoreError.clear();   // the kept tuning goes straight back
         if (keep.source.isNotEmpty())
         {
             juce::String err;
-            tuning.restoreTuning (keep, err);
+            if (! tuning.restoreTuning (keep, err))
+                tuningRestoreError = err.isNotEmpty() ? err : juce::String ("Invalid value.");
         }
         else
             tuning.clearScala();
@@ -3984,7 +6063,65 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
         snapshotLoadedPreset (name); // AFTER the tuning revert - that is the real final state
         return true;
     }
-    return false;
+    // XmlDocument::parse returned nothing: the file is there and is not XML at all
+    // (truncated by a crash mid-save, edited by hand, or simply something else).
+    return refuse ("this preset file could not be read - it is not valid XML. Nothing was "
+                   "loaded - the patch you were playing is untouched.");
+}
+
+//==============================================================================
+// DELETING A PRESET - the rules are at the declaration.
+static bool presetDeleteToTrash = true;   // TESTS flip it; production never does
+
+void FractalAdditiveAudioProcessor::setPresetDeleteToTrashForTests (bool toTrash)
+{
+    presetDeleteToTrash = toTrash;
+}
+
+FractalAdditiveAudioProcessor::PresetDeleteRefusal
+FractalAdditiveAudioProcessor::deletePreset (const juce::String& name, int& cornerOut, bool* wentToBinOut,
+                                             int* cornerMaskOut)
+{
+    cornerOut = -1;
+    if (wentToBinOut != nullptr) *wentToBinOut = false;
+    if (cornerMaskOut != nullptr) *cornerMaskOut = 0;
+    const auto folder = getPresetFolder();
+    const auto file   = presetFile (name);
+
+    // IN THE PRESET FOLDER, AND NOWHERE ELSE. presetFile is getChildFile, which resolves
+    // "..\\" and absolute paths - a name that is not a plain file name would otherwise
+    // aim this at any file on the disk. The list only ever hands over plain names; this
+    // is the function's own guarantee, not the list's.
+    if (name.trim().isEmpty() || file.getParentDirectory() != folder || ! file.existsAsFile())
+        return PresetDeleteRefusal::NoSuchPreset;
+
+    // NOT REFUSED FOR A CORNER ANY MORE: the corner carries its own copy (see the declaration).
+    // Only NAMED, so the editor can say that corner is unaffected. Compared as FILES (see
+    // writePresetFile): "bell" and "Bell" are one file on Windows.
+    int holding = 0;   // EVERY corner holding it - the message names them all, not just the first
+    for (int i = 0; i < kPlaygroundCorners; ++i)
+        if (pgCorner[(size_t) i].assigned() && presetFile (pgCorner[(size_t) i].name) == file)
+        {
+            if (cornerOut < 0) cornerOut = i;
+            holding |= 1 << i;
+        }
+
+    // WHERE IT WENT, TOLD TRUTHFULLY. FOF_ALLOWUNDO on a drive with no Recycle Bin (a network
+    // share, a removable stick) deletes for good and still reports success, so "it can be
+    // restored" is only claimed for a file on a local disk - and never for the suite's own
+    // outright deletes (night review).
+    const bool toBin = presetDeleteToTrash && file.isOnHardDisk();
+    const bool moved = presetDeleteToTrash ? file.moveToTrash() : file.deleteFile();
+    // BOTH: SHFileOperation can report success for an operation the user's shell hook
+    // cancelled, and a file still standing is the only fact that matters.
+    if (! moved || file.existsAsFile())
+        return PresetDeleteRefusal::CouldNotDelete;
+
+    if (loadedPresetName.isNotEmpty() && presetFile (loadedPresetName) == file)
+        loadedPresetName.clear();   // nothing left on disk for the "*" to be measured against
+    if (wentToBinOut != nullptr) *wentToBinOut = toBin;
+    if (cornerMaskOut != nullptr) *cornerMaskOut = holding;
+    return PresetDeleteRefusal::None;
 }
 
 //==============================================================================
@@ -3992,45 +6129,154 @@ bool FractalAdditiveAudioProcessor::loadPreset (const juce::String& name)
 // log-vs-linear choice per family, nearest-corner-with-hysteresis) and in
 // spectrum::blendTemplates (the partial-list crossfade); this is the wiring.
 //==============================================================================
+// Every parameter, at its DEFAULT. The base a corner is built on, so the store is total
+// from the first instant (see PlaygroundCorner::params): a preset that predates a
+// parameter means the parameter's default, in morph, in mix and in corner edit alike.
+void FractalAdditiveAudioProcessor::fillCornerDefaults (PlaygroundCorner& c) const
+{
+    const auto& all = getParameters();
+    c.params.assign ((size_t) all.size(), 0.0f);
+    for (int i = 0; i < all.size(); ++i)
+        if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]))
+            c.params[(size_t) i] = p->convertFrom0to1 (p->getDefaultValue());
+}
+
 bool FractalAdditiveAudioProcessor::assignPlaygroundCorner (int corner, const juce::String& presetName,
                                                             juce::String& errorOut)
 {
     if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners))
         return false;
 
+    // Re-assigning the corner being EDITED replaces its contents from disk, which is
+    // exactly what discards unsaved edits (rule 4) - so edit mode has to end first, or
+    // the frozen live patch would be handed back later from a corner that no longer
+    // exists and the scratch surface would be left standing as if it were the patch.
+    // FROM THE FILE. A pick from the corner list is the one way a corner re-reads its preset:
+    // a saved state rebuilds corners from the copies it carries (restoreState).
+    juce::ValueTree tree;
+    juce::String readError;
+    if (presetName.isNotEmpty())
+    {
+        const auto file = presetFile (presetName);
+        if (! file.existsAsFile())
+            readError = "That preset no longer exists.";
+        else if (auto xml = juce::XmlDocument::parse (file))
+            tree = juce::ValueTree::fromXml (*xml);
+        else
+            readError = "That preset could not be read.";
+    }
+    return assignPlaygroundCornerFromTree (corner, presetName, tree, readError, errorOut);
+}
+
+bool FractalAdditiveAudioProcessor::assignPlaygroundCornerUndoable (int corner, const juce::String& presetName,
+                                                                    juce::String& errorOut)
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners))
+        return false;
+    // RULE 7 AGAIN: WHILE ANOTHER CORNER IS BEING EDITED, NOTHING IS MINTED. endPlaygroundCornerEdit
+    // unwinds the shared stack back to the session's marker, so a pick or an X made on a
+    // DIFFERENT corner during the session was undone the moment OK was pressed - silently, and
+    // with its redo cleared by the session's own step (review, 2026-09-15). Inside a session a
+    // pick is the plain assign it always was; the session's step is the one Ctrl+Z gets.
+    if (pgEditCorner >= 0 && corner != pgEditCorner)
+        return assignPlaygroundCorner (corner, presetName, errorOut);
+    // Edit mode on THIS corner ends FIRST and leaves its own session step, so the pick lands on
+    // top of it and the first Ctrl+Z takes back the pick, the next one the edits.
+    if (corner == pgEditCorner)
+        endPlaygroundCornerEdit();
+    const auto before = pgCorner[(size_t) corner];
+    const bool ok = assignPlaygroundCorner (corner, presetName, errorOut);
+    // A failed pick changes the corner too (it is left empty, with the reason), so it is a step.
+    if (before.assigned() || pgCorner[(size_t) corner].assigned())
+    {
+        undoManager.beginNewTransaction ("corner");
+        undoManager.perform (new CornerEditSessionAction (*this, corner, before, pgCorner[(size_t) corner]));
+        // LEFT OPEN, with the ~1 s transaction clock restarted. In MORPH mode the blend writes
+        // every control for the new corner on the next ticks, and APVTS files those writes onto
+        // the stack a few hundred ms later: closed here, they became a step IN FRONT of the pick,
+        // and the first Ctrl+Z reverted only the controls while the corner kept the new preset.
+        undoTxnTick = 0;
+    }
+    return ok;
+}
+
+void FractalAdditiveAudioProcessor::readCornerRouting (PlaygroundCorner& c, const juce::ValueTree& tree) const
+{
+    // THE ADAPTIVE / REALTIME SPECTRUM IS PART OF THE PRESET, not something outside
+    // it: a corner remembers whether it was saved with the follower armed, and the
+    // nearest-corner rule carries that over like any other discrete setting.
+    c.rtLink = 0;
+    c.rtSet  = RtSettings{};
+    if (auto rt = tree.getChildWithName ("REALTIME"); rt.isValid())
+    {
+        c.rtLink = (int) rt.getProperty ("link", 0);
+        c.rtSet  = realtimeSettingsFromTree (rt);
+    }
+
+    // The preset's MODULATOR ROUTING, for MIX mode's per-corner ModEngine (see
+    // PlaygroundCorner). Kept as the saved text and parsed only when a sub-engine
+    // is refreshed - morph mode never pays for it.
+    for (auto& t : c.modTargets) t.clear();
+    for (auto& w : c.modWaves)   w.clear();
+    if (auto ms = tree.getChildWithName ("MODS"); ms.isValid())
+    {
+        for (int m = 0; m < ModEngine::kMods; ++m)
+            c.modTargets[m] = ms.getProperty ("t" + juce::String (m)).toString();
+        for (int l = 0; l < ModEngine::kLfos; ++l)
+            c.modWaves[l] = ms.getProperty ("w" + juce::String (l)).toString();
+    }
+}
+
+bool FractalAdditiveAudioProcessor::assignPlaygroundCornerFromTree (int corner, const juce::String& presetName,
+                                                                    const juce::ValueTree& tree,
+                                                                    const juce::String& readError,
+                                                                    juce::String& errorOut)
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners))
+        return false;
+
+    // Re-assigning the corner being EDITED replaces its contents, which is exactly what
+    // discards unsaved edits (rule 4) - so edit mode has to end first, or the frozen live
+    // patch would be handed back later from a corner that no longer exists and the scratch
+    // surface would be left standing as if it were the patch.
+    if (corner == pgEditCorner)
+        endPlaygroundCornerEdit();
+
     auto& c = pgCorner[(size_t) corner];
     c = PlaygroundCorner{};                    // clearing is just "assign nothing"
+    c.serial = ++pgCornerSerial;               // a new version, whatever its name
 
     if (presetName.isNotEmpty())
     {
-        auto file = getPresetFolder().getChildFile (presetName + ".gsting");
-        if (! file.existsAsFile())
-        { errorOut = "That preset no longer exists."; refreshPlaygroundActive(); return false; }
-
-        auto xml = juce::XmlDocument::parse (file);
-        if (xml == nullptr)
-        { errorOut = "That preset could not be read."; refreshPlaygroundActive(); return false; }
+        if (readError.isNotEmpty())
+        { errorOut = readError; refreshPlaygroundActive(); return false; }
 
         // Same gate loadPreset uses: .gsting files are user-editable, and a foreign tree
         // would give every corner value a default and make the corner sound like an
         // init patch while claiming to be the preset.
-        auto tree = juce::ValueTree::fromXml (*xml);
         if (! tree.hasType (apvts.state.getType()))
         { errorOut = "That file is not a Fibl\xc3\xb3 preset."; refreshPlaygroundActive(); return false; }
 
         c.name = presetName;
+        // The copy the corner is saved with - without that preset's own pad, so corners
+        // never nest (a corner never reads it, and a copy of a copy would grow every save),
+        // and without its tuning BANK, which a corner never reads either and whose slots can
+        // each hold a whole exported patch.
+        c.source = tree.createCopy();
+        c.source.removeChild (c.source.getChildWithName ("PLAYGROUND"), nullptr);
+        c.source.removeChild (c.source.getChildWithName ("BANK"), nullptr);
 
         // Parameter values, indexed by getParameters() order (see PlaygroundCorner).
+        // DEFAULTS FIRST, then whatever the file carries on top: that is what makes the
+        // store TOTAL, and "the parameter's default" the one answer for a parameter this
+        // preset predates. Never the live patch's value - a corner must sound the same
+        // whatever happened to be loaded when it was dropped here.
         const auto& all = getParameters();
-        c.params.assign ((size_t) all.size(), 0.0f);
-        c.hasParam.assign ((size_t) all.size(), 0);
+        fillCornerDefaults (c);
         for (int i = 0; i < all.size(); ++i)
             if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]))
                 if (auto child = tree.getChildWithProperty ("id", p->paramID); child.isValid())
-                {
-                    c.params[(size_t) i]   = (float) (double) child.getProperty ("value");
-                    c.hasParam[(size_t) i] = 1;
-                }
+                    c.params[(size_t) i] = (float) (double) child.getProperty ("value");
 
         // The Custom Engine's own scale, and the per-partial amplitude edits: both are
         // state, not parameters, and both are part of what this corner SOUNDS like.
@@ -4061,25 +6307,7 @@ bool FractalAdditiveAudioProcessor::assignPlaygroundCorner (int corner, const ju
             c.manual = c.value (mi, v) && v > 0.5;
         }
 
-        // THE ADAPTIVE / REALTIME SPECTRUM IS PART OF THE PRESET, not something outside
-        // it: a corner remembers whether it was saved with the follower armed, and the
-        // nearest-corner rule carries that over like any other discrete setting.
-        if (auto rt = tree.getChildWithName ("REALTIME"); rt.isValid())
-        {
-            c.rtLink = (int) rt.getProperty ("link", 0);
-            c.rtSet  = realtimeSettingsFromTree (rt);
-        }
-
-        // The preset's MODULATOR ROUTING, for MIX mode's per-corner ModEngine (see
-        // PlaygroundCorner). Kept as the saved text and parsed only when a sub-engine
-        // is refreshed - morph mode never pays for it.
-        if (auto ms = tree.getChildWithName ("MODS"); ms.isValid())
-        {
-            for (int m = 0; m < ModEngine::kMods; ++m)
-                c.modTargets[m] = ms.getProperty ("t" + juce::String (m)).toString();
-            for (int l = 0; l < ModEngine::kLfos; ++l)
-                c.modWaves[l] = ms.getProperty ("w" + juce::String (l)).toString();
-        }
+        readCornerRouting (c, tree);
 
         compileCornerTemplate (c);
     }
@@ -4094,6 +6322,432 @@ juce::String FractalAdditiveAudioProcessor::getPlaygroundCornerName (int corner)
 {
     return juce::isPositiveAndBelow (corner, kPlaygroundCorners) ? pgCorner[(size_t) corner].name
                                                                  : juce::String();
+}
+
+juce::String FractalAdditiveAudioProcessor::getPlaygroundCornerDisplayName (int corner) const
+{
+    const auto n = getPlaygroundCornerName (corner);
+    return (n.isNotEmpty() && isPlaygroundCornerEdited (corner)) ? n + "*" : n;
+}
+
+//==============================================================================
+// EDITING A CORNER IN PLACE - and THE OWNERSHIP RULES, which are the whole feature.
+//
+// The complaint this answers is simple: a corner is a preset you are listening to, and
+// there was no way to change it without leaving, loading it, editing it, saving it and
+// dropping it back. Now the corner's Edit button turns the main editor into that
+// corner's editor.
+//
+// The trap is equally simple, and it is a data-loss one: this instrument already has a
+// LIVE PATCH with its own identity (a preset name, a drift mark, an undo history, the
+// host's project state), and the main editor's controls are that patch. Pointing them
+// at a corner without saying who owns what is how a user loses the sound they were
+// working on. So:
+//
+//  1. THE LIVE PATCH IS FROZEN, NOT REPLACED. Entering edit mode captures the whole
+//     live patch (captureState) plus its preset identity and drift reference, and
+//     leaving writes them back. The controls in between are a SCRATCH SURFACE.
+//  2. THE HOST NEVER SEES THE SCRATCH SURFACE. getStateInformation saves the frozen
+//     live patch while edit mode is on - a project saved mid-edit reopens as the patch
+//     the user had, never as somebody's corner.
+//  3. THE PRESETS COMBO IS NOT THE CORNER. The editor freezes and disables it (and
+//     hides the drift mark) for the duration: a corner is not "the loaded preset", and
+//     letting the combo load one would drop a whole preset onto the scratch surface.
+//  4. THE EDITS LIVE IN THE CORNER, IN MEMORY, FOR THIS SESSION. The .gsting file the
+//     corner points at is NEVER written by editing. Unsaved edits stay on the corner
+//     when edit mode ends (they are what you were just listening to - discarding them
+//     silently would be the worse surprise) and the trailing "*" says so, in the pad,
+//     in the corner's box and in the frozen preset field. Re-assigning that corner (a pick
+//     from the corner list, which re-reads the preset from disk) is what discards them.
+//     Saving a preset or project KEEPS them: a saved pad carries each corner's copy with
+//     its unsaved edits and its "*" (polypresets, 2026-09-15).
+//  5. THE TUNING IS NOT PART OF A CORNER. Push and pull both go through
+//     presetmorph::morphSpaceFor and skip everything it excludes, so tuningMode, refA,
+//     octaveShift, bendRange, the bank slot and the playground's own point cannot be
+//     carried into a corner or out of one - the same promise the morph itself makes.
+//  6. MORPH MODE PINS THE POINT TO THE CORNER. In morph mode the blend WRITES every
+//     continuous parameter sixty times a second, so there is no surface left to type
+//     into unless the blend is that corner: the point moves onto the corner on entry
+//     (and back off on exit). Then what you see, what you hear and what you are
+//     editing are the same thing. In MIX mode nothing is pinned and nothing needs to
+//     be - the corner is its own engine, so you hear the edit against the other three
+//     at whatever balance the point is sitting at. That is the "in context" case.
+//==============================================================================
+bool FractalAdditiveAudioProcessor::beginPlaygroundCornerEdit (int corner)
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners)) return false;
+    if (! pgCorner[(size_t) corner].assigned() || ! pgActive)     return false;
+    if (pgEditCorner == corner) return true;
+    // One corner at a time: two scratch surfaces would need two frozen live patches,
+    // and the second entry would freeze the FIRST corner as if it were the live one.
+    if (pgEditCorner >= 0) endPlaygroundCornerEdit();
+
+    pgEditLiveState       = captureState();
+    pgEditLiveX           = apvts.getRawParameterValue ("pgX")->load();
+    pgEditLiveY           = apvts.getRawParameterValue ("pgY")->load();
+    pgEditLivePresetName  = loadedPresetName;
+    pgEditLivePresetSnap  = loadedPresetSnapshot;
+    pgEditCorner          = corner;
+    pgEditCompilePending  = false;
+    pgEditPrimed          = false;   // the next pull is the baseline, not an edit
+
+    // RULE 7: FENCE THE SESSION OFF FROM THE LIVE PATCH'S UNDO HISTORY (see the block
+    // above CornerEditBoundaryAction). The marker goes down BEFORE the pin and before
+    // pushCornerToLiveSurface, because both of those write parameters and a parameter
+    // write is a step on the shared stack that puts corner values on the live patch when
+    // it is undone. `pgEditCornerBefore` is what makes the whole session one undoable
+    // step on the way out.
+    pgEditCornerBefore = pgCorner[(size_t) corner];
+    undoManager.beginNewTransaction();
+    undoManager.perform (new CornerEditBoundaryAction (*this));
+    pgEditStackDepth = undoManager.getUndoDescriptions().size();
+
+    // Rule 6: morph mode pins the point onto the corner being edited.
+    if (! isPlaygroundMixMode())
+        for (const char* id : { "pgX", "pgY" })
+        {
+            const bool isX = juce::String (id) == "pgX";
+            const float v  = (isX ? (corner & 1) : (corner & 2)) ? 1.0f : 0.0f;
+            if (auto* p = apvts.getParameter (id))
+                p->setValueNotifyingHost (v);
+        }
+
+    pushCornerToLiveSurface (corner);
+    pgDirty = true;   // the next tick republishes with a generation bump
+    return true;
+}
+
+void FractalAdditiveAudioProcessor::endPlaygroundCornerEdit()
+{
+    if (pgEditCorner < 0) return;
+    const int corner = pgEditCorner;
+    pgEditCorner = -1;
+
+    // RULE 7: TAKE THE SESSION BACK OFF THE SHARED UNDO STACK, first, before anything
+    // else is written. Every transaction minted while the controls were a scratch
+    // surface writes into the LIVE patch when undone or redone: that is what wiped a
+    // hand-drawn spectrum on the first Ctrl+Z after leaving and let Ctrl+Y install the
+    // corner's own drawing on the user's sound.
+    //
+    // Undoing them (JUCE cannot drop transactions, and clearUndoHistory() would take the
+    // user's own history with it) also walks every parameter back to what the live patch
+    // had, which the explicit restore below then confirms value by value.
+    //
+    // TWO stop conditions, because unwinding one transaction too far eats the user's own
+    // last edit: the marker's undo() raises pgEditUnwound, and the depth guard catches
+    // the case where the marker has been dropped off the bottom of a full stack. Erring
+    // towards leaving residue beats erring towards eating history.
+    const auto cornerAfter = pgCorner[(size_t) corner];
+    pgEditUnwound = false;
+    bool unwound  = false;
+    while (! pgEditUnwound
+           && undoManager.canUndo()
+           && undoManager.getUndoDescriptions().size() >= pgEditStackDepth)
+    {
+        undoManager.undo();
+        unwound = true;
+    }
+    // The session's edits belong to the CORNER, and the unwind is about the live patch's
+    // history only - nothing it undoes may take the corner's own content with it.
+    pgCorner[(size_t) corner] = cornerAfter;
+
+    // Hand the LIVE PATCH back. Deliberately NOT restoreState(): that would rebuild every
+    // corner from the frozen state's PLAYGROUND child - the copies as they were when edit
+    // mode was entered - which would throw away the very edits this session was making,
+    // including the ones on the corner just left. Only what entering edit mode touched is
+    // put back.
+    if (pgEditLiveState.isValid())
+    {
+        const auto& all = getParameters();
+        for (int i = 0; i < all.size(); ++i)
+            if (auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]))
+            {
+                const bool isDiscrete = dynamic_cast<juce::AudioParameterChoice*> (all[i]) != nullptr
+                                     || dynamic_cast<juce::AudioParameterBool*>   (all[i]) != nullptr;
+                if (presetmorph::morphSpaceFor (p->paramID.toStdString(), isDiscrete)
+                        == presetmorph::MorphSpace::Excluded)
+                    continue;   // never written on the way in, so never written on the way out
+                if (auto ch = pgEditLiveState.getChildWithProperty ("id", p->paramID); ch.isValid())
+                {
+                    const float norm = juce::jlimit (0.0f, 1.0f,
+                                        p->convertTo0to1 ((float) (double) ch.getProperty ("value")));
+                    if (std::abs (p->getValue() - norm) > 1.0e-6f)
+                        p->setValueNotifyingHost (norm);
+                }
+            }
+
+        // The non-parameter half of the live patch: its Custom Engine scale (with the
+        // spectrum's provenance) and its per-partial amplitude edits.
+        if (auto tim = pgEditLiveState.getChildWithName ("TIMBRE"); tim.isValid())
+        {
+            juce::String err;
+            const auto src = tim.getProperty ("source").toString();
+            const auto nm  = tim.getProperty ("name").toString();
+            if (src.isEmpty()) clearTimbre();
+            else
+            {
+                std::vector<double> perDeg; double per = 2.0;
+                if (nm != "typed" && TuningManager::parseScalaScale (src, perDeg, per, err))
+                {
+                    timbreDegrees.assign (perDeg.begin(), perDeg.end());
+                    timbrePeriod = (float) per;
+                    timbreName   = nm;
+                    timbreSource = src;
+                }
+                else if (! loadTimbreText (src, err))
+                {
+                    // Same rule as the MIX/winner load: never the previous spectrum under a name
+                    // that did not load, and never in silence (night review, pre-existing).
+                    clearTimbre();
+                    timbreRestoreError = err.isNotEmpty() ? err : juce::String ("Invalid value.");
+                }
+                specProvName   = tim.getProperty ("provName").toString();
+                specProvSource = tim.getProperty ("provSource").toString();
+                specProvPeriod = tim.getProperty ("provPeriod").toString();
+            }
+        }
+        else
+            clearTimbre();
+
+        {
+            std::vector<spectrum::PartialGain> g;
+            if (auto pg = pgEditLiveState.getChildWithName ("PGAINS"); pg.isValid())
+                for (const auto& tok : juce::StringArray::fromTokens (pg.getProperty ("v").toString(), " ", ""))
+                {
+                    const int col = tok.indexOfChar (':');
+                    if (col > 0)
+                        g.push_back ({ tok.substring (0, col).getLargeIntValue(),
+                                       tok.substring (col + 1).getFloatValue() });
+                }
+            bool man = false;
+            if (auto ch = pgEditLiveState.getChildWithProperty ("id", "partialManual"); ch.isValid())
+                man = (double) ch.getProperty ("value") > 0.5;
+            setPartialGains (g, man, false);   // the next blend publish resolves them
+        }
+
+        // The point goes back where the user left it (morph mode pinned it - rule 6).
+        for (const char* id : { "pgX", "pgY" })
+            if (auto* p = apvts.getParameter (id))
+                p->setValueNotifyingHost (juce::String (id) == "pgX" ? pgEditLiveX : pgEditLiveY);
+
+        // ...and so does the live patch's IDENTITY: which preset it came from and what
+        // "drifted" is measured against. Without this the editor's dirty mark would be
+        // reporting how far the LIVE patch has drifted from the corner it just showed.
+        loadedPresetName     = pgEditLivePresetName;
+        loadedPresetSnapshot = pgEditLivePresetSnap;
+    }
+
+    pgEditLiveState = {};
+    pgEditLivePresetSnap.clear();
+
+    // RULE 7, the other half: ONE STEP for the whole session, in place of the dozens it
+    // used to leave. It writes only the corner, so no direction of it can reach the live
+    // patch - and performing it is the only way to clear the redo stack the unwind just
+    // filled, because JUCE drops future transactions on a new action and by no other
+    // route. Skipped when the session minted nothing: there is then no redo stack to
+    // clear and a step that does nothing is a Ctrl+Z that appears broken.
+    if (unwound)
+    {
+        undoManager.beginNewTransaction ("corner edit");
+        undoManager.perform (new CornerEditSessionAction (*this, corner,
+                                                          pgEditCornerBefore, cornerAfter));
+    }
+    pgEditCornerBefore = {};
+    pgEditStackDepth   = 0;
+
+    pgDirty = true;   // the morph owns the controls again: re-apply EVERYTHING
+}
+
+// Corner -> the live control surface. Everything a corner owns, and only that (rule 5:
+// the tuning and the point are excluded and must survive untouched).
+//
+// EVERY non-excluded parameter is written, without exception. This used to skip the
+// parameters the corner's preset predated, which left the BLEND's value for them
+// standing on a surface that was supposed to be the corner - and the next
+// pullPlaygroundCornerEdit read it straight back into the corner store, so an untouched
+// visit walked the corner towards the other one while the "*" said nothing had happened
+// (hunt entry 10, run 51(c): stored ampSustain nan -> 0.0500, the blend's value).
+// Because the store is total there is now nothing to skip.
+void FractalAdditiveAudioProcessor::pushCornerToLiveSurface (int corner)
+{
+    const auto& c = pgCorner[(size_t) corner];
+    const auto& all = getParameters();
+    for (int i = 0; i < all.size(); ++i)
+    {
+        auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]);
+        if (p == nullptr) continue;
+        const bool isDiscrete = dynamic_cast<juce::AudioParameterChoice*> (all[i]) != nullptr
+                             || dynamic_cast<juce::AudioParameterBool*>   (all[i]) != nullptr;
+        if (presetmorph::morphSpaceFor (p->paramID.toStdString(), isDiscrete)
+                == presetmorph::MorphSpace::Excluded)
+            continue;
+        double v = 0.0;
+        if (! c.value (i, v)) continue;   // not a parameter at all (see PlaygroundCorner::value)
+        const float norm = juce::jlimit (0.0f, 1.0f, p->convertTo0to1 ((float) v));
+        if (std::abs (p->getValue() - norm) > 1.0e-6f)
+            p->setValueNotifyingHost (norm);
+    }
+    // The Custom Engine scale, the provenance and the per-partial edits - the same
+    // non-parameter half the winner-corner rule already knows how to apply.
+    applyPlaygroundDiscreteState (corner);
+}
+
+// The live control surface -> the corner, once per 60 Hz tick while edit mode is on.
+// This is where "the controls edit THAT corner" actually happens.
+void FractalAdditiveAudioProcessor::pullPlaygroundCornerEdit()
+{
+    auto& c = pgCorner[(size_t) pgEditCorner];
+    if (! c.assigned()) { endPlaygroundCornerEdit(); return; }
+
+    bool changed = false;
+    const auto& all = getParameters();
+    if (c.params.size() != (size_t) all.size())
+        fillCornerDefaults (c);   // total, always - never a row of zeroes
+    for (int i = 0; i < all.size(); ++i)
+    {
+        auto* p = dynamic_cast<juce::RangedAudioParameter*> (all[i]);
+        if (p == nullptr) continue;
+        const bool isDiscrete = dynamic_cast<juce::AudioParameterChoice*> (all[i]) != nullptr
+                             || dynamic_cast<juce::AudioParameterBool*>   (all[i]) != nullptr;
+        if (presetmorph::morphSpaceFor (p->paramID.toStdString(), isDiscrete)
+                == presetmorph::MorphSpace::Excluded)
+            continue;
+        // The parameter object's own value is the USER'S BASE - modulation never goes
+        // through setValue (captureState relies on the same fact), so a corner cannot
+        // absorb an LFO's momentary displacement and freeze it as a value.
+        const float v = p->convertFrom0to1 (p->getValue());
+        if (std::abs (c.params[(size_t) i] - v) > 1.0e-7f)
+        {
+            c.params[(size_t) i] = v;
+            changed = true;
+        }
+    }
+
+    // ...and the non-parameter half, so editing the Custom Engine's scale or dragging a
+    // partial's amplitude lands in the corner too rather than being silently dropped.
+    if (c.timbreName != timbreName || c.timbreSource != timbreSource
+        || c.provName != specProvName || c.provSource != specProvSource
+        || c.provPeriod != specProvPeriod)
+    {
+        c.timbreName = timbreName; c.timbreSource = timbreSource;
+        c.provName = specProvName; c.provSource = specProvSource; c.provPeriod = specProvPeriod;
+        changed = true;
+    }
+    {
+        const auto& live = getPartialGains();
+        const bool man = apvts.getRawParameterValue ("partialManual")->load() > 0.5f;
+        if (man != c.manual || live.size() != c.gains.size()
+            || ! std::equal (live.begin(), live.end(), c.gains.begin(),
+                             [] (const spectrum::PartialGain& a, const spectrum::PartialGain& b)
+                             { return a.key == b.key && std::abs (a.dB - b.dB) < 1.0e-6f; }))
+        {
+            c.gains  = live;
+            c.manual = man;
+            changed  = true;
+        }
+    }
+
+    if (changed && ! pgEditPrimed)
+    {
+        // The baseline pull (see pgEditPrimed): the corner has taken the surface's view
+        // of itself, which is not something the user did.
+        ++c.rev;                         // the sub-engine still has to see the values
+        changed = false;
+    }
+    pgEditPrimed = true;
+    if (changed)
+    {
+        c.edited = true;                 // the "*"
+        ++c.rev;                         // the mix sub-engine's refill trigger
+        pgEditCompilePending = true;
+    }
+    // THE RECOMPILE, throttled to the glide cadence and never skipped for good: a full
+    // compileSpectrum every frame of a knob drag stalls the message thread, and dropping
+    // the last one would leave the corner's SPECTRUM permanently one edit behind the
+    // controls that produced it (pgParamsPending's lesson, on this side of the fence).
+    if (pgEditCompilePending && (++pgEditTick % kPgGlideTicks) == 0)
+    {
+        compileCornerTemplate (c);
+        pgEditCompilePending = false;
+        pgDirty = true;                  // republish the blend WITH a generation bump
+    }
+}
+
+juce::String FractalAdditiveAudioProcessor::savePlaygroundCornerAs (int corner, const juce::String& name)
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners)) return {};
+    auto& c = pgCorner[(size_t) corner];
+    if (! c.assigned()) return {};
+    // ONLY the corner in edit mode can be saved, and that is not a limitation - it is
+    // the only corner whose FULL state exists anywhere. A corner's store keeps what a
+    // BLEND needs (parameter values, scale, partial edits, routing); a .gsting also
+    // carries the rhythm slots, the tuning bank, the segment picker and the preset's own
+    // tuning. Writing a corner from its store would produce a preset that quietly lost
+    // all of those while claiming to be the same sound.
+    if (corner != pgEditCorner) return {};
+
+    const auto safe = juce::File::createLegalFileName (name).trim();
+
+    // The edited corner is standing ON the live control surface - beginPlaygroundCornerEdit
+    // pushed every one of its values there and pullPlaygroundCornerEdit has been reading
+    // them back ever since - so captureState() describes THAT CORNER, not a blend. This
+    // is the one save the fixed-point rule lets through onto a corner's own file, and
+    // that is why: here the surface IS the corner's stored state (see writePresetFile).
+    PresetWriteRefusal why = PresetWriteRefusal::None;
+    int blocked = -1;
+    auto written = captureState();
+
+    // THE CORNER'S OWN ROUTING, NOT THE LIVE PATCH'S. Edit mode puts a corner's PARAMETERS on
+    // the controls, never its modulator routing or its chord follower - those stay the live
+    // patch's (morph mode treats routing as live-patch state). So captureState's MODS and
+    // REALTIME describe the USER's patch, and a corner saved with them - the file, and since
+    // polypresets the corner's own copy - took the user's LFOs and follower (review,
+    // 2026-09-15). They come from the corner's copy instead, so file, copy and corner agree.
+    for (const char* child : { "MODS", "REALTIME" })
+    {
+        written.removeChild (written.getChildWithName (child), nullptr);
+        if (auto own = c.source.getChildWithName (child); own.isValid())
+            written.appendChild (own.createCopy(), nullptr);
+    }
+
+    // The corner now IS that file: renamed, and the "*" goes away because the edits it
+    // warned about are on disk. snapshotLoadedPreset is deliberately NOT called - the
+    // LIVE patch's identity is frozen while a corner is being edited (rule 1), and
+    // saving a corner must not quietly claim the user's own patch is now this preset.
+    //
+    // Done BEFORE the write, so the file's own pad names this corner as the preset it now is
+    // - it used to carry it under its OLD name, marked edited - and put back if the write fails.
+    const auto keep = c;
+    c.name   = safe;
+    c.edited = false;
+    c.source = written.createCopy();
+    c.source.removeChild (c.source.getChildWithName ("PLAYGROUND"), nullptr);
+    c.source.removeChild (c.source.getChildWithName ("BANK"), nullptr);
+    written.removeChild (written.getChildWithName ("PLAYGROUND"), nullptr);
+    if (getPlaygroundAssignedCount() > 0)
+        written.appendChild (playgroundChildForState(), nullptr);
+    if (! writePresetFile (safe, written, true, why, blocked))
+    {
+        c = keep;
+        return {};
+    }
+    ++c.rev;
+    return safe;
+}
+
+float FractalAdditiveAudioProcessor::getPlaygroundCornerParamForTests (int corner,
+                                                                       const juce::String& id) const
+{
+    if (! juce::isPositiveAndBelow (corner, kPlaygroundCorners))
+        return std::numeric_limits<float>::quiet_NaN();
+    // NaN means "this corner has NO stored value for that parameter" - which, before the
+    // fixed-point fix, is the state an untouched corner-edit visit turned into "the
+    // blend's value, and the * says nothing happened" (hunt entry 10).
+    const auto& c = pgCorner[(size_t) corner];
+    double v = 0.0;
+    if (! c.value (paramIndexOf (id.toRawUTF8()), v))
+        return std::numeric_limits<float>::quiet_NaN();
+    return (float) v;
 }
 
 int FractalAdditiveAudioProcessor::getPlaygroundAssignedCount() const
@@ -4128,11 +6782,10 @@ int FractalAdditiveAudioProcessor::paramIndexOf (const char* id) const
     return -1;
 }
 
-// A corner preset's value for a parameter. The fallback is the parameter's DEFAULT,
-// never the live patch: a corner must sound the same whatever was loaded when it was
-// assigned. One helper, because the corner compile and the adaptive-corner compile
-// both need it and two copies would eventually disagree about what "the corner's
-// value" means.
+// A corner's value for a parameter, by id. The store is total (fillCornerDefaults ran
+// before the file was read), so the default a preset that predates the parameter means
+// is already sitting in it - this is a lookup, not a fallback, and the last place that
+// could have held a second opinion about what "the corner's value" means is gone.
 float FractalAdditiveAudioProcessor::cornerValueOr (const PlaygroundCorner& c, const char* id) const
 {
     double v = 0.0;
@@ -4228,12 +6881,15 @@ bool FractalAdditiveAudioProcessor::startCornerAdapt (int corner, const std::vec
     const double topRatio = std::exp2 ((totalC - std::max (1.0, gap)) / 1200.0);
 
     // Priced with the realtime register cap (this IS a follower), and only the absurd is
-    // refused - same bound, same reason as startSpectrumAdapt.
+    // refused - same bound, same reason, same PAIR-count comparison as startSpectrumAdapt
+    // (the calibrated estimate follows the machine and its one-shot probe can catch a
+    // load spike; the refusal must not).
     const auto regs = adaptRegistersFor (s, f0, /*realtime*/ true);
+    const int  nRegs = (int) std::max<size_t> (1, regs.f0.size());
     const double estMs = dissonance::adaptEstimateMs (N, (int) alphas.size(), s.rootOnly,
-                                                      (int) std::max<size_t> (1, regs.f0.size()),
-                                                      s.shapeAmps);
-    if (estMs > dissonance::kAdaptAbsurdMs)
+                                                      nRegs, s.shapeAmps);
+    if (dissonance::adaptTotalPairs (N, (int) alphas.size(), s.rootOnly,
+                                     nRegs, s.shapeAmps, 6) > dissonance::kAdaptAbsurdPairs)
     {
         errorOut = "This corner's adaptation is estimated at " + juce::String (estMs / 60000.0, 1)
                  + " minutes per search - it cannot follow anything at that price.";
@@ -4262,7 +6918,7 @@ bool FractalAdditiveAudioProcessor::startCornerAdapt (int corner, const std::vec
 
     adaptThread = std::make_unique<std::thread> (
         [this, seed = std::move (seed), alphas, f0, s, N, gap, topRatio, regs,
-         corner, name = c.name, period]()
+         corner, name = c.name, serial = c.serial, period]()
         {
             const auto goal = s.goal == 1 ? dissonance::Goal::Max
                             : s.goal == 2 ? dissonance::Goal::Range
@@ -4275,6 +6931,7 @@ bool FractalAdditiveAudioProcessor::startCornerAdapt (int corner, const std::vec
             {
                 CornerAdaptResult r;
                 r.corner     = corner;
+                r.cornerSerial = serial;   // ...and so does the VERSION (see PlaygroundCorner::serial)
                 r.cornerName = name;    // identity travels WITH the result: the corner may
                 r.period     = period;  // be reassigned before this lands (see the consume)
                 r.aimAlphas  = alphas;
@@ -4328,7 +6985,7 @@ void FractalAdditiveAudioProcessor::applyCornerAdaptResult (PlaygroundCorner& c,
     {
         const int i = paramIndexOf (id);
         if (juce::isPositiveAndBelow (i, (int) c.params.size()))
-        { c.params[(size_t) i] = v; c.hasParam[(size_t) i] = 1; }
+            c.params[(size_t) i] = v;
     };
     setParam ("timbreOn", 1.0f);        // the adapted spectrum replaces the corner's
     setParam ("partialManual", 0.0f);   // engine, exactly as the follower replaces the live one
@@ -4421,7 +7078,11 @@ void FractalAdditiveAudioProcessor::drivePlaygroundAdaptive()
         // The name check is the identity check: the corner may have been reassigned (or
         // cleared) while the search ran, and this result belongs to the preset it was
         // started FOR, not to whichever one sits on that corner now.
-        if (r.valid && ! stale && c != nullptr && c->rtAdaptive() && c->name == r.cornerName)
+        // AND THE VERSION: since corners carry their own copies, two corners with one name can
+        // differ - an undone pick, a re-picked re-saved preset, a project reloaded while the
+        // search ran - and a result must land only on the version it was computed for.
+        if (r.valid && ! stale && c != nullptr && c->rtAdaptive() && c->name == r.cornerName
+            && c->serial == r.cornerSerial)
         {
             applyCornerAdaptResult (*c, r);
             ++pgAdaptApplies;
@@ -4526,6 +7187,7 @@ void FractalAdditiveAudioProcessor::refreshPlaygroundActive()
         if (rtLink != RtLink::Off)
             setRealtimeLink (RtLink::Off, rtSet);
         pgWinner = -1;   // no incumbent: the first apply adopts the highest weight outright
+        pgBlendTick = 0; pgLastBump = -1000000; pgGlidePending = false;
         // Adaptive corners start FRESH: adopt the current result generation so nothing
         // from a previous engagement can land into this one, and lift the launch floor
         // so the first search is not throttled (the follower's own engage rule).
@@ -4557,11 +7219,20 @@ void FractalAdditiveAudioProcessor::drivePlayground()
     {
         // The playground let go (or never engaged): the mix must let go with it, or
         // four sub-engines would keep sounding under a pad that no longer exists.
+        // Corner edit goes with it for the same reason - a scratch surface standing in
+        // for a corner nobody is blending is just the user's patch, silently replaced.
+        endPlaygroundCornerEdit();
         pgMixDriving  = false;
         pgLastMixMode = false;
         mixEngaged.store (false, std::memory_order_release);
         return;
     }
+
+    // CORNER EDIT: the controls belong to a corner this tick, so read them INTO it
+    // before anything else looks at either. Done first so the mix refresh and the blend
+    // below both see the edit in the same frame it was made.
+    if (pgEditCorner >= 0) pullPlaygroundCornerEdit();
+    const bool editing = pgEditCorner >= 0;   // the pull can end edit mode (corner gone)
 
     const bool mixMode = isPlaygroundMixMode();
     if (mixMode != pgLastMixMode)
@@ -4608,18 +7279,24 @@ void FractalAdditiveAudioProcessor::drivePlayground()
     // point being clicked somewhere else, a corner being (re)assigned, or a discrete
     // setting flipping. Those are genuine spectrum CHANGES and the voices' own machinery
     // (the per-voice morph, or the 50 ms template fade when Morph is off) is what should
-    // carry them. Anything smaller is a drag, and a drag must NOT bump the generation -
-    // see SpectrumEngine::BlendJob::bumpGeneration for why sixty morph restarts a second
-    // is the click machine this project spent days removing.
+    // carry them, immediately. A drag is smaller than that, and its generation bumps are
+    // THROTTLED to 10 Hz instead (see the glide block below) - bumping all sixty frames
+    // a second is the click machine this project spent days removing, bumping none of
+    // them is "no pitch bend en los parciales".
     const double moved = (pgLastX < 0.0) ? 1.0 : std::abs (x - pgLastX) + std::abs (y - pgLastY);
     const bool   jump  = pgDirty || winnerChanged || moved > 0.15;
 
     const bool movedAny = pgDirty || winnerChanged || moved >= 1.0e-6;
     if (movedAny) pgParamsPending = true;
-    if (! movedAny && ! pgParamsPending)
+    ++pgBlendTick;
+    if (! movedAny && ! pgParamsPending && ! pgGlidePending)
         return;                                  // parked AND settled: nothing left to do
 
-    if (winnerChanged)
+    // Both writes below are SKIPPED while a corner is being edited: they exist to drive
+    // the controls FROM the blend, and the controls are the user's hands right now. Left
+    // running, every edit would be overwritten within 33 ms and the feature would read as
+    // a knob that snaps back.
+    if (winnerChanged && ! editing)
         applyPlaygroundDiscreteState (winner);
 
     // THE CONTROLS follow at ~30 Hz, not 60. Every write goes through the normal
@@ -4633,14 +7310,36 @@ void FractalAdditiveAudioProcessor::drivePlayground()
     // a skipped tick leaves every control one frame short of the point - for ever, because
     // the next tick sees no movement and returns early. The parked patch then quietly did
     // not match the pad, by a hair that never closed.
-    if (pgDirty || winnerChanged || (++pgParamTick & 1) == 0)
+    if (! editing && (pgDirty || winnerChanged || (++pgParamTick & 1) == 0))
     {
         applyPlaygroundContinuous (w);
         pgParamsPending = false;
     }
 
     if (movedAny)
-        postPlaygroundBlend (w, jump);
+    {
+        // THE FREQUENCY GLIDE (see kPgGlideTicks in the header): every ~6th frame of a
+        // drag publishes WITH a generation bump - 10 Hz, the adaptive corners' own
+        // republish rate - so with Morph on the voices BEND their partials to the
+        // moving blend, and with Morph off they cross the 50 ms fade. The frames in
+        // between publish bump-less: amplitudes keep tracking at 60 Hz without
+        // restarting anyone's morph clock.
+        const bool bump = jump || pgBlendTick - pgLastBump >= kPgGlideTicks;
+        postPlaygroundBlend (w, bump);
+        if (bump) { pgLastBump = pgBlendTick; pgGlidePending = false; }
+        else        pgGlidePending = true;
+    }
+    else if (pgGlidePending)
+    {
+        // The drag STOPPED between two glide ticks: the last bumped publish aimed the
+        // voices at a blend up to 100 ms behind the point. One final bumped publish
+        // lands them EXACTLY on the parked position - without it a parked pad would
+        // keep sounding a hair short of its own point for ever (the same one-frame-
+        // short trap pgParamsPending closes for the controls).
+        postPlaygroundBlend (w, true);
+        pgLastBump      = pgBlendTick;
+        pgGlidePending  = false;
+    }
 
     // The playground owns the spectrum while it is engaged, so the ordinary
     // "settings changed -> requestRebuild" test in timerCallback must not fire behind it
@@ -4661,7 +7360,17 @@ void FractalAdditiveAudioProcessor::drivePlayground()
 //==============================================================================
 void FractalAdditiveAudioProcessor::drivePlaygroundMix (const double w[kPlaygroundCorners])
 {
-    const int wantVoices = (int) apvts.getRawParameterValue ("pgVoices")->load();
+    // MONOPHONIC GLIDE IN MIX MODE: the rule applies to EVERY sub-engine, identically,
+    // and it is not refused here. It could not sensibly be: there is ONE note stream and
+    // the corners all hear it, so a mix that was mono in one engine and polyphonic in
+    // another would answer a single held chord with four different articulations. Each
+    // corner therefore drops to one voice exactly as the main engine does, and the
+    // takeover glides in each of them (the voices read the LIVE mono parameters, never
+    // the corner preset's - see AdditiveVoice's constructor for why).
+    //
+    // "Mix Voices per Corner" is not silently overridden: while mono is on the control
+    // is disabled and reads 1, so the panel states what is in force (see the editor).
+    const int wantVoices = lastMonoGlide ? 1 : (int) apvts.getRawParameterValue ("pgVoices")->load();
     for (int i = 0; i < kPlaygroundCorners; ++i)
     {
         if (! pgCorner[(size_t) i].assigned()) continue;
@@ -4705,9 +7414,17 @@ void FractalAdditiveAudioProcessor::refreshMixEngine (int corner)
     auto* e = mixEng[(size_t) corner].get();
     auto& c = pgCorner[(size_t) corner];
     if (e == nullptr || ! c.assigned()) return;
-    if (e->lastTmpl == c.tmpl && e->lastName == c.name) return;
+    if (e->lastTmpl == c.tmpl && e->lastName == c.name && e->lastRev == c.rev) return;
+    // A CORNER EDIT that moved only voice parameters leaves the template pointer alone,
+    // so the template publish below is gated on the pointer really changing: the bank and
+    // the routing refresh at the full tick rate (they are cheap and the user is turning
+    // the knob NOW), while publishNow - which bumps the sub-engine's generation and
+    // restarts every voice's morph - stays at the ~10 Hz the recompile itself runs at.
+    // Publishing every frame is the click machine this project keeps documenting.
+    const bool tmplChanged = (e->lastTmpl != c.tmpl);
     e->lastTmpl = c.tmpl;
     e->lastName = c.name;
+    e->lastRev  = c.rev;
 
     // The preset's values (defaults where it predates a parameter - cornerValueOr's
     // rule, applied by the bank so voices and modulators read the same numbers).
@@ -4742,7 +7459,7 @@ void FractalAdditiveAudioProcessor::refreshMixEngine (int corner)
     // the corner's OWN voices morph (its morph on) or cross the 50 ms fade (off) -
     // the same treatment a live spectrum change gets, which is the whole point.
     e->spectrum.setOverrides (c.gains, c.manual, false);
-    if (c.tmpl != nullptr)
+    if (tmplChanged && c.tmpl != nullptr)
         e->spectrum.publishNow (*c.tmpl);
 }
 
@@ -4773,9 +7490,19 @@ void FractalAdditiveAudioProcessor::applyPlaygroundDiscreteState (int corner)
             timbreName   = c.timbreName;
             timbreSource = c.timbreSource;
         }
-        else
+        else if (! loadTimbreText (c.timbreSource, err))
         {
-            loadTimbreText (c.timbreSource, err);
+            // A CORNER WHOSE INTERVALS NO LONGER PARSE must not go on sounding the PREVIOUS
+            // corner's spectrum: loadTimbreText leaves the old one in place when it refuses, so
+            // this used to be a silent wrong sound (night review, pre-existing). The engine is
+            // cleared and the failure stated - once per source, since this runs on every winner
+            // change and a notice per crossing would be noise, not information.
+            clearTimbre();
+            if (c.timbreSource != lastReportedBadCornerTimbre)
+            {
+                lastReportedBadCornerTimbre = c.timbreSource;
+                timbreRestoreError = err.isNotEmpty() ? err : juce::String ("Invalid value.");
+            }
         }
         // AFTER the loads (loadTimbreText clears provenance): the winner's spectrum
         // arrives with the winner's own origin - which is empty when its preset had
@@ -4811,18 +7538,28 @@ void FractalAdditiveAudioProcessor::applyPlaygroundContinuous (const double w[kP
         {
             // Nearest corner - one winner for every discrete setting at once, so the
             // engine, the scale and the manual switch can never come from three
-            // different presets (see nearestCorner in PresetMorph.h).
+            // different presets (see nearestCorner in PresetMorph.h). The winner ALWAYS
+            // has a value (the store is total), so a corner whose preset predates a
+            // discrete setting now reproduces that setting's default at its own vertex
+            // instead of leaving whatever the pad last wrote - which is what left a
+            // corner that never mentioned mono permanently monophonic (hunt entry 8).
             if (pgWinner < 0 || ! pgCorner[(size_t) pgWinner].value (i, target))
                 continue;
         }
         else
         {
+            // Every corner with weight contributes, always: the store is total, so the
+            // weights are never renormalised over "the corners that happen to know this
+            // parameter". That renormalisation is what let one corner rule a parameter
+            // 100 % across the whole pad and made the vertex path-dependent (hunt entry
+            // 11), and it disagreed with MIX mode, where ParamBank::fill has always used
+            // the default. One rule now, in both modes.
             double v[kPlaygroundCorners], ww[kPlaygroundCorners];
             int n = 0;
             for (int k = 0; k < kPlaygroundCorners; ++k)
                 if (w[k] > 0.0 && pgCorner[(size_t) k].value (i, v[n]))
                     ww[n++] = w[k];
-            if (n == 0) continue;      // no assigned corner knows this parameter
+            if (n == 0) continue;      // nothing assigned at all
             target = presetmorph::blendScalar (v, ww, n, space);
         }
 

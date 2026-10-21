@@ -168,7 +168,7 @@ namespace presetmorph
             return MorphSpace::Linear;
         // Every envelope time: ampAttack/Decay/Release, filter*, pitch*, and Morph Time.
         if (endsWith (id, "Attack") || endsWith (id, "Decay") || endsWith (id, "Release")
-            || id == "morphTime")
+            || id == "morphTime" || id == "dryWetTime")
             return MorphSpace::Log;
         // The modulator envelopes' one-letter segments (modE1A, modE2D, modE3R...) are
         // times too. "S" is a sustain LEVEL (0..1) and is deliberately not in the set.
